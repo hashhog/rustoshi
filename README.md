@@ -35,6 +35,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Chain state (tip tracking, median-time-past, reorganization support)
 - [x] Mempool (transaction storage, fee-rate ordering, ancestor/descendant limits)
 - [x] Fee estimation (confirmation time prediction, exponential decay, bucket statistics)
+- [x] Block template construction (ancestor-feerate selection, BIP-34 coinbase, witness commitment)
 - [ ] IBD orchestration (sync coordinator)
 - [ ] JSON-RPC server
 - [ ] Wallet functionality
