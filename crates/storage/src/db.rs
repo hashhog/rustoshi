@@ -172,4 +172,68 @@ impl ChainDb {
     pub fn contains_key(&self, cf_name: &str, key: &[u8]) -> Result<bool, StorageError> {
         Ok(self.get_cf(cf_name, key)?.is_some())
     }
+
+    /// Open the database with optimized performance settings for IBD.
+    ///
+    /// This configuration is tuned for maximum throughput during initial block
+    /// download, with larger write buffers, more aggressive compaction, and
+    /// optimized block caching.
+    ///
+    /// Key optimizations:
+    /// - 64 MB write buffers (reduces compaction frequency during heavy writes)
+    /// - 512 MB shared block cache (keeps hot data in memory)
+    /// - Bloom filters on UTXO column family (reduces disk reads)
+    /// - Level compaction with dynamic level sizes
+    /// - Background jobs for parallel compaction
+    pub fn open_optimized(path: &Path) -> Result<Self, StorageError> {
+        let mut db_opts = Options::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+
+        // Performance tuning
+        db_opts.set_max_open_files(512);
+        db_opts.set_keep_log_file_num(2);
+        db_opts.set_max_total_wal_size(128 * 1024 * 1024); // 128 MB WAL
+        db_opts.set_max_background_jobs(4);
+        db_opts.set_bytes_per_sync(1024 * 1024); // 1 MB sync interval
+        db_opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
+        db_opts.set_level_compaction_dynamic_level_bytes(true);
+
+        // Write buffer: 64 MB (larger = fewer compactions during IBD)
+        db_opts.set_write_buffer_size(64 * 1024 * 1024);
+        db_opts.set_max_write_buffer_number(3);
+        db_opts.set_min_write_buffer_number_to_merge(2);
+
+        // Block cache: 512 MB shared across all column families
+        let cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024);
+
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_COLUMN_FAMILIES
+            .iter()
+            .map(|name| {
+                let mut cf_opts = Options::default();
+
+                let mut block_opts = rocksdb::BlockBasedOptions::default();
+                block_opts.set_block_cache(&cache);
+
+                if *name == CF_UTXO {
+                    // UTXO: heavy random reads, benefit from bloom filter
+                    block_opts.set_bloom_filter(10.0, false);
+                    block_opts.set_cache_index_and_filter_blocks(true);
+                    block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+                    cf_opts.set_write_buffer_size(128 * 1024 * 1024); // 128 MB for UTXO
+                }
+
+                if *name == CF_BLOCKS {
+                    // Blocks: large sequential reads, use large blocks
+                    block_opts.set_block_size(128 * 1024); // 128 KB blocks
+                }
+
+                cf_opts.set_block_based_table_factory(&block_opts);
+                ColumnFamilyDescriptor::new(*name, cf_opts)
+            })
+            .collect();
+
+        let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
+        Ok(Self { db })
+    }
 }
