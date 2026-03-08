@@ -21,7 +21,7 @@ pub enum HexError {
 /// to how they are serialized on the wire. The internal representation stores
 /// bytes in serialization (little-endian) order. The `from_hex` and `to_hex`
 /// methods automatically reverse byte order for display.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct Hash256(pub [u8; 32]);
 
 impl Hash256 {
@@ -107,7 +107,7 @@ impl From<[u8; 32]> for Hash256 {
 /// A 160-bit hash (RIPEMD-160 result).
 ///
 /// Used primarily for Bitcoin addresses (P2PKH, P2SH).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct Hash160(pub [u8; 20]);
 
 impl Hash160 {
