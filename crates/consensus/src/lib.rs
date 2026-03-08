@@ -25,6 +25,7 @@
 //! block validation.
 
 pub mod chain_state;
+pub mod fee_estimator;
 pub mod mempool;
 pub mod params;
 pub mod script;
@@ -51,4 +52,5 @@ pub use validation::{
     TransactionSignatureChecker, TxValidationError, UndoData, UtxoView, ValidationError,
 };
 pub use chain_state::{ChainState, UtxoCache};
+pub use fee_estimator::FeeEstimator;
 pub use mempool::{Mempool, MempoolConfig, MempoolEntry, MempoolError};
