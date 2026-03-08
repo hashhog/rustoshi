@@ -1,0 +1,10 @@
+[package]
+name = "rustoshi-primitives"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+hex.workspace = true
+bytes.workspace = true
