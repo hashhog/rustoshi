@@ -40,6 +40,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] HD wallet (BIP-32/44/84 key derivation, address generation, UTXO tracking, transaction building)
 - [x] CLI and application entry point (clap-based CLI, event loop, graceful shutdown)
 - [x] Testing suite (unit tests, integration tests, property-based tests)
+- [x] Performance optimizations (parallel script validation, UTXO compression, DB tuning, benchmarks)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
@@ -55,6 +56,7 @@ cargo run -- --help              # show all CLI options
 ```
 rustoshi/
   rustoshi/           # binary crate (CLI entry point)
+    benches/          # criterion benchmarks
   crates/
     primitives/       # Hash256, transactions, blocks, serialization
     crypto/           # SHA256d, HASH160, secp256k1 ECDSA, sighash, addresses
@@ -71,4 +73,5 @@ rustoshi/
 cargo test --workspace           # run all tests
 cargo test -p rustoshi           # run integration + property tests
 cargo clippy --workspace         # lint checks
+cargo bench --workspace          # run benchmarks
 ```
