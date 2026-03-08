@@ -31,8 +31,9 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Peer management (connection pool, DNS seed resolution, address manager)
 - [x] Header synchronization (block locator, getheaders protocol)
 - [x] Block download manager (parallel downloads, sliding window, stall detection)
-- [ ] Chain management and IBD orchestration
-- [ ] Chain reorganization
+- [x] UTXO cache (in-memory with database fallback, flush batching)
+- [x] Chain state (tip tracking, median-time-past, reorganization support)
+- [ ] IBD orchestration (sync coordinator)
 - [ ] JSON-RPC server
 - [ ] Wallet functionality
 
