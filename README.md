@@ -20,6 +20,8 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Sighash computation (legacy and BIP-143 SegWit)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH)
+- [x] Consensus parameters (chain config, genesis blocks, soft fork heights)
+- [x] Difficulty adjustment algorithm
 - [ ] P2P network protocol
 - [ ] Block validation and chain management
 - [ ] Persistent storage (RocksDB)
@@ -41,7 +43,7 @@ rustoshi/
   crates/
     primitives/       # Hash256, transactions, blocks, serialization
     crypto/           # SHA256d, HASH160, secp256k1 ECDSA, sighash, addresses
-    consensus/        # script interpreter, validation rules
+    consensus/        # script interpreter, chain params, difficulty adjustment
     network/          # P2P protocol
     storage/          # RocksDB persistence
     rpc/              # JSON-RPC server
