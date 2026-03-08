@@ -35,3 +35,4 @@ rocksdb = "0.24"
 axum = "0.7"
 jsonrpsee = { version = "0.22", features = ["server", "macros"] }
 proptest = "1.4"
+tempfile = "3"
