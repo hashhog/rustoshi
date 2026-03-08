@@ -1,0 +1,10 @@
+[package]
+name = "rustoshi-consensus"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustoshi-primitives = { path = "../primitives" }
+rustoshi-crypto = { path = "../crypto" }
+thiserror.workspace = true
+tracing.workspace = true
