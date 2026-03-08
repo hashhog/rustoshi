@@ -29,8 +29,9 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] P2P message serialization (version, headers, inv, block, tx, etc.)
 - [x] P2P peer connection (TCP, version/verack handshake, ping/pong keepalive)
 - [x] Peer management (connection pool, DNS seed resolution, address manager)
-- [ ] Header-first sync and block download
-- [ ] Chain management and reorganization
+- [x] Header synchronization (block locator, getheaders protocol)
+- [ ] Block download and chain management
+- [ ] Chain reorganization
 - [ ] JSON-RPC server
 - [ ] Wallet functionality
 
