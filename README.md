@@ -34,6 +34,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] UTXO cache (in-memory with database fallback, flush batching)
 - [x] Chain state (tip tracking, median-time-past, reorganization support)
 - [x] Mempool (transaction storage, fee-rate ordering, ancestor/descendant limits)
+- [x] Fee estimation (confirmation time prediction, exponential decay, bucket statistics)
 - [ ] IBD orchestration (sync coordinator)
 - [ ] JSON-RPC server
 - [ ] Wallet functionality
