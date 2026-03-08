@@ -8,6 +8,8 @@
 //! - `script`: Bitcoin Script interpreter with support for P2PKH, P2SH, P2WPKH,
 //!   P2WSH, and basic multisig. Includes proper handling of consensus vs policy
 //!   flags.
+//! - `params`: Consensus parameters, chain configuration, genesis blocks, and
+//!   soft fork activation heights for all networks.
 //!
 //! # Consensus vs Policy
 //!
@@ -18,9 +20,21 @@
 //! See `ScriptFlags::consensus_flags()` for the correct flags to use during
 //! block validation.
 
+pub mod params;
 pub mod script;
 
+pub use params::{
+    block_subsidy, calculate_next_work_required, compact_to_target, target_to_compact,
+    ChainParams, NetworkId, NetworkMagic,
+    // Consensus constants
+    COINBASE_MATURITY, COIN, DIFFICULTY_ADJUSTMENT_INTERVAL, INITIAL_SUBSIDY,
+    LOCKTIME_THRESHOLD, MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT,
+    MAX_MONEY, MAX_OPS_PER_SCRIPT, MAX_PUBKEYS_PER_MULTISIG, MAX_SCRIPT_ELEMENT_SIZE,
+    MAX_SCRIPT_SIZE, MAX_STACK_SIZE, MAX_TIMESPAN, MEDIAN_TIME_PAST_WINDOW, MIN_TIMESPAN,
+    SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_MASK, SEQUENCE_LOCKTIME_TYPE_FLAG,
+    SUBSIDY_HALVING_INTERVAL, TARGET_BLOCK_TIME, TARGET_TIMESPAN, WITNESS_SCALE_FACTOR,
+};
 pub use script::{
-    eval_script, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh, verify_script,
-    DummyChecker, Opcode, ScriptError, ScriptFlags, SigVersion, SignatureChecker, Stack,
+    eval_script, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh, verify_script, DummyChecker,
+    Opcode, ScriptError, ScriptFlags, SigVersion, SignatureChecker, Stack,
 };
