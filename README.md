@@ -33,6 +33,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Block download manager (parallel downloads, sliding window, stall detection)
 - [x] UTXO cache (in-memory with database fallback, flush batching)
 - [x] Chain state (tip tracking, median-time-past, reorganization support)
+- [x] Mempool (transaction storage, fee-rate ordering, ancestor/descendant limits)
 - [ ] IBD orchestration (sync coordinator)
 - [ ] JSON-RPC server
 - [ ] Wallet functionality
