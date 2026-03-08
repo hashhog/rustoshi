@@ -26,7 +26,8 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Block validation (context-free and contextual checks, BIP-34 height encoding)
 - [x] Transaction validation (UTXO lookup, script verification, sigops counting)
 - [x] Block connection/disconnection (UTXO updates, undo data, reorg support)
-- [ ] P2P network protocol
+- [x] P2P message serialization (version, headers, inv, block, tx, etc.)
+- [ ] P2P peer management and network sync
 - [ ] Chain management and reorganization
 - [ ] JSON-RPC server
 - [ ] Wallet functionality
@@ -47,7 +48,7 @@ rustoshi/
     primitives/       # Hash256, transactions, blocks, serialization
     crypto/           # SHA256d, HASH160, secp256k1 ECDSA, sighash, addresses
     consensus/        # script interpreter, chain params, validation
-    network/          # P2P protocol
+    network/          # P2P protocol (message types, serialization)
     storage/          # RocksDB persistence
     rpc/              # JSON-RPC server
     wallet/           # key management
