@@ -48,11 +48,12 @@ pub use script::{
     Opcode, ScriptError, ScriptFlags, SigVersion, SignatureChecker, Stack,
 };
 pub use validation::{
-    check_block, check_transaction, connect_block, contextual_check_block,
-    contextual_check_block_header, disconnect_block, BlockIndexEntry, ChainContext, CoinEntry,
-    TransactionSignatureChecker, TxValidationError, UndoData, UtxoView, ValidationError,
+    check_block, check_transaction, connect_block, connect_block_parallel, contextual_check_block,
+    contextual_check_block_header, disconnect_block, validate_scripts_parallel, BlockIndexEntry,
+    ChainContext, CoinEntry, TransactionSignatureChecker, TxValidationError, UndoData, UtxoView,
+    ValidationError,
 };
-pub use chain_state::{ChainState, UtxoCache};
+pub use chain_state::{ChainState, CompressedScript, UtxoCache};
 pub use fee_estimator::FeeEstimator;
 pub use mempool::{Mempool, MempoolConfig, MempoolEntry, MempoolError};
 pub use block_template::{build_block_template, BlockTemplate, BlockTemplateConfig};
