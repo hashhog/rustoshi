@@ -12,6 +12,8 @@
 //!   soft fork activation heights for all networks.
 //! - `validation`: Block and transaction validation, including context-free checks,
 //!   contextual checks (BIP-34, witness commitment), and UTXO-based connection.
+//! - `chain_state`: UTXO cache and chain state management, including chain tip
+//!   tracking, median-time-past computation, and reorganization support.
 //!
 //! # Consensus vs Policy
 //!
@@ -22,6 +24,7 @@
 //! See `ScriptFlags::consensus_flags()` for the correct flags to use during
 //! block validation.
 
+pub mod chain_state;
 pub mod params;
 pub mod script;
 pub mod validation;
@@ -46,3 +49,4 @@ pub use validation::{
     contextual_check_block_header, disconnect_block, BlockIndexEntry, ChainContext, CoinEntry,
     TransactionSignatureChecker, TxValidationError, UndoData, UtxoView, ValidationError,
 };
+pub use chain_state::{ChainState, UtxoCache};
