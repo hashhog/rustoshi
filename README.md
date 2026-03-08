@@ -11,8 +11,12 @@ to be educational, well-structured, and idiomatic Rust.
 ## Current status
 
 - [x] Project structure and Cargo workspace
-- [ ] Primitive types (hashes, scripts, addresses)
-- [ ] Cryptographic operations (SHA256, RIPEMD160, secp256k1)
+- [x] Hash types (Hash256, Hash160) with hex encoding
+- [x] Binary serialization (Encodable/Decodable traits, CompactSize)
+- [x] Transaction types (OutPoint, TxIn, TxOut, Transaction)
+- [x] Block types (BlockHeader, Block) with Merkle root computation
+- [x] SegWit-aware serialization (txid vs wtxid)
+- [ ] Cryptographic operations (secp256k1 signatures)
 - [ ] P2P network protocol
 - [ ] Consensus rules and block validation
 - [ ] Persistent storage (RocksDB)
@@ -32,7 +36,7 @@ cargo run -- --help
 rustoshi/
   rustoshi/           # binary crate (CLI entry point)
   crates/
-    primitives/       # foundational types
+    primitives/       # Hash256, transactions, blocks, serialization
     crypto/           # hashing and signing
     network/          # P2P protocol
     consensus/        # validation rules
