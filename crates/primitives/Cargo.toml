@@ -8,3 +8,4 @@ thiserror.workspace = true
 serde.workspace = true
 hex.workspace = true
 bytes.workspace = true
+sha2.workspace = true
