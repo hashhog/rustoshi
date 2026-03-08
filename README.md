@@ -19,8 +19,9 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Cryptographic operations (SHA256d, HASH160, tagged hashes, secp256k1 ECDSA)
 - [x] Sighash computation (legacy and BIP-143 SegWit)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
+- [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH)
 - [ ] P2P network protocol
-- [ ] Consensus rules and block validation
+- [ ] Block validation and chain management
 - [ ] Persistent storage (RocksDB)
 - [ ] JSON-RPC server
 - [ ] Wallet functionality
@@ -40,8 +41,8 @@ rustoshi/
   crates/
     primitives/       # Hash256, transactions, blocks, serialization
     crypto/           # SHA256d, HASH160, secp256k1 ECDSA, sighash, addresses
+    consensus/        # script interpreter, validation rules
     network/          # P2P protocol
-    consensus/        # validation rules
     storage/          # RocksDB persistence
     rpc/              # JSON-RPC server
     wallet/           # key management
