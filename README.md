@@ -28,7 +28,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Block connection/disconnection (UTXO updates, undo data, reorg support)
 - [x] P2P message serialization (version, headers, inv, block, tx, etc.)
 - [x] P2P peer connection (TCP, version/verack handshake, ping/pong keepalive)
-- [ ] Peer management (connection pool, address discovery)
+- [x] Peer management (connection pool, DNS seed resolution, address manager)
 - [ ] Header-first sync and block download
 - [ ] Chain management and reorganization
 - [ ] JSON-RPC server
@@ -50,7 +50,7 @@ rustoshi/
     primitives/       # Hash256, transactions, blocks, serialization
     crypto/           # SHA256d, HASH160, secp256k1 ECDSA, sighash, addresses
     consensus/        # script interpreter, chain params, validation
-    network/          # P2P protocol (message types, serialization)
+    network/          # P2P protocol (message types, peer management)
     storage/          # RocksDB persistence
     rpc/              # JSON-RPC server
     wallet/           # key management
