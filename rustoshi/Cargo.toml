@@ -1,0 +1,18 @@
+[package]
+name = "rustoshi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustoshi-primitives = { path = "../crates/primitives" }
+rustoshi-crypto = { path = "../crates/crypto" }
+rustoshi-network = { path = "../crates/network" }
+rustoshi-consensus = { path = "../crates/consensus" }
+rustoshi-storage = { path = "../crates/storage" }
+rustoshi-rpc = { path = "../crates/rpc" }
+rustoshi-wallet = { path = "../crates/wallet" }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
