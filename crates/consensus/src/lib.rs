@@ -24,6 +24,7 @@
 //! See `ScriptFlags::consensus_flags()` for the correct flags to use during
 //! block validation.
 
+pub mod block_template;
 pub mod chain_state;
 pub mod fee_estimator;
 pub mod mempool;
@@ -54,3 +55,4 @@ pub use validation::{
 pub use chain_state::{ChainState, UtxoCache};
 pub use fee_estimator::FeeEstimator;
 pub use mempool::{Mempool, MempoolConfig, MempoolEntry, MempoolError};
+pub use block_template::{build_block_template, BlockTemplate, BlockTemplateConfig};
