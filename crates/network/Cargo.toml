@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 rustoshi-primitives = { path = "../primitives" }
 rustoshi-crypto = { path = "../crypto" }
+rustoshi-consensus = { path = "../consensus" }
 thiserror.workspace = true
 tokio.workspace = true
 bytes.workspace = true
