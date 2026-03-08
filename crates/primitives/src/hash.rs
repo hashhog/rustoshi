@@ -21,7 +21,7 @@ pub enum HexError {
 /// to how they are serialized on the wire. The internal representation stores
 /// bytes in serialization (little-endian) order. The `from_hex` and `to_hex`
 /// methods automatically reverse byte order for display.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Hash256(pub [u8; 32]);
 
 impl Hash256 {
