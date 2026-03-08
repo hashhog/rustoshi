@@ -37,8 +37,8 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Fee estimation (confirmation time prediction, exponential decay, bucket statistics)
 - [x] Block template construction (ancestor-feerate selection, BIP-34 coinbase, witness commitment)
 - [x] JSON-RPC server (getblockchaininfo, getblock, sendrawtransaction, estimatesmartfee, etc.)
+- [x] HD wallet (BIP-32/44/84 key derivation, address generation, UTXO tracking, transaction building)
 - [ ] IBD orchestration (sync coordinator)
-- [ ] Wallet functionality
 
 ## Quick start
 
@@ -59,7 +59,7 @@ rustoshi/
     network/          # P2P protocol (message types, peer management)
     storage/          # RocksDB persistence
     rpc/              # JSON-RPC server
-    wallet/           # key management
+    wallet/           # HD wallet (BIP-32/44/84, transaction signing)
 ```
 
 ## Running tests
