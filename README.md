@@ -27,7 +27,9 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Transaction validation (UTXO lookup, script verification, sigops counting)
 - [x] Block connection/disconnection (UTXO updates, undo data, reorg support)
 - [x] P2P message serialization (version, headers, inv, block, tx, etc.)
-- [ ] P2P peer management and network sync
+- [x] P2P peer connection (TCP, version/verack handshake, ping/pong keepalive)
+- [ ] Peer management (connection pool, address discovery)
+- [ ] Header-first sync and block download
 - [ ] Chain management and reorganization
 - [ ] JSON-RPC server
 - [ ] Wallet functionality
