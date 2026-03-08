@@ -22,9 +22,9 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH)
 - [x] Consensus parameters (chain config, genesis blocks, soft fork heights)
 - [x] Difficulty adjustment algorithm
+- [x] Persistent storage (RocksDB with column families, UTXO set, undo data)
 - [ ] P2P network protocol
 - [ ] Block validation and chain management
-- [ ] Persistent storage (RocksDB)
 - [ ] JSON-RPC server
 - [ ] Wallet functionality
 
