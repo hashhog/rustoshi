@@ -38,13 +38,15 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Block template construction (ancestor-feerate selection, BIP-34 coinbase, witness commitment)
 - [x] JSON-RPC server (getblockchaininfo, getblock, sendrawtransaction, estimatesmartfee, etc.)
 - [x] HD wallet (BIP-32/44/84 key derivation, address generation, UTXO tracking, transaction building)
-- [ ] IBD orchestration (sync coordinator)
+- [x] CLI and application entry point (clap-based CLI, event loop, graceful shutdown)
+- [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
 
 ```bash
 cargo build --workspace
-cargo run -- --help
+cargo run -- --network testnet4  # start node on testnet4
+cargo run -- --help              # show all CLI options
 ```
 
 ## Project structure
