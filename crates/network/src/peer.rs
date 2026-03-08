@@ -183,6 +183,99 @@ impl PendingRead {
     }
 }
 
+/// Pre-allocated message reader for efficient message parsing.
+///
+/// Uses fixed-size header buffer and a reusable payload buffer to reduce
+/// allocations during block download. This is particularly important during
+/// IBD when millions of messages are processed.
+///
+/// # Performance Notes
+/// - Header buffer is fixed at 24 bytes (MESSAGE_HEADER_SIZE)
+/// - Payload buffer starts at 4 MB and grows as needed
+/// - Buffer is reused across messages, avoiding repeated allocations
+pub struct MessageReader {
+    /// Fixed header buffer (24 bytes).
+    header_buf: [u8; MESSAGE_HEADER_SIZE],
+    /// Reusable payload buffer (grows as needed, never shrinks).
+    payload_buf: Vec<u8>,
+}
+
+impl MessageReader {
+    /// Create a new MessageReader with pre-allocated buffers.
+    ///
+    /// The payload buffer starts at 4 MB to handle full blocks without
+    /// reallocation.
+    pub fn new() -> Self {
+        Self {
+            header_buf: [0u8; MESSAGE_HEADER_SIZE],
+            payload_buf: Vec::with_capacity(4 * 1024 * 1024), // 4 MB initial
+        }
+    }
+
+    /// Read a single P2P message from the stream.
+    ///
+    /// Uses the pre-allocated buffers to avoid allocations. The payload buffer
+    /// is resized as needed but never reallocated for smaller messages.
+    ///
+    /// # Arguments
+    /// * `reader` - The async reader to read from
+    /// * `expected_magic` - Network magic bytes to validate
+    ///
+    /// # Returns
+    /// The deserialized NetworkMessage, or an error.
+    pub async fn read_message<R: tokio::io::AsyncReadExt + Unpin>(
+        &mut self,
+        reader: &mut R,
+        expected_magic: &[u8; 4],
+    ) -> std::io::Result<NetworkMessage> {
+        // Read 24-byte header
+        reader.read_exact(&mut self.header_buf).await?;
+        let (magic, command, length, checksum) = parse_message_header(&self.header_buf);
+
+        // Validate magic
+        if magic != *expected_magic {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad magic: {:?}", magic),
+            ));
+        }
+
+        // Validate length
+        if length as usize > MAX_MESSAGE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message too large: {} bytes", length),
+            ));
+        }
+
+        // Resize payload buffer (no realloc if already big enough)
+        self.payload_buf.resize(length as usize, 0);
+
+        // Read payload
+        if !self.payload_buf.is_empty() {
+            reader.read_exact(&mut self.payload_buf[..length as usize]).await?;
+        }
+
+        // Validate checksum
+        let computed = sha256d(&self.payload_buf[..length as usize]);
+        if checksum != computed.0[..4] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checksum mismatch",
+            ));
+        }
+
+        // Deserialize
+        NetworkMessage::deserialize(&command, &self.payload_buf[..length as usize])
+    }
+}
+
+impl Default for MessageReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Run an outbound peer connection task.
 ///
 /// This handles:
@@ -1184,5 +1277,84 @@ mod tests {
         let payload_state = PendingRead::new_payload(1000);
         assert_eq!(payload_state.phase, ReadPhase::Payload);
         assert_eq!(payload_state.expected, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_message_reader_preallocated_buffer() {
+        // Create a pre-allocated message reader
+        let mut reader = MessageReader::new();
+
+        // Initial capacity should be 4 MB
+        assert!(reader.payload_buf.capacity() >= 4 * 1024 * 1024);
+
+        // Create multiple messages of different sizes
+        let messages = vec![
+            NetworkMessage::Ping(0x1234567890ABCDEF),
+            NetworkMessage::Verack,
+            NetworkMessage::Inv(
+                (0..100)
+                    .map(|i| InvVector {
+                        inv_type: InvType::MsgTx,
+                        hash: rustoshi_primitives::Hash256([i as u8; 32]),
+                    })
+                    .collect(),
+            ),
+        ];
+
+        for msg in messages {
+            let data = serialize_message(&TESTNET4_MAGIC, &msg);
+            let mut cursor = Cursor::new(data);
+
+            let read_msg = reader.read_message(&mut cursor, &TESTNET4_MAGIC).await.unwrap();
+
+            // Verify message was read correctly
+            match (&msg, &read_msg) {
+                (NetworkMessage::Ping(n1), NetworkMessage::Ping(n2)) => assert_eq!(n1, n2),
+                (NetworkMessage::Verack, NetworkMessage::Verack) => {}
+                (NetworkMessage::Inv(v1), NetworkMessage::Inv(v2)) => {
+                    assert_eq!(v1.len(), v2.len());
+                }
+                _ => panic!("message type mismatch"),
+            }
+        }
+
+        // Buffer should still have same capacity (reused, not reallocated)
+        assert!(reader.payload_buf.capacity() >= 4 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_message_reader_bad_magic() {
+        let mut reader = MessageReader::new();
+
+        let msg = NetworkMessage::Verack;
+        let data = serialize_message(&TESTNET4_MAGIC, &msg);
+        let mut cursor = Cursor::new(data);
+
+        // Try to read with wrong magic
+        let wrong_magic = [0xFF, 0xFF, 0xFF, 0xFF];
+        let result = reader.read_message(&mut cursor, &wrong_magic).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("bad magic"));
+    }
+
+    #[tokio::test]
+    async fn test_message_reader_checksum_mismatch() {
+        let mut reader = MessageReader::new();
+
+        let msg = NetworkMessage::Ping(42);
+        let mut data = serialize_message(&TESTNET4_MAGIC, &msg);
+
+        // Corrupt the checksum (bytes 20-23)
+        data[20] ^= 0xFF;
+        data[21] ^= 0xFF;
+
+        let mut cursor = Cursor::new(data);
+        let result = reader.read_message(&mut cursor, &TESTNET4_MAGIC).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("checksum"));
     }
 }
