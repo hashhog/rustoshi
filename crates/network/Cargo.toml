@@ -1,0 +1,14 @@
+[package]
+name = "rustoshi-network"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustoshi-primitives = { path = "../primitives" }
+rustoshi-crypto = { path = "../crypto" }
+thiserror.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+rand.workspace = true
+serde.workspace = true
