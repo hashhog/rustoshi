@@ -8,6 +8,7 @@ rustoshi-primitives = { path = "../primitives" }
 rustoshi-consensus = { path = "../consensus" }
 rustoshi-storage = { path = "../storage" }
 rustoshi-network = { path = "../network" }
+rustoshi-crypto = { path = "../crypto" }
 thiserror.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
@@ -16,3 +17,7 @@ serde_json.workspace = true
 axum.workspace = true
 jsonrpsee.workspace = true
 tracing.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3.16"
