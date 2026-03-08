@@ -1,11 +1,20 @@
 //! Rustoshi crypto crate
 //!
-//! Cryptographic primitives for Bitcoin: hashing, signing, verification.
+//! Cryptographic primitives for Bitcoin: hashing, signing, verification, address encoding.
 
+pub mod address;
+pub mod base58;
+pub mod bech32;
 pub mod hashes;
 pub mod keys;
 pub mod sighash;
 
+pub use address::{Address, AddressError, Network};
+pub use base58::{base58check_decode, base58check_encode, Base58Error};
+pub use bech32::{
+    bech32_decode, bech32_encode, convert_bits, decode_segwit_address, encode_segwit_address,
+    Bech32Error, Bech32Variant,
+};
 pub use hashes::{hash160, merkle_root, sha256, sha256d, tagged_hash};
 pub use keys::{
     ecdsa_sign, ecdsa_verify, generate_private_key, parse_compact_signature, parse_der_signature,
