@@ -39,6 +39,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] JSON-RPC server (getblockchaininfo, getblock, sendrawtransaction, estimatesmartfee, etc.)
 - [x] HD wallet (BIP-32/44/84 key derivation, address generation, UTXO tracking, transaction building)
 - [x] CLI and application entry point (clap-based CLI, event loop, graceful shutdown)
+- [x] Testing suite (unit tests, integration tests, property-based tests)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
@@ -67,5 +68,7 @@ rustoshi/
 ## Running tests
 
 ```bash
-cargo test --workspace
+cargo test --workspace           # run all tests
+cargo test -p rustoshi           # run integration + property tests
+cargo clippy --workspace         # lint checks
 ```
