@@ -18,6 +18,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] SegWit-aware serialization (txid vs wtxid)
 - [x] Cryptographic operations (SHA256d, HASH160, tagged hashes, secp256k1 ECDSA)
 - [x] Sighash computation (legacy and BIP-143 SegWit)
+- [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [ ] P2P network protocol
 - [ ] Consensus rules and block validation
 - [ ] Persistent storage (RocksDB)
@@ -38,7 +39,7 @@ rustoshi/
   rustoshi/           # binary crate (CLI entry point)
   crates/
     primitives/       # Hash256, transactions, blocks, serialization
-    crypto/           # SHA256d, HASH160, secp256k1 ECDSA, sighash
+    crypto/           # SHA256d, HASH160, secp256k1 ECDSA, sighash, addresses
     network/          # P2P protocol
     consensus/        # validation rules
     storage/          # RocksDB persistence
