@@ -10,6 +10,8 @@
 //!   flags.
 //! - `params`: Consensus parameters, chain configuration, genesis blocks, and
 //!   soft fork activation heights for all networks.
+//! - `validation`: Block and transaction validation, including context-free checks,
+//!   contextual checks (BIP-34, witness commitment), and UTXO-based connection.
 //!
 //! # Consensus vs Policy
 //!
@@ -22,6 +24,7 @@
 
 pub mod params;
 pub mod script;
+pub mod validation;
 
 pub use params::{
     block_subsidy, calculate_next_work_required, compact_to_target, target_to_compact,
@@ -37,4 +40,9 @@ pub use params::{
 pub use script::{
     eval_script, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh, verify_script, DummyChecker,
     Opcode, ScriptError, ScriptFlags, SigVersion, SignatureChecker, Stack,
+};
+pub use validation::{
+    check_block, check_transaction, connect_block, contextual_check_block,
+    contextual_check_block_header, disconnect_block, BlockIndexEntry, ChainContext, CoinEntry,
+    TransactionSignatureChecker, TxValidationError, UndoData, UtxoView, ValidationError,
 };
