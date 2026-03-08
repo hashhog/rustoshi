@@ -36,8 +36,8 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Mempool (transaction storage, fee-rate ordering, ancestor/descendant limits)
 - [x] Fee estimation (confirmation time prediction, exponential decay, bucket statistics)
 - [x] Block template construction (ancestor-feerate selection, BIP-34 coinbase, witness commitment)
+- [x] JSON-RPC server (getblockchaininfo, getblock, sendrawtransaction, estimatesmartfee, etc.)
 - [ ] IBD orchestration (sync coordinator)
-- [ ] JSON-RPC server
 - [ ] Wallet functionality
 
 ## Quick start
