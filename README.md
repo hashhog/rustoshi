@@ -41,6 +41,8 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] CLI and application entry point (clap-based CLI, event loop, graceful shutdown)
 - [x] Testing suite (unit tests, integration tests, property-based tests)
 - [x] Performance optimizations (parallel script validation, UTXO compression, DB tuning, benchmarks)
+- [x] BIP-146 NULLFAIL enforcement at SegWit activation height
+- [x] BIP-141 WITNESS_PUBKEYTYPE enforcement (compressed pubkeys in SegWit v0)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
