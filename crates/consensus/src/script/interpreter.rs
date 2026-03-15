@@ -23,8 +23,8 @@
 //!
 //! # Consensus vs Policy Flags
 //!
-//! **CRITICAL**: Only 7 flags are consensus-enforced during block validation:
-//! - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, TAPROOT
+//! **CRITICAL**: Only 8 flags are consensus-enforced during block validation:
+//! - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, NULLFAIL, TAPROOT
 //!
 //! Policy flags (CLEANSTACK, SIGPUSHONLY, LOW_S, etc.) are enforced for
 //! mempool acceptance but NOT during block validation. Adding policy flags
@@ -58,12 +58,13 @@ pub const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000FFFF;
 /// Script verification flags.
 ///
 /// **IMPORTANT**: When validating blocks, only use consensus flags:
-/// - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, TAPROOT
+/// - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, NULLFAIL, TAPROOT
 ///
 /// Policy flags should only be used for mempool validation.
 #[derive(Clone, Debug, Default)]
 pub struct ScriptFlags {
-    /// BIP-16: Pay-to-Script-Hash
+    // ========== Consensus flags (enforced during block validation) ==========
+    /// BIP-16: Pay-to-Script-Hash (consensus)
     pub verify_p2sh: bool,
     /// BIP-66: Strict DER signature encoding (consensus)
     pub verify_dersig: bool,
@@ -73,8 +74,10 @@ pub struct ScriptFlags {
     pub verify_checksequenceverify: bool,
     /// BIP-141: Segregated Witness (consensus)
     pub verify_witness: bool,
-    /// BIP-147: NULLDUMMY - dummy element must be empty (consensus)
+    /// BIP-147: NULLDUMMY - dummy element must be empty (consensus, activated with SegWit)
     pub verify_nulldummy: bool,
+    /// BIP-146: NULLFAIL - failed signature must be empty (consensus, activated with SegWit)
+    pub verify_nullfail: bool,
     /// BIP-341/342: Taproot (consensus)
     pub verify_taproot: bool,
 
@@ -95,8 +98,6 @@ pub struct ScriptFlags {
     pub verify_discourage_upgradable_witness_program: bool,
     /// OP_IF/NOTIF argument must be minimal
     pub verify_minimalif: bool,
-    /// Failed signature must be empty
-    pub verify_nullfail: bool,
     /// Witness pubkeys must be compressed
     pub verify_witness_pubkeytype: bool,
     /// Fail on upgradable taproot versions
@@ -128,6 +129,7 @@ impl ScriptFlags {
             verify_checksequenceverify: height >= csv_height,
             verify_witness: height >= segwit_height,
             verify_nulldummy: height >= segwit_height, // BIP-147 activated with SegWit
+            verify_nullfail: height >= segwit_height,  // BIP-146 activated with SegWit
             verify_taproot: height >= taproot_height,
             ..Default::default()
         }
@@ -2007,5 +2009,153 @@ mod tests {
 
         let result = verify_script(&script_sig, &script_pubkey, &witness, &flags, &checker);
         assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    // =========================
+    // NULLFAIL (BIP-146) tests
+    // =========================
+
+    #[test]
+    fn nullfail_checksig_empty_sig_allowed() {
+        // With NULLFAIL enabled, an empty signature that fails verification is OK
+        let mut stack = vec![
+            vec![],                          // Empty signature (OK for NULLFAIL)
+            vec![0x02; 33],                  // Fake pubkey
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_nullfail = true;
+        let checker = DummyChecker;
+
+        // OP_CHECKSIG
+        let script = [0xac];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        // Should succeed (empty sig is allowed even though verification fails)
+        assert!(result.is_ok());
+        assert_eq!(stack.len(), 1);
+        assert!(!stack_bool(&stack[0])); // Result is false but no error
+    }
+
+    #[test]
+    fn nullfail_checksig_nonempty_sig_rejected() {
+        // With NULLFAIL enabled, a non-empty signature that fails verification is rejected
+        let mut stack = vec![
+            vec![0x30, 0x06, 0x01],          // Non-empty invalid signature
+            vec![0x02; 33],                  // Fake pubkey
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_nullfail = true;
+        let checker = DummyChecker;
+
+        // OP_CHECKSIG
+        let script = [0xac];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(matches!(result, Err(ScriptError::NullFail)));
+    }
+
+    #[test]
+    fn nullfail_disabled_nonempty_sig_allowed() {
+        // Without NULLFAIL, a non-empty failing signature is allowed
+        let mut stack = vec![
+            vec![0x30, 0x06, 0x01],          // Non-empty invalid signature
+            vec![0x02; 33],                  // Fake pubkey
+        ];
+        let flags = ScriptFlags::default(); // NULLFAIL is false by default
+        let checker = DummyChecker;
+
+        // OP_CHECKSIG
+        let script = [0xac];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        // Should succeed (NULLFAIL not enforced)
+        assert!(result.is_ok());
+        assert_eq!(stack.len(), 1);
+        assert!(!stack_bool(&stack[0])); // Result is false
+    }
+
+    #[test]
+    fn nullfail_checksigverify_nonempty_sig_rejected() {
+        // With NULLFAIL enabled, CHECKSIGVERIFY with non-empty failing sig is rejected
+        let mut stack = vec![
+            vec![0x30, 0x06, 0x01],          // Non-empty invalid signature
+            vec![0x02; 33],                  // Fake pubkey
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_nullfail = true;
+        let checker = DummyChecker;
+
+        // OP_CHECKSIGVERIFY
+        let script = [0xad];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        // NULLFAIL error takes precedence over CHECKSIGVERIFY failure
+        assert!(matches!(result, Err(ScriptError::NullFail)));
+    }
+
+    #[test]
+    fn nullfail_checkmultisig_empty_sigs_allowed() {
+        // With NULLFAIL enabled, empty signatures that fail verification are OK
+        // Stack layout (bottom to top): dummy, sig1, nSigs, pubkey1, nKeys
+        // Pop order: nKeys(1), pubkey(1), nSigs(1), sig(1), dummy
+        let mut stack = vec![
+            vec![],                          // Dummy element (bottom of stack, popped last)
+            vec![],                          // Empty signature 1 (OK for NULLFAIL)
+            vec![1],                         // nSigs = 1
+            vec![0x02; 33],                  // Pubkey 1
+            vec![1],                         // nKeys = 1 (TOP of stack, popped first)
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_nullfail = true;
+        let checker = DummyChecker;
+
+        // OP_CHECKMULTISIG
+        let script = [0xae];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        // Should succeed (empty sigs allowed, even though verification fails)
+        assert!(result.is_ok());
+        assert_eq!(stack.len(), 1);
+        assert!(!stack_bool(&stack[0])); // Result is false but no error
+    }
+
+    #[test]
+    fn nullfail_checkmultisig_nonempty_sig_rejected() {
+        // With NULLFAIL enabled, non-empty failing signatures are rejected
+        let mut stack = vec![
+            vec![],                          // Dummy element
+            vec![0x30, 0x06, 0x01],          // Non-empty invalid signature
+            vec![1],                         // nSigs = 1
+            vec![0x02; 33],                  // Pubkey 1
+            vec![1],                         // nKeys = 1
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_nullfail = true;
+        let checker = DummyChecker;
+
+        // OP_CHECKMULTISIG
+        let script = [0xae];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(matches!(result, Err(ScriptError::NullFail)));
+    }
+
+    #[test]
+    fn nullfail_consensus_flags_segwit_height() {
+        // Verify NULLFAIL is enabled at segwit activation height (mainnet)
+        let flags = ScriptFlags::consensus_flags(481_824, false);
+        assert!(flags.verify_nullfail);
+        assert!(flags.verify_witness);
+        assert!(flags.verify_nulldummy);
+    }
+
+    #[test]
+    fn nullfail_consensus_flags_before_segwit() {
+        // Verify NULLFAIL is NOT enabled before segwit activation
+        let flags = ScriptFlags::consensus_flags(481_823, false);
+        assert!(!flags.verify_nullfail);
+        assert!(!flags.verify_witness);
+    }
+
+    #[test]
+    fn nullfail_consensus_flags_testnet4() {
+        // Testnet4 has all soft forks active from block 1
+        let flags = ScriptFlags::consensus_flags(1, true);
+        assert!(flags.verify_nullfail);
+        assert!(flags.verify_witness);
     }
 }
