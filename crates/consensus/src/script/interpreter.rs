@@ -23,8 +23,8 @@
 //!
 //! # Consensus vs Policy Flags
 //!
-//! **CRITICAL**: Only 8 flags are consensus-enforced during block validation:
-//! - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, NULLFAIL, TAPROOT
+//! **CRITICAL**: Only 9 flags are consensus-enforced during block validation:
+//! - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, NULLFAIL, WITNESS_PUBKEYTYPE, TAPROOT
 //!
 //! Policy flags (CLEANSTACK, SIGPUSHONLY, LOW_S, etc.) are enforced for
 //! mempool acceptance but NOT during block validation. Adding policy flags
@@ -58,7 +58,7 @@ pub const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000FFFF;
 /// Script verification flags.
 ///
 /// **IMPORTANT**: When validating blocks, only use consensus flags:
-/// - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, NULLFAIL, TAPROOT
+/// - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, NULLFAIL, WITNESS_PUBKEYTYPE, TAPROOT
 ///
 /// Policy flags should only be used for mempool validation.
 #[derive(Clone, Debug, Default)]
@@ -78,6 +78,8 @@ pub struct ScriptFlags {
     pub verify_nulldummy: bool,
     /// BIP-146: NULLFAIL - failed signature must be empty (consensus, activated with SegWit)
     pub verify_nullfail: bool,
+    /// BIP-141: Witness pubkeys must be compressed (consensus, activated with SegWit)
+    pub verify_witness_pubkeytype: bool,
     /// BIP-341/342: Taproot (consensus)
     pub verify_taproot: bool,
 
@@ -98,8 +100,6 @@ pub struct ScriptFlags {
     pub verify_discourage_upgradable_witness_program: bool,
     /// OP_IF/NOTIF argument must be minimal
     pub verify_minimalif: bool,
-    /// Witness pubkeys must be compressed
-    pub verify_witness_pubkeytype: bool,
     /// Fail on upgradable taproot versions
     pub verify_discourage_upgradable_taproot_version: bool,
     /// Fail on OP_SUCCESS opcodes
@@ -130,6 +130,7 @@ impl ScriptFlags {
             verify_witness: height >= segwit_height,
             verify_nulldummy: height >= segwit_height, // BIP-147 activated with SegWit
             verify_nullfail: height >= segwit_height,  // BIP-146 activated with SegWit
+            verify_witness_pubkeytype: height >= segwit_height, // BIP-141 activated with SegWit
             verify_taproot: height >= taproot_height,
             ..Default::default()
         }
@@ -235,6 +236,8 @@ pub enum ScriptError {
     NegativePickRoll,
     #[error("pick/roll index out of bounds")]
     PickRollOutOfBounds,
+    #[error("witness pubkey must be compressed")]
+    WitnessPubkeyType,
 }
 
 /// Signature version for sighash computation.
@@ -954,6 +957,14 @@ fn eval_script_internal(
                 let pubkey = ctx.pop()?;
                 let sig = ctx.pop()?;
 
+                // BIP-141: Witness v0 requires compressed pubkeys
+                if ctx.flags.verify_witness_pubkeytype
+                    && ctx.sig_version == SigVersion::WitnessV0
+                    && !is_compressed_pubkey(&pubkey)
+                {
+                    return Err(ScriptError::WitnessPubkeyType);
+                }
+
                 let success = if sig.is_empty() {
                     false
                 } else {
@@ -972,6 +983,14 @@ fn eval_script_internal(
             Opcode::OP_CHECKSIGVERIFY => {
                 let pubkey = ctx.pop()?;
                 let sig = ctx.pop()?;
+
+                // BIP-141: Witness v0 requires compressed pubkeys
+                if ctx.flags.verify_witness_pubkeytype
+                    && ctx.sig_version == SigVersion::WitnessV0
+                    && !is_compressed_pubkey(&pubkey)
+                {
+                    return Err(ScriptError::WitnessPubkeyType);
+                }
 
                 let success = if sig.is_empty() {
                     false
@@ -1047,6 +1066,14 @@ fn eval_script_internal(
                         let pubkey = &pubkeys[key_idx];
                         key_idx += 1;
 
+                        // BIP-141: Witness v0 requires compressed pubkeys
+                        if ctx.flags.verify_witness_pubkeytype
+                            && ctx.sig_version == SigVersion::WitnessV0
+                            && !is_compressed_pubkey(pubkey)
+                        {
+                            return Err(ScriptError::WitnessPubkeyType);
+                        }
+
                         if ctx.checker.check_sig(sig_bytes, pubkey, full_script, ctx.sig_version) {
                             found = true;
                             break;
@@ -1120,6 +1147,14 @@ fn eval_script_internal(
                     while key_idx < n_keys {
                         let pubkey = &pubkeys[key_idx];
                         key_idx += 1;
+
+                        // BIP-141: Witness v0 requires compressed pubkeys
+                        if ctx.flags.verify_witness_pubkeytype
+                            && ctx.sig_version == SigVersion::WitnessV0
+                            && !is_compressed_pubkey(pubkey)
+                        {
+                            return Err(ScriptError::WitnessPubkeyType);
+                        }
 
                         if ctx.checker.check_sig(sig_bytes, pubkey, full_script, ctx.sig_version) {
                             found = true;
@@ -1424,6 +1459,14 @@ pub fn parse_witness_program(script: &[u8]) -> Option<(u8, &[u8])> {
     }
 
     Some((version, &script[2..]))
+}
+
+/// Check if a public key is compressed (33 bytes, starting with 0x02 or 0x03).
+///
+/// Compressed public keys encode only the x-coordinate plus a parity bit.
+/// BIP-141 requires all public keys in witness v0 programs to be compressed.
+fn is_compressed_pubkey(pubkey: &[u8]) -> bool {
+    pubkey.len() == 33 && (pubkey[0] == 0x02 || pubkey[0] == 0x03)
 }
 
 /// Check if scriptSig is push-only (required for P2SH and SegWit).
@@ -2156,6 +2199,258 @@ mod tests {
         // Testnet4 has all soft forks active from block 1
         let flags = ScriptFlags::consensus_flags(1, true);
         assert!(flags.verify_nullfail);
+        assert!(flags.verify_witness);
+    }
+
+    // =================================
+    // WITNESS_PUBKEYTYPE (BIP-141) tests
+    // =================================
+
+    #[test]
+    fn witness_pubkeytype_compressed_key_accepted() {
+        // A compressed pubkey (33 bytes, 0x02 or 0x03 prefix) should be accepted
+        let compressed_pubkey = {
+            let mut key = vec![0x02];
+            key.extend([0x42u8; 32]);
+            key
+        };
+        let mut stack = vec![
+            vec![],              // Empty signature (will fail verification, but that's ok)
+            compressed_pubkey,   // Compressed pubkey (33 bytes, 0x02 prefix)
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness_pubkeytype = true;
+        let checker = DummyChecker;
+
+        // OP_CHECKSIG in WitnessV0 mode
+        let script = [0xac];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        // Should succeed (signature fails, but pubkey is valid)
+        assert!(result.is_ok());
+        assert_eq!(stack.len(), 1);
+        assert!(!stack_bool(&stack[0])); // False because sig verification failed
+    }
+
+    #[test]
+    fn witness_pubkeytype_compressed_key_03_accepted() {
+        // A compressed pubkey with 0x03 prefix should also be accepted
+        let compressed_pubkey = {
+            let mut key = vec![0x03];
+            key.extend([0x42u8; 32]);
+            key
+        };
+        let mut stack = vec![
+            vec![],              // Empty signature
+            compressed_pubkey,   // Compressed pubkey (33 bytes, 0x03 prefix)
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness_pubkeytype = true;
+        let checker = DummyChecker;
+
+        // OP_CHECKSIG in WitnessV0 mode
+        let script = [0xac];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn witness_pubkeytype_uncompressed_key_rejected() {
+        // An uncompressed pubkey (65 bytes, 0x04 prefix) should be rejected in witness v0
+        let uncompressed_pubkey = {
+            let mut key = vec![0x04];
+            key.extend([0x42u8; 64]);
+            key
+        };
+        let mut stack = vec![
+            vec![],                // Empty signature
+            uncompressed_pubkey,   // Uncompressed pubkey (65 bytes, 0x04 prefix)
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness_pubkeytype = true;
+        let checker = DummyChecker;
+
+        // OP_CHECKSIG in WitnessV0 mode
+        let script = [0xac];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn witness_pubkeytype_wrong_length_rejected() {
+        // A key with wrong length (not 33 bytes) should be rejected
+        let bad_pubkey = vec![0x02, 0x42, 0x42]; // Only 3 bytes, not 33
+        let mut stack = vec![
+            vec![],
+            bad_pubkey,
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness_pubkeytype = true;
+        let checker = DummyChecker;
+
+        let script = [0xac]; // OP_CHECKSIG
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn witness_pubkeytype_wrong_prefix_rejected() {
+        // A 33-byte key with wrong prefix (not 0x02 or 0x03) should be rejected
+        let bad_pubkey = {
+            let mut key = vec![0x04]; // Wrong prefix for 33-byte key
+            key.extend([0x42u8; 32]);
+            key
+        };
+        let mut stack = vec![
+            vec![],
+            bad_pubkey,
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness_pubkeytype = true;
+        let checker = DummyChecker;
+
+        let script = [0xac]; // OP_CHECKSIG
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn witness_pubkeytype_legacy_mode_uncompressed_allowed() {
+        // In legacy mode (SigVersion::Base), uncompressed keys should still be allowed
+        let uncompressed_pubkey = {
+            let mut key = vec![0x04];
+            key.extend([0x42u8; 64]);
+            key
+        };
+        let mut stack = vec![
+            vec![],                // Empty signature
+            uncompressed_pubkey,   // Uncompressed pubkey
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness_pubkeytype = true; // Flag is set, but not in witness mode
+        let checker = DummyChecker;
+
+        // OP_CHECKSIG in Base (legacy) mode - uncompressed keys allowed
+        let script = [0xac];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        // Should succeed (pubkey type check only applies to WitnessV0)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn witness_pubkeytype_flag_disabled_uncompressed_allowed() {
+        // With the flag disabled, uncompressed keys should be allowed even in witness v0
+        let uncompressed_pubkey = {
+            let mut key = vec![0x04];
+            key.extend([0x42u8; 64]);
+            key
+        };
+        let mut stack = vec![
+            vec![],
+            uncompressed_pubkey,
+        ];
+        let flags = ScriptFlags::default(); // verify_witness_pubkeytype is false
+        let checker = DummyChecker;
+
+        let script = [0xac]; // OP_CHECKSIG
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        // Should succeed (flag not set)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn witness_pubkeytype_checksigverify_uncompressed_rejected() {
+        // OP_CHECKSIGVERIFY should also reject uncompressed keys
+        let uncompressed_pubkey = {
+            let mut key = vec![0x04];
+            key.extend([0x42u8; 64]);
+            key
+        };
+        let mut stack = vec![
+            vec![],
+            uncompressed_pubkey,
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness_pubkeytype = true;
+        let checker = DummyChecker;
+
+        let script = [0xad]; // OP_CHECKSIGVERIFY
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn witness_pubkeytype_checkmultisig_uncompressed_rejected() {
+        // OP_CHECKMULTISIG should reject uncompressed keys in witness v0
+        let uncompressed_pubkey = {
+            let mut key = vec![0x04];
+            key.extend([0x42u8; 64]);
+            key
+        };
+        // Stack layout for 1-of-1 multisig (bottom to top):
+        // dummy, sig, nSigs, pubkey, nKeys
+        let mut stack = vec![
+            vec![],                // Dummy element
+            vec![0x30, 0x06, 0x01], // Non-empty signature
+            vec![1],               // nSigs = 1
+            uncompressed_pubkey,   // Uncompressed pubkey
+            vec![1],               // nKeys = 1
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness_pubkeytype = true;
+        let checker = DummyChecker;
+
+        let script = [0xae]; // OP_CHECKMULTISIG
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn witness_pubkeytype_checkmultisig_compressed_accepted() {
+        // OP_CHECKMULTISIG should accept compressed keys in witness v0
+        let compressed_pubkey = {
+            let mut key = vec![0x02];
+            key.extend([0x42u8; 32]);
+            key
+        };
+        // Stack layout for 1-of-1 multisig with empty sig (will fail but pubkey check passes)
+        let mut stack = vec![
+            vec![],              // Dummy element
+            vec![],              // Empty signature
+            vec![1],             // nSigs = 1
+            compressed_pubkey,   // Compressed pubkey
+            vec![1],             // nKeys = 1
+        ];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness_pubkeytype = true;
+        let checker = DummyChecker;
+
+        let script = [0xae]; // OP_CHECKMULTISIG
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        // Should succeed (pubkey is valid, sig verification fails but that's expected)
+        assert!(result.is_ok());
+        assert!(!stack_bool(&stack[0])); // Result is false (sig failed)
+    }
+
+    #[test]
+    fn witness_pubkeytype_consensus_flags_enabled_at_segwit() {
+        // Verify WITNESS_PUBKEYTYPE is enabled at segwit activation height (mainnet)
+        let flags = ScriptFlags::consensus_flags(481_824, false);
+        assert!(flags.verify_witness_pubkeytype);
+        assert!(flags.verify_witness);
+    }
+
+    #[test]
+    fn witness_pubkeytype_consensus_flags_disabled_before_segwit() {
+        // Verify WITNESS_PUBKEYTYPE is NOT enabled before segwit activation
+        let flags = ScriptFlags::consensus_flags(481_823, false);
+        assert!(!flags.verify_witness_pubkeytype);
+    }
+
+    #[test]
+    fn witness_pubkeytype_consensus_flags_testnet4() {
+        // Testnet4 has all soft forks active from block 1
+        let flags = ScriptFlags::consensus_flags(1, true);
+        assert!(flags.verify_witness_pubkeytype);
         assert!(flags.verify_witness);
     }
 }
