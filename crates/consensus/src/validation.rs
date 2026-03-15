@@ -13,8 +13,8 @@
 //!
 //! # Consensus vs Policy
 //!
-//! **CRITICAL**: Only 7 script flags are consensus-enforced:
-//! - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, TAPROOT
+//! **CRITICAL**: Only 8 script flags are consensus-enforced:
+//! - P2SH, DERSIG, CLTV, CSV, WITNESS, NULLDUMMY, NULLFAIL, TAPROOT
 //!
 //! Adding policy flags (CLEANSTACK, LOW_S, etc.) to block validation causes valid
 //! blocks to be rejected. See `script_flags_for_height` for the correct flags.
@@ -1025,10 +1025,11 @@ pub fn disconnect_block(
 /// - CSV: BIP-68/112/113
 /// - WITNESS: BIP-141/143
 /// - NULLDUMMY: BIP-147 (activated with SegWit)
+/// - NULLFAIL: BIP-146 (activated with SegWit)
 /// - TAPROOT: BIP-341/342
 fn script_flags_for_height(height: u32, params: &ChainParams) -> ScriptFlags {
     // NOTE: Do NOT add policy flags here!
-    // CLEANSTACK, LOW_S, STRICTENC, MINIMALDATA, MINIMALIF, NULLFAIL, etc.
+    // CLEANSTACK, LOW_S, STRICTENC, MINIMALDATA, MINIMALIF, etc.
     // are policy-only and must NOT be enforced during block validation.
 
     ScriptFlags {
@@ -1044,6 +1045,8 @@ fn script_flags_for_height(height: u32, params: &ChainParams) -> ScriptFlags {
         verify_witness: height >= params.segwit_height,
         // BIP-147: NULLDUMMY (activated with SegWit)
         verify_nulldummy: height >= params.segwit_height,
+        // BIP-146: NULLFAIL (activated with SegWit)
+        verify_nullfail: height >= params.segwit_height,
         // BIP-341/342: Taproot
         verify_taproot: height >= params.taproot_height,
         // All policy flags stay at default (false)
@@ -1583,7 +1586,8 @@ mod tests {
         assert!(!flags.verify_minimaldata);
         assert!(!flags.verify_cleanstack);
         assert!(!flags.verify_minimalif);
-        assert!(!flags.verify_nullfail);
+        // NOTE: verify_nullfail is now consensus (BIP-146), activated with SegWit
+        assert!(flags.verify_nullfail);
     }
 
     // =========================
