@@ -4,37 +4,90 @@
 //! during IBD (initial block download) and normal operation.
 //!
 //! Run with: `cargo bench --workspace`
+//!
+//! SHA-256 benchmarks test hardware acceleration (SHA-NI on x86_64, SHA2 on AArch64).
+//! Target: >500 MB/s on modern x86_64 with SHA-NI.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rustoshi_consensus::CompressedScript;
-use rustoshi_crypto::{hash160, merkle_root, sha256d};
+use rustoshi_crypto::{hash160, merkle_root, sha256, sha256_implementation, sha256d};
 use rustoshi_primitives::{
     Block, BlockHeader, Decodable, Encodable, Hash256, OutPoint, Transaction, TxIn, TxOut,
 };
+
+/// Benchmark SHA256 for various data sizes with throughput measurement.
+///
+/// SHA256 is the most performance-critical operation in block validation.
+/// With hardware acceleration (SHA-NI), we target >500 MB/s.
+fn bench_sha256(c: &mut Criterion) {
+    // Print implementation info
+    println!("SHA-256 implementation: {}", sha256_implementation());
+
+    let mut group = c.benchmark_group("sha256_throughput");
+
+    // Test various sizes
+    for size in [32, 64, 80, 256, 1024, 4096, 65536, 1024 * 1024].iter() {
+        let data = vec![0xabu8; *size];
+        group.throughput(Throughput::Bytes(*size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
+            b.iter(|| sha256(black_box(&data)))
+        });
+    }
+
+    group.finish();
+}
 
 /// Benchmark SHA256d for various data sizes.
 ///
 /// SHA256d is used extensively: block hashes, txid computation, merkle trees.
 fn bench_sha256d(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sha256d");
+
     let data_32 = vec![0u8; 32];
+    let data_64 = vec![0u8; 64]; // merkle tree node size
     let data_80 = vec![0u8; 80]; // block header size
     let data_1kb = vec![0u8; 1024];
     let data_1mb = vec![0u8; 1024 * 1024];
 
-    c.bench_function("sha256d_32b", |b| {
+    group.throughput(Throughput::Bytes(32));
+    group.bench_function("32b", |b| {
         b.iter(|| sha256d(black_box(&data_32)))
     });
 
-    c.bench_function("sha256d_80b", |b| {
+    group.throughput(Throughput::Bytes(64));
+    group.bench_function("64b", |b| {
+        b.iter(|| sha256d(black_box(&data_64)))
+    });
+
+    group.throughput(Throughput::Bytes(80));
+    group.bench_function("80b", |b| {
         b.iter(|| sha256d(black_box(&data_80)))
     });
 
-    c.bench_function("sha256d_1kb", |b| {
+    group.throughput(Throughput::Bytes(1024));
+    group.bench_function("1kb", |b| {
         b.iter(|| sha256d(black_box(&data_1kb)))
     });
 
-    c.bench_function("sha256d_1mb", |b| {
+    group.throughput(Throughput::Bytes(1024 * 1024));
+    group.bench_function("1mb", |b| {
         b.iter(|| sha256d(black_box(&data_1mb)))
+    });
+
+    group.finish();
+}
+
+/// Benchmark sha256d_64 specifically (merkle tree internal nodes).
+fn bench_sha256d_64(c: &mut Criterion) {
+    let data = [0xabu8; 64];
+
+    c.bench_function("sha256d_64", |b| {
+        b.iter(|| {
+            let mut input = data;
+            // Use the accelerated implementation through merkle_root-style call
+            let result = sha256d(black_box(&input));
+            black_box(result)
+        })
     });
 }
 
@@ -280,7 +333,9 @@ fn bench_hash256(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_sha256,
     bench_sha256d,
+    bench_sha256d_64,
     bench_hash160,
     bench_transaction_serialize,
     bench_block_header_hash,
