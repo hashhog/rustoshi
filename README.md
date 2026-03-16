@@ -32,7 +32,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Peer management (connection pool, DNS seed resolution, address manager)
 - [x] Header synchronization (block locator, getheaders protocol)
 - [x] Block download manager (parallel downloads, sliding window, stall detection)
-- [x] UTXO cache (in-memory with database fallback, flush batching)
+- [x] UTXO cache (multi-layer CoinsView hierarchy, DIRTY/FRESH flags, batch flushing)
 - [x] Chain state (tip tracking, median-time-past, reorganization support)
 - [x] Mempool (transaction storage, fee-rate ordering, 25/25/101kvB package limits)
 - [x] Fee estimation (confirmation time prediction, exponential decay, bucket statistics)
@@ -74,7 +74,7 @@ rustoshi/
     crypto/           # SHA256d, HASH160, secp256k1 ECDSA, sighash, addresses
     consensus/        # script interpreter, chain params, validation, difficulty adjustment
     network/          # P2P protocol (message types, peer management)
-    storage/          # RocksDB persistence
+    storage/          # RocksDB persistence, UTXO cache layer
     rpc/              # JSON-RPC server
     wallet/           # HD wallet (BIP-32/44/84, transaction signing)
 ```
