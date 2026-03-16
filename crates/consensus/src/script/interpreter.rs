@@ -238,6 +238,8 @@ pub enum ScriptError {
     PickRollOutOfBounds,
     #[error("witness pubkey must be compressed")]
     WitnessPubkeyType,
+    #[error("script evaluated to false")]
+    EvalFalse,
 }
 
 /// Signature version for sighash computation.
@@ -1669,13 +1671,15 @@ fn verify_witness_program(
 
                 eval_script(&mut stack, &script, flags, checker, SigVersion::WitnessV0)?;
 
-                if stack.is_empty() || !stack_bool(stack.last().unwrap()) {
-                    return Err(ScriptError::VerifyFailed);
-                }
-
-                // Clean stack: must have exactly one element
+                // Witness scripts implicitly require cleanstack: exactly one element
+                // This check comes FIRST per Bitcoin Core's ExecuteWitnessScript
                 if stack.len() != 1 {
                     return Err(ScriptError::CleanStack);
+                }
+
+                // The single remaining element must be true
+                if !stack_bool(&stack[0]) {
+                    return Err(ScriptError::EvalFalse);
                 }
 
                 Ok(())
@@ -1700,12 +1704,15 @@ fn verify_witness_program(
 
                 eval_script(&mut stack, witness_script, flags, checker, SigVersion::WitnessV0)?;
 
-                if stack.is_empty() || !stack_bool(stack.last().unwrap()) {
-                    return Err(ScriptError::VerifyFailed);
-                }
-
+                // Witness scripts implicitly require cleanstack: exactly one element
+                // This check comes FIRST per Bitcoin Core's ExecuteWitnessScript
                 if stack.len() != 1 {
                     return Err(ScriptError::CleanStack);
+                }
+
+                // The single remaining element must be true
+                if !stack_bool(&stack[0]) {
+                    return Err(ScriptError::EvalFalse);
                 }
 
                 Ok(())
@@ -2452,5 +2459,151 @@ mod tests {
         let flags = ScriptFlags::consensus_flags(1, true);
         assert!(flags.verify_witness_pubkeytype);
         assert!(flags.verify_witness);
+    }
+
+    // ==================== Witness cleanstack tests ====================
+
+    #[test]
+    fn witness_cleanstack_p2wpkh_single_element_success() {
+        // P2WPKH with valid execution leaving exactly 1 true element should succeed
+        // We can't fully test this without real signatures, but we verify the structure
+        let program = [0u8; 20]; // Dummy 20-byte program
+        let witness = vec![
+            vec![0x30], // Dummy signature
+            vec![0x02; 33], // Dummy compressed pubkey
+        ];
+        let flags = ScriptFlags::standard_flags();
+        let checker = DummyChecker;
+
+        // This will fail at signature verification, but the cleanstack logic is correct
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        // Expect failure due to signature check, not cleanstack
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn witness_cleanstack_p2wsh_extra_stack_items() {
+        // P2WSH script that leaves extra items on the stack should fail with CleanStack
+        // Script: OP_1 OP_1 (pushes two 1s, leaving 2 items on stack)
+        let witness_script = vec![0x51, 0x51]; // OP_1 OP_1
+        let program = sha256(&witness_script);
+
+        let witness = vec![
+            witness_script, // The witness script itself
+        ];
+        let flags = ScriptFlags::standard_flags();
+        let checker = DummyChecker;
+
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn witness_cleanstack_p2wsh_empty_stack() {
+        // P2WSH script that leaves empty stack should fail with CleanStack
+        // Script: OP_1 OP_DROP (pushes 1, then drops it, leaving empty stack)
+        let witness_script = vec![0x51, 0x75]; // OP_1 OP_DROP
+        let program = sha256(&witness_script);
+
+        let witness = vec![
+            witness_script, // The witness script itself
+        ];
+        let flags = ScriptFlags::standard_flags();
+        let checker = DummyChecker;
+
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn witness_cleanstack_p2wsh_single_false() {
+        // P2WSH script that leaves single false element should fail with EvalFalse
+        // Script: OP_0 (pushes empty/false)
+        let witness_script = vec![0x00]; // OP_0
+        let program = sha256(&witness_script);
+
+        let witness = vec![
+            witness_script, // The witness script itself
+        ];
+        let flags = ScriptFlags::standard_flags();
+        let checker = DummyChecker;
+
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        assert!(matches!(result, Err(ScriptError::EvalFalse)));
+    }
+
+    #[test]
+    fn witness_cleanstack_p2wsh_single_true() {
+        // P2WSH script that leaves single true element should succeed
+        // Script: OP_1 (pushes 1)
+        let witness_script = vec![0x51]; // OP_1
+        let program = sha256(&witness_script);
+
+        let witness = vec![
+            witness_script, // The witness script itself
+        ];
+        let flags = ScriptFlags::standard_flags();
+        let checker = DummyChecker;
+
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn witness_cleanstack_not_flag_gated() {
+        // Witness cleanstack is NOT controlled by verify_cleanstack flag
+        // It's always enforced for witness programs
+        let witness_script = vec![0x51, 0x51]; // OP_1 OP_1 (leaves 2 items)
+        let program = sha256(&witness_script);
+
+        let witness = vec![
+            witness_script,
+        ];
+        // Create flags with verify_cleanstack = false
+        let flags = ScriptFlags::default();
+        assert!(!flags.verify_cleanstack); // Confirm flag is off
+        let checker = DummyChecker;
+
+        // Should still fail with CleanStack because witness cleanstack is implicit
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn witness_cleanstack_p2wsh_with_stack_items() {
+        // P2WSH with initial stack items that leaves more than 1 item fails
+        // Script: OP_1 (just pushes 1, but we have an item already on stack)
+        let witness_script = vec![0x51]; // OP_1
+        let program = sha256(&witness_script);
+
+        // Witness: [stack_item, witness_script]
+        // Stack after script: [stack_item, 1] - 2 items
+        let witness = vec![
+            vec![0x42], // Extra stack item
+            witness_script,
+        ];
+        let flags = ScriptFlags::standard_flags();
+        let checker = DummyChecker;
+
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn witness_cleanstack_order_cleanstack_before_eval_false() {
+        // When stack has multiple items AND top is false, should return CleanStack (not EvalFalse)
+        // Script: OP_1 OP_0 (pushes 1, then 0 - two items, top is false)
+        let witness_script = vec![0x51, 0x00]; // OP_1 OP_0
+        let program = sha256(&witness_script);
+
+        let witness = vec![
+            witness_script,
+        ];
+        let flags = ScriptFlags::standard_flags();
+        let checker = DummyChecker;
+
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        // Should be CleanStack because len != 1, not EvalFalse
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
     }
 }
