@@ -197,6 +197,10 @@ pub struct ChainParams {
     pub pow_limit: [u8; 32],
     pub pow_allow_min_difficulty_blocks: bool,
     pub pow_no_retargeting: bool,
+    /// BIP94 enforcement (testnet4): Use the first block of the difficulty period
+    /// instead of the last block when calculating the new target. This prevents
+    /// the time warp attack.
+    pub enforce_bip94: bool,
 
     // Soft fork activation heights
     pub bip34_height: u32,
@@ -244,6 +248,7 @@ impl ChainParams {
             pow_limit: mainnet_pow_limit(),
             pow_allow_min_difficulty_blocks: false,
             pow_no_retargeting: false,
+            enforce_bip94: false,
             bip34_height: 227_931,
             bip65_height: 388_381,
             bip66_height: 363_725,
@@ -277,6 +282,7 @@ impl ChainParams {
             pow_limit: testnet_pow_limit(),
             pow_allow_min_difficulty_blocks: true,
             pow_no_retargeting: false,
+            enforce_bip94: false,
             bip34_height: 21111,
             bip65_height: 581885,
             bip66_height: 330776,
@@ -312,6 +318,7 @@ impl ChainParams {
             pow_limit: testnet_pow_limit(),
             pow_allow_min_difficulty_blocks: true,
             pow_no_retargeting: false,
+            enforce_bip94: true, // BIP94 time warp fix for testnet4
             // Testnet4 activates all soft forks from genesis (height 1)
             bip34_height: 1,
             bip65_height: 1,
@@ -344,6 +351,7 @@ impl ChainParams {
             pow_limit: signet_pow_limit(),
             pow_allow_min_difficulty_blocks: false,
             pow_no_retargeting: false,
+            enforce_bip94: false,
             bip34_height: 1,
             bip65_height: 1,
             bip66_height: 1,
@@ -372,6 +380,7 @@ impl ChainParams {
             pow_limit: regtest_pow_limit(),
             pow_allow_min_difficulty_blocks: true,
             pow_no_retargeting: true,
+            enforce_bip94: false,
             bip34_height: 1, // Always enforced on regtest
             bip65_height: 1,
             bip66_height: 1,
