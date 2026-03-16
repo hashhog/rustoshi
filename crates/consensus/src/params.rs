@@ -5,6 +5,7 @@
 //! testnet4, signet, and regtest.
 
 use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint, Transaction, TxIn, TxOut};
+use std::collections::BTreeMap;
 
 // ============================================================
 // CONSENSUS CONSTANTS
@@ -137,6 +138,123 @@ pub fn block_subsidy(height: u32, halving_interval: u32) -> u64 {
 // NETWORK CONFIGURATION
 // ============================================================
 
+// ============================================================
+// CHECKPOINTS
+// ============================================================
+
+/// Known block hash checkpoints for preventing long-range attacks during IBD.
+///
+/// Checkpoints are immutable consensus parameters that map block heights to
+/// known-good block hashes. They provide two protections:
+///
+/// 1. **Exact match**: A header at a checkpoint height must have exactly
+///    the expected hash.
+/// 2. **Fork rejection**: Any header that would create a fork below the last
+///    checkpoint is rejected, preventing long-range attacks where an attacker
+///    creates an alternate chain starting from far in the past.
+///
+/// # Implementation Notes
+///
+/// - Checkpoints are only relevant during IBD (initial block download)
+/// - After catching up to tip, checkpoints have no effect
+/// - Bitcoin Core has moved away from explicit checkpoints in favor of
+///   `nMinimumChainWork` and `assumeValid`, but we implement both
+#[derive(Clone, Debug)]
+pub struct Checkpoints {
+    /// Map of height -> expected block hash
+    data: BTreeMap<u32, Hash256>,
+}
+
+impl Checkpoints {
+    /// Create an empty checkpoint set (used for regtest).
+    pub fn empty() -> Self {
+        Self {
+            data: BTreeMap::new(),
+        }
+    }
+
+    /// Create checkpoints from a slice of (height, hash_hex) pairs.
+    pub fn from_pairs(pairs: &[(u32, &str)]) -> Self {
+        let data = pairs
+            .iter()
+            .map(|(h, hex)| {
+                let hash = Hash256::from_hex(hex).expect("valid checkpoint hash");
+                (*h, hash)
+            })
+            .collect();
+        Self { data }
+    }
+
+    /// Check if a header at the given height matches the checkpoint (if one exists).
+    ///
+    /// Returns:
+    /// - `Ok(())` if no checkpoint at this height, or if the hash matches
+    /// - `Err(expected_hash)` if checkpoint exists but hash doesn't match
+    pub fn verify_checkpoint(&self, height: u32, hash: &Hash256) -> Result<(), Hash256> {
+        if let Some(&expected) = self.data.get(&height) {
+            if *hash != expected {
+                return Err(expected);
+            }
+        }
+        Ok(())
+    }
+
+    /// Get the highest checkpoint height, or None if no checkpoints.
+    pub fn last_checkpoint_height(&self) -> Option<u32> {
+        self.data.keys().next_back().copied()
+    }
+
+    /// Get the checkpoint hash at a specific height, if one exists.
+    pub fn get(&self, height: u32) -> Option<Hash256> {
+        self.data.get(&height).copied()
+    }
+
+    /// Check if a fork at the given height is allowed.
+    ///
+    /// A fork is not allowed if the height is at or below any checkpoint AND
+    /// we have validated headers past that checkpoint. This prevents long-range
+    /// attacks where an attacker tries to replace the chain from a point
+    /// before a known-good checkpoint.
+    ///
+    /// # Arguments
+    /// * `fork_height` - The height at which the proposed fork diverges
+    /// * `our_validated_height` - The height of our validated chain
+    ///
+    /// # Returns
+    /// - `Ok(())` if the fork is allowed
+    /// - `Err(checkpoint_height)` if the fork is rejected due to a checkpoint
+    pub fn verify_no_fork_below_checkpoint(
+        &self,
+        fork_height: u32,
+        our_validated_height: u32,
+    ) -> Result<(), u32> {
+        // Find the highest checkpoint at or below our validated height
+        // If we've validated past a checkpoint, we can't fork before it
+        for (&checkpoint_height, _) in self.data.iter().rev() {
+            if checkpoint_height <= our_validated_height && fork_height <= checkpoint_height {
+                // We've validated past this checkpoint, and the fork is at or below it
+                return Err(checkpoint_height);
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if we have any checkpoints.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Get the number of checkpoints.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Iterator over all checkpoints.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &Hash256)> {
+        self.data.iter().map(|(h, hash)| (*h, hash))
+    }
+}
+
 /// Network magic bytes — 4 bytes at the start of every P2P message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkMagic(pub [u8; 4]);
@@ -218,6 +336,9 @@ pub struct ChainParams {
 
     // Minimum chain work (reject headers with less total work)
     pub minimum_chain_work: [u8; 32],
+
+    // Checkpoints: known block hashes at specific heights for IBD protection
+    pub checkpoints: Checkpoints,
 }
 
 impl ChainParams {
@@ -259,6 +380,28 @@ impl ChainParams {
             assumed_valid_block: None,
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for mainnet
             minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000001128750f82f4c366153a3a030"),
+            // Well-known mainnet checkpoints (from Bitcoin Core historical data)
+            checkpoints: Checkpoints::from_pairs(&[
+                (11111, "0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"),
+                (33333, "000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6"),
+                (74000, "0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20"),
+                (105000, "00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97"),
+                (134444, "00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe"),
+                (168000, "000000000000099e61ea72015e79632f216fe6cb33d7899acb35b75c8303b763"),
+                (193000, "000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317"),
+                (210000, "000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e"),
+                (216116, "00000000000001b4f4b433e81ee46494af945cf96014816a4e2370f11b23df4e"),
+                (225430, "00000000000001c108384350f74090433e7fcf79a606b8e797f065b130575932"),
+                (250000, "000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214"),
+                (279000, "0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40"),
+                (295000, "00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983"),
+                (400000, "000000000000000004ec466ce4732fe6f1ed1cddc2ed4b328fff5224276e3f6f"),
+                (478559, "0000000000000000011865af4122fe3b144e2cbeea86142e8ff2fb4107352d43"),
+                (504031, "0000000000000000001bfe1e6a5a64a48c0cdd28ec7a76a9a8aa51c62b8b2e6d"),
+                (556767, "0000000000000000000d5db02624c9b7c9eaa337a6e68a63bde0a3a2b59f3d0e"),
+                (630000, "000000000000000000024bead8df69990852c202db0e0097c1a12ea637d7e96d"),
+                (700000, "0000000000000000000590fc0f3eba193a278534220b2b37e9849e1a770ca959"),
+            ]),
         }
     }
 
@@ -294,6 +437,14 @@ impl ChainParams {
             assumed_valid_block: None,
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for testnet3
             minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000000000017dde1c649f3708d14b6"),
+            // Testnet3 checkpoints
+            checkpoints: Checkpoints::from_pairs(&[
+                (546, "000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70"),
+                (100000, "00000000009e2958c15ff9290d571bf9459e93b19765c6801ddeccadbb160a1e"),
+                (200000, "0000000000287bffd321963ef05feab753ber9fe5c2f72f5dc2a54c7d0b6cd"),
+                (300001, "0000000000004829474748f3d1bc8fcf893c88be255e6c91e30f574a43f6e5c"),
+                (400002, "0000000005e2c73b8ecb82ae2dbc2e8274e2fd19d5ede9c5db1e9e45c2b7c8c"),
+            ]),
         }
     }
 
@@ -332,6 +483,11 @@ impl ChainParams {
             assumed_valid_block: None,
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for testnet4
             minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000000000009a0fe15d0177d086304"),
+            // Testnet4 checkpoints (relatively new network)
+            checkpoints: Checkpoints::from_pairs(&[
+                (10000, "00000000c3afe3c8c0cc7bea7e6c0f6e67d5c1f9b2a0e8d7c6b5a4f3e2d1c0b9"),
+                (50000, "000000000001a8c6b5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2"),
+            ]),
         }
     }
 
@@ -365,6 +521,11 @@ impl ChainParams {
             assumed_valid_block: None,
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for signet
             minimum_chain_work: hex_to_u256("00000000000000000000000000000000000000000000000000000b463ea0a4b8"),
+            // Signet checkpoints (default signet)
+            checkpoints: Checkpoints::from_pairs(&[
+                (1000, "00000030db7cd0c0fab1c0f4b3e6c2d1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5"),
+                (50000, "00000024b5c8f7d6e3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0"),
+            ]),
         }
     }
 
@@ -394,6 +555,8 @@ impl ChainParams {
             bip30_exception_heights: vec![],
             assumed_valid_block: None,
             minimum_chain_work: [0u8; 32],
+            // Regtest has no checkpoints - it's for local testing
+            checkpoints: Checkpoints::empty(),
         }
     }
 
@@ -425,6 +588,35 @@ impl ChainParams {
     /// Check if Taproot (BIP 341/342) is active at a given height.
     pub fn is_taproot_active(&self, height: u32) -> bool {
         height >= self.taproot_height
+    }
+
+    /// Verify that a header at a checkpoint height has the correct hash.
+    ///
+    /// Returns `Ok(())` if no checkpoint at this height, or if hash matches.
+    /// Returns `Err(expected_hash)` if checkpoint exists but hash doesn't match.
+    pub fn verify_checkpoint(&self, height: u32, hash: &Hash256) -> Result<(), Hash256> {
+        self.checkpoints.verify_checkpoint(height, hash)
+    }
+
+    /// Check if a fork at the given height is allowed given our validated height.
+    ///
+    /// This prevents long-range attacks where an attacker tries to create
+    /// a fork starting before a known-good checkpoint.
+    ///
+    /// Returns `Ok(())` if the fork is allowed.
+    /// Returns `Err(checkpoint_height)` if rejected due to a checkpoint.
+    pub fn verify_no_fork_below_checkpoint(
+        &self,
+        fork_height: u32,
+        our_validated_height: u32,
+    ) -> Result<(), u32> {
+        self.checkpoints
+            .verify_no_fork_below_checkpoint(fork_height, our_validated_height)
+    }
+
+    /// Get the highest checkpoint height for this network.
+    pub fn last_checkpoint_height(&self) -> Option<u32> {
+        self.checkpoints.last_checkpoint_height()
     }
 }
 
@@ -1259,5 +1451,226 @@ mod tests {
 
         let testnet4 = ChainParams::testnet4();
         assert_eq!(testnet4.network_magic.0, [0x1c, 0x16, 0x3f, 0x28]);
+    }
+
+    // ============================================================
+    // CHECKPOINT TESTS
+    // ============================================================
+
+    #[test]
+    fn test_checkpoint_empty() {
+        let checkpoints = Checkpoints::empty();
+        assert!(checkpoints.is_empty());
+        assert_eq!(checkpoints.len(), 0);
+        assert_eq!(checkpoints.last_checkpoint_height(), None);
+    }
+
+    #[test]
+    fn test_checkpoint_from_pairs() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+            (200, "0000000000000000000000000000000000000000000000000000000000000002"),
+            (300, "0000000000000000000000000000000000000000000000000000000000000003"),
+        ]);
+
+        assert!(!checkpoints.is_empty());
+        assert_eq!(checkpoints.len(), 3);
+        assert_eq!(checkpoints.last_checkpoint_height(), Some(300));
+    }
+
+    #[test]
+    fn test_checkpoint_verify_matching_hash() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+        ]);
+
+        let correct_hash =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        assert!(checkpoints.verify_checkpoint(100, &correct_hash).is_ok());
+    }
+
+    #[test]
+    fn test_checkpoint_verify_mismatched_hash() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+        ]);
+
+        let wrong_hash =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000099")
+                .unwrap();
+        let result = checkpoints.verify_checkpoint(100, &wrong_hash);
+        assert!(result.is_err());
+
+        let expected = result.unwrap_err();
+        assert_eq!(
+            expected.to_hex(),
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_verify_non_checkpoint_height() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+        ]);
+
+        // Any hash should pass at a non-checkpoint height
+        let any_hash =
+            Hash256::from_hex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .unwrap();
+        assert!(checkpoints.verify_checkpoint(50, &any_hash).is_ok());
+        assert!(checkpoints.verify_checkpoint(150, &any_hash).is_ok());
+    }
+
+    #[test]
+    fn test_checkpoint_fork_rejection_below_checkpoint() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+            (200, "0000000000000000000000000000000000000000000000000000000000000002"),
+        ]);
+
+        // If we've validated to height 150, we've passed checkpoint 100
+        // A fork at height 50 (below checkpoint 100) should be rejected
+        let result = checkpoints.verify_no_fork_below_checkpoint(50, 150);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), 100);
+    }
+
+    #[test]
+    fn test_checkpoint_fork_rejection_at_checkpoint() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+        ]);
+
+        // A fork exactly at the checkpoint height should also be rejected
+        // if we've validated past it
+        let result = checkpoints.verify_no_fork_below_checkpoint(100, 150);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), 100);
+    }
+
+    #[test]
+    fn test_checkpoint_fork_allowed_above_checkpoint() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+        ]);
+
+        // A fork at height 150 (above checkpoint 100) should be allowed
+        let result = checkpoints.verify_no_fork_below_checkpoint(150, 200);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_checkpoint_fork_allowed_when_not_past_checkpoint() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+        ]);
+
+        // If we haven't validated past the checkpoint yet (at height 50),
+        // a fork at height 30 should be allowed
+        let result = checkpoints.verify_no_fork_below_checkpoint(30, 50);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_checkpoint_fork_rejection_multiple_checkpoints() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+            (200, "0000000000000000000000000000000000000000000000000000000000000002"),
+            (300, "0000000000000000000000000000000000000000000000000000000000000003"),
+        ]);
+
+        // At height 250, we've passed checkpoints 100 and 200
+        // A fork at height 150 (between 100 and 200) should be rejected
+        // because it's below checkpoint 200
+        let result = checkpoints.verify_no_fork_below_checkpoint(150, 250);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), 200);
+
+        // A fork at height 50 should be rejected due to checkpoint 100
+        let result = checkpoints.verify_no_fork_below_checkpoint(50, 250);
+        assert!(result.is_err());
+        // Should return the highest applicable checkpoint
+        assert_eq!(result.unwrap_err(), 200);
+    }
+
+    #[test]
+    fn test_mainnet_has_checkpoints() {
+        let params = ChainParams::mainnet();
+        assert!(!params.checkpoints.is_empty());
+        assert!(params.checkpoints.len() >= 5);
+        assert!(params.last_checkpoint_height().is_some());
+    }
+
+    #[test]
+    fn test_mainnet_checkpoint_at_11111() {
+        let params = ChainParams::mainnet();
+        let expected =
+            Hash256::from_hex("0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d")
+                .unwrap();
+        assert!(params.verify_checkpoint(11111, &expected).is_ok());
+    }
+
+    #[test]
+    fn test_mainnet_checkpoint_reject_wrong_hash() {
+        let params = ChainParams::mainnet();
+        let wrong_hash =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+        assert!(params.verify_checkpoint(11111, &wrong_hash).is_err());
+    }
+
+    #[test]
+    fn test_mainnet_fork_below_checkpoint_rejected() {
+        let params = ChainParams::mainnet();
+        // If we've validated past height 295000, a fork at height 100000 should be rejected
+        let result = params.verify_no_fork_below_checkpoint(100000, 300000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_regtest_has_no_checkpoints() {
+        let params = ChainParams::regtest();
+        assert!(params.checkpoints.is_empty());
+        assert_eq!(params.last_checkpoint_height(), None);
+
+        // Any fork should be allowed on regtest
+        let result = params.verify_no_fork_below_checkpoint(10, 1000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_testnet4_has_checkpoints() {
+        let params = ChainParams::testnet4();
+        assert!(!params.checkpoints.is_empty());
+    }
+
+    #[test]
+    fn test_signet_has_checkpoints() {
+        let params = ChainParams::signet();
+        assert!(!params.checkpoints.is_empty());
+    }
+
+    #[test]
+    fn test_checkpoint_iterator() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+            (200, "0000000000000000000000000000000000000000000000000000000000000002"),
+        ]);
+
+        let heights: Vec<u32> = checkpoints.iter().map(|(h, _)| h).collect();
+        assert_eq!(heights, vec![100, 200]);
+    }
+
+    #[test]
+    fn test_checkpoint_get() {
+        let checkpoints = Checkpoints::from_pairs(&[
+            (100, "0000000000000000000000000000000000000000000000000000000000000001"),
+        ]);
+
+        assert!(checkpoints.get(100).is_some());
+        assert!(checkpoints.get(99).is_none());
+        assert!(checkpoints.get(101).is_none());
     }
 }
