@@ -6,10 +6,17 @@
 //!
 //! The signature hash is the message that gets signed by ECDSA. Different
 //! sighash types allow signing different parts of the transaction.
+//!
+//! For legacy sighash, this module also implements:
+//! - FindAndDelete: removes the push-encoded signature from the scriptCode
+//! - OP_CODESEPARATOR handling: scriptCode starts after the last separator
 
 use crate::hashes::sha256d;
 use rustoshi_primitives::{write_compact_size, Encodable, Hash256, OutPoint, Transaction};
 use std::io::Write;
+
+/// OP_CODESEPARATOR opcode value.
+pub const OP_CODESEPARATOR: u8 = 0xab;
 
 /// Sighash type flags.
 ///
@@ -58,6 +65,146 @@ impl SigHashType {
     pub fn is_single(self) -> bool {
         self.base_type() == 0x03
     }
+}
+
+// ============================================================
+// FindAndDelete and OP_CODESEPARATOR handling for legacy sighash
+// ============================================================
+
+/// Create a push-encoded version of the given data.
+///
+/// This encodes data the way it would appear in a Bitcoin script:
+/// - Length 0-75: single length byte followed by data
+/// - Length 76-255: OP_PUSHDATA1 (0x4c) + 1-byte length + data
+/// - Length 256-65535: OP_PUSHDATA2 (0x4d) + 2-byte LE length + data
+/// - Length 65536+: OP_PUSHDATA4 (0x4e) + 4-byte LE length + data
+fn push_encode(data: &[u8]) -> Vec<u8> {
+    let len = data.len();
+    let mut result = Vec::with_capacity(len + 5);
+
+    if len <= 75 {
+        result.push(len as u8);
+    } else if len <= 255 {
+        result.push(0x4c); // OP_PUSHDATA1
+        result.push(len as u8);
+    } else if len <= 65535 {
+        result.push(0x4d); // OP_PUSHDATA2
+        result.extend_from_slice(&(len as u16).to_le_bytes());
+    } else {
+        result.push(0x4e); // OP_PUSHDATA4
+        result.extend_from_slice(&(len as u32).to_le_bytes());
+    }
+    result.extend_from_slice(data);
+    result
+}
+
+/// Remove all occurrences of the push-encoded signature from the script.
+///
+/// This is the "FindAndDelete" operation required for legacy sighash computation.
+/// It removes all instances where the signature appears as a pushed value in the
+/// script. This is necessary because when we're verifying a signature, we need
+/// to compute the sighash over a version of the script that doesn't contain
+/// the signature itself (since it didn't exist when the signer created it).
+///
+/// The signature should include the sighash type byte at the end.
+///
+/// # Arguments
+/// * `script` - The scriptCode (script bytes)
+/// * `sig` - The signature bytes (including sighash type byte)
+///
+/// # Returns
+/// A new script with all push-encoded occurrences of the signature removed.
+pub fn find_and_delete(script: &[u8], sig: &[u8]) -> Vec<u8> {
+    if sig.is_empty() {
+        return script.to_vec();
+    }
+
+    let pattern = push_encode(sig);
+    if pattern.is_empty() || pattern.len() > script.len() {
+        return script.to_vec();
+    }
+
+    // Find and remove all occurrences of the pattern
+    let mut result = Vec::with_capacity(script.len());
+    let mut i = 0;
+
+    while i < script.len() {
+        // Check if pattern matches at current position
+        if i + pattern.len() <= script.len() && script[i..i + pattern.len()] == pattern[..] {
+            // Skip the pattern
+            i += pattern.len();
+        } else {
+            result.push(script[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
+/// Remove all OP_CODESEPARATOR opcodes from the script.
+///
+/// In legacy sighash, OP_CODESEPARATOR is removed from the scriptCode before
+/// hashing. Note that this is different from handling the "subscript" which
+/// starts after the last executed OP_CODESEPARATOR - both must be done.
+///
+/// # Arguments
+/// * `script` - The script bytes
+///
+/// # Returns
+/// A new script with all OP_CODESEPARATOR opcodes removed.
+pub fn remove_codeseparators(script: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(script.len());
+    let mut i = 0;
+
+    while i < script.len() {
+        let opcode = script[i];
+
+        if opcode == OP_CODESEPARATOR {
+            // Skip OP_CODESEPARATOR
+            i += 1;
+            continue;
+        }
+
+        // Copy opcode
+        result.push(opcode);
+        i += 1;
+
+        // Handle push data opcodes - copy their data too
+        if opcode >= 0x01 && opcode <= 0x4b {
+            // Direct push: opcode is length
+            let len = opcode as usize;
+            let end = (i + len).min(script.len());
+            result.extend_from_slice(&script[i..end]);
+            i = end;
+        } else if opcode == 0x4c && i < script.len() {
+            // OP_PUSHDATA1
+            let len = script[i] as usize;
+            result.push(script[i]);
+            i += 1;
+            let end = (i + len).min(script.len());
+            result.extend_from_slice(&script[i..end]);
+            i = end;
+        } else if opcode == 0x4d && i + 1 < script.len() {
+            // OP_PUSHDATA2
+            let len = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+            result.extend_from_slice(&script[i..i + 2]);
+            i += 2;
+            let end = (i + len).min(script.len());
+            result.extend_from_slice(&script[i..end]);
+            i = end;
+        } else if opcode == 0x4e && i + 3 < script.len() {
+            // OP_PUSHDATA4
+            let len = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]]) as usize;
+            result.extend_from_slice(&script[i..i + 4]);
+            i += 4;
+            let end = (i + len).min(script.len());
+            result.extend_from_slice(&script[i..end]);
+            i = end;
+        }
+    }
+
+    result
 }
 
 /// Compute the legacy (pre-SegWit) signature hash for a transaction input.
