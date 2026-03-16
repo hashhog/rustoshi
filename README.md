@@ -53,6 +53,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Checkpoint verification (known block hashes, fork rejection below checkpoints)
 - [x] Transaction index (txindex, getrawtransaction for confirmed txs with blockhash)
 - [x] Flat file block storage (blk?????.dat files, 128 MiB limit, pre-allocation)
+- [x] Miniscript (type system, parsing, compilation, satisfaction, analysis)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
@@ -76,7 +77,7 @@ rustoshi/
     network/          # P2P protocol (message types, peer management)
     storage/          # RocksDB persistence, UTXO cache layer
     rpc/              # JSON-RPC server
-    wallet/           # HD wallet (BIP-32/44/84, transaction signing)
+    wallet/           # HD wallet (BIP-32/44/84), miniscript, PSBT, descriptors
 ```
 
 ## Running tests
