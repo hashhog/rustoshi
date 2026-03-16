@@ -47,6 +47,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] BIP-16 P2SH push-only scriptSig enforcement (unconditional after P2SH activation)
 - [x] BIP-68 relative lock-time enforcement (sequence locks)
 - [x] Sigop counting with witness discount (P2SH, P2WPKH, P2WSH)
+- [x] BIP-9 versionbits state machine (soft fork activation tracking)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
