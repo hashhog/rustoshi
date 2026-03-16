@@ -503,6 +503,72 @@ impl ChainState {
         Ok((old_chain.len(), new_chain.len()))
     }
 
+    /// Disconnect a single block from the chain tip.
+    ///
+    /// This reverses the effects of the block on the UTXO set using the
+    /// provided undo data. After disconnection, the chain tip is updated
+    /// to the previous block.
+    ///
+    /// # Arguments
+    /// * `block` - The block to disconnect (must be the current chain tip).
+    /// * `undo` - The undo data for the block (from storage).
+    /// * `utxo_cache` - UTXO view to update.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `ValidationError` if:
+    /// - The block is not the current chain tip.
+    /// - The undo data is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Disconnect the tip block
+    /// let tip_hash = chain_state.tip_hash();
+    /// let block = storage.get_block(&tip_hash)?;
+    /// let undo = storage.get_undo(&tip_hash)?;
+    /// chain_state.disconnect_block(&block, &undo, &mut utxo_cache)?;
+    /// ```
+    pub fn disconnect_block<U: UtxoView>(
+        &mut self,
+        block: &Block,
+        undo: &UndoData,
+        utxo_cache: &mut U,
+    ) -> Result<(), ValidationError> {
+        // Verify this block is the current tip
+        let block_hash = block.block_hash();
+        if block_hash != self.tip_hash {
+            return Err(ValidationError::PrevBlockNotFound(format!(
+                "block {} is not the current tip {}",
+                block_hash, self.tip_hash
+            )));
+        }
+
+        // Cannot disconnect the genesis block
+        if self.tip_height == 0 {
+            return Err(ValidationError::InvalidChain);
+        }
+
+        // Perform the disconnection
+        disconnect_block(block, undo, utxo_cache)?;
+
+        // Update chain tip to previous block
+        self.tip_hash = block.header.prev_block_hash;
+        self.tip_height -= 1;
+
+        // Clear MTP cache since it may be affected
+        self.mtp_cache.clear();
+
+        tracing::info!(
+            "Disconnected block {} at height {} (new tip: {} at height {})",
+            block_hash,
+            self.tip_height + 1,
+            self.tip_hash,
+            self.tip_height
+        );
+
+        Ok(())
+    }
+
     /// Compute the median time past (MTP) for a block.
     ///
     /// MTP is the median of the timestamps of the previous 11 blocks.
@@ -560,7 +626,7 @@ impl ChainState {
 mod tests {
     use super::*;
     use crate::params::ChainParams;
-    use rustoshi_primitives::OutPoint;
+    use rustoshi_primitives::{Block, BlockHeader, OutPoint, Transaction};
 
     // Helper to create a simple UTXO cache with no database backing
     fn empty_cache() -> UtxoCache<impl Fn(&OutPoint) -> Option<CoinEntry> + Send> {
@@ -1157,5 +1223,267 @@ mod tests {
                 script
             );
         }
+    }
+
+    // =========================
+    // ChainState disconnect_block tests
+    // =========================
+
+    #[test]
+    fn disconnect_block_rejects_non_tip() {
+        let params = ChainParams::regtest();
+        let genesis_hash = params.genesis_hash;
+
+        // Create a chain state at some tip
+        let tip_hash = Hash256::from_bytes([0xaa; 32]);
+        let mut state = ChainState::new(tip_hash, 5, params);
+
+        // Try to disconnect a block that's not the tip
+        let _wrong_hash = Hash256::from_bytes([0xbb; 32]);
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: genesis_hash,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+
+        let undo = UndoData {
+            spent_coins: vec![],
+        };
+
+        let mut cache = empty_cache();
+        let result = state.disconnect_block(&block, &undo, &mut cache);
+
+        assert!(result.is_err());
+        match result {
+            Err(ValidationError::PrevBlockNotFound(msg)) => {
+                assert!(msg.contains("not the current tip"));
+            }
+            _ => panic!("Expected PrevBlockNotFound error for non-tip block"),
+        }
+    }
+
+    #[test]
+    fn disconnect_block_rejects_genesis() {
+        let params = ChainParams::regtest();
+        let genesis_hash = params.genesis_hash;
+        let genesis = params.genesis_block.clone();
+
+        // Create a chain state at genesis (height 0)
+        let mut state = ChainState::new(genesis_hash, 0, params);
+
+        let undo = UndoData {
+            spent_coins: vec![],
+        };
+
+        let mut cache = empty_cache();
+        let result = state.disconnect_block(&genesis, &undo, &mut cache);
+
+        assert!(result.is_err());
+        match result {
+            Err(ValidationError::InvalidChain) => {}
+            _ => panic!("Expected InvalidChain error for genesis disconnect"),
+        }
+    }
+
+    #[test]
+    fn disconnect_block_updates_tip() {
+        use rustoshi_primitives::{TxIn, TxOut};
+
+        let params = ChainParams::regtest();
+        let prev_hash = Hash256::from_bytes([0x11; 32]);
+
+        // Create a simple block
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x01, 0x01], // Height 1 encoding
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: vec![0x51], // OP_1
+            }],
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: prev_hash,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1000,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        let block_hash = block.block_hash();
+
+        // Create a chain state at this block
+        let mut state = ChainState::new(block_hash, 5, params);
+
+        // Empty undo data (coinbase-only block has no spent inputs)
+        let undo = UndoData {
+            spent_coins: vec![],
+        };
+
+        // Add the coinbase output to the cache
+        let mut cache = empty_cache();
+        let outpoint = OutPoint {
+            txid: block.transactions[0].txid(),
+            vout: 0,
+        };
+        cache.add_utxo(
+            &outpoint,
+            CoinEntry {
+                height: 5,
+                is_coinbase: true,
+                value: 50_0000_0000,
+                script_pubkey: vec![0x51],
+            },
+        );
+
+        // Disconnect the block
+        let result = state.disconnect_block(&block, &undo, &mut cache);
+        assert!(result.is_ok());
+
+        // Verify tip was updated
+        assert_eq!(state.tip_hash(), prev_hash);
+        assert_eq!(state.tip_height(), 4);
+
+        // Verify the coinbase output was removed
+        assert!(cache.get_utxo(&outpoint).is_none());
+    }
+
+    #[test]
+    fn disconnect_block_restores_spent_utxos() {
+        use rustoshi_primitives::{TxIn, TxOut};
+
+        let params = ChainParams::regtest();
+        let prev_hash = Hash256::from_bytes([0x22; 32]);
+
+        // A previously-existing UTXO that was spent
+        let spent_outpoint = OutPoint {
+            txid: Hash256::from_bytes([0x99; 32]),
+            vout: 0,
+        };
+        let spent_coin = CoinEntry {
+            height: 100,
+            is_coinbase: false,
+            value: 25_0000_0000,
+            script_pubkey: vec![0x51],
+        };
+
+        // Create a block with a transaction that spends this UTXO
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x01, 0x01],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+        };
+
+        let spending_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: spent_outpoint.clone(),
+                script_sig: vec![0x51], // OP_1
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 24_9999_0000, // fee = 0.0001 BTC
+                script_pubkey: vec![0x52], // OP_2
+            }],
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: prev_hash,
+                merkle_root: Hash256::ZERO,
+                timestamp: 2000,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase.clone(), spending_tx.clone()],
+        };
+
+        let block_hash = block.block_hash();
+
+        // Chain state at this block
+        let mut state = ChainState::new(block_hash, 10, params);
+
+        // Undo data contains the spent coin
+        let undo = UndoData {
+            spent_coins: vec![spent_coin.clone()],
+        };
+
+        // Cache contains the outputs created by this block
+        let mut cache = empty_cache();
+        let coinbase_outpoint = OutPoint {
+            txid: coinbase.txid(),
+            vout: 0,
+        };
+        let spending_outpoint = OutPoint {
+            txid: spending_tx.txid(),
+            vout: 0,
+        };
+        cache.add_utxo(
+            &coinbase_outpoint,
+            CoinEntry {
+                height: 10,
+                is_coinbase: true,
+                value: 50_0000_0000,
+                script_pubkey: vec![0x51],
+            },
+        );
+        cache.add_utxo(
+            &spending_outpoint,
+            CoinEntry {
+                height: 10,
+                is_coinbase: false,
+                value: 24_9999_0000,
+                script_pubkey: vec![0x52],
+            },
+        );
+
+        // The spent UTXO should NOT be in the cache before disconnect
+        assert!(cache.get_utxo(&spent_outpoint).is_none());
+
+        // Disconnect the block
+        let result = state.disconnect_block(&block, &undo, &mut cache);
+        assert!(result.is_ok());
+
+        // Verify tip was updated
+        assert_eq!(state.tip_hash(), prev_hash);
+        assert_eq!(state.tip_height(), 9);
+
+        // Verify the block's outputs were removed
+        assert!(cache.get_utxo(&coinbase_outpoint).is_none());
+        assert!(cache.get_utxo(&spending_outpoint).is_none());
+
+        // Verify the spent UTXO was restored
+        let restored = cache.get_utxo(&spent_outpoint).unwrap();
+        assert_eq!(restored.height, 100);
+        assert!(!restored.is_coinbase);
+        assert_eq!(restored.value, 25_0000_0000);
     }
 }
