@@ -196,6 +196,9 @@ pub struct VersionMessage {
 pub const PROTOCOL_VERSION: i32 = 70016;
 /// Minimum supported peer protocol version.
 pub const MIN_PEER_PROTO_VERSION: i32 = 31800;
+/// Minimum protocol version for witness support (post-SegWit).
+/// We require SegWit support for all connections.
+pub const MIN_WITNESS_PROTO_VERSION: i32 = 70015;
 /// Protocol version that added wtxidrelay.
 pub const WTXID_RELAY_VERSION: i32 = 70016;
 /// Protocol version that added sendheaders.
