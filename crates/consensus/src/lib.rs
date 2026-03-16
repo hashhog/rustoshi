@@ -32,6 +32,7 @@ pub mod params;
 pub mod pow;
 pub mod script;
 pub mod validation;
+pub mod versionbits;
 
 pub use params::{
     block_subsidy, calculate_next_work_required, compact_to_target, target_to_compact,
@@ -65,4 +66,11 @@ pub use block_template::{
 };
 pub use pow::{
     get_next_work_required, check_proof_of_work, permitted_difficulty_transition, BlockIndex,
+};
+pub use versionbits::{
+    get_state_for, get_state_statistics, compute_block_version, is_deployment_active,
+    get_deployments, BIP9Deployment, BIP9Stats, DeploymentId, ThresholdState,
+    VersionbitsBlockInfo, VersionbitsCache, VERSIONBITS_TOP_BITS, VERSIONBITS_TOP_MASK,
+    VERSIONBITS_PERIOD, VERSIONBITS_THRESHOLD_MAINNET, VERSIONBITS_THRESHOLD_TESTNET,
+    ALWAYS_ACTIVE, NEVER_ACTIVE, NO_TIMEOUT,
 };
