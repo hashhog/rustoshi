@@ -623,6 +623,23 @@ pub struct DecodedRawTransaction {
     pub vout: Vec<TxOutputInfo>,
 }
 
+// ============================================================
+// BAN INFO
+// ============================================================
+
+/// Entry in the banned list returned by `listbanned` RPC.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BannedInfo {
+    /// The banned IP address.
+    pub address: String,
+    /// Unix timestamp when the ban was created.
+    pub ban_created: u64,
+    /// Unix timestamp when the ban expires.
+    pub ban_until: u64,
+    /// Reason for the ban.
+    pub ban_reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,5 +855,436 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"connections\":10"));
         assert!(json.contains("\"networkactive\":true"));
+    }
+
+    // ============================================================
+    // GETBLOCKCHAININFO TESTS
+    // ============================================================
+
+    #[test]
+    fn test_getblockchaininfo_response_fields() {
+        let info = BlockchainInfo {
+            chain: "main".to_string(),
+            blocks: 850000,
+            headers: 850000,
+            bestblockhash: "0000000000000000000265abc123def456789012345678901234567890123456"
+                .to_string(),
+            difficulty: 95672703408666.97,
+            mediantime: 1710000000,
+            verificationprogress: 0.9999999,
+            initialblockdownload: false,
+            chainwork: "00000000000000000000000000000000000000007b0e".to_string(),
+            size_on_disk: 600_000_000_000,
+            pruned: false,
+            warnings: String::new(),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+
+        // Verify all required fields are present
+        assert!(json.contains("\"chain\":\"main\""));
+        assert!(json.contains("\"blocks\":850000"));
+        assert!(json.contains("\"headers\":850000"));
+        assert!(json.contains("\"bestblockhash\":"));
+        assert!(json.contains("\"difficulty\":"));
+        assert!(json.contains("\"mediantime\":"));
+        assert!(json.contains("\"verificationprogress\":"));
+        assert!(json.contains("\"initialblockdownload\":false"));
+        assert!(json.contains("\"chainwork\":"));
+        assert!(json.contains("\"pruned\":false"));
+    }
+
+    #[test]
+    fn test_getblockchaininfo_testnet_chain() {
+        let info = BlockchainInfo {
+            chain: "test4".to_string(),
+            blocks: 50000,
+            headers: 50000,
+            bestblockhash: "00000000".repeat(8),
+            difficulty: 1.0,
+            mediantime: 1700000000,
+            verificationprogress: 1.0,
+            initialblockdownload: false,
+            chainwork: "0".repeat(64),
+            size_on_disk: 1_000_000_000,
+            pruned: false,
+            warnings: String::new(),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"chain\":\"test4\""));
+    }
+
+    // ============================================================
+    // GETBLOCKTEMPLATE TESTS
+    // ============================================================
+
+    #[test]
+    fn test_getblocktemplate_response_bip22() {
+        let template = BlockTemplateResult {
+            version: 0x20000000,
+            rules: vec!["csv".to_string(), "segwit".to_string()],
+            vbavailable: serde_json::json!({}),
+            vbrequired: 0,
+            previousblockhash: "00000000".repeat(8),
+            transactions: vec![],
+            coinbaseaux: serde_json::json!({}),
+            coinbasevalue: 312500000,
+            longpollid: "someblockid:850000".to_string(),
+            target: "0000000000000000000abc".to_string(),
+            mintime: 1710000000 - 7200,
+            mutable: vec![
+                "time".to_string(),
+                "transactions".to_string(),
+                "prevblock".to_string(),
+            ],
+            noncerange: "00000000ffffffff".to_string(),
+            sigoplimit: 80000,
+            sizelimit: 4000000,
+            weightlimit: 4000000,
+            curtime: 1710000000,
+            bits: "1d00ffff".to_string(),
+            height: 850001,
+            default_witness_commitment: None,
+        };
+
+        let json = serde_json::to_string(&template).unwrap();
+
+        // BIP22/23 required fields
+        assert!(json.contains("\"version\":"));
+        assert!(json.contains("\"rules\":"));
+        assert!(json.contains("\"previousblockhash\":"));
+        assert!(json.contains("\"transactions\":"));
+        assert!(json.contains("\"coinbasevalue\":"));
+        assert!(json.contains("\"target\":"));
+        assert!(json.contains("\"mintime\":"));
+        assert!(json.contains("\"mutable\":"));
+        assert!(json.contains("\"noncerange\":"));
+        assert!(json.contains("\"sigoplimit\":80000"));
+        assert!(json.contains("\"sizelimit\":4000000"));
+        assert!(json.contains("\"weightlimit\":4000000"));
+        assert!(json.contains("\"curtime\":"));
+        assert!(json.contains("\"bits\":"));
+        assert!(json.contains("\"height\":"));
+    }
+
+    #[test]
+    fn test_getblocktemplate_transaction_entry() {
+        let tx = BlockTemplateTransaction {
+            data: "0100000001".to_string(),
+            txid: "abcd".repeat(16),
+            hash: "efgh".repeat(16),
+            depends: vec![0, 1],
+            fee: 5000,
+            sigops: 4,
+            weight: 500,
+        };
+
+        let json = serde_json::to_string(&tx).unwrap();
+        assert!(json.contains("\"data\":"));
+        assert!(json.contains("\"txid\":"));
+        assert!(json.contains("\"hash\":"));
+        assert!(json.contains("\"depends\":[0,1]"));
+        assert!(json.contains("\"fee\":5000"));
+        assert!(json.contains("\"sigops\":4"));
+        assert!(json.contains("\"weight\":500"));
+    }
+
+    // ============================================================
+    // GETMEMPOOLINFO TESTS
+    // ============================================================
+
+    #[test]
+    fn test_getmempoolinfo_response_fields() {
+        let info = MempoolInfo {
+            loaded: true,
+            size: 5000,
+            bytes: 2_500_000,
+            usage: 5_000_000,
+            total_fee: 0.05,
+            maxmempool: 300_000_000,
+            mempoolminfee: 0.00001,
+            minrelaytxfee: 0.00001,
+            unbroadcastcount: 10,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+
+        // All required Bitcoin Core fields
+        assert!(json.contains("\"loaded\":true"));
+        assert!(json.contains("\"size\":5000"));
+        assert!(json.contains("\"bytes\":2500000"));
+        assert!(json.contains("\"usage\":5000000"));
+        assert!(json.contains("\"maxmempool\":300000000"));
+        assert!(json.contains("\"mempoolminfee\":"));
+        assert!(json.contains("\"minrelaytxfee\":"));
+        assert!(json.contains("\"unbroadcastcount\":10"));
+    }
+
+    // ============================================================
+    // GETRAWMEMPOOL VERBOSE TESTS
+    // ============================================================
+
+    #[test]
+    fn test_getrawmempool_verbose_entry() {
+        let entry = MempoolEntry {
+            vsize: 250,
+            weight: 1000,
+            fee: 0.000025,
+            modifiedfee: 0.000025,
+            time: 1710000000,
+            height: 850000,
+            descendantcount: 1,
+            descendantsize: 250,
+            descendantfees: 2500,
+            ancestorcount: 0,
+            ancestorsize: 0,
+            ancestorfees: 0,
+            wtxid: "abcd".repeat(16),
+            depends: vec!["1234".repeat(16)],
+            spentby: vec![],
+            bip125_replaceable: true,
+            unbroadcast: false,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+
+        // Bitcoin Core mempool entry fields
+        assert!(json.contains("\"vsize\":250"));
+        assert!(json.contains("\"weight\":1000"));
+        assert!(json.contains("\"fee\":"));
+        assert!(json.contains("\"modifiedfee\":"));
+        assert!(json.contains("\"time\":"));
+        assert!(json.contains("\"height\":850000"));
+        assert!(json.contains("\"descendantcount\":1"));
+        assert!(json.contains("\"ancestorcount\":0"));
+        assert!(json.contains("\"wtxid\":"));
+        assert!(json.contains("\"depends\":"));
+        assert!(json.contains("\"spentby\":"));
+        assert!(json.contains("\"bip125-replaceable\":true"));
+        assert!(json.contains("\"unbroadcast\":false"));
+    }
+
+    // ============================================================
+    // ESTIMATESMARTFEE TESTS
+    // ============================================================
+
+    #[test]
+    fn test_estimatesmartfee_success() {
+        let result = FeeEstimateResult {
+            feerate: Some(0.00015),
+            errors: None,
+            blocks: 6,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"feerate\":0.00015"));
+        assert!(json.contains("\"blocks\":6"));
+        // errors should be null, not present
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["errors"].is_null());
+    }
+
+    #[test]
+    fn test_estimatesmartfee_no_estimate() {
+        let result = FeeEstimateResult {
+            feerate: None,
+            errors: Some(vec![
+                "Insufficient data for fee estimation".to_string(),
+                "No feerate found".to_string(),
+            ]),
+            blocks: 2,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"blocks\":2"));
+        assert!(json.contains("\"errors\":"));
+        assert!(json.contains("Insufficient data"));
+        // feerate should be null
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["feerate"].is_null());
+    }
+
+    // ============================================================
+    // VALIDATEADDRESS TESTS
+    // ============================================================
+
+    #[test]
+    fn test_validateaddress_p2wpkh_mainnet() {
+        let result = ValidateAddressResult {
+            isvalid: true,
+            address: Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string()),
+            script_pubkey: Some("0014751e76e8199196d454941c45d1b3a323f1433bd6".to_string()),
+            isscript: Some(false),
+            iswitness: Some(true),
+            witness_version: Some(0),
+            witness_program: Some("751e76e8199196d454941c45d1b3a323f1433bd6".to_string()),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"isvalid\":true"));
+        assert!(json.contains("\"iswitness\":true"));
+        assert!(json.contains("\"witness_version\":0"));
+    }
+
+    #[test]
+    fn test_validateaddress_p2tr() {
+        let result = ValidateAddressResult {
+            isvalid: true,
+            address: Some(
+                "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr".to_string(),
+            ),
+            script_pubkey: Some(
+                "5120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c".to_string(),
+            ),
+            isscript: Some(true),
+            iswitness: Some(true),
+            witness_version: Some(1),
+            witness_program: Some(
+                "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c".to_string(),
+            ),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"isvalid\":true"));
+        assert!(json.contains("\"witness_version\":1"));
+    }
+
+    #[test]
+    fn test_validateaddress_legacy_p2pkh() {
+        let result = ValidateAddressResult {
+            isvalid: true,
+            address: Some("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2".to_string()),
+            script_pubkey: Some(
+                "76a91477bff20c60e522dfaa3350c39b030a5d004e839a88ac".to_string(),
+            ),
+            isscript: Some(false),
+            iswitness: Some(false),
+            witness_version: None,
+            witness_program: None,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"isvalid\":true"));
+        assert!(json.contains("\"iswitness\":false"));
+        assert!(json.contains("\"witness_version\":null"));
+    }
+
+    // ============================================================
+    // GETPEERINFO TESTS
+    // ============================================================
+
+    #[test]
+    fn test_getpeerinfo_outbound_full_relay() {
+        let peer = PeerInfoRpc {
+            id: 5,
+            addr: "192.168.1.100:8333".to_string(),
+            addrbind: Some("192.168.1.1:48888".to_string()),
+            addrlocal: Some("192.168.1.1:48888".to_string()),
+            network: "ipv4".to_string(),
+            services: "0000000000000409".to_string(),
+            servicesnames: vec![
+                "NETWORK".to_string(),
+                "WITNESS".to_string(),
+                "NETWORK_LIMITED".to_string(),
+            ],
+            relaytxes: true,
+            lastsend: 1710000000,
+            lastrecv: 1710000001,
+            bytessent: 150000,
+            bytesrecv: 200000,
+            conntime: 1709990000,
+            timeoffset: -1,
+            pingtime: Some(0.025),
+            minping: Some(0.020),
+            pingwait: None,
+            version: 70016,
+            subver: "/Satoshi:25.0.0/".to_string(),
+            inbound: false,
+            bip152_hb_to: true,
+            bip152_hb_from: true,
+            startingheight: 850000,
+            synced_headers: 850010,
+            synced_blocks: 850005,
+            connection_type: "outbound-full-relay".to_string(),
+        };
+
+        let json = serde_json::to_string(&peer).unwrap();
+
+        // All Bitcoin Core required fields
+        assert!(json.contains("\"id\":5"));
+        assert!(json.contains("\"addr\":\"192.168.1.100:8333\""));
+        assert!(json.contains("\"services\":"));
+        assert!(json.contains("\"servicesnames\":"));
+        assert!(json.contains("\"relaytxes\":true"));
+        assert!(json.contains("\"lastsend\":"));
+        assert!(json.contains("\"lastrecv\":"));
+        assert!(json.contains("\"bytessent\":150000"));
+        assert!(json.contains("\"bytesrecv\":200000"));
+        assert!(json.contains("\"conntime\":"));
+        assert!(json.contains("\"pingtime\":"));
+        assert!(json.contains("\"version\":70016"));
+        assert!(json.contains("\"subver\":\"/Satoshi:25.0.0/\""));
+        assert!(json.contains("\"inbound\":false"));
+        assert!(json.contains("\"synced_headers\":850010"));
+        assert!(json.contains("\"synced_blocks\":850005"));
+        assert!(json.contains("\"connection_type\":\"outbound-full-relay\""));
+    }
+
+    #[test]
+    fn test_getpeerinfo_inbound() {
+        let peer = PeerInfoRpc {
+            id: 10,
+            addr: "10.0.0.50:45678".to_string(),
+            addrbind: None,
+            addrlocal: None,
+            network: "ipv4".to_string(),
+            services: "0000000000000001".to_string(),
+            servicesnames: vec!["NETWORK".to_string()],
+            relaytxes: true,
+            lastsend: 0,
+            lastrecv: 0,
+            bytessent: 0,
+            bytesrecv: 0,
+            conntime: 0,
+            timeoffset: 0,
+            pingtime: None,
+            minping: None,
+            pingwait: None,
+            version: 70015,
+            subver: "/CustomClient:1.0/".to_string(),
+            inbound: true,
+            bip152_hb_to: false,
+            bip152_hb_from: false,
+            startingheight: 0,
+            synced_headers: 0,
+            synced_blocks: 0,
+            connection_type: "inbound".to_string(),
+        };
+
+        let json = serde_json::to_string(&peer).unwrap();
+        assert!(json.contains("\"inbound\":true"));
+        assert!(json.contains("\"connection_type\":\"inbound\""));
+    }
+
+    // ============================================================
+    // NETWORK INTERFACE TESTS
+    // ============================================================
+
+    #[test]
+    fn test_network_interface_serialization() {
+        let iface = NetworkInterface {
+            name: "onion".to_string(),
+            limited: false,
+            reachable: true,
+            proxy: "127.0.0.1:9050".to_string(),
+            proxy_randomize_credentials: true,
+        };
+
+        let json = serde_json::to_string(&iface).unwrap();
+        assert!(json.contains("\"name\":\"onion\""));
+        assert!(json.contains("\"reachable\":true"));
+        assert!(json.contains("\"proxy\":\"127.0.0.1:9050\""));
+        assert!(json.contains("\"proxy_randomize_credentials\":true"));
     }
 }
