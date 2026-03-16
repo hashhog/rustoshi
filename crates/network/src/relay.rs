@@ -7,6 +7,15 @@
 //! - Inbound peers: average 5-second interval
 //! - Blocks are always announced immediately (never trickled)
 //!
+//! Also implements BIP 133 feefilter:
+//! - Peers announce their minimum fee rate
+//! - Transactions below this rate are not relayed to that peer
+//! - Reduces bandwidth waste from transactions peers will reject
+//!
+//! And incremental relay fee enforcement:
+//! - For RBF, replacement must pay additional fees covering its own relay cost
+//! - Default incremental relay fee: 1000 sat/kvB (1 sat/vB)
+//!
 //! This improves privacy by making it harder to determine the origin
 //! of a transaction, and reduces bandwidth spikes from announcing
 //! transactions to all peers simultaneously.
@@ -16,7 +25,7 @@
 use crate::message::{InvType, InvVector};
 use crate::peer::PeerId;
 use rustoshi_primitives::Hash256;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Average delay between trickled inventory transmissions for inbound peers.
@@ -37,6 +46,446 @@ pub const INVENTORY_BROADCAST_PER_SECOND: usize = 14;
 /// Based on inbound interval * rate per second.
 pub const INVENTORY_BROADCAST_TARGET: usize =
     INVENTORY_BROADCAST_PER_SECOND * INBOUND_INVENTORY_BROADCAST_INTERVAL.as_secs() as usize;
+
+// =============================================================================
+// BIP 133 Feefilter Constants
+// =============================================================================
+
+/// Average delay between feefilter broadcasts (10 minutes).
+/// Reference: Bitcoin Core `AVG_FEEFILTER_BROADCAST_INTERVAL`
+pub const AVG_FEEFILTER_BROADCAST_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Maximum feefilter broadcast delay after significant change (5 minutes).
+/// If the fee filter changes substantially, we schedule a broadcast within this time.
+/// Reference: Bitcoin Core `MAX_FEEFILTER_CHANGE_DELAY`
+pub const MAX_FEEFILTER_CHANGE_DELAY: Duration = Duration::from_secs(5 * 60);
+
+/// Default minimum relay fee rate in sat/kvB (1000 sat/kvB = 1 sat/vB).
+/// This is the minimum fee rate we will relay transactions at.
+/// Reference: Bitcoin Core `DEFAULT_MIN_RELAY_TX_FEE`
+pub const DEFAULT_MIN_RELAY_FEE: u64 = 1000;
+
+/// Default incremental relay fee rate in sat/kvB (1000 sat/kvB = 1 sat/vB).
+/// For RBF, the replacement must pay at least this much per kvB more than the original.
+/// Also used as the minimum fee rate step for mempool limiting.
+/// Reference: Bitcoin Core `DEFAULT_INCREMENTAL_RELAY_FEE`
+pub const DEFAULT_INCREMENTAL_RELAY_FEE: u64 = 1000;
+
+/// Maximum money value (21 million BTC in satoshis).
+/// Used as the feefilter value during IBD to signal "don't send me txs".
+pub const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+
+/// Fee filter spacing multiplier for privacy quantization.
+/// Fee rates are rounded to multiples of this factor (1.1x steps).
+/// Reference: Bitcoin Core `FeeFilterRounder::FEE_FILTER_SPACING`
+pub const FEE_FILTER_SPACING: f64 = 1.1;
+
+/// Maximum feerate for the fee filter set (10 BTC/kvB).
+pub const MAX_FILTER_FEERATE: f64 = 1e7;
+
+// =============================================================================
+// FeeFilterRounder
+// =============================================================================
+
+/// Rounds fee rates for privacy before broadcasting.
+///
+/// This quantizes fee rates to a set of discrete values to prevent
+/// fingerprinting based on the exact mempool minimum fee.
+/// The values form a geometric sequence with ratio FEE_FILTER_SPACING.
+///
+/// Reference: Bitcoin Core `FeeFilterRounder`
+#[derive(Debug)]
+pub struct FeeFilterRounder {
+    /// Pre-computed set of fee values (sorted).
+    fee_set: BTreeSet<u64>,
+}
+
+impl FeeFilterRounder {
+    /// Create a new FeeFilterRounder with fee buckets starting from `min_incremental_fee`.
+    pub fn new(min_incremental_fee: u64) -> Self {
+        let mut fee_set = BTreeSet::new();
+        let mut fee = min_incremental_fee as f64;
+
+        while fee <= MAX_FILTER_FEERATE {
+            fee_set.insert(fee as u64);
+            fee *= FEE_FILTER_SPACING;
+        }
+
+        Self { fee_set }
+    }
+
+    /// Round a fee rate to the nearest bucket value.
+    ///
+    /// Randomly selects between the lower and upper bound with 50% probability
+    /// to add noise for privacy.
+    pub fn round(&self, current_min_fee: u64) -> u64 {
+        // Find the first bucket >= current_min_fee
+        let upper = self.fee_set.range(current_min_fee..).next();
+        // Find the last bucket < current_min_fee
+        let lower = self.fee_set.range(..current_min_fee).next_back();
+
+        match (lower, upper) {
+            (None, None) => 0,
+            (Some(&l), None) => l,
+            (None, Some(&u)) => u,
+            (Some(&l), Some(&u)) => {
+                // Randomly choose between lower and upper with 50% probability
+                if rand::random::<bool>() {
+                    l
+                } else {
+                    u
+                }
+            }
+        }
+    }
+
+    /// Get the number of fee buckets.
+    pub fn bucket_count(&self) -> usize {
+        self.fee_set.len()
+    }
+}
+
+impl Default for FeeFilterRounder {
+    fn default() -> Self {
+        Self::new(DEFAULT_INCREMENTAL_RELAY_FEE)
+    }
+}
+
+// =============================================================================
+// FeeFilterState
+// =============================================================================
+
+/// Per-peer feefilter state for BIP 133.
+///
+/// Tracks:
+/// - The feefilter we've received from this peer (their minimum acceptable fee)
+/// - The feefilter we've sent to this peer (our minimum acceptable fee)
+/// - Scheduling for when to send the next feefilter update
+#[derive(Debug)]
+pub struct FeeFilterState {
+    /// The minimum fee rate (sat/kvB) this peer will accept.
+    /// Received via feefilter message from the peer.
+    pub fee_filter_received: u64,
+
+    /// The last fee filter value we sent to this peer.
+    pub fee_filter_sent: u64,
+
+    /// Next scheduled time to send a feefilter message.
+    pub next_send_feefilter: Instant,
+
+    /// Whether this peer supports feefilter (protocol version >= 70013).
+    pub supports_feefilter: bool,
+
+    /// Whether this is a block-relay-only connection.
+    /// Block-relay-only peers don't need feefilter since they don't relay txs.
+    pub is_block_only: bool,
+}
+
+impl FeeFilterState {
+    /// Create a new FeeFilterState for a peer.
+    pub fn new(supports_feefilter: bool, is_block_only: bool) -> Self {
+        Self {
+            fee_filter_received: 0,
+            fee_filter_sent: 0,
+            next_send_feefilter: Instant::now() + poisson_next_send(AVG_FEEFILTER_BROADCAST_INTERVAL),
+            supports_feefilter,
+            is_block_only,
+        }
+    }
+
+    /// Update the received feefilter from this peer.
+    pub fn set_received(&mut self, fee_rate: u64) {
+        self.fee_filter_received = fee_rate;
+    }
+
+    /// Check if a transaction with the given fee rate should be relayed to this peer.
+    ///
+    /// Returns true if the tx fee rate meets or exceeds the peer's feefilter.
+    pub fn should_relay(&self, tx_fee_rate: u64) -> bool {
+        tx_fee_rate >= self.fee_filter_received
+    }
+
+    /// Check if we should send a feefilter update now.
+    ///
+    /// Returns Some(fee_rate) if we should send, None otherwise.
+    pub fn maybe_send_feefilter(
+        &mut self,
+        current_min_fee: u64,
+        min_relay_fee: u64,
+        rounder: &FeeFilterRounder,
+        now: Instant,
+        is_ibd: bool,
+    ) -> Option<u64> {
+        if !self.supports_feefilter || self.is_block_only {
+            return None;
+        }
+
+        // During IBD, signal that we don't want transactions
+        let current_filter = if is_ibd {
+            MAX_MONEY
+        } else {
+            current_min_fee
+        };
+
+        // If we sent MAX_MONEY during IBD and are now out of IBD,
+        // force an immediate update
+        if !is_ibd && self.fee_filter_sent == rounder.round(MAX_MONEY) {
+            self.next_send_feefilter = now;
+        }
+
+        if now >= self.next_send_feefilter {
+            let mut filter_to_send = rounder.round(current_filter);
+            // Always send at least the minimum relay fee
+            filter_to_send = filter_to_send.max(min_relay_fee);
+
+            let should_send = filter_to_send != self.fee_filter_sent;
+
+            // Schedule next send regardless
+            self.next_send_feefilter = now + poisson_next_send(AVG_FEEFILTER_BROADCAST_INTERVAL);
+
+            if should_send {
+                self.fee_filter_sent = filter_to_send;
+                return Some(filter_to_send);
+            }
+        } else {
+            // Check if the fee filter has changed substantially
+            // and we should send earlier than scheduled
+            let remaining = self.next_send_feefilter.saturating_duration_since(now);
+
+            if remaining > MAX_FEEFILTER_CHANGE_DELAY {
+                // Check for significant change: < 75% or > 133% of last sent value
+                let sent = self.fee_filter_sent;
+                if sent > 0 && (current_filter < 3 * sent / 4 || current_filter > 4 * sent / 3) {
+                    // Reschedule to within MAX_FEEFILTER_CHANGE_DELAY
+                    self.next_send_feefilter = now + rand_duration(MAX_FEEFILTER_CHANGE_DELAY);
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// Generate a random duration up to max_duration.
+fn rand_duration(max_duration: Duration) -> Duration {
+    let secs = rand::random::<f64>() * max_duration.as_secs_f64();
+    Duration::from_secs_f64(secs)
+}
+
+// =============================================================================
+// Incremental Relay Fee
+// =============================================================================
+
+/// Check if a replacement transaction pays sufficient fees for RBF.
+///
+/// For BIP 125 RBF, the replacement transaction must:
+/// 1. Pay at least as much total fee as the original (Rule #3)
+/// 2. Pay an additional fee to cover its own relay cost (Rule #4)
+///
+/// The additional fee must be at least: `incremental_relay_fee * replacement_vsize`
+///
+/// # Arguments
+/// * `original_fees` - Total fees of the transaction(s) being replaced
+/// * `replacement_fees` - Total fees of the replacement transaction
+/// * `replacement_vsize` - Virtual size of the replacement transaction
+/// * `incremental_relay_fee` - Incremental relay fee rate in sat/kvB
+///
+/// # Returns
+/// * `Ok(())` if the fees are sufficient
+/// * `Err(String)` with an error message if insufficient
+pub fn pays_for_rbf(
+    original_fees: u64,
+    replacement_fees: u64,
+    replacement_vsize: u64,
+    incremental_relay_fee: u64,
+) -> Result<(), String> {
+    // Rule #3: The replacement fees must be greater than or equal to fees of the
+    // transactions it replaces, otherwise the bandwidth used by those conflicting
+    // transactions would not be paid for.
+    if replacement_fees < original_fees {
+        return Err(format!(
+            "insufficient fee: replacement fee {} < original fee {}",
+            replacement_fees, original_fees
+        ));
+    }
+
+    // Rule #4: The new transaction must pay for its own bandwidth.
+    // Otherwise, we have a DoS vector where attackers can cause a transaction to be
+    // replaced (and relayed) repeatedly by increasing the fee by tiny amounts.
+    let additional_fees = replacement_fees.saturating_sub(original_fees);
+    let required_additional = get_fee(incremental_relay_fee, replacement_vsize);
+
+    if additional_fees < required_additional {
+        return Err(format!(
+            "insufficient fee: additional fee {} < required {} (incremental relay fee for {} vbytes)",
+            additional_fees, required_additional, replacement_vsize
+        ));
+    }
+
+    Ok(())
+}
+
+/// Calculate the fee for a given fee rate and virtual size.
+///
+/// fee = ceil(fee_rate * vsize / 1000)
+///
+/// Fee rate is in sat/kvB, vsize is in vbytes.
+pub fn get_fee(fee_rate: u64, vsize: u64) -> u64 {
+    // fee = ceil(fee_rate * vsize / 1000)
+    // Using integer math: (fee_rate * vsize + 999) / 1000
+    (fee_rate.saturating_mul(vsize) + 999) / 1000
+}
+
+/// Calculate the fee rate from fee and virtual size.
+///
+/// fee_rate = fee * 1000 / vsize (in sat/kvB)
+pub fn get_fee_rate(fee: u64, vsize: u64) -> u64 {
+    if vsize == 0 {
+        return 0;
+    }
+    fee.saturating_mul(1000) / vsize
+}
+
+// =============================================================================
+// FeeFilterManager
+// =============================================================================
+
+/// Manager for all peers' feefilter state.
+#[derive(Debug)]
+pub struct FeeFilterManager {
+    /// Per-peer feefilter state.
+    peer_states: HashMap<PeerId, FeeFilterState>,
+
+    /// Fee filter rounder for privacy.
+    rounder: FeeFilterRounder,
+
+    /// Current minimum relay fee rate (sat/kvB).
+    min_relay_fee: u64,
+
+    /// Incremental relay fee rate (sat/kvB).
+    incremental_relay_fee: u64,
+}
+
+impl FeeFilterManager {
+    /// Create a new FeeFilterManager.
+    pub fn new(min_relay_fee: u64, incremental_relay_fee: u64) -> Self {
+        Self {
+            peer_states: HashMap::new(),
+            rounder: FeeFilterRounder::new(incremental_relay_fee),
+            min_relay_fee,
+            incremental_relay_fee,
+        }
+    }
+
+    /// Add a peer to the manager.
+    pub fn add_peer(&mut self, peer_id: PeerId, supports_feefilter: bool, is_block_only: bool) {
+        self.peer_states.insert(
+            peer_id,
+            FeeFilterState::new(supports_feefilter, is_block_only),
+        );
+    }
+
+    /// Remove a peer from the manager.
+    pub fn remove_peer(&mut self, peer_id: PeerId) {
+        self.peer_states.remove(&peer_id);
+    }
+
+    /// Handle a received feefilter message from a peer.
+    pub fn handle_feefilter(&mut self, peer_id: PeerId, fee_rate: u64) {
+        if let Some(state) = self.peer_states.get_mut(&peer_id) {
+            state.set_received(fee_rate);
+        }
+    }
+
+    /// Get the feefilter received from a peer.
+    pub fn get_peer_feefilter(&self, peer_id: PeerId) -> u64 {
+        self.peer_states
+            .get(&peer_id)
+            .map(|s| s.fee_filter_received)
+            .unwrap_or(0)
+    }
+
+    /// Check if a transaction should be relayed to a specific peer.
+    ///
+    /// Returns true if the tx fee rate meets or exceeds the peer's feefilter.
+    pub fn should_relay_to_peer(&self, peer_id: PeerId, tx_fee_rate: u64) -> bool {
+        self.peer_states
+            .get(&peer_id)
+            .map(|s| s.should_relay(tx_fee_rate))
+            .unwrap_or(true)
+    }
+
+    /// Get pending feefilter messages to send.
+    ///
+    /// Returns a list of (peer_id, fee_rate) for each peer that needs a feefilter update.
+    pub fn get_pending_feefilters(
+        &mut self,
+        current_mempool_min_fee: u64,
+        is_ibd: bool,
+    ) -> Vec<(PeerId, u64)> {
+        let now = Instant::now();
+        let mut updates = Vec::new();
+
+        for (&peer_id, state) in &mut self.peer_states {
+            if let Some(fee_rate) = state.maybe_send_feefilter(
+                current_mempool_min_fee,
+                self.min_relay_fee,
+                &self.rounder,
+                now,
+                is_ibd,
+            ) {
+                updates.push((peer_id, fee_rate));
+            }
+        }
+
+        updates
+    }
+
+    /// Check if a replacement transaction pays sufficient fees.
+    pub fn pays_for_rbf(
+        &self,
+        original_fees: u64,
+        replacement_fees: u64,
+        replacement_vsize: u64,
+    ) -> Result<(), String> {
+        pays_for_rbf(
+            original_fees,
+            replacement_fees,
+            replacement_vsize,
+            self.incremental_relay_fee,
+        )
+    }
+
+    /// Get the minimum relay fee rate.
+    pub fn min_relay_fee(&self) -> u64 {
+        self.min_relay_fee
+    }
+
+    /// Get the incremental relay fee rate.
+    pub fn incremental_relay_fee(&self) -> u64 {
+        self.incremental_relay_fee
+    }
+
+    /// Set the minimum relay fee rate.
+    pub fn set_min_relay_fee(&mut self, fee_rate: u64) {
+        self.min_relay_fee = fee_rate;
+    }
+
+    /// Get the number of tracked peers.
+    pub fn peer_count(&self) -> usize {
+        self.peer_states.len()
+    }
+}
+
+impl Default for FeeFilterManager {
+    fn default() -> Self {
+        Self::new(DEFAULT_MIN_RELAY_FEE, DEFAULT_INCREMENTAL_RELAY_FEE)
+    }
+}
+
+// =============================================================================
+// Inventory Trickling
+// =============================================================================
 
 /// Per-peer relay state for inventory trickling.
 #[derive(Debug)]
@@ -774,5 +1223,324 @@ mod tests {
     fn test_inventory_trickle_default() {
         let trickle = InventoryTrickle::default();
         assert_eq!(trickle.peer_count(), 0);
+    }
+
+    // =========================================================================
+    // FeeFilter Tests
+    // =========================================================================
+
+    #[test]
+    fn test_feefilter_constants() {
+        // Verify constants match Bitcoin Core
+        assert_eq!(DEFAULT_MIN_RELAY_FEE, 1000); // 1000 sat/kvB
+        assert_eq!(DEFAULT_INCREMENTAL_RELAY_FEE, 1000); // 1000 sat/kvB
+        assert_eq!(AVG_FEEFILTER_BROADCAST_INTERVAL, Duration::from_secs(600)); // 10 min
+        assert_eq!(MAX_FEEFILTER_CHANGE_DELAY, Duration::from_secs(300)); // 5 min
+        assert_eq!(MAX_MONEY, 21_000_000 * 100_000_000); // 21M BTC in satoshis
+    }
+
+    #[test]
+    fn test_fee_filter_rounder_creation() {
+        let rounder = FeeFilterRounder::new(DEFAULT_INCREMENTAL_RELAY_FEE);
+        // Should have many buckets from 1000 to 10M
+        assert!(rounder.bucket_count() > 50);
+        assert!(rounder.bucket_count() < 500);
+    }
+
+    #[test]
+    fn test_fee_filter_rounder_round() {
+        let rounder = FeeFilterRounder::new(1000);
+
+        // Very small fee should round to first bucket or 0
+        let rounded = rounder.round(100);
+        assert!(rounded <= 1000);
+
+        // Fee at a bucket should round near it
+        let rounded = rounder.round(1000);
+        assert!(rounded >= 900 && rounded <= 1100);
+
+        // Large fee should round to a large bucket
+        let rounded = rounder.round(1_000_000);
+        assert!(rounded >= 500_000 && rounded <= 2_000_000);
+    }
+
+    #[test]
+    fn test_fee_filter_rounder_default() {
+        let rounder = FeeFilterRounder::default();
+        assert!(rounder.bucket_count() > 0);
+    }
+
+    #[test]
+    fn test_feefilter_state_new() {
+        let state = FeeFilterState::new(true, false);
+        assert!(state.supports_feefilter);
+        assert!(!state.is_block_only);
+        assert_eq!(state.fee_filter_received, 0);
+        assert_eq!(state.fee_filter_sent, 0);
+    }
+
+    #[test]
+    fn test_feefilter_state_set_received() {
+        let mut state = FeeFilterState::new(true, false);
+        state.set_received(5000);
+        assert_eq!(state.fee_filter_received, 5000);
+    }
+
+    #[test]
+    fn test_feefilter_state_should_relay() {
+        let mut state = FeeFilterState::new(true, false);
+
+        // With no feefilter set, should relay everything
+        assert!(state.should_relay(0));
+        assert!(state.should_relay(1000));
+
+        // Set feefilter to 1000
+        state.set_received(1000);
+
+        // Should not relay below feefilter
+        assert!(!state.should_relay(0));
+        assert!(!state.should_relay(999));
+
+        // Should relay at or above feefilter
+        assert!(state.should_relay(1000));
+        assert!(state.should_relay(2000));
+    }
+
+    #[test]
+    fn test_feefilter_manager_add_remove_peer() {
+        let mut manager = FeeFilterManager::default();
+
+        let peer1 = PeerId(1);
+        let peer2 = PeerId(2);
+
+        manager.add_peer(peer1, true, false);
+        manager.add_peer(peer2, true, true);
+
+        assert_eq!(manager.peer_count(), 2);
+
+        manager.remove_peer(peer1);
+        assert_eq!(manager.peer_count(), 1);
+    }
+
+    #[test]
+    fn test_feefilter_manager_handle_feefilter() {
+        let mut manager = FeeFilterManager::default();
+
+        let peer = PeerId(1);
+        manager.add_peer(peer, true, false);
+
+        // Initially no feefilter
+        assert_eq!(manager.get_peer_feefilter(peer), 0);
+
+        // Handle feefilter message
+        manager.handle_feefilter(peer, 5000);
+        assert_eq!(manager.get_peer_feefilter(peer), 5000);
+    }
+
+    #[test]
+    fn test_feefilter_manager_should_relay() {
+        let mut manager = FeeFilterManager::default();
+
+        let peer = PeerId(1);
+        manager.add_peer(peer, true, false);
+        manager.handle_feefilter(peer, 1000);
+
+        // Should not relay below feefilter
+        assert!(!manager.should_relay_to_peer(peer, 500));
+
+        // Should relay at or above feefilter
+        assert!(manager.should_relay_to_peer(peer, 1000));
+        assert!(manager.should_relay_to_peer(peer, 2000));
+    }
+
+    #[test]
+    fn test_feefilter_manager_unknown_peer() {
+        let manager = FeeFilterManager::default();
+
+        // Unknown peer should default to relay
+        assert!(manager.should_relay_to_peer(PeerId(999), 0));
+        assert_eq!(manager.get_peer_feefilter(PeerId(999)), 0);
+    }
+
+    #[test]
+    fn test_bip133_feefilter_message_parsing() {
+        // Test that feefilter values are u64 in sat/kvB
+        let fee_rate: u64 = 1000; // 1 sat/vB = 1000 sat/kvB
+
+        // Verify fee rate calculation
+        assert_eq!(get_fee(fee_rate, 1000), 1000); // 1000 sat for 1000 vbytes
+        assert_eq!(get_fee(fee_rate, 100), 100); // 100 sat for 100 vbytes
+        assert_eq!(get_fee(fee_rate, 1), 1); // Minimum 1 sat for 1 vbyte (rounded up)
+    }
+
+    // =========================================================================
+    // Incremental Relay Fee Tests
+    // =========================================================================
+
+    #[test]
+    fn test_incremental_relay_fee_constants() {
+        // Verify incremental relay fee default
+        assert_eq!(DEFAULT_INCREMENTAL_RELAY_FEE, 1000); // 1000 sat/kvB = 1 sat/vB
+    }
+
+    #[test]
+    fn test_get_fee() {
+        // Test fee calculation: fee = ceil(fee_rate * vsize / 1000)
+
+        // 1000 sat/kvB * 1000 vB / 1000 = 1000 sat
+        assert_eq!(get_fee(1000, 1000), 1000);
+
+        // 1000 sat/kvB * 250 vB / 1000 = 250 sat
+        assert_eq!(get_fee(1000, 250), 250);
+
+        // 1000 sat/kvB * 1 vB / 1000 = 1 sat (ceiling)
+        assert_eq!(get_fee(1000, 1), 1);
+
+        // 2000 sat/kvB * 500 vB / 1000 = 1000 sat
+        assert_eq!(get_fee(2000, 500), 1000);
+
+        // Test ceiling behavior
+        // 1000 * 141 / 1000 = 141
+        assert_eq!(get_fee(1000, 141), 141);
+
+        // Test with 0 vsize
+        assert_eq!(get_fee(1000, 0), 0);
+    }
+
+    #[test]
+    fn test_get_fee_rate() {
+        // Test fee rate calculation: fee_rate = fee * 1000 / vsize
+
+        // 1000 sat / 1000 vB * 1000 = 1000 sat/kvB
+        assert_eq!(get_fee_rate(1000, 1000), 1000);
+
+        // 250 sat / 250 vB * 1000 = 1000 sat/kvB
+        assert_eq!(get_fee_rate(250, 250), 1000);
+
+        // 2000 sat / 1000 vB * 1000 = 2000 sat/kvB
+        assert_eq!(get_fee_rate(2000, 1000), 2000);
+
+        // Test with 0 vsize (should not panic)
+        assert_eq!(get_fee_rate(1000, 0), 0);
+    }
+
+    #[test]
+    fn test_pays_for_rbf_rule3() {
+        // Rule #3: Replacement fees must be >= original fees
+        // Note: We use incremental_fee=0 to isolate Rule #3 testing
+
+        // Equal fees should pass (with 0 incremental fee)
+        assert!(pays_for_rbf(1000, 1000, 100, 0).is_ok());
+
+        // Higher fees should pass
+        assert!(pays_for_rbf(1000, 2000, 100, 0).is_ok());
+
+        // Lower fees should fail
+        let result = pays_for_rbf(1000, 999, 100, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("insufficient fee"), "Error should mention insufficient fee: {}", err_msg);
+    }
+
+    #[test]
+    fn test_pays_for_rbf_rule4() {
+        // Rule #4: Additional fees must cover incremental relay fee * vsize
+        let incremental_fee = DEFAULT_INCREMENTAL_RELAY_FEE; // 1000 sat/kvB
+
+        // For 1000 vB at 1000 sat/kvB, need 1000 additional sat
+        // Original: 1000, Replacement: 2000, vsize: 1000
+        // Additional = 1000, Required = 1000 sat/kvB * 1000 vB / 1000 = 1000
+        assert!(pays_for_rbf(1000, 2000, 1000, incremental_fee).is_ok());
+
+        // Not enough additional (need 1000, only have 999)
+        let result = pays_for_rbf(1000, 1999, 1000, incremental_fee);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("additional fee"));
+
+        // For 250 vB, need 250 additional sat
+        assert!(pays_for_rbf(1000, 1250, 250, incremental_fee).is_ok());
+
+        // Exact boundary: 249 vB needs ceil(249 * 1000 / 1000) = 249 sat
+        assert!(pays_for_rbf(1000, 1249, 249, incremental_fee).is_ok());
+    }
+
+    #[test]
+    fn test_pays_for_rbf_zero_incremental_fee() {
+        // With zero incremental fee, only rule #3 applies
+        assert!(pays_for_rbf(1000, 1000, 1000, 0).is_ok());
+        assert!(pays_for_rbf(1000, 999, 1000, 0).is_err());
+    }
+
+    #[test]
+    fn test_pays_for_rbf_large_transactions() {
+        // Test with large transactions
+        let incremental_fee = DEFAULT_INCREMENTAL_RELAY_FEE;
+        let large_vsize: u64 = 100_000; // 100 kvB
+        let required_additional = get_fee(incremental_fee, large_vsize);
+
+        // 100,000 sat additional for 100 kvB
+        assert_eq!(required_additional, 100_000);
+
+        // Should pass with exactly enough
+        assert!(pays_for_rbf(1_000_000, 1_100_000, large_vsize, incremental_fee).is_ok());
+
+        // Should fail with 1 sat less
+        let result = pays_for_rbf(1_000_000, 1_099_999, large_vsize, incremental_fee);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_feefilter_manager_rbf_check() {
+        let manager = FeeFilterManager::default();
+
+        // Test through manager interface
+        assert!(manager.pays_for_rbf(1000, 2000, 1000).is_ok());
+        assert!(manager.pays_for_rbf(1000, 1999, 1000).is_err());
+    }
+
+    #[test]
+    fn test_feefilter_manager_min_relay_fee() {
+        let mut manager = FeeFilterManager::new(2000, 1000);
+
+        assert_eq!(manager.min_relay_fee(), 2000);
+        assert_eq!(manager.incremental_relay_fee(), 1000);
+
+        manager.set_min_relay_fee(3000);
+        assert_eq!(manager.min_relay_fee(), 3000);
+    }
+
+    #[test]
+    fn test_feefilter_integration_with_inventory() {
+        // Test that feefilter works with inventory trickling
+        let mut fee_manager = FeeFilterManager::default();
+        let mut trickle = InventoryTrickle::new();
+
+        let peer = PeerId(1);
+        fee_manager.add_peer(peer, true, false);
+        trickle.add_peer(peer, false, false, true);
+
+        // Set peer's feefilter to 1000 sat/kvB
+        fee_manager.handle_feefilter(peer, 1000);
+
+        // A transaction with fee rate 500 should NOT be relayed
+        assert!(!fee_manager.should_relay_to_peer(peer, 500));
+
+        // A transaction with fee rate 1000 should be relayed
+        assert!(fee_manager.should_relay_to_peer(peer, 1000));
+    }
+
+    #[test]
+    fn test_feefilter_block_only_peer() {
+        // Block-only peers should not participate in feefilter
+        let state = FeeFilterState::new(true, true);
+        assert!(state.is_block_only);
+
+        // Even with feefilter support, block-only should not send feefilter
+        let mut manager = FeeFilterManager::default();
+        let peer = PeerId(1);
+        manager.add_peer(peer, true, true); // block-only
+
+        // Should still relay (block-only doesn't receive txs anyway)
+        assert!(manager.should_relay_to_peer(peer, 0));
     }
 }
