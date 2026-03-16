@@ -297,6 +297,324 @@ pub fn permitted_difficulty_transition(
     true
 }
 
+// ============================================================
+// CHAINWORK CALCULATIONS
+// ============================================================
+
+/// A 256-bit unsigned integer for chainwork calculations.
+///
+/// Used to track cumulative proof-of-work on a chain. Stored in big-endian format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainWork(pub [u8; 32]);
+
+impl ChainWork {
+    /// Zero chainwork.
+    pub const ZERO: Self = Self([0u8; 32]);
+
+    /// Create chainwork from big-endian bytes.
+    pub fn from_be_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Create chainwork from a hex string.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        if s.len() > 64 {
+            return None;
+        }
+
+        // Pad with leading zeros
+        let padded = format!("{:0>64}", s);
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in padded.as_bytes().chunks(2).enumerate() {
+            let hex_str = std::str::from_utf8(chunk).ok()?;
+            bytes[i] = u8::from_str_radix(hex_str, 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
+
+    /// Convert to hex string.
+    pub fn to_hex(&self) -> String {
+        let mut s = String::with_capacity(64);
+        for byte in &self.0 {
+            s.push_str(&format!("{:02x}", byte));
+        }
+        // Strip leading zeros for display
+        let trimmed = s.trim_start_matches('0');
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// Check if this chainwork is zero.
+    pub fn is_zero(&self) -> bool {
+        self.0.iter().all(|&b| b == 0)
+    }
+
+    /// Add another chainwork value (saturating at max).
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        let mut result = [0u8; 32];
+        let mut carry = 0u16;
+
+        // Add from least significant byte to most significant
+        for i in (0..32).rev() {
+            let sum = self.0[i] as u16 + other.0[i] as u16 + carry;
+            result[i] = sum as u8;
+            carry = sum >> 8;
+        }
+
+        // If there's overflow, saturate to max
+        if carry > 0 {
+            return Self([0xff; 32]);
+        }
+
+        Self(result)
+    }
+
+    /// Compare two chainwork values.
+    /// Returns Ordering::Less if self < other, etc.
+    pub fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for i in 0..32 {
+            match self.0[i].cmp(&other.0[i]) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+impl std::cmp::Ord for ChainWork {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        ChainWork::cmp(self, other)
+    }
+}
+
+impl std::cmp::PartialOrd for ChainWork {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for ChainWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
+/// Calculate the proof-of-work for a given compact target (bits).
+///
+/// This implements Bitcoin Core's `GetBlockProof` function.
+/// Work = 2^256 / (target + 1) = (~target / (target + 1)) + 1
+///
+/// # Arguments
+/// * `bits` - The compact difficulty target from the block header
+///
+/// # Returns
+/// The chainwork contribution for this block.
+pub fn get_block_proof(bits: u32) -> ChainWork {
+    let target = compact_to_target(bits);
+
+    // Check for invalid target (zero or negative)
+    if target == [0u8; 32] {
+        return ChainWork::ZERO;
+    }
+
+    // We need to compute 2**256 / (target + 1)
+    // Since 2**256 doesn't fit in 256 bits, we use the identity:
+    // 2**256 / (target + 1) = (~target / (target + 1)) + 1
+    //
+    // This works because ~target = 2**256 - 1 - target, so:
+    // ~target / (target + 1) + 1 = (2**256 - 1 - target) / (target + 1) + 1
+    //                            = (2**256 - 1 - target + target + 1) / (target + 1)
+    //                            = 2**256 / (target + 1)
+
+    // Compute ~target
+    let mut not_target = [0u8; 32];
+    for i in 0..32 {
+        not_target[i] = !target[i];
+    }
+
+    // Compute target + 1
+    let mut target_plus_one = target;
+    let mut carry = 1u16;
+    for i in (0..32).rev() {
+        let sum = target_plus_one[i] as u16 + carry;
+        target_plus_one[i] = sum as u8;
+        carry = sum >> 8;
+        if carry == 0 {
+            break;
+        }
+    }
+
+    // If target + 1 overflowed (target was all 1s), this is an edge case
+    // that shouldn't happen with valid targets, but handle it gracefully
+    if carry > 0 {
+        return ChainWork([0u8; 32]); // Would be infinite work
+    }
+
+    // Divide ~target by (target + 1)
+    let quotient = divide_256(&not_target, &target_plus_one);
+
+    // Add 1 to the quotient
+    let mut result = quotient;
+    let mut add_carry = 1u16;
+    for i in (0..32).rev() {
+        let sum = result[i] as u16 + add_carry;
+        result[i] = sum as u8;
+        add_carry = sum >> 8;
+        if add_carry == 0 {
+            break;
+        }
+    }
+
+    ChainWork(result)
+}
+
+/// Divide a 256-bit number by another 256-bit number.
+/// Returns the quotient (rounded down).
+fn divide_256(dividend: &[u8; 32], divisor: &[u8; 32]) -> [u8; 32] {
+    // Simple long division for 256-bit numbers
+    // We use a shift-and-subtract algorithm
+
+    // Check for division by zero
+    if divisor.iter().all(|&b| b == 0) {
+        return [0xff; 32]; // Return max value for division by zero
+    }
+
+    // Fast path: if dividend < divisor, result is 0
+    if compare_targets(dividend, divisor) < 0 {
+        return [0u8; 32];
+    }
+
+    // Use 512-bit intermediate for accurate division
+    // Convert to arrays of u64 for easier manipulation
+    let mut remainder = [0u64; 8]; // 512 bits
+    let mut quotient = [0u64; 4]; // 256 bits
+
+    // Load dividend into lower half of remainder
+    for i in 0..4 {
+        let offset = i * 8;
+        let mut word = 0u64;
+        for j in 0..8 {
+            word = (word << 8) | (dividend[offset + j] as u64);
+        }
+        remainder[4 + i] = word;
+    }
+
+    // Load divisor
+    let mut div = [0u64; 4];
+    for i in 0..4 {
+        let offset = i * 8;
+        let mut word = 0u64;
+        for j in 0..8 {
+            word = (word << 8) | (divisor[offset + j] as u64);
+        }
+        div[i] = word;
+    }
+
+    // Find the highest bit set in divisor
+    let mut div_bits = 0;
+    for i in 0..4 {
+        if div[i] != 0 {
+            div_bits = (3 - i) * 64 + (64 - div[i].leading_zeros() as usize);
+            break;
+        }
+    }
+
+    // Find the highest bit set in dividend
+    let mut rem_bits = 0;
+    for i in 4..8 {
+        if remainder[i] != 0 {
+            rem_bits = (7 - i) * 64 + (64 - remainder[i].leading_zeros() as usize);
+            break;
+        }
+    }
+
+    if rem_bits < div_bits {
+        return [0u8; 32];
+    }
+
+    // Shift divisor left to align with dividend
+    let shift = rem_bits - div_bits;
+    let mut shifted_div = [0u64; 8];
+
+    // Shift div left by 'shift' bits into shifted_div
+    let word_shift = shift / 64;
+    let bit_shift = shift % 64;
+
+    for i in 0..4 {
+        let dest = 4 - word_shift + i;
+        if dest < 8 {
+            shifted_div[dest] |= div[i] >> (64 - bit_shift).min(63);
+            if dest > 0 && bit_shift > 0 {
+                shifted_div[dest - 1] |= div[i] << bit_shift;
+            } else if bit_shift == 0 {
+                shifted_div[dest] = div[i];
+            }
+        }
+    }
+
+    // Perform division
+    for bit in (0..=shift).rev() {
+        // Compare remainder with shifted divisor
+        let mut cmp = std::cmp::Ordering::Equal;
+        for i in 0..8 {
+            match remainder[i].cmp(&shifted_div[i]) {
+                std::cmp::Ordering::Equal => continue,
+                ord => {
+                    cmp = ord;
+                    break;
+                }
+            }
+        }
+
+        if cmp != std::cmp::Ordering::Less {
+            // Set quotient bit
+            let q_word = 3 - bit / 64;
+            let q_bit = bit % 64;
+            if q_word < 4 {
+                quotient[q_word] |= 1u64 << q_bit;
+            }
+
+            // Subtract shifted divisor from remainder
+            let mut borrow = 0i128;
+            for i in (0..8).rev() {
+                let diff = remainder[i] as i128 - shifted_div[i] as i128 - borrow;
+                if diff < 0 {
+                    remainder[i] = (diff + (1i128 << 64)) as u64;
+                    borrow = 1;
+                } else {
+                    remainder[i] = diff as u64;
+                    borrow = 0;
+                }
+            }
+        }
+
+        // Shift divisor right by 1
+        let mut carry = 0u64;
+        for i in 0..8 {
+            let new_carry = shifted_div[i] << 63;
+            shifted_div[i] = (shifted_div[i] >> 1) | carry;
+            carry = new_carry;
+        }
+    }
+
+    // Convert quotient back to bytes
+    let mut result = [0u8; 32];
+    for i in 0..4 {
+        let word = quotient[i];
+        let offset = i * 8;
+        for j in 0..8 {
+            result[offset + j] = ((word >> (56 - j * 8)) & 0xff) as u8;
+        }
+    }
+
+    result
+}
+
 /// Check that a block's proof of work is valid.
 ///
 /// # Arguments
@@ -776,5 +1094,140 @@ mod tests {
                 assert_eq!(bits, genesis_bits, "Height {} should keep same difficulty", h);
             }
         }
+    }
+
+    // ============================================================
+    // CHAINWORK TESTS
+    // ============================================================
+
+    #[test]
+    fn test_chainwork_from_hex() {
+        let work = ChainWork::from_hex("ff").unwrap();
+        assert_eq!(work.0[31], 0xff);
+        for i in 0..31 {
+            assert_eq!(work.0[i], 0);
+        }
+
+        let work = ChainWork::from_hex("0x1234").unwrap();
+        assert_eq!(work.0[30], 0x12);
+        assert_eq!(work.0[31], 0x34);
+    }
+
+    #[test]
+    fn test_chainwork_to_hex() {
+        let mut bytes = [0u8; 32];
+        bytes[31] = 0xff;
+        let work = ChainWork(bytes);
+        assert_eq!(work.to_hex(), "ff");
+
+        bytes[30] = 0x12;
+        bytes[31] = 0x34;
+        let work = ChainWork(bytes);
+        assert_eq!(work.to_hex(), "1234");
+
+        let work = ChainWork::ZERO;
+        assert_eq!(work.to_hex(), "0");
+    }
+
+    #[test]
+    fn test_chainwork_saturating_add() {
+        let mut a_bytes = [0u8; 32];
+        a_bytes[31] = 100;
+        let a = ChainWork(a_bytes);
+
+        let mut b_bytes = [0u8; 32];
+        b_bytes[31] = 50;
+        let b = ChainWork(b_bytes);
+
+        let sum = a.saturating_add(&b);
+        assert_eq!(sum.0[31], 150);
+
+        // Test with carry
+        let mut a_bytes = [0u8; 32];
+        a_bytes[31] = 0xff;
+        let a = ChainWork(a_bytes);
+
+        let mut b_bytes = [0u8; 32];
+        b_bytes[31] = 0x01;
+        let b = ChainWork(b_bytes);
+
+        let sum = a.saturating_add(&b);
+        assert_eq!(sum.0[31], 0x00);
+        assert_eq!(sum.0[30], 0x01);
+    }
+
+    #[test]
+    fn test_chainwork_cmp() {
+        let mut a_bytes = [0u8; 32];
+        a_bytes[31] = 100;
+        let a = ChainWork(a_bytes);
+
+        let mut b_bytes = [0u8; 32];
+        b_bytes[31] = 50;
+        let b = ChainWork(b_bytes);
+
+        assert!(a > b);
+        assert!(b < a);
+        assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_get_block_proof_genesis() {
+        // Genesis difficulty: 0x1d00ffff
+        // Target: 00000000ffff00000000...
+        let bits = 0x1d00ffff;
+        let work = get_block_proof(bits);
+
+        // Work should be non-zero
+        assert!(!work.is_zero());
+
+        // At genesis difficulty, work per block is approximately 2^32
+        // (since target has ~32 leading zeros)
+        // The exact value is 2^256 / (target + 1)
+        // With target = 0x00000000ffff... the work is around 0x100010001
+        assert!(work.0[28] > 0 || work.0[27] > 0 || work.0[26] > 0);
+    }
+
+    #[test]
+    fn test_get_block_proof_harder_difficulty() {
+        // Harder difficulty should give more work per block
+        let easy_bits = 0x1d00ffff;
+        let hard_bits = 0x1c00ffff; // 256x harder
+
+        let easy_work = get_block_proof(easy_bits);
+        let hard_work = get_block_proof(hard_bits);
+
+        // Harder difficulty (smaller target) = more work
+        assert!(hard_work > easy_work);
+    }
+
+    #[test]
+    fn test_get_block_proof_invalid_bits() {
+        // Zero mantissa should give zero work
+        let work = get_block_proof(0x1d000000);
+        assert!(work.is_zero());
+
+        // Negative target should give zero work
+        let work = get_block_proof(0x1d800000);
+        assert!(work.is_zero());
+    }
+
+    #[test]
+    fn test_chainwork_mainnet_minimum() {
+        // Verify we can parse Bitcoin Core's minimum chainwork for mainnet
+        let work = ChainWork::from_hex("0000000000000000000000000000000000000001128750f82f4c366153a3a030").unwrap();
+        assert!(!work.is_zero());
+
+        // Verify roundtrip
+        let hex = work.to_hex();
+        let work2 = ChainWork::from_hex(&hex).unwrap();
+        assert_eq!(work, work2);
+    }
+
+    #[test]
+    fn test_chainwork_testnet4_minimum() {
+        // Verify we can parse Bitcoin Core's minimum chainwork for testnet4
+        let work = ChainWork::from_hex("0000000000000000000000000000000000000000000009a0fe15d0177d086304").unwrap();
+        assert!(!work.is_zero());
     }
 }
