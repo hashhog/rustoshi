@@ -54,6 +54,8 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Transaction index (txindex, getrawtransaction for confirmed txs with blockhash)
 - [x] Flat file block storage (blk?????.dat files, 128 MiB limit, pre-allocation)
 - [x] Miniscript (type system, parsing, compilation, satisfaction, analysis)
+- [x] BIP-133 feefilter (peer min fee rate, privacy-preserving quantization, Poisson delays)
+- [x] Incremental relay fee (RBF fee bump requirements, 1000 sat/kvB default)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
