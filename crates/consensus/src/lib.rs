@@ -36,7 +36,7 @@ pub mod versionbits;
 
 pub use params::{
     block_subsidy, calculate_next_work_required, compact_to_target, target_to_compact,
-    ChainParams, NetworkId, NetworkMagic,
+    ChainParams, Checkpoints, NetworkId, NetworkMagic,
     // Consensus constants
     COINBASE_MATURITY, COIN, DIFFICULTY_ADJUSTMENT_INTERVAL, INITIAL_SUBSIDY,
     LOCKTIME_THRESHOLD, MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT,
