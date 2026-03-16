@@ -27,7 +27,8 @@
 
 use crate::params::{
     block_subsidy, ChainParams, COINBASE_MATURITY, LOCKTIME_THRESHOLD, MAX_BLOCK_SIGOPS_COST,
-    MAX_BLOCK_WEIGHT, MAX_MONEY, MAX_PUBKEYS_PER_MULTISIG, WITNESS_SCALE_FACTOR,
+    MAX_BLOCK_WEIGHT, MAX_MONEY, MAX_PUBKEYS_PER_MULTISIG, SEQUENCE_LOCKTIME_DISABLE_FLAG,
+    SEQUENCE_LOCKTIME_MASK, SEQUENCE_LOCKTIME_TYPE_FLAG, WITNESS_SCALE_FACTOR,
 };
 use crate::script::{verify_script, ScriptFlags, SigVersion, SignatureChecker};
 use rayon::prelude::*;
@@ -589,6 +590,160 @@ fn check_witness_commitment(block: &Block) -> Result<(), ValidationError> {
 }
 
 // ============================================================
+// BIP-68 SEQUENCE LOCKS
+// ============================================================
+
+/// The granularity of time-based sequence locks (512 seconds per unit).
+const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9; // 2^9 = 512 seconds
+
+/// Result of calculating sequence locks for a transaction.
+///
+/// Contains the minimum height and time that must be reached before
+/// the transaction can be included in a block.
+#[derive(Clone, Debug, Default)]
+pub struct SequenceLocks {
+    /// Minimum block height required for the transaction to be valid.
+    /// -1 means no height-based lock.
+    pub min_height: i32,
+    /// Minimum median-time-past required for the transaction to be valid.
+    /// -1 means no time-based lock.
+    pub min_time: i64,
+}
+
+/// Trait for providing context needed for BIP-68 sequence lock calculation.
+///
+/// This trait abstracts access to chain state needed to compute sequence locks,
+/// primarily the median-time-past of ancestor blocks.
+pub trait SequenceLockContext {
+    /// Get the median-time-past for the block at the given height.
+    ///
+    /// For sequence lock calculation, we need the MTP of the block prior
+    /// to when the UTXO was mined (i.e., height - 1).
+    fn get_mtp_at_height(&self, height: u32) -> u32;
+}
+
+/// Calculate the sequence locks for a transaction (BIP-68).
+///
+/// This computes the minimum block height and median-time-past required
+/// for the transaction to be valid. Each input with a relative lock-time
+/// (sequence number without the disable flag) contributes to these minimums.
+///
+/// # Arguments
+/// * `tx` - The transaction to check.
+/// * `spent_heights` - Heights of the blocks where each input's UTXO was mined.
+/// * `context` - Provider for median-time-past lookups.
+/// * `enforce_bip68` - Whether BIP-68 is active (tx version >= 2 and CSV soft fork active).
+///
+/// # Returns
+/// The minimum height and time for the transaction to be valid.
+///
+/// # Reference
+/// Bitcoin Core: `consensus/tx_verify.cpp` - `CalculateSequenceLocks`
+pub fn calculate_sequence_locks<C: SequenceLockContext>(
+    tx: &Transaction,
+    spent_heights: &[u32],
+    context: &C,
+    enforce_bip68: bool,
+) -> SequenceLocks {
+    assert_eq!(spent_heights.len(), tx.inputs.len());
+
+    // Will be set to the equivalent height- and time-based nLockTime
+    // values that would be necessary to satisfy all relative lock-
+    // time constraints. The semantics of nLockTime are the last invalid
+    // height/time, so use -1 to have the effect of any height or time being valid.
+    let mut min_height: i32 = -1;
+    let mut min_time: i64 = -1;
+
+    // Do not enforce sequence numbers as a relative lock time
+    // unless we have been instructed to
+    if !enforce_bip68 {
+        return SequenceLocks {
+            min_height,
+            min_time,
+        };
+    }
+
+    for (idx, input) in tx.inputs.iter().enumerate() {
+        // Sequence numbers with the most significant bit set are not
+        // treated as relative lock-times, nor are they given any
+        // consensus-enforced meaning at this point.
+        if input.sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
+            continue;
+        }
+
+        let coin_height = spent_heights[idx];
+
+        if input.sequence & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
+            // Time-based relative lock-times are measured from the
+            // smallest allowed timestamp of the block containing the
+            // txout being spent, which is the median time past of the
+            // block prior.
+            //
+            // For the first block (height 0), use height 0's MTP as a fallback.
+            let coin_time = if coin_height > 0 {
+                context.get_mtp_at_height(coin_height - 1) as i64
+            } else {
+                context.get_mtp_at_height(0) as i64
+            };
+
+            // NOTE: Subtract 1 to maintain nLockTime semantics.
+            // BIP-68 relative lock times have the semantics of calculating
+            // the first block or time at which the transaction would be
+            // valid. When calculating the effective block time or height
+            // for the entire transaction, we switch to using the
+            // semantics of nLockTime which is the last invalid block
+            // time or height. Thus we subtract 1 from the calculated
+            // time or height.
+            let lock_value = (input.sequence & SEQUENCE_LOCKTIME_MASK) as i64;
+            let lock_time = coin_time + (lock_value << SEQUENCE_LOCKTIME_GRANULARITY) - 1;
+            if lock_time > min_time {
+                min_time = lock_time;
+            }
+        } else {
+            // Height-based relative lock-time
+            let lock_value = (input.sequence & SEQUENCE_LOCKTIME_MASK) as i32;
+            let lock_height = coin_height as i32 + lock_value - 1;
+            if lock_height > min_height {
+                min_height = lock_height;
+            }
+        }
+    }
+
+    SequenceLocks {
+        min_height,
+        min_time,
+    }
+}
+
+/// Check if sequence locks are satisfied for a block at the given height.
+///
+/// The transaction can be included if:
+/// - The block height > min_height (or min_height == -1)
+/// - The block's MTP > min_time (or min_time == -1)
+///
+/// # Arguments
+/// * `locks` - The calculated sequence locks for a transaction.
+/// * `block_height` - The height of the block we want to include the transaction in.
+/// * `block_mtp` - The median-time-past of the previous block (block_height - 1).
+///
+/// # Returns
+/// `true` if all sequence locks are satisfied, `false` otherwise.
+///
+/// # Reference
+/// Bitcoin Core: `consensus/tx_verify.cpp` - `EvaluateSequenceLocks`
+pub fn check_sequence_locks(locks: &SequenceLocks, block_height: u32, block_mtp: i64) -> bool {
+    // Check height lock
+    if locks.min_height >= block_height as i32 {
+        return false;
+    }
+    // Check time lock
+    if locks.min_time >= block_mtp {
+        return false;
+    }
+    true
+}
+
+// ============================================================
 // UTXO VIEW AND BLOCK CONNECTION
 // ============================================================
 
@@ -637,13 +792,62 @@ pub trait UtxoView {
 /// Transactions within a block CAN spend outputs created by earlier
 /// transactions in the same block. This function updates the UTXO view
 /// during the validation loop to support this.
+///
+/// # BIP-68 Sequence Locks
+///
+/// This version does not enforce BIP-68 sequence locks. Use
+/// `connect_block_with_sequence_locks` for full BIP-68 enforcement.
 pub fn connect_block(
     block: &Block,
     height: u32,
     utxo_view: &mut dyn UtxoView,
     params: &ChainParams,
 ) -> Result<(UndoData, u64), ValidationError> {
+    // Create a null context that doesn't enforce sequence locks
+    // This maintains backward compatibility with callers that don't need BIP-68
+    let null_context = NullSequenceLockContext;
+    connect_block_with_sequence_locks(block, height, utxo_view, params, &null_context, 0)
+}
+
+/// A null sequence lock context that provides no MTP data.
+///
+/// When BIP-68 is not active or the caller doesn't have MTP data,
+/// this context returns 0 for all MTP queries, which effectively
+/// disables time-based sequence locks while still allowing height-based
+/// checks against the block height parameter.
+struct NullSequenceLockContext;
+
+impl SequenceLockContext for NullSequenceLockContext {
+    fn get_mtp_at_height(&self, _height: u32) -> u32 {
+        0
+    }
+}
+
+/// Connect a block with full BIP-68 sequence lock enforcement.
+///
+/// This is the full-featured version that validates sequence locks
+/// for all non-coinbase transactions when BIP-68/CSV is active.
+///
+/// # Arguments
+/// * `block` - The block to connect.
+/// * `height` - The height of the block being connected.
+/// * `utxo_view` - UTXO view for reading/writing UTXOs.
+/// * `params` - Chain parameters.
+/// * `seq_context` - Context for sequence lock MTP lookups.
+/// * `prev_block_mtp` - The median-time-past of the previous block.
+///
+/// # Returns
+/// (undo_data, total_fees) on success.
+pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
+    block: &Block,
+    height: u32,
+    utxo_view: &mut dyn UtxoView,
+    params: &ChainParams,
+    seq_context: &C,
+    prev_block_mtp: u32,
+) -> Result<(UndoData, u64), ValidationError> {
     let flags = script_flags_for_height(height, params);
+    let csv_active = height >= params.csv_height;
     let mut total_fees: u64 = 0;
     let mut spent_coins = Vec::new();
 
@@ -681,9 +885,13 @@ pub fn connect_block(
             continue;
         }
 
-        // Validate inputs
+        // Collect coins and their heights for this transaction
+        let mut coins: Vec<CoinEntry> = Vec::with_capacity(tx.inputs.len());
+        let mut spent_heights: Vec<u32> = Vec::with_capacity(tx.inputs.len());
+
+        // Validate inputs - first pass: collect coins and check basic validity
         let mut input_sum: u64 = 0;
-        for (input_idx, input) in tx.inputs.iter().enumerate() {
+        for input in &tx.inputs {
             // Get the coin being spent
             let coin = utxo_view.get_utxo(&input.previous_output).ok_or(
                 TxValidationError::MissingInput(
@@ -705,6 +913,24 @@ pub fn connect_block(
             input_sum = input_sum
                 .checked_add(coin.value)
                 .ok_or(TxValidationError::InputValueOverflow)?;
+
+            spent_heights.push(coin.height);
+            coins.push(coin);
+        }
+
+        // BIP-68: Check sequence locks
+        // BIP-68 only applies if tx version >= 2 and CSV is active
+        let enforce_bip68 = tx.version >= 2 && csv_active;
+        if enforce_bip68 {
+            let locks = calculate_sequence_locks(tx, &spent_heights, seq_context, true);
+            if !check_sequence_locks(&locks, height, prev_block_mtp as i64) {
+                return Err(TxValidationError::SequenceLockNotMet.into());
+            }
+        }
+
+        // Second pass: verify scripts and update UTXO set
+        for (input_idx, input) in tx.inputs.iter().enumerate() {
+            let coin = &coins[input_idx];
 
             // Verify the script
             let checker = TransactionSignatureChecker::new(tx, input_idx, coin.value);
@@ -854,13 +1080,46 @@ pub fn validate_scripts_parallel(
 ///
 /// # Returns
 /// `(undo_data, total_fees)` on success.
+///
+/// # BIP-68 Sequence Locks
+///
+/// This version does not enforce BIP-68 sequence locks. Use
+/// `connect_block_parallel_with_sequence_locks` for full BIP-68 enforcement.
 pub fn connect_block_parallel(
     block: &Block,
     height: u32,
     utxo_view: &mut dyn UtxoView,
     params: &ChainParams,
 ) -> Result<(UndoData, u64), ValidationError> {
+    let null_context = NullSequenceLockContext;
+    connect_block_parallel_with_sequence_locks(block, height, utxo_view, params, &null_context, 0)
+}
+
+/// Connect a block with parallel script validation and BIP-68 sequence lock enforcement.
+///
+/// This is the full-featured parallel version that validates scripts in parallel
+/// and enforces BIP-68 sequence locks when active.
+///
+/// # Arguments
+/// * `block` - The block to connect
+/// * `height` - The height of the block
+/// * `utxo_view` - The UTXO view to read from and update
+/// * `params` - Chain parameters
+/// * `seq_context` - Context for sequence lock MTP lookups
+/// * `prev_block_mtp` - The median-time-past of the previous block
+///
+/// # Returns
+/// `(undo_data, total_fees)` on success.
+pub fn connect_block_parallel_with_sequence_locks<C: SequenceLockContext>(
+    block: &Block,
+    height: u32,
+    utxo_view: &mut dyn UtxoView,
+    params: &ChainParams,
+    seq_context: &C,
+    prev_block_mtp: u32,
+) -> Result<(UndoData, u64), ValidationError> {
     let flags = script_flags_for_height(height, params);
+    let csv_active = height >= params.csv_height;
     let mut total_fees: u64 = 0;
     let mut spent_coins = Vec::new();
     let mut tx_coins: Vec<Vec<CoinEntry>> = Vec::new();
@@ -896,6 +1155,7 @@ pub fn connect_block_parallel(
 
         let mut input_sum: u64 = 0;
         let mut coins_for_tx = Vec::with_capacity(tx.inputs.len());
+        let mut spent_heights: Vec<u32> = Vec::with_capacity(tx.inputs.len());
 
         for input in &tx.inputs {
             let coin = utxo_view.get_utxo(&input.previous_output).ok_or(
@@ -918,11 +1178,21 @@ pub fn connect_block_parallel(
                 .checked_add(coin.value)
                 .ok_or(TxValidationError::InputValueOverflow)?;
 
+            spent_heights.push(coin.height);
             spent_coins.push(coin.clone());
             coins_for_tx.push(coin);
 
             // Mark as spent (for intra-block spending)
             utxo_view.spend_utxo(&input.previous_output);
+        }
+
+        // BIP-68: Check sequence locks
+        let enforce_bip68 = tx.version >= 2 && csv_active;
+        if enforce_bip68 {
+            let locks = calculate_sequence_locks(tx, &spent_heights, seq_context, true);
+            if !check_sequence_locks(&locks, height, prev_block_mtp as i64) {
+                return Err(TxValidationError::SequenceLockNotMet.into());
+            }
         }
 
         tx_coins.push(coins_for_tx);
@@ -1473,7 +1743,7 @@ mod tests {
         )
         .unwrap();
 
-        let params = ChainParams::regtest();
+        let _params = ChainParams::regtest();
         // First it will fail PoW, so let's just test the merkle root check
         // by using a block that passes PoW
     }
@@ -1763,5 +2033,252 @@ mod tests {
 
         // Should fail for > 100 blocks
         assert!(!checker.check_sequence(101));
+    }
+
+    // =========================
+    // BIP-68 Sequence Lock tests
+    // =========================
+
+    /// Test context that provides MTP values for sequence lock testing.
+    struct TestSequenceLockContext {
+        /// Map from height to MTP at that height
+        mtp_by_height: std::collections::HashMap<u32, u32>,
+    }
+
+    impl TestSequenceLockContext {
+        fn new() -> Self {
+            Self {
+                mtp_by_height: std::collections::HashMap::new(),
+            }
+        }
+
+        fn with_mtp(mut self, height: u32, mtp: u32) -> Self {
+            self.mtp_by_height.insert(height, mtp);
+            self
+        }
+    }
+
+    impl SequenceLockContext for TestSequenceLockContext {
+        fn get_mtp_at_height(&self, height: u32) -> u32 {
+            *self.mtp_by_height.get(&height).unwrap_or(&0)
+        }
+    }
+
+    fn make_tx_with_sequence(version: i32, sequences: &[u32]) -> Transaction {
+        let inputs: Vec<TxIn> = sequences
+            .iter()
+            .enumerate()
+            .map(|(i, &seq)| TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::from_bytes([i as u8; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![0x51],
+                sequence: seq,
+                witness: vec![],
+            })
+            .collect();
+
+        Transaction {
+            version,
+            inputs,
+            outputs: vec![TxOut {
+                value: 100,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn sequence_locks_disabled_for_version_1() {
+        let tx = make_tx_with_sequence(1, &[10]); // 10 block relative lock
+        let spent_heights = vec![100];
+        let context = TestSequenceLockContext::new();
+
+        // BIP-68 not enforced for version 1
+        let locks = calculate_sequence_locks(&tx, &spent_heights, &context, false);
+        assert_eq!(locks.min_height, -1);
+        assert_eq!(locks.min_time, -1);
+    }
+
+    #[test]
+    fn sequence_locks_height_based() {
+        let tx = make_tx_with_sequence(2, &[10]); // 10 block relative lock
+        let spent_heights = vec![100];
+        let context = TestSequenceLockContext::new();
+
+        let locks = calculate_sequence_locks(&tx, &spent_heights, &context, true);
+
+        // min_height = spent_height + lock_value - 1 = 100 + 10 - 1 = 109
+        // (nLockTime semantics: 109 is the last invalid height)
+        assert_eq!(locks.min_height, 109);
+        assert_eq!(locks.min_time, -1); // No time-based lock
+    }
+
+    #[test]
+    fn sequence_locks_height_based_multiple_inputs() {
+        // Two inputs with different relative locks
+        let tx = make_tx_with_sequence(2, &[10, 50]);
+        let spent_heights = vec![100, 80];
+        let context = TestSequenceLockContext::new();
+
+        let locks = calculate_sequence_locks(&tx, &spent_heights, &context, true);
+
+        // Input 0: 100 + 10 - 1 = 109
+        // Input 1: 80 + 50 - 1 = 129
+        // max = 129
+        assert_eq!(locks.min_height, 129);
+        assert_eq!(locks.min_time, -1);
+    }
+
+    #[test]
+    fn sequence_locks_time_based() {
+        // Time-based lock: bit 22 set, lower 16 bits = 100 (100 * 512 seconds)
+        let time_lock = (1 << 22) | 100; // SEQUENCE_LOCKTIME_TYPE_FLAG | 100
+        let tx = make_tx_with_sequence(2, &[time_lock]);
+        let spent_heights = vec![100];
+
+        // MTP at height 99 (the block before the UTXO was mined)
+        let context = TestSequenceLockContext::new().with_mtp(99, 1000000);
+
+        let locks = calculate_sequence_locks(&tx, &spent_heights, &context, true);
+
+        // min_time = coin_mtp + (lock_value << 9) - 1
+        //          = 1000000 + (100 * 512) - 1
+        //          = 1000000 + 51200 - 1 = 1051199
+        assert_eq!(locks.min_height, -1);
+        assert_eq!(locks.min_time, 1051199);
+    }
+
+    #[test]
+    fn sequence_locks_disable_flag() {
+        // Disable flag set: bit 31
+        let disabled = 1 << 31; // SEQUENCE_LOCKTIME_DISABLE_FLAG
+        let tx = make_tx_with_sequence(2, &[disabled | 100]); // Would be 100 blocks without disable
+        let spent_heights = vec![100];
+        let context = TestSequenceLockContext::new();
+
+        let locks = calculate_sequence_locks(&tx, &spent_heights, &context, true);
+
+        // Disabled, so no locks
+        assert_eq!(locks.min_height, -1);
+        assert_eq!(locks.min_time, -1);
+    }
+
+    #[test]
+    fn sequence_locks_mixed_enabled_disabled() {
+        // Input 0: disabled, Input 1: 10 blocks
+        let disabled = 1 << 31;
+        let tx = make_tx_with_sequence(2, &[disabled | 500, 10]);
+        let spent_heights = vec![100, 200];
+        let context = TestSequenceLockContext::new();
+
+        let locks = calculate_sequence_locks(&tx, &spent_heights, &context, true);
+
+        // Only input 1 contributes: 200 + 10 - 1 = 209
+        assert_eq!(locks.min_height, 209);
+        assert_eq!(locks.min_time, -1);
+    }
+
+    #[test]
+    fn check_sequence_locks_height_satisfied() {
+        let locks = SequenceLocks {
+            min_height: 100,
+            min_time: -1,
+        };
+
+        // Block 101 satisfies height 100
+        assert!(check_sequence_locks(&locks, 101, 0));
+        // Block 100 does NOT satisfy (must be strictly greater)
+        assert!(!check_sequence_locks(&locks, 100, 0));
+        // Block 99 does NOT satisfy
+        assert!(!check_sequence_locks(&locks, 99, 0));
+    }
+
+    #[test]
+    fn check_sequence_locks_time_satisfied() {
+        let locks = SequenceLocks {
+            min_height: -1,
+            min_time: 1000000,
+        };
+
+        // MTP 1000001 satisfies time 1000000
+        assert!(check_sequence_locks(&locks, 1, 1000001));
+        // MTP 1000000 does NOT satisfy (must be strictly greater)
+        assert!(!check_sequence_locks(&locks, 1, 1000000));
+        // MTP 999999 does NOT satisfy
+        assert!(!check_sequence_locks(&locks, 1, 999999));
+    }
+
+    #[test]
+    fn check_sequence_locks_both_satisfied() {
+        let locks = SequenceLocks {
+            min_height: 100,
+            min_time: 1000000,
+        };
+
+        // Both conditions must be satisfied
+        assert!(check_sequence_locks(&locks, 101, 1000001));
+        // Height satisfied but not time
+        assert!(!check_sequence_locks(&locks, 101, 999999));
+        // Time satisfied but not height
+        assert!(!check_sequence_locks(&locks, 99, 1000001));
+    }
+
+    #[test]
+    fn check_sequence_locks_no_locks() {
+        let locks = SequenceLocks {
+            min_height: -1,
+            min_time: -1,
+        };
+
+        // No locks means always satisfied
+        assert!(check_sequence_locks(&locks, 0, 0));
+        assert!(check_sequence_locks(&locks, 1, 1));
+    }
+
+    #[test]
+    fn sequence_locks_zero_relative_height() {
+        // Lock of 0 blocks means immediately spendable
+        let tx = make_tx_with_sequence(2, &[0]);
+        let spent_heights = vec![100];
+        let context = TestSequenceLockContext::new();
+
+        let locks = calculate_sequence_locks(&tx, &spent_heights, &context, true);
+
+        // 100 + 0 - 1 = 99
+        assert_eq!(locks.min_height, 99);
+
+        // Block 100 should satisfy (100 > 99)
+        assert!(check_sequence_locks(&locks, 100, 0));
+    }
+
+    #[test]
+    fn sequence_locks_max_relative_height() {
+        // Maximum height lock (16 bits)
+        let max_lock = 0xFFFF; // 65535 blocks
+        let tx = make_tx_with_sequence(2, &[max_lock]);
+        let spent_heights = vec![100];
+        let context = TestSequenceLockContext::new();
+
+        let locks = calculate_sequence_locks(&tx, &spent_heights, &context, true);
+
+        // 100 + 65535 - 1 = 65634
+        assert_eq!(locks.min_height, 65634);
+    }
+
+    #[test]
+    fn sequence_locks_bip68_not_enforced() {
+        let tx = make_tx_with_sequence(2, &[10]);
+        let spent_heights = vec![100];
+        let context = TestSequenceLockContext::new();
+
+        // Explicitly disable BIP-68 enforcement
+        let locks = calculate_sequence_locks(&tx, &spent_heights, &context, false);
+
+        // Should return no locks
+        assert_eq!(locks.min_height, -1);
+        assert_eq!(locks.min_time, -1);
     }
 }
