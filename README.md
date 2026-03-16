@@ -37,7 +37,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Mempool (transaction storage, fee-rate ordering, 25/25/101kvB package limits)
 - [x] Fee estimation (confirmation time prediction, exponential decay, bucket statistics)
 - [x] Block template construction (ancestor-feerate selection, BIP-34 coinbase, witness commitment)
-- [x] JSON-RPC server (getblockchaininfo, getblock, sendrawtransaction, estimatesmartfee, etc.)
+- [x] JSON-RPC server (getblockchaininfo, getnetworkinfo, getpeerinfo, getmempoolinfo, getrawmempool, estimatesmartfee, validateaddress, getblocktemplate)
 - [x] HD wallet (BIP-32/44/84 key derivation, address generation, UTXO tracking, transaction building)
 - [x] CLI and application entry point (clap-based CLI, event loop, graceful shutdown)
 - [x] Testing suite (unit tests, integration tests, property-based tests)
