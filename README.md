@@ -33,7 +33,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Block download manager (parallel downloads, sliding window, stall detection)
 - [x] UTXO cache (in-memory with database fallback, flush batching)
 - [x] Chain state (tip tracking, median-time-past, reorganization support)
-- [x] Mempool (transaction storage, fee-rate ordering, ancestor/descendant limits)
+- [x] Mempool (transaction storage, fee-rate ordering, 25/25/101kvB package limits)
 - [x] Fee estimation (confirmation time prediction, exponential decay, bucket statistics)
 - [x] Block template construction (ancestor-feerate selection, BIP-34 coinbase, witness commitment)
 - [x] JSON-RPC server (getblockchaininfo, getblock, sendrawtransaction, estimatesmartfee, etc.)
