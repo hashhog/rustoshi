@@ -28,6 +28,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Block connection/disconnection (UTXO updates, undo data, reorg support)
 - [x] P2P message serialization (version, headers, inv, block, tx, etc.)
 - [x] P2P peer connection (TCP, version/verack handshake, ping/pong keepalive)
+- [x] Pre-handshake message rejection (self-connection detection, protocol version check)
 - [x] Peer management (connection pool, DNS seed resolution, address manager)
 - [x] Header synchronization (block locator, getheaders protocol)
 - [x] Block download manager (parallel downloads, sliding window, stall detection)
@@ -48,6 +49,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] BIP-68 relative lock-time enforcement (sequence locks)
 - [x] Sigop counting with witness discount (P2SH, P2WPKH, P2WSH)
 - [x] BIP-9 versionbits state machine (soft fork activation tracking)
+- [x] Inventory trickling (Poisson-timed tx relay, inbound/outbound intervals, batching)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
