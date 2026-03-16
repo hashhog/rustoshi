@@ -2606,4 +2606,255 @@ mod tests {
         // Should be CleanStack because len != 1, not EvalFalse
         assert!(matches!(result, Err(ScriptError::CleanStack)));
     }
+
+    // ==================== P2SH push-only tests ====================
+
+    #[test]
+    fn p2sh_push_only_valid_scriptsig() {
+        // P2SH with a push-only scriptSig should succeed
+        // scriptPubKey: OP_HASH160 <20 bytes> OP_EQUAL
+        // scriptSig: <push redeem_script> where redeem_script = OP_1
+        let redeem_script = vec![0x51]; // OP_1
+        let redeem_hash = hash160(&redeem_script);
+
+        // Build P2SH scriptPubKey: OP_HASH160 <20 bytes> OP_EQUAL
+        let mut script_pubkey = vec![0xa9, 0x14]; // OP_HASH160, push 20 bytes
+        script_pubkey.extend_from_slice(redeem_hash.as_bytes());
+        script_pubkey.push(0x87); // OP_EQUAL
+
+        // scriptSig: just push the redeem script (1 byte length + script)
+        let mut script_sig = vec![redeem_script.len() as u8];
+        script_sig.extend_from_slice(&redeem_script);
+
+        let mut flags = ScriptFlags::default();
+        flags.verify_p2sh = true;
+        let checker = DummyChecker;
+        let witness = vec![];
+
+        let result = verify_script(&script_sig, &script_pubkey, &witness, &flags, &checker);
+        assert!(result.is_ok(), "P2SH with push-only scriptSig should succeed: {:?}", result);
+    }
+
+    #[test]
+    fn p2sh_push_only_scriptsig_with_op_dup_fails() {
+        // P2SH with a scriptSig containing OP_DUP (non-push) must fail
+        // This is the BIP-16 consensus rule: scriptSig must be push-only for P2SH
+        //
+        // We need a scriptSig that:
+        // 1. Executes successfully (no stack underflow)
+        // 2. Contains a non-push opcode
+        // 3. Leaves the correct redeem script on top of stack
+        //
+        // scriptSig: <push redeem_script> OP_DUP
+        // This pushes the redeem script, then duplicates it (leaving two copies)
+        // The scriptPubKey (OP_HASH160 <hash> OP_EQUAL) will consume top, leaving one copy
+        // The P2SH logic will then use that copy as the redeem script
+        // But this fails the push-only check!
+
+        let redeem_script = vec![0x51]; // OP_1
+        let redeem_hash = hash160(&redeem_script);
+
+        // Build P2SH scriptPubKey: OP_HASH160 <20 bytes> OP_EQUAL
+        let mut script_pubkey = vec![0xa9, 0x14]; // OP_HASH160, push 20 bytes
+        script_pubkey.extend_from_slice(redeem_hash.as_bytes());
+        script_pubkey.push(0x87); // OP_EQUAL
+
+        // scriptSig: <push redeem_script> OP_DUP
+        // This pushes the script then dups it - stack will have two copies
+        let mut script_sig = vec![redeem_script.len() as u8];
+        script_sig.extend_from_slice(&redeem_script);
+        script_sig.push(0x76); // OP_DUP
+
+        let mut flags = ScriptFlags::default();
+        flags.verify_p2sh = true;
+        let checker = DummyChecker;
+        let witness = vec![];
+
+        let result = verify_script(&script_sig, &script_pubkey, &witness, &flags, &checker);
+        assert!(
+            matches!(result, Err(ScriptError::SigPushOnly)),
+            "P2SH with non-push-only scriptSig (OP_DUP) must fail with SigPushOnly: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn p2sh_push_only_scriptsig_with_op_add_fails() {
+        // P2SH scriptSig with OP_ADD (arithmetic op) must fail
+        let redeem_script = vec![0x51]; // OP_1
+        let redeem_hash = hash160(&redeem_script);
+
+        let mut script_pubkey = vec![0xa9, 0x14];
+        script_pubkey.extend_from_slice(redeem_hash.as_bytes());
+        script_pubkey.push(0x87);
+
+        // scriptSig: <push 1> <push 1> OP_ADD <push redeem_script>
+        // This would leave "2" and redeem_script on stack, but it's non-push-only
+        let mut script_sig = vec![0x51, 0x51, 0x93]; // OP_1 OP_1 OP_ADD
+        script_sig.push(redeem_script.len() as u8);
+        script_sig.extend_from_slice(&redeem_script);
+
+        let mut flags = ScriptFlags::default();
+        flags.verify_p2sh = true;
+        let checker = DummyChecker;
+        let witness = vec![];
+
+        let result = verify_script(&script_sig, &script_pubkey, &witness, &flags, &checker);
+        assert!(
+            matches!(result, Err(ScriptError::SigPushOnly)),
+            "P2SH with non-push-only scriptSig (OP_ADD) must fail: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn p2sh_push_only_not_enforced_without_p2sh_flag() {
+        // When verify_p2sh is false, the push-only check should NOT apply
+        // (This represents pre-BIP16 behavior)
+        let redeem_script = vec![0x51]; // OP_1
+        let redeem_hash = hash160(&redeem_script);
+
+        let mut script_pubkey = vec![0xa9, 0x14];
+        script_pubkey.extend_from_slice(redeem_hash.as_bytes());
+        script_pubkey.push(0x87);
+
+        // scriptSig with OP_DUP - would fail if P2SH is enforced
+        // But without P2SH flag, this is treated as a regular script
+        // OP_DUP <push 20 bytes (redeem_hash)> - this will make hash160(redeem_hash) != redeem_hash
+        // Let's use a scriptSig that would pass the OP_HASH160 check without P2SH semantics
+        // Actually, for this test we just need to verify that the push-only check
+        // doesn't trigger when verify_p2sh is false.
+
+        // Use a non-P2SH interpretation: scriptSig: <push hash>, scriptPubKey: OP_HASH160 <hash> OP_EQUAL
+        // This should verify as: HASH160(hash) == hash (which will fail, but not with SigPushOnly)
+
+        // Simpler approach: use a scriptSig with OP_1 OP_DROP <push redeem_script>
+        // With P2SH disabled, this is just: execute scriptSig, then scriptPubKey
+        // Actually this won't work. Let's just verify the check doesn't trigger.
+
+        // The simplest test: P2SH-looking scriptPubKey with non-push scriptSig
+        // Without verify_p2sh, the P2SH special handling is skipped entirely
+        let mut script_sig = vec![0x76]; // Just OP_DUP
+        script_sig.push(0x14); // Push 20 bytes
+        script_sig.extend_from_slice(redeem_hash.as_bytes());
+
+        let flags = ScriptFlags::default(); // verify_p2sh is false
+        assert!(!flags.verify_p2sh);
+        let checker = DummyChecker;
+        let witness = vec![];
+
+        let result = verify_script(&script_sig, &script_pubkey, &witness, &flags, &checker);
+        // Should NOT fail with SigPushOnly (P2SH disabled)
+        // It will fail for other reasons (hash mismatch) but not push-only
+        assert!(
+            !matches!(result, Err(ScriptError::SigPushOnly)),
+            "Without P2SH flag, push-only check should not apply: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn p2sh_push_only_with_op_nop_fails() {
+        // Even OP_NOP in scriptSig fails the push-only check
+        let redeem_script = vec![0x51]; // OP_1
+        let redeem_hash = hash160(&redeem_script);
+
+        let mut script_pubkey = vec![0xa9, 0x14];
+        script_pubkey.extend_from_slice(redeem_hash.as_bytes());
+        script_pubkey.push(0x87);
+
+        // scriptSig: OP_NOP <push redeem_script>
+        let mut script_sig = vec![0x61]; // OP_NOP
+        script_sig.push(redeem_script.len() as u8);
+        script_sig.extend_from_slice(&redeem_script);
+
+        let mut flags = ScriptFlags::default();
+        flags.verify_p2sh = true;
+        let checker = DummyChecker;
+        let witness = vec![];
+
+        let result = verify_script(&script_sig, &script_pubkey, &witness, &flags, &checker);
+        assert!(
+            matches!(result, Err(ScriptError::SigPushOnly)),
+            "P2SH with OP_NOP in scriptSig must fail: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn p2sh_push_only_with_pushdata_ops_succeeds() {
+        // PUSHDATA1/2/4 are valid push operations
+        let redeem_script = vec![0x51]; // OP_1
+        let redeem_hash = hash160(&redeem_script);
+
+        let mut script_pubkey = vec![0xa9, 0x14];
+        script_pubkey.extend_from_slice(redeem_hash.as_bytes());
+        script_pubkey.push(0x87);
+
+        // scriptSig using PUSHDATA1: 0x4c <len> <data>
+        let mut script_sig = vec![0x4c, redeem_script.len() as u8];
+        script_sig.extend_from_slice(&redeem_script);
+
+        let mut flags = ScriptFlags::default();
+        flags.verify_p2sh = true;
+        let checker = DummyChecker;
+        let witness = vec![];
+
+        let result = verify_script(&script_sig, &script_pubkey, &witness, &flags, &checker);
+        assert!(result.is_ok(), "PUSHDATA1 should be valid in scriptSig: {:?}", result);
+    }
+
+    #[test]
+    fn p2sh_push_only_op_1negate_succeeds() {
+        // OP_1NEGATE is a valid push operation (pushes -1)
+        let redeem_script = vec![0x51]; // OP_1
+        let redeem_hash = hash160(&redeem_script);
+
+        let mut script_pubkey = vec![0xa9, 0x14];
+        script_pubkey.extend_from_slice(redeem_hash.as_bytes());
+        script_pubkey.push(0x87);
+
+        // scriptSig: OP_1NEGATE OP_DROP <push redeem_script>
+        // Wait, OP_DROP is not push-only. Let's use a different redeem script.
+
+        // Use a redeem script that consumes the extra stack item: OP_DROP OP_1
+        let redeem_script2 = vec![0x75, 0x51]; // OP_DROP OP_1
+        let redeem_hash2 = hash160(&redeem_script2);
+
+        let mut script_pubkey2 = vec![0xa9, 0x14];
+        script_pubkey2.extend_from_slice(redeem_hash2.as_bytes());
+        script_pubkey2.push(0x87);
+
+        // scriptSig: OP_1NEGATE <push redeem_script>
+        // This pushes -1 onto the stack, then the redeem script drops it and pushes 1
+        let mut script_sig = vec![0x4f]; // OP_1NEGATE
+        script_sig.push(redeem_script2.len() as u8);
+        script_sig.extend_from_slice(&redeem_script2);
+
+        let mut flags = ScriptFlags::default();
+        flags.verify_p2sh = true;
+        let checker = DummyChecker;
+        let witness = vec![];
+
+        let result = verify_script(&script_sig, &script_pubkey2, &witness, &flags, &checker);
+        assert!(result.is_ok(), "OP_1NEGATE should be valid push in scriptSig: {:?}", result);
+    }
+
+    #[test]
+    fn p2sh_push_only_consensus_flags_enabled() {
+        // Verify that P2SH is enabled at the correct activation height (mainnet)
+        let flags = ScriptFlags::consensus_flags(173_805, false);
+        assert!(flags.verify_p2sh);
+
+        // Before activation
+        let flags_before = ScriptFlags::consensus_flags(173_804, false);
+        assert!(!flags_before.verify_p2sh);
+    }
+
+    #[test]
+    fn p2sh_push_only_testnet4_always_enabled() {
+        // Testnet4 has P2SH active from block 1
+        let flags = ScriptFlags::consensus_flags(1, true);
+        assert!(flags.verify_p2sh);
+    }
 }
