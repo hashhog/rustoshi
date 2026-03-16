@@ -1,18 +1,21 @@
 //! HD Wallet implementation with address generation and transaction building.
 //!
-//! This module implements a BIP-84 compatible HD wallet supporting:
+//! This module implements a hierarchical deterministic wallet supporting:
 //! - Native SegWit (P2WPKH) addresses (BIP-84)
 //! - Legacy (P2PKH) addresses (BIP-44)
+//! - Wrapped SegWit (P2SH-P2WPKH) addresses (BIP-49)
+//! - Taproot (P2TR) addresses (BIP-86)
 //! - UTXO tracking
 //! - Transaction creation and signing
+//! - BnB and Knapsack coin selection
 
 use std::collections::HashMap;
 
 use rustoshi_crypto::{
     address::{Address, Network},
-    hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash,
+    hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash, tagged_hash,
 };
-use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut};
+use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut, Encodable, write_compact_size};
 use secp256k1::{Message, Secp256k1};
 
 use crate::hd::{ExtendedPrivKey, WalletError, HARDENED_FLAG};
@@ -22,6 +25,12 @@ const BIP84_PURPOSE: u32 = 84 | HARDENED_FLAG;
 
 /// BIP-44 purpose for legacy addresses (P2PKH).
 const BIP44_PURPOSE: u32 = 44 | HARDENED_FLAG;
+
+/// BIP-49 purpose for wrapped SegWit (P2SH-P2WPKH).
+const BIP49_PURPOSE: u32 = 49 | HARDENED_FLAG;
+
+/// BIP-86 purpose for Taproot (P2TR).
+const BIP86_PURPOSE: u32 = 86 | HARDENED_FLAG;
 
 /// BIP-84/44 coin type for Bitcoin mainnet (0').
 const COIN_MAINNET: u32 = HARDENED_FLAG;
@@ -45,7 +54,12 @@ pub enum AddressType {
     P2PKH,
     /// Wrapped SegWit (BIP-49, P2SH-P2WPKH). Starts with 3 (mainnet) or 2 (testnet).
     P2shP2wpkh,
+    /// Taproot (BIP-86, P2TR). Starts with bc1p (mainnet) or tb1p (testnet).
+    P2TR,
 }
+
+/// Coinbase maturity: coinbase outputs cannot be spent for 100 blocks.
+pub const COINBASE_MATURITY: u32 = 100;
 
 /// A UTXO owned by the wallet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +76,10 @@ pub struct WalletUtxo {
     pub confirmations: u32,
     /// Whether this is a change address.
     pub is_change: bool,
+    /// Whether this UTXO is from a coinbase transaction.
+    pub is_coinbase: bool,
+    /// Block height at which this UTXO was created.
+    pub height: Option<u32>,
 }
 
 /// The HD wallet.
@@ -84,6 +102,8 @@ pub struct Wallet {
     address_type: AddressType,
     /// Lookahead window for address scanning (gap limit).
     gap_limit: u32,
+    /// Current chain tip height (for maturity calculations).
+    chain_height: u32,
 }
 
 impl Wallet {
@@ -114,6 +134,7 @@ impl Wallet {
             account: 0,
             address_type,
             gap_limit: 20,
+            chain_height: 0,
         })
     }
 
@@ -159,12 +180,16 @@ impl Wallet {
 
     /// Build the derivation path for an address.
     ///
-    /// BIP-84 (P2WPKH): m/84'/coin'/account'/change/index
     /// BIP-44 (P2PKH): m/44'/coin'/account'/change/index
+    /// BIP-49 (P2SH-P2WPKH): m/49'/coin'/account'/change/index
+    /// BIP-84 (P2WPKH): m/84'/coin'/account'/change/index
+    /// BIP-86 (P2TR): m/86'/coin'/account'/change/index
     fn derivation_path(&self, is_change: bool, index: u32) -> Vec<u32> {
         let purpose = match self.address_type {
-            AddressType::P2WPKH | AddressType::P2shP2wpkh => BIP84_PURPOSE,
             AddressType::P2PKH => BIP44_PURPOSE,
+            AddressType::P2shP2wpkh => BIP49_PURPOSE,
+            AddressType::P2WPKH => BIP84_PURPOSE,
+            AddressType::P2TR => BIP86_PURPOSE,
         };
         let coin = match self.network {
             Network::Mainnet => COIN_MAINNET,
@@ -201,9 +226,42 @@ impl Wallet {
                     network: self.network,
                 }
             }
+            AddressType::P2TR => {
+                // BIP-86: P2TR key-path spending
+                // The output key is: P = internal_key + H(tagged_hash("TapTweak", internal_key)) * G
+                // For key-path only (no scripts), the tweak is just the internal key itself
+                let xonly = secp256k1::XOnlyPublicKey::from(pubkey);
+                let output_key = self.compute_taproot_output_key(&xonly);
+                Address::P2TR {
+                    output_key,
+                    network: self.network,
+                }
+            }
         };
 
         Ok(addr.encode())
+    }
+
+    /// Compute the Taproot output key (tweaked x-only public key).
+    ///
+    /// For BIP-86 key-path only spending, the tweak is computed as:
+    /// tweak = tagged_hash("TapTweak", internal_key)
+    /// output_key = internal_key + tweak * G
+    fn compute_taproot_output_key(&self, internal_key: &secp256k1::XOnlyPublicKey) -> [u8; 32] {
+        let secp = Secp256k1::new();
+
+        // Compute tweak: t = tagged_hash("TapTweak", internal_key)
+        let tweak_hash = tagged_hash("TapTweak", &internal_key.serialize());
+
+        // Create the tweak scalar
+        let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash)
+            .expect("tweak should be valid scalar");
+
+        // Compute the tweaked key pair (output key)
+        let (output_key, _parity) = internal_key.add_tweak(&secp, &tweak)
+            .expect("tweak should not overflow");
+
+        output_key.serialize()
     }
 
     /// Get the private key for a derivation path (for signing).
@@ -250,6 +308,59 @@ impl Wallet {
             .sum()
     }
 
+    /// Get immature coinbase balance (coinbase outputs that haven't reached maturity).
+    pub fn immature_balance(&self) -> u64 {
+        self.utxos
+            .values()
+            .filter(|u| u.is_coinbase && !self.is_mature(u))
+            .map(|u| u.value)
+            .sum()
+    }
+
+    /// Get spendable balance (confirmed, mature UTXOs only).
+    ///
+    /// This excludes:
+    /// - Unconfirmed UTXOs (confirmations == 0)
+    /// - Immature coinbase UTXOs (less than COINBASE_MATURITY confirmations)
+    pub fn spendable_balance(&self) -> u64 {
+        self.utxos
+            .values()
+            .filter(|u| self.is_spendable(u))
+            .map(|u| u.value)
+            .sum()
+    }
+
+    /// Check if a UTXO has reached coinbase maturity.
+    ///
+    /// Regular (non-coinbase) UTXOs are always mature.
+    /// Coinbase UTXOs require COINBASE_MATURITY (100) confirmations.
+    pub fn is_mature(&self, utxo: &WalletUtxo) -> bool {
+        if !utxo.is_coinbase {
+            return true;
+        }
+        // Use height-based calculation if available, otherwise fall back to confirmations
+        if let Some(height) = utxo.height {
+            self.chain_height >= height + COINBASE_MATURITY
+        } else {
+            utxo.confirmations >= COINBASE_MATURITY
+        }
+    }
+
+    /// Check if a UTXO is spendable (confirmed and mature).
+    pub fn is_spendable(&self, utxo: &WalletUtxo) -> bool {
+        utxo.confirmations >= 1 && self.is_mature(utxo)
+    }
+
+    /// Set the current chain height (for maturity calculations).
+    pub fn set_chain_height(&mut self, height: u32) {
+        self.chain_height = height;
+    }
+
+    /// Get the current chain height.
+    pub fn chain_height(&self) -> u32 {
+        self.chain_height
+    }
+
     /// Build and sign a transaction.
     ///
     /// # Steps
@@ -280,10 +391,11 @@ impl Wallet {
         let mut selected_utxos: Vec<WalletUtxo> = Vec::new();
         let mut selected_value: u64 = 0;
 
+        // Filter to only spendable UTXOs (confirmed and mature)
         let mut sorted_utxos: Vec<&WalletUtxo> = self
             .utxos
             .values()
-            .filter(|u| u.confirmations >= 1)
+            .filter(|u| self.is_spendable(u))
             .collect();
         sorted_utxos.sort_by(|a, b| b.value.cmp(&a.value));
 
@@ -374,6 +486,9 @@ impl Wallet {
                 }
                 AddressType::P2shP2wpkh => {
                     self.sign_p2sh_p2wpkh_input(&mut tx, i, utxo, &private_key, &secp)?;
+                }
+                AddressType::P2TR => {
+                    self.sign_p2tr_input(&mut tx, i, utxo, &selected_utxos, &private_key, &secp)?;
                 }
             }
         }
@@ -476,6 +591,161 @@ impl Wallet {
         Ok(())
     }
 
+    /// Sign a P2TR input (Taproot key-path spending).
+    ///
+    /// For BIP-86 key-path spending:
+    /// 1. Compute the tweaked private key
+    /// 2. Compute BIP-341 sighash
+    /// 3. Create Schnorr signature
+    fn sign_p2tr_input(
+        &self,
+        tx: &mut Transaction,
+        input_index: usize,
+        _utxo: &WalletUtxo,
+        all_utxos: &[WalletUtxo],
+        private_key: &secp256k1::SecretKey,
+        secp: &Secp256k1<secp256k1::All>,
+    ) -> Result<(), WalletError> {
+        // Get the public key and compute the tweaked keypair
+        let keypair = secp256k1::Keypair::from_secret_key(secp, private_key);
+        let (xonly_pubkey, _parity) = keypair.x_only_public_key();
+
+        // Compute the tweak (same as in derive_address)
+        let tweak_hash = tagged_hash("TapTweak", &xonly_pubkey.serialize());
+        let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash)
+            .map_err(|_| WalletError::SigningError("invalid tweak".to_string()))?;
+
+        // Create tweaked keypair for signing
+        let tweaked_keypair = keypair.add_xonly_tweak(secp, &tweak)
+            .map_err(|_| WalletError::SigningError("tweak failed".to_string()))?;
+
+        // Compute BIP-341 Taproot sighash
+        let sighash = self.compute_taproot_sighash(tx, input_index, all_utxos, 0x00)?;
+
+        // Create Schnorr signature
+        let msg = Message::from_digest(sighash);
+        let sig = secp.sign_schnorr(&msg, &tweaked_keypair);
+
+        // For SIGHASH_DEFAULT (0x00), we don't append the hash type byte
+        // This saves one byte in the witness
+        let sig_bytes = sig.serialize().to_vec();
+
+        // Witness is just the 64-byte Schnorr signature
+        tx.inputs[input_index].witness = vec![sig_bytes];
+
+        Ok(())
+    }
+
+    /// Compute BIP-341 Taproot sighash for key-path spending.
+    fn compute_taproot_sighash(
+        &self,
+        tx: &Transaction,
+        input_index: usize,
+        prevouts: &[WalletUtxo],
+        hash_type: u8,
+    ) -> Result<[u8; 32], WalletError> {
+        use std::io::Write;
+
+        // Epoch byte (0x00 for Taproot)
+        let epoch = 0x00u8;
+
+        // Hash type handling
+        // 0x00 = SIGHASH_DEFAULT (treated as SIGHASH_ALL for signing)
+        let sighash_type = if hash_type == 0x00 { 0x01 } else { hash_type as u32 };
+        let anyone_can_pay = (sighash_type & 0x80) != 0;
+        let sighash_none = (sighash_type & 0x03) == 0x02;
+        let sighash_single = (sighash_type & 0x03) == 0x03;
+
+        let mut preimage = Vec::with_capacity(200);
+
+        // 1. Epoch (1 byte)
+        preimage.push(epoch);
+
+        // 2. Hash type (1 byte) - write the original hash_type, not sighash_type
+        preimage.push(hash_type);
+
+        // 3. Version (4 bytes LE)
+        preimage.write_all(&tx.version.to_le_bytes()).unwrap();
+
+        // 4. Locktime (4 bytes LE)
+        preimage.write_all(&tx.lock_time.to_le_bytes()).unwrap();
+
+        // 5-7. sha_prevouts, sha_amounts, sha_scriptpubkeys, sha_sequences
+        if !anyone_can_pay {
+            // sha_prevouts
+            let mut prevouts_data = Vec::new();
+            for input in &tx.inputs {
+                input.previous_output.encode(&mut prevouts_data).unwrap();
+            }
+            let sha_prevouts = rustoshi_crypto::sha256(&prevouts_data);
+            preimage.write_all(&sha_prevouts).unwrap();
+
+            // sha_amounts
+            let mut amounts_data = Vec::new();
+            for utxo in prevouts {
+                amounts_data.write_all(&utxo.value.to_le_bytes()).unwrap();
+            }
+            let sha_amounts = rustoshi_crypto::sha256(&amounts_data);
+            preimage.write_all(&sha_amounts).unwrap();
+
+            // sha_scriptpubkeys
+            let mut scripts_data = Vec::new();
+            for utxo in prevouts {
+                write_compact_size(&mut scripts_data, utxo.script_pubkey.len() as u64).unwrap();
+                scripts_data.write_all(&utxo.script_pubkey).unwrap();
+            }
+            let sha_scriptpubkeys = rustoshi_crypto::sha256(&scripts_data);
+            preimage.write_all(&sha_scriptpubkeys).unwrap();
+
+            // sha_sequences
+            let mut sequences_data = Vec::new();
+            for input in &tx.inputs {
+                sequences_data.write_all(&input.sequence.to_le_bytes()).unwrap();
+            }
+            let sha_sequences = rustoshi_crypto::sha256(&sequences_data);
+            preimage.write_all(&sha_sequences).unwrap();
+        }
+
+        // 8. sha_outputs
+        if !sighash_none && !sighash_single {
+            let mut outputs_data = Vec::new();
+            for output in &tx.outputs {
+                output.encode(&mut outputs_data).unwrap();
+            }
+            let sha_outputs = rustoshi_crypto::sha256(&outputs_data);
+            preimage.write_all(&sha_outputs).unwrap();
+        } else if sighash_single && input_index < tx.outputs.len() {
+            let mut output_data = Vec::new();
+            tx.outputs[input_index].encode(&mut output_data).unwrap();
+            let sha_outputs = rustoshi_crypto::sha256(&output_data);
+            preimage.write_all(&sha_outputs).unwrap();
+        }
+
+        // 9. Spend type (1 byte)
+        // ext_flag = 0 for key-path, annex_present = 0
+        let spend_type = 0x00u8;
+        preimage.push(spend_type);
+
+        // 10. Input-specific data
+        if anyone_can_pay {
+            // Serialize the specific prevout
+            let input = &tx.inputs[input_index];
+            input.previous_output.encode(&mut preimage).unwrap();
+            preimage.write_all(&prevouts[input_index].value.to_le_bytes()).unwrap();
+            write_compact_size(&mut preimage, prevouts[input_index].script_pubkey.len() as u64).unwrap();
+            preimage.write_all(&prevouts[input_index].script_pubkey).unwrap();
+            preimage.write_all(&input.sequence.to_le_bytes()).unwrap();
+        } else {
+            // Input index (4 bytes LE)
+            preimage.write_all(&(input_index as u32).to_le_bytes()).unwrap();
+        }
+
+        // No annex or script-path data for key-path spending
+
+        // Compute tagged hash
+        Ok(tagged_hash("TapSighash", &preimage))
+    }
+
     /// Check if an address belongs to this wallet.
     pub fn is_mine(&self, address: &str) -> bool {
         self.addresses.contains_key(address)
@@ -553,6 +823,30 @@ impl Wallet {
             utxo.confirmations = confirmations;
         }
     }
+
+    /// Get the current address indices (for serialization).
+    pub fn get_indices(&self) -> (u32, u32) {
+        (self.next_receive_index, self.next_change_index)
+    }
+
+    /// Restore address indices from saved state.
+    pub fn restore_indices(&mut self, receive_index: u32, change_index: u32) {
+        self.next_receive_index = receive_index;
+        self.next_change_index = change_index;
+    }
+
+    /// List unspent UTXOs.
+    pub fn list_unspent(&self) -> Vec<&WalletUtxo> {
+        self.utxos.values().collect()
+    }
+
+    /// List spendable unspent UTXOs (confirmed and mature).
+    pub fn list_spendable_unspent(&self) -> Vec<&WalletUtxo> {
+        self.utxos
+            .values()
+            .filter(|u| self.is_spendable(u))
+            .collect()
+    }
 }
 
 /// Estimate the virtual size (vsize) of a transaction.
@@ -587,6 +881,14 @@ fn estimate_tx_vsize(num_inputs: usize, num_outputs: usize, addr_type: AddressTy
             // - Plus witness data
             // ~91 vbytes per input, ~32 per output
             11 + num_inputs * 91 + num_outputs * 32
+        }
+        AddressType::P2TR => {
+            // P2TR (Taproot):
+            // - Input: 41 bytes base + 65 bytes witness (64 sig + 1 count)
+            // - weight = 41*4 + 65 = 229, vsize = ~57
+            // - Output: 8 + 1 + 34 (P2TR script) = 43 bytes
+            // Simplified: ~57 vbytes per input, ~43 per output, ~11 overhead
+            11 + num_inputs * 57 + num_outputs * 43
         }
     }
 }
@@ -752,6 +1054,8 @@ mod tests {
             derivation_path: vec![],
             confirmations: 6,
             is_change: false,
+            is_coinbase: false,
+            height: Some(100),
         };
 
         let utxo2 = WalletUtxo {
@@ -764,6 +1068,8 @@ mod tests {
             derivation_path: vec![],
             confirmations: 0,
             is_change: false,
+            is_coinbase: false,
+            height: None,
         };
 
         wallet.add_utxo(utxo1);
@@ -811,6 +1117,8 @@ mod tests {
             derivation_path: path,
             confirmations: 6,
             is_change: false,
+            is_coinbase: false,
+            height: Some(100),
         };
         wallet.add_utxo(utxo);
 
@@ -854,6 +1162,8 @@ mod tests {
             derivation_path: path,
             confirmations: 6,
             is_change: false,
+            is_coinbase: false,
+            height: Some(100),
         };
         wallet.add_utxo(utxo);
 
@@ -897,6 +1207,8 @@ mod tests {
             derivation_path: path,
             confirmations: 6,
             is_change: false,
+            is_coinbase: false,
+            height: Some(100),
         };
         wallet.add_utxo(utxo);
 
@@ -969,6 +1281,8 @@ mod tests {
             derivation_path: vec![],
             confirmations: 6,
             is_change: false,
+            is_coinbase: false,
+            height: Some(100),
         };
 
         wallet.add_utxo(utxo);
@@ -995,6 +1309,8 @@ mod tests {
             derivation_path: vec![],
             confirmations: 0,
             is_change: false,
+            is_coinbase: false,
+            height: Some(100),
         };
 
         wallet.add_utxo(utxo);
@@ -1002,5 +1318,261 @@ mod tests {
 
         wallet.update_confirmations(&outpoint, 1);
         assert_eq!(wallet.confirmed_balance(), 100_000);
+    }
+
+    #[test]
+    fn p2tr_address_mainnet() {
+        let seed = test_seed();
+        let mut wallet = Wallet::from_seed(&seed, Network::Mainnet, AddressType::P2TR).unwrap();
+
+        let addr = wallet.get_new_address().unwrap();
+
+        // Mainnet P2TR addresses start with bc1p
+        assert!(addr.starts_with("bc1p"), "P2TR address should start with bc1p: {}", addr);
+
+        // Verify derivation path is BIP-86
+        let path = wallet.get_derivation_path(&addr).unwrap();
+        assert_eq!(
+            path,
+            &vec![
+                86 | HARDENED_FLAG, // BIP-86 purpose
+                0 | HARDENED_FLAG,  // mainnet coin type
+                0 | HARDENED_FLAG,  // account
+                0,                  // receiving
+                0                   // first address
+            ]
+        );
+    }
+
+    #[test]
+    fn p2tr_address_testnet() {
+        let seed = test_seed();
+        let mut wallet = Wallet::from_seed(&seed, Network::Testnet, AddressType::P2TR).unwrap();
+
+        let addr = wallet.get_new_address().unwrap();
+
+        // Testnet P2TR addresses start with tb1p
+        assert!(addr.starts_with("tb1p"), "P2TR address should start with tb1p: {}", addr);
+
+        // Verify derivation path is BIP-86 for testnet
+        let path = wallet.get_derivation_path(&addr).unwrap();
+        assert_eq!(
+            path,
+            &vec![
+                86 | HARDENED_FLAG, // BIP-86 purpose
+                1 | HARDENED_FLAG,  // testnet coin type
+                0 | HARDENED_FLAG,  // account
+                0,                  // receiving
+                0                   // first address
+            ]
+        );
+    }
+
+    #[test]
+    fn p2tr_vsize_estimation() {
+        // P2TR inputs are smaller due to Schnorr sigs (64 bytes vs ~72 DER)
+        // But P2TR outputs are larger (34 bytes vs 22 bytes)
+        let p2tr_vsize = estimate_tx_vsize(1, 2, AddressType::P2TR);
+        let p2wpkh_vsize = estimate_tx_vsize(1, 2, AddressType::P2WPKH);
+
+        // P2TR: 11 + 57 + 86 = 154 vbytes
+        // P2WPKH: 11 + 68 + 62 = 141 vbytes
+        // With 2 outputs, P2TR may actually be larger due to output size difference
+        // But P2TR scales better with more inputs
+        assert!(p2tr_vsize > 0 && p2wpkh_vsize > 0, "Both should have valid vsize");
+
+        // With more inputs, P2TR becomes more efficient
+        let p2tr_3in = estimate_tx_vsize(3, 2, AddressType::P2TR);
+        let p2wpkh_3in = estimate_tx_vsize(3, 2, AddressType::P2WPKH);
+
+        // 3 P2TR inputs: 11 + 57*3 + 43*2 = 11 + 171 + 86 = 268
+        // 3 P2WPKH inputs: 11 + 68*3 + 31*2 = 11 + 204 + 62 = 277
+        assert!(p2tr_3in < p2wpkh_3in, "P2TR should be smaller with multiple inputs");
+    }
+
+    #[test]
+    fn p2tr_multiple_addresses() {
+        let seed = test_seed();
+        let mut wallet = Wallet::from_seed(&seed, Network::Testnet, AddressType::P2TR).unwrap();
+
+        // Generate multiple addresses
+        let addr1 = wallet.get_new_address().unwrap();
+        let addr2 = wallet.get_new_address().unwrap();
+        let change = wallet.get_change_address().unwrap();
+
+        // All should be unique
+        assert_ne!(addr1, addr2);
+        assert_ne!(addr1, change);
+        assert_ne!(addr2, change);
+
+        // All should be valid P2TR addresses
+        assert!(addr1.starts_with("tb1p"));
+        assert!(addr2.starts_with("tb1p"));
+        assert!(change.starts_with("tb1p"));
+
+        // Verify change address path
+        let change_path = wallet.get_derivation_path(&change).unwrap();
+        assert_eq!(change_path[3], 1); // Change chain
+    }
+
+    #[test]
+    fn coinbase_maturity_immature() {
+        let seed = test_seed();
+        let mut wallet = Wallet::from_seed(&seed, Network::Testnet, AddressType::P2WPKH).unwrap();
+
+        // Set current chain height
+        wallet.set_chain_height(150);
+
+        // Coinbase UTXO created at height 100 (50 confirmations, needs 100)
+        let utxo = WalletUtxo {
+            outpoint: OutPoint {
+                txid: rustoshi_primitives::Hash256::ZERO,
+                vout: 0,
+            },
+            value: 5_000_000_000, // 50 BTC coinbase reward
+            script_pubkey: vec![],
+            derivation_path: vec![],
+            confirmations: 50,
+            is_change: false,
+            is_coinbase: true,
+            height: Some(100),
+        };
+
+        wallet.add_utxo(utxo);
+
+        // Balance shows total, but spendable should be 0 (immature)
+        assert_eq!(wallet.balance(), 5_000_000_000);
+        assert_eq!(wallet.immature_balance(), 5_000_000_000);
+        assert_eq!(wallet.spendable_balance(), 0);
+        assert!(!wallet.is_mature(wallet.list_utxos()[0]));
+    }
+
+    #[test]
+    fn coinbase_maturity_mature() {
+        let seed = test_seed();
+        let mut wallet = Wallet::from_seed(&seed, Network::Testnet, AddressType::P2WPKH).unwrap();
+
+        // Set current chain height
+        wallet.set_chain_height(200);
+
+        // Coinbase UTXO created at height 100 (100 confirmations, exactly mature)
+        let utxo = WalletUtxo {
+            outpoint: OutPoint {
+                txid: rustoshi_primitives::Hash256::ZERO,
+                vout: 0,
+            },
+            value: 5_000_000_000,
+            script_pubkey: vec![],
+            derivation_path: vec![],
+            confirmations: 100,
+            is_change: false,
+            is_coinbase: true,
+            height: Some(100),
+        };
+
+        wallet.add_utxo(utxo);
+
+        // Now it should be spendable
+        assert_eq!(wallet.balance(), 5_000_000_000);
+        assert_eq!(wallet.immature_balance(), 0);
+        assert_eq!(wallet.spendable_balance(), 5_000_000_000);
+        assert!(wallet.is_mature(wallet.list_utxos()[0]));
+    }
+
+    #[test]
+    fn non_coinbase_always_mature() {
+        let seed = test_seed();
+        let mut wallet = Wallet::from_seed(&seed, Network::Testnet, AddressType::P2WPKH).unwrap();
+
+        wallet.set_chain_height(10);
+
+        // Regular UTXO with only 1 confirmation
+        let utxo = WalletUtxo {
+            outpoint: OutPoint {
+                txid: rustoshi_primitives::Hash256::ZERO,
+                vout: 0,
+            },
+            value: 100_000,
+            script_pubkey: vec![],
+            derivation_path: vec![],
+            confirmations: 1,
+            is_change: false,
+            is_coinbase: false,
+            height: Some(9),
+        };
+
+        wallet.add_utxo(utxo);
+
+        // Non-coinbase UTXOs are always mature (if confirmed)
+        assert_eq!(wallet.spendable_balance(), 100_000);
+        assert_eq!(wallet.immature_balance(), 0);
+        assert!(wallet.is_mature(wallet.list_utxos()[0]));
+    }
+
+    #[test]
+    fn coinbase_excluded_from_transaction() {
+        let seed = test_seed();
+        let mut wallet = Wallet::from_seed(&seed, Network::Testnet, AddressType::P2WPKH).unwrap();
+
+        // Set chain height so coinbase is immature (99 confirmations)
+        wallet.set_chain_height(199);
+
+        // Generate an address for the regular UTXO
+        let addr = wallet.get_new_address().unwrap();
+        let addr_obj = Address::from_string(&addr, Some(Network::Testnet)).unwrap();
+        let path = wallet.get_derivation_path(&addr).unwrap().clone();
+
+        // Add an immature coinbase UTXO (large value, but not spendable)
+        let coinbase_utxo = WalletUtxo {
+            outpoint: OutPoint {
+                txid: rustoshi_primitives::Hash256([1u8; 32]),
+                vout: 0,
+            },
+            value: 5_000_000_000,
+            script_pubkey: addr_obj.to_script_pubkey(),
+            derivation_path: path.clone(),
+            confirmations: 99, // 1 short of maturity
+            is_change: false,
+            is_coinbase: true,
+            height: Some(100),
+        };
+
+        // Add a regular UTXO (smaller, but spendable)
+        let regular_utxo = WalletUtxo {
+            outpoint: OutPoint {
+                txid: rustoshi_primitives::Hash256([2u8; 32]),
+                vout: 0,
+            },
+            value: 100_000,
+            script_pubkey: addr_obj.to_script_pubkey(),
+            derivation_path: path,
+            confirmations: 6,
+            is_change: false,
+            is_coinbase: false,
+            height: Some(193),
+        };
+
+        wallet.add_utxo(coinbase_utxo);
+        wallet.add_utxo(regular_utxo);
+
+        // Total balance is high, but spendable is only the regular UTXO
+        assert_eq!(wallet.balance(), 5_000_100_000);
+        assert_eq!(wallet.spendable_balance(), 100_000);
+
+        // Transaction should succeed using only the regular UTXO
+        let tx = wallet.create_transaction(
+            vec![("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_string(), 10_000)],
+            1.0,
+        ).unwrap();
+
+        // Should have used the regular UTXO, not the immature coinbase
+        assert_eq!(tx.inputs.len(), 1);
+        assert_eq!(tx.inputs[0].previous_output.txid.0, [2u8; 32]); // The regular UTXO
+    }
+
+    #[test]
+    fn coinbase_maturity_constant() {
+        // Verify the constant matches Bitcoin consensus
+        assert_eq!(COINBASE_MATURITY, 100);
     }
 }

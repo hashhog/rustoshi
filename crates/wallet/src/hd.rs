@@ -104,6 +104,10 @@ pub enum WalletError {
     /// Invalid derivation path format.
     #[error("invalid derivation path: {0}")]
     InvalidPath(String),
+
+    /// Cryptographic operation failed.
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }
 
 impl ExtendedPrivKey {
