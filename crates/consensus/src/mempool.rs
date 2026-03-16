@@ -318,19 +318,21 @@ impl Mempool {
             ));
         }
 
-        // Check descendant limits for existing ancestors
+        // Check descendant limits for ALL ancestors (not just direct parents)
         // Adding this transaction would increase their descendant counts
-        for parent in &mempool_parents {
-            if let Some(parent_entry) = self.transactions.get(parent) {
-                if parent_entry.descendant_count + 1 > self.config.max_descendant_count {
+        // We must check every ancestor, as any of them exceeding the limit causes rejection
+        let all_ancestors = self.get_all_ancestors(&mempool_parents);
+        for ancestor_txid in &all_ancestors {
+            if let Some(ancestor_entry) = self.transactions.get(ancestor_txid) {
+                if ancestor_entry.descendant_count + 1 > self.config.max_descendant_count {
                     return Err(MempoolError::TooManyDescendants(
-                        parent_entry.descendant_count + 1,
+                        ancestor_entry.descendant_count + 1,
                         self.config.max_descendant_count,
                     ));
                 }
-                if parent_entry.descendant_size + vsize > self.config.max_descendant_size {
+                if ancestor_entry.descendant_size + vsize > self.config.max_descendant_size {
                     return Err(MempoolError::DescendantSizeTooLarge(
-                        parent_entry.descendant_size + vsize,
+                        ancestor_entry.descendant_size + vsize,
                         self.config.max_descendant_size,
                     ));
                 }
@@ -382,10 +384,11 @@ impl Mempool {
         self.parents.insert(txid, mempool_parents.clone());
         for parent in &mempool_parents {
             self.children.entry(*parent).or_default().insert(txid);
-            // Update parent's descendant stats
-            self.update_ancestors_for_add(*parent, vsize, fee);
         }
         self.children.entry(txid).or_default();
+
+        // Update all ancestors' descendant stats (once per ancestor, not per parent)
+        self.update_all_ancestors_for_add(&mempool_parents, vsize, fee);
 
         self.total_size += vsize;
         let fee_key = FeeRateKey {
@@ -399,9 +402,15 @@ impl Mempool {
     }
 
     /// Update all ancestors' descendant stats when adding a new transaction.
-    fn update_ancestors_for_add(&mut self, parent: Hash256, vsize: usize, fee: u64) {
+    /// Takes all direct parents and updates every unique ancestor exactly once.
+    fn update_all_ancestors_for_add(
+        &mut self,
+        direct_parents: &HashSet<Hash256>,
+        vsize: usize,
+        fee: u64,
+    ) {
         let mut visited = HashSet::new();
-        let mut queue = vec![parent];
+        let mut queue: Vec<Hash256> = direct_parents.iter().cloned().collect();
 
         while let Some(current) = queue.pop() {
             if !visited.insert(current) {
@@ -453,10 +462,10 @@ impl Mempool {
                 self.created_utxos.remove(&outpoint);
             }
 
-            // Update ancestor descendant stats
+            // Update ancestor descendant stats (once per ancestor, not per parent)
             if let Some(parents) = self.parents.get(txid).cloned() {
+                self.update_all_ancestors_for_remove(&parents, entry.vsize, entry.fee);
                 for parent in &parents {
-                    self.update_ancestors_for_remove(*parent, entry.vsize, entry.fee);
                     if let Some(children) = self.children.get_mut(parent) {
                         children.remove(txid);
                     }
@@ -476,9 +485,15 @@ impl Mempool {
     }
 
     /// Update all ancestors' descendant stats when removing a transaction.
-    fn update_ancestors_for_remove(&mut self, parent: Hash256, vsize: usize, fee: u64) {
+    /// Takes all direct parents and updates every unique ancestor exactly once.
+    fn update_all_ancestors_for_remove(
+        &mut self,
+        direct_parents: &HashSet<Hash256>,
+        vsize: usize,
+        fee: u64,
+    ) {
         let mut visited = HashSet::new();
-        let mut queue = vec![parent];
+        let mut queue: Vec<Hash256> = direct_parents.iter().cloned().collect();
 
         while let Some(current) = queue.pop() {
             if !visited.insert(current) {
@@ -603,6 +618,25 @@ impl Mempool {
         }
 
         (visited.len(), total_size, total_fees)
+    }
+
+    /// Get all ancestors (including direct parents) for a set of direct parents.
+    fn get_all_ancestors(&self, direct_parents: &HashSet<Hash256>) -> HashSet<Hash256> {
+        let mut visited = HashSet::new();
+        let mut queue: Vec<Hash256> = direct_parents.iter().cloned().collect();
+
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(grandparents) = self.parents.get(&current) {
+                for gp in grandparents {
+                    queue.push(*gp);
+                }
+            }
+        }
+
+        visited
     }
 
     /// Get all descendants of a transaction.
@@ -1299,5 +1333,301 @@ mod tests {
         };
         assert!(!mempool.is_spent(&other));
         assert_eq!(mempool.get_spending_tx(&other), None);
+    }
+
+    #[test]
+    fn test_chain_of_25_transactions_passes() {
+        // Default config allows 25 ancestors (including self)
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        // Create initial UTXO with enough value for 25 transactions
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let initial_value = 25_000_000u64; // 0.25 BTC
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, initial_value)]);
+
+        // Build chain of 25 transactions
+        let mut prev_txid = utxo_txid;
+        let mut prev_value = initial_value;
+        let mut txids = Vec::new();
+
+        for i in 0..25 {
+            let fee = 1000u64; // 1000 satoshi fee per tx
+            let output_value = prev_value - fee;
+            let tx = make_tx(vec![(prev_txid, 0)], vec![output_value], 1);
+            let txid = tx.txid();
+
+            let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+            assert!(
+                result.is_ok(),
+                "Transaction {} in chain should be accepted, got: {:?}",
+                i + 1,
+                result
+            );
+
+            txids.push(txid);
+            prev_txid = txid;
+            prev_value = output_value;
+        }
+
+        // Verify all 25 transactions are in mempool
+        assert_eq!(mempool.size(), 25);
+
+        // Verify the last transaction has 25 ancestors (including itself)
+        let last_entry = mempool.get(&txids[24]).unwrap();
+        assert_eq!(last_entry.ancestor_count, 25);
+
+        // Verify the first transaction has 25 descendants (including itself)
+        let first_entry = mempool.get(&txids[0]).unwrap();
+        assert_eq!(first_entry.descendant_count, 25);
+    }
+
+    #[test]
+    fn test_chain_of_26_transactions_fails_ancestor_limit() {
+        // Default config allows 25 ancestors (including self)
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        // Create initial UTXO with enough value for 26 transactions
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let initial_value = 30_000_000u64;
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, initial_value)]);
+
+        // Build chain of 25 transactions (should all pass)
+        let mut prev_txid = utxo_txid;
+        let mut prev_value = initial_value;
+
+        for i in 0..25 {
+            let fee = 1000u64;
+            let output_value = prev_value - fee;
+            let tx = make_tx(vec![(prev_txid, 0)], vec![output_value], 1);
+            let txid = tx.txid();
+
+            let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+            assert!(
+                result.is_ok(),
+                "Transaction {} should be accepted",
+                i + 1
+            );
+
+            prev_txid = txid;
+            prev_value = output_value;
+        }
+
+        assert_eq!(mempool.size(), 25);
+
+        // 26th transaction should fail (would have 26 ancestors)
+        let fee = 1000u64;
+        let output_value = prev_value - fee;
+        let tx26 = make_tx(vec![(prev_txid, 0)], vec![output_value], 1);
+
+        let result = mempool.add_transaction(tx26, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::TooManyAncestors(26, 25))),
+            "26th transaction should be rejected for too many ancestors, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_descendant_limit_blocks_new_children() {
+        // Test that descendant limit prevents adding children when an ancestor
+        // already has max descendants
+        let config = MempoolConfig {
+            max_ancestor_count: 50, // High ancestor limit
+            max_descendant_count: 3, // Low descendant limit for testing
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        // Create initial UTXO
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000)]);
+
+        // tx1: root transaction
+        let tx1 = make_tx(vec![(utxo_txid, 0)], vec![99_000_000], 1);
+        let txid1 = tx1.txid();
+        mempool
+            .add_transaction(tx1, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // tx2: child of tx1
+        let tx2 = make_tx(vec![(txid1, 0)], vec![98_000_000], 1);
+        let txid2 = tx2.txid();
+        mempool
+            .add_transaction(tx2, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // tx3: child of tx2, grandchild of tx1
+        let tx3 = make_tx(vec![(txid2, 0)], vec![97_000_000], 1);
+        let txid3 = tx3.txid();
+        mempool
+            .add_transaction(tx3, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // Verify tx1 now has 3 descendants (including itself)
+        assert_eq!(mempool.get(&txid1).unwrap().descendant_count, 3);
+
+        // tx4: child of tx3, should fail because tx1 would have 4 descendants
+        let tx4 = make_tx(vec![(txid3, 0)], vec![96_000_000], 1);
+        let result = mempool.add_transaction(tx4, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::TooManyDescendants(4, 3))),
+            "tx4 should be rejected for too many descendants, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_package_limits_with_branching() {
+        // Test ancestor/descendant limits with a branching transaction graph
+        //
+        //       utxo
+        //        |
+        //       tx1 (2 outputs)
+        //      /   \
+        //    tx2   tx3
+        //      \   /
+        //       tx4 (spends both)
+        //
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        // Create initial UTXO
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000)]);
+
+        // tx1: root with 2 outputs
+        let tx1 = make_tx(vec![(utxo_txid, 0)], vec![49_000_000, 49_000_000], 1);
+        let txid1 = tx1.txid();
+        mempool
+            .add_transaction(tx1, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // tx2: spends output 0 of tx1
+        let tx2 = make_tx(vec![(txid1, 0)], vec![48_000_000], 1);
+        let txid2 = tx2.txid();
+        mempool
+            .add_transaction(tx2, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // tx3: spends output 1 of tx1
+        let tx3 = make_tx(vec![(txid1, 1)], vec![48_000_000], 1);
+        let txid3 = tx3.txid();
+        mempool
+            .add_transaction(tx3, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // tx4: spends outputs from both tx2 and tx3
+        let tx4 = make_tx(vec![(txid2, 0), (txid3, 0)], vec![95_000_000], 1);
+        let txid4 = tx4.txid();
+        mempool
+            .add_transaction(tx4, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // tx4 should have 4 ancestors: tx1, tx2, tx3, and itself
+        let entry4 = mempool.get(&txid4).unwrap();
+        assert_eq!(entry4.ancestor_count, 4);
+
+        // tx1 should have 4 descendants: itself, tx2, tx3, and tx4
+        let entry1 = mempool.get(&txid1).unwrap();
+        assert_eq!(entry1.descendant_count, 4);
+    }
+
+    #[test]
+    fn test_ancestor_size_limit() {
+        // Test that ancestor size limit is enforced
+        // Each transaction is ~86 vbytes, so set limit to allow only 2 txs
+        let config = MempoolConfig {
+            max_ancestor_count: 100,
+            max_ancestor_size: 200, // About 2 transactions worth (~86 vB each)
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        // Create initial UTXO
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000)]);
+
+        // First transaction
+        let tx1 = make_tx(vec![(utxo_txid, 0)], vec![99_000_000], 1);
+        let txid1 = tx1.txid();
+        let vsize1 = tx1.vsize();
+        mempool
+            .add_transaction(tx1, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // Second transaction
+        let tx2 = make_tx(vec![(txid1, 0)], vec![98_000_000], 1);
+        let txid2 = tx2.txid();
+        mempool
+            .add_transaction(tx2, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // Third transaction should fail due to ancestor size limit
+        let tx3 = make_tx(vec![(txid2, 0)], vec![97_000_000], 1);
+        let vsize3 = tx3.vsize();
+        let result = mempool.add_transaction(tx3, &|op| utxos.get(op).cloned());
+
+        // Total ancestor size would be: vsize1 + vsize2 + vsize3 > 200
+        assert!(
+            matches!(result, Err(MempoolError::AncestorSizeTooLarge(_, 200))),
+            "tx3 should be rejected for ancestor size too large, got: {:?} (vsize1={}, vsize3={})",
+            result,
+            vsize1,
+            vsize3
+        );
+    }
+
+    #[test]
+    fn test_descendant_size_limit() {
+        // Test that descendant size limit is enforced
+        // Each transaction is ~86 vbytes, so set limit to allow only 2 txs
+        let config = MempoolConfig {
+            max_descendant_count: 100,
+            max_descendant_size: 200, // About 2 transactions worth (~86 vB each)
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        // Create initial UTXO
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000)]);
+
+        // First transaction
+        let tx1 = make_tx(vec![(utxo_txid, 0)], vec![99_000_000], 1);
+        let txid1 = tx1.txid();
+        mempool
+            .add_transaction(tx1, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // Second transaction
+        let tx2 = make_tx(vec![(txid1, 0)], vec![98_000_000], 1);
+        let txid2 = tx2.txid();
+        mempool
+            .add_transaction(tx2, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // Third transaction should fail due to descendant size limit on tx1
+        let tx3 = make_tx(vec![(txid2, 0)], vec![97_000_000], 1);
+        let result = mempool.add_transaction(tx3, &|op| utxos.get(op).cloned());
+
+        assert!(
+            matches!(result, Err(MempoolError::DescendantSizeTooLarge(_, 200))),
+            "tx3 should be rejected for descendant size too large, got: {:?}",
+            result
+        );
     }
 }
