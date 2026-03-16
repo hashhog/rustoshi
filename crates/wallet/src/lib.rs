@@ -44,6 +44,7 @@ pub mod coin_selection;
 pub mod db;
 pub mod descriptor;
 pub mod hd;
+pub mod manager;
 pub mod miniscript;
 pub mod psbt;
 pub mod wallet;
@@ -64,4 +65,5 @@ pub use miniscript::{
     SatisfactionResult, ScriptContext, StrKey, Type, TypeProperties, Witness,
 };
 pub use psbt::{KeyOrigin, Psbt, PsbtError, PsbtInput, PsbtOutput, PsbtRole};
+pub use manager::{CreateWalletOptions, WalletDirEntry, WalletManager, WalletResult};
 pub use wallet::{calculate_vsize, AddressType, Wallet, WalletUtxo};
