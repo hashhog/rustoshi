@@ -29,6 +29,7 @@ pub mod chain_state;
 pub mod fee_estimator;
 pub mod mempool;
 pub mod params;
+pub mod pow;
 pub mod script;
 pub mod validation;
 
@@ -58,4 +59,10 @@ pub use validation::{
 pub use chain_state::{ChainState, CompressedScript, UtxoCache};
 pub use fee_estimator::FeeEstimator;
 pub use mempool::{Mempool, MempoolConfig, MempoolEntry, MempoolError};
-pub use block_template::{build_block_template, BlockTemplate, BlockTemplateConfig};
+pub use block_template::{
+    build_block_template, is_final_tx, BlockTemplate, BlockTemplateConfig, MAX_SEQUENCE_NONFINAL,
+    SEQUENCE_FINAL,
+};
+pub use pow::{
+    get_next_work_required, check_proof_of_work, permitted_difficulty_transition, BlockIndex,
+};
