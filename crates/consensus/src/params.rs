@@ -257,7 +257,8 @@ impl ChainParams {
             taproot_height: 709_632,
             bip30_exception_heights: vec![91842, 91880],
             assumed_valid_block: None,
-            minimum_chain_work: [0u8; 32], // simplified; real value is very large
+            // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for mainnet
+            minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000001128750f82f4c366153a3a030"),
         }
     }
 
@@ -291,7 +292,8 @@ impl ChainParams {
             taproot_height: 2032291, // testnet3 taproot approximate
             bip30_exception_heights: vec![],
             assumed_valid_block: None,
-            minimum_chain_work: [0u8; 32],
+            // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for testnet3
+            minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000000000017dde1c649f3708d14b6"),
         }
     }
 
@@ -328,7 +330,8 @@ impl ChainParams {
             taproot_height: 1,
             bip30_exception_heights: vec![],
             assumed_valid_block: None,
-            minimum_chain_work: [0u8; 32],
+            // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for testnet4
+            minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000000000009a0fe15d0177d086304"),
         }
     }
 
@@ -360,7 +363,8 @@ impl ChainParams {
             taproot_height: 1,
             bip30_exception_heights: vec![],
             assumed_valid_block: None,
-            minimum_chain_work: [0u8; 32],
+            // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for signet
+            minimum_chain_work: hex_to_u256("00000000000000000000000000000000000000000000000000000b463ea0a4b8"),
         }
     }
 
@@ -717,6 +721,24 @@ fn hex_decode(s: &str) -> Vec<u8> {
         bytes.push((high << 4 | low) as u8);
     }
     bytes
+}
+
+/// Decode a 64-character hex string to a [u8; 32] array.
+/// Used for minimum_chain_work values. Panics on invalid hex.
+fn hex_to_u256(s: &str) -> [u8; 32] {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    assert!(s.len() <= 64, "hex string too long for u256");
+
+    // Pad with leading zeros to 64 characters
+    let padded = format!("{:0>64}", s);
+    let mut result = [0u8; 32];
+    let mut chars = padded.chars();
+    for byte in result.iter_mut() {
+        let high = chars.next().unwrap().to_digit(16).expect("valid hex char");
+        let low = chars.next().unwrap().to_digit(16).expect("valid hex char");
+        *byte = ((high << 4) | low) as u8;
+    }
+    result
 }
 
 // ============================================================

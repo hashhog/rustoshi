@@ -66,6 +66,7 @@ pub use block_template::{
 };
 pub use pow::{
     get_next_work_required, check_proof_of_work, permitted_difficulty_transition, BlockIndex,
+    get_block_proof, ChainWork,
 };
 pub use versionbits::{
     get_state_for, get_state_statistics, compute_block_version, is_deployment_active,
