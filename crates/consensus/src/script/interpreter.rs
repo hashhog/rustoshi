@@ -264,9 +264,9 @@ pub trait SignatureChecker {
     /// Verify a signature against a public key.
     ///
     /// # Arguments
-    /// * `sig` - The signature bytes (without sighash type for checksig ops)
+    /// * `sig` - The full signature bytes INCLUDING the sighash type byte at the end
     /// * `pubkey` - The public key bytes
-    /// * `script_code` - The script being signed (for sighash computation)
+    /// * `script_code` - The subscript for sighash computation (after last OP_CODESEPARATOR)
     /// * `sig_version` - Which sighash algorithm to use
     ///
     /// # Returns
@@ -306,6 +306,30 @@ impl SignatureChecker for DummyChecker {
 
     fn check_sequence(&self, _: i64) -> bool {
         false
+    }
+}
+
+/// Get the subscript for signature hashing.
+///
+/// Returns the portion of the script starting after the last OP_CODESEPARATOR.
+/// If no OP_CODESEPARATOR has been encountered (codesep_pos is the sentinel
+/// value 0xFFFFFFFF), returns the full script.
+///
+/// # Arguments
+/// * `full_script` - The complete script being executed
+/// * `codesep_pos` - Position of last OP_CODESEPARATOR, or 0xFFFFFFFF if none
+fn get_subscript(full_script: &[u8], codesep_pos: u32) -> &[u8] {
+    if codesep_pos == 0xFFFFFFFF {
+        // No OP_CODESEPARATOR encountered, use full script
+        full_script
+    } else {
+        // Start after the OP_CODESEPARATOR
+        let start = (codesep_pos as usize) + 1;
+        if start < full_script.len() {
+            &full_script[start..]
+        } else {
+            &[]
+        }
     }
 }
 
@@ -572,11 +596,18 @@ fn eval_script_internal(
                     false
                 } else {
                     let val = ctx.pop()?;
-                    if ctx.flags.verify_minimalif && val.len() > 1 {
-                        return Err(ScriptError::MinimalIf);
-                    }
-                    if ctx.flags.verify_minimalif && val.len() == 1 && val[0] != 0 && val[0] != 1 {
-                        return Err(ScriptError::MinimalIf);
+                    // MINIMALIF: argument must be exactly empty or [0x01].
+                    // - Tapscript: unconditional consensus rule
+                    // - Witness v0: policy rule, enabled via verify_minimalif flag
+                    let check_minimalif = ctx.sig_version == SigVersion::Tapscript
+                        || (ctx.sig_version == SigVersion::WitnessV0
+                            && ctx.flags.verify_minimalif);
+                    if check_minimalif {
+                        // Only [] (empty) and [0x01] are valid.
+                        // [0x00], [0x02], multi-byte values all fail.
+                        if val.len() > 1 || (val.len() == 1 && val[0] != 1) {
+                            return Err(ScriptError::MinimalIf);
+                        }
                     }
                     stack_bool(&val)
                 };
@@ -587,11 +618,18 @@ fn eval_script_internal(
                     true
                 } else {
                     let val = ctx.pop()?;
-                    if ctx.flags.verify_minimalif && val.len() > 1 {
-                        return Err(ScriptError::MinimalIf);
-                    }
-                    if ctx.flags.verify_minimalif && val.len() == 1 && val[0] != 0 && val[0] != 1 {
-                        return Err(ScriptError::MinimalIf);
+                    // MINIMALIF: argument must be exactly empty or [0x01].
+                    // - Tapscript: unconditional consensus rule
+                    // - Witness v0: policy rule, enabled via verify_minimalif flag
+                    let check_minimalif = ctx.sig_version == SigVersion::Tapscript
+                        || (ctx.sig_version == SigVersion::WitnessV0
+                            && ctx.flags.verify_minimalif);
+                    if check_minimalif {
+                        // Only [] (empty) and [0x01] are valid.
+                        // [0x00], [0x02], multi-byte values all fail.
+                        if val.len() > 1 || (val.len() == 1 && val[0] != 1) {
+                            return Err(ScriptError::MinimalIf);
+                        }
                     }
                     !stack_bool(&val)
                 };
@@ -950,7 +988,8 @@ fn eval_script_internal(
             }
             Opcode::OP_CODESEPARATOR => {
                 // Update the position for signature hashing
-                // pc is now pointing past the CODESEPARATOR
+                // Store the position OF the OP_CODESEPARATOR opcode.
+                // The subscript for sighash will start AFTER this position.
                 ctx.codesep_pos = (pc - 1) as u32;
             }
             Opcode::OP_CHECKSIG => {
@@ -970,9 +1009,10 @@ fn eval_script_internal(
                 let success = if sig.is_empty() {
                     false
                 } else {
-                    // The last byte of sig is the sighash type
-                    let sig_bytes = &sig[..sig.len() - 1];
-                    ctx.checker.check_sig(sig_bytes, &pubkey, full_script, ctx.sig_version)
+                    // Compute the subscript starting after the last OP_CODESEPARATOR
+                    let subscript = get_subscript(full_script, ctx.codesep_pos);
+                    // Pass full signature including sighash type byte
+                    ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
                 };
 
                 // NULLFAIL: failed sig must be empty
@@ -997,8 +1037,10 @@ fn eval_script_internal(
                 let success = if sig.is_empty() {
                     false
                 } else {
-                    let sig_bytes = &sig[..sig.len() - 1];
-                    ctx.checker.check_sig(sig_bytes, &pubkey, full_script, ctx.sig_version)
+                    // Compute the subscript starting after the last OP_CODESEPARATOR
+                    let subscript = get_subscript(full_script, ctx.codesep_pos);
+                    // Pass full signature including sighash type byte
+                    ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
                 };
 
                 if !success && ctx.flags.verify_nullfail && !sig.is_empty() {
@@ -1052,6 +1094,8 @@ fn eval_script_internal(
 
                 // Verify signatures in order
                 // Each signature must match a pubkey, and pubkeys are consumed left-to-right
+                // Compute the subscript starting after the last OP_CODESEPARATOR
+                let subscript = get_subscript(full_script, ctx.codesep_pos);
                 let mut key_idx = 0;
                 let mut success = true;
                 for sig in sigs.iter() {
@@ -1061,7 +1105,6 @@ fn eval_script_internal(
                         break;
                     }
 
-                    let sig_bytes = &sig[..sig.len() - 1];
                     let mut found = false;
 
                     while key_idx < n_keys {
@@ -1076,7 +1119,8 @@ fn eval_script_internal(
                             return Err(ScriptError::WitnessPubkeyType);
                         }
 
-                        if ctx.checker.check_sig(sig_bytes, pubkey, full_script, ctx.sig_version) {
+                        // Pass full signature including sighash type byte
+                        if ctx.checker.check_sig(sig, pubkey, subscript, ctx.sig_version) {
                             found = true;
                             break;
                         }
@@ -1135,6 +1179,8 @@ fn eval_script_internal(
                     return Err(ScriptError::NullDummy);
                 }
 
+                // Compute the subscript starting after the last OP_CODESEPARATOR
+                let subscript = get_subscript(full_script, ctx.codesep_pos);
                 let mut key_idx = 0;
                 let mut success = true;
                 for sig in sigs.iter() {
@@ -1143,7 +1189,6 @@ fn eval_script_internal(
                         break;
                     }
 
-                    let sig_bytes = &sig[..sig.len() - 1];
                     let mut found = false;
 
                     while key_idx < n_keys {
@@ -1158,7 +1203,8 @@ fn eval_script_internal(
                             return Err(ScriptError::WitnessPubkeyType);
                         }
 
-                        if ctx.checker.check_sig(sig_bytes, pubkey, full_script, ctx.sig_version) {
+                        // Pass full signature including sighash type byte
+                        if ctx.checker.check_sig(sig, pubkey, subscript, ctx.sig_version) {
                             found = true;
                             break;
                         }
@@ -2856,5 +2902,170 @@ mod tests {
         // Testnet4 has P2SH active from block 1
         let flags = ScriptFlags::consensus_flags(1, true);
         assert!(flags.verify_p2sh);
+    }
+
+    // ==================== MINIMALIF tests ====================
+
+    #[test]
+    fn minimalif_witness_v0_0x02_rejected() {
+        // OP_IF with [0x02] on stack fails MINIMALIF in witness v0
+        // Script: <0x02> OP_IF OP_1 OP_ELSE OP_2 OP_ENDIF
+        // The [0x02] is truthy but not minimal (only [0x01] is allowed)
+        let mut stack = vec![vec![0x02]]; // Push 0x02 (truthy but non-minimal)
+        let mut flags = ScriptFlags::default();
+        flags.verify_minimalif = true;
+        let checker = DummyChecker;
+
+        // OP_IF OP_1 OP_ELSE OP_2 OP_ENDIF
+        let script = [0x63, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn minimalif_witness_v0_0x01_accepted() {
+        // OP_IF with [0x01] on stack passes MINIMALIF in witness v0
+        let mut stack = vec![vec![0x01]]; // Exactly [0x01] - the only valid true
+        let mut flags = ScriptFlags::default();
+        flags.verify_minimalif = true;
+        let checker = DummyChecker;
+
+        // OP_IF OP_1 OP_ELSE OP_2 OP_ENDIF
+        let script = [0x63, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(result.is_ok());
+        // Should have taken true branch, pushed 1
+        assert_eq!(stack.len(), 1);
+        assert_eq!(decode_script_num(&stack[0], false, 4).unwrap(), 1);
+    }
+
+    #[test]
+    fn minimalif_witness_v0_empty_takes_else_branch() {
+        // OP_IF with [] (empty) on stack takes else branch
+        let mut stack = vec![vec![]]; // Empty vector - valid false
+        let mut flags = ScriptFlags::default();
+        flags.verify_minimalif = true;
+        let checker = DummyChecker;
+
+        // OP_IF OP_1 OP_ELSE OP_2 OP_ENDIF
+        let script = [0x63, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(result.is_ok());
+        // Should have taken false branch (else), pushed 2
+        assert_eq!(stack.len(), 1);
+        assert_eq!(decode_script_num(&stack[0], false, 4).unwrap(), 2);
+    }
+
+    #[test]
+    fn minimalif_witness_v0_0x00_rejected() {
+        // OP_IF with [0x00] on stack fails MINIMALIF
+        // [0x00] is falsy but NOT the minimal false (empty vector is)
+        let mut stack = vec![vec![0x00]];
+        let mut flags = ScriptFlags::default();
+        flags.verify_minimalif = true;
+        let checker = DummyChecker;
+
+        let script = [0x63, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn minimalif_witness_v0_multi_byte_rejected() {
+        // OP_IF with [0x01, 0x00] on stack fails MINIMALIF (multi-byte)
+        let mut stack = vec![vec![0x01, 0x00]];
+        let mut flags = ScriptFlags::default();
+        flags.verify_minimalif = true;
+        let checker = DummyChecker;
+
+        let script = [0x63, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn minimalif_op_notif_0x02_rejected() {
+        // OP_NOTIF with [0x02] on stack fails MINIMALIF
+        let mut stack = vec![vec![0x02]];
+        let mut flags = ScriptFlags::default();
+        flags.verify_minimalif = true;
+        let checker = DummyChecker;
+
+        // OP_NOTIF OP_1 OP_ELSE OP_2 OP_ENDIF
+        let script = [0x64, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn minimalif_op_notif_0x01_takes_else_branch() {
+        // OP_NOTIF with [0x01] takes else branch (because NOT true = false)
+        let mut stack = vec![vec![0x01]];
+        let mut flags = ScriptFlags::default();
+        flags.verify_minimalif = true;
+        let checker = DummyChecker;
+
+        // OP_NOTIF OP_1 OP_ELSE OP_2 OP_ENDIF
+        let script = [0x64, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(result.is_ok());
+        // NOTIF with true input takes else branch (NOT true = false)
+        assert_eq!(decode_script_num(&stack[0], false, 4).unwrap(), 2);
+    }
+
+    #[test]
+    fn minimalif_op_notif_empty_takes_true_branch() {
+        // OP_NOTIF with [] takes the true branch (because NOT false = true)
+        let mut stack = vec![vec![]];
+        let mut flags = ScriptFlags::default();
+        flags.verify_minimalif = true;
+        let checker = DummyChecker;
+
+        // OP_NOTIF OP_1 OP_ELSE OP_2 OP_ENDIF
+        let script = [0x64, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(result.is_ok());
+        // NOTIF with false input takes main branch (NOT false = true)
+        assert_eq!(decode_script_num(&stack[0], false, 4).unwrap(), 1);
+    }
+
+    #[test]
+    fn minimalif_tapscript_unconditional() {
+        // Tapscript enforces MINIMALIF unconditionally (no flag needed)
+        let mut stack = vec![vec![0x02]];
+        let flags = ScriptFlags::default(); // verify_minimalif is false
+        let checker = DummyChecker;
+
+        let script = [0x63, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Tapscript);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn minimalif_legacy_not_enforced() {
+        // Legacy scripts do NOT enforce MINIMALIF (even with flag)
+        let mut stack = vec![vec![0x02]];
+        let mut flags = ScriptFlags::default();
+        flags.verify_minimalif = true; // Flag is set but should be ignored for legacy
+        let checker = DummyChecker;
+
+        let script = [0x63, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        // Should succeed - legacy doesn't enforce MINIMALIF
+        assert!(result.is_ok());
+        assert_eq!(decode_script_num(&stack[0], false, 4).unwrap(), 1);
+    }
+
+    #[test]
+    fn minimalif_witness_v0_flag_required() {
+        // Witness v0 requires the flag to enforce MINIMALIF (it's policy, not consensus)
+        let mut stack = vec![vec![0x02]];
+        let flags = ScriptFlags::default(); // verify_minimalif is false
+        let checker = DummyChecker;
+
+        let script = [0x63, 0x51, 0x67, 0x52, 0x68];
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        // Should succeed - flag not set
+        assert!(result.is_ok());
     }
 }
