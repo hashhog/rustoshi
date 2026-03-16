@@ -50,6 +50,8 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Sigop counting with witness discount (P2SH, P2WPKH, P2WSH)
 - [x] BIP-9 versionbits state machine (soft fork activation tracking)
 - [x] Inventory trickling (Poisson-timed tx relay, inbound/outbound intervals, batching)
+- [x] Checkpoint verification (known block hashes, fork rejection below checkpoints)
+- [x] Transaction index (txindex, getrawtransaction for confirmed txs with blockhash)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
