@@ -52,6 +52,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Inventory trickling (Poisson-timed tx relay, inbound/outbound intervals, batching)
 - [x] Checkpoint verification (known block hashes, fork rejection below checkpoints)
 - [x] Transaction index (txindex, getrawtransaction for confirmed txs with blockhash)
+- [x] Flat file block storage (blk?????.dat files, 128 MiB limit, pre-allocation)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
