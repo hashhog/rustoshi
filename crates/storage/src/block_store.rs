@@ -119,7 +119,7 @@ pub struct TxIndexEntry {
 /// UTXO entry stored in CF_UTXO.
 ///
 /// Contains the data needed to validate spending of this output.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoinEntry {
     /// Height of the block that created this output.
     pub height: u32,

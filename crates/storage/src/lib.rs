@@ -43,8 +43,10 @@
 pub mod block_store;
 pub mod columns;
 pub mod db;
+pub mod undo;
 
 pub use block_store::{BlockIndexEntry, BlockStatus, BlockStore, CoinEntry, TxIndexEntry, UndoData};
+pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;
 pub use db::{ChainDb, StorageError, CURRENT_DB_VERSION};
 
@@ -439,5 +441,193 @@ mod tests {
         assert_eq!(entry.block_hash, retrieved.block_hash);
         assert_eq!(entry.tx_offset, retrieved.tx_offset);
         assert_eq!(entry.tx_length, retrieved.tx_length);
+    }
+
+    // =========================
+    // BlockUndo and TxUndo tests
+    // =========================
+
+    #[test]
+    fn test_block_undo_storage_roundtrip() {
+        use crate::undo::{BlockUndo, TxUndo};
+
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let hash = Hash256::from_hex(
+            "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048",
+        )
+        .unwrap();
+
+        // Create a BlockUndo with structured tx undos
+        let mut block_undo = BlockUndo::new();
+
+        // Transaction 1 spent 2 inputs
+        let mut tx1_undo = TxUndo::new();
+        tx1_undo.add_spent_coin(CoinEntry {
+            height: 0,
+            is_coinbase: true,
+            value: 50_0000_0000,
+            script_pubkey: vec![0x51], // OP_1
+        });
+        tx1_undo.add_spent_coin(CoinEntry {
+            height: 50,
+            is_coinbase: false,
+            value: 10_0000_0000,
+            script_pubkey: vec![0x76, 0xa9, 0x14], // P2PKH prefix
+        });
+        block_undo.add_tx_undo(tx1_undo);
+
+        // Transaction 2 spent 1 input
+        let mut tx2_undo = TxUndo::new();
+        tx2_undo.add_spent_coin(CoinEntry {
+            height: 100,
+            is_coinbase: false,
+            value: 5_0000_0000,
+            script_pubkey: vec![0x00, 0x14], // P2WPKH prefix
+        });
+        block_undo.add_tx_undo(tx2_undo);
+
+        // Convert to flat UndoData for storage
+        let undo_data = UndoData {
+            spent_coins: block_undo.to_flat(),
+        };
+
+        store.put_undo(&hash, &undo_data).unwrap();
+        let retrieved = store.get_undo(&hash).unwrap().unwrap();
+
+        assert_eq!(retrieved.spent_coins.len(), 3);
+        assert_eq!(retrieved.spent_coins[0].height, 0);
+        assert!(retrieved.spent_coins[0].is_coinbase);
+        assert_eq!(retrieved.spent_coins[0].value, 50_0000_0000);
+        assert_eq!(retrieved.spent_coins[1].height, 50);
+        assert!(!retrieved.spent_coins[1].is_coinbase);
+        assert_eq!(retrieved.spent_coins[2].height, 100);
+    }
+
+    #[test]
+    fn test_block_undo_from_flat_conversion() {
+        use crate::undo::BlockUndo;
+
+        // Simulate what connect_block produces: flat list of spent coins
+        let spent_coins = vec![
+            CoinEntry {
+                height: 100,
+                is_coinbase: true,
+                value: 50_0000_0000,
+                script_pubkey: vec![0x51],
+            },
+            CoinEntry {
+                height: 200,
+                is_coinbase: false,
+                value: 25_0000_0000,
+                script_pubkey: vec![0x52],
+            },
+            CoinEntry {
+                height: 300,
+                is_coinbase: false,
+                value: 12_5000_0000,
+                script_pubkey: vec![0x53],
+            },
+        ];
+
+        // First tx (non-coinbase) had 2 inputs, second had 1 input
+        let input_counts = vec![2, 1];
+
+        let block_undo = BlockUndo::from_flat(&spent_coins, &input_counts);
+
+        // Verify structure
+        assert_eq!(block_undo.len(), 2);
+        assert_eq!(block_undo.tx_undo[0].len(), 2);
+        assert_eq!(block_undo.tx_undo[1].len(), 1);
+
+        // Verify roundtrip
+        let flat_again = block_undo.to_flat();
+        assert_eq!(flat_again.len(), 3);
+        assert_eq!(flat_again[0].height, 100);
+        assert_eq!(flat_again[1].height, 200);
+        assert_eq!(flat_again[2].height, 300);
+    }
+
+    #[test]
+    fn test_undo_delete() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let hash = Hash256::from_hex(
+            "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048",
+        )
+        .unwrap();
+
+        let undo = UndoData {
+            spent_coins: vec![CoinEntry {
+                height: 100,
+                is_coinbase: false,
+                value: 1_0000_0000,
+                script_pubkey: vec![0x51],
+            }],
+        };
+
+        store.put_undo(&hash, &undo).unwrap();
+        assert!(store.get_undo(&hash).unwrap().is_some());
+
+        store.delete_undo(&hash).unwrap();
+        assert!(store.get_undo(&hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_undo_with_have_undo_flag() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let hash = Hash256::from_hex(
+            "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048",
+        )
+        .unwrap();
+
+        // Create block index entry without HAVE_UNDO flag
+        let mut status = BlockStatus::new();
+        status.set(BlockStatus::HAVE_DATA);
+        status.set(BlockStatus::VALID_SCRIPTS);
+
+        let entry = BlockIndexEntry {
+            height: 1,
+            status,
+            n_tx: 2,
+            timestamp: 1231469665,
+            bits: 0x1d00ffff,
+            nonce: 2573394689,
+            version: 1,
+            prev_hash: Hash256::ZERO,
+            chain_work: [0u8; 32],
+        };
+
+        store.put_block_index(&hash, &entry).unwrap();
+
+        // Verify HAVE_UNDO is not set
+        let retrieved = store.get_block_index(&hash).unwrap().unwrap();
+        assert!(!retrieved.status.has(BlockStatus::HAVE_UNDO));
+
+        // Store undo data
+        let undo = UndoData {
+            spent_coins: vec![CoinEntry {
+                height: 0,
+                is_coinbase: true,
+                value: 50_0000_0000,
+                script_pubkey: vec![0x51],
+            }],
+        };
+        store.put_undo(&hash, &undo).unwrap();
+
+        // Update block index with HAVE_UNDO flag
+        let mut updated_entry = retrieved;
+        updated_entry.status.set(BlockStatus::HAVE_UNDO);
+        store.put_block_index(&hash, &updated_entry).unwrap();
+
+        // Verify HAVE_UNDO is now set
+        let final_entry = store.get_block_index(&hash).unwrap().unwrap();
+        assert!(final_entry.status.has(BlockStatus::HAVE_UNDO));
+        assert!(final_entry.status.has(BlockStatus::HAVE_DATA));
+        assert!(final_entry.status.has(BlockStatus::VALID_SCRIPTS));
     }
 }
