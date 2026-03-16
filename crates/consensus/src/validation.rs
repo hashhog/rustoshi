@@ -1098,10 +1098,17 @@ impl<'a> SignatureChecker for TransactionSignatureChecker<'a> {
         // Compute the sighash based on version
         let sighash = match sig_version {
             SigVersion::Base => {
-                rustoshi_crypto::legacy_sighash(self.tx, self.input_index, subscript, hash_type)
+                // For legacy sighash:
+                // 1. Apply FindAndDelete to remove the push-encoded signature
+                // 2. Remove OP_CODESEPARATOR opcodes from the subscript
+                // Both operations are required for correct legacy sighash computation.
+                let script_code = rustoshi_crypto::find_and_delete(subscript, sig_data);
+                let script_code = rustoshi_crypto::remove_codeseparators(&script_code);
+                rustoshi_crypto::legacy_sighash(self.tx, self.input_index, &script_code, hash_type)
             }
             SigVersion::WitnessV0 => {
-                // For P2WPKH, the subscript should already be the scriptCode
+                // For SegWit v0, FindAndDelete is NOT applied (BIP-143).
+                // The subscript should already be the scriptCode.
                 rustoshi_crypto::segwit_v0_sighash(
                     self.tx,
                     self.input_index,
