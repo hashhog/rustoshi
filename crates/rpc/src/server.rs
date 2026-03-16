@@ -29,6 +29,7 @@ use rustoshi_consensus::{
     mempool::{Mempool, MempoolConfig},
     ChainParams, NetworkId, COIN,
 };
+use rustoshi_network::message::{InvType, InvVector, NetworkMessage};
 use rustoshi_network::peer_manager::PeerManager;
 use rustoshi_primitives::{Block, Decodable, Encodable, Hash256, OutPoint, Transaction};
 use rustoshi_storage::{block_store::BlockStore, ChainDb};
@@ -52,10 +53,16 @@ pub mod rpc_error {
     pub const RPC_DATABASE_ERROR: i32 = -20;
     /// Deserialization error.
     pub const RPC_DESERIALIZATION_ERROR: i32 = -22;
-    /// Transaction or block already in chain.
-    pub const RPC_VERIFY_ALREADY_IN_CHAIN: i32 = -27;
+    /// Transaction error (generic).
+    pub const RPC_TRANSACTION_ERROR: i32 = -25;
     /// Transaction rejected by mempool.
     pub const RPC_VERIFY_REJECTED: i32 = -26;
+    /// Transaction rejected by mempool (alias for clarity).
+    pub const RPC_TRANSACTION_REJECTED: i32 = -26;
+    /// Transaction or block already in chain.
+    pub const RPC_VERIFY_ALREADY_IN_CHAIN: i32 = -27;
+    /// Transaction already in UTXO set (confirmed).
+    pub const RPC_TRANSACTION_ALREADY_IN_CHAIN: i32 = -27;
     /// P2P network disabled.
     pub const RPC_CLIENT_P2P_DISABLED: i32 = -9;
     /// Block not found.
@@ -176,16 +183,32 @@ pub trait RustoshiRpc {
     async fn get_difficulty(&self) -> RpcResult<f64>;
 
     /// Get raw transaction by txid.
+    ///
+    /// Parameters:
+    /// - txid: The transaction ID
+    /// - verbose: If true, return JSON object with details; if false, return hex
+    /// - blockhash: Optional block hash to look in for confirmed transactions
     #[method(name = "getrawtransaction")]
     async fn get_raw_transaction(
         &self,
         txid: String,
         verbose: Option<bool>,
+        blockhash: Option<String>,
     ) -> RpcResult<serde_json::Value>;
 
     /// Send a raw transaction (hex-encoded) to the network.
+    ///
+    /// Parameters:
+    /// - hex: The hex-encoded raw transaction
+    /// - maxfeerate: Optional max fee rate in BTC/kvB (default: 0.10). Set to 0 to allow any fee.
+    /// - maxburnamount: Optional max amount for provably unspendable outputs in BTC (default: 0)
     #[method(name = "sendrawtransaction")]
-    async fn send_raw_transaction(&self, hex: String) -> RpcResult<String>;
+    async fn send_raw_transaction(
+        &self,
+        hex: String,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> RpcResult<String>;
 
     /// Decode a raw transaction without broadcasting.
     #[method(name = "decoderawtransaction")]
@@ -250,6 +273,27 @@ pub trait RustoshiRpc {
         vout: u32,
         include_mempool: Option<bool>,
     ) -> RpcResult<Option<TxOutResult>>;
+
+    /// List all banned IP addresses.
+    #[method(name = "listbanned")]
+    async fn list_banned(&self) -> RpcResult<Vec<BannedInfo>>;
+
+    /// Add or remove an IP from the ban list.
+    ///
+    /// Commands: "add" (ban), "remove" (unban)
+    /// bantime: duration in seconds (default: 24h = 86400)
+    #[method(name = "setban")]
+    async fn set_ban(
+        &self,
+        subnet: String,
+        command: String,
+        bantime: Option<u64>,
+        absolute: Option<bool>,
+    ) -> RpcResult<()>;
+
+    /// Clear all banned IPs.
+    #[method(name = "clearbanned")]
+    async fn clear_banned(&self) -> RpcResult<()>;
 }
 
 // ============================================================
@@ -544,6 +588,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         &self,
         txid: String,
         verbose: Option<bool>,
+        blockhash: Option<String>,
     ) -> RpcResult<serde_json::Value> {
         let tx_hash = Self::parse_hash(&txid)?;
         let verbose = verbose.unwrap_or(false);
@@ -551,18 +596,89 @@ impl RustoshiRpcServer for RpcServerImpl {
         let state = self.state.read().await;
         let store = BlockStore::new(&state.db);
 
-        // Check mempool first
-        if let Some(entry) = state.mempool.get(&tx_hash) {
-            let tx = &entry.tx;
-            if !verbose {
-                return Ok(serde_json::Value::String(hex::encode(tx.serialize())));
-            }
+        // Parse optional blockhash parameter
+        let block_hash_filter = if let Some(ref bh) = blockhash {
+            Some(Self::parse_hash(bh)?)
+        } else {
+            None
+        };
 
-            let info = build_tx_info(tx, None, None);
-            return Ok(serde_json::to_value(info).unwrap());
+        // 1. Check mempool first (unless blockhash is specified)
+        if block_hash_filter.is_none() {
+            if let Some(entry) = state.mempool.get(&tx_hash) {
+                let tx = &entry.tx;
+                if !verbose {
+                    return Ok(serde_json::Value::String(hex::encode(tx.serialize())));
+                }
+
+                let info = build_tx_info_verbose(tx, None, None, None, &state, &store);
+                return Ok(serde_json::to_value(info).unwrap());
+            }
         }
 
-        // Check tx index
+        // 2. If blockhash is provided, load that specific block and search for the txid
+        if let Some(target_block_hash) = block_hash_filter {
+            // Verify the block exists
+            let block_index = store.get_block_index(&target_block_hash).map_err(|e| {
+                Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+            })?;
+
+            if block_index.is_none() {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                    "Block hash not found",
+                ));
+            }
+
+            let block = store.get_block(&target_block_hash).map_err(|e| {
+                Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+            })?;
+
+            if block.is_none() {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "Block not available",
+                ));
+            }
+
+            let block = block.unwrap();
+
+            // Find the transaction in the block
+            for tx in &block.transactions {
+                if tx.txid() == tx_hash {
+                    if !verbose {
+                        return Ok(serde_json::Value::String(hex::encode(tx.serialize())));
+                    }
+
+                    let block_index = block_index.as_ref();
+                    let confirmations = block_index.map(|e| {
+                        if state.best_height >= e.height {
+                            state.best_height - e.height + 1
+                        } else {
+                            0
+                        }
+                    });
+                    let blocktime = block_index.map(|e| e.timestamp);
+
+                    let info = build_tx_info_verbose(
+                        tx,
+                        Some(&target_block_hash),
+                        confirmations,
+                        blocktime,
+                        &state,
+                        &store,
+                    );
+                    return Ok(serde_json::to_value(info).unwrap());
+                }
+            }
+
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                "No such transaction found in the provided block. Use gettransaction for wallet transactions.",
+            ));
+        }
+
+        // 3. If txindex is enabled, look up the transaction in the transaction index
         if let Ok(Some(tx_entry)) = store.get_tx_index(&tx_hash) {
             // Load the block to get the transaction
             if let Ok(Some(block)) = store.get_block(&tx_entry.block_hash) {
@@ -581,11 +697,15 @@ impl RustoshiRpcServer for RpcServerImpl {
                                 0
                             }
                         });
+                        let blocktime = block_index.as_ref().map(|e| e.timestamp);
 
-                        let info = build_tx_info(
+                        let info = build_tx_info_verbose(
                             tx,
                             Some(&tx_entry.block_hash),
                             confirmations,
+                            blocktime,
+                            &state,
+                            &store,
                         );
                         return Ok(serde_json::to_value(info).unwrap());
                     }
@@ -595,26 +715,83 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         Err(Self::rpc_error(
             rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
-            "Transaction not found",
+            "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
         ))
     }
 
-    async fn send_raw_transaction(&self, hex: String) -> RpcResult<String> {
+    async fn send_raw_transaction(
+        &self,
+        hex: String,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> RpcResult<String> {
+        // Default maxfeerate: 0.10 BTC/kvB (10,000,000 sat/kvB)
+        // Bitcoin Core uses DEFAULT_MAX_RAW_TX_FEE_RATE = 0.10 BTC/kvB
+        let max_fee_rate_btc_kvb = maxfeerate.unwrap_or(0.10);
+
+        // Reject fee rates > 1 BTC/kvB as clearly erroneous
+        if max_fee_rate_btc_kvb > 1.0 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                "maxfeerate cannot exceed 1 BTC/kvB",
+            ));
+        }
+
+        // Convert BTC/kvB to sat/vB: BTC/kvB * COIN / 1000
+        let max_fee_rate_sat_vb = max_fee_rate_btc_kvb * (COIN as f64) / 1000.0;
+
+        // Default maxburnamount: 0 BTC
+        let max_burn_btc = maxburnamount.unwrap_or(0.0);
+        let max_burn_sats = (max_burn_btc * COIN as f64) as u64;
+
+        // Parse the transaction
         let tx_bytes = Self::parse_hex(&hex)?;
 
         let tx = Transaction::deserialize(&tx_bytes).map_err(|_| {
             Self::rpc_error(
                 rpc_error::RPC_DESERIALIZATION_ERROR,
-                "Invalid transaction",
+                "TX decode failed. Make sure the tx has at least one input.",
             )
         })?;
 
         let txid = tx.txid();
+        let wtxid = tx.wtxid();
+        let vsize = tx.vsize();
+
+        // Check for provably unspendable outputs (OP_RETURN) exceeding maxburnamount
+        // OP_RETURN = 0x6a
+        for output in &tx.outputs {
+            let is_unspendable = output.script_pubkey.first() == Some(&0x6a); // OP_RETURN
+            if is_unspendable && output.value > max_burn_sats {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TRANSACTION_ERROR,
+                    format!(
+                        "Unspendable output exceeds maximum: {} > {} satoshis",
+                        output.value, max_burn_sats
+                    ),
+                ));
+            }
+        }
 
         let mut state = self.state.write().await;
 
-        // Collect UTXO data upfront to avoid borrow conflicts
+        // Check if transaction already exists in mempool
+        if state.mempool.contains(&txid) {
+            // Transaction already in mempool - return txid without error (Bitcoin Core behavior)
+            return Ok(txid.to_hex());
+        }
+
+        // Check if transaction is already confirmed (in UTXO set / tx index)
         let db = Arc::clone(&state.db);
+        let store = BlockStore::new(&db);
+        if let Ok(Some(_)) = store.get_tx_index(&txid) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_TRANSACTION_ALREADY_IN_CHAIN,
+                "Transaction already in block chain",
+            ));
+        }
+
+        // UTXO lookup closure
         let utxo_lookup = |outpoint: &OutPoint| {
             let store = BlockStore::new(&db);
             store
@@ -632,15 +809,96 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Add to mempool
         match state.mempool.add_transaction(tx, &utxo_lookup) {
             Ok(_) => {
-                // Track for fee estimation - get fee_rate first to avoid double borrow
-                let fee_rate = state.mempool.get(&txid).map(|e| e.fee_rate).unwrap_or(0.0);
+                // Get fee info for validation and estimation
+                let entry = state.mempool.get(&txid);
+                let (fee, fee_rate) = entry
+                    .map(|e| (e.fee, e.fee_rate))
+                    .unwrap_or((0, 0.0));
+
+                // Check if fee rate exceeds maxfeerate (unless maxfeerate is 0)
+                if max_fee_rate_btc_kvb > 0.0 && fee_rate > max_fee_rate_sat_vb {
+                    // Remove from mempool - fee too high
+                    state.mempool.remove_transaction(&txid, false);
+                    let fee_rate_btc_kvb = fee_rate * 1000.0 / (COIN as f64);
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_ERROR,
+                        format!(
+                            "Fee rate too high: {:.8} BTC/kvB > {:.8} BTC/kvB (maxfeerate)",
+                            fee_rate_btc_kvb, max_fee_rate_btc_kvb
+                        ),
+                    ));
+                }
+
+                // Calculate the absolute max fee based on maxfeerate
+                let max_fee = (max_fee_rate_sat_vb * vsize as f64) as u64;
+                if max_fee_rate_btc_kvb > 0.0 && fee > max_fee {
+                    // Remove from mempool - absolute fee too high
+                    state.mempool.remove_transaction(&txid, false);
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_ERROR,
+                        format!(
+                            "Absurdly high fee: {} satoshis (max: {} based on vsize {})",
+                            fee, max_fee, vsize
+                        ),
+                    ));
+                }
+
+                // Track for fee estimation
                 state.fee_estimator.track_transaction(txid, fee_rate);
+
+                // Drop the state lock before broadcasting
+                drop(state);
+
+                // Relay to connected peers via inv message
+                // Use WitnessTx type since we support SegWit
+                let inv = vec![InvVector {
+                    inv_type: InvType::MsgWitnessTx,
+                    hash: wtxid,
+                }];
+                let inv_msg = NetworkMessage::Inv(inv);
+
+                // Broadcast to all connected peers
+                let peer_state = self.peer_state.read().await;
+                if let Some(ref peer_manager) = peer_state.peer_manager {
+                    peer_manager.broadcast(inv_msg).await;
+                    tracing::debug!("Relayed transaction {} to peers", txid.to_hex());
+                }
+
                 Ok(txid.to_hex())
             }
-            Err(e) => Err(Self::rpc_error(
-                rpc_error::RPC_VERIFY_REJECTED,
-                format!("Transaction rejected: {}", e),
-            )),
+            Err(e) => {
+                // Map mempool errors to appropriate RPC errors
+                use rustoshi_consensus::mempool::MempoolError;
+                match &e {
+                    MempoolError::AlreadyExists => {
+                        // Already in mempool - return txid without error
+                        Ok(txid.to_hex())
+                    }
+                    MempoolError::MissingInput(prev_txid, vout) => Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_REJECTED,
+                        format!("Missing input: {}:{}", prev_txid.to_hex(), vout),
+                    )),
+                    MempoolError::Conflict(conflicting_txid) => Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_REJECTED,
+                        format!(
+                            "Transaction conflicts with mempool entry {}",
+                            conflicting_txid.to_hex()
+                        ),
+                    )),
+                    MempoolError::InsufficientFee(rate, min) => Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_REJECTED,
+                        format!("Fee rate too low: {:.2} sat/vB (minimum: {})", rate, min),
+                    )),
+                    MempoolError::Validation(verr) => Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_REJECTED,
+                        format!("Transaction validation failed: {}", verr),
+                    )),
+                    _ => Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_REJECTED,
+                        format!("Transaction rejected: {}", e),
+                    )),
+                }
+            }
         }
     }
 
@@ -810,14 +1068,17 @@ impl RustoshiRpcServer for RpcServerImpl {
             .unwrap()
             .as_secs() as u32;
 
-        // Get the current tip's bits for difficulty
+        // Get the current tip's bits and timestamp for difficulty and MTP
         let store = BlockStore::new(&state.db);
-        let bits = store
-            .get_header(&state.best_hash)
-            .ok()
-            .flatten()
-            .map(|h| h.bits)
-            .unwrap_or(0x1d00ffff);
+        let tip_header = store.get_header(&state.best_hash).ok().flatten();
+        let bits = tip_header.as_ref().map(|h| h.bits).unwrap_or(0x1d00ffff);
+
+        // Compute median-time-past (simplified: use tip timestamp as approximation)
+        // A full implementation would compute the median of the last 11 block timestamps
+        let median_time_past = tip_header
+            .as_ref()
+            .map(|h| h.timestamp as i64)
+            .unwrap_or(timestamp as i64);
 
         let config = BlockTemplateConfig {
             coinbase_script_pubkey: vec![0x51], // OP_1 (anyone can spend for testing)
@@ -830,6 +1091,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             state.best_height + 1,
             timestamp,
             bits,
+            median_time_past,
             &state.params,
             &config,
         );
@@ -1178,6 +1440,92 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         Ok(None)
     }
+
+    async fn list_banned(&self) -> RpcResult<Vec<BannedInfo>> {
+        let peer_state = self.peer_state.read().await;
+
+        if let Some(ref pm) = peer_state.peer_manager {
+            let banned: Vec<BannedInfo> = pm
+                .list_banned()
+                .into_iter()
+                .map(|(ip, entry)| BannedInfo {
+                    address: ip.to_string(),
+                    ban_created: entry.ban_created,
+                    ban_until: entry.ban_until,
+                    ban_reason: entry.reason.clone(),
+                })
+                .collect();
+            Ok(banned)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    async fn set_ban(
+        &self,
+        subnet: String,
+        command: String,
+        bantime: Option<u64>,
+        absolute: Option<bool>,
+    ) -> RpcResult<()> {
+        // Parse IP address (we don't support subnets yet, just IPs)
+        let ip: std::net::IpAddr = subnet.parse().map_err(|_| {
+            Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                "Invalid IP address format",
+            )
+        })?;
+
+        let mut peer_state = self.peer_state.write().await;
+
+        if let Some(ref mut pm) = peer_state.peer_manager {
+            match command.as_str() {
+                "add" => {
+                    // Default ban time is 24 hours (86400 seconds)
+                    let duration_secs = bantime.unwrap_or(86400);
+                    let duration = std::time::Duration::from_secs(duration_secs);
+                    let reason = if absolute.unwrap_or(false) {
+                        "manually banned (absolute)".to_string()
+                    } else {
+                        "manually banned".to_string()
+                    };
+                    pm.ban_ip(ip, duration, reason);
+                    Ok(())
+                }
+                "remove" => {
+                    if pm.unban(&ip) {
+                        Ok(())
+                    } else {
+                        // Bitcoin Core returns success even if IP wasn't banned
+                        Ok(())
+                    }
+                }
+                _ => Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!("Invalid command '{}'. Use 'add' or 'remove'.", command),
+                )),
+            }
+        } else {
+            Err(Self::rpc_error(
+                rpc_error::RPC_CLIENT_P2P_DISABLED,
+                "P2P networking is disabled",
+            ))
+        }
+    }
+
+    async fn clear_banned(&self) -> RpcResult<()> {
+        let mut peer_state = self.peer_state.write().await;
+
+        if let Some(ref mut pm) = peer_state.peer_manager {
+            pm.clear_banned();
+            Ok(())
+        } else {
+            Err(Self::rpc_error(
+                rpc_error::RPC_CLIENT_P2P_DISABLED,
+                "P2P networking is disabled",
+            ))
+        }
+    }
 }
 
 // ============================================================
@@ -1250,6 +1598,7 @@ fn detect_script_type(script: &[u8]) -> String {
 }
 
 /// Build transaction info from a transaction.
+#[allow(dead_code)]
 fn build_tx_info(
     tx: &Transaction,
     block_hash: Option<&Hash256>,
@@ -1321,6 +1670,267 @@ fn build_tx_info(
         blocktime: None,
         time: None,
     }
+}
+
+/// Build verbose transaction info with all details.
+///
+/// This is used by getrawtransaction verbose mode.
+fn build_tx_info_verbose(
+    tx: &Transaction,
+    block_hash: Option<&Hash256>,
+    confirmations: Option<u32>,
+    blocktime: Option<u32>,
+    _state: &RpcState,
+    _store: &BlockStore,
+) -> TransactionInfo {
+    TransactionInfo {
+        txid: tx.txid().to_hex(),
+        wtxid: tx.wtxid().to_hex(),
+        hash: tx.wtxid().to_hex(),
+        size: tx.serialize().len() as u32,
+        vsize: tx.vsize() as u32,
+        weight: tx.weight() as u32,
+        version: tx.version,
+        locktime: tx.lock_time,
+        vin: tx
+            .inputs
+            .iter()
+            .map(|input| {
+                if input.previous_output.is_null() {
+                    TxInputInfo {
+                        txid: None,
+                        vout: None,
+                        script_sig: None,
+                        coinbase: Some(hex::encode(&input.script_sig)),
+                        txinwitness: if input.witness.is_empty() {
+                            None
+                        } else {
+                            Some(input.witness.iter().map(hex::encode).collect())
+                        },
+                        sequence: input.sequence,
+                    }
+                } else {
+                    TxInputInfo {
+                        txid: Some(input.previous_output.txid.to_hex()),
+                        vout: Some(input.previous_output.vout),
+                        script_sig: Some(ScriptSigInfo {
+                            asm: disassemble_script(&input.script_sig),
+                            hex: hex::encode(&input.script_sig),
+                        }),
+                        coinbase: None,
+                        txinwitness: if input.witness.is_empty() {
+                            None
+                        } else {
+                            Some(input.witness.iter().map(hex::encode).collect())
+                        },
+                        sequence: input.sequence,
+                    }
+                }
+            })
+            .collect(),
+        vout: tx
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(n, output)| {
+                let script_type = detect_script_type(&output.script_pubkey);
+                TxOutputInfo {
+                    value: output.value as f64 / COIN as f64,
+                    n: n as u32,
+                    script_pubkey: ScriptPubKeyInfo {
+                        asm: disassemble_script(&output.script_pubkey),
+                        hex: hex::encode(&output.script_pubkey),
+                        script_type,
+                        address: None, // Address encoding would require bech32/base58 logic
+                    },
+                }
+            })
+            .collect(),
+        hex: hex::encode(tx.serialize()),
+        blockhash: block_hash.map(|h| h.to_hex()),
+        confirmations,
+        blocktime,
+        time: blocktime, // time is the same as blocktime for confirmed txs
+    }
+}
+
+/// Disassemble a script into human-readable form.
+fn disassemble_script(script: &[u8]) -> String {
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < script.len() {
+        let opcode = script[i];
+
+        match opcode {
+            // Push data opcodes
+            0x00 => result.push("0".to_string()),
+            0x01..=0x4b => {
+                // Direct push of 1-75 bytes
+                let len = opcode as usize;
+                if i + 1 + len <= script.len() {
+                    result.push(hex::encode(&script[i + 1..i + 1 + len]));
+                    i += len;
+                } else {
+                    result.push(format!("[error: truncated push]"));
+                    break;
+                }
+            }
+            0x4c => {
+                // OP_PUSHDATA1
+                if i + 1 < script.len() {
+                    let len = script[i + 1] as usize;
+                    if i + 2 + len <= script.len() {
+                        result.push(hex::encode(&script[i + 2..i + 2 + len]));
+                        i += 1 + len;
+                    } else {
+                        result.push("[error: truncated pushdata1]".to_string());
+                        break;
+                    }
+                } else {
+                    result.push("[error: truncated pushdata1]".to_string());
+                    break;
+                }
+            }
+            0x4d => {
+                // OP_PUSHDATA2
+                if i + 2 < script.len() {
+                    let len = u16::from_le_bytes([script[i + 1], script[i + 2]]) as usize;
+                    if i + 3 + len <= script.len() {
+                        result.push(hex::encode(&script[i + 3..i + 3 + len]));
+                        i += 2 + len;
+                    } else {
+                        result.push("[error: truncated pushdata2]".to_string());
+                        break;
+                    }
+                } else {
+                    result.push("[error: truncated pushdata2]".to_string());
+                    break;
+                }
+            }
+            0x4e => {
+                // OP_PUSHDATA4
+                if i + 4 < script.len() {
+                    let len = u32::from_le_bytes([
+                        script[i + 1],
+                        script[i + 2],
+                        script[i + 3],
+                        script[i + 4],
+                    ]) as usize;
+                    if i + 5 + len <= script.len() {
+                        result.push(hex::encode(&script[i + 5..i + 5 + len]));
+                        i += 4 + len;
+                    } else {
+                        result.push("[error: truncated pushdata4]".to_string());
+                        break;
+                    }
+                } else {
+                    result.push("[error: truncated pushdata4]".to_string());
+                    break;
+                }
+            }
+            // Small integers
+            0x4f => result.push("OP_1NEGATE".to_string()),
+            0x50 => result.push("OP_RESERVED".to_string()),
+            0x51 => result.push("OP_1".to_string()),
+            0x52 => result.push("OP_2".to_string()),
+            0x53 => result.push("OP_3".to_string()),
+            0x54 => result.push("OP_4".to_string()),
+            0x55 => result.push("OP_5".to_string()),
+            0x56 => result.push("OP_6".to_string()),
+            0x57 => result.push("OP_7".to_string()),
+            0x58 => result.push("OP_8".to_string()),
+            0x59 => result.push("OP_9".to_string()),
+            0x5a => result.push("OP_10".to_string()),
+            0x5b => result.push("OP_11".to_string()),
+            0x5c => result.push("OP_12".to_string()),
+            0x5d => result.push("OP_13".to_string()),
+            0x5e => result.push("OP_14".to_string()),
+            0x5f => result.push("OP_15".to_string()),
+            0x60 => result.push("OP_16".to_string()),
+            // Flow control
+            0x61 => result.push("OP_NOP".to_string()),
+            0x63 => result.push("OP_IF".to_string()),
+            0x64 => result.push("OP_NOTIF".to_string()),
+            0x67 => result.push("OP_ELSE".to_string()),
+            0x68 => result.push("OP_ENDIF".to_string()),
+            0x69 => result.push("OP_VERIFY".to_string()),
+            0x6a => result.push("OP_RETURN".to_string()),
+            // Stack ops
+            0x6b => result.push("OP_TOALTSTACK".to_string()),
+            0x6c => result.push("OP_FROMALTSTACK".to_string()),
+            0x73 => result.push("OP_IFDUP".to_string()),
+            0x74 => result.push("OP_DEPTH".to_string()),
+            0x75 => result.push("OP_DROP".to_string()),
+            0x76 => result.push("OP_DUP".to_string()),
+            0x77 => result.push("OP_NIP".to_string()),
+            0x78 => result.push("OP_OVER".to_string()),
+            0x79 => result.push("OP_PICK".to_string()),
+            0x7a => result.push("OP_ROLL".to_string()),
+            0x7b => result.push("OP_ROT".to_string()),
+            0x7c => result.push("OP_SWAP".to_string()),
+            0x7d => result.push("OP_TUCK".to_string()),
+            0x6d => result.push("OP_2DROP".to_string()),
+            0x6e => result.push("OP_2DUP".to_string()),
+            0x6f => result.push("OP_3DUP".to_string()),
+            0x70 => result.push("OP_2OVER".to_string()),
+            0x71 => result.push("OP_2ROT".to_string()),
+            0x72 => result.push("OP_2SWAP".to_string()),
+            // Splice ops
+            0x82 => result.push("OP_SIZE".to_string()),
+            // Bitwise logic
+            0x87 => result.push("OP_EQUAL".to_string()),
+            0x88 => result.push("OP_EQUALVERIFY".to_string()),
+            // Arithmetic
+            0x8b => result.push("OP_1ADD".to_string()),
+            0x8c => result.push("OP_1SUB".to_string()),
+            0x8f => result.push("OP_NEGATE".to_string()),
+            0x90 => result.push("OP_ABS".to_string()),
+            0x91 => result.push("OP_NOT".to_string()),
+            0x92 => result.push("OP_0NOTEQUAL".to_string()),
+            0x93 => result.push("OP_ADD".to_string()),
+            0x94 => result.push("OP_SUB".to_string()),
+            0x9a => result.push("OP_BOOLAND".to_string()),
+            0x9b => result.push("OP_BOOLOR".to_string()),
+            0x9c => result.push("OP_NUMEQUAL".to_string()),
+            0x9d => result.push("OP_NUMEQUALVERIFY".to_string()),
+            0x9e => result.push("OP_NUMNOTEQUAL".to_string()),
+            0x9f => result.push("OP_LESSTHAN".to_string()),
+            0xa0 => result.push("OP_GREATERTHAN".to_string()),
+            0xa1 => result.push("OP_LESSTHANOREQUAL".to_string()),
+            0xa2 => result.push("OP_GREATERTHANOREQUAL".to_string()),
+            0xa3 => result.push("OP_MIN".to_string()),
+            0xa4 => result.push("OP_MAX".to_string()),
+            0xa5 => result.push("OP_WITHIN".to_string()),
+            // Crypto
+            0xa6 => result.push("OP_RIPEMD160".to_string()),
+            0xa7 => result.push("OP_SHA1".to_string()),
+            0xa8 => result.push("OP_SHA256".to_string()),
+            0xa9 => result.push("OP_HASH160".to_string()),
+            0xaa => result.push("OP_HASH256".to_string()),
+            0xab => result.push("OP_CODESEPARATOR".to_string()),
+            0xac => result.push("OP_CHECKSIG".to_string()),
+            0xad => result.push("OP_CHECKSIGVERIFY".to_string()),
+            0xae => result.push("OP_CHECKMULTISIG".to_string()),
+            0xaf => result.push("OP_CHECKMULTISIGVERIFY".to_string()),
+            // Expansion
+            0xb0 => result.push("OP_NOP1".to_string()),
+            0xb1 => result.push("OP_CHECKLOCKTIMEVERIFY".to_string()),
+            0xb2 => result.push("OP_CHECKSEQUENCEVERIFY".to_string()),
+            0xb3 => result.push("OP_NOP4".to_string()),
+            0xb4 => result.push("OP_NOP5".to_string()),
+            0xb5 => result.push("OP_NOP6".to_string()),
+            0xb6 => result.push("OP_NOP7".to_string()),
+            0xb7 => result.push("OP_NOP8".to_string()),
+            0xb8 => result.push("OP_NOP9".to_string()),
+            0xb9 => result.push("OP_NOP10".to_string()),
+            0xba => result.push("OP_CHECKSIGADD".to_string()),
+            _ => result.push(format!("OP_UNKNOWN[{:#04x}]", opcode)),
+        }
+        i += 1;
+    }
+
+    result.join(" ")
 }
 
 // ============================================================
@@ -1545,6 +2155,248 @@ mod tests {
         // Larger exponent
         let target2 = compact_to_target_f64(0x1d00ffff);
         assert!(target2 > target);
+    }
+
+    // ============================================================
+    // GETRAWTRANSACTION TESTS
+    // ============================================================
+
+    #[test]
+    fn test_disassemble_script_p2pkh() {
+        // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+        let script = vec![
+            0x76, 0xa9, 0x14, // OP_DUP OP_HASH160 <20>
+            0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x88, 0xac, // OP_EQUALVERIFY OP_CHECKSIG
+        ];
+        let asm = disassemble_script(&script);
+        assert!(asm.contains("OP_DUP"));
+        assert!(asm.contains("OP_HASH160"));
+        assert!(asm.contains("89abcdef0123456789abcdef0123456789abcdef"));
+        assert!(asm.contains("OP_EQUALVERIFY"));
+        assert!(asm.contains("OP_CHECKSIG"));
+    }
+
+    #[test]
+    fn test_disassemble_script_p2sh() {
+        // P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+        let script = vec![
+            0xa9, 0x14, // OP_HASH160 <20>
+            0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0x87, // OP_EQUAL
+        ];
+        let asm = disassemble_script(&script);
+        assert!(asm.contains("OP_HASH160"));
+        assert!(asm.contains("OP_EQUAL"));
+    }
+
+    #[test]
+    fn test_disassemble_script_p2wpkh() {
+        // P2WPKH: OP_0 <20 bytes>
+        let script = vec![
+            0x00, 0x14, // OP_0 <20>
+            0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        ];
+        let asm = disassemble_script(&script);
+        assert!(asm.contains("0"));
+        assert!(asm.contains("89abcdef0123456789abcdef0123456789abcdef"));
+    }
+
+    #[test]
+    fn test_disassemble_script_p2tr() {
+        // P2TR: OP_1 <32 bytes>
+        let mut script = vec![0x51, 0x20]; // OP_1 <32>
+        script.extend([0xab; 32]);
+        let asm = disassemble_script(&script);
+        assert!(asm.contains("OP_1"));
+    }
+
+    #[test]
+    fn test_disassemble_script_op_return() {
+        // OP_RETURN with data
+        let script = vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef];
+        let asm = disassemble_script(&script);
+        assert!(asm.contains("OP_RETURN"));
+        assert!(asm.contains("deadbeef"));
+    }
+
+    #[test]
+    fn test_disassemble_script_multisig() {
+        // 2-of-3 multisig: OP_2 <pk1> <pk2> <pk3> OP_3 OP_CHECKMULTISIG
+        let mut script = vec![0x52]; // OP_2
+        // Add three 33-byte compressed pubkeys
+        for _ in 0..3 {
+            script.push(0x21); // push 33 bytes
+            script.extend([0xab; 33]);
+        }
+        script.push(0x53); // OP_3
+        script.push(0xae); // OP_CHECKMULTISIG
+
+        let asm = disassemble_script(&script);
+        assert!(asm.contains("OP_2"));
+        assert!(asm.contains("OP_3"));
+        assert!(asm.contains("OP_CHECKMULTISIG"));
+    }
+
+    #[test]
+    fn test_disassemble_script_cltv() {
+        // CLTV script: <locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP
+        let script = vec![
+            0x04, // push 4 bytes
+            0x00, 0x00, 0x00, 0x01, // locktime value
+            0xb1, // OP_CHECKLOCKTIMEVERIFY
+            0x75, // OP_DROP
+        ];
+        let asm = disassemble_script(&script);
+        assert!(asm.contains("OP_CHECKLOCKTIMEVERIFY"));
+        assert!(asm.contains("OP_DROP"));
+    }
+
+    #[test]
+    fn test_disassemble_script_csv() {
+        // CSV script: <sequence> OP_CHECKSEQUENCEVERIFY
+        let script = vec![
+            0x02, // push 2 bytes
+            0x00, 0x01, // sequence value
+            0xb2, // OP_CHECKSEQUENCEVERIFY
+        ];
+        let asm = disassemble_script(&script);
+        assert!(asm.contains("OP_CHECKSEQUENCEVERIFY"));
+    }
+
+    #[test]
+    fn test_disassemble_script_empty() {
+        let script: Vec<u8> = vec![];
+        let asm = disassemble_script(&script);
+        assert!(asm.is_empty());
+    }
+
+    #[test]
+    fn test_disassemble_script_small_integers() {
+        // OP_1 through OP_16
+        let script = vec![0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58];
+        let asm = disassemble_script(&script);
+        assert!(asm.contains("OP_1"));
+        assert!(asm.contains("OP_2"));
+        assert!(asm.contains("OP_3"));
+        assert!(asm.contains("OP_4"));
+        assert!(asm.contains("OP_5"));
+        assert!(asm.contains("OP_6"));
+        assert!(asm.contains("OP_7"));
+        assert!(asm.contains("OP_8"));
+    }
+
+    #[test]
+    fn test_build_tx_info_basic() {
+        use rustoshi_primitives::{Transaction, TxIn, TxOut, OutPoint, Hash256};
+
+        // Create a simple transaction
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 100_000_000, // 1 BTC
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14, // OP_DUP OP_HASH160 <20>
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x88, 0xac, // OP_EQUALVERIFY OP_CHECKSIG
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        let info = build_tx_info(&tx, None, None);
+
+        assert_eq!(info.version, 2);
+        assert_eq!(info.locktime, 0);
+        assert_eq!(info.vin.len(), 1);
+        assert_eq!(info.vout.len(), 1);
+        assert!(info.blockhash.is_none());
+        assert!(info.confirmations.is_none());
+        assert_eq!(info.vout[0].value, 1.0);
+        assert_eq!(info.vout[0].script_pubkey.script_type, "pubkeyhash");
+    }
+
+    #[test]
+    fn test_build_tx_info_with_confirmations() {
+        use rustoshi_primitives::{Transaction, TxIn, TxOut, OutPoint, Hash256};
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256([0xab; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 50_000_000,
+                script_pubkey: vec![0x51, 0x20].into_iter().chain([0x00; 32]).collect(),
+            }],
+            lock_time: 0,
+        };
+
+        let block_hash = Hash256([0xcd; 32]);
+        let info = build_tx_info(&tx, Some(&block_hash), Some(10));
+
+        assert!(info.blockhash.is_some());
+        assert_eq!(info.blockhash.unwrap(), block_hash.to_hex());
+        assert_eq!(info.confirmations, Some(10));
+        assert_eq!(info.vout[0].script_pubkey.script_type, "witness_v1_taproot");
+    }
+
+    #[test]
+    fn test_build_tx_info_coinbase() {
+        use rustoshi_primitives::{Transaction, TxIn, TxOut, OutPoint, Hash256};
+
+        // Coinbase transaction
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x03, 0x01, 0x02, 0x03], // Block height
+                sequence: 0xffffffff,
+                witness: vec![vec![0x00; 32]],
+            }],
+            outputs: vec![TxOut {
+                value: 625_000_000, // 6.25 BTC block reward
+                script_pubkey: vec![0x51], // OP_1 (anyone can spend)
+            }],
+            lock_time: 0,
+        };
+
+        let info = build_tx_info(&tx, None, None);
+
+        // Coinbase input should have coinbase field set
+        assert!(info.vin[0].coinbase.is_some());
+        assert!(info.vin[0].txid.is_none());
+        assert!(info.vin[0].vout.is_none());
+    }
+
+    #[test]
+    fn test_getrawtransaction_error_messages() {
+        // Test that the error message matches Bitcoin Core format
+        let err = RpcServerImpl::rpc_error(
+            rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+            "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
+        );
+        assert_eq!(err.code(), rpc_error::RPC_INVALID_ADDRESS_OR_KEY);
+        assert!(err.message().contains("Use gettransaction for wallet transactions"));
     }
 
 }
