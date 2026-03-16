@@ -21,7 +21,10 @@ pub use keys::{
     parse_public_key, parse_secret_key, public_key_from_private, serialize_compact_signature,
     serialize_der_signature, serialize_pubkey_compressed, serialize_pubkey_uncompressed,
 };
-pub use sighash::{legacy_sighash, p2wpkh_script_code, segwit_v0_sighash, SigHashType};
+pub use sighash::{
+    find_and_delete, legacy_sighash, p2wpkh_script_code, remove_codeseparators, segwit_v0_sighash,
+    SigHashType, OP_CODESEPARATOR,
+};
 
 // Re-export secp256k1 types that are used in the public API
 pub use secp256k1::{ecdsa::Signature, PublicKey, SecretKey};
