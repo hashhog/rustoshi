@@ -3,27 +3,29 @@
 //! Bitcoin uses SHA-256d (double SHA-256) for most hashes, including block hashes,
 //! transaction IDs, and Merkle trees. HASH160 (RIPEMD-160(SHA-256(x))) is used for
 //! address generation. BIP-340 introduces tagged hashes for Schnorr signatures.
+//!
+//! This module uses hardware-accelerated SHA-256 when available:
+//! - x86_64: SHA-NI (Intel SHA Extensions)
+//! - AArch64: ARM SHA-2 instructions
+//! - Fallback: Portable Rust implementation via sha2 crate
 
 use ripemd::Ripemd160;
 use rustoshi_primitives::{Hash160, Hash256};
 use sha2::{Digest, Sha256};
 
+use crate::sha256 as sha256_accel;
+
 /// Double SHA-256: SHA256(SHA256(data))
 /// This is used for block hashes, transaction IDs, and Merkle trees.
+/// Uses hardware acceleration when available (SHA-NI on x86_64, SHA2 on AArch64).
 pub fn sha256d(data: &[u8]) -> Hash256 {
-    let first = Sha256::digest(data);
-    let second = Sha256::digest(first);
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&second);
-    Hash256(result)
+    Hash256(sha256_accel::sha256d(data))
 }
 
 /// Single SHA-256.
+/// Uses hardware acceleration when available (SHA-NI on x86_64, SHA2 on AArch64).
 pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let hash = Sha256::digest(data);
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&hash);
-    result
+    sha256_accel::sha256(data)
 }
 
 /// HASH160: RIPEMD160(SHA256(data))
@@ -53,6 +55,7 @@ pub fn tagged_hash(tag: &str, data: &[u8]) -> [u8; 32] {
 /// Compute the SHA-256d Merkle root from a list of hashes.
 /// If the list has an odd number of elements, duplicate the last one.
 /// If the list is empty, return the zero hash.
+/// Uses optimized sha256d_64 for merkle tree internal nodes.
 pub fn merkle_root(hashes: &[Hash256]) -> Hash256 {
     if hashes.is_empty() {
         return Hash256::ZERO;
@@ -71,7 +74,8 @@ pub fn merkle_root(hashes: &[Hash256]) -> Hash256 {
             let mut combined = [0u8; 64];
             combined[..32].copy_from_slice(&pair[0].0);
             combined[32..].copy_from_slice(&pair[1].0);
-            next_level.push(sha256d(&combined));
+            // Use optimized sha256d_64 for 64-byte merkle tree nodes
+            next_level.push(Hash256(sha256_accel::sha256d_64(&combined)));
         }
         current_level = next_level;
     }

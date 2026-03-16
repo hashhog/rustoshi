@@ -1,12 +1,18 @@
 //! Rustoshi crypto crate
 //!
 //! Cryptographic primitives for Bitcoin: hashing, signing, verification, address encoding.
+//!
+//! This crate uses hardware-accelerated cryptographic operations when available:
+//! - SHA-256: SHA-NI (x86_64), SHA2 (AArch64), or portable fallback
+//! - secp256k1: Uses the rust-secp256k1 crate with assembly optimizations
 
 pub mod address;
 pub mod base58;
 pub mod bech32;
 pub mod hashes;
+pub mod hwaccel;
 pub mod keys;
+pub mod sha256;
 pub mod sighash;
 
 pub use address::{Address, AddressError, Network};
@@ -16,6 +22,8 @@ pub use bech32::{
     Bech32Error, Bech32Variant,
 };
 pub use hashes::{hash160, merkle_root, sha256, sha256d, tagged_hash};
+pub use hwaccel::{sha256_capabilities, Sha256Capabilities};
+pub use sha256::sha256_implementation;
 pub use keys::{
     ecdsa_sign, ecdsa_verify, generate_private_key, parse_compact_signature, parse_der_signature,
     parse_public_key, parse_secret_key, public_key_from_private, serialize_compact_signature,
