@@ -21,7 +21,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH)
 - [x] Consensus parameters (chain config, genesis blocks, soft fork heights)
-- [x] Difficulty adjustment algorithm
+- [x] Difficulty adjustment (mainnet retarget, testnet 20-min rule, BIP-94 time warp fix, regtest no-retarget)
 - [x] Persistent storage (RocksDB with column families, UTXO set, undo data)
 - [x] Block validation (context-free and contextual checks, BIP-34 height encoding)
 - [x] Transaction validation (UTXO lookup, script verification, sigops counting)
@@ -46,6 +46,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Witness cleanstack enforcement (implicit cleanstack for witness v0/v1)
 - [x] BIP-16 P2SH push-only scriptSig enforcement (unconditional after P2SH activation)
 - [x] BIP-68 relative lock-time enforcement (sequence locks)
+- [x] Sigop counting with witness discount (P2SH, P2WPKH, P2WSH)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
@@ -65,7 +66,7 @@ rustoshi/
   crates/
     primitives/       # Hash256, transactions, blocks, serialization
     crypto/           # SHA256d, HASH160, secp256k1 ECDSA, sighash, addresses
-    consensus/        # script interpreter, chain params, validation
+    consensus/        # script interpreter, chain params, validation, difficulty adjustment
     network/          # P2P protocol (message types, peer management)
     storage/          # RocksDB persistence
     rpc/              # JSON-RPC server
