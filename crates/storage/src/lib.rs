@@ -45,6 +45,7 @@ pub mod blockstore;
 pub mod columns;
 pub mod db;
 pub mod undo;
+pub mod utxo_cache;
 
 pub use block_store::{BlockIndexEntry, BlockStatus, BlockStore, CoinEntry, TxIndexEntry, UndoData};
 pub use blockstore::{
@@ -54,6 +55,10 @@ pub use blockstore::{
 pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;
 pub use db::{ChainDb, StorageError, CURRENT_DB_VERSION};
+pub use utxo_cache::{
+    CacheEntryFlags, Coin, CoinsCacheEntry, CoinsView, CoinsViewCache, CoinsViewDB,
+    DEFAULT_DB_CACHE_BYTES,
+};
 
 #[cfg(test)]
 mod tests {
