@@ -45,6 +45,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] BIP-141 WITNESS_PUBKEYTYPE enforcement (compressed pubkeys in SegWit v0)
 - [x] Witness cleanstack enforcement (implicit cleanstack for witness v0/v1)
 - [x] BIP-16 P2SH push-only scriptSig enforcement (unconditional after P2SH activation)
+- [x] BIP-68 relative lock-time enforcement (sequence locks)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
