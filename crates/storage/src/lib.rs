@@ -41,11 +41,16 @@
 //! ```
 
 pub mod block_store;
+pub mod blockstore;
 pub mod columns;
 pub mod db;
 pub mod undo;
 
 pub use block_store::{BlockIndexEntry, BlockStatus, BlockStore, CoinEntry, TxIndexEntry, UndoData};
+pub use blockstore::{
+    BlockFileInfo, BlockFileLocation, FlatBlockStore, FlatFilePos, FlatFileSeq,
+    BLOCKFILE_CHUNK_SIZE, MAX_BLOCKFILE_SIZE, STORAGE_HEADER_BYTES, UNDOFILE_CHUNK_SIZE,
+};
 pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;
 pub use db::{ChainDb, StorageError, CURRENT_DB_VERSION};
