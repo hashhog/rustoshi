@@ -5,15 +5,24 @@
 //! - DNS seed resolution for initial peer discovery
 //! - Address manager for tracking known peers
 //! - Peer quality tracking (ban scores, response times, attempt counts)
+//! - Misbehavior scoring and ban management
 //!
 //! The peer manager coordinates outbound connection attempts, accepts inbound
 //! connections, and routes messages between peers and the node's message handler.
 
-use crate::message::*;
-use crate::peer::*;
+use crate::message::{
+    parse_message_header, serialize_message, NetAddress, NetworkMessage,
+    TimestampedNetAddress, VersionMessage, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
+    MIN_WITNESS_PROTO_VERSION, NODE_NETWORK, NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
+};
+use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
+use crate::peer::{
+    run_outbound_peer, DisconnectReason, PeerCommand, PeerEvent, PeerId, PeerInfo, PeerState,
+};
 use rustoshi_consensus::{ChainParams, NetworkId};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -33,6 +42,8 @@ pub struct PeerManagerConfig {
     pub listen_port: u16,
     /// Whether to accept inbound connections.
     pub listen: bool,
+    /// Data directory for persistent state (banlist, etc.).
+    pub data_dir: PathBuf,
 }
 
 impl Default for PeerManagerConfig {
@@ -44,6 +55,7 @@ impl Default for PeerManagerConfig {
             ban_duration: Duration::from_secs(24 * 60 * 60),
             listen_port: 8333,
             listen: true,
+            data_dir: PathBuf::from("."),
         }
     }
 }
@@ -55,6 +67,12 @@ impl PeerManagerConfig {
             listen_port: 48333,
             ..Default::default()
         }
+    }
+
+    /// Set the data directory.
+    pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
+        self.data_dir = data_dir;
+        self
     }
 }
 
@@ -376,6 +394,10 @@ pub struct PeerManager {
     peers: HashMap<PeerId, PeerHandle>,
     /// Address manager for peer discovery.
     addr_manager: AddressManager,
+    /// Misbehavior tracker for all peers.
+    misbehavior_tracker: MisbehaviorTracker,
+    /// Ban manager for persistent bans.
+    ban_manager: BanManager,
     /// Next peer ID to assign.
     next_peer_id: u64,
     /// Channel for receiving events from peer tasks.
@@ -390,11 +412,14 @@ impl PeerManager {
     /// Create a new peer manager with the given configuration and chain parameters.
     pub fn new(config: PeerManagerConfig, params: ChainParams) -> Self {
         let (event_tx, event_rx) = mpsc::channel(1024);
+        let ban_manager = BanManager::with_duration(config.data_dir.clone(), config.ban_duration);
         Self {
             config,
             params,
             peers: HashMap::new(),
             addr_manager: AddressManager::new(),
+            misbehavior_tracker: MisbehaviorTracker::new(),
+            ban_manager,
             next_peer_id: 1,
             event_tx,
             event_rx,
@@ -473,6 +498,12 @@ impl PeerManager {
 
     /// Initiate an outbound connection to a peer.
     async fn connect_to(&mut self, addr: SocketAddr) {
+        // Skip banned addresses
+        if self.ban_manager.is_addr_banned(&addr) {
+            tracing::debug!("Skipping banned address: {}", addr);
+            return;
+        }
+
         let peer_id = PeerId(self.next_peer_id);
         self.next_peer_id += 1;
 
@@ -570,11 +601,83 @@ impl PeerManager {
 
     /// Ban a peer for misbehavior.
     pub async fn ban_peer(&mut self, peer_id: PeerId) {
+        self.ban_peer_with_reason(peer_id, "manual ban".to_string()).await;
+    }
+
+    /// Ban a peer with a specific reason.
+    pub async fn ban_peer_with_reason(&mut self, peer_id: PeerId, reason: String) {
         if let Some(peer) = self.peers.get(&peer_id) {
-            self.addr_manager
-                .ban(&peer.info.addr, self.config.ban_duration);
+            let addr = peer.info.addr;
+            self.addr_manager.ban(&addr, self.config.ban_duration);
+            self.ban_manager.ban_addr(addr, self.config.ban_duration, reason);
             let _ = peer.command_tx.send(PeerCommand::Disconnect).await;
         }
+    }
+
+    /// Record misbehavior for a peer. Returns true if the peer was banned.
+    ///
+    /// If the misbehavior score reaches 100, the peer is disconnected and banned.
+    pub async fn misbehaving(&mut self, peer_id: PeerId, reason: MisbehaviorReason) -> bool {
+        let should_ban = self.misbehavior_tracker.misbehaving(peer_id, reason.clone());
+
+        if should_ban {
+            self.ban_peer_with_reason(peer_id, reason.to_string()).await;
+        }
+
+        should_ban
+    }
+
+    /// Record misbehavior with a custom score and message. Returns true if the peer was banned.
+    ///
+    /// This mirrors Bitcoin Core's Misbehaving(peer, howmuch, message) signature.
+    pub async fn misbehaving_with_score(
+        &mut self,
+        peer_id: PeerId,
+        howmuch: u32,
+        message: &str,
+    ) -> bool {
+        let should_ban = self.misbehavior_tracker.misbehaving_with_score(peer_id, howmuch, message);
+
+        if should_ban {
+            self.ban_peer_with_reason(peer_id, message.to_string()).await;
+        }
+
+        should_ban
+    }
+
+    /// Get the misbehavior score for a peer.
+    pub fn get_misbehavior_score(&self, peer_id: PeerId) -> u32 {
+        self.misbehavior_tracker.get_score(peer_id)
+    }
+
+    /// Check if an IP address is banned.
+    pub fn is_banned(&self, ip: &IpAddr) -> bool {
+        self.ban_manager.is_banned(ip)
+    }
+
+    /// Check if a socket address is banned.
+    pub fn is_addr_banned(&self, addr: &SocketAddr) -> bool {
+        self.ban_manager.is_addr_banned(addr)
+    }
+
+    /// Ban an IP address directly (e.g., via RPC).
+    pub fn ban_ip(&mut self, ip: IpAddr, duration: Duration, reason: String) {
+        self.ban_manager.ban(ip, duration, reason);
+    }
+
+    /// Unban an IP address. Returns true if the IP was previously banned.
+    pub fn unban(&mut self, ip: &IpAddr) -> bool {
+        self.ban_manager.unban(ip)
+    }
+
+    /// Get all banned addresses.
+    pub fn list_banned(&self) -> Vec<(IpAddr, &BanEntry)> {
+        self.ban_manager.get_banned()
+    }
+
+    /// Clear all bans.
+    pub fn clear_banned(&mut self) {
+        self.ban_manager.clear();
     }
 
     /// Get the next peer event.
@@ -611,6 +714,8 @@ impl PeerManager {
                 if let Some(peer) = self.peers.remove(id) {
                     self.addr_manager.mark_disconnected(&peer.info.addr);
                 }
+                // Clean up misbehavior tracking for this peer
+                self.misbehavior_tracker.remove_peer(*id);
                 // Try to replace the connection
                 self.fill_outbound_connections().await;
             }
@@ -715,6 +820,12 @@ impl PeerManager {
 /// Run an inbound peer connection task.
 ///
 /// Similar to run_outbound_peer but for connections initiated by remote peers.
+/// Enforces pre-handshake message validation:
+/// - First message must be version
+/// - Minimum protocol version (70015 for witness)
+/// - Self-connection detection via nonce
+/// - Duplicate version rejection
+/// - Pre-handshake message rejection
 #[allow(clippy::too_many_arguments)]
 pub async fn run_inbound_peer(
     peer_id: PeerId,
@@ -726,21 +837,40 @@ pub async fn run_inbound_peer(
     event_tx: mpsc::Sender<PeerEvent>,
     command_rx: mpsc::Receiver<PeerCommand>,
 ) {
+    use tokio::time::timeout;
+
     // Split the stream
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
 
-    // Read their version message first
+    // Generate our nonce for self-connection detection
+    let our_nonce: u64 = rand::random();
+
+    // Apply 60-second handshake timeout (Bitcoin Core default)
+    let handshake_timeout = Duration::from_secs(60);
+
+    // Read their version message first (with timeout)
     let mut header_buf = [0u8; MESSAGE_HEADER_SIZE];
-    if reader.read_exact(&mut header_buf).await.is_err() {
-        let _ = event_tx
-            .send(PeerEvent::Disconnected(
-                peer_id,
-                DisconnectReason::IoError("failed to read version header".to_string()),
-            ))
-            .await;
-        return;
+    let read_result = timeout(handshake_timeout, reader.read_exact(&mut header_buf)).await;
+
+    match read_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(
+                    peer_id,
+                    DisconnectReason::IoError(format!("failed to read version header: {}", e)),
+                ))
+                .await;
+            return;
+        }
+        Err(_) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                .await;
+            return;
+        }
     }
 
     let (msg_magic, command, length, checksum) = parse_message_header(&header_buf);
@@ -754,25 +884,48 @@ pub async fn run_inbound_peer(
         return;
     }
 
+    // First message MUST be version (pre-handshake validation)
     if command != "version" {
         let _ = event_tx
             .send(PeerEvent::Disconnected(
                 peer_id,
-                DisconnectReason::HandshakeFailed("expected version".to_string()),
+                DisconnectReason::PreHandshakeMessage(command.clone()),
+            ))
+            .await;
+        return;
+    }
+
+    // Validate length
+    if length as usize > MAX_MESSAGE_SIZE {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::ProtocolError("message too large".to_string()),
             ))
             .await;
         return;
     }
 
     let mut payload = vec![0u8; length as usize];
-    if !payload.is_empty() && reader.read_exact(&mut payload).await.is_err() {
-        let _ = event_tx
-            .send(PeerEvent::Disconnected(
-                peer_id,
-                DisconnectReason::IoError("failed to read version payload".to_string()),
-            ))
-            .await;
-        return;
+    if !payload.is_empty() {
+        match timeout(handshake_timeout, reader.read_exact(&mut payload)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                let _ = event_tx
+                    .send(PeerEvent::Disconnected(
+                        peer_id,
+                        DisconnectReason::IoError(format!("failed to read version payload: {}", e)),
+                    ))
+                    .await;
+                return;
+            }
+            Err(_) => {
+                let _ = event_tx
+                    .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                    .await;
+                return;
+            }
+        }
     }
 
     // Validate checksum
@@ -800,6 +953,28 @@ pub async fn run_inbound_peer(
         }
     };
 
+    // Check minimum protocol version (70015 for witness support)
+    if their_version.version < MIN_WITNESS_PROTO_VERSION {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::ObsoleteVersion(their_version.version),
+            ))
+            .await;
+        return;
+    }
+
+    // Check for self-connection (matching nonce)
+    if their_version.nonce == our_nonce && our_nonce != 0 {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::SelfConnection,
+            ))
+            .await;
+        return;
+    }
+
     // Send our version
     let our_version = VersionMessage {
         version: PROTOCOL_VERSION,
@@ -810,7 +985,7 @@ pub async fn run_inbound_peer(
             .as_secs() as i64,
         addr_recv: socket_addr_to_net_address(addr, their_version.services),
         addr_from: socket_addr_to_net_address("0.0.0.0:0".parse().unwrap(), our_services),
-        nonce: rand::random(),
+        nonce: our_nonce,
         user_agent: "/Rustoshi:0.1.0/".to_string(),
         start_height: our_start_height,
         relay: true,
@@ -849,23 +1024,102 @@ pub async fn run_inbound_peer(
         return;
     }
 
-    // Wait for their verack
-    // (In practice, we'd use the message loop state machine here)
-    if reader.read_exact(&mut header_buf).await.is_err() {
-        let _ = event_tx
-            .send(PeerEvent::Disconnected(
-                peer_id,
-                DisconnectReason::IoError("failed to read verack header".to_string()),
-            ))
-            .await;
-        return;
-    }
+    // Track whether we've received version (for duplicate detection)
+    let mut version_received = true;
+    let mut handshake_complete = false;
 
-    let (_, command, length, _) = parse_message_header(&header_buf);
-    if command != "verack" && length > 0 {
-        // Skip payload if not verack
-        let mut skip = vec![0u8; length as usize];
-        let _ = reader.read_exact(&mut skip).await;
+    // Wait for their verack (with pre-handshake message validation)
+    while !handshake_complete {
+        let read_result = timeout(handshake_timeout, reader.read_exact(&mut header_buf)).await;
+
+        match read_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                let _ = event_tx
+                    .send(PeerEvent::Disconnected(
+                        peer_id,
+                        DisconnectReason::IoError("failed to read message header".to_string()),
+                    ))
+                    .await;
+                return;
+            }
+            Err(_) => {
+                let _ = event_tx
+                    .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                    .await;
+                return;
+            }
+        }
+
+        let (_, cmd, len, chk) = parse_message_header(&header_buf);
+
+        // Read payload if any
+        let mut msg_payload = vec![0u8; len as usize];
+        if !msg_payload.is_empty() {
+            match timeout(handshake_timeout, reader.read_exact(&mut msg_payload)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {
+                    let _ = event_tx
+                        .send(PeerEvent::Disconnected(
+                            peer_id,
+                            DisconnectReason::IoError("failed to read message payload".to_string()),
+                        ))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = event_tx
+                        .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                        .await;
+                    return;
+                }
+            }
+
+            // Validate checksum
+            let computed = rustoshi_crypto::sha256d(&msg_payload);
+            if chk != computed.0[..4] {
+                let _ = event_tx
+                    .send(PeerEvent::Disconnected(
+                        peer_id,
+                        DisconnectReason::ProtocolError("checksum mismatch".to_string()),
+                    ))
+                    .await;
+                return;
+            }
+        }
+
+        match cmd.as_str() {
+            "verack" => {
+                handshake_complete = true;
+            }
+            "version" => {
+                // Duplicate version message (misbehavior score 1)
+                if version_received {
+                    let _ = event_tx
+                        .send(PeerEvent::Disconnected(
+                            peer_id,
+                            DisconnectReason::DuplicateVersion,
+                        ))
+                        .await;
+                    return;
+                }
+                version_received = true;
+            }
+            // Pre-verack negotiation messages are allowed
+            "wtxidrelay" | "sendaddrv2" | "sendtxrcncl" => {
+                continue;
+            }
+            // Any other message before handshake is complete is a protocol violation
+            _ => {
+                let _ = event_tx
+                    .send(PeerEvent::Disconnected(
+                        peer_id,
+                        DisconnectReason::PreHandshakeMessage(cmd),
+                    ))
+                    .await;
+                return;
+            }
+        }
     }
 
     // Connection established
@@ -1225,5 +1479,108 @@ mod tests {
         // Test that DNS resolution handles failures gracefully
         let addrs = resolve_dns_seeds(&["nonexistent.invalid.domain"], 8333).await;
         assert!(addrs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_misbehavior_tracking() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = PeerManagerConfig::testnet4().with_data_dir(temp_dir.path().to_path_buf());
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let peer_id = PeerId(1);
+
+        // Initial score should be 0
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 0);
+
+        // Record a minor violation (10 points)
+        let banned = mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction).await;
+        assert!(!banned);
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 10);
+
+        // Record more violations
+        mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction).await;
+        mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction).await;
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 30);
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_misbehavior_instant_ban() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = PeerManagerConfig::testnet4().with_data_dir(temp_dir.path().to_path_buf());
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let peer_id = PeerId(1);
+
+        // Invalid block header = 100 points = instant ban
+        let banned = mgr.misbehaving(peer_id, MisbehaviorReason::InvalidBlockHeader).await;
+        assert!(banned);
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 100);
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_ban_and_unban() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = PeerManagerConfig::testnet4().with_data_dir(temp_dir.path().to_path_buf());
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let ip: std::net::IpAddr = "192.168.1.1".parse().unwrap();
+
+        assert!(!mgr.is_banned(&ip));
+
+        mgr.ban_ip(ip, Duration::from_secs(3600), "test ban".to_string());
+        assert!(mgr.is_banned(&ip));
+
+        assert!(mgr.unban(&ip));
+        assert!(!mgr.is_banned(&ip));
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_list_banned() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = PeerManagerConfig::testnet4().with_data_dir(temp_dir.path().to_path_buf());
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let ip1: std::net::IpAddr = "192.168.1.1".parse().unwrap();
+        let ip2: std::net::IpAddr = "192.168.1.2".parse().unwrap();
+
+        mgr.ban_ip(ip1, Duration::from_secs(3600), "test1".to_string());
+        mgr.ban_ip(ip2, Duration::from_secs(3600), "test2".to_string());
+
+        let banned = mgr.list_banned();
+        assert_eq!(banned.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_misbehaving_with_score() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = PeerManagerConfig::testnet4().with_data_dir(temp_dir.path().to_path_buf());
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let peer_id = PeerId(1);
+
+        // Add 50 points with custom message
+        let banned = mgr.misbehaving_with_score(peer_id, 50, "custom violation").await;
+        assert!(!banned);
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 50);
+
+        // Add 50 more points - should trigger ban
+        let banned = mgr.misbehaving_with_score(peer_id, 50, "another violation").await;
+        assert!(banned);
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 100);
     }
 }

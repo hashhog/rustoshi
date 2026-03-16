@@ -9,7 +9,11 @@
 //! The design uses channels to separate I/O from business logic, preventing
 //! blocking I/O from stalling the main event loop.
 
-use crate::message::*;
+use crate::message::{
+    parse_message_header, serialize_message, NetworkMessage, VersionMessage,
+    MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE, MIN_WITNESS_PROTO_VERSION, NODE_WITNESS,
+    SENDHEADERS_VERSION, WTXID_RELAY_VERSION,
+};
 use rustoshi_crypto::sha256d;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -22,7 +26,8 @@ use tokio::time::{timeout, Duration, Instant};
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Timeout for completing the version/verack handshake.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bitcoin Core uses 60 seconds for connection timeout.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Interval between ping messages.
 pub const PING_INTERVAL: Duration = Duration::from_secs(120);
@@ -122,6 +127,14 @@ pub enum DisconnectReason {
     ConnectionClosed,
     /// I/O error.
     IoError(String),
+    /// Duplicate version message received.
+    DuplicateVersion,
+    /// Self-connection detected (matching nonce).
+    SelfConnection,
+    /// Pre-handshake message received (not version/verack).
+    PreHandshakeMessage(String),
+    /// Protocol version too old.
+    ObsoleteVersion(i32),
 }
 
 /// Commands sent from the main node to peer connection tasks.
@@ -347,21 +360,28 @@ pub async fn run_outbound_peer(
         return;
     }
 
-    // 3. Perform handshake with timeout
+    // 3. Perform handshake with timeout (60 seconds per Bitcoin Core)
+    let our_nonce = our_version.nonce;
     let handshake_result = timeout(
         HANDSHAKE_TIMEOUT,
-        perform_handshake(&mut reader, &mut writer, &magic),
+        perform_handshake(&mut reader, &mut writer, &magic, our_nonce),
     )
     .await;
 
     let their_version = match handshake_result {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
+            let reason = match e {
+                HandshakeError::DuplicateVersion => DisconnectReason::DuplicateVersion,
+                HandshakeError::SelfConnection => DisconnectReason::SelfConnection,
+                HandshakeError::ObsoleteVersion(v) => DisconnectReason::ObsoleteVersion(v),
+                HandshakeError::PreHandshakeMessage(cmd) => {
+                    DisconnectReason::PreHandshakeMessage(cmd)
+                }
+                _ => DisconnectReason::HandshakeFailed(e.to_string()),
+            };
             let _ = event_tx
-                .send(PeerEvent::Disconnected(
-                    peer_id,
-                    DisconnectReason::HandshakeFailed(e.to_string()),
-                ))
+                .send(PeerEvent::Disconnected(peer_id, reason))
                 .await;
             return;
         }
@@ -414,37 +434,122 @@ pub async fn run_outbound_peer(
     run_message_loop(peer_id, &magic, reader, writer, event_tx, command_rx).await;
 }
 
-/// Perform the version/verack handshake.
+/// Result of handshake validation.
+#[derive(Debug)]
+pub enum HandshakeError {
+    /// Expected version message but got something else.
+    ExpectedVersion(String),
+    /// Received duplicate version message.
+    DuplicateVersion,
+    /// Self-connection detected (nonce matches our own).
+    SelfConnection,
+    /// Protocol version too old.
+    ObsoleteVersion(i32),
+    /// Pre-handshake message received (not version/verack).
+    PreHandshakeMessage(String),
+    /// I/O error during handshake.
+    IoError(std::io::Error),
+}
+
+impl std::fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HandshakeError::ExpectedVersion(cmd) => {
+                write!(f, "expected version message, got {}", cmd)
+            }
+            HandshakeError::DuplicateVersion => write!(f, "duplicate version message"),
+            HandshakeError::SelfConnection => write!(f, "self-connection detected"),
+            HandshakeError::ObsoleteVersion(v) => write!(f, "obsolete protocol version: {}", v),
+            HandshakeError::PreHandshakeMessage(cmd) => {
+                write!(f, "pre-handshake message: {}", cmd)
+            }
+            HandshakeError::IoError(e) => write!(f, "io error: {}", e),
+        }
+    }
+}
+
+impl From<std::io::Error> for HandshakeError {
+    fn from(e: std::io::Error) -> Self {
+        HandshakeError::IoError(e)
+    }
+}
+
+/// Misbehavior scores for handshake violations.
+pub mod handshake_misbehavior {
+    /// Pre-handshake message received (not version).
+    pub const PRE_HANDSHAKE_MESSAGE: u32 = 10;
+    /// Duplicate version message.
+    pub const DUPLICATE_VERSION: u32 = 1;
+}
+
+/// Perform the version/verack handshake with full validation.
+///
+/// This validates:
+/// - First message must be version
+/// - No duplicate version messages
+/// - Self-connection detection via nonce
+/// - Minimum protocol version (70015 for witness support)
+/// - Only version/verack/wtxidrelay/sendaddrv2/sendtxrcncl allowed before handshake complete
 async fn perform_handshake(
     reader: &mut BufReader<OwnedReadHalf>,
     writer: &mut BufWriter<OwnedWriteHalf>,
     magic: &[u8; 4],
-) -> std::io::Result<VersionMessage> {
+    our_nonce: u64,
+) -> Result<VersionMessage, HandshakeError> {
     // Read their version message
     let their_version_msg = read_message_simple(reader, magic).await?;
     let their_version = match their_version_msg {
         NetworkMessage::Version(v) => v,
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "expected version message",
-            ))
+        other => {
+            return Err(HandshakeError::ExpectedVersion(other.command().to_string()));
         }
     };
+
+    // Check for self-connection (matching nonce)
+    if their_version.nonce == our_nonce && our_nonce != 0 {
+        return Err(HandshakeError::SelfConnection);
+    }
+
+    // Check minimum protocol version (70015 for witness support)
+    if their_version.version < MIN_WITNESS_PROTO_VERSION {
+        return Err(HandshakeError::ObsoleteVersion(their_version.version));
+    }
 
     // Send verack
     let verack_data = serialize_message(magic, &NetworkMessage::Verack);
     writer.write_all(&verack_data).await?;
     writer.flush().await?;
 
-    // Read messages until we get verack (some peers send wtxidrelay/sendaddrv2 first)
+    // Track whether we've received version (to detect duplicates)
+    let mut version_received = true;
+
+    // Read messages until we get verack
+    // Only certain messages are allowed before handshake is complete:
+    // - verack (completes handshake)
+    // - wtxidrelay, sendaddrv2, sendtxrcncl (BIP negotiation, must be before verack)
     loop {
         let msg = read_message_simple(reader, magic).await?;
         match msg {
             NetworkMessage::Verack => break,
-            // Buffer other pre-verack messages (wtxidrelay, sendaddrv2, etc.)
-            // In a full implementation, we'd process these appropriately
-            _ => continue,
+            NetworkMessage::Version(_) => {
+                // Duplicate version message
+                if version_received {
+                    return Err(HandshakeError::DuplicateVersion);
+                }
+                version_received = true;
+            }
+            // These are allowed before verack (BIP negotiation messages)
+            NetworkMessage::WtxidRelay
+            | NetworkMessage::SendAddrV2 => {
+                // Allowed pre-verack negotiation messages - just continue
+                continue;
+            }
+            // Any other message before handshake is complete is a protocol violation
+            other => {
+                return Err(HandshakeError::PreHandshakeMessage(
+                    other.command().to_string(),
+                ));
+            }
         }
     }
 
@@ -775,6 +880,10 @@ pub async fn read_message<R: AsyncReadExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{
+        InvType, InvVector, NetAddress, NetworkMessage, VersionMessage,
+        NODE_NETWORK, NODE_WITNESS, PROTOCOL_VERSION,
+    };
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -1356,5 +1465,432 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("checksum"));
+    }
+
+    // ============================================================
+    // PRE-HANDSHAKE VALIDATION TESTS
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_handshake_rejects_pre_handshake_ping() {
+        // Test that a ping message sent before version is rejected
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer_id = PeerId(1);
+        let (event_tx, mut event_rx) = mpsc::channel(10);
+        let (_command_tx, command_rx) = mpsc::channel(10);
+
+        let our_version = create_test_version();
+        let magic = TESTNET4_MAGIC;
+
+        // Spawn a mock server that sends ping before version
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            // Read client's version
+            let mut header = [0u8; MESSAGE_HEADER_SIZE];
+            stream.read_exact(&mut header).await.unwrap();
+            let (_, _, length, _) = parse_message_header(&header);
+            let mut payload = vec![0u8; length as usize];
+            if !payload.is_empty() {
+                stream.read_exact(&mut payload).await.unwrap();
+            }
+
+            // Send ping BEFORE version (protocol violation)
+            let ping_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Ping(0x123456));
+            stream.write_all(&ping_msg).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        // Spawn the client
+        let client_handle = tokio::spawn(async move {
+            run_outbound_peer(peer_id, addr, magic, our_version, event_tx, command_rx).await;
+        });
+
+        // Should get disconnected due to pre-handshake message
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("should receive event")
+            .expect("channel should not be closed");
+
+        match event {
+            PeerEvent::Disconnected(id, reason) => {
+                assert_eq!(id, peer_id);
+                match reason {
+                    DisconnectReason::PreHandshakeMessage(cmd) => {
+                        assert_eq!(cmd, "ping");
+                    }
+                    DisconnectReason::HandshakeFailed(msg) => {
+                        assert!(msg.contains("ping") || msg.contains("version"));
+                    }
+                    _ => panic!("expected PreHandshakeMessage, got {:?}", reason),
+                }
+            }
+            _ => panic!("expected Disconnected event"),
+        }
+
+        server_handle.await.unwrap();
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_handshake_rejects_obsolete_protocol_version() {
+        // Test that protocol version < 70015 is rejected
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer_id = PeerId(1);
+        let (event_tx, mut event_rx) = mpsc::channel(10);
+        let (_command_tx, command_rx) = mpsc::channel(10);
+
+        let our_version = create_test_version();
+        let magic = TESTNET4_MAGIC;
+
+        // Spawn a mock server that sends old protocol version
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            // Read client's version
+            let mut header = [0u8; MESSAGE_HEADER_SIZE];
+            stream.read_exact(&mut header).await.unwrap();
+            let (_, _, length, _) = parse_message_header(&header);
+            let mut payload = vec![0u8; length as usize];
+            if !payload.is_empty() {
+                stream.read_exact(&mut payload).await.unwrap();
+            }
+
+            // Send version with obsolete protocol version (pre-witness)
+            let old_version = VersionMessage {
+                version: 70010, // Pre-SegWit version
+                services: NODE_NETWORK,
+                timestamp: 1234567890,
+                addr_recv: NetAddress::from_ipv4([127, 0, 0, 1], 48333, 0),
+                addr_from: NetAddress::from_ipv4([127, 0, 0, 1], 48333, NODE_NETWORK),
+                nonce: 0xDEADBEEF,
+                user_agent: "/old:1.0/".to_string(),
+                start_height: 100,
+                relay: true,
+            };
+            let version_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(old_version));
+            stream.write_all(&version_msg).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        // Spawn the client
+        let client_handle = tokio::spawn(async move {
+            run_outbound_peer(peer_id, addr, magic, our_version, event_tx, command_rx).await;
+        });
+
+        // Should get disconnected due to obsolete version
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("should receive event")
+            .expect("channel should not be closed");
+
+        match event {
+            PeerEvent::Disconnected(id, reason) => {
+                assert_eq!(id, peer_id);
+                match reason {
+                    DisconnectReason::ObsoleteVersion(v) => {
+                        assert_eq!(v, 70010);
+                    }
+                    DisconnectReason::HandshakeFailed(msg) => {
+                        assert!(msg.contains("70010") || msg.contains("obsolete"));
+                    }
+                    _ => panic!("expected ObsoleteVersion, got {:?}", reason),
+                }
+            }
+            _ => panic!("expected Disconnected event"),
+        }
+
+        server_handle.await.unwrap();
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_handshake_rejects_duplicate_version() {
+        // Test that receiving two version messages is rejected
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer_id = PeerId(1);
+        let (event_tx, mut event_rx) = mpsc::channel(10);
+        let (_command_tx, command_rx) = mpsc::channel(10);
+
+        let our_version = create_test_version();
+        let magic = TESTNET4_MAGIC;
+
+        // Spawn a mock server that sends duplicate version
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            // Read client's version
+            let mut header = [0u8; MESSAGE_HEADER_SIZE];
+            stream.read_exact(&mut header).await.unwrap();
+            let (_, _, length, _) = parse_message_header(&header);
+            let mut payload = vec![0u8; length as usize];
+            if !payload.is_empty() {
+                stream.read_exact(&mut payload).await.unwrap();
+            }
+
+            // Send first version
+            let server_version = VersionMessage {
+                version: PROTOCOL_VERSION,
+                services: NODE_NETWORK | NODE_WITNESS,
+                timestamp: 1234567890,
+                addr_recv: NetAddress::from_ipv4([127, 0, 0, 1], 48333, 0),
+                addr_from: NetAddress::from_ipv4([127, 0, 0, 1], 48333, NODE_NETWORK),
+                nonce: 0xDEADBEEF,
+                user_agent: "/mock:1.0/".to_string(),
+                start_height: 100,
+                relay: true,
+            };
+            let version_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version.clone()));
+            stream.write_all(&version_msg).await.unwrap();
+
+            // Send DUPLICATE version (protocol violation)
+            stream.write_all(&version_msg).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        // Spawn the client
+        let client_handle = tokio::spawn(async move {
+            run_outbound_peer(peer_id, addr, magic, our_version, event_tx, command_rx).await;
+        });
+
+        // Should get disconnected due to duplicate version
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("should receive event")
+            .expect("channel should not be closed");
+
+        match event {
+            PeerEvent::Disconnected(id, reason) => {
+                assert_eq!(id, peer_id);
+                match reason {
+                    DisconnectReason::DuplicateVersion => {}
+                    DisconnectReason::HandshakeFailed(msg) => {
+                        assert!(msg.contains("duplicate"));
+                    }
+                    _ => panic!("expected DuplicateVersion, got {:?}", reason),
+                }
+            }
+            _ => panic!("expected Disconnected event"),
+        }
+
+        server_handle.await.unwrap();
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_handshake_rejects_self_connection() {
+        // Test that self-connection (matching nonce) is rejected
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer_id = PeerId(1);
+        let (event_tx, mut event_rx) = mpsc::channel(10);
+        let (_command_tx, command_rx) = mpsc::channel(10);
+
+        // Use a specific nonce for our version
+        let our_nonce = 0x1234567890ABCDEF_u64;
+        let mut our_version = create_test_version();
+        our_version.nonce = our_nonce;
+
+        let magic = TESTNET4_MAGIC;
+
+        // Spawn a mock server that echoes back the same nonce
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            // Read client's version
+            let mut header = [0u8; MESSAGE_HEADER_SIZE];
+            stream.read_exact(&mut header).await.unwrap();
+            let (_, _, length, _) = parse_message_header(&header);
+            let mut payload = vec![0u8; length as usize];
+            if !payload.is_empty() {
+                stream.read_exact(&mut payload).await.unwrap();
+            }
+
+            // Parse the client's version to get their nonce
+            let client_version = match NetworkMessage::deserialize("version", &payload) {
+                Ok(NetworkMessage::Version(v)) => v,
+                _ => panic!("expected version message"),
+            };
+
+            // Send version with SAME nonce (self-connection)
+            let server_version = VersionMessage {
+                version: PROTOCOL_VERSION,
+                services: NODE_NETWORK | NODE_WITNESS,
+                timestamp: 1234567890,
+                addr_recv: NetAddress::from_ipv4([127, 0, 0, 1], 48333, 0),
+                addr_from: NetAddress::from_ipv4([127, 0, 0, 1], 48333, NODE_NETWORK),
+                nonce: client_version.nonce, // Echo back the same nonce
+                user_agent: "/self:1.0/".to_string(),
+                start_height: 100,
+                relay: true,
+            };
+            let version_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version));
+            stream.write_all(&version_msg).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        // Spawn the client
+        let client_handle = tokio::spawn(async move {
+            run_outbound_peer(peer_id, addr, magic, our_version, event_tx, command_rx).await;
+        });
+
+        // Should get disconnected due to self-connection
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("should receive event")
+            .expect("channel should not be closed");
+
+        match event {
+            PeerEvent::Disconnected(id, reason) => {
+                assert_eq!(id, peer_id);
+                match reason {
+                    DisconnectReason::SelfConnection => {}
+                    DisconnectReason::HandshakeFailed(msg) => {
+                        assert!(msg.contains("self") || msg.contains("nonce"));
+                    }
+                    _ => panic!("expected SelfConnection, got {:?}", reason),
+                }
+            }
+            _ => panic!("expected Disconnected event"),
+        }
+
+        server_handle.await.unwrap();
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_handshake_allows_wtxidrelay_before_verack() {
+        // Test that wtxidrelay/sendaddrv2 messages are allowed before verack
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer_id = PeerId(1);
+        let (event_tx, mut event_rx) = mpsc::channel(10);
+        let (_command_tx, command_rx) = mpsc::channel(10);
+
+        let our_version = create_test_version();
+        let magic = TESTNET4_MAGIC;
+
+        // Spawn a mock server that sends wtxidrelay before verack
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            // Read client's version
+            let mut header = [0u8; MESSAGE_HEADER_SIZE];
+            stream.read_exact(&mut header).await.unwrap();
+            let (_, _, length, _) = parse_message_header(&header);
+            let mut payload = vec![0u8; length as usize];
+            if !payload.is_empty() {
+                stream.read_exact(&mut payload).await.unwrap();
+            }
+
+            // Send version
+            let server_version = VersionMessage {
+                version: PROTOCOL_VERSION,
+                services: NODE_NETWORK | NODE_WITNESS,
+                timestamp: 1234567890,
+                addr_recv: NetAddress::from_ipv4([127, 0, 0, 1], 48333, 0),
+                addr_from: NetAddress::from_ipv4([127, 0, 0, 1], 48333, NODE_NETWORK),
+                nonce: 0xDEADBEEF,
+                user_agent: "/mock:1.0/".to_string(),
+                start_height: 100,
+                relay: true,
+            };
+            let version_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version));
+            stream.write_all(&version_msg).await.unwrap();
+
+            // Send wtxidrelay BEFORE verack (this is allowed per BIP 339)
+            let wtxidrelay_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::WtxidRelay);
+            stream.write_all(&wtxidrelay_msg).await.unwrap();
+
+            // Send sendaddrv2 BEFORE verack (this is allowed per BIP 155)
+            let sendaddrv2_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::SendAddrV2);
+            stream.write_all(&sendaddrv2_msg).await.unwrap();
+
+            // Send verack
+            let verack_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Verack);
+            stream.write_all(&verack_msg).await.unwrap();
+            stream.flush().await.unwrap();
+
+            // Read their verack
+            let mut header = [0u8; MESSAGE_HEADER_SIZE];
+            let _ = stream.read_exact(&mut header).await;
+        });
+
+        // Spawn the client
+        let client_handle = tokio::spawn(async move {
+            run_outbound_peer(peer_id, addr, magic, our_version, event_tx, command_rx).await;
+        });
+
+        // Should successfully connect (wtxidrelay/sendaddrv2 before verack is allowed)
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("should receive event")
+            .expect("channel should not be closed");
+
+        match event {
+            PeerEvent::Connected(id, info) => {
+                assert_eq!(id, peer_id);
+                assert_eq!(info.version, PROTOCOL_VERSION);
+                assert_eq!(info.user_agent, "/mock:1.0/");
+            }
+            PeerEvent::Disconnected(id, reason) => {
+                panic!("unexpected disconnect: id={}, reason={:?}", id.0, reason);
+            }
+            _ => panic!("expected Connected event, got {:?}", event),
+        }
+
+        server_handle.await.unwrap();
+        // Client will disconnect when server closes
+    }
+
+    #[test]
+    fn test_handshake_error_display() {
+        // Test that HandshakeError has proper Display implementation
+        let err = HandshakeError::ExpectedVersion("ping".to_string());
+        assert!(err.to_string().contains("version"));
+        assert!(err.to_string().contains("ping"));
+
+        let err = HandshakeError::DuplicateVersion;
+        assert!(err.to_string().contains("duplicate"));
+
+        let err = HandshakeError::SelfConnection;
+        assert!(err.to_string().contains("self"));
+
+        let err = HandshakeError::ObsoleteVersion(70010);
+        assert!(err.to_string().contains("70010"));
+
+        let err = HandshakeError::PreHandshakeMessage("getdata".to_string());
+        assert!(err.to_string().contains("getdata"));
+    }
+
+    #[test]
+    fn test_handshake_misbehavior_scores() {
+        // Test that misbehavior scores are correctly defined
+        assert_eq!(handshake_misbehavior::PRE_HANDSHAKE_MESSAGE, 10);
+        assert_eq!(handshake_misbehavior::DUPLICATE_VERSION, 1);
+    }
+
+    #[test]
+    fn test_disconnect_reason_variants() {
+        // Test new DisconnectReason variants
+        let reason = DisconnectReason::DuplicateVersion;
+        assert!(format!("{:?}", reason).contains("DuplicateVersion"));
+
+        let reason = DisconnectReason::SelfConnection;
+        assert!(format!("{:?}", reason).contains("SelfConnection"));
+
+        let reason = DisconnectReason::PreHandshakeMessage("inv".to_string());
+        assert!(format!("{:?}", reason).contains("inv"));
+
+        let reason = DisconnectReason::ObsoleteVersion(70010);
+        assert!(format!("{:?}", reason).contains("70010"));
     }
 }
