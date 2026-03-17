@@ -25,18 +25,20 @@
 //! block validation.
 
 pub mod block_template;
+pub mod chain_manager;
 pub mod chain_state;
 pub mod fee_estimator;
 pub mod mempool;
 pub mod params;
 pub mod pow;
 pub mod script;
+pub mod sig_cache;
 pub mod validation;
 pub mod versionbits;
 
 pub use params::{
     block_subsidy, calculate_next_work_required, compact_to_target, target_to_compact,
-    ChainParams, Checkpoints, NetworkId, NetworkMagic,
+    AssumeutxoData, AssumeutxoHash, ChainParams, Checkpoints, NetworkId, NetworkMagic,
     // Consensus constants
     COINBASE_MATURITY, COIN, DIFFICULTY_ADJUSTMENT_INTERVAL, INITIAL_SUBSIDY,
     LOCKTIME_THRESHOLD, MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT,
@@ -75,3 +77,9 @@ pub use versionbits::{
     VERSIONBITS_PERIOD, VERSIONBITS_THRESHOLD_MAINNET, VERSIONBITS_THRESHOLD_TESTNET,
     ALWAYS_ACTIVE, NEVER_ACTIVE, NO_TIMEOUT,
 };
+pub use chain_manager::{
+    block_status, compare_chain_work, find_descendants, get_ancestor, is_ancestor,
+    is_ancestor_or_descendant, BlockMeta, ChainManagementError, ChainManagerState,
+    InvalidateBlockResult, PreciousBlockResult, ReconsiderBlockResult,
+};
+pub use sig_cache::{SigCache, DEFAULT_MAX_ENTRIES};
