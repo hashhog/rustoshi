@@ -145,8 +145,10 @@ pub enum NetworkMessage {
     Block(Block),
     /// Transaction data.
     Tx(Transaction),
-    /// Peer addresses.
+    /// Peer addresses (legacy format).
     Addr(Vec<TimestampedNetAddress>),
+    /// Peer addresses (BIP155 format with variable-length addresses).
+    AddrV2(Vec<crate::addr::AddrV2Entry>),
     /// Request peer addresses.
     GetAddr,
     /// Objects not found.
@@ -159,12 +161,46 @@ pub enum NetworkMessage {
     SendHeaders,
     /// Compact block relay (BIP 152).
     SendCmpct(SendCmpctMessage),
+    /// Compact block (BIP 152).
+    CmpctBlock(Vec<u8>),
+    /// Request missing transactions for compact block (BIP 152).
+    GetBlockTxn(Vec<u8>),
+    /// Missing transactions for compact block (BIP 152).
+    BlockTxn(Vec<u8>),
     /// Request mempool contents.
     MemPool,
     /// Announce transactions by wtxid (BIP 339).
     WtxidRelay,
     /// Use addrv2 format (BIP 155).
     SendAddrV2,
+    /// Announce tx reconciliation support (BIP 330).
+    SendTxRcncl(crate::erlay::SendTxRcncl),
+    /// Request reconciliation (BIP 330 Erlay).
+    ReqRecon(Vec<u8>),
+    /// Sketch data for reconciliation (BIP 330 Erlay).
+    Sketch(Vec<u8>),
+    /// Report reconciliation differences (BIP 330 Erlay).
+    ReconcilDiff(Vec<u8>),
+    /// BIP 37 bloom filter: load filter.
+    FilterLoad(Vec<u8>),
+    /// BIP 37 bloom filter: add element.
+    FilterAdd(Vec<u8>),
+    /// BIP 37 bloom filter: clear filter (empty payload).
+    FilterClear,
+    /// BIP 37: filtered block (header + merkle match flags).
+    MerkleBlock(Vec<u8>),
+    /// BIP 157: request compact block filters.
+    GetCFilters(Vec<u8>),
+    /// BIP 157: compact block filter.
+    CFilter(Vec<u8>),
+    /// BIP 157: request compact block filter headers.
+    GetCFHeaders(Vec<u8>),
+    /// BIP 157: compact block filter headers.
+    CFHeaders(Vec<u8>),
+    /// BIP 157: request compact block filter checkpoints.
+    GetCFCheckpt(Vec<u8>),
+    /// BIP 157: compact block filter checkpoints.
+    CFCheckpt(Vec<u8>),
     /// Unknown or unsupported message type.
     Unknown { command: String, payload: Vec<u8> },
 }
@@ -268,15 +304,33 @@ impl NetworkMessage {
             NetworkMessage::Block(_) => "block",
             NetworkMessage::Tx(_) => "tx",
             NetworkMessage::Addr(_) => "addr",
+            NetworkMessage::AddrV2(_) => "addrv2",
             NetworkMessage::GetAddr => "getaddr",
             NetworkMessage::NotFound(_) => "notfound",
             NetworkMessage::Reject(_) => "reject",
             NetworkMessage::FeeFilter(_) => "feefilter",
             NetworkMessage::SendHeaders => "sendheaders",
             NetworkMessage::SendCmpct(_) => "sendcmpct",
+            NetworkMessage::CmpctBlock(_) => "cmpctblock",
+            NetworkMessage::GetBlockTxn(_) => "getblocktxn",
+            NetworkMessage::BlockTxn(_) => "blocktxn",
             NetworkMessage::MemPool => "mempool",
             NetworkMessage::WtxidRelay => "wtxidrelay",
             NetworkMessage::SendAddrV2 => "sendaddrv2",
+            NetworkMessage::SendTxRcncl(_) => "sendtxrcncl",
+            NetworkMessage::ReqRecon(_) => "reqrecon",
+            NetworkMessage::Sketch(_) => "sketch",
+            NetworkMessage::ReconcilDiff(_) => "reconcildiff",
+            NetworkMessage::FilterLoad(_) => "filterload",
+            NetworkMessage::FilterAdd(_) => "filteradd",
+            NetworkMessage::FilterClear => "filterclear",
+            NetworkMessage::MerkleBlock(_) => "merkleblock",
+            NetworkMessage::GetCFilters(_) => "getcfilters",
+            NetworkMessage::CFilter(_) => "cfilter",
+            NetworkMessage::GetCFHeaders(_) => "getcfheaders",
+            NetworkMessage::CFHeaders(_) => "cfheaders",
+            NetworkMessage::GetCFCheckpt(_) => "getcfcheckpt",
+            NetworkMessage::CFCheckpt(_) => "cfcheckpt",
             NetworkMessage::Unknown { command, .. } => command,
         }
     }
@@ -346,6 +400,9 @@ impl NetworkMessage {
                     serialize_net_address(&mut buf, &addr.address);
                 }
             }
+            NetworkMessage::AddrV2(entries) => {
+                buf = crate::addr::serialize_addrv2_message(entries);
+            }
             NetworkMessage::GetAddr => {}
             NetworkMessage::FeeFilter(fee_rate) => {
                 buf.extend_from_slice(&fee_rate.to_le_bytes());
@@ -355,9 +412,58 @@ impl NetworkMessage {
                 buf.push(if msg.announce { 1 } else { 0 });
                 buf.extend_from_slice(&msg.version.to_le_bytes());
             }
+            NetworkMessage::CmpctBlock(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::GetBlockTxn(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::BlockTxn(data) => {
+                buf.extend_from_slice(data);
+            }
             NetworkMessage::MemPool => {}
             NetworkMessage::WtxidRelay => {}
             NetworkMessage::SendAddrV2 => {}
+            NetworkMessage::SendTxRcncl(msg) => {
+                buf = msg.serialize();
+            }
+            NetworkMessage::ReqRecon(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::Sketch(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::ReconcilDiff(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::FilterLoad(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::FilterAdd(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::FilterClear => {}
+            NetworkMessage::MerkleBlock(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::GetCFilters(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::CFilter(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::GetCFHeaders(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::CFHeaders(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::GetCFCheckpt(data) => {
+                buf.extend_from_slice(data);
+            }
+            NetworkMessage::CFCheckpt(data) => {
+                buf.extend_from_slice(data);
+            }
             NetworkMessage::Reject(r) => {
                 write_compact_size(&mut buf, r.message.len() as u64).unwrap();
                 buf.extend_from_slice(r.message.as_bytes());
@@ -529,6 +635,10 @@ impl NetworkMessage {
                 Ok(NetworkMessage::Addr(addrs))
             }
             "getaddr" => Ok(NetworkMessage::GetAddr),
+            "addrv2" => {
+                let entries = crate::addr::deserialize_addrv2_message(payload)?;
+                Ok(NetworkMessage::AddrV2(entries))
+            }
             "feefilter" => {
                 let mut buf = [0u8; 8];
                 cursor.read_exact(&mut buf)?;
@@ -545,9 +655,32 @@ impl NetworkMessage {
                     version: u64::from_le_bytes(buf),
                 }))
             }
+            "cmpctblock" => Ok(NetworkMessage::CmpctBlock(payload.to_vec())),
+            "getblocktxn" => Ok(NetworkMessage::GetBlockTxn(payload.to_vec())),
+            "blocktxn" => Ok(NetworkMessage::BlockTxn(payload.to_vec())),
             "mempool" => Ok(NetworkMessage::MemPool),
             "wtxidrelay" => Ok(NetworkMessage::WtxidRelay),
             "sendaddrv2" => Ok(NetworkMessage::SendAddrV2),
+            "sendtxrcncl" => {
+                let msg = crate::erlay::SendTxRcncl::deserialize(payload)?;
+                Ok(NetworkMessage::SendTxRcncl(msg))
+            }
+            // BIP 330 Erlay reconciliation round-trip messages
+            "reqrecon" => Ok(NetworkMessage::ReqRecon(payload.to_vec())),
+            "sketch" => Ok(NetworkMessage::Sketch(payload.to_vec())),
+            "reconcildiff" => Ok(NetworkMessage::ReconcilDiff(payload.to_vec())),
+            // BIP 37 bloom filter messages
+            "filterload" => Ok(NetworkMessage::FilterLoad(payload.to_vec())),
+            "filteradd" => Ok(NetworkMessage::FilterAdd(payload.to_vec())),
+            "filterclear" => Ok(NetworkMessage::FilterClear),
+            "merkleblock" => Ok(NetworkMessage::MerkleBlock(payload.to_vec())),
+            // BIP 157/158 compact block filter messages
+            "getcfilters" => Ok(NetworkMessage::GetCFilters(payload.to_vec())),
+            "cfilter" => Ok(NetworkMessage::CFilter(payload.to_vec())),
+            "getcfheaders" => Ok(NetworkMessage::GetCFHeaders(payload.to_vec())),
+            "cfheaders" => Ok(NetworkMessage::CFHeaders(payload.to_vec())),
+            "getcfcheckpt" => Ok(NetworkMessage::GetCFCheckpt(payload.to_vec())),
+            "cfcheckpt" => Ok(NetworkMessage::CFCheckpt(payload.to_vec())),
             "reject" => {
                 let msg_len = read_compact_size(&mut cursor)? as usize;
                 let mut msg_bytes = vec![0u8; msg_len];
@@ -1249,6 +1382,91 @@ mod tests {
             assert_eq!(v.relay, true);
         } else {
             panic!("expected Version");
+        }
+    }
+
+    #[test]
+    fn addrv2_message_roundtrip() {
+        use std::net::Ipv4Addr;
+
+        let entries = vec![
+            crate::addr::AddrV2Entry {
+                timestamp: 1700000000,
+                services: 1033,
+                addr: crate::addr::NetworkAddr::Ipv4(Ipv4Addr::new(192, 168, 1, 1)),
+                port: 8333,
+            },
+            crate::addr::AddrV2Entry {
+                timestamp: 1700000001,
+                services: 1,
+                addr: crate::addr::NetworkAddr::TorV3([0x42; 32]),
+                port: 9050,
+            },
+        ];
+
+        let msg = NetworkMessage::AddrV2(entries.clone());
+        assert_eq!(msg.command(), "addrv2");
+
+        let payload = msg.serialize_payload();
+        let decoded = NetworkMessage::deserialize("addrv2", &payload).unwrap();
+
+        if let NetworkMessage::AddrV2(addrs) = decoded {
+            assert_eq!(addrs.len(), 2);
+            assert_eq!(addrs[0].timestamp, entries[0].timestamp);
+            assert_eq!(addrs[0].port, 8333);
+            assert_eq!(addrs[1].timestamp, entries[1].timestamp);
+            assert_eq!(addrs[1].port, 9050);
+            // Verify TorV3 address
+            if let crate::addr::NetworkAddr::TorV3(pubkey) = &addrs[1].addr {
+                assert_eq!(pubkey, &[0x42; 32]);
+            } else {
+                panic!("expected TorV3 address");
+            }
+        } else {
+            panic!("expected AddrV2");
+        }
+    }
+
+    #[test]
+    fn addrv2_with_i2p_and_cjdns() {
+        let entries = vec![
+            crate::addr::AddrV2Entry {
+                timestamp: 1700000000,
+                services: 1,
+                addr: crate::addr::NetworkAddr::I2P([0xab; 32]),
+                port: 4567,
+            },
+            crate::addr::AddrV2Entry {
+                timestamp: 1700000001,
+                services: 1,
+                addr: crate::addr::NetworkAddr::Cjdns([
+                    0xfc, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+                ]),
+                port: 8333,
+            },
+        ];
+
+        let msg = NetworkMessage::AddrV2(entries);
+        let payload = msg.serialize_payload();
+        let decoded = NetworkMessage::deserialize("addrv2", &payload).unwrap();
+
+        if let NetworkMessage::AddrV2(addrs) = decoded {
+            assert_eq!(addrs.len(), 2);
+            // Verify I2P address
+            if let crate::addr::NetworkAddr::I2P(hash) = &addrs[0].addr {
+                assert_eq!(hash, &[0xab; 32]);
+            } else {
+                panic!("expected I2P address");
+            }
+            // Verify CJDNS address
+            if let crate::addr::NetworkAddr::Cjdns(addr) = &addrs[1].addr {
+                assert_eq!(addr[0], 0xfc);
+            } else {
+                panic!("expected CJDNS address");
+            }
+        } else {
+            panic!("expected AddrV2");
         }
     }
 }

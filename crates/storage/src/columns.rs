@@ -43,6 +43,21 @@ pub const CF_META: &str = "meta";
 /// Value: serialized UndoData (spent coins needed to reverse the block)
 pub const CF_UNDO: &str = "undo";
 
+/// BIP157 compact block filters indexed by block hash.
+/// Key: block_hash (32 bytes)
+/// Value: serialized BlockFilter (type, encoded GCS filter)
+pub const CF_BLOCKFILTER: &str = "blockfilter";
+
+/// BIP157 block filter headers indexed by height.
+/// Key: height (4 bytes, big-endian)
+/// Value: block_hash (32 bytes) + filter_hash (32 bytes) + filter_header (32 bytes)
+pub const CF_BLOCKFILTER_HEADER: &str = "blockfilter_header";
+
+/// Coin statistics per block indexed by height.
+/// Key: height (4 bytes, big-endian)
+/// Value: serialized CoinStatsEntry (muhash, utxo_count, total_amount, etc.)
+pub const CF_COINSTATS: &str = "coinstats";
+
 /// List of all column families for database initialization.
 pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     CF_HEADERS,
@@ -53,4 +68,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     CF_TX_INDEX,
     CF_META,
     CF_UNDO,
+    CF_BLOCKFILTER,
+    CF_BLOCKFILTER_HEADER,
+    CF_COINSTATS,
 ];

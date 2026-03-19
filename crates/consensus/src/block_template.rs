@@ -5,6 +5,8 @@
 //! - Coinbase transaction creation with BIP-34 height encoding
 //! - Witness commitment output generation (BIP-141)
 //! - Block weight and sigops limit enforcement
+//! - Transaction finality (locktime) enforcement
+//! - Anti-fee-sniping (coinbase locktime = height - 1)
 //!
 //! # Algorithm
 //!
@@ -21,13 +23,42 @@
 //!
 //! This algorithm correctly handles CPFP (Child Pays For Parent) scenarios where
 //! a high-fee child transaction makes its low-fee parent economically viable.
+//!
+//! # Transaction Finality (IsFinalTx)
+//!
+//! A transaction is considered final (eligible for inclusion in a block) if:
+//! 1. `nLockTime == 0`, OR
+//! 2. `nLockTime < threshold` where threshold is either block height (if < 500,000,000)
+//!    or median-time-past (if >= 500,000,000), OR
+//! 3. All inputs have `nSequence == 0xFFFFFFFF` (SEQUENCE_FINAL)
+//!
+//! Non-final transactions are rejected from the block template.
+//!
+//! # Anti-Fee-Sniping
+//!
+//! The coinbase transaction uses:
+//! - `nLockTime = height - 1` to prevent miners from re-mining old blocks
+//! - `nSequence = 0xFFFFFFFE` (MAX_SEQUENCE_NONFINAL) to ensure locktime is enforced
 
 use crate::mempool::Mempool;
-use crate::params::{block_subsidy, ChainParams, MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT};
+use crate::params::{
+    block_subsidy, ChainParams, LOCKTIME_THRESHOLD, MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT,
+};
 use rustoshi_crypto::merkle_root;
 use rustoshi_primitives::{BlockHeader, Hash256, OutPoint, Transaction, TxIn, TxOut};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
+
+// ============================================================
+// SEQUENCE CONSTANTS
+// ============================================================
+
+/// Final sequence number - disables relative locktime (BIP-68) and allows locktime bypass
+pub const SEQUENCE_FINAL: u32 = 0xFFFFFFFF;
+
+/// Maximum non-final sequence - enables locktime without triggering relative locktime
+/// This is used for coinbase transactions per Bitcoin Core's anti-fee-sniping.
+pub const MAX_SEQUENCE_NONFINAL: u32 = SEQUENCE_FINAL - 1;
 
 // ============================================================
 // BLOCK TEMPLATE
@@ -89,6 +120,54 @@ impl Default for BlockTemplateConfig {
 }
 
 // ============================================================
+// TRANSACTION FINALITY (IsFinalTx)
+// ============================================================
+
+/// Check if a transaction is final for inclusion in a block.
+///
+/// A transaction is final if:
+/// 1. `nLockTime == 0`, OR
+/// 2. `nLockTime < cutoff` where cutoff is block height (if nLockTime < 500,000,000)
+///    or median-time-past (if nLockTime >= 500,000,000), OR
+/// 3. All inputs have `nSequence == SEQUENCE_FINAL` (0xFFFFFFFF)
+///
+/// This matches Bitcoin Core's `IsFinalTx()` in `consensus/tx_verify.cpp`.
+///
+/// # Arguments
+/// * `tx` - The transaction to check
+/// * `block_height` - The height of the block being constructed
+/// * `median_time_past` - The median-time-past of the previous block
+pub fn is_final_tx(tx: &Transaction, block_height: u32, median_time_past: i64) -> bool {
+    // Locktime 0 is always final
+    if tx.lock_time == 0 {
+        return true;
+    }
+
+    // Determine if locktime is height-based or time-based
+    let cutoff = if tx.lock_time < LOCKTIME_THRESHOLD {
+        // Height-based locktime
+        block_height as i64
+    } else {
+        // Time-based locktime
+        median_time_past
+    };
+
+    // If locktime is satisfied, tx is final
+    if (tx.lock_time as i64) < cutoff {
+        return true;
+    }
+
+    // Even if locktime isn't satisfied, tx is final if all inputs have SEQUENCE_FINAL
+    // This effectively disables locktime checking
+    for input in &tx.inputs {
+        if input.sequence != SEQUENCE_FINAL {
+            return false;
+        }
+    }
+    true
+}
+
+// ============================================================
 // TRANSACTION PRIORITY
 // ============================================================
 
@@ -140,6 +219,7 @@ impl PartialOrd for TxPriority {
 /// * `height` - Height of the block being constructed
 /// * `timestamp` - Block timestamp
 /// * `bits` - Difficulty target in compact format
+/// * `median_time_past` - Median-time-past of the previous block (for locktime checks)
 /// * `params` - Chain parameters
 /// * `config` - Template construction configuration
 ///
@@ -152,6 +232,7 @@ pub fn build_block_template(
     height: u32,
     timestamp: u32,
     bits: u32,
+    median_time_past: i64,
     params: &ChainParams,
     config: &BlockTemplateConfig,
 ) -> BlockTemplate {
@@ -171,6 +252,11 @@ pub fn build_block_template(
 
     for txid in &sorted {
         if let Some(entry) = mempool.get(txid) {
+            // Skip non-final transactions (locktime not yet satisfied)
+            if !is_final_tx(&entry.tx, height, median_time_past) {
+                continue;
+            }
+
             // Compute ancestor fee rate
             let ancestor_fee_rate = if entry.ancestor_size > 0 {
                 entry.ancestor_fees as f64 / entry.ancestor_size as f64
@@ -200,6 +286,10 @@ pub fn build_block_template(
 
         // Add the transaction
         if let Some(entry) = mempool.get(&priority.txid) {
+            // Double-check finality (in case mempool state changed)
+            if !is_final_tx(&entry.tx, height, median_time_past) {
+                continue;
+            }
             selected_txs.push(entry.tx.clone());
             selected_txids.insert(priority.txid);
             total_fees += entry.fee;
@@ -256,12 +346,24 @@ pub fn build_block_template(
 // COINBASE TRANSACTION
 // ============================================================
 
-/// Build a coinbase transaction.
+/// Build a coinbase transaction with anti-fee-sniping protection.
 ///
 /// The coinbase transaction:
 /// - Has a single input with null outpoint (txid=0, vout=0xFFFFFFFF)
 /// - ScriptSig contains: BIP-34 height encoding + extra data
 /// - Has witness commitment output if any selected tx has witness data
+/// - Uses anti-fee-sniping locktime (height - 1) per Bitcoin Core convention
+/// - Uses sequence 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL) to ensure locktime is enforced
+///
+/// # Anti-Fee-Sniping
+///
+/// Setting `nLockTime = nHeight - 1` prevents miners from profitably re-mining
+/// old blocks. A re-mined block at height N-1 would have `nLockTime = N-2`,
+/// which would be satisfied at height N-1. But the new block template at N
+/// has `nLockTime = N-1`, making the coinbase invalid in any re-mined N-1 block.
+///
+/// This is a miner coordination mechanism, not consensus-enforced, but widely
+/// adopted by Bitcoin Core and mining pools.
 fn build_coinbase_tx(
     height: u32,
     value: u64,
@@ -301,12 +403,20 @@ fn build_coinbase_tx(
         });
     }
 
+    // Anti-fee-sniping: set locktime to height - 1
+    // This prevents miners from profitably re-mining old blocks.
+    // For genesis (height 0) or height 1, use 0 as locktime.
+    let lock_time = if height > 1 { height - 1 } else { 0 };
+
     Transaction {
         version: 2,
         inputs: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: coinbase_script,
-            sequence: 0xFFFFFFFF,
+            // Use MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) to ensure locktime is enforced
+            // This value still opts out of BIP-68 relative locktime but enables
+            // absolute locktime checking via nLockTime.
+            sequence: MAX_SEQUENCE_NONFINAL,
             witness: if has_witness {
                 vec![witness_nonce]
             } else {
@@ -314,7 +424,7 @@ fn build_coinbase_tx(
             },
         }],
         outputs,
-        lock_time: 0,
+        lock_time,
     }
 }
 
@@ -606,6 +716,7 @@ mod tests {
             1,
             1714777860,
             0x1d00ffff,
+            1714777800, // MTP
             &params,
             &config,
         );
@@ -668,6 +779,7 @@ mod tests {
             100,
             1714777860,
             0x1d00ffff,
+            1714777800, // MTP
             &params,
             &template_config,
         );
@@ -713,6 +825,7 @@ mod tests {
             100,
             1714777860,
             0x1d00ffff,
+            1714777800, // MTP
             &params,
             &template_config,
         );
@@ -749,6 +862,7 @@ mod tests {
             100,
             1714777860,
             0x1d00ffff,
+            1714777800, // MTP
             &params,
             &template_config,
         );
@@ -787,6 +901,7 @@ mod tests {
             100,
             1714777860,
             0x1d00ffff,
+            1714777800, // MTP
             &params,
             &template_config,
         );
@@ -835,6 +950,7 @@ mod tests {
             100,
             1714777860,
             0x1d00ffff,
+            1714777800, // MTP
             &params,
             &template_config,
         );
@@ -883,6 +999,7 @@ mod tests {
             50,
             timestamp,
             bits,
+            1714777800, // MTP
             &params,
             &config,
         );
@@ -907,6 +1024,7 @@ mod tests {
             1,
             1714777860,
             0x1d00ffff, // genesis difficulty
+            1714777800, // MTP
             &params,
             &config,
         );
@@ -932,5 +1050,362 @@ mod tests {
         // Higher block height = slightly larger coinbase
         let weight_high = estimate_coinbase_weight(1_000_000, b"test");
         assert!(weight_high >= weight);
+    }
+
+    // ============================================================
+    // IS_FINAL_TX TESTS
+    // ============================================================
+
+    #[test]
+    fn test_is_final_tx_locktime_zero() {
+        // Locktime 0 is always final
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![],
+                sequence: 0, // non-final sequence
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+        };
+
+        assert!(is_final_tx(&tx, 100, 1000000));
+        assert!(is_final_tx(&tx, 0, 0));
+    }
+
+    #[test]
+    fn test_is_final_tx_height_based() {
+        // Height-based locktime (< 500,000,000)
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![],
+                sequence: 0xFFFFFFFE, // non-final sequence (enables locktime)
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 100, // block height 100
+        };
+
+        // Not final if block height <= locktime
+        assert!(!is_final_tx(&tx, 99, 1000000));
+        assert!(!is_final_tx(&tx, 100, 1000000));
+
+        // Final if block height > locktime
+        assert!(is_final_tx(&tx, 101, 1000000));
+        assert!(is_final_tx(&tx, 200, 1000000));
+    }
+
+    #[test]
+    fn test_is_final_tx_time_based() {
+        // Time-based locktime (>= 500,000,000)
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![],
+                sequence: 0xFFFFFFFE, // non-final sequence
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 500_000_100, // Unix timestamp
+        };
+
+        // Not final if MTP <= locktime
+        assert!(!is_final_tx(&tx, 1000, 500_000_099));
+        assert!(!is_final_tx(&tx, 1000, 500_000_100));
+
+        // Final if MTP > locktime
+        assert!(is_final_tx(&tx, 1000, 500_000_101));
+        assert!(is_final_tx(&tx, 1000, 600_000_000));
+    }
+
+    #[test]
+    fn test_is_final_tx_all_final_sequences() {
+        // All inputs with SEQUENCE_FINAL (0xFFFFFFFF) makes tx final regardless of locktime
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: vec![],
+                    sequence: SEQUENCE_FINAL,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: vec![],
+                    sequence: SEQUENCE_FINAL,
+                    witness: vec![],
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 500_000_000, // would normally be non-final
+        };
+
+        // Always final because all sequences are SEQUENCE_FINAL
+        assert!(is_final_tx(&tx, 1, 1)); // very early block
+        assert!(is_final_tx(&tx, 100, 400_000_000)); // MTP before locktime
+    }
+
+    #[test]
+    fn test_is_final_tx_mixed_sequences() {
+        // If any input doesn't have SEQUENCE_FINAL, locktime is enforced
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: vec![],
+                    sequence: SEQUENCE_FINAL,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: vec![],
+                    sequence: 0, // non-final
+                    witness: vec![],
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 100, // block height
+        };
+
+        // Not final until height > locktime
+        assert!(!is_final_tx(&tx, 99, 1000000));
+        assert!(is_final_tx(&tx, 101, 1000000));
+    }
+
+    // ============================================================
+    // COINBASE ANTI-FEE-SNIPING TESTS
+    // ============================================================
+
+    #[test]
+    fn test_coinbase_anti_fee_sniping_locktime() {
+        // Coinbase at height 100 should have locktime = 99
+        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"test", &[]);
+        assert_eq!(coinbase.lock_time, 99);
+
+        // Coinbase at height 1 should have locktime = 0
+        let coinbase = build_coinbase_tx(1, 5_000_000_000, &[0x51], b"test", &[]);
+        assert_eq!(coinbase.lock_time, 0);
+
+        // Coinbase at height 0 (genesis) should have locktime = 0
+        let coinbase = build_coinbase_tx(0, 5_000_000_000, &[0x51], b"test", &[]);
+        assert_eq!(coinbase.lock_time, 0);
+
+        // Coinbase at height 500000 should have locktime = 499999
+        let coinbase = build_coinbase_tx(500_000, 5_000_000_000, &[0x51], b"test", &[]);
+        assert_eq!(coinbase.lock_time, 499_999);
+    }
+
+    #[test]
+    fn test_coinbase_sequence_max_nonfinal() {
+        // Coinbase should use MAX_SEQUENCE_NONFINAL (0xFFFFFFFE)
+        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"test", &[]);
+        assert_eq!(coinbase.inputs[0].sequence, MAX_SEQUENCE_NONFINAL);
+        assert_eq!(coinbase.inputs[0].sequence, 0xFFFFFFFE);
+    }
+
+    #[test]
+    fn test_coinbase_is_final_for_its_block() {
+        // Coinbase at height 100 has locktime 99
+        // At height 100, it should be final
+        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"test", &[]);
+        assert!(is_final_tx(&coinbase, 100, 1000000));
+
+        // At height 99 it would NOT be final (locktime not satisfied)
+        // This is the anti-fee-sniping protection
+        assert!(!is_final_tx(&coinbase, 99, 1000000));
+    }
+
+    // ============================================================
+    // BLOCK TEMPLATE LOCKTIME FILTERING TESTS
+    // ============================================================
+
+    /// Helper to create a transaction with specified locktime and sequence
+    fn make_tx_with_locktime(
+        inputs: Vec<(Hash256, u32)>,
+        outputs: Vec<u64>,
+        version: i32,
+        lock_time: u32,
+        sequence: u32,
+    ) -> Transaction {
+        Transaction {
+            version,
+            inputs: inputs
+                .into_iter()
+                .map(|(txid, vout)| TxIn {
+                    previous_output: OutPoint { txid, vout },
+                    script_sig: vec![0x51],
+                    sequence,
+                    witness: vec![],
+                })
+                .collect(),
+            outputs: outputs
+                .into_iter()
+                .map(|value| TxOut {
+                    value,
+                    script_pubkey: vec![
+                        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                        0xac,
+                    ],
+                })
+                .collect(),
+            lock_time,
+        }
+    }
+
+    #[test]
+    fn test_block_template_rejects_non_final_tx() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        // Create UTXO
+        let utxo =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+
+        // Add transaction with locktime 200 (not final at height 100)
+        let tx_non_final = make_tx_with_locktime(
+            vec![(utxo, 0)],
+            vec![90_000],
+            1,
+            200, // locktime at block height 200
+            0xFFFFFFFE, // non-final sequence
+        );
+        mempool
+            .add_transaction(tx_non_final, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        let params = ChainParams::testnet4();
+        let template_config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            ..Default::default()
+        };
+
+        // Build template at height 100 - tx should be rejected
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800, // MTP
+            &params,
+            &template_config,
+        );
+
+        // Should only have coinbase (non-final tx rejected)
+        assert_eq!(template.transactions.len(), 1);
+        assert!(template.transactions[0].is_coinbase());
+    }
+
+    #[test]
+    fn test_block_template_accepts_final_tx() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+
+        // Add transaction with locktime 50 (final at height 100)
+        let tx_final = make_tx_with_locktime(
+            vec![(utxo, 0)],
+            vec![90_000],
+            1,
+            50, // locktime at block height 50
+            0xFFFFFFFE,
+        );
+        mempool
+            .add_transaction(tx_final, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        let params = ChainParams::testnet4();
+        let template_config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            ..Default::default()
+        };
+
+        // Build template at height 100 - tx should be accepted
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800,
+            &params,
+            &template_config,
+        );
+
+        // Should have coinbase + 1 transaction
+        assert_eq!(template.transactions.len(), 2);
+    }
+
+    #[test]
+    fn test_block_template_accepts_tx_with_final_sequences() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+
+        // Add tx with high locktime but SEQUENCE_FINAL (should be accepted)
+        let tx_final_seq = make_tx_with_locktime(
+            vec![(utxo, 0)],
+            vec![90_000],
+            1,
+            200, // locktime not satisfied
+            SEQUENCE_FINAL, // but sequence is final
+        );
+        mempool
+            .add_transaction(tx_final_seq, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        let params = ChainParams::testnet4();
+        let template_config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            ..Default::default()
+        };
+
+        // Build template at height 100 - tx should be accepted (SEQUENCE_FINAL)
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800,
+            &params,
+            &template_config,
+        );
+
+        // Should have coinbase + 1 transaction
+        assert_eq!(template.transactions.len(), 2);
     }
 }

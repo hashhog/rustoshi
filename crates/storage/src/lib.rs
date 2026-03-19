@@ -44,20 +44,36 @@ pub mod block_store;
 pub mod blockstore;
 pub mod columns;
 pub mod db;
+pub mod indexes;
+pub mod snapshot;
 pub mod undo;
 pub mod utxo_cache;
 
-pub use block_store::{BlockIndexEntry, BlockStatus, BlockStore, CoinEntry, TxIndexEntry, UndoData};
+pub use block_store::{BlockIndexEntry, BlockStatus, BlockStore, BlockStoreUtxoView, CoinEntry, TxIndexEntry, UndoData};
 pub use blockstore::{
-    BlockFileInfo, BlockFileLocation, FlatBlockStore, FlatFilePos, FlatFileSeq,
-    BLOCKFILE_CHUNK_SIZE, MAX_BLOCKFILE_SIZE, STORAGE_HEADER_BYTES, UNDOFILE_CHUNK_SIZE,
+    BlockFileInfo, BlockFileLocation, FlatBlockStore, FlatFilePos, FlatFileSeq, PruneConfig,
+    BLOCKFILE_CHUNK_SIZE, MAX_BLOCKFILE_SIZE, MIN_BLOCKS_TO_KEEP, MIN_DISK_SPACE_FOR_BLOCK_FILES,
+    MIN_PRUNE_TARGET_MIB, STORAGE_HEADER_BYTES, UNDOFILE_CHUNK_SIZE,
 };
 pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;
 pub use db::{ChainDb, StorageError, CURRENT_DB_VERSION};
+pub use indexes::{
+    BlockFilter, BlockFilterError, BlockFilterIndex, BlockFilterType, CoinStatsEntry,
+    CoinStatsError, CoinStatsIndex, FilterHeaderEntry, GCSError, GCSFilter, MuHash3072, Num3072,
+    TxIndex, TxIndexError, TxLocation, BASIC_FILTER_M, BASIC_FILTER_P,
+};
 pub use utxo_cache::{
     CacheEntryFlags, Coin, CoinsCacheEntry, CoinsView, CoinsViewCache, CoinsViewDB,
     DEFAULT_DB_CACHE_BYTES,
+};
+pub use snapshot::{
+    compute_utxo_hash, find_snapshot_chainstate_dir, read_snapshot_blockhash,
+    write_snapshot_blockhash, ChainstateManager, SnapshotActivation, SnapshotError,
+    SnapshotMetadata, SnapshotReader, SnapshotState, SnapshotWriter,
+    IBD_ACTIVE_CACHE_PERCENT, IBD_CACHE_PERCENT, SNAPSHOT_ACTIVE_CACHE_PERCENT,
+    SNAPSHOT_BLOCKHASH_FILENAME, SNAPSHOT_CACHE_PERCENT, SNAPSHOT_CHAINSTATE_SUFFIX,
+    SNAPSHOT_MAGIC_BYTES, SNAPSHOT_VERSION,
 };
 
 #[cfg(test)]

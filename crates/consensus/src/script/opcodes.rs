@@ -588,21 +588,23 @@ impl Opcode {
         matches!(self, Opcode::OP_VERIF | Opcode::OP_VERNOTIF)
     }
 
-    /// Returns true if this is an OP_SUCCESS opcode in tapscript context.
+    /// Returns true if this is an OP_SUCCESS opcode in tapscript context (BIP-342).
     ///
     /// In tapscript, these opcodes cause unconditional script success.
-    /// This includes OP_RESERVED (0x50), OP_VER (0x62), OP_RESERVED1 (0x89),
-    /// OP_RESERVED2 (0x8a), and all undefined opcodes 0xbb-0xfe except
-    /// 0xba (OP_CHECKSIGADD) and the range 0xc0-0xfe.
+    /// Per BIP-342, the OP_SUCCESSx opcodes are:
+    ///   0x50, 0x62, 0x7e-0x81, 0x83-0x86, 0x89-0x8a, 0x8d-0x8e,
+    ///   0x95-0xb9, 0xbb-0xfe
+    /// Note: 0xba (OP_CHECKSIGADD) is NOT OP_SUCCESS - it's a valid tapscript opcode.
     pub fn is_tapscript_success(&self) -> bool {
         let byte = *self as u8;
         matches!(
             self,
             Opcode::OP_RESERVED | Opcode::OP_VER | Opcode::OP_RESERVED1 | Opcode::OP_RESERVED2
-        ) || ((0xbb..=0xfe).contains(&byte) && byte != 0xba)
-            || (0x7e..=0x81).contains(&byte)  // OP_CAT through OP_RIGHT
+        ) || (0x7e..=0x81).contains(&byte)  // OP_CAT through OP_RIGHT
             || (0x83..=0x86).contains(&byte)  // OP_INVERT through OP_XOR
-            || matches!(self, Opcode::OP_2MUL | Opcode::OP_2DIV)
+            || matches!(self, Opcode::OP_2MUL | Opcode::OP_2DIV)  // 0x8d-0x8e
+            || (0x95..=0xb9).contains(&byte)  // OP_MUL through OP_NOP10
+            || (0xbb..=0xfe).contains(&byte)
     }
 
     /// Convert to raw byte value.

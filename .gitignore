@@ -6,3 +6,5 @@ Cargo.lock
 .vscode/
 *.swp
 *.swo
+
+.claude/skills/

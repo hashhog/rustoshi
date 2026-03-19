@@ -173,6 +173,24 @@ impl ChainDb {
         Ok(self.get_cf(cf_name, key)?.is_some())
     }
 
+    /// Iterate over all key-value pairs in a column family.
+    ///
+    /// Returns an iterator that yields `(key, value)` pairs.
+    /// The iteration order depends on the column family's configuration.
+    pub fn iter_cf(
+        &self,
+        cf_name: &str,
+    ) -> Result<impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + '_, StorageError> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
+        Ok(self
+            .db
+            .iterator_cf(&cf, rocksdb::IteratorMode::Start)
+            .filter_map(|result| result.ok()))
+    }
+
     /// Open the database with optimized performance settings for IBD.
     ///
     /// This configuration is tuned for maximum throughput during initial block

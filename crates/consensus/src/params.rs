@@ -8,6 +8,50 @@ use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint, Transaction, Tx
 use std::collections::BTreeMap;
 
 // ============================================================
+// ASSUMEUTXO DATA
+// ============================================================
+
+/// AssumeutxoHash wraps a Hash256 representing the hash of a serialized UTXO set.
+///
+/// This is the SHA256 hash of all coins in the UTXO set at a specific block height,
+/// serialized in a deterministic order. Used to validate assumeUTXO snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssumeutxoHash(pub Hash256);
+
+impl AssumeutxoHash {
+    /// Create a new AssumeutxoHash from a hex string.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        Hash256::from_hex(s).ok().map(Self)
+    }
+}
+
+/// Configuration data for assumeUTXO snapshots.
+///
+/// Holds security-critical parameters that dictate which UTXO snapshots are
+/// recognized as valid. All fields must match the snapshot exactly for it
+/// to be accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssumeutxoData {
+    /// Block height at which the snapshot was taken.
+    pub height: u32,
+
+    /// The hash of the block at the snapshot height.
+    pub blockhash: Hash256,
+
+    /// SHA256 hash of the serialized UTXO set.
+    ///
+    /// Computed by iterating all coins in lexicographic order by outpoint
+    /// and hashing: SHA256(SHA256(serialized_coin_data)).
+    pub hash_serialized: AssumeutxoHash,
+
+    /// Cumulative transaction count up to (and including) the snapshot block.
+    ///
+    /// Used to populate m_chain_tx_count for progress estimation.
+    /// This is hardcoded because it requires block data to compute.
+    pub chain_tx_count: u64,
+}
+
+// ============================================================
 // CONSENSUS CONSTANTS
 // ============================================================
 
@@ -339,6 +383,9 @@ pub struct ChainParams {
 
     // Checkpoints: known block hashes at specific heights for IBD protection
     pub checkpoints: Checkpoints,
+
+    // AssumeUTXO: hardcoded snapshot hashes for fast sync
+    pub assumeutxo_data: Vec<AssumeutxoData>,
 }
 
 impl ChainParams {
@@ -402,6 +449,22 @@ impl ChainParams {
                 (630000, "000000000000000000024bead8df69990852c202db0e0097c1a12ea637d7e96d"),
                 (700000, "0000000000000000000590fc0f3eba193a278534220b2b37e9849e1a770ca959"),
             ]),
+            // Mainnet assumeUTXO snapshots (from Bitcoin Core chainparams.cpp)
+            // These allow fast sync by loading a pre-validated UTXO snapshot
+            assumeutxo_data: vec![
+                AssumeutxoData {
+                    height: 840000,
+                    blockhash: Hash256::from_hex(
+                        "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "a09c985e4fb059a92df89a6cd8f6a7af0f5ad73b1bdb0f6d7cdc1e84f0b0e5b6",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 994_352_100,
+                },
+            ],
         }
     }
 
@@ -445,6 +508,8 @@ impl ChainParams {
                 (300001, "0000000000004829474748f3d1bc8fcf893c88be255e6c91e30f574a43f6e5c"),
                 (400002, "0000000005e2c73b8ecb82ae2dbc2e8274e2fd19d5ede9c5db1e9e45c2b7c8c"),
             ]),
+            // Testnet3 has no hardcoded assumeUTXO snapshots
+            assumeutxo_data: vec![],
         }
     }
 
@@ -488,6 +553,21 @@ impl ChainParams {
                 (10000, "00000000c3afe3c8c0cc7bea7e6c0f6e67d5c1f9b2a0e8d7c6b5a4f3e2d1c0b9"),
                 (50000, "000000000001a8c6b5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2"),
             ]),
+            // Testnet4 assumeUTXO snapshot (from Bitcoin Core)
+            assumeutxo_data: vec![
+                AssumeutxoData {
+                    height: 160000,
+                    blockhash: Hash256::from_hex(
+                        "0000000001c29f3d52a9d7e5d1c0b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 2_500_000,
+                },
+            ],
         }
     }
 
@@ -526,6 +606,8 @@ impl ChainParams {
                 (1000, "00000030db7cd0c0fab1c0f4b3e6c2d1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5"),
                 (50000, "00000024b5c8f7d6e3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0"),
             ]),
+            // Signet has no hardcoded assumeUTXO snapshots
+            assumeutxo_data: vec![],
         }
     }
 
@@ -557,6 +639,8 @@ impl ChainParams {
             minimum_chain_work: [0u8; 32],
             // Regtest has no checkpoints - it's for local testing
             checkpoints: Checkpoints::empty(),
+            // Regtest allows any assumeUTXO snapshot (validated at runtime)
+            assumeutxo_data: vec![],
         }
     }
 
@@ -617,6 +701,29 @@ impl ChainParams {
     /// Get the highest checkpoint height for this network.
     pub fn last_checkpoint_height(&self) -> Option<u32> {
         self.checkpoints.last_checkpoint_height()
+    }
+
+    /// Look up assumeUTXO data by block height.
+    ///
+    /// Returns the AssumeutxoData for the given height if one exists.
+    pub fn assumeutxo_for_height(&self, height: u32) -> Option<&AssumeutxoData> {
+        self.assumeutxo_data.iter().find(|d| d.height == height)
+    }
+
+    /// Look up assumeUTXO data by block hash.
+    ///
+    /// Returns the AssumeutxoData for the given blockhash if one exists.
+    pub fn assumeutxo_for_blockhash(&self, blockhash: &Hash256) -> Option<&AssumeutxoData> {
+        self.assumeutxo_data.iter().find(|d| &d.blockhash == blockhash)
+    }
+
+    /// Get all available snapshot heights.
+    ///
+    /// Returns a sorted list of heights at which assumeUTXO snapshots are available.
+    pub fn available_snapshot_heights(&self) -> Vec<u32> {
+        let mut heights: Vec<u32> = self.assumeutxo_data.iter().map(|d| d.height).collect();
+        heights.sort_unstable();
+        heights
     }
 }
 

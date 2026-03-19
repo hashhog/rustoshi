@@ -236,9 +236,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Configure peer manager
     let peer_config = PeerManagerConfig {
-        max_outbound: cli.maxconnections,
+        max_outbound_full_relay: cli.maxconnections.saturating_sub(2),
+        max_outbound_block_relay: 2, // Block-relay-only anchors for eclipse resistance
         listen_port: cli.port.unwrap_or(params.default_port),
         listen: cli.listen,
+        data_dir: datadir.clone(),
         ..Default::default()
     };
     let mut peer_manager = PeerManager::new(peer_config, params.clone());
@@ -320,9 +322,34 @@ async fn main() -> anyhow::Result<()> {
                                             );
                                         }
                                         // Begin block download
-                                        block_downloader.set_best_header_height(
-                                            header_sync.best_header_height()
-                                        );
+                                        let new_best = header_sync.best_header_height();
+                                        let old_best = block_downloader.validated_tip_height();
+                                        block_downloader.set_best_header_height(new_best);
+
+                                        // Enqueue blocks we need to download
+                                        if new_best > old_best {
+                                            let mut blocks_to_download = Vec::new();
+                                            for h in (old_best + 1)..=new_best {
+                                                if let Ok(Some(hash)) = block_store.get_hash_by_height(h) {
+                                                    blocks_to_download.push((hash, h));
+                                                }
+                                            }
+                                            if !blocks_to_download.is_empty() {
+                                                tracing::info!(
+                                                    "Enqueueing {} blocks for download (heights {}..={})",
+                                                    blocks_to_download.len(), old_best + 1, new_best
+                                                );
+                                                block_downloader.enqueue_blocks(blocks_to_download);
+                                            }
+
+                                            // Send getdata requests
+                                            let requests = block_downloader.assign_requests();
+                                            tracing::info!("Block download: {} getdata requests to send", requests.len());
+                                            for (peer, msg) in requests {
+                                                tracing::info!("Sending getdata to peer {}", peer.0);
+                                                peer_manager.send_to_peer(peer, msg).await;
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!("Header sync error from peer {}: {}", peer_id.0, e);
