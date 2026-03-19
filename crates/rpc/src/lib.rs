@@ -13,6 +13,7 @@
 //! - Network information (getpeerinfo, getnetworkinfo, addnode)
 //! - Fee estimation (estimatesmartfee)
 //! - UTXO queries (gettxout)
+//! - ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence)
 //!
 //! # Example
 //!
@@ -30,8 +31,20 @@
 //! let handle = start_rpc_server(config, state, peer_state).await?;
 //! ```
 
+pub mod rest;
 pub mod server;
 pub mod types;
+pub mod wallet;
+pub mod zmq;
 
+pub use rest::{rest_router, RestState};
 pub use server::{start_rpc_server, PeerState, RpcServerImpl, RpcState, RustoshiRpcServer};
 pub use types::*;
+pub use wallet::{
+    BalanceInfo, CreateWalletResult, ListWalletDirResult, LoadWalletResult,
+    UnloadWalletResult, UnspentOutput, WalletRpcImpl, WalletRpcServer, WalletRpcState,
+};
+pub use zmq::{
+    parse_zmq_args, SharedZmqNotifier, ZmqError, ZmqNotificationInfo, ZmqNotifier,
+    ZmqNotifierConfig, ZmqTopic,
+};

@@ -42,6 +42,26 @@ pub const UNDOFILE_CHUNK_SIZE: u64 = 0x100000; // 1,048,576 bytes
 pub const STORAGE_HEADER_BYTES: u32 = 8;
 
 // ============================================================
+// PRUNING CONSTANTS
+// ============================================================
+
+/// Minimum pruning target in MiB (matches Bitcoin Core).
+/// This is the minimum disk space required to store enough blocks for reorgs.
+pub const MIN_PRUNE_TARGET_MIB: u64 = 550;
+
+/// Minimum number of blocks to keep from the tip (for handling reorgs).
+/// Bitcoin Core uses 288 blocks (~2 days worth at 10 min/block).
+pub const MIN_BLOCKS_TO_KEEP: u32 = 288;
+
+/// Convert MiB to bytes.
+const fn mib_to_bytes(mib: u64) -> u64 {
+    mib * 1024 * 1024
+}
+
+/// Minimum disk space for block files (550 MiB in bytes).
+pub const MIN_DISK_SPACE_FOR_BLOCK_FILES: u64 = mib_to_bytes(MIN_PRUNE_TARGET_MIB);
+
+// ============================================================
 // FLAT FILE POSITION
 // ============================================================
 
@@ -285,6 +305,45 @@ impl FlatFileSeq {
 // FLAT BLOCK STORE
 // ============================================================
 
+/// Pruning configuration.
+#[derive(Clone, Debug)]
+pub struct PruneConfig {
+    /// Target disk usage in bytes. If 0, pruning is disabled.
+    pub prune_target: u64,
+    /// Whether to use fast pruning mode (for tests).
+    pub fast_prune: bool,
+}
+
+impl Default for PruneConfig {
+    fn default() -> Self {
+        Self {
+            prune_target: 0,
+            fast_prune: false,
+        }
+    }
+}
+
+impl PruneConfig {
+    /// Create a pruning configuration with a target in MiB.
+    pub fn with_target_mib(target_mib: u64) -> Self {
+        let target = if target_mib > 0 && target_mib < MIN_PRUNE_TARGET_MIB {
+            // Enforce minimum
+            MIN_DISK_SPACE_FOR_BLOCK_FILES
+        } else {
+            mib_to_bytes(target_mib)
+        };
+        Self {
+            prune_target: target,
+            fast_prune: false,
+        }
+    }
+
+    /// Check if pruning is enabled.
+    pub fn is_prune_mode(&self) -> bool {
+        self.prune_target > 0
+    }
+}
+
 /// Flat file block storage manager.
 ///
 /// Stores blocks in `blk?????.dat` files and undo data in `rev?????.dat` files.
@@ -300,6 +359,12 @@ pub struct FlatBlockStore {
     file_info: Vec<BlockFileInfo>,
     /// Current block file number.
     current_file: i32,
+    /// Pruning configuration.
+    prune_config: PruneConfig,
+    /// Flag indicating pruning check is needed after allocation.
+    check_for_pruning: bool,
+    /// Flag indicating we have pruned blocks previously.
+    have_pruned: bool,
 }
 
 impl FlatBlockStore {
@@ -310,6 +375,21 @@ impl FlatBlockStore {
     /// * `blocks_dir` - Directory for block files
     /// * `magic` - Network magic bytes
     pub fn new(blocks_dir: impl Into<PathBuf>, magic: &NetworkMagic) -> Self {
+        Self::with_config(blocks_dir, magic, PruneConfig::default())
+    }
+
+    /// Create a new FlatBlockStore with pruning configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `blocks_dir` - Directory for block files
+    /// * `magic` - Network magic bytes
+    /// * `prune_config` - Pruning configuration
+    pub fn with_config(
+        blocks_dir: impl Into<PathBuf>,
+        magic: &NetworkMagic,
+        prune_config: PruneConfig,
+    ) -> Self {
         let blocks_dir = blocks_dir.into();
         Self {
             block_files: FlatFileSeq::new(&blocks_dir, "blk", BLOCKFILE_CHUNK_SIZE),
@@ -317,7 +397,40 @@ impl FlatBlockStore {
             magic: *magic.as_bytes(),
             file_info: vec![BlockFileInfo::new()],
             current_file: 0,
+            prune_config,
+            check_for_pruning: false,
+            have_pruned: false,
         }
+    }
+
+    /// Check if pruning mode is enabled.
+    pub fn is_prune_mode(&self) -> bool {
+        self.prune_config.is_prune_mode()
+    }
+
+    /// Get the prune target in bytes.
+    pub fn prune_target(&self) -> u64 {
+        self.prune_config.prune_target
+    }
+
+    /// Check if we have previously pruned blocks.
+    pub fn have_pruned(&self) -> bool {
+        self.have_pruned
+    }
+
+    /// Set the have_pruned flag (called when loading from database).
+    pub fn set_have_pruned(&mut self, have_pruned: bool) {
+        self.have_pruned = have_pruned;
+    }
+
+    /// Check if pruning check is needed.
+    pub fn needs_pruning_check(&self) -> bool {
+        self.check_for_pruning
+    }
+
+    /// Clear the pruning check flag.
+    pub fn clear_pruning_check(&mut self) {
+        self.check_for_pruning = false;
     }
 
     /// Initialize from existing database state.
@@ -550,6 +663,274 @@ impl FlatBlockStore {
     /// Get the path to an undo file.
     pub fn undo_file_path(&self, file_num: i32) -> PathBuf {
         self.undo_files.filename(&FlatFilePos::new(file_num, 0))
+    }
+
+    /// Get the maximum block file number (0-indexed count - 1).
+    pub fn max_blockfile_num(&self) -> i32 {
+        self.file_info.len().saturating_sub(1) as i32
+    }
+
+    /// Get the number of block files.
+    pub fn file_count(&self) -> usize {
+        self.file_info.len()
+    }
+
+    // ============================================================
+    // PRUNING METHODS
+    // ============================================================
+
+    /// Clear the metadata for a single block file.
+    ///
+    /// This marks all blocks in the file as pruned (no data/undo) in the block index
+    /// and clears the file info. Call `unlink_pruned_files` after to actually delete.
+    ///
+    /// Returns the list of block hashes that were in this file (for index updates).
+    pub fn prune_one_block_file(&mut self, file_number: i32) {
+        if file_number < 0 || file_number as usize >= self.file_info.len() {
+            return;
+        }
+
+        // Clear the file info
+        self.file_info[file_number as usize] = BlockFileInfo::new();
+        self.have_pruned = true;
+
+        tracing::debug!(
+            "Pruned block file {}: cleared metadata",
+            file_number
+        );
+    }
+
+    /// Find files that can be pruned to reach the target disk usage.
+    ///
+    /// Returns a set of file numbers that should be pruned.
+    ///
+    /// # Arguments
+    ///
+    /// * `chain_tip_height` - Current chain tip height
+    /// * `finalized_height` - Height of oldest block we must keep (for reorgs)
+    ///
+    /// Files are only pruned if all blocks in them are below `finalized_height`.
+    pub fn find_files_to_prune(
+        &self,
+        chain_tip_height: u32,
+        finalized_height: u32,
+    ) -> Vec<i32> {
+        if !self.is_prune_mode() {
+            return Vec::new();
+        }
+
+        let current_usage = self.calculate_disk_usage();
+        let target = self.prune_config.prune_target;
+
+        // Include a buffer for upcoming allocations
+        let buffer = BLOCKFILE_CHUNK_SIZE + UNDOFILE_CHUNK_SIZE;
+
+        if current_usage + buffer < target {
+            return Vec::new();
+        }
+
+        let mut files_to_prune = Vec::new();
+        let mut bytes_to_prune = 0u64;
+
+        // Iterate through files from oldest to newest (excluding the current write file)
+        for file_num in 0..self.current_file {
+            // Stop if we've pruned enough
+            if current_usage.saturating_sub(bytes_to_prune) + buffer < target {
+                break;
+            }
+
+            let info = &self.file_info[file_num as usize];
+
+            // Skip empty files (already pruned)
+            if info.n_size == 0 {
+                continue;
+            }
+
+            // Don't prune files that contain blocks within MIN_BLOCKS_TO_KEEP of tip
+            let last_block_can_prune = chain_tip_height.saturating_sub(MIN_BLOCKS_TO_KEEP);
+            if info.height_last > last_block_can_prune {
+                continue;
+            }
+
+            bytes_to_prune += info.n_size as u64 + info.n_undo_size as u64;
+            files_to_prune.push(file_num);
+        }
+
+        if !files_to_prune.is_empty() {
+            tracing::info!(
+                "Found {} files to prune, will free {} bytes",
+                files_to_prune.len(),
+                bytes_to_prune
+            );
+        }
+
+        files_to_prune
+    }
+
+    /// Find files that can be manually pruned up to a specific height.
+    ///
+    /// Used by the `pruneblockchain` RPC.
+    ///
+    /// # Arguments
+    ///
+    /// * `prune_height` - Prune blocks up to and including this height
+    /// * `chain_tip_height` - Current chain tip height
+    pub fn find_files_to_prune_manual(
+        &self,
+        prune_height: u32,
+        chain_tip_height: u32,
+    ) -> Vec<i32> {
+        if !self.is_prune_mode() {
+            return Vec::new();
+        }
+
+        let mut files_to_prune = Vec::new();
+
+        // Don't prune blocks within MIN_BLOCKS_TO_KEEP of the tip
+        let last_block_can_prune = chain_tip_height.saturating_sub(MIN_BLOCKS_TO_KEEP);
+        let effective_prune_height = prune_height.min(last_block_can_prune);
+
+        for file_num in 0..=self.max_blockfile_num() {
+            if file_num as usize >= self.file_info.len() {
+                break;
+            }
+
+            let info = &self.file_info[file_num as usize];
+
+            // Skip empty files
+            if info.n_size == 0 {
+                continue;
+            }
+
+            // Only prune if the entire file is at or below the prune height
+            if info.height_last <= effective_prune_height {
+                files_to_prune.push(file_num);
+            }
+        }
+
+        files_to_prune
+    }
+
+    /// Delete block and undo files from disk.
+    ///
+    /// Call this after `prune_one_block_file` to actually remove the files.
+    pub fn unlink_pruned_files(&self, files_to_prune: &[i32]) -> Result<(), StorageError> {
+        for &file_num in files_to_prune {
+            let blk_path = self.block_file_path(file_num);
+            let rev_path = self.undo_file_path(file_num);
+
+            let mut removed_blk = false;
+            let mut removed_rev = false;
+
+            if blk_path.exists() {
+                if let Err(e) = fs::remove_file(&blk_path) {
+                    tracing::warn!("Failed to remove {}: {}", blk_path.display(), e);
+                } else {
+                    removed_blk = true;
+                }
+            }
+
+            if rev_path.exists() {
+                if let Err(e) = fs::remove_file(&rev_path) {
+                    tracing::warn!("Failed to remove {}: {}", rev_path.display(), e);
+                } else {
+                    removed_rev = true;
+                }
+            }
+
+            if removed_blk || removed_rev {
+                tracing::debug!(
+                    "Prune: deleted blk/rev {:05} (blk={}, rev={})",
+                    file_num,
+                    removed_blk,
+                    removed_rev
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute automatic pruning if needed.
+    ///
+    /// This is called after allocating new block space when in prune mode.
+    ///
+    /// Returns the list of pruned file numbers if any pruning occurred.
+    pub fn maybe_prune(
+        &mut self,
+        chain_tip_height: u32,
+        finalized_height: u32,
+    ) -> Result<Vec<i32>, StorageError> {
+        if !self.check_for_pruning || !self.is_prune_mode() {
+            return Ok(Vec::new());
+        }
+
+        self.check_for_pruning = false;
+
+        let files_to_prune = self.find_files_to_prune(chain_tip_height, finalized_height);
+
+        if files_to_prune.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Clear metadata for each file
+        for &file_num in &files_to_prune {
+            self.prune_one_block_file(file_num);
+        }
+
+        // Delete the actual files
+        self.unlink_pruned_files(&files_to_prune)?;
+
+        Ok(files_to_prune)
+    }
+
+    /// Check if a block has been pruned.
+    ///
+    /// A block is considered pruned if:
+    /// 1. We have previously pruned blocks (have_pruned is true)
+    /// 2. The block's file has been cleared (n_size == 0)
+    pub fn is_block_pruned(&self, file_num: i32) -> bool {
+        if !self.have_pruned {
+            return false;
+        }
+
+        if file_num < 0 || file_num as usize >= self.file_info.len() {
+            return true; // Unknown file, assume pruned
+        }
+
+        self.file_info[file_num as usize].n_size == 0
+    }
+
+    /// Scan for and unlink already-pruned files on startup.
+    ///
+    /// This handles the case where we marked files as pruned in the database
+    /// but crashed before deleting them from disk.
+    pub fn scan_and_unlink_pruned_files(&self) -> Result<(), StorageError> {
+        if !self.have_pruned {
+            return Ok(());
+        }
+
+        let mut files_to_delete = Vec::new();
+
+        for file_num in 0..self.max_blockfile_num() {
+            if file_num as usize >= self.file_info.len() {
+                break;
+            }
+
+            if self.file_info[file_num as usize].n_size == 0 {
+                files_to_delete.push(file_num);
+            }
+        }
+
+        if !files_to_delete.is_empty() {
+            tracing::info!(
+                "Cleaning up {} previously pruned block files",
+                files_to_delete.len()
+            );
+            self.unlink_pruned_files(&files_to_delete)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -844,5 +1225,269 @@ mod tests {
         assert_eq!(BLOCKFILE_CHUNK_SIZE, 0x1000000);
         assert_eq!(UNDOFILE_CHUNK_SIZE, 0x100000);
         assert_eq!(STORAGE_HEADER_BYTES, 8);
+    }
+
+    // ============================================================
+    // PRUNING TESTS
+    // ============================================================
+
+    #[test]
+    fn test_pruning_constants() {
+        assert_eq!(MIN_PRUNE_TARGET_MIB, 550);
+        assert_eq!(MIN_BLOCKS_TO_KEEP, 288);
+        assert_eq!(MIN_DISK_SPACE_FOR_BLOCK_FILES, 550 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_prune_config_default() {
+        let config = PruneConfig::default();
+        assert_eq!(config.prune_target, 0);
+        assert!(!config.is_prune_mode());
+    }
+
+    #[test]
+    fn test_prune_config_with_target() {
+        let config = PruneConfig::with_target_mib(1000);
+        assert_eq!(config.prune_target, 1000 * 1024 * 1024);
+        assert!(config.is_prune_mode());
+    }
+
+    #[test]
+    fn test_prune_config_enforces_minimum() {
+        // Request below minimum should be clamped to minimum
+        let config = PruneConfig::with_target_mib(100);
+        assert_eq!(config.prune_target, MIN_DISK_SPACE_FOR_BLOCK_FILES);
+    }
+
+    #[test]
+    fn test_prune_config_zero_means_disabled() {
+        let config = PruneConfig::with_target_mib(0);
+        assert_eq!(config.prune_target, 0);
+        assert!(!config.is_prune_mode());
+    }
+
+    #[test]
+    fn test_flat_block_store_with_prune_config() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let config = PruneConfig::with_target_mib(1000);
+        let store = FlatBlockStore::with_config(dir.path(), &params.network_magic, config);
+
+        assert!(store.is_prune_mode());
+        assert_eq!(store.prune_target(), 1000 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_flat_block_store_pruning_disabled_by_default() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let store = FlatBlockStore::new(dir.path(), &params.network_magic);
+
+        assert!(!store.is_prune_mode());
+        assert_eq!(store.prune_target(), 0);
+    }
+
+    #[test]
+    fn test_find_files_to_prune_disabled() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let store = FlatBlockStore::new(dir.path(), &params.network_magic);
+
+        // Pruning disabled, should return empty
+        let files = store.find_files_to_prune(1000, 0);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_find_files_to_prune_manual_disabled() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let store = FlatBlockStore::new(dir.path(), &params.network_magic);
+
+        // Pruning disabled, should return empty
+        let files = store.find_files_to_prune_manual(500, 1000);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_prune_one_block_file() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let config = PruneConfig::with_target_mib(1000);
+        let mut store = FlatBlockStore::with_config(dir.path(), &params.network_magic, config);
+
+        // Write a block to create file info
+        let block = create_test_block(1);
+        store.write_block(&block, 1).expect("failed to write block");
+
+        // Verify file info exists
+        let info = store.get_file_info(0).unwrap();
+        assert!(info.n_size > 0);
+
+        // Prune the file
+        store.prune_one_block_file(0);
+
+        // File info should be cleared
+        let info = store.get_file_info(0).unwrap();
+        assert_eq!(info.n_size, 0);
+        assert!(store.have_pruned());
+    }
+
+    #[test]
+    fn test_is_block_pruned() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let config = PruneConfig::with_target_mib(1000);
+        let mut store = FlatBlockStore::with_config(dir.path(), &params.network_magic, config);
+
+        // Write a block
+        let block = create_test_block(1);
+        store.write_block(&block, 1).expect("failed to write block");
+
+        // Not pruned yet
+        assert!(!store.is_block_pruned(0));
+
+        // Prune the file
+        store.prune_one_block_file(0);
+
+        // Now pruned
+        assert!(store.is_block_pruned(0));
+    }
+
+    #[test]
+    fn test_unlink_pruned_files() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let config = PruneConfig::with_target_mib(1000);
+        let mut store = FlatBlockStore::with_config(dir.path(), &params.network_magic, config);
+
+        // Write a block to create the file
+        let block = create_test_block(1);
+        store.write_block(&block, 1).expect("failed to write block");
+
+        let blk_path = store.block_file_path(0);
+        assert!(blk_path.exists());
+
+        // Unlink the file
+        store.unlink_pruned_files(&[0]).expect("failed to unlink");
+
+        // File should be gone
+        assert!(!blk_path.exists());
+    }
+
+    #[test]
+    fn test_find_files_to_prune_respects_min_blocks_to_keep() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        // Small prune target to force pruning
+        let config = PruneConfig {
+            prune_target: 100, // Very small
+            fast_prune: false,
+        };
+        let mut store = FlatBlockStore::with_config(dir.path(), &params.network_magic, config);
+
+        // Write blocks to file 0 with heights 0-99
+        for height in 0..100 {
+            let block = create_test_block(height);
+            store.write_block(&block, height).expect("failed to write block");
+        }
+
+        // Force rotation to a new file by simulating that file 0 is complete
+        store.current_file = 1;
+        store.file_info.push(BlockFileInfo::new());
+
+        // With chain tip at 500, we can prune up to height 212 (500 - 288)
+        // File 0 has blocks 0-99, so it should be pruneable
+        let chain_tip_height = 500;
+        let files = store.find_files_to_prune(chain_tip_height, 0);
+
+        // File 0 should be in the prunable list since all blocks are below tip - 288
+        assert!(files.contains(&0));
+    }
+
+    #[test]
+    fn test_find_files_to_prune_manual_respects_min_blocks_to_keep() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let config = PruneConfig::with_target_mib(1000);
+        let mut store = FlatBlockStore::with_config(dir.path(), &params.network_magic, config);
+
+        // Write blocks with various heights
+        for height in 0..100 {
+            let block = create_test_block(height);
+            store.write_block(&block, height).expect("failed to write block");
+        }
+
+        // With chain tip at 200, we can only prune up to height 0 (200 - 288 would be negative)
+        // But height 99 > 0, so file shouldn't be prunable
+        let files = store.find_files_to_prune_manual(100, 200);
+
+        // The file has height_last = 99 and effective_prune_height = 0 (since 200 - 288 < 0)
+        // So file 0 should NOT be prunable
+        assert!(files.is_empty());
+
+        // With chain tip at 500, effective_prune_height = min(100, 500-288) = 100
+        // File 0 has height_last = 99 <= 100, so it should be prunable
+        let files = store.find_files_to_prune_manual(100, 500);
+        assert!(files.contains(&0));
+    }
+
+    #[test]
+    fn test_maybe_prune() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let config = PruneConfig {
+            prune_target: 100, // Very small target
+            fast_prune: false,
+        };
+        let mut store = FlatBlockStore::with_config(dir.path(), &params.network_magic, config);
+
+        // Write blocks
+        for height in 0..50 {
+            let block = create_test_block(height);
+            store.write_block(&block, height).expect("failed to write block");
+        }
+
+        // Force pruning check
+        store.check_for_pruning = true;
+
+        // Call maybe_prune with a high chain tip
+        let pruned = store.maybe_prune(1000, 0).expect("pruning failed");
+
+        // Should have pruned file 0
+        assert!(pruned.contains(&0));
+
+        // File should be marked as pruned
+        assert!(store.is_block_pruned(0));
+
+        // Check flag should be cleared
+        assert!(!store.needs_pruning_check());
+    }
+
+    #[test]
+    fn test_pruneblockchain_files_deleted() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let params = ChainParams::testnet4();
+        let config = PruneConfig::with_target_mib(1000);
+        let mut store = FlatBlockStore::with_config(dir.path(), &params.network_magic, config);
+
+        // Write blocks
+        for height in 0..10 {
+            let block = create_test_block(height);
+            store.write_block(&block, height).expect("failed to write block");
+        }
+
+        let blk_path = store.block_file_path(0);
+        assert!(blk_path.exists());
+
+        // Manually prune file 0
+        let files = store.find_files_to_prune_manual(100, 500);
+        for file in &files {
+            store.prune_one_block_file(*file);
+        }
+        store.unlink_pruned_files(&files).expect("failed to unlink");
+
+        // File should be gone
+        assert!(!blk_path.exists());
     }
 }

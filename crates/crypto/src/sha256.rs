@@ -66,7 +66,12 @@ mod portable {
 // x86_64 SHA-NI implementation
 // =============================================================================
 
-// SHA-NI implementation - currently disabled due to state extraction bug
+// SHA-NI implementation using _mm_sha256rnds2_epu32 intrinsics.
+// This module provides hardware-accelerated SHA-256 via Intel SHA Extensions
+// (available on AMD Zen+ / Intel Goldmont+ and later).
+// Currently disabled in the dispatch functions due to a state extraction bug
+// in extract_hash. The sha2 crate (used by the portable path) also auto-detects
+// SHA-NI at runtime via CPUID, so hardware acceleration is used regardless.
 // TODO: Fix the extract_hash function to properly unshuffle the SHA-NI state
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]

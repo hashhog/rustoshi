@@ -30,7 +30,10 @@ use crate::params::{
     MAX_BLOCK_WEIGHT, MAX_MONEY, MAX_PUBKEYS_PER_MULTISIG, SEQUENCE_LOCKTIME_DISABLE_FLAG,
     SEQUENCE_LOCKTIME_MASK, SEQUENCE_LOCKTIME_TYPE_FLAG, WITNESS_SCALE_FACTOR,
 };
-use crate::script::{verify_script, ScriptFlags, SigVersion, SignatureChecker};
+use crate::script::{
+    is_p2sh, is_push_only, parse_witness_program, verify_script, ScriptFlags, SigVersion,
+    SignatureChecker,
+};
 use rayon::prelude::*;
 use rustoshi_crypto::sha256d;
 use rustoshi_primitives::{compact_size_len, Block, BlockHeader, Hash256, OutPoint, Transaction};
@@ -301,21 +304,32 @@ fn compute_block_weight(block: &Block) -> u64 {
     weight
 }
 
-/// Count sigops in a block.
+/// Count sigops in a block without UTXO context.
 ///
-/// For pre-SegWit blocks, we count raw sigops scaled by WITNESS_SCALE_FACTOR.
-/// For SegWit transactions, witness sigops are counted directly.
+/// This is a preliminary check that counts only legacy sigops (from scriptSig
+/// and scriptPubKey), scaled by WITNESS_SCALE_FACTOR. It cannot count P2SH or
+/// witness sigops because those require UTXO data.
+///
+/// The full sigop cost is computed during `connect_block` via
+/// `get_transaction_sigop_cost` for each transaction.
+///
+/// Reference: Bitcoin Core validation.cpp CheckBlock()
 fn count_block_sigops(block: &Block) -> u64 {
     let mut sigops: u64 = 0;
     for tx in &block.transactions {
         // Legacy sigops from scriptSig and scriptPubKey
-        sigops += count_tx_legacy_sigops(tx) as u64 * WITNESS_SCALE_FACTOR;
+        sigops += get_legacy_sigop_count(tx) as u64 * WITNESS_SCALE_FACTOR;
     }
     sigops
 }
 
-/// Count legacy sigops in a transaction.
-fn count_tx_legacy_sigops(tx: &Transaction) -> u32 {
+/// Count legacy sigops in a transaction (from scriptSig and scriptPubKey).
+///
+/// Uses inaccurate counting (OP_CHECKMULTISIG = 20 sigops) because we don't
+/// know the actual redeem scripts without UTXO context.
+///
+/// Reference: Bitcoin Core tx_verify.cpp GetLegacySigOpCount()
+pub fn get_legacy_sigop_count(tx: &Transaction) -> u32 {
     let mut count = 0u32;
     for input in &tx.inputs {
         count += count_script_sigops(&input.script_sig, false);
@@ -326,14 +340,239 @@ fn count_tx_legacy_sigops(tx: &Transaction) -> u32 {
     count
 }
 
+/// Count P2SH sigops in a transaction.
+///
+/// For each input spending a P2SH output, extract the redeem script from
+/// scriptSig and count its sigops with accurate multisig counting.
+///
+/// Requires UTXO data to check if the spent output is P2SH.
+///
+/// Reference: Bitcoin Core tx_verify.cpp GetP2SHSigOpCount()
+pub fn get_p2sh_sigop_count(tx: &Transaction, get_coin: impl Fn(&OutPoint) -> Option<CoinEntry>) -> u32 {
+    if tx.is_coinbase() {
+        return 0;
+    }
+
+    let mut count = 0u32;
+    for input in &tx.inputs {
+        let Some(coin) = get_coin(&input.previous_output) else {
+            continue;
+        };
+
+        if is_p2sh(&coin.script_pubkey) {
+            // Extract the last push from scriptSig (the serialized redeem script)
+            if let Some(redeem_script) = get_last_scriptpush(&input.script_sig) {
+                count += count_script_sigops(&redeem_script, true);
+            }
+        }
+    }
+    count
+}
+
+/// Get the transaction sigop cost (weighted sigops for block limit).
+///
+/// The total cost is computed as:
+/// - Legacy sigops (scriptSig + scriptPubKey) × WITNESS_SCALE_FACTOR
+/// - P2SH sigops (redeem script) × WITNESS_SCALE_FACTOR (if P2SH flag active)
+/// - Witness sigops (P2WPKH/P2WSH) × 1 (no scaling - witness discount)
+///
+/// The block limit is MAX_BLOCK_SIGOPS_COST (80,000).
+///
+/// Reference: Bitcoin Core tx_verify.cpp GetTransactionSigOpCost()
+pub fn get_transaction_sigop_cost(
+    tx: &Transaction,
+    get_coin: impl Fn(&OutPoint) -> Option<CoinEntry>,
+    flags: &ScriptFlags,
+) -> u64 {
+    // Start with legacy sigops, scaled by WITNESS_SCALE_FACTOR
+    let mut cost = get_legacy_sigop_count(tx) as u64 * WITNESS_SCALE_FACTOR;
+
+    if tx.is_coinbase() {
+        return cost;
+    }
+
+    // Add P2SH sigops if P2SH is active
+    if flags.verify_p2sh {
+        // Need to pass a closure that can be called multiple times
+        let mut p2sh_count = 0u32;
+        for input in &tx.inputs {
+            let Some(coin) = get_coin(&input.previous_output) else {
+                continue;
+            };
+            if is_p2sh(&coin.script_pubkey) {
+                if let Some(redeem_script) = get_last_scriptpush(&input.script_sig) {
+                    p2sh_count += count_script_sigops(&redeem_script, true);
+                }
+            }
+        }
+        cost += p2sh_count as u64 * WITNESS_SCALE_FACTOR;
+    }
+
+    // Add witness sigops (NOT scaled - this is the witness discount)
+    for input in &tx.inputs {
+        let Some(coin) = get_coin(&input.previous_output) else {
+            continue;
+        };
+        cost += count_witness_sigops(
+            &input.script_sig,
+            &coin.script_pubkey,
+            &input.witness,
+            flags,
+        ) as u64;
+    }
+
+    cost
+}
+
+/// Count witness sigops for an input.
+///
+/// For bare witness programs (P2WPKH/P2WSH):
+/// - P2WPKH: 1 sigop
+/// - P2WSH: count sigops in witness script with accurate counting
+///
+/// For P2SH-wrapped witness programs:
+/// - Extract redeem script from scriptSig
+/// - If it's a witness program, count as above
+///
+/// Witness sigops are NOT scaled (this is the witness discount).
+///
+/// Reference: Bitcoin Core interpreter.cpp CountWitnessSigOps()
+fn count_witness_sigops(
+    script_sig: &[u8],
+    script_pubkey: &[u8],
+    witness: &[Vec<u8>],
+    flags: &ScriptFlags,
+) -> u32 {
+    if !flags.verify_witness {
+        return 0;
+    }
+
+    // Check for bare witness program
+    if let Some((version, program)) = parse_witness_program(script_pubkey) {
+        return witness_sigops(version, program, witness);
+    }
+
+    // Check for P2SH-wrapped witness program
+    if is_p2sh(script_pubkey) && is_push_only(script_sig) {
+        if let Some(redeem_script) = get_last_scriptpush(script_sig) {
+            if let Some((version, program)) = parse_witness_program(&redeem_script) {
+                return witness_sigops(version, program, witness);
+            }
+        }
+    }
+
+    0
+}
+
+/// Count sigops for a witness program.
+///
+/// - Version 0, 20 bytes (P2WPKH): 1 sigop
+/// - Version 0, 32 bytes (P2WSH): count sigops in witness script with accurate counting
+/// - Other versions: 0 (unknown, future upgrade)
+///
+/// Reference: Bitcoin Core interpreter.cpp WitnessSigOps()
+fn witness_sigops(version: u8, program: &[u8], witness: &[Vec<u8>]) -> u32 {
+    if version == 0 {
+        if program.len() == 20 {
+            // P2WPKH: always 1 sigop
+            return 1;
+        }
+        if program.len() == 32 && !witness.is_empty() {
+            // P2WSH: the last witness item is the script
+            let witness_script = &witness[witness.len() - 1];
+            return count_script_sigops(witness_script, true);
+        }
+    }
+    // Unknown witness version: 0 sigops (future soft forks may change this)
+    0
+}
+
+/// Extract the last push from a push-only script.
+///
+/// For P2SH, the last item pushed by scriptSig is the serialized redeem script.
+/// For P2SH-wrapped witness, the last item is the witness program.
+///
+/// Returns None if the script is not push-only or is empty.
+fn get_last_scriptpush(script: &[u8]) -> Option<Vec<u8>> {
+    let mut pc = 0;
+    let mut last_data: Option<Vec<u8>> = None;
+
+    while pc < script.len() {
+        let op = script[pc];
+        pc += 1;
+
+        if op == 0x00 {
+            // OP_0: push empty
+            last_data = Some(vec![]);
+        } else if op >= 0x01 && op <= 0x4b {
+            // Direct push (1-75 bytes)
+            let len = op as usize;
+            if pc + len > script.len() {
+                return None;
+            }
+            last_data = Some(script[pc..pc + len].to_vec());
+            pc += len;
+        } else if op == 0x4c {
+            // OP_PUSHDATA1
+            if pc >= script.len() {
+                return None;
+            }
+            let len = script[pc] as usize;
+            pc += 1;
+            if pc + len > script.len() {
+                return None;
+            }
+            last_data = Some(script[pc..pc + len].to_vec());
+            pc += len;
+        } else if op == 0x4d {
+            // OP_PUSHDATA2
+            if pc + 1 >= script.len() {
+                return None;
+            }
+            let len = u16::from_le_bytes([script[pc], script[pc + 1]]) as usize;
+            pc += 2;
+            if pc + len > script.len() {
+                return None;
+            }
+            last_data = Some(script[pc..pc + len].to_vec());
+            pc += len;
+        } else if op == 0x4e {
+            // OP_PUSHDATA4
+            if pc + 3 >= script.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([script[pc], script[pc + 1], script[pc + 2], script[pc + 3]]) as usize;
+            pc += 4;
+            if pc + len > script.len() {
+                return None;
+            }
+            last_data = Some(script[pc..pc + len].to_vec());
+            pc += len;
+        } else if op >= 0x51 && op <= 0x60 {
+            // OP_1 through OP_16: push the value
+            last_data = Some(vec![op - 0x50]);
+        } else if op == 0x4f {
+            // OP_1NEGATE: push -1
+            last_data = Some(vec![0x81]);
+        } else if op > 0x60 {
+            // Not a push operation - this script is not push-only
+            return None;
+        }
+    }
+
+    last_data
+}
+
 /// Count sigops in a script.
 ///
 /// - OP_CHECKSIG/OP_CHECKSIGVERIFY: 1 sigop each
 /// - OP_CHECKMULTISIG/OP_CHECKMULTISIGVERIFY: 20 sigops (or actual key count if accurate=true)
 ///
 /// The `accurate` parameter uses the preceding OP_n to get the actual key count
-/// for multisig, but this is only used for P2SH where we execute the redeem script.
-fn count_script_sigops(script: &[u8], accurate: bool) -> u32 {
+/// for multisig. This is used for P2SH redeem scripts and witness scripts.
+///
+/// Reference: Bitcoin Core script.cpp GetSigOpCount()
+pub fn count_script_sigops(script: &[u8], accurate: bool) -> u32 {
     let mut count = 0u32;
     let mut last_opcode = 0u8;
     let mut i = 0;
@@ -850,11 +1089,15 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     let csv_active = height >= params.csv_height;
     let mut total_fees: u64 = 0;
     let mut spent_coins = Vec::new();
+    let mut block_sigop_cost: u64 = 0;
 
     // Validate each transaction
     for tx in &block.transactions {
         // Skip coinbase for input validation (it has no real inputs)
         if tx.is_coinbase() {
+            // Count coinbase sigops (legacy only, no inputs)
+            block_sigop_cost += get_legacy_sigop_count(tx) as u64 * WITNESS_SCALE_FACTOR;
+
             // Add coinbase outputs to UTXO set immediately
             // (for potential intra-block spending in future soft forks, though
             // currently coinbase outputs can't be spent until maturity)
@@ -917,6 +1160,24 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
             spent_heights.push(coin.height);
             coins.push(coin);
         }
+
+        // Calculate sigop cost for this transaction using the collected coins
+        // Create a closure that looks up coins by input index
+        let tx_sigop_cost = {
+            let coins_ref = &coins;
+            let inputs = &tx.inputs;
+            let get_coin = |outpoint: &OutPoint| -> Option<CoinEntry> {
+                // Find which input has this outpoint
+                for (idx, input) in inputs.iter().enumerate() {
+                    if input.previous_output == *outpoint {
+                        return Some(coins_ref[idx].clone());
+                    }
+                }
+                None
+            };
+            get_transaction_sigop_cost(tx, get_coin, &flags)
+        };
+        block_sigop_cost += tx_sigop_cost;
 
         // BIP-68: Check sequence locks
         // BIP-68 only applies if tx version >= 2 and CSV is active
@@ -983,6 +1244,11 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
         }
     }
 
+    // Check block sigop cost limit
+    if block_sigop_cost > MAX_BLOCK_SIGOPS_COST {
+        return Err(ValidationError::SigopsLimitExceeded(block_sigop_cost));
+    }
+
     // Verify coinbase doesn't exceed allowed value (subsidy + fees)
     let subsidy = block_subsidy(height, params.subsidy_halving_interval);
     let max_coinbase_value = subsidy + total_fees;
@@ -1021,6 +1287,42 @@ pub fn validate_scripts_parallel(
     coins: &[Vec<CoinEntry>],
     flags: &ScriptFlags,
 ) -> Result<(), TxValidationError> {
+    validate_scripts_parallel_with_cache(block, coins, flags, None)
+}
+
+/// Validate all transaction scripts in a block in parallel with optional caching.
+///
+/// This is the same as `validate_scripts_parallel` but with an optional signature
+/// cache. When provided, the cache is checked before each script verification
+/// and successful verifications are cached for future use.
+///
+/// # Arguments
+/// * `block` - The block containing transactions to validate
+/// * `coins` - Pre-fetched coins for each input (indexed by (tx_index, input_index))
+/// * `flags` - Script verification flags for this block height
+/// * `sig_cache` - Optional signature cache for avoiding redundant verifications
+///
+/// # Returns
+/// `Ok(())` if all scripts are valid, or the first error encountered.
+///
+/// # Cache Usage
+///
+/// The cache key includes the txid, input index, and flags. This ensures that:
+/// - Different transactions are cached separately
+/// - Different inputs within a transaction are cached separately
+/// - Different verification flags don't share cache entries
+///
+/// Only successful verifications are cached. Cache entries should be cleared
+/// during chain reorganizations.
+pub fn validate_scripts_parallel_with_cache(
+    block: &Block,
+    coins: &[Vec<CoinEntry>],
+    flags: &ScriptFlags,
+    sig_cache: Option<&crate::sig_cache::SigCache>,
+) -> Result<(), TxValidationError> {
+    // Convert flags to u32 for cache key
+    let flags_bits = flags.to_bits();
+
     // Collect all (tx, input_index, coin) tuples for non-coinbase transactions
     let script_checks: Vec<_> = block
         .transactions
@@ -1039,15 +1341,34 @@ pub fn validate_scripts_parallel(
     let results: Vec<Result<(), TxValidationError>> = script_checks
         .par_iter()
         .map(|(tx, input_idx, coin)| {
+            let txid_bytes: [u8; 32] = tx.txid().0;
+
+            // Check cache first
+            if let Some(cache) = sig_cache {
+                if cache.contains(&txid_bytes, *input_idx as u32, flags_bits) {
+                    return Ok(());
+                }
+            }
+
+            // Verify script
             let checker = TransactionSignatureChecker::new(tx, *input_idx, coin.value);
-            verify_script(
+            let result = verify_script(
                 &tx.inputs[*input_idx].script_sig,
                 &coin.script_pubkey,
                 &tx.inputs[*input_idx].witness,
                 flags,
                 &checker,
             )
-            .map_err(|e| TxValidationError::ScriptFailed(e.to_string()))
+            .map_err(|e| TxValidationError::ScriptFailed(e.to_string()));
+
+            // Cache successful verification
+            if result.is_ok() {
+                if let Some(cache) = sig_cache {
+                    cache.insert(&txid_bytes, *input_idx as u32, flags_bits);
+                }
+            }
+
+            result
         })
         .collect();
 
@@ -1095,6 +1416,40 @@ pub fn connect_block_parallel(
     connect_block_parallel_with_sequence_locks(block, height, utxo_view, params, &null_context, 0)
 }
 
+/// Connect a block with parallel script validation and signature caching.
+///
+/// Same as `connect_block_parallel` but with an optional signature cache to
+/// avoid redundant script verification for transactions already validated
+/// in the mempool.
+///
+/// # Arguments
+/// * `block` - The block to connect
+/// * `height` - The height of the block
+/// * `utxo_view` - The UTXO view to read from and update
+/// * `params` - Chain parameters
+/// * `sig_cache` - Optional signature cache
+///
+/// # Returns
+/// `(undo_data, total_fees)` on success.
+pub fn connect_block_parallel_with_cache(
+    block: &Block,
+    height: u32,
+    utxo_view: &mut dyn UtxoView,
+    params: &ChainParams,
+    sig_cache: Option<&crate::sig_cache::SigCache>,
+) -> Result<(UndoData, u64), ValidationError> {
+    let null_context = NullSequenceLockContext;
+    connect_block_parallel_with_cache_and_sequence_locks(
+        block,
+        height,
+        utxo_view,
+        params,
+        &null_context,
+        0,
+        sig_cache,
+    )
+}
+
 /// Connect a block with parallel script validation and BIP-68 sequence lock enforcement.
 ///
 /// This is the full-featured parallel version that validates scripts in parallel
@@ -1118,15 +1473,57 @@ pub fn connect_block_parallel_with_sequence_locks<C: SequenceLockContext>(
     seq_context: &C,
     prev_block_mtp: u32,
 ) -> Result<(UndoData, u64), ValidationError> {
+    connect_block_parallel_with_cache_and_sequence_locks(
+        block,
+        height,
+        utxo_view,
+        params,
+        seq_context,
+        prev_block_mtp,
+        None,
+    )
+}
+
+/// Connect a block with parallel script validation, BIP-68 sequence locks, and signature caching.
+///
+/// This is the most fully-featured block connection function. It:
+/// - Validates scripts in parallel using rayon
+/// - Enforces BIP-68 sequence locks when active
+/// - Uses an optional signature cache to skip redundant verification
+///
+/// # Arguments
+/// * `block` - The block to connect
+/// * `height` - The height of the block
+/// * `utxo_view` - The UTXO view to read from and update
+/// * `params` - Chain parameters
+/// * `seq_context` - Context for sequence lock MTP lookups
+/// * `prev_block_mtp` - The median-time-past of the previous block
+/// * `sig_cache` - Optional signature cache to avoid redundant verification
+///
+/// # Returns
+/// `(undo_data, total_fees)` on success.
+pub fn connect_block_parallel_with_cache_and_sequence_locks<C: SequenceLockContext>(
+    block: &Block,
+    height: u32,
+    utxo_view: &mut dyn UtxoView,
+    params: &ChainParams,
+    seq_context: &C,
+    prev_block_mtp: u32,
+    sig_cache: Option<&crate::sig_cache::SigCache>,
+) -> Result<(UndoData, u64), ValidationError> {
     let flags = script_flags_for_height(height, params);
     let csv_active = height >= params.csv_height;
     let mut total_fees: u64 = 0;
     let mut spent_coins = Vec::new();
     let mut tx_coins: Vec<Vec<CoinEntry>> = Vec::new();
+    let mut block_sigop_cost: u64 = 0;
 
     // First pass: validate inputs and collect coins
     for tx in &block.transactions {
         if tx.is_coinbase() {
+            // Count coinbase sigops (legacy only, no inputs)
+            block_sigop_cost += get_legacy_sigop_count(tx) as u64 * WITNESS_SCALE_FACTOR;
+
             // Add coinbase outputs to UTXO set immediately
             let txid = tx.txid();
             for (vout, output) in tx.outputs.iter().enumerate() {
@@ -1186,6 +1583,22 @@ pub fn connect_block_parallel_with_sequence_locks<C: SequenceLockContext>(
             utxo_view.spend_utxo(&input.previous_output);
         }
 
+        // Calculate sigop cost for this transaction
+        let tx_sigop_cost = {
+            let coins_ref = &coins_for_tx;
+            let inputs = &tx.inputs;
+            let get_coin = |outpoint: &OutPoint| -> Option<CoinEntry> {
+                for (idx, input) in inputs.iter().enumerate() {
+                    if input.previous_output == *outpoint {
+                        return Some(coins_ref[idx].clone());
+                    }
+                }
+                None
+            };
+            get_transaction_sigop_cost(tx, get_coin, &flags)
+        };
+        block_sigop_cost += tx_sigop_cost;
+
         // BIP-68: Check sequence locks
         let enforce_bip68 = tx.version >= 2 && csv_active;
         if enforce_bip68 {
@@ -1225,8 +1638,13 @@ pub fn connect_block_parallel_with_sequence_locks<C: SequenceLockContext>(
         }
     }
 
-    // Parallel script validation
-    validate_scripts_parallel(block, &tx_coins, &flags)?;
+    // Parallel script validation (with optional cache)
+    validate_scripts_parallel_with_cache(block, &tx_coins, &flags, sig_cache)?;
+
+    // Check block sigop cost limit
+    if block_sigop_cost > MAX_BLOCK_SIGOPS_COST {
+        return Err(ValidationError::SigopsLimitExceeded(block_sigop_cost));
+    }
 
     // Verify coinbase doesn't exceed allowed value
     let subsidy = block_subsidy(height, params.subsidy_halving_interval);
@@ -2280,5 +2698,216 @@ mod tests {
         // Should return no locks
         assert_eq!(locks.min_height, -1);
         assert_eq!(locks.min_time, -1);
+    }
+
+    // =========================
+    // Extended sigop tests
+    // =========================
+
+    #[test]
+    fn get_last_scriptpush_simple() {
+        // Push 4 bytes: 0x04 0x01 0x02 0x03 0x04
+        let script = vec![0x04, 0x01, 0x02, 0x03, 0x04];
+        let result = get_last_scriptpush(&script);
+        assert_eq!(result, Some(vec![0x01, 0x02, 0x03, 0x04]));
+    }
+
+    #[test]
+    fn get_last_scriptpush_multiple_pushes() {
+        // Push 2 bytes, then push 3 bytes
+        let script = vec![0x02, 0x01, 0x02, 0x03, 0x11, 0x22, 0x33];
+        let result = get_last_scriptpush(&script);
+        assert_eq!(result, Some(vec![0x11, 0x22, 0x33]));
+    }
+
+    #[test]
+    fn get_last_scriptpush_op_n() {
+        // OP_1 (0x51) pushes the value 1
+        let script = vec![0x51];
+        let result = get_last_scriptpush(&script);
+        assert_eq!(result, Some(vec![1]));
+    }
+
+    #[test]
+    fn get_last_scriptpush_op_0() {
+        // OP_0 pushes empty
+        let script = vec![0x00];
+        let result = get_last_scriptpush(&script);
+        assert_eq!(result, Some(vec![]));
+    }
+
+    #[test]
+    fn get_last_scriptpush_not_push_only() {
+        // OP_DUP (0x76) is not a push operation
+        let script = vec![0x76];
+        let result = get_last_scriptpush(&script);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn witness_sigops_p2wpkh() {
+        // P2WPKH program is 20 bytes
+        let program = [0u8; 20];
+        let witness = vec![vec![0u8; 72], vec![0u8; 33]]; // sig, pubkey
+        assert_eq!(witness_sigops(0, &program, &witness), 1);
+    }
+
+    #[test]
+    fn witness_sigops_p2wsh_checksig() {
+        // P2WSH program is 32 bytes
+        let program = [0u8; 32];
+        // Simple script containing just OP_CHECKSIG
+        let script = vec![0xac]; // OP_CHECKSIG
+        let witness = vec![vec![0u8; 72], vec![0u8; 33], script];
+        assert_eq!(witness_sigops(0, &program, &witness), 1);
+    }
+
+    #[test]
+    fn witness_sigops_p2wsh_multisig_accurate() {
+        // P2WSH with 2-of-3 multisig
+        let program = [0u8; 32];
+        // OP_2 <pubkey> <pubkey> <pubkey> OP_3 OP_CHECKMULTISIG
+        let mut script = vec![0x52]; // OP_2
+        script.push(0x21);
+        script.extend([0u8; 33]);
+        script.push(0x21);
+        script.extend([0u8; 33]);
+        script.push(0x21);
+        script.extend([0u8; 33]);
+        script.push(0x53); // OP_3
+        script.push(0xae); // OP_CHECKMULTISIG
+
+        let witness = vec![vec![], vec![0u8; 72], vec![0u8; 72], script];
+        // With accurate counting, should be 3 (from OP_3)
+        assert_eq!(witness_sigops(0, &program, &witness), 3);
+    }
+
+    #[test]
+    fn witness_sigops_unknown_version() {
+        // Unknown witness version should return 0
+        let program = [0u8; 32];
+        let witness = vec![vec![0u8; 64]];
+        assert_eq!(witness_sigops(1, &program, &witness), 0);
+        assert_eq!(witness_sigops(16, &program, &witness), 0);
+    }
+
+    #[test]
+    fn get_legacy_sigop_count_p2pkh() {
+        // P2PKH transaction: input has no sigops, output has 1 (OP_CHECKSIG)
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::from_bytes([1u8; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![0x48; 72], // Placeholder signature
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 1000,
+                // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        // P2PKH output has 1 sigop (OP_CHECKSIG)
+        assert_eq!(get_legacy_sigop_count(&tx), 1);
+    }
+
+    #[test]
+    fn sigop_cost_p2pkh_legacy() {
+        // P2PKH spends should have sigops scaled by WITNESS_SCALE_FACTOR
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::from_bytes([1u8; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![0x48; 72], // Placeholder signature
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![0x51], // OP_1 (no sigops)
+            }],
+            lock_time: 0,
+        };
+
+        // The spent output is P2PKH with 1 sigop in the scriptPubKey
+        // But get_legacy_sigop_count only counts scriptSig and output scriptPubKeys
+        // The scriptSig might have sigops too
+        let flags = ScriptFlags {
+            verify_p2sh: true,
+            verify_witness: true,
+            ..Default::default()
+        };
+
+        // With no real coins, we just test the legacy counting
+        let cost = get_transaction_sigop_cost(&tx, |_| None, &flags);
+        // scriptSig has no sigops, output scriptPubKey has no sigops
+        assert_eq!(cost, 0);
+    }
+
+    #[test]
+    fn sigop_cost_witness_discount() {
+        // Test that witness sigops are NOT scaled
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::from_bytes([1u8; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![], // Empty for SegWit
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0u8; 72], vec![0u8; 33]], // sig, pubkey
+            }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![0x51], // OP_1
+            }],
+            lock_time: 0,
+        };
+
+        // The spent output is P2WPKH: OP_0 <20 bytes>
+        let p2wpkh_output = CoinEntry {
+            height: 100,
+            is_coinbase: false,
+            value: 2000,
+            script_pubkey: vec![0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                               0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                               0x00, 0x00],
+        };
+
+        let flags = ScriptFlags {
+            verify_p2sh: true,
+            verify_witness: true,
+            ..Default::default()
+        };
+
+        let expected_outpoint = OutPoint {
+            txid: Hash256::from_bytes([1u8; 32]),
+            vout: 0,
+        };
+
+        let cost = get_transaction_sigop_cost(&tx, |outpoint| {
+            if *outpoint == expected_outpoint {
+                Some(p2wpkh_output.clone())
+            } else {
+                None
+            }
+        }, &flags);
+
+        // P2WPKH: 1 witness sigop (NOT scaled) + 0 legacy sigops
+        // Total cost = 1
+        assert_eq!(cost, 1);
     }
 }

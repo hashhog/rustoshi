@@ -106,6 +106,8 @@ pub struct ScriptFlags {
     pub verify_discourage_op_success: bool,
     /// Fail on upgradable pubkey types
     pub verify_discourage_upgradable_pubkeytype: bool,
+    /// OP_CODESEPARATOR forbidden in witness v0
+    pub verify_const_scriptcode: bool,
 }
 
 impl ScriptFlags {
@@ -161,7 +163,80 @@ impl ScriptFlags {
             verify_discourage_upgradable_taproot_version: true,
             verify_discourage_op_success: true,
             verify_discourage_upgradable_pubkeytype: true,
+            verify_const_scriptcode: true,
         }
+    }
+
+    /// Convert flags to a 32-bit integer for use as a cache key.
+    ///
+    /// Each flag is assigned a bit position. This allows the cache to
+    /// distinguish between different verification contexts.
+    pub fn to_bits(&self) -> u32 {
+        let mut bits: u32 = 0;
+        if self.verify_p2sh {
+            bits |= 1 << 0;
+        }
+        if self.verify_dersig {
+            bits |= 1 << 1;
+        }
+        if self.verify_checklocktimeverify {
+            bits |= 1 << 2;
+        }
+        if self.verify_checksequenceverify {
+            bits |= 1 << 3;
+        }
+        if self.verify_witness {
+            bits |= 1 << 4;
+        }
+        if self.verify_nulldummy {
+            bits |= 1 << 5;
+        }
+        if self.verify_nullfail {
+            bits |= 1 << 6;
+        }
+        if self.verify_witness_pubkeytype {
+            bits |= 1 << 7;
+        }
+        if self.verify_taproot {
+            bits |= 1 << 8;
+        }
+        if self.verify_strictenc {
+            bits |= 1 << 9;
+        }
+        if self.verify_low_s {
+            bits |= 1 << 10;
+        }
+        if self.verify_sigpushonly {
+            bits |= 1 << 11;
+        }
+        if self.verify_minimaldata {
+            bits |= 1 << 12;
+        }
+        if self.verify_cleanstack {
+            bits |= 1 << 13;
+        }
+        if self.verify_discourage_upgradable_nops {
+            bits |= 1 << 14;
+        }
+        if self.verify_discourage_upgradable_witness_program {
+            bits |= 1 << 15;
+        }
+        if self.verify_minimalif {
+            bits |= 1 << 16;
+        }
+        if self.verify_discourage_upgradable_taproot_version {
+            bits |= 1 << 17;
+        }
+        if self.verify_discourage_op_success {
+            bits |= 1 << 18;
+        }
+        if self.verify_discourage_upgradable_pubkeytype {
+            bits |= 1 << 19;
+        }
+        if self.verify_const_scriptcode {
+            bits |= 1 << 20;
+        }
+        bits
     }
 }
 
@@ -987,6 +1062,10 @@ fn eval_script_internal(
                 ctx.push(sha256d(&data).0.to_vec())?;
             }
             Opcode::OP_CODESEPARATOR => {
+                // In witness v0, OP_CODESEPARATOR is forbidden if CONST_SCRIPTCODE is set
+                if ctx.sig_version == SigVersion::WitnessV0 && ctx.flags.verify_const_scriptcode {
+                    return Err(ScriptError::BadOpcode);
+                }
                 // Update the position for signature hashing
                 // Store the position OF the OP_CODESEPARATOR opcode.
                 // The subscript for sighash will start AFTER this position.
@@ -1470,6 +1549,27 @@ pub fn is_p2wsh(script: &[u8]) -> bool {
 /// Check if a script is P2TR: OP_1 <32 bytes>
 pub fn is_p2tr(script: &[u8]) -> bool {
     script.len() == 34 && script[0] == 0x51 && script[1] == 0x20
+}
+
+/// Check if a script is Pay-to-Anchor (P2A): OP_1 <0x4e73>
+///
+/// P2A is a special anyone-can-spend output used for CPFP fee bumping
+/// in Lightning and similar protocols. The script is exactly 4 bytes:
+/// - OP_1 (0x51) - witness version 1
+/// - PUSHBYTES_2 (0x02) - push 2 bytes
+/// - 0x4e 0x73 - the anchor program ("Ns" in ASCII)
+///
+/// P2A outputs are exempt from dust thresholds and require an empty witness.
+pub fn is_p2a(script: &[u8]) -> bool {
+    script.len() == 4 && script[0] == 0x51 && script[1] == 0x02 && script[2] == 0x4e && script[3] == 0x73
+}
+
+/// Check if a witness program is Pay-to-Anchor (P2A).
+///
+/// Given a parsed witness version and program, checks if it matches
+/// the P2A format (version 1, 2-byte program "4e73").
+pub fn is_p2a_program(version: u8, program: &[u8]) -> bool {
+    version == 1 && program.len() == 2 && program[0] == 0x4e && program[1] == 0x73
 }
 
 /// Parse a witness program from a scriptPubKey.
@@ -2045,6 +2145,57 @@ mod tests {
             0, 0, 0, // 32 bytes
         ];
         assert!(is_p2wsh(&p2wsh));
+    }
+
+    #[test]
+    fn is_p2a_detection() {
+        // Valid P2A: OP_1 PUSHBYTES_2 0x4e 0x73
+        let p2a = [0x51, 0x02, 0x4e, 0x73];
+        assert!(is_p2a(&p2a));
+
+        // Also verify via is_p2a_program
+        let (version, program) = parse_witness_program(&p2a).unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(program, &[0x4e, 0x73]);
+        assert!(is_p2a_program(version, program));
+
+        // Not P2A - wrong program bytes
+        let wrong_program = [0x51, 0x02, 0x00, 0x00];
+        assert!(!is_p2a(&wrong_program));
+        let (v, p) = parse_witness_program(&wrong_program).unwrap();
+        assert!(!is_p2a_program(v, p));
+
+        // Not P2A - wrong length
+        let too_short = [0x51, 0x02, 0x4e];
+        assert!(!is_p2a(&too_short));
+
+        // Not P2A - P2TR (32 bytes, not 2)
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend([0u8; 32]);
+        assert!(!is_p2a(&p2tr));
+
+        // Not P2A - wrong version (OP_0 instead of OP_1)
+        let wrong_version = [0x00, 0x02, 0x4e, 0x73];
+        assert!(!is_p2a(&wrong_version));
+    }
+
+    #[test]
+    fn p2a_anchor_script_bytes() {
+        // Verify the exact P2A script as defined in Bitcoin Core
+        // Script: OP_1 (0x51), PUSHBYTES_2 (0x02), 0x4e, 0x73
+        // The bytes "Ns" in ASCII are 0x4e 0x73
+        let p2a_script = [0x51, 0x02, 0x4e, 0x73];
+
+        // Should be recognized as P2A
+        assert!(is_p2a(&p2a_script));
+
+        // Should parse as witness v1 program with 2 bytes
+        let parsed = parse_witness_program(&p2a_script);
+        assert!(parsed.is_some());
+        let (version, program) = parsed.unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(program.len(), 2);
+        assert_eq!(program, &[0x4e, 0x73]);
     }
 
     #[test]

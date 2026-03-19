@@ -640,6 +640,286 @@ pub struct BannedInfo {
     pub ban_reason: String,
 }
 
+// ============================================================
+// PACKAGE RELAY
+// ============================================================
+
+/// Per-transaction result in a package submission.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PackageTxResultRpc {
+    /// Transaction ID.
+    pub txid: String,
+    /// Witness transaction ID.
+    pub wtxid: String,
+    /// Virtual size in bytes.
+    pub vsize: u64,
+    /// Fee in BTC.
+    pub fees: PackageFees,
+    /// Whether this transaction was already in the mempool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed: Option<bool>,
+    /// Error message if validation failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reject_reason: Option<String>,
+}
+
+/// Fee information for a transaction in a package.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PackageFees {
+    /// Base fee in BTC.
+    pub base: f64,
+    /// Effective fee rate in BTC/kvB.
+    #[serde(rename = "effective-feerate")]
+    pub effective_feerate: f64,
+    /// List of transaction IDs this effective fee rate applies to.
+    #[serde(rename = "effective-includes")]
+    pub effective_includes: Vec<String>,
+}
+
+/// Response for `submitpackage` RPC.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SubmitPackageResult {
+    /// Aggregate package fee rate in BTC/kvB.
+    pub package_feerate: Option<f64>,
+    /// Message describing the result.
+    pub package_msg: String,
+    /// Per-transaction results, keyed by wtxid.
+    #[serde(rename = "tx-results")]
+    pub tx_results: std::collections::HashMap<String, PackageTxResultRpc>,
+    /// List of txids that were replaced (RBF).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_transactions: Option<Vec<String>>,
+}
+
+// ============================================================
+// PRUNING
+// ============================================================
+
+/// Response for `pruneblockchain` RPC.
+///
+/// Returns the last block height that was pruned.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PruneBlockchainResult {
+    /// The last block height that was pruned (or would be pruned).
+    pub pruneheight: u32,
+}
+
+// ============================================================
+// DESCRIPTORS
+// ============================================================
+
+/// Response for `getdescriptorinfo` RPC.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DescriptorInfoResult {
+    /// The descriptor string (without checksum).
+    pub descriptor: String,
+    /// The checksum.
+    pub checksum: String,
+    /// Whether this is a ranged descriptor.
+    pub isrange: bool,
+    /// Whether this descriptor requires private keys for solving.
+    pub issolvable: bool,
+    /// Whether this descriptor has private key data.
+    pub hasprivatekeys: bool,
+}
+
+/// Response for `deriveaddresses` RPC.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeriveAddressesResult {
+    /// The derived addresses.
+    pub addresses: Vec<String>,
+}
+
+/// Request for `importdescriptors` RPC.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImportDescriptorRequest {
+    /// The descriptor string.
+    pub desc: String,
+    /// Whether this descriptor has signing keys.
+    #[serde(default)]
+    pub active: bool,
+    /// Optional range for ranged descriptors [start, end] or just end.
+    #[serde(default)]
+    pub range: Option<serde_json::Value>,
+    /// Timestamp for rescanning (0 for genesis, "now" for no rescan).
+    #[serde(default)]
+    pub timestamp: serde_json::Value,
+    /// Whether this is an internal (change) descriptor.
+    #[serde(default)]
+    pub internal: bool,
+    /// Optional label for the addresses.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Response for `importdescriptors` RPC (per-descriptor result).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImportDescriptorResult {
+    /// Whether the import was successful.
+    pub success: bool,
+    /// Any warnings during import.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
+    /// Error message if import failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ImportDescriptorError>,
+}
+
+/// Error info for failed descriptor import.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImportDescriptorError {
+    /// Error code.
+    pub code: i32,
+    /// Error message.
+    pub message: String,
+}
+
+// ============================================================
+// PSBT (BIP-174)
+// ============================================================
+
+/// Input for `createpsbt` RPC.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CreatePsbtInput {
+    /// Previous transaction ID.
+    pub txid: String,
+    /// Previous output index.
+    pub vout: u32,
+    /// Optional sequence number.
+    pub sequence: Option<u32>,
+}
+
+/// Response for `decodepsbt` RPC.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DecodePsbtResult {
+    /// The underlying unsigned transaction.
+    pub tx: DecodedRawTransaction,
+    /// Global extended public keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_xpubs: Option<Vec<GlobalXpub>>,
+    /// PSBT version (0 if not specified).
+    pub psbt_version: u32,
+    /// Unknown global key-value pairs (hex-encoded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<serde_json::Value>,
+    /// Input information.
+    pub inputs: Vec<DecodePsbtInput>,
+    /// Output information.
+    pub outputs: Vec<DecodePsbtOutput>,
+    /// Transaction fee in BTC (if calculable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee: Option<f64>,
+}
+
+/// Global extended public key in decoded PSBT.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GlobalXpub {
+    /// Extended public key (base58).
+    pub xpub: String,
+    /// Master key fingerprint.
+    pub master_fingerprint: String,
+    /// Derivation path.
+    pub path: String,
+}
+
+/// Input in decoded PSBT.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DecodePsbtInput {
+    /// Non-witness UTXO (full previous transaction).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_witness_utxo: Option<serde_json::Value>,
+    /// Witness UTXO.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_utxo: Option<WitnessUtxo>,
+    /// Partial signatures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_signatures: Option<serde_json::Value>,
+    /// Sighash type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sighash: Option<String>,
+    /// Redeem script.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeem_script: Option<ScriptInfo>,
+    /// Witness script.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_script: Option<ScriptInfo>,
+    /// BIP32 derivation paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bip32_derivs: Option<Vec<Bip32Deriv>>,
+    /// Final scriptSig.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_scriptsig: Option<ScriptInfo>,
+    /// Final scriptWitness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_scriptwitness: Option<Vec<String>>,
+    /// Unknown key-value pairs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<serde_json::Value>,
+}
+
+/// Witness UTXO in decoded PSBT input.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WitnessUtxo {
+    /// Amount in BTC.
+    pub amount: f64,
+    /// Script pubkey info.
+    #[serde(rename = "scriptPubKey")]
+    pub script_pubkey: ScriptPubKeyInfo,
+}
+
+/// Script information for PSBT.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ScriptInfo {
+    /// Disassembled script.
+    pub asm: String,
+    /// Raw hex.
+    pub hex: String,
+    /// Script type.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub script_type: Option<String>,
+}
+
+/// BIP32 derivation path information.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Bip32Deriv {
+    /// Public key (hex).
+    pub pubkey: String,
+    /// Master key fingerprint.
+    pub master_fingerprint: String,
+    /// Derivation path.
+    pub path: String,
+}
+
+/// Output in decoded PSBT.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DecodePsbtOutput {
+    /// Redeem script.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeem_script: Option<ScriptInfo>,
+    /// Witness script.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_script: Option<ScriptInfo>,
+    /// BIP32 derivation paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bip32_derivs: Option<Vec<Bip32Deriv>>,
+    /// Unknown key-value pairs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<serde_json::Value>,
+}
+
+/// Response for `finalizepsbt` RPC.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FinalizePsbtResult {
+    /// The base64-encoded PSBT (if not extractable or extract is false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub psbt: Option<String>,
+    /// The hex-encoded network transaction (if extractable and extract is true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hex: Option<String>,
+    /// Whether the PSBT is complete (all inputs finalized).
+    pub complete: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

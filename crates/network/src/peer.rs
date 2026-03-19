@@ -93,6 +93,8 @@ pub struct PeerInfo {
     pub supports_sendheaders: bool,
     /// Whether peer supports wtxid relay (BIP 339).
     pub supports_wtxid_relay: bool,
+    /// Whether peer supports addrv2 (BIP 155).
+    pub supports_addrv2: bool,
     /// Minimum fee rate filter (BIP 133).
     pub feefilter: u64,
 }
@@ -368,7 +370,7 @@ pub async fn run_outbound_peer(
     )
     .await;
 
-    let their_version = match handshake_result {
+    let hs_result = match handshake_result {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             let reason = match e {
@@ -393,6 +395,8 @@ pub async fn run_outbound_peer(
         }
     };
 
+    let their_version = &hs_result.version;
+
     // 4. Build peer info
     let peer_info = PeerInfo {
         addr,
@@ -411,7 +415,8 @@ pub async fn run_outbound_peer(
         bytes_recv: 0,
         supports_witness: their_version.services & NODE_WITNESS != 0,
         supports_sendheaders: their_version.version >= SENDHEADERS_VERSION,
-        supports_wtxid_relay: false,
+        supports_wtxid_relay: hs_result.wants_wtxid_relay,
+        supports_addrv2: hs_result.wants_addrv2,
         feefilter: 0,
     };
 
@@ -419,13 +424,12 @@ pub async fn run_outbound_peer(
         .send(PeerEvent::Connected(peer_id, peer_info))
         .await;
 
-    // 5. Send post-handshake negotiation messages
+    // 5. Send post-handshake feature negotiation messages
+    // Note: BIP 155 (sendaddrv2) and BIP 339 (wtxidrelay) are sent BEFORE verack
+    // in perform_handshake(). Only sendheaders is sent after verack.
+    // BIP 130: sendheaders - request headers announcements instead of inv
     if their_version.version >= SENDHEADERS_VERSION {
         let msg = serialize_message(&magic, &NetworkMessage::SendHeaders);
-        let _ = writer.write_all(&msg).await;
-    }
-    if their_version.version >= WTXID_RELAY_VERSION {
-        let msg = serialize_message(&magic, &NetworkMessage::WtxidRelay);
         let _ = writer.write_all(&msg).await;
     }
     let _ = writer.flush().await;
@@ -482,6 +486,17 @@ pub mod handshake_misbehavior {
     pub const DUPLICATE_VERSION: u32 = 1;
 }
 
+/// Result of a successful handshake, including BIP negotiation flags.
+#[derive(Debug, Clone)]
+pub struct HandshakeResult {
+    /// The peer's version message.
+    pub version: VersionMessage,
+    /// Whether the peer signaled wtxidrelay support (BIP 339).
+    pub wants_wtxid_relay: bool,
+    /// Whether the peer signaled addrv2 support (BIP 155).
+    pub wants_addrv2: bool,
+}
+
 /// Perform the version/verack handshake with full validation.
 ///
 /// This validates:
@@ -490,12 +505,19 @@ pub mod handshake_misbehavior {
 /// - Self-connection detection via nonce
 /// - Minimum protocol version (70015 for witness support)
 /// - Only version/verack/wtxidrelay/sendaddrv2/sendtxrcncl allowed before handshake complete
+///
+/// The BIP negotiation flow is:
+/// 1. Send/receive VERSION
+/// 2. Send WTXIDRELAY, SENDADDRV2 (before VERACK per BIP 155)
+/// 3. Send/receive VERACK
+///
+/// Returns HandshakeResult containing the peer's version and BIP negotiation flags.
 async fn perform_handshake(
     reader: &mut BufReader<OwnedReadHalf>,
     writer: &mut BufWriter<OwnedWriteHalf>,
     magic: &[u8; 4],
     our_nonce: u64,
-) -> Result<VersionMessage, HandshakeError> {
+) -> Result<HandshakeResult, HandshakeError> {
     // Read their version message
     let their_version_msg = read_message_simple(reader, magic).await?;
     let their_version = match their_version_msg {
@@ -515,6 +537,17 @@ async fn perform_handshake(
         return Err(HandshakeError::ObsoleteVersion(their_version.version));
     }
 
+    // Send BIP negotiation messages BEFORE verack (per BIP 155, BIP 339)
+    // BIP 339: wtxidrelay - announce transactions by wtxid
+    if their_version.version >= WTXID_RELAY_VERSION {
+        let wtxid_msg = serialize_message(magic, &NetworkMessage::WtxidRelay);
+        writer.write_all(&wtxid_msg).await?;
+    }
+    // BIP 155: sendaddrv2 - signal support for addrv2 messages
+    // Send to all peers (protocol version >= 70016 is a courtesy, not a requirement)
+    let addrv2_msg = serialize_message(magic, &NetworkMessage::SendAddrV2);
+    writer.write_all(&addrv2_msg).await?;
+
     // Send verack
     let verack_data = serialize_message(magic, &NetworkMessage::Verack);
     writer.write_all(&verack_data).await?;
@@ -522,6 +555,10 @@ async fn perform_handshake(
 
     // Track whether we've received version (to detect duplicates)
     let mut version_received = true;
+
+    // Track BIP negotiation messages received before verack
+    let mut wants_wtxid_relay = false;
+    let mut wants_addrv2 = false;
 
     // Read messages until we get verack
     // Only certain messages are allowed before handshake is complete:
@@ -538,11 +575,13 @@ async fn perform_handshake(
                 }
                 version_received = true;
             }
-            // These are allowed before verack (BIP negotiation messages)
-            NetworkMessage::WtxidRelay
-            | NetworkMessage::SendAddrV2 => {
-                // Allowed pre-verack negotiation messages - just continue
-                continue;
+            // BIP 339: wtxid relay negotiation
+            NetworkMessage::WtxidRelay => {
+                wants_wtxid_relay = true;
+            }
+            // BIP 155: addrv2 negotiation
+            NetworkMessage::SendAddrV2 => {
+                wants_addrv2 = true;
             }
             // Any other message before handshake is complete is a protocol violation
             other => {
@@ -553,7 +592,11 @@ async fn perform_handshake(
         }
     }
 
-    Ok(their_version)
+    Ok(HandshakeResult {
+        version: their_version,
+        wants_wtxid_relay,
+        wants_addrv2,
+    })
 }
 
 /// Simple message reading for handshake phase (no select! cancellation concerns).
@@ -943,6 +986,7 @@ mod tests {
             supports_witness: true,
             supports_sendheaders: true,
             supports_wtxid_relay: false,
+            supports_addrv2: false,
             feefilter: 0,
         };
 
@@ -1190,6 +1234,7 @@ mod tests {
             supports_witness: false,
             supports_sendheaders: true,
             supports_wtxid_relay: false,
+            supports_addrv2: false,
             feefilter: 0,
         };
 

@@ -393,6 +393,106 @@ impl<'a> BlockStore<'a> {
 
     // ---------------- GENESIS INITIALIZATION ----------------
 
+    // ---------------- BLOCK VALIDITY ----------------
+
+    /// Mark a block as invalid.
+    ///
+    /// This sets the FAILED_VALIDITY flag on the block index entry.
+    pub fn mark_block_invalid(&self, hash: &Hash256) -> Result<(), StorageError> {
+        if let Some(mut entry) = self.get_block_index(hash)? {
+            entry.status.set(BlockStatus::FAILED_VALIDITY);
+            self.put_block_index(hash, &entry)?;
+        }
+        Ok(())
+    }
+
+    /// Remove the invalid status from a block.
+    ///
+    /// This clears the FAILED_VALIDITY and FAILED_CHILD flags on the block index entry.
+    pub fn unmark_block_invalid(&self, hash: &Hash256) -> Result<(), StorageError> {
+        if let Some(mut entry) = self.get_block_index(hash)? {
+            entry.status.clear(BlockStatus::FAILED_VALIDITY);
+            entry.status.clear(BlockStatus::FAILED_CHILD);
+            self.put_block_index(hash, &entry)?;
+        }
+        Ok(())
+    }
+
+    /// Get the height of a block by its hash.
+    pub fn get_height(&self, hash: &Hash256) -> Result<Option<u32>, StorageError> {
+        if let Some(entry) = self.get_block_index(hash)? {
+            Ok(Some(entry.height))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Create a UTXO view backed by this store.
+    pub fn utxo_view(&self) -> BlockStoreUtxoView<'_> {
+        BlockStoreUtxoView::new(self)
+    }
+
+    /// Iterate over all block index entries.
+    ///
+    /// Returns an iterator of `(Hash256, BlockIndexEntry)` pairs.
+    /// This is useful for chain management operations that need to
+    /// scan the entire block index (e.g., finding descendants).
+    pub fn iter_block_index(
+        &self,
+    ) -> Result<impl Iterator<Item = (Hash256, BlockIndexEntry)> + '_, StorageError> {
+        let iter = self.db.iter_cf(CF_BLOCK_INDEX)?;
+        Ok(iter.filter_map(|(key, value)| {
+            if key.len() != 32 {
+                return None;
+            }
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes.copy_from_slice(&key);
+            let hash = Hash256(hash_bytes);
+
+            let entry: BlockIndexEntry = serde_json::from_slice(&value).ok()?;
+            Some((hash, entry))
+        }))
+    }
+
+    /// Get all block hashes in the block index.
+    ///
+    /// This is a convenience method for operations that only need
+    /// the hashes without full entries.
+    pub fn get_all_block_hashes(&self) -> Result<Vec<Hash256>, StorageError> {
+        let iter = self.db.iter_cf(CF_BLOCK_INDEX)?;
+        Ok(iter
+            .filter_map(|(key, _)| {
+                if key.len() != 32 {
+                    return None;
+                }
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes.copy_from_slice(&key);
+                Some(Hash256(hash_bytes))
+            })
+            .collect())
+    }
+
+    /// Mark a block as FAILED_CHILD (descendant of invalid block).
+    pub fn mark_block_failed_child(&self, hash: &Hash256) -> Result<(), StorageError> {
+        if let Some(mut entry) = self.get_block_index(hash)? {
+            entry.status.set(BlockStatus::FAILED_CHILD);
+            self.put_block_index(hash, &entry)?;
+        }
+        Ok(())
+    }
+
+    /// Check if a block is marked as invalid (either FAILED_VALIDITY or FAILED_CHILD).
+    pub fn is_block_invalid(&self, hash: &Hash256) -> Result<bool, StorageError> {
+        if let Some(entry) = self.get_block_index(hash)? {
+            Ok(entry.status.has(BlockStatus::FAILED_VALIDITY)
+                || entry.status.has(BlockStatus::FAILED_CHILD))
+        } else {
+            Ok(false)
+        }
+    }
+
+    // ---------------- GENESIS INITIALIZATION ----------------
+
     /// Initialize the database with the genesis block if not already initialized.
     ///
     /// This is idempotent - calling it on an already-initialized database
@@ -449,4 +549,80 @@ fn outpoint_key(outpoint: &OutPoint) -> Vec<u8> {
     key.extend_from_slice(outpoint.txid.as_bytes());
     key.extend_from_slice(&outpoint.vout.to_be_bytes());
     key
+}
+
+// ============================================================
+// UTXO VIEW FOR BLOCK STORE
+// ============================================================
+
+/// A UTXO view backed by BlockStore with an in-memory cache.
+///
+/// This implements the `UtxoView` trait from consensus, allowing
+/// block validation to work directly with the storage layer.
+pub struct BlockStoreUtxoView<'a> {
+    store: &'a BlockStore<'a>,
+    /// In-memory cache for new UTXOs added during block connection
+    cache: std::collections::HashMap<OutPoint, Option<CoinEntry>>,
+}
+
+impl<'a> BlockStoreUtxoView<'a> {
+    /// Create a new UTXO view backed by the given store.
+    pub fn new(store: &'a BlockStore<'a>) -> Self {
+        Self {
+            store,
+            cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Flush all cached changes to the database.
+    pub fn flush(&mut self) -> Result<(), StorageError> {
+        for (outpoint, coin) in self.cache.drain() {
+            match coin {
+                Some(c) => self.store.put_utxo(&outpoint, &c)?,
+                None => self.store.delete_utxo(&outpoint)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Import the consensus CoinEntry type for UtxoView trait
+pub use rustoshi_consensus::validation::CoinEntry as ConsensusCoinEntry;
+
+impl<'a> rustoshi_consensus::validation::UtxoView for BlockStoreUtxoView<'a> {
+    fn get_utxo(&self, outpoint: &OutPoint) -> Option<rustoshi_consensus::validation::CoinEntry> {
+        // First check the cache
+        if let Some(cached) = self.cache.get(outpoint) {
+            return cached.as_ref().map(|c| rustoshi_consensus::validation::CoinEntry {
+                height: c.height,
+                is_coinbase: c.is_coinbase,
+                value: c.value,
+                script_pubkey: c.script_pubkey.clone(),
+            });
+        }
+
+        // Fall back to database
+        self.store.get_utxo(outpoint).ok().flatten().map(|c| {
+            rustoshi_consensus::validation::CoinEntry {
+                height: c.height,
+                is_coinbase: c.is_coinbase,
+                value: c.value,
+                script_pubkey: c.script_pubkey,
+            }
+        })
+    }
+
+    fn add_utxo(&mut self, outpoint: &OutPoint, coin: rustoshi_consensus::validation::CoinEntry) {
+        let storage_coin = CoinEntry {
+            height: coin.height,
+            is_coinbase: coin.is_coinbase,
+            value: coin.value,
+            script_pubkey: coin.script_pubkey,
+        };
+        self.cache.insert(outpoint.clone(), Some(storage_coin));
+    }
+
+    fn spend_utxo(&mut self, outpoint: &OutPoint) {
+        self.cache.insert(outpoint.clone(), None);
+    }
 }

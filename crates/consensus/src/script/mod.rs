@@ -27,6 +27,10 @@
 //! - **P2TR** (Pay-to-Taproot): The newest script type using Schnorr signatures
 //!   and Merkle trees of scripts.
 //!
+//! - **P2A** (Pay-to-Anchor): A special anyone-can-spend output type used for
+//!   CPFP fee bumping in Lightning and similar protocols. The script is
+//!   `OP_1 <0x4e73>` (4 bytes total). P2A outputs are exempt from dust thresholds.
+//!
 //! # Consensus vs Policy
 //!
 //! **CRITICAL**: Only 7 verification flags are consensus-enforced:
@@ -40,7 +44,7 @@
 //! ```
 //! use rustoshi_consensus::script::{
 //!     eval_script, verify_script, ScriptFlags, DummyChecker, SigVersion,
-//!     is_p2pkh, is_p2sh, is_p2wpkh, is_p2wsh,
+//!     is_p2a, is_p2pkh, is_p2sh, is_p2wpkh, is_p2wsh,
 //! };
 //!
 //! // A simple script that pushes true
@@ -58,8 +62,8 @@ pub mod num;
 pub mod opcodes;
 
 pub use interpreter::{
-    eval_script, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh, is_push_only,
-    parse_witness_program, verify_script, DummyChecker, ScriptError, ScriptFlags,
+    eval_script, is_p2a, is_p2a_program, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
+    is_push_only, parse_witness_program, verify_script, DummyChecker, ScriptError, ScriptFlags,
     SigVersion, SignatureChecker, Stack,
     LOCKTIME_THRESHOLD, MAX_OPS_PER_SCRIPT, MAX_PUBKEYS_PER_MULTISIG,
     MAX_SCRIPT_ELEMENT_SIZE, MAX_SCRIPT_SIZE, MAX_STACK_SIZE,
