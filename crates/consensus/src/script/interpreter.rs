@@ -315,6 +315,18 @@ pub enum ScriptError {
     WitnessPubkeyType,
     #[error("script evaluated to false")]
     EvalFalse,
+    #[error("non-minimal push")]
+    MinimalPush,
+    #[error("non-strict DER signature")]
+    SigDer,
+    #[error("invalid public key type")]
+    PubKeyType,
+    #[error("invalid signature hash type")]
+    SigHashType,
+    #[error("discourage upgradable NOPs")]
+    DiscourageUpgradableNops,
+    #[error("signature high S value")]
+    SigHighS,
 }
 
 /// Signature version for sighash computation.
@@ -406,6 +418,212 @@ fn get_subscript(full_script: &[u8], codesep_pos: u32) -> &[u8] {
             &[]
         }
     }
+}
+
+/// Check that a push opcode uses the minimal encoding for the given data.
+///
+/// Bitcoin Core's CheckMinimalPush: ensures the most compact push opcode is used.
+fn check_minimal_push(data: &[u8], opcode: u8) -> bool {
+    if data.is_empty() {
+        // Empty data should use OP_0 (0x00)
+        return opcode == 0x00;
+    }
+    if data.len() == 1 {
+        if data[0] >= 1 && data[0] <= 16 {
+            // Single byte 1-16 should use OP_1..OP_16
+            return opcode == 0x51 + (data[0] - 1);
+        }
+        if data[0] == 0x81 {
+            // 0x81 (-1) should use OP_1NEGATE
+            return opcode == 0x4f;
+        }
+    }
+    if data.len() <= 75 {
+        // Should use direct push (opcode == length)
+        return opcode as usize == data.len();
+    }
+    if data.len() <= 255 {
+        // Should use OP_PUSHDATA1
+        return opcode == 0x4c;
+    }
+    if data.len() <= 65535 {
+        // Should use OP_PUSHDATA2
+        return opcode == 0x4d;
+    }
+    true
+}
+
+/// Strict DER signature encoding check (BIP-66).
+///
+/// The signature includes the hashtype byte at the end.
+/// Format: 0x30 <total_len> 0x02 <r_len> <r> 0x02 <s_len> <s> <hashtype>
+fn is_valid_signature_encoding(sig: &[u8]) -> bool {
+    // Empty signature is always valid (it just fails verification)
+    if sig.is_empty() {
+        return true;
+    }
+
+    // Minimum: 30 06 02 01 R 02 01 S hashtype = 9 bytes
+    // Maximum: 30 44 02 21 R(33) 02 21 S(33) hashtype = 73 bytes
+    if sig.len() < 9 || sig.len() > 73 {
+        return false;
+    }
+
+    // Compound tag
+    if sig[0] != 0x30 {
+        return false;
+    }
+
+    // Total length should be sig.len() - 3 (tag, length byte, hashtype)
+    if sig[1] as usize != sig.len() - 3 {
+        return false;
+    }
+
+    // R value
+    if sig[2] != 0x02 {
+        return false;
+    }
+    let len_r = sig[3] as usize;
+    if len_r == 0 {
+        return false;
+    }
+    // 5 = 3 (header: tag, len, r_tag) + 1 (r_len) + at least 1 for s
+    if 5 + len_r >= sig.len() {
+        return false;
+    }
+
+    // S value
+    let s_offset = 4 + len_r;
+    if sig[s_offset] != 0x02 {
+        return false;
+    }
+    let len_s = sig[s_offset + 1] as usize;
+    if len_s == 0 {
+        return false;
+    }
+
+    // Total: 4 (header) + len_r + 2 (s header) + len_s + 1 (hashtype)
+    if len_r + len_s + 7 != sig.len() {
+        return false;
+    }
+
+    // R must not be negative (high bit of first byte)
+    if sig[4] & 0x80 != 0 {
+        return false;
+    }
+    // R must not have excessive zero-padding
+    if len_r > 1 && sig[4] == 0x00 && sig[5] & 0x80 == 0 {
+        return false;
+    }
+
+    // S must not be negative
+    let s_data_offset = s_offset + 2;
+    if sig[s_data_offset] & 0x80 != 0 {
+        return false;
+    }
+    // S must not have excessive zero-padding
+    if len_s > 1 && sig[s_data_offset] == 0x00 && sig[s_data_offset + 1] & 0x80 == 0 {
+        return false;
+    }
+
+    true
+}
+
+/// Check if a signature has a low S value (BIP-62 rule 5).
+///
+/// The S value must be at most half the curve order.
+fn is_low_s_signature(sig: &[u8]) -> bool {
+    if sig.is_empty() {
+        return true;
+    }
+    if !is_valid_signature_encoding(sig) {
+        return false;
+    }
+    // Extract S value
+    let len_r = sig[3] as usize;
+    let s_offset = 4 + len_r;
+    let len_s = sig[s_offset + 1] as usize;
+    let s_data = &sig[s_offset + 2..s_offset + 2 + len_s];
+
+    // Half curve order for secp256k1:
+    // 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+    let half_order: [u8; 32] = [
+        0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D,
+        0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
+    ];
+
+    // S must be <= half_order
+    // Pad S to 32 bytes for comparison
+    if s_data.len() > 32 {
+        return false;
+    }
+    let mut s_padded = [0u8; 32];
+    s_padded[32 - s_data.len()..].copy_from_slice(s_data);
+
+    s_padded <= half_order
+}
+
+/// Check if a pubkey is compressed or uncompressed (but NOT hybrid).
+///
+/// Valid formats:
+/// - Compressed: 33 bytes, starts with 0x02 or 0x03
+/// - Uncompressed: 65 bytes, starts with 0x04
+///
+/// Rejects hybrid keys (0x06, 0x07).
+fn is_compressed_or_uncompressed_pubkey(pubkey: &[u8]) -> bool {
+    if pubkey.is_empty() {
+        return false;
+    }
+    match pubkey[0] {
+        0x02 | 0x03 => pubkey.len() == 33,
+        0x04 => pubkey.len() == 65,
+        _ => false,
+    }
+}
+
+/// Check if a signature's hashtype byte is one of the defined types.
+///
+/// Valid hashtypes: SIGHASH_ALL(1), SIGHASH_NONE(2), SIGHASH_SINGLE(3),
+/// optionally combined with SIGHASH_ANYONECANPAY(0x80).
+fn is_defined_hashtype(sig: &[u8]) -> bool {
+    if sig.is_empty() {
+        return true;
+    }
+    let hashtype = sig[sig.len() - 1] & 0x1f;
+    hashtype >= 1 && hashtype <= 3
+}
+
+/// Perform STRICTENC/DERSIG/LOW_S signature checks.
+///
+/// Called from CHECKSIG/CHECKMULTISIG before actual signature verification.
+fn check_signature_encoding(sig: &[u8], flags: &ScriptFlags) -> Result<(), ScriptError> {
+    if sig.is_empty() {
+        return Ok(());
+    }
+    if (flags.verify_dersig || flags.verify_strictenc || flags.verify_low_s)
+        && !is_valid_signature_encoding(sig)
+    {
+        return Err(ScriptError::SigDer);
+    }
+    if flags.verify_low_s && !is_low_s_signature(sig) {
+        return Err(ScriptError::SigHighS);
+    }
+    if flags.verify_strictenc && !is_defined_hashtype(sig) {
+        return Err(ScriptError::SigHashType);
+    }
+    Ok(())
+}
+
+/// Perform STRICTENC public key checks.
+///
+/// Called from CHECKSIG/CHECKMULTISIG when STRICTENC flag is set.
+fn check_pubkey_encoding(pubkey: &[u8], flags: &ScriptFlags) -> Result<(), ScriptError> {
+    if flags.verify_strictenc && !is_compressed_or_uncompressed_pubkey(pubkey) {
+        return Err(ScriptError::PubKeyType);
+    }
+    Ok(())
 }
 
 /// The stack type used by the script interpreter.
@@ -523,8 +741,11 @@ fn eval_script_internal(
             if pc + len > script.len() {
                 return Err(ScriptError::BadOpcode);
             }
+            let data = script[pc..pc + len].to_vec();
             if executing {
-                let data = script[pc..pc + len].to_vec();
+                if ctx.flags.verify_minimaldata && !check_minimal_push(&data, opcode_byte) {
+                    return Err(ScriptError::MinimalPush);
+                }
                 ctx.push(data)?;
             }
             pc += len;
@@ -541,8 +762,15 @@ fn eval_script_internal(
             if pc + len > script.len() {
                 return Err(ScriptError::BadOpcode);
             }
+            let data = script[pc..pc + len].to_vec();
+            // PUSH_SIZE check applies even in non-executing branches
+            if data.len() > MAX_SCRIPT_ELEMENT_SIZE {
+                return Err(ScriptError::PushSize);
+            }
             if executing {
-                let data = script[pc..pc + len].to_vec();
+                if ctx.flags.verify_minimaldata && !check_minimal_push(&data, 0x4c) {
+                    return Err(ScriptError::MinimalPush);
+                }
                 ctx.push(data)?;
             }
             pc += len;
@@ -558,8 +786,14 @@ fn eval_script_internal(
             if pc + len > script.len() {
                 return Err(ScriptError::BadOpcode);
             }
+            let data = script[pc..pc + len].to_vec();
+            if data.len() > MAX_SCRIPT_ELEMENT_SIZE {
+                return Err(ScriptError::PushSize);
+            }
             if executing {
-                let data = script[pc..pc + len].to_vec();
+                if ctx.flags.verify_minimaldata && !check_minimal_push(&data, 0x4d) {
+                    return Err(ScriptError::MinimalPush);
+                }
                 ctx.push(data)?;
             }
             pc += len;
@@ -576,8 +810,14 @@ fn eval_script_internal(
             if pc + len > script.len() {
                 return Err(ScriptError::BadOpcode);
             }
+            let data = script[pc..pc + len].to_vec();
+            if data.len() > MAX_SCRIPT_ELEMENT_SIZE {
+                return Err(ScriptError::PushSize);
+            }
             if executing {
-                let data = script[pc..pc + len].to_vec();
+                if ctx.flags.verify_minimaldata && !check_minimal_push(&data, 0x4e) {
+                    return Err(ScriptError::MinimalPush);
+                }
                 ctx.push(data)?;
             }
             pc += len;
@@ -667,9 +907,10 @@ fn eval_script_internal(
                 return Err(ScriptError::BadOpcode);
             }
             Opcode::OP_IF => {
-                let cond = if ctx.stack.is_empty() {
-                    false
-                } else {
+                let cond = {
+                    if ctx.stack.is_empty() {
+                        return Err(ScriptError::InvalidStackOperation);
+                    }
                     let val = ctx.pop()?;
                     // MINIMALIF: argument must be exactly empty or [0x01].
                     // - Tapscript: unconditional consensus rule
@@ -689,9 +930,10 @@ fn eval_script_internal(
                 ctx.exec_stack.push(cond);
             }
             Opcode::OP_NOTIF => {
-                let cond = if ctx.stack.is_empty() {
-                    true
-                } else {
+                let cond = {
+                    if ctx.stack.is_empty() {
+                        return Err(ScriptError::InvalidStackOperation);
+                    }
                     let val = ctx.pop()?;
                     // MINIMALIF: argument must be exactly empty or [0x01].
                     // - Tapscript: unconditional consensus rule
@@ -1077,6 +1319,11 @@ fn eval_script_internal(
                 let pubkey = ctx.pop()?;
                 let sig = ctx.pop()?;
 
+                // STRICTENC/DERSIG/LOW_S signature encoding checks
+                check_signature_encoding(&sig, ctx.flags)?;
+                // STRICTENC pubkey type check
+                check_pubkey_encoding(&pubkey, ctx.flags)?;
+
                 // BIP-141: Witness v0 requires compressed pubkeys
                 if ctx.flags.verify_witness_pubkeytype
                     && ctx.sig_version == SigVersion::WitnessV0
@@ -1104,6 +1351,11 @@ fn eval_script_internal(
             Opcode::OP_CHECKSIGVERIFY => {
                 let pubkey = ctx.pop()?;
                 let sig = ctx.pop()?;
+
+                // STRICTENC/DERSIG/LOW_S signature encoding checks
+                check_signature_encoding(&sig, ctx.flags)?;
+                // STRICTENC pubkey type check
+                check_pubkey_encoding(&pubkey, ctx.flags)?;
 
                 // BIP-141: Witness v0 requires compressed pubkeys
                 if ctx.flags.verify_witness_pubkeytype
@@ -1148,7 +1400,8 @@ fn eval_script_internal(
                 // Pop pubkeys
                 let mut pubkeys = Vec::with_capacity(n_keys);
                 for _ in 0..n_keys {
-                    pubkeys.push(ctx.pop()?);
+                    let pk = ctx.pop()?;
+                    pubkeys.push(pk);
                 }
 
                 // Pop nSigs
@@ -1162,7 +1415,8 @@ fn eval_script_internal(
                 // Pop signatures
                 let mut sigs = Vec::with_capacity(n_sigs);
                 for _ in 0..n_sigs {
-                    sigs.push(ctx.pop()?);
+                    let s = ctx.pop()?;
+                    sigs.push(s);
                 }
 
                 // Pop the dummy element (CHECKMULTISIG bug)
@@ -1176,8 +1430,14 @@ fn eval_script_internal(
                 // Compute the subscript starting after the last OP_CODESEPARATOR
                 let subscript = get_subscript(full_script, ctx.codesep_pos);
                 let mut key_idx = 0;
+                let mut sig_idx = 0;
                 let mut success = true;
-                for sig in sigs.iter() {
+                while sig_idx < n_sigs {
+                    let sig = &sigs[sig_idx];
+
+                    // Check signature encoding (only when we actually try to use it)
+                    check_signature_encoding(sig, ctx.flags)?;
+
                     if sig.is_empty() {
                         // Empty signature always fails
                         success = false;
@@ -1189,6 +1449,9 @@ fn eval_script_internal(
                     while key_idx < n_keys {
                         let pubkey = &pubkeys[key_idx];
                         key_idx += 1;
+
+                        // Check pubkey encoding (only when we actually try to use it)
+                        check_pubkey_encoding(pubkey, ctx.flags)?;
 
                         // BIP-141: Witness v0 requires compressed pubkeys
                         if ctx.flags.verify_witness_pubkeytype
@@ -1203,12 +1466,21 @@ fn eval_script_internal(
                             found = true;
                             break;
                         }
+
+                        // Remaining sigs > remaining keys means failure
+                        let sigs_remaining = n_sigs - sig_idx;
+                        let keys_remaining = n_keys - key_idx;
+                        if sigs_remaining > keys_remaining {
+                            success = false;
+                            break;
+                        }
                     }
 
                     if !found {
                         success = false;
                         break;
                     }
+                    sig_idx += 1;
                 }
 
                 // NULLFAIL: if failed, all sigs must be empty
@@ -1238,7 +1510,8 @@ fn eval_script_internal(
 
                 let mut pubkeys = Vec::with_capacity(n_keys);
                 for _ in 0..n_keys {
-                    pubkeys.push(ctx.pop()?);
+                    let pk = ctx.pop()?;
+                    pubkeys.push(pk);
                 }
 
                 let n_sigs_data = ctx.pop()?;
@@ -1250,7 +1523,8 @@ fn eval_script_internal(
 
                 let mut sigs = Vec::with_capacity(n_sigs);
                 for _ in 0..n_sigs {
-                    sigs.push(ctx.pop()?);
+                    let s = ctx.pop()?;
+                    sigs.push(s);
                 }
 
                 let dummy = ctx.pop()?;
@@ -1261,8 +1535,14 @@ fn eval_script_internal(
                 // Compute the subscript starting after the last OP_CODESEPARATOR
                 let subscript = get_subscript(full_script, ctx.codesep_pos);
                 let mut key_idx = 0;
+                let mut sig_idx = 0;
                 let mut success = true;
-                for sig in sigs.iter() {
+                while sig_idx < n_sigs {
+                    let sig = &sigs[sig_idx];
+
+                    // Check signature encoding
+                    check_signature_encoding(sig, ctx.flags)?;
+
                     if sig.is_empty() {
                         success = false;
                         break;
@@ -1273,6 +1553,9 @@ fn eval_script_internal(
                     while key_idx < n_keys {
                         let pubkey = &pubkeys[key_idx];
                         key_idx += 1;
+
+                        // Check pubkey encoding
+                        check_pubkey_encoding(pubkey, ctx.flags)?;
 
                         // BIP-141: Witness v0 requires compressed pubkeys
                         if ctx.flags.verify_witness_pubkeytype
@@ -1287,12 +1570,21 @@ fn eval_script_internal(
                             found = true;
                             break;
                         }
+
+                        // Remaining sigs > remaining keys means failure
+                        let sigs_remaining = n_sigs - sig_idx;
+                        let keys_remaining = n_keys - key_idx;
+                        if sigs_remaining > keys_remaining {
+                            success = false;
+                            break;
+                        }
                     }
 
                     if !found {
                         success = false;
                         break;
                     }
+                    sig_idx += 1;
                 }
 
                 if !success && ctx.flags.verify_nullfail {
@@ -1311,14 +1603,14 @@ fn eval_script_internal(
             // ==================== Locktime ====================
             Opcode::OP_NOP1 => {
                 if ctx.flags.verify_discourage_upgradable_nops {
-                    return Err(ScriptError::BadOpcode);
+                    return Err(ScriptError::DiscourageUpgradableNops);
                 }
             }
             Opcode::OP_CHECKLOCKTIMEVERIFY => {
                 if !ctx.flags.verify_checklocktimeverify {
                     // Pre-BIP-65: treat as NOP
                     if ctx.flags.verify_discourage_upgradable_nops {
-                        return Err(ScriptError::BadOpcode);
+                        return Err(ScriptError::DiscourageUpgradableNops);
                     }
                 } else {
                     // BIP-65: verify locktime
@@ -1336,7 +1628,7 @@ fn eval_script_internal(
                 if !ctx.flags.verify_checksequenceverify {
                     // Pre-BIP-112: treat as NOP
                     if ctx.flags.verify_discourage_upgradable_nops {
-                        return Err(ScriptError::BadOpcode);
+                        return Err(ScriptError::DiscourageUpgradableNops);
                     }
                 } else {
                     // BIP-112: verify sequence
@@ -1361,7 +1653,7 @@ fn eval_script_internal(
             | Opcode::OP_NOP9
             | Opcode::OP_NOP10 => {
                 if ctx.flags.verify_discourage_upgradable_nops {
-                    return Err(ScriptError::BadOpcode);
+                    return Err(ScriptError::DiscourageUpgradableNops);
                 }
             }
 
@@ -1845,8 +2137,8 @@ fn verify_witness_program(
                 }
 
                 // Stack is everything except the witness script
-                // Witness items are bottom-to-top on wire, must reverse
-                let mut stack: Stack = witness[..witness.len() - 1].iter().rev().cloned().collect();
+                // Witness items are bottom-to-top: index 0 = bottom, last = top
+                let mut stack: Stack = witness[..witness.len() - 1].to_vec();
 
                 eval_script(&mut stack, witness_script, flags, checker, SigVersion::WitnessV0)?;
 
@@ -1868,27 +2160,24 @@ fn verify_witness_program(
         }
         1 => {
             // SegWit v1 (Taproot)
-            if !flags.verify_taproot {
-                // Taproot not active, treat as anyone-can-spend
-                return Ok(());
+            if flags.verify_taproot && program.len() == 32 {
+                // Taproot key-path / script-path spending
+                // Taproot verification would go here
+                // For now, treat as anyone-can-spend
+                Ok(())
+            } else {
+                // Taproot not active or program length != 32: unknown witness program
+                if flags.verify_discourage_upgradable_witness_program {
+                    return Err(ScriptError::WitnessProgramLength);
+                }
+                // Anyone-can-spend
+                Ok(())
             }
-
-            if program.len() != 32 {
-                return Err(ScriptError::WitnessProgramLength);
-            }
-
-            // Taproot verification would go here
-            // For now, reject (we haven't implemented Taproot yet)
-            if flags.verify_discourage_upgradable_witness_program {
-                return Err(ScriptError::BadOpcode);
-            }
-
-            Ok(())
         }
         2..=16 => {
             // Future SegWit versions
             if flags.verify_discourage_upgradable_witness_program {
-                return Err(ScriptError::BadOpcode);
+                return Err(ScriptError::WitnessProgramLength);
             }
             // Unknown versions succeed (soft-fork safe)
             Ok(())
