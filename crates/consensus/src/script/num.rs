@@ -76,26 +76,14 @@ pub fn decode_script_num(data: &[u8], require_minimal: bool, max_len: usize) -> 
 
     // Check for non-minimal encoding if required
     if require_minimal {
-        // If the last byte has only the sign bit set (0x80) and the second-to-last
-        // byte doesn't have its high bit set, then this encoding is not minimal.
-        // (We could have used one fewer byte.)
-        //
-        // Exception: if there's only one byte and it's 0x80, that's negative zero
-        // which is the minimal encoding for that value.
+        // If the most-significant-byte (minus the sign bit) is zero,
+        // then we're not minimally encoded unless the next byte's high
+        // bit would conflict with the sign bit.
         if let Some(&last) = data.last() {
-            // If high bits (other than sign) are all zero in last byte...
             if last & 0x7f == 0 {
-                // ...and either this is the only byte (0x00 should be empty), or
-                // the second-to-last byte doesn't need the extra byte for sign
-                if data.len() == 1 {
-                    // Single byte 0x00 or 0x80 - 0x00 is non-minimal (should be empty)
-                    if last == 0x00 {
-                        return Err(ScriptNumError::NonMinimal);
-                    }
-                    // 0x80 is negative zero, which is "minimal" for that value
-                } else if data[data.len() - 2] & 0x80 == 0 {
-                    // The second-to-last byte doesn't have its high bit set,
-                    // so we don't need this extra byte for the sign
+                // For single byte: both 0x00 and 0x80 (negative zero) are non-minimal
+                // For multi-byte: non-minimal unless second-to-last has high bit set
+                if data.len() <= 1 || data[data.len() - 2] & 0x80 == 0 {
                     return Err(ScriptNumError::NonMinimal);
                 }
             }
