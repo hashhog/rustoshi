@@ -2,10 +2,13 @@
 //!
 //! Parses script assembly notation, constructs script bytecode, and
 //! verifies each test case against the rustoshi script interpreter.
+//!
+//! Uses real signature verification by constructing crediting and spending
+//! transactions following Bitcoin Core's test approach.
 
-use rustoshi_consensus::script::{
-    verify_script, DummyChecker, ScriptFlags,
-};
+use rustoshi_consensus::script::{verify_script, ScriptFlags};
+use rustoshi_consensus::validation::TransactionSignatureChecker;
+use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut};
 
 /// Path to the script_tests.json test vectors.
 const SCRIPT_TESTS_JSON: &str =
@@ -302,6 +305,58 @@ fn parse_flags(s: &str) -> ScriptFlags {
     flags
 }
 
+/// Build a crediting transaction following Bitcoin Core's test approach.
+///
+/// - version 1, locktime 0
+/// - one input: null prevout, scriptSig = OP_0 OP_0, sequence 0xFFFFFFFF
+/// - one output: scriptPubKey = test's scriptPubKey, value = amount
+fn build_crediting_tx(script_pubkey: &[u8], value: u64) -> Transaction {
+    Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: vec![0x00, 0x00], // OP_0 OP_0
+            sequence: 0xFFFFFFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value,
+            script_pubkey: script_pubkey.to_vec(),
+        }],
+        lock_time: 0,
+    }
+}
+
+/// Build a spending transaction following Bitcoin Core's test approach.
+///
+/// - version 1, locktime 0
+/// - one input: prevout = crediting_txid:0, scriptSig = test's scriptSig,
+///   witness = test's witness, sequence 0xFFFFFFFF
+/// - one output: scriptPubKey = empty, value = crediting tx output value
+fn build_spending_tx(
+    crediting_tx: &Transaction,
+    script_sig: &[u8],
+    witness: Vec<Vec<u8>>,
+) -> Transaction {
+    Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint {
+                txid: crediting_tx.txid(),
+                vout: 0,
+            },
+            script_sig: script_sig.to_vec(),
+            sequence: 0xFFFFFFFF,
+            witness,
+        }],
+        outputs: vec![TxOut {
+            value: crediting_tx.outputs[0].value,
+            script_pubkey: vec![],
+        }],
+        lock_time: 0,
+    }
+}
+
 #[test]
 fn script_tests_json() {
     let data = std::fs::read_to_string(SCRIPT_TESTS_JSON)
@@ -314,8 +369,6 @@ fn script_tests_json() {
     let mut fail = 0usize;
     let mut skip = 0usize;
     let mut parse_errors = 0usize;
-
-    let checker = DummyChecker;
 
     for (i, entry) in vectors.iter().enumerate() {
         let arr = match entry.as_array() {
@@ -332,23 +385,68 @@ fn script_tests_json() {
             continue;
         }
 
-        // Skip witness tests (first element is an array)
-        if arr[0].is_array() {
+        // Determine if this is a witness test (first element is an array)
+        let (witness_data, amount, sig_idx) = if arr[0].is_array() {
+            // Witness test: [[wit_item1, wit_item2, ..., amount], scriptSig, scriptPubKey, flags, expected, ...]
+            let wit_arr = arr[0].as_array().unwrap();
+            if wit_arr.is_empty() {
+                skip += 1;
+                continue;
+            }
+            // Last element of witness array is the amount (float, in BTC)
+            let amount_btc = match wit_arr.last().unwrap().as_f64() {
+                Some(a) => a,
+                None => {
+                    skip += 1;
+                    continue;
+                }
+            };
+            let amount_sat = (amount_btc * 100_000_000.0).round() as u64;
+
+            // All elements except the last are witness items (hex strings)
+            let mut witness: Vec<Vec<u8>> = Vec::new();
+            for w in &wit_arr[..wit_arr.len() - 1] {
+                let hex_str = match w.as_str() {
+                    Some(s) => s,
+                    None => {
+                        // Not a string witness item, skip this test
+                        break;
+                    }
+                };
+                match hex::decode(hex_str) {
+                    Ok(bytes) => witness.push(bytes),
+                    Err(_) => {
+                        // Bad hex in witness
+                        break;
+                    }
+                }
+            }
+            if witness.len() != wit_arr.len() - 1 {
+                skip += 1;
+                continue;
+            }
+
+            (witness, amount_sat, 1usize) // scriptSig starts at index 1
+        } else {
+            // Non-witness test: [scriptSig, scriptPubKey, flags, expected, ...]
+            (vec![], 0u64, 0usize)
+        };
+
+        // Must have enough elements after sig_idx
+        if arr.len() < sig_idx + 4 {
             skip += 1;
             continue;
         }
 
-        // Must have 4 or 5 elements
-        if arr.len() < 4 {
-            skip += 1;
-            continue;
-        }
-
-        let script_sig_asm = arr[0].as_str().unwrap_or("");
-        let script_pubkey_asm = arr[1].as_str().unwrap_or("");
-        let flags_str = arr[2].as_str().unwrap_or("");
-        let expected = arr[3].as_str().unwrap_or("");
-        let comment = if arr.len() >= 5 { arr[4].as_str().unwrap_or("") } else { "" };
+        let script_sig_asm = arr[sig_idx].as_str().unwrap_or("");
+        let script_pubkey_asm = arr[sig_idx + 1].as_str().unwrap_or("");
+        let flags_str = arr[sig_idx + 2].as_str().unwrap_or("");
+        let expected = arr[sig_idx + 3].as_str().unwrap_or("");
+        let comment = if arr.len() >= sig_idx + 5 {
+            arr[sig_idx + 4].as_str().unwrap_or("")
+        } else {
+            ""
+        };
 
         let script_sig = match parse_script_asm(script_sig_asm) {
             Ok(s) => s,
@@ -369,9 +467,21 @@ fn script_tests_json() {
         };
 
         let flags = parse_flags(flags_str);
-        let witness: Vec<Vec<u8>> = vec![];
 
-        let result = verify_script(&script_sig, &script_pubkey, &witness, &flags, &checker);
+        // Build crediting and spending transactions
+        let crediting_tx = build_crediting_tx(&script_pubkey, amount);
+        let spending_tx = build_spending_tx(&crediting_tx, &script_sig, witness_data.clone());
+
+        // Create a real signature checker with the spending transaction
+        let checker = TransactionSignatureChecker::new(&spending_tx, 0, amount);
+
+        let result = verify_script(
+            &script_sig,
+            &script_pubkey,
+            &witness_data,
+            &flags,
+            &checker,
+        );
 
         let expect_ok = expected == "OK";
         let got_ok = result.is_ok();
@@ -394,13 +504,18 @@ fn script_tests_json() {
     }
 
     println!(
-        "script_tests.json results: {} passed, {} failed, {} skipped, {} parse errors",
+        "\nscript_tests.json results: {} passed, {} failed, {} skipped, {} parse errors",
         pass, fail, skip, parse_errors
     );
 
-    // Don't hard-fail the test for now since DummyChecker always returns false for sigs
-    // which causes signature-dependent tests to fail. Report the results.
+    // With real signature verification, we expect very few failures.
+    // Assert a high pass rate.
+    let total_run = pass + fail;
+    if total_run > 0 {
+        let pass_rate = (pass as f64 / total_run as f64) * 100.0;
+        println!("Pass rate: {:.1}% ({}/{})", pass_rate, pass, total_run);
+    }
     if fail > 0 {
-        eprintln!("NOTE: {} failures expected due to DummyChecker (no real sig verification)", fail);
+        eprintln!("NOTE: {} tests failed", fail);
     }
 }
