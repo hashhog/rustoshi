@@ -9,7 +9,7 @@ use rustoshi_consensus::script::{
 
 /// Path to the script_tests.json test vectors.
 const SCRIPT_TESTS_JSON: &str =
-    "/home/max/hashhog/ouroboros/bitcoin/src/test/data/script_tests.json";
+    "/home/max/hashhog/bitcoin/src/test/data/script_tests.json";
 
 /// Decode a hex string into bytes.
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {
