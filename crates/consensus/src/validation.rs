@@ -1746,6 +1746,22 @@ fn script_flags_for_height(height: u32, params: &ChainParams) -> ScriptFlags {
 // SIGNATURE CHECKER
 // ============================================================
 
+/// Lax DER signature parser using secp256k1's built-in `from_der_lax`.
+///
+/// This is equivalent to Bitcoin Core's `ecdsa_signature_parse_der_lax`.
+/// It tolerates various DER encoding violations that strict DER parsing
+/// would reject. Bitcoin Core uses this for all signature verification;
+/// strict DER enforcement is handled separately by the DERSIG script flag
+/// check in the interpreter, not at the crypto level.
+///
+/// After parsing, the signature is normalized to low-S form because the
+/// Rust secp256k1 binding's `verify_ecdsa` requires low-S signatures.
+fn lax_der_parse(data: &[u8]) -> Result<secp256k1::ecdsa::Signature, secp256k1::Error> {
+    let mut sig = secp256k1::ecdsa::Signature::from_der_lax(data)?;
+    sig.normalize_s();
+    Ok(sig)
+}
+
 /// Transaction signature checker for script verification.
 ///
 /// Implements the SignatureChecker trait to verify signatures
@@ -1815,7 +1831,10 @@ impl<'a> SignatureChecker for TransactionSignatureChecker<'a> {
         let Ok(pk) = secp256k1::PublicKey::from_slice(pubkey) else {
             return false;
         };
-        let Ok(sig) = secp256k1::ecdsa::Signature::from_der(sig_bytes) else {
+        // Use lax DER parsing like Bitcoin Core's ecdsa_signature_parse_der_lax.
+        // Strict DER is enforced by the script interpreter's DERSIG flag check,
+        // not at the signature verification level.
+        let Ok(sig) = lax_der_parse(sig_bytes) else {
             return false;
         };
 
@@ -2318,6 +2337,24 @@ mod tests {
 
         // With accurate counting, it uses the preceding OP_n (OP_3 = 3 keys)
         assert_eq!(count_script_sigops(&script, true), 3);
+    }
+
+    // =========================
+    // Lax DER parsing tests
+    // =========================
+
+    #[test]
+    fn lax_der_parse_roundtrip() {
+        // Signature with R having extra leading zero pad (non-strict DER)
+        let sig_hex = "304402200060558477337b9022e70534f1fea71a318caf836812465a2509931c5e7c4987022078ec32bd50ac9e03a349ba953dfd9fe1c8d2dd8bdb1d38ddca844d3d5c78c118";
+        let sig_bytes = hex::decode(sig_hex).unwrap();
+
+        // Strict DER should reject this (R has extra leading zero)
+        assert!(secp256k1::ecdsa::Signature::from_der(&sig_bytes).is_err());
+
+        // Lax DER should accept it
+        let result = lax_der_parse(&sig_bytes);
+        assert!(result.is_ok(), "lax_der_parse failed: {:?}", result.err());
     }
 
     // =========================
