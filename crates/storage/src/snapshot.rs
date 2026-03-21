@@ -606,7 +606,7 @@ fn write_compressed_amount<W: Write>(writer: &mut W, value: u64) -> Result<(), S
 /// Read a script with length prefix.
 fn read_script<R: Read>(reader: &mut R) -> Result<Vec<u8>, SnapshotError> {
     let len = read_varint(reader)? as usize;
-    if len > 10_000 {
+    if len > 4_000_000 {
         return Err(SnapshotError::MalformedCoin("script too large".to_string()));
     }
     let mut script = vec![0u8; len];

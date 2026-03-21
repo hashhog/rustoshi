@@ -147,7 +147,7 @@ impl Decodable for TxOut {
         let value = u64::from_le_bytes(value_bytes);
 
         let script_len = read_compact_size(reader)?;
-        if script_len > 10_000 {
+        if script_len > 4_000_000 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "script too large",
@@ -383,7 +383,7 @@ impl Decodable for Transaction {
         for _ in 0..input_count {
             let previous_output = OutPoint::decode(reader)?;
             let script_len = read_compact_size(reader)?;
-            if script_len > 10_000 {
+            if script_len > 4_000_000 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "script too large",
