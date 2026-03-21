@@ -327,6 +327,14 @@ pub enum ScriptError {
     DiscourageUpgradableNops,
     #[error("signature high S value")]
     SigHighS,
+    #[error("tapscript empty pubkey")]
+    TapscriptEmptyPubkey,
+    #[error("tapscript checkmultisig")]
+    TapscriptCheckmultisig,
+    #[error("witness program wrong length")]
+    WitnessProgramWrongLength,
+    #[error("taproot program mismatch")]
+    WitnessProgramMismatch2,
 }
 
 /// Signature version for sighash computation.
@@ -1319,70 +1327,122 @@ fn eval_script_internal(
                 let pubkey = ctx.pop()?;
                 let sig = ctx.pop()?;
 
-                // STRICTENC/DERSIG/LOW_S signature encoding checks
-                check_signature_encoding(&sig, ctx.flags)?;
-                // STRICTENC pubkey type check
-                check_pubkey_encoding(&pubkey, ctx.flags)?;
-
-                // BIP-141: Witness v0 requires compressed pubkeys
-                if ctx.flags.verify_witness_pubkeytype
-                    && ctx.sig_version == SigVersion::WitnessV0
-                    && !is_compressed_pubkey(&pubkey)
-                {
-                    return Err(ScriptError::WitnessPubkeyType);
-                }
-
-                let success = if sig.is_empty() {
-                    false
+                if ctx.sig_version == SigVersion::Tapscript {
+                    // BIP-342 tapscript rules
+                    if pubkey.is_empty() {
+                        return Err(ScriptError::TapscriptEmptyPubkey);
+                    }
+                    if pubkey.len() == 32 {
+                        // 32-byte pubkey: Schnorr signature check
+                        // For now, treat empty sig as false, non-empty as checker
+                        let success = if sig.is_empty() {
+                            false
+                        } else {
+                            let subscript = get_subscript(full_script, ctx.codesep_pos);
+                            ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
+                        };
+                        if !success && !sig.is_empty() {
+                            return Err(ScriptError::NullFail);
+                        }
+                        ctx.push(bool_to_stack(success))?;
+                    } else {
+                        // Unknown pubkey type in tapscript: succeeds unconditionally
+                        // (soft-fork safe: future key types)
+                        ctx.push(bool_to_stack(true))?;
+                    }
                 } else {
-                    // Compute the subscript starting after the last OP_CODESEPARATOR
-                    let subscript = get_subscript(full_script, ctx.codesep_pos);
-                    // Pass full signature including sighash type byte
-                    ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
-                };
+                    // Legacy / SegWit v0 CHECKSIG
+                    // STRICTENC/DERSIG/LOW_S signature encoding checks
+                    check_signature_encoding(&sig, ctx.flags)?;
+                    // STRICTENC pubkey type check
+                    check_pubkey_encoding(&pubkey, ctx.flags)?;
 
-                // NULLFAIL: failed sig must be empty
-                if !success && ctx.flags.verify_nullfail && !sig.is_empty() {
-                    return Err(ScriptError::NullFail);
+                    // BIP-141: Witness v0 requires compressed pubkeys
+                    if ctx.flags.verify_witness_pubkeytype
+                        && ctx.sig_version == SigVersion::WitnessV0
+                        && !is_compressed_pubkey(&pubkey)
+                    {
+                        return Err(ScriptError::WitnessPubkeyType);
+                    }
+
+                    let success = if sig.is_empty() {
+                        false
+                    } else {
+                        // Compute the subscript starting after the last OP_CODESEPARATOR
+                        let subscript = get_subscript(full_script, ctx.codesep_pos);
+                        // Pass full signature including sighash type byte
+                        ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
+                    };
+
+                    // NULLFAIL: failed sig must be empty
+                    if !success && ctx.flags.verify_nullfail && !sig.is_empty() {
+                        return Err(ScriptError::NullFail);
+                    }
+
+                    ctx.push(bool_to_stack(success))?;
                 }
-
-                ctx.push(bool_to_stack(success))?;
             }
             Opcode::OP_CHECKSIGVERIFY => {
                 let pubkey = ctx.pop()?;
                 let sig = ctx.pop()?;
 
-                // STRICTENC/DERSIG/LOW_S signature encoding checks
-                check_signature_encoding(&sig, ctx.flags)?;
-                // STRICTENC pubkey type check
-                check_pubkey_encoding(&pubkey, ctx.flags)?;
-
-                // BIP-141: Witness v0 requires compressed pubkeys
-                if ctx.flags.verify_witness_pubkeytype
-                    && ctx.sig_version == SigVersion::WitnessV0
-                    && !is_compressed_pubkey(&pubkey)
-                {
-                    return Err(ScriptError::WitnessPubkeyType);
-                }
-
-                let success = if sig.is_empty() {
-                    false
+                if ctx.sig_version == SigVersion::Tapscript {
+                    // BIP-342 tapscript rules
+                    if pubkey.is_empty() {
+                        return Err(ScriptError::TapscriptEmptyPubkey);
+                    }
+                    if pubkey.len() == 32 {
+                        let success = if sig.is_empty() {
+                            false
+                        } else {
+                            let subscript = get_subscript(full_script, ctx.codesep_pos);
+                            ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
+                        };
+                        if !success && !sig.is_empty() {
+                            return Err(ScriptError::NullFail);
+                        }
+                        if !success {
+                            return Err(ScriptError::CheckSigVerifyFailed);
+                        }
+                    }
+                    // Unknown pubkey type: succeeds unconditionally
                 } else {
-                    // Compute the subscript starting after the last OP_CODESEPARATOR
-                    let subscript = get_subscript(full_script, ctx.codesep_pos);
-                    // Pass full signature including sighash type byte
-                    ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
-                };
+                    // STRICTENC/DERSIG/LOW_S signature encoding checks
+                    check_signature_encoding(&sig, ctx.flags)?;
+                    // STRICTENC pubkey type check
+                    check_pubkey_encoding(&pubkey, ctx.flags)?;
 
-                if !success && ctx.flags.verify_nullfail && !sig.is_empty() {
-                    return Err(ScriptError::NullFail);
-                }
+                    // BIP-141: Witness v0 requires compressed pubkeys
+                    if ctx.flags.verify_witness_pubkeytype
+                        && ctx.sig_version == SigVersion::WitnessV0
+                        && !is_compressed_pubkey(&pubkey)
+                    {
+                        return Err(ScriptError::WitnessPubkeyType);
+                    }
 
-                if !success {
-                    return Err(ScriptError::CheckSigVerifyFailed);
+                    let success = if sig.is_empty() {
+                        false
+                    } else {
+                        // Compute the subscript starting after the last OP_CODESEPARATOR
+                        let subscript = get_subscript(full_script, ctx.codesep_pos);
+                        // Pass full signature including sighash type byte
+                        ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
+                    };
+
+                    if !success && ctx.flags.verify_nullfail && !sig.is_empty() {
+                        return Err(ScriptError::NullFail);
+                    }
+
+                    if !success {
+                        return Err(ScriptError::CheckSigVerifyFailed);
+                    }
                 }
             }
             Opcode::OP_CHECKMULTISIG => {
+                // BIP-342: CHECKMULTISIG disabled in tapscript
+                if ctx.sig_version == SigVersion::Tapscript {
+                    return Err(ScriptError::TapscriptCheckmultisig);
+                }
                 // Pop nKeys
                 let n_keys_data = ctx.pop()?;
                 let n_keys = decode_script_num(&n_keys_data, ctx.flags.verify_minimaldata, DEFAULT_MAX_NUM_SIZE)?;
@@ -1495,6 +1555,10 @@ fn eval_script_internal(
                 ctx.push(bool_to_stack(success))?;
             }
             Opcode::OP_CHECKMULTISIGVERIFY => {
+                // BIP-342: CHECKMULTISIGVERIFY disabled in tapscript
+                if ctx.sig_version == SigVersion::Tapscript {
+                    return Err(ScriptError::TapscriptCheckmultisig);
+                }
                 // Same logic as OP_CHECKMULTISIG, but return error instead of pushing
                 let n_keys_data = ctx.pop()?;
                 let n_keys = decode_script_num(&n_keys_data, ctx.flags.verify_minimaldata, DEFAULT_MAX_NUM_SIZE)?;
@@ -2159,12 +2223,167 @@ fn verify_witness_program(
             }
         }
         1 => {
-            // SegWit v1 (Taproot)
+            // SegWit v1 (Taproot / BIP-341)
             if flags.verify_taproot && program.len() == 32 {
-                // Taproot key-path / script-path spending
-                // Taproot verification would go here
-                // For now, treat as anyone-can-spend
-                Ok(())
+                if witness.is_empty() {
+                    return Err(ScriptError::WitnessProgramMismatch);
+                }
+
+                // Check for annex (last witness item starting with 0x50)
+                let has_annex = witness.len() >= 2 && !witness.last().unwrap().is_empty()
+                    && witness.last().unwrap()[0] == 0x50;
+                let effective_witness = if has_annex {
+                    &witness[..witness.len() - 1]
+                } else {
+                    witness
+                };
+
+                if effective_witness.len() == 1 {
+                    // Key-path spending: single witness element is the signature
+                    // Verify Schnorr signature against the output key
+                    // For now, accept (key-path spend validation requires BIP-340 sighash)
+                    Ok(())
+                } else if effective_witness.len() >= 2 {
+                    // Script-path spending
+                    // Last element = control block, second-to-last = script
+                    let control_block = &effective_witness[effective_witness.len() - 1];
+                    let tap_script = &effective_witness[effective_witness.len() - 2];
+
+                    if control_block.is_empty() {
+                        return Err(ScriptError::WitnessProgramMismatch);
+                    }
+
+                    let leaf_version = control_block[0] & 0xfe;
+
+                    // Control block: 1 byte version+parity, 32 bytes internal key,
+                    // then 0..N 32-byte merkle path nodes
+                    if control_block.len() < 33 || (control_block.len() - 33) % 32 != 0 {
+                        return Err(ScriptError::WitnessProgramMismatch);
+                    }
+
+                    let internal_key = &control_block[1..33];
+
+                    // Compute tapleaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script) || script)
+                    let tapleaf_hash = {
+                        use sha2::{Sha256, Digest};
+                        let tag = Sha256::digest(b"TapLeaf");
+                        let mut data = Vec::new();
+                        data.push(leaf_version);
+                        // compact_size encoding of script length
+                        let slen = tap_script.len();
+                        if slen < 0xfd {
+                            data.push(slen as u8);
+                        } else if slen <= 0xffff {
+                            data.push(0xfd);
+                            data.push((slen & 0xff) as u8);
+                            data.push(((slen >> 8) & 0xff) as u8);
+                        } else {
+                            data.push(0xfe);
+                            data.push((slen & 0xff) as u8);
+                            data.push(((slen >> 8) & 0xff) as u8);
+                            data.push(((slen >> 16) & 0xff) as u8);
+                            data.push(((slen >> 24) & 0xff) as u8);
+                        }
+                        data.extend_from_slice(tap_script);
+                        let mut hasher = Sha256::new();
+                        hasher.update(&tag);
+                        hasher.update(&tag);
+                        hasher.update(&data);
+                        let result: [u8; 32] = hasher.finalize().into();
+                        result
+                    };
+
+                    // Compute merkle root from tapleaf hash and merkle path
+                    let merkle_path_len = (control_block.len() - 33) / 32;
+                    let mut k = tapleaf_hash;
+                    for j in 0..merkle_path_len {
+                        let node = &control_block[33 + j * 32..33 + (j + 1) * 32];
+                        use sha2::{Sha256, Digest};
+                        let tag = Sha256::digest(b"TapBranch");
+                        let mut hasher = Sha256::new();
+                        hasher.update(&tag);
+                        hasher.update(&tag);
+                        // Sort: lexicographically smaller one first
+                        if k < *<&[u8; 32]>::try_from(node).unwrap() {
+                            hasher.update(&k);
+                            hasher.update(node);
+                        } else {
+                            hasher.update(node);
+                            hasher.update(&k);
+                        }
+                        k = hasher.finalize().into();
+                    }
+
+                    // Compute tweaked output key and verify against program
+                    let secp = secp256k1::Secp256k1::new();
+                    let internal_xonly = match secp256k1::XOnlyPublicKey::from_slice(internal_key) {
+                        Ok(k) => k,
+                        Err(_) => return Err(ScriptError::WitnessProgramMismatch),
+                    };
+
+                    // TapTweak = tagged_hash("TapTweak", internal_key || merkle_root)
+                    let tweak_hash = {
+                        use sha2::{Sha256, Digest};
+                        let tag = Sha256::digest(b"TapTweak");
+                        let mut hasher = Sha256::new();
+                        hasher.update(&tag);
+                        hasher.update(&tag);
+                        hasher.update(internal_key);
+                        hasher.update(&k);
+                        let result: [u8; 32] = hasher.finalize().into();
+                        result
+                    };
+
+                    let tweak_scalar = match secp256k1::Scalar::from_be_bytes(tweak_hash) {
+                        Ok(s) => s,
+                        Err(_) => return Err(ScriptError::WitnessProgramMismatch),
+                    };
+
+                    let (output_key, output_parity) = internal_xonly
+                        .add_tweak(&secp, &tweak_scalar)
+                        .map_err(|_| ScriptError::WitnessProgramMismatch)?;
+
+                    // Verify the tweaked key matches the witness program
+                    if output_key.serialize() != program {
+                        return Err(ScriptError::WitnessProgramMismatch);
+                    }
+
+                    // Verify parity matches control block
+                    let expected_parity = control_block[0] & 0x01;
+                    let actual_parity: u8 = match output_parity {
+                        secp256k1::Parity::Even => 0,
+                        secp256k1::Parity::Odd => 1,
+                    };
+                    if expected_parity != actual_parity {
+                        return Err(ScriptError::WitnessProgramMismatch);
+                    }
+
+                    // Only execute leaf version 0xc0 (tapscript)
+                    if leaf_version == 0xc0 {
+                        // Execute the tapscript
+                        // Stack = all witness items except script and control block
+                        let mut stack: Stack = effective_witness[..effective_witness.len() - 2].to_vec();
+
+                        eval_script(&mut stack, tap_script, flags, checker, SigVersion::Tapscript)?;
+
+                        // Cleanstack: exactly one element
+                        if stack.len() != 1 {
+                            return Err(ScriptError::CleanStack);
+                        }
+
+                        // Must be true
+                        if !stack_bool(&stack[0]) {
+                            return Err(ScriptError::EvalFalse);
+                        }
+                    }
+                    // Other leaf versions: anyone-can-spend (soft-fork safe)
+
+                    Ok(())
+                } else {
+                    Err(ScriptError::WitnessProgramMismatch)
+                }
+            } else if program.len() != 32 && flags.verify_taproot {
+                Err(ScriptError::WitnessProgramWrongLength)
             } else {
                 // Taproot not active or program length != 32: unknown witness program
                 if flags.verify_discourage_upgradable_witness_program {
