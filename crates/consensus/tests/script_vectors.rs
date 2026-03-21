@@ -515,7 +515,9 @@ fn script_tests_json() {
         let pass_rate = (pass as f64 / total_run as f64) * 100.0;
         println!("Pass rate: {:.1}% ({}/{})", pass_rate, pass, total_run);
     }
-    if fail > 0 {
-        eprintln!("NOTE: {} tests failed", fail);
-    }
+    assert_eq!(
+        fail, 0,
+        "{} out of {} tests failed ({} skipped, {} parse errors)",
+        fail, total_run, skip, parse_errors
+    );
 }
