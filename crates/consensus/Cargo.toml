@@ -19,5 +19,7 @@ rand = "0.8"
 [dev-dependencies]
 serde_json.workspace = true
 hex.workspace = true
+sha2 = "0.10"
+secp256k1.workspace = true
 rustoshi-crypto = { path = "../crypto" }
 rustoshi-primitives = { path = "../primitives" }

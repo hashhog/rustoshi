@@ -9,6 +9,7 @@
 use rustoshi_consensus::script::{verify_script, ScriptFlags};
 use rustoshi_consensus::validation::TransactionSignatureChecker;
 use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut};
+use sha2::{Sha256, Digest};
 
 /// Path to the script_tests.json test vectors.
 const SCRIPT_TESTS_JSON: &str =
@@ -357,6 +358,84 @@ fn build_spending_tx(
     }
 }
 
+/// Compute a BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)
+fn tagged_hash(tag: &[u8], data: &[u8]) -> [u8; 32] {
+    let tag_hash = Sha256::digest(tag);
+    let mut hasher = Sha256::new();
+    hasher.update(&tag_hash);
+    hasher.update(&tag_hash);
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Encode a compact size (Bitcoin varint) for script length
+fn compact_size(n: usize) -> Vec<u8> {
+    if n < 0xfd {
+        vec![n as u8]
+    } else if n <= 0xffff {
+        let mut v = vec![0xfd];
+        v.push((n & 0xff) as u8);
+        v.push(((n >> 8) & 0xff) as u8);
+        v
+    } else {
+        let mut v = vec![0xfe];
+        v.push((n & 0xff) as u8);
+        v.push(((n >> 8) & 0xff) as u8);
+        v.push(((n >> 16) & 0xff) as u8);
+        v.push(((n >> 24) & 0xff) as u8);
+        v
+    }
+}
+
+/// Internal key for taproot test vectors: secp256k1 generator point G (x-only)
+const INTERNAL_KEY: [u8; 32] = [
+    0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac,
+    0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07,
+    0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9,
+    0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+];
+
+/// Given a leaf script, compute the taproot output key, control block, and scriptPubKey.
+/// Returns (control_block_bytes, output_key_bytes) for a single-leaf tree.
+fn compute_taproot_data(leaf_script: &[u8]) -> (Vec<u8>, [u8; 32]) {
+    // Compute tapleaf hash: tagged_hash("TapLeaf", 0xc0 || compact_size(script_len) || script)
+    let mut leaf_data = vec![0xc0u8]; // leaf version
+    leaf_data.extend_from_slice(&compact_size(leaf_script.len()));
+    leaf_data.extend_from_slice(leaf_script);
+    let tapleaf_hash = tagged_hash(b"TapLeaf", &leaf_data);
+
+    // Merkle root = tapleaf hash (single leaf, no path)
+    let merkle_root = tapleaf_hash;
+
+    // TapTweak = tagged_hash("TapTweak", internal_key || merkle_root)
+    let mut tweak_data = Vec::new();
+    tweak_data.extend_from_slice(&INTERNAL_KEY);
+    tweak_data.extend_from_slice(&merkle_root);
+    let tweak_hash = tagged_hash(b"TapTweak", &tweak_data);
+
+    // Compute output key: internal_key + tweak * G
+    let secp = secp256k1::Secp256k1::new();
+    let internal_xonly = secp256k1::XOnlyPublicKey::from_slice(&INTERNAL_KEY)
+        .expect("valid internal key");
+    let tweak_scalar = secp256k1::Scalar::from_be_bytes(tweak_hash)
+        .expect("valid tweak scalar");
+    let (output_key, parity) = internal_xonly
+        .add_tweak(&secp, &tweak_scalar)
+        .expect("valid tweaked key");
+
+    let output_key_bytes = output_key.serialize();
+
+    // Control block: (0xc0 | parity_bit) || internal_key_x_only (33 bytes, no merkle path)
+    let parity_bit: u8 = match parity {
+        secp256k1::Parity::Even => 0,
+        secp256k1::Parity::Odd => 1,
+    };
+    let mut control_block = vec![0xc0 | parity_bit];
+    control_block.extend_from_slice(&INTERNAL_KEY);
+
+    (control_block, output_key_bytes)
+}
+
 #[test]
 fn script_tests_json() {
     let data = std::fs::read_to_string(SCRIPT_TESTS_JSON)
@@ -386,7 +465,7 @@ fn script_tests_json() {
         }
 
         // Determine if this is a witness test (first element is an array)
-        let (witness_data, amount, sig_idx) = if arr[0].is_array() {
+        let (witness_data, amount, sig_idx, taproot_output_key) = if arr[0].is_array() {
             // Witness test: [[wit_item1, wit_item2, ..., amount], scriptSig, scriptPubKey, flags, expected, ...]
             let wit_arr = arr[0].as_array().unwrap();
             if wit_arr.is_empty() {
@@ -403,33 +482,79 @@ fn script_tests_json() {
             };
             let amount_sat = (amount_btc * 100_000_000.0).round() as u64;
 
-            // All elements except the last are witness items (hex strings)
+            // All elements except the last are witness items (hex strings or placeholders)
             let mut witness: Vec<Vec<u8>> = Vec::new();
+            let mut has_taproot_placeholders = false;
+            let mut leaf_script_bytes: Option<Vec<u8>> = None;
+            let mut parse_ok = true;
+
             for w in &wit_arr[..wit_arr.len() - 1] {
                 let hex_str = match w.as_str() {
                     Some(s) => s,
                     None => {
-                        // Not a string witness item, skip this test
+                        parse_ok = false;
                         break;
                     }
                 };
-                match hex::decode(hex_str) {
-                    Ok(bytes) => witness.push(bytes),
-                    Err(_) => {
-                        // Bad hex in witness
-                        break;
+
+                if hex_str.starts_with("#SCRIPT# ") {
+                    // Parse the ASM after "#SCRIPT# " into script bytes
+                    has_taproot_placeholders = true;
+                    let asm = &hex_str["#SCRIPT# ".len()..];
+                    match parse_script_asm(asm) {
+                        Ok(script_bytes) => {
+                            leaf_script_bytes = Some(script_bytes.clone());
+                            witness.push(script_bytes);
+                        }
+                        Err(e) => {
+                            eprintln!("test {}: parse #SCRIPT# error: {} (asm: {:?})", i, e, asm);
+                            parse_ok = false;
+                            break;
+                        }
+                    }
+                } else if hex_str == "#CONTROLBLOCK#" {
+                    has_taproot_placeholders = true;
+                    // Will be filled in after we know the leaf script
+                    witness.push(vec![]); // placeholder
+                } else {
+                    match hex::decode(hex_str) {
+                        Ok(bytes) => witness.push(bytes),
+                        Err(_) => {
+                            parse_ok = false;
+                            break;
+                        }
                     }
                 }
             }
-            if witness.len() != wit_arr.len() - 1 {
+
+            if !parse_ok || witness.len() != wit_arr.len() - 1 {
                 skip += 1;
                 continue;
             }
 
-            (witness, amount_sat, 1usize) // scriptSig starts at index 1
+            // If we have taproot placeholders, compute control block and fill it in
+            let taproot_data = if has_taproot_placeholders {
+                if let Some(ref script_bytes) = leaf_script_bytes {
+                    let (control_block, output_key) = compute_taproot_data(script_bytes);
+                    // Find and replace the empty control block placeholder
+                    // The control block is the last witness item
+                    if let Some(last) = witness.last_mut() {
+                        if last.is_empty() {
+                            *last = control_block;
+                        }
+                    }
+                    Some(output_key)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            (witness, amount_sat, 1usize, taproot_data) // scriptSig starts at index 1
         } else {
             // Non-witness test: [scriptSig, scriptPubKey, flags, expected, ...]
-            (vec![], 0u64, 0usize)
+            (vec![], 0u64, 0usize, None)
         };
 
         // Must have enough elements after sig_idx
@@ -457,12 +582,32 @@ fn script_tests_json() {
             }
         };
 
-        let script_pubkey = match parse_script_asm(script_pubkey_asm) {
-            Ok(s) => s,
-            Err(e) => {
+        let script_pubkey = if script_pubkey_asm.contains("#TAPROOTOUTPUT#") {
+            // Replace #TAPROOTOUTPUT# with the actual output key hex
+            if let Some(ref output_key) = taproot_output_key {
+                let output_key_hex = format!("0x{}", hex::encode(output_key));
+                let replaced = script_pubkey_asm.replace("#TAPROOTOUTPUT#", &output_key_hex);
+                match parse_script_asm(&replaced) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        parse_errors += 1;
+                        eprintln!("test {}: parse scriptPubKey error: {} (asm: {:?})", i, e, replaced);
+                        continue;
+                    }
+                }
+            } else {
                 parse_errors += 1;
-                eprintln!("test {}: parse scriptPubKey error: {} (asm: {:?})", i, e, script_pubkey_asm);
+                eprintln!("test {}: #TAPROOTOUTPUT# without taproot data", i);
                 continue;
+            }
+        } else {
+            match parse_script_asm(script_pubkey_asm) {
+                Ok(s) => s,
+                Err(e) => {
+                    parse_errors += 1;
+                    eprintln!("test {}: parse scriptPubKey error: {} (asm: {:?})", i, e, script_pubkey_asm);
+                    continue;
+                }
             }
         };
 
