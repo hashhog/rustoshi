@@ -317,7 +317,7 @@ async fn main() -> anyhow::Result<()> {
                                     Ok(false) => {
                                         if header_count > 0 {
                                             tracing::info!(
-                                                "Header sync complete at height {}",
+                                                "Headers caught up to height {}",
                                                 header_sync.best_header_height()
                                             );
                                         }

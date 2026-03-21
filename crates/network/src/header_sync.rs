@@ -198,10 +198,37 @@ impl HeaderSync {
         headers: Vec<BlockHeader>,
         validate_and_store: &mut dyn FnMut(&BlockHeader, u32) -> Result<(), String>,
     ) -> Result<bool, String> {
-        // Verify we were expecting headers from this peer
-        match &self.state {
-            SyncState::DownloadingHeaders { peer, .. } if *peer == peer_id => {}
-            _ => return Err("unexpected headers message".into()),
+        // Check if we were actively syncing from this peer
+        let is_active_sync = matches!(
+            &self.state,
+            SyncState::DownloadingHeaders { peer, .. } if *peer == peer_id
+        );
+
+        if !is_active_sync {
+            // Accept unsolicited headers (BIP 130: peers announce new blocks
+            // via headers messages). Process them if they connect to our chain.
+            if headers.is_empty() {
+                return Ok(false);
+            }
+
+            // Check if the first header connects to our tip
+            if headers[0].prev_block_hash != self.best_header_hash {
+                // Doesn't connect to our tip -- ignore silently.
+                // This is normal: peers may be on a different fork or
+                // we may not have synced to the same point yet.
+                tracing::debug!(
+                    "Ignoring unsolicited headers from peer {}: prev_hash {} doesn't match our tip {}",
+                    peer_id.0, headers[0].prev_block_hash, self.best_header_hash
+                );
+                return Ok(false);
+            }
+
+            // Falls through to normal processing below -- these headers
+            // extend our chain (new block announcements).
+            tracing::info!(
+                "Processing {} unsolicited header(s) from peer {} (new block announcement)",
+                headers.len(), peer_id.0
+            );
         }
 
         if headers.is_empty() {
@@ -605,7 +632,9 @@ mod tests {
     }
 
     #[test]
-    fn test_process_headers_unexpected_peer_returns_err() {
+    fn test_process_unsolicited_headers_accepted_if_connected() {
+        // BIP 130: peers can send unsolicited headers to announce new blocks.
+        // These should be accepted if they connect to our chain tip.
         let genesis_hash = Hash256([0; 32]);
         let mut sync = HeaderSync::new(genesis_hash);
         let peer1 = PeerId(1);
@@ -618,11 +647,33 @@ mod tests {
             last_hash: genesis_hash,
         };
 
+        // peer2 sends headers that connect to our tip — should be accepted
         let headers = make_valid_header_chain(genesis_hash, 10);
         let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()));
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unexpected"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), false); // fewer than MAX_HEADERS
+        assert_eq!(sync.best_header_height(), 10);
+    }
+
+    #[test]
+    fn test_process_unsolicited_headers_ignored_if_not_connected() {
+        // Unsolicited headers that don't connect to our tip should be ignored
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer2 = PeerId(2);
+
+        sync.register_peer(peer2, 200);
+
+        // Create headers that don't connect to genesis
+        let bad_prev = Hash256([99; 32]);
+        let headers = make_valid_header_chain(bad_prev, 5);
+        let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()));
+
+        // Should return Ok(false) — silently ignored
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), false);
+        assert_eq!(sync.best_header_height(), 0); // unchanged
     }
 
     #[test]
