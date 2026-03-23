@@ -1091,6 +1091,12 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     let mut spent_coins = Vec::new();
     let mut block_sigop_cost: u64 = 0;
 
+    // Assume-valid: skip script verification for blocks at or below the assume-valid height
+    let skip_scripts = match params.assumed_valid_height {
+        Some(av_height) => height <= av_height,
+        None => false,
+    };
+
     // Validate each transaction
     for tx in &block.transactions {
         // Skip coinbase for input validation (it has no real inputs)
@@ -1193,16 +1199,18 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
         for (input_idx, input) in tx.inputs.iter().enumerate() {
             let coin = &coins[input_idx];
 
-            // Verify the script
-            let checker = TransactionSignatureChecker::new(tx, input_idx, coin.value);
-            verify_script(
-                &input.script_sig,
-                &coin.script_pubkey,
-                &input.witness,
-                &flags,
-                &checker,
-            )
-            .map_err(|e| TxValidationError::ScriptFailed(e.to_string()))?;
+            // Verify the script (skip if below assume-valid height)
+            if !skip_scripts {
+                let checker = TransactionSignatureChecker::new(tx, input_idx, coin.value);
+                verify_script(
+                    &input.script_sig,
+                    &coin.script_pubkey,
+                    &input.witness,
+                    &flags,
+                    &checker,
+                )
+                .map_err(|e| TxValidationError::ScriptFailed(e.to_string()))?;
+            }
 
             // Save spent coin for undo data
             spent_coins.push(coin.clone());
@@ -1639,7 +1647,14 @@ pub fn connect_block_parallel_with_cache_and_sequence_locks<C: SequenceLockConte
     }
 
     // Parallel script validation (with optional cache)
-    validate_scripts_parallel_with_cache(block, &tx_coins, &flags, sig_cache)?;
+    // Skip if below assume-valid height
+    let skip_scripts = match params.assumed_valid_height {
+        Some(av_height) => height <= av_height,
+        None => false,
+    };
+    if !skip_scripts {
+        validate_scripts_parallel_with_cache(block, &tx_coins, &flags, sig_cache)?;
+    }
 
     // Check block sigop cost limit
     if block_sigop_cost > MAX_BLOCK_SIGOPS_COST {

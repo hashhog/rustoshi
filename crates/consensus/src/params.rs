@@ -377,6 +377,8 @@ pub struct ChainParams {
 
     // Assumed-valid block hash (skip script verification before this)
     pub assumed_valid_block: Option<Hash256>,
+    // Height of the assumed-valid block (used for fast height comparison)
+    pub assumed_valid_height: Option<u32>,
 
     // Minimum chain work (reject headers with less total work)
     pub minimum_chain_work: [u8; 32],
@@ -425,6 +427,7 @@ impl ChainParams {
             taproot_height: 709_632,
             bip30_exception_heights: vec![91842, 91880],
             assumed_valid_block: None,
+            assumed_valid_height: None,
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for mainnet
             minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000001128750f82f4c366153a3a030"),
             // Well-known mainnet checkpoints (from Bitcoin Core historical data)
@@ -498,6 +501,7 @@ impl ChainParams {
             taproot_height: 2032291, // testnet3 taproot approximate
             bip30_exception_heights: vec![],
             assumed_valid_block: None,
+            assumed_valid_height: None,
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for testnet3
             minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000000000017dde1c649f3708d14b6"),
             // Testnet3 checkpoints
@@ -545,7 +549,11 @@ impl ChainParams {
             segwit_height: 1,
             taproot_height: 1,
             bip30_exception_heights: vec![],
-            assumed_valid_block: None,
+            assumed_valid_block: Some(
+                Hash256::from_hex("0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a")
+                    .expect("valid testnet4 assume-valid hash"),
+            ),
+            assumed_valid_height: Some(123613),
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for testnet4
             minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000000000009a0fe15d0177d086304"),
             // Testnet4 checkpoints (relatively new network)
@@ -599,6 +607,7 @@ impl ChainParams {
             taproot_height: 1,
             bip30_exception_heights: vec![],
             assumed_valid_block: None,
+            assumed_valid_height: None,
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for signet
             minimum_chain_work: hex_to_u256("00000000000000000000000000000000000000000000000000000b463ea0a4b8"),
             // Signet checkpoints (default signet)
@@ -636,6 +645,7 @@ impl ChainParams {
             taproot_height: 1,
             bip30_exception_heights: vec![],
             assumed_valid_block: None,
+            assumed_valid_height: None,
             minimum_chain_work: [0u8; 32],
             // Regtest has no checkpoints - it's for local testing
             checkpoints: Checkpoints::empty(),
