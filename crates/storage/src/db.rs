@@ -84,9 +84,11 @@ impl ChainDb {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        db_opts.set_max_open_files(256);
+        db_opts.set_max_open_files(-1); // unlimited (let OS manage)
         db_opts.set_keep_log_file_num(2);
         db_opts.set_max_total_wal_size(64 * 1024 * 1024); // 64 MB
+        db_opts.set_write_buffer_size(64 * 1024 * 1024); // 64 MB write buffer
+        db_opts.set_max_write_buffer_number(3);
 
         // Configure per-column-family options
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_COLUMN_FAMILIES
