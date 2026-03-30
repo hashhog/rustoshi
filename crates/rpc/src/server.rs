@@ -3898,11 +3898,15 @@ fn compute_merkle_root(transactions: &[Transaction]) -> Hash256 {
 
 /// Check if a hash (big-endian) is less than a target (big-endian).
 fn hash_less_than_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
+    // hash is in internal byte order (LSB first), target is big-endian (MSB first).
+    // Compare most-significant bytes first.
     for i in 0..32 {
-        if hash[i] < target[i] {
+        let h = hash[31 - i];
+        let t = target[i];
+        if h < t {
             return true;
         }
-        if hash[i] > target[i] {
+        if h > t {
             return false;
         }
     }
