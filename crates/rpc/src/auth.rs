@@ -132,20 +132,88 @@ where
             return Box::pin(async move { Ok(resp) });
         }
 
-        // --- 2. Normalise Content-Type: text/plain → application/json -----
-        // Bitcoin Core accepts both; jsonrpsee only accepts application/json.
-        if let Some(ct) = req.headers().get(header::CONTENT_TYPE) {
-            let ct_str = ct.to_str().unwrap_or("");
-            if ct_str.starts_with("text/plain") {
-                req.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    header::HeaderValue::from_static("application/json"),
-                );
+        // --- 2. Normalise Content-Type ------------------------------------
+        // Bitcoin Core accepts both `application/json` and `text/plain`, and
+        // also handles requests with no Content-Type at all (e.g. curl
+        // --data-binary without -H).  jsonrpsee requires `application/json`,
+        // so default/rewrite as needed.
+        let needs_ct_fixup = match req.headers().get(header::CONTENT_TYPE) {
+            None => true,
+            Some(ct) => {
+                let s = ct.to_str().unwrap_or("");
+                !s.starts_with("application/json")
             }
+        };
+        if needs_ct_fixup {
+            req.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
         }
 
-        let fut = self.inner.call(req);
-        Box::pin(async move { fut.await })
+        // --- 3. Normalise jsonrpc version: "1.0" → "2.0" -----------------
+        // Bitcoin Core accepts any jsonrpc version (or none).  jsonrpsee is a
+        // strict JSON-RPC 2.0 framework that returns a parse error for
+        // anything other than "2.0".  Rewrite the version in the request
+        // body so 1.0 clients like bitcoin-cli work out of the box.
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            let (parts, body) = req.into_parts();
+            let bytes = match hyper::body::to_bytes(body).await {
+                Ok(b) => b,
+                Err(_) => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from("Failed to read request body"))
+                        .expect("static response"));
+                }
+            };
+            let mut json_bytes = bytes.to_vec();
+
+            // Normalise the JSON-RPC envelope so that jsonrpsee (a strict
+            // 2.0 implementation) accepts requests from 1.0/1.1 clients:
+            //   - Set "jsonrpc" to "2.0" if missing or not "2.0"
+            //   - Default "id" to 1 when absent (1.0 has no notifications;
+            //     a missing id should still produce a response)
+            if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&json_bytes) {
+                let normalise = |obj: &mut serde_json::Value| {
+                    if let Some(map) = obj.as_object_mut() {
+                        match map.get("jsonrpc") {
+                            Some(v) if v == "2.0" => {}
+                            _ => {
+                                map.insert(
+                                    "jsonrpc".to_string(),
+                                    serde_json::Value::String("2.0".to_string()),
+                                );
+                                // 1.0 clients don't send "id" but still
+                                // expect a response — add a default.
+                                if !map.contains_key("id") {
+                                    map.insert(
+                                        "id".to_string(),
+                                        serde_json::Value::Number(1.into()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                };
+                if val.is_array() {
+                    if let Some(arr) = val.as_array_mut() {
+                        for item in arr.iter_mut() {
+                            normalise(item);
+                        }
+                    }
+                } else {
+                    normalise(&mut val);
+                }
+                if let Ok(new_bytes) = serde_json::to_vec(&val) {
+                    json_bytes = new_bytes;
+                }
+            }
+
+            let req = Request::from_parts(parts, Body::from(json_bytes));
+            inner.call(req).await
+        })
     }
 }
 
