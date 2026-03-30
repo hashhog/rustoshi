@@ -3620,7 +3620,7 @@ impl RpcServerImpl {
             block_hashes.push(hash);
             // Yield between blocks so the event loop can process peer
             // getdata requests before the next inv is broadcast.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
         Ok(block_hashes)
@@ -3654,7 +3654,7 @@ impl RpcServerImpl {
         let prev_hash = state.best_hash;
 
         // Get current timestamp
-        let timestamp = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as u32;
@@ -3667,13 +3667,26 @@ impl RpcServerImpl {
             .map(|h| h.bits)
             .unwrap_or(0x207fffff); // Regtest default difficulty
 
-        // Compute median-time-past (simplified)
-        let median_time_past = store
-            .get_header(&prev_hash)
-            .ok()
-            .flatten()
-            .map(|h| h.timestamp as i64)
-            .unwrap_or(timestamp as i64);
+        // Compute median-time-past from the last 11 blocks
+        let mut timestamps = Vec::new();
+        let mut cursor = prev_hash;
+        for _ in 0..11 {
+            if let Ok(Some(hdr)) = store.get_header(&cursor) {
+                timestamps.push(hdr.timestamp);
+                cursor = hdr.prev_block_hash;
+            } else {
+                break;
+            }
+        }
+        let median_time_past = if timestamps.is_empty() {
+            now as i64
+        } else {
+            timestamps.sort();
+            timestamps[timestamps.len() / 2] as i64
+        };
+
+        // Timestamp must be strictly greater than MTP
+        let timestamp = std::cmp::max(now, (median_time_past + 1) as u32);
 
         // Build block template
         let config = BlockTemplateConfig {
