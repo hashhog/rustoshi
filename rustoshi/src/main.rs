@@ -100,15 +100,21 @@ enum Commands {
 ///
 /// Mainnet data is stored directly in the data directory, while other networks
 /// use subdirectories (following Bitcoin Core's convention).
-fn resolve_datadir(datadir: &str, params: &ChainParams) -> PathBuf {
+/// Expand `~` in a datadir string and return the base path (no network
+/// subdirectory).  The cookie file is written here so that all
+/// implementations share the same `<datadir>/.cookie` convention.
+fn resolve_base_datadir(datadir: &str) -> PathBuf {
     let expanded = if datadir.starts_with('~') {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         datadir.replacen('~', &home, 1)
     } else {
         datadir.to_string()
     };
+    PathBuf::from(expanded)
+}
 
-    let mut path = PathBuf::from(expanded);
+fn resolve_datadir(datadir: &str, params: &ChainParams) -> PathBuf {
+    let mut path = resolve_base_datadir(datadir);
 
     // Append network subdirectory (except mainnet)
     match params.network_id {
@@ -226,7 +232,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Resolve data directory
+    // Resolve data directories — base (for cookie file) and network-specific
+    // (for chainstate, blocks, etc.)
+    let base_datadir = resolve_base_datadir(&cli.datadir);
+    std::fs::create_dir_all(&base_datadir)?;
     let datadir = resolve_datadir(&cli.datadir, &params);
     std::fs::create_dir_all(&datadir)?;
     tracing::info!("Data directory: {}", datadir.display());
@@ -270,7 +279,7 @@ async fn main() -> anyhow::Result<()> {
     // Generate cookie file for RPC auth (Bitcoin Core pattern).
     // The cookie is always written so that tools like bitcoin-cli can
     // authenticate without needing --rpcuser/--rpcpassword on the CLI.
-    let cookie_secret = write_cookie_file(&datadir)?;
+    let cookie_secret = write_cookie_file(&base_datadir)?;
 
     // Start RPC server
     let rpc_config = RpcConfig {
@@ -692,7 +701,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::debug!("RPC server stopped");
 
     // Delete the cookie file so stale credentials don't linger after shutdown.
-    delete_cookie_file(&datadir);
+    delete_cookie_file(&base_datadir);
 
     // Flush chain state
     {
