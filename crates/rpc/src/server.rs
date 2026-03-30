@@ -3618,6 +3618,9 @@ impl RpcServerImpl {
         for _ in 0..nblocks {
             let hash = self.mine_single_block(script_pubkey.clone(), None, maxtries).await?;
             block_hashes.push(hash);
+            // Yield between blocks so the event loop can process peer
+            // getdata requests before the next inv is broadcast.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         Ok(block_hashes)
