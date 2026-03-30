@@ -183,10 +183,17 @@ impl HeaderSync {
     /// Validates header chain connectivity and proof-of-work, then calls the
     /// provided closure to store each header.
     ///
+    /// When the first header's prev_hash doesn't match our tip (e.g. after a
+    /// reorg or if we're on a stale fork), `find_hash_height` is consulted.
+    /// If the prev_hash exists in our chain at some earlier height, we rewind
+    /// our header tip to that fork point and accept the new headers. This
+    /// mirrors Bitcoin Core's `FindForkInGlobalIndex` behavior.
+    ///
     /// # Arguments
     /// * `peer_id` - The peer that sent the headers
     /// * `headers` - The received headers
     /// * `validate_and_store` - Callback to validate and store each header
+    /// * `find_hash_height` - Given a block hash, returns its height if it's in our chain
     ///
     /// # Returns
     /// - `Ok(true)` if we should request more headers (received MAX_HEADERS)
@@ -197,6 +204,7 @@ impl HeaderSync {
         peer_id: PeerId,
         headers: Vec<BlockHeader>,
         validate_and_store: &mut dyn FnMut(&BlockHeader, u32) -> Result<(), String>,
+        find_hash_height: &dyn Fn(&Hash256) -> Option<u32>,
     ) -> Result<bool, String> {
         // Check if we were actively syncing from this peer
         let is_active_sync = matches!(
@@ -243,20 +251,36 @@ impl HeaderSync {
 
         // Validate header chain connectivity
         let mut prev_hash = self.best_header_hash;
+        let mut base_height = self.best_header_height;
+
+        // Check if the first header connects to our tip. If not, see if it
+        // connects to an earlier block in our chain (fork/reorg scenario).
+        if !headers.is_empty() && headers[0].prev_block_hash != prev_hash {
+            let fork_prev = &headers[0].prev_block_hash;
+            if let Some(fork_height) = find_hash_height(fork_prev) {
+                tracing::info!(
+                    "Headers from peer {} fork from height {} (hash {}), rewinding header tip from height {}",
+                    peer_id.0, fork_height, fork_prev, self.best_header_height
+                );
+                self.best_header_height = fork_height;
+                self.best_header_hash = *fork_prev;
+                prev_hash = *fork_prev;
+                base_height = fork_height;
+            } else {
+                return Err(format!(
+                    "first header prev_hash {} doesn't match our tip {} and is not in our chain",
+                    headers[0].prev_block_hash, prev_hash
+                ));
+            }
+        }
+
         for (i, header) in headers.iter().enumerate() {
             // Each header must reference the previous one
             if header.prev_block_hash != prev_hash {
-                // Could be connecting to an earlier point — handle forks
-                if i == 0 {
-                    return Err(format!(
-                        "first header prev_hash {} doesn't match our tip {}",
-                        header.prev_block_hash, prev_hash
-                    ));
-                }
                 return Err("headers not connected".into());
             }
 
-            let height = self.best_header_height + 1 + i as u32;
+            let height = base_height + 1 + i as u32;
 
             // Validate proof of work
             if !header.validate_pow() {
@@ -446,7 +470,7 @@ mod tests {
             last_hash: genesis_hash,
         };
 
-        let result = sync.process_headers(peer, vec![], &mut |_, _| Ok(()));
+        let result = sync.process_headers(peer, vec![], &mut |_, _| Ok(()), &|_| None);
         assert_eq!(result, Ok(false));
         assert_eq!(sync.state, SyncState::Idle);
     }
@@ -465,7 +489,7 @@ mod tests {
         // Create a header that doesn't connect to genesis
         let bad_header = make_test_header(Hash256([1; 32]), 0);
 
-        let result = sync.process_headers(peer, vec![bad_header], &mut |_, _| Ok(()));
+        let result = sync.process_headers(peer, vec![bad_header], &mut |_, _| Ok(()), &|_| None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("prev_hash"));
     }
@@ -483,7 +507,7 @@ mod tests {
 
         let headers = make_valid_header_chain(genesis_hash, MAX_HEADERS_PER_REQUEST);
 
-        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()));
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
         assert_eq!(result, Ok(true));
         assert_eq!(sync.best_header_height, MAX_HEADERS_PER_REQUEST as u32);
         assert!(matches!(sync.state, SyncState::DownloadingHeaders { .. }));
@@ -502,7 +526,7 @@ mod tests {
 
         let headers = make_valid_header_chain(genesis_hash, 500);
 
-        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()));
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
         assert_eq!(result, Ok(false));
         assert_eq!(sync.best_header_height, 500);
         assert_eq!(sync.state, SyncState::Idle);
@@ -649,7 +673,7 @@ mod tests {
 
         // peer2 sends headers that connect to our tip — should be accepted
         let headers = make_valid_header_chain(genesis_hash, 10);
-        let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()));
+        let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()), &|_| None);
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), false); // fewer than MAX_HEADERS
@@ -668,7 +692,7 @@ mod tests {
         // Create headers that don't connect to genesis
         let bad_prev = Hash256([99; 32]);
         let headers = make_valid_header_chain(bad_prev, 5);
-        let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()));
+        let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()), &|_| None);
 
         // Should return Ok(false) — silently ignored
         assert!(result.is_ok());
@@ -689,7 +713,7 @@ mod tests {
         };
 
         let headers = make_valid_header_chain(genesis_hash, MAX_HEADERS_PER_REQUEST + 1);
-        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()));
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("too many"));
@@ -713,7 +737,7 @@ mod tests {
         let result = sync.process_headers(peer, headers, &mut |_, h| {
             heights.push(h);
             Ok(())
-        });
+        }, &|_| None);
 
         assert!(result.is_ok());
         assert_eq!(heights, vec![1, 2, 3]);
@@ -741,7 +765,7 @@ mod tests {
             } else {
                 Ok(())
             }
-        });
+        }, &|_| None);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("validation failed"));

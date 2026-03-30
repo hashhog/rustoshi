@@ -376,6 +376,7 @@ async fn main() -> anyhow::Result<()> {
                         match msg {
                             NetworkMessage::Headers(headers) => {
                                 let header_count = headers.len();
+                                let current_header_height = header_sync.best_header_height();
                                 let need_more = header_sync.process_headers(
                                     peer_id,
                                     headers,
@@ -387,6 +388,18 @@ async fn main() -> anyhow::Result<()> {
                                             .put_height_index(height, &header.block_hash())
                                             .map_err(|e| e.to_string())?;
                                         Ok(())
+                                    },
+                                    &|hash| {
+                                        // Walk back through the height index to find this hash.
+                                        // This is the equivalent of Bitcoin Core's FindForkInGlobalIndex.
+                                        for h in (0..=current_header_height).rev() {
+                                            if let Ok(Some(stored_hash)) = block_store.get_hash_by_height(h) {
+                                                if stored_hash == *hash {
+                                                    return Some(h);
+                                                }
+                                            }
+                                        }
+                                        None
                                     },
                                 );
 
@@ -448,6 +461,26 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                     Err(e) => {
                                         tracing::warn!("Header sync error from peer {}: {}", peer_id.0, e);
+
+                                        // When the first header doesn't connect to our tip,
+                                        // the peer may have reorged or we're on a stale fork.
+                                        // Re-request headers with a full block locator so the
+                                        // peer can find our fork point (like Bitcoin Core's
+                                        // FindForkInGlobalIndex behavior).
+                                        if e.contains("not in our chain") {
+                                            tracing::info!(
+                                                "Re-requesting headers from peer {} with block locator to find fork point",
+                                                peer_id.0
+                                            );
+                                            if let Some((target, msg)) = header_sync.start_sync(|h| {
+                                                block_store.get_hash_by_height(h).ok().flatten()
+                                            }) {
+                                                let ps = peer_state.read().await;
+                                                if let Some(ref pm) = ps.peer_manager {
+                                                    pm.send_to_peer(target, msg).await;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
