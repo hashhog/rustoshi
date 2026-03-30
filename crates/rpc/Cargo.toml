@@ -20,6 +20,11 @@ jsonrpsee.workspace = true
 tracing.workspace = true
 hex.workspace = true
 zmq.workspace = true
+rand.workspace = true
+base64 = "0.22"
+tower = "0.4"
+hyper = "0.14"
+http = "0.2"
 
 [dev-dependencies]
 tempfile = "3.16"

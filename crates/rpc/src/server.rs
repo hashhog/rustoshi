@@ -18,6 +18,7 @@
 //! let handle = start_rpc_server(config, state).await?;
 //! ```
 
+use crate::auth::{AuthCredentials, AuthLayer};
 use crate::types::*;
 use jsonrpsee::core::{async_trait, RpcResult};
 use jsonrpsee::proc_macros::rpc;
@@ -4615,8 +4616,23 @@ pub async fn start_rpc_server(
     state: Arc<RwLock<RpcState>>,
     peer_state: Arc<RwLock<PeerState>>,
 ) -> anyhow::Result<ServerHandle> {
+    // Build auth credentials from config.
+    // If neither cookie nor user/pass is set, the middleware still runs and
+    // will reject every request with 401 — callers should always provide at
+    // least one credential source (cookie generation in main.rs ensures this).
+    let credentials = AuthCredentials {
+        cookie_secret: config.cookie_secret.clone(),
+        user_pass: match (config.auth_user.clone(), config.auth_password.clone()) {
+            (Some(u), Some(p)) => Some((u, p)),
+            _ => None,
+        },
+    };
+
+    let http_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(credentials));
+
     let server = ServerBuilder::default()
         .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_SIZE as u32))
+        .set_http_middleware(http_middleware)
         .build(&config.bind_address)
         .await?;
 

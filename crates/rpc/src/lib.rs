@@ -31,6 +31,7 @@
 //! let handle = start_rpc_server(config, state, peer_state).await?;
 //! ```
 
+pub mod auth;
 pub mod rest;
 pub mod server;
 pub mod types;

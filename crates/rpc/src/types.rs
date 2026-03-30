@@ -18,6 +18,10 @@ pub struct RpcConfig {
     pub auth_user: Option<String>,
     /// Optional HTTP Basic Auth password.
     pub auth_password: Option<String>,
+    /// Cookie secret generated at startup for cookie-based auth.
+    /// This is the raw hex string that was written to the .cookie file
+    /// (i.e. the password half of `__cookie__:<secret>`).
+    pub cookie_secret: Option<String>,
 }
 
 impl Default for RpcConfig {
@@ -26,6 +30,7 @@ impl Default for RpcConfig {
             bind_address: "127.0.0.1:8332".to_string(),
             auth_user: None,
             auth_password: None,
+            cookie_secret: None,
         }
     }
 }
@@ -37,6 +42,7 @@ impl RpcConfig {
             bind_address: "127.0.0.1:48332".to_string(),
             auth_user: None,
             auth_password: None,
+            cookie_secret: None,
         }
     }
 
@@ -46,6 +52,7 @@ impl RpcConfig {
             bind_address: "127.0.0.1:8332".to_string(),
             auth_user: None,
             auth_password: None,
+            cookie_secret: None,
         }
     }
 }
