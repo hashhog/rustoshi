@@ -495,6 +495,39 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
 
+                            NetworkMessage::GetData(items) => {
+                                // Serve requested blocks/transactions to peers
+                                for item in &items {
+                                    match item.inv_type {
+                                        InvType::MsgBlock | InvType::MsgWitnessBlock => {
+                                            // Look up block from storage and send it
+                                            match block_store.get_block(&item.hash) {
+                                                Ok(Some(block)) => {
+                                                    tracing::debug!(
+                                                        "Serving block {} to peer {}",
+                                                        item.hash, peer_id.0
+                                                    );
+                                                    let ps = peer_state.read().await;
+                                                    if let Some(ref pm) = ps.peer_manager {
+                                                        pm.send_to_peer(
+                                                            peer_id,
+                                                            NetworkMessage::Block(block),
+                                                        ).await;
+                                                    }
+                                                }
+                                                _ => {
+                                                    tracing::debug!(
+                                                        "Block {} not found for peer {}",
+                                                        item.hash, peer_id.0
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
                             // Forward other messages to peer manager for internal handling
                             _ => {
                                 let mut ps = peer_state.write().await;
