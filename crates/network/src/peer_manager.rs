@@ -735,6 +735,9 @@ pub struct PeerManager {
     params: ChainParams,
     /// Connected peers indexed by PeerId.
     peers: HashMap<PeerId, PeerHandle>,
+    /// Inbound peer command senders — kept alive until the peer is
+    /// registered via Connected event in handle_event().
+    inbound_cmd_txs: Option<Arc<std::sync::Mutex<HashMap<PeerId, mpsc::Sender<PeerCommand>>>>>,
     /// Address manager for peer discovery.
     addr_manager: AddressManager,
     /// Misbehavior tracker for all peers.
@@ -779,6 +782,7 @@ impl PeerManager {
             config,
             params,
             peers: HashMap::new(),
+            inbound_cmd_txs: None,
             addr_manager: AddressManager::new(),
             misbehavior_tracker: MisbehaviorTracker::new(),
             ban_manager,
@@ -835,6 +839,11 @@ impl PeerManager {
                     let next_id = Arc::new(std::sync::atomic::AtomicU64::new(
                         self.next_peer_id + 10000, // offset to avoid collision with outbound IDs
                     ));
+                    // Shared map to keep command senders alive until the peer
+                    // manager moves them into PeerHandle on Connected event.
+                    let inbound_senders: Arc<std::sync::Mutex<HashMap<PeerId, mpsc::Sender<PeerCommand>>>> =
+                        Arc::new(std::sync::Mutex::new(HashMap::new()));
+                    self.inbound_cmd_txs = Some(inbound_senders.clone());
                     tokio::spawn(async move {
                         loop {
                             match listener.accept().await {
@@ -844,8 +853,11 @@ impl PeerManager {
                                     );
                                     let event_tx = event_tx.clone();
                                     let (cmd_tx, cmd_rx) = mpsc::channel(256);
-                                    // Notify the peer manager about the inbound peer
-                                    // (the run_inbound_peer task will send Connected/Disconnected events)
+                                    // Store cmd_tx so it stays alive until the peer
+                                    // manager registers the peer in its handle map.
+                                    tracing::info!("Storing cmd_tx for inbound peer {}", peer_id.0);
+                                    inbound_senders.lock().unwrap().insert(peer_id, cmd_tx);
+                                    let senders_ref = inbound_senders.clone();
                                     tokio::spawn(async move {
                                         run_inbound_peer(
                                             peer_id,
@@ -858,8 +870,9 @@ impl PeerManager {
                                             cmd_rx,
                                         )
                                         .await;
+                                        // Clean up sender on disconnect
+                                        senders_ref.lock().unwrap().remove(&peer_id);
                                     });
-                                    let _ = cmd_tx; // keep sender alive for now (peer task owns receiver)
                                 }
                                 Err(e) => {
                                     tracing::warn!("Failed to accept inbound connection: {}", e);
@@ -1263,13 +1276,35 @@ impl PeerManager {
                     info.user_agent
                 );
 
+                // For inbound peers, create a PeerHandle from the shared
+                // command sender stored by the listener task.
+                if !self.peers.contains_key(id) {
+                    tracing::info!("Peer {} not in peers map, checking inbound_cmd_txs (is_some={})", id.0, self.inbound_cmd_txs.is_some());
+                    if let Some(ref inbound_map) = self.inbound_cmd_txs {
+                        if let Some(cmd_tx) = inbound_map.lock().unwrap().remove(id) {
+                            self.peers.insert(
+                                *id,
+                                PeerHandle {
+                                    info: info.clone(),
+                                    command_tx: cmd_tx,
+                                    conn_type: ConnectionType::Inbound,
+                                    connected_time: Instant::now(),
+                                    min_ping_time: None,
+                                    last_block_time: None,
+                                    last_tx_time: None,
+                                    stale_state: StalePeerState::new(),
+                                },
+                            );
+                            self.addr_manager.mark_inbound_success(&info.addr);
+                        }
+                    }
+                }
+
                 // Track netgroup for outbound connections
                 if let Some(peer) = self.peers.get(id) {
                     if peer.conn_type != ConnectionType::Inbound {
                         self.addr_manager
                             .mark_outbound_success(&info.addr, &self.netgroup_manager);
-                    } else {
-                        self.addr_manager.mark_inbound_success(&info.addr);
                     }
                 }
 
@@ -2056,51 +2091,15 @@ pub async fn run_inbound_peer(
         .send(PeerEvent::Connected(peer_id, peer_info))
         .await;
 
-    // The main message loop would continue here...
-    // For now, we just hold the connection until disconnected
-    let mut cmd_rx = command_rx;
-    let mut read_buf = [0u8; 1];
-    loop {
-        tokio::select! {
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(PeerCommand::SendMessage(msg)) => {
-                        let data = serialize_message(&magic, &msg);
-                        if writer.write_all(&data).await.is_err() {
-                            let _ = event_tx.send(PeerEvent::Disconnected(
-                                peer_id, DisconnectReason::IoError("write failed".to_string())
-                            )).await;
-                            return;
-                        }
-                        let _ = writer.flush().await;
-                    }
-                    Some(PeerCommand::Disconnect) | None => {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
-                            peer_id, DisconnectReason::PeerRequested
-                        )).await;
-                        return;
-                    }
-                }
-            }
-            result = reader.read(&mut read_buf) => {
-                match result {
-                    Ok(0) => {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
-                            peer_id, DisconnectReason::ConnectionClosed
-                        )).await;
-                        return;
-                    }
-                    Err(_) => {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
-                            peer_id, DisconnectReason::ConnectionClosed
-                        )).await;
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
+    // BIP 130: sendheaders - request headers announcements instead of inv
+    if their_version.version >= SENDHEADERS_VERSION {
+        let msg = serialize_message(&magic, &NetworkMessage::SendHeaders);
+        let _ = writer.write_all(&msg).await;
     }
+    let _ = writer.flush().await;
+
+    // Full message loop — same as outbound peers
+    crate::peer::run_message_loop(peer_id, &magic, reader, writer, event_tx, command_rx).await;
 }
 
 // ============================================================

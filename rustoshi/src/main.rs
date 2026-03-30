@@ -289,6 +289,14 @@ async fn main() -> anyhow::Result<()> {
             event = event_rx.recv() => {
                 match event {
                     Some(PeerEvent::Connected(peer_id, info)) => {
+                        // Register inbound peer handle in PeerManager
+                        {
+                            let mut ps = peer_state.write().await;
+                            if let Some(ref mut pm) = ps.peer_manager {
+                                pm.handle_event(PeerEvent::Connected(peer_id, info.clone())).await;
+                            }
+                        }
+
                         tracing::info!(
                             "Peer {} connected: {} ({})",
                             peer_id.0, info.addr, info.user_agent

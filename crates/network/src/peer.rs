@@ -648,7 +648,7 @@ async fn read_message_simple(
 ///
 /// Uses a pinned read future to prevent TCP stream desync when select!
 /// cancels the read branch.
-async fn run_message_loop(
+pub async fn run_message_loop(
     peer_id: PeerId,
     magic: &[u8; 4],
     mut reader: BufReader<OwnedReadHalf>,
