@@ -1656,7 +1656,12 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         if let Some(ref mut pm) = peer_state.peer_manager {
             match command.as_str() {
-                "add" | "onetry" => {
+                "onetry" => {
+                    // Immediately initiate an outbound connection
+                    pm.connect_to_peer(socket_addr).await;
+                    Ok(())
+                }
+                "add" => {
                     pm.add_peer(socket_addr);
                     Ok(())
                 }
@@ -2094,7 +2099,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                         hash: wtxid,
                     }];
                     let inv_msg = NetworkMessage::Inv(inv);
-                    peer_manager.broadcast(inv_msg);
+                    peer_manager.broadcast(inv_msg).await;
                 }
             }
         }

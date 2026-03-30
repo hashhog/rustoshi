@@ -253,23 +253,40 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Manual peer added: {}", addr);
     }
 
+    // Take event receiver out of peer manager so we can poll it independently
+    // without holding a lock on the peer manager.
+    let mut event_rx = peer_manager
+        .take_event_receiver()
+        .expect("event receiver already taken");
+
     // Initialize header sync and block download
     let mut header_sync = HeaderSync::new(params.genesis_hash);
     header_sync.set_best_header(best_height, best_hash);
     let mut block_downloader = BlockDownloader::new(best_height, best_height);
 
-    // Start peer connections
+    // Start peer connections (including TCP listener for inbound)
     peer_manager.start().await;
+
+    // Move peer manager into peer_state so RPC handlers can access it
+    {
+        let mut ps = peer_state.write().await;
+        ps.peer_manager = Some(peer_manager);
+    }
 
     tracing::info!("Node started. Waiting for peers...");
 
     // ============================================================
     // MAIN EVENT LOOP
     // ============================================================
+    //
+    // The event_rx was taken from PeerManager before it was moved into PeerState.
+    // We poll event_rx directly here without holding any locks. When we need to
+    // interact with the peer manager (send_to_peer, handle_event), we briefly
+    // acquire the peer_state lock.
     loop {
         tokio::select! {
-            // Handle peer events
-            event = peer_manager.next_event() => {
+            // Handle peer events (polled without holding any locks)
+            event = event_rx.recv() => {
                 match event {
                     Some(PeerEvent::Connected(peer_id, info)) => {
                         tracing::info!(
@@ -283,7 +300,10 @@ async fn main() -> anyhow::Result<()> {
                         if let Some((target_peer, msg)) = header_sync.start_sync(|h| {
                             block_store.get_hash_by_height(h).ok().flatten()
                         }) {
-                            peer_manager.send_to_peer(target_peer, msg).await;
+                            let ps = peer_state.read().await;
+                            if let Some(ref pm) = ps.peer_manager {
+                                pm.send_to_peer(target_peer, msg).await;
+                            }
                         }
                     }
 
@@ -311,7 +331,10 @@ async fn main() -> anyhow::Result<()> {
                                         if let Some((target, msg)) = header_sync.start_sync(|h| {
                                             block_store.get_hash_by_height(h).ok().flatten()
                                         }) {
-                                            peer_manager.send_to_peer(target, msg).await;
+                                            let ps = peer_state.read().await;
+                                            if let Some(ref pm) = ps.peer_manager {
+                                                pm.send_to_peer(target, msg).await;
+                                            }
                                         }
                                     }
                                     Ok(false) => {
@@ -345,9 +368,12 @@ async fn main() -> anyhow::Result<()> {
                                             // Send getdata requests
                                             let requests = block_downloader.assign_requests();
                                             tracing::info!("Block download: {} getdata requests to send", requests.len());
-                                            for (peer, msg) in requests {
-                                                tracing::info!("Sending getdata to peer {}", peer.0);
-                                                peer_manager.send_to_peer(peer, msg).await;
+                                            let ps = peer_state.read().await;
+                                            if let Some(ref pm) = ps.peer_manager {
+                                                for (peer, msg) in requests {
+                                                    tracing::info!("Sending getdata to peer {}", peer.0);
+                                                    pm.send_to_peer(peer, msg).await;
+                                                }
                                             }
                                         }
                                     }
@@ -398,8 +424,11 @@ async fn main() -> anyhow::Result<()> {
 
                                 // Request more blocks
                                 let requests = block_downloader.assign_requests();
-                                for (peer, msg) in requests {
-                                    peer_manager.send_to_peer(peer, msg).await;
+                                let ps = peer_state.read().await;
+                                if let Some(ref pm) = ps.peer_manager {
+                                    for (peer, msg) in requests {
+                                        pm.send_to_peer(peer, msg).await;
+                                    }
                                 }
                             }
 
@@ -419,12 +448,14 @@ async fn main() -> anyhow::Result<()> {
                                             let rpc = rpc_state.read().await;
                                             if !rpc.mempool.contains(&item.hash) {
                                                 drop(rpc);
-                                                peer_manager
-                                                    .send_to_peer(
+                                                let ps = peer_state.read().await;
+                                                if let Some(ref pm) = ps.peer_manager {
+                                                    pm.send_to_peer(
                                                         peer_id,
                                                         NetworkMessage::GetData(vec![item.clone()]),
                                                     )
                                                     .await;
+                                                }
                                             }
                                         }
                                         _ => {}
@@ -458,7 +489,10 @@ async fn main() -> anyhow::Result<()> {
 
                             // Forward other messages to peer manager for internal handling
                             _ => {
-                                peer_manager.handle_event(PeerEvent::Message(peer_id, msg)).await;
+                                let mut ps = peer_state.write().await;
+                                if let Some(ref mut pm) = ps.peer_manager {
+                                    pm.handle_event(PeerEvent::Message(peer_id, msg)).await;
+                                }
                             }
                         }
                     }
@@ -467,7 +501,10 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!("Peer {} disconnected: {:?}", peer_id.0, reason);
                         header_sync.remove_peer(peer_id);
                         block_downloader.remove_peer(peer_id);
-                        peer_manager.handle_event(PeerEvent::Disconnected(peer_id, reason)).await;
+                        let mut ps = peer_state.write().await;
+                        if let Some(ref mut pm) = ps.peer_manager {
+                            pm.handle_event(PeerEvent::Disconnected(peer_id, reason)).await;
+                        }
                     }
 
                     None => {
