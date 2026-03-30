@@ -637,8 +637,11 @@ pub fn check_proof_of_work(block_hash: &[u8; 32], bits: u32, params: &ChainParam
     }
 
     // Block hash must be <= target
-    // Note: block_hash is already in the correct byte order for comparison
-    compare_targets(block_hash, &target) <= 0
+    // block_hash is in internal byte order (LSB first), target is big-endian (MSB first).
+    // Reverse hash to big-endian before comparing.
+    let mut hash_be = *block_hash;
+    hash_be.reverse();
+    compare_targets(&hash_be, &target) <= 0
 }
 
 #[cfg(test)]
