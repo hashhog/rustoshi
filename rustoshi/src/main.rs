@@ -495,7 +495,72 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
 
+                            NetworkMessage::GetHeaders(gh_msg) => {
+                                // Serve headers to peers (headers-first sync)
+                                // Find the fork point from the locator
+                                let mut start_hash = None;
+                                for locator_hash in &gh_msg.locator_hashes {
+                                    if block_store.get_header(locator_hash).ok().flatten().is_some() {
+                                        start_hash = Some(*locator_hash);
+                                        break;
+                                    }
+                                }
+                                // If no locator matched, start from genesis
+                                let start_height = if let Some(hash) = start_hash {
+                                    // Find the height for this hash
+                                    let rpc = rpc_state.read().await;
+                                    let mut h = 0u32;
+                                    for check_h in 0..=rpc.best_height {
+                                        if let Ok(Some(hh)) = block_store.get_hash_by_height(check_h) {
+                                            if hh == hash {
+                                                h = check_h;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    h
+                                } else {
+                                    0
+                                };
+                                // Send up to 2000 headers starting from start_height + 1
+                                let rpc = rpc_state.read().await;
+                                let max_headers = 2000u32;
+                                let end_height = std::cmp::min(
+                                    start_height + max_headers,
+                                    rpc.best_height,
+                                );
+                                let mut headers = Vec::new();
+                                for h in (start_height + 1)..=end_height {
+                                    if let Ok(Some(hash)) = block_store.get_hash_by_height(h) {
+                                        if let Ok(Some(header)) = block_store.get_header(&hash) {
+                                            headers.push(header);
+                                        } else {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                drop(rpc);
+                                if !headers.is_empty() {
+                                    tracing::info!(
+                                        "Serving {} headers (heights {}..={}) to peer {}",
+                                        headers.len(), start_height + 1,
+                                        start_height + headers.len() as u32,
+                                        peer_id.0
+                                    );
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.send_to_peer(
+                                            peer_id,
+                                            NetworkMessage::Headers(headers),
+                                        ).await;
+                                    }
+                                }
+                            }
+
                             NetworkMessage::GetData(items) => {
+                                tracing::info!("Received getdata with {} items from peer {}", items.len(), peer_id.0);
                                 // Serve requested blocks/transactions to peers
                                 for item in &items {
                                     match item.inv_type {
