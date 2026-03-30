@@ -23,7 +23,8 @@ use crate::message::{
 use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
 use crate::netgroup::{NetGroup, NetGroupManager};
 use crate::peer::{
-    run_outbound_peer, DisconnectReason, PeerCommand, PeerEvent, PeerId, PeerInfo, PeerState,
+    run_inbound_peer, run_outbound_peer, DisconnectReason, PeerCommand, PeerEvent, PeerId,
+    PeerInfo, PeerState,
 };
 use crate::stale_detection::{
     StalePeerDetector, StalePeerState, EXTRA_PEER_CHECK_INTERVAL, MINIMUM_CONNECT_TIME,
@@ -34,6 +35,7 @@ use std::fs;
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -749,8 +751,8 @@ pub struct PeerManager {
     next_peer_id: u64,
     /// Channel for receiving events from peer tasks.
     event_tx: mpsc::Sender<PeerEvent>,
-    /// Receiver for peer events.
-    event_rx: mpsc::Receiver<PeerEvent>,
+    /// Receiver for peer events (Option so it can be taken for independent polling).
+    event_rx: Option<mpsc::Receiver<PeerEvent>>,
     /// Our current best block height (for version messages).
     start_height: i32,
     /// Anchor connections loaded from disk.
@@ -785,7 +787,7 @@ impl PeerManager {
             last_stale_check: Instant::now(),
             next_peer_id: 1,
             event_tx,
-            event_rx,
+            event_rx: Some(event_rx),
             start_height: 0,
             anchors,
         }
@@ -806,8 +808,72 @@ impl PeerManager {
         &self.netgroup_manager
     }
 
-    /// Start the peer manager: resolve DNS seeds and begin connecting.
+    /// Take the event receiver out of the peer manager.
+    ///
+    /// This allows the caller to poll events independently (e.g., in a `tokio::select!`)
+    /// without holding a lock on the peer manager itself. Returns `None` if already taken.
+    pub fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<PeerEvent>> {
+        self.event_rx.take()
+    }
+
+    /// Start the peer manager: resolve DNS seeds, begin connecting, and optionally
+    /// start a TCP listener for inbound connections.
     pub async fn start(&mut self) {
+        // Start TCP listener for inbound connections if configured
+        if self.config.listen {
+            let listen_addr: SocketAddr =
+                format!("0.0.0.0:{}", self.config.listen_port).parse().unwrap();
+            match tokio::net::TcpListener::bind(listen_addr).await {
+                Ok(listener) => {
+                    tracing::info!("P2P listening on {}", listen_addr);
+                    let event_tx = self.event_tx.clone();
+                    let magic = self.params.network_magic.0;
+                    let our_services = NODE_NETWORK | NODE_WITNESS;
+                    let our_start_height = self.start_height;
+                    // We need a shared counter for peer IDs for inbound peers.
+                    // Use an AtomicU64 to generate unique IDs.
+                    let next_id = Arc::new(std::sync::atomic::AtomicU64::new(
+                        self.next_peer_id + 10000, // offset to avoid collision with outbound IDs
+                    ));
+                    tokio::spawn(async move {
+                        loop {
+                            match listener.accept().await {
+                                Ok((stream, addr)) => {
+                                    let peer_id = PeerId(
+                                        next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                                    );
+                                    let event_tx = event_tx.clone();
+                                    let (cmd_tx, cmd_rx) = mpsc::channel(256);
+                                    // Notify the peer manager about the inbound peer
+                                    // (the run_inbound_peer task will send Connected/Disconnected events)
+                                    tokio::spawn(async move {
+                                        run_inbound_peer(
+                                            peer_id,
+                                            stream,
+                                            addr,
+                                            magic,
+                                            our_services,
+                                            our_start_height,
+                                            event_tx,
+                                            cmd_rx,
+                                        )
+                                        .await;
+                                    });
+                                    let _ = cmd_tx; // keep sender alive for now (peer task owns receiver)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to accept inbound connection: {}", e);
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("Failed to bind P2P listener on {}: {}", listen_addr, e);
+                }
+            }
+        }
+
         // First, try to connect to anchor peers (block-relay-only)
         // These are persisted from previous sessions for eclipse attack resistance
         self.connect_to_anchors().await;
@@ -839,6 +905,12 @@ impl PeerManager {
     /// Add a manual peer address (e.g., from command line).
     pub fn add_peer(&mut self, addr: SocketAddr) {
         self.addr_manager.add_manual_address(addr);
+    }
+
+    /// Immediately initiate an outbound connection to a peer (for addnode "onetry").
+    pub async fn connect_to_peer(&mut self, addr: SocketAddr) {
+        self.connect_to_with_type(addr, ConnectionType::FullRelay)
+            .await;
     }
 
     /// Connect to anchor peers (block-relay-only connections from previous session).
@@ -1165,7 +1237,12 @@ impl PeerManager {
     ///
     /// This should be called in a loop to process incoming events.
     pub async fn next_event(&mut self) -> Option<PeerEvent> {
-        self.event_rx.recv().await
+        if let Some(ref mut rx) = self.event_rx {
+            rx.recv().await
+        } else {
+            // event_rx was taken; use a pending future that never resolves
+            std::future::pending().await
+        }
     }
 
     /// Get the event sender for spawning new peer tasks.
