@@ -3841,6 +3841,22 @@ impl RpcServerImpl {
                     height
                 );
 
+                // Broadcast inv(MSG_BLOCK) to all connected peers
+                {
+                    let ps = self.peer_state.read().await;
+                    if let Some(ref pm) = ps.peer_manager {
+                        let inv_msg = NetworkMessage::Inv(vec![InvVector {
+                            inv_type: InvType::MsgBlock,
+                            hash: block_hash,
+                        }]);
+                        pm.broadcast(inv_msg).await;
+                        tracing::info!(
+                            "Broadcast block inv {} to peers",
+                            block_hash.to_hex()
+                        );
+                    }
+                }
+
                 Ok(block_hash.to_hex())
             }
             Err(e) => Err(Self::rpc_error(
