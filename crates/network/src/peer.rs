@@ -867,6 +867,7 @@ async fn handle_message(
     }
 
     // Forward all messages to the event handler
+    tracing::debug!("Forwarding {} message from peer {} to main loop", msg.command(), peer_id.0);
     let _ = event_tx.send(PeerEvent::Message(peer_id, msg)).await;
 
     Ok(())

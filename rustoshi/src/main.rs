@@ -352,9 +352,13 @@ async fn main() -> anyhow::Result<()> {
                                                 header_sync.best_header_height()
                                             );
                                         }
-                                        // Begin block download
+                                        // Begin block download (only for blocks above our tip)
                                         let new_best = header_sync.best_header_height();
-                                        let old_best = block_downloader.validated_tip_height();
+                                        let rpc_best = rpc_state.read().await.best_height;
+                                        let old_best = std::cmp::max(
+                                            block_downloader.validated_tip_height(),
+                                            rpc_best,
+                                        );
                                         block_downloader.set_best_header_height(new_best);
 
                                         // Enqueue blocks we need to download
@@ -413,11 +417,13 @@ async fn main() -> anyhow::Result<()> {
                                         tracing::error!("Failed to update best block: {}", e);
                                     }
 
-                                    // Update RPC state
+                                    // Update RPC state only if this advances the tip
                                     {
                                         let mut rpc = rpc_state.write().await;
-                                        rpc.best_height = height;
-                                        rpc.best_hash = block_hash;
+                                        if height > rpc.best_height {
+                                            rpc.best_height = height;
+                                            rpc.best_hash = block_hash;
+                                        }
                                     }
 
                                     // Progress logging
