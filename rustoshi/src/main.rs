@@ -9,6 +9,8 @@
 //! - Handle graceful shutdown
 
 use clap::{Parser, Subcommand};
+use rand::RngCore;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -140,6 +142,46 @@ fn default_rpc_port(network_id: NetworkId) -> u16 {
 }
 
 // ============================================================
+// COOKIE AUTH HELPERS
+// ============================================================
+
+/// Generate a 32-byte random secret and write the Bitcoin Core-style cookie
+/// file to `<datadir>/.cookie`.
+///
+/// The file contains a single line: `__cookie__:<64-hex-chars>`.
+/// File permissions are set to 0o600 (owner read/write only) so that only
+/// the process owner can read the credentials.
+///
+/// Returns the raw hex secret (the password half of the cookie string).
+fn write_cookie_file(datadir: &PathBuf) -> anyhow::Result<String> {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let secret = hex::encode(bytes);
+
+    let cookie_content = format!("__cookie__:{}", secret);
+    let cookie_path = datadir.join(".cookie");
+
+    std::fs::write(&cookie_path, &cookie_content)?;
+
+    // Restrict to owner read/write (0o600) — same as Bitcoin Core.
+    std::fs::set_permissions(&cookie_path, std::fs::Permissions::from_mode(0o600))?;
+
+    tracing::info!("Cookie file written to {}", cookie_path.display());
+    Ok(secret)
+}
+
+/// Delete the cookie file on shutdown so stale credentials don't linger.
+fn delete_cookie_file(datadir: &PathBuf) {
+    let cookie_path = datadir.join(".cookie");
+    if let Err(e) = std::fs::remove_file(&cookie_path) {
+        // Not fatal — the file may already be gone, or on a read-only FS.
+        tracing::warn!("Failed to delete cookie file {}: {}", cookie_path.display(), e);
+    } else {
+        tracing::debug!("Cookie file deleted: {}", cookie_path.display());
+    }
+}
+
+// ============================================================
 // MAIN ENTRY POINT
 // ============================================================
 
@@ -225,11 +267,17 @@ async fn main() -> anyhow::Result<()> {
     // Initialize peer state (empty for now, will be updated)
     let peer_state = Arc::new(RwLock::new(PeerState::default()));
 
+    // Generate cookie file for RPC auth (Bitcoin Core pattern).
+    // The cookie is always written so that tools like bitcoin-cli can
+    // authenticate without needing --rpcuser/--rpcpassword on the CLI.
+    let cookie_secret = write_cookie_file(&datadir)?;
+
     // Start RPC server
     let rpc_config = RpcConfig {
         bind_address: rpc_bind.clone(),
         auth_user: cli.rpcuser.clone(),
         auth_password: cli.rpcpassword.clone(),
+        cookie_secret: Some(cookie_secret),
     };
     let rpc_handle = start_rpc_server(rpc_config, rpc_state.clone(), peer_state.clone()).await?;
     tracing::info!("RPC server listening on {}", rpc_bind);
@@ -642,6 +690,9 @@ async fn main() -> anyhow::Result<()> {
     // Stop RPC server
     rpc_handle.stop()?;
     tracing::debug!("RPC server stopped");
+
+    // Delete the cookie file so stale credentials don't linger after shutdown.
+    delete_cookie_file(&datadir);
 
     // Flush chain state
     {
