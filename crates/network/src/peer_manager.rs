@@ -23,7 +23,7 @@ use crate::message::{
 use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
 use crate::netgroup::{NetGroup, NetGroupManager};
 use crate::peer::{
-    run_inbound_peer, run_outbound_peer, DisconnectReason, PeerCommand, PeerEvent, PeerId,
+    run_outbound_peer, DisconnectReason, PeerCommand, PeerEvent, PeerId,
     PeerInfo, PeerState,
 };
 use crate::stale_detection::{
