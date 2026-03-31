@@ -340,6 +340,8 @@ async fn main() -> anyhow::Result<()> {
     // We poll event_rx directly here without holding any locks. When we need to
     // interact with the peer manager (send_to_peer, handle_event), we briefly
     // acquire the peer_state lock.
+    let mut block_retry_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    block_retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             // Handle peer events (polled without holding any locks)
@@ -716,6 +718,23 @@ async fn main() -> anyhow::Result<()> {
                     None => {
                         tracing::warn!("Peer event channel closed");
                         break;
+                    }
+                }
+            }
+
+            // Periodic block download retry — picks up enqueued blocks that
+            // couldn't be assigned on the first try (e.g. no peers available yet).
+            _ = block_retry_interval.tick() => {
+                if !block_downloader.download_queue_empty() {
+                    let requests = block_downloader.assign_requests();
+                    if !requests.is_empty() {
+                        tracing::info!("Periodic retry: {} getdata requests", requests.len());
+                        let ps = peer_state.read().await;
+                        if let Some(ref pm) = ps.peer_manager {
+                            for (peer, msg) in requests {
+                                pm.send_to_peer(peer, msg).await;
+                            }
+                        }
                     }
                 }
             }

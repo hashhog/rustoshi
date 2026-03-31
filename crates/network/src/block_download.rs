@@ -143,6 +143,10 @@ impl BlockDownloader {
     /// responsive even if they previously failed to deliver blocks.
     /// Without this, a transient stall permanently excludes a peer from
     /// block downloads, eventually deadlocking when all peers stall.
+    pub fn download_queue_empty(&self) -> bool {
+        self.download_queue.is_empty()
+    }
+
     pub fn clear_stalling(&mut self) {
         for state in self.peer_states.values_mut() {
             state.stalling = false;
