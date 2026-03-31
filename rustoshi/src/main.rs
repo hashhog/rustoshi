@@ -431,6 +431,10 @@ async fn main() -> anyhow::Result<()> {
                                         );
                                         block_downloader.set_best_header_height(new_best);
 
+                                        // Receiving headers means peers are responsive —
+                                        // clear any stall flags so they can serve blocks.
+                                        block_downloader.clear_stalling();
+
                                         // Enqueue blocks we need to download
                                         if new_best > old_best {
                                             let mut blocks_to_download = Vec::new();
