@@ -177,12 +177,16 @@ impl BlockDownloader {
     pub fn assign_requests(&mut self) -> Vec<(PeerId, NetworkMessage)> {
         let mut requests: Vec<(PeerId, NetworkMessage)> = Vec::new();
 
-        // Find peers with available capacity
+        // Find peers with available capacity.
+        // Don't exclude "stalling" peers — they may just have had a transient
+        // timeout.  The adaptive timeout handles slow peers without permanently
+        // excluding them, matching Bitcoin Core's approach of giving peers
+        // multiple chances before disconnecting.
         let mut available_peers: Vec<PeerId> = self
             .peer_states
             .iter()
             .filter(|(_, state)| {
-                state.blocks_in_flight < MAX_BLOCKS_IN_FLIGHT_PER_PEER && !state.stalling
+                state.blocks_in_flight < MAX_BLOCKS_IN_FLIGHT_PER_PEER
             })
             .map(|(id, _)| *id)
             .collect();
