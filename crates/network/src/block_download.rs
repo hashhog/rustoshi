@@ -28,7 +28,9 @@ const MAX_BLOCKS_IN_FLIGHT: usize = 1024;
 
 /// Base timeout for a single block request.
 /// We use adaptive timeouts: double on stall, decay on success.
-const BASE_BLOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// 30 seconds allows time for peers to propagate blocks at tip
+/// (blocks arrive every ~10 minutes, peer latency up to seconds).
+const BASE_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum timeout after adaptive increases.
 const MAX_BLOCK_TIMEOUT: Duration = Duration::from_secs(64);
