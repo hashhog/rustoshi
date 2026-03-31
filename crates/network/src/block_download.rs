@@ -135,6 +135,18 @@ impl BlockDownloader {
         self.peer_states.insert(peer_id, PeerDownloadState::new());
     }
 
+    /// Clear stalling flags for all peers.
+    ///
+    /// Called after new headers are received, indicating that peers are
+    /// responsive even if they previously failed to deliver blocks.
+    /// Without this, a transient stall permanently excludes a peer from
+    /// block downloads, eventually deadlocking when all peers stall.
+    pub fn clear_stalling(&mut self) {
+        for state in self.peer_states.values_mut() {
+            state.stalling = false;
+        }
+    }
+
     /// Remove a peer (disconnected or banned).
     ///
     /// Any blocks that were assigned to this peer are re-queued for
