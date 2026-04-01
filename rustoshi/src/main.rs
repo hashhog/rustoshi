@@ -725,6 +725,10 @@ async fn main() -> anyhow::Result<()> {
             // Periodic block download retry — picks up enqueued blocks that
             // couldn't be assigned on the first try (e.g. no peers available yet).
             _ = block_retry_interval.tick() => {
+                // Check for timed-out block requests FIRST — this frees
+                // blocks_in_flight slots so assign_requests can use them.
+                let _disconnect = block_downloader.check_timeouts();
+
                 if !block_downloader.download_queue_empty() {
                     let requests = block_downloader.assign_requests();
                     if !requests.is_empty() {
