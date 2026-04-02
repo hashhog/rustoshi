@@ -84,15 +84,21 @@ impl ChainDb {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        db_opts.set_max_open_files(512);
+        db_opts.set_max_open_files(256);
         db_opts.set_keep_log_file_num(2);
-        db_opts.set_max_total_wal_size(32 * 1024 * 1024); // 32 MB
-        db_opts.set_write_buffer_size(16 * 1024 * 1024); // 16 MB write buffer
+        db_opts.set_max_total_wal_size(16 * 1024 * 1024); // 16 MB
+        db_opts.set_write_buffer_size(8 * 1024 * 1024); // 8 MB write buffer
         db_opts.set_max_write_buffer_number(2);
+        // Limit background compaction memory
+        db_opts.set_db_write_buffer_size(64 * 1024 * 1024); // 64 MB total across all CFs
+        // Disable mmap reads — prevents OS from mapping 100+ GB of SST files
+        // into the process's virtual memory (RSS). Use pread() instead.
+        db_opts.set_allow_mmap_reads(false);
+        db_opts.set_allow_mmap_writes(false);
 
-        // Shared block cache across all column families (128 MiB)
+        // Shared block cache across all column families (64 MiB)
         // Index and filter blocks are stored in the cache (not pinned) to limit memory.
-        let block_cache = rocksdb::Cache::new_lru_cache(128 * 1024 * 1024);
+        let block_cache = rocksdb::Cache::new_lru_cache(64 * 1024 * 1024);
 
         // Configure per-column-family options
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_COLUMN_FAMILIES
@@ -123,6 +129,20 @@ impl ChainDb {
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
         Ok(Self { db })
+    }
+
+    /// Drop all data from the blocks column family to reclaim disk space.
+    /// Blocks are large (~500GB for mainnet) and don't need to be in RocksDB.
+    pub fn drop_blocks_cf(&self) -> Result<(), StorageError> {
+        if let Some(cf) = self.db.cf_handle(CF_BLOCKS) {
+            // DeleteRange covers all possible 32-byte hash keys
+            let start = [0u8; 32];
+            let end = [0xFFu8; 32];
+            self.db.delete_range_cf(&cf, start, end)?;
+            // Compact to actually free disk space
+            self.db.compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+        }
+        Ok(())
     }
 
     /// Get a value from a column family.
