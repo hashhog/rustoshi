@@ -631,38 +631,60 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             NetworkMessage::GetHeaders(gh_msg) => {
-                                // Serve headers to peers (headers-first sync)
-                                // Find the fork point from the locator
-                                let mut start_hash = None;
-                                for locator_hash in &gh_msg.locator_hashes {
-                                    if block_store.get_header(locator_hash).ok().flatten().is_some() {
-                                        start_hash = Some(*locator_hash);
-                                        break;
+                                // Rate-limit header serving during IBD to prioritize
+                                // block downloads. Skip if we're far behind tip.
+                                let our_height = {
+                                    let rpc = rpc_state.read().await;
+                                    rpc.best_height
+                                };
+                                let best_header = header_sync.best_header_height();
+
+                                // During IBD (>1000 blocks behind headers), rate-limit
+                                // header serving to avoid starving block downloads
+                                if best_header > our_height + 1000 {
+                                    // Only serve headers occasionally during IBD
+                                    // Skip most getheaders to free bandwidth for blocks
+                                    static IBD_HEADER_COUNTER: std::sync::atomic::AtomicU64
+                                        = std::sync::atomic::AtomicU64::new(0);
+                                    let count = IBD_HEADER_COUNTER.fetch_add(1,
+                                        std::sync::atomic::Ordering::Relaxed);
+                                    if count % 10 != 0 {
+                                        // Skip 9 out of 10 getheaders during IBD
+                                        continue;
                                     }
                                 }
-                                // If no locator matched, start from genesis
-                                let start_height = if let Some(hash) = start_hash {
-                                    // Find the height for this hash
-                                    let rpc = rpc_state.read().await;
-                                    let mut h = 0u32;
-                                    for check_h in 0..=rpc.best_height {
-                                        if let Ok(Some(hh)) = block_store.get_hash_by_height(check_h) {
-                                            if hh == hash {
-                                                h = check_h;
-                                                break;
+
+                                // Find fork point from locator (use hash index, not linear scan)
+                                let start_height = {
+                                    let mut found_height = 0u32;
+                                    for locator_hash in &gh_msg.locator_hashes {
+                                        // Try to find the height for this hash via the height index
+                                        if let Ok(Some(_)) = block_store.get_header(locator_hash) {
+                                            // Find height by checking the block index
+                                            for h in (0..=our_height).rev() {
+                                                if let Ok(Some(hh)) = block_store.get_hash_by_height(h) {
+                                                    if &hh == locator_hash {
+                                                        found_height = h;
+                                                        break;
+                                                    }
+                                                }
+                                                // Locator hashes use exponential backoff, so
+                                                // the matching hash should be close to the tip.
+                                                // Bail early if we've searched 2000+ heights.
+                                                if our_height.saturating_sub(h) > 2000 && h < our_height.saturating_sub(2000) {
+                                                    break;
+                                                }
                                             }
+                                            break;
                                         }
                                     }
-                                    h
-                                } else {
-                                    0
+                                    found_height
                                 };
-                                // Send up to 2000 headers starting from start_height + 1
-                                let rpc = rpc_state.read().await;
-                                let max_headers = 2000u32;
+
+                                // Send up to 2000 headers
                                 let end_height = std::cmp::min(
-                                    start_height + max_headers,
-                                    rpc.best_height,
+                                    start_height + 2000,
+                                    our_height,
                                 );
                                 let mut headers = Vec::new();
                                 for h in (start_height + 1)..=end_height {
@@ -676,7 +698,6 @@ async fn main() -> anyhow::Result<()> {
                                         break;
                                     }
                                 }
-                                drop(rpc);
                                 if !headers.is_empty() {
                                     tracing::info!(
                                         "Serving {} headers (heights {}..={}) to peer {}",
