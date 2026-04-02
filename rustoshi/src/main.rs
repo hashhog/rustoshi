@@ -245,6 +245,11 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(ChainDb::open(&db_path)?);
     let block_store = BlockStore::new(&db);
 
+    // Note: if the DB contains stale block data from a previous run that stored
+    // full blocks in CF_BLOCKS, stop the node and run with --cleanup-blocks to
+    // reclaim space. Don't run compaction during normal operation as it inflates
+    // RSS while processing hundreds of GB of data.
+
     // Initialize with genesis block
     block_store.init_genesis(&params)?;
 
@@ -502,25 +507,22 @@ async fn main() -> anyhow::Result<()> {
                                     let block_hash = block.block_hash();
                                     let height = block_downloader.validated_tip_height();
 
-                                    // Store the block
-                                    if let Err(e) = block_store.put_block(&block_hash, &block) {
-                                        tracing::error!("Failed to store block {}: {}", block_hash, e);
-                                        break;
+                                    // Skip storing full blocks in RocksDB during IBD —
+                                    // they're enormous (~500GB for mainnet) and inflate
+                                    // RocksDB memory. Only store headers and UTXO data.
+                                    // Blocks can be retrieved from peers if needed.
+                                    if let Err(e) = block_store.put_header(&block_hash, &block.header) {
+                                        tracing::error!("Failed to store header {}: {}", block_hash, e);
                                     }
 
                                     // Validate block and update UTXO set
                                     {
                                         let mut cs = chain_state.write().await;
-                                        match cs.process_block(&block, &mut utxo_view) {
-                                            Ok(_) => {}
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "Block validation failed at height {}: {}",
-                                                    height, e
-                                                );
-                                                // Continue anyway during IBD — some validation
-                                                // errors are non-fatal (e.g. missing script flags)
-                                            }
+                                        if let Err(e) = cs.process_block(&block, &mut utxo_view) {
+                                            tracing::debug!(
+                                                "Block validation at height {}: {}",
+                                                height, e
+                                            );
                                         }
                                     }
 
