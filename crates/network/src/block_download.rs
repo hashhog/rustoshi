@@ -24,7 +24,8 @@ use tokio::time::{Duration, Instant};
 const MAX_BLOCKS_IN_FLIGHT_PER_PEER: usize = 16;
 
 /// Maximum total number of blocks in flight across all peers.
-const MAX_BLOCKS_IN_FLIGHT: usize = 1024;
+/// Bitcoin Core uses 1024 but we limit to 128 to bound memory for large mainnet blocks.
+const MAX_BLOCKS_IN_FLIGHT: usize = 128;
 
 /// Base timeout for a single block request.
 /// We use adaptive timeouts: double on stall, decay on success.

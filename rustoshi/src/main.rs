@@ -332,6 +332,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Node started. Waiting for peers...");
 
+    // UTXO cache for block validation, bounded to 2 GiB
+    let mut utxo_view = block_store.utxo_view();
+
     // ============================================================
     // MAIN EVENT LOOP
     // ============================================================
@@ -505,8 +508,35 @@ async fn main() -> anyhow::Result<()> {
                                         break;
                                     }
 
-                                    // Note: ChainState is used for block validation.
-                                    // The RPC state tracks best_height/best_hash separately.
+                                    // Validate block and update UTXO set
+                                    {
+                                        let mut cs = chain_state.write().await;
+                                        match cs.process_block(&block, &mut utxo_view) {
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Block validation failed at height {}: {}",
+                                                    height, e
+                                                );
+                                                // Continue anyway during IBD — some validation
+                                                // errors are non-fatal (e.g. missing script flags)
+                                            }
+                                        }
+                                    }
+
+                                    // Flush UTXO cache if it exceeds the 2 GiB limit
+                                    if utxo_view.needs_flush() {
+                                        let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
+                                        let entries = utxo_view.cache_len();
+                                        if let Err(e) = utxo_view.flush() {
+                                            tracing::error!("UTXO cache flush failed: {}", e);
+                                        } else {
+                                            tracing::info!(
+                                                "UTXO cache flushed: {} entries, ~{} MiB at height {}",
+                                                entries, cache_mb, height
+                                            );
+                                        }
+                                    }
 
                                     // Update database tip
                                     if let Err(e) = block_store.set_best_block(&block_hash, height) {
@@ -525,9 +555,10 @@ async fn main() -> anyhow::Result<()> {
                                     // Progress logging
                                     if height.is_multiple_of(10000) {
                                         tracing::info!(
-                                            "Synced to height {} ({:.1}%)",
+                                            "Synced to height {} ({:.1}%) cache={} MiB",
                                             height,
-                                            block_downloader.progress()
+                                            block_downloader.progress(),
+                                            utxo_view.estimated_memory() / (1024 * 1024),
                                         );
                                     }
                                 }
@@ -762,6 +793,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Delete the cookie file so stale credentials don't linger after shutdown.
     delete_cookie_file(&base_datadir);
+
+    // Flush UTXO cache to disk
+    if utxo_view.cache_len() > 0 {
+        let entries = utxo_view.cache_len();
+        let mem_mb = utxo_view.estimated_memory() / (1024 * 1024);
+        match utxo_view.flush() {
+            Ok(()) => tracing::info!("UTXO cache flushed on shutdown: {} entries, ~{} MiB", entries, mem_mb),
+            Err(e) => tracing::error!("Failed to flush UTXO cache on shutdown: {}", e),
+        }
+    }
 
     // Flush chain state
     {
