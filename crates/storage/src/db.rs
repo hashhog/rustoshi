@@ -84,32 +84,39 @@ impl ChainDb {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        db_opts.set_max_open_files(-1); // unlimited (let OS manage)
+        db_opts.set_max_open_files(512);
         db_opts.set_keep_log_file_num(2);
-        db_opts.set_max_total_wal_size(64 * 1024 * 1024); // 64 MB
-        db_opts.set_write_buffer_size(64 * 1024 * 1024); // 64 MB write buffer
-        db_opts.set_max_write_buffer_number(3);
+        db_opts.set_max_total_wal_size(32 * 1024 * 1024); // 32 MB
+        db_opts.set_write_buffer_size(16 * 1024 * 1024); // 16 MB write buffer
+        db_opts.set_max_write_buffer_number(2);
+
+        // Shared block cache across all column families (128 MiB)
+        // Index and filter blocks are stored in the cache (not pinned) to limit memory.
+        let block_cache = rocksdb::Cache::new_lru_cache(128 * 1024 * 1024);
 
         // Configure per-column-family options
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_COLUMN_FAMILIES
             .iter()
             .map(|name| {
                 let mut cf_opts = Options::default();
+                let mut block_opts = rocksdb::BlockBasedOptions::default();
+                block_opts.set_block_cache(&block_cache);
+                // Store index/filter blocks in the block cache (evictable)
+                // rather than pinning them in memory indefinitely.
+                block_opts.set_cache_index_and_filter_blocks(true);
+                block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
 
                 // UTXO column family: add bloom filters for fast existence checks
                 if *name == CF_UTXO {
-                    let mut block_opts = rocksdb::BlockBasedOptions::default();
                     block_opts.set_bloom_filter(10.0, false);
-                    cf_opts.set_block_based_table_factory(&block_opts);
                 }
 
                 // Blocks column family: larger block size for sequential reads during IBD
                 if *name == CF_BLOCKS {
-                    let mut block_opts = rocksdb::BlockBasedOptions::default();
                     block_opts.set_block_size(64 * 1024); // 64 KB blocks
-                    cf_opts.set_block_based_table_factory(&block_opts);
                 }
 
+                cf_opts.set_block_based_table_factory(&block_opts);
                 ColumnFamilyDescriptor::new(*name, cf_opts)
             })
             .collect();

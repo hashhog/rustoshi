@@ -555,34 +555,108 @@ fn outpoint_key(outpoint: &OutPoint) -> Vec<u8> {
 // UTXO VIEW FOR BLOCK STORE
 // ============================================================
 
+/// Default UTXO cache memory limit: 2 GiB.
+pub const DEFAULT_UTXO_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Estimated per-entry overhead in the HashMap.
+/// OutPoint (36 bytes) + Option<CoinEntry> header (8) + CoinEntry fields (8+1+8 = 17)
+/// + HashMap node overhead (~80 bytes on 64-bit with hash + pointers)
+/// + average scriptPubKey (~34 bytes for P2WSH/P2TR)
+const CACHE_ENTRY_OVERHEAD: usize = 180;
+
 /// A UTXO view backed by BlockStore with an in-memory cache.
 ///
 /// This implements the `UtxoView` trait from consensus, allowing
 /// block validation to work directly with the storage layer.
+///
+/// The cache is bounded by `max_cache_bytes`. When the estimated memory
+/// usage exceeds this limit, `flush_if_needed()` writes all dirty entries
+/// to RocksDB and clears the cache.
 pub struct BlockStoreUtxoView<'a> {
     store: &'a BlockStore<'a>,
     /// In-memory cache for new UTXOs added during block connection
     cache: std::collections::HashMap<OutPoint, Option<CoinEntry>>,
+    /// Estimated memory usage of cached entries (bytes).
+    estimated_mem: usize,
+    /// Maximum cache size in bytes before triggering a flush.
+    max_cache_bytes: usize,
 }
 
 impl<'a> BlockStoreUtxoView<'a> {
     /// Create a new UTXO view backed by the given store.
     pub fn new(store: &'a BlockStore<'a>) -> Self {
+        Self::with_cache_limit(store, DEFAULT_UTXO_CACHE_BYTES)
+    }
+
+    /// Create a new UTXO view with a custom cache byte limit.
+    pub fn with_cache_limit(store: &'a BlockStore<'a>, max_cache_bytes: usize) -> Self {
         Self {
             store,
             cache: std::collections::HashMap::new(),
+            estimated_mem: 0,
+            max_cache_bytes,
         }
     }
 
-    /// Flush all cached changes to the database.
+    /// Estimated memory usage of the cache in bytes.
+    pub fn estimated_memory(&self) -> usize {
+        self.estimated_mem
+    }
+
+    /// Number of entries in the cache.
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Returns true if the cache has exceeded its memory limit.
+    pub fn needs_flush(&self) -> bool {
+        self.estimated_mem >= self.max_cache_bytes
+    }
+
+    /// Flush all cached changes to the database using a WriteBatch.
     pub fn flush(&mut self) -> Result<(), StorageError> {
+        if self.cache.is_empty() {
+            return Ok(());
+        }
+        let mut batch = self.store.db.new_batch();
+        let cf = self.store.db.cf_handle(CF_UTXO)
+            .ok_or_else(|| StorageError::Corruption("missing UTXO column family".into()))?;
         for (outpoint, coin) in self.cache.drain() {
+            let key = outpoint_key(&outpoint);
             match coin {
-                Some(c) => self.store.put_utxo(&outpoint, &c)?,
-                None => self.store.delete_utxo(&outpoint)?,
+                Some(c) => {
+                    let data = serde_json::to_vec(&c)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                    batch.put_cf(cf, &key, &data);
+                }
+                None => {
+                    batch.delete_cf(cf, &key);
+                }
             }
         }
+        self.store.db.write_batch(batch)?;
+        self.estimated_mem = 0;
         Ok(())
+    }
+
+    /// Flush to disk if the cache exceeds its memory limit.
+    /// Returns the number of entries flushed, or 0 if no flush was needed.
+    pub fn flush_if_needed(&mut self) -> Result<usize, StorageError> {
+        if self.needs_flush() {
+            let count = self.cache.len();
+            self.flush()?;
+            Ok(count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn estimate_entry_size(coin: &Option<CoinEntry>) -> usize {
+        CACHE_ENTRY_OVERHEAD
+            + coin
+                .as_ref()
+                .map(|c| c.script_pubkey.len())
+                .unwrap_or(0)
     }
 }
 
@@ -619,10 +693,23 @@ impl<'a> rustoshi_consensus::validation::UtxoView for BlockStoreUtxoView<'a> {
             value: coin.value,
             script_pubkey: coin.script_pubkey,
         };
-        self.cache.insert(outpoint.clone(), Some(storage_coin));
+        let new_size = Self::estimate_entry_size(&Some(storage_coin.clone()));
+        if let Some(old) = self.cache.insert(outpoint.clone(), Some(storage_coin)) {
+            // Replace: subtract old, add new
+            let old_size = Self::estimate_entry_size(&old);
+            self.estimated_mem = self.estimated_mem.saturating_sub(old_size) + new_size;
+        } else {
+            self.estimated_mem += new_size;
+        }
     }
 
     fn spend_utxo(&mut self, outpoint: &OutPoint) {
-        self.cache.insert(outpoint.clone(), None);
+        let new_size = Self::estimate_entry_size(&None);
+        if let Some(old) = self.cache.insert(outpoint.clone(), None) {
+            let old_size = Self::estimate_entry_size(&old);
+            self.estimated_mem = self.estimated_mem.saturating_sub(old_size) + new_size;
+        } else {
+            self.estimated_mem += new_size;
+        }
     }
 }
