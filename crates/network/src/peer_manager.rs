@@ -852,7 +852,7 @@ impl PeerManager {
                                         next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                                     );
                                     let event_tx = event_tx.clone();
-                                    let (cmd_tx, cmd_rx) = mpsc::channel(256);
+                                    let (cmd_tx, cmd_rx) = mpsc::channel(32);
                                     // Store cmd_tx so it stays alive until the peer
                                     // manager registers the peer in its handle map.
                                     tracing::info!("Storing cmd_tx for inbound peer {}", peer_id.0);
@@ -1052,7 +1052,7 @@ impl PeerManager {
         let peer_id = PeerId(self.next_peer_id);
         self.next_peer_id += 1;
 
-        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let event_tx = self.event_tx.clone();
         let magic = self.params.network_magic.0;
 
@@ -1135,12 +1135,18 @@ impl PeerManager {
     }
 
     /// Send a message to a specific peer.
+    /// Uses try_send to avoid blocking the caller if the peer's
+    /// send buffer is full (back-pressure: message is dropped).
     pub async fn send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> bool {
         if let Some(peer) = self.peers.get(&peer_id) {
-            peer.command_tx
-                .send(PeerCommand::SendMessage(msg))
-                .await
-                .is_ok()
+            match peer.command_tx.try_send(PeerCommand::SendMessage(msg)) {
+                Ok(()) => true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!("Send buffer full for peer {}, dropping message", peer_id.0);
+                    false
+                }
+                Err(_) => false,
+            }
         } else {
             false
         }
