@@ -253,9 +253,65 @@ async fn main() -> anyhow::Result<()> {
     // Initialize with genesis block
     block_store.init_genesis(&params)?;
 
-    // Load chain state
+    // Load chain state.
+    // The stored best_height may be a stale cumulative counter from a bug in
+    // earlier versions. Derive the actual height from the block index instead.
     let best_hash = block_store.get_best_block_hash()?.unwrap();
-    let best_height = block_store.get_best_height()?.unwrap();
+    let stored_height = block_store.get_best_height()?.unwrap();
+
+    // Try to find the actual height by looking up the best hash in the height index
+    let best_height = {
+        let mut found = stored_height;
+        // Scan backwards from stored height to find the hash
+        for h in (0..=std::cmp::min(stored_height, 1_000_000)).rev() {
+            if let Ok(Some(hash)) = block_store.get_hash_by_height(h) {
+                if hash == best_hash {
+                    found = h;
+                    break;
+                }
+            }
+            // Only scan 10000 heights to avoid long startup
+            if stored_height > h + 10000 {
+                break;
+            }
+        }
+        // If stored height is unreasonably high (>1M and hash not found),
+        // it's the cumulative counter bug. Reset to 0.
+        if found == stored_height && stored_height > 1_000_000 {
+            tracing::warn!("Stored height {} looks like cumulative counter, scanning for actual height", stored_height);
+            // Scan from 0 upward to find the highest height with a matching hash
+            let mut actual = 0u32;
+            for h in (0..=943_500).rev() {
+                if let Ok(Some(hash)) = block_store.get_hash_by_height(h) {
+                    if hash == best_hash {
+                        actual = h;
+                        break;
+                    }
+                }
+                // Only check recent heights
+                if h < 943_500u32.saturating_sub(1000) {
+                    break;
+                }
+            }
+            if actual > 0 {
+                tracing::info!("Found actual height: {}", actual);
+                actual
+            } else {
+                // Can't determine height, use 0 as safe default
+                tracing::warn!("Could not determine actual height, defaulting to 0");
+                0
+            }
+        } else {
+            found
+        }
+    };
+
+    // Fix the stored height
+    if best_height != stored_height {
+        tracing::info!("Correcting stored height from {} to {}", stored_height, best_height);
+        block_store.set_best_block(&best_hash, best_height)?;
+    }
+
     tracing::info!("Chain tip: {} (height {})", best_hash, best_height);
 
     // Initialize chain state for local block processing
@@ -372,12 +428,21 @@ async fn main() -> anyhow::Result<()> {
                         block_downloader.add_peer(peer_id);
 
                         // Start header sync if we need to catch up
-                        if let Some((target_peer, msg)) = header_sync.start_sync(|h| {
+                        match header_sync.start_sync(|h| {
                             block_store.get_hash_by_height(h).ok().flatten()
                         }) {
-                            let ps = peer_state.read().await;
-                            if let Some(ref pm) = ps.peer_manager {
-                                pm.send_to_peer(target_peer, msg).await;
+                            Some((target_peer, msg)) => {
+                                tracing::info!("Sending getheaders to peer {}", target_peer.0);
+                                let ps = peer_state.read().await;
+                                if let Some(ref pm) = ps.peer_manager {
+                                    let ok = pm.send_to_peer(target_peer, msg).await;
+                                    tracing::info!("getheaders send result: {}", ok);
+                                }
+                            }
+                            None => {
+                                tracing::info!("No sync peer found (our height={}, peers={})",
+                                    header_sync.best_header_height(),
+                                    header_sync.peer_count());
                             }
                         }
                     }
@@ -710,10 +775,12 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                     let ps = peer_state.read().await;
                                     if let Some(ref pm) = ps.peer_manager {
-                                        pm.send_to_peer(
+                                        // Use try_send for header serving — it's bulk
+                                        // data that can be dropped without harm.
+                                        pm.try_send_to_peer(
                                             peer_id,
                                             NetworkMessage::Headers(headers),
-                                        ).await;
+                                        );
                                     }
                                 }
                             }
@@ -733,10 +800,10 @@ async fn main() -> anyhow::Result<()> {
                                                     );
                                                     let ps = peer_state.read().await;
                                                     if let Some(ref pm) = ps.peer_manager {
-                                                        pm.send_to_peer(
+                                                        pm.try_send_to_peer(
                                                             peer_id,
                                                             NetworkMessage::Block(block),
-                                                        ).await;
+                                                        );
                                                     }
                                                 }
                                                 _ => {
