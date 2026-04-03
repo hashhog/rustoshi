@@ -69,6 +69,11 @@ impl HeaderSync {
         self.peer_heights.insert(peer_id, height);
     }
 
+    /// Number of registered peers.
+    pub fn peer_count(&self) -> usize {
+        self.peer_heights.len()
+    }
+
     /// Remove a disconnected peer.
     ///
     /// If we were syncing from this peer, reset state to Idle so we can

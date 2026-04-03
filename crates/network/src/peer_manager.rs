@@ -1135,18 +1135,25 @@ impl PeerManager {
     }
 
     /// Send a message to a specific peer.
-    /// Uses try_send to avoid blocking the caller if the peer's
-    /// send buffer is full (back-pressure: message is dropped).
+    /// Uses blocking send to ensure critical messages (getheaders, getdata)
+    /// are not dropped. For bulk responses (headers serving), use
+    /// try_send_to_peer instead.
     pub async fn send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> bool {
         if let Some(peer) = self.peers.get(&peer_id) {
-            match peer.command_tx.try_send(PeerCommand::SendMessage(msg)) {
-                Ok(()) => true,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    tracing::debug!("Send buffer full for peer {}, dropping message", peer_id.0);
-                    false
-                }
-                Err(_) => false,
-            }
+            peer.command_tx
+                .send(PeerCommand::SendMessage(msg))
+                .await
+                .is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Try to send a message without blocking. Drops the message if the
+    /// peer's send buffer is full. Use for non-critical bulk responses.
+    pub fn try_send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> bool {
+        if let Some(peer) = self.peers.get(&peer_id) {
+            peer.command_tx.try_send(PeerCommand::SendMessage(msg)).is_ok()
         } else {
             false
         }
