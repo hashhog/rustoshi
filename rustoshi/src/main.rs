@@ -639,9 +639,12 @@ async fn main() -> anyhow::Result<()> {
                                 };
                                 let best_header = header_sync.best_header_height();
 
-                                // During IBD (>1000 blocks behind headers), rate-limit
-                                // header serving to avoid starving block downloads
-                                if best_header > our_height + 1000 {
+                                // During IBD, rate-limit header serving to avoid
+                                // starving block downloads and bloating memory.
+                                // Also rate-limit at startup before our own headers
+                                // are synced (best_header == 0 means we haven't
+                                // finished our own header sync yet).
+                                if best_header > our_height + 1000 || best_header == 0 {
                                     // Only serve headers occasionally during IBD
                                     // Skip most getheaders to free bandwidth for blocks
                                     static IBD_HEADER_COUNTER: std::sync::atomic::AtomicU64
