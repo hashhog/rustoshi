@@ -56,6 +56,7 @@ to be educational, well-structured, and idiomatic Rust.
 - [x] Miniscript (type system, parsing, compilation, satisfaction, analysis)
 - [x] BIP-133 feefilter (peer min fee rate, privacy-preserving quantization, Poisson delays)
 - [x] Incremental relay fee (RBF fee bump requirements, 1000 sat/kvB default)
+- [x] Mainnet sync (in progress, syncing through IBD)
 - [ ] Full IBD sync (testnet4 sync to tip)
 
 ## Quick start
