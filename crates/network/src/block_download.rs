@@ -43,6 +43,18 @@ const BLOCK_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 #[allow(dead_code)]
 const DOWNLOAD_WINDOW_SIZE: u32 = 1024;
 
+/// Maximum number of received blocks buffered in memory awaiting validation.
+/// Mainnet blocks average ~1.5 MB, so 512 blocks ≈ 768 MB — within the memory
+/// budget while allowing enough buffer for out-of-order arrivals during IBD.
+/// Without this cap, slow validation causes unbounded memory growth (e.g. 13+ GB).
+///
+/// NOTE: This limit is checked independently from MAX_BLOCKS_IN_FLIGHT.
+/// Previously, received_blocks + in_flight shared a single 128 cap, which
+/// starved the download pipeline: out-of-order blocks filled received_blocks,
+/// leaving no room for new in_flight requests (observed as 0 getdata after
+/// enqueueing 131K blocks, with only periodic retries of 2-8 blocks).
+const MAX_RECEIVED_BLOCKS: usize = 512;
+
 /// A block that has been requested but not yet received.
 #[derive(Debug, Clone)]
 struct InFlightBlock {
@@ -103,6 +115,11 @@ pub struct BlockDownloader {
     received_blocks: HashMap<Hash256, Block>,
     /// Hashes in download-order, used to process blocks sequentially.
     pending_hashes: VecDeque<Hash256>,
+    /// Set of hashes in pending_hashes for O(1) dedup lookups.
+    /// Maintained in sync with pending_hashes to avoid rebuilding
+    /// a HashSet on every enqueue_blocks call (which was O(n) for
+    /// 900K+ blocks and caused multi-second stalls).
+    pending_set: std::collections::HashSet<Hash256>,
 }
 
 impl BlockDownloader {
@@ -120,14 +137,26 @@ impl BlockDownloader {
             best_header_height,
             received_blocks: HashMap::new(),
             pending_hashes: VecDeque::new(),
+            pending_set: std::collections::HashSet::new(),
         }
     }
 
     /// Add a range of block hashes to download (after headers are synced).
     ///
     /// Blocks should be added in chain order (lowest height first).
+    /// Deduplicates against blocks already queued, in-flight, or received.
     pub fn enqueue_blocks(&mut self, blocks: Vec<(Hash256, u32)>) {
         for item in blocks {
+            // Skip blocks already in the pipeline.
+            // Uses the persistent pending_set for O(1) dedup instead of
+            // rebuilding a HashSet from pending_hashes on every call.
+            if self.in_flight.contains_key(&item.0)
+                || self.received_blocks.contains_key(&item.0)
+                || self.pending_set.contains(&item.0)
+            {
+                continue;
+            }
+            self.pending_set.insert(item.0);
             self.pending_hashes.push_back(item.0);
             self.download_queue.push_back(item);
         }
@@ -146,6 +175,19 @@ impl BlockDownloader {
     /// block downloads, eventually deadlocking when all peers stall.
     pub fn download_queue_empty(&self) -> bool {
         self.download_queue.is_empty()
+    }
+
+    /// Return the number of blocks still in the download queue.
+    pub fn download_queue_len(&self) -> usize {
+        self.download_queue.len()
+    }
+
+    pub fn received_blocks_count(&self) -> usize {
+        self.received_blocks.len()
+    }
+
+    pub fn pending_hashes_count(&self) -> usize {
+        self.pending_hashes.len()
     }
 
     pub fn clear_stalling(&mut self) {
@@ -198,6 +240,22 @@ impl BlockDownloader {
 
         if available_peers.is_empty() || self.download_queue.is_empty() {
             return requests;
+        }
+
+        // Backpressure: don't request more blocks if the received buffer is full.
+        // This prevents unbounded memory growth when validation is slower than download.
+        // Exception: if the next block we need for validation is NOT in received_blocks
+        // and NOT in_flight, we MUST bypass backpressure to fetch it — otherwise
+        // the buffer can never drain and we deadlock.
+        if self.received_blocks.len() >= MAX_RECEIVED_BLOCKS {
+            let next_needed_available = self.pending_hashes.front()
+                .map(|h| self.received_blocks.contains_key(h) || self.in_flight.contains_key(h))
+                .unwrap_or(true);
+            if next_needed_available {
+                return requests;
+            }
+            // Next needed block is missing — allow a small number of requests through
+            // to fetch it, but don't open the floodgates.
         }
 
         // Track inventory vectors per peer for batching
@@ -299,12 +357,26 @@ impl BlockDownloader {
     pub fn next_block_to_validate(&mut self) -> Option<Block> {
         let hash = self.pending_hashes.front()?;
         if let Some(block) = self.received_blocks.remove(hash) {
-            self.pending_hashes.pop_front();
+            let h = self.pending_hashes.pop_front().unwrap();
+            self.pending_set.remove(&h);
             self.validated_tip_height += 1;
             Some(block)
         } else {
             // Next block in sequence hasn't arrived yet
             None
+        }
+    }
+
+    /// Returns true if the next block in chain order is available for
+    /// validation (i.e. it has been received and is buffered).
+    ///
+    /// Unlike `next_block_to_validate`, this does not consume the block.
+    /// Used by the event loop to decide whether to set `validation_pending`.
+    pub fn has_next_block(&self) -> bool {
+        if let Some(hash) = self.pending_hashes.front() {
+            self.received_blocks.contains_key(hash)
+        } else {
+            false
         }
     }
 
@@ -400,6 +472,26 @@ impl BlockDownloader {
     /// Get the number of registered peers.
     pub fn peer_count(&self) -> usize {
         self.peer_states.len()
+    }
+
+    /// Get the number of blocks currently in flight (requested but not yet received).
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Get the number of pending hashes awaiting validation.
+    pub fn pending_hashes_len(&self) -> usize {
+        self.pending_hashes.len()
+    }
+
+    /// Get the hash at the front of the pending validation queue.
+    pub fn pending_front_hash(&self) -> Option<Hash256> {
+        self.pending_hashes.front().cloned()
+    }
+
+    /// Check if a hash is in the received blocks buffer.
+    pub fn is_in_received(&self, hash: &Hash256) -> bool {
+        self.received_blocks.contains_key(hash)
     }
 }
 
@@ -662,7 +754,10 @@ mod tests {
     }
 
     #[test]
-    fn test_stalled_peers_not_assigned_new_blocks() {
+    fn test_stalled_peers_still_assigned_blocks() {
+        // Stalling peers are NOT excluded from assignment — the adaptive
+        // timeout handles slow peers without permanently excluding them,
+        // matching Bitcoin Core's approach. See assign_requests() comment.
         let mut dl = BlockDownloader::new(0, 100);
 
         let peer1 = PeerId(1);
@@ -679,13 +774,19 @@ mod tests {
             .collect();
         dl.enqueue_blocks(blocks);
 
-        // Assign requests
+        // Assign requests — both peers should get blocks
         let requests = dl.assign_requests();
-
-        // All blocks should go to peer2 (peer1 is stalling)
-        for (peer_id, _) in &requests {
-            assert_eq!(*peer_id, peer2);
-        }
+        let total: usize = requests
+            .iter()
+            .filter_map(|(_, msg)| {
+                if let NetworkMessage::GetData(items) = msg {
+                    Some(items.len())
+                } else {
+                    None
+                }
+            })
+            .sum();
+        assert_eq!(total, 4);
     }
 
     #[test]

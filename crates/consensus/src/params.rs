@@ -426,8 +426,12 @@ impl ChainParams {
             segwit_height: 481_824,
             taproot_height: 709_632,
             bip30_exception_heights: vec![91842, 91880],
-            assumed_valid_block: None,
-            assumed_valid_height: None,
+            // Bitcoin Core default assumevalid block (height 938343)
+            assumed_valid_block: Some(
+                Hash256::from_hex("00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac")
+                    .expect("valid mainnet assume-valid hash"),
+            ),
+            assumed_valid_height: Some(938_343),
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for mainnet
             minimum_chain_work: hex_to_u256("0000000000000000000000000000000000000001128750f82f4c366153a3a030"),
             // Well-known mainnet checkpoints (from Bitcoin Core historical data)
