@@ -33,7 +33,7 @@ use rustoshi_consensus::{
     fee_estimator::FeeEstimator,
     mempool::{Mempool, MempoolConfig, PackageAcceptResult},
     check_transaction,
-    ChainParams, NetworkId, COIN,
+    ChainParams, ChainState, NetworkId, COIN,
 };
 use rustoshi_network::message::{InvType, InvVector, NetworkMessage};
 use rustoshi_network::peer_manager::PeerManager;
@@ -1504,13 +1504,72 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn submit_block(&self, hex: String) -> RpcResult<Option<String>> {
         let block_bytes = Self::parse_hex(&hex)?;
 
-        let _block = Block::deserialize(&block_bytes).map_err(|_| {
-            Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Invalid block")
+        let block = Block::deserialize(&block_bytes).map_err(|_| {
+            Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Block decode failed")
         })?;
 
-        // Full block validation would go here
-        // For now, just acknowledge receipt
-        Ok(None)
+        let block_hash = block.block_hash();
+
+        let mut state = self.state.write().await;
+
+        // Check for duplicate — block already known at our tip or in the store
+        {
+            let store = BlockStore::new(&state.db);
+            if let Ok(Some(_)) = store.get_header(&block_hash) {
+                return Ok(Some("duplicate".to_string()));
+            }
+        }
+
+        // Build a ChainState from the current tip and validate + connect the block
+        let mut chain_state =
+            ChainState::new(state.best_hash, state.best_height, state.params.clone());
+
+        let store = BlockStore::new(&state.db);
+        let mut utxo_view = store.utxo_view();
+
+        match chain_state.process_block(&block, &mut utxo_view) {
+            Ok((_undo_data, _fees)) => {
+                // Store header and block data
+                if let Err(e) = store.put_header(&block_hash, &block.header) {
+                    tracing::error!("submitblock: failed to store header: {}", e);
+                    return Ok(Some(format!("database-error: {}", e)));
+                }
+                if let Err(e) = store.put_block(&block_hash, &block) {
+                    tracing::error!("submitblock: failed to store block: {}", e);
+                    return Ok(Some(format!("database-error: {}", e)));
+                }
+
+                // Flush UTXO changes to disk
+                if let Err(e) = utxo_view.flush() {
+                    tracing::error!("submitblock: UTXO flush failed: {}", e);
+                    return Ok(Some(format!("database-error: {}", e)));
+                }
+
+                // Update best block pointer
+                let new_height = state.best_height + 1;
+                if let Err(e) = store.set_best_block(&block_hash, new_height) {
+                    tracing::error!("submitblock: failed to update best block: {}", e);
+                    return Ok(Some(format!("database-error: {}", e)));
+                }
+
+                // Update RPC state
+                state.best_height = new_height;
+                state.best_hash = block_hash;
+
+                tracing::info!(
+                    "submitblock: accepted block {} at height {}",
+                    block_hash,
+                    new_height
+                );
+
+                // null means success per BIP22
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::warn!("submitblock: block {} rejected: {}", block_hash, e);
+                Ok(Some(e.to_string()))
+            }
+        }
     }
 
     async fn get_mining_info(&self) -> RpcResult<MiningInfo> {
