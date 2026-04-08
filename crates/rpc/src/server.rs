@@ -1539,6 +1539,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                     return Ok(Some(format!("database-error: {}", e)));
                 }
 
+                // Populate height-to-hash index
+                let new_height = state.best_height + 1;
+                if let Err(e) = store.put_height_index(new_height, &block_hash) {
+                    tracing::error!("submitblock: failed to store height index: {}", e);
+                    return Ok(Some(format!("database-error: {}", e)));
+                }
+
                 // Flush UTXO changes to disk
                 if let Err(e) = utxo_view.flush() {
                     tracing::error!("submitblock: UTXO flush failed: {}", e);
@@ -1546,7 +1553,6 @@ impl RustoshiRpcServer for RpcServerImpl {
                 }
 
                 // Update best block pointer
-                let new_height = state.best_height + 1;
                 if let Err(e) = store.set_best_block(&block_hash, new_height) {
                     tracing::error!("submitblock: failed to update best block: {}", e);
                     return Ok(Some(format!("database-error: {}", e)));
