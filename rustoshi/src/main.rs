@@ -17,7 +17,7 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
-use rustoshi_consensus::{ChainParams, ChainState, NetworkId};
+use rustoshi_consensus::{ChainParams, ChainState, FeeEstimator, NetworkId};
 use rustoshi_network::{
     BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason, NetworkMessage, PeerEvent,
     PeerManager, PeerManagerConfig,
@@ -868,6 +868,15 @@ async fn main() -> anyhow::Result<()> {
     // Initialize RPC state
     let mut rpc_state_inner = RpcState::new(db.clone(), params.clone());
     rpc_state_inner.init_from_db().map_err(|e| anyhow::anyhow!(e))?;
+
+    // Load persisted fee estimates if available
+    let fee_estimates_path = datadir.join("fee_estimates.json");
+    let loaded_estimator = FeeEstimator::load(&fee_estimates_path);
+    if loaded_estimator.current_height() > 0 {
+        tracing::info!("Loaded fee estimates from disk (height {})", loaded_estimator.current_height());
+    }
+    rpc_state_inner.fee_estimator = loaded_estimator;
+
     let rpc_state = Arc::new(RwLock::new(rpc_state_inner));
 
     // Initialize peer state (empty for now, will be updated)
@@ -1314,13 +1323,33 @@ async fn main() -> anyhow::Result<()> {
                                         tracing::error!("Failed to update best block: {}", e);
                                     }
 
-                                    // Update RPC state only if this advances the tip
+                                    // Update RPC state and clean mempool
                                     {
                                         let mut rpc = rpc_state.write().await;
                                         if height > rpc.best_height {
                                             rpc.best_height = height;
                                             rpc.best_hash = block_hash;
                                         }
+
+                                        // Remove confirmed transactions from mempool
+                                        let block_txids: Vec<Hash256> = block
+                                            .transactions
+                                            .iter()
+                                            .map(|tx| tx.txid())
+                                            .collect();
+                                        let block_spent: Vec<OutPoint> = block
+                                            .transactions
+                                            .iter()
+                                            .flat_map(|tx| {
+                                                tx.inputs.iter().map(|i| i.previous_output.clone())
+                                            })
+                                            .collect();
+                                        rpc.mempool
+                                            .remove_for_block(&block_txids, &block_spent);
+
+                                        // Clear recently-rejected filter -- rejection reasons
+                                        // may no longer apply after a new block
+                                        rpc.recently_rejected.clear();
                                     }
 
                                     // Progress logging
@@ -1356,6 +1385,7 @@ async fn main() -> anyhow::Result<()> {
 
                             NetworkMessage::Inv(inv_items) => {
                                 // Handle new block/transaction announcements
+                                let mut tx_requests = Vec::new();
                                 for item in &inv_items {
                                     match item.inv_type {
                                         InvType::MsgBlock | InvType::MsgWitnessBlock => {
@@ -1367,28 +1397,33 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         InvType::MsgTx | InvType::MsgWitnessTx => {
                                             // New transaction -- request if not in mempool
+                                            // and not recently rejected
                                             let rpc = rpc_state.read().await;
-                                            if !rpc.mempool.contains(&item.hash) {
-                                                drop(rpc);
-                                                let ps = peer_state.read().await;
-                                                if let Some(ref pm) = ps.peer_manager {
-                                                    pm.send_to_peer(
-                                                        peer_id,
-                                                        NetworkMessage::GetData(vec![item.clone()]),
-                                                    )
-                                                    .await;
-                                                }
+                                            if !rpc.mempool.contains(&item.hash)
+                                                && !rpc.recently_rejected.contains(&item.hash)
+                                            {
+                                                tx_requests.push(item.clone());
                                             }
                                         }
                                         _ => {}
+                                    }
+                                }
+                                if !tx_requests.is_empty() {
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.send_to_peer(
+                                            peer_id,
+                                            NetworkMessage::GetData(tx_requests),
+                                        )
+                                        .await;
                                     }
                                 }
                             }
 
                             NetworkMessage::Tx(tx) => {
                                 let txid = tx.txid();
+                                let wtxid = tx.wtxid();
                                 let mut rpc = rpc_state.write().await;
-                                // For now just log - proper mempool validation requires UTXO lookup
                                 match rpc.mempool.add_transaction(tx, &|outpoint| {
                                     // Look up UTXO from storage
                                     block_store.get_utxo(outpoint).ok().flatten().map(|coin| {
@@ -1402,9 +1437,36 @@ async fn main() -> anyhow::Result<()> {
                                 }) {
                                     Ok(_) => {
                                         tracing::debug!("Added tx {} to mempool", txid);
+                                        drop(rpc);
+                                        // Relay to all peers except the source
+                                        let ps = peer_state.read().await;
+                                        if let Some(ref pm) = ps.peer_manager {
+                                            let inv = InvVector {
+                                                inv_type: InvType::MsgWitnessTx,
+                                                hash: wtxid,
+                                            };
+                                            let peers: Vec<_> = pm
+                                                .connected_peers()
+                                                .iter()
+                                                .map(|(id, _)| *id)
+                                                .collect();
+                                            for pid in peers {
+                                                if pid != peer_id {
+                                                    pm.send_to_peer(
+                                                        pid,
+                                                        NetworkMessage::Inv(vec![inv.clone()]),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::debug!("Rejected tx {}: {}", txid, e);
+                                        // Add to recently-rejected filter to avoid re-requesting
+                                        if rpc.recently_rejected.len() < 50_000 {
+                                            rpc.recently_rejected.insert(txid);
+                                        }
                                     }
                                 }
                             }
@@ -1524,6 +1586,21 @@ async fn main() -> anyhow::Result<()> {
                                                     tracing::debug!(
                                                         "Block {} not found for peer {}",
                                                         item.hash, peer_id.0
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        InvType::MsgTx | InvType::MsgWitnessTx => {
+                                            // Serve transaction from mempool
+                                            let rpc = rpc_state.read().await;
+                                            if let Some(entry) = rpc.mempool.get(&item.hash) {
+                                                let tx = entry.tx.clone();
+                                                drop(rpc);
+                                                let ps = peer_state.read().await;
+                                                if let Some(ref pm) = ps.peer_manager {
+                                                    pm.try_send_to_peer(
+                                                        peer_id,
+                                                        NetworkMessage::Tx(tx),
                                                     );
                                                 }
                                             }
@@ -1688,6 +1765,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Delete the cookie file so stale credentials don't linger after shutdown.
     delete_cookie_file(&base_datadir);
+
+    // Save fee estimates to disk
+    {
+        let state = rpc_state.read().await;
+        match state.fee_estimator.save(&fee_estimates_path) {
+            Ok(()) => tracing::info!("Fee estimates saved to {}", fee_estimates_path.display()),
+            Err(e) => tracing::error!("Failed to save fee estimates: {}", e),
+        }
+    }
 
     // Flush UTXO cache to disk
     if utxo_view.cache_len() > 0 {
