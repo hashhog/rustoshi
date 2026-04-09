@@ -1504,9 +1504,27 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn submit_block(&self, hex: String) -> RpcResult<Option<String>> {
         let block_bytes = Self::parse_hex(&hex)?;
 
-        let block = Block::deserialize(&block_bytes).map_err(|_| {
-            Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Block decode failed")
-        })?;
+        // Defense in depth: catch any panics during deserialization so a malformed
+        // block from a peer/RPC caller can never crash the node process.
+        let decode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Block::deserialize(&block_bytes)
+        }));
+        let block = match decode_result {
+            Ok(Ok(b)) => b,
+            Ok(Err(_)) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DESERIALIZATION_ERROR,
+                    "Block decode failed",
+                ));
+            }
+            Err(_) => {
+                tracing::error!("submitblock: panic caught during block deserialization");
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DESERIALIZATION_ERROR,
+                    "Block decode failed (internal error)",
+                ));
+            }
+        };
 
         let block_hash = block.block_hash();
 

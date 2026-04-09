@@ -26,6 +26,9 @@ pub const MAX_HEADERS: usize = 2000;
 /// Maximum number of addresses in a single addr message.
 pub const MAX_ADDR: usize = 1000;
 
+/// Maximum number of locator hashes in getheaders/getblocks (Bitcoin Core: MAX_LOCATOR_SZ = 101).
+const MAX_LOCATOR_HASHES: usize = 101;
+
 /// Inventory type flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]
@@ -537,6 +540,12 @@ impl NetworkMessage {
                 cursor.read_exact(&mut buf4)?;
                 let version = u32::from_le_bytes(buf4);
                 let count = read_compact_size(&mut cursor)? as usize;
+                if count > MAX_LOCATOR_HASHES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "too many locator hashes",
+                    ));
+                }
                 let mut locator_hashes = Vec::with_capacity(count);
                 for _ in 0..count {
                     let mut hash = [0u8; 32];
@@ -556,6 +565,12 @@ impl NetworkMessage {
                 cursor.read_exact(&mut buf4)?;
                 let version = u32::from_le_bytes(buf4);
                 let count = read_compact_size(&mut cursor)? as usize;
+                if count > MAX_LOCATOR_HASHES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "too many locator hashes",
+                    ));
+                }
                 let mut locator_hashes = Vec::with_capacity(count);
                 for _ in 0..count {
                     let mut hash = [0u8; 32];
@@ -600,11 +615,23 @@ impl NetworkMessage {
             }
             "getdata" => {
                 let count = read_compact_size(&mut cursor)? as usize;
+                if count > MAX_INV_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "too many getdata items",
+                    ));
+                }
                 let items = deserialize_inv_vectors(&mut cursor, count)?;
                 Ok(NetworkMessage::GetData(items))
             }
             "notfound" => {
                 let count = read_compact_size(&mut cursor)? as usize;
+                if count > MAX_INV_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "too many notfound items",
+                    ));
+                }
                 let items = deserialize_inv_vectors(&mut cursor, count)?;
                 Ok(NetworkMessage::NotFound(items))
             }
