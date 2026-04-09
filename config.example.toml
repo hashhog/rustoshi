@@ -1,0 +1,46 @@
+# Rustoshi - Bitcoin Full Node (Rust)
+# Example configuration file
+# Copy to your data directory and modify as needed.
+
+[network]
+# Network: mainnet, testnet3, testnet4, signet, regtest
+network = "mainnet"
+# P2P listen port (default depends on network)
+# port = 8333
+# Accept inbound P2P connections
+listen = true
+# Maximum outbound connections
+maxconnections = 8
+# Connect only to this peer (for testing/manual peering)
+# connect = "127.0.0.1:8333"
+
+[storage]
+# Data directory for blockchain data and configuration
+datadir = "~/.rustoshi"
+# Enable transaction indexing
+txindex = false
+# Prune blockchain data to this many MiB (0 = no pruning)
+# prune = 0
+
+[rpc]
+# RPC bind address and port
+rpcbind = "127.0.0.1:8332"
+# RPC authentication credentials
+# rpcuser = ""
+# rpcpassword = ""
+
+[p2p]
+# P2P listen port (overrides network default)
+# port = 8333
+
+[mempool]
+# (Uses Bitcoin Core defaults internally)
+
+[logging]
+# Log level: trace, debug, info, warn, error
+loglevel = "info"
+
+[metrics]
+# Prometheus metrics endpoint
+# enabled = true
+# port = 9332
