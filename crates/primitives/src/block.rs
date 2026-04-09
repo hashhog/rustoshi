@@ -9,6 +9,11 @@ use crate::transaction::Transaction;
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 
+/// Maximum number of transactions in a block. A 4MB block at minimum transaction
+/// weight (60 WU each) can hold at most ~68k transactions. We use 25k as a safe
+/// upper bound matching the per-transaction input/output limits.
+const MAX_TX_COUNT: u64 = 25_000;
+
 /// A block header (80 bytes).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct BlockHeader {
@@ -267,11 +272,11 @@ impl Decodable for Block {
         let header = BlockHeader::decode(reader)?;
         let tx_count = read_compact_size(reader)?;
 
-        // Sanity check
-        if tx_count > 1_000_000 {
+        // Sanity check: prevent OOM from absurdly large counts
+        if tx_count > MAX_TX_COUNT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "too many transactions",
+                format!("too many transactions: {}", tx_count),
             ));
         }
 

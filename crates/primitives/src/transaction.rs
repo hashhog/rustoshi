@@ -10,6 +10,18 @@ use crate::serialize::{
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 
+/// Maximum number of inputs/outputs per transaction (consensus: MAX_BLOCK_WEIGHT / MIN_TX_WEIGHT
+/// gives ~25k as a safe upper bound; Bitcoin Core uses similar limits implicitly via block size).
+const MAX_TX_IN_COUNT: usize = 25_000;
+const MAX_TX_OUT_COUNT: usize = 25_000;
+/// Maximum script size (consensus limit is 10,000 bytes for scriptSig; scriptPubKey can be
+/// larger in witness but we cap at the block weight limit for safety).
+const MAX_SCRIPT_SIZE: u64 = 10_000;
+/// Maximum number of witness items per input.
+const MAX_WITNESS_ITEMS: usize = 500;
+/// Maximum size of a single witness item (capped at max block weight = 4MB).
+const MAX_WITNESS_ITEM_SIZE: u64 = 4_000_000;
+
 /// An outpoint references a specific output of a previous transaction.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct OutPoint {
@@ -147,10 +159,10 @@ impl Decodable for TxOut {
         let value = u64::from_le_bytes(value_bytes);
 
         let script_len = read_compact_size(reader)?;
-        if script_len > 4_000_000 {
+        if script_len > MAX_WITNESS_ITEM_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "script too large",
+                format!("scriptPubKey too large: {}", script_len),
             ));
         }
         let mut script_pubkey = vec![0u8; script_len as usize];
@@ -379,14 +391,20 @@ impl Decodable for Transaction {
         };
 
         // Read inputs
+        if input_count > MAX_TX_IN_COUNT as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("too many inputs: {}", input_count),
+            ));
+        }
         let mut inputs = Vec::with_capacity(input_count as usize);
         for _ in 0..input_count {
             let previous_output = OutPoint::decode(reader)?;
             let script_len = read_compact_size(reader)?;
-            if script_len > 4_000_000 {
+            if script_len > MAX_SCRIPT_SIZE {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "script too large",
+                    format!("scriptSig too large: {}", script_len),
                 ));
             }
             let mut script_sig = vec![0u8; script_len as usize];
@@ -406,6 +424,12 @@ impl Decodable for Transaction {
 
         // Read outputs
         let output_count = read_compact_size(reader)?;
+        if output_count > MAX_TX_OUT_COUNT as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("too many outputs: {}", output_count),
+            ));
+        }
         let mut outputs = Vec::with_capacity(output_count as usize);
         for _ in 0..output_count {
             outputs.push(TxOut::decode(reader)?);
@@ -415,14 +439,19 @@ impl Decodable for Transaction {
         if has_witness {
             for input in &mut inputs {
                 let witness_count = read_compact_size(reader)?;
+                if witness_count > MAX_WITNESS_ITEMS as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("too many witness items: {}", witness_count),
+                    ));
+                }
                 input.witness = Vec::with_capacity(witness_count as usize);
                 for _ in 0..witness_count {
                     let item_len = read_compact_size(reader)?;
-                    // Witness items can be larger (up to ~4MB for entire block)
-                    if item_len > 0x02000000 {
+                    if item_len > MAX_WITNESS_ITEM_SIZE {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "witness item too large",
+                            format!("witness item too large: {}", item_len),
                         ));
                     }
                     let mut item = vec![0u8; item_len as usize];
