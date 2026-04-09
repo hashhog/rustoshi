@@ -34,7 +34,10 @@
 //! ```
 
 use rustoshi_primitives::Hash256;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io;
+use std::path::Path;
 
 /// Maximum confirmation target (approximately one week of blocks).
 const MAX_CONFIRMATION_TARGET: usize = 1008;
@@ -67,7 +70,7 @@ const MIN_TRACKED_TXS: f64 = 200.0;
 const SUCCESS_THRESHOLD: f64 = 0.85;
 
 /// Statistics for a single fee rate bucket.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct BucketStats {
     /// Exponentially-decayed count of transactions that confirmed within each target.
     /// Indexed by confirmation target (1..=MAX_CONFIRMATION_TARGET).
@@ -98,7 +101,7 @@ impl BucketStats {
 }
 
 /// A transaction being tracked from mempool entry to confirmation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TrackedTransaction {
     /// Fee rate in satoshis per virtual byte.
     pub fee_rate: f64,
@@ -106,6 +109,14 @@ struct TrackedTransaction {
     pub bucket_index: usize,
     /// Block height when the transaction entered the mempool.
     pub entered_height: u32,
+}
+
+/// Serializable state for fee estimator persistence.
+#[derive(Serialize, Deserialize)]
+struct FeeEstimatorState {
+    buckets: Vec<BucketStats>,
+    tracked: HashMap<Hash256, TrackedTransaction>,
+    current_height: u32,
 }
 
 /// Fee estimator that learns from observed confirmation times.
@@ -318,6 +329,54 @@ impl FeeEstimator {
             .get(bucket_index)
             .map(|b| b.total)
             .unwrap_or(0.0)
+    }
+
+    /// Save fee estimator state to a JSON file.
+    ///
+    /// Writes to a temporary file first, then atomically renames to avoid
+    /// corruption on crash.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let state = FeeEstimatorState {
+            buckets: self.buckets.clone(),
+            tracked: self.tracked.clone(),
+            current_height: self.current_height,
+        };
+        let json = serde_json::to_string(&state)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, &json)?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    /// Load fee estimator state from a JSON file.
+    ///
+    /// Returns a new FeeEstimator with default state if the file doesn't exist
+    /// or contains invalid data.
+    pub fn load(path: &Path) -> Self {
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(_) => return Self::new(),
+        };
+        let state: FeeEstimatorState = match serde_json::from_str(&data) {
+            Ok(s) => s,
+            Err(_) => return Self::new(),
+        };
+        let num_buckets = FEE_RATE_BUCKETS.len();
+        if state.buckets.len() != num_buckets {
+            return Self::new();
+        }
+        let mut estimator = Self {
+            buckets: state.buckets,
+            tracked: state.tracked,
+            current_height: state.current_height,
+            last_estimates: vec![None; MAX_CONFIRMATION_TARGET + 1],
+        };
+        // Rebuild cached estimates from loaded state
+        for target in 1..=MAX_CONFIRMATION_TARGET {
+            estimator.last_estimates[target] = estimator.estimate_internal(target);
+        }
+        estimator
     }
 }
 
