@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
+use tokio::io::AsyncWriteExt;
 
 use rustoshi_consensus::{ChainParams, ChainState, FeeEstimator, NetworkId};
 use rustoshi_network::{
@@ -76,6 +77,10 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     loglevel: String,
+
+    /// Prometheus metrics port (0 to disable)
+    #[arg(long, default_value = "9332")]
+    metrics_port: u16,
 
     /// Prune blockchain data to this many MiB
     #[arg(long)]
@@ -141,6 +146,77 @@ fn resolve_datadir(datadir: &str, params: &ChainParams) -> PathBuf {
     }
 
     path
+}
+
+// ============================================================
+// PROMETHEUS METRICS SERVER
+// ============================================================
+
+/// Start a lightweight HTTP server that serves Prometheus-format metrics.
+async fn start_metrics_server(
+    port: u16,
+    rpc_state: Arc<RwLock<RpcState>>,
+    peer_state: Arc<RwLock<PeerState>>,
+) {
+    if port == 0 {
+        return;
+    }
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("Metrics server failed to bind to {}: {}", addr, e);
+            return;
+        }
+    };
+    tracing::info!("Prometheus metrics server listening on {}", addr);
+
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let rpc_state = rpc_state.clone();
+        let peer_state = peer_state.clone();
+        tokio::spawn(async move {
+            // Read the HTTP request (we don't need to parse it, just consume it)
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+
+            // Gather metrics from state
+            let (height, mempool_size) = {
+                let state = rpc_state.read().await;
+                (state.best_height, state.mempool.size())
+            };
+            let peers = {
+                let ps = peer_state.read().await;
+                ps.peer_manager.as_ref().map_or(0, |pm| pm.peer_count() as u32)
+            };
+
+            let body = format!(
+                "# HELP bitcoin_blocks_total Current block height\n\
+                 # TYPE bitcoin_blocks_total gauge\n\
+                 bitcoin_blocks_total {}\n\
+                 # HELP bitcoin_peers_connected Number of connected peers\n\
+                 # TYPE bitcoin_peers_connected gauge\n\
+                 bitcoin_peers_connected {}\n\
+                 # HELP bitcoin_mempool_size Mempool transaction count\n\
+                 # TYPE bitcoin_mempool_size gauge\n\
+                 bitcoin_mempool_size {}\n",
+                height, peers, mempool_size,
+            );
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+    }
 }
 
 /// Get the appropriate RPC port for a network.
@@ -897,6 +973,13 @@ async fn main() -> anyhow::Result<()> {
     };
     let rpc_handle = start_rpc_server(rpc_config, rpc_state.clone(), peer_state.clone()).await?;
     tracing::info!("RPC server listening on {}", rpc_bind);
+
+    // Start Prometheus metrics server
+    tokio::spawn(start_metrics_server(
+        cli.metrics_port,
+        rpc_state.clone(),
+        peer_state.clone(),
+    ));
 
     // Configure peer manager
     let peer_config = PeerManagerConfig {
