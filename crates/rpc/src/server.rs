@@ -1360,7 +1360,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             maxmempool: 300 * 1024 * 1024, // 300 MB
             mempoolminfee: min_fee_rate,
             minrelaytxfee: min_fee_rate,
+            incrementalrelayfee: min_fee_rate,
             unbroadcastcount: 0,
+            fullrbf: true,
         })
     }
 
