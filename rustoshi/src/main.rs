@@ -19,8 +19,8 @@ use tracing_subscriber::EnvFilter;
 
 use rustoshi_consensus::{ChainParams, ChainState, NetworkId};
 use rustoshi_network::{
-    BlockDownloader, HeaderSync, InvType, NetworkMessage, PeerEvent, PeerManager,
-    PeerManagerConfig,
+    BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason, NetworkMessage, PeerEvent,
+    PeerManager, PeerManagerConfig,
 };
 use rustoshi_rpc::{start_rpc_server, PeerState, RpcConfig, RpcState};
 use rustoshi_storage::{BlockStore, ChainDb};
@@ -1215,6 +1215,18 @@ async fn main() -> anyhow::Result<()> {
                                     Err(e) => {
                                         tracing::warn!("Header sync error from peer {}: {}", peer_id.0, e);
 
+                                        // Score misbehavior based on the error type
+                                        {
+                                            let mut ps = peer_state.write().await;
+                                            if let Some(ref mut pm) = ps.peer_manager {
+                                                if e.contains("not connected") || e.contains("not in our chain") {
+                                                    pm.misbehaving(peer_id, MisbehaviorReason::HeadersDontConnect).await;
+                                                } else if e.contains("proof of work") {
+                                                    pm.misbehaving(peer_id, MisbehaviorReason::InvalidBlockHeader).await;
+                                                }
+                                            }
+                                        }
+
                                         // When the first header doesn't connect to our tip,
                                         // the peer may have reorged or we're on a stale fork.
                                         // Re-request headers with a full block locator so the
@@ -1521,6 +1533,70 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
 
+                            // BIP 152: Handle compact block relay messages
+                            NetworkMessage::SendCmpct(sc) => {
+                                tracing::debug!(
+                                    "Peer {} supports compact blocks: version={}, announce={}",
+                                    peer_id.0, sc.version, sc.announce
+                                );
+                                // Record peer's compact block preferences (forwarded to peer manager)
+                                let mut ps = peer_state.write().await;
+                                if let Some(ref mut pm) = ps.peer_manager {
+                                    pm.handle_event(PeerEvent::Message(peer_id, NetworkMessage::SendCmpct(sc))).await;
+                                }
+                            }
+
+                            NetworkMessage::CmpctBlock(data) => {
+                                // We received a compact block. Since we don't have a mempool,
+                                // we can't reconstruct the block from short IDs. Decode the
+                                // header to get the block hash, then fall back to requesting
+                                // the full block via getdata.
+                                if data.len() >= 80 {
+                                    let block_hash = rustoshi_crypto::sha256d(&data[..80]);
+                                    tracing::info!(
+                                        "Received cmpctblock from peer {}, falling back to full block request (hash={})",
+                                        peer_id.0, block_hash
+                                    );
+                                    let inv = InvVector {
+                                        inv_type: InvType::MsgWitnessBlock,
+                                        hash: block_hash,
+                                    };
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.send_to_peer(
+                                            peer_id,
+                                            NetworkMessage::GetData(vec![inv]),
+                                        ).await;
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "Received invalid cmpctblock from peer {} (too short: {} bytes)",
+                                        peer_id.0, data.len()
+                                    );
+                                }
+                            }
+
+                            NetworkMessage::GetBlockTxn(data) => {
+                                // Peer is requesting missing transactions for a compact block
+                                // they're reconstructing. We would need to look up the block
+                                // and send the requested transactions. For now, log and ignore
+                                // since we don't typically send compact blocks to peers yet.
+                                tracing::debug!(
+                                    "Received getblocktxn from peer {} ({} bytes), ignoring (compact block serving not yet implemented)",
+                                    peer_id.0, data.len()
+                                );
+                            }
+
+                            NetworkMessage::BlockTxn(data) => {
+                                // Response to our getblocktxn request with missing transactions.
+                                // Since we fall back to full block download, we shouldn't receive
+                                // these. Log for diagnostics.
+                                tracing::debug!(
+                                    "Received blocktxn from peer {} ({} bytes), ignoring (using full block download)",
+                                    peer_id.0, data.len()
+                                );
+                            }
+
                             // Forward other messages to peer manager for internal handling
                             _ => {
                                 let mut ps = peer_state.write().await;
@@ -1554,6 +1630,16 @@ async fn main() -> anyhow::Result<()> {
                 // Check for timed-out block requests FIRST — this frees
                 // blocks_in_flight slots so assign_requests can use them.
                 let timed_out = block_downloader.check_timeouts();
+
+                // Score misbehavior for peers with stalled block downloads
+                if !timed_out.is_empty() {
+                    let mut ps = peer_state.write().await;
+                    if let Some(ref mut pm) = ps.peer_manager {
+                        for stalled_peer in &timed_out {
+                            pm.misbehaving(*stalled_peer, MisbehaviorReason::BlockDownloadStall).await;
+                        }
+                    }
+                }
 
                 let queue_len = block_downloader.download_queue_len();
                 let in_flight = block_downloader.in_flight_count();
