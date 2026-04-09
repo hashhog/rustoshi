@@ -1325,6 +1325,12 @@ impl PeerManager {
                     peer.info = info.clone();
                     peer.connected_time = Instant::now();
                 }
+
+                // BIP133: Send initial feefilter after handshake
+                // Use high fee rate (100 sat/vbyte) to discourage tx relay during sync
+                if info.relay {
+                    self.send_initial_feefilter(*id).await;
+                }
             }
             PeerEvent::Disconnected(id, reason) => {
                 tracing::info!("Peer {} disconnected: {:?}", id.0, reason);
@@ -1376,27 +1382,59 @@ impl PeerManager {
                     if let Some(peer) = self.peers.get(id) {
                         self.addr_manager.add_peer_addresses(addrs, peer.info.addr);
                     }
+                    // BIP155: Relay a random subset of new addresses to 2 other peers
+                    if addrs.len() <= MAX_ADDR {
+                        self.relay_addresses_to_peers(*id).await;
+                    }
+                }
+
+                // Handle addrv2 messages (BIP155)
+                if let NetworkMessage::AddrV2(entries) = msg {
+                    if entries.len() <= MAX_ADDR {
+                        self.addr_manager.add_addrv2_addresses(entries, self.peers.get(id).map(|p| p.info.addr).unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()));
+                        // Relay to 2 other peers
+                        self.relay_addresses_to_peers(*id).await;
+                    }
+                }
+
+                // Handle feefilter messages (BIP133)
+                if let NetworkMessage::FeeFilter(fee_rate) = msg {
+                    if let Some(peer) = self.peers.get_mut(id) {
+                        // Validate: must be within money range (max 21M BTC in sats)
+                        if *fee_rate <= 2_100_000_000_000_000 {
+                            peer.info.feefilter = *fee_rate;
+                        }
+                    }
                 }
 
                 // Handle getaddr messages
                 if let NetworkMessage::GetAddr = msg {
-                    let addrs = self.addr_manager.get_addresses_for_sharing(MAX_ADDR);
-                    let timestamped_addrs: Vec<TimestampedNetAddress> = addrs
-                        .into_iter()
-                        .map(|info| TimestampedNetAddress {
-                            timestamp: info
-                                .last_seen
-                                .elapsed()
-                                .as_secs()
-                                .saturating_sub(info.last_seen.elapsed().as_secs())
-                                as u32,
-                            address: socket_addr_to_net_address(info.addr, info.services),
-                        })
-                        .collect();
-                    if !timestamped_addrs.is_empty() {
-                        let _ = self
-                            .send_to_peer(*id, NetworkMessage::Addr(timestamped_addrs))
-                            .await;
+                    // Send addrv2 if peer supports it, otherwise legacy addr
+                    let peer_supports_addrv2 = self.peers.get(id).map(|p| p.info.supports_addrv2).unwrap_or(false);
+                    if peer_supports_addrv2 {
+                        let entries = self.addr_manager.get_addrv2_for_sharing(MAX_ADDR);
+                        if !entries.is_empty() {
+                            let _ = self.send_to_peer(*id, NetworkMessage::AddrV2(entries)).await;
+                        }
+                    } else {
+                        let addrs = self.addr_manager.get_addresses_for_sharing(MAX_ADDR);
+                        let timestamped_addrs: Vec<TimestampedNetAddress> = addrs
+                            .into_iter()
+                            .map(|info| TimestampedNetAddress {
+                                timestamp: info
+                                    .last_seen
+                                    .elapsed()
+                                    .as_secs()
+                                    .saturating_sub(info.last_seen.elapsed().as_secs())
+                                    as u32,
+                                address: socket_addr_to_net_address(info.addr, info.services),
+                            })
+                            .collect();
+                        if !timestamped_addrs.is_empty() {
+                            let _ = self
+                                .send_to_peer(*id, NetworkMessage::Addr(timestamped_addrs))
+                                .await;
+                        }
                     }
                 }
 
@@ -1431,6 +1469,61 @@ impl PeerManager {
         }
 
         Some(event)
+    }
+
+    /// Relay addresses to up to 2 random peers (excluding the source).
+    /// This implements Bitcoin Core's RelayAddress behavior.
+    async fn relay_addresses_to_peers(&mut self, source_id: PeerId) {
+        use rand::seq::SliceRandom;
+        let candidates: Vec<PeerId> = self
+            .peers
+            .iter()
+            .filter(|(pid, peer)| {
+                **pid != source_id
+                    && peer.conn_type != ConnectionType::BlockRelayOnly
+                    && peer.info.state == PeerState::Established
+            })
+            .map(|(pid, _)| *pid)
+            .collect();
+        let mut rng = rand::thread_rng();
+        let targets: Vec<PeerId> = candidates
+            .choose_multiple(&mut rng, std::cmp::min(2, candidates.len()))
+            .cloned()
+            .collect();
+        for target_id in targets {
+            let target_supports_addrv2 = self
+                .peers
+                .get(&target_id)
+                .map(|p| p.info.supports_addrv2)
+                .unwrap_or(false);
+            if target_supports_addrv2 {
+                let entries = self.addr_manager.get_addrv2_for_sharing(10);
+                if !entries.is_empty() {
+                    let _ = self.send_to_peer(target_id, NetworkMessage::AddrV2(entries)).await;
+                }
+            } else {
+                let addrs = self.addr_manager.get_addresses_for_sharing(10);
+                let timestamped: Vec<TimestampedNetAddress> = addrs
+                    .into_iter()
+                    .map(|info| TimestampedNetAddress {
+                        timestamp: 0,
+                        address: socket_addr_to_net_address(info.addr, info.services),
+                    })
+                    .collect();
+                if !timestamped.is_empty() {
+                    let _ = self.send_to_peer(target_id, NetworkMessage::Addr(timestamped)).await;
+                }
+            }
+        }
+    }
+
+    /// Send initial feefilter to a peer (BIP133).
+    /// Without mempool, we set a high fee rate (100 sat/vbyte = 100000 sat/kvB)
+    /// to discourage transaction relay.
+    pub async fn send_initial_feefilter(&mut self, peer_id: PeerId) {
+        // 100 sat/vbyte = 100,000 sat/kvB (sat per 1000 virtual bytes)
+        let fee_rate: u64 = 100_000;
+        let _ = self.send_to_peer(peer_id, NetworkMessage::FeeFilter(fee_rate)).await;
     }
 
     /// Update our tip height for stale peer detection.
@@ -1982,6 +2075,7 @@ pub async fn run_inbound_peer(
     // Track whether we've received version (for duplicate detection)
     let mut version_received = true;
     let mut handshake_complete = false;
+    let mut wants_addrv2 = false;
 
     // Wait for their verack (with pre-handshake message validation)
     while !handshake_complete {
@@ -2062,6 +2156,9 @@ pub async fn run_inbound_peer(
             }
             // Pre-verack negotiation messages are allowed
             "wtxidrelay" | "sendaddrv2" | "sendtxrcncl" => {
+                if cmd == "sendaddrv2" {
+                    wants_addrv2 = true;
+                }
                 continue;
             }
             // Any other message before handshake is complete is a protocol violation
@@ -2096,7 +2193,7 @@ pub async fn run_inbound_peer(
         supports_witness: their_version.services & NODE_WITNESS != 0,
         supports_sendheaders: their_version.version >= SENDHEADERS_VERSION,
         supports_wtxid_relay: false,
-        supports_addrv2: false,
+        supports_addrv2: wants_addrv2,
         feefilter: 0,
     };
 
