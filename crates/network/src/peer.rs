@@ -10,9 +10,9 @@
 //! blocking I/O from stalling the main event loop.
 
 use crate::message::{
-    parse_message_header, serialize_message, NetworkMessage, VersionMessage,
+    parse_message_header, serialize_message, NetworkMessage, SendCmpctMessage, VersionMessage,
     MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE, MIN_WITNESS_PROTO_VERSION, NODE_WITNESS,
-    SENDHEADERS_VERSION, WTXID_RELAY_VERSION,
+    SENDCMPCT_VERSION, SENDHEADERS_VERSION, WTXID_RELAY_VERSION,
 };
 use rustoshi_crypto::sha256d;
 use std::net::SocketAddr;
@@ -430,6 +430,18 @@ pub async fn run_outbound_peer(
     // BIP 130: sendheaders - request headers announcements instead of inv
     if their_version.version >= SENDHEADERS_VERSION {
         let msg = serialize_message(&magic, &NetworkMessage::SendHeaders);
+        let _ = writer.write_all(&msg).await;
+    }
+    // BIP 152: sendcmpct - signal compact block relay support (version 2 = segwit)
+    // announce=false means low-bandwidth mode (we receive inv/headers first)
+    if their_version.version >= SENDCMPCT_VERSION {
+        let msg = serialize_message(
+            &magic,
+            &NetworkMessage::SendCmpct(SendCmpctMessage {
+                announce: false,
+                version: 2,
+            }),
+        );
         let _ = writer.write_all(&msg).await;
     }
     let _ = writer.flush().await;
