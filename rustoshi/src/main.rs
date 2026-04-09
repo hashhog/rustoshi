@@ -22,6 +22,7 @@ use rustoshi_network::{
     BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason, NetworkMessage, PeerEvent,
     PeerManager, PeerManagerConfig,
 };
+use rustoshi_primitives::{Hash256, OutPoint};
 use rustoshi_rpc::{start_rpc_server, PeerState, RpcConfig, RpcState};
 use rustoshi_storage::{BlockStore, ChainDb};
 
@@ -1624,54 +1625,112 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             NetworkMessage::CmpctBlock(data) => {
-                                // We received a compact block. Since we don't have a mempool,
-                                // we can't reconstruct the block from short IDs. Decode the
-                                // header to get the block hash, then fall back to requesting
-                                // the full block via getdata.
-                                if data.len() >= 80 {
-                                    let block_hash = rustoshi_crypto::sha256d(&data[..80]);
-                                    tracing::info!(
-                                        "Received cmpctblock from peer {}, falling back to full block request (hash={})",
-                                        peer_id.0, block_hash
-                                    );
-                                    let inv = InvVector {
-                                        inv_type: InvType::MsgWitnessBlock,
-                                        hash: block_hash,
-                                    };
-                                    let ps = peer_state.read().await;
-                                    if let Some(ref pm) = ps.peer_manager {
-                                        pm.send_to_peer(
-                                            peer_id,
-                                            NetworkMessage::GetData(vec![inv]),
-                                        ).await;
+                                // BIP 152: Reconstruct block from compact block + mempool
+                                use rustoshi_network::{CmpctBlock, PartiallyDownloadedBlock, BlockTxnRequest, BlockTxn};
+                                use rustoshi_primitives::{Hash256, Transaction};
+                                match CmpctBlock::decode(&mut std::io::Cursor::new(&data)) {
+                                    Ok(cmpct) => {
+                                        let block_hash = cmpct.block_hash();
+                                        let mempool_txns = {
+                                            let rpc = rpc_state.read().await;
+                                            rpc.mempool.collect_for_compact_block()
+                                        };
+                                        let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
+                                            mempool_txns.iter().map(|(h, t)| (h, t)).collect();
+                                        match PartiallyDownloadedBlock::init_data(
+                                            &cmpct, mempool_refs.into_iter(), &[],
+                                        ) {
+                                            Ok(mut partial) => {
+                                                let missing = partial.get_missing_indices();
+                                                let (prefilled, from_mempool, _extra) = partial.stats();
+                                                if missing.is_empty() {
+                                                    match partial.fill_block(vec![]) {
+                                                        Ok(block) => {
+                                                            tracing::info!(
+                                                                "Compact block {} reconstructed (prefilled={}, mempool={})",
+                                                                block_hash, prefilled, from_mempool
+                                                            );
+                                                            block_downloader.handle_block(peer_id, block).await;
+                                                        }
+                                                        Err(_) => {
+                                                            tracing::warn!("Compact block {} merkle mismatch, requesting full block", block_hash);
+                                                            let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
+                                                            let ps = peer_state.read().await;
+                                                            if let Some(ref pm) = ps.peer_manager {
+                                                                pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    let miss_pct = missing.len() as f64 / cmpct.block_tx_count() as f64 * 100.0;
+                                                    if miss_pct > 50.0 {
+                                                        tracing::info!("Compact block {} missing {:.0}% txns, requesting full block", block_hash, miss_pct);
+                                                        let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
+                                                        let ps = peer_state.read().await;
+                                                        if let Some(ref pm) = ps.peer_manager {
+                                                            pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
+                                                        }
+                                                    } else {
+                                                        tracing::info!("Compact block {} missing {} txns (mempool_hits={}), sending getblocktxn", block_hash, missing.len(), from_mempool);
+                                                        let req = BlockTxnRequest::new(block_hash, missing);
+                                                        let ps = peer_state.read().await;
+                                                        if let Some(ref pm) = ps.peer_manager {
+                                                            pm.send_to_peer(peer_id, NetworkMessage::GetBlockTxn(req.serialize())).await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(status) => {
+                                                tracing::warn!("Compact block init failed ({:?}), requesting full block", status);
+                                                let block_hash = rustoshi_crypto::sha256d(&data[..80]);
+                                                let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
+                                                let ps = peer_state.read().await;
+                                                if let Some(ref pm) = ps.peer_manager {
+                                                    pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
+                                                }
+                                            }
+                                        }
                                     }
-                                } else {
-                                    tracing::warn!(
-                                        "Received invalid cmpctblock from peer {} (too short: {} bytes)",
-                                        peer_id.0, data.len()
-                                    );
+                                    Err(e) => {
+                                        tracing::warn!("Failed to decode cmpctblock from peer {} ({} bytes): {}", peer_id.0, data.len(), e);
+                                    }
                                 }
                             }
 
                             NetworkMessage::GetBlockTxn(data) => {
-                                // Peer is requesting missing transactions for a compact block
-                                // they're reconstructing. We would need to look up the block
-                                // and send the requested transactions. For now, log and ignore
-                                // since we don't typically send compact blocks to peers yet.
-                                tracing::debug!(
-                                    "Received getblocktxn from peer {} ({} bytes), ignoring (compact block serving not yet implemented)",
-                                    peer_id.0, data.len()
-                                );
+                                use rustoshi_network::{BlockTxnRequest, BlockTxn};
+                                match BlockTxnRequest::deserialize(&data) {
+                                    Ok(req) => {
+                                        if let Ok(Some(block)) = block_store.get_block(&req.block_hash) {
+                                            let txns: Vec<Arc<rustoshi_primitives::Transaction>> = req.indices.iter()
+                                                .filter_map(|&idx| block.transactions.get(idx as usize).map(|tx| Arc::new(tx.clone())))
+                                                .collect();
+                                            let resp = BlockTxn::from_arcs(req.block_hash, txns);
+                                            let ps = peer_state.read().await;
+                                            if let Some(ref pm) = ps.peer_manager {
+                                                pm.send_to_peer(peer_id, NetworkMessage::BlockTxn(resp.serialize())).await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("Failed to decode getblocktxn from peer {}: {}", peer_id.0, e);
+                                    }
+                                }
                             }
 
                             NetworkMessage::BlockTxn(data) => {
-                                // Response to our getblocktxn request with missing transactions.
-                                // Since we fall back to full block download, we shouldn't receive
-                                // these. Log for diagnostics.
-                                tracing::debug!(
-                                    "Received blocktxn from peer {} ({} bytes), ignoring (using full block download)",
-                                    peer_id.0, data.len()
-                                );
+                                use rustoshi_network::BlockTxn;
+                                match BlockTxn::deserialize(&data) {
+                                    Ok(blocktxn) => {
+                                        tracing::debug!(
+                                            "Received blocktxn for {} from peer {} ({} txns)",
+                                            blocktxn.block_hash, peer_id.0, blocktxn.transactions.len()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("Failed to decode blocktxn from peer {}: {}", peer_id.0, e);
+                                    }
+                                }
                             }
 
                             // Forward other messages to peer manager for internal handling

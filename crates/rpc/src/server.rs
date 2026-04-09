@@ -40,6 +40,7 @@ use rustoshi_network::peer_manager::PeerManager;
 use rustoshi_primitives::{Block, Decodable, Encodable, Hash256, OutPoint, Transaction, TxIn, TxOut};
 use rustoshi_storage::{block_store::BlockStore, ChainDb};
 use rustoshi_wallet::psbt::Psbt;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, RwLock};
@@ -112,6 +113,9 @@ pub struct RpcState {
     pub chain_manager_state: ChainManagerState,
     /// Server start time (Unix timestamp).
     pub start_time: u64,
+    /// Recently-rejected transaction hashes to avoid re-requesting.
+    /// Cleared when a new block is connected (the rejection reason may no longer apply).
+    pub recently_rejected: HashSet<Hash256>,
 }
 
 impl RpcState {
@@ -134,6 +138,7 @@ impl RpcState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            recently_rejected: HashSet::new(),
         }
     }
 
@@ -156,6 +161,7 @@ impl RpcState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            recently_rejected: HashSet::new(),
         }
     }
 

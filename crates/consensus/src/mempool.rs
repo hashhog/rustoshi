@@ -31,6 +31,7 @@ use crate::script::is_p2a;
 use crate::validation::{check_transaction, CoinEntry, TxValidationError};
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxOut};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
@@ -1825,6 +1826,15 @@ impl Mempool {
     /// Get a transaction by its txid.
     pub fn get(&self, txid: &Hash256) -> Option<&MempoolEntry> {
         self.transactions.get(txid)
+    }
+
+    /// Collect all mempool transactions as (wtxid, Arc<Transaction>) pairs.
+    /// Used for BIP152 compact block reconstruction.
+    pub fn collect_for_compact_block(&self) -> Vec<(Hash256, Arc<Transaction>)> {
+        self.transactions.values().map(|entry| {
+            let wtxid = entry.tx.wtxid();
+            (wtxid, Arc::new(entry.tx.clone()))
+        }).collect()
     }
 
     /// Check if a transaction is in the mempool.
