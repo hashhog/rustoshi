@@ -291,8 +291,12 @@ pub struct MempoolInfo {
     pub mempoolminfee: f64,
     /// Minimum relay fee rate (BTC/kvB).
     pub minrelaytxfee: f64,
+    /// Minimum fee rate increment for mempool limiting or replacement (BTC/kvB).
+    pub incrementalrelayfee: f64,
     /// Number of transactions not depending on others.
     pub unbroadcastcount: usize,
+    /// Whether the mempool accepts RBF without signaling.
+    pub fullrbf: bool,
 }
 
 /// Entry in mempool for `getrawmempool` verbose mode.
