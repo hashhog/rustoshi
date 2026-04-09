@@ -1,0 +1,13 @@
+services:
+  rustoshi:
+    build: .
+    container_name: rustoshi
+    restart: unless-stopped
+    volumes:
+      - rustoshi-data:/data
+    ports:
+      - "8333:8333"
+      - "8332:8332"
+
+volumes:
+  rustoshi-data:
