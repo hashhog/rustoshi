@@ -47,6 +47,12 @@ pub mod scores {
     pub const INVALID_ADDR: u32 = 20;
     /// Invalid inv message.
     pub const INVALID_INV: u32 = 20;
+    /// Headers that don't connect to our chain.
+    pub const HEADERS_DONT_CONNECT: u32 = 20;
+    /// Block download stalling (peer not delivering requested blocks).
+    pub const BLOCK_DOWNLOAD_STALL: u32 = 50;
+    /// Sending unrequested data (blocks/txns we didn't ask for).
+    pub const UNREQUESTED_DATA: u32 = 5;
 }
 
 /// Reason for misbehavior (for logging and debugging).
@@ -74,6 +80,12 @@ pub enum MisbehaviorReason {
     InvalidAddr,
     /// Invalid inv message.
     InvalidInv,
+    /// Headers that don't connect to our chain.
+    HeadersDontConnect,
+    /// Block download stalling.
+    BlockDownloadStall,
+    /// Sending unrequested data.
+    UnrequestedData,
 }
 
 impl MisbehaviorReason {
@@ -91,6 +103,9 @@ impl MisbehaviorReason {
             MisbehaviorReason::InvalidCompactBlock => scores::INVALID_COMPACT_BLOCK,
             MisbehaviorReason::InvalidAddr => scores::INVALID_ADDR,
             MisbehaviorReason::InvalidInv => scores::INVALID_INV,
+            MisbehaviorReason::HeadersDontConnect => scores::HEADERS_DONT_CONNECT,
+            MisbehaviorReason::BlockDownloadStall => scores::BLOCK_DOWNLOAD_STALL,
+            MisbehaviorReason::UnrequestedData => scores::UNREQUESTED_DATA,
         }
     }
 }
@@ -109,6 +124,9 @@ impl std::fmt::Display for MisbehaviorReason {
             MisbehaviorReason::InvalidCompactBlock => write!(f, "invalid compact block"),
             MisbehaviorReason::InvalidAddr => write!(f, "invalid addr message"),
             MisbehaviorReason::InvalidInv => write!(f, "invalid inv message"),
+            MisbehaviorReason::HeadersDontConnect => write!(f, "headers don't connect"),
+            MisbehaviorReason::BlockDownloadStall => write!(f, "block download stalling"),
+            MisbehaviorReason::UnrequestedData => write!(f, "unrequested data"),
         }
     }
 }
