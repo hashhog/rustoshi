@@ -822,7 +822,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
             // Get median time past, chainwork, and tip timestamp for IBD check
             if let Ok(Some(entry)) = store.get_block_index(&state.best_hash) {
-                let cw_hex = hex::encode(&entry.chain_work);
+                let cw_hex = hex::encode(entry.chain_work);
                 (
                     difficulty,
                     entry.timestamp as u64,
@@ -1005,36 +1005,21 @@ impl RustoshiRpcServer for RpcServerImpl {
             .get_block_index(&block_hash)
             .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
 
-        // Resolve height from block index entry; fall back to a binary search
+        // Resolve height from block index entry; fall back to a linear scan
         // through the height index for blocks synced before this fix.
         let height = if let Some(ref e) = entry {
             e.height
         } else {
-            // Binary search: heights are dense and monotonic in the active chain.
+            // Walk from tip back to genesis to find the height for this hash.
+            // This is only needed for blocks that were synced before the block
+            // index write was introduced; new blocks will always have an entry.
             let best = state.best_height;
             let mut found = None;
-            let lo: u32 = 0;
-            let hi: u32 = best;
-            while lo <= hi {
-                let mid = lo + (hi - lo) / 2;
-                match store.get_hash_by_height(mid) {
-                    Ok(Some(h)) if h == block_hash => { found = Some(mid); break; }
-                    Ok(Some(_)) => {
-                        // We can't tell which side to go without a prev-hash chain walk,
-                        // so fall back to a linear scan from tip.
+            for h in (0..=best).rev() {
+                if let Ok(Some(candidate)) = store.get_hash_by_height(h) {
+                    if candidate == block_hash {
+                        found = Some(h);
                         break;
-                    }
-                    _ => break,
-                }
-            }
-            if found.is_none() {
-                // Linear scan fallback: walk from tip back to genesis.
-                for h in (0..=best).rev() {
-                    if let Ok(Some(candidate)) = store.get_hash_by_height(h) {
-                        if candidate == block_hash {
-                            found = Some(h);
-                            break;
-                        }
                     }
                 }
             }
@@ -1070,7 +1055,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Populate chainwork from block index entry (big-endian byte array to hex string).
         // If the entry is absent (historical block synced before this fix), report zeros.
         let chainwork_hex = if let Some(ref e) = entry {
-            hex::encode(&e.chain_work)
+            hex::encode(e.chain_work)
         } else {
             "0".repeat(64)
         };
