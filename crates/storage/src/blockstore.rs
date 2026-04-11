@@ -254,8 +254,8 @@ impl FlatFileSeq {
     ///
     /// Returns the number of bytes allocated (0 if no allocation needed).
     pub fn allocate(&self, pos: &FlatFilePos, add_size: u64) -> Result<u64, StorageError> {
-        let n_old_chunks = (pos.pos as u64 + self.chunk_size - 1) / self.chunk_size;
-        let n_new_chunks = (pos.pos as u64 + add_size + self.chunk_size - 1) / self.chunk_size;
+        let n_old_chunks = (pos.pos as u64).div_ceil(self.chunk_size);
+        let n_new_chunks = (pos.pos as u64 + add_size).div_ceil(self.chunk_size);
 
         if n_new_chunks > n_old_chunks {
             let old_size = pos.pos as u64;
@@ -306,21 +306,12 @@ impl FlatFileSeq {
 // ============================================================
 
 /// Pruning configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PruneConfig {
     /// Target disk usage in bytes. If 0, pruning is disabled.
     pub prune_target: u64,
     /// Whether to use fast pruning mode (for tests).
     pub fast_prune: bool,
-}
-
-impl Default for PruneConfig {
-    fn default() -> Self {
-        Self {
-            prune_target: 0,
-            fast_prune: false,
-        }
-    }
 }
 
 impl PruneConfig {
@@ -713,7 +704,7 @@ impl FlatBlockStore {
     pub fn find_files_to_prune(
         &self,
         chain_tip_height: u32,
-        finalized_height: u32,
+        _finalized_height: u32,
     ) -> Vec<i32> {
         if !self.is_prune_mode() {
             return Vec::new();

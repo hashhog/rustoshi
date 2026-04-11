@@ -504,7 +504,7 @@ fn get_last_scriptpush(script: &[u8]) -> Option<Vec<u8>> {
         if op == 0x00 {
             // OP_0: push empty
             last_data = Some(vec![]);
-        } else if op >= 0x01 && op <= 0x4b {
+        } else if (0x01..=0x4b).contains(&op) {
             // Direct push (1-75 bytes)
             let len = op as usize;
             if pc + len > script.len() {
@@ -548,7 +548,7 @@ fn get_last_scriptpush(script: &[u8]) -> Option<Vec<u8>> {
             }
             last_data = Some(script[pc..pc + len].to_vec());
             pc += len;
-        } else if op >= 0x51 && op <= 0x60 {
+        } else if (0x51..=0x60).contains(&op) {
             // OP_1 through OP_16: push the value
             last_data = Some(vec![op - 0x50]);
         } else if op == 0x4f {

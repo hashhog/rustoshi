@@ -249,8 +249,12 @@ mod tests {
 
     #[test]
     fn decode_negative_zero() {
-        // 0x80 is negative zero, decodes to 0
-        assert_eq!(decode_script_num(&[0x80], true, 4).unwrap(), 0);
+        // 0x80 is negative zero. With require_minimal=true, this is non-minimal
+        // (the minimal encoding of 0 is the empty vector), so it must be rejected.
+        // This matches Bitcoin Core CScriptNum behavior with fRequireMinimal=true.
+        assert!(decode_script_num(&[0x80], true, 4).is_err());
+        // With require_minimal=false, 0x80 decodes to 0.
+        assert_eq!(decode_script_num(&[0x80], false, 4).unwrap(), 0);
     }
 
     #[test]
@@ -302,7 +306,7 @@ mod tests {
 
     #[test]
     fn encode_zero() {
-        assert_eq!(encode_script_num(0), vec![]);
+        assert_eq!(encode_script_num(0), Vec::<u8>::new());
     }
 
     #[test]
@@ -393,7 +397,7 @@ mod tests {
     #[test]
     fn bool_to_stack_values() {
         assert_eq!(bool_to_stack(true), vec![0x01]);
-        assert_eq!(bool_to_stack(false), vec![]);
+        assert_eq!(bool_to_stack(false), Vec::<u8>::new());
     }
 
     #[test]

@@ -186,7 +186,7 @@ where
     K: Ord,
     P: Fn(&EvictionCandidate) -> bool,
 {
-    candidates.sort_by(|a, b| key(a).cmp(&key(b)));
+    candidates.sort_by_key(|c| key(c));
 
     // Remove from end: last k elements matching predicate
     let mut to_remove = k;
@@ -211,7 +211,7 @@ fn erase_last_k_by_reverse<F, K, P>(
     K: Ord,
     P: Fn(&EvictionCandidate) -> bool,
 {
-    candidates.sort_by(|a, b| key(b).cmp(&key(a)));
+    candidates.sort_by_key(|c| std::cmp::Reverse(key(c)));
 
     let mut to_remove = k;
     let mut i = candidates.len();
@@ -485,13 +485,12 @@ mod tests {
         let c2 = make_candidate(2, "192.168.1.2:8333", 50, Some(100), None, None); // Younger
         let c3 = make_candidate(3, "10.0.0.1:8333", 100, Some(100), None, None); // Different group
 
-        // With many peers from same netgroup, should evict from that group
+        // With only 3 candidates, the protection slots (4 by netgroup, 8 by ping, etc.)
+        // absorb all candidates, so no eviction occurs. This matches Bitcoin Core behavior
+        // where SelectNodeToEvict returns nullopt when all candidates are protected.
         let candidates = vec![c1.clone(), c2.clone(), c3.clone()];
-
-        // Should evict the younger peer (c2) from the most-connected netgroup (192.168.x.x)
         let result = select_node_to_evict(candidates);
-        // The exact result depends on protection logic, but we should get some eviction
-        assert!(result.is_some());
+        assert!(result.is_none());
     }
 
     #[test]
@@ -499,8 +498,11 @@ mod tests {
         let c1 = make_candidate(1, "192.168.1.1:8333", 100, Some(50), None, None);
 
         let result = select_node_to_evict(vec![c1]);
-        // With only one peer, it should be evicted (not enough to trigger protections)
-        assert_eq!(result, Some(PeerId(1)));
+        // With only one peer, protection slots (4 by netgroup, 8 by ping, etc.) exceed the
+        // number of candidates, so the peer is protected and no eviction occurs.
+        // This matches Bitcoin Core's SelectNodeToEvict which returns nullopt when all
+        // remaining candidates have been protected.
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -532,8 +534,10 @@ mod tests {
         c1.prefer_evict = true;
 
         let result = select_node_to_evict(vec![c1, c2]);
-        // Should prefer to evict c1 since it has prefer_evict flag
-        assert_eq!(result, Some(PeerId(1)));
+        // With only 2 candidates, protection slots (4 by netgroup, 8 by ping, etc.) absorb
+        // all candidates before eviction selection runs, so the result is None.
+        // The prefer_evict flag is only used to select AMONG already-surviving candidates.
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -572,8 +576,11 @@ mod tests {
             })
             .collect();
 
-        // With diverse netgroups, we should still be able to evict someone
+        // With 20 candidates across 20 diverse netgroups but no tx/block activity,
+        // the protection slots (4 by netgroup + 8 by ping + 4 by tx + 8 block-relay + 4 by block = 28)
+        // exceed the candidate count of 20, so all are protected and no eviction occurs.
+        // This matches Bitcoin Core's SelectNodeToEvict behavior.
         let result = select_node_to_evict(candidates);
-        assert!(result.is_some());
+        assert!(result.is_none());
     }
 }

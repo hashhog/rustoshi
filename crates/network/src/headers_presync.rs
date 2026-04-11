@@ -96,6 +96,7 @@ impl CompressedHeader {
 
 /// Result of processing headers.
 #[derive(Debug)]
+#[derive(Default)]
 pub struct ProcessingResult {
     /// Headers that have been fully validated and can be added to the chain.
     pub pow_validated_headers: Vec<BlockHeader>,
@@ -105,15 +106,6 @@ pub struct ProcessingResult {
     pub request_more: bool,
 }
 
-impl Default for ProcessingResult {
-    fn default() -> Self {
-        Self {
-            pow_validated_headers: Vec::new(),
-            success: false,
-            request_more: false,
-        }
-    }
-}
 
 /// Header sync state machine implementing PRESYNC/REDOWNLOAD anti-DoS protection.
 pub struct HeadersPresyncState {
@@ -193,16 +185,8 @@ impl HeadersPresyncState {
         // Random offset for commitment positions
         let commit_offset = rand::random::<u64>() % COMMITMENT_PERIOD;
 
-        // Estimate maximum reasonable chain length: ~6 blocks per second from chain start
-        // This is a generous upper bound used to limit memory during PRESYNC
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Assume chain_start timestamp is roughly at genesis (~1231000000 for mainnet)
-        // For safety, allow chains up to 20 years of 6 blocks/sec
-        let max_blocks = 20 * 365 * 24 * 60 * 60 * 6; // ~3.7 billion
+        // Upper bound on commitments: allow up to 20 years of 6 blocks/sec (~3.7 billion blocks)
+        let max_blocks = 20 * 365 * 24 * 60 * 60 * 6;
         let max_commitments = max_blocks / COMMITMENT_PERIOD;
 
         Self {
@@ -266,11 +250,9 @@ impl HeadersPresyncState {
         match self.state {
             PresyncState::Presync => {
                 result.success = self.validate_and_store_commitments(headers);
-                if result.success {
-                    if full_message || self.state == PresyncState::Redownload {
-                        // Either more headers available, or we transitioned to REDOWNLOAD
-                        result.request_more = true;
-                    }
+                if result.success && (full_message || self.state == PresyncState::Redownload) {
+                    // Either more headers available, or we transitioned to REDOWNLOAD
+                    result.request_more = true;
                     // If not full and still in PRESYNC, chain ended without enough work
                 }
             }

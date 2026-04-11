@@ -638,11 +638,11 @@ mod tests {
 
         // Just m
         let path = parse_derivation_path("m").unwrap();
-        assert_eq!(path, vec![]);
+        assert_eq!(path, Vec::<u32>::new());
 
         // Empty
         let path = parse_derivation_path("").unwrap();
-        assert_eq!(path, vec![]);
+        assert_eq!(path, Vec::<u32>::new());
     }
 
     #[test]

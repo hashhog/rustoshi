@@ -8,7 +8,7 @@ use rustoshi_primitives::{Decodable, Hash256, Transaction};
 
 /// Path to the sighash test vectors JSON file.
 const SIGHASH_JSON: &str =
-    "/home/max/hashhog/ouroboros/bitcoin/src/test/data/sighash.json";
+    "/home/work/hashhog/bitcoin-core/src/test/data/sighash.json";
 
 /// Decode a hex string into bytes (no byte-order reversal).
 fn hex_to_bytes(s: &str) -> Vec<u8> {
@@ -73,11 +73,14 @@ fn sighash_vectors() {
         // Compute the legacy sighash.
         let result = legacy_sighash(&tx, input_index, &script, hash_type);
 
-        // The expected hash in sighash.json is in raw byte order (not display-reversed),
-        // so we decode directly and compare against Hash256's internal bytes.
-        let expected_bytes: [u8; 32] = hex_to_bytes(expected_hex)
+        // The expected hash in sighash.json is stored in display byte order
+        // (little-endian / reversed from the raw SHA256d output), matching
+        // Bitcoin Core's convention for printing transaction hashes.
+        // Reverse the bytes so we compare against the raw SHA256d output order.
+        let mut expected_bytes: [u8; 32] = hex_to_bytes(expected_hex)
             .try_into()
             .expect("expected hash should be 32 bytes");
+        expected_bytes.reverse();
         let expected = Hash256(expected_bytes);
 
         if result == expected {

@@ -584,12 +584,13 @@ impl Socks5Proxy {
         host: &str,
         port: u16,
     ) -> Result<(), ProxyError> {
-        let mut buf = Vec::new();
-        buf.push(SOCKS5_VERSION);
-        buf.push(Socks5Command::Connect as u8);
-        buf.push(0x00); // Reserved
-        buf.push(Socks5Atyp::DomainName as u8);
-        buf.push(host.len() as u8);
+        let mut buf = vec![
+            SOCKS5_VERSION,
+            Socks5Command::Connect as u8,
+            0x00, // Reserved
+            Socks5Atyp::DomainName as u8,
+            host.len() as u8,
+        ];
         buf.extend_from_slice(host.as_bytes());
         buf.push((port >> 8) as u8);
         buf.push((port & 0xff) as u8);
@@ -762,7 +763,7 @@ pub fn hostname_to_torv3_pubkey(hostname: &str) -> Result<[u8; 32], ProxyError> 
 
     let mut hasher = Sha256::new();
     hasher.update(b".onion checksum");
-    hasher.update(&pubkey);
+    hasher.update(pubkey);
     hasher.update([version]);
     let hash = hasher.finalize();
 

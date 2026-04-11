@@ -175,10 +175,10 @@ fn compute_siphash_keys(salt1: u64, salt2: u64) -> (u64, u64) {
     };
 
     let mut hasher = Sha256::new();
-    hasher.update(&tag_hash);
-    hasher.update(&tag_hash);
-    hasher.update(&min_salt.to_le_bytes());
-    hasher.update(&max_salt.to_le_bytes());
+    hasher.update(tag_hash);
+    hasher.update(tag_hash);
+    hasher.update(min_salt.to_le_bytes());
+    hasher.update(max_salt.to_le_bytes());
     let result = hasher.finalize();
 
     // Extract k0 and k1 from the hash
@@ -570,8 +570,8 @@ impl Minisketch {
         let mut syndromes = vec![0u32; self.capacity];
         for &elem in &self.elements {
             let mut power = elem;
-            for i in 0..self.capacity {
-                syndromes[i] ^= power;
+            for syndrome in syndromes.iter_mut() {
+                *syndrome ^= power;
                 power = gf32_mul(power, elem);
             }
         }
