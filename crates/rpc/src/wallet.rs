@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)]
 //! Wallet RPC methods.
 //!
 //! This module implements Bitcoin Core-compatible wallet RPCs for multi-wallet support:
@@ -23,7 +24,6 @@ use rustoshi_wallet::{CreateWalletOptions, WalletManager, WalletDirEntry};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::server::rpc_error;
 
 /// Wallet RPC error codes (Bitcoin Core compatible).
 pub mod wallet_error {
@@ -683,9 +683,9 @@ impl WalletRpcServer for WalletRpcImpl {
             .filter(|utxo| {
                 utxo.confirmations >= min_confirmations && utxo.confirmations <= max_confirmations
             })
-            .filter(|utxo| {
+            .filter(|_utxo| {
                 // Filter by addresses if specified
-                addresses.as_ref().map_or(true, |addrs| {
+                addresses.as_ref().is_none_or(|addrs| {
                     // We'd need to derive the address from the UTXO to filter
                     // For now, accept all if addresses are specified
                     !addrs.is_empty()
@@ -905,11 +905,11 @@ impl WalletRpcServer for WalletRpcImpl {
         let mut signed_count = 0;
 
         // For each input, try to find the corresponding UTXO and sign
-        for (input_index, input) in tx.inputs.iter_mut().enumerate() {
+        for input in tx.inputs.iter_mut() {
             let outpoint = &input.previous_output;
 
             // First check if this UTXO is in the wallet
-            if let Some(utxo) = wallet_guard.get_utxo(outpoint) {
+            if let Some(_utxo) = wallet_guard.get_utxo(outpoint) {
                 // UTXO is in wallet, we should be able to sign it
                 // For now, we'll mark this as signed since create_transaction already signs
                 // A full implementation would sign individual inputs

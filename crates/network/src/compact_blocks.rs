@@ -907,10 +907,8 @@ impl CompactBlockRelay {
             state.handle_sendcmpct(announce, version);
 
             // Update high-bandwidth peer set
-            if state.enabled && state.wants_high_bandwidth {
-                if self.high_bandwidth_peers.len() < MAX_CMPCTBLOCK_PEERS_HB {
-                    self.high_bandwidth_peers.insert(peer_id);
-                }
+            if state.enabled && state.wants_high_bandwidth && self.high_bandwidth_peers.len() < MAX_CMPCTBLOCK_PEERS_HB {
+                self.high_bandwidth_peers.insert(peer_id);
             }
         }
     }

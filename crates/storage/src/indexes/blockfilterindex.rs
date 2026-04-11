@@ -306,7 +306,7 @@ impl<'a> BlockFilterIndex<'a> {
 fn sha256d(data: &[u8]) -> Hash256 {
     use sha2::{Digest, Sha256};
     let first = Sha256::digest(data);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     Hash256::from_bytes(second.into())
 }
 

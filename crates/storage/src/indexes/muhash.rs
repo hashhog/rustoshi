@@ -159,8 +159,8 @@ impl Num3072 {
         }
 
         // Copy result back, handling any final carry
-        for i in 0..LIMBS {
-            self.limbs[i] = product[i] as u64;
+        for (limb, &p) in self.limbs.iter_mut().zip(product.iter()) {
+            *limb = p as u64;
         }
 
         // Final reductions if needed
@@ -276,7 +276,7 @@ impl MuHash3072 {
         // Hash the result
         use sha2::{Digest, Sha256};
         let bytes = self.numerator.to_bytes();
-        let hash = Sha256::digest(&bytes);
+        let hash = Sha256::digest(bytes);
 
         Hash256::from_bytes(hash.into())
     }
@@ -339,7 +339,7 @@ fn chacha20_keystream(key: &[u8], output: &mut [u8]) {
     state[14] = 0;
     state[15] = 0;
 
-    let blocks_needed = (output.len() + 63) / 64;
+    let blocks_needed = output.len().div_ceil(64);
     let mut out_pos = 0;
 
     for block_num in 0..blocks_needed {

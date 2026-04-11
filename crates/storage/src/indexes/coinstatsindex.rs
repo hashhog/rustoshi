@@ -261,7 +261,7 @@ fn compress_amount(n: u64) -> u64 {
     let mut e = 0;
     let mut n = n;
 
-    while n % 10 == 0 && e < 9 {
+    while n.is_multiple_of(10) && e < 9 {
         n /= 10;
         e += 1;
     }
@@ -269,9 +269,9 @@ fn compress_amount(n: u64) -> u64 {
     if e < 9 {
         let d = n % 10;
         n /= 10;
-        return 1 + (n * 9 + d - 1) * 10 + e;
+        1 + (n * 9 + d - 1) * 10 + e
     } else {
-        return 1 + (n - 1) * 10 + 9;
+        1 + (n - 1) * 10 + 9
     }
 }
 

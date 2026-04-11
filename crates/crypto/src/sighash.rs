@@ -171,7 +171,7 @@ pub fn remove_codeseparators(script: &[u8]) -> Vec<u8> {
         i += 1;
 
         // Handle push data opcodes - copy their data too
-        if opcode >= 0x01 && opcode <= 0x4b {
+        if (0x01..=0x4b).contains(&opcode) {
             // Direct push: opcode is length
             let len = opcode as usize;
             let end = (i + len).min(script.len());
@@ -239,6 +239,12 @@ pub fn legacy_sighash(
 ) -> Hash256 {
     let sighash_type = SigHashType(hash_type);
 
+    // Remove OP_CODESEPARATOR from the subscript before hashing.
+    // Bitcoin Core's CTransactionSignatureSerializer::SerializeScriptCode skips
+    // OP_CODESEPARATOR bytes when writing the script, matching this behavior.
+    let subscript = remove_codeseparators(subscript);
+    let subscript = subscript.as_slice();
+
     // SIGHASH_SINGLE bug: if input_index >= outputs.len(), return hash of 0x01
     // This is a famous Bitcoin bug that must be preserved for consensus
     if sighash_type.is_single() && input_index >= tx.outputs.len() {
@@ -256,14 +262,14 @@ pub fn legacy_sighash(
     if sighash_type.anyone_can_pay() {
         // Only include the input being signed
         write_compact_size(&mut buf, 1).unwrap();
-        write_legacy_input(&mut buf, tx, input_index, subscript, hash_type);
+        write_legacy_input(&mut buf, tx, input_index, subscript, hash_type, true);
     } else {
         write_compact_size(&mut buf, tx.inputs.len() as u64).unwrap();
         for i in 0..tx.inputs.len() {
             if i == input_index {
-                write_legacy_input(&mut buf, tx, i, subscript, hash_type);
+                write_legacy_input(&mut buf, tx, i, subscript, hash_type, true);
             } else {
-                write_legacy_input(&mut buf, tx, i, &[], hash_type);
+                write_legacy_input(&mut buf, tx, i, &[], hash_type, false);
             }
         }
     }
@@ -302,12 +308,16 @@ pub fn legacy_sighash(
 }
 
 /// Write a legacy input for sighash computation.
+///
+/// `is_signed_input` indicates whether this is the input being signed.
+/// Only non-signed inputs have their sequence zeroed for SIGHASH_NONE/SINGLE.
 fn write_legacy_input(
     buf: &mut Vec<u8>,
     tx: &Transaction,
     index: usize,
     script: &[u8],
     hash_type: u32,
+    is_signed_input: bool,
 ) {
     let input = &tx.inputs[index];
     let sighash_type = SigHashType(hash_type);
@@ -319,8 +329,10 @@ fn write_legacy_input(
     write_compact_size(buf, script.len() as u64).unwrap();
     buf.write_all(script).unwrap();
 
-    // Sequence - for non-signed inputs with NONE/SINGLE, use 0
-    let sequence = if script.is_empty() && (sighash_type.is_none() || sighash_type.is_single()) {
+    // Sequence - only zero out OTHER inputs' sequences for NONE/SINGLE.
+    // The signed input always keeps its original sequence.
+    // Bitcoin Core: `if (nInput != nIn && (fHashSingle || fHashNone)) sequence = 0`
+    let sequence = if !is_signed_input && (sighash_type.is_none() || sighash_type.is_single()) {
         0u32
     } else {
         input.sequence
