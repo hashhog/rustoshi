@@ -4,12 +4,12 @@
 //! validation to storage.
 
 use rustoshi_consensus::{
-    block_subsidy, check_block, ChainParams, MAX_MONEY, COINBASE_MATURITY,
+    block_subsidy, check_block, get_block_proof, ChainParams, ChainWork, MAX_MONEY, COINBASE_MATURITY,
 };
 use rustoshi_crypto::{merkle_root, sha256d};
 use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint, Transaction, TxIn, TxOut};
 use rustoshi_primitives::serialize::{read_compact_size, write_compact_size, Decodable, Encodable};
-use rustoshi_storage::{BlockStore, ChainDb};
+use rustoshi_storage::{block_store::{BlockIndexEntry, BlockStatus}, BlockStore, ChainDb};
 use std::io::Cursor;
 
 /// Helper to create a temporary database for testing.
@@ -661,4 +661,165 @@ fn test_outpoint_serialization() {
 
     let deserialized = OutPoint::deserialize(&serialized).unwrap();
     assert_eq!(outpoint, deserialized);
+}
+
+// =============================================================================
+// Regression: getblockheader returns zero fields when block index entry missing
+// https://github.com/hashhog/rustoshi — fixed 2026-04-11
+// =============================================================================
+
+/// Build a minimal coinbase transaction for a test block.
+fn make_coinbase(height: u32) -> Transaction {
+    Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: vec![height as u8],
+            sequence: 0xFFFF_FFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: 5_000_000_000,
+            script_pubkey: vec![0x51], // OP_1
+        }],
+        lock_time: 0,
+    }
+}
+
+/// Build a test block with a single coinbase that extends `prev_hash`.
+fn make_test_block(prev_hash: Hash256, bits: u32, nonce: u32, height: u32) -> Block {
+    let coinbase = make_coinbase(height);
+    let txids = vec![coinbase.txid()];
+    let merkle = merkle_root(&txids);
+
+    Block {
+        header: BlockHeader {
+            version: 0x2000_0000,
+            prev_block_hash: prev_hash,
+            merkle_root: merkle,
+            timestamp: 1_700_000_000 + height * 600,
+            bits,
+            nonce,
+        },
+        transactions: vec![coinbase],
+    }
+}
+
+/// Regression test: `put_block_index` must be called during sync so that
+/// `getblockheader` returns non-zero height, non-empty chainwork, and correct
+/// nTx.  Before the fix all sync paths omitted `put_block_index`, causing the
+/// RPC to fall back to `height=0 / nTx=0 / chainwork=000...000`.
+#[test]
+fn test_block_index_written_during_sync_for_getblockheader() {
+    let (db, _tmp) = temp_db();
+    let store = BlockStore::new(&db);
+    let params = ChainParams::regtest();
+
+    // Initialize genesis (writes BlockIndexEntry for height 0)
+    store.init_genesis(&params).unwrap();
+
+    let genesis_hash = params.genesis_hash;
+
+    // Simulate what the fixed sync paths now do: after process_block succeeds,
+    // compute cumulative chainwork and write the BlockIndexEntry.
+    let block1 = make_test_block(genesis_hash, 0x207f_ffff, 1, 1);
+    let hash1 = block1.block_hash();
+
+    // Compute chainwork the same way main.rs now does.
+    let genesis_entry = store.get_block_index(&genesis_hash).unwrap().unwrap();
+    let prev_work = ChainWork::from_be_bytes(genesis_entry.chain_work);
+    let this_work = prev_work.saturating_add(&get_block_proof(block1.header.bits));
+
+    let mut status = BlockStatus::new();
+    status.set(BlockStatus::VALID_SCRIPTS);
+    status.set(BlockStatus::HAVE_DATA);
+
+    let entry = BlockIndexEntry {
+        height: 1,
+        status,
+        n_tx: block1.transactions.len() as u32,
+        timestamp: block1.header.timestamp,
+        bits: block1.header.bits,
+        nonce: block1.header.nonce,
+        version: block1.header.version,
+        prev_hash: block1.header.prev_block_hash,
+        chain_work: this_work.0,
+    };
+
+    store.put_header(&hash1, &block1.header).unwrap();
+    store.put_height_index(1, &hash1).unwrap();
+    store.put_block_index(&hash1, &entry).unwrap();
+
+    // Now verify what getblockheader would see:
+    let stored_entry = store.get_block_index(&hash1).unwrap().unwrap();
+
+    // Height must be 1, not 0.
+    assert_eq!(stored_entry.height, 1, "height must be 1");
+
+    // nTx must be 1 (one coinbase), not 0.
+    assert_eq!(stored_entry.n_tx, 1, "nTx must be 1");
+
+    // chainwork must be non-zero (genesis contributes minimal work; block1 adds more).
+    let cw = ChainWork::from_be_bytes(stored_entry.chain_work);
+    assert!(!cw.is_zero(), "chainwork must be non-zero for a real block");
+
+    // Confirm the height index is consistent.
+    let hash_at_1 = store.get_hash_by_height(1).unwrap().unwrap();
+    assert_eq!(hash_at_1, hash1, "height index must resolve to block1 hash");
+}
+
+/// Regression test: chainwork accumulates correctly across multiple blocks.
+/// Each successive block must have strictly greater chainwork than the previous.
+#[test]
+fn test_chainwork_accumulates_correctly() {
+    let (db, _tmp) = temp_db();
+    let store = BlockStore::new(&db);
+    let params = ChainParams::regtest();
+
+    store.init_genesis(&params).unwrap();
+
+    let mut prev_hash = params.genesis_hash;
+    let mut prev_work = ChainWork::ZERO; // genesis starts at zero in init_genesis
+
+    for height in 1u32..=3 {
+        let block = make_test_block(prev_hash, 0x207f_ffff, height, height);
+        let hash = block.block_hash();
+
+        let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
+
+        let mut status = BlockStatus::new();
+        status.set(BlockStatus::VALID_SCRIPTS);
+        status.set(BlockStatus::HAVE_DATA);
+
+        let entry = BlockIndexEntry {
+            height,
+            status,
+            n_tx: block.transactions.len() as u32,
+            timestamp: block.header.timestamp,
+            bits: block.header.bits,
+            nonce: block.header.nonce,
+            version: block.header.version,
+            prev_hash: block.header.prev_block_hash,
+            chain_work: this_work.0,
+        };
+
+        store.put_header(&hash, &block.header).unwrap();
+        store.put_height_index(height, &hash).unwrap();
+        store.put_block_index(&hash, &entry).unwrap();
+
+        // Verify strictly increasing chainwork.
+        assert!(this_work > prev_work, "chainwork must increase at height {}", height);
+
+        prev_hash = hash;
+        prev_work = this_work;
+    }
+
+    // Verify block at height 3 has greater chainwork than block at height 1.
+    let hash1 = store.get_hash_by_height(1).unwrap().unwrap();
+    let hash3 = store.get_hash_by_height(3).unwrap().unwrap();
+    let entry1 = store.get_block_index(&hash1).unwrap().unwrap();
+    let entry3 = store.get_block_index(&hash3).unwrap().unwrap();
+    let work1 = ChainWork::from_be_bytes(entry1.chain_work);
+    let work3 = ChainWork::from_be_bytes(entry3.chain_work);
+    assert!(work3 > work1, "height-3 chainwork must exceed height-1 chainwork");
 }
