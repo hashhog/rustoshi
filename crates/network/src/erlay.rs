@@ -894,7 +894,7 @@ mod tests {
         let mut tracker = TxReconciliationTracker::default();
         let peer = PeerId(1);
 
-        let local_salt = tracker.pre_register_peer(peer);
+        let _local_salt = tracker.pre_register_peer(peer);
         let remote_salt = 0xDEADBEEF;
 
         let result = tracker.register_peer(peer, true, TXRECONCILIATION_VERSION, remote_salt);
