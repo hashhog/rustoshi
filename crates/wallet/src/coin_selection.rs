@@ -102,6 +102,7 @@ struct OutputGroup {
     /// Long-term fee (for waste calculation).
     long_term_fee: u64,
     /// Weight of this input.
+    #[allow(dead_code)]
     weight: usize,
 }
 
@@ -181,7 +182,7 @@ pub fn select_coins_bnb(
     let mut curr_available: i64 = total_available;
 
     // Fee rate comparison for waste optimization
-    let is_feerate_high = groups.first().map_or(false, |g| g.fee > g.long_term_fee);
+    let is_feerate_high = groups.first().is_some_and(|g| g.fee > g.long_term_fee);
 
     // Depth-first search
     let mut utxo_index = 0;
@@ -259,8 +260,8 @@ pub fn select_coins_bnb(
             curr_waste -= group.waste();
 
             // Restore available for this and subsequent UTXOs
-            for i in last_idx..groups.len() {
-                curr_available += groups[i].effective_value;
+            for group in &groups[last_idx..] {
+                curr_available += group.effective_value;
             }
             utxo_index = last_idx + 1;
         }
@@ -533,7 +534,7 @@ pub fn select_coins_largest_first(
     }
 
     // Calculate waste
-    let waste: i64 = selected.iter().map(|u| {
+    let waste: i64 = selected.iter().map(|_u| {
         let fee = (params.input_weight as f64 / 4.0 * params.fee_rate).ceil() as i64;
         let long_term_fee = (params.input_weight as f64 / 4.0 * params.long_term_fee_rate).ceil() as i64;
         fee - long_term_fee

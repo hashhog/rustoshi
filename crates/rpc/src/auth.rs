@@ -225,6 +225,7 @@ where
 ///
 /// Returns `Ok(())` on success, or an `Err(Response<Body>)` with a 401
 /// response (including the `WWW-Authenticate` challenge header) on failure.
+#[allow(clippy::result_large_err)]
 fn check_auth(
     headers: &http::HeaderMap,
     credentials: &AuthCredentials,

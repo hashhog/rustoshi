@@ -206,6 +206,7 @@ impl ChainDb {
     ///
     /// Returns an iterator that yields `(key, value)` pairs.
     /// The iteration order depends on the column family's configuration.
+    #[allow(clippy::type_complexity)]
     pub fn iter_cf(
         &self,
         cf_name: &str,

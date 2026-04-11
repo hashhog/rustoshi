@@ -600,7 +600,7 @@ fn is_defined_hashtype(sig: &[u8]) -> bool {
         return true;
     }
     let hashtype = sig[sig.len() - 1] & 0x1f;
-    hashtype >= 1 && hashtype <= 3
+    (1..=3).contains(&hashtype)
 }
 
 /// Perform STRICTENC/DERSIG/LOW_S signature checks.
@@ -2286,8 +2286,8 @@ fn verify_witness_program(
                         }
                         data.extend_from_slice(tap_script);
                         let mut hasher = Sha256::new();
-                        hasher.update(&tag);
-                        hasher.update(&tag);
+                        hasher.update(tag);
+                        hasher.update(tag);
                         hasher.update(&data);
                         let result: [u8; 32] = hasher.finalize().into();
                         result
@@ -2301,15 +2301,15 @@ fn verify_witness_program(
                         use sha2::{Sha256, Digest};
                         let tag = Sha256::digest(b"TapBranch");
                         let mut hasher = Sha256::new();
-                        hasher.update(&tag);
-                        hasher.update(&tag);
+                        hasher.update(tag);
+                        hasher.update(tag);
                         // Sort: lexicographically smaller one first
                         if k < *<&[u8; 32]>::try_from(node).unwrap() {
-                            hasher.update(&k);
+                            hasher.update(k);
                             hasher.update(node);
                         } else {
                             hasher.update(node);
-                            hasher.update(&k);
+                            hasher.update(k);
                         }
                         k = hasher.finalize().into();
                     }
@@ -2326,10 +2326,10 @@ fn verify_witness_program(
                         use sha2::{Sha256, Digest};
                         let tag = Sha256::digest(b"TapTweak");
                         let mut hasher = Sha256::new();
-                        hasher.update(&tag);
-                        hasher.update(&tag);
+                        hasher.update(tag);
+                        hasher.update(tag);
                         hasher.update(internal_key);
-                        hasher.update(&k);
+                        hasher.update(k);
                         let result: [u8; 32] = hasher.finalize().into();
                         result
                     };

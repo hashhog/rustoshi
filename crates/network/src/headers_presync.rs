@@ -96,6 +96,7 @@ impl CompressedHeader {
 
 /// Result of processing headers.
 #[derive(Debug)]
+#[derive(Default)]
 pub struct ProcessingResult {
     /// Headers that have been fully validated and can be added to the chain.
     pub pow_validated_headers: Vec<BlockHeader>,
@@ -105,15 +106,6 @@ pub struct ProcessingResult {
     pub request_more: bool,
 }
 
-impl Default for ProcessingResult {
-    fn default() -> Self {
-        Self {
-            pow_validated_headers: Vec::new(),
-            success: false,
-            request_more: false,
-        }
-    }
-}
 
 /// Header sync state machine implementing PRESYNC/REDOWNLOAD anti-DoS protection.
 pub struct HeadersPresyncState {
@@ -193,16 +185,8 @@ impl HeadersPresyncState {
         // Random offset for commitment positions
         let commit_offset = rand::random::<u64>() % COMMITMENT_PERIOD;
 
-        // Estimate maximum reasonable chain length: ~6 blocks per second from chain start
-        // This is a generous upper bound used to limit memory during PRESYNC
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Assume chain_start timestamp is roughly at genesis (~1231000000 for mainnet)
-        // For safety, allow chains up to 20 years of 6 blocks/sec
-        let max_blocks = 20 * 365 * 24 * 60 * 60 * 6; // ~3.7 billion
+        // Upper bound on commitments: allow up to 20 years of 6 blocks/sec (~3.7 billion blocks)
+        let max_blocks = 20 * 365 * 24 * 60 * 60 * 6;
         let max_commitments = max_blocks / COMMITMENT_PERIOD;
 
         Self {
@@ -266,11 +250,9 @@ impl HeadersPresyncState {
         match self.state {
             PresyncState::Presync => {
                 result.success = self.validate_and_store_commitments(headers);
-                if result.success {
-                    if full_message || self.state == PresyncState::Redownload {
-                        // Either more headers available, or we transitioned to REDOWNLOAD
-                        result.request_more = true;
-                    }
+                if result.success && (full_message || self.state == PresyncState::Redownload) {
+                    // Either more headers available, or we transitioned to REDOWNLOAD
+                    result.request_more = true;
                     // If not full and still in PRESYNC, chain ended without enough work
                 }
             }
@@ -546,7 +528,7 @@ mod tests {
         let mut headers = Vec::with_capacity(count);
         let mut prev_hash = start_hash;
 
-        for i in 0..count {
+        for _i in 0..count {
             for nonce in 0..10000u32 {
                 let header = make_test_header(prev_hash, nonce);
                 if header.validate_pow() {
@@ -744,7 +726,7 @@ mod tests {
         );
 
         // Record the commit offset so we can create headers at those positions
-        let commit_offset = state.commit_offset;
+        let _commit_offset = state.commit_offset;
 
         // Do PRESYNC with one chain
         let headers1 = make_valid_chain(genesis_hash, 3000);
@@ -755,7 +737,7 @@ mod tests {
         // Try REDOWNLOAD with a different chain (different nonces = different hashes)
         let mut headers2 = Vec::new();
         let mut prev_hash = genesis_hash;
-        for i in 0..3000 {
+        for _i in 0..3000 {
             // Use different nonces to get different hashes
             for nonce in 10000..20000u32 {
                 let header = make_test_header(prev_hash, nonce);
@@ -767,7 +749,7 @@ mod tests {
             }
         }
 
-        let result = state.process_next_headers(&headers2, false);
+        let _result = state.process_next_headers(&headers2, false);
 
         // Should fail at some commitment check (unless we got very unlucky and
         // the 1-bit commitments happen to match, which is unlikely over many headers)
@@ -783,7 +765,7 @@ mod tests {
         let genesis_hash = params.genesis_hash;
         let min_work = ChainWork::from_hex("1").unwrap();
 
-        let mut state = HeadersPresyncState::new(
+        let state = HeadersPresyncState::new(
             params,
             genesis_hash,
             0,

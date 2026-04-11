@@ -373,7 +373,7 @@ impl FSChaCha20Poly1305 {
             (&nonce).into(),
             aad,
             &mut combined,
-            tag.try_into().unwrap(),
+            tag.into(),
         );
 
         if result.is_ok() {
@@ -735,6 +735,7 @@ pub enum SendState {
 /// V2 transport implementing the BIP324 state machine.
 pub struct V2Transport {
     /// Node ID for logging.
+    #[allow(dead_code)]
     node_id: u64,
     /// Whether we initiated the connection.
     initiator: bool,
@@ -751,6 +752,7 @@ pub struct V2Transport {
     /// Receive buffer.
     recv_buffer: Vec<u8>,
     /// Send buffer.
+    #[allow(dead_code)]
     send_buffer: Vec<u8>,
     /// Expected packet length (after decrypting length).
     recv_len: Option<u32>,

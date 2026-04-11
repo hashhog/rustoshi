@@ -11,9 +11,9 @@ use rustoshi_consensus::validation::TransactionSignatureChecker;
 use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut};
 use sha2::{Sha256, Digest};
 
-/// Path to the script_tests.json test vectors.
+/// Path to the script_tests.json test vectors (relative to crate root at build time).
 const SCRIPT_TESTS_JSON: &str =
-    "/home/max/hashhog/bitcoin/src/test/data/script_tests.json";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/script_tests.json");
 
 /// Decode a hex string into bytes.
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {

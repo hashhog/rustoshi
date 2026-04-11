@@ -338,7 +338,7 @@ async fn rest_headers(
     }
 
     let count: usize = parts[0].parse().map_err(|_| RestError::InvalidCount)?;
-    if count < 1 || count > MAX_REST_HEADERS_RESULTS {
+    if !(1..=MAX_REST_HEADERS_RESULTS).contains(&count) {
         return Err(RestError::InvalidCount);
     }
 
@@ -619,7 +619,7 @@ async fn rest_getutxos(
     let bitmap_str: String = hits.iter().map(|&h| if h { '1' } else { '0' }).collect();
 
     // Build bitmap bytes
-    let mut bitmap: Vec<u8> = vec![0u8; (hits.len() + 7) / 8];
+    let mut bitmap: Vec<u8> = vec![0u8; hits.len().div_ceil(8)];
     for (i, &hit) in hits.iter().enumerate() {
         if hit {
             bitmap[i / 8] |= 1 << (i % 8);
@@ -898,7 +898,7 @@ fn build_block_info(
         nonce: header.nonce,
         bits: format!("{:08x}", header.bits),
         difficulty: bits_to_difficulty(header.bits),
-        chainwork: hex::encode(&entry.chain_work),
+        chainwork: hex::encode(entry.chain_work),
         n_tx: block.transactions.len() as u32,
         previousblockhash: if entry.height > 0 {
             Some(header.prev_block_hash.to_hex())
@@ -966,7 +966,7 @@ fn build_tx_info(tx: &Transaction, block_hash: Option<Hash256>, height: Option<u
                         vout: None,
                         script_sig: None,
                         txinwitness: if !input.witness.is_empty() {
-                            Some(input.witness.iter().map(|w| hex::encode(w)).collect())
+                            Some(input.witness.iter().map(hex::encode).collect())
                         } else {
                             None
                         },
@@ -982,7 +982,7 @@ fn build_tx_info(tx: &Transaction, block_hash: Option<Hash256>, height: Option<u
                             hex: hex::encode(&input.script_sig),
                         }),
                         txinwitness: if !input.witness.is_empty() {
-                            Some(input.witness.iter().map(|w| hex::encode(w)).collect())
+                            Some(input.witness.iter().map(hex::encode).collect())
                         } else {
                             None
                         },

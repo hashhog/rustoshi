@@ -226,6 +226,7 @@ impl PartialOrd for TxPriority {
 /// # Returns
 ///
 /// A `BlockTemplate` ready for mining.
+#[allow(clippy::too_many_arguments)]
 pub fn build_block_template(
     mempool: &Mempool,
     prev_hash: Hash256,
@@ -406,7 +407,7 @@ fn build_coinbase_tx(
     // Anti-fee-sniping: set locktime to height - 1
     // This prevents miners from profitably re-mining old blocks.
     // For genesis (height 0) or height 1, use 0 as locktime.
-    let lock_time = if height > 1 { height - 1 } else { 0 };
+    let lock_time = height.saturating_sub(1);
 
     Transaction {
         version: 2,

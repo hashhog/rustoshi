@@ -584,12 +584,13 @@ impl Socks5Proxy {
         host: &str,
         port: u16,
     ) -> Result<(), ProxyError> {
-        let mut buf = Vec::new();
-        buf.push(SOCKS5_VERSION);
-        buf.push(Socks5Command::Connect as u8);
-        buf.push(0x00); // Reserved
-        buf.push(Socks5Atyp::DomainName as u8);
-        buf.push(host.len() as u8);
+        let mut buf = vec![
+            SOCKS5_VERSION,
+            Socks5Command::Connect as u8,
+            0x00, // Reserved
+            Socks5Atyp::DomainName as u8,
+            host.len() as u8,
+        ];
         buf.extend_from_slice(host.as_bytes());
         buf.push((port >> 8) as u8);
         buf.push((port & 0xff) as u8);
@@ -762,7 +763,7 @@ pub fn hostname_to_torv3_pubkey(hostname: &str) -> Result<[u8; 32], ProxyError> 
 
     let mut hasher = Sha256::new();
     hasher.update(b".onion checksum");
-    hasher.update(&pubkey);
+    hasher.update(pubkey);
     hasher.update([version]);
     let hash = hasher.finalize();
 
@@ -2046,7 +2047,7 @@ mod tests {
         });
 
         // Try to say hello (the full session creation would need more mocking)
-        let mut session = I2pSession::new_transient(addr);
+        let session = I2pSession::new_transient(addr);
         let result = session.hello().await;
         // Should succeed with the mock HELLO
         assert!(result.is_ok());
@@ -2077,12 +2078,11 @@ mod tests {
         assert!(matches!(result, Err(ProxyError::InvalidAddress(_))));
 
         // Wrong checksum (flip a byte)
-        let mut pubkey = [0x42u8; 32];
+        let pubkey = [0x42u8; 32];
         let hostname = torv3_pubkey_to_hostname(&pubkey);
-        pubkey[0] = 0x00; // Change the pubkey
+        // We kept the original hostname so parsing it should succeed
         let result = hostname_to_torv3_pubkey(&hostname);
-        // Should fail checksum because we changed the pubkey but kept the old hostname
-        // Actually this tests parsing the original hostname which should work
+        // Should succeed as this is just parsing the original valid hostname
         assert!(result.is_ok());
     }
 
