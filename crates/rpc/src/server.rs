@@ -185,6 +185,28 @@ impl RpcState {
             self.header_height = height;
         }
 
+        // Check if we should exit initial block download based on stored state
+        if self.best_height > 0 {
+            if let Ok(Some(entry)) = store.get_block_index(&self.best_hash) {
+                // Check if chain work >= minimum chain work
+                if compare_chain_work(&entry.chain_work, &self.params.minimum_chain_work)
+                    != std::cmp::Ordering::Less
+                {
+                    // Check if tip is recent (within 24h)
+                    let max_tip_age_secs = 24 * 60 * 60; // 24 hours in seconds
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let tip_age = now.saturating_sub(entry.timestamp as u64);
+
+                    if tip_age < max_tip_age_secs {
+                        self.is_ibd = false;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -713,6 +735,38 @@ impl RpcServerImpl {
 
         genesis_target / current_target
     }
+
+    /// Check if we should exit initial block download.
+    /// Returns true if chain has sufficient work AND tip is recent (< 24h old).
+    /// Once false, it remains false (latch behavior).
+    fn should_exit_ibd(&self, state: &RpcState, store: &BlockStore) -> bool {
+        // Once we've exited IBD, stay exited (latch behavior)
+        if !state.is_ibd {
+            return false;
+        }
+
+        // Get the best block entry to check chain work and time
+        if let Ok(Some(entry)) = store.get_block_index(&state.best_hash) {
+            // Check if chain work >= minimum chain work
+            if compare_chain_work(&entry.chain_work, &state.params.minimum_chain_work)
+                != std::cmp::Ordering::Less
+            {
+                // Check if tip is recent (within 24h)
+                let max_tip_age_secs = 24 * 60 * 60; // 24 hours in seconds
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let tip_age = now.saturating_sub(entry.timestamp as u64);
+
+                if tip_age < max_tip_age_secs {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
 }
 
 /// Convert compact bits to a floating-point target approximation.
@@ -740,11 +794,11 @@ impl RustoshiRpcServer for RpcServerImpl {
             1.0
         };
 
-        // Get median time past
-        let mediantime = if let Ok(Some(entry)) = store.get_block_index(&state.best_hash) {
-            entry.timestamp as u64
+        // Get median time past and chainwork
+        let (mediantime, chainwork_hex) = if let Ok(Some(entry)) = store.get_block_index(&state.best_hash) {
+            (entry.timestamp as u64, hex::encode(&entry.chain_work))
         } else {
-            0
+            (0, "0".repeat(64))
         };
 
         // Calculate verification progress
@@ -771,7 +825,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             mediantime,
             verificationprogress: progress,
             initialblockdownload: state.is_ibd,
-            chainwork: "0".repeat(64), // simplified
+            chainwork: chainwork_hex,
             size_on_disk: 0,           // would need filesystem stat
             pruned: state.prune_mode,
             warnings: String::new(),
@@ -910,19 +964,26 @@ impl RustoshiRpcServer for RpcServerImpl {
             None
         };
 
+        // Populate chainwork from block index entry (big-endian byte array to hex string)
+        let chainwork_hex = if let Some(ref e) = entry {
+            hex::encode(&e.chain_work)
+        } else {
+            "0".repeat(64)
+        };
+
         let header_info = BlockHeaderInfo {
             hash: block_hash.to_hex(),
             confirmations,
             height,
-            version: header.version,
-            version_hex: format!("{:08x}", header.version),
+            version: entry.as_ref().map(|e| e.version).unwrap_or(header.version),
+            version_hex: format!("{:08x}", entry.as_ref().map(|e| e.version).unwrap_or(header.version)),
             merkleroot: header.merkle_root.to_hex(),
             time: header.timestamp,
             mediantime: entry.as_ref().map(|e| e.timestamp as u64).unwrap_or(0),
-            nonce: header.nonce,
-            bits: format!("{:08x}", header.bits),
-            difficulty: Self::bits_to_difficulty(header.bits),
-            chainwork: "0".repeat(64),
+            nonce: entry.as_ref().map(|e| e.nonce).unwrap_or(header.nonce),
+            bits: format!("{:08x}", entry.as_ref().map(|e| e.bits).unwrap_or(header.bits)),
+            difficulty: Self::bits_to_difficulty(entry.as_ref().map(|e| e.bits).unwrap_or(header.bits)),
+            chainwork: chainwork_hex,
             n_tx: entry.as_ref().map(|e| e.n_tx).unwrap_or(0),
             previousblockhash: prev_hash,
             nextblockhash: next_hash,
@@ -1586,6 +1647,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Update RPC state
                 state.best_height = new_height;
                 state.best_hash = block_hash;
+
+                // Check if we should exit initial block download (and latch it to false)
+                if self.should_exit_ibd(&state, &store) {
+                    state.is_ibd = false;
+                    tracing::info!("Exiting initial block download at height {}", new_height);
+                }
 
                 tracing::info!(
                     "submitblock: accepted block {} at height {}",
@@ -3937,6 +4004,12 @@ impl RpcServerImpl {
                 // Update state
                 state.best_hash = block_hash;
                 state.best_height = height;
+
+                // Check if we should exit initial block download (and latch it to false)
+                if self.should_exit_ibd(&state, &store) {
+                    state.is_ibd = false;
+                    tracing::info!("Exiting initial block download at height {}", height);
+                }
 
                 // Remove mined transactions from mempool
                 for tx in &block.transactions[1..] {
