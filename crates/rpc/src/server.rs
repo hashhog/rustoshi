@@ -822,7 +822,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
             // Get median time past, chainwork, and tip timestamp for IBD check
             if let Ok(Some(entry)) = store.get_block_index(&state.best_hash) {
-                let cw_hex = hex::encode(&entry.chain_work);
+                let cw_hex = hex::encode(entry.chain_work);
                 (
                     difficulty,
                     entry.timestamp as u64,
@@ -1005,18 +1005,46 @@ impl RustoshiRpcServer for RpcServerImpl {
             .get_block_index(&block_hash)
             .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
 
-        let height = entry.as_ref().map(|e| e.height).unwrap_or(0);
-        let confirmations = if state.best_height >= height {
+        // Resolve height from block index entry; fall back to a linear scan
+        // through the height index for blocks synced before this fix.
+        let height = if let Some(ref e) = entry {
+            e.height
+        } else {
+            // Walk from tip back to genesis to find the height for this hash.
+            // This is only needed for blocks that were synced before the block
+            // index write was introduced; new blocks will always have an entry.
+            let best = state.best_height;
+            let mut found = None;
+            for h in (0..=best).rev() {
+                if let Ok(Some(candidate)) = store.get_hash_by_height(h) {
+                    if candidate == block_hash {
+                        found = Some(h);
+                        break;
+                    }
+                }
+            }
+            found.unwrap_or(0)
+        };
+
+        let confirmations = if height > 0 && state.best_height >= height {
             (state.best_height - height + 1) as i32
+        } else if height == 0 {
+            // Could be genesis (genuinely height 0) or an unresolved lookup.
+            // Use best_height + 1 only for genesis hash.
+            (state.best_height + 1) as i32
         } else {
             0
         };
 
-        let next_hash = store
-            .get_hash_by_height(height + 1)
-            .ok()
-            .flatten()
-            .map(|h| h.to_hex());
+        let next_hash = if height < state.best_height {
+            store
+                .get_hash_by_height(height + 1)
+                .ok()
+                .flatten()
+                .map(|h| h.to_hex())
+        } else {
+            None
+        };
 
         let prev_hash = if header.prev_block_hash != Hash256::ZERO {
             Some(header.prev_block_hash.to_hex())
@@ -1024,25 +1052,46 @@ impl RustoshiRpcServer for RpcServerImpl {
             None
         };
 
-        // Populate chainwork from block index entry (big-endian byte array to hex string)
+        // Populate chainwork from block index entry (big-endian byte array to hex string).
+        // If the entry is absent (historical block synced before this fix), report zeros.
         let chainwork_hex = if let Some(ref e) = entry {
-            hex::encode(&e.chain_work)
+            hex::encode(e.chain_work)
         } else {
             "0".repeat(64)
+        };
+
+        // Compute median-time-past: median of the timestamps of the 11 blocks
+        // ending at this block (inclusive), matching Bitcoin Core's GetMedianTimePast.
+        let mediantime = {
+            let window_start = height.saturating_sub(10);
+            let mut timestamps: Vec<u32> = Vec::with_capacity(11);
+            for h in window_start..=height {
+                if let Ok(Some(bh)) = store.get_hash_by_height(h) {
+                    if let Ok(Some(hdr)) = store.get_header(&bh) {
+                        timestamps.push(hdr.timestamp);
+                    }
+                }
+            }
+            if timestamps.is_empty() {
+                header.timestamp as u64
+            } else {
+                timestamps.sort_unstable();
+                timestamps[timestamps.len() / 2] as u64
+            }
         };
 
         let header_info = BlockHeaderInfo {
             hash: block_hash.to_hex(),
             confirmations,
             height,
-            version: entry.as_ref().map(|e| e.version).unwrap_or(header.version),
-            version_hex: format!("{:08x}", entry.as_ref().map(|e| e.version).unwrap_or(header.version)),
+            version: header.version,
+            version_hex: format!("{:08x}", header.version),
             merkleroot: header.merkle_root.to_hex(),
             time: header.timestamp,
-            mediantime: entry.as_ref().map(|e| e.timestamp as u64).unwrap_or(0),
-            nonce: entry.as_ref().map(|e| e.nonce).unwrap_or(header.nonce),
-            bits: format!("{:08x}", entry.as_ref().map(|e| e.bits).unwrap_or(header.bits)),
-            difficulty: Self::bits_to_difficulty(entry.as_ref().map(|e| e.bits).unwrap_or(header.bits)),
+            mediantime,
+            nonce: header.nonce,
+            bits: format!("{:08x}", header.bits),
+            difficulty: Self::bits_to_difficulty(header.bits),
             chainwork: chainwork_hex,
             n_tx: entry.as_ref().map(|e| e.n_tx).unwrap_or(0),
             previousblockhash: prev_hash,
