@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn test_eviction_prefer_evict_flag() {
         let mut c1 = make_candidate(1, "192.168.1.1:8333", 100, Some(50), None, None);
-        let mut c2 = make_candidate(2, "10.0.0.1:8333", 50, Some(50), None, None);
+        let c2 = make_candidate(2, "10.0.0.1:8333", 50, Some(50), None, None);
 
         c1.prefer_evict = true;
 
