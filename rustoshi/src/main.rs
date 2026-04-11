@@ -18,14 +18,14 @@ use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 use tokio::io::AsyncWriteExt;
 
-use rustoshi_consensus::{ChainParams, ChainState, FeeEstimator, NetworkId};
+use rustoshi_consensus::{get_block_proof, ChainParams, ChainState, ChainWork, FeeEstimator, NetworkId};
 use rustoshi_network::{
     BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason, NetworkMessage, PeerEvent,
     PeerManager, PeerManagerConfig,
 };
 use rustoshi_primitives::{Hash256, OutPoint};
 use rustoshi_rpc::{start_rpc_server, PeerState, RpcConfig, RpcState};
-use rustoshi_storage::{BlockStore, ChainDb};
+use rustoshi_storage::{block_store::{BlockIndexEntry, BlockStatus}, BlockStore, ChainDb};
 
 // ============================================================
 // CLI DEFINITIONS
@@ -544,6 +544,38 @@ fn run_import_from_blk_files(
             }
         }
 
+        // Store block index entry so getblockheader can return correct height/nTx/chainwork.
+        {
+            let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
+                block_store
+                    .get_block_index(&block.header.prev_block_hash)
+                    .ok()
+                    .flatten()
+                    .map(|e| ChainWork::from_be_bytes(e.chain_work))
+                    .unwrap_or(ChainWork::ZERO)
+            } else {
+                ChainWork::ZERO
+            };
+            let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_SCRIPTS);
+            status.set(BlockStatus::HAVE_DATA);
+            let entry = BlockIndexEntry {
+                height,
+                status,
+                n_tx: block.transactions.len() as u32,
+                timestamp: block.header.timestamp,
+                bits: block.header.bits,
+                nonce: block.header.nonce,
+                version: block.header.version,
+                prev_hash: block.header.prev_block_hash,
+                chain_work: this_work.0,
+            };
+            if let Err(e) = block_store.put_block_index(&hash, &entry) {
+                tracing::error!("Failed to store block index at height {}: {}", height, e);
+            }
+        }
+
         // Flush UTXO cache if needed
         if utxo_view.needs_flush() {
             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
@@ -676,6 +708,38 @@ fn run_import_from_stdin(
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", frame_height, e);
                 break;
+            }
+        }
+
+        // Store block index entry so getblockheader can return correct height/nTx/chainwork.
+        {
+            let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
+                block_store
+                    .get_block_index(&block.header.prev_block_hash)
+                    .ok()
+                    .flatten()
+                    .map(|e| ChainWork::from_be_bytes(e.chain_work))
+                    .unwrap_or(ChainWork::ZERO)
+            } else {
+                ChainWork::ZERO
+            };
+            let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_SCRIPTS);
+            status.set(BlockStatus::HAVE_DATA);
+            let entry = BlockIndexEntry {
+                height: frame_height,
+                status,
+                n_tx: block.transactions.len() as u32,
+                timestamp: block.header.timestamp,
+                bits: block.header.bits,
+                nonce: block.header.nonce,
+                version: block.header.version,
+                prev_hash: block.header.prev_block_hash,
+                chain_work: this_work.0,
+            };
+            if let Err(e) = block_store.put_block_index(&hash, &entry) {
+                tracing::error!("Failed to store block index at height {}: {}", frame_height, e);
             }
         }
 
@@ -1073,6 +1137,38 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
+                    // Store block index entry so getblockheader returns height/nTx/chainwork.
+                    {
+                        let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
+                            block_store
+                                .get_block_index(&block.header.prev_block_hash)
+                                .ok()
+                                .flatten()
+                                .map(|e| ChainWork::from_be_bytes(e.chain_work))
+                                .unwrap_or(ChainWork::ZERO)
+                        } else {
+                            ChainWork::ZERO
+                        };
+                        let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
+                        let mut status = BlockStatus::new();
+                        status.set(BlockStatus::VALID_SCRIPTS);
+                        status.set(BlockStatus::HAVE_DATA);
+                        let idx_entry = BlockIndexEntry {
+                            height,
+                            status,
+                            n_tx: block.transactions.len() as u32,
+                            timestamp: block.header.timestamp,
+                            bits: block.header.bits,
+                            nonce: block.header.nonce,
+                            version: block.header.version,
+                            prev_hash: block.header.prev_block_hash,
+                            chain_work: this_work.0,
+                        };
+                        if let Err(e) = block_store.put_block_index(&block_hash, &idx_entry) {
+                            tracing::error!("Failed to store block index at height {}: {}", height, e);
+                        }
+                    }
+
                     if utxo_view.needs_flush() {
                         let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                         let entries = utxo_view.cache_len();
@@ -1383,6 +1479,38 @@ async fn main() -> anyhow::Result<()> {
                                                 "Block validation failed at height {}: {}",
                                                 height, e
                                             );
+                                        }
+                                    }
+
+                                    // Store block index entry so getblockheader returns height/nTx/chainwork.
+                                    {
+                                        let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
+                                            block_store
+                                                .get_block_index(&block.header.prev_block_hash)
+                                                .ok()
+                                                .flatten()
+                                                .map(|e| ChainWork::from_be_bytes(e.chain_work))
+                                                .unwrap_or(ChainWork::ZERO)
+                                        } else {
+                                            ChainWork::ZERO
+                                        };
+                                        let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
+                                        let mut status = BlockStatus::new();
+                                        status.set(BlockStatus::VALID_SCRIPTS);
+                                        status.set(BlockStatus::HAVE_DATA);
+                                        let idx_entry = BlockIndexEntry {
+                                            height,
+                                            status,
+                                            n_tx: block.transactions.len() as u32,
+                                            timestamp: block.header.timestamp,
+                                            bits: block.header.bits,
+                                            nonce: block.header.nonce,
+                                            version: block.header.version,
+                                            prev_hash: block.header.prev_block_hash,
+                                            chain_work: this_work.0,
+                                        };
+                                        if let Err(e) = block_store.put_block_index(&block_hash, &idx_entry) {
+                                            tracing::error!("Failed to store block index at height {}: {}", height, e);
                                         }
                                     }
 
