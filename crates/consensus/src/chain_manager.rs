@@ -491,8 +491,6 @@ mod tests {
         let hash_b = make_hash(2);
 
         let work1 = [0u8; 32];
-        let mut work2 = [0u8; 32];
-        work2[31] = 1;
 
         // First precious call
         let seq1 = state.assign_precious_sequence(hash_a, &work1);
