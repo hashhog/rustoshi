@@ -747,7 +747,7 @@ impl RpcServerImpl {
     fn should_exit_ibd(
         &self,
         state: &RpcState,
-        tip_chain_work: &[u8],
+        tip_chain_work: &[u8; 32],
         tip_timestamp: u32,
     ) -> bool {
         // Once we've exited IBD, stay exited (latch behavior)
