@@ -6,9 +6,9 @@
 use rustoshi_crypto::legacy_sighash;
 use rustoshi_primitives::{Decodable, Hash256, Transaction};
 
-/// Path to the sighash test vectors JSON file.
+/// Path to the sighash test vectors JSON file (relative to crate root at build time).
 const SIGHASH_JSON: &str =
-    "/home/work/hashhog/bitcoin-core/src/test/data/sighash.json";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/sighash.json");
 
 /// Decode a hex string into bytes (no byte-order reversal).
 fn hex_to_bytes(s: &str) -> Vec<u8> {
