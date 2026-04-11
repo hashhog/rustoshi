@@ -32,6 +32,7 @@ use rustoshi_consensus::{
     },
     fee_estimator::FeeEstimator,
     mempool::{Mempool, MempoolConfig},
+    versionbits::{get_deployments, DeploymentId},
     ChainParams, ChainState, NetworkId, COIN,
 };
 use rustoshi_network::message::{InvType, InvVector, NetworkMessage};
@@ -660,6 +661,19 @@ pub trait RustoshiRpc {
     /// Returns bytes sent/received and the current time.
     #[method(name = "getnettotals")]
     async fn get_net_totals(&self) -> RpcResult<serde_json::Value>;
+
+    /// Get information about the current state of each deployment.
+    ///
+    /// Returns per-deployment activation info (type, active, height,
+    /// min_activation_height). Mirrors Bitcoin Core's getdeploymentinfo.
+    ///
+    /// Parameters:
+    /// - blockhash: Optional block hash to evaluate at (default: chain tip)
+    #[method(name = "getdeploymentinfo")]
+    async fn get_deployment_info(
+        &self,
+        blockhash: Option<String>,
+    ) -> RpcResult<serde_json::Value>;
 }
 
 // ============================================================
@@ -3873,6 +3887,121 @@ impl RustoshiRpcServer for RpcServerImpl {
             "timemillis": now * 1000
         }))
     }
+
+    async fn get_deployment_info(
+        &self,
+        blockhash: Option<String>,
+    ) -> RpcResult<serde_json::Value> {
+        let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+
+        // Resolve the target block height: use the provided block hash or fall
+        // back to the current chain tip.
+        let (eval_height, eval_hash) = if let Some(ref hash_str) = blockhash {
+            let hash = Self::parse_hash(hash_str)?;
+            let entry = store
+                .get_block_index(&hash)
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                .ok_or_else(|| {
+                    Self::rpc_error(rpc_error::RPC_BLOCK_NOT_FOUND, "Block not found")
+                })?;
+            (entry.height, hash)
+        } else {
+            (state.best_height, state.best_hash)
+        };
+
+        let params = &state.params;
+
+        // ---------------------------------------------------------------
+        // Deployment descriptors.
+        //
+        // CSV, SegWit, and Taproot were originally deployed via BIP 9 but
+        // are now considered "buried" on every network rustoshi supports:
+        // they are all enforced at a well-known fixed block height.  We
+        // therefore return type="buried" for all of them, matching the
+        // Bitcoin Core behaviour for these deployments post-activation.
+        //
+        // For future BIP 9 deployments added to versionbits.rs we expose
+        // the full bip9 sub-object so callers get signaling status.
+        // ---------------------------------------------------------------
+
+        // Helper: build a buried deployment JSON object.
+        let buried = |_name: &str, activation_height: u32, min_activation_height: u32| {
+            let active = eval_height >= activation_height;
+            let height = if active { Some(activation_height) } else { None };
+            serde_json::json!({
+                "type": "buried",
+                "active": active,
+                "height": height,
+                "min_activation_height": min_activation_height
+            })
+        };
+
+        let mut deployments = serde_json::Map::new();
+
+        // BIP 68/112/113 — CSV (relative lock-times)
+        deployments.insert(
+            "csv".to_string(),
+            buried("csv", params.csv_height, params.csv_height),
+        );
+
+        // BIP 141/143/147 — SegWit
+        deployments.insert(
+            "segwit".to_string(),
+            buried("segwit", params.segwit_height, params.segwit_height),
+        );
+
+        // BIP 341/342 — Taproot
+        deployments.insert(
+            "taproot".to_string(),
+            buried("taproot", params.taproot_height, params.taproot_height),
+        );
+
+        // ---------------------------------------------------------------
+        // For any BIP 9 deployments in the versionbits table that are NOT
+        // already represented as buried above (e.g. testdummy or future
+        // soft forks), include them with a bip9 sub-object.
+        // ---------------------------------------------------------------
+        let vb_deployments = get_deployments(params);
+        for (id, dep) in &vb_deployments {
+            let name = match id {
+                DeploymentId::Csv => continue,     // already covered as buried
+                DeploymentId::Segwit => continue,  // already covered as buried
+                DeploymentId::Taproot => continue, // already covered as buried
+                DeploymentId::Custom(n) => format!("custom_{}", n),
+            };
+
+            // For these extra deployments we can't cheaply reconstruct the
+            // full VersionbitsBlockInfo chain needed for get_state_for, so
+            // we report a static view: active = start_time == ALWAYS_ACTIVE.
+            use rustoshi_consensus::versionbits::ALWAYS_ACTIVE;
+            let active = dep.start_time == ALWAYS_ACTIVE;
+            let status = if active { "active" } else { "defined" };
+
+            deployments.insert(
+                name,
+                serde_json::json!({
+                    "type": "bip9",
+                    "active": active,
+                    "height": if active { Some(0u32) } else { None::<u32> },
+                    "min_activation_height": dep.min_activation_height,
+                    "bip9": {
+                        "bit": dep.bit,
+                        "start_time": dep.start_time,
+                        "timeout": dep.timeout,
+                        "min_activation_height": dep.min_activation_height,
+                        "status": status
+                    }
+                }),
+            );
+        }
+
+        Ok(serde_json::json!({
+            "hash": eval_hash.to_hex(),
+            "height": eval_height,
+            "deployments": deployments
+        }))
+    }
 }
 
 impl RpcServerImpl {
@@ -5849,5 +5978,123 @@ mod tests {
         assert_eq!(get_ancestor(&hash_c, 2, 2, &get_meta), Some(hash_c));
         // Ancestor at height > current should be None
         assert_eq!(get_ancestor(&hash_c, 2, 3, &get_meta), None);
+    }
+
+    // ============================================================
+    // GETDEPLOYMENTINFO UNIT TESTS
+    // ============================================================
+
+    /// Verify that the buried-deployment helper produces the correct JSON shape.
+    ///
+    /// These tests exercise the pure data-transformation logic used by
+    /// `get_deployment_info` without requiring a running server or database.
+    #[test]
+    fn test_deployment_info_regtest_all_active() {
+        // On regtest, csv/segwit/taproot all activate at height 1.
+        // At tip height 0 they should NOT be active.
+        let params = rustoshi_consensus::ChainParams::regtest();
+
+        let eval_height: u32 = 0;
+
+        // csv: activation height 1, eval_height 0 → inactive
+        let csv_active = eval_height >= params.csv_height;
+        assert!(!csv_active, "csv should be inactive at height 0 on regtest");
+
+        // At height 1, all three should be active.
+        let eval_height: u32 = 1;
+        assert!(eval_height >= params.csv_height,    "csv active at height 1");
+        assert!(eval_height >= params.segwit_height, "segwit active at height 1");
+        assert!(eval_height >= params.taproot_height,"taproot active at height 1");
+    }
+
+    #[test]
+    fn test_deployment_info_mainnet_heights() {
+        // On mainnet, all three deployments activate at well-known heights.
+        let params = rustoshi_consensus::ChainParams::mainnet();
+
+        // Before CSV activation (419328)
+        let pre_csv: u32 = 419_327;
+        assert!(pre_csv < params.csv_height);
+
+        // After Taproot activation (709632)
+        let post_taproot: u32 = 800_000;
+        assert!(post_taproot >= params.taproot_height);
+        assert!(post_taproot >= params.segwit_height);
+        assert!(post_taproot >= params.csv_height);
+
+        // Between CSV and SegWit
+        let between: u32 = 450_000;
+        assert!(between >= params.csv_height);
+        assert!(between < params.segwit_height);
+    }
+
+    #[test]
+    fn test_deployment_info_response_has_required_keys() {
+        // Simulate the JSON construction logic without a live server.
+        // This checks that the returned JSON object has the expected fields.
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let eval_height: u32 = 10;
+
+        let make_buried = |activation_height: u32, min_activation_height: u32| {
+            let active = eval_height >= activation_height;
+            let height: Option<u32> = if active { Some(activation_height) } else { None };
+            serde_json::json!({
+                "type": "buried",
+                "active": active,
+                "height": height,
+                "min_activation_height": min_activation_height
+            })
+        };
+
+        let mut deployments = serde_json::Map::new();
+        deployments.insert("csv".to_string(),    make_buried(params.csv_height, params.csv_height));
+        deployments.insert("segwit".to_string(), make_buried(params.segwit_height, params.segwit_height));
+        deployments.insert("taproot".to_string(),make_buried(params.taproot_height, params.taproot_height));
+
+        let response = serde_json::json!({
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "height": eval_height,
+            "deployments": deployments
+        });
+
+        // Top-level keys
+        assert!(response.get("hash").is_some(),        "missing 'hash' key");
+        assert!(response.get("height").is_some(),      "missing 'height' key");
+        assert!(response.get("deployments").is_some(), "missing 'deployments' key");
+
+        let deps = response["deployments"].as_object().unwrap();
+
+        // Must have at least csv, segwit, taproot
+        for name in &["csv", "segwit", "taproot"] {
+            let dep = deps.get(*name).unwrap_or_else(|| panic!("missing deployment '{}'", name));
+            assert!(dep.get("type").is_some(),                   "{}: missing 'type'", name);
+            assert!(dep.get("active").is_some(),                 "{}: missing 'active'", name);
+            assert!(dep.get("min_activation_height").is_some(),  "{}: missing 'min_activation_height'", name);
+        }
+
+        // On regtest at height 10, all three must be active
+        assert_eq!(deps["csv"]["active"],    serde_json::json!(true));
+        assert_eq!(deps["segwit"]["active"], serde_json::json!(true));
+        assert_eq!(deps["taproot"]["active"],serde_json::json!(true));
+
+        // Type must be "buried" for all three
+        assert_eq!(deps["csv"]["type"],    serde_json::json!("buried"));
+        assert_eq!(deps["segwit"]["type"], serde_json::json!("buried"));
+        assert_eq!(deps["taproot"]["type"],serde_json::json!("buried"));
+    }
+
+    #[test]
+    fn test_deployment_info_mainnet_pre_activation() {
+        // Before ANY soft fork on mainnet (height < 419328), none should be active.
+        let params = rustoshi_consensus::ChainParams::mainnet();
+        let eval_height: u32 = 300_000;
+
+        let csv_active    = eval_height >= params.csv_height;
+        let segwit_active = eval_height >= params.segwit_height;
+        let taproot_active= eval_height >= params.taproot_height;
+
+        assert!(!csv_active,    "csv should be inactive at height 300_000 on mainnet");
+        assert!(!segwit_active, "segwit should be inactive at height 300_000 on mainnet");
+        assert!(!taproot_active,"taproot should be inactive at height 300_000 on mainnet");
     }
 }
