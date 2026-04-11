@@ -512,9 +512,9 @@ impl ChainParams {
             checkpoints: Checkpoints::from_pairs(&[
                 (546, "000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70"),
                 (100000, "00000000009e2958c15ff9290d571bf9459e93b19765c6801ddeccadbb160a1e"),
-                (200000, "0000000000287bffd321963ef05feab753ber9fe5c2f72f5dc2a54c7d0b6cd"),
-                (300001, "0000000000004829474748f3d1bc8fcf893c88be255e6c91e30f574a43f6e5c"),
-                (400002, "0000000005e2c73b8ecb82ae2dbc2e8274e2fd19d5ede9c5db1e9e45c2b7c8c"),
+                (200000, "000000000000287bffd321963ef05feab753eca9fe5c2f72f5dc2a54c7d0b6cd"),
+                (300001, "00000000000004829474748f3d1bc8fcf893c88be255e6c91e30f574a43f6e5c"),
+                (400002, "00000000005e2c73b8ecb82ae2dbc2e8274e2fd19d5ede9c5db1e9e45c2b7c8c"),
             ]),
             // Testnet3 has no hardcoded assumeUTXO snapshots
             assumeutxo_data: vec![],
