@@ -739,33 +739,38 @@ impl RpcServerImpl {
     /// Check if we should exit initial block download.
     /// Returns true if chain has sufficient work AND tip is recent (< 24h old).
     /// Once false, it remains false (latch behavior).
-    fn should_exit_ibd(&self, state: &RpcState, store: &BlockStore) -> bool {
+    ///
+    /// Takes the tip's chain_work and timestamp as raw values rather than
+    /// looking them up through `&BlockStore`, so callers can fetch the entry
+    /// before mutating `state` and avoid a borrow-checker conflict between
+    /// `let store = BlockStore::new(&state.db)` and `state.best_* = ...`.
+    fn should_exit_ibd(
+        &self,
+        state: &RpcState,
+        tip_chain_work: &[u8],
+        tip_timestamp: u32,
+    ) -> bool {
         // Once we've exited IBD, stay exited (latch behavior)
         if !state.is_ibd {
             return false;
         }
 
-        // Get the best block entry to check chain work and time
-        if let Ok(Some(entry)) = store.get_block_index(&state.best_hash) {
-            // Check if chain work >= minimum chain work
-            if compare_chain_work(&entry.chain_work, &state.params.minimum_chain_work)
-                != std::cmp::Ordering::Less
-            {
-                // Check if tip is recent (within 24h)
-                let max_tip_age_secs = 24 * 60 * 60; // 24 hours in seconds
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let tip_age = now.saturating_sub(entry.timestamp as u64);
-
-                if tip_age < max_tip_age_secs {
-                    return true;
-                }
-            }
+        // Check if chain work >= minimum chain work
+        if compare_chain_work(tip_chain_work, &state.params.minimum_chain_work)
+            == std::cmp::Ordering::Less
+        {
+            return false;
         }
 
-        false
+        // Check if tip is recent (within 24h)
+        let max_tip_age_secs = 24 * 60 * 60; // 24 hours in seconds
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let tip_age = now.saturating_sub(tip_timestamp as u64);
+
+        tip_age < max_tip_age_secs
     }
 }
 
@@ -789,20 +794,45 @@ impl RustoshiRpcServer for RpcServerImpl {
         // submitblock/generate_block call would report initialblockdownload=true
         // forever.
         let mut state = self.state.write().await;
-        let store = BlockStore::new(&state.db);
 
-        // Get the best block header for difficulty
-        let difficulty = if let Ok(Some(header)) = store.get_header(&state.best_hash) {
-            Self::bits_to_difficulty(header.bits)
-        } else {
-            1.0
-        };
+        // Fetch everything we need from the store up front, then drop the store
+        // so we can mutate `state.is_ibd` without a borrow-checker conflict.
+        let (difficulty, mediantime, chainwork_bytes, chainwork_hex, tip_timestamp) = {
+            let store = BlockStore::new(&state.db);
 
-        // Get median time past and chainwork
-        let (mediantime, chainwork_hex) = if let Ok(Some(entry)) = store.get_block_index(&state.best_hash) {
-            (entry.timestamp as u64, hex::encode(&entry.chain_work))
-        } else {
-            (0, "0".repeat(64))
+            let difficulty = if let Ok(Some(header)) = store.get_header(&state.best_hash) {
+                Self::bits_to_difficulty(header.bits)
+            } else {
+                1.0
+            };
+
+            // Get median time past, chainwork, and tip timestamp for IBD check
+            if let Ok(Some(entry)) = store.get_block_index(&state.best_hash) {
+                let cw_hex = hex::encode(&entry.chain_work);
+                (
+                    difficulty,
+                    entry.timestamp as u64,
+                    entry.chain_work,
+                    cw_hex,
+                    entry.timestamp,
+                )
+            } else {
+                // No block index entry: fall back to header for tip_timestamp
+                // so the IBD latch can still evaluate against wall-clock age.
+                let fallback_ts = store
+                    .get_header(&state.best_hash)
+                    .ok()
+                    .flatten()
+                    .map(|h| h.timestamp)
+                    .unwrap_or(0);
+                (
+                    difficulty,
+                    0u64,
+                    [0u8; 32],
+                    "0".repeat(64),
+                    fallback_ts,
+                )
+            }
         };
 
         // Calculate verification progress
@@ -824,7 +854,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         // a node that finished sync without receiving a submitblock/generate
         // call still flips to initialblockdownload=false the first time a
         // client asks.
-        if state.is_ibd && self.should_exit_ibd(&state, &store) {
+        if state.is_ibd && self.should_exit_ibd(&state, &chainwork_bytes, tip_timestamp) {
             state.is_ibd = false;
             tracing::info!(
                 "Exiting initial block download at height {} (evaluated on getblockchaininfo)",
@@ -1664,11 +1694,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                 state.best_height = new_height;
                 state.best_hash = block_hash;
 
-                // Check if we should exit initial block download (and latch it to false)
-                if self.should_exit_ibd(&state, &store) {
-                    state.is_ibd = false;
-                    tracing::info!("Exiting initial block download at height {}", new_height);
-                }
+                // NOTE: IBD latch is re-evaluated on every getblockchaininfo
+                // call (see get_blockchain_info). We deliberately do NOT call
+                // should_exit_ibd here because submitblock does not write a
+                // BlockIndexEntry for the new block, so a lookup would return
+                // None and the check would be dead. The read-path evaluation
+                // handles this case.
 
                 tracing::info!(
                     "submitblock: accepted block {} at height {}",
@@ -4021,11 +4052,12 @@ impl RpcServerImpl {
                 state.best_hash = block_hash;
                 state.best_height = height;
 
-                // Check if we should exit initial block download (and latch it to false)
-                if self.should_exit_ibd(&state, &store) {
-                    state.is_ibd = false;
-                    tracing::info!("Exiting initial block download at height {}", height);
-                }
+                // NOTE: IBD latch is re-evaluated on every getblockchaininfo
+                // call (see get_blockchain_info). We deliberately do NOT call
+                // should_exit_ibd here because mine_single_block writes a
+                // BlockIndexEntry with chain_work=[0u8; 32] (see below), so
+                // the latch check would always fail until chain_work tracking
+                // is implemented.
 
                 // Remove mined transactions from mempool
                 for tx in &block.transactions[1..] {
