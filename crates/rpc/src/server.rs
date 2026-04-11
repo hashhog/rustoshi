@@ -784,7 +784,11 @@ fn compact_to_target_f64(bits: u32) -> f64 {
 #[async_trait]
 impl RustoshiRpcServer for RpcServerImpl {
     async fn get_blockchain_info(&self) -> RpcResult<BlockchainInfo> {
-        let state = self.state.read().await;
+        // Take a write lock so we can flip the IBD latch if the tip is now
+        // caught up. Without this, a node that finishes IBD before any
+        // submitblock/generate_block call would report initialblockdownload=true
+        // forever.
+        let mut state = self.state.write().await;
         let store = BlockStore::new(&state.db);
 
         // Get the best block header for difficulty
@@ -815,6 +819,18 @@ impl RustoshiRpcServer for RpcServerImpl {
             NetworkId::Signet => "signet",
             NetworkId::Regtest => "regtest",
         };
+
+        // Evaluate the IBD latch on every getblockchaininfo call. This ensures
+        // a node that finished sync without receiving a submitblock/generate
+        // call still flips to initialblockdownload=false the first time a
+        // client asks.
+        if state.is_ibd && self.should_exit_ibd(&state, &store) {
+            state.is_ibd = false;
+            tracing::info!(
+                "Exiting initial block download at height {} (evaluated on getblockchaininfo)",
+                state.best_height
+            );
+        }
 
         Ok(BlockchainInfo {
             chain: chain_name.to_string(),
