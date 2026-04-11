@@ -30,9 +30,8 @@
 //! ```
 
 use crate::hd::WalletError;
-use rustoshi_primitives::hash::Hash256;
 use rustoshi_primitives::serialize::{read_compact_size, write_compact_size, Decodable, Encodable};
-use rustoshi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+use rustoshi_primitives::transaction::{Transaction, TxOut};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Cursor, Read, Write};
 
@@ -248,7 +247,7 @@ impl KeyOrigin {
 
     /// Decode from reader with known length
     pub fn decode_with_len<R: Read>(reader: &mut R, len: usize) -> io::Result<Self> {
-        if len % 4 != 0 || len == 0 {
+        if !len.is_multiple_of(4) || len == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid key origin length",
@@ -469,7 +468,7 @@ impl PsbtInput {
         for (key, cbs) in &other.tap_leaf_scripts {
             self.tap_leaf_scripts
                 .entry(key.clone())
-                .or_insert_with(BTreeSet::new)
+                .or_default()
                 .extend(cbs.iter().cloned());
         }
         for (key, val) in &other.tap_bip32_derivation {
@@ -787,7 +786,7 @@ impl Psbt {
         for (origin, xpubs) in &other.xpubs {
             self.xpubs
                 .entry(origin.clone())
-                .or_insert_with(BTreeSet::new)
+                .or_default()
                 .extend(xpubs.iter().cloned());
         }
 
@@ -1451,7 +1450,7 @@ impl Psbt {
 
                     xpubs
                         .entry(origin)
-                        .or_insert_with(BTreeSet::new)
+                        .or_default()
                         .insert(xpub);
                 }
                 PSBT_GLOBAL_VERSION => {
@@ -1789,7 +1788,7 @@ fn decode_psbt_input<R: Read>(reader: &mut R) -> Result<PsbtInput, PsbtError> {
                 input.tap_script_sigs.insert((xonly, leaf_hash), value);
             }
             PSBT_IN_TAP_LEAF_SCRIPT => {
-                if key.len() < 34 || (key.len() - 2) % 32 != 0 {
+                if key.len() < 34 || !(key.len() - 2).is_multiple_of(32) {
                     return Err(PsbtError::InvalidKeySize {
                         key_type,
                         expected: 34,
@@ -2070,6 +2069,8 @@ fn decode_psbt_output<R: Read>(reader: &mut R) -> Result<PsbtOutput, PsbtError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustoshi_primitives::hash::Hash256;
+    use rustoshi_primitives::transaction::{OutPoint, TxIn};
 
     fn create_test_tx() -> Transaction {
         Transaction {

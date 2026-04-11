@@ -866,7 +866,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(100));
 
-        let (topic, body, seq) = handle.join().unwrap();
+        let (topic, body, _seq) = handle.join().unwrap();
 
         assert_eq!(topic, Some(b"sequence".to_vec()));
         assert!(body.is_some());

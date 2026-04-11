@@ -491,8 +491,6 @@ mod tests {
         let hash_b = make_hash(2);
 
         let work1 = [0u8; 32];
-        let mut work2 = [0u8; 32];
-        work2[31] = 1;
 
         // First precious call
         let seq1 = state.assign_precious_sequence(hash_a, &work1);
@@ -516,11 +514,14 @@ mod tests {
     #[test]
     fn test_is_ancestor_or_descendant() {
         // Chain: A -> B -> C
-        let hash_a = make_hash(0);
-        let hash_b = make_hash(1);
-        let hash_c = make_hash(2);
-        let hash_d = make_hash(3); // Unrelated
+        // Note: hash_a must NOT be Hash256::ZERO to avoid false positive matches
+        let hash_a = make_hash(1);
+        let hash_b = make_hash(2);
+        let hash_c = make_hash(3);
+        let hash_d = make_hash(4); // Unrelated
 
+        // D's prev_hash is Hash256::ZERO (unrelated chain rooted at genesis/zero)
+        // hash_a must not equal Hash256::ZERO to avoid false positive in is_ancestor check
         let blocks: HashMap<Hash256, BlockMeta> = [
             (
                 hash_a,
@@ -557,7 +558,7 @@ mod tests {
                 BlockMeta {
                     hash: hash_d,
                     height: 1,
-                    prev_hash: Hash256::ZERO, // Unrelated
+                    prev_hash: Hash256::ZERO, // Unrelated chain
                     status: 0,
                     chain_work: [0u8; 32],
                 },

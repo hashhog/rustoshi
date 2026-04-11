@@ -119,13 +119,13 @@ impl ChainSyncState {
 
     /// Check if the timeout has expired.
     pub fn is_timed_out(&self) -> bool {
-        self.timeout.map_or(false, |t| Instant::now() >= t)
+        self.timeout.is_some_and(|t| Instant::now() >= t)
     }
 
     /// Check if the peer has caught up to the required height.
     pub fn has_caught_up(&self, peer_best_height: u32) -> bool {
         self.work_header_height
-            .map_or(true, |h| peer_best_height >= h)
+            .is_none_or(|h| peer_best_height >= h)
     }
 }
 
@@ -184,7 +184,7 @@ impl StalePeerState {
             return false;
         }
         self.ping_start
-            .map_or(false, |start| start.elapsed() > PING_TIMEOUT_INTERVAL)
+            .is_some_and(|start| start.elapsed() > PING_TIMEOUT_INTERVAL)
     }
 
     /// Record that a ping was sent.
@@ -223,7 +223,7 @@ impl StalePeerState {
             return false;
         }
         self.last_getheaders_time
-            .map_or(false, |t| t.elapsed() > HEADERS_RESPONSE_TIME)
+            .is_some_and(|t| t.elapsed() > HEADERS_RESPONSE_TIME)
     }
 
     /// Update best known height from headers.

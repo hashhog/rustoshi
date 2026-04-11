@@ -535,7 +535,7 @@ pub fn compute_utxo_hash<V: CoinsView>(
     // Double SHA256
     let first_hash = hasher.finalize();
     let mut second_hasher = Sha256::new();
-    second_hasher.update(&first_hash);
+    second_hasher.update(first_hash);
     let final_hash = second_hasher.finalize();
 
     let mut hash_bytes = [0u8; 32];

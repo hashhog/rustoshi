@@ -532,7 +532,6 @@ impl MisbehaviorTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
     use tempfile::TempDir;
 
     #[test]

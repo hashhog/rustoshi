@@ -737,6 +737,7 @@ pub struct PeerManager {
     peers: HashMap<PeerId, PeerHandle>,
     /// Inbound peer command senders — kept alive until the peer is
     /// registered via Connected event in handle_event().
+    #[allow(clippy::type_complexity)]
     inbound_cmd_txs: Option<Arc<std::sync::Mutex<HashMap<PeerId, mpsc::Sender<PeerCommand>>>>>,
     /// Address manager for peer discovery.
     addr_manager: AddressManager,
@@ -1682,7 +1683,7 @@ impl PeerManager {
                         && p.connected_time.elapsed() >= MINIMUM_CONNECT_TIME
                         // Don't evict if peer recently sent a block
                         && p.last_block_time
-                            .map_or(true, |t| t.elapsed() > Duration::from_secs(60))
+                            .is_none_or(|t| t.elapsed() > Duration::from_secs(60))
                 })
                 .max_by_key(|(_, p)| p.connected_time) // Youngest = most recent connected_time
                 .map(|(id, _)| *id);

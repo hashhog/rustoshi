@@ -333,7 +333,7 @@ pub fn pays_for_rbf(
 pub fn get_fee(fee_rate: u64, vsize: u64) -> u64 {
     // fee = ceil(fee_rate * vsize / 1000)
     // Using integer math: (fee_rate * vsize + 999) / 1000
-    (fee_rate.saturating_mul(vsize) + 999) / 1000
+    fee_rate.saturating_mul(vsize).div_ceil(1000)
 }
 
 /// Calculate the fee rate from fee and virtual size.

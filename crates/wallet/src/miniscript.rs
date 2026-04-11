@@ -29,7 +29,7 @@
 //! let witness = ms.satisfy(&available_sigs)?;
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 
 // =============================================================================
@@ -1468,6 +1468,7 @@ const OP_PUSHDATA1: u8 = 0x4c;
 const OP_PUSHDATA2: u8 = 0x4d;
 const OP_1NEGATE: u8 = 0x4f;
 const OP_1: u8 = 0x51;
+#[allow(dead_code)]
 const OP_16: u8 = 0x60;
 const OP_IF: u8 = 0x63;
 const OP_NOTIF: u8 = 0x64;
@@ -1476,6 +1477,7 @@ const OP_ENDIF: u8 = 0x68;
 const OP_VERIFY: u8 = 0x69;
 const OP_TOALTSTACK: u8 = 0x6b;
 const OP_FROMALTSTACK: u8 = 0x6c;
+#[allow(dead_code)]
 const OP_2DROP: u8 = 0x6d;
 const OP_IFDUP: u8 = 0x73;
 const OP_DUP: u8 = 0x76;
@@ -1823,7 +1825,7 @@ fn push_scriptnum(script: &mut Vec<u8>, n: i64) {
         script.push(OP_0);
     } else if n == -1 {
         script.push(OP_1NEGATE);
-    } else if n >= 1 && n <= 16 {
+    } else if (1..=16).contains(&n) {
         script.push(OP_1 - 1 + n as u8);
     } else {
         // Encode as bytes
@@ -1848,7 +1850,7 @@ fn encode_scriptnum(n: i64) -> Vec<u8> {
     }
 
     // If the high bit is set, add a sign byte
-    if result.last().map_or(false, |&b| b & 0x80 != 0) {
+    if result.last().is_some_and(|&b| b & 0x80 != 0) {
         result.push(if neg { 0x80 } else { 0x00 });
     } else if neg {
         *result.last_mut().unwrap() |= 0x80;
@@ -2519,6 +2521,7 @@ impl<Pk: MiniscriptKey> fmt::Display for Fragment<Pk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_type_properties_default() {
@@ -2820,6 +2823,7 @@ mod tests {
             self
         }
 
+        #[allow(dead_code)]
         fn with_preimage(mut self, hash: [u8; 32], preimage: Vec<u8>) -> Self {
             self.preimages.insert(hash, preimage);
             self

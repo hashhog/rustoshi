@@ -363,8 +363,8 @@ impl DepGraph {
         }
 
         // Build descendants from ancestors
-        for i in 0..n {
-            for &anc in &ancestors[i] {
+        for (i, ancs) in ancestors.iter().enumerate() {
+            for &anc in ancs {
                 if anc != i {
                     descendants[anc].insert(i);
                 }
@@ -452,7 +452,7 @@ impl DepGraph {
                 }
 
                 // Merge with previous chunk if this chunk has higher feerate
-                while !chunks.is_empty() {
+                if !chunks.is_empty() {
                     let last = chunks.last().unwrap();
                     let combined = FeeFrac {
                         fee: last.feefrac.fee + feefrac.fee,
@@ -464,13 +464,11 @@ impl DepGraph {
                         merged.txids.extend(txids.iter().copied());
                         merged.feefrac = combined;
                         chunks.push(merged);
-                        break;
                     } else {
                         chunks.push(Chunk {
                             txids: txids.clone(),
                             feefrac,
                         });
-                        break;
                     }
                 }
 
@@ -1952,8 +1950,7 @@ impl Mempool {
             cluster_id
         } else {
             // Multiple parent clusters - merge them all
-            let merged_id = self.merge_clusters_and_add_tx(&parent_cluster_ids, txid, fee, vsize);
-            merged_id
+            self.merge_clusters_and_add_tx(&parent_cluster_ids, txid, fee, vsize)
         };
 
         // Update cluster_id in entry

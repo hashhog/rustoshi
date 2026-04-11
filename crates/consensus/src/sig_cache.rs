@@ -199,14 +199,30 @@ impl SigCache {
 
     /// Evict a batch of entries from the cache.
     ///
-    /// Clears 10% of entries to avoid frequent eviction overhead.
-    /// Uses DashMap's retain method which is more efficient than
-    /// individual removals.
+    /// Removes at least 1 entry and approximately 10% of entries overall to
+    /// avoid frequent eviction overhead. Guaranteeing at least 1 removal
+    /// prevents the cache from growing without bound when the probabilistic
+    /// retain would otherwise evict nothing (which has ~35% probability for
+    /// a cache of 10 entries).
     fn evict_batch(&self) {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        // Keep approximately 90% of entries (evict ~10%)
-        self.cache.retain(|_, _| rng.gen_bool(0.9));
+        let mut evicted = 0usize;
+        // Keep approximately 90% of entries (evict ~10%), but always evict at least 1.
+        self.cache.retain(|_, _| {
+            if !rng.gen_bool(0.9) {
+                evicted += 1;
+                false
+            } else {
+                true
+            }
+        });
+        // If probabilistic eviction removed nothing, forcibly remove one entry.
+        if evicted == 0 {
+            if let Some(entry) = self.cache.iter().next().map(|e| *e.key()) {
+                self.cache.remove(&entry);
+            }
+        }
     }
 }
 

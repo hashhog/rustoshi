@@ -1171,7 +1171,7 @@ mod tests {
         let mut buffer = Vec::new();
 
         // Simulate: we send version, they send version, they send verack
-        let our_version = create_test_version();
+        let _our_version = create_test_version();
         let their_version = VersionMessage {
             version: PROTOCOL_VERSION,
             services: NODE_NETWORK,
@@ -1284,7 +1284,7 @@ mod tests {
         let addr: SocketAddr = "10.255.255.1:48333".parse().unwrap();
 
         let (event_tx, mut event_rx) = mpsc::channel(10);
-        let (command_tx, command_rx) = mpsc::channel(10);
+        let (_command_tx, command_rx) = mpsc::channel(10);
 
         let version = create_test_version();
         let magic = TESTNET4_MAGIC;
@@ -1367,7 +1367,7 @@ mod tests {
         });
 
         // Spawn the client
-        let client_handle = tokio::spawn(async move {
+        let _client_handle = tokio::spawn(async move {
             run_outbound_peer(peer_id, addr, magic, our_version, event_tx, command_rx).await;
         });
 
@@ -1883,7 +1883,7 @@ mod tests {
         });
 
         // Spawn the client
-        let client_handle = tokio::spawn(async move {
+        let _client_handle = tokio::spawn(async move {
             run_outbound_peer(peer_id, addr, magic, our_version, event_tx, command_rx).await;
         });
 

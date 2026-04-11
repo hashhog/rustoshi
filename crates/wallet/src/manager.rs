@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::db::WalletDb;
-use crate::hd::{ExtendedPrivKey, WalletError};
+use crate::hd::WalletError;
 use crate::wallet::{AddressType, Wallet};
 use rustoshi_crypto::address::Network;
 use serde::{Deserialize, Serialize};
@@ -73,7 +73,7 @@ impl WalletManager {
     pub fn new(data_dir: &Path, network: Network) -> Result<Self, WalletError> {
         let wallets_dir = data_dir.join("wallets");
         fs::create_dir_all(&wallets_dir)
-            .map_err(|e| WalletError::Io(e))?;
+            .map_err(WalletError::Io)?;
 
         Ok(Self {
             wallets: HashMap::new(),
@@ -144,7 +144,7 @@ impl WalletManager {
 
         // Create wallet directory
         fs::create_dir_all(&wallet_dir)
-            .map_err(|e| WalletError::Io(e))?;
+            .map_err(WalletError::Io)?;
 
         // Create database
         let db_path = wallet_dir.join("wallet.sqlite");
@@ -355,9 +355,9 @@ impl WalletManager {
         }
 
         for entry in fs::read_dir(&self.wallets_dir)
-            .map_err(|e| WalletError::Io(e))?
+            .map_err(WalletError::Io)?
         {
-            let entry = entry.map_err(|e| WalletError::Io(e))?;
+            let entry = entry.map_err(WalletError::Io)?;
             let path = entry.path();
 
             if path.is_dir() {
@@ -430,7 +430,7 @@ impl WalletManager {
             .map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?;
 
         fs::write(&settings_path, content)
-            .map_err(|e| WalletError::Io(e))?;
+            .map_err(WalletError::Io)?;
 
         Ok(())
     }

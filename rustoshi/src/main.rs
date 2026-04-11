@@ -242,7 +242,7 @@ fn default_rpc_port(network_id: NetworkId) -> u16 {
 /// the process owner can read the credentials.
 ///
 /// Returns the raw hex secret (the password half of the cookie string).
-fn write_cookie_file(datadir: &PathBuf) -> anyhow::Result<String> {
+fn write_cookie_file(datadir: &std::path::Path) -> anyhow::Result<String> {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     let secret = hex::encode(bytes);
@@ -260,7 +260,7 @@ fn write_cookie_file(datadir: &PathBuf) -> anyhow::Result<String> {
 }
 
 /// Delete the cookie file on shutdown so stale credentials don't linger.
-fn delete_cookie_file(datadir: &PathBuf) {
+fn delete_cookie_file(datadir: &std::path::Path) {
     let cookie_path = datadir.join(".cookie");
     if let Err(e) = std::fs::remove_file(&cookie_path) {
         // Not fatal — the file may already be gone, or on a read-only FS.
@@ -319,7 +319,7 @@ fn detect_xor_key(blocks_dir: &std::path::Path, expected_magic: &[u8; 4]) -> [u8
     // the rest from the pattern (Bitcoin Core uses the same 8-byte key cyclically)
     // Actually, the key is stored in LevelDB, but we can derive all 8 bytes
     // from the file since we know bytes 8..12 must be version=1 (01000000 LE):
-    let mut more = [0u8; 4];
+    let _more = [0u8; 4];
     // Read bytes 8..12 (first 4 bytes of actual block header after magic+size)
     // but we need bytes 4..8 first. We know key repeats with period 8.
     // Derive from bytes at offset 8: they should be block version (01 00 00 00)
@@ -340,9 +340,7 @@ fn detect_xor_key(blocks_dir: &std::path::Path, expected_magic: &[u8; 4]) -> [u8
             if file.read_exact(&mut buf16).is_ok() {
                 // file offset 12..16, key offset 12%8=4, so key[4..8]
                 // decoded should be prevhash[0..4] = [0,0,0,0]
-                for i in 0..4 {
-                    key[4 + i] = buf16[i]; // ^ 0 = buf16[i]
-                }
+                key[4..(4 + 4)].copy_from_slice(&buf16); // ^ 0 = buf16[i]
             }
         }
     }
@@ -569,7 +567,7 @@ fn run_import_from_blk_files(
         height += 1;
 
         // Progress logging every 1000 blocks
-        if imported % 1000 == 0 {
+        if imported.is_multiple_of(1000) {
             let elapsed = batch_start.elapsed();
             let bps = 1000.0 / elapsed.as_secs_f64();
             let total_elapsed = import_start.elapsed();
@@ -703,7 +701,7 @@ fn run_import_from_stdin(
         imported += 1;
 
         // Progress logging every 1000 blocks
-        if imported % 1000 == 0 {
+        if imported.is_multiple_of(1000) {
             let elapsed = batch_start.elapsed();
             let bps = 1000.0 / elapsed.as_secs_f64();
             let total_elapsed = import_start.elapsed();
@@ -832,7 +830,7 @@ async fn main() -> anyhow::Result<()> {
             let mut hi = 1_000_000u32;
             // First, find the highest height that has any stored hash
             while lo < hi {
-                let mid = lo + (hi - lo + 1) / 2;
+                let mid = lo + (hi - lo).div_ceil(2);
                 if block_store.get_hash_by_height(mid).ok().flatten().is_some() {
                     lo = mid;
                 } else {
@@ -1576,7 +1574,7 @@ async fn main() -> anyhow::Result<()> {
                                         = std::sync::atomic::AtomicU64::new(0);
                                     let count = IBD_HEADER_COUNTER.fetch_add(1,
                                         std::sync::atomic::Ordering::Relaxed);
-                                    if count % 10 != 0 {
+                                    if !count.is_multiple_of(10) {
                                         // Skip 9 out of 10 getheaders during IBD
                                         continue;
                                     }
@@ -1709,7 +1707,7 @@ async fn main() -> anyhow::Result<()> {
 
                             NetworkMessage::CmpctBlock(data) => {
                                 // BIP 152: Reconstruct block from compact block + mempool
-                                use rustoshi_network::{CmpctBlock, PartiallyDownloadedBlock, BlockTxnRequest, BlockTxn};
+                                use rustoshi_network::{CmpctBlock, PartiallyDownloadedBlock, BlockTxnRequest};
                                 use rustoshi_primitives::{Hash256, Transaction};
                                 match CmpctBlock::decode(&mut std::io::Cursor::new(&data)) {
                                     Ok(cmpct) => {
@@ -1733,7 +1731,7 @@ async fn main() -> anyhow::Result<()> {
                                                                 "Compact block {} reconstructed (prefilled={}, mempool={})",
                                                                 block_hash, prefilled, from_mempool
                                                             );
-                                                            block_downloader.handle_block(peer_id, block).await;
+                                                            block_downloader.block_received(peer_id, block);
                                                         }
                                                         Err(_) => {
                                                             tracing::warn!("Compact block {} merkle mismatch, requesting full block", block_hash);

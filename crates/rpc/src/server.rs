@@ -27,12 +27,11 @@ use jsonrpsee::types::ErrorObjectOwned;
 use rustoshi_consensus::{
     block_template::{build_block_template, BlockTemplateConfig},
     chain_manager::{
-        block_status, compare_chain_work, find_descendants, get_ancestor, is_ancestor,
+        compare_chain_work, find_descendants,
         is_ancestor_or_descendant, BlockMeta, ChainManagerState,
     },
     fee_estimator::FeeEstimator,
-    mempool::{Mempool, MempoolConfig, PackageAcceptResult},
-    check_transaction,
+    mempool::{Mempool, MempoolConfig},
     ChainParams, ChainState, NetworkId, COIN,
 };
 use rustoshi_network::message::{InvType, InvVector, NetworkMessage};
@@ -2206,7 +2205,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn get_descriptor_info(&self, descriptor: String) -> RpcResult<DescriptorInfoResult> {
         use rustoshi_wallet::descriptor::{
-            descriptor_checksum, parse_descriptor, DescriptorInfo,
+            parse_descriptor, DescriptorInfo,
         };
 
         // Try to parse the descriptor (with or without checksum)
@@ -2529,7 +2528,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         // If the invalidated block is in the active chain, we need to reorg
         // Find the new best valid chain tip by walking back from the current tip
         // until we find a block that isn't invalid
+        #[allow(unused_assignments)]
         let mut new_tip_hash = state.best_hash;
+        #[allow(unused_assignments)]
         let mut new_tip_height = state.best_height;
 
         // Check if current tip or any ancestor is the invalidated block
@@ -2585,7 +2586,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn reconsider_block(&self, blockhash: String) -> RpcResult<()> {
         let hash = Self::parse_hash(&blockhash)?;
 
-        let mut state = self.state.write().await;
+        let state = self.state.write().await;
         let store = BlockStore::new(&state.db);
 
         // Verify the block exists and get its metadata
@@ -2973,7 +2974,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             // Final scriptWitness
             if let Some(ref witness) = input.final_script_witness {
                 decoded_input.final_scriptwitness = Some(
-                    witness.iter().map(|w| hex::encode(w)).collect()
+                    witness.iter().map(hex::encode).collect()
                 );
             }
 
@@ -3102,7 +3103,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         })?;
 
         // Try to finalize
-        let finalize_result = psbt.finalize();
+        let _finalize_result = psbt.finalize();
         let complete = psbt.is_finalized();
 
         if complete && extract {
@@ -3116,7 +3117,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                         complete: true,
                     })
                 }
-                Err(e) => {
+                Err(_e) => {
                     // Extraction failed, return the PSBT
                     Ok(FinalizePsbtResult {
                         psbt: Some(psbt.to_base64()),
@@ -3144,7 +3145,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         rawtxs: Vec<String>,
         maxfeerate: Option<f64>,
     ) -> RpcResult<serde_json::Value> {
-        let maxfeerate_btc_kvb = maxfeerate.unwrap_or(0.10);
+        let _maxfeerate_btc_kvb = maxfeerate.unwrap_or(0.10);
         let mut results = Vec::new();
 
         for raw in &rawtxs {
@@ -3263,7 +3264,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                             .map_err(|e| {
                                 Self::rpc_error(
                                     rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
-                                    &format!("Invalid address: {}", e),
+                                    format!("Invalid address: {}", e),
                                 )
                             })?;
                         let script = address.to_script_pubkey();
@@ -3297,13 +3298,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             if op == 0x00 {
                 asm_parts.push("0".to_string());
                 i += 1;
-            } else if op >= 0x01 && op <= 0x4b {
+            } else if (0x01..=0x4b).contains(&op) {
                 let len = op as usize;
                 if i + 1 + len <= bytes.len() {
                     asm_parts.push(hex::encode(&bytes[i + 1..i + 1 + len]));
                     i += 1 + len;
                 } else {
-                    asm_parts.push(format!("[error]"));
+                    asm_parts.push("[error]".to_string());
                     break;
                 }
             } else if op == 0x4c {
@@ -4265,7 +4266,7 @@ fn disassemble_script(script: &[u8]) -> String {
                     result.push(hex::encode(&script[i + 1..i + 1 + len]));
                     i += len;
                 } else {
-                    result.push(format!("[error: truncated push]"));
+                    result.push("[error: truncated push]".to_string());
                     break;
                 }
             }
@@ -4617,7 +4618,7 @@ fn build_decoded_raw_transaction(tx: &Transaction) -> DecodedRawTransaction {
                     txinwitness: if input.witness.is_empty() {
                         None
                     } else {
-                        Some(input.witness.iter().map(|w| hex::encode(w)).collect())
+                        Some(input.witness.iter().map(hex::encode).collect())
                     },
                     sequence: input.sequence,
                 }
@@ -4633,7 +4634,7 @@ fn build_decoded_raw_transaction(tx: &Transaction) -> DecodedRawTransaction {
                     txinwitness: if input.witness.is_empty() {
                         None
                     } else {
-                        Some(input.witness.iter().map(|w| hex::encode(w)).collect())
+                        Some(input.witness.iter().map(hex::encode).collect())
                     },
                     sequence: input.sequence,
                 }
@@ -4741,6 +4742,7 @@ pub async fn start_rpc_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustoshi_consensus::chain_manager::{block_status, get_ancestor, is_ancestor};
 
     #[test]
     fn test_compact_to_target_f64() {

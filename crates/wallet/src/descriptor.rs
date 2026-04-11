@@ -1523,12 +1523,12 @@ fn split_xpub_and_path(expr: &str) -> Result<(&str, &str, DeriveType, bool), Des
     };
 
     // Check for range indicator /*
-    let (path_str, derive_type, apostrophe) = if path_part.ends_with("/*'") {
-        (&path_part[..path_part.len() - 3], DeriveType::HardenedRanged, true)
-    } else if path_part.ends_with("/*h") {
-        (&path_part[..path_part.len() - 3], DeriveType::HardenedRanged, false)
-    } else if path_part.ends_with("/*") {
-        (&path_part[..path_part.len() - 2], DeriveType::UnhardenedRanged, true)
+    let (path_str, derive_type, apostrophe) = if let Some(s) = path_part.strip_suffix("/*'") {
+        (s, DeriveType::HardenedRanged, true)
+    } else if let Some(s) = path_part.strip_suffix("/*h") {
+        (s, DeriveType::HardenedRanged, false)
+    } else if let Some(s) = path_part.strip_suffix("/*") {
+        (s, DeriveType::UnhardenedRanged, true)
     } else {
         (path_part, DeriveType::NonRanged, path_part.contains('\''))
     };

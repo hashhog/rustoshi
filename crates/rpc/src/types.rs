@@ -982,7 +982,9 @@ mod tests {
             maxmempool: 300000000,
             mempoolminfee: 0.00001,
             minrelaytxfee: 0.00001,
+            incrementalrelayfee: 0.00001,
             unbroadcastcount: 0,
+            fullrbf: false,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -1296,7 +1298,9 @@ mod tests {
             maxmempool: 300_000_000,
             mempoolminfee: 0.00001,
             minrelaytxfee: 0.00001,
+            incrementalrelayfee: 0.00001,
             unbroadcastcount: 10,
+            fullrbf: false,
         };
 
         let json = serde_json::to_string(&info).unwrap();

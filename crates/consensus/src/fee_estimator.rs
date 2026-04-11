@@ -342,7 +342,7 @@ impl FeeEstimator {
             current_height: self.current_height,
         };
         let json = serde_json::to_string(&state)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         let tmp_path = path.with_extension("json.tmp");
         std::fs::write(&tmp_path, &json)?;
         std::fs::rename(&tmp_path, path)?;

@@ -293,57 +293,11 @@ mod x86_shani {
     #[target_feature(enable = "sha", enable = "sse4.1", enable = "ssse3")]
     #[inline]
     unsafe fn extract_hash(state0: __m128i, state1: __m128i, shuf_mask: __m128i) -> [u8; 32] {
-        // state0 = [H[5], H[4], H[7], H[6]]
-        // state1 = [H[1], H[0], H[3], H[2]]
+        // state0 = [H[5], H[4], H[7], H[6]] (as stored by _mm_set_epi32)
+        // state1 = [H[1], H[0], H[3], H[2]] (as stored by _mm_set_epi32)
         // We need to output H[0] H[1] H[2] H[3] H[4] H[5] H[6] H[7] in big-endian
 
-        // Unshuffle to get: s0 = [H[4], H[5], H[6], H[7]], s1 = [H[0], H[1], H[2], H[3]]
-        let t1 = _mm_shuffle_epi32(state0, 0x1b);  // [H[6], H[7], H[4], H[5]]
-        let t2 = _mm_shuffle_epi32(state1, 0xb1);  // [H[0], H[1], H[2], H[3]] -> [H[1], H[0], H[3], H[2]]
-        let s0 = _mm_blend_epi16(t1, t2, 0xf0);   // [H[6], H[7], H[2], H[3]]
-        let s1 = _mm_alignr_epi8(t2, t1, 0x08);   // [H[4], H[5], H[0], H[1]]
-
-        // Actually we need: H[0], H[1], H[2], H[3] then H[4], H[5], H[6], H[7]
-        // So output s1 first (contains H[0]-H[3] after fix), then s0 (H[4]-H[7])
-        // But wait, the unshuffling above doesn't quite give us the right order...
-
-        // Let me be more careful. Following Bitcoin Core:
-        // state0 after Shuffle: [H[5], H[4], H[7], H[6]] (little-endian words)
-        // state1 after Shuffle: [H[1], H[0], H[3], H[2]] (little-endian words)
-        //
-        // To extract, we need to unshuffle back to standard order and byte-swap each word.
-        // t1 = shuffle state0 with 0x1b: reverses words -> [H[6], H[7], H[4], H[5]]
-        // t2 = shuffle state1 with 0xb1: swaps pairs -> [H[0], H[1], H[2], H[3]]? No...
-        //
-        // Actually 0xb1 = 10 11 00 01 which means:
-        //   output[0] = input[1], output[1] = input[0], output[2] = input[3], output[3] = input[2]
-        //   So if state1 = [H[1], H[0], H[3], H[2]], then t2 = [H[0], H[1], H[2], H[3]]
-
-        // blend_epi16 with 0xf0 takes high 64 bits from t2, low 64 bits from t1
-        //   t1 = [H[6], H[7], H[4], H[5]]
-        //   t2 = [H[0], H[1], H[2], H[3]]
-        //   s0 = [H[6], H[7], H[2], H[3]] -- this doesn't look right
-
-        // Let me just use the simpler approach: directly extract the values
-        let t1 = _mm_shuffle_epi32(state0, 0x1b);  // [H[6], H[7], H[4], H[5]]
-        let t2 = _mm_shuffle_epi32(state1, 0xb1);  // [H[0], H[1], H[2], H[3]]
-
-        // Combine properly:
-        // We want first 128 bits = H[0..3], second 128 bits = H[4..7]
-        // From state1 (which has H[0-3] shuffled) and state0 (which has H[4-7] shuffled)
-
-        // Unshuffle properly:
-        let abef = _mm_unpacklo_epi32(t1, t2);  // [H[6], H[0], H[7], H[1]]
-        let cdgh = _mm_unpackhi_epi32(t1, t2);  // [H[4], H[2], H[5], H[3]]
-
-        // Interleave to get final order
-        let h0123 = _mm_unpackhi_epi64(abef, cdgh);  // [H[7], H[1], H[5], H[3]] = [a, b, c, d] where we need H[0..3]
-        let h4567 = _mm_unpacklo_epi64(abef, cdgh);  // [H[6], H[0], H[4], H[2]] = [e, f, g, h] where we need H[4..7]
-
-        // This is getting complicated. Let me try a different approach.
-        // Just store, reorder in memory, and reload...or use the simpler Bitcoin Core approach.
-
-        // Actually, let's just store the state vectors and extract manually
+        // Store state vectors and extract in the correct order
         let mut tmp0 = [0u32; 4];
         let mut tmp1 = [0u32; 4];
         _mm_storeu_si128(tmp0.as_mut_ptr() as *mut __m128i, state0);
@@ -709,6 +663,15 @@ mod tests {
     fn test_sha256_abc() {
         let result = sha256(b"abc");
         let expected = hex::decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad").unwrap();
+        assert_eq!(result.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_sha256_nist_vector2() {
+        // NIST FIPS 180-4 test vector: SHA-256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+        // Expected: 248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
+        let result = sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+        let expected = hex::decode("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1").unwrap();
         assert_eq!(result.as_slice(), expected.as_slice());
     }
 

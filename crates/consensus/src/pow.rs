@@ -58,7 +58,7 @@ pub fn get_next_work_required<I: BlockIndex>(
     let next_height = last.height() + 1;
 
     // Only change difficulty once per adjustment interval
-    if next_height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0 {
+    if !next_height.is_multiple_of(DIFFICULTY_ADJUSTMENT_INTERVAL) {
         // Special testnet rules: allow min-difficulty blocks
         if params.pow_allow_min_difficulty_blocks {
             // If the new block's timestamp is more than 2 * TARGET_BLOCK_TIME (20 minutes)
@@ -101,7 +101,7 @@ fn get_last_non_min_difficulty_bits<I: BlockIndex>(
     // 3. The current block uses minimum difficulty
     while let Some(prev) = current.prev() {
         // Stop at retarget boundaries
-        if current.height() % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 {
+        if current.height().is_multiple_of(DIFFICULTY_ADJUSTMENT_INTERVAL) {
             break;
         }
         // Stop if this block doesn't use minimum difficulty
@@ -266,7 +266,7 @@ pub fn permitted_difficulty_transition(
         return true;
     }
 
-    if height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 {
+    if height.is_multiple_of(DIFFICULTY_ADJUSTMENT_INTERVAL) {
         // At retarget: verify the new difficulty is within bounds
         let pow_limit = &params.pow_limit;
 
@@ -375,7 +375,7 @@ impl ChainWork {
 
     /// Compare two chainwork values.
     /// Returns Ordering::Less if self < other, etc.
-    pub fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn compare(&self, other: &Self) -> std::cmp::Ordering {
         for i in 0..32 {
             match self.0[i].cmp(&other.0[i]) {
                 std::cmp::Ordering::Equal => continue,
@@ -388,7 +388,7 @@ impl ChainWork {
 
 impl std::cmp::Ord for ChainWork {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        ChainWork::cmp(self, other)
+        self.compare(other)
     }
 }
 
@@ -475,13 +475,12 @@ pub fn get_block_proof(bits: u32) -> ChainWork {
 
 /// Divide a 256-bit number by another 256-bit number.
 /// Returns the quotient (rounded down).
+/// Uses a bit-by-bit shift-and-subtract algorithm operating on 256-bit values
+/// represented as four 64-bit big-endian words (words[0] = most significant).
 fn divide_256(dividend: &[u8; 32], divisor: &[u8; 32]) -> [u8; 32] {
-    // Simple long division for 256-bit numbers
-    // We use a shift-and-subtract algorithm
-
     // Check for division by zero
     if divisor.iter().all(|&b| b == 0) {
-        return [0xff; 32]; // Return max value for division by zero
+        return [0xff; 32];
     }
 
     // Fast path: if dividend < divisor, result is 0
@@ -489,129 +488,128 @@ fn divide_256(dividend: &[u8; 32], divisor: &[u8; 32]) -> [u8; 32] {
         return [0u8; 32];
     }
 
-    // Use 512-bit intermediate for accurate division
-    // Convert to arrays of u64 for easier manipulation
-    let mut remainder = [0u64; 8]; // 512 bits
-    let mut quotient = [0u64; 4]; // 256 bits
-
-    // Load dividend into lower half of remainder
-    for i in 0..4 {
-        let offset = i * 8;
-        let mut word = 0u64;
-        for j in 0..8 {
-            word = (word << 8) | (dividend[offset + j] as u64);
+    // Represent as four u64 words, big-endian (words[0] = most significant)
+    let load_words = |bytes: &[u8; 32]| -> [u64; 4] {
+        let mut w = [0u64; 4];
+        for (idx, word) in w.iter_mut().enumerate() {
+            let off = idx * 8;
+            *word = u64::from_be_bytes(bytes[off..off + 8].try_into().unwrap());
         }
-        remainder[4 + i] = word;
-    }
+        w
+    };
 
-    // Load divisor
-    let mut div = [0u64; 4];
-    for i in 0..4 {
-        let offset = i * 8;
-        let mut word = 0u64;
-        for j in 0..8 {
-            word = (word << 8) | (divisor[offset + j] as u64);
-        }
-        div[i] = word;
-    }
+    let mut rem = load_words(dividend);
+    let div = load_words(divisor);
+    let mut quot = [0u64; 4];
 
-    // Find the highest bit set in divisor
-    let mut div_bits = 0;
-    for i in 0..4 {
-        if div[i] != 0 {
-            div_bits = (3 - i) * 64 + (64 - div[i].leading_zeros() as usize);
-            break;
+    // Count significant bits in div (position of highest set bit, 0-indexed from LSB)
+    let div_bits: u32 = {
+        let mut b = 256u32;
+        for (idx, &d) in div.iter().enumerate() {
+            if d != 0 {
+                b = (3 - idx as u32) * 64 + (64 - d.leading_zeros());
+                break;
+            }
         }
-    }
+        b
+    };
 
-    // Find the highest bit set in dividend
-    let mut rem_bits = 0;
-    for i in 4..8 {
-        if remainder[i] != 0 {
-            rem_bits = (7 - i) * 64 + (64 - remainder[i].leading_zeros() as usize);
-            break;
+    // Count significant bits in rem
+    let rem_bits: u32 = {
+        let mut b = 0u32;
+        for (idx, &r) in rem.iter().enumerate() {
+            if r != 0 {
+                b = (3 - idx as u32) * 64 + (64 - r.leading_zeros());
+                break;
+            }
         }
-    }
+        b
+    };
 
     if rem_bits < div_bits {
         return [0u8; 32];
     }
 
-    // Shift divisor left to align with dividend
+    // Shift divisor left so its MSbit aligns with rem's MSbit
     let shift = rem_bits - div_bits;
-    let mut shifted_div = [0u64; 8];
 
-    // Shift div left by 'shift' bits into shifted_div
-    let word_shift = shift / 64;
-    let bit_shift = shift % 64;
-
-    for i in 0..4 {
-        let dest = 4 - word_shift + i;
-        if dest < 8 {
-            shifted_div[dest] |= div[i] >> (64 - bit_shift).min(63);
-            if dest > 0 && bit_shift > 0 {
-                shifted_div[dest - 1] |= div[i] << bit_shift;
-            } else if bit_shift == 0 {
-                shifted_div[dest] = div[i];
+    // shl_256: shift a 4-word big-endian number left by `n` bits
+    let shl_256 = |w: &[u64; 4], n: u32| -> [u64; 4] {
+        if n == 0 { return *w; }
+        let word_shift = (n / 64) as usize;
+        let bit_shift = n % 64;
+        let mut out = [0u64; 4];
+        for (i, out_word) in out.iter_mut().enumerate() {
+            let src = i + word_shift;
+            if src < 4 {
+                *out_word |= w[src] << bit_shift;
+                if bit_shift > 0 && src + 1 < 4 {
+                    *out_word |= w[src + 1] >> (64 - bit_shift);
+                }
             }
         }
-    }
+        out
+    };
 
-    // Perform division
-    for bit in (0..=shift).rev() {
-        // Compare remainder with shifted divisor
-        let mut cmp = std::cmp::Ordering::Equal;
-        for i in 0..8 {
-            match remainder[i].cmp(&shifted_div[i]) {
+    // shr1_256: shift a 4-word big-endian number right by 1 bit
+    let shr1_256 = |w: &[u64; 4]| -> [u64; 4] {
+        let mut out = [0u64; 4];
+        for i in (0..4).rev() {
+            out[i] = w[i] >> 1;
+            if i > 0 {
+                out[i] |= w[i - 1] << 63;
+            }
+        }
+        out
+    };
+
+    // cmp_256: compare two 4-word big-endian numbers; returns Ordering
+    let cmp_256 = |a: &[u64; 4], b: &[u64; 4]| -> std::cmp::Ordering {
+        for i in 0..4 {
+            match a[i].cmp(&b[i]) {
                 std::cmp::Ordering::Equal => continue,
-                ord => {
-                    cmp = ord;
-                    break;
-                }
+                ord => return ord,
             }
         }
+        std::cmp::Ordering::Equal
+    };
 
-        if cmp != std::cmp::Ordering::Less {
-            // Set quotient bit
-            let q_word = 3 - bit / 64;
-            let q_bit = bit % 64;
-            if q_word < 4 {
-                quotient[q_word] |= 1u64 << q_bit;
-            }
-
-            // Subtract shifted divisor from remainder
-            let mut borrow = 0i128;
-            for i in (0..8).rev() {
-                let diff = remainder[i] as i128 - shifted_div[i] as i128 - borrow;
-                if diff < 0 {
-                    remainder[i] = (diff + (1i128 << 64)) as u64;
-                    borrow = 1;
-                } else {
-                    remainder[i] = diff as u64;
-                    borrow = 0;
-                }
-            }
+    // sub_256: subtract b from a (a >= b assumed); returns a - b
+    let sub_256 = |a: &[u64; 4], b: &[u64; 4]| -> [u64; 4] {
+        let mut out = [0u64; 4];
+        let mut borrow = 0u64;
+        for i in (0..4).rev() {
+            let (d1, o1) = a[i].overflowing_sub(b[i]);
+            let (d2, o2) = d1.overflowing_sub(borrow);
+            out[i] = d2;
+            borrow = if o1 || o2 { 1 } else { 0 };
         }
+        out
+    };
 
-        // Shift divisor right by 1
-        let mut carry = 0u64;
-        for i in 0..8 {
-            let new_carry = shifted_div[i] << 63;
-            shifted_div[i] = (shifted_div[i] >> 1) | carry;
-            carry = new_carry;
+    // set_bit_256: set bit `n` (0 = LSB) in a 4-word big-endian number
+    let set_bit_256 = |w: &mut [u64; 4], n: u32| {
+        let word = 3 - (n / 64) as usize;
+        let bit = n % 64;
+        w[word] |= 1u64 << bit;
+    };
+
+    let mut shifted = shl_256(&div, shift);
+
+    // Long division: for each bit from `shift` down to 0, check if shifted divisor fits
+    for bit in (0..=shift).rev() {
+        if cmp_256(&rem, &shifted) != std::cmp::Ordering::Less {
+            rem = sub_256(&rem, &shifted);
+            set_bit_256(&mut quot, bit);
         }
+        shifted = shr1_256(&shifted);
     }
 
-    // Convert quotient back to bytes
+    // Convert quotient to bytes
     let mut result = [0u8; 32];
-    for i in 0..4 {
-        let word = quotient[i];
-        let offset = i * 8;
-        for j in 0..8 {
-            result[offset + j] = ((word >> (56 - j * 8)) & 0xff) as u8;
-        }
+    for (idx, &q) in quot.iter().enumerate() {
+        result[idx * 8..idx * 8 + 8].copy_from_slice(&q.to_be_bytes());
     }
-
     result
 }
 
