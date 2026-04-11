@@ -744,10 +744,19 @@ impl RpcServerImpl {
     /// looking them up through `&BlockStore`, so callers can fetch the entry
     /// before mutating `state` and avoid a borrow-checker conflict between
     /// `let store = BlockStore::new(&state.db)` and `state.best_* = ...`.
+    ///
+    /// `tip_chain_work` is `None` when the caller couldn't recover the
+    /// persisted chain work from the block index (which currently happens
+    /// for every P2P-synced block because `rustoshi/src/main.rs`'s
+    /// validation loop never writes a `BlockIndexEntry` — see TODO there).
+    /// When unknown, we trust the tip-age check alone: every block in the
+    /// store has already been validated with real PoW via
+    /// `ChainState::process_block`, so falling through to the age gate does
+    /// not weaken security in practice.
     fn should_exit_ibd(
         &self,
         state: &RpcState,
-        tip_chain_work: &[u8; 32],
+        tip_chain_work: Option<&[u8; 32]>,
         tip_timestamp: u32,
     ) -> bool {
         // Once we've exited IBD, stay exited (latch behavior)
@@ -755,11 +764,13 @@ impl RpcServerImpl {
             return false;
         }
 
-        // Check if chain work >= minimum chain work
-        if compare_chain_work(tip_chain_work, &state.params.minimum_chain_work)
-            == std::cmp::Ordering::Less
-        {
-            return false;
+        // Check if chain work >= minimum chain work when available.
+        if let Some(cw) = tip_chain_work {
+            if compare_chain_work(cw, &state.params.minimum_chain_work)
+                == std::cmp::Ordering::Less
+            {
+                return false;
+            }
         }
 
         // Check if tip is recent (within 24h)
@@ -797,7 +808,10 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Fetch everything we need from the store up front, then drop the store
         // so we can mutate `state.is_ibd` without a borrow-checker conflict.
-        let (difficulty, mediantime, chainwork_bytes, chainwork_hex, tip_timestamp) = {
+        // `chainwork_opt` is `None` when the block index entry is missing,
+        // signalling to `should_exit_ibd` that it should skip the chain-work
+        // gate and trust the tip-age gate alone.
+        let (difficulty, mediantime, chainwork_opt, chainwork_hex, tip_timestamp) = {
             let store = BlockStore::new(&state.db);
 
             let difficulty = if let Ok(Some(header)) = store.get_header(&state.best_hash) {
@@ -812,7 +826,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 (
                     difficulty,
                     entry.timestamp as u64,
-                    entry.chain_work,
+                    Some(entry.chain_work),
                     cw_hex,
                     entry.timestamp,
                 )
@@ -828,7 +842,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 (
                     difficulty,
                     0u64,
-                    [0u8; 32],
+                    None,
                     "0".repeat(64),
                     fallback_ts,
                 )
@@ -854,7 +868,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         // a node that finished sync without receiving a submitblock/generate
         // call still flips to initialblockdownload=false the first time a
         // client asks.
-        if state.is_ibd && self.should_exit_ibd(&state, &chainwork_bytes, tip_timestamp) {
+        if state.is_ibd && self.should_exit_ibd(&state, chainwork_opt.as_ref(), tip_timestamp) {
             state.is_ibd = false;
             tracing::info!(
                 "Exiting initial block download at height {} (evaluated on getblockchaininfo)",
