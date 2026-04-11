@@ -2823,6 +2823,7 @@ mod tests {
             self
         }
 
+        #[allow(dead_code)]
         fn with_preimage(mut self, hash: [u8; 32], preimage: Vec<u8>) -> Self {
             self.preimages.insert(hash, preimage);
             self
