@@ -86,6 +86,10 @@ pub struct BlockchainInfo {
     pub size_on_disk: u64,
     /// Whether the blockchain is pruned.
     pub pruned: bool,
+    /// Soft fork deployment state, keyed by deployment name.
+    /// Populated from the same canonical source as `getdeploymentinfo`.
+    #[serde(default)]
+    pub softforks: serde_json::Value,
     /// Any network and blockchain warnings.
     pub warnings: String,
 }
@@ -963,6 +967,7 @@ mod tests {
             chainwork: "00000000".to_string(),
             size_on_disk: 1000000,
             pruned: false,
+            softforks: serde_json::Value::Object(serde_json::Map::new()),
             warnings: "".to_string(),
         };
 
@@ -1169,6 +1174,7 @@ mod tests {
             chainwork: "00000000000000000000000000000000000000007b0e".to_string(),
             size_on_disk: 600_000_000_000,
             pruned: false,
+            softforks: serde_json::Value::Object(serde_json::Map::new()),
             warnings: String::new(),
         };
 
@@ -1201,6 +1207,7 @@ mod tests {
             chainwork: "0".repeat(64),
             size_on_disk: 1_000_000_000,
             pruned: false,
+            softforks: serde_json::Value::Object(serde_json::Map::new()),
             warnings: String::new(),
         };
 
