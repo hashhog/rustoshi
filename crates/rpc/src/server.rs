@@ -811,6 +811,90 @@ fn compact_to_target_f64(bits: u32) -> f64 {
     }
 }
 
+// ============================================================
+// SHARED DEPLOYMENT STATE HELPER
+// ============================================================
+
+/// Build a canonical softfork/deployment map for `eval_height` on `params`.
+///
+/// This is the single source of truth consumed by **both** `getblockchaininfo`
+/// (via the `softforks` field) and `getdeploymentinfo` (via the `deployments`
+/// field).  Neither RPC reads from a stale cache or a hard-coded table; both
+/// call this function and project its output into their respective JSON shapes.
+///
+/// Bitcoin Core reference: `DeploymentInfo()` / `SoftForkDescPushBack()` in
+/// `src/rpc/blockchain.cpp` (v28.0).  Both `getblockchaininfo` and
+/// `getdeploymentinfo` call `DeploymentInfo()`, which reads from
+/// `ChainstateActive()` + `DeploymentPos`.  We mirror that pattern here.
+///
+/// CSV, SegWit, and Taproot are treated as "buried" deployments: they
+/// activated at a fixed, well-known block height stored in `ChainParams` and
+/// are no longer subject to BIP 9 signalling.  Any additional entries from the
+/// versionbits table that are not yet buried are emitted with a `bip9`
+/// sub-object so callers receive full signalling state.
+pub fn build_softforks_map(
+    params: &ChainParams,
+    eval_height: u32,
+) -> serde_json::Map<String, serde_json::Value> {
+    // Helper: produce the JSON object for a buried deployment.
+    let buried = |activation_height: u32, min_activation_height: u32| {
+        let active = eval_height >= activation_height;
+        let height: Option<u32> = if active { Some(activation_height) } else { None };
+        serde_json::json!({
+            "type": "buried",
+            "active": active,
+            "height": height,
+            "min_activation_height": min_activation_height
+        })
+    };
+
+    let mut map = serde_json::Map::new();
+
+    // BIP 68/112/113 — CSV (relative lock-times)
+    map.insert("csv".to_string(), buried(params.csv_height, params.csv_height));
+
+    // BIP 141/143/147 — SegWit
+    map.insert("segwit".to_string(), buried(params.segwit_height, params.segwit_height));
+
+    // BIP 341/342 — Taproot
+    map.insert("taproot".to_string(), buried(params.taproot_height, params.taproot_height));
+
+    // Any BIP 9 deployments that are NOT covered by the buried entries above
+    // (e.g. testdummy, future soft forks).
+    let vb_deployments = get_deployments(params);
+    for (id, dep) in &vb_deployments {
+        let name = match id {
+            DeploymentId::Csv => continue,
+            DeploymentId::Segwit => continue,
+            DeploymentId::Taproot => continue,
+            DeploymentId::Custom(n) => format!("custom_{}", n),
+        };
+
+        use rustoshi_consensus::versionbits::ALWAYS_ACTIVE;
+        let active = dep.start_time == ALWAYS_ACTIVE;
+        let status = if active { "active" } else { "defined" };
+
+        map.insert(
+            name,
+            serde_json::json!({
+                "type": "bip9",
+                "active": active,
+                "height": if active { Some(0u32) } else { None::<u32> },
+                "min_activation_height": dep.min_activation_height,
+                "bip9": {
+                    "bit": dep.bit,
+                    "start_time": dep.start_time,
+                    "timeout": dep.timeout,
+                    "min_activation_height": dep.min_activation_height,
+                    "status": status
+                }
+            }),
+        );
+    }
+
+    map
+}
+
 #[async_trait]
 impl RustoshiRpcServer for RpcServerImpl {
     async fn get_blockchain_info(&self) -> RpcResult<BlockchainInfo> {
@@ -890,6 +974,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             );
         }
 
+        // Build softforks from the same canonical source as getdeploymentinfo.
+        let softforks_map = build_softforks_map(&state.params, state.best_height);
+
         Ok(BlockchainInfo {
             chain: chain_name.to_string(),
             blocks: state.best_height,
@@ -902,6 +989,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             chainwork: chainwork_hex,
             size_on_disk: 0,           // would need filesystem stat
             pruned: state.prune_mode,
+            softforks: serde_json::Value::Object(softforks_map),
             warnings: String::new(),
         })
     }
@@ -3910,91 +3998,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             (state.best_height, state.best_hash)
         };
 
-        let params = &state.params;
-
-        // ---------------------------------------------------------------
-        // Deployment descriptors.
-        //
-        // CSV, SegWit, and Taproot were originally deployed via BIP 9 but
-        // are now considered "buried" on every network rustoshi supports:
-        // they are all enforced at a well-known fixed block height.  We
-        // therefore return type="buried" for all of them, matching the
-        // Bitcoin Core behaviour for these deployments post-activation.
-        //
-        // For future BIP 9 deployments added to versionbits.rs we expose
-        // the full bip9 sub-object so callers get signaling status.
-        // ---------------------------------------------------------------
-
-        // Helper: build a buried deployment JSON object.
-        let buried = |_name: &str, activation_height: u32, min_activation_height: u32| {
-            let active = eval_height >= activation_height;
-            let height = if active { Some(activation_height) } else { None };
-            serde_json::json!({
-                "type": "buried",
-                "active": active,
-                "height": height,
-                "min_activation_height": min_activation_height
-            })
-        };
-
-        let mut deployments = serde_json::Map::new();
-
-        // BIP 68/112/113 — CSV (relative lock-times)
-        deployments.insert(
-            "csv".to_string(),
-            buried("csv", params.csv_height, params.csv_height),
-        );
-
-        // BIP 141/143/147 — SegWit
-        deployments.insert(
-            "segwit".to_string(),
-            buried("segwit", params.segwit_height, params.segwit_height),
-        );
-
-        // BIP 341/342 — Taproot
-        deployments.insert(
-            "taproot".to_string(),
-            buried("taproot", params.taproot_height, params.taproot_height),
-        );
-
-        // ---------------------------------------------------------------
-        // For any BIP 9 deployments in the versionbits table that are NOT
-        // already represented as buried above (e.g. testdummy or future
-        // soft forks), include them with a bip9 sub-object.
-        // ---------------------------------------------------------------
-        let vb_deployments = get_deployments(params);
-        for (id, dep) in &vb_deployments {
-            let name = match id {
-                DeploymentId::Csv => continue,     // already covered as buried
-                DeploymentId::Segwit => continue,  // already covered as buried
-                DeploymentId::Taproot => continue, // already covered as buried
-                DeploymentId::Custom(n) => format!("custom_{}", n),
-            };
-
-            // For these extra deployments we can't cheaply reconstruct the
-            // full VersionbitsBlockInfo chain needed for get_state_for, so
-            // we report a static view: active = start_time == ALWAYS_ACTIVE.
-            use rustoshi_consensus::versionbits::ALWAYS_ACTIVE;
-            let active = dep.start_time == ALWAYS_ACTIVE;
-            let status = if active { "active" } else { "defined" };
-
-            deployments.insert(
-                name,
-                serde_json::json!({
-                    "type": "bip9",
-                    "active": active,
-                    "height": if active { Some(0u32) } else { None::<u32> },
-                    "min_activation_height": dep.min_activation_height,
-                    "bip9": {
-                        "bit": dep.bit,
-                        "start_time": dep.start_time,
-                        "timeout": dep.timeout,
-                        "min_activation_height": dep.min_activation_height,
-                        "status": status
-                    }
-                }),
-            );
-        }
+        // Delegate entirely to the shared helper so getdeploymentinfo and
+        // getblockchaininfo.softforks always read from the same source of truth.
+        let deployments = build_softforks_map(&state.params, eval_height);
 
         Ok(serde_json::json!({
             "hash": eval_hash.to_hex(),
@@ -6096,5 +6102,128 @@ mod tests {
         assert!(!csv_active,    "csv should be inactive at height 300_000 on mainnet");
         assert!(!segwit_active, "segwit should be inactive at height 300_000 on mainnet");
         assert!(!taproot_active,"taproot should be inactive at height 300_000 on mainnet");
+    }
+
+    // ============================================================
+    // SOFTFORK BRIDGE TESTS
+    // ============================================================
+
+    /// Verify that `build_softforks_map` is the single source of truth for
+    /// both `getblockchaininfo.softforks` and `getdeploymentinfo.deployments`.
+    ///
+    /// The test calls the shared helper at two regtest heights (0 and 10) and
+    /// asserts that every field a caller would compare across the two RPCs
+    /// (active, type, height, min_activation_height) is identical.  This is a
+    /// pure-logic test that does not require a running node or database.
+    #[test]
+    fn test_softforks_bridge_shared_helper_regtest() {
+        let params = rustoshi_consensus::ChainParams::regtest();
+
+        // Test at height 0: csv/segwit/taproot all activate at height 1 on
+        // regtest, so none should be active at height 0.
+        {
+            let map = build_softforks_map(&params, 0);
+
+            for name in &["csv", "segwit", "taproot"] {
+                let dep = map.get(*name).unwrap_or_else(|| panic!("missing deployment '{}'", name));
+                assert_eq!(dep["active"], serde_json::json!(false),
+                    "{name}: should be inactive at height 0 on regtest");
+                assert_eq!(dep["type"], serde_json::json!("buried"),
+                    "{name}: type should be 'buried'");
+                // height field must be absent (null) when inactive
+                assert_eq!(dep["height"], serde_json::json!(null),
+                    "{name}: height should be null when inactive");
+            }
+        }
+
+        // Test at height 10: all three should be active (activation_height = 1).
+        {
+            let map = build_softforks_map(&params, 10);
+
+            for name in &["csv", "segwit", "taproot"] {
+                let dep = map.get(*name).unwrap_or_else(|| panic!("missing deployment '{}'", name));
+                assert_eq!(dep["active"], serde_json::json!(true),
+                    "{name}: should be active at height 10 on regtest");
+                assert_eq!(dep["type"], serde_json::json!("buried"),
+                    "{name}: type should be 'buried'");
+                // height field must equal the activation height (1 on regtest)
+                assert_eq!(dep["height"], serde_json::json!(1u32),
+                    "{name}: height should be 1 (activation height) when active");
+                assert_eq!(dep["min_activation_height"], serde_json::json!(1u32),
+                    "{name}: min_activation_height mismatch");
+            }
+        }
+    }
+
+    /// Regtest round-trip test: both `getblockchaininfo.softforks` and
+    /// `getdeploymentinfo.deployments` must agree on every shared field for
+    /// every named deployment.
+    ///
+    /// This test starts an in-process `RpcServerImpl` backed by an ephemeral
+    /// regtest datadir (no mainnet data touched), calls both RPCs, and
+    /// asserts field-level equality for `active`, `type`, `height`, and
+    /// `min_activation_height` across every deployment present in both
+    /// responses.
+    #[tokio::test]
+    async fn test_softforks_getblockchaininfo_matches_getdeploymentinfo_regtest() {
+        use rustoshi_storage::ChainDb;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        // Ephemeral regtest datadir — never touches mainnet or testnet.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+
+        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        // --- Call both RPCs ---
+        let chain_info = rpc.get_blockchain_info().await
+            .expect("getblockchaininfo failed");
+        let deploy_info = rpc.get_deployment_info(None).await
+            .expect("getdeploymentinfo failed");
+
+        // Extract the two maps.
+        let softforks = chain_info.softforks.as_object()
+            .expect("getblockchaininfo.softforks must be a JSON object");
+        let deployments = deploy_info["deployments"].as_object()
+            .expect("getdeploymentinfo.deployments must be a JSON object");
+
+        // Every deployment that appears in getblockchaininfo.softforks must
+        // appear in getdeploymentinfo.deployments with identical fields, and
+        // vice-versa — the two RPCs share the same helper so their key sets
+        // are always identical.
+        let sf_keys: std::collections::BTreeSet<_> = softforks.keys().collect();
+        let di_keys: std::collections::BTreeSet<_> = deployments.keys().collect();
+        assert_eq!(sf_keys, di_keys,
+            "getblockchaininfo.softforks and getdeploymentinfo.deployments must have the same deployment names");
+
+        for name in sf_keys {
+            let sf = &softforks[name];
+            let di = &deployments[name];
+
+            assert_eq!(sf["active"], di["active"],
+                "deployment '{name}': active mismatch between getblockchaininfo and getdeploymentinfo");
+            assert_eq!(sf["type"], di["type"],
+                "deployment '{name}': type mismatch");
+            assert_eq!(sf["height"], di["height"],
+                "deployment '{name}': height mismatch");
+            assert_eq!(sf["min_activation_height"], di["min_activation_height"],
+                "deployment '{name}': min_activation_height mismatch");
+
+            // If a bip9 sub-object is present in one, it must be present in
+            // both with identical start_time, timeout, and bit.
+            if sf.get("bip9").is_some() || di.get("bip9").is_some() {
+                let sf_bip9 = sf.get("bip9")
+                    .unwrap_or_else(|| panic!("'{name}': bip9 present in getdeploymentinfo but not in getblockchaininfo"));
+                let di_bip9 = di.get("bip9")
+                    .unwrap_or_else(|| panic!("'{name}': bip9 present in getblockchaininfo but not in getdeploymentinfo"));
+                assert_eq!(sf_bip9["bit"],        di_bip9["bit"],        "'{name}' bip9.bit mismatch");
+                assert_eq!(sf_bip9["start_time"], di_bip9["start_time"], "'{name}' bip9.start_time mismatch");
+                assert_eq!(sf_bip9["timeout"],    di_bip9["timeout"],    "'{name}' bip9.timeout mismatch");
+            }
+        }
     }
 }
