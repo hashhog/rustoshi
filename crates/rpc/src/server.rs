@@ -230,6 +230,11 @@ pub trait RustoshiRpc {
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> RpcResult<BlockchainInfo>;
 
+    /// hashhog W70: uniform fleet-wide sync-state report.
+    /// Spec: meta-repo `spec/getsyncstate.md`.
+    #[method(name = "getsyncstate")]
+    async fn get_sync_state(&self) -> RpcResult<SyncStateResult>;
+
     /// Get the hash of a block at a given height.
     #[method(name = "getblockhash")]
     async fn get_block_hash(&self, height: u32) -> RpcResult<String>;
@@ -1009,6 +1014,48 @@ impl RustoshiRpcServer for RpcServerImpl {
                 format!("Database error: {}", e),
             )),
         }
+    }
+
+    async fn get_sync_state(&self) -> RpcResult<SyncStateResult> {
+        let state = self.state.read().await;
+
+        let chain = match state.params.network_id {
+            NetworkId::Mainnet => "main",
+            NetworkId::Testnet3 => "test",
+            NetworkId::Testnet4 => "testnet4",
+            NetworkId::Signet => "signet",
+            NetworkId::Regtest => "regtest",
+        };
+
+        let progress = if state.header_height > 0 {
+            (state.best_height as f64 / state.header_height as f64).min(1.0)
+        } else {
+            0.0
+        };
+
+        let num_peers = {
+            let peer_state = self.peer_state.read().await;
+            peer_state
+                .peer_manager
+                .as_ref()
+                .map(|pm| pm.peer_count() as u32)
+                .unwrap_or(0)
+        };
+
+        Ok(SyncStateResult {
+            tip_height: state.best_height,
+            tip_hash: state.best_hash.to_hex(),
+            best_header_height: state.header_height,
+            best_header_hash: state.best_hash.to_hex(),
+            initial_block_download: state.is_ibd,
+            num_peers,
+            verification_progress: Some(progress),
+            blocks_in_flight: None,
+            blocks_pending_connect: None,
+            last_block_received_time: None,
+            chain: Some(chain.to_string()),
+            protocol_version: Some(rustoshi_network::message::PROTOCOL_VERSION),
+        })
     }
 
     async fn get_block(&self, hash: String, verbosity: Option<u8>) -> RpcResult<serde_json::Value> {
