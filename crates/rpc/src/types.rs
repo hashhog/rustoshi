@@ -95,6 +95,31 @@ pub struct BlockchainInfo {
 }
 
 // ============================================================
+// SYNC STATE (hashhog W70 fleet-wide RPC)
+// ============================================================
+
+/// Response for `getsyncstate` RPC (hashhog v1).
+///
+/// Authoritative spec: meta-repo `spec/getsyncstate.md`.
+/// MUST fields are always present; SHOULD fields are `null` when the
+/// implementation doesn't track them yet.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncStateResult {
+    pub tip_height: u32,
+    pub tip_hash: String,
+    pub best_header_height: u32,
+    pub best_header_hash: String,
+    pub initial_block_download: bool,
+    pub num_peers: u32,
+    pub verification_progress: Option<f64>,
+    pub blocks_in_flight: Option<u32>,
+    pub blocks_pending_connect: Option<u32>,
+    pub last_block_received_time: Option<i64>,
+    pub chain: Option<String>,
+    pub protocol_version: Option<i32>,
+}
+
+// ============================================================
 // BLOCK INFO
 // ============================================================
 
@@ -951,6 +976,45 @@ mod tests {
     fn test_rpc_config_testnet4() {
         let config = RpcConfig::testnet4();
         assert_eq!(config.bind_address, "127.0.0.1:48332");
+    }
+
+    #[test]
+    fn test_sync_state_result_all_fields_present() {
+        // W70: SHOULD fields serialize as JSON null when None — NOT omitted —
+        // so consumer parsers can index by key without presence checks.
+        let result = SyncStateResult {
+            tip_height: 0,
+            tip_hash: "0".repeat(64),
+            best_header_height: 0,
+            best_header_hash: "0".repeat(64),
+            initial_block_download: true,
+            num_peers: 0,
+            verification_progress: None,
+            blocks_in_flight: None,
+            blocks_pending_connect: None,
+            last_block_received_time: None,
+            chain: None,
+            protocol_version: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&result).unwrap();
+        for k in [
+            "tip_height",
+            "tip_hash",
+            "best_header_height",
+            "best_header_hash",
+            "initial_block_download",
+            "num_peers",
+            "verification_progress",
+            "blocks_in_flight",
+            "blocks_pending_connect",
+            "last_block_received_time",
+            "chain",
+            "protocol_version",
+        ] {
+            assert!(v.get(k).is_some(), "missing key {}", k);
+        }
+        assert!(v["verification_progress"].is_null());
+        assert!(v["chain"].is_null());
     }
 
     #[test]
