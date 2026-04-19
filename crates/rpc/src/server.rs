@@ -1978,7 +1978,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     bytessent: info.bytes_sent,
                     bytesrecv: info.bytes_recv,
                     conntime: 0, // would need connection start time
-                    timeoffset: 0,
+                    timeoffset: info.time_offset,
                     pingtime: info.ping_time.map(|d| d.as_secs_f64()),
                     minping: info.ping_time.map(|d| d.as_secs_f64()),
                     pingwait: None,
