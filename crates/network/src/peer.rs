@@ -87,6 +87,9 @@ pub struct PeerInfo {
     pub bytes_sent: u64,
     /// Total bytes received from this peer.
     pub bytes_recv: u64,
+    /// Clock-skew at handshake in seconds: peer_version_timestamp - our_unix_time.
+    /// Matches Bitcoin Core CNode::nTimeOffset. Zero until VERSION received.
+    pub time_offset: i64,
     /// Whether peer supports SegWit (NODE_WITNESS).
     pub supports_witness: bool,
     /// Whether peer supports sendheaders (BIP 130).
@@ -398,6 +401,10 @@ pub async fn run_outbound_peer(
     let their_version = &hs_result.version;
 
     // 4. Build peer info
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let peer_info = PeerInfo {
         addr,
         version: their_version.version,
@@ -413,6 +420,7 @@ pub async fn run_outbound_peer(
         ping_time: None,
         bytes_sent: 0,
         bytes_recv: 0,
+        time_offset: their_version.timestamp - now_unix,
         supports_witness: their_version.services & NODE_WITNESS != 0,
         supports_sendheaders: their_version.version >= SENDHEADERS_VERSION,
         supports_wtxid_relay: hs_result.wants_wtxid_relay,
@@ -996,6 +1004,7 @@ mod tests {
             ping_time: None,
             bytes_sent: 0,
             bytes_recv: 0,
+            time_offset: 0,
             supports_witness: true,
             supports_sendheaders: true,
             supports_wtxid_relay: false,
@@ -1244,6 +1253,7 @@ mod tests {
             ping_time: None,
             bytes_sent: 0,
             bytes_recv: 0,
+            time_offset: 0,
             supports_witness: false,
             supports_sendheaders: true,
             supports_wtxid_relay: false,
