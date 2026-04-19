@@ -1091,6 +1091,7 @@ impl PeerManager {
                     ping_time: None,
                     bytes_sent: 0,
                     bytes_recv: 0,
+                    time_offset: 0,
                     supports_witness: false,
                     supports_sendheaders: false,
                     supports_wtxid_relay: false,
@@ -2176,6 +2177,10 @@ pub async fn run_inbound_peer(
     }
 
     // Connection established
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let peer_info = PeerInfo {
         addr,
         version: their_version.version,
@@ -2191,6 +2196,7 @@ pub async fn run_inbound_peer(
         ping_time: None,
         bytes_sent: 0,
         bytes_recv: 0,
+        time_offset: their_version.timestamp - now_unix,
         supports_witness: their_version.services & NODE_WITNESS != 0,
         supports_sendheaders: their_version.version >= SENDHEADERS_VERSION,
         supports_wtxid_relay: false,
