@@ -403,6 +403,24 @@ pub trait SignatureChecker {
     ) -> bool {
         false
     }
+
+    /// Verify a BIP-340 Schnorr signature for tapscript script-path
+    /// (BIP-342 OP_CHECKSIG / OP_CHECKSIGVERIFY / OP_CHECKSIGADD).
+    ///
+    /// Same as `check_schnorr_sig` but uses BIP-341 sighash with
+    /// ext_flag=1 — the digest commits to `tapleaf_hash` and the
+    /// position of the most recent OP_CODESEPARATOR (0xFFFFFFFF if
+    /// none has been encountered).
+    fn check_schnorr_sig_tapscript(
+        &self,
+        _sig: &[u8],
+        _xonly_pubkey: &[u8; 32],
+        _tapleaf_hash: &[u8; 32],
+        _codesep_pos: u32,
+        _annex: Option<&[u8]>,
+    ) -> bool {
+        false
+    }
 }
 
 /// Dummy signature checker that always returns false.
@@ -657,6 +675,15 @@ fn check_pubkey_encoding(pubkey: &[u8], flags: &ScriptFlags) -> Result<(), Scrip
 /// The stack type used by the script interpreter.
 pub type Stack = Vec<Vec<u8>>;
 
+/// Tapscript script-path execution context — BIP-342 OP_CHECKSIG and
+/// OP_CHECKSIGADD need access to the tapleaf hash and witness annex
+/// to compute the BIP-341 ext_flag=1 sighash. Only set when entering
+/// a tapscript leaf via `eval_script_tapscript`.
+pub struct TapscriptCtx<'a> {
+    pub tapleaf_hash: &'a [u8; 32],
+    pub annex: Option<&'a [u8]>,
+}
+
 /// Execution context for script evaluation.
 struct ExecContext<'a> {
     stack: Stack,
@@ -667,6 +694,7 @@ struct ExecContext<'a> {
     checker: &'a dyn SignatureChecker,
     sig_version: SigVersion,
     codesep_pos: u32, // Position of last OP_CODESEPARATOR
+    tapscript: Option<TapscriptCtx<'a>>, // Some(_) iff sig_version == Tapscript
 }
 
 impl<'a> ExecContext<'a> {
@@ -685,6 +713,26 @@ impl<'a> ExecContext<'a> {
             checker,
             sig_version,
             codesep_pos: 0xFFFFFFFF,
+            tapscript: None,
+        }
+    }
+
+    fn with_stack_tapscript(
+        stack: Stack,
+        flags: &'a ScriptFlags,
+        checker: &'a dyn SignatureChecker,
+        tapscript: TapscriptCtx<'a>,
+    ) -> Self {
+        ExecContext {
+            stack,
+            altstack: Vec::new(),
+            exec_stack: Vec::new(),
+            op_count: 0,
+            flags,
+            checker,
+            sig_version: SigVersion::Tapscript,
+            codesep_pos: 0xFFFFFFFF,
+            tapscript: Some(tapscript),
         }
     }
 
@@ -1353,13 +1401,25 @@ fn eval_script_internal(
                         return Err(ScriptError::TapscriptEmptyPubkey);
                     }
                     if pubkey.len() == 32 {
-                        // 32-byte pubkey: Schnorr signature check
-                        // For now, treat empty sig as false, non-empty as checker
+                        // 32-byte pubkey: Schnorr signature check via BIP-341
+                        // sighash with ext_flag=1 (script-path).
                         let success = if sig.is_empty() {
                             false
+                        } else if let Some(ts) = ctx.tapscript.as_ref() {
+                            let mut xonly = [0u8; 32];
+                            xonly.copy_from_slice(&pubkey);
+                            ctx.checker.check_schnorr_sig_tapscript(
+                                &sig,
+                                &xonly,
+                                ts.tapleaf_hash,
+                                ctx.codesep_pos,
+                                ts.annex,
+                            )
                         } else {
-                            let subscript = get_subscript(full_script, ctx.codesep_pos);
-                            ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
+                            // Tapscript context unavailable — caller invoked
+                            // eval_script (no tapscript ctx) on a tapscript leaf.
+                            // Fail closed; this is an internal-API misuse.
+                            false
                         };
                         if !success && !sig.is_empty() {
                             return Err(ScriptError::NullFail);
@@ -1414,9 +1474,18 @@ fn eval_script_internal(
                     if pubkey.len() == 32 {
                         let success = if sig.is_empty() {
                             false
+                        } else if let Some(ts) = ctx.tapscript.as_ref() {
+                            let mut xonly = [0u8; 32];
+                            xonly.copy_from_slice(&pubkey);
+                            ctx.checker.check_schnorr_sig_tapscript(
+                                &sig,
+                                &xonly,
+                                ts.tapleaf_hash,
+                                ctx.codesep_pos,
+                                ts.annex,
+                            )
                         } else {
-                            let subscript = get_subscript(full_script, ctx.codesep_pos);
-                            ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
+                            false
                         };
                         if !success && !sig.is_empty() {
                             return Err(ScriptError::NullFail);
@@ -1743,12 +1812,55 @@ fn eval_script_internal(
 
             // ==================== Tapscript ====================
             Opcode::OP_CHECKSIGADD => {
-                // Only valid in tapscript
+                // BIP-342: only valid in tapscript.
                 if ctx.sig_version != SigVersion::Tapscript {
                     return Err(ScriptError::BadOpcode);
                 }
-                // Not implementing full tapscript yet
-                return Err(ScriptError::BadOpcode);
+
+                // Stack order (top-down): pubkey, num, sig.
+                let pubkey = ctx.pop()?;
+                let num_bytes = ctx.pop()?;
+                let sig = ctx.pop()?;
+
+                let num = decode_script_num(
+                    &num_bytes,
+                    ctx.flags.verify_minimaldata,
+                    DEFAULT_MAX_NUM_SIZE,
+                )?;
+
+                if pubkey.is_empty() {
+                    return Err(ScriptError::TapscriptEmptyPubkey);
+                }
+
+                let success = if pubkey.len() == 32 {
+                    if sig.is_empty() {
+                        false
+                    } else if let Some(ts) = ctx.tapscript.as_ref() {
+                        let mut xonly = [0u8; 32];
+                        xonly.copy_from_slice(&pubkey);
+                        ctx.checker.check_schnorr_sig_tapscript(
+                            &sig,
+                            &xonly,
+                            ts.tapleaf_hash,
+                            ctx.codesep_pos,
+                            ts.annex,
+                        )
+                    } else {
+                        false
+                    }
+                } else {
+                    // BIP-342: unknown pubkey type — succeed unconditionally
+                    // (soft-fork safe). DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+                    // is a SegWit-v0 flag and does NOT apply to tapscript.
+                    true
+                };
+
+                if !success && !sig.is_empty() {
+                    return Err(ScriptError::NullFail);
+                }
+
+                let result = if success { num + 1 } else { num };
+                ctx.push(encode_script_num(result))?;
             }
 
             // ==================== Invalid/Unknown ====================
@@ -1889,6 +2001,29 @@ pub fn eval_script(
         flags,
         checker,
         sig_version,
+    );
+
+    let result = eval_script_internal(&mut ctx, script, script);
+
+    *stack = ctx.stack;
+    result
+}
+
+/// Evaluate a tapscript leaf (BIP-342) — same as `eval_script` but with
+/// the tapleaf hash + annex needed for ext_flag=1 sighash computation
+/// inside OP_CHECKSIG / OP_CHECKSIGVERIFY / OP_CHECKSIGADD.
+pub fn eval_script_tapscript(
+    stack: &mut Stack,
+    script: &[u8],
+    flags: &ScriptFlags,
+    checker: &dyn SignatureChecker,
+    tapscript: TapscriptCtx<'_>,
+) -> Result<(), ScriptError> {
+    let mut ctx = ExecContext::with_stack_tapscript(
+        std::mem::take(stack),
+        flags,
+        checker,
+        tapscript,
     );
 
     let result = eval_script_internal(&mut ctx, script, script);
@@ -2401,7 +2536,19 @@ fn verify_witness_program(
                         // Stack = all witness items except script and control block
                         let mut stack: Stack = effective_witness[..effective_witness.len() - 2].to_vec();
 
-                        eval_script(&mut stack, tap_script, flags, checker, SigVersion::Tapscript)?;
+                        // Annex (if present) is the *original* last witness item,
+                        // including the leading 0x50 prefix byte. Used by BIP-341
+                        // sighash inside OP_CHECKSIG / OP_CHECKSIGVERIFY / OP_CHECKSIGADD.
+                        let annex = if has_annex {
+                            Some(witness.last().unwrap().as_slice())
+                        } else {
+                            None
+                        };
+                        let tapscript_ctx = TapscriptCtx {
+                            tapleaf_hash: &tapleaf_hash,
+                            annex,
+                        };
+                        eval_script_tapscript(&mut stack, tap_script, flags, checker, tapscript_ctx)?;
 
                         // Cleanstack: exactly one element
                         if stack.len() != 1 {

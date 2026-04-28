@@ -1980,6 +1980,36 @@ impl<'a> SignatureChecker for TransactionSignatureChecker<'a> {
         xonly_pubkey: &[u8; 32],
         annex: Option<&[u8]>,
     ) -> bool {
+        self.check_schnorr_inner(sig, xonly_pubkey, annex, None)
+    }
+
+    fn check_schnorr_sig_tapscript(
+        &self,
+        sig: &[u8],
+        xonly_pubkey: &[u8; 32],
+        tapleaf_hash: &[u8; 32],
+        codesep_pos: u32,
+        annex: Option<&[u8]>,
+    ) -> bool {
+        let ctx = crate::script::taproot_sighash::TapscriptContext {
+            tapleaf_hash,
+            codesep_pos,
+        };
+        self.check_schnorr_inner(sig, xonly_pubkey, annex, Some(ctx))
+    }
+}
+
+impl<'a> TransactionSignatureChecker<'a> {
+    /// Shared Schnorr verification path for both key-path and tapscript
+    /// script-path. `script_path = None` for key-path (ext_flag=0); pass
+    /// the tapscript context (tapleaf_hash + codesep_pos) for ext_flag=1.
+    fn check_schnorr_inner(
+        &self,
+        sig: &[u8],
+        xonly_pubkey: &[u8; 32],
+        annex: Option<&[u8]>,
+        script_path: Option<crate::script::taproot_sighash::TapscriptContext<'_>>,
+    ) -> bool {
         use crate::script::taproot_sighash::{
             compute_taproot_sighash, TaprootPrevouts, SIGHASH_DEFAULT,
         };
@@ -2019,7 +2049,7 @@ impl<'a> SignatureChecker for TransactionSignatureChecker<'a> {
             prevouts,
             hash_type,
             annex,
-            None, // key-path: ext_flag = 0
+            script_path,
         ) {
             Ok(h) => h,
             Err(_) => return false,
