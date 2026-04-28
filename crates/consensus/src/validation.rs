@@ -1195,13 +1195,25 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
             }
         }
 
+        // Materialize per-input prevouts once so the Taproot checker can
+        // build BIP-341 sha_amounts / sha_scriptpubkeys without re-walking
+        // `coins` on every call. Cheap: ~Coin::SIZE * inputs bytes per tx.
+        let spent_amounts: Vec<u64> = coins.iter().map(|c| c.value).collect();
+        let spent_scripts: Vec<Vec<u8>> = coins.iter().map(|c| c.script_pubkey.clone()).collect();
+
         // Second pass: verify scripts and update UTXO set
         for (input_idx, input) in tx.inputs.iter().enumerate() {
             let coin = &coins[input_idx];
 
             // Verify the script (skip if below assume-valid height)
             if !skip_scripts {
-                let checker = TransactionSignatureChecker::new(tx, input_idx, coin.value);
+                let checker = TransactionSignatureChecker::new(
+                    tx,
+                    input_idx,
+                    coin.value,
+                    &spent_amounts,
+                    &spent_scripts,
+                );
                 verify_script(
                     &input.script_sig,
                     &coin.script_pubkey,
@@ -1331,7 +1343,21 @@ pub fn validate_scripts_parallel_with_cache(
     // Convert flags to u32 for cache key
     let flags_bits = flags.to_bits();
 
-    // Collect all (tx, input_index, coin) tuples for non-coinbase transactions
+    // Materialize per-tx prevouts once so each parallel checker can build
+    // BIP-341 sha_amounts / sha_scriptpubkeys cheaply from slices.
+    // Indexed by tx_idx_in_coins (= block-level tx index minus the coinbase).
+    let per_tx_prevouts: Vec<(Vec<u64>, Vec<Vec<u8>>)> = coins
+        .iter()
+        .map(|tc| {
+            (
+                tc.iter().map(|c| c.value).collect(),
+                tc.iter().map(|c| c.script_pubkey.clone()).collect(),
+            )
+        })
+        .collect();
+
+    // Collect all (tx, input_index, coin, tx_coin_idx) tuples for
+    // non-coinbase transactions. tx_coin_idx indexes into per_tx_prevouts.
     let script_checks: Vec<_> = block
         .transactions
         .iter()
@@ -1340,7 +1366,7 @@ pub fn validate_scripts_parallel_with_cache(
         .flat_map(|(tx_idx, tx)| {
             tx.inputs.iter().enumerate().map(move |(input_idx, _input)| {
                 // tx_idx - 1 because we skip coinbase in the coins array
-                (tx, input_idx, &coins[tx_idx - 1][input_idx])
+                (tx, input_idx, &coins[tx_idx - 1][input_idx], tx_idx - 1)
             })
         })
         .collect();
@@ -1348,7 +1374,7 @@ pub fn validate_scripts_parallel_with_cache(
     // Validate all scripts in parallel
     let results: Vec<Result<(), TxValidationError>> = script_checks
         .par_iter()
-        .map(|(tx, input_idx, coin)| {
+        .map(|(tx, input_idx, coin, tx_coin_idx)| {
             let txid_bytes: [u8; 32] = tx.txid().0;
 
             // Check cache first
@@ -1359,7 +1385,14 @@ pub fn validate_scripts_parallel_with_cache(
             }
 
             // Verify script
-            let checker = TransactionSignatureChecker::new(tx, *input_idx, coin.value);
+            let (spent_amounts, spent_scripts) = &per_tx_prevouts[*tx_coin_idx];
+            let checker = TransactionSignatureChecker::new(
+                tx,
+                *input_idx,
+                coin.value,
+                spent_amounts,
+                spent_scripts,
+            );
             let result = verify_script(
                 &tx.inputs[*input_idx].script_sig,
                 &coin.script_pubkey,
@@ -1781,19 +1814,40 @@ fn lax_der_parse(data: &[u8]) -> Result<secp256k1::ecdsa::Signature, secp256k1::
 ///
 /// Implements the SignatureChecker trait to verify signatures
 /// against a specific transaction input.
+///
+/// `spent_amounts` and `spent_scripts` carry the per-input prevouts
+/// the *whole* transaction is spending; they are required for
+/// BIP-341 Taproot sighash computation (`sha_amounts` and
+/// `sha_scriptpubkeys` digest all inputs). For pre-Taproot scripts,
+/// these slices are unused and may be empty.
 pub struct TransactionSignatureChecker<'a> {
     tx: &'a Transaction,
     input_index: usize,
     amount: u64,
+    spent_amounts: &'a [u64],
+    spent_scripts: &'a [Vec<u8>],
 }
 
 impl<'a> TransactionSignatureChecker<'a> {
     /// Create a new signature checker for a transaction input.
-    pub fn new(tx: &'a Transaction, input_index: usize, amount: u64) -> Self {
+    ///
+    /// Pass `&[]` for `spent_amounts` and `spent_scripts` when the
+    /// caller knows Taproot won't be exercised (e.g. legacy script
+    /// unit tests). For mainnet block validation, pass slices covering
+    /// every input's prevout.
+    pub fn new(
+        tx: &'a Transaction,
+        input_index: usize,
+        amount: u64,
+        spent_amounts: &'a [u64],
+        spent_scripts: &'a [Vec<u8>],
+    ) -> Self {
         Self {
             tx,
             input_index,
             amount,
+            spent_amounts,
+            spent_scripts,
         }
     }
 }
@@ -1918,6 +1972,71 @@ impl<'a> SignatureChecker for TransactionSignatureChecker<'a> {
         }
 
         true
+    }
+
+    fn check_schnorr_sig(
+        &self,
+        sig: &[u8],
+        xonly_pubkey: &[u8; 32],
+        annex: Option<&[u8]>,
+    ) -> bool {
+        use crate::script::taproot_sighash::{
+            compute_taproot_sighash, TaprootPrevouts, SIGHASH_DEFAULT,
+        };
+
+        // BIP-341: signature is 64B (SIGHASH_DEFAULT) or 65B (with hash_type at byte 64).
+        let (sig_bytes, hash_type) = match sig.len() {
+            64 => (sig, SIGHASH_DEFAULT),
+            65 => {
+                let ht = sig[64];
+                // Strict: explicit SIGHASH_DEFAULT (0x00) byte is invalid;
+                // 64-byte form must be used for default. Per BIP-341.
+                if ht == SIGHASH_DEFAULT {
+                    return false;
+                }
+                (&sig[..64], ht)
+            }
+            _ => return false,
+        };
+
+        // Need full prevouts; if the caller didn't supply them, fail closed.
+        if self.spent_amounts.len() != self.tx.inputs.len()
+            || self.spent_scripts.len() != self.tx.inputs.len()
+        {
+            return false;
+        }
+
+        let scripts_refs: Vec<&[u8]> =
+            self.spent_scripts.iter().map(|s| s.as_slice()).collect();
+        let prevouts = TaprootPrevouts {
+            amounts: self.spent_amounts,
+            scripts: &scripts_refs,
+        };
+
+        let sighash = match compute_taproot_sighash(
+            self.tx,
+            self.input_index,
+            prevouts,
+            hash_type,
+            annex,
+            None, // key-path: ext_flag = 0
+        ) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        let xonly = match secp256k1::XOnlyPublicKey::from_slice(xonly_pubkey) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let sig_obj = match secp256k1::schnorr::Signature::from_slice(sig_bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let msg = secp256k1::Message::from_digest(sighash);
+
+        let secp = secp256k1::Secp256k1::verification_only();
+        secp.verify_schnorr(&sig_obj, &msg, &xonly).is_ok()
     }
 }
 
@@ -2393,7 +2512,7 @@ mod tests {
             lock_time: 500000,
         };
 
-        let checker = TransactionSignatureChecker::new(&tx, 0, 0);
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
 
         // Locktime <= tx locktime should succeed
         assert!(checker.check_locktime(500000));
@@ -2420,7 +2539,7 @@ mod tests {
             lock_time: 100, // Block height
         };
 
-        let checker = TransactionSignatureChecker::new(&tx, 0, 0);
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
 
         // Block height locktime
         assert!(checker.check_locktime(50));
@@ -2446,7 +2565,7 @@ mod tests {
             lock_time: 500000,
         };
 
-        let checker = TransactionSignatureChecker::new(&tx, 0, 0);
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
 
         // Should fail because sequence is final
         assert!(!checker.check_locktime(500000));
@@ -2469,7 +2588,7 @@ mod tests {
             lock_time: 0,
         };
 
-        let checker = TransactionSignatureChecker::new(&tx, 0, 0);
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
 
         // Required sequence with disable flag set should always succeed
         assert!(checker.check_sequence(0x80000000u32 as i64));
@@ -2495,7 +2614,7 @@ mod tests {
             lock_time: 0,
         };
 
-        let checker = TransactionSignatureChecker::new(&tx, 0, 0);
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
 
         // Should succeed for <= 100 blocks
         assert!(checker.check_sequence(100));
