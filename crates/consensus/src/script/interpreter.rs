@@ -383,6 +383,26 @@ pub trait SignatureChecker {
     ///
     /// For OP_CHECKSEQUENCEVERIFY (BIP-112).
     fn check_sequence(&self, sequence: i64) -> bool;
+
+    /// Verify a BIP-340 Schnorr signature for Taproot key-path spending.
+    ///
+    /// `sig` is 64 bytes (SIGHASH_DEFAULT) or 65 bytes (with explicit
+    /// sighash type byte at offset 64). `xonly_pubkey` is the 32-byte
+    /// x-only output key from the witness program.
+    ///
+    /// `annex` should be `Some(_)` if a witness annex is present; the
+    /// bytes must include the leading 0x50.
+    ///
+    /// Default impl returns false so legacy `DummyChecker` and similar
+    /// stubs continue to compile.
+    fn check_schnorr_sig(
+        &self,
+        _sig: &[u8],
+        _xonly_pubkey: &[u8; 32],
+        _annex: Option<&[u8]>,
+    ) -> bool {
+        false
+    }
 }
 
 /// Dummy signature checker that always returns false.
@@ -2239,10 +2259,27 @@ fn verify_witness_program(
                 };
 
                 if effective_witness.len() == 1 {
-                    // Key-path spending: single witness element is the signature
-                    // Verify Schnorr signature against the output key
-                    // For now, accept (key-path spend validation requires BIP-340 sighash)
-                    Ok(())
+                    // Key-path spending: single witness element is the signature.
+                    // BIP-341: signature is verified against the witness program
+                    // (the tweaked output key Q) directly — no on-the-fly tweak
+                    // computation needed by the verifier.
+                    let sig = &effective_witness[0];
+                    let mut xonly_pubkey = [0u8; 32];
+                    xonly_pubkey.copy_from_slice(program);
+
+                    // Annex (if present) is the *original* last witness element,
+                    // including the leading 0x50 prefix byte.
+                    let annex = if has_annex {
+                        Some(witness.last().unwrap().as_slice())
+                    } else {
+                        None
+                    };
+
+                    if checker.check_schnorr_sig(sig, &xonly_pubkey, annex) {
+                        Ok(())
+                    } else {
+                        Err(ScriptError::EvalFalse)
+                    }
                 } else if effective_witness.len() >= 2 {
                     // Script-path spending
                     // Last element = control block, second-to-last = script
