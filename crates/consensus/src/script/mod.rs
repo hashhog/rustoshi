@@ -60,6 +60,7 @@
 pub mod interpreter;
 pub mod num;
 pub mod opcodes;
+pub mod taproot_sighash;
 
 pub use interpreter::{
     eval_script, is_p2a, is_p2a_program, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
