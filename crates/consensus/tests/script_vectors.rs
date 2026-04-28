@@ -618,7 +618,7 @@ fn script_tests_json() {
         let spending_tx = build_spending_tx(&crediting_tx, &script_sig, witness_data.clone());
 
         // Create a real signature checker with the spending transaction
-        let checker = TransactionSignatureChecker::new(&spending_tx, 0, amount);
+        let checker = TransactionSignatureChecker::new(&spending_tx, 0, amount, &[], &[]);
 
         let result = verify_script(
             &script_sig,
