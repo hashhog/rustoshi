@@ -1835,6 +1835,17 @@ impl Mempool {
         }).collect()
     }
 
+    /// Collect all mempool transactions as `(txid, wtxid)` pairs.
+    /// Used by the BIP-35 `mempool` message handler to build the inv response.
+    /// Caller picks txid vs wtxid based on whether the requesting peer
+    /// negotiated BIP 339 wtxid relay.
+    pub fn collect_txid_wtxid(&self) -> Vec<(Hash256, Hash256)> {
+        self.transactions
+            .values()
+            .map(|entry| (entry.txid, entry.tx.wtxid()))
+            .collect()
+    }
+
     /// Check if a transaction is in the mempool.
     pub fn contains(&self, txid: &Hash256) -> bool {
         self.transactions.contains_key(txid)
@@ -3238,6 +3249,57 @@ mod tests {
         assert_eq!(result.unwrap(), txid);
         assert!(mempool.contains(&txid));
         assert_eq!(mempool.size(), 1);
+    }
+
+    /// BIP 35 / mempool message: `collect_txid_wtxid` walks the mempool and
+    /// returns one (txid, wtxid) pair per entry — used by the network handler
+    /// to assemble inv responses to a peer's `mempool` request.
+    #[test]
+    fn test_collect_txid_wtxid_for_mempool_message() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        // Empty mempool: zero entries.
+        assert!(mempool.collect_txid_wtxid().is_empty());
+
+        let prev1 =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000011")
+                .unwrap();
+        let prev2 =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000012")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: prev1, vout: 0 }, 100_000),
+            (OutPoint { txid: prev2, vout: 0 }, 100_000),
+        ]);
+
+        let tx1 = make_tx(vec![(prev1, 0)], vec![90_000], 1);
+        let tx2 = make_tx(vec![(prev2, 0)], vec![80_000], 1);
+        let txid1 = tx1.txid();
+        let wtxid1 = tx1.wtxid();
+        let txid2 = tx2.txid();
+        let wtxid2 = tx2.wtxid();
+
+        mempool
+            .add_transaction(tx1, &|op| utxos.get(op).cloned())
+            .expect("tx1 accepted");
+        mempool
+            .add_transaction(tx2, &|op| utxos.get(op).cloned())
+            .expect("tx2 accepted");
+
+        let pairs = mempool.collect_txid_wtxid();
+        assert_eq!(pairs.len(), 2);
+
+        let mut txids: Vec<Hash256> = pairs.iter().map(|(t, _)| *t).collect();
+        let mut wtxids: Vec<Hash256> = pairs.iter().map(|(_, w)| *w).collect();
+        txids.sort();
+        wtxids.sort();
+        let mut expected_txids = vec![txid1, txid2];
+        let mut expected_wtxids = vec![wtxid1, wtxid2];
+        expected_txids.sort();
+        expected_wtxids.sort();
+        assert_eq!(txids, expected_txids);
+        assert_eq!(wtxids, expected_wtxids);
     }
 
     #[test]

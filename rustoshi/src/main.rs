@@ -58,6 +58,11 @@ struct Cli {
     #[arg(long, default_value = "true")]
     listen: bool,
 
+    /// Advertise NODE_BLOOM (BIP 37) and serve BIP 35 mempool requests.
+    /// Mirrors Bitcoin Core's `-peerbloomfilters` (default: enabled).
+    #[arg(long, default_value = "true")]
+    peerbloomfilters: bool,
+
     /// P2P listen port (overrides network default)
     #[arg(long)]
     port: Option<u16>,
@@ -1049,6 +1054,7 @@ async fn main() -> anyhow::Result<()> {
         max_outbound_block_relay: 2, // Block-relay-only anchors for eclipse resistance
         listen_port: cli.port.unwrap_or(params.default_port),
         listen: cli.listen,
+        peer_bloom_filters: cli.peerbloomfilters,
         data_dir: datadir.clone(),
         ..Default::default()
     };
@@ -1816,6 +1822,89 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         }
                                         _ => {}
+                                    }
+                                }
+                            }
+
+                            // BIP 35: Respond to a peer's `mempool` request with the full
+                            // set of in-mempool txids (or wtxids when the peer negotiated
+                            // BIP 339 wtxid relay), chunked into inv messages of
+                            // MAX_INV_SIZE entries.  Mirrors Bitcoin Core's handler in
+                            // `net_processing.cpp` (search for `NetMsgType::MEMPOOL`).
+                            NetworkMessage::MemPool => {
+                                use rustoshi_network::message::MAX_INV_SIZE;
+
+                                // Gate: drop + disconnect if we did not advertise NODE_BLOOM.
+                                // Core: `if (!(peer.m_our_services & NODE_BLOOM) && !pfrom.HasPermission(...))
+                                //       { ... pfrom.fDisconnect = true; }`
+                                let (bloom_enabled, peer_supports_wtxid, has_pm) = {
+                                    let ps = peer_state.read().await;
+                                    match ps.peer_manager.as_ref() {
+                                        Some(pm) => (
+                                            pm.peer_bloom_filters_enabled(),
+                                            pm.get_peer_info(peer_id)
+                                                .map(|i| i.supports_wtxid_relay)
+                                                .unwrap_or(false),
+                                            true,
+                                        ),
+                                        None => (false, false, false),
+                                    }
+                                };
+
+                                if !has_pm {
+                                    // Peer manager unavailable — nothing to do.
+                                } else if !bloom_enabled {
+                                    tracing::debug!(
+                                        "mempool request from peer {} with bloom filters disabled, disconnecting",
+                                        peer_id.0
+                                    );
+                                    let mut ps = peer_state.write().await;
+                                    if let Some(ref mut pm) = ps.peer_manager {
+                                        pm.disconnect_peer(peer_id).await;
+                                    }
+                                } else {
+                                    // Walk the mempool and build inv vectors.
+                                    let entries: Vec<(Hash256, Hash256)> = {
+                                        let rpc = rpc_state.read().await;
+                                        rpc.mempool.collect_txid_wtxid()
+                                    };
+
+                                    if entries.is_empty() {
+                                        tracing::debug!(
+                                            "mempool request from peer {}: empty mempool, no inv to send",
+                                            peer_id.0
+                                        );
+                                    } else {
+                                        let inv_type = if peer_supports_wtxid {
+                                            InvType::MsgWitnessTx
+                                        } else {
+                                            InvType::MsgTx
+                                        };
+                                        let mut invs: Vec<InvVector> = entries
+                                            .into_iter()
+                                            .map(|(txid, wtxid)| InvVector {
+                                                inv_type,
+                                                hash: if peer_supports_wtxid { wtxid } else { txid },
+                                            })
+                                            .collect();
+
+                                        tracing::debug!(
+                                            "mempool request from peer {}: sending {} inv entries (wtxid={})",
+                                            peer_id.0, invs.len(), peer_supports_wtxid
+                                        );
+
+                                        // Chunk into MAX_INV_SIZE-sized inv messages.
+                                        let ps = peer_state.read().await;
+                                        if let Some(ref pm) = ps.peer_manager {
+                                            while !invs.is_empty() {
+                                                let take = invs.len().min(MAX_INV_SIZE);
+                                                let chunk: Vec<InvVector> = invs.drain(..take).collect();
+                                                pm.try_send_to_peer(
+                                                    peer_id,
+                                                    NetworkMessage::Inv(chunk),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }

@@ -18,7 +18,8 @@ use crate::eviction::{select_node_to_evict, EvictionCandidate, EvictionCandidate
 use crate::message::{
     parse_message_header, serialize_message, NetAddress, NetworkMessage,
     TimestampedNetAddress, VersionMessage, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
-    MIN_WITNESS_PROTO_VERSION, NODE_NETWORK, NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
+    MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_NETWORK, NODE_WITNESS, PROTOCOL_VERSION,
+    SENDHEADERS_VERSION,
 };
 use crate::v2_transport::{
     constants::{
@@ -70,6 +71,9 @@ pub struct PeerManagerConfig {
     pub listen_port: u16,
     /// Whether to accept inbound connections.
     pub listen: bool,
+    /// Whether to advertise NODE_BLOOM (BIP 37) and serve BIP 35 mempool requests.
+    /// Bitcoin Core's `-peerbloomfilters` (default: true).
+    pub peer_bloom_filters: bool,
     /// Data directory for persistent state (banlist, anchors.dat, etc.).
     pub data_dir: PathBuf,
 }
@@ -91,6 +95,7 @@ impl Default for PeerManagerConfig {
             ban_duration: Duration::from_secs(24 * 60 * 60),
             listen_port: 8333,
             listen: true,
+            peer_bloom_filters: true,
             data_dir: PathBuf::from("."),
         }
     }
@@ -815,6 +820,23 @@ impl PeerManager {
         self.start_height = height;
     }
 
+    /// Service flags advertised by this node (NODE_NETWORK | NODE_WITNESS, plus
+    /// NODE_BLOOM when `peer_bloom_filters` is enabled — Bitcoin Core's
+    /// `g_local_services` after `init.cpp`'s `-peerbloomfilters` gate).
+    pub fn local_services(&self) -> u64 {
+        let mut s = NODE_NETWORK | NODE_WITNESS;
+        if self.config.peer_bloom_filters {
+            s |= NODE_BLOOM;
+        }
+        s
+    }
+
+    /// True if NODE_BLOOM is advertised in our outbound version messages.
+    /// Required by BIP-35 to honor `mempool` requests from peers.
+    pub fn peer_bloom_filters_enabled(&self) -> bool {
+        self.config.peer_bloom_filters
+    }
+
     /// Get a reference to the network group manager.
     pub fn netgroup_manager(&self) -> &NetGroupManager {
         &self.netgroup_manager
@@ -840,7 +862,7 @@ impl PeerManager {
                     tracing::info!("P2P listening on {}", listen_addr);
                     let event_tx = self.event_tx.clone();
                     let magic = self.params.network_magic.0;
-                    let our_services = NODE_NETWORK | NODE_WITNESS;
+                    let our_services = self.local_services();
                     let our_start_height = self.start_height;
                     // We need a shared counter for peer IDs for inbound peers.
                     // Use an AtomicU64 to generate unique IDs.
@@ -1124,9 +1146,10 @@ impl PeerManager {
 
     /// Build a version message for outgoing connections with relay flag.
     fn build_version_message_with_relay(&self, addr: SocketAddr, relay: bool) -> VersionMessage {
+        let our_services = self.local_services();
         VersionMessage {
             version: PROTOCOL_VERSION,
-            services: NODE_NETWORK | NODE_WITNESS,
+            services: our_services,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1134,7 +1157,7 @@ impl PeerManager {
             addr_recv: socket_addr_to_net_address(addr, 0),
             addr_from: socket_addr_to_net_address(
                 "0.0.0.0:0".parse().unwrap(),
-                NODE_NETWORK | NODE_WITNESS,
+                our_services,
             ),
             nonce: rand::random(),
             user_agent: "/Rustoshi:0.1.0/".to_string(),
@@ -3040,6 +3063,57 @@ mod tests {
         assert_eq!(version.user_agent, "/Rustoshi:0.1.0/");
         assert_eq!(version.start_height, 0);
         assert!(version.relay);
+    }
+
+    /// BIP 35 / NODE_BLOOM: by default `peer_bloom_filters=true`, so our outbound
+    /// version messages (and `local_services()`) must include the NODE_BLOOM bit.
+    /// This is the wire-level signal that lets peers know they may send `mempool`
+    /// to us per BIP 35.
+    #[test]
+    fn test_node_bloom_advertised_by_default() {
+        let config = PeerManagerConfig::testnet4();
+        assert!(config.peer_bloom_filters, "peer_bloom_filters default should be true");
+
+        let params = ChainParams::testnet4();
+        let mgr = PeerManager::new(config, params);
+
+        assert!(mgr.peer_bloom_filters_enabled());
+        let services = mgr.local_services();
+        assert!(services & NODE_BLOOM != 0, "NODE_BLOOM must be advertised by default");
+        assert!(services & NODE_NETWORK != 0);
+        assert!(services & NODE_WITNESS != 0);
+
+        let addr: SocketAddr = "192.168.1.1:48333".parse().unwrap();
+        let version = mgr.build_version_message(addr);
+        assert!(
+            version.services & NODE_BLOOM != 0,
+            "outbound version message must include NODE_BLOOM"
+        );
+        assert!(
+            version.addr_from.services & NODE_BLOOM != 0,
+            "addr_from in version must also include NODE_BLOOM"
+        );
+    }
+
+    /// When `-peerbloomfilters=false`, the operator opts out of BIP 35 + BIP 37.
+    /// NODE_BLOOM must NOT appear on the wire and the gate in the MEMPOOL handler
+    /// must report bloom_disabled (so the handler disconnects the peer).
+    #[test]
+    fn test_node_bloom_disabled_via_config() {
+        let mut config = PeerManagerConfig::testnet4();
+        config.peer_bloom_filters = false;
+        let params = ChainParams::testnet4();
+        let mgr = PeerManager::new(config, params);
+
+        assert!(!mgr.peer_bloom_filters_enabled());
+        let services = mgr.local_services();
+        assert_eq!(services & NODE_BLOOM, 0, "NODE_BLOOM must NOT be set when disabled");
+        assert!(services & NODE_NETWORK != 0);
+        assert!(services & NODE_WITNESS != 0);
+
+        let addr: SocketAddr = "192.168.1.1:48333".parse().unwrap();
+        let version = mgr.build_version_message(addr);
+        assert_eq!(version.services & NODE_BLOOM, 0);
     }
 
     #[test]
