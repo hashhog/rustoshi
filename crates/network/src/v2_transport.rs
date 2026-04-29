@@ -142,6 +142,33 @@ pub fn get_message_type(short_id: u8) -> Option<&'static str> {
     None
 }
 
+/// The exact 12-byte v1 command field for a `version` message:
+/// `b"version\0\0\0\0\0"`.  Used to disambiguate v1 from v2 on inbound.
+pub const V1_VERSION_COMMAND: [u8; 12] = *b"version\0\0\0\0\0";
+
+/// Classify the first 16 bytes of an inbound TCP stream.  Returns true
+/// iff the bytes are the unambiguous start of a v1 VERSION message:
+/// the network magic (4 bytes) followed by `"version\0\0\0\0\0"` (12
+/// bytes).  In every other case (including a 64-byte ElligatorSwift
+/// pubkey from a BIP-324 v2 initiator, since the magic match has
+/// astronomically low probability for random bytes), returns false and
+/// the caller should treat the stream as v2.
+///
+/// Bitcoin Core uses this exact heuristic — see BIP-324 §"Detecting
+/// V1 vs V2".  The only downside is that v1 peers whose first message
+/// is unexpectedly NOT `version` (a protocol violation) will be
+/// misclassified as v2; the cipher handshake will fail and the peer
+/// will be disconnected, which is fine.
+pub fn looks_like_v1_version(bytes: &[u8], network_magic: &[u8; 4]) -> bool {
+    if bytes.len() < V1_PREFIX_LEN {
+        return false;
+    }
+    if &bytes[..4] != network_magic {
+        return false;
+    }
+    bytes[4..16] == V1_VERSION_COMMAND
+}
+
 /// ElligatorSwift-encoded public key (64 bytes).
 ///
 /// This encoding makes secp256k1 public keys indistinguishable from random bytes,
@@ -219,61 +246,166 @@ pub fn compute_bip324_ecdh_secret(
     shared.to_secret_bytes()
 }
 
-/// Forward-secure ChaCha20 stream cipher.
+/// Forward-secure ChaCha20 stream cipher (BIP-324 length cipher).
 ///
-/// Automatically rekeys every `rekey_interval` operations to provide forward secrecy.
+/// Per BIP-324, the length cipher's keystream is CONTINUOUS within a rekey
+/// epoch: each 3-byte length-prefix encryption consumes the next 3 bytes of
+/// a single ChaCha20 keystream initialised at the start of the epoch.  The
+/// per-epoch nonce is `[0, 0, 0, 0] || LE64(rekey_counter)` (constant within
+/// an epoch), and the keystream is consumed monotonically.  After exactly
+/// `rekey_interval` (= 224) `crypt()` calls, the next 32 bytes of keystream
+/// become the new key, the rekey_counter increments, and the keystream
+/// restarts at block 0 with the fresh epoch nonce.
+///
+/// A previous implementation built a fresh ChaCha20 cipher per `crypt()`
+/// call with `chunk_counter` baked into the nonce — this produces a
+/// different keystream for every packet starting at block 0, instead of
+/// advancing through a single continuous stream.  The result diverges from
+/// Bitcoin Core / ouroboros byte-for-byte starting at packet 2, silently
+/// corrupting every encrypted length prefix beyond the first and breaking
+/// real-peer interop.  See clearbit's identical fix in `cb04a1f`.
+///
+/// Reference:
+/// - bitcoin-core/src/crypto/chacha20.cpp::FSChaCha20::Crypt (line 349)
+///   — keeps a stateful `m_chacha20` and only re-seeks the nonce on rekey.
+/// - ouroboros/src/ouroboros/transport_v2.py::FSChaCha20.crypt
+///
+/// Note: `FSChaCha20Poly1305` (the AEAD packet cipher) below is *not*
+/// affected — it correctly builds a fresh AEAD per packet because each
+/// AEAD packet uses a unique `(packet_counter, rekey_counter)` nonce, and
+/// poly1305-key material is taken from block 0 with content from block 1+.
 pub struct FSChaCha20 {
+    /// Current epoch key.  Replaced on rekey.
     key: [u8; 32],
+    /// Rekey threshold (number of `crypt()` calls per epoch).
     rekey_interval: u32,
+    /// Number of `crypt()` calls so far in the current epoch.  Drives
+    /// rekeying only — it does NOT participate in the nonce.
     chunk_counter: u32,
+    /// Monotonic rekey counter.  Forms the high 8 bytes of the per-epoch
+    /// nonce.  Bumped on rekey.
     rekey_counter: u64,
+    /// Cached ChaCha20 keystream buffer for the current 64-byte block.
+    /// Bytes are consumed from `[keystream_used..]`; when fully drained,
+    /// `draw_block()` regenerates the next block of keystream from the
+    /// stateful cipher.
+    keystream_buf: [u8; 64],
+    /// Number of bytes already consumed from `keystream_buf`.  Starts at
+    /// 64 ("empty") so the first `crypt()` triggers a block draw.
+    keystream_used: u8,
+    /// Stateful ChaCha20 cipher for the current epoch.  Rebuilt on rekey
+    /// with the fresh epoch key + epoch nonce (chunk counter starts at 0).
+    /// We use `Option` because the cipher is rebuilt on rekey and lazily
+    /// initialised on first use.
+    cipher: Option<ChaCha20>,
 }
 
 impl FSChaCha20 {
-    /// Create a new FSChaCha20 cipher.
+    /// Create a new FSChaCha20 cipher.  The cipher state is initialised
+    /// lazily on first `crypt()` call with epoch nonce
+    /// `[0,0,0,0] || LE64(0)`.
     pub fn new(key: [u8; 32], rekey_interval: u32) -> Self {
         Self {
             key,
             rekey_interval,
             chunk_counter: 0,
             rekey_counter: 0,
+            keystream_buf: [0u8; 64],
+            keystream_used: 64, // start "empty" so first crypt draws a block
+            cipher: None,
         }
     }
 
-    /// Encrypt or decrypt data.
+    /// Build the per-epoch nonce: `[0, 0, 0, 0] || LE64(rekey_counter)`.
+    /// Constant within an epoch; bumped only on rekey.
+    fn epoch_nonce(&self) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        // First 4 bytes: zero (BIP-324 length-cipher convention).
+        // Last 8 bytes: rekey_counter little-endian.
+        nonce[4..12].copy_from_slice(&self.rekey_counter.to_le_bytes());
+        nonce
+    }
+
+    /// Pull `out.len()` bytes of keystream into `out`, advancing the
+    /// stateful cipher across as many 64-byte blocks as needed.
+    fn draw_keystream(&mut self, out: &mut [u8]) {
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.keystream_used as usize >= 64 {
+                // Refill: generate next 64 bytes of keystream from the
+                // stateful epoch cipher.  This advances the cipher's
+                // internal block counter by 1.
+                self.refill_block();
+            }
+            let avail = 64 - self.keystream_used as usize;
+            let need = out.len() - written;
+            let take = avail.min(need);
+            out[written..written + take].copy_from_slice(
+                &self.keystream_buf[self.keystream_used as usize
+                    ..self.keystream_used as usize + take],
+            );
+            self.keystream_used += take as u8;
+            written += take;
+        }
+    }
+
+    /// Refill `keystream_buf` with the next 64-byte ChaCha20 block from
+    /// the stateful epoch cipher.  Initialises the cipher on first use.
+    fn refill_block(&mut self) {
+        if self.cipher.is_none() {
+            let nonce = self.epoch_nonce();
+            self.cipher = Some(ChaCha20::new((&self.key).into(), (&nonce).into()));
+        }
+        let cipher = self.cipher.as_mut().unwrap();
+        // XOR a 64-byte zero block to extract the next 64 bytes of
+        // keystream.  apply_keystream advances the cipher's internal
+        // block counter, giving us continuous keystream within the epoch.
+        self.keystream_buf = [0u8; 64];
+        cipher.apply_keystream(&mut self.keystream_buf);
+        self.keystream_used = 0;
+    }
+
+    /// Encrypt or decrypt data.  Each call consumes `input.len()` bytes
+    /// from the current epoch's continuous keystream.  After
+    /// `rekey_interval` calls, transparently rotates to a new key.
     pub fn crypt(&mut self, input: &[u8], output: &mut [u8]) {
         assert_eq!(input.len(), output.len());
 
-        // Construct nonce: 4 bytes chunk_counter + 8 bytes rekey_counter
-        let mut nonce = [0u8; 12];
-        nonce[0..4].copy_from_slice(&self.chunk_counter.to_le_bytes());
-        nonce[4..12].copy_from_slice(&self.rekey_counter.to_le_bytes());
+        // Draw keystream into output, then XOR with input.
+        self.draw_keystream(output);
+        for (o, i) in output.iter_mut().zip(input.iter()) {
+            *o ^= *i;
+        }
 
-        // Create cipher and encrypt/decrypt
-        let mut cipher = ChaCha20::new((&self.key).into(), (&nonce).into());
-        output.copy_from_slice(input);
-        cipher.apply_keystream(output);
-
-        // Update counters and possibly rekey
+        // Update chunk counter and possibly rekey.
         self.chunk_counter += 1;
         if self.chunk_counter == self.rekey_interval {
             self.rekey();
         }
     }
 
+    /// Rotate to a new epoch.  Per BIP-324, the new key is the next 32
+    /// bytes of keystream (block 7, 8, ... in the OLD epoch's keystream
+    /// — but this differs from Bitcoin Core, which simply reads the next
+    /// 32 bytes from the internal cipher state).  We follow Bitcoin
+    /// Core's stateful model: pull 32 bytes from the *current* cipher's
+    /// position as the new key, then advance the rekey counter and reset
+    /// the cipher with the new epoch nonce.
     fn rekey(&mut self) {
-        // Generate new key from keystream with special nonce
-        let mut nonce = [0u8; 12];
-        nonce[0..4].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-        nonce[4..12].copy_from_slice(&self.rekey_counter.to_le_bytes());
-
-        let mut cipher = ChaCha20::new((&self.key).into(), (&nonce).into());
+        // Pull next 32 bytes of keystream as the new key (continuing the
+        // current epoch's stream).
         let mut new_key = [0u8; 32];
-        cipher.apply_keystream(&mut new_key);
+        self.draw_keystream(&mut new_key);
 
+        // Advance to new epoch.
         self.key = new_key;
-        self.chunk_counter = 0;
         self.rekey_counter += 1;
+        self.chunk_counter = 0;
+        // Force fresh cipher init with new key + new epoch nonce on the
+        // next draw.
+        self.cipher = None;
+        self.keystream_buf = [0u8; 64];
+        self.keystream_used = 64;
     }
 }
 
@@ -492,6 +624,29 @@ impl Bip324Cipher {
     /// Check if the cipher is initialized.
     pub fn is_initialized(&self) -> bool {
         self.send_l_cipher.is_some()
+    }
+
+    /// Convenience wrapper: initialize this cipher in responder (server)
+    /// mode after receiving the peer's ElligatorSwift pubkey.  Equivalent
+    /// to `self.initialize(their_pubkey, false, network_magic)`.  Used by
+    /// the inbound BIP-324 v2 wiring in `peer_manager::run_inbound_peer`.
+    pub fn initialize_for_responder(
+        &mut self,
+        their_pubkey: &EllSwiftPubKey,
+        network_magic: &[u8; 4],
+    ) {
+        self.initialize(their_pubkey, false, network_magic);
+    }
+
+    /// Convenience wrapper: initialize this cipher in initiator (client)
+    /// mode after receiving the peer's ElligatorSwift pubkey.  Equivalent
+    /// to `self.initialize(their_pubkey, true, network_magic)`.
+    pub fn initialize_for_initiator(
+        &mut self,
+        their_pubkey: &EllSwiftPubKey,
+        network_magic: &[u8; 4],
+    ) {
+        self.initialize(their_pubkey, true, network_magic);
     }
 
     /// Initialize the cipher with the peer's public key.
@@ -1196,6 +1351,156 @@ mod tests {
         cipher2.crypt(&ciphertext, &mut decrypted);
 
         assert_eq!(plaintext, decrypted);
+    }
+
+    /// Regression test for the BIP-324 length-cipher continuous-keystream
+    /// requirement.  The previous implementation built a fresh ChaCha20
+    /// per `crypt()` call with `chunk_counter` baked into the nonce, so
+    /// every call started at block 0 of a different stream.  This test
+    /// verifies that calling `crypt()` N times on 3-byte chunks produces
+    /// the same ciphertext as calling `crypt()` once on a 3*N-byte chunk
+    /// (i.e. the ciphertext is a contiguous slice of one keystream).
+    ///
+    /// If this test fails, real-peer interop is broken at packet 2 — see
+    /// clearbit `cb04a1f`.
+    #[test]
+    fn test_fs_chacha20_continuous_keystream() {
+        let key = [0x37u8; 32];
+
+        // Reference: encrypt 30 zero bytes in one call.
+        let mut ref_cipher = FSChaCha20::new(key, REKEY_INTERVAL);
+        let mut reference = [0u8; 30];
+        ref_cipher.crypt(&[0u8; 30], &mut reference);
+
+        // Compare against 10 calls of 3 bytes each (the wire-format
+        // length-prefix shape for 10 BIP-324 packets).
+        let mut chunked = FSChaCha20::new(key, REKEY_INTERVAL);
+        let mut out = [0u8; 30];
+        for i in 0..10 {
+            chunked.crypt(&[0u8; 3], &mut out[i * 3..(i + 1) * 3]);
+        }
+
+        assert_eq!(
+            reference, out,
+            "FSChaCha20 length cipher must produce a continuous keystream \
+             across multiple crypt() calls within an epoch"
+        );
+    }
+
+    /// Cross-impl byte-for-byte compatibility test: feed a known key and
+    /// pull 30 bytes via 10 successive 3-byte crypt() calls, comparing
+    /// against the keystream a plain ChaCha20 would emit at block 0 with
+    /// the BIP-324 epoch nonce `[0,0,0,0] || LE64(0)`.
+    #[test]
+    fn test_fs_chacha20_matches_plain_chacha20() {
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
+        let key = [0xa5u8; 32];
+
+        // Reference plain ChaCha20 with the BIP-324 epoch nonce.
+        let nonce = [0u8; 12]; // [0,0,0,0] || LE64(0)
+        let mut plain = chacha20::ChaCha20::new((&key).into(), (&nonce).into());
+        let mut plain_keystream = [0u8; 30];
+        plain.apply_keystream(&mut plain_keystream);
+
+        // FSChaCha20 invoked in 3-byte chunks should produce the same
+        // bytes (since input is zero, ciphertext == keystream).
+        let mut fs = FSChaCha20::new(key, REKEY_INTERVAL);
+        let mut fs_keystream = [0u8; 30];
+        for i in 0..10 {
+            fs.crypt(&[0u8; 3], &mut fs_keystream[i * 3..(i + 1) * 3]);
+        }
+
+        assert_eq!(plain_keystream, fs_keystream);
+    }
+
+    /// Wire-ordering round-trip: two packets, encrypted in order then
+    /// decrypted in order using a single sender/receiver pair (the
+    /// real-world use of a length cipher on a TCP stream).  Catches
+    /// the same bug as `test_fs_chacha20_continuous_keystream` but
+    /// from the symmetry direction — if encrypt and decrypt drift
+    /// out of sync after packet 1, packet 2 will not round-trip.
+    #[test]
+    fn test_fs_chacha20_two_packet_wire_ordering() {
+        let key = [0xc0u8; 32];
+
+        let mut send = FSChaCha20::new(key, REKEY_INTERVAL);
+        let mut recv = FSChaCha20::new(key, REKEY_INTERVAL);
+
+        // Two distinct 3-byte plaintexts, encrypted in order.
+        let pt1 = [0x01, 0x02, 0x03];
+        let pt2 = [0xaa, 0xbb, 0xcc];
+
+        let mut ct1 = [0u8; 3];
+        let mut ct2 = [0u8; 3];
+        send.crypt(&pt1, &mut ct1);
+        send.crypt(&pt2, &mut ct2);
+
+        // Decrypt in the same order.
+        let mut rt1 = [0u8; 3];
+        let mut rt2 = [0u8; 3];
+        recv.crypt(&ct1, &mut rt1);
+        recv.crypt(&ct2, &mut rt2);
+
+        assert_eq!(rt1, pt1, "packet 1 must round-trip");
+        assert_eq!(
+            rt2, pt2,
+            "packet 2 must round-trip; failure means encrypt/decrypt \
+             cipher streams are not advancing in lockstep within an epoch"
+        );
+    }
+
+    #[test]
+    fn test_looks_like_v1_version_real_v1_prefix() {
+        // Mainnet magic + b"version\0\0\0\0\0".
+        let mainnet = [0xf9, 0xbe, 0xb4, 0xd9];
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&mainnet);
+        bytes[4..16].copy_from_slice(b"version\0\0\0\0\0");
+        assert!(looks_like_v1_version(&bytes, &mainnet));
+    }
+
+    #[test]
+    fn test_looks_like_v1_version_v2_pubkey() {
+        // The first 16 bytes of a 64-byte ellswift pubkey are
+        // essentially random; the first 4 bytes match the network
+        // magic only with probability ~1/2^32.
+        let mainnet = [0xf9, 0xbe, 0xb4, 0xd9];
+        let pubkey_prefix = [
+            0xec, 0x0a, 0xdf, 0xf2, 0x57, 0xbb, 0xfe, 0x50, 0x0c, 0x18, 0x8c, 0x80, 0xb4, 0xfd,
+            0xd6, 0x40,
+        ];
+        assert!(!looks_like_v1_version(&pubkey_prefix, &mainnet));
+    }
+
+    #[test]
+    fn test_looks_like_v1_version_short_input() {
+        // Anything shorter than 16 bytes can't be classified as v1.
+        let mainnet = [0xf9, 0xbe, 0xb4, 0xd9];
+        assert!(!looks_like_v1_version(&[], &mainnet));
+        assert!(!looks_like_v1_version(&[0u8; 15], &mainnet));
+    }
+
+    #[test]
+    fn test_looks_like_v1_version_magic_match_wrong_command() {
+        // Magic matches but the v1 command is "inv" not "version" —
+        // the spec only treats VERSION as the unambiguous v1 marker
+        // because it's always the first message.
+        let mainnet = [0xf9, 0xbe, 0xb4, 0xd9];
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&mainnet);
+        bytes[4..16].copy_from_slice(b"inv\0\0\0\0\0\0\0\0\0");
+        assert!(!looks_like_v1_version(&bytes, &mainnet));
+    }
+
+    #[test]
+    fn test_looks_like_v1_version_wrong_magic() {
+        // Even with "version" in bytes 4..16, a non-matching magic
+        // prefix is not v1 (most likely v2 ellswift pubkey).
+        let mainnet = [0xf9, 0xbe, 0xb4, 0xd9];
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        bytes[4..16].copy_from_slice(b"version\0\0\0\0\0");
+        assert!(!looks_like_v1_version(&bytes, &mainnet));
     }
 
     #[test]
