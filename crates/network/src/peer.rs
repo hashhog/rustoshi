@@ -305,25 +305,27 @@ impl Default for MessageReader {
 }
 
 /// Returns true iff outbound BIP-324 v2 negotiation is enabled.  Gated by
-/// the `RUSTOSHI_BIP324_V2_OUTBOUND` environment variable (default OFF
-/// pending live-fleet verification).  Set to `1` / `true` / `yes` / `on`
-/// to enable; any other value or unset → outbound connections start
-/// directly with v1 (matching prior behavior).
+/// the `RUSTOSHI_BIP324_V2_OUTBOUND` environment variable (default ON
+/// since the live two-rustoshi handshake completed end-to-end on the W90
+/// fleet — `ef3bb91` ellswift signing-context fix + `766304a` app-frame
+/// transport).  Set to `0` / `false` / `no` / `off` to fall back to
+/// v1-only outbound (matches per-peer v1-fallback behaviour for
+/// individual addresses that turn out to be v1-only).
 ///
-/// Mirrors `peer_manager::bip324_v2_inbound_enabled` for inbound.  Once
-/// flipped to default-ON in a future commit, this flag will gate the
-/// fall-back-to-v1 LRU cache path.  The cipher fix in `0de596e`
-/// (continuous FSChaCha20 keystream) is required before real-peer v2
-/// interop can succeed in either direction.
+/// Mirrors `peer_manager::bip324_v2_inbound_enabled` for inbound — both
+/// flipped together because the underlying transport and cipher are
+/// shared.  Bitcoin Core defaults `-v2transport=1` since v26 (2024); we
+/// match that policy.
 ///
-/// Reference: clearbit `Peer.bip324V2Enabled` (Zig).
+/// Reference: clearbit `Peer.bip324V2Enabled` (Zig, default ON since
+/// `cb04a1f`); blockbrew `BIP324V2` (Go, default ON since this wave).
 pub fn bip324_v2_outbound_enabled() -> bool {
     match std::env::var("RUSTOSHI_BIP324_V2_OUTBOUND") {
         Ok(v) => {
             let v = v.to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
+            !(v == "0" || v == "false" || v == "no" || v == "off")
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -1944,11 +1946,19 @@ mod tests {
         NODE_NETWORK, NODE_WITNESS, PROTOCOL_VERSION,
     };
     use std::io::Cursor;
+    use std::sync::MutexGuard;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
     // Testnet4 magic bytes
     const TESTNET4_MAGIC: [u8; 4] = [0x1c, 0x16, 0x3f, 0x28];
+
+    /// Process-wide serializer for tests that mutate the v1-only LRU
+    /// cache OR the `RUSTOSHI_BIP324_V2_*` env vars.  See
+    /// `crate::v2_test_lock` for the full rationale.
+    fn global_v2_test_lock() -> MutexGuard<'static, ()> {
+        crate::v2_test_lock::lock()
+    }
 
     fn create_test_version() -> VersionMessage {
         VersionMessage {
@@ -2283,10 +2293,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_timeout() {
+        let _g = global_v2_test_lock();
         // Try to connect to a non-routable IP with a very short timeout
         let peer_id = PeerId(1);
         // 10.255.255.1 is a non-routable IP that should timeout
         let addr: SocketAddr = "10.255.255.1:48333".parse().unwrap();
+        // Outbound v2 is default-ON; mark this addr as v1-only so the
+        // handshake skips the v2 probe path (which would also fail on a
+        // non-routable IP, but via a different code path that this test
+        // is not asserting against).
+        mark_v1_only(addr);
 
         let (event_tx, mut event_rx) = mpsc::channel(10);
         let (_command_tx, command_rx) = mpsc::channel(10);
@@ -2322,9 +2338,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_with_mock_peer() {
+        let _g = global_v2_test_lock();
         // Create a mock server that does the handshake
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // Mock server speaks v1 only; outbound v2 is default-ON, so mark
+        // this addr as v1-only to skip the v2 probe path.
+        mark_v1_only(addr);
 
         let peer_id = PeerId(1);
         let (event_tx, mut event_rx) = mpsc::channel(10);
@@ -2536,9 +2556,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_rejects_pre_handshake_ping() {
+        let _g = global_v2_test_lock();
         // Test that a ping message sent before version is rejected
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        mark_v1_only(addr); // mock speaks v1; skip v2 probe (default-ON)
 
         let peer_id = PeerId(1);
         let (event_tx, mut event_rx) = mpsc::channel(10);
@@ -2599,9 +2621,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_rejects_obsolete_protocol_version() {
+        let _g = global_v2_test_lock();
         // Test that protocol version < 70015 is rejected
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        mark_v1_only(addr); // mock speaks v1; skip v2 probe (default-ON)
 
         let peer_id = PeerId(1);
         let (event_tx, mut event_rx) = mpsc::channel(10);
@@ -2673,9 +2697,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_rejects_duplicate_version() {
+        let _g = global_v2_test_lock();
         // Test that receiving two version messages is rejected
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        mark_v1_only(addr); // mock speaks v1; skip v2 probe (default-ON)
 
         let peer_id = PeerId(1);
         let (event_tx, mut event_rx) = mpsc::channel(10);
@@ -2748,9 +2774,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_rejects_self_connection() {
+        let _g = global_v2_test_lock();
         // Test that self-connection (matching nonce) is rejected
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        mark_v1_only(addr); // mock speaks v1; skip v2 probe (default-ON)
 
         let peer_id = PeerId(1);
         let (event_tx, mut event_rx) = mpsc::channel(10);
@@ -2830,9 +2858,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_allows_wtxidrelay_before_verack() {
+        let _g = global_v2_test_lock();
         // Test that wtxidrelay/sendaddrv2 messages are allowed before verack
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        mark_v1_only(addr); // mock speaks v1; skip v2 probe (default-ON)
 
         let peer_id = PeerId(1);
         let (event_tx, mut event_rx) = mpsc::channel(10);
@@ -2959,32 +2989,32 @@ mod tests {
 
     // -------- BIP-324 v2 outbound state-machine tests --------
 
-    /// The env-var gate must default to OFF.  Live-fleet flip happens
-    /// by setting `RUSTOSHI_BIP324_V2_OUTBOUND=1` (or `true` / `yes` /
-    /// `on`).  Anything else, including unset, returns false.
+    /// The env-var gate defaults to ON (matches Bitcoin Core ≥26's
+    /// `-v2transport=1`).  Operators set `RUSTOSHI_BIP324_V2_OUTBOUND=0`
+    /// (or `false` / `no` / `off`) to opt out.  Anything else, including
+    /// unset, returns true.
     #[test]
-    fn test_bip324_v2_outbound_disabled_by_default() {
+    fn test_bip324_v2_outbound_default_on() {
         // SAFETY: Cargo runs each test in its own process by default;
         // even if a user pre-set the env var, removing it here only
         // affects this test process.  We re-set it to its prior value
         // at the end on a best-effort basis (drops on panic, but the
         // process exits anyway).
+        let _g = global_v2_test_lock();
         let prior = std::env::var("RUSTOSHI_BIP324_V2_OUTBOUND").ok();
         std::env::remove_var("RUSTOSHI_BIP324_V2_OUTBOUND");
         assert!(
-            !bip324_v2_outbound_enabled(),
-            "v2 outbound must be OFF when env var is unset"
+            bip324_v2_outbound_enabled(),
+            "v2 outbound must default ON when env var is unset"
         );
-        std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", "0");
-        assert!(
-            !bip324_v2_outbound_enabled(),
-            "v2 outbound must be OFF when env var is '0'"
-        );
-        std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", "no");
-        assert!(
-            !bip324_v2_outbound_enabled(),
-            "v2 outbound must be OFF when env var is 'no'"
-        );
+        for off in ["0", "false", "False", "FALSE", "no", "NO", "off", "OFF"] {
+            std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", off);
+            assert!(
+                !bip324_v2_outbound_enabled(),
+                "v2 outbound must be OFF when env var is {:?}",
+                off
+            );
+        }
         if let Some(v) = prior {
             std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", v);
         } else {
@@ -2992,10 +3022,11 @@ mod tests {
         }
     }
 
-    /// All the canonical "ON" strings (1, true, yes, on) must enable
-    /// the gate, case-insensitive.
+    /// All the canonical "ON" strings (1, true, yes, on) — and any other
+    /// non-OFF value — keep the gate enabled, case-insensitive.
     #[test]
     fn test_bip324_v2_outbound_enable_strings() {
+        let _g = global_v2_test_lock();
         let prior = std::env::var("RUSTOSHI_BIP324_V2_OUTBOUND").ok();
         for v in ["1", "true", "True", "TRUE", "yes", "YES", "on", "ON"] {
             std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", v);
@@ -3017,6 +3048,7 @@ mod tests {
     /// addresses used by other tests.
     #[test]
     fn test_v1_only_cache_roundtrip() {
+        let _g = global_v2_test_lock();
         let addr: SocketAddr = "203.0.113.42:8333".parse().unwrap();
         clear_v1_only_cache();
         assert!(!is_v1_only(&addr), "fresh cache must not contain addr");
@@ -3032,6 +3064,7 @@ mod tests {
     /// bound — it caps at the max.
     #[test]
     fn test_v1_only_cache_lru_eviction() {
+        let _g = global_v2_test_lock();
         clear_v1_only_cache();
         // Insert V2_FALLBACK_CACHE_MAX + 100 distinct addresses.
         for i in 0..(V2_FALLBACK_CACHE_MAX as u16 + 100) {
