@@ -2359,8 +2359,8 @@ async fn run_inbound_v2_peer(
     mut writer: BufWriter<tokio::net::tcp::OwnedWriteHalf>,
     addr: SocketAddr,
     magic: [u8; 4],
-    _our_services: u64,
-    _our_start_height: i32,
+    our_services: u64,
+    our_start_height: i32,
     _our_nonce: u64,
     prefix: [u8; V1_PREFIX_LEN],
     handshake_timeout: Duration,
@@ -2608,22 +2608,97 @@ async fn run_inbound_v2_peer(
         plain_len,
     );
 
-    // The application-layer message loop over the encrypted v2 channel
-    // is not yet plumbed (it requires refactoring `run_message_loop`
-    // to dispatch through V2Transport for both directions).  For now,
-    // disconnect cleanly so the peer can fall back to v1 on retry,
-    // and so live-test logs unambiguously record cipher-handshake
-    // success without spurious "decrypt failed" noise from app traffic.
+    // ----- Application-layer version/verack over the cipher. -----
     //
-    // FOLLOW-UP: introduce a `run_v2_message_loop` sibling that pumps
-    // bytes through V2Transport.receive_bytes / send_message and feeds
-    // decoded NetworkMessages into the same `handle_message` path.
+    // BIP-324 §"Wire format": after both sides have decrypted the empty
+    // version packet exchanged during the cipher handshake (which exists
+    // only to AEAD-authenticate the garbage), the application protocol
+    // resumes exactly as in v1 — a peer-initiated VERSION followed by
+    // SENDADDRV2 / WTXIDRELAY / VERACK in either direction — except
+    // every message is now framed through `Bip324Cipher.encrypt` /
+    // `decrypt`.  As the responder we wait for the peer's VERSION first.
+    let app_hs = match timeout(
+        handshake_timeout,
+        crate::peer::perform_v2_handshake_inbound(
+            &mut cipher,
+            &mut reader,
+            &mut writer,
+            &magic,
+            our_services,
+            our_start_height,
+            _our_nonce,
+            addr,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(reason)) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, reason))
+                .await;
+            return;
+        }
+        Err(_) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                .await;
+            return;
+        }
+    };
+
+    let their_version = app_hs.version;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let peer_info = PeerInfo {
+        addr,
+        version: their_version.version,
+        services: their_version.services,
+        user_agent: their_version.user_agent.clone(),
+        start_height: their_version.start_height,
+        relay: their_version.relay,
+        inbound: true,
+        state: PeerState::Established,
+        last_send: Instant::now(),
+        last_recv: Instant::now(),
+        ping_nonce: None,
+        ping_time: None,
+        bytes_sent: 0,
+        bytes_recv: 0,
+        time_offset: their_version.timestamp - now_unix,
+        supports_witness: their_version.services & NODE_WITNESS != 0,
+        supports_sendheaders: their_version.version >= SENDHEADERS_VERSION,
+        supports_wtxid_relay: app_hs.wants_wtxid_relay,
+        supports_addrv2: app_hs.wants_addrv2,
+        feefilter: 0,
+    };
+
     let _ = event_tx
-        .send(PeerEvent::Disconnected(
-            peer_id,
-            DisconnectReason::PeerRequested,
-        ))
+        .send(PeerEvent::Connected(peer_id, peer_info))
         .await;
+
+    tracing::info!(
+        "peer {:?} ({}): BIP-324 v2 application handshake COMPLETE \
+         (ua=\"{}\", version={})",
+        peer_id,
+        addr,
+        their_version.user_agent,
+        their_version.version,
+    );
+
+    // ----- Main v2 message loop over the cipher. -----
+    crate::peer::run_message_loop_v2(
+        peer_id,
+        &magic,
+        cipher,
+        reader,
+        writer,
+        event_tx,
+        _command_rx,
+    )
+    .await;
 }
 
 // ============================================================
