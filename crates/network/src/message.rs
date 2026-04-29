@@ -117,7 +117,8 @@ pub struct TimestampedNetAddress {
 /// This node can serve the full blockchain.
 pub const NODE_NETWORK: u64 = 1;
 /// This node supports BIP 37 bloom filters and BIP 35 mempool messages.
-/// Set when `-peerbloomfilters` is enabled (Bitcoin Core default: enabled).
+/// Set when `-peerbloomfilters` is enabled (Bitcoin Core default: disabled —
+/// see `bitcoin-core/src/net_processing.h:44 DEFAULT_PEERBLOOMFILTERS=false`).
 pub const NODE_BLOOM: u64 = 1 << 2;
 /// This node supports SegWit (BIP 144).
 pub const NODE_WITNESS: u64 = 1 << 3;
