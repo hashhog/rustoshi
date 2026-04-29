@@ -1875,23 +1875,24 @@ impl PeerManager {
 // ============================================================
 
 /// Returns true iff inbound BIP-324 v2 negotiation is enabled.  Gated by
-/// the `RUSTOSHI_BIP324_V2_INBOUND` environment variable (default OFF
-/// pending live-fleet verification).  Set to `1` / `true` to enable,
-/// any other value or unset → disabled (inbound v2 connections will
-/// disconnect with `bad magic` as before).
+/// the `RUSTOSHI_BIP324_V2_INBOUND` environment variable (default ON since
+/// the live two-rustoshi handshake completed end-to-end on the W90 fleet
+/// (`ef3bb91` ellswift signing-context fix + `766304a` app-frame transport)
+/// and the Phase C interop matrix shows rustoshi → ouroboros v2/v2.  Set
+/// to `0` / `false` / `no` / `off` to refuse v2 inbound (peers that send
+/// the v2 ellswift will disconnect with `bad magic`, same as the prior
+/// default-OFF behaviour).
 ///
-/// Once flipped to default-ON in a future commit, this flag will gate
-/// fallback to v1-only for the inbound path.  The cipher fix in this
-/// commit (continuous FSChaCha20 keystream) is required before
-/// real-peer v2 interop can succeed; clearbit took the same path
-/// (default-OFF → flip-ON) — see clearbit `cb04a1f`.
+/// Flipped in lock-step with `peer::bip324_v2_outbound_enabled` because
+/// the underlying transport + cipher are shared.  Bitcoin Core defaults
+/// `-v2transport=1` since v26 (2024); we match that policy.
 pub fn bip324_v2_inbound_enabled() -> bool {
     match std::env::var("RUSTOSHI_BIP324_V2_INBOUND") {
         Ok(v) => {
             let v = v.to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
+            !(v == "0" || v == "false" || v == "no" || v == "off")
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -3643,5 +3644,40 @@ mod tests {
     fn test_extra_peer_check_interval_constant() {
         // Verify check interval is 45 seconds per Bitcoin Core
         assert_eq!(EXTRA_PEER_CHECK_INTERVAL, Duration::from_secs(45));
+    }
+
+    /// `RUSTOSHI_BIP324_V2_INBOUND` defaults ON (matches Bitcoin Core ≥26
+    /// `-v2transport=1`); operators set the var to `0` / `false` / `no` /
+    /// `off` to opt out.  Mirrors `peer::test_bip324_v2_outbound_default_on`.
+    #[test]
+    fn test_bip324_v2_inbound_default_on() {
+        let _g = crate::v2_test_lock::lock();
+        let prior = std::env::var("RUSTOSHI_BIP324_V2_INBOUND").ok();
+        std::env::remove_var("RUSTOSHI_BIP324_V2_INBOUND");
+        assert!(
+            bip324_v2_inbound_enabled(),
+            "v2 inbound must default ON when env var is unset"
+        );
+        for off in ["0", "false", "False", "FALSE", "no", "NO", "off", "OFF"] {
+            std::env::set_var("RUSTOSHI_BIP324_V2_INBOUND", off);
+            assert!(
+                !bip324_v2_inbound_enabled(),
+                "v2 inbound must be OFF when env var is {:?}",
+                off
+            );
+        }
+        for on in ["1", "true", "True", "TRUE", "yes", "YES", "on", "ON"] {
+            std::env::set_var("RUSTOSHI_BIP324_V2_INBOUND", on);
+            assert!(
+                bip324_v2_inbound_enabled(),
+                "v2 inbound must be ON for env var = {:?}",
+                on
+            );
+        }
+        if let Some(v) = prior {
+            std::env::set_var("RUSTOSHI_BIP324_V2_INBOUND", v);
+        } else {
+            std::env::remove_var("RUSTOSHI_BIP324_V2_INBOUND");
+        }
     }
 }

@@ -19,6 +19,9 @@ pub mod relay;
 pub mod stale_detection;
 pub mod v2_transport;
 
+#[cfg(test)]
+pub(crate) mod v2_test_lock;
+
 pub use addr::*;
 pub use block_download::*;
 pub use compact_blocks::*;
