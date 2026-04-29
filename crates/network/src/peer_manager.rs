@@ -20,6 +20,13 @@ use crate::message::{
     TimestampedNetAddress, VersionMessage, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
     MIN_WITNESS_PROTO_VERSION, NODE_NETWORK, NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
 };
+use crate::v2_transport::{
+    constants::{
+        ELLSWIFT_PUBKEY_LEN, EXPANSION, GARBAGE_TERMINATOR_LEN, HEADER_LEN, LENGTH_LEN,
+        MAX_GARBAGE_LEN, V1_PREFIX_LEN,
+    },
+    looks_like_v1_version, Bip324Cipher, EllSwiftPubKey,
+};
 use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
 use crate::netgroup::{NetGroup, NetGroupManager};
 use crate::peer::{
@@ -1867,6 +1874,27 @@ impl PeerManager {
 // INBOUND CONNECTION HANDLING
 // ============================================================
 
+/// Returns true iff inbound BIP-324 v2 negotiation is enabled.  Gated by
+/// the `RUSTOSHI_BIP324_V2_INBOUND` environment variable (default OFF
+/// pending live-fleet verification).  Set to `1` / `true` to enable,
+/// any other value or unset → disabled (inbound v2 connections will
+/// disconnect with `bad magic` as before).
+///
+/// Once flipped to default-ON in a future commit, this flag will gate
+/// fallback to v1-only for the inbound path.  The cipher fix in this
+/// commit (continuous FSChaCha20 keystream) is required before
+/// real-peer v2 interop can succeed; clearbit took the same path
+/// (default-OFF → flip-ON) — see clearbit `cb04a1f`.
+pub fn bip324_v2_inbound_enabled() -> bool {
+    match std::env::var("RUSTOSHI_BIP324_V2_INBOUND") {
+        Ok(v) => {
+            let v = v.to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        }
+        Err(_) => false,
+    }
+}
+
 /// Run an inbound peer connection task.
 ///
 /// Similar to run_outbound_peer but for connections initiated by remote peers.
@@ -1900,10 +1928,19 @@ pub async fn run_inbound_peer(
     // Apply 60-second handshake timeout (Bitcoin Core default)
     let handshake_timeout = Duration::from_secs(60);
 
-    // Read their version message first (with timeout)
-    let mut header_buf = [0u8; MESSAGE_HEADER_SIZE];
-    let read_result = timeout(handshake_timeout, reader.read_exact(&mut header_buf)).await;
-
+    // BIP-324 v2 detection: peek the first V1_PREFIX_LEN (=16) bytes so
+    // we can classify the wire as v1 or v2.  The two leading-byte
+    // patterns are unambiguous:
+    //   - v1: [4-byte magic][b"version\0\0\0\0\0"]      → looks_like_v1_version() == true
+    //   - v2: [first 16 bytes of 64-byte ellswift pubkey] → essentially
+    //         random (1/2^32 chance of magic-collision per BIP-324).
+    //
+    // We pick which path to take based on the result.  If the bytes
+    // look like v2 BUT inbound v2 negotiation is disabled (default
+    // until live-verified), we fall through to the v1 path which will
+    // disconnect with `bad magic`, matching prior behavior.
+    let mut prefix_buf = [0u8; V1_PREFIX_LEN];
+    let read_result = timeout(handshake_timeout, reader.read_exact(&mut prefix_buf)).await;
     match read_result {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
@@ -1911,6 +1948,68 @@ pub async fn run_inbound_peer(
                 .send(PeerEvent::Disconnected(
                     peer_id,
                     DisconnectReason::IoError(format!("failed to read version header: {}", e)),
+                ))
+                .await;
+            return;
+        }
+        Err(_) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                .await;
+            return;
+        }
+    }
+
+    // BIP-324 classification.
+    let is_v1 = looks_like_v1_version(&prefix_buf, &magic);
+    if !is_v1 && bip324_v2_inbound_enabled() {
+        // Hand off to the v2 inbound path.  prefix_buf holds the first
+        // 16 bytes of the peer's 64-byte ellswift pubkey; the remaining
+        // 48 bytes plus the rest of the BIP-324 handshake will be
+        // pulled by run_inbound_v2_peer.
+        tracing::info!(
+            "peer {:?} ({}): BIP-324 v2 detected on inbound, driving cipher handshake",
+            peer_id,
+            addr
+        );
+        run_inbound_v2_peer(
+            peer_id,
+            reader,
+            writer,
+            addr,
+            magic,
+            our_services,
+            our_start_height,
+            our_nonce,
+            prefix_buf,
+            handshake_timeout,
+            event_tx,
+            command_rx,
+        )
+        .await;
+        return;
+    }
+
+    // V1 path: we have the first 16 bytes; read the remaining
+    // MESSAGE_HEADER_SIZE - 16 = 8 bytes (length + checksum fields) to
+    // complete the v1 message header.
+    let mut header_buf = [0u8; MESSAGE_HEADER_SIZE];
+    header_buf[..V1_PREFIX_LEN].copy_from_slice(&prefix_buf);
+    let read_result = timeout(
+        handshake_timeout,
+        reader.read_exact(&mut header_buf[V1_PREFIX_LEN..]),
+    )
+    .await;
+    match read_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(
+                    peer_id,
+                    DisconnectReason::IoError(format!(
+                        "failed to read version header tail: {}",
+                        e
+                    )),
                 ))
                 .await;
             return;
@@ -2217,6 +2316,314 @@ pub async fn run_inbound_peer(
 
     // Full message loop — same as outbound peers
     crate::peer::run_message_loop(peer_id, &magic, reader, writer, event_tx, command_rx).await;
+}
+
+/// Drive a BIP-324 v2 inbound handshake to cipher-handshake-complete.
+///
+/// On entry, `prefix` holds the first `V1_PREFIX_LEN` (=16) bytes of the
+/// peer's 64-byte ElligatorSwift pubkey, already drained from the
+/// reader.  This function:
+///
+/// 1. Reads the remaining 48 bytes of the peer's ellswift pubkey.
+/// 2. Initializes a fresh `Bip324Cipher` in responder mode.
+/// 3. Sends our own 64-byte ellswift pubkey + a random garbage payload.
+/// 4. Sends our 16-byte garbage terminator followed by an encrypted
+///    BIP-324 "version packet" (zero-byte contents, garbage as AAD).
+/// 5. Scans the inbound stream byte-by-byte for the peer's garbage
+///    terminator (capped at `MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN`
+///    bytes); the bytes preceding the terminator are the peer's
+///    garbage and become the AAD for decrypting their version packet.
+/// 6. Decrypts the peer's encrypted length prefix (3 bytes) via the
+///    length cipher, then reads `header + len + tag` bytes and
+///    decrypts the version packet to confirm AEAD integrity.
+///
+/// On success, the cipher handshake is complete: both sides have
+/// derived the same session ID, and the AEAD packet ciphers are
+/// synchronised.  At that point we emit a tracing log so live tests
+/// can confirm interop, then *cleanly disconnect*.  Wrapping the
+/// existing `run_message_loop` to dispatch messages over V2Transport
+/// (encrypt outgoing / decrypt incoming) is deliberately deferred
+/// to a follow-up commit to keep this change reviewable: the cipher
+/// fix + handshake plumbing is what unblocks real-peer interop;
+/// the application-frame wrapper is mechanical from there.
+///
+/// Reference:
+/// - clearbit `cb04a1f` — equivalent Zig implementation, live-verified
+///   against Bitcoin Core 28.x mainnet peers.
+/// - ouroboros `_negotiate_v2` — full Python BIP-324 wire flow.
+/// - BIP-324 §"Wire format" — packet layout + handshake order.
+#[allow(clippy::too_many_arguments)]
+async fn run_inbound_v2_peer(
+    peer_id: PeerId,
+    mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut writer: BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+    addr: SocketAddr,
+    magic: [u8; 4],
+    _our_services: u64,
+    _our_start_height: i32,
+    _our_nonce: u64,
+    prefix: [u8; V1_PREFIX_LEN],
+    handshake_timeout: Duration,
+    event_tx: mpsc::Sender<PeerEvent>,
+    _command_rx: mpsc::Receiver<PeerCommand>,
+) {
+    use tokio::time::timeout;
+    // ----- Step 1: complete the peer's 64-byte ellswift pubkey. -----
+    let mut their_pubkey_bytes = [0u8; ELLSWIFT_PUBKEY_LEN];
+    their_pubkey_bytes[..V1_PREFIX_LEN].copy_from_slice(&prefix);
+    let read_result = timeout(
+        handshake_timeout,
+        reader.read_exact(&mut their_pubkey_bytes[V1_PREFIX_LEN..]),
+    )
+    .await;
+    match read_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(
+                    peer_id,
+                    DisconnectReason::IoError(format!(
+                        "v2 handshake: failed to read ellswift pubkey: {}",
+                        e
+                    )),
+                ))
+                .await;
+            return;
+        }
+        Err(_) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                .await;
+            return;
+        }
+    }
+    let their_pubkey = match EllSwiftPubKey::from_bytes(&their_pubkey_bytes) {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(
+                    peer_id,
+                    DisconnectReason::HandshakeFailed(
+                        "v2 handshake: invalid ellswift pubkey".to_string(),
+                    ),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    // ----- Step 2: build our random ellswift keypair + garbage. -----
+    let mut cipher = Bip324Cipher::random();
+    cipher.initialize_for_responder(&their_pubkey, &magic);
+
+    // Random garbage of 0..=MAX_GARBAGE_LEN bytes (Bitcoin Core sends 0
+    // by default; clearbit/ouroboros include it for traffic analysis
+    // resistance).  We send 0 bytes for now to minimise the failure
+    // surface during initial wiring; a future commit can randomise it.
+    let our_garbage: Vec<u8> = Vec::new();
+
+    // ----- Step 3: send our pubkey + garbage. -----
+    let our_pubkey_bytes = *cipher.our_pubkey().as_bytes();
+    if writer.write_all(&our_pubkey_bytes).await.is_err()
+        || writer.write_all(&our_garbage).await.is_err()
+    {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::IoError(
+                    "v2 handshake: failed to send pubkey + garbage".to_string(),
+                ),
+            ))
+            .await;
+        return;
+    }
+
+    // ----- Step 4: send garbage terminator + encrypted version packet. -----
+    // The version packet has zero-byte contents per BIP-324; our
+    // garbage is the AAD so the peer can authenticate it received our
+    // garbage unchanged.
+    let our_garbage_term = *cipher.send_garbage_terminator();
+    let mut version_packet = vec![0u8; EXPANSION]; // contents.len()==0, so EXPANSION = LENGTH_LEN+HEADER_LEN+TAG_LEN
+    if let Err(e) = cipher.encrypt(&[], &our_garbage, false, &mut version_packet) {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::HandshakeFailed(format!(
+                    "v2 handshake: failed to encrypt version packet: {}",
+                    e
+                )),
+            ))
+            .await;
+        return;
+    }
+    if writer.write_all(&our_garbage_term).await.is_err()
+        || writer.write_all(&version_packet).await.is_err()
+        || writer.flush().await.is_err()
+    {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::IoError(
+                    "v2 handshake: failed to send terminator/version packet".to_string(),
+                ),
+            ))
+            .await;
+        return;
+    }
+
+    // ----- Step 5: scan inbound for the peer's garbage terminator. -----
+    let recv_garbage_term = *cipher.recv_garbage_terminator();
+    let mut their_garbage: Vec<u8> = Vec::new();
+    let scan_result = timeout(handshake_timeout, async {
+        loop {
+            if their_garbage.len() > MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "garbage exceeds MAX_GARBAGE_LEN before terminator",
+                ));
+            }
+            let mut byte = [0u8; 1];
+            reader.read_exact(&mut byte).await?;
+            their_garbage.push(byte[0]);
+            // Only check once we have at least GARBAGE_TERMINATOR_LEN bytes.
+            if their_garbage.len() >= GARBAGE_TERMINATOR_LEN {
+                let tail_start = their_garbage.len() - GARBAGE_TERMINATOR_LEN;
+                if their_garbage[tail_start..] == recv_garbage_term {
+                    // Strip the terminator so the remaining bytes are
+                    // pure garbage (used as AAD for decrypting the
+                    // version packet).
+                    their_garbage.truncate(tail_start);
+                    return Ok::<(), std::io::Error>(());
+                }
+            }
+        }
+    })
+    .await;
+    match scan_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(
+                    peer_id,
+                    DisconnectReason::HandshakeFailed(format!(
+                        "v2 handshake: garbage scan failed: {}",
+                        e
+                    )),
+                ))
+                .await;
+            return;
+        }
+        Err(_) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                .await;
+            return;
+        }
+    }
+
+    // ----- Step 6: decrypt the peer's version packet. -----
+    let mut enc_len = [0u8; LENGTH_LEN];
+    if timeout(handshake_timeout, reader.read_exact(&mut enc_len))
+        .await
+        .map(|r| r.is_err())
+        .unwrap_or(true)
+    {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::IoError(
+                    "v2 handshake: failed to read encrypted length".to_string(),
+                ),
+            ))
+            .await;
+        return;
+    }
+    let plain_len = match cipher.decrypt_length(&enc_len) {
+        Ok(n) => n as usize,
+        Err(e) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(
+                    peer_id,
+                    DisconnectReason::HandshakeFailed(format!(
+                        "v2 handshake: length decrypt failed: {}",
+                        e
+                    )),
+                ))
+                .await;
+            return;
+        }
+    };
+    if plain_len > MAX_MESSAGE_SIZE {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::ProtocolError(
+                    "v2 handshake: version packet too large".to_string(),
+                ),
+            ))
+            .await;
+        return;
+    }
+
+    let total_aead = HEADER_LEN + plain_len + 16; // 16 = TAG_LEN; constant inlined to avoid pulling another import
+    let mut aead_buf = vec![0u8; total_aead];
+    if timeout(handshake_timeout, reader.read_exact(&mut aead_buf))
+        .await
+        .map(|r| r.is_err())
+        .unwrap_or(true)
+    {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::IoError(
+                    "v2 handshake: failed to read encrypted version packet".to_string(),
+                ),
+            ))
+            .await;
+        return;
+    }
+
+    let mut contents = vec![0u8; plain_len];
+    if let Err(e) = cipher.decrypt(&aead_buf, &their_garbage, &mut contents) {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::HandshakeFailed(format!(
+                    "v2 handshake: version packet AEAD decrypt failed: {}",
+                    e
+                )),
+            ))
+            .await;
+        return;
+    }
+
+    // ----- Cipher handshake complete. -----
+    tracing::info!(
+        "peer {:?} ({}): BIP-324 v2 cipher handshake COMPLETE \
+         (session_id={}, their_garbage={} bytes, version_packet={} bytes)",
+        peer_id,
+        addr,
+        hex::encode(cipher.session_id()),
+        their_garbage.len(),
+        plain_len,
+    );
+
+    // The application-layer message loop over the encrypted v2 channel
+    // is not yet plumbed (it requires refactoring `run_message_loop`
+    // to dispatch through V2Transport for both directions).  For now,
+    // disconnect cleanly so the peer can fall back to v1 on retry,
+    // and so live-test logs unambiguously record cipher-handshake
+    // success without spurious "decrypt failed" noise from app traffic.
+    //
+    // FOLLOW-UP: introduce a `run_v2_message_loop` sibling that pumps
+    // bytes through V2Transport.receive_bytes / send_message and feeds
+    // decoded NetworkMessages into the same `handle_message` path.
+    let _ = event_tx
+        .send(PeerEvent::Disconnected(
+            peer_id,
+            DisconnectReason::PeerRequested,
+        ))
+        .await;
 }
 
 // ============================================================
