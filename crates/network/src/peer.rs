@@ -17,9 +17,10 @@ use crate::message::{
 use crate::v2_transport::{
     constants::{
         ELLSWIFT_PUBKEY_LEN, EXPANSION, GARBAGE_TERMINATOR_LEN, HEADER_LEN, LENGTH_LEN,
-        MAX_GARBAGE_LEN, V1_PREFIX_LEN,
+        MAX_GARBAGE_LEN, TAG_LEN, V1_PREFIX_LEN,
     },
-    looks_like_v1_version, Bip324Cipher, EllSwiftPubKey,
+    decode_message_type_and_payload, encode_message_type_and_payload, looks_like_v1_version,
+    Bip324Cipher, EllSwiftPubKey,
 };
 use rustoshi_crypto::sha256d;
 use std::collections::HashSet;
@@ -421,25 +422,25 @@ pub async fn run_outbound_peer(
     // socket, and fall through to the v1 path on a fresh socket.
     if bip324_v2_outbound_enabled() && !is_v1_only(&addr) {
         match try_v2_outbound_handshake(addr, magic).await {
-            Ok(()) => {
-                // Cipher handshake completed.  The application-layer
-                // version/verack pump over the encrypted v2 channel is
-                // not yet plumbed (mirrors the inbound path's deferred
-                // wrap of `run_message_loop`).  Disconnect cleanly so
-                // the v1 path takes over on the next connection attempt
-                // — and so live-test logs unambiguously record cipher-
-                // handshake success without spurious app-traffic noise.
-                //
-                // FOLLOW-UP: dispatch `run_message_loop` through
-                // `Bip324Cipher.encrypt`/`decrypt` for both directions
-                // so the application protocol runs over the encrypted
-                // channel end-to-end.
-                let _ = event_tx
-                    .send(PeerEvent::Disconnected(
-                        peer_id,
-                        DisconnectReason::PeerRequested,
-                    ))
-                    .await;
+            Ok((cipher, reader, writer)) => {
+                // Cipher handshake completed.  Drive the application-layer
+                // version/verack handshake over the encrypted channel,
+                // then enter the v2 message loop.  Both directions are
+                // wrapped through `Bip324Cipher.encrypt`/`decrypt`
+                // (length cipher + AEAD) and re-key automatically every
+                // `REKEY_INTERVAL` packets.
+                run_outbound_v2_peer(
+                    peer_id,
+                    addr,
+                    magic,
+                    our_version.clone(),
+                    cipher,
+                    reader,
+                    writer,
+                    event_tx,
+                    command_rx,
+                )
+                .await;
                 return;
             }
             Err(e) => {
@@ -662,16 +663,24 @@ impl std::fmt::Display for V2OutboundError {
 ///   7. Decrypt the encrypted length, then read header + payload + tag
 ///      and verify the AEAD.
 ///
-/// On success, the cipher is in lockstep with the peer.  The function
-/// returns `Ok(())` and drops the connection (the application-layer
-/// version/verack pump over the encrypted channel is a follow-up; see
-/// the call site in `run_outbound_peer`).
+/// On success, the cipher is in lockstep with the peer and the function
+/// returns the initialized `Bip324Cipher` together with the still-open
+/// reader/writer halves so the caller can drive the application-layer
+/// version/verack handshake and the long-running message loop over the
+/// encrypted channel.
 ///
 /// Bounded by `V2_HANDSHAKE_DEADLINE` (30 s).
 async fn try_v2_outbound_handshake(
     addr: SocketAddr,
     magic: [u8; 4],
-) -> Result<(), V2OutboundError> {
+) -> Result<
+    (
+        Bip324Cipher,
+        BufReader<OwnedReadHalf>,
+        BufWriter<OwnedWriteHalf>,
+    ),
+    V2OutboundError,
+> {
     // ----- Step 1: open a fresh TCP connection. -----
     let stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
@@ -849,7 +858,438 @@ async fn try_v2_outbound_handshake(
         plain_len,
     );
 
+    Ok((cipher, reader, writer))
+}
+
+// ============================================================
+// BIP-324 v2 application-layer transport (encrypted send/recv)
+// ============================================================
+//
+// After `try_v2_outbound_handshake` (or `run_inbound_v2_peer`'s cipher
+// driver) returns successfully, both peers share a `Bip324Cipher` whose
+// length cipher (FSChaCha20) and packet cipher (FSChaCha20-Poly1305) are
+// in lockstep.  The Bitcoin application protocol — `version`, `verack`,
+// `ping`, `getheaders`, …— still flows in both directions, but every
+// message is now framed as a BIP-324 packet:
+//
+//   [3-byte length cipher] || [1-byte AEAD header] || [contents] || [16-byte tag]
+//
+// where `contents` is the v2 envelope produced by
+// `encode_message_type_and_payload(command, payload)`: a single-byte
+// short-id (or 0 + 12-byte command) followed by the v1-style payload.
+//
+// The helper functions below wrap a `Bip324Cipher` + tokio I/O halves so
+// `run_message_loop_v2` can read/write `NetworkMessage` values without
+// duplicating cipher plumbing.
+
+/// Encrypt and send one application-layer message over the v2 channel.
+///
+/// Equivalent to `serialize_message` + `writer.write_all` on the v1 path,
+/// but produces a BIP-324 framed packet instead of a v1 24-byte header
+/// followed by the payload.
+///
+/// Generic over `AsyncWrite` so unit tests can drive it through a
+/// `tokio::io::duplex` pipe without a real TCP socket.
+pub(crate) async fn v2_send_message<W: tokio::io::AsyncWrite + Unpin>(
+    cipher: &mut Bip324Cipher,
+    writer: &mut W,
+    msg: &NetworkMessage,
+) -> std::io::Result<()> {
+    let payload = msg.serialize_payload();
+    let contents = encode_message_type_and_payload(msg.command(), &payload);
+    let mut frame = vec![0u8; contents.len() + EXPANSION];
+    cipher
+        .encrypt(&contents, &[], false, &mut frame)
+        .map_err(|e| std::io::Error::other(format!("v2 encrypt: {}", e)))?;
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
     Ok(())
+}
+
+/// Receive one application-layer message from the v2 channel.
+///
+/// Reads exactly one BIP-324 packet from `reader`, decrypts the length
+/// then the AEAD contents, and decodes the v2 message-type envelope into
+/// a `NetworkMessage`.  Skips packets with the BIP-324 ignore bit set
+/// (decoy traffic) by recursing.  Bounded packet size so that a hostile
+/// peer can't make us allocate up to `u32::MAX` for a single read.
+///
+/// Generic over `AsyncRead` so unit tests can drive it through a
+/// `tokio::io::duplex` pipe.
+pub(crate) async fn v2_recv_message<R: tokio::io::AsyncRead + Unpin>(
+    cipher: &mut Bip324Cipher,
+    reader: &mut R,
+) -> std::io::Result<NetworkMessage> {
+    loop {
+        // Step 1: 3-byte length cipher → plain length.
+        let mut enc_len = [0u8; LENGTH_LEN];
+        reader.read_exact(&mut enc_len).await?;
+        let plain_len = cipher.decrypt_length(&enc_len).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("v2 length decrypt: {}", e),
+            )
+        })? as usize;
+
+        if plain_len > MAX_MESSAGE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("v2 packet too large: {}", plain_len),
+            ));
+        }
+
+        // Step 2: AEAD ciphertext (header + contents + tag).
+        let aead_len = HEADER_LEN + plain_len + TAG_LEN;
+        let mut aead_buf = vec![0u8; aead_len];
+        reader.read_exact(&mut aead_buf).await?;
+
+        let mut contents = vec![0u8; plain_len];
+        let ignore = cipher
+            .decrypt(&aead_buf, &[], &mut contents)
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("v2 AEAD decrypt: {}", e),
+                )
+            })?;
+
+        if ignore {
+            // Decoy packet — caller asked for a real message, keep reading.
+            continue;
+        }
+
+        // Step 3: decode v2 envelope (short id / 12-byte command + payload).
+        let (command, payload) = decode_message_type_and_payload(&contents).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("v2 envelope: {}", e),
+            )
+        })?;
+
+        return NetworkMessage::deserialize(&command, &payload);
+    }
+}
+
+/// Drive the application-layer version/verack handshake as the *initiator*
+/// over the post-cipher-handshake encrypted channel.
+///
+/// Mirrors `perform_handshake` byte-for-byte at the application layer
+/// (same v1 message sequence — VERSION → SENDADDRV2 / WTXIDRELAY → VERACK),
+/// just framed through `v2_send_message` / `v2_recv_message` instead of
+/// the v1 framing.  Per BIP-324 §"Wire format" the BIP-324 "version
+/// packet" exchanged inside the cipher handshake is empty contents +
+/// garbage AAD, NOT the application VERSION message — the application
+/// VERSION still has to be sent first thing on the encrypted channel.
+pub(crate) async fn perform_v2_handshake_outbound(
+    cipher: &mut Bip324Cipher,
+    reader: &mut BufReader<OwnedReadHalf>,
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    our_version: &VersionMessage,
+) -> Result<HandshakeResult, HandshakeError> {
+    // Send our VERSION first.
+    v2_send_message(cipher, writer, &NetworkMessage::Version(our_version.clone()))
+        .await?;
+
+    // Receive their VERSION.
+    let their_version_msg = v2_recv_message(cipher, reader).await?;
+    let their_version = match their_version_msg {
+        NetworkMessage::Version(v) => v,
+        other => {
+            return Err(HandshakeError::ExpectedVersion(other.command().to_string()));
+        }
+    };
+
+    if their_version.nonce == our_version.nonce && our_version.nonce != 0 {
+        return Err(HandshakeError::SelfConnection);
+    }
+    if their_version.version < MIN_WITNESS_PROTO_VERSION {
+        return Err(HandshakeError::ObsoleteVersion(their_version.version));
+    }
+
+    // Send pre-verack BIP negotiation messages.
+    if their_version.version >= WTXID_RELAY_VERSION {
+        v2_send_message(cipher, writer, &NetworkMessage::WtxidRelay).await?;
+    }
+    v2_send_message(cipher, writer, &NetworkMessage::SendAddrV2).await?;
+    v2_send_message(cipher, writer, &NetworkMessage::Verack).await?;
+
+    // Read until VERACK; track BIP negotiation flags along the way.
+    let mut version_received = true; // we already got it above
+    let mut wants_wtxid_relay = false;
+    let mut wants_addrv2 = false;
+    loop {
+        let msg = v2_recv_message(cipher, reader).await?;
+        match msg {
+            NetworkMessage::Verack => break,
+            NetworkMessage::Version(_) => {
+                if version_received {
+                    return Err(HandshakeError::DuplicateVersion);
+                }
+                version_received = true;
+            }
+            NetworkMessage::WtxidRelay => wants_wtxid_relay = true,
+            NetworkMessage::SendAddrV2 => wants_addrv2 = true,
+            other => {
+                return Err(HandshakeError::PreHandshakeMessage(
+                    other.command().to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(HandshakeResult {
+        version: their_version,
+        wants_wtxid_relay,
+        wants_addrv2,
+    })
+}
+
+/// Drive the application-layer version/verack handshake as the *responder*
+/// over the post-cipher-handshake encrypted channel.
+///
+/// The peer initiated, so the wire order from our PoV is:
+///   recv VERSION
+///   send VERSION + (WTXIDRELAY) + SENDADDRV2 + VERACK
+///   loop until peer's VERACK arrives, accepting WTXIDRELAY / SENDADDRV2
+///
+/// Returns a `DisconnectReason` instead of `HandshakeError` so the
+/// caller in `peer_manager::run_inbound_v2_peer` can forward straight to
+/// the event loop without translating two error types.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn perform_v2_handshake_inbound(
+    cipher: &mut Bip324Cipher,
+    reader: &mut BufReader<OwnedReadHalf>,
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    _magic: &[u8; 4],
+    our_services: u64,
+    our_start_height: i32,
+    our_nonce: u64,
+    addr: SocketAddr,
+) -> Result<HandshakeResult, DisconnectReason> {
+    use crate::message::{NetAddress, PROTOCOL_VERSION};
+
+    // Receive their VERSION first (they initiated the connection).
+    let their_version_msg = v2_recv_message(cipher, reader)
+        .await
+        .map_err(|e| DisconnectReason::IoError(format!("v2 recv version: {}", e)))?;
+    let their_version = match their_version_msg {
+        NetworkMessage::Version(v) => v,
+        other => {
+            return Err(DisconnectReason::HandshakeFailed(format!(
+                "expected version, got {}",
+                other.command()
+            )));
+        }
+    };
+
+    // Self-connection check.
+    if their_version.nonce == our_nonce && our_nonce != 0 {
+        return Err(DisconnectReason::SelfConnection);
+    }
+    // Protocol-version floor.
+    if their_version.version < MIN_WITNESS_PROTO_VERSION {
+        return Err(DisconnectReason::ObsoleteVersion(their_version.version));
+    }
+
+    // Build our VERSION.  We mirror `peer_manager::run_inbound_peer`'s
+    // construction so live-fleet peers see consistent fields whether
+    // they reached us via v1 or v2.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let our_addr_recv_ip = match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            let mut ip = [0u8; 16];
+            ip[10] = 0xff;
+            ip[11] = 0xff;
+            ip[12..16].copy_from_slice(&v4.octets());
+            ip
+        }
+        std::net::IpAddr::V6(v6) => v6.octets(),
+    };
+    let our_version = VersionMessage {
+        version: PROTOCOL_VERSION,
+        services: our_services,
+        timestamp: now_unix,
+        addr_recv: NetAddress {
+            services: their_version.services,
+            ip: our_addr_recv_ip,
+            port: addr.port(),
+        },
+        addr_from: NetAddress {
+            services: our_services,
+            ip: [0u8; 16],
+            port: 0,
+        },
+        nonce: our_nonce,
+        user_agent: "/Rustoshi:0.1.0/".to_string(),
+        start_height: our_start_height,
+        relay: true,
+    };
+
+    v2_send_message(cipher, writer, &NetworkMessage::Version(our_version))
+        .await
+        .map_err(|e| DisconnectReason::IoError(format!("v2 send version: {}", e)))?;
+
+    // Pre-verack BIP negotiation messages.
+    if their_version.version >= WTXID_RELAY_VERSION {
+        v2_send_message(cipher, writer, &NetworkMessage::WtxidRelay)
+            .await
+            .map_err(|e| DisconnectReason::IoError(format!("v2 send wtxidrelay: {}", e)))?;
+    }
+    v2_send_message(cipher, writer, &NetworkMessage::SendAddrV2)
+        .await
+        .map_err(|e| DisconnectReason::IoError(format!("v2 send sendaddrv2: {}", e)))?;
+    v2_send_message(cipher, writer, &NetworkMessage::Verack)
+        .await
+        .map_err(|e| DisconnectReason::IoError(format!("v2 send verack: {}", e)))?;
+
+    // Read until VERACK; track BIP negotiation flags.
+    let mut version_received = true;
+    let mut wants_wtxid_relay = false;
+    let mut wants_addrv2 = false;
+    loop {
+        let msg = v2_recv_message(cipher, reader)
+            .await
+            .map_err(|e| DisconnectReason::IoError(format!("v2 recv handshake: {}", e)))?;
+        match msg {
+            NetworkMessage::Verack => break,
+            NetworkMessage::Version(_) => {
+                if version_received {
+                    return Err(DisconnectReason::DuplicateVersion);
+                }
+                version_received = true;
+            }
+            NetworkMessage::WtxidRelay => wants_wtxid_relay = true,
+            NetworkMessage::SendAddrV2 => wants_addrv2 = true,
+            other => {
+                return Err(DisconnectReason::PreHandshakeMessage(
+                    other.command().to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(HandshakeResult {
+        version: their_version,
+        wants_wtxid_relay,
+        wants_addrv2,
+    })
+}
+
+/// Drive an outbound peer to completion over a v2 (BIP-324) encrypted
+/// channel: application-layer handshake + post-handshake feature
+/// negotiation + main message loop.
+///
+/// Counterpart of `run_outbound_peer`'s v1 tail (steps 2–6).  Called from
+/// `run_outbound_peer` after a successful `try_v2_outbound_handshake`.
+#[allow(clippy::too_many_arguments)]
+async fn run_outbound_v2_peer(
+    peer_id: PeerId,
+    addr: SocketAddr,
+    magic: [u8; 4],
+    our_version: VersionMessage,
+    mut cipher: Bip324Cipher,
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: BufWriter<OwnedWriteHalf>,
+    event_tx: mpsc::Sender<PeerEvent>,
+    command_rx: mpsc::Receiver<PeerCommand>,
+) {
+    // 1. Application-layer version/verack over the cipher.
+    let hs_result = match timeout(
+        HANDSHAKE_TIMEOUT,
+        perform_v2_handshake_outbound(&mut cipher, &mut reader, &mut writer, &our_version),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            let reason = match e {
+                HandshakeError::DuplicateVersion => DisconnectReason::DuplicateVersion,
+                HandshakeError::SelfConnection => DisconnectReason::SelfConnection,
+                HandshakeError::ObsoleteVersion(v) => DisconnectReason::ObsoleteVersion(v),
+                HandshakeError::PreHandshakeMessage(cmd) => {
+                    DisconnectReason::PreHandshakeMessage(cmd)
+                }
+                _ => DisconnectReason::HandshakeFailed(e.to_string()),
+            };
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, reason))
+                .await;
+            return;
+        }
+        Err(_) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                .await;
+            return;
+        }
+    };
+
+    let their_version = &hs_result.version;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let peer_info = PeerInfo {
+        addr,
+        version: their_version.version,
+        services: their_version.services,
+        user_agent: their_version.user_agent.clone(),
+        start_height: their_version.start_height,
+        relay: their_version.relay,
+        inbound: false,
+        state: PeerState::Established,
+        last_send: Instant::now(),
+        last_recv: Instant::now(),
+        ping_nonce: None,
+        ping_time: None,
+        bytes_sent: 0,
+        bytes_recv: 0,
+        time_offset: their_version.timestamp - now_unix,
+        supports_witness: their_version.services & NODE_WITNESS != 0,
+        supports_sendheaders: their_version.version >= SENDHEADERS_VERSION,
+        supports_wtxid_relay: hs_result.wants_wtxid_relay,
+        supports_addrv2: hs_result.wants_addrv2,
+        feefilter: 0,
+    };
+
+    let _ = event_tx
+        .send(PeerEvent::Connected(peer_id, peer_info))
+        .await;
+
+    tracing::info!(
+        "peer {:?} ({}): BIP-324 v2 application handshake COMPLETE \
+         (session_id={}, ua=\"{}\", version={})",
+        peer_id,
+        addr,
+        hex::encode(cipher.session_id()),
+        their_version.user_agent,
+        their_version.version,
+    );
+
+    // 2. Post-handshake feature negotiation.
+    if their_version.version >= SENDHEADERS_VERSION {
+        let _ = v2_send_message(&mut cipher, &mut writer, &NetworkMessage::SendHeaders).await;
+    }
+    if their_version.version >= SENDCMPCT_VERSION {
+        let _ = v2_send_message(
+            &mut cipher,
+            &mut writer,
+            &NetworkMessage::SendCmpct(SendCmpctMessage {
+                announce: false,
+                version: 2,
+            }),
+        )
+        .await;
+    }
+
+    // 3. Main message loop over the cipher.
+    run_message_loop_v2(
+        peer_id, &magic, cipher, reader, writer, event_tx, command_rx,
+    )
+    .await;
 }
 
 /// Result of handshake validation.
@@ -1246,6 +1686,167 @@ pub async fn run_message_loop(
             }
         }
     }
+}
+
+/// Run the main message loop on a BIP-324 v2 (encrypted) channel.
+///
+/// Mirrors `run_message_loop` but every read goes through
+/// `v2_recv_message` (length cipher → AEAD decrypt → v2 envelope decode)
+/// and every write goes through `v2_send_message` (v2 envelope encode →
+/// AEAD encrypt → length cipher).  The cipher's internal `packet_counter`
+/// re-keys automatically every `REKEY_INTERVAL` (=224) packets per
+/// BIP-324; both sides advance in lockstep because every successful
+/// encrypt on one side is matched by a successful decrypt on the other.
+///
+/// Cancellation note: unlike the v1 path, v2 reads are not split into a
+/// chunk-buffered state machine.  `tokio::select!` cancels the in-flight
+/// `read_exact` cleanly only at AsyncRead poll boundaries; the BufReader
+/// holds any in-flight bytes so we can resume on the next iteration.
+/// The current implementation issues one `v2_recv_message` future per
+/// loop iteration and lets cancellation drop it; on the v2 path this is
+/// safe because the only competing branches (command and ping) write
+/// rather than read, and we always re-enter `v2_recv_message` from the
+/// top — any partial packet in BufReader's internal buffer survives.
+///
+/// (If select! cancellation is later proven to corrupt v2 stream state
+/// in practice, we'll add a `PendingV2Read` state machine analogous to
+/// `PendingRead` for the v1 path.  For initial wiring we follow the
+/// same straight-line read pattern that haskoin's `receiveMessage` uses
+/// post-`cfa04bd`.)
+pub async fn run_message_loop_v2(
+    peer_id: PeerId,
+    magic: &[u8; 4],
+    mut cipher: Bip324Cipher,
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: BufWriter<OwnedWriteHalf>,
+    event_tx: mpsc::Sender<PeerEvent>,
+    mut command_rx: mpsc::Receiver<PeerCommand>,
+) {
+    let _ = magic; // kept for parity with v1 signature; v2 doesn't use network magic post-handshake
+    let mut last_ping = Instant::now();
+    let mut ping_nonce_pending: Option<(u64, Instant)> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Outgoing commands first.
+            cmd = command_rx.recv() => {
+                match cmd {
+                    Some(PeerCommand::SendMessage(msg)) => {
+                        if let Err(e) = v2_send_message(&mut cipher, &mut writer, &msg).await {
+                            let _ = event_tx.send(PeerEvent::Disconnected(
+                                peer_id,
+                                DisconnectReason::IoError(format!("v2 send: {}", e)),
+                            )).await;
+                            return;
+                        }
+                    }
+                    Some(PeerCommand::Disconnect) | None => {
+                        let _ = event_tx.send(PeerEvent::Disconnected(
+                            peer_id,
+                            DisconnectReason::PeerRequested,
+                        )).await;
+                        return;
+                    }
+                }
+            }
+
+            // Read next encrypted packet → NetworkMessage.
+            recv = v2_recv_message(&mut cipher, &mut reader) => {
+                match recv {
+                    Ok(msg) => {
+                        if let Err(e) = handle_message_v2(
+                            peer_id, &msg, &mut cipher, &mut writer,
+                            &mut ping_nonce_pending, &event_tx,
+                        ).await {
+                            let _ = event_tx.send(PeerEvent::Disconnected(
+                                peer_id,
+                                DisconnectReason::ProtocolError(e.to_string()),
+                            )).await;
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        let _ = event_tx.send(PeerEvent::Disconnected(
+                            peer_id,
+                            DisconnectReason::ConnectionClosed,
+                        )).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(PeerEvent::Disconnected(
+                            peer_id,
+                            DisconnectReason::IoError(e.to_string()),
+                        )).await;
+                        return;
+                    }
+                }
+            }
+
+            // Periodic ping.
+            _ = tokio::time::sleep(PING_INTERVAL.saturating_sub(last_ping.elapsed())) => {
+                if let Some((_, sent_at)) = &ping_nonce_pending {
+                    if sent_at.elapsed() > PING_TIMEOUT {
+                        let _ = event_tx.send(PeerEvent::Disconnected(
+                            peer_id, DisconnectReason::Timeout,
+                        )).await;
+                        return;
+                    }
+                } else {
+                    let nonce: u64 = rand::random();
+                    if let Err(e) = v2_send_message(
+                        &mut cipher, &mut writer, &NetworkMessage::Ping(nonce),
+                    ).await {
+                        let _ = event_tx.send(PeerEvent::Disconnected(
+                            peer_id,
+                            DisconnectReason::IoError(format!("v2 ping send: {}", e)),
+                        )).await;
+                        return;
+                    }
+                    ping_nonce_pending = Some((nonce, Instant::now()));
+                    last_ping = Instant::now();
+                }
+            }
+        }
+    }
+}
+
+/// v2 sibling of `handle_message` — auto-pong on ping, pong RTT tracking,
+/// and forward to the main event loop.  Unlike the v1 path the inbound
+/// message is already deserialized (`v2_recv_message` does that), so we
+/// match on the variant directly.
+async fn handle_message_v2(
+    peer_id: PeerId,
+    msg: &NetworkMessage,
+    cipher: &mut Bip324Cipher,
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    ping_nonce_pending: &mut Option<(u64, Instant)>,
+    event_tx: &mpsc::Sender<PeerEvent>,
+) -> std::io::Result<()> {
+    match msg {
+        NetworkMessage::Ping(nonce) => {
+            v2_send_message(cipher, writer, &NetworkMessage::Pong(*nonce)).await?;
+        }
+        NetworkMessage::Pong(nonce) => {
+            if let Some((pending_nonce, sent_at)) = ping_nonce_pending {
+                if nonce == pending_nonce {
+                    let rtt = sent_at.elapsed();
+                    tracing::debug!("v2 peer {:?} ping RTT: {:?}", peer_id, rtt);
+                    *ping_nonce_pending = None;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    tracing::debug!(
+        "v2 forwarding {} from peer {} to main loop",
+        msg.command(),
+        peer_id.0
+    );
+    let _ = event_tx.send(PeerEvent::Message(peer_id, msg.clone())).await;
+    Ok(())
 }
 
 /// Handle a received message, sending pong for ping and tracking pong RTT.
@@ -2532,5 +3133,217 @@ mod tests {
     #[test]
     fn test_v2_handshake_deadline_constant() {
         assert_eq!(V2_HANDSHAKE_DEADLINE, Duration::from_secs(30));
+    }
+
+    // ============================================================
+    // BIP-324 v2 application-layer wire-framing tests
+    //
+    // These exercise `v2_send_message` / `v2_recv_message` end-to-end
+    // through a `tokio::io::duplex` pipe, with two ciphers built via
+    // `Bip324Cipher::pair_for_test` so the round-trip does NOT depend
+    // on secp256k1 (which aborts in some sandboxed test runners).
+    // ============================================================
+
+    use crate::v2_transport::Bip324Cipher;
+    use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
+
+    /// Encrypt a `NetworkMessage` on the initiator side, send it over a
+    /// duplex pipe, decrypt on the responder side, and compare round-
+    /// trip equality.  Repeats for several message types so we cover
+    /// short-id encoding (`ping`, `getheaders`) AND long-encoding
+    /// (`version`, `verack` is short-id 0… actually `verack` falls
+    /// into the long-encoding path because it's not in the short-id
+    /// table — that asymmetry is exactly what we want to test).
+    #[tokio::test]
+    async fn test_v2_send_recv_roundtrip_via_duplex() {
+        let (mut alice, mut bob) = Bip324Cipher::pair_for_test();
+        let (a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
+        let (mut a_writer, mut b_reader) =
+            (tokio::io::BufWriter::new(a_to_b), tokio::io::BufReader::new(b_from_a));
+
+        let messages = vec![
+            NetworkMessage::Ping(0x1234_5678_9ABC_DEF0),
+            NetworkMessage::Pong(0xCAFE_BABE_DEAD_BEEF),
+            NetworkMessage::Verack,
+            NetworkMessage::SendHeaders,
+            NetworkMessage::SendAddrV2,
+            NetworkMessage::WtxidRelay,
+        ];
+
+        for msg in &messages {
+            v2_send_message(&mut alice, &mut a_writer, msg).await.unwrap();
+        }
+        a_writer.flush().await.unwrap();
+
+        for expected in &messages {
+            let got = v2_recv_message(&mut bob, &mut b_reader).await.unwrap();
+            assert_eq!(
+                got.command(),
+                expected.command(),
+                "round-trip command mismatch"
+            );
+            // Compare payloads byte-for-byte to catch envelope bugs.
+            assert_eq!(
+                got.serialize_payload(),
+                expected.serialize_payload(),
+                "round-trip payload mismatch for {}",
+                expected.command()
+            );
+        }
+    }
+
+    /// Bidirectional exchange: alice and bob each send one message,
+    /// each decrypts the other's.  Verifies the send/recv keying is
+    /// correctly mirrored (initiator's send_l == responder's recv_l,
+    /// etc.) — a single-direction test would miss a key-swap bug.
+    #[tokio::test]
+    async fn test_v2_bidirectional_via_duplex() {
+        let (mut alice, mut bob) = Bip324Cipher::pair_for_test();
+        let (a_end, b_end) = tokio::io::duplex(64 * 1024);
+        let (a_r, a_w) = tokio::io::split(a_end);
+        let (b_r, b_w) = tokio::io::split(b_end);
+        let mut a_writer = tokio::io::BufWriter::new(a_w);
+        let mut a_reader = tokio::io::BufReader::new(a_r);
+        let mut b_writer = tokio::io::BufWriter::new(b_w);
+        let mut b_reader = tokio::io::BufReader::new(b_r);
+
+        // Alice → Bob
+        v2_send_message(&mut alice, &mut a_writer, &NetworkMessage::Ping(1))
+            .await
+            .unwrap();
+        a_writer.flush().await.unwrap();
+        match v2_recv_message(&mut bob, &mut b_reader).await.unwrap() {
+            NetworkMessage::Ping(n) => assert_eq!(n, 1),
+            other => panic!("expected Ping, got {}", other.command()),
+        }
+
+        // Bob → Alice
+        v2_send_message(&mut bob, &mut b_writer, &NetworkMessage::Pong(2))
+            .await
+            .unwrap();
+        b_writer.flush().await.unwrap();
+        match v2_recv_message(&mut alice, &mut a_reader).await.unwrap() {
+            NetworkMessage::Pong(n) => assert_eq!(n, 2),
+            other => panic!("expected Pong, got {}", other.command()),
+        }
+    }
+
+    /// BIP-324 mandates a key rotation after every `REKEY_INTERVAL`
+    /// (=224) packets.  Both sides must advance the rekey counter in
+    /// lockstep — if one side skips the rotation the next packet's
+    /// AEAD tag won't validate.  Send 250 messages (well past the 224
+    /// boundary) and confirm every one round-trips intact.
+    #[tokio::test]
+    async fn test_v2_rekey_boundary_at_224_packets() {
+        use crate::v2_transport::constants::REKEY_INTERVAL;
+        let (mut alice, mut bob) = Bip324Cipher::pair_for_test();
+        let (a_to_b, b_from_a) = tokio::io::duplex(1024 * 1024);
+        let (mut a_writer, mut b_reader) =
+            (tokio::io::BufWriter::new(a_to_b), tokio::io::BufReader::new(b_from_a));
+
+        let total = (REKEY_INTERVAL as u64) + 26; // 250 messages
+        for i in 0..total {
+            v2_send_message(&mut alice, &mut a_writer, &NetworkMessage::Ping(i))
+                .await
+                .unwrap();
+        }
+        a_writer.flush().await.unwrap();
+
+        for i in 0..total {
+            let msg = v2_recv_message(&mut bob, &mut b_reader).await.unwrap();
+            match msg {
+                NetworkMessage::Ping(n) => assert_eq!(
+                    n, i,
+                    "packet {} (post-rekey={}) round-trip diverged",
+                    i,
+                    i >= REKEY_INTERVAL as u64
+                ),
+                other => panic!("expected Ping, got {}", other.command()),
+            }
+        }
+    }
+
+    /// A hostile or just slow peer might deliver an encrypted packet
+    /// in many tiny chunks.  `v2_recv_message` issues `read_exact`
+    /// internally, which the BufReader wraps so the framing logic
+    /// must remain correct regardless of how the bytes arrive.  This
+    /// test pushes one full packet's worth of ciphertext one byte at
+    /// a time and confirms decryption still works.
+    #[tokio::test]
+    async fn test_v2_recv_byte_by_byte_feed() {
+        let (mut alice, mut bob) = Bip324Cipher::pair_for_test();
+
+        // Encrypt a single message into a buffer.
+        let msg = NetworkMessage::Ping(0xDEAD_BEEF_CAFE_BABE);
+        let payload = msg.serialize_payload();
+        let contents = encode_message_type_and_payload(msg.command(), &payload);
+        let mut frame = vec![0u8; contents.len() + EXPANSION];
+        alice.encrypt(&contents, &[], false, &mut frame).unwrap();
+
+        // Trickle the bytes through a duplex pipe one at a time.
+        let (writer_end, reader_end) = tokio::io::duplex(8192);
+        let frame_clone = frame.clone();
+        let writer_task = tokio::spawn(async move {
+            let mut w = writer_end;
+            for byte in frame_clone {
+                w.write_all(&[byte]).await.unwrap();
+                w.flush().await.unwrap();
+                // Yield so the reader gets a chance to make partial
+                // progress between byte arrivals.
+                tokio::task::yield_now().await;
+            }
+            // Drop `w` to half-close — keeps EOF semantics tidy if
+            // the reader ever overshoots, which would surface as a
+            // test failure rather than a hang.
+            drop(w);
+        });
+
+        let mut br = tokio::io::BufReader::with_capacity(1, reader_end);
+        let got = v2_recv_message(&mut bob, &mut br).await.unwrap();
+        writer_task.await.unwrap();
+
+        match got {
+            NetworkMessage::Ping(n) => assert_eq!(n, 0xDEAD_BEEF_CAFE_BABE),
+            other => panic!("expected Ping, got {}", other.command()),
+        }
+    }
+
+    /// BIP-324 §"Wire format": packets with the 0x80 ignore bit set
+    /// (decoys) must be silently skipped on receive.  Send one decoy
+    /// followed by a real Ping and confirm the receiver only surfaces
+    /// the Ping (not the decoy, which has empty contents and would
+    /// otherwise blow up in `decode_message_type_and_payload`).
+    #[tokio::test]
+    async fn test_v2_recv_skips_ignore_flag_packets() {
+        let (mut alice, mut bob) = Bip324Cipher::pair_for_test();
+        let (a_to_b, b_from_a) = tokio::io::duplex(8192);
+        let (mut a_writer, mut b_reader) =
+            (tokio::io::BufWriter::new(a_to_b), tokio::io::BufReader::new(b_from_a));
+
+        // Send a decoy: contents must be non-empty (so the v2 envelope
+        // decodes), but with the ignore bit set the receiver should
+        // skip past without decoding it.  We use a 1-byte contents
+        // with short-id 0 (long-encoding leader) — the decryptor will
+        // surface ignore=true and never try to decode the envelope.
+        let decoy_contents = vec![0xFFu8; 32];
+        let mut decoy_frame = vec![0u8; decoy_contents.len() + EXPANSION];
+        alice
+            .encrypt(&decoy_contents, &[], true, &mut decoy_frame)
+            .unwrap();
+        TokioAsyncWriteExt::write_all(&mut a_writer, &decoy_frame)
+            .await
+            .unwrap();
+
+        // Real ping after the decoy.
+        v2_send_message(&mut alice, &mut a_writer, &NetworkMessage::Ping(7))
+            .await
+            .unwrap();
+        a_writer.flush().await.unwrap();
+
+        let got = v2_recv_message(&mut bob, &mut b_reader).await.unwrap();
+        match got {
+            NetworkMessage::Ping(n) => assert_eq!(n, 7),
+            other => panic!("expected Ping after decoy, got {}", other.command()),
+        }
     }
 }

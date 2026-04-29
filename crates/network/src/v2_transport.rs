@@ -616,6 +616,72 @@ impl Bip324Cipher {
         Self::new(secret_key, entropy)
     }
 
+    /// Build a pair of post-handshake `Bip324Cipher`s with arbitrary
+    /// matching keys, bypassing ECDH/ElligatorSwift entirely.
+    ///
+    /// **Test-only.**  This is a convenience for unit tests that need
+    /// to verify wire-framing (encrypt/decrypt round-trip, re-key
+    /// boundary, byte-by-byte feed) without invoking secp256k1 — useful
+    /// in environments where the global secp context is not available
+    /// (e.g. some sandboxed test runners).  Real peers still go through
+    /// `initialize_for_initiator` / `initialize_for_responder`.
+    ///
+    /// Returns `(initiator, responder)`: each has its `send_*` keyed
+    /// with the same bytes as the other's `recv_*`, so anything one
+    /// encrypts the other decrypts (and vice versa).
+    #[cfg(test)]
+    pub fn pair_for_test() -> (Self, Self) {
+        // Distinct, deterministic keys for each direction so a swap
+        // bug (e.g. forgetting to flip send/recv on the responder
+        // side) would surface as a tag-mismatch rather than passing
+        // by accident.
+        let init_l = [0xA1u8; 32];
+        let init_p = [0xA2u8; 32];
+        let resp_l = [0xB1u8; 32];
+        let resp_p = [0xB2u8; 32];
+        let send_term_init = [0xC1u8; GARBAGE_TERMINATOR_LEN];
+        let recv_term_init = [0xC2u8; GARBAGE_TERMINATOR_LEN];
+        let session_id = [0xDDu8; SESSION_ID_LEN];
+
+        let make = |send_l: [u8; 32],
+                    send_p: [u8; 32],
+                    recv_l: [u8; 32],
+                    recv_p: [u8; 32],
+                    send_term: [u8; GARBAGE_TERMINATOR_LEN],
+                    recv_term: [u8; GARBAGE_TERMINATOR_LEN]|
+         -> Self {
+            Self {
+                secret_key: None,
+                our_pubkey: EllSwiftPubKey([0u8; ELLSWIFT_PUBKEY_LEN]),
+                session_id,
+                send_garbage_terminator: send_term,
+                recv_garbage_terminator: recv_term,
+                send_l_cipher: Some(FSChaCha20::new(send_l, REKEY_INTERVAL)),
+                recv_l_cipher: Some(FSChaCha20::new(recv_l, REKEY_INTERVAL)),
+                send_p_cipher: Some(FSChaCha20Poly1305::new(send_p, REKEY_INTERVAL)),
+                recv_p_cipher: Some(FSChaCha20Poly1305::new(recv_p, REKEY_INTERVAL)),
+            }
+        };
+
+        let initiator = make(
+            init_l,
+            init_p,
+            resp_l,
+            resp_p,
+            send_term_init,
+            recv_term_init,
+        );
+        let responder = make(
+            resp_l,
+            resp_p,
+            init_l,
+            init_p,
+            recv_term_init,
+            send_term_init,
+        );
+        (initiator, responder)
+    }
+
     /// Get our ElligatorSwift public key.
     pub fn our_pubkey(&self) -> &EllSwiftPubKey {
         &self.our_pubkey
