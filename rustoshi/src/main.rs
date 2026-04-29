@@ -59,8 +59,9 @@ struct Cli {
     listen: bool,
 
     /// Advertise NODE_BLOOM (BIP 37) and serve BIP 35 mempool requests.
-    /// Mirrors Bitcoin Core's `-peerbloomfilters` (default: enabled).
-    #[arg(long, default_value = "true")]
+    /// Mirrors Bitcoin Core's `-peerbloomfilters` (default: disabled, per
+    /// `bitcoin-core/src/net_processing.h:44 DEFAULT_PEERBLOOMFILTERS=false`).
+    #[arg(long, default_value = "false")]
     peerbloomfilters: bool,
 
     /// P2P listen port (overrides network default)

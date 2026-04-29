@@ -72,7 +72,8 @@ pub struct PeerManagerConfig {
     /// Whether to accept inbound connections.
     pub listen: bool,
     /// Whether to advertise NODE_BLOOM (BIP 37) and serve BIP 35 mempool requests.
-    /// Bitcoin Core's `-peerbloomfilters` (default: true).
+    /// Bitcoin Core's `-peerbloomfilters` (default: false; see
+    /// `bitcoin-core/src/net_processing.h:44 DEFAULT_PEERBLOOMFILTERS`).
     pub peer_bloom_filters: bool,
     /// Data directory for persistent state (banlist, anchors.dat, etc.).
     pub data_dir: PathBuf,
@@ -95,7 +96,7 @@ impl Default for PeerManagerConfig {
             ban_duration: Duration::from_secs(24 * 60 * 60),
             listen_port: 8333,
             listen: true,
-            peer_bloom_filters: true,
+            peer_bloom_filters: false,
             data_dir: PathBuf::from("."),
         }
     }
@@ -3065,55 +3066,68 @@ mod tests {
         assert!(version.relay);
     }
 
-    /// BIP 35 / NODE_BLOOM: by default `peer_bloom_filters=true`, so our outbound
-    /// version messages (and `local_services()`) must include the NODE_BLOOM bit.
-    /// This is the wire-level signal that lets peers know they may send `mempool`
-    /// to us per BIP 35.
+    /// BIP 35 / NODE_BLOOM: by default `peer_bloom_filters=false` (matching
+    /// Bitcoin Core's `DEFAULT_PEERBLOOMFILTERS=false` in `net_processing.h:44`),
+    /// so our outbound version messages (and `local_services()`) must NOT
+    /// include the NODE_BLOOM bit.
     #[test]
-    fn test_node_bloom_advertised_by_default() {
+    fn test_node_bloom_disabled_by_default() {
         let config = PeerManagerConfig::testnet4();
-        assert!(config.peer_bloom_filters, "peer_bloom_filters default should be true");
-
-        let params = ChainParams::testnet4();
-        let mgr = PeerManager::new(config, params);
-
-        assert!(mgr.peer_bloom_filters_enabled());
-        let services = mgr.local_services();
-        assert!(services & NODE_BLOOM != 0, "NODE_BLOOM must be advertised by default");
-        assert!(services & NODE_NETWORK != 0);
-        assert!(services & NODE_WITNESS != 0);
-
-        let addr: SocketAddr = "192.168.1.1:48333".parse().unwrap();
-        let version = mgr.build_version_message(addr);
         assert!(
-            version.services & NODE_BLOOM != 0,
-            "outbound version message must include NODE_BLOOM"
+            !config.peer_bloom_filters,
+            "peer_bloom_filters default should be false (Core parity)"
         );
-        assert!(
-            version.addr_from.services & NODE_BLOOM != 0,
-            "addr_from in version must also include NODE_BLOOM"
-        );
-    }
 
-    /// When `-peerbloomfilters=false`, the operator opts out of BIP 35 + BIP 37.
-    /// NODE_BLOOM must NOT appear on the wire and the gate in the MEMPOOL handler
-    /// must report bloom_disabled (so the handler disconnects the peer).
-    #[test]
-    fn test_node_bloom_disabled_via_config() {
-        let mut config = PeerManagerConfig::testnet4();
-        config.peer_bloom_filters = false;
         let params = ChainParams::testnet4();
         let mgr = PeerManager::new(config, params);
 
         assert!(!mgr.peer_bloom_filters_enabled());
         let services = mgr.local_services();
-        assert_eq!(services & NODE_BLOOM, 0, "NODE_BLOOM must NOT be set when disabled");
+        assert_eq!(
+            services & NODE_BLOOM,
+            0,
+            "NODE_BLOOM must NOT be advertised by default"
+        );
         assert!(services & NODE_NETWORK != 0);
         assert!(services & NODE_WITNESS != 0);
 
         let addr: SocketAddr = "192.168.1.1:48333".parse().unwrap();
         let version = mgr.build_version_message(addr);
-        assert_eq!(version.services & NODE_BLOOM, 0);
+        assert_eq!(
+            version.services & NODE_BLOOM,
+            0,
+            "outbound version message must NOT include NODE_BLOOM by default"
+        );
+        assert_eq!(
+            version.addr_from.services & NODE_BLOOM,
+            0,
+            "addr_from in version must NOT include NODE_BLOOM by default"
+        );
+    }
+
+    /// When `-peerbloomfilters=true`, the operator opts INTO BIP 35 + BIP 37.
+    /// NODE_BLOOM must appear on the wire and the gate in the MEMPOOL handler
+    /// must allow the request.
+    #[test]
+    fn test_node_bloom_enabled_via_config() {
+        let mut config = PeerManagerConfig::testnet4();
+        config.peer_bloom_filters = true;
+        let params = ChainParams::testnet4();
+        let mgr = PeerManager::new(config, params);
+
+        assert!(mgr.peer_bloom_filters_enabled());
+        let services = mgr.local_services();
+        assert!(
+            services & NODE_BLOOM != 0,
+            "NODE_BLOOM must be set when explicitly enabled"
+        );
+        assert!(services & NODE_NETWORK != 0);
+        assert!(services & NODE_WITNESS != 0);
+
+        let addr: SocketAddr = "192.168.1.1:48333".parse().unwrap();
+        let version = mgr.build_version_message(addr);
+        assert!(version.services & NODE_BLOOM != 0);
+        assert!(version.addr_from.services & NODE_BLOOM != 0);
     }
 
     #[test]
