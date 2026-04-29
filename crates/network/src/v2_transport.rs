@@ -13,12 +13,37 @@ use chacha20::ChaCha20;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
+use lazy_static::lazy_static;
 use rand::RngCore;
 use secp256k1::ellswift::{ElligatorSwift, ElligatorSwiftParty};
-use secp256k1::SecretKey;
+use secp256k1::{All, Secp256k1, SecretKey};
 use sha2::Sha256;
 use std::collections::HashMap;
 use thiserror::Error;
+
+lazy_static! {
+    /// Lazily-initialized full-capability secp256k1 context.
+    ///
+    /// `secp256k1` 0.28's `ElligatorSwift::new(seckey, rand)` invokes the C
+    /// function `secp256k1_ellswift_create` with the static
+    /// `context_no_precomp`, whose `ecmult_gen_ctx` is zero-initialized.
+    /// The C implementation calls
+    /// `ARG_CHECK(ecmult_gen_context_is_built(&ctx->ecmult_gen_ctx))` (see
+    /// `secp256k1-sys/.../modules/ellswift/main_impl.h:461`), which fires
+    /// the illegal-argument callback (default: `abort()`) on the static
+    /// context.  This was the panic blocking all 18 rustoshi pairs in the
+    /// BIP324 interop matrix.
+    ///
+    /// The fix is to use `ElligatorSwift::from_seckey(&secp, sk, Some(rand))`
+    /// with a context that actually has its signing-side (`ecmult_gen`)
+    /// precomputation built.  `Secp256k1::new()` returns a `Secp256k1<All>`
+    /// (created with `SECP256K1_START_SIGN | SECP256K1_START_VERIFY`),
+    /// which has `ecmult_gen_ctx` built.  We cache it once and reuse for
+    /// every handshake — building a context is expensive (it allocates and
+    /// precomputes tables); the workspace already enables the `lowmemory`
+    /// feature so the table is the smaller variant.
+    static ref SECP_CTX: Secp256k1<All> = Secp256k1::new();
+}
 
 /// Errors that can occur during BIP324 operations.
 #[derive(Debug, Error)]
@@ -206,9 +231,17 @@ impl EllSwiftPubKey {
 /// Generate an ElligatorSwift-encoded public key from a secret key.
 ///
 /// The encoding uses 32 bytes of entropy to select one of the ~2^256 possible encodings.
+///
+/// Implementation note: We MUST use `ElligatorSwift::from_seckey(&secp, ...)`,
+/// not `ElligatorSwift::new(...)`, because the latter calls the C function
+/// with `secp256k1_context_no_precomp` (the static no-precomp context),
+/// whose `ecmult_gen_ctx` is not built.  `secp256k1_ellswift_create` asserts
+/// `ARG_CHECK(ecmult_gen_context_is_built)` and aborts via the default
+/// illegal-argument callback when that assertion fails.  Using a context
+/// constructed via `Secp256k1::new()` (which enables `SECP256K1_START_SIGN`)
+/// satisfies that assertion.
 pub fn ellswift_create(secret_key: &SecretKey, entropy: &[u8; 32]) -> EllSwiftPubKey {
-    // Use the secp256k1 crate's native ElligatorSwift support
-    let es = ElligatorSwift::new(*secret_key, *entropy);
+    let es = ElligatorSwift::from_seckey(&*SECP_CTX, *secret_key, Some(*entropy));
     EllSwiftPubKey::from_ellswift(es)
 }
 
