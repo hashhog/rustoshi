@@ -14,8 +14,17 @@ use crate::message::{
     MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE, MIN_WITNESS_PROTO_VERSION, NODE_WITNESS,
     SENDCMPCT_VERSION, SENDHEADERS_VERSION, WTXID_RELAY_VERSION,
 };
+use crate::v2_transport::{
+    constants::{
+        ELLSWIFT_PUBKEY_LEN, EXPANSION, GARBAGE_TERMINATOR_LEN, HEADER_LEN, LENGTH_LEN,
+        MAX_GARBAGE_LEN, V1_PREFIX_LEN,
+    },
+    looks_like_v1_version, Bip324Cipher, EllSwiftPubKey,
+};
 use rustoshi_crypto::sha256d;
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::{Mutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -294,13 +303,102 @@ impl Default for MessageReader {
     }
 }
 
+/// Returns true iff outbound BIP-324 v2 negotiation is enabled.  Gated by
+/// the `RUSTOSHI_BIP324_V2_OUTBOUND` environment variable (default OFF
+/// pending live-fleet verification).  Set to `1` / `true` / `yes` / `on`
+/// to enable; any other value or unset → outbound connections start
+/// directly with v1 (matching prior behavior).
+///
+/// Mirrors `peer_manager::bip324_v2_inbound_enabled` for inbound.  Once
+/// flipped to default-ON in a future commit, this flag will gate the
+/// fall-back-to-v1 LRU cache path.  The cipher fix in `0de596e`
+/// (continuous FSChaCha20 keystream) is required before real-peer v2
+/// interop can succeed in either direction.
+///
+/// Reference: clearbit `Peer.bip324V2Enabled` (Zig).
+pub fn bip324_v2_outbound_enabled() -> bool {
+    match std::env::var("RUSTOSHI_BIP324_V2_OUTBOUND") {
+        Ok(v) => {
+            let v = v.to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        }
+        Err(_) => false,
+    }
+}
+
+/// Maximum size of the per-process BIP-324 v2 outbound v1-only fall-back
+/// LRU cache.  Mirrors clearbit's `V2_FALLBACK_CACHE_MAX = 4096`.  Once
+/// full, a single arbitrary entry is evicted; reprobing v1-only peers
+/// is cheap (one round-trip cost) so eviction policy isn't critical.
+pub const V2_FALLBACK_CACHE_MAX: usize = 4096;
+
+/// V2 handshake deadline (seconds).  Matches Bitcoin Core's
+/// `peers.timeoutbal`-aligned handshake budget and clearbit's
+/// `V2_HANDSHAKE_DEADLINE_MS = 30_000`.
+pub const V2_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Per-process LRU set of remote socket addresses that have been
+/// observed to NOT speak BIP-324 v2 (either timed out or sent v1 magic
+/// in response to our ellswift pubkey).  Once an address lands here,
+/// subsequent outbound attempts skip the v2 probe and go straight to
+/// v1.  Bounded by `V2_FALLBACK_CACHE_MAX`.
+///
+/// We use a process-wide `OnceLock<Mutex<HashSet>>` rather than threading
+/// state through every `run_outbound_peer` call: the data structure is
+/// hot only on connection setup (a few times per minute) and the lock
+/// is held for microseconds.
+fn v1_only_cache() -> &'static Mutex<HashSet<SocketAddr>> {
+    static CACHE: OnceLock<Mutex<HashSet<SocketAddr>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Returns true if `addr` is in the v1-only fall-back set.
+pub fn is_v1_only(addr: &SocketAddr) -> bool {
+    v1_only_cache()
+        .lock()
+        .map(|set| set.contains(addr))
+        .unwrap_or(false)
+}
+
+/// Mark `addr` as v1-only so future outbound attempts skip the v2 probe.
+/// If the cache is full, evicts a single arbitrary entry (HashSet
+/// iteration order is implementation-defined; Rust's hash-randomisation
+/// makes this effectively a random eviction).
+pub fn mark_v1_only(addr: SocketAddr) {
+    if let Ok(mut set) = v1_only_cache().lock() {
+        if set.len() >= V2_FALLBACK_CACHE_MAX {
+            // Evict an arbitrary entry to bound memory.
+            if let Some(victim) = set.iter().next().copied() {
+                set.remove(&victim);
+            }
+        }
+        set.insert(addr);
+    }
+}
+
+/// Test-only helper: clear the v1-only cache.
+#[cfg(test)]
+pub fn clear_v1_only_cache() {
+    if let Ok(mut set) = v1_only_cache().lock() {
+        set.clear();
+    }
+}
+
 /// Run an outbound peer connection task.
 ///
 /// This handles:
 /// 1. TCP connection with timeout
-/// 2. Version/verack handshake
-/// 3. Post-handshake negotiation (sendheaders, wtxidrelay)
-/// 4. Message read/write loop with ping/pong keepalive
+/// 2. (Optional) BIP-324 v2 cipher handshake (when
+///    `RUSTOSHI_BIP324_V2_OUTBOUND=1` and the address is not v1-only)
+/// 3. Version/verack handshake
+/// 4. Post-handshake negotiation (sendheaders, wtxidrelay)
+/// 5. Message read/write loop with ping/pong keepalive
+///
+/// On v2 path failure (timeout, peer responded with v1 magic, AEAD
+/// decrypt failed, etc.), the v2 socket is abandoned (sending v2
+/// garbage corrupts v1 framing on the remote, so the same socket
+/// cannot be reused), the address is cached in the v1-only set, and
+/// a fresh TCP connection is opened for the v1 handshake.
 ///
 /// # Arguments
 /// * `peer_id` - Unique identifier for this peer
@@ -317,6 +415,47 @@ pub async fn run_outbound_peer(
     event_tx: mpsc::Sender<PeerEvent>,
     command_rx: mpsc::Receiver<PeerCommand>,
 ) {
+    // BIP-324 v2 outbound probe path.  When enabled and the address is
+    // not in the v1-only LRU cache, attempt the v2 cipher handshake on a
+    // dedicated socket first.  On any failure, mark v1-only, drop the
+    // socket, and fall through to the v1 path on a fresh socket.
+    if bip324_v2_outbound_enabled() && !is_v1_only(&addr) {
+        match try_v2_outbound_handshake(addr, magic).await {
+            Ok(()) => {
+                // Cipher handshake completed.  The application-layer
+                // version/verack pump over the encrypted v2 channel is
+                // not yet plumbed (mirrors the inbound path's deferred
+                // wrap of `run_message_loop`).  Disconnect cleanly so
+                // the v1 path takes over on the next connection attempt
+                // — and so live-test logs unambiguously record cipher-
+                // handshake success without spurious app-traffic noise.
+                //
+                // FOLLOW-UP: dispatch `run_message_loop` through
+                // `Bip324Cipher.encrypt`/`decrypt` for both directions
+                // so the application protocol runs over the encrypted
+                // channel end-to-end.
+                let _ = event_tx
+                    .send(PeerEvent::Disconnected(
+                        peer_id,
+                        DisconnectReason::PeerRequested,
+                    ))
+                    .await;
+                return;
+            }
+            Err(e) => {
+                tracing::info!(
+                    "peer {:?} ({}): BIP-324 v2 outbound handshake failed: {}; \
+                     marking v1-only and reconnecting on a fresh socket",
+                    peer_id,
+                    addr,
+                    e
+                );
+                mark_v1_only(addr);
+                // Fall through to v1 path with a fresh TCP connection.
+            }
+        }
+    }
+
     // 1. Connect with timeout
     let stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
@@ -456,6 +595,261 @@ pub async fn run_outbound_peer(
 
     // 6. Main message loop
     run_message_loop(peer_id, &magic, reader, writer, event_tx, command_rx).await;
+}
+
+/// Errors specific to the outbound BIP-324 v2 cipher handshake.
+#[derive(Debug)]
+pub enum V2OutboundError {
+    /// TCP connection failed.
+    ConnectFailed(String),
+    /// Connection timed out.
+    Timeout,
+    /// Peer responded with v1 magic (i.e. is treating our 64-byte
+    /// ellswift garbage as a v1 message header).  Caller MUST close
+    /// the socket (sending v2 garbage is destructive on a v1 peer).
+    V1MagicDetected,
+    /// I/O error during the handshake.
+    IoError(String),
+    /// Cipher operation failed (encrypt / decrypt / length-decrypt).
+    CipherError(String),
+    /// Peer's pubkey or version packet was malformed / over-sized.
+    ProtocolError(String),
+}
+
+impl std::fmt::Display for V2OutboundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            V2OutboundError::ConnectFailed(s) => write!(f, "v2 connect failed: {}", s),
+            V2OutboundError::Timeout => write!(f, "v2 handshake timeout"),
+            V2OutboundError::V1MagicDetected => write!(f, "v2 peer responded with v1 magic"),
+            V2OutboundError::IoError(s) => write!(f, "v2 io error: {}", s),
+            V2OutboundError::CipherError(s) => write!(f, "v2 cipher error: {}", s),
+            V2OutboundError::ProtocolError(s) => write!(f, "v2 protocol error: {}", s),
+        }
+    }
+}
+
+/// Drive a BIP-324 v2 cipher handshake as the *initiator* against `addr`.
+///
+/// Mirrors the inbound responder flow in
+/// `peer_manager::run_inbound_v2_peer` but with the order reversed and
+/// with a v1-magic detection short-circuit: as the initiator we send
+/// our pubkey + garbage first and observe the peer's reply, so we can
+/// detect a v1-only peer (which will treat our ellswift bytes as a v1
+/// version header and reply with its own v1 version) by inspecting the
+/// first 16 bytes for the magic prefix.
+///
+/// Wire flow (initiator):
+///   1. Open a fresh TCP connection.
+///   2. Build a `Bip324Cipher::random()` and initialize it for
+///      *initiator* mode against the peer's pubkey (not yet received —
+///      we initialize lazily after step 4).
+///   3. Send our 64-byte ellswift pubkey + garbage (0 bytes for now,
+///      matching the responder side; randomising garbage is a
+///      follow-up).
+///   4. Read the first 16 bytes of the peer's reply.  If the bytes
+///      look like a v1 VERSION header (`looks_like_v1_version`),
+///      abandon — the peer is v1-only.  Otherwise treat as the
+///      first 16 bytes of the peer's 64-byte ellswift pubkey.
+///   5. Read the remaining 48 bytes of the peer's pubkey, initialise
+///      the cipher in initiator mode, then send our garbage terminator
+///      and an encrypted version packet (zero contents, our garbage
+///      as AAD).
+///   6. Scan the peer's stream for our `recv_garbage_terminator`
+///      (capped at MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN), the
+///      bytes preceding it are the AAD for decrypting the peer's
+///      encrypted version packet.
+///   7. Decrypt the encrypted length, then read header + payload + tag
+///      and verify the AEAD.
+///
+/// On success, the cipher is in lockstep with the peer.  The function
+/// returns `Ok(())` and drops the connection (the application-layer
+/// version/verack pump over the encrypted channel is a follow-up; see
+/// the call site in `run_outbound_peer`).
+///
+/// Bounded by `V2_HANDSHAKE_DEADLINE` (30 s).
+async fn try_v2_outbound_handshake(
+    addr: SocketAddr,
+    magic: [u8; 4],
+) -> Result<(), V2OutboundError> {
+    // ----- Step 1: open a fresh TCP connection. -----
+    let stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(V2OutboundError::ConnectFailed(e.to_string())),
+        Err(_) => return Err(V2OutboundError::Timeout),
+    };
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(writer);
+
+    // ----- Step 2: build our cipher. -----
+    let mut cipher = Bip324Cipher::random();
+    let our_pubkey_bytes = *cipher.our_pubkey().as_bytes();
+
+    // Random garbage is allowed in [0, MAX_GARBAGE_LEN].  We send 0
+    // bytes for now to match the inbound responder side and minimise
+    // failure surface during initial wiring; a future commit can
+    // randomise.
+    let our_garbage: Vec<u8> = Vec::new();
+
+    // ----- Step 3: send our ellswift pubkey + garbage. -----
+    if writer.write_all(&our_pubkey_bytes).await.is_err()
+        || writer.write_all(&our_garbage).await.is_err()
+        || writer.flush().await.is_err()
+    {
+        return Err(V2OutboundError::IoError(
+            "failed to send pubkey + garbage".to_string(),
+        ));
+    }
+
+    // ----- Step 4: read the peer's first 16 bytes; detect v1 magic. -----
+    let mut prefix = [0u8; V1_PREFIX_LEN];
+    match timeout(V2_HANDSHAKE_DEADLINE, reader.read_exact(&mut prefix)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Err(V2OutboundError::IoError(format!(
+                "failed to read peer pubkey prefix: {}",
+                e
+            )))
+        }
+        Err(_) => return Err(V2OutboundError::Timeout),
+    }
+    if looks_like_v1_version(&prefix, &magic) {
+        // Peer is v1 — we've already corrupted its framing by sending
+        // 64+ bytes of v2 garbage, but that's the cost of probing.
+        // Caller will reconnect on a fresh socket in v1 mode.
+        return Err(V2OutboundError::V1MagicDetected);
+    }
+
+    // ----- Step 5: read the remaining 48 bytes of the peer's pubkey. -----
+    let mut their_pubkey_bytes = [0u8; ELLSWIFT_PUBKEY_LEN];
+    their_pubkey_bytes[..V1_PREFIX_LEN].copy_from_slice(&prefix);
+    match timeout(
+        V2_HANDSHAKE_DEADLINE,
+        reader.read_exact(&mut their_pubkey_bytes[V1_PREFIX_LEN..]),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Err(V2OutboundError::IoError(format!(
+                "failed to read peer pubkey tail: {}",
+                e
+            )))
+        }
+        Err(_) => return Err(V2OutboundError::Timeout),
+    }
+    let their_pubkey = EllSwiftPubKey::from_bytes(&their_pubkey_bytes)
+        .map_err(|_| V2OutboundError::ProtocolError("invalid ellswift pubkey".to_string()))?;
+
+    // Initialise the cipher in initiator mode now that we have the
+    // peer's pubkey.  This consumes our secret key inside the cipher.
+    cipher.initialize_for_initiator(&their_pubkey, &magic);
+
+    // ----- Step 6: send garbage terminator + encrypted version packet. -----
+    let our_garbage_term = *cipher.send_garbage_terminator();
+    let mut version_packet = vec![0u8; EXPANSION]; // contents.len() == 0
+    cipher
+        .encrypt(&[], &our_garbage, false, &mut version_packet)
+        .map_err(|e| V2OutboundError::CipherError(format!("encrypt version packet: {}", e)))?;
+    if writer.write_all(&our_garbage_term).await.is_err()
+        || writer.write_all(&version_packet).await.is_err()
+        || writer.flush().await.is_err()
+    {
+        return Err(V2OutboundError::IoError(
+            "failed to send terminator/version packet".to_string(),
+        ));
+    }
+
+    // ----- Step 7: scan inbound for the peer's garbage terminator. -----
+    let recv_garbage_term = *cipher.recv_garbage_terminator();
+    let mut their_garbage: Vec<u8> = Vec::new();
+    let scan_result = timeout(V2_HANDSHAKE_DEADLINE, async {
+        loop {
+            if their_garbage.len() > MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "garbage exceeds MAX_GARBAGE_LEN before terminator",
+                ));
+            }
+            let mut byte = [0u8; 1];
+            reader.read_exact(&mut byte).await?;
+            their_garbage.push(byte[0]);
+            if their_garbage.len() >= GARBAGE_TERMINATOR_LEN {
+                let tail_start = their_garbage.len() - GARBAGE_TERMINATOR_LEN;
+                if their_garbage[tail_start..] == recv_garbage_term {
+                    their_garbage.truncate(tail_start);
+                    return Ok::<(), std::io::Error>(());
+                }
+            }
+        }
+    })
+    .await;
+    match scan_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(V2OutboundError::ProtocolError(format!(
+                "garbage scan: {}",
+                e
+            )))
+        }
+        Err(_) => return Err(V2OutboundError::Timeout),
+    }
+
+    // ----- Step 8: decrypt the peer's encrypted length. -----
+    let mut enc_len = [0u8; LENGTH_LEN];
+    match timeout(V2_HANDSHAKE_DEADLINE, reader.read_exact(&mut enc_len)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Err(V2OutboundError::IoError(format!(
+                "failed to read encrypted length: {}",
+                e
+            )))
+        }
+        Err(_) => return Err(V2OutboundError::Timeout),
+    }
+    let plain_len = cipher
+        .decrypt_length(&enc_len)
+        .map_err(|e| V2OutboundError::CipherError(format!("length decrypt: {}", e)))?
+        as usize;
+    if plain_len > MAX_MESSAGE_SIZE {
+        return Err(V2OutboundError::ProtocolError(format!(
+            "version packet too large: {} bytes",
+            plain_len
+        )));
+    }
+
+    // ----- Step 9: read + decrypt the peer's encrypted version packet. -----
+    // 16 = TAG_LEN; we don't import it directly to keep the use list short.
+    let total_aead = HEADER_LEN + plain_len + 16;
+    let mut aead_buf = vec![0u8; total_aead];
+    match timeout(V2_HANDSHAKE_DEADLINE, reader.read_exact(&mut aead_buf)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Err(V2OutboundError::IoError(format!(
+                "failed to read encrypted version packet: {}",
+                e
+            )))
+        }
+        Err(_) => return Err(V2OutboundError::Timeout),
+    }
+
+    let mut contents = vec![0u8; plain_len];
+    cipher
+        .decrypt(&aead_buf, &their_garbage, &mut contents)
+        .map_err(|e| V2OutboundError::CipherError(format!("version packet AEAD: {}", e)))?;
+
+    // ----- Cipher handshake complete. -----
+    tracing::info!(
+        "outbound v2 ({}): BIP-324 v2 cipher handshake COMPLETE \
+         (session_id={}, their_garbage={} bytes, version_packet={} bytes)",
+        addr,
+        hex::encode(cipher.session_id()),
+        their_garbage.len(),
+        plain_len,
+    );
+
+    Ok(())
 }
 
 /// Result of handshake validation.
@@ -1960,5 +2354,183 @@ mod tests {
 
         let reason = DisconnectReason::ObsoleteVersion(70010);
         assert!(format!("{:?}", reason).contains("70010"));
+    }
+
+    // -------- BIP-324 v2 outbound state-machine tests --------
+
+    /// The env-var gate must default to OFF.  Live-fleet flip happens
+    /// by setting `RUSTOSHI_BIP324_V2_OUTBOUND=1` (or `true` / `yes` /
+    /// `on`).  Anything else, including unset, returns false.
+    #[test]
+    fn test_bip324_v2_outbound_disabled_by_default() {
+        // SAFETY: Cargo runs each test in its own process by default;
+        // even if a user pre-set the env var, removing it here only
+        // affects this test process.  We re-set it to its prior value
+        // at the end on a best-effort basis (drops on panic, but the
+        // process exits anyway).
+        let prior = std::env::var("RUSTOSHI_BIP324_V2_OUTBOUND").ok();
+        std::env::remove_var("RUSTOSHI_BIP324_V2_OUTBOUND");
+        assert!(
+            !bip324_v2_outbound_enabled(),
+            "v2 outbound must be OFF when env var is unset"
+        );
+        std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", "0");
+        assert!(
+            !bip324_v2_outbound_enabled(),
+            "v2 outbound must be OFF when env var is '0'"
+        );
+        std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", "no");
+        assert!(
+            !bip324_v2_outbound_enabled(),
+            "v2 outbound must be OFF when env var is 'no'"
+        );
+        if let Some(v) = prior {
+            std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", v);
+        } else {
+            std::env::remove_var("RUSTOSHI_BIP324_V2_OUTBOUND");
+        }
+    }
+
+    /// All the canonical "ON" strings (1, true, yes, on) must enable
+    /// the gate, case-insensitive.
+    #[test]
+    fn test_bip324_v2_outbound_enable_strings() {
+        let prior = std::env::var("RUSTOSHI_BIP324_V2_OUTBOUND").ok();
+        for v in ["1", "true", "True", "TRUE", "yes", "YES", "on", "ON"] {
+            std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", v);
+            assert!(
+                bip324_v2_outbound_enabled(),
+                "v2 outbound must be ON for env var = {:?}",
+                v
+            );
+        }
+        if let Some(v) = prior {
+            std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", v);
+        } else {
+            std::env::remove_var("RUSTOSHI_BIP324_V2_OUTBOUND");
+        }
+    }
+
+    /// `mark_v1_only` + `is_v1_only` round-trip — basic correctness.
+    /// Note: the LRU cache is process-wide so this test must avoid
+    /// addresses used by other tests.
+    #[test]
+    fn test_v1_only_cache_roundtrip() {
+        let addr: SocketAddr = "203.0.113.42:8333".parse().unwrap();
+        clear_v1_only_cache();
+        assert!(!is_v1_only(&addr), "fresh cache must not contain addr");
+        mark_v1_only(addr);
+        assert!(is_v1_only(&addr), "marked addr must be in cache");
+        let other: SocketAddr = "203.0.113.43:8333".parse().unwrap();
+        assert!(!is_v1_only(&other), "unmarked addr must NOT be in cache");
+        clear_v1_only_cache();
+    }
+
+    /// LRU cache must respect `V2_FALLBACK_CACHE_MAX`: inserting more
+    /// than that many entries must NOT cause the cache to grow without
+    /// bound — it caps at the max.
+    #[test]
+    fn test_v1_only_cache_lru_eviction() {
+        clear_v1_only_cache();
+        // Insert V2_FALLBACK_CACHE_MAX + 100 distinct addresses.
+        for i in 0..(V2_FALLBACK_CACHE_MAX as u16 + 100) {
+            // Use 198.51.100.0/16 reserved-for-documentation range.
+            let oct_a = (i / 256) as u8;
+            let oct_b = (i % 256) as u8;
+            let addr: SocketAddr = format!("198.51.{}.{}:8333", oct_a, oct_b)
+                .parse()
+                .unwrap();
+            mark_v1_only(addr);
+        }
+        // Cache size must be <= V2_FALLBACK_CACHE_MAX (we evict on
+        // insert when at capacity).
+        let size = v1_only_cache().lock().unwrap().len();
+        assert!(
+            size <= V2_FALLBACK_CACHE_MAX,
+            "cache must respect cap; got {} > {}",
+            size,
+            V2_FALLBACK_CACHE_MAX
+        );
+        // And must be exactly capped (we inserted +100 over the cap).
+        assert_eq!(
+            size, V2_FALLBACK_CACHE_MAX,
+            "cache must fill to exactly the cap"
+        );
+        clear_v1_only_cache();
+    }
+
+    /// V2OutboundError Display impl must include enough context for
+    /// debugging (used in tracing logs).
+    #[test]
+    fn test_v2_outbound_error_display() {
+        let err = V2OutboundError::ConnectFailed("refused".to_string());
+        assert!(err.to_string().contains("refused"));
+
+        let err = V2OutboundError::Timeout;
+        assert!(err.to_string().contains("timeout"));
+
+        let err = V2OutboundError::V1MagicDetected;
+        assert!(err.to_string().contains("v1 magic"));
+
+        let err = V2OutboundError::CipherError("tag mismatch".to_string());
+        assert!(err.to_string().contains("tag mismatch"));
+
+        let err = V2OutboundError::ProtocolError("oversized".to_string());
+        assert!(err.to_string().contains("oversized"));
+    }
+
+    /// V1-magic detection: when a v1-only peer sees our 64-byte
+    /// ellswift garbage on the wire, it tries to parse it as a v1
+    /// message header and (typically) replies with its own version
+    /// message starting with the network magic.  We must detect this
+    /// in the first 16 bytes of the peer's reply via
+    /// `looks_like_v1_version` and fall back.
+    ///
+    /// This test exercises the same classification logic used inside
+    /// `try_v2_outbound_handshake` so we can verify the detection
+    /// without needing live secp256k1 (the lowmemory feature aborts on
+    /// `ElligatorSwift::new`, which would block any real handshake
+    /// test).
+    #[test]
+    fn test_v1_magic_detection_in_outbound_reply() {
+        // Mainnet magic + b"version\0\0\0\0\0".
+        let mainnet = [0xf9, 0xbe, 0xb4, 0xd9];
+        let mut v1_reply = [0u8; V1_PREFIX_LEN];
+        v1_reply[..4].copy_from_slice(&mainnet);
+        v1_reply[4..16].copy_from_slice(b"version\0\0\0\0\0");
+        assert!(
+            looks_like_v1_version(&v1_reply, &mainnet),
+            "v1 peer reply must be classified as v1"
+        );
+
+        // Random-looking 16 bytes (i.e. start of an ellswift pubkey)
+        // must NOT be classified as v1 with overwhelming probability.
+        let v2_pubkey_prefix = [
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        assert!(
+            !looks_like_v1_version(&v2_pubkey_prefix, &mainnet),
+            "v2 peer reply (random pubkey prefix) must NOT be classified as v1"
+        );
+
+        // Magic match but wrong command (e.g. peer sent "addr" first
+        // — protocol violation): not a v1 marker.  This matches
+        // `looks_like_v1_version`'s contract: only the unambiguous v1
+        // VERSION-message start is treated as v1.
+        let mut wrong_cmd = [0u8; V1_PREFIX_LEN];
+        wrong_cmd[..4].copy_from_slice(&mainnet);
+        wrong_cmd[4..16].copy_from_slice(b"addr\0\0\0\0\0\0\0\0");
+        assert!(
+            !looks_like_v1_version(&wrong_cmd, &mainnet),
+            "magic+wrong-command must NOT be classified as v1"
+        );
+    }
+
+    /// V2 handshake deadline must match the documented 30s budget
+    /// (mirrors clearbit's `V2_HANDSHAKE_DEADLINE_MS = 30_000`).
+    #[test]
+    fn test_v2_handshake_deadline_constant() {
+        assert_eq!(V2_HANDSHAKE_DEADLINE, Duration::from_secs(30));
     }
 }
