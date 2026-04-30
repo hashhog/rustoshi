@@ -26,8 +26,10 @@ pub use hwaccel::{sha256_capabilities, Sha256Capabilities};
 pub use sha256::sha256_implementation;
 pub use keys::{
     ecdsa_sign, ecdsa_verify, generate_private_key, parse_compact_signature, parse_der_signature,
-    parse_public_key, parse_secret_key, public_key_from_private, serialize_compact_signature,
-    serialize_der_signature, serialize_pubkey_compressed, serialize_pubkey_uncompressed,
+    parse_public_key, parse_secret_key, public_key_from_private, recover_message_pubkey,
+    serialize_compact_signature, serialize_der_signature, serialize_pubkey_compressed,
+    serialize_pubkey_uncompressed, sign_message_compact, signed_message_hash,
+    BITCOIN_SIGNED_MESSAGE_MAGIC,
 };
 pub use sighash::{
     find_and_delete, legacy_sighash, p2wpkh_script_code, remove_codeseparators, segwit_v0_sighash,
