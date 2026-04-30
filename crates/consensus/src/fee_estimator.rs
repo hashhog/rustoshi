@@ -100,6 +100,19 @@ impl BucketStats {
     }
 }
 
+/// Per-bucket statistics surfaced to the RPC layer for `estimaterawfee`.
+#[derive(Clone, Debug)]
+pub struct RawBucketStats {
+    /// Inclusive low end of the bucket fee-rate range (sat/vB).
+    pub startrange: f64,
+    /// Exclusive high end of the bucket fee-rate range (sat/vB).
+    pub endrange: f64,
+    /// Decayed total transactions seen in this bucket.
+    pub total: f64,
+    /// Decayed transactions that confirmed within the requested target.
+    pub confirmed: f64,
+}
+
 /// A transaction being tracked from mempool entry to confirmation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TrackedTransaction {
@@ -329,6 +342,47 @@ impl FeeEstimator {
             .get(bucket_index)
             .map(|b| b.total)
             .unwrap_or(0.0)
+    }
+
+    /// Per-bucket raw statistics for `estimaterawfee`.
+    ///
+    /// Returned tuple: `(low_feerate, high_feerate, in_mempool, confirmed)` per
+    /// bucket, where `confirmed` is the decayed count of transactions that
+    /// confirmed within `target` blocks (high-feerate bucket boundary uses the
+    /// next bucket value, or the same value for the last bucket).
+    ///
+    /// Mirrors Bitcoin Core's `CBlockPolicyEstimator::estimateRawFee` which
+    /// exposes the underlying confirm/total per fee bucket so callers can
+    /// build the `feeRate -> {startrange, endrange, withintarget, totalconfirmed,
+    /// inmempool, leftmempool}` JSON object.
+    pub fn raw_bucket_stats(&self, target: usize) -> Vec<RawBucketStats> {
+        let n = FEE_RATE_BUCKETS.len();
+        let mut out = Vec::with_capacity(n);
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            let start = FEE_RATE_BUCKETS[i];
+            let end = if i + 1 < n {
+                FEE_RATE_BUCKETS[i + 1]
+            } else {
+                FEE_RATE_BUCKETS[i]
+            };
+            let confirmed = bucket
+                .confirmed_within
+                .get(target)
+                .copied()
+                .unwrap_or(0.0);
+            out.push(RawBucketStats {
+                startrange: start,
+                endrange: end,
+                total: bucket.total,
+                confirmed,
+            });
+        }
+        out
+    }
+
+    /// Number of fee-rate buckets (constant).
+    pub fn bucket_count(&self) -> usize {
+        FEE_RATE_BUCKETS.len()
     }
 
     /// Save fee estimator state to a JSON file.

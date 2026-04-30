@@ -6,7 +6,103 @@
 //! and verification operations.
 
 use rustoshi_primitives::Hash256;
-use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, SecretKey};
+use secp256k1::{
+    ecdsa::{RecoverableSignature, RecoveryId, Signature},
+    Message, PublicKey, Secp256k1, SecretKey,
+};
+
+use crate::hashes::sha256d;
+
+/// Prefix used by Bitcoin Core for `signmessage`/`verifymessage`.
+/// The leading 0x18 is the compact-size length of the literal text.
+pub const BITCOIN_SIGNED_MESSAGE_MAGIC: &[u8] = b"\x18Bitcoin Signed Message:\n";
+
+/// Build the SHA256d digest used by Bitcoin's signed-message format.
+///
+/// Layout: `\x18Bitcoin Signed Message:\n` || compactSize(len(message)) || message
+/// Returns SHA256d of the serialized buffer (matches `MessageHash` in
+/// `bitcoin-core/src/util/message.cpp`).
+pub fn signed_message_hash(message: &[u8]) -> Hash256 {
+    let mut buf =
+        Vec::with_capacity(BITCOIN_SIGNED_MESSAGE_MAGIC.len() + 9 + message.len());
+    buf.extend_from_slice(BITCOIN_SIGNED_MESSAGE_MAGIC);
+    encode_compact_size(message.len() as u64, &mut buf);
+    buf.extend_from_slice(message);
+    sha256d(&buf)
+}
+
+fn encode_compact_size(n: u64, out: &mut Vec<u8>) {
+    if n < 253 {
+        out.push(n as u8);
+    } else if n <= 0xFFFF {
+        out.push(0xfd);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= 0xFFFF_FFFF {
+        out.push(0xfe);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        out.push(0xff);
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
+/// Sign a Bitcoin signed-message using the compact-recoverable ECDSA format
+/// expected by `signmessage` / `verifymessage`.
+///
+/// Returns the 65-byte signature: `[recovery_byte][r 32][s 32]`. The recovery
+/// byte encodes the parity (recid) plus a flag for compressed pubkeys:
+/// - 27 + recid for uncompressed pubkeys (rarely seen post-2014)
+/// - 31 + recid for compressed pubkeys (the modern default; matches Core)
+///
+/// `compressed = true` matches Bitcoin Core's default for all derived keys.
+pub fn sign_message_compact(secret: &SecretKey, message: &[u8], compressed: bool) -> [u8; 65] {
+    let secp = Secp256k1::new();
+    let hash = signed_message_hash(message);
+    let msg = Message::from_digest(hash.0);
+    let sig = secp.sign_ecdsa_recoverable(&msg, secret);
+    let (rec_id, compact) = sig.serialize_compact();
+    let recid: i32 = rec_id.to_i32();
+    debug_assert!((0..=3).contains(&recid));
+    let header = if compressed {
+        31u8 + recid as u8
+    } else {
+        27u8 + recid as u8
+    };
+    let mut out = [0u8; 65];
+    out[0] = header;
+    out[1..].copy_from_slice(&compact);
+    out
+}
+
+/// Recover the public key from a Bitcoin compact-recoverable signature
+/// produced by `signmessage`. Returns `(public_key, compressed_flag)` so the
+/// caller can re-derive the address using the same encoding the signer used.
+///
+/// Returns `secp256k1::Error::InvalidSignature` for malformed or unrecoverable
+/// signatures (length != 65 or header outside 27..=34).
+pub fn recover_message_pubkey(
+    sig_bytes: &[u8],
+    message: &[u8],
+) -> Result<(PublicKey, bool), secp256k1::Error> {
+    if sig_bytes.len() != 65 {
+        return Err(secp256k1::Error::InvalidSignature);
+    }
+    let header = sig_bytes[0];
+    if !(27..=34).contains(&header) {
+        return Err(secp256k1::Error::InvalidSignature);
+    }
+    let compressed = header >= 31;
+    let recid_int = (header - if compressed { 31 } else { 27 }) as i32;
+    let recid = RecoveryId::from_i32(recid_int)?;
+    let mut compact = [0u8; 64];
+    compact.copy_from_slice(&sig_bytes[1..]);
+    let rec_sig = RecoverableSignature::from_compact(&compact, recid)?;
+    let hash = signed_message_hash(message);
+    let msg = Message::from_digest(hash.0);
+    let secp = Secp256k1::new();
+    let pubkey = secp.recover_ecdsa(&msg, &rec_sig)?;
+    Ok((pubkey, compressed))
+}
 
 /// Generate a new random private key.
 pub fn generate_private_key() -> SecretKey {
@@ -206,5 +302,62 @@ mod tests {
         let zero_bytes: [u8; 32] = [0u8; 32];
         let result = parse_secret_key(&zero_bytes);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn signed_message_hash_matches_core() {
+        // Layout sanity: magic prefix + compact-size + message, hashed with SHA256d.
+        let h = signed_message_hash(b"hello");
+        // Independently constructed buffer
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x18Bitcoin Signed Message:\n");
+        buf.push(5u8); // compact-size for 5
+        buf.extend_from_slice(b"hello");
+        let expected = sha256d(&buf);
+        assert_eq!(h, expected);
+    }
+
+    #[test]
+    fn sign_and_recover_compact_compressed() {
+        let secret = generate_private_key();
+        let pubkey = public_key_from_private(&secret);
+        let msg = b"a quick brown fox";
+        let sig = sign_message_compact(&secret, msg, true);
+        // Compressed signer => header byte must be in 31..=34
+        assert!((31..=34).contains(&sig[0]));
+
+        let (recovered, compressed) = recover_message_pubkey(&sig, msg).unwrap();
+        assert!(compressed);
+        assert_eq!(recovered, pubkey);
+
+        // Tampering the message must fail to recover the original pubkey.
+        let (other, _) = recover_message_pubkey(&sig, b"different message").unwrap();
+        assert_ne!(other, pubkey);
+    }
+
+    #[test]
+    fn sign_and_recover_compact_uncompressed() {
+        let secret = generate_private_key();
+        let pubkey = public_key_from_private(&secret);
+        let msg = b"";
+        let sig = sign_message_compact(&secret, msg, false);
+        // Uncompressed signer => header byte in 27..=30
+        assert!((27..=30).contains(&sig[0]));
+
+        let (recovered, compressed) = recover_message_pubkey(&sig, msg).unwrap();
+        assert!(!compressed);
+        assert_eq!(recovered, pubkey);
+    }
+
+    #[test]
+    fn recover_rejects_bad_inputs() {
+        // Wrong length
+        assert!(recover_message_pubkey(&[0u8; 64], b"x").is_err());
+        // Header out of range
+        let mut bad = [0u8; 65];
+        bad[0] = 26;
+        assert!(recover_message_pubkey(&bad, b"x").is_err());
+        bad[0] = 35;
+        assert!(recover_message_pubkey(&bad, b"x").is_err());
     }
 }

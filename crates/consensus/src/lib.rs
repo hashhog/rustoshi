@@ -62,7 +62,7 @@ pub use validation::{
     TransactionSignatureChecker, TxValidationError, UndoData, UtxoView, ValidationError,
 };
 pub use chain_state::{ChainState, CompressedScript, UtxoCache};
-pub use fee_estimator::FeeEstimator;
+pub use fee_estimator::{FeeEstimator, RawBucketStats};
 pub use mempool::{Mempool, MempoolConfig, MempoolEntry, MempoolError};
 pub use mempool_persist::{
     dump_mempool, dump_mempool_with_key, header_size, load_mempool, DumpStats, LoadStats,
