@@ -41,6 +41,7 @@ use rustoshi_primitives::{Block, Decodable, Encodable, Hash256, OutPoint, Transa
 use rustoshi_storage::{block_store::BlockStore, ChainDb};
 use rustoshi_wallet::psbt::Psbt;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, RwLock};
@@ -116,6 +117,10 @@ pub struct RpcState {
     /// Recently-rejected transaction hashes to avoid re-requesting.
     /// Cleared when a new block is connected (the rejection reason may no longer apply).
     pub recently_rejected: HashSet<Hash256>,
+    /// Path to the on-disk `mempool.dat` file (Core-format, byte-compatible).
+    /// Set by the node binary at startup; `None` disables the
+    /// `dumpmempool` / `loadmempool` RPCs.
+    pub mempool_dat_path: Option<PathBuf>,
 }
 
 impl RpcState {
@@ -139,6 +144,7 @@ impl RpcState {
                 .unwrap_or_default()
                 .as_secs(),
             recently_rejected: HashSet::new(),
+            mempool_dat_path: None,
         }
     }
 
@@ -162,6 +168,7 @@ impl RpcState {
                 .unwrap_or_default()
                 .as_secs(),
             recently_rejected: HashSet::new(),
+            mempool_dat_path: None,
         }
     }
 
@@ -302,6 +309,21 @@ pub trait RustoshiRpc {
     /// Get all transaction IDs in the mempool.
     #[method(name = "getrawmempool")]
     async fn get_raw_mempool(&self, verbose: Option<bool>) -> RpcResult<serde_json::Value>;
+
+    /// Dump the current mempool state to `mempool.dat` in the Bitcoin Core
+    /// on-disk format (XOR-obfuscated v2). Returns an object containing the
+    /// path written, the number of transactions persisted, and the size in
+    /// bytes. Mirrors `bitcoin-cli savemempool`/`dumpmempool` for cross-impl
+    /// fleet ops.
+    #[method(name = "dumpmempool")]
+    async fn dump_mempool(&self) -> RpcResult<serde_json::Value>;
+
+    /// Load mempool entries from `mempool.dat` and reinsert them via the
+    /// standard validation path. Returns counts of accepted/failed entries.
+    /// Idempotent: loading a file containing transactions already in the
+    /// mempool is a no-op for those transactions.
+    #[method(name = "loadmempool")]
+    async fn load_mempool(&self) -> RpcResult<serde_json::Value>;
 
     /// Estimate the fee rate for confirmation within `conf_target` blocks.
     #[method(name = "estimatesmartfee")]
@@ -1723,6 +1745,72 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         Ok(serde_json::Value::Object(result))
+    }
+
+    async fn dump_mempool(&self) -> RpcResult<serde_json::Value> {
+        let state = self.state.read().await;
+        let path = match state.mempool_dat_path.clone() {
+            Some(p) => p,
+            None => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "mempool.dat path is not configured",
+                ))
+            }
+        };
+        match rustoshi_consensus::dump_mempool(&state.mempool, &path) {
+            Ok(stats) => Ok(serde_json::json!({
+                "path": path.display().to_string(),
+                "size": stats.txs,
+                "bytes": stats.bytes,
+            })),
+            Err(e) => Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                format!("dumpmempool failed: {}", e),
+            )),
+        }
+    }
+
+    async fn load_mempool(&self) -> RpcResult<serde_json::Value> {
+        let mut state = self.state.write().await;
+        let path = match state.mempool_dat_path.clone() {
+            Some(p) => p,
+            None => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "mempool.dat path is not configured",
+                ))
+            }
+        };
+        let db = state.db.clone();
+        let utxo_lookup = move |outpoint: &OutPoint| {
+            let store = BlockStore::new(&db);
+            store
+                .get_utxo(outpoint)
+                .ok()
+                .flatten()
+                .map(|c| rustoshi_consensus::validation::CoinEntry {
+                    height: c.height,
+                    is_coinbase: c.is_coinbase,
+                    value: c.value,
+                    script_pubkey: c.script_pubkey,
+                })
+        };
+        match rustoshi_consensus::load_mempool(&mut state.mempool, &path, &utxo_lookup) {
+            Ok(stats) => Ok(serde_json::json!({
+                "path": path.display().to_string(),
+                "version": stats.version,
+                "total": stats.total,
+                "accepted": stats.accepted,
+                "failed": stats.failed,
+                "deltas": stats.deltas,
+                "unbroadcast": stats.unbroadcast,
+            })),
+            Err(e) => Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                format!("loadmempool failed: {}", e),
+            )),
+        }
     }
 
     async fn estimate_smart_fee(&self, conf_target: u32) -> RpcResult<FeeEstimateResult> {
@@ -3837,6 +3925,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getmempoolinfo" => "getmempoolinfo\nReturns details on the active state of the TX memory pool.",
                 "getrawmempool" => "getrawmempool ( verbose )\nReturns all transaction ids in memory pool.",
                 "getmempoolentry" => "getmempoolentry \"txid\"\nReturns mempool data for given transaction.",
+                "dumpmempool" => "dumpmempool\nWrite the mempool to mempool.dat (Bitcoin Core-format, byte-compatible).",
+                "loadmempool" => "loadmempool\nLoad transactions from mempool.dat back into the mempool.",
                 "getmempoolancestors" => "getmempoolancestors \"txid\" ( verbose )\nReturns all in-mempool ancestors.",
                 "getnetworkinfo" => "getnetworkinfo\nReturns an object containing various state info regarding P2P networking.",
                 "getpeerinfo" => "getpeerinfo\nReturns data about each connected network node.",
@@ -3866,8 +3956,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "invalidateblock", "preciousblock", "pruneblockchain", "reconsiderblock",
                 "",
                 "== Mempool ==",
-                "getmempoolancestors", "getmempoolentry", "getmempoolinfo", "getrawmempool",
-                "testmempoolaccept",
+                "dumpmempool", "getmempoolancestors", "getmempoolentry", "getmempoolinfo",
+                "getrawmempool", "loadmempool", "testmempoolaccept",
                 "",
                 "== Mining ==",
                 "getblocktemplate", "getmininginfo", "submitblock",
