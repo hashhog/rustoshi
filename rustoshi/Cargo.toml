@@ -18,6 +18,8 @@ tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
 rand.workspace = true
 hex.workspace = true
+libc = "0.2"
+toml = "0.8"
 
 [dev-dependencies]
 proptest.workspace = true
