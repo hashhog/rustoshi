@@ -16,7 +16,15 @@ use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tokio::io::AsyncWriteExt;
+
+mod ops;
+use ops::{
+    daemonize, debug_categories_to_directives, notify_ready, remove_pid_file, write_pid_file,
+    ConfFile, ReopenableLogFile,
+};
 
 use rustoshi_consensus::{
     dump_mempool, get_block_proof, load_mempool, ChainParams, ChainState, ChainWork, FeeEstimator,
@@ -100,6 +108,54 @@ struct Cli {
     /// For stdin: pipe framed data [4B height LE][4B size LE][block bytes].
     #[arg(long, value_name = "PATH")]
     import_blocks: Option<String>,
+
+    /// Run as a background daemon (Bitcoin Core `-daemon`).
+    /// Forks via libc daemon(0,0), detaches stdio, writes a PID file.
+    #[arg(long, default_value = "false")]
+    daemon: bool,
+
+    /// Path to PID file (default: `<datadir>/rustoshi.pid`).
+    /// Always written on launch, removed on graceful shutdown.
+    #[arg(long, value_name = "PATH")]
+    pidfile: Option<String>,
+
+    /// Bitcoin Core-style debug-category list, comma-separated.
+    /// E.g. `--debug=net,mempool,rpc`. `--debug=all` enables every category;
+    /// `--debug=0` disables all. Stacks on top of `--loglevel`.
+    #[arg(long = "debug", value_name = "CATEGORIES")]
+    debug_categories: Option<String>,
+
+    /// Path to a TOML or Bitcoin Core-style key=value config file.
+    /// Parsed before CLI defaults so CLI flags always win.
+    /// Default search order: explicit `--conf`, then `<datadir>/rustoshi.conf`,
+    /// then `~/.rustoshi/rustoshi.conf`.
+    #[arg(long = "conf", value_name = "PATH")]
+    conf: Option<String>,
+
+    /// If true, write logs to stdout in addition to the debug log file.
+    /// Mirrors Bitcoin Core's `-printtoconsole` (default: true).
+    /// Use `--no-printtoconsole` to disable stdout logging while keeping the
+    /// debug log file.  Implicitly disabled when `--daemon` is set.
+    #[arg(
+        long = "printtoconsole",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+    )]
+    printtoconsole: bool,
+
+    /// Path to the rustoshi debug log file (default: `<datadir>/debug.log`).
+    /// SIGHUP reopens this file in place for logrotate compatibility.
+    #[arg(long = "debuglogfile", value_name = "PATH")]
+    debuglogfile: Option<String>,
+
+    /// File descriptor for sd_notify-style readiness signaling.
+    /// When set, rustoshi writes "READY=1\n" to the FD once startup is
+    /// complete, allowing process supervisors to detect successful launch.
+    #[arg(long = "ready-fd", value_name = "FD")]
+    ready_fd: Option<i32>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -188,11 +244,46 @@ async fn start_metrics_server(
         let rpc_state = rpc_state.clone();
         let peer_state = peer_state.clone();
         tokio::spawn(async move {
-            // Read the HTTP request (we don't need to parse it, just consume it)
+            // Read the HTTP request line so we can route by path.
             let mut buf = [0u8; 4096];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await
+                .unwrap_or(0);
+            let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            // Extract first request line, then the path token.
+            let path = req.lines().next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
 
-            // Gather metrics from state
+            // /health: minimal liveness endpoint for process supervisors.
+            // Returns 200 once the node has booted (we're inside the running
+            // metrics task, which only starts after RPC is up). Body is
+            // small JSON so curl/jq scripts can consume it.
+            if path == "/health" || path == "/healthz" || path == "/livez" {
+                let height = {
+                    let state = rpc_state.read().await;
+                    state.best_height
+                };
+                let peers = {
+                    let ps = peer_state.read().await;
+                    ps.peer_manager.as_ref().map_or(0, |pm| pm.peer_count() as u32)
+                };
+                let body = format!(
+                    "{{\"status\":\"ok\",\"height\":{},\"peers\":{}}}\n",
+                    height, peers
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                return;
+            }
+
+            // Default: Prometheus /metrics body.
             let (height, mempool_size) = {
                 let state = rpc_state.read().await;
                 (state.best_height, state.mempool.size())
@@ -809,21 +900,167 @@ fn run_import_from_stdin(
 // MAIN ENTRY POINT
 // ============================================================
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+/// Apply settings parsed from `--conf` over an existing `Cli`, but only for
+/// values that the user hasn't already set explicitly on the command line.
+///
+/// We do this by re-parsing the CLI from a synthesized argv where the
+/// conf-file values are inserted *before* the user's argv tokens; clap's
+/// "later wins" precedence then ensures CLI flags override the config file.
+/// Because that approach is fragile across long-flag names, we instead apply
+/// each conf field manually below — it's a finite list and matches Bitcoin
+/// Core's bitcoind.cpp behavior of merging only specific known keys.
+fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
+    fn was_set(argv: &[String], long: &str) -> bool {
+        // Crude detector: any token equal to `--<long>`, `--<long>=...`, or
+        // bitcoind-style `-<long>`/`-<long>=...`.
+        let dd = format!("--{}", long);
+        let dd_eq = format!("--{}=", long);
+        let single = format!("-{}", long);
+        let single_eq = format!("-{}=", long);
+        argv.iter().any(|a| {
+            a == &dd || a == &single || a.starts_with(&dd_eq) || a.starts_with(&single_eq)
+        })
+    }
 
-    // Initialize logging
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.loglevel));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    // Strings
+    macro_rules! merge_str {
+        ($field:ident, $key:expr) => {
+            if !was_set(raw_argv, $key) {
+                if let Some(v) = conf.get($key) {
+                    cli.$field = v.to_string();
+                }
+            }
+        };
+    }
+    macro_rules! merge_opt_str {
+        ($field:ident, $key:expr) => {
+            if !was_set(raw_argv, $key) {
+                if let Some(v) = conf.get($key) {
+                    cli.$field = Some(v.to_string());
+                }
+            }
+        };
+    }
+    macro_rules! merge_bool {
+        ($field:ident, $key:expr) => {
+            if !was_set(raw_argv, $key) {
+                if let Some(v) = conf.get_bool($key) {
+                    cli.$field = v;
+                }
+            }
+        };
+    }
 
-    tracing::info!("Rustoshi v{}", env!("CARGO_PKG_VERSION"));
+    merge_str!(network, "network");
+    merge_str!(datadir, "datadir");
+    merge_str!(rpcbind, "rpcbind");
+    merge_opt_str!(rpcuser, "rpcuser");
+    merge_opt_str!(rpcpassword, "rpcpassword");
+    merge_bool!(listen, "listen");
+    merge_bool!(peerbloomfilters, "peerbloomfilters");
+    if !was_set(raw_argv, "port") {
+        if let Some(v) = conf.get("port") {
+            if let Ok(p) = v.parse::<u16>() {
+                cli.port = Some(p);
+            }
+        }
+    }
+    if !was_set(raw_argv, "maxconnections") {
+        if let Some(v) = conf.get("maxconnections") {
+            if let Ok(n) = v.parse::<usize>() {
+                cli.maxconnections = n;
+            }
+        }
+    }
+    merge_opt_str!(connect, "connect");
+    merge_bool!(txindex, "txindex");
+    merge_str!(loglevel, "loglevel");
+    if !was_set(raw_argv, "metrics-port") && !was_set(raw_argv, "metrics_port") {
+        if let Some(v) = conf.get("metrics_port") {
+            if let Ok(p) = v.parse::<u16>() {
+                cli.metrics_port = p;
+            }
+        }
+    }
+    if !was_set(raw_argv, "prune") {
+        if let Some(v) = conf.get("prune") {
+            if let Ok(n) = v.parse::<u64>() {
+                cli.prune = Some(n);
+            }
+        }
+    }
+    merge_bool!(daemon, "daemon");
+    merge_opt_str!(pidfile, "pidfile");
+    merge_opt_str!(debug_categories, "debug");
+    merge_bool!(printtoconsole, "printtoconsole");
+    merge_opt_str!(debuglogfile, "debuglogfile");
+}
 
-    // Resolve network
+/// Locate a config file path: explicit `--conf`, then `<datadir>/rustoshi.conf`,
+/// then `~/.rustoshi/rustoshi.conf`.  Returns `None` if none of the candidates
+/// exist (so a missing config file is non-fatal — Core behaves the same).
+fn find_conf_file(cli: &Cli) -> Option<PathBuf> {
+    if let Some(p) = &cli.conf {
+        // Explicit path: require it to exist (mirrors Core's `-conf` strictness)
+        let path = PathBuf::from(p);
+        return path.exists().then_some(path);
+    }
+    let datadir = resolve_base_datadir(&cli.datadir);
+    let candidate = datadir.join("rustoshi.conf");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let alt = PathBuf::from(home).join(".rustoshi").join("rustoshi.conf");
+        if alt.exists() {
+            return Some(alt);
+        }
+    }
+    None
+}
+
+fn main() -> anyhow::Result<()> {
+    let raw_argv: Vec<String> = std::env::args().collect();
+    let mut cli = Cli::parse();
+
+    // Merge config-file values BEFORE we daemonize / start the runtime, so
+    // `-daemon=1` in the conf file works the same as on the CLI.
+    if let Some(conf_path) = find_conf_file(&cli) {
+        match ConfFile::load(&conf_path) {
+            Ok(conf) => {
+                apply_conf_to_cli(&mut cli, &conf, &raw_argv);
+                // We can't log via tracing yet — buffer this for after init.
+                eprintln!("rustoshi: loaded config from {}", conf_path.display());
+            }
+            Err(e) => {
+                eprintln!(
+                    "rustoshi: failed to load conf file {}: {}",
+                    conf_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // Daemonize (if requested) BEFORE constructing the tokio runtime; tokio's
+    // IO driver does not survive a fork.
+    if cli.daemon {
+        if let Err(e) = daemonize() {
+            eprintln!("rustoshi: -daemon: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // Now build the tokio runtime and run the async body.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
+    // Resolve network early so we can place the debug log under the
+    // network-specific data directory.
     let params = match cli.network.as_str() {
         "mainnet" | "main" => ChainParams::mainnet(),
         "testnet3" | "testnet" => ChainParams::testnet3(),
@@ -833,29 +1070,109 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("Unknown network: {}", cli.network),
     };
 
+    // Resolve datadirs eagerly so we can write the PID file + debug log.
+    let base_datadir = resolve_base_datadir(&cli.datadir);
+    std::fs::create_dir_all(&base_datadir)?;
+    let datadir = resolve_datadir(&cli.datadir, &params);
+    std::fs::create_dir_all(&datadir)?;
+
+    // ---------- LOGGING SETUP ----------
+    //
+    // Build an EnvFilter from `loglevel`, then layer `-debug=<cat>` directives
+    // on top.  `RUST_LOG` (if present) wins over both, matching the original
+    // behavior.
+    let base_filter = match std::env::var("RUST_LOG") {
+        Ok(env) => EnvFilter::try_new(env)
+            .unwrap_or_else(|_| EnvFilter::new(&cli.loglevel)),
+        Err(_) => {
+            let mut spec = cli.loglevel.clone();
+            if let Some(ref dbg) = cli.debug_categories {
+                let (extra, unknown) = debug_categories_to_directives(dbg);
+                if !extra.is_empty() {
+                    spec.push(',');
+                    spec.push_str(&extra);
+                }
+                for cat in &unknown {
+                    eprintln!("rustoshi: -debug: unknown category '{}'", cat);
+                }
+            }
+            EnvFilter::try_new(&spec).unwrap_or_else(|_| EnvFilter::new(&cli.loglevel))
+        }
+    };
+
+    let log_file_path = match &cli.debuglogfile {
+        Some(p) => PathBuf::from(p),
+        None => datadir.join("debug.log"),
+    };
+    let log_file = ReopenableLogFile::new(log_file_path.clone())
+        .map_err(|e| anyhow::anyhow!("open debug log {}: {}", log_file_path.display(), e))?;
+
+    // Compose stdout + file layers.  We use registry+layers so we can add a
+    // file writer on top of the optional stdout writer.
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(log_file.clone());
+    let registry = tracing_subscriber::registry()
+        .with(base_filter)
+        .with(file_layer);
+    if cli.printtoconsole && !cli.daemon {
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .with_target(false);
+        registry.with(stdout_layer).init();
+    } else {
+        registry.init();
+    }
+
+    tracing::info!("Rustoshi v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Debug log: {}", log_file_path.display());
+    if cli.daemon {
+        tracing::info!("Running as daemon (forked, stdio detached)");
+    }
+
     tracing::info!("Network: {:?}", params.network_id);
     tracing::info!("Genesis: {}", params.genesis_hash);
+
+    // ---------- PID FILE ----------
+    let pid_path = match &cli.pidfile {
+        Some(p) => PathBuf::from(p),
+        None => datadir.join("rustoshi.pid"),
+    };
+    if let Err(e) = write_pid_file(&pid_path) {
+        tracing::warn!("Failed to write PID file {}: {}", pid_path.display(), e);
+    } else {
+        tracing::info!("PID {} written to {}", std::process::id(), pid_path.display());
+    }
 
     // Handle subcommands
     if let Some(cmd) = &cli.command {
         match cmd {
             Commands::Reindex => {
-                tracing::info!("Reindex requested - not yet implemented");
+                // HONEST PROGRESS: full block-index rebuild from blk*.dat is
+                // out of scope for this op-parity pass.  We still parse the
+                // flag, log what would happen, and exit cleanly — same as
+                // before, but with operator-visible context so it doesn't
+                // look like a successful no-op reindex.
+                tracing::warn!(
+                    "Reindex requested. NOT YET IMPLEMENTED: rustoshi does not currently \
+                     rebuild the block index from blk*.dat. To resync from scratch use \
+                     `rustoshi resync` (also stubbed) or stop the node, delete the \
+                     `chainstate` directory under `{}`, and restart. \
+                     Tracking issue: rustoshi#TODO-reindex.",
+                    datadir.display()
+                );
+                remove_pid_file(&pid_path);
                 return Ok(());
             }
             Commands::Resync => {
-                tracing::info!("Resync requested - not yet implemented");
+                tracing::warn!("Resync requested - not yet implemented");
+                remove_pid_file(&pid_path);
                 return Ok(());
             }
         }
     }
 
-    // Resolve data directories — base (for cookie file) and network-specific
-    // (for chainstate, blocks, etc.)
-    let base_datadir = resolve_base_datadir(&cli.datadir);
-    std::fs::create_dir_all(&base_datadir)?;
-    let datadir = resolve_datadir(&cli.datadir, &params);
-    std::fs::create_dir_all(&datadir)?;
+    // (datadir + base_datadir already resolved above for PID/log setup)
     tracing::info!("Data directory: {}", datadir.display());
 
     // Open database
@@ -995,6 +1312,7 @@ async fn main() -> anyhow::Result<()> {
             imported, chain_state.tip_height()
         );
 
+        remove_pid_file(&pid_path);
         return Ok(());
     }
 
@@ -1130,6 +1448,47 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("Node started. Waiting for peers...");
+
+    // ---------- SIGHUP HANDLER (log reopen for logrotate) ----------
+    // Bitcoin Core reopens the debug log on SIGHUP so logrotate can move
+    // the file out from under a running daemon. We do the same: spawn a
+    // detached task that listens for SIGHUP and calls reopen() on the
+    // ReopenableLogFile we created above.
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let log_file_for_hup = log_file.clone();
+        match signal(SignalKind::hangup()) {
+            Ok(mut hup) => {
+                tokio::spawn(async move {
+                    while hup.recv().await.is_some() {
+                        match log_file_for_hup.reopen() {
+                            Ok(()) => tracing::info!(
+                                "SIGHUP received: reopened debug log {}",
+                                log_file_for_hup.path().display()
+                            ),
+                            Err(e) => tracing::error!(
+                                "SIGHUP: failed to reopen debug log {}: {}",
+                                log_file_for_hup.path().display(),
+                                e
+                            ),
+                        }
+                    }
+                });
+            }
+            Err(e) => tracing::warn!("Failed to install SIGHUP handler: {}", e),
+        }
+    }
+
+    // ---------- READINESS SIGNAL (sd_notify-style) ----------
+    // Tell our supervisor (systemd / runit / start_mainnet.sh / etc.) that
+    // startup completed.  Best-effort: failures here are logged but not
+    // fatal — the node is still operating.
+    if let Some(fd) = cli.ready_fd {
+        match notify_ready(fd) {
+            Ok(()) => tracing::info!("Wrote READY=1 to fd {}", fd),
+            Err(e) => tracing::warn!("Failed to notify readiness on fd {}: {}", fd, e),
+        }
+    }
 
     // UTXO cache for block validation, bounded to 2 GiB
     let mut utxo_view = block_store.utxo_view();
@@ -2144,9 +2503,19 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Handle shutdown signal (Ctrl+C)
+            // Handle shutdown signal (Ctrl+C in foreground; SIGTERM under
+            // daemon mode / supervisor).  Both produce a graceful shutdown.
             _ = signal::ctrl_c() => {
                 tracing::info!("Received shutdown signal (Ctrl+C)");
+                break;
+            }
+            _ = async {
+                use tokio::signal::unix::{signal, SignalKind};
+                if let Ok(mut s) = signal(SignalKind::terminate()) {
+                    s.recv().await;
+                }
+            } => {
+                tracing::info!("Received shutdown signal (SIGTERM)");
                 break;
             }
         }
@@ -2209,6 +2578,9 @@ async fn main() -> anyhow::Result<()> {
             cs.tip_height()
         );
     }
+
+    // Remove PID file so a subsequent supervisor restart sees a clean state.
+    remove_pid_file(&pid_path);
 
     tracing::info!("Shutdown complete");
 
@@ -2317,6 +2689,14 @@ mod tests {
         assert_eq!(cli.loglevel, "info");
         assert!(cli.prune.is_none());
         assert!(cli.command.is_none());
+        // New ops-parity defaults
+        assert!(!cli.daemon);
+        assert!(cli.pidfile.is_none());
+        assert!(cli.debug_categories.is_none());
+        assert!(cli.conf.is_none());
+        assert!(cli.printtoconsole);
+        assert!(cli.debuglogfile.is_none());
+        assert!(cli.ready_fd.is_none());
     }
 
     #[test]
@@ -2396,5 +2776,84 @@ mod tests {
     fn test_cli_subcommand_resync() {
         let cli = Cli::try_parse_from(["rustoshi", "resync"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Resync)));
+    }
+
+    // ----- New ops-parity flag tests -----
+
+    #[test]
+    fn test_cli_daemon_flag() {
+        // Presence of `--daemon` enables daemon mode; default is false.
+        let cli = Cli::try_parse_from(["rustoshi", "--daemon"]).unwrap();
+        assert!(cli.daemon);
+        // Absence keeps default false.
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert!(!cli.daemon);
+    }
+
+    #[test]
+    fn test_cli_pidfile_flag() {
+        let cli = Cli::try_parse_from(["rustoshi", "--pidfile", "/run/rustoshi.pid"]).unwrap();
+        assert_eq!(cli.pidfile.as_deref(), Some("/run/rustoshi.pid"));
+    }
+
+    #[test]
+    fn test_cli_debug_categories_flag() {
+        let cli = Cli::try_parse_from(["rustoshi", "--debug", "net,mempool,rpc"]).unwrap();
+        assert_eq!(cli.debug_categories.as_deref(), Some("net,mempool,rpc"));
+    }
+
+    #[test]
+    fn test_cli_conf_flag() {
+        let cli = Cli::try_parse_from(["rustoshi", "--conf", "/etc/rustoshi/rustoshi.conf"]).unwrap();
+        assert_eq!(cli.conf.as_deref(), Some("/etc/rustoshi/rustoshi.conf"));
+    }
+
+    #[test]
+    fn test_cli_printtoconsole_flag() {
+        // `--printtoconsole=false` explicitly disables (Core-compat syntax).
+        let cli = Cli::try_parse_from(["rustoshi", "--printtoconsole=false"]).unwrap();
+        assert!(!cli.printtoconsole);
+        // Default is true.
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert!(cli.printtoconsole);
+        // Bare flag re-asserts true.
+        let cli = Cli::try_parse_from(["rustoshi", "--printtoconsole"]).unwrap();
+        assert!(cli.printtoconsole);
+    }
+
+    #[test]
+    fn test_cli_debuglogfile_flag() {
+        let cli = Cli::try_parse_from(["rustoshi", "--debuglogfile", "/var/log/rustoshi.log"]).unwrap();
+        assert_eq!(cli.debuglogfile.as_deref(), Some("/var/log/rustoshi.log"));
+    }
+
+    #[test]
+    fn test_cli_ready_fd_flag() {
+        let cli = Cli::try_parse_from(["rustoshi", "--ready-fd", "3"]).unwrap();
+        assert_eq!(cli.ready_fd, Some(3));
+    }
+
+    #[test]
+    fn test_apply_conf_to_cli_respects_cli_precedence() {
+        // CLI flag should win over conf file value.
+        let mut cli = Cli::try_parse_from(["rustoshi", "--network", "regtest"]).unwrap();
+        let conf = ConfFile::parse("network=mainnet\nlisten=false\n");
+        let raw_argv: Vec<String> =
+            ["rustoshi", "--network", "regtest"].iter().map(|s| s.to_string()).collect();
+        apply_conf_to_cli(&mut cli, &conf, &raw_argv);
+        // CLI wins for network
+        assert_eq!(cli.network, "regtest");
+        // listen wasn't on CLI, so conf wins
+        assert!(!cli.listen);
+    }
+
+    #[test]
+    fn test_apply_conf_to_cli_fills_unset_values() {
+        let mut cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        let conf = ConfFile::parse("rpcuser=carol\nrpcpassword=hunter2\n");
+        let raw_argv: Vec<String> = vec!["rustoshi".to_string()];
+        apply_conf_to_cli(&mut cli, &conf, &raw_argv);
+        assert_eq!(cli.rpcuser.as_deref(), Some("carol"));
+        assert_eq!(cli.rpcpassword.as_deref(), Some("hunter2"));
     }
 }
