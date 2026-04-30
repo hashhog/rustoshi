@@ -1832,6 +1832,34 @@ impl Mempool {
         visited.into_iter().collect()
     }
 
+    /// Get all mempool descendants of a transaction (not including the transaction itself).
+    ///
+    /// Walks the child graph transitively. Symmetric to [`get_ancestors_of`].
+    /// Used by the `getmempooldescendants` RPC.
+    pub fn get_descendants_of(&self, txid: &Hash256) -> Vec<Hash256> {
+        let mut visited = HashSet::new();
+        let mut queue = Vec::new();
+
+        if let Some(children) = self.children.get(txid) {
+            for c in children {
+                queue.push(*c);
+            }
+        }
+
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(grandchildren) = self.children.get(&current) {
+                for gc in grandchildren {
+                    queue.push(*gc);
+                }
+            }
+        }
+
+        visited.into_iter().collect()
+    }
+
     /// Get the number of transactions in the mempool.
     pub fn size(&self) -> usize {
         self.transactions.len()

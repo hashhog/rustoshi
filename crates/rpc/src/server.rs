@@ -60,6 +60,8 @@ pub mod rpc_error {
     pub const RPC_INVALID_PARAMS: i32 = -32602;
     /// General-purpose RPC error.
     pub const RPC_MISC_ERROR: i32 = -1;
+    /// Type error (e.g. wrong address class for the requested operation).
+    pub const RPC_TYPE_ERROR: i32 = -3;
     /// Invalid address or key.
     pub const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
     /// Database error.
@@ -328,6 +330,25 @@ pub trait RustoshiRpc {
     /// Estimate the fee rate for confirmation within `conf_target` blocks.
     #[method(name = "estimatesmartfee")]
     async fn estimate_smart_fee(&self, conf_target: u32) -> RpcResult<FeeEstimateResult>;
+
+    /// Estimate the raw fee data per fee-rate bucket for `conf_target` blocks.
+    ///
+    /// Returns the underlying bucket statistics used by `estimatesmartfee`.
+    /// Mirrors Bitcoin Core's `estimaterawfee` (see
+    /// `bitcoin-core/src/rpc/fees.cpp`). The optional `threshold` parameter is
+    /// accepted for API parity but currently has no effect on rustoshi's
+    /// estimator (which uses a fixed success threshold).
+    #[method(name = "estimaterawfee")]
+    async fn estimate_raw_fee(
+        &self,
+        conf_target: u32,
+        threshold: Option<f64>,
+    ) -> RpcResult<serde_json::Value>;
+
+    /// Persist the mempool to `mempool.dat`. Alias of `dumpmempool` matching
+    /// Bitcoin Core's `savemempool`. Returns `{"filename": "..."}`.
+    #[method(name = "savemempool")]
+    async fn save_mempool(&self) -> RpcResult<serde_json::Value>;
 
     /// Get a block template for mining.
     #[method(name = "getblocktemplate")]
@@ -635,6 +656,17 @@ pub trait RustoshiRpc {
         verbose: Option<bool>,
     ) -> RpcResult<serde_json::Value>;
 
+    /// Get all in-mempool descendants of a transaction.
+    ///
+    /// Symmetric to `getmempoolancestors` but walks the child graph.
+    /// Mirrors Bitcoin Core's `getmempooldescendants`.
+    #[method(name = "getmempooldescendants")]
+    async fn get_mempool_descendants(
+        &self,
+        txid: String,
+        verbose: Option<bool>,
+    ) -> RpcResult<serde_json::Value>;
+
     /// List all available RPC commands or get help for a specific command.
     #[method(name = "help")]
     async fn help(&self, command: Option<String>) -> RpcResult<String>;
@@ -678,6 +710,21 @@ pub trait RustoshiRpc {
         signature: String,
         message: String,
     ) -> RpcResult<bool>;
+
+    /// Sign a message with a private key.
+    ///
+    /// Bitcoin Core's `signmessage` accepts an address and looks up the
+    /// matching private key in the loaded wallet. Rustoshi's RPC layer does
+    /// not yet share a per-address keystore, so this method accepts the
+    /// signing key directly via the `privkey` parameter (either a 64-char
+    /// hex-encoded raw private key, or a Base58Check WIF). For wallet-based
+    /// signing, callers can use the wallet RPCs to export the WIF first.
+    ///
+    /// Returns: Base64-encoded compact-recoverable signature (65 bytes) over
+    /// `SHA256d("\x18Bitcoin Signed Message:\n" || compact-size(msg) || msg)`
+    /// per `bitcoin-core/src/rpc/signmessage.cpp`.
+    #[method(name = "signmessage")]
+    async fn sign_message(&self, privkey: String, message: String) -> RpcResult<String>;
 
     /// Get the server uptime in seconds.
     #[method(name = "uptime")]
@@ -1771,6 +1818,31 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
+    async fn save_mempool(&self) -> RpcResult<serde_json::Value> {
+        // Bitcoin Core's `savemempool` is a thin alias for `dumpmempool` that
+        // returns `{"filename": "..."}`. Reuse the same persistence call so
+        // both RPCs always agree on disk state.
+        let state = self.state.read().await;
+        let path = match state.mempool_dat_path.clone() {
+            Some(p) => p,
+            None => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "mempool.dat path is not configured",
+                ))
+            }
+        };
+        match rustoshi_consensus::dump_mempool(&state.mempool, &path) {
+            Ok(_) => Ok(serde_json::json!({
+                "filename": path.display().to_string(),
+            })),
+            Err(e) => Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                format!("savemempool failed: {}", e),
+            )),
+        }
+    }
+
     async fn load_mempool(&self) -> RpcResult<serde_json::Value> {
         let mut state = self.state.write().await;
         let path = match state.mempool_dat_path.clone() {
@@ -1832,6 +1904,59 @@ impl RustoshiRpcServer for RpcServerImpl {
                 blocks: conf_target,
             }),
         }
+    }
+
+    async fn estimate_raw_fee(
+        &self,
+        conf_target: u32,
+        _threshold: Option<f64>,
+    ) -> RpcResult<serde_json::Value> {
+        // Validate target (1..=1008, matching MAX_CONFIRMATION_TARGET).
+        if conf_target == 0 || conf_target > 1008 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                "Invalid conf_target, must be between 1 and 1008",
+            ));
+        }
+        let state = self.state.read().await;
+        let buckets = state
+            .fee_estimator
+            .raw_bucket_stats(conf_target as usize);
+        let mut out = serde_json::Map::new();
+        let mut feerate_sum = 0.0f64;
+        let mut total_count = 0.0f64;
+        let mut total_confirmed = 0.0f64;
+        let arr: Vec<serde_json::Value> = buckets
+            .iter()
+            .map(|b| {
+                feerate_sum += b.startrange * b.total;
+                total_count += b.total;
+                total_confirmed += b.confirmed;
+                serde_json::json!({
+                    "startrange": b.startrange,
+                    "endrange": b.endrange,
+                    "withintarget": b.confirmed,
+                    "totalconfirmed": b.confirmed,
+                    "inmempool": b.total,
+                    "leftmempool": 0.0_f64,
+                })
+            })
+            .collect();
+        out.insert("blocks".to_string(), serde_json::json!(conf_target));
+        out.insert("buckets".to_string(), serde_json::Value::Array(arr));
+        // `short`/`medium`/`long` horizon shape in Core; rustoshi has a single
+        // horizon, so we expose a flat structure plus `decay`/`scale` metadata
+        // for parity-tooling consumers.
+        out.insert("decay".to_string(), serde_json::json!(0.998_f64));
+        out.insert("scale".to_string(), serde_json::json!(1));
+        let avg_feerate = if total_count > 0.0 {
+            feerate_sum / total_count
+        } else {
+            0.0
+        };
+        out.insert("avg_feerate".to_string(), serde_json::json!(avg_feerate));
+        out.insert("total_confirmed".to_string(), serde_json::json!(total_confirmed));
+        Ok(serde_json::Value::Object(out))
     }
 
     async fn get_block_template(
@@ -3904,6 +4029,51 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
+    async fn get_mempool_descendants(
+        &self,
+        txid: String,
+        verbose: Option<bool>,
+    ) -> RpcResult<serde_json::Value> {
+        // Symmetric mirror of `get_mempool_ancestors` walking the child graph.
+        // See `bitcoin-core/src/rpc/mempool.cpp::getmempooldescendants`.
+        let txid_hash = Self::parse_hash(&txid)?;
+        let verbose = verbose.unwrap_or(false);
+        let state = self.state.read().await;
+
+        if state.mempool.get(&txid_hash).is_none() {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                "Transaction not in mempool",
+            ));
+        }
+
+        let descendants = state.mempool.get_descendants_of(&txid_hash);
+
+        if verbose {
+            let mut result = serde_json::Map::new();
+            for d in &descendants {
+                if let Some(entry) = state.mempool.get(d) {
+                    result.insert(
+                        d.to_string(),
+                        serde_json::json!({
+                            "vsize": entry.vsize,
+                            "weight": entry.weight,
+                            "fee": entry.fee as f64 / COIN as f64,
+                            "descendantcount": entry.descendant_count,
+                            "descendantsize": entry.descendant_size,
+                            "descendantfees": entry.descendant_fees
+                        }),
+                    );
+                }
+            }
+            Ok(serde_json::Value::Object(result))
+        } else {
+            Ok(serde_json::json!(
+                descendants.iter().map(|h| h.to_string()).collect::<Vec<_>>()
+            ))
+        }
+    }
+
     async fn help(&self, command: Option<String>) -> RpcResult<String> {
         if let Some(cmd) = command {
             let help_text = match cmd.as_str() {
@@ -3926,8 +4096,10 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getrawmempool" => "getrawmempool ( verbose )\nReturns all transaction ids in memory pool.",
                 "getmempoolentry" => "getmempoolentry \"txid\"\nReturns mempool data for given transaction.",
                 "dumpmempool" => "dumpmempool\nWrite the mempool to mempool.dat (Bitcoin Core-format, byte-compatible).",
+                "savemempool" => "savemempool\nDumps the mempool to disk. Returns {\"filename\": \"mempool.dat\"}.",
                 "loadmempool" => "loadmempool\nLoad transactions from mempool.dat back into the mempool.",
                 "getmempoolancestors" => "getmempoolancestors \"txid\" ( verbose )\nReturns all in-mempool ancestors.",
+                "getmempooldescendants" => "getmempooldescendants \"txid\" ( verbose )\nReturns all in-mempool descendants.",
                 "getnetworkinfo" => "getnetworkinfo\nReturns an object containing various state info regarding P2P networking.",
                 "getpeerinfo" => "getpeerinfo\nReturns data about each connected network node.",
                 "getconnectioncount" => "getconnectioncount\nReturns the number of connections to other nodes.",
@@ -3937,6 +4109,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "submitblock" => "submitblock \"hexdata\" ( \"dummy\" )\nAttempts to submit new block to network.",
                 "getmininginfo" => "getmininginfo\nReturns a json object containing mining-related information.",
                 "estimatesmartfee" => "estimatesmartfee conf_target ( \"estimate_mode\" )\nEstimates the approximate fee per kilobyte.",
+                "estimaterawfee" => "estimaterawfee conf_target ( threshold )\nReturns the underlying fee bucket statistics for a target.",
+                "signmessage" => "signmessage \"privkey\" \"message\"\nSigns a message with the given private key (hex or WIF). Returns base64 sig.",
                 "stop" => "stop\nRequest a graceful shutdown.",
                 "help" => "help ( \"command\" )\nList all commands, or get help for a specified command.",
                 "walletpassphrase" => "walletpassphrase \"passphrase\" timeout\nStores the wallet decryption key in memory for 'timeout' seconds.",
@@ -3956,8 +4130,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "invalidateblock", "preciousblock", "pruneblockchain", "reconsiderblock",
                 "",
                 "== Mempool ==",
-                "dumpmempool", "getmempoolancestors", "getmempoolentry", "getmempoolinfo",
-                "getrawmempool", "loadmempool", "testmempoolaccept",
+                "dumpmempool", "getmempoolancestors", "getmempooldescendants",
+                "getmempoolentry", "getmempoolinfo", "getrawmempool", "loadmempool",
+                "savemempool", "testmempoolaccept",
                 "",
                 "== Mining ==",
                 "getblocktemplate", "getmininginfo", "submitblock",
@@ -3978,8 +4153,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "combinepsbt", "createpsbt", "decodepsbt", "finalizepsbt",
                 "",
                 "== Util ==",
-                "estimatesmartfee", "getnettotals", "help", "stop", "uptime",
-                "verifymessage",
+                "estimaterawfee", "estimatesmartfee", "getnettotals", "help",
+                "signmessage", "stop", "uptime", "verifymessage",
             ];
             Ok(commands.join("\n"))
         }
@@ -4006,7 +4181,11 @@ impl RustoshiRpcServer for RpcServerImpl {
         signature: String,
         message: String,
     ) -> RpcResult<bool> {
-        // Validate address format
+        use base64::Engine;
+        use rustoshi_crypto::address::Address;
+        use rustoshi_crypto::hashes::hash160;
+        use rustoshi_crypto::recover_message_pubkey;
+
         if address.is_empty() {
             return Err(Self::rpc_error(
                 rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
@@ -4014,70 +4193,59 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
-        // Decode the base64 signature (65 bytes: 1 recovery + 32 r + 32 s)
-        // Decode base64 signature
-        let sig_bytes = {
-            let cleaned: String = signature.chars().filter(|c| !c.is_whitespace()).collect();
-            let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut result = Vec::new();
-            let mut buf: u32 = 0;
-            let mut bits: u32 = 0;
-            for c in cleaned.bytes() {
-                if c == b'=' { break; }
-                let val = match alphabet.iter().position(|&b| b == c) {
-                    Some(v) => v as u32,
-                    None => return Err(Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid base64 character")),
-                };
-                buf = (buf << 6) | val;
-                bits += 6;
-                if bits >= 8 {
-                    bits -= 8;
-                    result.push((buf >> bits) as u8);
-                    buf &= (1 << bits) - 1;
-                }
+        // Decode the base64-encoded compact-recoverable signature.
+        let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(signature.trim()) {
+            Ok(b) => b,
+            Err(_) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    "Malformed base64 encoding",
+                ))
             }
-            result
         };
 
-        if sig_bytes.len() != 65 {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                "Invalid signature length (expected 65 bytes)",
-            ));
-        }
-
-        // Bitcoin signed message format
-        let msg_bytes = message.as_bytes();
-        let prefix = b"\x18Bitcoin Signed Message:\n";
-        let mut buf = Vec::with_capacity(prefix.len() + 9 + msg_bytes.len());
-        buf.extend_from_slice(prefix);
-        // Compact size encoding for message length
-        match msg_bytes.len() {
-            n if n < 253 => buf.push(n as u8),
-            n => {
-                buf.push(0xfd);
-                buf.extend_from_slice(&(n as u16).to_le_bytes());
+        // Parse the address up-front; we need its hash to compare against the
+        // recovered pubkey hash. Rejecting bech32 (segwit/taproot) addresses
+        // matches Core, which restricts `verifymessage` to legacy P2PKH.
+        let parsed = Address::from_string(&address, None).map_err(|_| {
+            Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "Invalid address")
+        })?;
+        let expected_hash = match parsed {
+            Address::P2PKH { hash, .. } => hash,
+            _ => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    "Address does not refer to a P2PKH key",
+                ))
             }
-        }
-        buf.extend_from_slice(msg_bytes);
+        };
 
-        // Hash the message (SHA-256d as per Bitcoin protocol)
-        let _msg_hash = rustoshi_crypto::hashes::sha256d(&buf);
+        // Recover the pubkey; format errors are reported as `false` per Core's
+        // contract (verifymessage returns a bool, not an error, for bad sigs).
+        let (pubkey, compressed) = match recover_message_pubkey(&sig_bytes, message.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => return Ok(false),
+        };
+        let serialized: Vec<u8> = if compressed {
+            pubkey.serialize().to_vec()
+        } else {
+            pubkey.serialize_uncompressed().to_vec()
+        };
+        let recovered_hash = hash160(&serialized);
+        Ok(recovered_hash == expected_hash)
+    }
 
-        // Recovery: first byte encodes recovery id (27-34), remaining 64 bytes are r||s.
-        let rec_id_byte = sig_bytes[0];
-        if !(27..=34).contains(&rec_id_byte) {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                "Invalid recovery flag in signature",
-            ));
-        }
+    async fn sign_message(&self, privkey: String, message: String) -> RpcResult<String> {
+        use base64::Engine;
 
-        // Full ECDSA recovery requires secp256k1; delegate to the crypto layer.
-        // For now, validate the format is correct and return false for unverifiable sigs.
-        // A complete implementation would recover the pubkey, derive the address, and compare.
-        let _ = &address;
-        Ok(false)
+        // Accept either a 64-char hex raw private key or a Base58Check WIF.
+        let secret = parse_signing_privkey(privkey.trim()).map_err(|e| {
+            Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, e)
+        })?;
+        // The `compressed` flag is part of the WIF format (0x01 suffix). For
+        // raw hex the safe Core-compatible default is compressed.
+        let sig = rustoshi_crypto::sign_message_compact(&secret.0, message.as_bytes(), secret.1);
+        Ok(base64::engine::general_purpose::STANDARD.encode(sig))
     }
 
     async fn uptime(&self) -> RpcResult<u64> {
@@ -4430,6 +4598,53 @@ impl RpcServerImpl {
             )),
         }
     }
+}
+
+/// Parse a signing private key from either:
+/// - 64-character hex (raw 32-byte secret) — assumed compressed-pubkey form,
+/// - or a Base58Check WIF (mainnet 0x80, testnet 0xef) with optional 0x01
+///   compression suffix.
+///
+/// Returns `(SecretKey, compressed)` so the caller can pass the correct
+/// flag to the message-sign primitive (so the recovery byte matches the
+/// pubkey hash encoding the signer would normally publish).
+fn parse_signing_privkey(input: &str) -> Result<(rustoshi_crypto::SecretKey, bool), String> {
+    use rustoshi_crypto::base58check_decode;
+
+    // Hex form: 64 chars, raw 32-byte private key. Default compressed=true.
+    if input.len() == 64 && input.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(input).map_err(|_| "Invalid hex private key".to_string())?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "Invalid private key length".to_string())?;
+        let key = rustoshi_crypto::SecretKey::from_slice(&arr)
+            .map_err(|e| format!("Invalid private key: {}", e))?;
+        return Ok((key, true));
+    }
+    // WIF: base58check; 33 bytes (uncompressed) or 34 bytes (compressed).
+    let data = base58check_decode(input).map_err(|e| format!("Invalid WIF: {}", e))?;
+    if data.is_empty() {
+        return Err("Empty WIF payload".to_string());
+    }
+    // First byte is the version (0x80 mainnet, 0xef testnet/regtest).
+    let payload = &data[1..];
+    let (raw, compressed) = match payload.len() {
+        32 => (payload, false),
+        33 => {
+            if payload[32] != 0x01 {
+                return Err("Invalid WIF compression flag".to_string());
+            }
+            (&payload[..32], true)
+        }
+        _ => return Err("Invalid WIF payload length".to_string()),
+    };
+    let arr: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| "Invalid WIF key length".to_string())?;
+    let key = rustoshi_crypto::SecretKey::from_slice(&arr)
+        .map_err(|e| format!("Invalid private key: {}", e))?;
+    Ok((key, compressed))
 }
 
 /// Compute merkle root for a list of transactions.
@@ -6362,5 +6577,198 @@ mod tests {
                 assert_eq!(sf_bip9["timeout"],    di_bip9["timeout"],    "'{name}' bip9.timeout mismatch");
             }
         }
+    }
+
+    // ============================================================
+    // signmessage / verifymessage / mempool descendants / estimaterawfee
+    // ============================================================
+
+    /// Build a P2PKH legacy (mainnet) address from a compressed pubkey.
+    fn mainnet_p2pkh_from_compressed(pubkey: &[u8; 33]) -> String {
+        use rustoshi_crypto::address::{Address, Network};
+        use rustoshi_crypto::hashes::hash160;
+        let h = hash160(pubkey);
+        Address::P2PKH {
+            hash: h,
+            network: Network::Mainnet,
+        }
+        .encode()
+    }
+
+    #[test]
+    fn parse_signing_privkey_accepts_hex() {
+        // 32 bytes, valid range.
+        let hex = "0101010101010101010101010101010101010101010101010101010101010101";
+        let (key, compressed) = parse_signing_privkey(hex).expect("parse hex");
+        assert!(compressed, "raw hex defaults to compressed");
+        assert_eq!(key.secret_bytes()[0], 0x01);
+    }
+
+    #[test]
+    fn parse_signing_privkey_rejects_bad_hex() {
+        // Wrong length
+        assert!(parse_signing_privkey("abcd").is_err());
+        // Non-hex
+        assert!(parse_signing_privkey(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn parse_signing_privkey_accepts_wif_compressed_and_uncompressed() {
+        use rustoshi_crypto::base58::base58check_encode;
+        let raw = [0x42u8; 32];
+        // Compressed WIF: 0x80 || 32 bytes || 0x01
+        let mut buf = vec![0x80];
+        buf.extend_from_slice(&raw);
+        buf.push(0x01);
+        let wif_c = base58check_encode(&buf);
+        let (k1, c1) = parse_signing_privkey(&wif_c).expect("compressed wif");
+        assert!(c1);
+        assert_eq!(k1.secret_bytes(), raw);
+
+        // Uncompressed WIF: 0x80 || 32 bytes
+        let mut buf2 = vec![0x80];
+        buf2.extend_from_slice(&raw);
+        let wif_u = base58check_encode(&buf2);
+        let (k2, c2) = parse_signing_privkey(&wif_u).expect("uncompressed wif");
+        assert!(!c2);
+        assert_eq!(k2.secret_bytes(), raw);
+    }
+
+    #[tokio::test]
+    async fn signmessage_verifymessage_roundtrip_compressed() {
+        // Sign with a hex private key, then derive its compressed P2PKH address
+        // and verify the signature in the same RPC server.
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let state = Arc::new(RwLock::new(RpcState::new(
+            db,
+            ChainParams::regtest(),
+        )));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state, peer_state);
+
+        // Deterministic privkey for reproducibility.
+        let hex_key =
+            "1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        let msg = "hello rustoshi".to_string();
+        let sig_b64 = server
+            .sign_message(hex_key.clone(), msg.clone())
+            .await
+            .expect("signmessage");
+
+        // Derive the matching compressed mainnet P2PKH address from the secret.
+        let secret =
+            rustoshi_crypto::parse_secret_key(&hex::decode(&hex_key).unwrap().try_into().unwrap())
+                .unwrap();
+        let pubkey = rustoshi_crypto::public_key_from_private(&secret);
+        let compressed = rustoshi_crypto::serialize_pubkey_compressed(&pubkey);
+        let addr = mainnet_p2pkh_from_compressed(&compressed);
+
+        let ok = server
+            .verify_message(addr.clone(), sig_b64.clone(), msg.clone())
+            .await
+            .expect("verifymessage");
+        assert!(ok, "valid signature must verify");
+
+        // Tampered message -> false (no error)
+        let bad = server
+            .verify_message(addr, sig_b64, "hello bitcoin core".to_string())
+            .await
+            .expect("verifymessage tampered");
+        assert!(!bad, "tampered message must not verify");
+
+        // Garbage base64 -> error (Core parity)
+        let err = server
+            .verify_message(
+                mainnet_p2pkh_from_compressed(&compressed),
+                "$$$".to_string(),
+                msg,
+            )
+            .await;
+        assert!(err.is_err(), "malformed base64 must error out");
+    }
+
+    #[tokio::test]
+    async fn savemempool_returns_filename_and_writes_file() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let dat = tmp.path().join("mempool.dat");
+        let mut rpc_state = RpcState::new(db, ChainParams::regtest());
+        rpc_state.mempool_dat_path = Some(dat.clone());
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state, peer_state);
+
+        let resp = server.save_mempool().await.expect("savemempool");
+        assert_eq!(resp["filename"], serde_json::json!(dat.display().to_string()));
+        assert!(dat.exists(), "savemempool must write the file to disk");
+    }
+
+    #[tokio::test]
+    async fn savemempool_errors_when_path_unset() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let state = Arc::new(RwLock::new(RpcState::new(
+            db,
+            ChainParams::regtest(),
+        )));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state, peer_state);
+        assert!(server.save_mempool().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn getmempooldescendants_errors_for_missing_tx() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let state = Arc::new(RwLock::new(RpcState::new(
+            db,
+            ChainParams::regtest(),
+        )));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state, peer_state);
+        let zero = "0".repeat(64);
+        let r = server.get_mempool_descendants(zero, Some(false)).await;
+        assert!(r.is_err(), "missing tx must error like getmempoolancestors");
+    }
+
+    #[tokio::test]
+    async fn estimaterawfee_returns_bucket_array() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let state = Arc::new(RwLock::new(RpcState::new(
+            db,
+            ChainParams::regtest(),
+        )));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state, peer_state);
+        let resp = server.estimate_raw_fee(6, None).await.expect("estimaterawfee");
+        let buckets = resp["buckets"].as_array().expect("buckets array");
+        assert!(!buckets.is_empty(), "should expose all fee buckets");
+        for b in buckets {
+            assert!(b.get("startrange").is_some());
+            assert!(b.get("endrange").is_some());
+            assert!(b.get("inmempool").is_some());
+            assert!(b.get("withintarget").is_some());
+        }
+
+        // Invalid target -> error (matches Core)
+        assert!(server.estimate_raw_fee(0, None).await.is_err());
+        assert!(server.estimate_raw_fee(2000, None).await.is_err());
     }
 }
