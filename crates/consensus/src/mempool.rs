@@ -32,8 +32,18 @@ use crate::validation::{check_transaction, CoinEntry, TxValidationError};
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxOut};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+/// Helper: current wall-clock time as seconds since Unix epoch (i64).
+/// Used for the `time_seconds` field of `MempoolEntry`, which is
+/// persisted in the Core-format `mempool.dat` file.
+fn now_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 // ============================================================
 // RBF CONSTANTS
@@ -592,8 +602,17 @@ pub struct MempoolEntry {
     /// Mining score: the effective fee rate of the chunk this transaction is in.
     /// This is the fee rate at which this transaction would be included when mining.
     pub mining_score: f64,
-    /// Time when the transaction was added.
+    /// Time when the transaction was added (monotonic clock, used for
+    /// elapsed-time queries).
     pub time_added: Instant,
+    /// Wall-clock time when the transaction was added, as seconds since
+    /// the Unix epoch. Persisted to the Core-format `mempool.dat` file.
+    pub time_seconds: i64,
+    /// Fee delta in satoshis applied via `prioritisetransaction`.
+    /// Persisted alongside the transaction in `mempool.dat`. Currently
+    /// always zero (rustoshi does not yet implement `prioritisetransaction`),
+    /// but the field exists so the format is stable.
+    pub fee_delta: i64,
     /// Fee rate in satoshis per virtual byte.
     pub fee_rate: f64,
     /// Ancestor count (including this transaction).
@@ -1114,6 +1133,8 @@ impl Mempool {
             cluster_id: 0, // Will be set by add_to_clusters
             mining_score: fee_rate, // Initial value, will be updated by add_to_clusters
             time_added: Instant::now(),
+            time_seconds: now_unix_seconds(),
+            fee_delta: 0,
             fee_rate,
             ancestor_count: ancestor_count + 1,
             ancestor_size: ancestor_size + vsize,
@@ -1833,6 +1854,34 @@ impl Mempool {
             let wtxid = entry.tx.wtxid();
             (wtxid, Arc::new(entry.tx.clone()))
         }).collect()
+    }
+
+    /// Iterate over all mempool entries.
+    /// Used by the `mempool_persist` module to walk the mempool when
+    /// dumping `mempool.dat`.
+    pub fn entries(&self) -> impl Iterator<Item = &MempoolEntry> {
+        self.transactions.values()
+    }
+
+    /// Override the wall-clock time on an existing entry.
+    /// Used by `mempool_persist::load_mempool` so that an entry loaded
+    /// from disk preserves its original `nTime` rather than picking up
+    /// the load timestamp.
+    pub fn set_entry_time_seconds(&mut self, txid: &Hash256, time_seconds: i64) {
+        if let Some(entry) = self.transactions.get_mut(txid) {
+            entry.time_seconds = time_seconds;
+        }
+    }
+
+    /// Override the fee delta on an existing entry.
+    /// Used by `mempool_persist::load_mempool` to restore the prioritise
+    /// delta read from `mempool.dat`. Note: rustoshi does not yet
+    /// implement `prioritisetransaction`, so this only round-trips
+    /// data persisted by an external tool (or a future implementation).
+    pub fn set_entry_fee_delta(&mut self, txid: &Hash256, fee_delta: i64) {
+        if let Some(entry) = self.transactions.get_mut(txid) {
+            entry.fee_delta = fee_delta;
+        }
     }
 
     /// Collect all mempool transactions as `(txid, wtxid)` pairs.
@@ -2821,6 +2870,8 @@ impl Mempool {
             cluster_id: 0, // Will be set by add_to_clusters
             mining_score: fee_rate, // Initial value, will be updated by add_to_clusters
             time_added: Instant::now(),
+            time_seconds: now_unix_seconds(),
+            fee_delta: 0,
             fee_rate,
             ancestor_count: ancestor_count + 1,
             ancestor_size: ancestor_size + vsize,
