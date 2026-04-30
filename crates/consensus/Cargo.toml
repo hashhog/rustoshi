@@ -25,3 +25,4 @@ sha2 = "0.10"
 secp256k1.workspace = true
 rustoshi-crypto = { path = "../crypto" }
 rustoshi-primitives = { path = "../primitives" }
+tempfile.workspace = true

@@ -18,7 +18,10 @@ use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 use tokio::io::AsyncWriteExt;
 
-use rustoshi_consensus::{get_block_proof, ChainParams, ChainState, ChainWork, FeeEstimator, NetworkId};
+use rustoshi_consensus::{
+    dump_mempool, get_block_proof, load_mempool, ChainParams, ChainState, ChainWork, FeeEstimator,
+    NetworkId,
+};
 use rustoshi_network::{
     BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason, NetworkMessage, PeerEvent,
     PeerManager, PeerManagerConfig,
@@ -1021,6 +1024,43 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Loaded fee estimates from disk (height {})", loaded_estimator.current_height());
     }
     rpc_state_inner.fee_estimator = loaded_estimator;
+
+    // Load persisted mempool from `mempool.dat` (Core-format, byte-compatible).
+    // Failures here are non-fatal: a missing or corrupt file just means we
+    // start with an empty mempool, exactly like Bitcoin Core.
+    let mempool_dat_path = datadir.join("mempool.dat");
+    rpc_state_inner.mempool_dat_path = Some(mempool_dat_path.clone());
+    if mempool_dat_path.exists() {
+        let db_for_lookup = db.clone();
+        let utxo_lookup = move |outpoint: &OutPoint| {
+            let store = BlockStore::new(&db_for_lookup);
+            store
+                .get_utxo(outpoint)
+                .ok()
+                .flatten()
+                .map(|c| rustoshi_consensus::validation::CoinEntry {
+                    height: c.height,
+                    is_coinbase: c.is_coinbase,
+                    value: c.value,
+                    script_pubkey: c.script_pubkey,
+                })
+        };
+        match load_mempool(&mut rpc_state_inner.mempool, &mempool_dat_path, &utxo_lookup) {
+            Ok(stats) => tracing::info!(
+                "Loaded mempool from disk: {} accepted, {} failed, {} expired/skipped, {} unbroadcast (file v{})",
+                stats.accepted,
+                stats.failed,
+                stats.total.saturating_sub(stats.accepted + stats.failed),
+                stats.unbroadcast,
+                stats.version,
+            ),
+            Err(e) => tracing::warn!(
+                "Failed to load mempool from {}: {}. Continuing anyway.",
+                mempool_dat_path.display(),
+                e,
+            ),
+        }
+    }
 
     let rpc_state = Arc::new(RwLock::new(rpc_state_inner));
 
@@ -2130,6 +2170,22 @@ async fn main() -> anyhow::Result<()> {
         match state.fee_estimator.save(&fee_estimates_path) {
             Ok(()) => tracing::info!("Fee estimates saved to {}", fee_estimates_path.display()),
             Err(e) => tracing::error!("Failed to save fee estimates: {}", e),
+        }
+    }
+
+    // Dump mempool to `mempool.dat` (Core-format, byte-compatible). Same
+    // best-effort posture as fee-estimate persistence: log and continue
+    // on any I/O failure.
+    {
+        let state = rpc_state.read().await;
+        match dump_mempool(&state.mempool, &mempool_dat_path) {
+            Ok(stats) => tracing::info!(
+                "Mempool dumped to {} ({} txs, {} bytes)",
+                mempool_dat_path.display(),
+                stats.txs,
+                stats.bytes,
+            ),
+            Err(e) => tracing::error!("Failed to dump mempool: {}", e),
         }
     }
 
