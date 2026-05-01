@@ -4470,8 +4470,8 @@ impl RustoshiRpcServer for RpcServerImpl {
             written += 1;
         }
 
-        let (_file, txoutset_hash) = writer
-            .finish()
+        let (_file, txoutset_hash, core_hash_serialized, muhash) = writer
+            .finish_with_hashes()
             .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
 
         std::fs::rename(&temp_path, &abs_path).map_err(|e| {
@@ -4488,7 +4488,16 @@ impl RustoshiRpcServer for RpcServerImpl {
             "base_hash": tip_hash.to_hex(),
             "base_height": tip_height,
             "path": abs_path.display().to_string(),
+            // Legacy rustoshi `compute_utxo_hash` form — preserved so old
+            // tooling keeps working.  Does NOT match Core.
             "txoutset_hash": txoutset_hash.0.to_hex(),
+            // Core HASH_SERIALIZED form (sha256d of TxOutSer bytes,
+            // grouped by txid).  This is what
+            // `AssumeutxoData::hash_serialized` is anchored to.
+            "hash_serialized": core_hash_serialized.0.to_hex(),
+            // Core MuHash3072 form (matches `gettxoutsetinfo`'s `muhash`
+            // field; order-independent in the prime field).
+            "muhash": muhash.0.to_hex(),
             "nchaintx": nchaintx,
         }))
     }
@@ -4537,17 +4546,27 @@ impl RustoshiRpcServer for RpcServerImpl {
             })?;
         let base_height = assume.height;
 
-        // Stream coins into the UTXO column family + accumulate the running
-        // serialized hash for cross-check against `assume.hash_serialized`.
+        // Stream coins into the UTXO column family + accumulate three
+        // hashes in parallel:
+        //   1. legacy rustoshi `compute_utxo_hash` form (back-compat)
+        //   2. Core-compatible `hash_serialized` (sha256d over `TxOutSer`
+        //      bytes; this is what `AssumeutxoData::hash_serialized` is
+        //      anchored to in `bitcoin-core/src/kernel/chainparams.cpp`)
+        //   3. MuHash3072 over the same `TxOutSer` bytes (matches
+        //      `gettxoutsetinfo`'s `muhash` field)
         let store = BlockStore::new(&state.db);
         use sha2::Digest as _;
-        let mut hasher = sha2::Sha256::new();
+        let mut legacy_hasher = sha2::Sha256::new();
+        let mut core_hasher = sha2::Sha256::new();
+        let mut muhash = rustoshi_storage::MuHash3072::new();
         let mut loaded: u64 = 0;
         while let Some((outpoint, coin)) = reader
             .read_coin()
             .map_err(|e| Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, e.to_string()))?
         {
-            // Hash form must match `compute_utxo_hash` exactly.
+            // Legacy (rustoshi-only) per-coin layout — not Core-compatible
+            // but preserved here so existing snapshots produced by older
+            // dumptxoutset still validate.
             let mut data = Vec::with_capacity(32 + 4 + 4 + 1 + 8 + coin.tx_out.script_pubkey.len());
             data.extend_from_slice(outpoint.txid.as_bytes());
             data.extend_from_slice(&outpoint.vout.to_le_bytes());
@@ -4555,7 +4574,36 @@ impl RustoshiRpcServer for RpcServerImpl {
             data.push(if coin.is_coinbase { 1 } else { 0 });
             data.extend_from_slice(&coin.tx_out.value.to_le_bytes());
             data.extend_from_slice(&coin.tx_out.script_pubkey);
-            hasher.update(&data);
+            legacy_hasher.update(&data);
+
+            // Core-compatible TxOutSer (kernel/coinstats.cpp::TxOutSer):
+            //   outpoint || u32_LE((height<<1)|coinbase) || i64_LE(value)
+            //   || CompactSize(script.len()) || script
+            let mut core_bytes = Vec::with_capacity(
+                32 + 4 + 4 + 8 + 9 + coin.tx_out.script_pubkey.len(),
+            );
+            core_bytes.extend_from_slice(outpoint.txid.as_bytes());
+            core_bytes.extend_from_slice(&outpoint.vout.to_le_bytes());
+            let code: u32 = (coin.height << 1) | (coin.is_coinbase as u32);
+            core_bytes.extend_from_slice(&code.to_le_bytes());
+            core_bytes.extend_from_slice(&(coin.tx_out.value as i64).to_le_bytes());
+            // CompactSize(script_len)
+            let n = coin.tx_out.script_pubkey.len() as u64;
+            if n < 0xFD {
+                core_bytes.push(n as u8);
+            } else if n <= 0xFFFF {
+                core_bytes.push(0xFD);
+                core_bytes.extend_from_slice(&(n as u16).to_le_bytes());
+            } else if n <= 0xFFFF_FFFF {
+                core_bytes.push(0xFE);
+                core_bytes.extend_from_slice(&(n as u32).to_le_bytes());
+            } else {
+                core_bytes.push(0xFF);
+                core_bytes.extend_from_slice(&n.to_le_bytes());
+            }
+            core_bytes.extend_from_slice(&coin.tx_out.script_pubkey);
+            core_hasher.update(&core_bytes);
+            muhash.insert(&core_bytes);
 
             let entry = coin.to_entry();
             store
@@ -4579,24 +4627,50 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Final double-SHA256 over the streamed per-coin layout, matching
         // `compute_utxo_hash`'s output.
-        let first_hash = hasher.finalize();
+        let first_hash = legacy_hasher.finalize();
         let mut second = sha2::Sha256::new();
         second.update(first_hash);
         let final_hash = second.finalize();
         let mut final_bytes = [0u8; 32];
         final_bytes.copy_from_slice(&final_hash);
-        let computed = Hash256(final_bytes);
+        let computed_legacy = Hash256(final_bytes);
 
-        if computed != assume.hash_serialized.0 {
+        // Final sha256d over the Core TxOutSer bytes — this is the form
+        // `validation.cpp:5912-5914` validates against, modulo the
+        // per-tx-group ordering (which our writer/loader already enforce).
+        let first_core = core_hasher.finalize();
+        let mut second_core = sha2::Sha256::new();
+        second_core.update(first_core);
+        let final_core = second_core.finalize();
+        let mut core_bytes_out = [0u8; 32];
+        core_bytes_out.copy_from_slice(&final_core);
+        let computed_core_hash_serialized = Hash256(core_bytes_out);
+
+        // Finalize the MuHash for completeness (returned in the JSON
+        // response so callers can cross-check against `gettxoutsetinfo`).
+        let computed_muhash = muhash.finalize();
+
+        // Validate against the chainparams entry's hash_serialized.  We
+        // accept either the legacy rustoshi form (back-compat with
+        // existing snapshots) OR the Core HASH_SERIALIZED form.  When
+        // neither matches we report Core's exact wording from
+        // `bitcoin-core/src/validation.cpp:5912-5914`.
+        let expected = assume.hash_serialized.0;
+        if computed_legacy != expected && computed_core_hash_serialized != expected {
             return Err(Self::rpc_error(
                 rpc_error::RPC_VERIFY_REJECTED,
                 format!(
-                    "txoutset_hash mismatch: snapshot computes {}, expected {}",
-                    computed.to_hex(),
-                    assume.hash_serialized.0.to_hex()
+                    "Bad snapshot content hash: expected {}, got {}",
+                    expected.to_hex(),
+                    computed_core_hash_serialized.to_hex()
                 ),
             ));
         }
+        let computed = if computed_core_hash_serialized == expected {
+            computed_core_hash_serialized
+        } else {
+            computed_legacy
+        };
 
         // Mark the snapshot as the new chain tip — this is a one-way operation
         // mirroring Core's `ActivateSnapshot`. A full implementation would
@@ -4620,6 +4694,17 @@ impl RustoshiRpcServer for RpcServerImpl {
             "tip_hash": metadata_blockhash.to_hex(),
             "base_height": base_height,
             "path": abs_path.display().to_string(),
+            // Hash actually used for the chainparams cross-check.  Will be
+            // either the legacy rustoshi form or the Core HASH_SERIALIZED
+            // form, depending on which matched.
+            "txoutset_hash": computed.to_hex(),
+            // Core's gettxoutsetinfo MuHash variant (over the same per-coin
+            // TxOutSer bytes).  Independent of insertion order.
+            "muhash": computed_muhash.to_hex(),
+            // Core's HASH_SERIALIZED variant (sha256d over per-coin
+            // TxOutSer bytes).  This is what `AssumeutxoData::hash_serialized`
+            // is anchored to in Core's chainparams.cpp.
+            "hash_serialized": computed_core_hash_serialized.to_hex(),
         }))
     }
 }

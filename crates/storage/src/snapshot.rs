@@ -372,6 +372,15 @@ pub struct SnapshotWriter<W: Write> {
     /// Running double-SHA256 hash over the per-coin serialization (matches the
     /// hash form stored in `AssumeutxoData::hash_serialized` in chainparams).
     hasher: Sha256,
+    /// Running Core-compatible HASH_SERIALIZED accumulator (sha256d over
+    /// `TxOutSer` per-coin bytes).  Mirrors
+    /// `kernel/coinstats.cpp::ComputeUTXOStats(HASH_SERIALIZED, ...)` and
+    /// is what gets compared against `AssumeutxoData::hash_serialized`.
+    core_hasher: Sha256,
+    /// Running MuHash3072 accumulator over the same per-coin `TxOutSer`
+    /// bytes.  This is what `gettxoutsetinfo`'s `muhash` field contains
+    /// and is order-independent.
+    muhash: crate::indexes::muhash::MuHash3072,
     /// Buffered (vout, coin) entries that share `pending_txid`.
     pending_txid: Option<Hash256>,
     pending_coins: Vec<(u32, Coin)>,
@@ -389,6 +398,8 @@ impl<W: Write> SnapshotWriter<W> {
             writer: buf_writer,
             coins_written: 0,
             hasher: Sha256::new(),
+            core_hasher: Sha256::new(),
+            muhash: crate::indexes::muhash::MuHash3072::new(),
             pending_txid: None,
             pending_coins: Vec::new(),
         })
@@ -450,6 +461,14 @@ impl<W: Write> SnapshotWriter<W> {
             let coin_bytes = serialize_coin_for_hash(&outpoint, coin);
             self.hasher.update(&coin_bytes);
 
+            // Also run the Core-compatible TxOutSer through both
+            // `hash_serialized` (sha256d) and MuHash3072.  Same per-coin
+            // bytes feed both accumulators.  See `tx_out_ser` above for
+            // the exact byte layout (matches kernel/coinstats.cpp).
+            let core_bytes = tx_out_ser(&outpoint, coin);
+            self.core_hasher.update(&core_bytes);
+            self.muhash.insert(&core_bytes);
+
             self.coins_written += 1;
         }
         Ok(())
@@ -474,6 +493,46 @@ impl<W: Write> SnapshotWriter<W> {
             .into_inner()
             .map_err(|e| SnapshotError::Io(e.into_error()))?;
         Ok((inner, hash))
+    }
+
+    /// Finish writing and return all three computed hashes:
+    ///
+    /// 1. legacy rustoshi `compute_utxo_hash`-form (kept for back-compat with
+    ///    callers that still use the old hash; does NOT match Core).
+    /// 2. Core-compatible `hash_serialized` (sha256d over `TxOutSer`
+    ///    bytes; matches `AssumeutxoData::hash_serialized` and
+    ///    `kernel/coinstats.cpp::ComputeUTXOStats(HASH_SERIALIZED, ...)`).
+    /// 3. MuHash3072 finalize (matches `gettxoutsetinfo`'s `muhash` field).
+    pub fn finish_with_hashes(
+        mut self,
+    ) -> Result<(W, AssumeutxoHash, AssumeutxoHash, AssumeutxoHash), SnapshotError> {
+        self.flush_group()?;
+        self.writer.flush()?;
+
+        // Legacy hash
+        let first_hash = self.hasher.finalize();
+        let mut second_hasher = Sha256::new();
+        second_hasher.update(first_hash);
+        let mut legacy = [0u8; 32];
+        legacy.copy_from_slice(&second_hasher.finalize());
+        let legacy_hash = AssumeutxoHash(Hash256(legacy));
+
+        // Core HASH_SERIALIZED
+        let first_core = self.core_hasher.finalize();
+        let mut second_core = Sha256::new();
+        second_core.update(first_core);
+        let mut core_bytes = [0u8; 32];
+        core_bytes.copy_from_slice(&second_core.finalize());
+        let core_hash_serialized = AssumeutxoHash(Hash256(core_bytes));
+
+        // MuHash finalize
+        let muhash = AssumeutxoHash(self.muhash.finalize());
+
+        let inner = self
+            .writer
+            .into_inner()
+            .map_err(|e| SnapshotError::Io(e.into_error()))?;
+        Ok((inner, legacy_hash, core_hash_serialized, muhash))
     }
 
     /// Get the number of coins written.
@@ -606,6 +665,109 @@ pub fn compute_utxo_hash<V: CoinsView>(
     let mut hash_bytes = [0u8; 32];
     hash_bytes.copy_from_slice(&final_hash);
     AssumeutxoHash(Hash256(hash_bytes))
+}
+
+// ============================================================
+// CORE-COMPATIBLE TxOutSer + UTXO MuHash / hash_serialized
+// ============================================================
+//
+// These two functions mirror what Bitcoin Core does in
+// `bitcoin-core/src/kernel/coinstats.cpp::TxOutSer` and
+// `ComputeUTXOStats`.  The output is what gets stored in
+// `AssumeutxoData::hash_serialized` (HashWriter / sha256d form) and what
+// `gettxoutsetinfo` returns under the `muhash` field.
+//
+// Per-coin serialization (`TxOutSer`):
+//   - outpoint:       32-byte txid (on-disk byte order) + u32 LE vout
+//   - height/cb:      u32 LE = (height << 1) | coinbase
+//   - CTxOut.nValue:  i64 LE
+//   - CTxOut.script:  CompactSize(script.len()) + script bytes
+//
+// NOTE: `code` and `nValue` here are NOT compressed — the snapshot file
+// format (which compresses both via VARINT) is a separate serialization;
+// `hashSerialized` is computed over the *uncompressed* CTxOut wire form.
+
+/// Serialize a single `(OutPoint, Coin)` exactly the way Bitcoin Core's
+/// `TxOutSer` does, for hashing into `hashSerialized` / MuHash3072.
+fn tx_out_ser(outpoint: &OutPoint, coin: &Coin) -> Vec<u8> {
+    let script = &coin.tx_out.script_pubkey;
+    let mut out = Vec::with_capacity(32 + 4 + 4 + 8 + 9 + script.len());
+
+    // outpoint
+    out.extend_from_slice(outpoint.txid.as_bytes());
+    out.extend_from_slice(&outpoint.vout.to_le_bytes());
+
+    // (height << 1) | coinbase  — uint32_t LE
+    let code: u32 = (coin.height << 1) | (coin.is_coinbase as u32);
+    out.extend_from_slice(&code.to_le_bytes());
+
+    // CTxOut: int64_t nValue (LE) + CScript (CompactSize prefix + bytes)
+    out.extend_from_slice(&(coin.tx_out.value as i64).to_le_bytes());
+    write_compact_size_to_vec(&mut out, script.len() as u64);
+    out.extend_from_slice(script);
+
+    out
+}
+
+/// CompactSize-encode `n` and append to `out`.  Wire-format equivalent
+/// of `WriteCompactSize` in `bitcoin-core/src/serialize.h`.
+fn write_compact_size_to_vec(out: &mut Vec<u8>, n: u64) {
+    if n < 0xFD {
+        out.push(n as u8);
+    } else if n <= 0xFFFF {
+        out.push(0xFD);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= 0xFFFF_FFFF {
+        out.push(0xFE);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        out.push(0xFF);
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
+/// Compute the Core-compatible `hashSerialized` over a stream of coins.
+///
+/// This is the **HASH_SERIALIZED** variant from
+/// `kernel/coinstats.cpp::ComputeUTXOStats`: a single SHA256d (HashWriter)
+/// over each coin's `TxOutSer` bytes, in the order they are presented.
+/// Coins MUST be supplied grouped by txid in lexicographic order — that is
+/// what Core's `CCoinsViewCursor` produces and what
+/// `AssumeutxoData::hash_serialized` is anchored to.
+pub fn compute_hash_serialized(
+    coins: impl Iterator<Item = (OutPoint, Coin)>,
+) -> AssumeutxoHash {
+    let mut hasher = Sha256::new();
+    for (outpoint, coin) in coins {
+        let bytes = tx_out_ser(&outpoint, &coin);
+        hasher.update(&bytes);
+    }
+    let first = hasher.finalize();
+    let mut second = Sha256::new();
+    second.update(first);
+    let final_hash = second.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&final_hash);
+    AssumeutxoHash(Hash256(out))
+}
+
+/// Compute the Core-compatible `muhash` over a UTXO set, returning the
+/// 32-byte SHA256 of the canonical 384-byte MuHash3072 representation.
+///
+/// This is what `gettxoutsetinfo` returns under the `muhash` field and
+/// what `kernel/coinstats.cpp::ComputeUTXOStats(MUHASH, ...)` computes.
+/// Order-independent (multiplication in the prime field is commutative),
+/// so the iterator can yield coins in any order.
+pub fn compute_utxo_muhash(
+    coins: impl Iterator<Item = (OutPoint, Coin)>,
+) -> AssumeutxoHash {
+    use crate::indexes::muhash::MuHash3072;
+    let mut acc = MuHash3072::new();
+    for (outpoint, coin) in coins {
+        let bytes = tx_out_ser(&outpoint, &coin);
+        acc.insert(&bytes);
+    }
+    AssumeutxoHash(acc.finalize())
 }
 
 // ============================================================
@@ -1925,5 +2087,172 @@ mod tests {
         assert!(!manager.is_snapshot_validated());
         assert!(manager.snapshot_base_height().is_none());
         assert!(matches!(manager.snapshot_state(), SnapshotState::NotLoaded));
+    }
+
+    // -----------------------------------------------------------------
+    // MuHash3072 + hash_serialized snapshot wiring
+    // -----------------------------------------------------------------
+
+    /// Lock down the byte layout of `tx_out_ser` against
+    /// `bitcoin-core/src/kernel/coinstats.cpp::TxOutSer`.  A small P2PKH
+    /// coin at height=1, coinbase=true, value=50_0000_0000 must produce:
+    ///
+    /// txid(32) || vout_LE(4) || u32_LE(code = (1<<1)|1 = 3) ||
+    /// i64_LE(50_0000_0000) || CompactSize(25) || P2PKH(25)
+    #[test]
+    fn test_tx_out_ser_byte_layout_locked() {
+        let txid = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000002",
+        )
+        .unwrap();
+        let mut p2pkh = vec![0x76u8, 0xa9, 20];
+        p2pkh.extend_from_slice(&[0x77; 20]);
+        p2pkh.extend_from_slice(&[0x88, 0xac]);
+        assert_eq!(p2pkh.len(), 25);
+
+        let coin = Coin {
+            tx_out: TxOut {
+                value: 50_0000_0000,
+                script_pubkey: p2pkh.clone(),
+            },
+            height: 1,
+            is_coinbase: true,
+        };
+        let outpoint = OutPoint { txid, vout: 0 };
+
+        let ser = tx_out_ser(&outpoint, &coin);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(txid.as_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes()); // vout
+        expected.extend_from_slice(&3u32.to_le_bytes()); // code
+        expected.extend_from_slice(&(50_0000_0000i64).to_le_bytes()); // value
+        expected.push(25); // CompactSize(25) — single byte
+        expected.extend_from_slice(&p2pkh);
+        assert_eq!(ser, expected, "TxOutSer byte layout drifted from Core");
+    }
+
+    /// MuHash over a small UTXO set is order-independent.
+    #[test]
+    fn test_compute_utxo_muhash_order_independent() {
+        let mk = |seed: u8, vout: u32, height: u32| -> (OutPoint, Coin) {
+            let txid = Hash256::from_bytes([seed; 32]);
+            let coin = Coin {
+                tx_out: TxOut {
+                    value: 1_0000_0000,
+                    script_pubkey: vec![0x51 + seed], // OP_1..OP_16-ish
+                },
+                height,
+                is_coinbase: false,
+            };
+            (OutPoint { txid, vout }, coin)
+        };
+
+        let coins_a = vec![mk(1, 0, 100), mk(2, 0, 200), mk(3, 0, 300)];
+        let coins_b = vec![mk(3, 0, 300), mk(1, 0, 100), mk(2, 0, 200)];
+
+        let h_a = compute_utxo_muhash(coins_a.into_iter());
+        let h_b = compute_utxo_muhash(coins_b.into_iter());
+        assert_eq!(h_a, h_b, "MuHash must be order-independent");
+    }
+
+    /// `hash_serialized` is order-dependent (sha256d streams), so two
+    /// permutations of the same UTXO set produce different hashes.
+    /// Both must, however, be different from the empty-set hash.
+    #[test]
+    fn test_compute_hash_serialized_basic() {
+        let mk = |seed: u8| -> (OutPoint, Coin) {
+            let txid = Hash256::from_bytes([seed; 32]);
+            (
+                OutPoint { txid, vout: 0 },
+                Coin {
+                    tx_out: TxOut {
+                        value: 1_0000_0000,
+                        script_pubkey: vec![0x51],
+                    },
+                    height: 100,
+                    is_coinbase: false,
+                },
+            )
+        };
+
+        let empty = compute_hash_serialized(std::iter::empty());
+        let h1 = compute_hash_serialized(vec![mk(1), mk(2)].into_iter());
+        let h2 = compute_hash_serialized(vec![mk(2), mk(1)].into_iter());
+
+        assert_ne!(h1.0, empty.0);
+        assert_ne!(h2.0, empty.0);
+        // Different ordering yields different sha256d streams.
+        assert_ne!(h1.0, h2.0);
+    }
+
+    /// Round-trip: dumptxoutset writer's MuHash equals an independent
+    /// MuHash over the same coins.  Confirms the writer is feeding bytes
+    /// to the muhash accumulator correctly.
+    #[test]
+    fn test_writer_muhash_matches_independent_compute() {
+        use std::io::Cursor;
+
+        let magic = NetworkMagic([0xf9, 0xbe, 0xb4, 0xd9]);
+        let blockhash = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+
+        // Build a small UTXO set, sorted by (txid, vout) so the writer
+        // never has to reshuffle a previously-flushed group.
+        let mut coins: Vec<(OutPoint, Coin)> = Vec::new();
+        for seed in 1u8..=4 {
+            for vout in 0u32..2 {
+                let txid = Hash256::from_bytes([seed; 32]);
+                let coin = Coin {
+                    tx_out: TxOut {
+                        value: (seed as u64) * 1_0000_0000 + vout as u64,
+                        script_pubkey: vec![0x51 + seed],
+                    },
+                    height: 100 + seed as u32,
+                    is_coinbase: vout == 0,
+                };
+                coins.push((OutPoint { txid, vout }, coin));
+            }
+        }
+        coins.sort_by(|a, b| {
+            a.0.txid.as_bytes().cmp(b.0.txid.as_bytes())
+                .then_with(|| a.0.vout.cmp(&b.0.vout))
+        });
+
+        // Independent MuHash + hash_serialized.
+        let independent_muhash = compute_utxo_muhash(coins.iter().cloned());
+        let independent_hash_serialized = compute_hash_serialized(coins.iter().cloned());
+
+        // Run the same coins through the writer.
+        let metadata = SnapshotMetadata::new(blockhash, coins.len() as u64, magic);
+        let mut output = Vec::new();
+        let writer_muhash;
+        let writer_hash_serialized;
+        {
+            let mut writer = SnapshotWriter::new(&mut output, &metadata).unwrap();
+            for (op, coin) in &coins {
+                writer.write_coin(op, coin).unwrap();
+            }
+            let (_w, _legacy, hs, mh) = writer.finish_with_hashes().unwrap();
+            writer_muhash = mh;
+            writer_hash_serialized = hs;
+        }
+        assert_eq!(writer_muhash, independent_muhash);
+        assert_eq!(writer_hash_serialized, independent_hash_serialized);
+
+        // Reading back should produce the same set of coins (round-trip).
+        let cursor = Cursor::new(output);
+        let mut reader = SnapshotReader::open(cursor, &magic).unwrap();
+        let mut decoded = Vec::new();
+        while let Some((op, coin)) = reader.read_coin().unwrap() {
+            decoded.push((op, coin));
+        }
+        reader.verify_complete().unwrap();
+        assert_eq!(decoded.len(), coins.len());
+
+        let read_muhash = compute_utxo_muhash(decoded.iter().cloned());
+        assert_eq!(read_muhash, independent_muhash);
     }
 }
