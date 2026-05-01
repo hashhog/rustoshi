@@ -456,20 +456,59 @@ impl ChainParams {
                 (630000, "000000000000000000024bead8df69990852c202db0e0097c1a12ea637d7e96d"),
                 (700000, "0000000000000000000590fc0f3eba193a278534220b2b37e9849e1a770ca959"),
             ]),
-            // Mainnet assumeUTXO snapshots (from Bitcoin Core chainparams.cpp)
-            // These allow fast sync by loading a pre-validated UTXO snapshot
+            // Mainnet assumeUTXO snapshots — values lifted verbatim from
+            // `bitcoin-core/src/kernel/chainparams.cpp` (`CMainParams`,
+            // `m_assumeutxo_data`). These hashes are consensus-critical: if a
+            // user attempts to load a snapshot whose blockhash matches one of
+            // these but whose serialized UTXO hash differs, we MUST reject.
             assumeutxo_data: vec![
                 AssumeutxoData {
-                    height: 840000,
+                    height: 840_000,
                     blockhash: Hash256::from_hex(
                         "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
                     )
                     .expect("valid hash"),
                     hash_serialized: AssumeutxoHash::from_hex(
-                        "a09c985e4fb059a92df89a6cd8f6a7af0f5ad73b1bdb0f6d7cdc1e84f0b0e5b6",
+                        "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96",
                     )
                     .expect("valid hash"),
-                    chain_tx_count: 994_352_100,
+                    chain_tx_count: 991_032_194,
+                },
+                AssumeutxoData {
+                    height: 880_000,
+                    blockhash: Hash256::from_hex(
+                        "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 1_145_604_538,
+                },
+                AssumeutxoData {
+                    height: 910_000,
+                    blockhash: Hash256::from_hex(
+                        "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 1_226_586_151,
+                },
+                AssumeutxoData {
+                    height: 935_000,
+                    blockhash: Hash256::from_hex(
+                        "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 1_305_397_408,
                 },
             ],
         }

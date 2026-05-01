@@ -38,7 +38,11 @@ use rustoshi_consensus::{
 use rustoshi_network::message::{InvType, InvVector, NetworkMessage};
 use rustoshi_network::peer_manager::PeerManager;
 use rustoshi_primitives::{Block, Decodable, Encodable, Hash256, OutPoint, Transaction, TxIn, TxOut};
-use rustoshi_storage::{block_store::BlockStore, ChainDb};
+use rustoshi_storage::{
+    block_store::{BlockStore, CoinEntry},
+    snapshot::{SnapshotMetadata, SnapshotReader, SnapshotWriter},
+    ChainDb, Coin, CF_UTXO,
+};
 use rustoshi_wallet::psbt::Psbt;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -123,6 +127,11 @@ pub struct RpcState {
     /// Set by the node binary at startup; `None` disables the
     /// `dumpmempool` / `loadmempool` RPCs.
     pub mempool_dat_path: Option<PathBuf>,
+    /// Network-resolved data directory (e.g. `~/.rustoshi/mainnet`). Used by
+    /// `dumptxoutset`/`loadtxoutset` to resolve relative paths the way Core's
+    /// `AbsPathForConfigVal` does. `None` falls back to the current working
+    /// directory.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl RpcState {
@@ -147,6 +156,7 @@ impl RpcState {
                 .as_secs(),
             recently_rejected: HashSet::new(),
             mempool_dat_path: None,
+            data_dir: None,
         }
     }
 
@@ -171,6 +181,7 @@ impl RpcState {
                 .as_secs(),
             recently_rejected: HashSet::new(),
             mempool_dat_path: None,
+            data_dir: None,
         }
     }
 
@@ -748,6 +759,40 @@ pub trait RustoshiRpc {
         &self,
         blockhash: Option<String>,
     ) -> RpcResult<serde_json::Value>;
+
+    /// Write the serialized UTXO set to a file in Bitcoin Core's
+    /// `dumptxoutset` byte-compatible format (snapshot version 2). Mirrors
+    /// `bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset`.
+    ///
+    /// Parameters:
+    /// - path: Output file path. If relative, prefixed by the data directory.
+    /// - snapshot_type: Optional, must be "latest" if provided. "rollback" is
+    ///   not supported in rustoshi yet (no temporary chainstate roll back).
+    ///
+    /// Returns: object with `coins_written`, `base_hash`, `base_height`,
+    /// `path`, `txoutset_hash`, and `nchaintx`.
+    #[method(name = "dumptxoutset")]
+    async fn dump_tx_outset(
+        &self,
+        path: String,
+        snapshot_type: Option<String>,
+    ) -> RpcResult<serde_json::Value>;
+
+    /// Load a serialized UTXO set from a file in Bitcoin Core's
+    /// `loadtxoutset` byte-compatible format. Mirrors
+    /// `bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset`.
+    ///
+    /// The snapshot's blockhash must match one of the hardcoded entries in
+    /// `ChainParams::assumeutxo_data` AND the recomputed serialized UTXO hash
+    /// must match `hash_serialized` for that entry, otherwise the load is
+    /// rejected.
+    ///
+    /// Parameters:
+    /// - path: Input file path. If relative, resolved against the data directory.
+    ///
+    /// Returns: object with `coins_loaded`, `tip_hash`, `base_height`, and `path`.
+    #[method(name = "loadtxoutset")]
+    async fn load_tx_outset(&self, path: String) -> RpcResult<serde_json::Value>;
 }
 
 // ============================================================
@@ -4311,6 +4356,270 @@ impl RustoshiRpcServer for RpcServerImpl {
             "hash": eval_hash.to_hex(),
             "height": eval_height,
             "deployments": deployments
+        }))
+    }
+
+    async fn dump_tx_outset(
+        &self,
+        path: String,
+        snapshot_type: Option<String>,
+    ) -> RpcResult<serde_json::Value> {
+        // Bitcoin Core's `dumptxoutset` accepts {"latest", "rollback"}; rustoshi
+        // does not yet implement temporary chainstate rollback, so we only
+        // accept "latest" (or empty -> defaults to "latest" for ergonomics).
+        let snap_type = snapshot_type.unwrap_or_default();
+        if !snap_type.is_empty() && snap_type != "latest" {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                format!(
+                    "Invalid snapshot type \"{}\". Only \"latest\" is supported by rustoshi.",
+                    snap_type
+                ),
+            ));
+        }
+
+        let state = self.state.read().await;
+
+        // Resolve relative paths against the configured data dir, mirroring
+        // Core's `fsbridge::AbsPathJoin(args.GetDataDirNet(), ...)`.
+        let path_buf = std::path::PathBuf::from(&path);
+        let abs_path = if path_buf.is_absolute() {
+            path_buf
+        } else if let Some(ref dd) = state.data_dir {
+            dd.join(&path)
+        } else {
+            std::env::current_dir()
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?
+                .join(&path)
+        };
+
+        if abs_path.exists() {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                format!(
+                    "{} already exists. If you are sure this is what you want, move it out of the way first.",
+                    abs_path.display()
+                ),
+            ));
+        }
+
+        // Tip metadata.
+        let store = BlockStore::new(&state.db);
+        let tip_hash = state.best_hash;
+        let tip_height = state.best_height;
+        let tip_index = store
+            .get_block_index(&tip_hash)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
+
+        // Iterate the UTXO column family. RocksDB returns keys in lex order;
+        // our `outpoint_key` is `txid (32) || vout (4 BE)`, so iteration is
+        // already in `(txid, vout)` ascending order — the same ordering Core
+        // requires for `dumptxoutset`.
+        let mut coins_count: u64 = 0;
+        for (key, _) in state
+            .db
+            .iter_cf(CF_UTXO)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+        {
+            if key.len() == 36 {
+                coins_count += 1;
+            }
+        }
+
+        // Write to a temp path and rename on success, mirroring Core's
+        // `temppath = path + ".incomplete"` flow.
+        let temp_path = {
+            let mut p = abs_path.clone().into_os_string();
+            p.push(".incomplete");
+            std::path::PathBuf::from(p)
+        };
+
+        let file = std::fs::File::create(&temp_path)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+
+        let metadata = SnapshotMetadata::new(tip_hash, coins_count, state.params.network_magic);
+        let mut writer = SnapshotWriter::new(file, &metadata)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+
+        let mut written: u64 = 0;
+        for (key, value) in state
+            .db
+            .iter_cf(CF_UTXO)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+        {
+            if key.len() != 36 {
+                continue;
+            }
+            let mut txid_bytes = [0u8; 32];
+            txid_bytes.copy_from_slice(&key[..32]);
+            let txid = Hash256(txid_bytes);
+            let mut vout_bytes = [0u8; 4];
+            vout_bytes.copy_from_slice(&key[32..]);
+            let vout = u32::from_be_bytes(vout_bytes);
+
+            let entry: CoinEntry = serde_json::from_slice(&value).map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_DATABASE_ERROR,
+                    format!("UTXO deserialization failed: {}", e),
+                )
+            })?;
+            let coin = Coin::from_entry(&entry);
+            writer
+                .write_coin(&OutPoint { txid, vout }, &coin)
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+            written += 1;
+        }
+
+        let (_file, txoutset_hash) = writer
+            .finish()
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+
+        std::fs::rename(&temp_path, &abs_path).map_err(|e| {
+            Self::rpc_error(rpc_error::RPC_MISC_ERROR, format!("rename failed: {}", e))
+        })?;
+
+        let nchaintx: u64 = tip_index
+            .as_ref()
+            .map(|e| e.n_tx as u64)
+            .unwrap_or(0);
+
+        Ok(serde_json::json!({
+            "coins_written": written,
+            "base_hash": tip_hash.to_hex(),
+            "base_height": tip_height,
+            "path": abs_path.display().to_string(),
+            "txoutset_hash": txoutset_hash.0.to_hex(),
+            "nchaintx": nchaintx,
+        }))
+    }
+
+    async fn load_tx_outset(&self, path: String) -> RpcResult<serde_json::Value> {
+        let mut state = self.state.write().await;
+
+        let path_buf = std::path::PathBuf::from(&path);
+        let abs_path = if path_buf.is_absolute() {
+            path_buf
+        } else if let Some(ref dd) = state.data_dir {
+            dd.join(&path)
+        } else {
+            std::env::current_dir()
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?
+                .join(&path)
+        };
+
+        let file = std::fs::File::open(&abs_path).map_err(|e| {
+            Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                format!("Couldn't open file {} for reading: {}", abs_path.display(), e),
+            )
+        })?;
+
+        let mut reader = SnapshotReader::open(file, &state.params.network_magic).map_err(|e| {
+            Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, e.to_string())
+        })?;
+
+        // Validate the snapshot's blockhash against the hardcoded
+        // `assumeutxo_data` set. Unrecognized bases must be rejected.
+        let metadata_blockhash = reader.metadata().base_blockhash;
+        let metadata_coins_count = reader.metadata().coins_count;
+        let assume = state
+            .params
+            .assumeutxo_for_blockhash(&metadata_blockhash)
+            .cloned()
+            .ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!(
+                        "Snapshot blockhash {} is not in chainparams.assumeutxo_data — rejecting.",
+                        metadata_blockhash.to_hex()
+                    ),
+                )
+            })?;
+        let base_height = assume.height;
+
+        // Stream coins into the UTXO column family + accumulate the running
+        // serialized hash for cross-check against `assume.hash_serialized`.
+        let store = BlockStore::new(&state.db);
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        let mut loaded: u64 = 0;
+        while let Some((outpoint, coin)) = reader
+            .read_coin()
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, e.to_string()))?
+        {
+            // Hash form must match `compute_utxo_hash` exactly.
+            let mut data = Vec::with_capacity(32 + 4 + 4 + 1 + 8 + coin.tx_out.script_pubkey.len());
+            data.extend_from_slice(outpoint.txid.as_bytes());
+            data.extend_from_slice(&outpoint.vout.to_le_bytes());
+            data.extend_from_slice(&coin.height.to_le_bytes());
+            data.push(if coin.is_coinbase { 1 } else { 0 });
+            data.extend_from_slice(&coin.tx_out.value.to_le_bytes());
+            data.extend_from_slice(&coin.tx_out.script_pubkey);
+            hasher.update(&data);
+
+            let entry = coin.to_entry();
+            store
+                .put_utxo(&outpoint, &entry)
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
+            loaded += 1;
+        }
+        reader
+            .verify_complete()
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, e.to_string()))?;
+
+        if loaded != metadata_coins_count {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_DESERIALIZATION_ERROR,
+                format!(
+                    "coins_count mismatch: header says {} but body had {}",
+                    metadata_coins_count, loaded
+                ),
+            ));
+        }
+
+        // Final double-SHA256 over the streamed per-coin layout, matching
+        // `compute_utxo_hash`'s output.
+        let first_hash = hasher.finalize();
+        let mut second = sha2::Sha256::new();
+        second.update(first_hash);
+        let final_hash = second.finalize();
+        let mut final_bytes = [0u8; 32];
+        final_bytes.copy_from_slice(&final_hash);
+        let computed = Hash256(final_bytes);
+
+        if computed != assume.hash_serialized.0 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_VERIFY_REJECTED,
+                format!(
+                    "txoutset_hash mismatch: snapshot computes {}, expected {}",
+                    computed.to_hex(),
+                    assume.hash_serialized.0.to_hex()
+                ),
+            ));
+        }
+
+        // Mark the snapshot as the new chain tip — this is a one-way operation
+        // mirroring Core's `ActivateSnapshot`. A full implementation would
+        // also flag the chainstate as snapshot-derived for later background
+        // validation; for now we update best_hash / best_height so subsequent
+        // RPCs see the loaded tip.
+        state.best_hash = metadata_blockhash;
+        state.best_height = base_height;
+        if state.header_height < base_height {
+            state.header_height = base_height;
+        }
+
+        // Persist a marker in the data dir so a restart can recognize the
+        // snapshot-derived state. Best-effort; failure is non-fatal.
+        if let Some(ref dd) = state.data_dir {
+            let _ = rustoshi_storage::write_snapshot_blockhash(dd, &metadata_blockhash);
+        }
+
+        Ok(serde_json::json!({
+            "coins_loaded": loaded,
+            "tip_hash": metadata_blockhash.to_hex(),
+            "base_height": base_height,
+            "path": abs_path.display().to_string(),
         }))
     }
 }
