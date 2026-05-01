@@ -604,19 +604,45 @@ impl ChainParams {
                 (10000, "00000000c3afe3c8c0cc7bea7e6c0f6e67d5c1f9b2a0e8d7c6b5a4f3e2d1c0b9"),
                 (50000, "000000000001a8c6b5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2"),
             ]),
-            // Testnet4 assumeUTXO snapshot (from Bitcoin Core)
+            // Testnet4 assumeUTXO snapshots — values lifted verbatim from
+            // `bitcoin-core/src/kernel/chainparams.cpp` `CTestNet4Params`
+            // `m_assumeutxo_data`. Heights 90000, 120000, 290000.
             assumeutxo_data: vec![
                 AssumeutxoData {
-                    height: 160000,
+                    height: 90_000,
                     blockhash: Hash256::from_hex(
-                        "0000000001c29f3d52a9d7e5d1c0b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7",
+                        "0000000002ebe8bcda020e0dd6ccfbdfac531d2f6a81457191b99fc2df2dbe3b",
                     )
                     .expect("valid hash"),
                     hash_serialized: AssumeutxoHash::from_hex(
-                        "b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2",
+                        "784fb5e98241de66fdd429f4392155c9e7db5c017148e66e8fdbc95746f8b9b5",
                     )
                     .expect("valid hash"),
-                    chain_tx_count: 2_500_000,
+                    chain_tx_count: 11_347_043,
+                },
+                AssumeutxoData {
+                    height: 120_000,
+                    blockhash: Hash256::from_hex(
+                        "000000000bd2317e51b3c5794981c35ba894ce27d3e772d5c39ecd9cbce01dc8",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "10b05d05ad468d0971162e1b222a4aa66caca89da2bb2a93f8f37fb29c4794b0",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 14_141_057,
+                },
+                AssumeutxoData {
+                    height: 290_000,
+                    blockhash: Hash256::from_hex(
+                        "0000000577f2741bb30cd9d39d6d71b023afbeb9764f6260786a97969d5c9ac0",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "97267e000b4b876800167e71b9123f1529d13b14308abec2888bbd2160d14545",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 28_547_497,
                 },
             ],
         }
@@ -1832,5 +1858,129 @@ mod tests {
         assert!(checkpoints.get(100).is_some());
         assert!(checkpoints.get(99).is_none());
         assert!(checkpoints.get(101).is_none());
+    }
+
+    /// Pin testnet4 assumeUTXO entries to the literal Bitcoin Core values from
+    /// `bitcoin-core/src/kernel/chainparams.cpp` (`CTestNet4Params`,
+    /// `m_assumeutxo_data`, lines 376-389). These are consensus-critical: any
+    /// drift from Core would break snapshot validation. This test exists to
+    /// catch regressions if anyone re-introduces placeholder values.
+    #[test]
+    fn test_testnet4_assumeutxo_matches_core() {
+        let params = ChainParams::testnet4();
+        assert_eq!(
+            params.assumeutxo_data.len(),
+            3,
+            "testnet4 should have exactly 3 assumeUTXO entries (heights 90000, 120000, 290000)"
+        );
+
+        // Entry 1: height 90,000
+        let entry_90k = params
+            .assumeutxo_for_height(90_000)
+            .expect("testnet4 must have assumeUTXO entry at height 90000");
+        assert_eq!(entry_90k.height, 90_000);
+        assert_eq!(
+            entry_90k.blockhash,
+            Hash256::from_hex(
+                "0000000002ebe8bcda020e0dd6ccfbdfac531d2f6a81457191b99fc2df2dbe3b"
+            )
+            .unwrap(),
+            "testnet4 height-90000 blockhash must match Core chainparams.cpp:381"
+        );
+        assert_eq!(
+            entry_90k.hash_serialized,
+            AssumeutxoHash::from_hex(
+                "784fb5e98241de66fdd429f4392155c9e7db5c017148e66e8fdbc95746f8b9b5"
+            )
+            .unwrap(),
+            "testnet4 height-90000 hash_serialized must match Core chainparams.cpp:379"
+        );
+        assert_eq!(
+            entry_90k.chain_tx_count, 11_347_043,
+            "testnet4 height-90000 chain_tx_count must match Core chainparams.cpp:380"
+        );
+
+        // Entry 2: height 120,000
+        let entry_120k = params
+            .assumeutxo_for_height(120_000)
+            .expect("testnet4 must have assumeUTXO entry at height 120000");
+        assert_eq!(entry_120k.height, 120_000);
+        assert_eq!(
+            entry_120k.blockhash,
+            Hash256::from_hex(
+                "000000000bd2317e51b3c5794981c35ba894ce27d3e772d5c39ecd9cbce01dc8"
+            )
+            .unwrap(),
+            "testnet4 height-120000 blockhash must match Core chainparams.cpp:387"
+        );
+        assert_eq!(
+            entry_120k.hash_serialized,
+            AssumeutxoHash::from_hex(
+                "10b05d05ad468d0971162e1b222a4aa66caca89da2bb2a93f8f37fb29c4794b0"
+            )
+            .unwrap(),
+            "testnet4 height-120000 hash_serialized must match Core chainparams.cpp:385"
+        );
+        assert_eq!(
+            entry_120k.chain_tx_count, 14_141_057,
+            "testnet4 height-120000 chain_tx_count must match Core chainparams.cpp:386"
+        );
+
+        // Entry 3: height 290,000
+        let entry_290k = params
+            .assumeutxo_for_height(290_000)
+            .expect("testnet4 must have assumeUTXO entry at height 290000");
+        assert_eq!(entry_290k.height, 290_000);
+        assert_eq!(
+            entry_290k.blockhash,
+            Hash256::from_hex(
+                "0000000577f2741bb30cd9d39d6d71b023afbeb9764f6260786a97969d5c9ac0"
+            )
+            .unwrap(),
+            "testnet4 height-290000 blockhash must match Core chainparams.cpp"
+        );
+        assert_eq!(
+            entry_290k.hash_serialized,
+            AssumeutxoHash::from_hex(
+                "97267e000b4b876800167e71b9123f1529d13b14308abec2888bbd2160d14545"
+            )
+            .unwrap(),
+            "testnet4 height-290000 hash_serialized must match Core chainparams.cpp"
+        );
+        assert_eq!(
+            entry_290k.chain_tx_count, 28_547_497,
+            "testnet4 height-290000 chain_tx_count must match Core chainparams.cpp"
+        );
+    }
+
+    /// Sanity check: ensure no testnet4 assumeUTXO hex strings are placeholder
+    /// patterns (e.g., "b1c2d3e4..." or "abcdef01...") that someone might have
+    /// re-introduced as a dev stub.
+    #[test]
+    fn test_testnet4_assumeutxo_no_placeholder_patterns() {
+        let params = ChainParams::testnet4();
+        // The previous bug used the string "b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6...".
+        // Hash256/AssumeutxoHash store as bytes, so we round-trip through hex
+        // and confirm none of the entries match the known-bad placeholder.
+        let bad_hash = AssumeutxoHash::from_hex(
+            "b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2",
+        )
+        .unwrap();
+        let bad_block = Hash256::from_hex(
+            "0000000001c29f3d52a9d7e5d1c0b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7",
+        )
+        .unwrap();
+        for entry in &params.assumeutxo_data {
+            assert_ne!(
+                entry.hash_serialized, bad_hash,
+                "testnet4 entry at height {} has the known-bad placeholder hash_serialized",
+                entry.height
+            );
+            assert_ne!(
+                entry.blockhash, bad_block,
+                "testnet4 entry at height {} has the known-bad placeholder blockhash",
+                entry.height
+            );
+        }
     }
 }
