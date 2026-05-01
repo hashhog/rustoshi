@@ -157,6 +157,15 @@ struct Cli {
     #[arg(long = "ready-fd", value_name = "FD")]
     ready_fd: Option<i32>,
 
+    /// Path to a Bitcoin Core-format UTXO snapshot to load on startup.
+    /// Mirrors Core's `-loadsnapshot=<path>` (see
+    /// `bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset`). The snapshot's
+    /// blockhash must be in `chainparams.assumeutxo_data` and its serialized
+    /// UTXO hash must match the recorded value, otherwise the load is
+    /// rejected and the node continues a normal genesis IBD.
+    #[arg(long = "load-snapshot", value_name = "PATH")]
+    load_snapshot: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1333,7 +1342,110 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     // Initialize RPC state
     let mut rpc_state_inner = RpcState::new(db.clone(), params.clone());
+    rpc_state_inner.data_dir = Some(datadir.clone());
     rpc_state_inner.init_from_db().map_err(|e| anyhow::anyhow!(e))?;
+
+    // If `--load-snapshot=<path>` was provided, ingest the Core-format UTXO
+    // snapshot before any P2P/RPC services come up. Mirrors Core's
+    // `-loadsnapshot` initial-block-download fast path. We deliberately do
+    // this BEFORE binding the RPC port so external clients can never observe
+    // a half-loaded UTXO set.
+    if let Some(ref snap_path) = cli.load_snapshot {
+        let path = if std::path::Path::new(snap_path).is_absolute() {
+            std::path::PathBuf::from(snap_path)
+        } else {
+            datadir.join(snap_path)
+        };
+        tracing::info!("Loading UTXO snapshot from {}", path.display());
+        let file = std::fs::File::open(&path)
+            .map_err(|e| anyhow::anyhow!("open snapshot {}: {}", path.display(), e))?;
+        let mut reader = rustoshi_storage::SnapshotReader::open(file, &params.network_magic)
+            .map_err(|e| anyhow::anyhow!("snapshot header parse: {}", e))?;
+
+        let blockhash = reader.metadata().base_blockhash;
+        let assume = params
+            .assumeutxo_for_blockhash(&blockhash)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "snapshot blockhash {} not in chainparams.assumeutxo_data",
+                    blockhash.to_hex()
+                )
+            })?;
+        let coins_total = reader.metadata().coins_count;
+        tracing::info!(
+            "Snapshot recognized: height={} coins={} expected_hash={}",
+            assume.height,
+            coins_total,
+            assume.hash_serialized.0.to_hex()
+        );
+
+        let store = BlockStore::new(&db);
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        let mut loaded: u64 = 0;
+        while let Some((outpoint, coin)) = reader
+            .read_coin()
+            .map_err(|e| anyhow::anyhow!("snapshot body parse: {}", e))?
+        {
+            let mut data =
+                Vec::with_capacity(32 + 4 + 4 + 1 + 8 + coin.tx_out.script_pubkey.len());
+            data.extend_from_slice(outpoint.txid.as_bytes());
+            data.extend_from_slice(&outpoint.vout.to_le_bytes());
+            data.extend_from_slice(&coin.height.to_le_bytes());
+            data.push(if coin.is_coinbase { 1 } else { 0 });
+            data.extend_from_slice(&coin.tx_out.value.to_le_bytes());
+            data.extend_from_slice(&coin.tx_out.script_pubkey);
+            hasher.update(&data);
+
+            let entry = coin.to_entry();
+            store
+                .put_utxo(&outpoint, &entry)
+                .map_err(|e| anyhow::anyhow!("put_utxo: {}", e))?;
+            loaded += 1;
+            if loaded % 1_000_000 == 0 {
+                tracing::info!(
+                    "snapshot import progress: {} / {} coins ({:.1}%)",
+                    loaded,
+                    coins_total,
+                    (loaded as f64 / coins_total.max(1) as f64) * 100.0
+                );
+            }
+        }
+        if loaded != coins_total {
+            return Err(anyhow::anyhow!(
+                "snapshot coins_count mismatch: header={} body={}",
+                coins_total,
+                loaded
+            ));
+        }
+        let first = hasher.finalize();
+        let mut second = sha2::Sha256::new();
+        second.update(first);
+        let final_hash = second.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&final_hash);
+        let computed = rustoshi_primitives::Hash256(bytes);
+        if computed != assume.hash_serialized.0 {
+            return Err(anyhow::anyhow!(
+                "snapshot txoutset_hash mismatch: computed {} expected {}",
+                computed.to_hex(),
+                assume.hash_serialized.0.to_hex()
+            ));
+        }
+        rpc_state_inner.best_hash = blockhash;
+        rpc_state_inner.best_height = assume.height;
+        if rpc_state_inner.header_height < assume.height {
+            rpc_state_inner.header_height = assume.height;
+        }
+        let _ = rustoshi_storage::write_snapshot_blockhash(&datadir, &blockhash);
+        tracing::info!(
+            "Snapshot loaded: {} coins, tip {} at height {}",
+            loaded,
+            blockhash.to_hex(),
+            assume.height
+        );
+    }
 
     // Load persisted fee estimates if available
     let fee_estimates_path = datadir.join("fee_estimates.json");
