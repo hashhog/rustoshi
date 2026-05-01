@@ -766,8 +766,20 @@ pub trait RustoshiRpc {
     ///
     /// Parameters:
     /// - path: Output file path. If relative, prefixed by the data directory.
-    /// - snapshot_type: Optional, must be "latest" if provided. "rollback" is
-    ///   not supported in rustoshi yet (no temporary chainstate roll back).
+    /// - snapshot_type: Optional. One of:
+    ///     - "" / unset / "latest": dump the current tip's UTXO set.
+    ///     - "rollback": find the highest hardcoded `assumeutxo_data` height
+    ///       that is <= our tip, roll the chainstate back to that height,
+    ///       dump, then roll forward to the original tip. **Currently
+    ///       returns a structured `not yet implemented` error**: rustoshi
+    ///       has only one persistent UTXO set, so a temporary rollback would
+    ///       require a clean rewind/replay primitive that does not exist
+    ///       yet. The path through param validation + assumeutxo height
+    ///       resolution still runs, so the caller still gets the rejection
+    ///       reason with the would-be target height.
+    /// - options: Optional Core-style named-parameter object. Currently only
+    ///   the `rollback` key is recognised (number = height, string = hash).
+    ///   When present, snapshot_type must be empty or "rollback".
     ///
     /// Returns: object with `coins_written`, `base_hash`, `base_height`,
     /// `path`, `txoutset_hash`, and `nchaintx`.
@@ -776,6 +788,7 @@ pub trait RustoshiRpc {
         &self,
         path: String,
         snapshot_type: Option<String>,
+        options: Option<serde_json::Value>,
     ) -> RpcResult<serde_json::Value>;
 
     /// Load a serialized UTXO set from a file in Bitcoin Core's
@@ -4363,22 +4376,125 @@ impl RustoshiRpcServer for RpcServerImpl {
         &self,
         path: String,
         snapshot_type: Option<String>,
+        options: Option<serde_json::Value>,
     ) -> RpcResult<serde_json::Value> {
-        // Bitcoin Core's `dumptxoutset` accepts {"latest", "rollback"}; rustoshi
-        // does not yet implement temporary chainstate rollback, so we only
-        // accept "latest" (or empty -> defaults to "latest" for ergonomics).
+        // Mirrors `bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset` parameter
+        // handling. `snapshot_type` is "latest" / "rollback" / "" (=> latest).
+        // `options` is an object that may contain `{"rollback": <h | hash>}`.
         let snap_type = snapshot_type.unwrap_or_default();
-        if !snap_type.is_empty() && snap_type != "latest" {
+
+        // Snapshot the tip metadata up-front; needed for both rollback target
+        // resolution and the "latest" fast path.
+        let state = self.state.read().await;
+        let tip_height = state.best_height;
+
+        // -------- snapshot type / target resolution --------
+        // Outcome of this block:
+        //   * `target_height = Some(h)` if rollback was requested (and we
+        //     successfully resolved a height).
+        //   * `target_height = None` for the "latest" path.
+        let target_height: Option<u32> = match (snap_type.as_str(), options.as_ref()) {
+            // Named-param rollback object: `{"rollback": <h | hash>}`.
+            (st, Some(opts)) if opts.get("rollback").is_some() => {
+                if !st.is_empty() && st != "rollback" {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMS,
+                        format!(
+                            "Invalid snapshot type \"{}\" specified with rollback option",
+                            st
+                        ),
+                    ));
+                }
+                let v = &opts["rollback"];
+                if let Some(h) = v.as_u64() {
+                    if h > u32::MAX as u64 {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_INVALID_PARAMS,
+                            format!("rollback height {} out of range", h),
+                        ));
+                    }
+                    Some(h as u32)
+                } else if let Some(s) = v.as_str() {
+                    // Numeric strings are accepted to match Core's
+                    // ParseHashOrHeight behaviour for short numeric inputs.
+                    if let Ok(h) = s.parse::<u32>() {
+                        Some(h)
+                    } else {
+                        let parsed = Self::parse_hash(s)?;
+                        let store = BlockStore::new(&state.db);
+                        let entry = store
+                            .get_block_index(&parsed)
+                            .map_err(|e| {
+                                Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+                            })?
+                            .ok_or_else(|| {
+                                Self::rpc_error(
+                                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                                    format!("Block not found: {}", s),
+                                )
+                            })?;
+                        Some(entry.height)
+                    }
+                } else {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMS,
+                        "rollback option must be a height (integer) or block hash (hex string)",
+                    ));
+                }
+            }
+            // Bare "rollback" with no target -> latest assumeutxo height <= tip.
+            ("rollback", _) => {
+                let mut candidate: Option<u32> = None;
+                for d in &state.params.assumeutxo_data {
+                    if d.height <= tip_height && Some(d.height) > candidate {
+                        candidate = Some(d.height);
+                    }
+                }
+                let h = candidate.ok_or_else(|| {
+                    Self::rpc_error(
+                        rpc_error::RPC_MISC_ERROR,
+                        format!(
+                            "No assumeutxo snapshot height <= current tip ({}) is available for this network",
+                            tip_height
+                        ),
+                    )
+                })?;
+                Some(h)
+            }
+            ("" | "latest", _) => None,
+            (other, _) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!(
+                        "Invalid snapshot type \"{}\" specified. Please specify \"rollback\" or \"latest\"",
+                        other
+                    ),
+                ));
+            }
+        };
+
+        // -------- rollback path: not yet implemented --------
+        // rustoshi has a single persistent UTXO column family and lacks the
+        // temporary-chainstate primitive Core uses (a separate snapshot
+        // chainstate that lives alongside the active one). We resolved the
+        // target height above so the caller still gets a useful error, but
+        // we cannot yet safely perform the disconnect -> dump -> reconnect
+        // dance without risking corruption of the live UTXO set.
+        //
+        // TODO(max): wire this up once rustoshi gains a clean
+        //   "rewind chainstate to height H" primitive that operates on a
+        //   shadow UTXO view (see `ChainState::disconnect_block` /
+        //   `validation::connect_block` for the building blocks).
+        if let Some(h) = target_height {
             return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
+                rpc_error::RPC_MISC_ERROR,
                 format!(
-                    "Invalid snapshot type \"{}\". Only \"latest\" is supported by rustoshi.",
-                    snap_type
+                    "rollback mode not yet implemented (would have rolled back from height {} to {}); use snapshot_type=\"latest\" for now",
+                    tip_height, h
                 ),
             ));
         }
 
-        let state = self.state.read().await;
 
         // Resolve relative paths against the configured data dir, mirroring
         // Core's `fsbridge::AbsPathJoin(args.GetDataDirNet(), ...)`.
@@ -4403,10 +4519,11 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
-        // Tip metadata.
+        // Tip metadata. `tip_height` was bound at the top of the method so the
+        // rollback-target resolver could see it; rebinding the hash + index
+        // here keeps the rest of the body unchanged.
         let store = BlockStore::new(&state.db);
         let tip_hash = state.best_hash;
-        let tip_height = state.best_height;
         let tip_index = store
             .get_block_index(&tip_hash)
             .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
@@ -7164,5 +7281,180 @@ mod tests {
         // Invalid target -> error (matches Core)
         assert!(server.estimate_raw_fee(0, None).await.is_err());
         assert!(server.estimate_raw_fee(2000, None).await.is_err());
+    }
+
+    // ============================================================
+    // DUMPTXOUTSET ROLLBACK PARAMETER TESTS
+    // ============================================================
+
+    /// Helper: spin up a dumptxoutset-ready RpcServerImpl on the given network.
+    /// `set_tip_height` lets a test pretend the chainstate has reached a
+    /// specific height, which is what `rollback`'s assumeutxo lookup hangs
+    /// off of. The on-disk UTXO set stays empty, so any code path that
+    /// actually tries to dump will produce a (valid, empty) snapshot.
+    async fn dumptxoutset_test_server(
+        params: rustoshi_consensus::ChainParams,
+        set_tip_height: u32,
+    ) -> (tempfile::TempDir, RpcServerImpl) {
+        use rustoshi_storage::ChainDb;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.best_height = set_tip_height;
+        rpc_state.data_dir = Some(tmp.path().to_path_buf());
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state, peer_state);
+        (tmp, server)
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rollback_picks_latest_assumeutxo_below_tip() {
+        // mainnet has assumeutxo entries at 840k, 880k, 910k, 935k. Pretend
+        // we are synced to 945k -> the rollback target should be 935k.
+        let params = rustoshi_consensus::ChainParams::mainnet();
+        let (_tmp, server) = dumptxoutset_test_server(params, 945_000).await;
+
+        let res = server
+            .dump_tx_outset(
+                "snap.dat".to_string(),
+                Some("rollback".to_string()),
+                None,
+            )
+            .await;
+        let err = res.expect_err("rollback path must surface a not-yet-implemented error");
+        // Error message must mention the resolved target height (935000) and
+        // the current tip so callers can sanity-check the assumeutxo lookup.
+        let msg = err.message().to_string();
+        assert!(
+            msg.contains("935000"),
+            "error must surface resolved assumeutxo target height: {}",
+            msg
+        );
+        assert!(
+            msg.contains("945000"),
+            "error must surface current tip height: {}",
+            msg
+        );
+        assert!(
+            msg.to_lowercase().contains("not yet implemented"),
+            "rollback path must clearly say not-yet-implemented: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rollback_under_lowest_snapshot_errors() {
+        // tip below 840k -> no candidate height -> RPC_MISC_ERROR.
+        let params = rustoshi_consensus::ChainParams::mainnet();
+        let (_tmp, server) = dumptxoutset_test_server(params, 800_000).await;
+
+        let res = server
+            .dump_tx_outset("snap.dat".to_string(), Some("rollback".to_string()), None)
+            .await;
+        let err = res.expect_err("must error when no snapshot height fits");
+        assert!(
+            err.message().to_lowercase().contains("no assumeutxo"),
+            "expected 'no assumeutxo' in error, got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rollback_no_snapshots_on_regtest() {
+        // regtest has zero assumeutxo entries -> always errors on rollback.
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let (_tmp, server) = dumptxoutset_test_server(params, 100).await;
+
+        let res = server
+            .dump_tx_outset("snap.dat".to_string(), Some("rollback".to_string()), None)
+            .await;
+        assert!(res.is_err(), "regtest has no snapshots; rollback must err");
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rollback_options_height_resolves() {
+        // {"rollback": 880000} on mainnet should resolve 880000 directly,
+        // bypassing the assumeutxo-table lookup. Result is still
+        // not-yet-implemented but the error string must echo the height.
+        let params = rustoshi_consensus::ChainParams::mainnet();
+        let (_tmp, server) = dumptxoutset_test_server(params, 945_000).await;
+
+        let res = server
+            .dump_tx_outset(
+                "snap.dat".to_string(),
+                None,
+                Some(serde_json::json!({"rollback": 880_000})),
+            )
+            .await;
+        let err = res.expect_err("rollback options height must surface not-yet-implemented");
+        assert!(
+            err.message().contains("880000"),
+            "explicit height must round-trip in error: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rejects_latest_with_rollback_options() {
+        // Core rejects snapshot_type="latest" combined with options.rollback.
+        let params = rustoshi_consensus::ChainParams::mainnet();
+        let (_tmp, server) = dumptxoutset_test_server(params, 945_000).await;
+
+        let res = server
+            .dump_tx_outset(
+                "snap.dat".to_string(),
+                Some("latest".to_string()),
+                Some(serde_json::json!({"rollback": 880_000})),
+            )
+            .await;
+        let err = res.expect_err("must reject conflicting type+options combo");
+        assert!(
+            err.message().to_lowercase().contains("rollback"),
+            "error must reference rollback conflict: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rejects_unknown_snapshot_type() {
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let (_tmp, server) = dumptxoutset_test_server(params, 0).await;
+
+        let res = server
+            .dump_tx_outset("snap.dat".to_string(), Some("bogus".to_string()), None)
+            .await;
+        let err = res.expect_err("unknown snapshot_type must be rejected");
+        assert!(
+            err.message().contains("bogus"),
+            "error must echo invalid type name: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_latest_path_unchanged() {
+        // The pre-existing "latest" code path must still produce a snapshot
+        // file with the expected JSON shape even after the rollback rewrite.
+        // We point at a fresh regtest db (empty UTXO set) so the dump
+        // succeeds with `coins_written == 0`. base_blockhash defaults to
+        // Hash256::ZERO since no blocks have been processed; we only assert
+        // the structural invariants that callers rely on.
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let (tmp, server) = dumptxoutset_test_server(params, 0).await;
+
+        let resp = server
+            .dump_tx_outset("snap.dat".to_string(), Some("latest".to_string()), None)
+            .await
+            .expect("latest snapshot dump must still succeed");
+        assert!(resp.get("coins_written").is_some());
+        assert!(resp.get("base_hash").is_some());
+        assert!(resp.get("base_height").is_some());
+        assert!(resp.get("path").is_some());
+        // Sanity-check the file actually exists at the resolved location.
+        let p = std::path::PathBuf::from(resp["path"].as_str().unwrap());
+        assert!(p.exists(), "dumptxoutset must create the file: {}", p.display());
+        // Cleanup is automatic when `tmp` drops.
+        drop(tmp);
     }
 }
