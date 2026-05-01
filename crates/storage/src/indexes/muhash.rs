@@ -82,13 +82,12 @@ impl Num3072 {
         data
     }
 
-    /// Check if this number is >= the modulus.
+    /// Indicates whether `self` is `>= modulus`.  Mirrors Core's
+    /// `Num3072::IsOverflow` (`bitcoin-core/src/crypto/muhash.cpp:116`).
     fn is_overflow(&self) -> bool {
-        // Check if limbs[0] > MAX - MAX_PRIME_DIFF (would wrap when we add diff)
         if self.limbs[0] <= u64::MAX - MAX_PRIME_DIFF {
             return false;
         }
-        // All other limbs must be max for overflow
         for i in 1..LIMBS {
             if self.limbs[i] != u64::MAX {
                 return false;
@@ -97,100 +96,142 @@ impl Num3072 {
         true
     }
 
-    /// Reduce by subtracting the modulus (add MAX_PRIME_DIFF).
+    /// Reduce once by subtracting the modulus (add `MAX_PRIME_DIFF` and discard the
+    /// 2^3072 carry).  Mirrors Core's `Num3072::FullReduce`.
     fn full_reduce(&mut self) {
-        let mut carry = MAX_PRIME_DIFF;
-        for limb in &mut self.limbs {
-            let (sum, overflow) = limb.overflowing_add(carry);
-            *limb = sum;
-            carry = if overflow { 1 } else { 0 };
+        // c0 starts as MAX_PRIME_DIFF; for each limb add it, write low 64
+        // bits, propagate the high 64 bits as the new c0.  Same semantics
+        // as Core's `addnextract2` loop.
+        let mut c0: u64 = MAX_PRIME_DIFF;
+        let mut c1: u64 = 0;
+        for i in 0..LIMBS {
+            // [c0, c1] += limbs[i]
+            let (s0, carry1) = c0.overflowing_add(self.limbs[i]);
+            c0 = s0;
+            if carry1 {
+                let (s1, _) = c1.overflowing_add(1);
+                c1 = s1;
+            }
+            // extract low limb and shift
+            self.limbs[i] = c0;
+            c0 = c1;
+            c1 = 0;
         }
     }
 
-    /// Multiply self by another Num3072 modulo the prime.
+    /// Schoolbook 3072x3072 -> 6144 multiply followed by Mersenne-style
+    /// reduction using `2^3072 ≡ MAX_PRIME_DIFF (mod p)`.
+    ///
+    /// We avoid the u128-accumulator-overflow class of bugs by always
+    /// keeping each cell of the work buffer ≤ 2^64-1 before any
+    /// reduction-multiply step.
     pub fn multiply(&mut self, other: &Num3072) {
-        // We use schoolbook multiplication with reduction.
-        // This is not the most efficient but is correct.
-
-        // Product will be 6144 bits, stored in double limbs
-        let mut product = [0u128; LIMBS * 2];
-
-        // Compute full product
+        // ---- Step 1: full schoolbook product into a 2*LIMBS u64 buffer. ----
+        let mut prod = [0u64; LIMBS * 2];
         for i in 0..LIMBS {
-            let mut carry = 0u128;
+            let mut carry: u128 = 0;
             for j in 0..LIMBS {
-                let mul = (self.limbs[i] as u128) * (other.limbs[j] as u128);
-                let sum = product[i + j] + mul + carry;
-                product[i + j] = sum & 0xFFFFFFFFFFFFFFFF;
-                carry = sum >> 64;
+                // (a*b) + prod[i+j] + carry  fits in u128 because:
+                //   a*b      <= (2^64 - 1)^2 = 2^128 - 2^65 + 1
+                //   prod cell + carry         <= 2^64 - 1 + 2^64 - 1 < 2^65
+                // Sum  < 2^128 — no overflow.
+                let t = (self.limbs[i] as u128) * (other.limbs[j] as u128)
+                    + prod[i + j] as u128
+                    + carry;
+                prod[i + j] = t as u64;
+                carry = t >> 64;
             }
-            // Propagate carry
-            let mut k = i + LIMBS;
-            while carry > 0 && k < product.len() {
-                let sum = product[k] + carry;
-                product[k] = sum & 0xFFFFFFFFFFFFFFFF;
-                carry = sum >> 64;
-                k += 1;
-            }
+            // Carry propagates into prod[i+LIMBS..].  Since the j-loop above
+            // already consumed prod[i+j] up to j=LIMBS-1, the next slot is
+            // prod[i+LIMBS], which has not yet been touched in this i-iter.
+            prod[i + LIMBS] = carry as u64;
         }
 
-        // Reduce: for each limb above LIMBS, multiply by MAX_PRIME_DIFF and add back
-        // This works because 2^3072 ≡ MAX_PRIME_DIFF (mod p)
-        for i in (LIMBS..LIMBS * 2).rev() {
-            if product[i] == 0 {
-                continue;
-            }
-
-            let high = product[i];
-            product[i] = 0;
-
-            // Add high * MAX_PRIME_DIFF to product[i - LIMBS..]
-            let mut carry = 0u128;
-            let mul = high * (MAX_PRIME_DIFF as u128);
-            for j in 0..LIMBS {
-                let idx = i - LIMBS + j;
-                if idx >= LIMBS {
+        // ---- Step 2: fold high half into low half via 2^3072 = MAX_PRIME_DIFF. ----
+        // For each upper limb at position p (p >= LIMBS), it contributes
+        // `prod[p] * 2^(64*(p-LIMBS)) * MAX_PRIME_DIFF` to the low half.
+        // Iterate from highest to lowest so that the multiply-add only ever
+        // touches in-range positions.
+        //
+        // After the first fold pass the upper half can become non-zero
+        // again because prod[p] * MAX_PRIME_DIFF can be up to ~2^85 which
+        // can carry into prod[p+1].  We loop until clean.
+        loop {
+            // Does any upper limb hold non-zero data?
+            let mut has_high = false;
+            for p in LIMBS..(LIMBS * 2) {
+                if prod[p] != 0 {
+                    has_high = true;
                     break;
                 }
-                let sum = product[idx] + (if j == 0 { mul } else { 0 }) + carry;
-                product[idx] = sum & 0xFFFFFFFFFFFFFFFF;
-                carry = sum >> 64;
+            }
+            if !has_high {
+                break;
+            }
+
+            // Take the upper half into a temp and zero it out.
+            let mut high = [0u64; LIMBS];
+            for p in 0..LIMBS {
+                high[p] = prod[LIMBS + p];
+                prod[LIMBS + p] = 0;
+            }
+
+            // Add high * MAX_PRIME_DIFF into prod[0..2*LIMBS].
+            let mut carry: u128 = 0;
+            for p in 0..LIMBS {
+                let t = (high[p] as u128) * (MAX_PRIME_DIFF as u128)
+                    + prod[p] as u128
+                    + carry;
+                prod[p] = t as u64;
+                carry = t >> 64;
+            }
+            // Spill remaining carry into the upper half (will be absorbed
+            // by the next iteration).
+            let mut p = LIMBS;
+            while carry > 0 && p < LIMBS * 2 {
+                let t = prod[p] as u128 + carry;
+                prod[p] = t as u64;
+                carry = t >> 64;
+                p += 1;
             }
         }
 
-        // Copy result back, handling any final carry
-        for (limb, &p) in self.limbs.iter_mut().zip(product.iter()) {
-            *limb = p as u64;
+        // ---- Step 3: write back, then reduce if still >= modulus. ----
+        for i in 0..LIMBS {
+            self.limbs[i] = prod[i];
         }
-
-        // Final reductions if needed
-        while self.is_overflow() {
+        // After up to two `FullReduce`s `self` is in [0, p).  In practice
+        // one is almost always enough, but be conservative.
+        if self.is_overflow() {
+            self.full_reduce();
+        }
+        if self.is_overflow() {
             self.full_reduce();
         }
     }
 
-    /// Compute the modular inverse using extended Euclidean algorithm.
+    /// Compute the modular inverse via Fermat's little theorem: for a
+    /// prime modulus `p`, `a^(p-2) ≡ a^{-1} (mod p)`.
     ///
-    /// This is a simplified version - for production use, the safegcd
-    /// algorithm from Bitcoin Core would be more efficient.
+    /// Here `p - 2 = 2^3072 - MAX_PRIME_DIFF - 2 = 2^3072 - 1103719`,
+    /// which in our 48-limb LE representation is:
+    ///   - limb 0      = 2^64 - 1103719
+    ///   - limbs 1..47 = 2^64 - 1
+    ///
+    /// This is slower than Core's safegcd (which is what Core uses), but
+    /// it is correct and fully self-contained.  Used only at finalize
+    /// time, so the cost is paid once per UTXO-set hash, not per coin.
     pub fn inverse(&self) -> Self {
-        // We use Fermat's little theorem: a^(-1) = a^(p-2) mod p
-        // where p = 2^3072 - MAX_PRIME_DIFF
-        //
-        // p - 2 = 2^3072 - MAX_PRIME_DIFF - 2 = 2^3072 - 1103719
-        //
-        // We compute this using square-and-multiply.
-
-        // First, create p - 2
-        let mut exp = [0xFFFFFFFFFFFFFFFFu64; LIMBS];
-        exp[0] = u64::MAX - MAX_PRIME_DIFF - 1; // 2^3072 - 1 - MAX_PRIME_DIFF - 1
+        // Build p - 2.
+        let mut exp = [u64::MAX; LIMBS];
+        exp[0] = u64::MAX - MAX_PRIME_DIFF - 1; // = 2^64 - 1 - 1103717 - 1
 
         let mut result = Num3072::one();
         let mut base = self.clone();
 
-        // Square and multiply
-        for limb in exp.iter() {
-            let mut bits = *limb;
+        // Square-and-multiply, low bit of low limb first.
+        for &limb in &exp {
+            let mut bits = limb;
             for _ in 0..64 {
                 if bits & 1 == 1 {
                     result.multiply(&base);
@@ -204,10 +245,22 @@ impl Num3072 {
         result
     }
 
-    /// Divide self by another Num3072 modulo the prime.
+    /// `self = self / other  (mod p)`.  Implemented as `self *= other^{-1}`.
     pub fn divide(&mut self, other: &Num3072) {
-        let inv = other.inverse();
+        // Normalize the divisor to [0, p) first, mirroring
+        // `Num3072::Divide` in Core.
+        let mut b = other.clone();
+        if b.is_overflow() {
+            b.full_reduce();
+        }
+        let inv = b.inverse();
+        if self.is_overflow() {
+            self.full_reduce();
+        }
         self.multiply(&inv);
+        if self.is_overflow() {
+            self.full_reduce();
+        }
     }
 }
 
@@ -544,6 +597,81 @@ mod tests {
         let result2 = restored.clone_for_finalize().finalize();
 
         assert_eq!(result1, result2);
+    }
+
+    /// Cross-checked against Bitcoin Core's
+    /// `bitcoin-core/src/test/crypto_tests.cpp::muhash_tests`:
+    ///
+    /// ```cpp
+    /// MuHash3072 acc2 = FromInt(0);
+    /// unsigned char tmp[32]  = {1, 0};   acc2.Insert(tmp);
+    /// unsigned char tmp2[32] = {2, 0};   acc2.Remove(tmp2);
+    /// acc2.Finalize(out);
+    /// BOOST_CHECK_EQUAL(out,
+    ///   uint256{"10d312b100cbd32ada024a6646e40d3482fcff103668d2625f10002a607d5863"});
+    /// ```
+    ///
+    /// `FromInt(i)` is `MuHash3072(unsigned char[32]{i,0,...})`, i.e. the
+    /// 32-byte buffer with `i` in the first byte and zeros elsewhere.
+    /// Core's `uint256{"hex"}` parses *display order* (reversed); SHA256's
+    /// raw output equals the internal byte order of that uint256, which is
+    /// what our `Hash256::to_hex()` reverses on the way out — so the hex
+    /// string we produce should match Core's literal.
+    #[test]
+    fn test_muhash_known_vector_core_acc2() {
+        let mut zero = [0u8; 32];
+        zero[0] = 0;
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        let mut two = [0u8; 32];
+        two[0] = 2;
+
+        let mut acc = MuHash3072::new();
+        acc.insert(&zero);
+        acc.insert(&one);
+        acc.remove(&two);
+
+        let result = acc.finalize();
+        let expected = "10d312b100cbd32ada024a6646e40d3482fcff103668d2625f10002a607d5863";
+        let got = result.to_hex();
+        assert_eq!(
+            got, expected,
+            "MuHash3072 known-vector mismatch (Core crypto_tests.cpp acc2)"
+        );
+    }
+
+    /// Empty MuHash3072 finalizes to SHA256 of the canonical 384-byte
+    /// representation of the value 1 (limb 0 = 1, all others zero).
+    /// This is what Core does when no coins have been inserted: the
+    /// numerator and denominator are both 1, the divide leaves 1, and we
+    /// SHA256 the 384-byte LE serialization.
+    #[test]
+    fn test_muhash_empty_known_value() {
+        // 384 bytes: [0x01, 0x00, 0x00, ..., 0x00].
+        use sha2::{Digest, Sha256};
+        let mut canonical = [0u8; 384];
+        canonical[0] = 1;
+        let expected = Sha256::digest(canonical);
+
+        let mut acc = MuHash3072::new();
+        let got = acc.finalize();
+        assert_eq!(got.as_bytes(), expected.as_slice());
+    }
+
+    /// Round-trip: inserting then removing the same data must produce the
+    /// same hash as the empty accumulator (since x/x = 1 in the prime
+    /// field).  This exercises the modular inverse path.
+    #[test]
+    fn test_muhash_insert_remove_is_identity() {
+        let mut empty = MuHash3072::new();
+        let empty_hash = empty.finalize();
+
+        let mut acc = MuHash3072::new();
+        acc.insert(b"any data");
+        acc.remove(b"any data");
+        let got = acc.finalize();
+
+        assert_eq!(got, empty_hash);
     }
 
     #[test]
