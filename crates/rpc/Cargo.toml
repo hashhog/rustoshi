@@ -19,6 +19,7 @@ axum.workspace = true
 jsonrpsee.workspace = true
 tracing.workspace = true
 hex.workspace = true
+sha2.workspace = true
 zmq.workspace = true
 rand.workspace = true
 base64 = "0.22"
