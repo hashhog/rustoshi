@@ -4384,7 +4384,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         let snap_type = snapshot_type.unwrap_or_default();
 
         // Snapshot the tip metadata up-front; needed for both rollback target
-        // resolution and the "latest" fast path.
+        // resolution and the "latest" fast path. The rollback path needs a
+        // write lock once it actually mutates the chainstate; we acquire that
+        // below after parameter resolution.
         let state = self.state.read().await;
         let tip_height = state.best_height;
 
@@ -4473,28 +4475,93 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         };
 
-        // -------- rollback path: not yet implemented --------
-        // rustoshi has a single persistent UTXO column family and lacks the
-        // temporary-chainstate primitive Core uses (a separate snapshot
-        // chainstate that lives alongside the active one). We resolved the
-        // target height above so the caller still gets a useful error, but
-        // we cannot yet safely perform the disconnect -> dump -> reconnect
-        // dance without risking corruption of the live UTXO set.
+        // -------- rollback path --------
+        // Mirrors `bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset`'s
+        // `TemporaryRollback` block: walk the active chain from tip down to
+        // `target_height`, restoring UTXOs from each block's stored undo data,
+        // dump the snapshot at the rolled-back tip, then re-apply the
+        // disconnected blocks via `connect_block` to restore the original tip.
         //
-        // TODO(max): wire this up once rustoshi gains a clean
-        //   "rewind chainstate to height H" primitive that operates on a
-        //   shadow UTXO view (see `ChainState::disconnect_block` /
-        //   `validation::connect_block` for the building blocks).
-        if let Some(h) = target_height {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_MISC_ERROR,
-                format!(
-                    "rollback mode not yet implemented (would have rolled back from height {} to {}); use snapshot_type=\"latest\" for now",
-                    tip_height, h
-                ),
-            ));
-        }
+        // Unlike Core (which uses a parallel snapshot chainstate), rustoshi
+        // mutates the live UTXO set directly. The replay path does NOT
+        // re-validate scripts — they were already validated when these blocks
+        // were first connected and we have not changed the spent set, only
+        // round-tripped it. This matches Core's behaviour (`TemporaryRollback`
+        // never reruns script verification).
+        //
+        // If anything fails partway through, the chainstate is left rolled
+        // back: the caller is told to restart the node (Core does the same;
+        // see the abort path in `dumptxoutset`). Block bodies + headers stay
+        // on disk, so a normal `ActivateBestChain` on next start replays.
+        if let Some(target_h) = target_height {
+            // Sanity: target must be strictly below tip (==tip is also fine
+            // structurally but pointless — fall through to "latest" by passing
+            // through the dump path with no disconnects). For ergonomic parity
+            // with Core, we only invoke the rewind path when there is real
+            // work to do.
+            if target_h > tip_height {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!(
+                        "rollback target height {} is above current tip {}",
+                        target_h, tip_height
+                    ),
+                ));
+            }
 
+            // Resolve target hash via the height index BEFORE we drop the
+            // read lock. If the target falls off the active chain
+            // (chainstate corruption / partial reindex), we surface an error
+            // here rather than trying to rewind blindly.
+            let store = BlockStore::new(&state.db);
+            let target_hash = store
+                .get_hash_by_height(target_h)
+                .map_err(|e| {
+                    Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+                })?
+                .ok_or_else(|| {
+                    Self::rpc_error(
+                        rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                        format!(
+                            "no active-chain block at height {} (chainstate not synced past target)",
+                            target_h
+                        ),
+                    )
+                })?;
+
+            // Capture the active-chain block hashes from `target_h+1..=tip`
+            // BEFORE we touch the height index. We need these to drive the
+            // disconnect walk and the subsequent reconnect walk. If any
+            // height is missing from the index, the chainstate is in an
+            // unexpected state and we abort early.
+            let mut chain_hashes: Vec<(u32, Hash256)> =
+                Vec::with_capacity((tip_height - target_h) as usize);
+            for h in (target_h + 1)..=tip_height {
+                let hash = store
+                    .get_hash_by_height(h)
+                    .map_err(|e| {
+                        Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_DATABASE_ERROR,
+                            format!("missing active-chain hash at height {}", h),
+                        )
+                    })?;
+                chain_hashes.push((h, hash));
+            }
+
+            // Drop the read lock before re-acquiring as a write lock. The
+            // chainstate may move between these two acquisitions in theory,
+            // but in practice rustoshi serialises chain progression through
+            // the same RpcState write lock, so any concurrent block-connect
+            // will queue behind us.
+            drop(state);
+
+            return self
+                .dump_tx_outset_rollback_inner(path, target_h, target_hash, chain_hashes)
+                .await;
+        }
 
         // Resolve relative paths against the configured data dir, mirroring
         // Core's `fsbridge::AbsPathJoin(args.GetDataDirNet(), ...)`.
@@ -4827,6 +4894,388 @@ impl RustoshiRpcServer for RpcServerImpl {
 }
 
 impl RpcServerImpl {
+    /// Disconnect→dump→reconnect path for `dumptxoutset` rollback mode.
+    ///
+    /// `target_height` / `target_hash` identify the rolled-back tip the
+    /// caller wants the snapshot anchored at (an ancestor of the current
+    /// tip). `chain_hashes` is the ordered list of active-chain blocks
+    /// strictly above `target_height` up to the current tip — these are the
+    /// blocks we will disconnect (then re-apply on the way out).
+    ///
+    /// Mirrors `bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset` 's
+    /// `TemporaryRollback` (`src/validation.cpp` `InvalidateBlock` is the
+    /// equivalent primitive on Core's side; we use a lighter-weight
+    /// disconnect-and-replay because we do not need to stick on the
+    /// rolled-back chain after dumping).
+    async fn dump_tx_outset_rollback_inner(
+        &self,
+        path: String,
+        target_height: u32,
+        target_hash: Hash256,
+        chain_hashes: Vec<(u32, Hash256)>,
+    ) -> RpcResult<serde_json::Value> {
+        use rustoshi_consensus::validation::UtxoView as _;
+
+        let mut state = self.state.write().await;
+
+        // Resolve the snapshot output path before we touch anything: an
+        // already-existing file is the only error we want to surface
+        // BEFORE rolling the chain back, so the caller can retry without
+        // having paid for a rewind+replay round-trip.
+        let path_buf = std::path::PathBuf::from(&path);
+        let abs_path = if path_buf.is_absolute() {
+            path_buf
+        } else if let Some(ref dd) = state.data_dir {
+            dd.join(&path)
+        } else {
+            std::env::current_dir()
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?
+                .join(&path)
+        };
+        if abs_path.exists() {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                format!(
+                    "{} already exists. If you are sure this is what you want, move it out of the way first.",
+                    abs_path.display()
+                ),
+            ));
+        }
+
+        let original_tip_hash = state.best_hash;
+        let original_tip_height = state.best_height;
+
+        // -------- 1. Pre-fetch every block + undo we will need --------
+        // We materialise the disconnected blocks (and their undo data) up
+        // front so the disconnect/reconnect loops are pure UTXO mutations
+        // with no further DB-miss surprises midway through. The
+        // `BlockStore` is constructed in a tight scope so its borrow on
+        // `state.db` doesn't conflict with the later mutations of
+        // `state.best_*`.
+        let mut disconnect_plan: Vec<(u32, Hash256, Block, rustoshi_storage::block_store::UndoData)> =
+            Vec::with_capacity(chain_hashes.len());
+        {
+            let store = BlockStore::new(&state.db);
+            for (h, hash) in &chain_hashes {
+                let block = store
+                    .get_block(hash)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_DATABASE_ERROR,
+                            format!(
+                                "rollback aborted: missing block body at height {} ({})",
+                                h, hash
+                            ),
+                        )
+                    })?;
+                let undo = store
+                    .get_undo(hash)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_DATABASE_ERROR,
+                            format!(
+                                "rollback aborted: missing undo data at height {} ({}); cannot safely rewind",
+                                h, hash
+                            ),
+                        )
+                    })?;
+                disconnect_plan.push((*h, *hash, block, undo));
+            }
+        }
+
+        // -------- 2. Disconnect tip → target --------
+        // We walk the planned blocks in reverse (tip-first) and apply
+        // `validation::disconnect_block` against a single `BlockStoreUtxoView`.
+        // The view buffers UTXO mutations in memory and we flush at the end
+        // of the disconnect walk.
+        //
+        // The two `UndoData` types (storage vs validation) have identical
+        // shape; we transcribe entry-by-entry.
+        {
+            let store = BlockStore::new(&state.db);
+            let mut utxo_view = store.utxo_view();
+            for (h, hash, block, storage_undo) in disconnect_plan.iter().rev() {
+                let v_undo = rustoshi_consensus::validation::UndoData {
+                    spent_coins: storage_undo
+                        .spent_coins
+                        .iter()
+                        .map(|c| rustoshi_consensus::validation::CoinEntry {
+                            height: c.height,
+                            is_coinbase: c.is_coinbase,
+                            value: c.value,
+                            script_pubkey: c.script_pubkey.clone(),
+                        })
+                        .collect(),
+                };
+                rustoshi_consensus::validation::disconnect_block(block, &v_undo, &mut utxo_view)
+                    .map_err(|e| {
+                        Self::rpc_error(
+                            rpc_error::RPC_MISC_ERROR,
+                            format!(
+                                "rollback aborted at height {} ({}): disconnect_block failed: {}",
+                                h, hash, e
+                            ),
+                        )
+                    })?;
+            }
+            utxo_view.flush().map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_DATABASE_ERROR,
+                    format!("rollback aborted: UTXO flush failed after disconnect: {}", e),
+                )
+            })?;
+            store
+                .set_best_block(&target_hash, target_height)
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
+        }
+
+        // Update the chain tip metadata to reflect the rolled-back state.
+        // The height index entries for `target_height+1..=original_tip_height`
+        // are deliberately LEFT in place: the reconnect walk below relies on
+        // them, and even on the failure path keeping them is harmless because
+        // the next start-up will activate the longest valid chain.
+        state.best_hash = target_hash;
+        state.best_height = target_height;
+
+        tracing::info!(
+            "dumptxoutset rollback: rewound {} blocks ({} -> {}) for snapshot",
+            disconnect_plan.len(),
+            original_tip_height,
+            target_height
+        );
+
+        // -------- 3. Dump the snapshot at the rolled-back tip --------
+        let dump_result = Self::dump_tx_outset_at_current_tip(&state, &abs_path);
+
+        // -------- 4. Reconnect target+1..tip --------
+        // Independent of whether the dump succeeded, we always try to
+        // restore the chain to its original tip. If the dump failed we
+        // still want to leave the node usable.
+        //
+        // Replay does NOT re-validate scripts: the disconnect/reconnect
+        // round-trip preserves UTXO contents bit-for-bit (we restore the
+        // exact `spent_coins` we just consumed and re-add the exact
+        // outputs we just deleted). Re-running scripts would just re-prove
+        // what we already proved on the original connect — and would also
+        // double the cost of `dumptxoutset` for no benefit. Mirrors Core's
+        // `TemporaryRollback`, which never reruns script verification.
+        let replay_result: Result<(), ErrorObjectOwned> = (|| {
+            let store = BlockStore::new(&state.db);
+            let mut utxo_view = store.utxo_view();
+            for (h, hash, block, _undo) in disconnect_plan.iter() {
+                // Re-apply outputs (including coinbase) and re-spend inputs
+                // by hand. We avoid `connect_block` here because it would
+                // re-run script verification + sigop counting; we only need
+                // the UTXO-set delta.
+                for tx in &block.transactions {
+                    let txid = tx.txid();
+                    if !tx.is_coinbase() {
+                        for input in &tx.inputs {
+                            utxo_view.spend_utxo(&input.previous_output);
+                        }
+                    }
+                    for (vout, output) in tx.outputs.iter().enumerate() {
+                        // Skip provably-unspendable OP_RETURN outputs to
+                        // match what `connect_block`/`connect_block_parallel`
+                        // store in the UTXO set.
+                        if !output.script_pubkey.is_empty()
+                            && output.script_pubkey[0] == 0x6a
+                        {
+                            continue;
+                        }
+                        // Skip the magic null-witness-commitment placeholder
+                        // (empty script + zero value) used by witness coinbase.
+                        if tx.is_coinbase()
+                            && output.script_pubkey.is_empty()
+                            && output.value == 0
+                        {
+                            continue;
+                        }
+                        let outpoint = OutPoint { txid, vout: vout as u32 };
+                        utxo_view.add_utxo(
+                            &outpoint,
+                            rustoshi_consensus::validation::CoinEntry {
+                                height: *h,
+                                is_coinbase: tx.is_coinbase(),
+                                value: output.value,
+                                script_pubkey: output.script_pubkey.clone(),
+                            },
+                        );
+                    }
+                }
+                // Restore tip metadata as we go so a mid-replay crash
+                // leaves the persistent state at a connected prefix of the
+                // original chain.
+                utxo_view.flush().map_err(|e| {
+                    Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!(
+                            "rollback replay: flush failed at height {} ({}): {}",
+                            h, hash, e
+                        ),
+                    )
+                })?;
+                store.set_best_block(hash, *h).map_err(|e| {
+                    Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!(
+                            "rollback replay: set_best_block failed at height {}: {}",
+                            h, e
+                        ),
+                    )
+                })?;
+            }
+            Ok(())
+        })();
+
+        // Restore in-memory tip pointers regardless of dump outcome —
+        // either we replayed cleanly (state matches `original_tip_*`) or
+        // the replay errored partway through (in which case persistent
+        // state is at the last successfully-replayed height, but the
+        // safest in-memory bet is still the original tip; the caller is
+        // told to restart).
+        match &replay_result {
+            Ok(()) => {
+                state.best_hash = original_tip_hash;
+                state.best_height = original_tip_height;
+                tracing::info!(
+                    "dumptxoutset rollback: replayed {} blocks; tip restored to {} at height {}",
+                    disconnect_plan.len(),
+                    original_tip_hash,
+                    original_tip_height
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    "dumptxoutset rollback: replay failed ({}); chainstate left mid-replay, \
+                     restart node to recover via ActivateBestChain",
+                    err.message()
+                );
+            }
+        }
+
+        // Surface dump or replay failure (dump first — replay errors are
+        // operationally identical to a dump that succeeded but couldn't
+        // restore). On success, return the dump's JSON with an extra
+        // `rollback` block so callers can verify the rewind happened.
+        let dump_json = dump_result?;
+        replay_result?;
+
+        let mut obj = match dump_json {
+            serde_json::Value::Object(m) => m,
+            other => {
+                let mut m = serde_json::Map::new();
+                m.insert("result".to_string(), other);
+                m
+            }
+        };
+        obj.insert(
+            "rollback".to_string(),
+            serde_json::json!({
+                "from_height": original_tip_height,
+                "from_hash": original_tip_hash.to_hex(),
+                "to_height": target_height,
+                "to_hash": target_hash.to_hex(),
+                "blocks_rewound": disconnect_plan.len(),
+            }),
+        );
+        Ok(serde_json::Value::Object(obj))
+    }
+
+    /// Dump the UTXO set at the current `state.best_*` to `abs_path`.
+    ///
+    /// Factored out so the rollback path can call into the same writer
+    /// the "latest" path uses, after rewinding the chainstate. Pure
+    /// snapshot-of-current-state — no chain mutation here.
+    fn dump_tx_outset_at_current_tip(
+        state: &RpcState,
+        abs_path: &std::path::Path,
+    ) -> RpcResult<serde_json::Value> {
+        let store = BlockStore::new(&state.db);
+        let tip_hash = state.best_hash;
+        let tip_height = state.best_height;
+        let tip_index = store
+            .get_block_index(&tip_hash)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
+
+        // Count coins.
+        let mut coins_count: u64 = 0;
+        for (key, _) in state
+            .db
+            .iter_cf(CF_UTXO)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+        {
+            if key.len() == 36 {
+                coins_count += 1;
+            }
+        }
+
+        let temp_path = {
+            let mut p = abs_path.to_path_buf().into_os_string();
+            p.push(".incomplete");
+            std::path::PathBuf::from(p)
+        };
+
+        let file = std::fs::File::create(&temp_path)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+
+        let metadata = SnapshotMetadata::new(tip_hash, coins_count, state.params.network_magic);
+        let mut writer = SnapshotWriter::new(file, &metadata)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+
+        let mut written: u64 = 0;
+        for (key, value) in state
+            .db
+            .iter_cf(CF_UTXO)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+        {
+            if key.len() != 36 {
+                continue;
+            }
+            let mut txid_bytes = [0u8; 32];
+            txid_bytes.copy_from_slice(&key[..32]);
+            let txid = Hash256(txid_bytes);
+            let mut vout_bytes = [0u8; 4];
+            vout_bytes.copy_from_slice(&key[32..]);
+            let vout = u32::from_be_bytes(vout_bytes);
+
+            let entry: CoinEntry = serde_json::from_slice(&value).map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_DATABASE_ERROR,
+                    format!("UTXO deserialization failed: {}", e),
+                )
+            })?;
+            let coin = Coin::from_entry(&entry);
+            writer
+                .write_coin(&OutPoint { txid, vout }, &coin)
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+            written += 1;
+        }
+
+        let (_file, txoutset_hash, core_hash_serialized, muhash) = writer
+            .finish_with_hashes()
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+
+        std::fs::rename(&temp_path, abs_path).map_err(|e| {
+            Self::rpc_error(rpc_error::RPC_MISC_ERROR, format!("rename failed: {}", e))
+        })?;
+
+        let nchaintx: u64 = tip_index.as_ref().map(|e| e.n_tx as u64).unwrap_or(0);
+
+        Ok(serde_json::json!({
+            "coins_written": written,
+            "base_hash": tip_hash.to_hex(),
+            "base_height": tip_height,
+            "path": abs_path.display().to_string(),
+            "txoutset_hash": txoutset_hash.0.to_hex(),
+            "hash_serialized": core_hash_serialized.0.to_hex(),
+            "muhash": muhash.0.to_hex(),
+            "nchaintx": nchaintx,
+        }))
+    }
+
     /// Mine blocks with coinbase reward going to the specified scriptPubKey.
     async fn mine_blocks(
         &self,
@@ -7311,7 +7760,11 @@ mod tests {
     #[tokio::test]
     async fn dumptxoutset_rollback_picks_latest_assumeutxo_below_tip() {
         // mainnet has assumeutxo entries at 840k, 880k, 910k, 935k. Pretend
-        // we are synced to 945k -> the rollback target should be 935k.
+        // we are synced to 945k -> the rollback target should resolve to
+        // 935k. Because the test fixture's chainstate has no actual blocks
+        // at those heights, the rewind path now hard-errors instead of
+        // walking — but the error must still surface the resolved height
+        // so callers can sanity-check the assumeutxo lookup.
         let params = rustoshi_consensus::ChainParams::mainnet();
         let (_tmp, server) = dumptxoutset_test_server(params, 945_000).await;
 
@@ -7322,23 +7775,16 @@ mod tests {
                 None,
             )
             .await;
-        let err = res.expect_err("rollback path must surface a not-yet-implemented error");
-        // Error message must mention the resolved target height (935000) and
-        // the current tip so callers can sanity-check the assumeutxo lookup.
+        let err = res.expect_err(
+            "rollback path must error when there are no blocks to rewind through",
+        );
         let msg = err.message().to_string();
+        // The rollback target (935000) is what we resolved to; the error
+        // text now comes from the chainstate lookup that proves the
+        // resolver did pick 935k.
         assert!(
             msg.contains("935000"),
             "error must surface resolved assumeutxo target height: {}",
-            msg
-        );
-        assert!(
-            msg.contains("945000"),
-            "error must surface current tip height: {}",
-            msg
-        );
-        assert!(
-            msg.to_lowercase().contains("not yet implemented"),
-            "rollback path must clearly say not-yet-implemented: {}",
             msg
         );
     }
@@ -7375,8 +7821,9 @@ mod tests {
     #[tokio::test]
     async fn dumptxoutset_rollback_options_height_resolves() {
         // {"rollback": 880000} on mainnet should resolve 880000 directly,
-        // bypassing the assumeutxo-table lookup. Result is still
-        // not-yet-implemented but the error string must echo the height.
+        // bypassing the assumeutxo-table lookup. The fixture has no blocks
+        // at that height, so the rewind path errors with the resolved
+        // height in the message — that's what we assert on.
         let params = rustoshi_consensus::ChainParams::mainnet();
         let (_tmp, server) = dumptxoutset_test_server(params, 945_000).await;
 
@@ -7387,7 +7834,9 @@ mod tests {
                 Some(serde_json::json!({"rollback": 880_000})),
             )
             .await;
-        let err = res.expect_err("rollback options height must surface not-yet-implemented");
+        let err = res.expect_err(
+            "rollback options height must error on a fixture with no blocks",
+        );
         assert!(
             err.message().contains("880000"),
             "explicit height must round-trip in error: {}",
@@ -7456,5 +7905,373 @@ mod tests {
         assert!(p.exists(), "dumptxoutset must create the file: {}", p.display());
         // Cleanup is automatic when `tmp` drops.
         drop(tmp);
+    }
+
+    // ============================================================
+    // DUMPTXOUTSET ROLLBACK REWIND→DUMP→REPLAY TESTS
+    // ============================================================
+
+    /// Helper: append a synthetic block at height `h` building on `prev_hash`.
+    ///
+    /// The block has a single coinbase that pays `value` to a placeholder
+    /// scriptPubKey. We persist the block, header, height-index, block-index,
+    /// undo data, and UTXO so the rollback path's prefetch + disconnect +
+    /// replay loops have everything they need.
+    ///
+    /// `txid_marker` is mixed into the coinbase scriptSig so each block's
+    /// coinbase txid is distinct (otherwise the coinbase `OutPoint`s would
+    /// collide across heights and the UTXO-set restore would be ambiguous).
+    fn synth_append_block(
+        store: &BlockStore,
+        h: u32,
+        prev_hash: Hash256,
+        value: u64,
+        txid_marker: u8,
+    ) -> (Hash256, Block) {
+        // Build a coinbase tx — input has empty prev-out and a unique
+        // scriptSig so each height yields a distinct txid.
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: u32::MAX,
+                },
+                script_sig: vec![txid_marker; 4 + h as usize % 8],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value,
+                script_pubkey: vec![0x51], // OP_TRUE
+            }],
+            lock_time: 0,
+        };
+        let block = Block {
+            header: rustoshi_primitives::BlockHeader {
+                version: 1,
+                prev_block_hash: prev_hash,
+                merkle_root: Hash256::ZERO, // not validated on the rollback path
+                timestamp: 1_700_000_000 + h,
+                bits: 0x207fffff,
+                nonce: h,
+            },
+            transactions: vec![coinbase.clone()],
+        };
+        let block_hash = block.block_hash();
+
+        store.put_block(&block_hash, &block).unwrap();
+        store.put_header(&block_hash, &block.header).unwrap();
+        store.put_height_index(h, &block_hash).unwrap();
+        {
+            use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_SCRIPTS);
+            status.set(BlockStatus::HAVE_DATA);
+            let entry = BlockIndexEntry {
+                height: h,
+                status,
+                n_tx: block.transactions.len() as u32,
+                timestamp: block.header.timestamp,
+                bits: block.header.bits,
+                nonce: block.header.nonce,
+                version: block.header.version,
+                prev_hash,
+                chain_work: [0u8; 32],
+            };
+            store.put_block_index(&block_hash, &entry).unwrap();
+        }
+
+        // Coinbase-only blocks consume nothing, so the undo data is empty
+        // (`spent_coins` is empty).
+        store
+            .put_undo(
+                &block_hash,
+                &rustoshi_storage::block_store::UndoData {
+                    spent_coins: vec![],
+                },
+            )
+            .unwrap();
+
+        // Add the coinbase output to the UTXO set so the disconnect path has
+        // something to remove and the replay path has something to add back.
+        let coinbase_txid = coinbase.txid();
+        store
+            .put_utxo(
+                &OutPoint {
+                    txid: coinbase_txid,
+                    vout: 0,
+                },
+                &rustoshi_storage::block_store::CoinEntry {
+                    height: h,
+                    is_coinbase: true,
+                    value,
+                    script_pubkey: vec![0x51],
+                },
+            )
+            .unwrap();
+
+        store.set_best_block(&block_hash, h).unwrap();
+        (block_hash, block)
+    }
+
+    /// Walk `CF_UTXO` and return a sorted snapshot for diffing.
+    fn snapshot_utxo(db: &ChainDb) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut rows: Vec<_> = db
+            .iter_cf(CF_UTXO)
+            .unwrap()
+            .filter(|(k, _)| k.len() == 36)
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rollback_above_tip_errors() {
+        // Explicit `{"rollback": N}` where N > tip must reject with a clear
+        // "above tip" error. Mirrors Core's
+        // `dumptxoutset` behaviour at `bitcoin-core/src/rpc/blockchain.cpp`.
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let (_tmp, server) = dumptxoutset_test_server(params, 5).await;
+
+        let res = server
+            .dump_tx_outset(
+                "snap.dat".to_string(),
+                None,
+                Some(serde_json::json!({"rollback": 100})),
+            )
+            .await;
+        let err = res.expect_err("above-tip rollback must error");
+        let msg = err.message().to_string();
+        assert!(msg.contains("100"), "error must echo target height: {}", msg);
+        assert!(
+            msg.to_lowercase().contains("above") || msg.to_lowercase().contains("tip"),
+            "error must mention tip/above: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rollback_rewind_dump_replay_round_trips_utxo_set() {
+        // End-to-end: build a 3-block chain on top of regtest genesis,
+        // capture the UTXO set, run rollback to genesis, and verify the
+        // UTXO set + chain tip are restored bit-for-bit after replay.
+        // This is the property that makes rollback safe to use on a live
+        // chain: the only externally-visible artefact is the snapshot file.
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let genesis_hash = params.genesis_hash;
+
+        // Seed genesis.
+        {
+            let store = BlockStore::new(&db);
+            store.init_genesis(&params).unwrap();
+            assert_eq!(store.get_best_height().unwrap(), Some(0));
+        }
+
+        // Build h=1, h=2, h=3 on top of genesis.
+        let (h1, _b1) = {
+            let store = BlockStore::new(&db);
+            synth_append_block(&store, 1, genesis_hash, 50_000_000, 0xA1)
+        };
+        let (h2, _b2) = {
+            let store = BlockStore::new(&db);
+            synth_append_block(&store, 2, h1, 50_000_000, 0xA2)
+        };
+        let (h3, _b3) = {
+            let store = BlockStore::new(&db);
+            synth_append_block(&store, 3, h2, 50_000_000, 0xA3)
+        };
+
+        // Capture pre-rollback state.
+        let utxo_before = snapshot_utxo(&db);
+        assert_eq!(
+            utxo_before.len(),
+            3,
+            "expected 3 coinbase outputs on the chain"
+        );
+
+        // Wire up the RPC server with the seeded chainstate.
+        let mut rpc_state = RpcState::new(db.clone(), params);
+        rpc_state.best_height = 3;
+        rpc_state.best_hash = h3;
+        rpc_state.data_dir = Some(tmp.path().to_path_buf());
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state.clone(), peer_state);
+
+        // Roll back to genesis (height 0). Snapshot should land at the
+        // genesis tip.
+        let resp = server
+            .dump_tx_outset(
+                "rolled.dat".to_string(),
+                None,
+                Some(serde_json::json!({"rollback": 0})),
+            )
+            .await
+            .expect("rollback dump must succeed on a healthy chainstate");
+
+        // Snapshot file must exist and be anchored at genesis.
+        let snap_path = std::path::PathBuf::from(resp["path"].as_str().unwrap());
+        assert!(snap_path.exists(), "snapshot file must be written");
+        assert_eq!(resp["base_height"].as_u64(), Some(0));
+        assert_eq!(
+            resp["base_hash"].as_str().unwrap(),
+            genesis_hash.to_hex(),
+            "snapshot must be anchored at genesis hash"
+        );
+        // Genesis has no spendable outputs in regtest -> the snapshot is
+        // empty. (Regtest genesis coinbase is unspendable by consensus.)
+        assert_eq!(
+            resp["coins_written"].as_u64(),
+            Some(0),
+            "regtest genesis has no UTXOs"
+        );
+
+        // Rollback metadata must reflect the rewind we just performed.
+        let rb = &resp["rollback"];
+        assert_eq!(rb["from_height"].as_u64(), Some(3));
+        assert_eq!(rb["to_height"].as_u64(), Some(0));
+        assert_eq!(rb["blocks_rewound"].as_u64(), Some(3));
+
+        // Post-replay: tip + UTXO state must match exactly what we had
+        // before the rollback.
+        let utxo_after = snapshot_utxo(&db);
+        assert_eq!(
+            utxo_before, utxo_after,
+            "UTXO set must round-trip through rewind+replay byte-for-byte"
+        );
+        let st = state.read().await;
+        assert_eq!(st.best_height, 3, "in-memory tip height must be restored");
+        assert_eq!(st.best_hash, h3, "in-memory tip hash must be restored");
+        let store = BlockStore::new(&st.db);
+        assert_eq!(store.get_best_height().unwrap(), Some(3));
+        assert_eq!(store.get_best_block_hash().unwrap(), Some(h3));
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rollback_partial_rewind_to_intermediate_height() {
+        // Roll back to a strictly-intermediate height (target=1 on a tip=3
+        // chain). Verifies the height-arithmetic is right and that the
+        // snapshot is taken at the rolled-back tip (not genesis, not the
+        // original tip).
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let genesis_hash = params.genesis_hash;
+
+        {
+            let store = BlockStore::new(&db);
+            store.init_genesis(&params).unwrap();
+        }
+        let (h1, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_block(&store, 1, genesis_hash, 50_000_000, 0xB1)
+        };
+        let (h2, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_block(&store, 2, h1, 50_000_000, 0xB2)
+        };
+        let (h3, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_block(&store, 3, h2, 50_000_000, 0xB3)
+        };
+
+        let utxo_before = snapshot_utxo(&db);
+
+        let mut rpc_state = RpcState::new(db.clone(), params);
+        rpc_state.best_height = 3;
+        rpc_state.best_hash = h3;
+        rpc_state.data_dir = Some(tmp.path().to_path_buf());
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state.clone(), peer_state);
+
+        let resp = server
+            .dump_tx_outset(
+                "rolled-mid.dat".to_string(),
+                None,
+                Some(serde_json::json!({"rollback": 1})),
+            )
+            .await
+            .expect("intermediate-height rollback must succeed");
+
+        // Snapshot anchored at h1; only one coinbase output should be in
+        // the dump (the one created by block 1).
+        assert_eq!(resp["base_height"].as_u64(), Some(1));
+        assert_eq!(resp["base_hash"].as_str().unwrap(), h1.to_hex());
+        assert_eq!(resp["coins_written"].as_u64(), Some(1));
+        assert_eq!(resp["rollback"]["blocks_rewound"].as_u64(), Some(2));
+
+        // Post-replay: original tip + UTXO set restored.
+        assert_eq!(snapshot_utxo(&db), utxo_before);
+        let st = state.read().await;
+        assert_eq!(st.best_height, 3);
+        assert_eq!(st.best_hash, h3);
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_rollback_rejects_existing_snapshot_file() {
+        // Pre-existing output path must be rejected BEFORE any rewind
+        // happens, so the caller can retry without paying for a useless
+        // disconnect+reconnect.
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let genesis_hash = params.genesis_hash;
+        {
+            let store = BlockStore::new(&db);
+            store.init_genesis(&params).unwrap();
+        }
+        let (h1, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_block(&store, 1, genesis_hash, 50_000_000, 0xC1)
+        };
+
+        let mut rpc_state = RpcState::new(db.clone(), params);
+        rpc_state.best_height = 1;
+        rpc_state.best_hash = h1;
+        rpc_state.data_dir = Some(tmp.path().to_path_buf());
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state.clone(), peer_state);
+
+        // Plant a file at the target snapshot path.
+        let snap_path = tmp.path().join("already-here.dat");
+        std::fs::write(&snap_path, b"existing").unwrap();
+        let utxo_before = snapshot_utxo(&db);
+
+        let res = server
+            .dump_tx_outset(
+                "already-here.dat".to_string(),
+                None,
+                Some(serde_json::json!({"rollback": 0})),
+            )
+            .await;
+        let err = res.expect_err("must reject when output already exists");
+        assert!(
+            err.message().to_lowercase().contains("already exists"),
+            "error must say 'already exists': {}",
+            err.message()
+        );
+
+        // Crucially: chain must be UNTOUCHED when the existence check
+        // rejects the request.
+        assert_eq!(
+            snapshot_utxo(&db),
+            utxo_before,
+            "chainstate must not be mutated when output path is rejected"
+        );
+        let st = state.read().await;
+        assert_eq!(st.best_height, 1);
+        assert_eq!(st.best_hash, h1);
     }
 }
