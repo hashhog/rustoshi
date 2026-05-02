@@ -2056,18 +2056,26 @@ impl RustoshiRpcServer for RpcServerImpl {
             &config,
         );
 
-        // Build BIP-22 format response
+        // Build BIP-22 format response. The per-tx sigop cost lines up
+        // index-for-index with `template.transactions`; we skip the coinbase
+        // (index 0) here just like we skip it in the transaction list.
         let txs: Vec<BlockTemplateTransaction> = template
             .transactions
             .iter()
+            .enumerate()
             .skip(1) // skip coinbase
-            .map(|tx| BlockTemplateTransaction {
+            .map(|(i, tx)| BlockTemplateTransaction {
                 data: hex::encode(tx.serialize()),
                 txid: tx.txid().to_hex(),
                 hash: tx.wtxid().to_hex(),
                 depends: vec![],
                 fee: 0, // would need to look up from mempool
-                sigops: 0,
+                sigops: template
+                    .per_tx_sigops
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(u32::MAX as u64) as u32,
                 weight: tx.weight() as u32,
             })
             .collect();
