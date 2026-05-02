@@ -1008,12 +1008,47 @@ fn special_script_size(n_size: u64) -> usize {
     }
 }
 
+/// Recover the full 65-byte uncompressed pubkey from the compressed P2PK
+/// "special" CompressScript tags `0x04` / `0x05`. The on-wire payload is the
+/// 32-byte x-coordinate; the parity bit is encoded as `n_size - 2`
+/// (`0x04` → `0x02`, `0x05` → `0x03`). We assemble a 33-byte compressed
+/// pubkey from `(parity || x)`, hand it to `secp256k1` to recover the
+/// y-coordinate, and serialize the resulting point uncompressed.
+///
+/// Mirrors `bitcoin-core/src/compressor.cpp` `DecompressScript` cases
+/// `0x04`/`0x05`, which call `CPubKey::Decompress()` →
+/// `secp256k1_ec_pubkey_parse` (33-byte compressed) →
+/// `secp256k1_ec_pubkey_serialize` (65-byte uncompressed).
+fn recover_uncompressed_pubkey(n_size: u64, x_coord: &[u8]) -> Result<[u8; 65], SnapshotError> {
+    debug_assert!(n_size == 0x04 || n_size == 0x05);
+    if x_coord.len() != 32 {
+        return Err(SnapshotError::MalformedCoin(format!(
+            "uncompressed-P2PK x-coordinate has wrong length: expected 32, got {}",
+            x_coord.len()
+        )));
+    }
+    // Build the 33-byte compressed pubkey: parity byte || x.
+    let mut compressed = [0u8; 33];
+    compressed[0] = (n_size - 2) as u8; // 0x04 → 0x02, 0x05 → 0x03
+    compressed[1..].copy_from_slice(x_coord);
+
+    // Parse (validates that x is on the curve) and serialize uncompressed.
+    let pk = secp256k1::PublicKey::from_slice(&compressed).map_err(|e| {
+        SnapshotError::MalformedCoin(format!(
+            "uncompressed-P2PK x-coordinate does not decompress to a valid \
+             secp256k1 point (tag={:#04x}): {e}",
+            n_size
+        ))
+    })?;
+    Ok(pk.serialize_uncompressed())
+}
+
 /// Decompress a special-form script back to its raw scriptPubKey bytes.
-/// Returns `None` if the form is one we cannot reconstruct (currently the
-/// uncompressed P2PK 0x04/0x05 forms — TODO: integrate secp256k1 to recover
-/// the full 65-byte pubkey). For now those decode as a placeholder
-/// `OP_RETURN` to match Core's "overly long script" sentinel.
-fn decompress_special_script(n_size: u64, payload: &[u8]) -> Option<Vec<u8>> {
+/// Returns `Err(MalformedCoin)` if the form is structurally invalid (e.g. an
+/// uncompressed-P2PK x-coordinate that does not lie on secp256k1). Returns
+/// `Ok(None)` only for `n_size` values that are not "special" forms (the
+/// caller treats those as generic-form scripts).
+fn decompress_special_script(n_size: u64, payload: &[u8]) -> Result<Vec<u8>, SnapshotError> {
     match n_size {
         0x00 => {
             // P2PKH: OP_DUP OP_HASH160 <20> ... OP_EQUALVERIFY OP_CHECKSIG
@@ -1021,7 +1056,7 @@ fn decompress_special_script(n_size: u64, payload: &[u8]) -> Option<Vec<u8>> {
             out.extend_from_slice(&[0x76, 0xa9, 20]);
             out.extend_from_slice(&payload[..20]);
             out.extend_from_slice(&[0x88, 0xac]);
-            Some(out)
+            Ok(out)
         }
         0x01 => {
             // P2SH: OP_HASH160 <20> ... OP_EQUAL
@@ -1029,7 +1064,7 @@ fn decompress_special_script(n_size: u64, payload: &[u8]) -> Option<Vec<u8>> {
             out.extend_from_slice(&[0xa9, 20]);
             out.extend_from_slice(&payload[..20]);
             out.push(0x87);
-            Some(out)
+            Ok(out)
         }
         0x02 | 0x03 => {
             // Compressed P2PK: 33-byte push + OP_CHECKSIG.
@@ -1038,19 +1073,24 @@ fn decompress_special_script(n_size: u64, payload: &[u8]) -> Option<Vec<u8>> {
             out.push(n_size as u8);
             out.extend_from_slice(&payload[..32]);
             out.push(0xac);
-            Some(out)
+            Ok(out)
         }
         0x04 | 0x05 => {
-            // TODO(snapshot-compress): recover full uncompressed pubkey via
-            // secp256k1 point decompression. For now, rustoshi never emits
-            // this on the writer side, but a Core-produced snapshot may
-            // include it — we substitute a placeholder OP_RETURN so loading
-            // does not crash. UTXOs decoded this way will not validate as
-            // spendable, but the loader still acks the byte stream.
-            let _ = payload;
-            Some(vec![0x6a]) // OP_RETURN
+            // Uncompressed P2PK: payload is the 32-byte x-coordinate; parity
+            // is encoded by the tag. We recover the full y-coordinate via
+            // `secp256k1` and emit the original 67-byte scriptPubKey shape:
+            //     <push65> 0x04 || x[32] || y[32] OP_CHECKSIG
+            // Matches Core's `compressor.cpp` `DecompressScript` exactly.
+            let uncompressed = recover_uncompressed_pubkey(n_size, &payload[..32])?;
+            let mut out = Vec::with_capacity(67);
+            out.push(65); // OP_PUSHBYTES_65
+            out.extend_from_slice(&uncompressed);
+            out.push(0xac); // OP_CHECKSIG
+            Ok(out)
         }
-        _ => None,
+        _ => Err(SnapshotError::MalformedCoin(format!(
+            "unsupported special script size {n_size}"
+        ))),
     }
 }
 
@@ -1084,9 +1124,7 @@ fn read_compressed_script<R: Read>(reader: &mut R) -> Result<Vec<u8>, SnapshotEr
         }
         let mut payload = vec![0u8; payload_len];
         reader.read_exact(&mut payload)?;
-        return decompress_special_script(n_size, &payload).ok_or_else(|| {
-            SnapshotError::MalformedCoin(format!("unsupported special script size {n_size}"))
-        });
+        return decompress_special_script(n_size, &payload);
     }
     // Generic form: real script bytes follow.
     let raw_size = (n_size - N_SPECIAL_SCRIPTS) as usize;
@@ -1656,6 +1694,85 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let decoded = read_compressed_script(&mut cursor).unwrap();
         assert_eq!(decoded, p2pk);
+    }
+
+    #[test]
+    fn test_decompress_uncompressed_p2pk_generator_point() {
+        // Pin Core-compatible decompression of the well-known generator point G.
+        // Compressed (33B) form: 0x02 || G.x.
+        // Uncompressed (65B) form: 0x04 || G.x || G.y.
+        // Source: SEC2 §2.7.1 (and matches Bitcoin Core's
+        // `bitcoin-core/src/secp256k1` test vectors).
+        let g_x = hex_to_bytes(
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        );
+        let g_y = hex_to_bytes(
+            "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+        );
+
+        // Construct on-wire compressed-stream bytes for tag 0x04 (even-y):
+        //   VARINT(0x04) = 0x04, followed by 32-byte x.
+        let mut wire = vec![0x04u8];
+        wire.extend_from_slice(&g_x);
+
+        let mut cursor = Cursor::new(&wire);
+        let script = read_compressed_script(&mut cursor).unwrap();
+
+        // Expect: <65> 0x04 || x[32] || y[32] OP_CHECKSIG  (67 bytes total).
+        assert_eq!(script.len(), 67, "uncompressed P2PK script should be 67B");
+        assert_eq!(script[0], 65, "OP_PUSHBYTES_65");
+        assert_eq!(script[1], 0x04, "uncompressed pubkey tag");
+        assert_eq!(&script[2..34], g_x.as_slice(), "x-coord round-trips");
+        assert_eq!(&script[34..66], g_y.as_slice(), "y-coord recovered via secp");
+        assert_eq!(script[66], 0xac, "trailing OP_CHECKSIG");
+    }
+
+    #[test]
+    fn test_decompress_uncompressed_p2pk_invalid_x_rejected() {
+        // x = 0 has no valid y on secp256k1 (0^3 + 7 = 7 is not a QR mod p).
+        // Core's `CPubKey::Decompress()` returns false; we propagate
+        // `MalformedCoin` so `loadtxoutset` aborts rather than silently
+        // installing a bogus UTXO.
+        let mut wire = vec![0x04u8]; // tag 0x04 (even parity)
+        wire.extend_from_slice(&[0u8; 32]); // x = 0
+
+        let mut cursor = Cursor::new(&wire);
+        let res = read_compressed_script(&mut cursor);
+        assert!(matches!(res, Err(SnapshotError::MalformedCoin(_))),
+            "x=0 must fail-closed, got {res:?}");
+    }
+
+    #[test]
+    fn test_decompress_uncompressed_p2pk_odd_parity_tag() {
+        // Sanity: tag 0x05 selects the odd-y root. The generator point G has
+        // even y; pick a different x where we can verify the odd root by
+        // round-tripping through secp256k1's API directly.
+        let g_x = hex_to_bytes(
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        );
+        // Start from compressed (0x03 || G.x) → odd-y point = -G.
+        let mut compressed = vec![0x03u8];
+        compressed.extend_from_slice(&g_x);
+        let pk = secp256k1::PublicKey::from_slice(&compressed).unwrap();
+        let expected_uncompressed = pk.serialize_uncompressed();
+
+        // Now feed the same x through the snapshot wire format with tag 0x05.
+        let mut wire = vec![0x05u8];
+        wire.extend_from_slice(&g_x);
+        let mut cursor = Cursor::new(&wire);
+        let script = read_compressed_script(&mut cursor).unwrap();
+
+        assert_eq!(script.len(), 67);
+        assert_eq!(script[0], 65);
+        assert_eq!(&script[1..66], expected_uncompressed.as_slice());
+        assert_eq!(script[66], 0xac);
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
