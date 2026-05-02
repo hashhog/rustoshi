@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -16,6 +17,83 @@ use crate::hd::WalletError;
 use crate::wallet::{AddressType, Wallet};
 use rustoshi_crypto::address::Network;
 use serde::{Deserialize, Serialize};
+
+/// File name for the persisted master HD seed.
+///
+/// Stored as raw 64 bytes inside the wallet directory. Mirrors Bitcoin Core's
+/// `WALLET_HDCHAIN` ("hdchain") key in `wallet/walletdb.cpp`, but kept as a
+/// separate file because rustoshi's `WalletDb` (SQLite) intentionally does not
+/// store secret material.
+const SEED_FILE_NAME: &str = "wallet_seed.bin";
+
+/// Length of the persisted master seed in bytes (matches `Wallet::from_seed`
+/// and BIP-39 64-byte seeds).
+const SEED_LEN: usize = 64;
+
+/// Persist a master seed to `<wallet_dir>/wallet_seed.bin`.
+///
+/// On Unix, the file is created with mode `0600` so that only the running
+/// user can read the secret. On other platforms we fall back to default
+/// permissions.
+fn persist_seed(wallet_dir: &Path, seed: &[u8; SEED_LEN]) -> Result<(), WalletError> {
+    let seed_path = wallet_dir.join(SEED_FILE_NAME);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&seed_path)
+            .map_err(WalletError::Io)?;
+        file.write_all(seed).map_err(WalletError::Io)?;
+        file.sync_all().map_err(WalletError::Io)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&seed_path)
+            .map_err(WalletError::Io)?;
+        file.write_all(seed).map_err(WalletError::Io)?;
+        file.sync_all().map_err(WalletError::Io)?;
+    }
+
+    Ok(())
+}
+
+/// Load a master seed from `<wallet_dir>/wallet_seed.bin`.
+///
+/// Returns `Ok(None)` if the file does not exist (e.g., a blank wallet, or a
+/// wallet directory predating this fix). Returns an error if the file exists
+/// but is the wrong size or unreadable.
+fn load_seed(wallet_dir: &Path) -> Result<Option<[u8; SEED_LEN]>, WalletError> {
+    let seed_path = wallet_dir.join(SEED_FILE_NAME);
+    if !seed_path.exists() {
+        return Ok(None);
+    }
+
+    let mut file = fs::File::open(&seed_path).map_err(WalletError::Io)?;
+    let mut buf = Vec::with_capacity(SEED_LEN);
+    file.read_to_end(&mut buf).map_err(WalletError::Io)?;
+
+    if buf.len() != SEED_LEN {
+        return Err(WalletError::InvalidPath(format!(
+            "wallet seed file has invalid length {} (expected {})",
+            buf.len(),
+            SEED_LEN
+        )));
+    }
+
+    let mut seed = [0u8; SEED_LEN];
+    seed.copy_from_slice(&buf);
+    Ok(Some(seed))
+}
 
 /// Options for creating a new wallet.
 #[derive(Clone, Debug, Default)]
@@ -155,13 +233,22 @@ impl WalletManager {
             // Create a blank wallet with a dummy seed
             // In a real implementation, we'd have a different constructor
             warnings.push("blank wallet created - no keys available".into());
-            let seed = [0u8; 64];
+            let seed = [0u8; SEED_LEN];
+            // Persist even the blank seed so that loadwallet round-trips
+            // produce a wallet equivalent to the one held in memory rather
+            // than silently diverging.
+            persist_seed(&wallet_dir, &seed)?;
             Wallet::from_seed(&seed, self.network, AddressType::P2WPKH)?
         } else {
-            // Generate a random seed
-            let mut seed = [0u8; 64];
+            // Generate a random seed and persist it BEFORE constructing the
+            // wallet so that a later `loadwallet` reproduces the same key
+            // material (Bitcoin Core writes the HD chain to walletdb under
+            // the `WALLET_HDCHAIN` key in `wallet/walletdb.cpp`; we use a
+            // sibling file because our SQLite store is non-secret).
+            let mut seed = [0u8; SEED_LEN];
             getrandom::getrandom(&mut seed)
                 .map_err(|e| WalletError::Crypto(format!("failed to generate random seed: {}", e)))?;
+            persist_seed(&wallet_dir, &seed)?;
             Wallet::from_seed(&seed, self.network, AddressType::P2WPKH)?
         };
 
@@ -228,10 +315,20 @@ impl WalletManager {
         let meta = db.load_wallet_meta()?
             .ok_or_else(|| WalletError::InvalidPath("wallet metadata not found".into()))?;
 
-        // For now, create a wallet from a fixed seed (in production, we'd load the
-        // encrypted seed from the database)
-        // TODO: Implement proper seed storage and loading
-        let seed = [0u8; 64];
+        // Load the master seed from `<wallet_dir>/wallet_seed.bin`. This is
+        // the on-disk equivalent of Bitcoin Core's `WALLET_HDCHAIN` (see
+        // `bitcoin-core/src/wallet/walletdb.cpp`). Prior to this code path,
+        // `loadwallet` deterministically returned a zero-seeded wallet
+        // regardless of what `createwallet` had generated, which silently
+        // diverged in-memory key material from any reload.
+        let seed = load_seed(&wallet_dir)?.ok_or_else(|| {
+            WalletError::InvalidPath(format!(
+                "wallet '{}' is missing its persisted seed ({}); was it created \
+                 before the loadwallet zero-seed fix? Re-create the wallet to \
+                 generate a new seed.",
+                name, SEED_FILE_NAME
+            ))
+        })?;
         let mut wallet = Wallet::from_seed(&seed, meta.network, meta.address_type)?;
 
         // Restore state
@@ -540,5 +637,143 @@ mod tests {
         // List should show both
         let dir_entries = manager.list_wallet_dir().unwrap();
         assert_eq!(dir_entries.len(), 2);
+    }
+
+    /// Regression test for the loadwallet zero-seed bug.
+    ///
+    /// Before the fix, `create_wallet` generated a random seed but never
+    /// persisted it, while `load_wallet` constructed the reloaded wallet
+    /// from a literal `[0u8; 64]`. The reloaded wallet therefore derived a
+    /// completely different first address than the in-memory original.
+    ///
+    /// This test asserts that:
+    ///   1. createwallet's first address is non-deterministic (random seed),
+    ///   2. unload + load round-trip yields the SAME first address
+    ///      (i.e. the seed was actually persisted and reloaded), and
+    ///   3. the reloaded address is NOT the all-zero-seed address (which
+    ///      would indicate the regression returned).
+    #[test]
+    fn test_loadwallet_persists_seed_across_reload() {
+        let temp_dir = tempdir().unwrap();
+        let mut manager = WalletManager::new(temp_dir.path(), Network::Testnet).unwrap();
+
+        // 1. Create the wallet and capture its first receiving address
+        //    (peek so we don't bump indices and obscure the comparison).
+        manager
+            .create_wallet("regress", CreateWalletOptions::default())
+            .unwrap();
+        let original_addr = {
+            let arc = manager.get_wallet("regress").unwrap();
+            let w = arc.lock().unwrap();
+            w.peek_address().unwrap()
+        };
+
+        // The freshly generated random seed must NOT collide with the
+        // all-zero seed used by the buggy load path.
+        let zero_seed_wallet =
+            Wallet::from_seed(&[0u8; SEED_LEN], Network::Testnet, AddressType::P2WPKH)
+                .unwrap();
+        let zero_seed_addr = zero_seed_wallet.peek_address().unwrap();
+        assert_ne!(
+            original_addr, zero_seed_addr,
+            "createwallet must produce a random seed, not zero"
+        );
+
+        // 2. Drop the in-memory wallet (simulating a process restart) and
+        //    reload from disk.
+        manager.unload_wallet("regress", true).unwrap();
+        assert!(!manager.is_loaded("regress"));
+
+        manager.load_wallet("regress").unwrap();
+        let reloaded_addr = {
+            let arc = manager.get_wallet("regress").unwrap();
+            let w = arc.lock().unwrap();
+            w.peek_address().unwrap()
+        };
+
+        // 3. The reloaded address must match the original (seed survived
+        //    the round-trip) and must NOT be the zero-seed address (the
+        //    bug we are guarding against).
+        assert_eq!(
+            reloaded_addr, original_addr,
+            "loadwallet must reproduce the seed from createwallet"
+        );
+        assert_ne!(
+            reloaded_addr, zero_seed_addr,
+            "loadwallet must not silently fall back to a zero seed"
+        );
+
+        // The seed file should exist in the wallet directory and be exactly
+        // SEED_LEN bytes.
+        let seed_path = manager
+            .wallets_dir()
+            .join("regress")
+            .join(SEED_FILE_NAME);
+        let meta = fs::metadata(&seed_path).expect("seed file must exist on disk");
+        assert_eq!(
+            meta.len() as usize,
+            SEED_LEN,
+            "persisted seed must be exactly {} bytes",
+            SEED_LEN
+        );
+    }
+
+    /// Two independently-created wallets must have different first addresses
+    /// — i.e. each gets its own random seed, persisted separately. This
+    /// catches a different shape of the same regression where every wallet
+    /// shared one seed.
+    #[test]
+    fn test_create_wallet_seeds_are_unique_per_wallet() {
+        let temp_dir = tempdir().unwrap();
+        let mut manager = WalletManager::new(temp_dir.path(), Network::Testnet).unwrap();
+
+        manager.create_wallet("a", CreateWalletOptions::default()).unwrap();
+        manager.create_wallet("b", CreateWalletOptions::default()).unwrap();
+
+        let addr_a = {
+            let arc = manager.get_wallet("a").unwrap();
+            let w = arc.lock().unwrap();
+            w.peek_address().unwrap()
+        };
+        let addr_b = {
+            let arc = manager.get_wallet("b").unwrap();
+            let w = arc.lock().unwrap();
+            w.peek_address().unwrap()
+        };
+
+        assert_ne!(
+            addr_a, addr_b,
+            "distinct wallets must have distinct random seeds"
+        );
+    }
+
+    /// `load_wallet` must surface a clear error when the persisted seed
+    /// file is missing (e.g., a wallet directory predating this fix) rather
+    /// than silently substituting a zero seed.
+    #[test]
+    fn test_load_wallet_errors_when_seed_missing() {
+        let temp_dir = tempdir().unwrap();
+        let mut manager = WalletManager::new(temp_dir.path(), Network::Testnet).unwrap();
+
+        manager.create_wallet("orphan", CreateWalletOptions::default()).unwrap();
+        manager.unload_wallet("orphan", true).unwrap();
+
+        // Simulate a pre-fix wallet directory by deleting the seed file.
+        let seed_path = manager
+            .wallets_dir()
+            .join("orphan")
+            .join(SEED_FILE_NAME);
+        fs::remove_file(&seed_path).unwrap();
+
+        let err = manager.load_wallet("orphan").unwrap_err();
+        match err {
+            WalletError::InvalidPath(msg) => {
+                assert!(
+                    msg.contains("missing its persisted seed"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected InvalidPath, got {other:?}"),
+        }
     }
 }
