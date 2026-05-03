@@ -4702,26 +4702,43 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         // Write to a temp path and rename on success, mirroring Core's
-        // `temppath = path + ".incomplete"` flow.
+        // `temppath = path + ".incomplete"` flow in
+        // `bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset`. The
+        // sync_all() before rename is the durability barrier — without
+        // it a power loss between rename and dirty-page flush could
+        // leave `<path>` visible with zero-length / torn contents.
         let temp_path = {
             let mut p = abs_path.clone().into_os_string();
             p.push(".incomplete");
             std::path::PathBuf::from(p)
         };
 
+        // Best-effort cleanup helper used on every error path past
+        // `File::create` so a failed dump leaves at most one
+        // .incomplete artifact, never a torn `<path>`.
+        let cleanup_temp = |tp: &std::path::Path| {
+            let _ = std::fs::remove_file(tp);
+        };
+
         let file = std::fs::File::create(&temp_path)
             .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
 
         let metadata = SnapshotMetadata::new(tip_hash, coins_count, state.params.network_magic);
-        let mut writer = SnapshotWriter::new(file, &metadata)
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+        let mut writer = SnapshotWriter::new(file, &metadata).map_err(|e| {
+            cleanup_temp(&temp_path);
+            Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
+        })?;
 
         let mut written: u64 = 0;
-        for (key, value) in state
+        for entry_iter in state
             .db
             .iter_cf(CF_UTXO)
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+            .map_err(|e| {
+                cleanup_temp(&temp_path);
+                Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+            })?
         {
+            let (key, value) = entry_iter;
             if key.len() != 36 {
                 continue;
             }
@@ -4733,6 +4750,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             let vout = u32::from_be_bytes(vout_bytes);
 
             let entry: CoinEntry = serde_json::from_slice(&value).map_err(|e| {
+                cleanup_temp(&temp_path);
                 Self::rpc_error(
                     rpc_error::RPC_DATABASE_ERROR,
                     format!("UTXO deserialization failed: {}", e),
@@ -4741,15 +4759,35 @@ impl RustoshiRpcServer for RpcServerImpl {
             let coin = Coin::from_entry(&entry);
             writer
                 .write_coin(&OutPoint { txid, vout }, &coin)
-                .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+                .map_err(|e| {
+                    cleanup_temp(&temp_path);
+                    Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
+                })?;
             written += 1;
         }
 
-        let (_file, txoutset_hash, core_hash_serialized, muhash) = writer
+        let (file, txoutset_hash, core_hash_serialized, muhash) = writer
             .finish_with_hashes()
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+            .map_err(|e| {
+                cleanup_temp(&temp_path);
+                Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
+            })?;
+
+        // Durability barrier: fsync the temp file before the atomic
+        // rename. Mirrors Core's `Fdatasync`/`fclose` flush before
+        // `rename(temppath, path)` in `dumptxoutset`. We then drop the
+        // handle (closing the fd) and hand the rename to the OS.
+        if let Err(e) = file.sync_all() {
+            cleanup_temp(&temp_path);
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                format!("fsync failed: {}", e),
+            ));
+        }
+        drop(file);
 
         std::fs::rename(&temp_path, &abs_path).map_err(|e| {
+            cleanup_temp(&temp_path);
             Self::rpc_error(rpc_error::RPC_MISC_ERROR, format!("rename failed: {}", e))
         })?;
 
@@ -5318,19 +5356,33 @@ impl RpcServerImpl {
             std::path::PathBuf::from(p)
         };
 
+        // Best-effort cleanup helper used on every error path past
+        // `File::create` so a failed dump leaves at most one
+        // .incomplete artifact, never a torn `<path>`. Mirrors Core's
+        // flow in rpc/blockchain.cpp::dumptxoutset.
+        let cleanup_temp = |tp: &std::path::Path| {
+            let _ = std::fs::remove_file(tp);
+        };
+
         let file = std::fs::File::create(&temp_path)
             .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
 
         let metadata = SnapshotMetadata::new(tip_hash, coins_count, state.params.network_magic);
-        let mut writer = SnapshotWriter::new(file, &metadata)
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+        let mut writer = SnapshotWriter::new(file, &metadata).map_err(|e| {
+            cleanup_temp(&temp_path);
+            Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
+        })?;
 
         let mut written: u64 = 0;
-        for (key, value) in state
+        for entry_iter in state
             .db
             .iter_cf(CF_UTXO)
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+            .map_err(|e| {
+                cleanup_temp(&temp_path);
+                Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+            })?
         {
+            let (key, value) = entry_iter;
             if key.len() != 36 {
                 continue;
             }
@@ -5342,6 +5394,7 @@ impl RpcServerImpl {
             let vout = u32::from_be_bytes(vout_bytes);
 
             let entry: CoinEntry = serde_json::from_slice(&value).map_err(|e| {
+                cleanup_temp(&temp_path);
                 Self::rpc_error(
                     rpc_error::RPC_DATABASE_ERROR,
                     format!("UTXO deserialization failed: {}", e),
@@ -5350,15 +5403,34 @@ impl RpcServerImpl {
             let coin = Coin::from_entry(&entry);
             writer
                 .write_coin(&OutPoint { txid, vout }, &coin)
-                .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+                .map_err(|e| {
+                    cleanup_temp(&temp_path);
+                    Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
+                })?;
             written += 1;
         }
 
-        let (_file, txoutset_hash, core_hash_serialized, muhash) = writer
+        let (file, txoutset_hash, core_hash_serialized, muhash) = writer
             .finish_with_hashes()
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
+            .map_err(|e| {
+                cleanup_temp(&temp_path);
+                Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
+            })?;
+
+        // Durability barrier: fsync the temp file before the atomic
+        // rename. Mirrors Core's `Fdatasync`/`fclose` flush before
+        // `rename(temppath, path)` in `dumptxoutset`.
+        if let Err(e) = file.sync_all() {
+            cleanup_temp(&temp_path);
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                format!("fsync failed: {}", e),
+            ));
+        }
+        drop(file);
 
         std::fs::rename(&temp_path, abs_path).map_err(|e| {
+            cleanup_temp(&temp_path);
             Self::rpc_error(rpc_error::RPC_MISC_ERROR, format!("rename failed: {}", e))
         })?;
 
@@ -8004,6 +8076,67 @@ mod tests {
         let p = std::path::PathBuf::from(resp["path"].as_str().unwrap());
         assert!(p.exists(), "dumptxoutset must create the file: {}", p.display());
         // Cleanup is automatic when `tmp` drops.
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_atomic_write_no_incomplete_artifact() {
+        // Mirrors Bitcoin Core's rpc/blockchain.cpp::dumptxoutset which
+        // writes to <path>.incomplete, fsyncs, and renames. After a
+        // successful dump only <path> should exist; the .incomplete
+        // temp must be gone so that an operator copying the snapshot
+        // mid-dump never sees a torn file.
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let (tmp, server) = dumptxoutset_test_server(params, 0).await;
+
+        let resp = server
+            .dump_tx_outset("atomic.dat".to_string(), Some("latest".to_string()), None)
+            .await
+            .expect("dump must succeed on a fresh regtest chainstate");
+
+        let final_path = std::path::PathBuf::from(resp["path"].as_str().unwrap());
+        let mut tmp_os = final_path.clone().into_os_string();
+        tmp_os.push(".incomplete");
+        let temp_path = std::path::PathBuf::from(tmp_os);
+
+        assert!(
+            final_path.exists(),
+            "final snapshot path missing after successful dump: {}",
+            final_path.display()
+        );
+        assert!(
+            !temp_path.exists(),
+            ".incomplete temp file leaked after successful dump: {}",
+            temp_path.display()
+        );
+
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_refuses_to_overwrite() {
+        // Mirrors Core's "<path> already exists. If you are sure this is
+        // what you want, move it out of the way first." guard. The first
+        // dump succeeds; a second dump to the same path must error before
+        // touching the snapshot writer.
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let (tmp, server) = dumptxoutset_test_server(params, 0).await;
+
+        let _ = server
+            .dump_tx_outset("clobber.dat".to_string(), Some("latest".to_string()), None)
+            .await
+            .expect("first dump must succeed");
+
+        let res = server
+            .dump_tx_outset("clobber.dat".to_string(), Some("latest".to_string()), None)
+            .await;
+        let err = res.expect_err("second dump must refuse to overwrite");
+        assert!(
+            err.message().contains("already exists"),
+            "expected 'already exists' guard, got: {}",
+            err.message()
+        );
+
         drop(tmp);
     }
 
