@@ -331,6 +331,8 @@ pub enum ScriptError {
     TapscriptEmptyPubkey,
     #[error("tapscript checkmultisig")]
     TapscriptCheckmultisig,
+    #[error("tapscript validation weight exceeded")]
+    TapscriptValidationWeight,
     #[error("witness program wrong length")]
     WitnessProgramWrongLength,
     #[error("taproot program mismatch")]
@@ -695,6 +697,18 @@ struct ExecContext<'a> {
     sig_version: SigVersion,
     codesep_pos: u32, // Position of last OP_CODESEPARATOR
     tapscript: Option<TapscriptCtx<'a>>, // Some(_) iff sig_version == Tapscript
+    /// BIP-342 tapscript validation-weight budget. Mirrors Core's
+    /// `ScriptExecutionData::m_validation_weight_left` (interpreter.cpp:362).
+    /// Initialized at the tapscript leaf entry to
+    /// `GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET (50)`,
+    /// decremented by `VALIDATION_WEIGHT_PER_SIGOP_PASSED (50)` for every
+    /// non-empty CHECKSIG / CHECKSIGVERIFY / CHECKSIGADD. Negative residue
+    /// aborts with `TapscriptValidationWeight`.
+    validation_weight_left: i64,
+    /// Whether `validation_weight_left` is initialized. Defensive guard
+    /// mirroring Core's `m_validation_weight_left_init`. False for
+    /// legacy / SegWit-v0 contexts where the budget is not consulted.
+    validation_weight_init: bool,
 }
 
 impl<'a> ExecContext<'a> {
@@ -714,6 +728,8 @@ impl<'a> ExecContext<'a> {
             sig_version,
             codesep_pos: 0xFFFFFFFF,
             tapscript: None,
+            validation_weight_left: 0,
+            validation_weight_init: false,
         }
     }
 
@@ -722,6 +738,7 @@ impl<'a> ExecContext<'a> {
         flags: &'a ScriptFlags,
         checker: &'a dyn SignatureChecker,
         tapscript: TapscriptCtx<'a>,
+        validation_weight_left: i64,
     ) -> Self {
         ExecContext {
             stack,
@@ -733,7 +750,25 @@ impl<'a> ExecContext<'a> {
             sig_version: SigVersion::Tapscript,
             codesep_pos: 0xFFFFFFFF,
             tapscript: Some(tapscript),
+            validation_weight_left,
+            validation_weight_init: true,
         }
+    }
+
+    /// Decrement the BIP-342 validation-weight counter by 50 (one
+    /// `VALIDATION_WEIGHT_PER_SIGOP_PASSED`). Returns
+    /// `TapscriptValidationWeight` if the residue would go negative,
+    /// matching Core's `m_validation_weight_left -= 50; if (... < 0) ...`
+    /// at interpreter.cpp:362-365. Caller must only invoke this when
+    /// processing a non-empty signature on the tapscript path; this is
+    /// `interpreter.cpp`'s `success = !sig.empty()` gate.
+    fn consume_validation_weight(&mut self) -> Result<(), ScriptError> {
+        debug_assert!(self.validation_weight_init);
+        self.validation_weight_left -= 50;
+        if self.validation_weight_left < 0 {
+            return Err(ScriptError::TapscriptValidationWeight);
+        }
+        Ok(())
     }
 
     /// Check if we're in an executing branch.
@@ -1396,7 +1431,17 @@ fn eval_script_internal(
                 let sig = ctx.pop()?;
 
                 if ctx.sig_version == SigVersion::Tapscript {
-                    // BIP-342 tapscript rules
+                    // BIP-342 tapscript rules.
+                    // Validation-weight budget: decrement by 50 BEFORE pubkey
+                    // inspection, but only when the signature is non-empty.
+                    // Mirrors Core's `success = !sig.empty()` gate at
+                    // interpreter.cpp:357-366. Per Core's comment, "Passing
+                    // with an upgradable public key version is also counted",
+                    // so the deduction fires before the 32-byte vs. unknown
+                    // branching below.
+                    if !sig.is_empty() {
+                        ctx.consume_validation_weight()?;
+                    }
                     if pubkey.is_empty() {
                         return Err(ScriptError::TapscriptEmptyPubkey);
                     }
@@ -1467,7 +1512,12 @@ fn eval_script_internal(
                 let sig = ctx.pop()?;
 
                 if ctx.sig_version == SigVersion::Tapscript {
-                    // BIP-342 tapscript rules
+                    // BIP-342 tapscript rules. See OP_CHECKSIG above for the
+                    // budget-gate rationale; CHECKSIGVERIFY follows the same
+                    // EvalChecksigTapscript path as CHECKSIG in Core.
+                    if !sig.is_empty() {
+                        ctx.consume_validation_weight()?;
+                    }
                     if pubkey.is_empty() {
                         return Err(ScriptError::TapscriptEmptyPubkey);
                     }
@@ -1828,6 +1878,14 @@ fn eval_script_internal(
                     DEFAULT_MAX_NUM_SIZE,
                 )?;
 
+                // BIP-342 validation-weight budget: see OP_CHECKSIG above.
+                // CHECKSIGADD goes through the same EvalChecksigTapscript
+                // path in Core, which decrements the budget on every
+                // !sig.empty() path before the pubkey type check.
+                if !sig.is_empty() {
+                    ctx.consume_validation_weight()?;
+                }
+
                 if pubkey.is_empty() {
                     return Err(ScriptError::TapscriptEmptyPubkey);
                 }
@@ -2012,24 +2070,62 @@ pub fn eval_script(
 /// Evaluate a tapscript leaf (BIP-342) — same as `eval_script` but with
 /// the tapleaf hash + annex needed for ext_flag=1 sighash computation
 /// inside OP_CHECKSIG / OP_CHECKSIGVERIFY / OP_CHECKSIGADD.
+///
+/// `validation_weight_left` is the BIP-342 sigop budget seeded at the
+/// tapscript entry point — Core's
+/// `m_validation_weight_left = ::GetSerializeSize(witness.stack) +
+/// VALIDATION_WEIGHT_OFFSET (50)` (interpreter.cpp:1981). The script
+/// will abort with `TapscriptValidationWeight` if more non-empty
+/// CHECKSIG / CHECKSIGADD operations are executed than the budget
+/// can pay for at 50 weight units each.
 pub fn eval_script_tapscript(
     stack: &mut Stack,
     script: &[u8],
     flags: &ScriptFlags,
     checker: &dyn SignatureChecker,
     tapscript: TapscriptCtx<'_>,
+    validation_weight_left: i64,
 ) -> Result<(), ScriptError> {
     let mut ctx = ExecContext::with_stack_tapscript(
         std::mem::take(stack),
         flags,
         checker,
         tapscript,
+        validation_weight_left,
     );
 
     let result = eval_script_internal(&mut ctx, script, script);
 
     *stack = ctx.stack;
     result
+}
+
+/// Compute the byte length of a Bitcoin compact-size encoding for `n`.
+/// Mirrors Core's `GetSizeOfCompactSize` (serialize.h):
+/// `< 0xfd` → 1, `<= 0xffff` → 3, `<= 0xffffffff` → 5, else 9.
+pub fn compact_size_len(n: u64) -> u64 {
+    if n < 0xfd {
+        1
+    } else if n <= 0xffff {
+        3
+    } else if n <= 0xffffffff {
+        5
+    } else {
+        9
+    }
+}
+
+/// Compute the on-the-wire serialized size of a witness stack the way
+/// Core's `::GetSerializeSize(witness.stack)` does it: a compact-size
+/// item count followed by, for each item, its compact-size length
+/// prefix and the bytes themselves. Used to seed the BIP-342 tapscript
+/// validation-weight budget at the leaf entry point.
+pub fn get_serialize_size_of_witness_stack(items: &[Vec<u8>]) -> u64 {
+    let mut n = compact_size_len(items.len() as u64);
+    for it in items {
+        n += compact_size_len(it.len() as u64) + it.len() as u64;
+    }
+    n
 }
 
 /// Check if a script is P2SH: OP_HASH160 <20 bytes> OP_EQUAL
@@ -2548,7 +2644,21 @@ fn verify_witness_program(
                             tapleaf_hash: &tapleaf_hash,
                             annex,
                         };
-                        eval_script_tapscript(&mut stack, tap_script, flags, checker, tapscript_ctx)?;
+                        // BIP-342 validation-weight budget: seeded from the
+                        // ORIGINAL pre-pop witness (annex + control + script
+                        // + args all counted), which is exactly what Core
+                        // passes to `::GetSerializeSize(witness.stack)` at
+                        // interpreter.cpp:1981.
+                        let validation_weight_left =
+                            get_serialize_size_of_witness_stack(witness) as i64 + 50;
+                        eval_script_tapscript(
+                            &mut stack,
+                            tap_script,
+                            flags,
+                            checker,
+                            tapscript_ctx,
+                            validation_weight_left,
+                        )?;
 
                         // Cleanstack: exactly one element
                         if stack.len() != 1 {
@@ -3910,5 +4020,155 @@ mod tests {
         let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
         // Should succeed - flag not set
         assert!(result.is_ok());
+    }
+
+    // ==================================================================
+    // BIP-342 tapscript validation-weight budget (interpreter.cpp:362)
+    // ==================================================================
+
+    /// Always-true Schnorr checker so we can drive CHECKSIG / CHECKSIGADD
+    /// to "success" in tests without real BIP-340 cryptography. Tapscript
+    /// only sees `check_schnorr_sig_tapscript`; the legacy ECDSA path is
+    /// not exercised here.
+    struct AlwaysTrueSchnorrChecker;
+    impl SignatureChecker for AlwaysTrueSchnorrChecker {
+        fn check_sig(&self, _: &[u8], _: &[u8], _: &[u8], _: SigVersion) -> bool { true }
+        fn check_locktime(&self, _: i64) -> bool { true }
+        fn check_sequence(&self, _: i64) -> bool { true }
+        fn check_schnorr_sig_tapscript(
+            &self,
+            _sig: &[u8],
+            _xonly_pubkey: &[u8; 32],
+            _tapleaf_hash: &[u8; 32],
+            _codesep_pos: u32,
+            _annex: Option<&[u8]>,
+        ) -> bool { true }
+    }
+
+    #[test]
+    fn compact_size_len_matches_core() {
+        assert_eq!(compact_size_len(0), 1);
+        assert_eq!(compact_size_len(0xfc), 1);
+        assert_eq!(compact_size_len(0xfd), 3);
+        assert_eq!(compact_size_len(0xffff), 3);
+        assert_eq!(compact_size_len(0x10000), 5);
+        assert_eq!(compact_size_len(0xffffffff), 5);
+        assert_eq!(compact_size_len(0x1_0000_0000), 9);
+    }
+
+    #[test]
+    fn get_serialize_size_of_witness_stack_matches_core() {
+        // Empty stack: just the count compact-size = 1 byte.
+        assert_eq!(get_serialize_size_of_witness_stack(&[]), 1);
+        // One 64-byte item: 1 (count) + 1 (item len prefix) + 64 (bytes).
+        assert_eq!(get_serialize_size_of_witness_stack(&[vec![0u8; 64]]), 66);
+        // Two items, 100 + 33 bytes:
+        assert_eq!(
+            get_serialize_size_of_witness_stack(&[vec![0u8; 100], vec![0u8; 33]]),
+            1 + (1 + 100) + (1 + 33),
+        );
+    }
+
+    #[test]
+    fn tapscript_budget_exhausted_aborts_checksig() {
+        // OP_CHECKSIG with a 32-byte pubkey and a 64-byte non-empty sig
+        // and budget = 49 must trip TAPSCRIPT_VALIDATION_WEIGHT.
+        // Stack (top-down): pubkey, sig.
+        let pubkey = vec![0x02u8; 32];
+        let sig = vec![0x42u8; 64];
+        let mut stack: Stack = vec![sig, pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xac]; // OP_CHECKSIG
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 49);
+        assert!(matches!(res, Err(ScriptError::TapscriptValidationWeight)));
+    }
+
+    #[test]
+    fn tapscript_budget_sufficient_succeeds_checksig() {
+        // Same setup, but budget = 50: 50 - 50 = 0 (not negative). Pass.
+        let pubkey = vec![0x02u8; 32];
+        let sig = vec![0x42u8; 64];
+        let mut stack: Stack = vec![sig, pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xac]; // OP_CHECKSIG
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 50);
+        assert!(res.is_ok(), "with budget 50, single CHECKSIG must succeed: {res:?}");
+        // Result is `true` on stack.
+        assert!(stack_bool(&stack[0]));
+    }
+
+    #[test]
+    fn tapscript_empty_sig_consumes_no_budget_checksig() {
+        // Empty sig + 32-byte pubkey: pushes false, MUST NOT decrement.
+        // Budget = 0 must succeed (single OP_CHECKSIG).
+        let pubkey = vec![0x02u8; 32];
+        let mut stack: Stack = vec![vec![], pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xac]; // OP_CHECKSIG
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 0);
+        assert!(res.is_ok(), "empty sig MUST NOT consume budget: {res:?}");
+        assert!(!stack_bool(&stack[0]));
+    }
+
+    #[test]
+    fn tapscript_budget_exhausted_aborts_checksigadd() {
+        // OP_CHECKSIGADD with a 32-byte pubkey and a 64-byte non-empty sig
+        // and budget = 0 must trip TAPSCRIPT_VALIDATION_WEIGHT.
+        // Stack (top-down): pubkey, num, sig.
+        let pubkey = vec![0x02u8; 32];
+        let sig = vec![0x42u8; 64];
+        let mut stack: Stack = vec![sig, vec![] /* num=0 */, pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xba]; // OP_CHECKSIGADD
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 0);
+        assert!(matches!(res, Err(ScriptError::TapscriptValidationWeight)));
+    }
+
+    #[test]
+    fn tapscript_budget_unknown_pubkey_also_consumes() {
+        // Per Core's comment: "Passing with an upgradable public key
+        // version is also counted." A non-32-byte pubkey on the
+        // CHECKSIG path with a non-empty sig MUST decrement the budget.
+        // Budget = 0 + non-empty sig + 33-byte pubkey → exhaust.
+        let pubkey = vec![0x02u8; 33]; // unknown pubkey type (not 32)
+        let sig = vec![0x42u8; 64];
+        let mut stack: Stack = vec![sig, pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xac]; // OP_CHECKSIG
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 0);
+        assert!(matches!(res, Err(ScriptError::TapscriptValidationWeight)));
+    }
+
+    #[test]
+    fn legacy_checksig_unaffected_by_budget() {
+        // SegWit-v0 / legacy paths must NOT touch the budget. Construct
+        // a checksig that decoder-fails (forces NULLFAIL off) and verify
+        // that with `eval_script` (non-tapscript), no budget assertion
+        // fires.
+        // <empty sig> <pubkey> CHECKSIG → push false (legacy path).
+        let pubkey = vec![0x02u8; 33];
+        let mut stack: Stack = vec![vec![], pubkey];
+        let mut flags = ScriptFlags::default();
+        flags.verify_nullfail = false;
+        let checker = DummyChecker;
+        let script = [0xac]; // OP_CHECKSIG
+        let res = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(res.is_ok(), "legacy CHECKSIG with empty sig should push false: {res:?}");
+        assert!(!stack_bool(&stack[0]));
     }
 }
