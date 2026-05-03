@@ -337,6 +337,8 @@ pub enum ScriptError {
     WitnessProgramWrongLength,
     #[error("taproot program mismatch")]
     WitnessProgramMismatch2,
+    #[error("discouraged OP_SUCCESS")]
+    DiscourageOpSuccess,
 }
 
 /// Signature version for sighash computation.
@@ -829,7 +831,15 @@ fn eval_script_internal(
     script: &[u8],
     full_script: &[u8],
 ) -> Result<(), ScriptError> {
-    if script.len() > MAX_SCRIPT_SIZE {
+    // BIP-342: tapscripts have NO 10,000-byte size limit (only the
+    // validation-weight budget). Mirrors Core interpreter.cpp:428:
+    //   if ((sigversion == BASE || sigversion == WITNESS_V0) && script.size() > MAX_SCRIPT_SIZE)
+    //       return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
+    // Mainnet block 944,279 (and many ordinals/inscription blocks) contain
+    // tapscripts > 10 KB; gating this is required for consensus parity.
+    if matches!(ctx.sig_version, SigVersion::Base | SigVersion::WitnessV0)
+        && script.len() > MAX_SCRIPT_SIZE
+    {
         return Err(ScriptError::ScriptSize);
     }
 
@@ -948,8 +958,18 @@ fn eval_script_internal(
             continue;
         }
 
-        // Count non-push opcodes
-        if opcode_byte > 0x60 {
+        // Count non-push opcodes (only for legacy/SegWit-v0 scripts).
+        // BIP-342: tapscripts have NO 201-opcode limit (only the
+        // validation-weight budget). Mirrors Core interpreter.cpp:450-454:
+        //   if (sigversion == BASE || sigversion == WITNESS_V0) {
+        //       if (opcode > OP_16 && ++nOpCount > MAX_OPS_PER_SCRIPT) ...
+        //   }
+        // Same rationale as the MAX_SCRIPT_SIZE gate above: the 944k
+        // inscription tapscript has ~701 non-push opcodes and would be
+        // rejected here without this gate.
+        if matches!(ctx.sig_version, SigVersion::Base | SigVersion::WitnessV0)
+            && opcode_byte > 0x60
+        {
             // > OP_16
             ctx.op_count += 1;
             if ctx.op_count > MAX_OPS_PER_SCRIPT {
@@ -2118,6 +2138,42 @@ pub fn eval_script_tapscript(
     tapscript: TapscriptCtx<'_>,
     validation_weight_left: i64,
 ) -> Result<(), ScriptError> {
+    // BIP-342: OP_SUCCESS pre-scan. Mirrors Core interpreter.cpp:1836-1856.
+    //
+    //   for (CScript::const_iterator pc = exec_script.begin(); pc < exec_script.end();) {
+    //       opcodetype opcode;
+    //       if (!exec_script.GetOp(pc, opcode))
+    //           return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+    //       if (IsOpSuccess(opcode)) {
+    //           if (flags & SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+    //               return set_error(serror, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
+    //           return set_success(serror);
+    //       }
+    //   }
+    //
+    // An OP_SUCCESS opcode anywhere in a tapscript causes the script to
+    // succeed unconditionally — even disabled / bad / over-budget opcodes
+    // are bypassed.  Without this pre-scan, rustoshi rejects tapscripts
+    // containing OP_CAT/OP_SUBSTR/etc. (via is_disabled at line 961) or
+    // 0xbb-0xfe undefined opcodes (via Opcode::OP_INVALIDOPCODE → BadOpcode)
+    // when they should succeed.
+    if scan_for_op_success(script)? {
+        if flags.verify_discourage_op_success {
+            return Err(ScriptError::DiscourageOpSuccess);
+        }
+        // Per BIP-342 + Core: leave the stack in a state where the
+        // post-eval cleanstack / top-of-stack-true checks at the call
+        // site (verify_witness_program) accept.  Core's set_success
+        // returns immediately without running the cleanstack rule, but
+        // we have to cooperate with our rust caller which DOES enforce
+        // single-element-truthy after the call returns.  Replacing the
+        // stack with a single truthy entry achieves the same observable
+        // outcome.
+        stack.clear();
+        stack.push(vec![0x01]);
+        return Ok(());
+    }
+
     let mut ctx = ExecContext::with_stack_tapscript(
         std::mem::take(stack),
         flags,
@@ -2130,6 +2186,83 @@ pub fn eval_script_tapscript(
 
     *stack = ctx.stack;
     result
+}
+
+/// Pre-scan a tapscript for OP_SUCCESS opcodes per BIP-342.
+///
+/// Returns `Ok(true)` if any OP_SUCCESS opcode is found, `Ok(false)` if
+/// the script is well-formed and contains no OP_SUCCESS, or
+/// `Err(ScriptError::BadOpcode)` if the script has a truncated push
+/// (matching Core's `GetOp` failure mode).
+fn scan_for_op_success(script: &[u8]) -> Result<bool, ScriptError> {
+    let mut pc = 0usize;
+    while pc < script.len() {
+        let opcode_byte = script[pc];
+        pc += 1;
+        // OP_SUCCESS check fires BEFORE we walk past push payload bytes —
+        // matches Core's GetOp ordering: it reads the opcode byte, then
+        // reads the payload.  Dispatch off the raw byte (NOT the parsed
+        // Opcode) because `Opcode::from_u8` collapses 0xbb..=0xfe to
+        // OP_INVALIDOPCODE, losing the original byte identity.
+        if Opcode::is_tapscript_success_byte(opcode_byte) {
+            return Ok(true);
+        }
+        // Walk past direct-push payloads (0x01..0x4b)
+        if (0x01..=0x4b).contains(&opcode_byte) {
+            let len = opcode_byte as usize;
+            if pc + len > script.len() {
+                return Err(ScriptError::BadOpcode);
+            }
+            pc += len;
+            continue;
+        }
+        // OP_PUSHDATA1
+        if opcode_byte == 0x4c {
+            if pc >= script.len() {
+                return Err(ScriptError::BadOpcode);
+            }
+            let len = script[pc] as usize;
+            pc += 1;
+            if pc + len > script.len() {
+                return Err(ScriptError::BadOpcode);
+            }
+            pc += len;
+            continue;
+        }
+        // OP_PUSHDATA2
+        if opcode_byte == 0x4d {
+            if pc + 2 > script.len() {
+                return Err(ScriptError::BadOpcode);
+            }
+            let len = u16::from_le_bytes([script[pc], script[pc + 1]]) as usize;
+            pc += 2;
+            if pc + len > script.len() {
+                return Err(ScriptError::BadOpcode);
+            }
+            pc += len;
+            continue;
+        }
+        // OP_PUSHDATA4
+        if opcode_byte == 0x4e {
+            if pc + 4 > script.len() {
+                return Err(ScriptError::BadOpcode);
+            }
+            let len = u32::from_le_bytes([
+                script[pc],
+                script[pc + 1],
+                script[pc + 2],
+                script[pc + 3],
+            ]) as usize;
+            pc += 4;
+            if pc + len > script.len() {
+                return Err(ScriptError::BadOpcode);
+            }
+            pc += len;
+            continue;
+        }
+        // Other opcodes: single byte, no payload.  Already consumed above.
+    }
+    Ok(false)
 }
 
 /// Compute the byte length of a Bitcoin compact-size encoding for `n`.
@@ -4290,5 +4423,269 @@ mod tests {
         let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
         assert!(matches!(result, Err(ScriptError::WitnessProgramLength)),
             "v0 + non-20/non-32 must still fail wrong-length: {result:?}");
+    }
+
+    // ============================================================
+    // BIP-342 tapscript size + opcount + OP_SUCCESS regression tests
+    // ============================================================
+    //
+    // These cover audit Bugs 1, 2, 3 (rustoshi-P0-FOUND.md). The
+    // prior code unconditionally enforced legacy/SegWit-v0 limits on
+    // tapscripts, which would have rejected mainnet block 944,279
+    // (282,722-byte tapscript with ~701 opcodes) and any tapscript
+    // containing OP_CAT/etc. or 0xbb-0xfe.
+    //
+    // Pattern: each test exercises eval_script_tapscript with a script
+    // that exceeds the legacy limit, and asserts no SCRIPT_SIZE /
+    // OP_COUNT / DISABLED_OPCODE error fires.
+
+    #[test]
+    fn tapscript_max_script_size_gate_allows_oversize() {
+        // Build a tapscript larger than MAX_SCRIPT_SIZE (10,000) bytes
+        // by chaining many OP_NOPs followed by a single OP_1 to leave
+        // a truthy stack.  Legacy/SegWit-v0 must reject; tapscript must
+        // accept (no SCRIPT_SIZE, no OP_COUNT — wait, OP_NOP > OP_16 so
+        // it would also trip the opcount limit; we test that gate
+        // separately below).
+        //
+        // To isolate the SCRIPT_SIZE check: use an 11,000-byte payload
+        // that would otherwise NOT trip OP_COUNT (push opcodes only,
+        // then a final OP_1).  We use 0x4b (PUSH 75 bytes) repeated.
+        //
+        //   per-iteration: 1 byte opcode + 75 bytes payload = 76 bytes
+        //   145 iterations = 11,020 bytes (> MAX_SCRIPT_SIZE = 10,000)
+        // Then drop everything except OP_1 at the end.
+        let mut script = Vec::with_capacity(11_100);
+        for _ in 0..145 {
+            script.push(0x4b);                  // PUSH 75 bytes
+            script.extend(std::iter::repeat(0x42).take(75));
+        }
+        // Drop them all (so cleanstack is satisfied)
+        for _ in 0..145 {
+            script.push(0x75); // OP_DROP
+        }
+        // Then OP_1 to leave a truthy single-element stack.
+        script.push(0x51); // OP_1
+        assert!(script.len() > MAX_SCRIPT_SIZE,
+            "test setup: script.len()={}, must be > {}", script.len(), MAX_SCRIPT_SIZE);
+
+        // Tapscript: must succeed (no SCRIPT_SIZE).
+        let mut stack: Stack = Stack::new();
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(res.is_ok(),
+            "tapscript with 11k bytes must succeed (no SCRIPT_SIZE): {res:?}");
+
+        // Legacy: must fail with SCRIPT_SIZE.
+        let mut stack2: Stack = Stack::new();
+        let res2 = eval_script(&mut stack2, &script, &flags, &checker, SigVersion::Base);
+        assert!(matches!(res2, Err(ScriptError::ScriptSize)),
+            "legacy script with 11k bytes must fail SCRIPT_SIZE: {res2:?}");
+
+        // SegWit v0: must fail with SCRIPT_SIZE.
+        let mut stack3: Stack = Stack::new();
+        let res3 = eval_script(&mut stack3, &script, &flags, &checker, SigVersion::WitnessV0);
+        assert!(matches!(res3, Err(ScriptError::ScriptSize)),
+            "witness-v0 script with 11k bytes must fail SCRIPT_SIZE: {res3:?}");
+    }
+
+    #[test]
+    fn tapscript_max_ops_gate_allows_high_opcount() {
+        // 250 OP_NOP opcodes (> MAX_OPS_PER_SCRIPT=201) + final OP_1.
+        // Tapscript must accept; legacy/SegWit-v0 must reject OP_COUNT.
+        let mut script: Vec<u8> = std::iter::repeat(0x61) // OP_NOP
+            .take(250)
+            .collect();
+        script.push(0x51); // OP_1
+        assert!(script.len() < MAX_SCRIPT_SIZE,
+            "test setup: must fit MAX_SCRIPT_SIZE so we isolate OP_COUNT");
+
+        // Tapscript: must succeed.
+        let mut stack: Stack = Stack::new();
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(res.is_ok(),
+            "tapscript with 250 opcodes must succeed (no OP_COUNT): {res:?}");
+
+        // Legacy: must fail with OpCount.
+        let mut stack2: Stack = Stack::new();
+        let res2 = eval_script(&mut stack2, &script, &flags, &checker, SigVersion::Base);
+        assert!(matches!(res2, Err(ScriptError::OpCount)),
+            "legacy script with 250 opcodes must fail OP_COUNT: {res2:?}");
+    }
+
+    #[test]
+    fn tapscript_op_success_50_succeeds_unconditionally() {
+        // BIP-342: byte 0x50 (OP_RESERVED / OP_SUCCESS80) anywhere in a
+        // tapscript causes unconditional success — even before any
+        // legacy validation runs (e.g. the script can be otherwise
+        // syntactically-malformed).  We test the canonical case: a
+        // single-byte 0x50 script.
+        let script = [0x50u8];
+        let mut stack: Stack = Stack::new();
+        let flags = ScriptFlags::default(); // verify_discourage_op_success = false
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(res.is_ok(),
+            "tapscript [0x50] (OP_SUCCESS80) must succeed unconditionally: {res:?}");
+        // Stack should hold a truthy element so the call site's
+        // top-of-stack-true check passes.
+        assert_eq!(stack.len(), 1);
+        assert!(stack_bool(&stack[0]));
+    }
+
+    #[test]
+    fn tapscript_op_success_with_disabled_opcode_still_succeeds() {
+        // OP_CAT (0x7e) is in the OP_SUCCESS range AND is also a "disabled"
+        // opcode in legacy. Per BIP-342 the OP_SUCCESS pre-scan fires first,
+        // so even though OP_CAT would trip is_disabled() in eval_script_internal,
+        // tapscript must succeed unconditionally.  This is the bug 3
+        // "OP_SUCCESS opcodes never recognized" regression.
+        let script = [0x7eu8]; // OP_CAT alone
+        let mut stack: Stack = Stack::new();
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(res.is_ok(),
+            "tapscript [OP_CAT] must succeed via OP_SUCCESS pre-scan: {res:?}");
+    }
+
+    #[test]
+    fn tapscript_op_success_high_byte_succeeds() {
+        // 0xbb..=0xfe range. Pick 0xbb (smallest in upper OP_SUCCESS range).
+        let script = [0xbbu8];
+        let mut stack: Stack = Stack::new();
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(res.is_ok(),
+            "tapscript [0xbb] (OP_SUCCESS in 0xbb..=0xfe range) must succeed: {res:?}");
+    }
+
+    #[test]
+    fn tapscript_op_success_with_discourage_flag_fails() {
+        // Standardness flag: when verify_discourage_op_success is on,
+        // the OP_SUCCESS pre-scan rejects rather than succeeds.  This is
+        // policy, not consensus — but Core ships the gate so we mirror it.
+        let script = [0x50u8];
+        let mut stack: Stack = Stack::new();
+        let mut flags = ScriptFlags::default();
+        flags.verify_discourage_op_success = true;
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(matches!(res, Err(ScriptError::DiscourageOpSuccess)),
+            "tapscript with DISCOURAGE_OP_SUCCESS must reject: {res:?}");
+    }
+
+    #[test]
+    fn tapscript_non_op_success_still_evaluates_normally() {
+        // 0xba (OP_CHECKSIGADD) is NOT OP_SUCCESS — it's a valid tapscript
+        // opcode. A script of just "OP_1" (0x51) also is not OP_SUCCESS.
+        // We need to confirm the pre-scan does NOT short-circuit when
+        // there's no OP_SUCCESS byte — fall through to normal eval.
+        let script = [0x51u8]; // OP_1
+        let mut stack: Stack = Stack::new();
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(res.is_ok(),
+            "tapscript [OP_1] must succeed via normal eval: {res:?}");
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0], vec![1]);
+    }
+
+    #[test]
+    fn tapscript_op_success_in_pushdata_payload_does_not_succeed() {
+        // Critical: a 0x50 byte that lives INSIDE a PUSHDATA payload is
+        // NOT an opcode, so the pre-scan must not see it.  Specifically:
+        //   <PUSH 1 byte> <0x50>  →  three bytes [0x01, 0x50, ...] —
+        //   wait, two bytes: opcode 0x01 (push 1) + payload 0x50.
+        // The 0x50 byte is the payload, not an opcode.  Pre-scan must
+        // walk past the payload and NOT short-circuit.
+        //
+        // Construct: PUSH(1)=0x01 + 0x50 + OP_DROP=0x75 + OP_1=0x51
+        // Should succeed via normal eval (push 0x50, drop, push 1).
+        let script = [0x01u8, 0x50, 0x75, 0x51];
+        let mut stack: Stack = Stack::new();
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(res.is_ok(),
+            "tapscript with 0x50 inside PUSH-1 payload must run normally: {res:?}");
+        assert!(stack_bool(&stack[0]));
+    }
+
+    #[test]
+    fn tapscript_op_success_in_pushdata1_payload_does_not_succeed() {
+        // Same idea with OP_PUSHDATA1.  Push 4 bytes including 0xbb.
+        // <PUSHDATA1=0x4c> <len=0x04> <4 bytes including 0xbb> <OP_DROP> <OP_1>
+        let script = [0x4cu8, 0x04, 0xbb, 0x00, 0x00, 0x00, 0x75, 0x51];
+        let mut stack: Stack = Stack::new();
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(res.is_ok(),
+            "tapscript with 0xbb inside PUSHDATA1 payload must run normally: {res:?}");
+        assert!(stack_bool(&stack[0]));
+    }
+
+    #[test]
+    fn tapscript_op_success_pre_scan_truncated_push_errors() {
+        // Truncated PUSH (length byte says push 5 bytes, but only 2
+        // remain) must surface as BadOpcode — same outcome as Core's
+        // GetOp returning false during the OP_SUCCESS pre-scan loop.
+        let script = [0x05u8, 0x42, 0x42]; // PUSH 5 bytes, but only 2 follow
+        let mut stack: Stack = Stack::new();
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(matches!(res, Err(ScriptError::BadOpcode)),
+            "truncated push during OP_SUCCESS pre-scan must error: {res:?}");
+    }
+
+    #[test]
+    fn op_success_byte_set_matches_core() {
+        // Spot-check a few bytes against Core's IsOpSuccess
+        // (script.cpp:364): 80, 98, 126-129, 131-134, 137-138, 141-142,
+        // 149-153, 187-254.
+        for b in [0x50u8, 0x62, 0x7e, 0x7f, 0x80, 0x81, 0x83, 0x86,
+                  0x89, 0x8a, 0x8d, 0x8e, 0x95, 0x99, 0xbb, 0xfe] {
+            assert!(Opcode::is_tapscript_success_byte(b),
+                "byte 0x{b:02x} should be OP_SUCCESS");
+        }
+        // NOT OP_SUCCESS: pushes (0x00..=0x4e), OP_1..OP_16, valid
+        // tapscript opcodes (OP_DUP=0x76, OP_DROP=0x75, OP_CHECKSIG=0xac,
+        // OP_CHECKSIGADD=0xba, OP_CHECKSIGVERIFY=0xad), and the
+        // 0x9a..=0xba range.
+        for b in [0x00u8, 0x01, 0x4b, 0x4c, 0x4d, 0x4e,
+                  0x51, 0x60, 0x61, 0x68, 0x69, 0x75, 0x76,
+                  0x82, 0x87, 0x88, 0x8b, 0x8c, 0x8f, 0x94,
+                  0x9a, 0xa9, 0xac, 0xad, 0xae, 0xaf, 0xba,
+                  0xff] {
+            assert!(!Opcode::is_tapscript_success_byte(b),
+                "byte 0x{b:02x} should NOT be OP_SUCCESS");
+        }
     }
 }
