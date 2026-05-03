@@ -1645,80 +1645,96 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         tracing::error!("Failed to store header {}: {}", block_hash, e);
                     }
 
-                    {
+                    // Validate the block. If validation fails we MUST NOT persist
+                    // the block index entry, advance set_best_block, or update
+                    // RPC state — doing so would corrupt the persisted tip
+                    // pointer to reference an unconnected block, and on the
+                    // next restart ChainState::new would load that hash as
+                    // tip even though no UTXO updates were applied. That
+                    // bug previously broke rustoshi mainnet for ~21 days
+                    // (first failure h=944601 on 2026-04-11; debug.log
+                    // shows zero "Connected block" lines despite tip
+                    // hash advancing across every restart).
+                    let validated = {
                         let mut cs = chain_state.write().await;
-                        if let Err(e) = cs.process_block(&block, &mut utxo_view) {
-                            tracing::warn!(
-                                "Block validation failed at height {}: {}",
-                                height, e
-                            );
+                        match cs.process_block(&block, &mut utxo_view) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Block validation failed at height {}: {}",
+                                    height, e
+                                );
+                                false
+                            }
                         }
-                    }
+                    };
 
-                    // Store block index entry so getblockheader returns height/nTx/chainwork.
-                    {
-                        let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
-                            block_store
-                                .get_block_index(&block.header.prev_block_hash)
-                                .ok()
-                                .flatten()
-                                .map(|e| ChainWork::from_be_bytes(e.chain_work))
-                                .unwrap_or(ChainWork::ZERO)
-                        } else {
-                            ChainWork::ZERO
-                        };
-                        let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
-                        let mut status = BlockStatus::new();
-                        status.set(BlockStatus::VALID_SCRIPTS);
-                        status.set(BlockStatus::HAVE_DATA);
-                        let idx_entry = BlockIndexEntry {
-                            height,
-                            status,
-                            n_tx: block.transactions.len() as u32,
-                            timestamp: block.header.timestamp,
-                            bits: block.header.bits,
-                            nonce: block.header.nonce,
-                            version: block.header.version,
-                            prev_hash: block.header.prev_block_hash,
-                            chain_work: this_work.0,
-                        };
-                        if let Err(e) = block_store.put_block_index(&block_hash, &idx_entry) {
-                            tracing::error!("Failed to store block index at height {}: {}", height, e);
+                    if validated {
+                        // Store block index entry so getblockheader returns height/nTx/chainwork.
+                        {
+                            let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
+                                block_store
+                                    .get_block_index(&block.header.prev_block_hash)
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| ChainWork::from_be_bytes(e.chain_work))
+                                    .unwrap_or(ChainWork::ZERO)
+                            } else {
+                                ChainWork::ZERO
+                            };
+                            let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
+                            let mut status = BlockStatus::new();
+                            status.set(BlockStatus::VALID_SCRIPTS);
+                            status.set(BlockStatus::HAVE_DATA);
+                            let idx_entry = BlockIndexEntry {
+                                height,
+                                status,
+                                n_tx: block.transactions.len() as u32,
+                                timestamp: block.header.timestamp,
+                                bits: block.header.bits,
+                                nonce: block.header.nonce,
+                                version: block.header.version,
+                                prev_hash: block.header.prev_block_hash,
+                                chain_work: this_work.0,
+                            };
+                            if let Err(e) = block_store.put_block_index(&block_hash, &idx_entry) {
+                                tracing::error!("Failed to store block index at height {}: {}", height, e);
+                            }
                         }
-                    }
 
-                    if utxo_view.needs_flush() {
-                        let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
-                        let entries = utxo_view.cache_len();
-                        if let Err(e) = utxo_view.flush() {
-                            tracing::error!("UTXO cache flush failed: {}", e);
-                        } else {
+                        if utxo_view.needs_flush() {
+                            let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
+                            let entries = utxo_view.cache_len();
+                            if let Err(e) = utxo_view.flush() {
+                                tracing::error!("UTXO cache flush failed: {}", e);
+                            } else {
+                                tracing::info!(
+                                    "UTXO cache flushed: {} entries, ~{} MiB at height {}",
+                                    entries, cache_mb, height
+                                );
+                            }
+                        }
+
+                        if let Err(e) = block_store.set_best_block(&block_hash, height) {
+                            tracing::error!("Failed to update best block: {}", e);
+                        }
+
+                        {
+                            let mut rpc = rpc_state.write().await;
+                            if height > rpc.best_height {
+                                rpc.best_height = height;
+                                rpc.best_hash = block_hash;
+                            }
+                        }
+
+                        if height.is_multiple_of(10000) {
                             tracing::info!(
-                                "UTXO cache flushed: {} entries, ~{} MiB at height {}",
-                                entries, cache_mb, height
+                                "Synced to height {} ({:.1}%) cache={} MiB",
+                                height,
+                                block_downloader.progress(),
+                                utxo_view.estimated_memory() / (1024 * 1024),
                             );
                         }
-                    }
-
-                    if let Err(e) = block_store.set_best_block(&block_hash, height) {
-                        tracing::error!("Failed to update best block: {}", e);
-                    }
-
-                    {
-                        let mut rpc = rpc_state.write().await;
-                        if height > rpc.best_height {
-                            rpc.best_height = height;
-                            rpc.best_hash = block_hash;
-                        }
-                    }
-
-                    if height.is_multiple_of(10000) {
-                        tracing::info!(
-                            "Synced to height {} ({:.1}%) cache={} MiB",
-                            height,
-                            block_downloader.progress(),
-                            utxo_view.estimated_memory() / (1024 * 1024),
-                        );
                     }
 
                     blocks_validated += 1;
@@ -1989,105 +2005,115 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         tracing::error!("Failed to store header {}: {}", block_hash, e);
                                     }
 
-                                    // Validate block and update UTXO set
-                                    {
+                                    // Validate block and update UTXO set. If validation
+                                    // fails we MUST NOT persist the block index entry,
+                                    // advance set_best_block, or update RPC state — see
+                                    // the matching site in the validation_interval branch
+                                    // above for the full rationale.
+                                    let validated = {
                                         let mut cs = chain_state.write().await;
-                                        if let Err(e) = cs.process_block(&block, &mut utxo_view) {
-                                            tracing::warn!(
-                                                "Block validation failed at height {}: {}",
-                                                height, e
-                                            );
+                                        match cs.process_block(&block, &mut utxo_view) {
+                                            Ok(_) => true,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Block validation failed at height {}: {}",
+                                                    height, e
+                                                );
+                                                false
+                                            }
                                         }
-                                    }
+                                    };
 
-                                    // Store block index entry so getblockheader returns height/nTx/chainwork.
-                                    {
-                                        let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
-                                            block_store
-                                                .get_block_index(&block.header.prev_block_hash)
-                                                .ok()
-                                                .flatten()
-                                                .map(|e| ChainWork::from_be_bytes(e.chain_work))
-                                                .unwrap_or(ChainWork::ZERO)
-                                        } else {
-                                            ChainWork::ZERO
-                                        };
-                                        let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
-                                        let mut status = BlockStatus::new();
-                                        status.set(BlockStatus::VALID_SCRIPTS);
-                                        status.set(BlockStatus::HAVE_DATA);
-                                        let idx_entry = BlockIndexEntry {
-                                            height,
-                                            status,
-                                            n_tx: block.transactions.len() as u32,
-                                            timestamp: block.header.timestamp,
-                                            bits: block.header.bits,
-                                            nonce: block.header.nonce,
-                                            version: block.header.version,
-                                            prev_hash: block.header.prev_block_hash,
-                                            chain_work: this_work.0,
-                                        };
-                                        if let Err(e) = block_store.put_block_index(&block_hash, &idx_entry) {
-                                            tracing::error!("Failed to store block index at height {}: {}", height, e);
+                                    if validated {
+                                        // Store block index entry so getblockheader returns height/nTx/chainwork.
+                                        {
+                                            let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
+                                                block_store
+                                                    .get_block_index(&block.header.prev_block_hash)
+                                                    .ok()
+                                                    .flatten()
+                                                    .map(|e| ChainWork::from_be_bytes(e.chain_work))
+                                                    .unwrap_or(ChainWork::ZERO)
+                                            } else {
+                                                ChainWork::ZERO
+                                            };
+                                            let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
+                                            let mut status = BlockStatus::new();
+                                            status.set(BlockStatus::VALID_SCRIPTS);
+                                            status.set(BlockStatus::HAVE_DATA);
+                                            let idx_entry = BlockIndexEntry {
+                                                height,
+                                                status,
+                                                n_tx: block.transactions.len() as u32,
+                                                timestamp: block.header.timestamp,
+                                                bits: block.header.bits,
+                                                nonce: block.header.nonce,
+                                                version: block.header.version,
+                                                prev_hash: block.header.prev_block_hash,
+                                                chain_work: this_work.0,
+                                            };
+                                            if let Err(e) = block_store.put_block_index(&block_hash, &idx_entry) {
+                                                tracing::error!("Failed to store block index at height {}: {}", height, e);
+                                            }
                                         }
-                                    }
 
-                                    // Flush UTXO cache if it exceeds the 2 GiB limit
-                                    if utxo_view.needs_flush() {
-                                        let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
-                                        let entries = utxo_view.cache_len();
-                                        if let Err(e) = utxo_view.flush() {
-                                            tracing::error!("UTXO cache flush failed: {}", e);
-                                        } else {
+                                        // Flush UTXO cache if it exceeds the 2 GiB limit
+                                        if utxo_view.needs_flush() {
+                                            let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
+                                            let entries = utxo_view.cache_len();
+                                            if let Err(e) = utxo_view.flush() {
+                                                tracing::error!("UTXO cache flush failed: {}", e);
+                                            } else {
+                                                tracing::info!(
+                                                    "UTXO cache flushed: {} entries, ~{} MiB at height {}",
+                                                    entries, cache_mb, height
+                                                );
+                                            }
+                                        }
+
+                                        // Update database tip
+                                        if let Err(e) = block_store.set_best_block(&block_hash, height) {
+                                            tracing::error!("Failed to update best block: {}", e);
+                                        }
+
+                                        // Update RPC state and clean mempool
+                                        {
+                                            let mut rpc = rpc_state.write().await;
+                                            if height > rpc.best_height {
+                                                rpc.best_height = height;
+                                                rpc.best_hash = block_hash;
+                                            }
+
+                                            // Remove confirmed transactions from mempool
+                                            let block_txids: Vec<Hash256> = block
+                                                .transactions
+                                                .iter()
+                                                .map(|tx| tx.txid())
+                                                .collect();
+                                            let block_spent: Vec<OutPoint> = block
+                                                .transactions
+                                                .iter()
+                                                .flat_map(|tx| {
+                                                    tx.inputs.iter().map(|i| i.previous_output.clone())
+                                                })
+                                                .collect();
+                                            rpc.mempool
+                                                .remove_for_block(&block_txids, &block_spent);
+
+                                            // Clear recently-rejected filter -- rejection reasons
+                                            // may no longer apply after a new block
+                                            rpc.recently_rejected.clear();
+                                        }
+
+                                        // Progress logging
+                                        if height.is_multiple_of(10000) {
                                             tracing::info!(
-                                                "UTXO cache flushed: {} entries, ~{} MiB at height {}",
-                                                entries, cache_mb, height
+                                                "Synced to height {} ({:.1}%) cache={} MiB",
+                                                height,
+                                                block_downloader.progress(),
+                                                utxo_view.estimated_memory() / (1024 * 1024),
                                             );
                                         }
-                                    }
-
-                                    // Update database tip
-                                    if let Err(e) = block_store.set_best_block(&block_hash, height) {
-                                        tracing::error!("Failed to update best block: {}", e);
-                                    }
-
-                                    // Update RPC state and clean mempool
-                                    {
-                                        let mut rpc = rpc_state.write().await;
-                                        if height > rpc.best_height {
-                                            rpc.best_height = height;
-                                            rpc.best_hash = block_hash;
-                                        }
-
-                                        // Remove confirmed transactions from mempool
-                                        let block_txids: Vec<Hash256> = block
-                                            .transactions
-                                            .iter()
-                                            .map(|tx| tx.txid())
-                                            .collect();
-                                        let block_spent: Vec<OutPoint> = block
-                                            .transactions
-                                            .iter()
-                                            .flat_map(|tx| {
-                                                tx.inputs.iter().map(|i| i.previous_output.clone())
-                                            })
-                                            .collect();
-                                        rpc.mempool
-                                            .remove_for_block(&block_txids, &block_spent);
-
-                                        // Clear recently-rejected filter -- rejection reasons
-                                        // may no longer apply after a new block
-                                        rpc.recently_rejected.clear();
-                                    }
-
-                                    // Progress logging
-                                    if height.is_multiple_of(10000) {
-                                        tracing::info!(
-                                            "Synced to height {} ({:.1}%) cache={} MiB",
-                                            height,
-                                            block_downloader.progress(),
-                                            utxo_view.estimated_memory() / (1024 * 1024),
-                                        );
                                     }
 
                                     blocks_validated += 1;
