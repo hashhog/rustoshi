@@ -2676,14 +2676,19 @@ fn verify_witness_program(
                 } else {
                     Err(ScriptError::WitnessProgramMismatch)
                 }
-            } else if program.len() != 32 && flags.verify_taproot {
-                Err(ScriptError::WitnessProgramWrongLength)
+            } else if program.len() == 2 && program[0] == 0x4e && program[1] == 0x73 {
+                // BIP-444 Pay-to-Anchor (P2A): OP_1 <0x4e73>. Always spendable;
+                // the relay DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM flag does NOT
+                // apply (Core script/interpreter.cpp:1990 returns true
+                // unconditionally for P2A).
+                Ok(())
             } else {
-                // Taproot not active or program length != 32: unknown witness program
+                // v1 + non-32 (non-P2A) or taproot inactive: anyone-can-spend
+                // per BIP-141 forward soft-fork compatibility, with optional
+                // relay-only DISCOURAGE flag.
                 if flags.verify_discourage_upgradable_witness_program {
                     return Err(ScriptError::WitnessProgramLength);
                 }
-                // Anyone-can-spend
                 Ok(())
             }
         }
@@ -4170,5 +4175,88 @@ mod tests {
         let res = eval_script(&mut stack, &script, &flags, &checker, SigVersion::WitnessV0);
         assert!(res.is_ok(), "legacy CHECKSIG with empty sig should push false: {res:?}");
         assert!(!stack_bool(&stack[0]));
+    }
+
+    // Regression test for the 945,394 P2A wedge (would have hit on next IBD
+    // attempt past height 944,183). Pre-fix, verify_witness_program rejected
+    // every v1 program with length != 32 as `WitnessProgramWrongLength`,
+    // even when verify_taproot was on. Per BIP-141 / Core
+    // script/interpreter.cpp:1947-1998 only v0 with bad length is a
+    // consensus failure; v1 + non-32 (and v2-v16) are anyone-can-spend, with
+    // P2A explicitly recognized. Mainnet block 945,394 tx 26b9fa21bb16d8fb...
+    // input 0 spends a P2A output with prevout 0x51024e73.
+
+    #[test]
+    fn verify_witness_program_p2a_succeeds() {
+        // BIP-444 P2A: v1 + 0x4e73 + empty witness must succeed regardless
+        // of verify_taproot.
+        let program = [0x4eu8, 0x73];
+        let witness: Vec<Vec<u8>> = vec![];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker);
+        assert!(result.is_ok(), "P2A spend should succeed: {result:?}");
+    }
+
+    #[test]
+    fn verify_witness_program_p2a_unconditional_vs_discourage() {
+        // P2A is unconditionally valid (Core line 1990 returns true regardless
+        // of DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM).
+        let program = [0x4eu8, 0x73];
+        let witness: Vec<Vec<u8>> = vec![];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        flags.verify_discourage_upgradable_witness_program = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker);
+        assert!(result.is_ok(), "P2A must bypass DISCOURAGE flag: {result:?}");
+    }
+
+    #[test]
+    fn verify_witness_program_v1_unknown_length_succeeds() {
+        // v1 + non-32, non-P2A program: anyone-can-spend (forward soft fork).
+        let program = [0x00u8; 4];
+        let witness: Vec<Vec<u8>> = vec![];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker);
+        assert!(result.is_ok(), "v1 + 4-byte program must succeed: {result:?}");
+    }
+
+    #[test]
+    fn verify_witness_program_v1_unknown_length_with_discourage_fails() {
+        // Relay-only DISCOURAGE flag rejects unknown v1 lengths.
+        let program = [0u8; 30];
+        let witness: Vec<Vec<u8>> = vec![];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        flags.verify_discourage_upgradable_witness_program = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker);
+        assert!(matches!(result, Err(ScriptError::WitnessProgramLength)),
+            "DISCOURAGE flag must reject v1+30-byte: {result:?}");
+    }
+
+    #[test]
+    fn verify_witness_program_v0_wrong_length_still_consensus_fails() {
+        // Regression: the v0 length check is consensus per BIP141 and must
+        // NOT have been weakened by the v1 forward-compat fix.
+        // (Rustoshi uses `WitnessProgramLength` for the v0 path; the buggy
+        // v1 path that this commit replaced was the only one using
+        // `WitnessProgramWrongLength`.)
+        let program = [0u8; 16]; // v0 + 16 bytes (not 20, not 32)
+        let witness: Vec<Vec<u8>> = vec![];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        assert!(matches!(result, Err(ScriptError::WitnessProgramLength)),
+            "v0 + non-20/non-32 must still fail wrong-length: {result:?}");
     }
 }
