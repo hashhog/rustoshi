@@ -26,8 +26,9 @@
 
 use crate::params::{ChainParams, MEDIAN_TIME_PAST_WINDOW};
 use crate::validation::{
-    check_block, connect_block, contextual_check_block, disconnect_block, BlockIndexEntry,
-    CoinEntry, StubChainContext, UndoData, UtxoView, ValidationError,
+    check_block, connect_block_with_sequence_locks, contextual_check_block, disconnect_block,
+    BlockIndexEntry, CoinEntry, SequenceLockContext, StubChainContext, UndoData, UtxoView,
+    ValidationError,
 };
 use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint};
 use std::collections::HashMap;
@@ -369,16 +370,33 @@ impl ChainState {
     ///
     /// Returns the fees collected in the block and the undo data.
     ///
+    /// # MTP semantics (BIP-113 / CSV)
+    ///
+    /// `prev_block_mtp` is the median-time-past of the parent block. When CSV
+    /// is active (mainnet h>=419,328), this value is used as the
+    /// `lock_time_cutoff` in `is_final_tx` (Core `validation.cpp::ContextualCheckBlock`)
+    /// AND as the time component for BIP-68 sequence-lock checks
+    /// (`check_sequence_locks`). Pass `0` only when MTP cannot be computed
+    /// (e.g. genesis-adjacent / fewer than 11 ancestors); for any block past
+    /// the CSV height, `0` will reject every transaction with a timestamp-
+    /// based locktime > 0 with `bad-txns-nonfinal`.
+    ///
+    /// Callers running on top of the block store should compute `prev_block_mtp`
+    /// via `compute_mtp_via_store(&block_store, &chain_state.tip_hash())`
+    /// (see `rustoshi/src/main.rs::compute_mtp_via_store`).
+    ///
     /// # Errors
     /// Returns `ValidationError` if:
     /// - The block doesn't extend our chain (prev_hash mismatch)
     /// - The block fails context-free validation
     /// - The block fails script verification
     /// - The block subsidy is invalid
+    /// - A non-coinbase transaction has `nLockTime > prev_block_mtp` (BIP-113)
     pub fn process_block<U: UtxoView>(
         &mut self,
         block: &Block,
         utxo_cache: &mut U,
+        prev_block_mtp: u32,
     ) -> Result<(UndoData, u64), ValidationError> {
         let hash = block.block_hash();
         let new_height = self.tip_height + 1;
@@ -403,8 +421,31 @@ impl ChainState {
         // both gaps to slip through silently (silent consensus split).
         contextual_check_block(block, new_height, &StubChainContext, &self.params)?;
 
-        // Connect block (validates scripts and updates UTXOs)
-        let (undo_data, fees) = connect_block(block, new_height, utxo_cache, &self.params)?;
+        // Connect block (validates scripts and updates UTXOs).
+        //
+        // We pass `prev_block_mtp` so that `is_final_tx` (BIP-113) sees
+        // the parent's median-time-past as `lock_time_cutoff` once CSV is
+        // active.  Without this, every tx with a timestamp-based
+        // `nLockTime > 0` is rejected as `bad-txns-nonfinal` once CSV
+        // activates (mainnet h>=419,328) — this is the regression that
+        // wedged rustoshi at the snapshot tip on 2026-05-02.
+        //
+        // For BIP-68 sequence-lock height-based MTP lookups (the
+        // `seq_context` argument), we still pass a null context: those
+        // queries need MTP at *arbitrary* historical heights, which
+        // requires the full block store. The current `NullSequenceLockContext`
+        // returns 0 for all heights, which only affects time-based
+        // BIP-68 sequence locks (a narrower path than BIP-113).  Wiring
+        // a real `SequenceLockContext` is tracked separately.
+        let null_seq_context = ChainStateNullSeqContext;
+        let (undo_data, fees) = connect_block_with_sequence_locks(
+            block,
+            new_height,
+            utxo_cache,
+            &self.params,
+            &null_seq_context,
+            prev_block_mtp,
+        )?;
 
         // Update tip
         self.tip_hash = hash;
@@ -531,7 +572,33 @@ impl ChainState {
             // every block connected via reorg too.  See process_block for
             // the full rationale.
             contextual_check_block(&block, new_height, &StubChainContext, &self.params)?;
-            let (_undo, _fees) = connect_block(&block, new_height, utxo_cache, &self.params)?;
+            // BIP-113: compute the parent's median-time-past so that
+            // `is_final_tx` (called from `connect_block_with_sequence_locks`)
+            // uses the correct `lock_time_cutoff` once CSV is active.
+            // Walks 11 ancestors via the `get_block` closure.  Returns 0
+            // when fewer than 11 ancestors are reachable (genesis-adjacent),
+            // matching `process_block`'s null-context behaviour.
+            //
+            // Without this, the reorg path mirrors the pre-fix
+            // `process_block` bug: every tx with a timestamp-based
+            // `nLockTime > 0` is rejected as `bad-txns-nonfinal` once
+            // CSV activates (mainnet h>=419,328) — wedge described in
+            // CORE-PARITY-AUDIT/_OVERNIGHT-STATUS-MORNING.md.
+            //
+            // Reference: bitcoin-core/src/validation.cpp ConnectBlock
+            // (~line 2486) which feeds `pindex->pprev->GetMedianTimePast()`
+            // into the IsFinalTx call.
+            let prev_block_mtp =
+                compute_mtp_via_get_block(&self.tip_hash, get_block);
+            let null_seq_context = ChainStateNullSeqContext;
+            let (_undo, _fees) = connect_block_with_sequence_locks(
+                &block,
+                new_height,
+                utxo_cache,
+                &self.params,
+                &null_seq_context,
+                prev_block_mtp,
+            )?;
             self.tip_hash = *hash;
             self.tip_height = new_height;
         }
@@ -654,6 +721,59 @@ impl ChainState {
     /// Clear the MTP cache.
     pub fn clear_mtp_cache(&mut self) {
         self.mtp_cache.clear();
+    }
+}
+
+/// Compute median-time-past (MTP) by walking 11 ancestors via the
+/// `get_block` closure used in the reorg path.
+///
+/// Returns 0 when fewer than `MEDIAN_TIME_PAST_WINDOW` ancestors are
+/// reachable (genesis-adjacent), matching the convention in
+/// `rustoshi/src/main.rs::compute_mtp_via_store` and Core's
+/// `CBlockIndex::GetMedianTimePast` for short chains.
+///
+/// Reference: bitcoin-core/src/chain.h CBlockIndex::GetMedianTimePast.
+fn compute_mtp_via_get_block<FB>(tip_hash: &Hash256, get_block: &FB) -> u32
+where
+    FB: Fn(&Hash256) -> Option<Block>,
+{
+    let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
+    let mut current = *tip_hash;
+    for _ in 0..MEDIAN_TIME_PAST_WINDOW {
+        match get_block(&current) {
+            Some(block) => {
+                timestamps.push(block.header.timestamp);
+                if block.header.prev_block_hash == Hash256::ZERO {
+                    break;
+                }
+                current = block.header.prev_block_hash;
+            }
+            None => return 0,
+        }
+    }
+    if timestamps.is_empty() {
+        return 0;
+    }
+    timestamps.sort_unstable();
+    timestamps[timestamps.len() / 2]
+}
+
+/// `SequenceLockContext` impl used by `process_block` for the time-based
+/// component of BIP-68 sequence-lock checks.
+///
+/// `ChainState` does not own a block store / header index, so it cannot
+/// look up MTP at arbitrary historical heights.  Returning 0 here matches
+/// the prior behaviour of the `NullSequenceLockContext` private type that
+/// `connect_block` (the no-MTP wrapper) defaulted to.
+///
+/// The BIP-113 `lock_time_cutoff` (used by `is_final_tx`) is a SEPARATE
+/// path — it's passed through `prev_block_mtp` to
+/// `connect_block_with_sequence_locks`, NOT looked up via this context.
+struct ChainStateNullSeqContext;
+
+impl SequenceLockContext for ChainStateNullSeqContext {
+    fn get_mtp_at_height(&self, _height: u32) -> u32 {
+        0
     }
 }
 
@@ -853,7 +973,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache);
+        let result = state.process_block(&block, &mut cache, 0);
 
         assert!(result.is_err());
         match result {
@@ -943,7 +1063,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache);
+        let result = state.process_block(&block, &mut cache, 0);
         if let Err(ValidationError::PrevBlockNotFound(h)) = &result {
             panic!(
                 "ChainState::new(snapshot_hash, snapshot_height) did not bind \
@@ -1017,7 +1137,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache);
+        let result = state.process_block(&block, &mut cache, 0);
 
         // We may get *some* validation error (e.g. the merkle root may be
         // computed differently, or PoW may fail), but we MUST NOT get
@@ -1774,7 +1894,7 @@ mod tests {
         // Recompute merkle root so we don't fail check_block first.
         block.header.merkle_root = block.compute_merkle_root();
 
-        let result = state.process_block(&block, &mut cache);
+        let result = state.process_block(&block, &mut cache, 0);
         // Either BadWitnessCommitment surfaces, or pow check fires first
         // (depends on regtest params).  We accept either rejection — the
         // critical thing is that the block is NOT silently accepted.

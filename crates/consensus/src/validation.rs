@@ -103,6 +103,12 @@ pub enum ValidationError {
 
     #[error("non-final transaction: bad-txns-nonfinal")]
     NonFinalTx,
+
+    /// BIP-30: a transaction in this block would overwrite an existing UTXO.
+    /// Reference: Bitcoin Core validation.cpp ConnectBlock — rejects with
+    /// "bad-txns-BIP30" when HaveCoin() is true for any output of a block tx.
+    #[error("bad-txns-BIP30: tried to overwrite transaction")]
+    Bip30DuplicateOutput,
 }
 
 /// Errors that can occur during transaction validation.
@@ -178,6 +184,8 @@ impl ValidationError {
             ValidationError::DuplicateTx(_) => "bad-txns-duplicate",
             // Non-final transaction
             ValidationError::NonFinalTx => "bad-txns-nonfinal",
+            // BIP-30: tx output would overwrite existing UTXO
+            ValidationError::Bip30DuplicateOutput => "bad-txns-BIP30",
             // BIP-34 coinbase height encoding
             ValidationError::BadCoinbaseHeight => "bad-cb-height",
             // Time checks
@@ -1232,6 +1240,40 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
         }
     }
 
+    // BIP-30: reject any block whose transactions would overwrite an existing
+    // unspent output in the UTXO set (CVE-2012-1909).
+    //
+    // Two mainnet blocks (h=91842 and h=91880) predate BIP-30 and intentionally
+    // duplicate earlier coinbase txids; they are permanently exempted by block
+    // height.  After BIP-34 activation (h≥bip34_height), the height-in-coinbase
+    // rule makes duplicate txids practically impossible, so the check is skipped
+    // for performance.  However, at h≥1,983,702 BIP-34 modular arithmetic begins
+    // to repeat pre-BIP34 coinbase heights, so the check is re-enabled there.
+    //
+    // Reference: Bitcoin Core validation.cpp ConnectBlock (around line 2467-2476)
+    // and IsBIP30Repeat().
+    let bip34_implies_bip30_limit: u32 = 1_983_702;
+    let is_bip30_exception = params.bip30_exception_heights.contains(&height);
+    let enforce_bip30 = if is_bip30_exception {
+        false
+    } else if height >= params.bip34_height && height < bip34_implies_bip30_limit {
+        // BIP-34 makes duplicates practically impossible in this range
+        false
+    } else {
+        true
+    };
+    if enforce_bip30 {
+        for tx in &block.transactions {
+            let txid = tx.txid();
+            for vout in 0..tx.outputs.len() {
+                let outpoint = OutPoint { txid, vout: vout as u32 };
+                if utxo_view.get_utxo(&outpoint).is_some() {
+                    return Err(ValidationError::Bip30DuplicateOutput);
+                }
+            }
+        }
+    }
+
     // Validate each transaction
     for tx in &block.transactions {
         // Skip coinbase for input validation (it has no real inputs)
@@ -1693,6 +1735,42 @@ pub fn connect_block_parallel_with_cache_and_sequence_locks<C: SequenceLockConte
     let mut spent_coins = Vec::new();
     let mut tx_coins: Vec<Vec<CoinEntry>> = Vec::new();
     let mut block_sigop_cost: u64 = 0;
+
+    // IsFinalTx: all transactions must be final at this block's height/time.
+    let lock_time_cutoff_par = if csv_active {
+        prev_block_mtp
+    } else {
+        block.header.timestamp
+    };
+    for tx in &block.transactions {
+        if !is_final_tx(tx, height, lock_time_cutoff_par) {
+            return Err(ValidationError::NonFinalTx);
+        }
+    }
+
+    // BIP-30: reject blocks that would overwrite an existing UTXO.
+    // Same logic as the sequential connect_block_with_sequence_locks.
+    // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+    let bip34_implies_bip30_limit_par: u32 = 1_983_702;
+    let is_bip30_exception_par = params.bip30_exception_heights.contains(&height);
+    let enforce_bip30_par = if is_bip30_exception_par {
+        false
+    } else if height >= params.bip34_height && height < bip34_implies_bip30_limit_par {
+        false
+    } else {
+        true
+    };
+    if enforce_bip30_par {
+        for tx in &block.transactions {
+            let txid = tx.txid();
+            for vout in 0..tx.outputs.len() {
+                let outpoint = OutPoint { txid, vout: vout as u32 };
+                if utxo_view.get_utxo(&outpoint).is_some() {
+                    return Err(ValidationError::Bip30DuplicateOutput);
+                }
+            }
+        }
+    }
 
     // First pass: validate inputs and collect coins
     for tx in &block.transactions {
@@ -3683,5 +3761,307 @@ mod tests {
         let params = ChainParams::regtest();
         let res = contextual_check_block(&block, 5, &StubChainContext, &params);
         assert!(res.is_ok(), "canonical BIP-34 coinbase must pass: {res:?}");
+    }
+
+    // ============================================================
+    // BIP-30 enforcement tests
+    //
+    // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+    // Mainnet exception heights: 91842 and 91880.
+    // ============================================================
+
+    /// Minimal in-memory UTXO view for BIP-30 tests.
+    struct Bip30Utxo(HashMap<OutPoint, CoinEntry>);
+    impl UtxoView for Bip30Utxo {
+        fn get_utxo(&self, op: &OutPoint) -> Option<CoinEntry> { self.0.get(op).cloned() }
+        fn add_utxo(&mut self, op: &OutPoint, coin: CoinEntry) { self.0.insert(op.clone(), coin); }
+        fn spend_utxo(&mut self, op: &OutPoint) { self.0.remove(op); }
+    }
+
+    impl Bip30Utxo {
+        fn new() -> Self { Bip30Utxo(HashMap::new()) }
+        fn seed_coin(&mut self, txid: Hash256) {
+            // Pre-populate output 0 of `txid` to simulate an existing UTXO.
+            self.0.insert(OutPoint { txid, vout: 0 }, CoinEntry {
+                height: 1000,
+                is_coinbase: true,
+                value: 100,
+                script_pubkey: vec![0x51],
+            });
+        }
+    }
+
+    /// Build a minimal valid block (regtest PoW) with a given coinbase.
+    fn make_bip30_test_block(coinbase: Transaction) -> Block {
+        use rustoshi_primitives::BlockHeader;
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        }
+    }
+
+    /// Return mainnet params (with correct BIP-30 exception heights 91842/91880
+    /// and bip34_height=227931) but swap in the regtest PoW limit so that any
+    /// block hash passes the PoW check without mining.
+    fn bip30_test_params() -> ChainParams {
+        let mut p = ChainParams::mainnet();
+        // Regtest PoW limit: 0x7fff...ff (first byte 0x7f, rest 0xff).
+        // With bits=0x207fffff any block hash satisfies this target.
+        let mut regtest_limit = [0xffu8; 32];
+        regtest_limit[0] = 0x7f;
+        p.pow_limit = regtest_limit;
+        p
+    }
+
+    #[test]
+    fn bip30_exempt_at_91842() {
+        // h=91842 is a BIP-30 exception block. Even if the UTXO set already
+        // has an entry at the coinbase txid:vout, the block must NOT be rejected.
+        let params = bip30_test_params();
+        let coinbase = make_coinbase_tx(91842, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid); // pre-existing UTXO at same txid
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 91842, &mut utxo, &params, &null_ctx, 0,
+        );
+        // Must not be Bip30DuplicateOutput (may succeed or fail for another reason).
+        assert!(
+            !matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "h=91842 must be BIP-30 exempt; got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn bip30_exempt_at_91880() {
+        // h=91880 is the second BIP-30 exception block.
+        let params = bip30_test_params();
+        let coinbase = make_coinbase_tx(91880, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid);
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 91880, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(
+            !matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "h=91880 must be BIP-30 exempt; got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn bip30_enforced_at_91843() {
+        // h=91843 is NOT a BIP-30 exception and is pre-BIP34 (bip34_height=227931).
+        // A duplicate coinbase txid MUST be rejected.
+        let params = bip30_test_params();
+        let coinbase = make_coinbase_tx(91843, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid);
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 91843, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(
+            matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "h=91843 must enforce BIP-30; got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn bip30_old_wrong_heights_not_exempt() {
+        // The previously wrong exception heights (91722, 91812) must NOT be exempt.
+        let params = bip30_test_params();
+        let null_ctx = NullSequenceLockContext;
+
+        for wrong_h in [91722u32, 91812u32] {
+            let coinbase = make_coinbase_tx(wrong_h, 5_000_000_000);
+            let coinbase_txid = coinbase.txid();
+            let block = make_bip30_test_block(coinbase);
+
+            let mut utxo = Bip30Utxo::new();
+            utxo.seed_coin(coinbase_txid);
+
+            let result = connect_block_with_sequence_locks(
+                &block, wrong_h, &mut utxo, &params, &null_ctx, 0,
+            );
+            assert!(
+                matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+                "h={wrong_h}: must enforce BIP-30 (old wrong exception height); got: {result:?}",
+            );
+        }
+    }
+
+    // ============================================================
+    // BIP-113 lock_time_cutoff = parent MTP regression
+    //
+    // Regression for the 2026-05-02 wedge at mainnet h=944,184: when
+    // CSV is active (mainnet h>=419,328) and `prev_block_mtp` is
+    // hardcoded to 0, every tx with a timestamp-based `nLockTime > 0`
+    // is rejected as `bad-txns-nonfinal`.  After the fix,
+    // `connect_block_with_sequence_locks` honours the caller-supplied
+    // `prev_block_mtp` and the same block validates cleanly.
+    //
+    // Reference: bitcoin-core/src/validation.cpp ConnectBlock — feeds
+    // `pindex->pprev->GetMedianTimePast()` into the `IsFinalTx` call;
+    // bitcoin-core/src/consensus/tx_verify.cpp IsFinalTx.
+    // ============================================================
+
+    /// Build a non-coinbase tx with a timestamp-based `nLockTime` whose
+    /// finality depends on the parent's median-time-past (BIP-113).
+    fn make_timestamp_locktime_tx(prev_txid: Hash256, lock_time: u32) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![0x51], // OP_1
+                sequence: 0x00000000,    // NOT SEQUENCE_FINAL — locktime applies
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50, script_pubkey: vec![0x51] }],
+            lock_time,
+        }
+    }
+
+    fn seeded_utxo(txid: Hash256) -> Bip30Utxo {
+        let mut u = Bip30Utxo::new();
+        u.0.insert(
+            OutPoint { txid, vout: 0 },
+            CoinEntry {
+                height: 1,
+                is_coinbase: false,
+                value: 100,
+                script_pubkey: vec![0x51],
+            },
+        );
+        u
+    }
+
+    #[test]
+    fn bip113_zero_mtp_rejects_timestamp_locktime_post_csv() {
+        // Mirrors the production bug: with CSV active and
+        // prev_block_mtp = 0, every timestamp-based locktime > 0 is
+        // rejected as bad-txns-nonfinal.
+        let params = bip30_test_params(); // mainnet params + regtest pow_limit
+        let prev_txid = Hash256::from_bytes([1u8; 32]);
+        // 1_577_836_800 = 2020-01-01 UTC, well above LOCKTIME_THRESHOLD
+        let tx = make_timestamp_locktime_tx(prev_txid, 1_577_836_800);
+        let coinbase = make_coinbase_tx(944_184, 5_000_000_000);
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_700_000_000,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, tx],
+        };
+
+        let mut utxo = seeded_utxo(prev_txid);
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 944_184, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(
+            matches!(result, Err(ValidationError::NonFinalTx)),
+            "with prev_block_mtp=0, timestamp-locktime tx must be rejected (control \
+             for the 944,184 wedge); got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bip113_correct_mtp_accepts_timestamp_locktime_post_csv() {
+        // Same block as above, but with prev_block_mtp set to a value
+        // strictly greater than the locktime — the tx is now final
+        // and the IsFinalTx check passes.  (The block may still fail
+        // a later check; we only care that it does NOT fail with
+        // `NonFinalTx` once MTP is plumbed through.)
+        let params = bip30_test_params();
+        let prev_txid = Hash256::from_bytes([1u8; 32]);
+        let lock_time = 1_577_836_800u32;
+        let tx = make_timestamp_locktime_tx(prev_txid, lock_time);
+        let coinbase = make_coinbase_tx(944_184, 5_000_000_000);
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_700_000_000,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, tx],
+        };
+
+        let mut utxo = seeded_utxo(prev_txid);
+        let null_ctx = NullSequenceLockContext;
+        // prev_block_mtp = lock_time + 1 → tx is final.
+        let result = connect_block_with_sequence_locks(
+            &block, 944_184, &mut utxo, &params, &null_ctx, lock_time + 1,
+        );
+        assert!(
+            !matches!(result, Err(ValidationError::NonFinalTx)),
+            "with correct prev_block_mtp > lock_time, tx must NOT be rejected as \
+             non-final; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bip113_zero_mtp_pre_csv_uses_block_timestamp() {
+        // Pre-CSV (mainnet h < 419,328): `lock_time_cutoff` falls back
+        // to the block timestamp, NOT prev_block_mtp.  So the same tx
+        // with a timestamp-locktime less than the block timestamp must
+        // pass IsFinalTx even when prev_block_mtp = 0.
+        let params = bip30_test_params(); // mainnet csv_height = 419,328
+        let prev_txid = Hash256::from_bytes([1u8; 32]);
+        let lock_time = 1_577_836_800u32;
+        let tx = make_timestamp_locktime_tx(prev_txid, lock_time);
+        let coinbase = make_coinbase_tx(100_000, 5_000_000_000);
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: lock_time + 1, // strictly greater → tx final via block ts
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, tx],
+        };
+
+        let mut utxo = seeded_utxo(prev_txid);
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 100_000, &mut utxo, &params, &null_ctx, 0,
+        );
+        // Pre-CSV: must NOT be NonFinalTx with this construction.
+        assert!(
+            !matches!(result, Err(ValidationError::NonFinalTx)),
+            "pre-CSV (h=100,000) timestamp-locktime tx must validate against the \
+             block timestamp, not prev_block_mtp; got: {result:?}"
+        );
     }
 }
