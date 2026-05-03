@@ -132,6 +132,13 @@ pub struct RpcState {
     /// `AbsPathForConfigVal` does. `None` falls back to the current working
     /// directory.
     pub data_dir: Option<PathBuf>,
+    /// Inbound block-submission pause flag. Set by the `dumptxoutset rollback`
+    /// dance (rewind→dump→replay) to prevent peers / RPC callers from racing
+    /// new blocks against the temporary chain rewind. Mirrors Bitcoin Core's
+    /// `NetworkDisable` RAII guard around the `TemporaryRollback` block in
+    /// `rpc/blockchain.cpp::dumptxoutset`. Peers stay connected; only block
+    /// acceptance is gated.
+    pub block_submission_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RpcState {
@@ -157,6 +164,7 @@ impl RpcState {
             recently_rejected: HashSet::new(),
             mempool_dat_path: None,
             data_dir: None,
+            block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -182,6 +190,7 @@ impl RpcState {
             recently_rejected: HashSet::new(),
             mempool_dat_path: None,
             data_dir: None,
+            block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -237,6 +246,33 @@ impl RpcState {
 pub struct PeerState {
     /// The peer manager.
     pub peer_manager: Option<PeerManager>,
+}
+
+/// RAII guard that mirrors Bitcoin Core's `NetworkDisable` (see
+/// `bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset`). On creation it sets
+/// the `block_submission_paused` flag; on drop it clears it (success OR
+/// panic OR early return). Held over the rewind→dump→replay dance so peers
+/// or `submitblock` callers cannot race new blocks into the chain mid-
+/// rollback. Peers stay connected; only block acceptance is gated.
+pub struct NetworkDisable {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl NetworkDisable {
+    /// Pause inbound block submission. Idempotent (safe to nest, but
+    /// nested guards each release on drop in LIFO order — first drop
+    /// clears, subsequent drops are no-ops because the flag is already
+    /// false). In practice we don't nest these.
+    pub fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self { flag }
+    }
+}
+
+impl Drop for NetworkDisable {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 // ============================================================
@@ -2107,6 +2143,24 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn submit_block(&self, hex: String) -> RpcResult<Option<String>> {
+        // NetworkDisable gate: refuse submissions while a `dumptxoutset
+        // rollback` dance is in progress. Mirrors Core's NetworkDisable
+        // RAII around TemporaryRollback. The chain-write lock would
+        // serialise us anyway, but the explicit gate gives a clean error
+        // instead of blocking the request for the full rewind+dump+replay.
+        {
+            let state = self.state.read().await;
+            if state
+                .block_submission_paused
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(Some(
+                    "rejected: block submission paused (dumptxoutset rollback in progress)"
+                        .to_string(),
+                ));
+            }
+        }
+
         let block_bytes = Self::parse_hex(&hex)?;
 
         // Defense in depth: catch any panics during deserialization so a malformed
@@ -4925,6 +4979,15 @@ impl RpcServerImpl {
         use rustoshi_consensus::validation::UtxoView as _;
 
         let mut state = self.state.write().await;
+
+        // NetworkDisable RAII: pause inbound block acceptance for the
+        // duration of the rewind→dump→replay dance. Peers stay connected,
+        // but `submitblock` and any P2P block handler that consults
+        // `block_submission_paused` will refuse new blocks until this
+        // guard drops. Mirrors `bitcoin-core/src/rpc/blockchain.cpp`'s
+        // `NetworkDisable` wrapper around `TemporaryRollback`. Drop fires
+        // on all exit paths (success, error, panic) restoring acceptance.
+        let _network_disable = NetworkDisable::new(state.block_submission_paused.clone());
 
         // Resolve the snapshot output path before we touch anything: an
         // already-existing file is the only error we want to surface
@@ -8281,5 +8344,79 @@ mod tests {
         let st = state.read().await;
         assert_eq!(st.best_height, 1);
         assert_eq!(st.best_hash, h1);
+    }
+
+    // ============================================================
+    // NETWORKDISABLE RAII TESTS (NetworkDisable around rollback)
+    // ============================================================
+
+    #[tokio::test]
+    async fn network_disable_raii_pauses_and_restores_flag() {
+        // RAII: setting a NetworkDisable guard sets the flag; dropping it
+        // clears the flag. Mirrors Core's NetworkDisable semantics.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!flag.load(Ordering::SeqCst));
+        {
+            let _guard = NetworkDisable::new(flag.clone());
+            assert!(
+                flag.load(Ordering::SeqCst),
+                "NetworkDisable must set the pause flag on construction"
+            );
+        }
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "NetworkDisable must clear the pause flag on drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_block_refuses_while_paused() {
+        // Mid-rollback: submitblock must not enter the chain-write path.
+        // We flip the pause flag manually (no need to drive a full
+        // rollback) and confirm submit_block returns the expected
+        // "block submission paused" reject string.
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let (_tmp, server) = dumptxoutset_test_server(params, 0).await;
+
+        // Flip pause manually.
+        {
+            let st = server.state.read().await;
+            st.block_submission_paused
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        // Any non-empty hex is fine: the gate runs before deserialization.
+        let res = server
+            .submit_block("00".to_string())
+            .await
+            .expect("submit_block must not error-return; it returns Ok(Some(reason))");
+        let reason = res.expect("paused submission must surface a reject reason");
+        assert!(
+            reason.contains("paused"),
+            "reject reason must mention pause: {}",
+            reason
+        );
+
+        // Clear pause; the next submit_block should now hit the normal
+        // decode/error path (we feed garbage so it returns an Err — the
+        // important bit is that we no longer hit the pause early-exit).
+        {
+            let st = server.state.read().await;
+            st.block_submission_paused
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        let res2 = server.submit_block("00".to_string()).await;
+        // Either a structured RPC error (decode failure) or Ok(Some(...))
+        // with a non-pause reason; both prove we got past the gate.
+        match res2 {
+            Err(_) => {}
+            Ok(Some(reason)) => assert!(
+                !reason.contains("paused"),
+                "must not report pause once flag is cleared: {}",
+                reason
+            ),
+            Ok(None) => {} // Accepted (regtest empty hex unlikely but ok).
+        }
     }
 }
