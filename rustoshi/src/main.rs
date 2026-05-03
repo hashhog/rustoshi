@@ -199,6 +199,41 @@ fn resolve_base_datadir(datadir: &str) -> PathBuf {
     PathBuf::from(expanded)
 }
 
+/// Compute the median-time-past (MTP) of the block at `tip_hash` by walking
+/// 11 ancestors via the block store.  Returns `None` if fewer than 11
+/// ancestors are reachable (genesis-adjacent), in which case callers
+/// should skip the MTP-vs-timestamp check (matches Core's behaviour
+/// when CBlockIndex::GetMedianTimePast walks fewer than the full window).
+fn compute_mtp_via_store(
+    block_store: &BlockStore,
+    tip_hash: &rustoshi_primitives::Hash256,
+) -> Option<u32> {
+    use rustoshi_consensus::params::MEDIAN_TIME_PAST_WINDOW;
+    let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
+    let mut current = *tip_hash;
+    for _ in 0..MEDIAN_TIME_PAST_WINDOW {
+        match block_store.get_header(&current) {
+            Ok(Some(header)) => {
+                timestamps.push(header.timestamp);
+                if header.prev_block_hash == rustoshi_primitives::Hash256::ZERO {
+                    // Walked off the front of the chain.
+                    break;
+                }
+                current = header.prev_block_hash;
+            }
+            _ => return None,
+        }
+    }
+    if timestamps.len() < MEDIAN_TIME_PAST_WINDOW {
+        // Genesis-adjacent: skip MTP check (Core also has no MTP near
+        // genesis; CBlockIndex::GetMedianTimePast returns at most what's
+        // available, but callers tolerate this near genesis).
+        return None;
+    }
+    timestamps.sort_unstable();
+    Some(timestamps[timestamps.len() / 2])
+}
+
 fn resolve_datadir(datadir: &str, params: &ChainParams) -> PathBuf {
     let mut path = resolve_base_datadir(datadir);
 
@@ -1849,10 +1884,51 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             NetworkMessage::Headers(headers) => {
                                 let header_count = headers.len();
                                 let current_header_height = header_sync.best_header_height();
+                                // BIP-113 / Core ContextualCheckBlockHeader:
+                                // header timestamp must NOT exceed wall-clock + 7200s.
+                                // Captured once per Headers message so the check runs
+                                // against a stable wall-clock reference for the whole
+                                // batch.
+                                let now_secs = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
                                 let need_more = header_sync.process_headers(
                                     peer_id,
                                     headers,
                                     &mut |header, height| {
+                                        // BIP-113 future-drift check: reject headers
+                                        // whose timestamp is more than MAX_FUTURE_BLOCK_TIME
+                                        // (7200 s) ahead of our wall clock.  Mirrors Core
+                                        // CheckBlockHeader (validation.cpp).  Previously
+                                        // not enforced — see audit Bug 0a.
+                                        if (header.timestamp as u64)
+                                            > now_secs
+                                                + rustoshi_consensus::params::MAX_FUTURE_BLOCK_TIME
+                                        {
+                                            return Err(format!(
+                                                "time-too-new: header timestamp {} > now {} + {}",
+                                                header.timestamp,
+                                                now_secs,
+                                                rustoshi_consensus::params::MAX_FUTURE_BLOCK_TIME
+                                            ));
+                                        }
+                                        // BIP-113 MTP check: reject headers whose timestamp
+                                        // is <= the median-time-past of the previous 11
+                                        // blocks. Walks ancestors via block_store.
+                                        // Skipped for the very first connection (genesis-
+                                        // adjacent) where MTP=0 by convention.
+                                        if let Some(mtp) = compute_mtp_via_store(
+                                            &block_store,
+                                            &header.prev_block_hash,
+                                        ) {
+                                            if header.timestamp <= mtp {
+                                                return Err(format!(
+                                                    "time-too-old: header timestamp {} <= MTP {}",
+                                                    header.timestamp, mtp
+                                                ));
+                                            }
+                                        }
                                         block_store
                                             .put_header(&header.block_hash(), header)
                                             .map_err(|e| e.to_string())?;

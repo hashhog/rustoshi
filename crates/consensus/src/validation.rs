@@ -672,20 +672,38 @@ pub trait ChainContext {
 
 /// Contextual validation of a block header.
 ///
-/// Checks that depend on the previous block:
+/// Checks that depend on the previous block / wall clock:
 /// - Timestamp must be greater than median-time-past of previous 11 blocks
-/// - Block version must be valid for the height (BIP-65/66)
+///   (Core: `validation.cpp::ContextualCheckBlockHeader`, error
+///   `time-too-old`).
+/// - Timestamp must NOT be more than `MAX_FUTURE_BLOCK_TIME` (7200 seconds)
+///   ahead of `current_time` (Core: `validation.cpp::CheckBlockHeader`,
+///   error `time-too-new`).
+/// - Block version must be valid for the height (BIP-65/66) — placeholder.
+///
+/// `current_time` is the node's wall-clock seconds since epoch, used for
+/// the future-drift check.  Pass `0` to skip the future-time check (only
+/// safe for tests / contexts where wall time isn't available).
 pub fn contextual_check_block_header(
     header: &BlockHeader,
     height: u32,
     _prev_entry: &BlockIndexEntry,
     context: &dyn ChainContext,
     params: &ChainParams,
+    current_time: u64,
 ) -> Result<(), ValidationError> {
     // Check timestamp against median-time-past
     let mtp = context.get_median_time_past(&header.prev_block_hash);
     if header.timestamp <= mtp {
         return Err(ValidationError::TimeTooOld);
+    }
+
+    // BIP-113 / Core: header.timestamp must not be > now + 2h.
+    // Skipped when current_time == 0 (test-only path).
+    if current_time != 0
+        && (header.timestamp as u64) > current_time + crate::params::MAX_FUTURE_BLOCK_TIME
+    {
+        return Err(ValidationError::TimeTooNew);
     }
 
     // BIP-65: Block version must be >= 4 after activation
@@ -727,9 +745,16 @@ pub fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -
 
 /// Contextual validation of a full block.
 ///
+/// Mirrors Bitcoin Core `validation.cpp::ContextualCheckBlock` — the
+/// checks here are the ones that depend on the block's height (or on
+/// chain context that isn't needed inside `check_block`).
+///
 /// Checks:
-/// - BIP-34: Coinbase height encoding (if active)
-/// - Witness commitment (if SegWit active)
+/// - BIP-34: Coinbase height encoding (if active).
+/// - SegWit witness commitment (if SegWit active).
+///
+/// The `_context` parameter is reserved for future contextual checks
+/// (e.g. BIP-30 duplicate-coinbase detection). It is currently unused.
 pub fn contextual_check_block(
     block: &Block,
     height: u32,
@@ -753,6 +778,31 @@ pub fn contextual_check_block(
     }
 
     Ok(())
+}
+
+/// Stub ChainContext for callers of `contextual_check_block` that don't
+/// have a real chain-context provider.  All trait methods return empty /
+/// zero values; safe because the current `contextual_check_block`
+/// implementation does not consult any of them.  If/when BIP-30 is wired
+/// in, callers must switch to a real provider.
+pub struct StubChainContext;
+
+impl ChainContext for StubChainContext {
+    fn get_block_index(&self, _hash: &Hash256) -> Option<BlockIndexEntry> {
+        None
+    }
+    fn get_utxo(&self, _outpoint: &OutPoint) -> Option<CoinEntry> {
+        None
+    }
+    fn get_median_time_past(&self, _hash: &Hash256) -> u32 {
+        0
+    }
+    fn get_hash_at_height(&self, _height: u32) -> Option<Hash256> {
+        None
+    }
+    fn tip_height(&self) -> u32 {
+        0
+    }
 }
 
 /// Encode a block height for BIP-34 coinbase.
@@ -3335,5 +3385,264 @@ mod tests {
             matches!(result, Err(ValidationError::NonFinalTx)),
             "Expected NonFinalTx error, got: {:?}", result
         );
+    }
+
+    // ============================================================
+    // contextual_check_block / contextual_check_block_header tests
+    //
+    // Closes Bug 0 + Bug 0a from rustoshi-P0-FOUND.md: prior to wiring
+    // these calls into chain_state, both functions were dead code and
+    // BIP-34 / SegWit-commitment / MTP-vs-timestamp / future-drift
+    // checks were silently bypassed.
+    // ============================================================
+
+    /// Minimal ChainContext with configurable MTP for header tests.
+    struct MtpStubContext {
+        mtp_by_hash: HashMap<Hash256, u32>,
+    }
+
+    impl ChainContext for MtpStubContext {
+        fn get_block_index(&self, _h: &Hash256) -> Option<BlockIndexEntry> { None }
+        fn get_utxo(&self, _o: &OutPoint) -> Option<CoinEntry> { None }
+        fn get_median_time_past(&self, hash: &Hash256) -> u32 {
+            *self.mtp_by_hash.get(hash).unwrap_or(&0)
+        }
+        fn get_hash_at_height(&self, _h: u32) -> Option<Hash256> { None }
+        fn tip_height(&self) -> u32 { 0 }
+    }
+
+    fn dummy_block_index_entry() -> BlockIndexEntry {
+        BlockIndexEntry {
+            height: 0,
+            timestamp: 0,
+            bits: 0,
+            prev_hash: Hash256::ZERO,
+            chain_work: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn contextual_check_block_header_rejects_time_too_old() {
+        // Bug 0a: a header whose timestamp <= MTP must be rejected with
+        // TimeTooOld.  Before this fix, the check existed but was never
+        // called.
+        let prev_hash = Hash256::from_bytes([0xab; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 1_700_000_000); // MTP = 1700000000
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 1,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 1_699_999_999, // <= MTP → reject
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            0, // current_time=0 to skip future-drift check
+        );
+        assert!(matches!(res, Err(ValidationError::TimeTooOld)),
+            "header timestamp == MTP must be rejected: {res:?}");
+    }
+
+    #[test]
+    fn contextual_check_block_header_accepts_when_above_mtp() {
+        let prev_hash = Hash256::from_bytes([0xab; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 1_700_000_000);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 1,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 1_700_000_001, // > MTP → accept
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            1_700_000_500, // current_time well after timestamp
+        );
+        assert!(res.is_ok(), "header > MTP must be accepted: {res:?}");
+    }
+
+    #[test]
+    fn contextual_check_block_header_rejects_time_too_new() {
+        // Bug 0a (future-drift): a header whose timestamp > now + 7200
+        // must be rejected with TimeTooNew.  Before the fix this was
+        // unreachable code.
+        let prev_hash = Hash256::from_bytes([0xab; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let now: u64 = 1_700_000_000;
+        let header = BlockHeader {
+            version: 1,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            // 4 hours in the future = 14,400 s; threshold is 7,200.
+            timestamp: (now + 4 * 60 * 60) as u32,
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            now,
+        );
+        assert!(matches!(res, Err(ValidationError::TimeTooNew)),
+            "header 4h in future must be rejected: {res:?}");
+    }
+
+    #[test]
+    fn contextual_check_block_header_accepts_within_drift_window() {
+        let prev_hash = Hash256::from_bytes([0xab; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let now: u64 = 1_700_000_000;
+        let header = BlockHeader {
+            version: 1,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: (now + 3600) as u32, // 1h in future, < 2h threshold
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            now,
+        );
+        assert!(res.is_ok(), "header within drift window must be accepted: {res:?}");
+    }
+
+    #[test]
+    fn contextual_check_block_rejects_bad_witness_commitment() {
+        // Bug 0: a block whose coinbase OP_RETURN witness commitment does
+        // not match SHA256d(witness_root || witness_nonce) must be
+        // rejected.  Prior to this fix, contextual_check_block was never
+        // called, so this scenario passed silently.
+        //
+        // Construct a SegWit block with a coinbase that has a witness
+        // commitment output and a non-coinbase tx that DOES carry witness
+        // data, but where the commitment value is intentionally wrong.
+
+        // Coinbase: scriptSig encodes height 1 (BIP-34), witness contains
+        // a 32-byte nonce (will be all zeros).
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        coinbase.inputs[0].witness = vec![vec![0u8; 32]];
+
+        // Add a witness-commitment output: OP_RETURN OP_PUSHBYTES_36
+        // 0xaa21a9ed <32-byte BAD HASH>.
+        let mut commit_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commit_script.extend_from_slice(&[0xff; 32]); // intentionally wrong
+        coinbase.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: commit_script,
+        });
+
+        // A second tx that carries witness data (so the
+        // commitment-check path actually runs).
+        let mut spend = make_simple_tx(Hash256::from_bytes([1u8; 32]), 0, 50);
+        spend.inputs[0].witness = vec![vec![0xaa; 33]];
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, spend],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        assert!(matches!(res, Err(ValidationError::BadWitnessCommitment)),
+            "block with bad witness commitment must be rejected: {res:?}");
+    }
+
+    #[test]
+    fn contextual_check_block_rejects_missing_bip34_height() {
+        // Bug 0 (BIP-34): a coinbase whose scriptSig does NOT start with
+        // the serialized block height must be rejected with
+        // BadCoinbaseHeight when bip34_height has been reached.  Prior
+        // to this fix, contextual_check_block was dead code so the
+        // wrong-height encoding sailed through.
+
+        // Build a coinbase with scriptSig that does NOT match the
+        // BIP-34 encoding for height 5.
+        let mut coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x99, 0x99, 0x99], // garbage prefix
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 5_000_000_000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+        };
+        let _ = &mut coinbase; // silence unused-mut on older rustc
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+        let params = ChainParams::regtest(); // bip34_height = 1
+        let res = contextual_check_block(&block, 5, &StubChainContext, &params);
+        assert!(matches!(res, Err(ValidationError::BadCoinbaseHeight)),
+            "missing BIP-34 height must be rejected: {res:?}");
+    }
+
+    #[test]
+    fn contextual_check_block_accepts_canonical_bip34_height() {
+        // Sanity: a coinbase with the correct BIP-34 prefix passes.
+        let coinbase = make_coinbase_tx(5, 5_000_000_000);
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 5, &StubChainContext, &params);
+        assert!(res.is_ok(), "canonical BIP-34 coinbase must pass: {res:?}");
     }
 }
