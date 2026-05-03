@@ -359,6 +359,104 @@ mod tests {
     }
 
     #[test]
+    fn test_assumeutxo_tip_activation_persists_across_reload() {
+        // Regression test for the 2026-05-03 mainnet snapshot wedge.
+        //
+        // Simulates the persistence pipeline that `--load-snapshot` needs
+        // for foreground IBD past the snapshot tip to survive a restart:
+        //   1. Genesis is initialized normally.
+        //   2. The snapshot block is recorded via:
+        //      - put_block_index
+        //      - put_height_index
+        //      - set_best_block
+        //   3. We reopen the same datadir.
+        //   4. Restart-time recovery reads the persisted "best block"
+        //      pointer back as the snapshot tip — NOT genesis.
+        //
+        // Without this round-trip, a fresh `cargo build && start` after
+        // `--load-snapshot` re-binds chain_state.tip = genesis on
+        // restart, even though the UTXO set in RocksDB is at the
+        // snapshot tip. That divergence is the wedge: foreground IBD
+        // re-walks from height 1 forever.
+        let dir = TempDir::new().expect("temp dir");
+        let snapshot_hash = Hash256::from_hex(
+            "0000000000000000000007e9c8b1c2c3d4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9",
+        )
+        .unwrap();
+        let snapshot_height: u32 = 944_183;
+
+        // Phase 1: write the snapshot tip.
+        {
+            let db = ChainDb::open(dir.path()).expect("open db");
+            let store = BlockStore::new(&db);
+            let params = ChainParams::mainnet();
+            store.init_genesis(&params).unwrap();
+
+            // Genesis is the tip immediately after init.
+            assert_eq!(
+                store.get_best_block_hash().unwrap().unwrap(),
+                params.genesis_hash
+            );
+            assert_eq!(store.get_best_height().unwrap().unwrap(), 0);
+
+            // Activate the snapshot tip.
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_HEADER);
+            status.set(BlockStatus::VALID_SCRIPTS);
+            status.set(BlockStatus::HAVE_DATA);
+            let snap_entry = BlockIndexEntry {
+                height: snapshot_height,
+                status,
+                n_tx: 0,
+                timestamp: 0,
+                bits: 0,
+                nonce: 0,
+                version: 0,
+                prev_hash: Hash256::ZERO,
+                chain_work: params.minimum_chain_work,
+            };
+            store.put_block_index(&snapshot_hash, &snap_entry).unwrap();
+            store
+                .put_height_index(snapshot_height, &snapshot_hash)
+                .unwrap();
+            store.set_best_block(&snapshot_hash, snapshot_height).unwrap();
+        }
+
+        // Phase 2: reopen the same datadir; verify the snapshot tip persisted.
+        {
+            let db = ChainDb::open(dir.path()).expect("reopen db");
+            let store = BlockStore::new(&db);
+
+            assert_eq!(
+                store.get_best_block_hash().unwrap().unwrap(),
+                snapshot_hash,
+                "best block hash must persist as the snapshot tip across reopen"
+            );
+            assert_eq!(
+                store.get_best_height().unwrap().unwrap(),
+                snapshot_height,
+                "best height must persist as the snapshot height across reopen"
+            );
+            assert_eq!(
+                store
+                    .get_hash_by_height(snapshot_height)
+                    .unwrap()
+                    .unwrap(),
+                snapshot_hash,
+                "height index must map snapshot height -> snapshot hash"
+            );
+            let idx = store.get_block_index(&snapshot_hash).unwrap().unwrap();
+            assert_eq!(idx.height, snapshot_height);
+            // chain_work must be at least minimum_chain_work so the IBD-exit
+            // latch can flip when wall-clock + tip-recency conditions are met.
+            assert_ne!(
+                idx.chain_work, [0u8; 32],
+                "snapshot block index entry must record a non-zero chain_work"
+            );
+        }
+    }
+
+    #[test]
     fn test_genesis_initialization() {
         let (_dir, db) = temp_db();
         let store = BlockStore::new(&db);
