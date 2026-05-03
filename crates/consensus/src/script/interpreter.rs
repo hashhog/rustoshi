@@ -834,12 +834,25 @@ fn eval_script_internal(
     }
 
     let mut pc = 0usize;
+    // BIP-341: opcode counter (index of current opcode, 0-based).
+    // Mirrors Core's `opcode_pos` (interpreter.cpp:433, incremented at the
+    // top of the for-loop so the first opcode sees opcode_pos=0).
+    // Used to record the position of OP_CODESEPARATOR in the tapscript
+    // sigmsg (interpreter.cpp:1055, 1565).  Must count every opcode
+    // including push-data ops — just like Core's `++opcode_pos` fires on
+    // every loop iteration.
+    let mut opcode_pos: u32 = 0;
 
     while pc < script.len() {
         let opcode_byte = script[pc];
         let opcode = Opcode::from_u8(opcode_byte);
         let executing = ctx.executing();
         pc += 1;
+        // Increment the opcode counter unconditionally here — before any
+        // `continue`, so every opcode (push or otherwise) advances the
+        // counter exactly once, matching Core's `++opcode_pos`.
+        let current_opcode_pos = opcode_pos;
+        opcode_pos += 1;
 
         // Check for always-illegal opcodes (even in non-executing branches)
         if opcode.is_always_illegal() {
@@ -947,6 +960,20 @@ fn eval_script_internal(
         // Check for disabled opcodes (even in non-executing branches)
         if opcode.is_disabled() {
             return Err(ScriptError::DisabledOpcode);
+        }
+
+        // CONST_SCRIPTCODE: OP_CODESEPARATOR in BASE (legacy non-segwit)
+        // scripts is rejected even in unexecuted branches when this flag is
+        // set.  Mirrors Core's check at interpreter.cpp:474-476, which fires
+        // BEFORE the fExec gate at line 478.  Core checks
+        // `sigversion == SigVersion::BASE` — not witness v0 — because
+        // OP_CODESEPARATOR is valid in witness scripts; the flag is a
+        // standardness rule for legacy relay only.
+        if opcode == Opcode::OP_CODESEPARATOR
+            && ctx.sig_version == SigVersion::Base
+            && ctx.flags.verify_const_scriptcode
+        {
+            return Err(ScriptError::BadOpcode);
         }
 
         // Handle flow control in non-executing branches
@@ -1415,14 +1442,19 @@ fn eval_script_internal(
                 ctx.push(sha256d(&data).0.to_vec())?;
             }
             Opcode::OP_CODESEPARATOR => {
-                // In witness v0, OP_CODESEPARATOR is forbidden if CONST_SCRIPTCODE is set
-                if ctx.sig_version == SigVersion::WitnessV0 && ctx.flags.verify_const_scriptcode {
-                    return Err(ScriptError::BadOpcode);
-                }
-                // Update the position for signature hashing
-                // Store the position OF the OP_CODESEPARATOR opcode.
-                // The subscript for sighash will start AFTER this position.
-                ctx.codesep_pos = (pc - 1) as u32;
+                // CONST_SCRIPTCODE: Core checks this ABOVE the fExec gate
+                // (interpreter.cpp:474-476) and ONLY for BASE (legacy) scripts.
+                // The check that fires here (inside the executing-branch match)
+                // is only a safety belt — the authoritative check must be placed
+                // before the non-executing-branch early-continue at line ~953.
+                // BIP-341: record the OPCODE INDEX (not byte position).
+                // Core stores `opcode_pos` (interpreter.cpp:1055), which is
+                // the 0-based counter of opcodes seen so far in the script.
+                // This value is committed to the tapscript sigmsg at
+                // interpreter.cpp:1565.  Using the byte position (`pc - 1`)
+                // was wrong: after any pushdata opcode, byte position > opcode
+                // index, producing a different sigmsg than Core.
+                ctx.codesep_pos = current_opcode_pos;
             }
             Opcode::OP_CHECKSIG => {
                 // Pop pubkey first (top), then signature (deeper)
