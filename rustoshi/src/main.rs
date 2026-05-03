@@ -1382,21 +1382,65 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         let store = BlockStore::new(&db);
         use sha2::Digest as _;
-        let mut hasher = sha2::Sha256::new();
+        // Maintain TWO hash accumulators in parallel, mirroring the RPC
+        // `loadtxoutset` path in `crates/rpc/src/server.rs::load_tx_outset`.
+        //
+        //   1. `legacy_hasher` — pre-Core rustoshi-only TxOutSer-shaped layout
+        //      (preserved so historical snapshots produced by old `dumptxoutset`
+        //      still validate against legacy-form `assumeutxo` entries).
+        //   2. `core_hasher`  — Core's `kernel/coinstats.cpp::TxOutSer`:
+        //        outpoint || u32_LE((height<<1)|coinbase) || i64_LE(value)
+        //        || CompactSize(script.len()) || script
+        //      This is what `AssumeutxoData::hash_serialized` is anchored to in
+        //      Bitcoin Core and what every other hashhog impl + the canonical
+        //      `tools/compute-snapshot-hash.py` produce.
+        //
+        // We accept either form so existing pinned hashes keep working AND
+        // fresh Core-compatible snapshots load. Without this fan-out the CLI
+        // load path would only ever match the legacy form, which is what
+        // caused the 2026-05-03 mainnet `loadtxoutset` failure
+        // (computed 566fbadc… vs expected 2eaf7172… — the Core-form anchor).
+        let mut legacy_hasher = sha2::Sha256::new();
+        let mut core_hasher = sha2::Sha256::new();
         let mut loaded: u64 = 0;
         while let Some((outpoint, coin)) = reader
             .read_coin()
             .map_err(|e| anyhow::anyhow!("snapshot body parse: {}", e))?
         {
-            let mut data =
+            // Legacy rustoshi layout (NOT Core-compatible).
+            let mut legacy_bytes =
                 Vec::with_capacity(32 + 4 + 4 + 1 + 8 + coin.tx_out.script_pubkey.len());
-            data.extend_from_slice(outpoint.txid.as_bytes());
-            data.extend_from_slice(&outpoint.vout.to_le_bytes());
-            data.extend_from_slice(&coin.height.to_le_bytes());
-            data.push(if coin.is_coinbase { 1 } else { 0 });
-            data.extend_from_slice(&coin.tx_out.value.to_le_bytes());
-            data.extend_from_slice(&coin.tx_out.script_pubkey);
-            hasher.update(&data);
+            legacy_bytes.extend_from_slice(outpoint.txid.as_bytes());
+            legacy_bytes.extend_from_slice(&outpoint.vout.to_le_bytes());
+            legacy_bytes.extend_from_slice(&coin.height.to_le_bytes());
+            legacy_bytes.push(if coin.is_coinbase { 1 } else { 0 });
+            legacy_bytes.extend_from_slice(&coin.tx_out.value.to_le_bytes());
+            legacy_bytes.extend_from_slice(&coin.tx_out.script_pubkey);
+            legacy_hasher.update(&legacy_bytes);
+
+            // Core HASH_SERIALIZED layout (kernel/coinstats.cpp::TxOutSer).
+            let script_len = coin.tx_out.script_pubkey.len() as u64;
+            let mut core_bytes =
+                Vec::with_capacity(32 + 4 + 4 + 8 + 9 + coin.tx_out.script_pubkey.len());
+            core_bytes.extend_from_slice(outpoint.txid.as_bytes());
+            core_bytes.extend_from_slice(&outpoint.vout.to_le_bytes());
+            let code: u32 = (coin.height << 1) | (coin.is_coinbase as u32);
+            core_bytes.extend_from_slice(&code.to_le_bytes());
+            core_bytes.extend_from_slice(&(coin.tx_out.value as i64).to_le_bytes());
+            if script_len < 0xFD {
+                core_bytes.push(script_len as u8);
+            } else if script_len <= 0xFFFF {
+                core_bytes.push(0xFD);
+                core_bytes.extend_from_slice(&(script_len as u16).to_le_bytes());
+            } else if script_len <= 0xFFFF_FFFF {
+                core_bytes.push(0xFE);
+                core_bytes.extend_from_slice(&(script_len as u32).to_le_bytes());
+            } else {
+                core_bytes.push(0xFF);
+                core_bytes.extend_from_slice(&script_len.to_le_bytes());
+            }
+            core_bytes.extend_from_slice(&coin.tx_out.script_pubkey);
+            core_hasher.update(&core_bytes);
 
             let entry = coin.to_entry();
             store
@@ -1419,18 +1463,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 loaded
             ));
         }
-        let first = hasher.finalize();
-        let mut second = sha2::Sha256::new();
-        second.update(first);
-        let final_hash = second.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&final_hash);
-        let computed = rustoshi_primitives::Hash256(bytes);
-        if computed != assume.hash_serialized.0 {
+        let finalize_sha256d = |h: sha2::Sha256| -> rustoshi_primitives::Hash256 {
+            let first = h.finalize();
+            let mut second = sha2::Sha256::new();
+            second.update(first);
+            let final_hash = second.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&final_hash);
+            rustoshi_primitives::Hash256(bytes)
+        };
+        let computed_legacy = finalize_sha256d(legacy_hasher);
+        let computed_core = finalize_sha256d(core_hasher);
+        let expected = assume.hash_serialized.0;
+        if computed_legacy != expected && computed_core != expected {
             return Err(anyhow::anyhow!(
-                "snapshot txoutset_hash mismatch: computed {} expected {}",
-                computed.to_hex(),
-                assume.hash_serialized.0.to_hex()
+                "snapshot txoutset_hash mismatch: computed {} (core form; legacy form was {}) expected {}",
+                computed_core.to_hex(),
+                computed_legacy.to_hex(),
+                expected.to_hex()
             ));
         }
         rpc_state_inner.best_hash = blockhash;
