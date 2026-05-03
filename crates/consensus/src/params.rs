@@ -510,6 +510,27 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 1_305_397_408,
                 },
+                // hashhog-local snapshot at h=944183 (utxo-snapshot-raw.dat
+                // from /data/nvme1/hashhog-mainnet/), used to recover
+                // rustoshi + blockbrew + lunarblock + hotbuns mainnet
+                // chainstate. NOT a Bitcoin Core chainparams entry — the
+                // four 840k/880k/910k/935k entries above ARE. Hash computed
+                // locally over the on-disk snapshot file (165,095,935 coins)
+                // by tools/compute-snapshot-hash.py. Cross-impl consistent
+                // with blockbrew/internal/consensus/assumeutxo.go and
+                // lunarblock/src/consensus.lua.
+                AssumeutxoData {
+                    height: 944_183,
+                    blockhash: Hash256::from_hex(
+                        "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 1_334_000_000,
+                },
             ],
         }
     }
