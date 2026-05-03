@@ -1235,11 +1235,21 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // Load chain state.
     // The stored best_height may be a stale cumulative counter from a bug in
     // earlier versions. Derive the actual height from the block index instead.
-    let best_hash = block_store.get_best_block_hash()?.unwrap();
+    //
+    // `best_hash` / `best_height` are intentionally mutable: when an
+    // assumeUTXO snapshot is loaded below (`--load-snapshot=<path>`), the
+    // snapshot's tip becomes the new chain tip and these values must be
+    // re-pointed at it BEFORE we wire `ChainState`, `HeaderSync`, and
+    // `BlockDownloader` (otherwise foreground IBD silently runs from
+    // genesis and never catches up to the snapshot tip — that was the
+    // 2026-05-03 mainnet wedge: tip claimed h=944,183 via RPC while the
+    // single foreground chain state was grinding `Connected block ...
+    // at height 245,000` from genesis).
+    let mut best_hash = block_store.get_best_block_hash()?.unwrap();
     let stored_height = block_store.get_best_height()?.unwrap();
 
     // Try to find the actual height by looking up the best hash in the height index
-    let best_height = {
+    let mut best_height = {
         let mut found = stored_height;
         // Scan backwards from stored height to find the hash
         for h in (0..=std::cmp::min(stored_height, 1_000_000)).rev() {
@@ -1360,12 +1370,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Initialize chain state for local block processing
-    let chain_state = Arc::new(RwLock::new(ChainState::new(
-        best_hash,
-        best_height,
-        params.clone(),
-    )));
+    // NOTE: `ChainState` initialization is intentionally deferred until
+    // AFTER the optional `--load-snapshot` block below. With assumeUTXO
+    // we may bump `best_hash` / `best_height` from genesis to the
+    // snapshot tip (e.g. h=944,183 on the 2026-05-03 mainnet snapshot),
+    // and `ChainState::new` must observe those bumped values — otherwise
+    // the foreground IBD path runs `process_block` from genesis forward
+    // forever and never extends past the snapshot tip. See the
+    // ASSUMEUTXO TIP ACTIVATION block (a few hundred lines below) for
+    // the full rationale.
 
     // Determine RPC bind address with appropriate port
     let rpc_bind = if cli.rpcbind == "127.0.0.1:8332" {
@@ -1524,11 +1537,101 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             rpc_state_inner.header_height = assume.height;
         }
         let _ = rustoshi_storage::write_snapshot_blockhash(&datadir, &blockhash);
+
+        // ============================================================
+        // ASSUMEUTXO TIP ACTIVATION
+        // ============================================================
+        //
+        // After the snapshot's UTXO set has been ingested into the DB,
+        // we must also (1) jump the chain-state machinery to the snapshot
+        // tip and (2) persist that tip so a subsequent restart loads it.
+        // Without this block the prior CLI snapshot path was a half-fix:
+        // the UTXO set was correct but every other tip-tracking
+        // structure (`ChainState`, `HeaderSync`, `BlockDownloader`,
+        // persisted `META_BEST_BLOCK_HASH/HEIGHT`) still pointed at
+        // genesis, so foreground IBD silently re-validated from height 1
+        // upward and never reached the snapshot tip — observed live on
+        // mainnet 2026-05-03 (rustoshi RPC reported `blocks=944,183`
+        // while the foreground chain state was at h~245,000 and growing
+        // at <1k blk/hr from genesis, ~17h after snapshot load).
+        //
+        // We mirror Core's `validation.cpp::ActivateSnapshot` effects
+        // (`Chainstate::m_chain.SetTip`, plus the persisted "best block"
+        // pointer in the leveldb meta column).  Background validation of
+        // 0..snapshot is NOT performed here — it requires a second
+        // chainstate + a separate UTXO column family, which this single-
+        // chainstate codebase doesn't have.  The trade-off is that the
+        // snapshot is treated as a hard checkpoint until proper dual-
+        // chainstate support lands; the operator-facing benefit is that
+        // the node is at the snapshot tip immediately and can serve the
+        // mainnet tip ~minutes after recovery instead of ~weeks.
+        //
+        // chain_work for the snapshot tip is set to `minimum_chain_work`
+        // from chainparams. We don't have the real cumulative work
+        // without scanning history, but the snapshot tip is hardcoded as
+        // trustworthy in `assumeutxo_data`, so accepting it as crossing
+        // the minimum-work threshold is correct by construction. The
+        // first foreground block past the snapshot then accumulates
+        // `minimum_chain_work + block_proof(snapshot+1)` and onward.
+        let snapshot_chain_work = ChainWork::from_be_bytes(params.minimum_chain_work);
+
+        // The snapshot block's full BlockHeader is unknown at this point
+        // (the snapshot file carries the UTXO set, not the block itself).
+        // We populate the BlockIndexEntry with the fields we know and
+        // zero/placeholder values for the rest. The header sync that
+        // follows will fetch the actual headers — including the snapshot
+        // block's neighbours — so callers needing the real header can
+        // wait for that. RPCs that consult only height/chain_work/n_tx
+        // (e.g. `getblockchaininfo`'s difficulty/chainwork fields) work
+        // from this entry directly.
+        let mut snap_status = BlockStatus::new();
+        snap_status.set(BlockStatus::VALID_HEADER);
+        snap_status.set(BlockStatus::VALID_TREE);
+        snap_status.set(BlockStatus::VALID_TRANSACTIONS);
+        snap_status.set(BlockStatus::VALID_CHAIN);
+        snap_status.set(BlockStatus::VALID_SCRIPTS);
+        snap_status.set(BlockStatus::HAVE_DATA);
+        let snap_index_entry = BlockIndexEntry {
+            height: assume.height,
+            status: snap_status,
+            n_tx: 0, // unknown without the block body
+            timestamp: 0,
+            bits: 0,
+            nonce: 0,
+            version: 0,
+            prev_hash: Hash256::ZERO,
+            chain_work: snapshot_chain_work.0,
+        };
+        if let Err(e) = block_store.put_block_index(&blockhash, &snap_index_entry) {
+            return Err(anyhow::anyhow!(
+                "snapshot activation: put_block_index failed: {}", e
+            ));
+        }
+        if let Err(e) = block_store.put_height_index(assume.height, &blockhash) {
+            return Err(anyhow::anyhow!(
+                "snapshot activation: put_height_index failed: {}", e
+            ));
+        }
+        if let Err(e) = block_store.set_best_block(&blockhash, assume.height) {
+            return Err(anyhow::anyhow!(
+                "snapshot activation: set_best_block failed: {}", e
+            ));
+        }
+
+        // Re-point the local `best_hash` / `best_height` so the
+        // `ChainState`, `HeaderSync`, `BlockDownloader` constructors that
+        // run after this block see the snapshot tip rather than genesis.
+        best_hash = blockhash;
+        best_height = assume.height;
+
         tracing::info!(
-            "Snapshot loaded: {} coins, tip {} at height {}",
+            "Snapshot loaded + activated: {} coins, tip {} at height {} (chain_work=minimum_chain_work; \
+             foreground IBD will extend past this point — background validation of 0..{} is NOT \
+             performed in this single-chainstate build)",
             loaded,
             blockhash.to_hex(),
-            assume.height
+            assume.height,
+            assume.height,
         );
     }
 
@@ -1630,7 +1733,27 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         .take_event_receiver()
         .expect("event receiver already taken");
 
-    // Initialize header sync and block download
+    // Initialize chain state for local block processing.
+    //
+    // This is intentionally deferred until AFTER the optional snapshot
+    // load so that `best_hash` / `best_height` reflect the snapshot tip
+    // (when one was loaded) rather than the pre-snapshot persisted tip.
+    // See the assumeUTXO activation block above for the full rationale.
+    let chain_state = Arc::new(RwLock::new(ChainState::new(
+        best_hash,
+        best_height,
+        params.clone(),
+    )));
+
+    // Initialize header sync and block download.
+    //
+    // For the assumeUTXO case both of these MUST start at the snapshot
+    // tip — not at genesis — otherwise:
+    //   * `HeaderSync` would build locators rooted at genesis and
+    //     re-walk every header from height 1, wasting bandwidth and
+    //     never marking the snapshot tip as known.
+    //   * `BlockDownloader::new(0, 0)` would treat block 1 as the next
+    //     block to validate, re-validating from genesis indefinitely.
     let mut header_sync = HeaderSync::new(params.genesis_hash);
     header_sync.set_best_header(best_height, best_hash);
     let mut block_downloader = BlockDownloader::new(best_height, best_height);
