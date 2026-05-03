@@ -679,8 +679,14 @@ fn run_import_from_blk_files(
             tracing::error!("Failed to store header at height {}: {}", height, e);
         }
 
+        // BIP-113: compute the median-time-past of the parent (current tip)
+        // for `lock_time_cutoff` in `is_final_tx`.  Returns 0 near genesis
+        // (fewer than 11 ancestors), which matches Core's behaviour.
+        let prev_block_mtp =
+            compute_mtp_via_store(block_store, &chain_state.tip_hash()).unwrap_or(0);
+
         // Validate and process
-        match chain_state.process_block(&block, utxo_view) {
+        match chain_state.process_block(&block, utxo_view, prev_block_mtp) {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", height, e);
@@ -846,8 +852,14 @@ fn run_import_from_stdin(
             tracing::error!("Failed to store height index at height {}: {}", frame_height, e);
         }
 
+        // BIP-113: compute the median-time-past of the parent (current tip)
+        // so `is_final_tx` uses the right `lock_time_cutoff` once CSV is
+        // active.  Returns 0 near genesis (matches Core).
+        let prev_block_mtp =
+            compute_mtp_via_store(block_store, &chain_state.tip_hash()).unwrap_or(0);
+
         // Validate and process
-        match chain_state.process_block(&block, utxo_view) {
+        match chain_state.process_block(&block, utxo_view, prev_block_mtp) {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", frame_height, e);
@@ -1865,7 +1877,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     // hash advancing across every restart).
                     let validated = {
                         let mut cs = chain_state.write().await;
-                        match cs.process_block(&block, &mut utxo_view) {
+                        // BIP-113: compute parent MTP for `is_final_tx`'s
+                        // `lock_time_cutoff`.  Without this, every tx with
+                        // a timestamp-based `nLockTime > 0` is rejected
+                        // post-CSV (mainnet h>=419,328) — wedged rustoshi's
+                        // post-snapshot IBD at h=944,184 on 2026-05-02.
+                        let prev_block_mtp =
+                            compute_mtp_via_store(&block_store, &cs.tip_hash())
+                                .unwrap_or(0);
+                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp) {
                             Ok(_) => true,
                             Err(e) => {
                                 tracing::warn!(
@@ -2302,7 +2322,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     // above for the full rationale.
                                     let validated = {
                                         let mut cs = chain_state.write().await;
-                                        match cs.process_block(&block, &mut utxo_view) {
+                                        // BIP-113: compute parent MTP for
+                                        // `is_final_tx`'s `lock_time_cutoff`.
+                                        // See validation_interval branch
+                                        // above for full rationale.
+                                        let prev_block_mtp =
+                                            compute_mtp_via_store(&block_store, &cs.tip_hash())
+                                                .unwrap_or(0);
+                                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp) {
                                             Ok(_) => true,
                                             Err(e) => {
                                                 tracing::warn!(
