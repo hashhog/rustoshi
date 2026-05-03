@@ -588,23 +588,41 @@ impl Opcode {
         matches!(self, Opcode::OP_VERIF | Opcode::OP_VERNOTIF)
     }
 
-    /// Returns true if this is an OP_SUCCESS opcode in tapscript context (BIP-342).
+    /// Returns true if this opcode (by raw byte) is an OP_SUCCESSx in
+    /// tapscript context (BIP-342).
     ///
     /// In tapscript, these opcodes cause unconditional script success.
-    /// Per BIP-342, the OP_SUCCESSx opcodes are:
-    ///   0x50, 0x62, 0x7e-0x81, 0x83-0x86, 0x89-0x8a, 0x8d-0x8e,
-    ///   0x95-0xb9, 0xbb-0xfe
-    /// Note: 0xba (OP_CHECKSIGADD) is NOT OP_SUCCESS - it's a valid tapscript opcode.
-    pub fn is_tapscript_success(&self) -> bool {
-        let byte = *self as u8;
-        matches!(
-            self,
-            Opcode::OP_RESERVED | Opcode::OP_VER | Opcode::OP_RESERVED1 | Opcode::OP_RESERVED2
-        ) || (0x7e..=0x81).contains(&byte)  // OP_CAT through OP_RIGHT
-            || (0x83..=0x86).contains(&byte)  // OP_INVERT through OP_XOR
-            || matches!(self, Opcode::OP_2MUL | Opcode::OP_2DIV)  // 0x8d-0x8e
-            || (0x95..=0xb9).contains(&byte)  // OP_MUL through OP_NOP10
+    /// The set of OP_SUCCESS bytes (mirrors Core `IsOpSuccess`,
+    /// `script/script.cpp:364`):
+    ///   80 (0x50), 98 (0x62),
+    ///   126..=129 (0x7e..=0x81),
+    ///   131..=134 (0x83..=0x86),
+    ///   137..=138 (0x89..=0x8a),
+    ///   141..=142 (0x8d..=0x8e),
+    ///   149..=153 (0x95..=0x99),
+    ///   187..=254 (0xbb..=0xfe).
+    /// Note: 0xba (OP_CHECKSIGADD) is NOT OP_SUCCESS — it's a valid
+    /// tapscript opcode.
+    ///
+    /// IMPORTANT: dispatch from a raw script byte rather than the parsed
+    /// `Opcode` enum, because `Opcode::from_u8` collapses many distinct
+    /// bytes (e.g. 0xbb..=0xfe) into `OP_INVALIDOPCODE` and we need to
+    /// know whether the original byte was in the OP_SUCCESS range.
+    pub fn is_tapscript_success_byte(byte: u8) -> bool {
+        byte == 0x50
+            || byte == 0x62
+            || (0x7e..=0x81).contains(&byte)  // OP_CAT..OP_RIGHT
+            || (0x83..=0x86).contains(&byte)  // OP_INVERT..OP_XOR
+            || (0x89..=0x8a).contains(&byte)  // OP_RESERVED1, OP_RESERVED2
+            || (0x8d..=0x8e).contains(&byte)  // OP_2MUL, OP_2DIV
+            || (0x95..=0x99).contains(&byte)  // OP_MUL, OP_DIV, OP_MOD, OP_LSHIFT, OP_RSHIFT
             || (0xbb..=0xfe).contains(&byte)
+    }
+
+    /// Convenience: same query keyed off a parsed `Opcode`.  Prefer
+    /// `is_tapscript_success_byte` when scanning raw script bytes.
+    pub fn is_tapscript_success(&self) -> bool {
+        Self::is_tapscript_success_byte(*self as u8)
     }
 
     /// Convert to raw byte value.
