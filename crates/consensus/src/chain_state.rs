@@ -333,6 +333,32 @@ impl ChainState {
         &self.params
     }
 
+    /// Override the chain tip without going through `process_block`.
+    ///
+    /// This is the assumeUTXO entry point: when a UTXO snapshot is loaded
+    /// at startup, the chain state must be jumped from genesis to the
+    /// snapshot tip so that subsequent `process_block` calls extend the
+    /// chain past the snapshot, not from genesis.
+    ///
+    /// Mirrors `bitcoin-core/src/validation.cpp::ActivateSnapshot`'s
+    /// effect on the active `Chainstate`'s `m_chain` tip pointer.
+    ///
+    /// Callers must ensure:
+    /// 1. The UTXO set already reflects the state at `(tip_hash, tip_height)`
+    ///    (e.g. snapshot has been loaded into the `BlockStore`).
+    /// 2. The block index entry for `tip_hash` has been written, otherwise
+    ///    chainwork accumulation for the next connected block will start at 0.
+    /// 3. `block_store.set_best_block(tip_hash, tip_height)` has been called
+    ///    so the persisted tip survives a restart.
+    ///
+    /// Also clears the median-time-past cache, since cached MTP values for
+    /// the old tip are stale.
+    pub fn set_tip(&mut self, tip_hash: Hash256, tip_height: u32) {
+        self.tip_hash = tip_hash;
+        self.tip_height = tip_height;
+        self.mtp_cache.clear();
+    }
+
     /// Process a new block, extending the active chain.
     ///
     /// Steps:
@@ -639,7 +665,7 @@ impl ChainState {
 mod tests {
     use super::*;
     use crate::params::ChainParams;
-    use rustoshi_primitives::{Block, BlockHeader, OutPoint, Transaction};
+    use rustoshi_primitives::{Block, BlockHeader, OutPoint, Transaction, TxIn, TxOut};
 
     // Helper to create a simple UTXO cache with no database backing
     fn empty_cache() -> UtxoCache<impl Fn(&OutPoint) -> Option<CoinEntry> + Send> {
@@ -834,6 +860,183 @@ mod tests {
             Err(ValidationError::PrevBlockNotFound(_)) => {}
             _ => panic!("Expected PrevBlockNotFound error"),
         }
+    }
+
+    #[test]
+    fn chain_state_set_tip_overrides_height_and_hash() {
+        // Regression for the assumeUTXO snapshot wedge: a fresh datadir
+        // starts with `chain_state.tip_hash = genesis, tip_height = 0`.
+        // After a UTXO snapshot is loaded, the chain state must be jumped
+        // to the snapshot tip so that subsequent `process_block` calls
+        // extend the chain past the snapshot, not from genesis.
+        //
+        // Without `set_tip`, foreground IBD past the snapshot tip never
+        // happens — the node walks blocks 1..N from genesis indefinitely
+        // (see `/data/nvme1/hashhog-mainnet/rustoshi/restart.log` after
+        // the 2026-05-03 snapshot recovery: `Connected block ... at
+        // height 245125` while RPC reports `blocks=944183`).
+        let params = ChainParams::regtest();
+        let mut state = ChainState::new(params.genesis_hash, 0, params);
+
+        let snapshot_hash = Hash256::from_bytes([0xab; 32]);
+        let snapshot_height = 944_183u32;
+        state.set_tip(snapshot_hash, snapshot_height);
+
+        assert_eq!(state.tip_hash(), snapshot_hash);
+        assert_eq!(state.tip_height(), snapshot_height);
+    }
+
+    #[test]
+    fn chain_state_constructed_at_snapshot_tip_extends_past_it() {
+        // After the assumeUTXO main.rs fix, `ChainState::new` is
+        // constructed AFTER snapshot loading with `best_hash` /
+        // `best_height` bumped to the snapshot tip. This test verifies
+        // that path: a `ChainState` built directly from the snapshot
+        // tip's hash/height accepts the next block whose `prev_hash`
+        // equals that tip, without first jumping through `set_tip`.
+        //
+        // This locks in the behaviour the deferred `chain_state` Arc
+        // creation in main.rs relies on.
+        let params = ChainParams::regtest();
+        let snapshot_hash = Hash256::from_bytes([0xcd; 32]);
+        let snapshot_height = 944_183u32;
+
+        let mut state = ChainState::new(snapshot_hash, snapshot_height, params);
+        assert_eq!(state.tip_hash(), snapshot_hash);
+        assert_eq!(state.tip_height(), snapshot_height);
+
+        // Verify the prev-hash gate is on the snapshot tip — we craft a
+        // block whose prev_block_hash matches the snapshot tip and check
+        // that `process_block` does not return PrevBlockNotFound. (Other
+        // validation errors are expected because we don't bother making
+        // a fully-valid block; the only thing under test is the prev-
+        // hash gate.)
+        let bip34_height = crate::validation::encode_bip34_height(snapshot_height + 1);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0xffff_ffff,
+                },
+                script_sig: bip34_height,
+                sequence: 0xffff_ffff,
+                witness: vec![vec![0u8; 32]],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x6a],
+            }],
+            lock_time: 0,
+        };
+        let coinbase_txid = coinbase.txid();
+        let block = Block {
+            header: BlockHeader {
+                version: 0x2000_0000,
+                prev_block_hash: snapshot_hash,
+                merkle_root: coinbase_txid,
+                timestamp: 1,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        let mut cache = empty_cache();
+        let result = state.process_block(&block, &mut cache);
+        if let Err(ValidationError::PrevBlockNotFound(h)) = &result {
+            panic!(
+                "ChainState::new(snapshot_hash, snapshot_height) did not bind \
+                 the prev-hash gate to the snapshot tip — got PrevBlockNotFound({})",
+                h
+            );
+        }
+    }
+
+    #[test]
+    fn chain_state_foreground_ibd_extends_past_snapshot_tip() {
+        // Foreground IBD must continue past the snapshot tip even when
+        // background validation is at h<snapshot. This test verifies the
+        // ChainState-level invariant: a block whose `prev_block_hash`
+        // equals the snapshot tip is accepted by `process_block` against
+        // a fresh chain state that has been jumped to the snapshot tip.
+        //
+        // We deliberately use an extremely high `snapshot_height`
+        // (mainnet's 2026-05-03 snapshot was at h=944,183) and an
+        // arbitrary placeholder hash to prove the gating is on the
+        // `(prev_hash == tip_hash)` check, not on validated history.
+        let params = ChainParams::regtest();
+        let mut state = ChainState::new(params.genesis_hash, 0, params);
+
+        let snapshot_hash = Hash256::from_bytes([0xab; 32]);
+        let snapshot_height = 944_183u32;
+        state.set_tip(snapshot_hash, snapshot_height);
+
+        // Build the next block (snapshot+1) extending the snapshot tip.
+        // We use a coinbase-only block with BIP-34-encoded height in the
+        // coinbase scriptSig so `contextual_check_block` accepts it.
+        // Coinbase value is the regtest subsidy at 944,184 (after several
+        // halvings). The actual amount doesn't matter for this test —
+        // `connect_block` only rejects if value > subsidy + fees.
+        let next_height = snapshot_height + 1;
+        let bip34_height = crate::validation::encode_bip34_height(next_height);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0xffff_ffff,
+                },
+                script_sig: bip34_height,
+                sequence: 0xffff_ffff,
+                witness: vec![vec![0u8; 32]], // BIP-141 witness reserved value
+            }],
+            outputs: vec![TxOut {
+                value: 0, // Subsidy may be 0 at extreme heights past 6,930,000;
+                          // at 944,184 it's ~6.25 BTC, but 0 is always valid
+                          // (a miner forfeiting subsidy).
+                script_pubkey: vec![0x6a], // OP_RETURN (provably unspendable)
+            }],
+            lock_time: 0,
+        };
+
+        // Witness commitment in coinbase output (segwit blocks must have one).
+        // Since this is regtest and we don't enable segwit on our test block,
+        // we set merkle_root to the coinbase txid (single-tx merkle tree).
+        let coinbase_txid = coinbase.txid();
+        let block = Block {
+            header: BlockHeader {
+                version: 0x2000_0000,
+                prev_block_hash: snapshot_hash,
+                merkle_root: coinbase_txid,
+                timestamp: 1,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        let mut cache = empty_cache();
+        let result = state.process_block(&block, &mut cache);
+
+        // We may get *some* validation error (e.g. the merkle root may be
+        // computed differently, or PoW may fail), but we MUST NOT get
+        // `PrevBlockNotFound` — that would mean the snapshot tip wasn't
+        // actually applied. The whole point of this test is to lock in
+        // that the snapshot-tip jump propagates to `process_block`'s
+        // prev-hash check.
+        if let Err(ValidationError::PrevBlockNotFound(h)) = &result {
+            panic!(
+                "process_block rejected block {} as not extending snapshot tip {}; \
+                 set_tip did not propagate. Got: PrevBlockNotFound({})",
+                next_height,
+                snapshot_hash.to_hex(),
+                h
+            );
+        }
+        // Every other outcome (Ok, or a different error) is acceptable for
+        // this regression — we're not testing the full validation pipeline,
+        // just that the prev-hash gate sees the snapshot tip.
     }
 
     // =========================
