@@ -967,6 +967,41 @@ impl RpcServerImpl {
     }
 }
 
+/// Compute the median-time-past (MTP) of the block at `tip_hash` by
+/// walking 11 ancestors via the block store.
+///
+/// Used by `submitblock` to populate `process_block`'s `prev_block_mtp`
+/// argument (BIP-113 `lock_time_cutoff` for `is_final_tx`).  Returns 0
+/// if fewer than `MEDIAN_TIME_PAST_WINDOW` ancestors are reachable
+/// (genesis-adjacent), matching Core's behaviour for short chains.
+///
+/// Mirrors `rustoshi/src/main.rs::compute_mtp_via_store` — kept as a
+/// crate-local helper here to avoid pulling the binary's helper into the
+/// RPC crate.  Drift between the two should stay limited (both walk the
+/// same `BlockStore::get_header` chain).
+fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> u32 {
+    use rustoshi_consensus::params::MEDIAN_TIME_PAST_WINDOW;
+    let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
+    let mut current = *tip_hash;
+    for _ in 0..MEDIAN_TIME_PAST_WINDOW {
+        match block_store.get_header(&current) {
+            Ok(Some(header)) => {
+                timestamps.push(header.timestamp);
+                if header.prev_block_hash == Hash256::ZERO {
+                    break;
+                }
+                current = header.prev_block_hash;
+            }
+            _ => return 0,
+        }
+    }
+    if timestamps.len() < MEDIAN_TIME_PAST_WINDOW {
+        return 0;
+    }
+    timestamps.sort_unstable();
+    timestamps[timestamps.len() / 2]
+}
+
 /// Convert compact bits to a floating-point target approximation.
 fn compact_to_target_f64(bits: u32) -> f64 {
     let exponent = (bits >> 24) as i32;
@@ -2233,7 +2268,14 @@ impl RustoshiRpcServer for RpcServerImpl {
         let store = BlockStore::new(&state.db);
         let mut utxo_view = store.utxo_view();
 
-        match chain_state.process_block(&block, &mut utxo_view) {
+        // BIP-113: walk the previous 11 headers to compute the parent's
+        // median-time-past, used as `lock_time_cutoff` in `is_final_tx`
+        // once CSV is active.  Returns 0 if the chain is genesis-adjacent
+        // (matches Core's `CBlockIndex::GetMedianTimePast` semantics for
+        // chains with < 11 ancestors).
+        let prev_block_mtp = compute_prev_block_mtp(&store, &state.best_hash);
+
+        match chain_state.process_block(&block, &mut utxo_view, prev_block_mtp) {
             Ok((_undo_data, _fees)) => {
                 // Store header and block data
                 if let Err(e) = store.put_header(&block_hash, &block.header) {
