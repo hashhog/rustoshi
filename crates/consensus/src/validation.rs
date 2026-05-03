@@ -100,6 +100,9 @@ pub enum ValidationError {
 
     #[error("block connects to invalid chain")]
     InvalidChain,
+
+    #[error("non-final transaction: bad-txns-nonfinal")]
+    NonFinalTx,
 }
 
 /// Errors that can occur during transaction validation.
@@ -696,6 +699,32 @@ pub fn contextual_check_block_header(
     Ok(())
 }
 
+/// Check whether a transaction is final at a given block height and time.
+///
+/// A transaction is final if:
+/// 1. nLockTime == 0, OR
+/// 2. nLockTime < threshold (height if < 500M, time if >= 500M), OR
+/// 3. All inputs have sequence == 0xFFFFFFFF (SEQUENCE_FINAL)
+///
+/// Reference: Bitcoin Core consensus/tx_verify.cpp IsFinalTx()
+/// Called from ContextualCheckBlock (validation.cpp:4146)
+pub fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -> bool {
+    if tx.lock_time == 0 {
+        return true;
+    }
+    // Compare locktime against block height or block time depending on threshold
+    let threshold = if tx.lock_time < LOCKTIME_THRESHOLD {
+        block_height
+    } else {
+        lock_time_cutoff
+    };
+    if tx.lock_time < threshold {
+        return true;
+    }
+    // Still final if all inputs have SEQUENCE_FINAL (0xFFFFFFFF)
+    tx.inputs.iter().all(|input| input.sequence == 0xFFFF_FFFF)
+}
+
 /// Contextual validation of a full block.
 ///
 /// Checks:
@@ -1096,6 +1125,21 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
         Some(av_height) => height <= av_height,
         None => false,
     };
+
+    // ContextualCheckBlock: enforce IsFinalTx for every transaction
+    // (Core validation.cpp:4146). This is a consensus rule that runs even
+    // under assumevalid — assumevalid only skips script verification.
+    // lock_time_cutoff is MTP when BIP-113/CSV is active, block timestamp otherwise.
+    let lock_time_cutoff = if csv_active {
+        prev_block_mtp
+    } else {
+        block.header.timestamp
+    };
+    for tx in &block.transactions {
+        if !is_final_tx(tx, height, lock_time_cutoff) {
+            return Err(ValidationError::NonFinalTx);
+        }
+    }
 
     // Validate each transaction
     for tx in &block.transactions {
@@ -2077,7 +2121,8 @@ impl<'a> TransactionSignatureChecker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustoshi_primitives::{TxIn, TxOut};
+    use rustoshi_primitives::{Block, BlockHeader, TxIn, TxOut};
+    use std::collections::HashMap;
 
     fn make_coinbase_tx(height: u32, value: u64) -> Transaction {
         let mut script_sig = encode_bip34_height(height);
@@ -3110,5 +3155,151 @@ mod tests {
         // P2WPKH: 1 witness sigop (NOT scaled) + 0 legacy sigops
         // Total cost = 1
         assert_eq!(cost, 1);
+    }
+
+    // =========================
+    // is_final_tx tests (Core parity: ContextualCheckBlock, validation.cpp:4146)
+    // =========================
+
+    #[test]
+    fn is_final_tx_zero_locktime_always_final() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00, 0x00],
+                sequence: 0x00000000, // non-final sequence
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 100, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        assert!(is_final_tx(&tx, 1000, 900_000_000));
+    }
+
+    #[test]
+    fn is_final_tx_height_based_satisfied() {
+        // lock_time = 100, block_height = 101 → satisfied
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00, 0x00],
+                sequence: 0x00000000,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 100, script_pubkey: vec![] }],
+            lock_time: 100,
+        };
+        assert!(is_final_tx(&tx, 101, 900_000_000));
+    }
+
+    #[test]
+    fn is_final_tx_height_based_not_satisfied_non_final_sequence() {
+        // lock_time = 200, block_height = 100, sequence != SEQUENCE_FINAL → non-final
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00, 0x00],
+                sequence: 0x00000001, // not SEQUENCE_FINAL
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 100, script_pubkey: vec![] }],
+            lock_time: 200,
+        };
+        assert!(!is_final_tx(&tx, 100, 900_000_000));
+    }
+
+    #[test]
+    fn is_final_tx_sequence_final_overrides_locktime() {
+        // lock_time = 999_999_999 (unsatisfied height), all inputs SEQUENCE_FINAL → final
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00, 0x00],
+                sequence: 0xFFFF_FFFF, // SEQUENCE_FINAL
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 100, script_pubkey: vec![] }],
+            lock_time: 999_999_999,
+        };
+        assert!(is_final_tx(&tx, 100, 900_000_000));
+    }
+
+    #[test]
+    fn connect_block_rejects_non_final_tx() {
+        // Build a block where a non-coinbase tx has lock_time = 1000
+        // but block_height = 500 and lock_time_cutoff = 999 → non-final
+        // This tests that connect_block_with_sequence_locks enforces IsFinalTx
+        use crate::params::ChainParams;
+
+        let params = ChainParams::regtest();
+
+        // Non-final tx: lock_time > block_height, input sequence != SEQUENCE_FINAL
+        let non_final_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::from_bytes([1u8; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![0x51],
+                sequence: 0x00000000, // not SEQUENCE_FINAL
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50, script_pubkey: vec![0x51] }],
+            lock_time: 1000, // block height 500 < 1000 → not final by height
+        };
+
+        // Build a minimal coinbase for height 1
+        let coinbase = make_coinbase_tx(1, 5_000_000_000);
+
+        use rustoshi_primitives::BlockHeader;
+        let header = BlockHeader {
+            version: 1,
+            prev_block_hash: Hash256::from_bytes([0u8; 32]),
+            merkle_root: Hash256::from_bytes([0u8; 32]),
+            timestamp: 1_700_000_000,
+            bits: 0x207fffff,
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            transactions: vec![coinbase, non_final_tx],
+        };
+
+        // Use a simple in-memory UTXO view
+        struct SimpleUtxo(HashMap<OutPoint, CoinEntry>);
+        impl UtxoView for SimpleUtxo {
+            fn get_utxo(&self, op: &OutPoint) -> Option<CoinEntry> { self.0.get(op).cloned() }
+            fn add_utxo(&mut self, op: &OutPoint, coin: CoinEntry) { self.0.insert(op.clone(), coin); }
+            fn spend_utxo(&mut self, op: &OutPoint) { self.0.remove(op); }
+        }
+
+        let mut utxo = SimpleUtxo(HashMap::new());
+        utxo.add_utxo(&OutPoint { txid: Hash256::from_bytes([1u8; 32]), vout: 0 }, CoinEntry {
+            height: 1,
+            is_coinbase: false,
+            value: 100,
+            script_pubkey: vec![0x51],
+        });
+
+        // height=500, block timestamp=1_700_000_000, csv not active in regtest at h=500
+        // prev_block_mtp doesn't matter here since csv_height for regtest is 0 actually
+        // but we just need the non-final check to fire
+        // For regtest csv_height=0 so csv IS active, so lock_time_cutoff = prev_block_mtp
+        // prev_block_mtp = 1_699_999_000 (< LOCKTIME_THRESHOLD=500M → treated as height??
+        // No: lock_time=1000 < LOCKTIME_THRESHOLD so it's height-based, compared to height=500
+        // 1000 >= 500 and sequence != SEQUENCE_FINAL → non-final
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 500, &mut utxo, &params, &null_ctx, 1_699_999_000
+        );
+        assert!(
+            matches!(result, Err(ValidationError::NonFinalTx)),
+            "Expected NonFinalTx error, got: {:?}", result
+        );
     }
 }
