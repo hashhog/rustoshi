@@ -154,6 +154,45 @@ pub enum TxValidationError {
     SequenceLockNotMet,
 }
 
+impl ValidationError {
+    /// Map this error to the canonical BIP-22 result string.
+    ///
+    /// Per BIP-22 and Bitcoin Core `BIP22ValidationResult` in
+    /// `src/rpc/mining.cpp`, `submitblock` must return short ASCII strings on
+    /// rejection rather than verbose internal error messages.  This method
+    /// provides the canonical mapping so that the RPC layer can stay clean and
+    /// every new validation variant gets an explicit string assignment.
+    pub fn bip22_string(&self) -> &'static str {
+        match self {
+            // PoW
+            ValidationError::BadProofOfWork => "high-hash",
+            // Merkle root
+            ValidationError::BadMerkleRoot => "bad-txnmrklroot",
+            // Witness commitment (BIP-141)
+            ValidationError::BadWitnessCommitment => "bad-witness-merkle-match",
+            // Coinbase value / subsidy
+            ValidationError::BadSubsidy(_, _) => "bad-cb-amount",
+            // Sigops budget
+            ValidationError::SigopsLimitExceeded(_) => "bad-blk-sigops",
+            // Duplicate tx within block
+            ValidationError::DuplicateTx(_) => "bad-txns-duplicate",
+            // Non-final transaction
+            ValidationError::NonFinalTx => "bad-txns-nonfinal",
+            // BIP-34 coinbase height encoding
+            ValidationError::BadCoinbaseHeight => "bad-cb-height",
+            // Time checks
+            ValidationError::TimeTooOld => "time-too-old",
+            ValidationError::TimeTooNew => "time-too-new",
+            // Script verification under mandatory flags
+            ValidationError::TxValidation(TxValidationError::ScriptFailed(_)) => {
+                "mandatory-script-verify-flag-failed"
+            }
+            // Catch-all: covers structural/weight/prev-block/chain errors
+            _ => "rejected",
+        }
+    }
+}
+
 // ============================================================
 // CONTEXT-FREE VALIDATION
 // ============================================================
@@ -815,7 +854,7 @@ impl ChainContext for StubChainContext {
 /// The checker in `contextual_check_block` uses byte-prefix comparison against
 /// this output, so any non-canonical encoding (zero-padded, length-prefixed for
 /// heights 1..16, missing sign byte) will be rejected.
-fn encode_bip34_height(height: u32) -> Vec<u8> {
+pub(crate) fn encode_bip34_height(height: u32) -> Vec<u8> {
     if height == 0 {
         // OP_0 — single byte 0x00
         return vec![0x00];

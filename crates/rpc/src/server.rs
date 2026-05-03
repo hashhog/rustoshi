@@ -2116,6 +2116,35 @@ impl RustoshiRpcServer for RpcServerImpl {
             })
             .collect();
 
+        // Extract the BIP-141 witness commitment scriptPubKey from the
+        // coinbase transaction that build_block_template already constructed.
+        // The commitment output is the second output of the coinbase
+        // (index 1) and has the form:
+        //   OP_RETURN(0x6a) || OP_PUSHBYTES_36(0x24) || 0xaa21a9ed || hash(32)
+        // We emit it only when segwit is active at the new height AND when
+        // the coinbase actually carries a commitment (i.e. there were segwit
+        // transactions in the template). This mirrors Core's behaviour in
+        // rpc/mining.cpp which returns the field only when required_outputs
+        // is non-empty.
+        let new_height = state.best_height + 1;
+        let default_witness_commitment = if state.params.is_segwit_active(new_height) {
+            // The commitment output is at index 1; its script starts with the
+            // 6-byte BIP-141 header 0x6a 0x24 0xaa 0x21 0xa9 0xed.
+            template.coinbase_tx.outputs.get(1).and_then(|out| {
+                if out.script_pubkey.len() == 38
+                    && out.script_pubkey[0] == 0x6a
+                    && out.script_pubkey[1] == 0x24
+                    && out.script_pubkey[2..6] == [0xaa, 0x21, 0xa9, 0xed]
+                {
+                    Some(hex::encode(&out.script_pubkey))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
         let result = BlockTemplateResult {
             version: template.header.version,
             rules: vec!["csv".to_string(), "segwit".to_string()],
@@ -2135,8 +2164,8 @@ impl RustoshiRpcServer for RpcServerImpl {
             weightlimit: 4000000,
             curtime: timestamp,
             bits: format!("{:08x}", bits),
-            height: state.best_height + 1,
-            default_witness_commitment: None, // would be computed from coinbase
+            height: new_height,
+            default_witness_commitment,
         };
 
         Ok(serde_json::to_value(result).unwrap())
@@ -2257,7 +2286,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
             Err(e) => {
                 tracing::warn!("submitblock: block {} rejected: {}", block_hash, e);
-                Ok(Some(e.to_string()))
+                // Return canonical BIP-22 result string per BIP-22 and Bitcoin Core
+                // BIP22ValidationResult() in src/rpc/mining.cpp.
+                Ok(Some(e.bip22_string().to_string()))
             }
         }
     }
@@ -8580,5 +8611,63 @@ mod tests {
             ),
             Ok(None) => {} // Accepted (regtest empty hex unlikely but ok).
         }
+    }
+
+    /// BIP-22 string mapping: each ValidationError variant must produce the
+    /// canonical string defined in BIP-22 / Bitcoin Core BIP22ValidationResult().
+    #[test]
+    fn bip22_string_mapping() {
+        use rustoshi_consensus::{TxValidationError, ValidationError};
+
+        // PoW failure
+        assert_eq!(ValidationError::BadProofOfWork.bip22_string(), "high-hash");
+        // Merkle root
+        assert_eq!(ValidationError::BadMerkleRoot.bip22_string(), "bad-txnmrklroot");
+        // Witness commitment (BIP-141)
+        assert_eq!(
+            ValidationError::BadWitnessCommitment.bip22_string(),
+            "bad-witness-merkle-match"
+        );
+        // Subsidy / coinbase amount
+        assert_eq!(
+            ValidationError::BadSubsidy(5000000001, 5000000000).bip22_string(),
+            "bad-cb-amount"
+        );
+        // Sigops budget
+        assert_eq!(
+            ValidationError::SigopsLimitExceeded(100001).bip22_string(),
+            "bad-blk-sigops"
+        );
+        // Duplicate transaction within block
+        assert_eq!(
+            ValidationError::DuplicateTx("abc".to_string()).bip22_string(),
+            "bad-txns-duplicate"
+        );
+        // Non-final transaction
+        assert_eq!(ValidationError::NonFinalTx.bip22_string(), "bad-txns-nonfinal");
+        // BIP-34 coinbase height encoding
+        assert_eq!(ValidationError::BadCoinbaseHeight.bip22_string(), "bad-cb-height");
+        // Time-too-old
+        assert_eq!(ValidationError::TimeTooOld.bip22_string(), "time-too-old");
+        // Time-too-new
+        assert_eq!(ValidationError::TimeTooNew.bip22_string(), "time-too-new");
+        // Script verification failure -> mandatory-script-verify-flag-failed
+        assert_eq!(
+            ValidationError::TxValidation(TxValidationError::ScriptFailed(
+                "OP_CHECKSIG failed".to_string()
+            ))
+            .bip22_string(),
+            "mandatory-script-verify-flag-failed"
+        );
+        // Catch-all: structural errors map to "rejected"
+        assert_eq!(
+            ValidationError::PrevBlockNotFound("abc".to_string()).bip22_string(),
+            "rejected"
+        );
+        assert_eq!(ValidationError::InvalidChain.bip22_string(), "rejected");
+        assert_eq!(
+            ValidationError::BlockTooLarge(5_000_000).bip22_string(),
+            "rejected"
+        );
     }
 }
