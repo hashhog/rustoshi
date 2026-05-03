@@ -1636,4 +1636,187 @@ mod tests {
         // per_tx_sigops aligns and tx[1] reports the real cost.
         assert_eq!(template.per_tx_sigops, vec![0, 4]);
     }
+
+    // ================================================================
+    // BIP-141 witness commitment tests (for getblocktemplate extraction)
+    // ================================================================
+
+    /// Empty template (coinbase-only, no segwit txs) should have NO
+    /// witness commitment output — the coinbase only carries one output.
+    #[test]
+    fn test_witness_commitment_absent_when_no_segwit_txs() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        let params = ChainParams::regtest();
+        let config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            ..Default::default()
+        };
+
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            1,
+            1714777860,
+            0x207fffff,
+            1714777800,
+            &params,
+            &config,
+        );
+
+        // Coinbase only has the value output when there are no witness txs.
+        assert_eq!(template.coinbase_tx.outputs.len(), 1);
+    }
+
+    /// When all non-coinbase txs are legacy (no witness), the coinbase
+    /// should still have NO commitment (BIP-141 §commitment structure: only
+    /// required when any tx has witness data).
+    #[test]
+    fn test_witness_commitment_absent_for_legacy_txs() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+        let params = ChainParams::regtest();
+
+        let utxo =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+        // make_tx produces legacy txs (no witness field).
+        let tx = make_tx(vec![(utxo, 0)], vec![90_000], 1);
+        mempool
+            .add_transaction(tx, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        let template_config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            ..Default::default()
+        };
+
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x207fffff,
+            1714777800,
+            &params,
+            &template_config,
+        );
+
+        // No witness tx → coinbase has only the value output.
+        assert_eq!(template.coinbase_tx.outputs.len(), 1);
+    }
+
+    /// When segwit txs are present, the coinbase must carry the BIP-141
+    /// witness commitment at output index 1.  We verify:
+    ///   – the 38-byte script structure (OP_RETURN 0x6a, PUSH36 0x24, magic 0xaa21a9ed)
+    ///   – the 32-byte commitment is sha256d(witness_merkle_root || zero_nonce)
+    ///
+    /// This is the canonical vector used by server.rs getblocktemplate:
+    /// the RPC field is simply hex(coinbase.outputs[1].script_pubkey).
+    #[test]
+    fn test_witness_commitment_present_for_segwit_txs() {
+        use rustoshi_crypto::{merkle_root, sha256d};
+
+        // Build a witness transaction manually.
+        let witness_tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0xde, 0xad, 0xbe, 0xef]],
+            }],
+            outputs: vec![TxOut {
+                value: 50_000,
+                script_pubkey: vec![0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                    0x00, 0x00, 0x00, 0x00],
+            }],
+            lock_time: 0,
+        };
+
+        // Feed through build_coinbase_tx directly (simpler than the mempool path
+        // because we can't add a spending-nothing witness tx to the mempool).
+        let coinbase = build_coinbase_tx(
+            500,
+            5_000_000_000,
+            &[0x51],
+            b"",
+            &[witness_tx.clone()],
+        );
+
+        // Commitment output must exist.
+        assert_eq!(coinbase.outputs.len(), 2);
+        let commitment_out = &coinbase.outputs[1];
+        assert_eq!(commitment_out.value, 0);
+        let script = &commitment_out.script_pubkey;
+
+        // Full 38-byte structure check.
+        assert_eq!(script.len(), 38);
+        assert_eq!(script[0], 0x6a);                                  // OP_RETURN
+        assert_eq!(script[1], 0x24);                                  // PUSH 36
+        assert_eq!(&script[2..6], &[0xaa, 0x21, 0xa9, 0xed]);        // BIP-141 header
+
+        // Recompute the expected commitment and compare against the script.
+        // witness_merkle_root = merkle([0x00..00, wtxid_of_witness_tx])
+        let zero_wtxid = Hash256::ZERO;
+        let witness_tx_wtxid = witness_tx.wtxid();
+        let expected_root = merkle_root(&[zero_wtxid, witness_tx_wtxid]);
+        let nonce = [0u8; 32];
+        let mut data = [0u8; 64];
+        data[..32].copy_from_slice(&expected_root.0);
+        data[32..].copy_from_slice(&nonce);
+        let expected_commitment = sha256d(&data);
+
+        assert_eq!(&script[6..], &expected_commitment.0);
+    }
+
+    /// Template with 3 segwit txs — commitment covers all of them via the
+    /// witness merkle tree in the order they appear in the selected set.
+    #[test]
+    fn test_witness_commitment_covers_all_segwit_txs() {
+        use rustoshi_crypto::{merkle_root, sha256d};
+
+        // Build 3 distinct witness txs.
+        let make_witness_tx = |seed: u8| -> Transaction {
+            Transaction {
+                version: 2,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint { txid: Hash256::ZERO, vout: u32::from(seed) },
+                    script_sig: vec![],
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![vec![seed; 4]],
+                }],
+                outputs: vec![TxOut {
+                    value: u64::from(seed) * 1_000,
+                    script_pubkey: vec![0x51],
+                }],
+                lock_time: 0,
+            }
+        };
+
+        let txs: Vec<Transaction> = (1u8..=3).map(make_witness_tx).collect();
+        let coinbase = build_coinbase_tx(700, 5_000_000_000, &[0x51], b"", &txs);
+
+        assert_eq!(coinbase.outputs.len(), 2);
+        let script = &coinbase.outputs[1].script_pubkey;
+        assert_eq!(script.len(), 38);
+
+        // Recompute expected commitment.
+        let mut wtxids = vec![Hash256::ZERO]; // coinbase
+        for tx in &txs {
+            wtxids.push(tx.wtxid());
+        }
+        let expected_root = merkle_root(&wtxids);
+        let nonce = [0u8; 32];
+        let mut data = [0u8; 64];
+        data[..32].copy_from_slice(&expected_root.0);
+        data[32..].copy_from_slice(&nonce);
+        let expected_commitment = sha256d(&data);
+
+        assert_eq!(&script[6..], &expected_commitment.0);
+    }
 }
