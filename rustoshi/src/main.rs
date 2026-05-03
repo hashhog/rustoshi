@@ -2110,12 +2110,53 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 rpc.header_height = new_best;
                                             }
                                         }
-                                        // Begin block download (only for blocks above our tip)
-                                        // Use best_header_height to avoid re-enqueuing already-queued blocks
-                                        let old_best = std::cmp::max(
-                                            block_downloader.best_header_height(),
-                                            block_downloader.validated_tip_height(),
-                                        );
+                                        // Begin block download for blocks above our actual
+                                        // validated chainstate tip.
+                                        //
+                                        // GAP-FILL: floor `old_best` at `chain_state.tip_height()`
+                                        // — NOT at `block_downloader.best_header_height()` /
+                                        // `validated_tip_height()`.  Both downloader counters
+                                        // advance unconditionally:
+                                        //   * `validated_tip_height` is incremented inside
+                                        //     `next_block_to_validate()` even when the
+                                        //     subsequent `process_block` fails.
+                                        //   * `best_header_height` is bumped to `new_best`
+                                        //     here (set_best_header_height a few lines down)
+                                        //     regardless of whether we actually download
+                                        //     and validate those blocks.
+                                        // If we used either of those as the floor, a single
+                                        // failed block would leave a permanent gap: the
+                                        // failure removes the block from
+                                        // pending_hashes/received_blocks, the downloader
+                                        // counters keep advancing, and every subsequent
+                                        // header arrival enqueues only the new tip's height
+                                        // (e.g. just block N+3580 when we're stuck at N).
+                                        // The next block then fails with "previous block
+                                        // not found" because its parent never gets
+                                        // re-requested, and the node wedges.
+                                        //
+                                        // Trusting `chain_state.tip_height()` ensures the
+                                        // entire gap (chainstate_tip+1 .. header_tip) is
+                                        // re-enqueued on every header arrival.  The
+                                        // BlockDownloader's own per-hash dedup
+                                        // (in_flight / received_blocks / pending_set)
+                                        // prevents duplicate downloads of blocks already
+                                        // in the pipeline, so this is cheap in the healthy
+                                        // case where chainstate is keeping up.
+                                        //
+                                        // Live-reproduced 2026-05-03: snapshot loaded at
+                                        // h=944,183, headers caught up to h=947,763, but
+                                        // block 944,184 failed validation.  Subsequent
+                                        // header arrivals (947,761, 947,762, 947,763) each
+                                        // enqueued only their own height, the gap
+                                        // 944,184..947,760 was never re-requested, and
+                                        // every downloaded block failed with
+                                        // "previous block not found".
+                                        let chainstate_tip = {
+                                            let cs = chain_state.read().await;
+                                            cs.tip_height()
+                                        };
+                                        let old_best = chainstate_tip;
                                         block_downloader.set_best_header_height(new_best);
 
                                         // Receiving headers means peers are responsive —
