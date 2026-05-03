@@ -4591,6 +4591,35 @@ impl RustoshiRpcServer for RpcServerImpl {
                     )
                 })?;
 
+            // Pruned-mode pre-check. Mirrors Bitcoin Core
+            // `rpc/blockchain.cpp::dumptxoutset`:
+            //     if (IsPruneMode() &&
+            //         target_index->nHeight <
+            //         node.chainman->m_blockman.GetFirstBlock()->nHeight)
+            //         throw "Block height N not available (pruned data).
+            //                Use a height after M.";
+            // rustoshi does not maintain a single "first available height"
+            // counter, but `BlockStore::has_block` answers the equivalent
+            // "is the block body still on disk?" question via CF_BLOCKS.
+            // When pruning is enabled and the target body has been
+            // reclaimed, fail fast so we never start a rewind that would
+            // tear on a missing body partway through.
+            if state.prune_mode {
+                let body_present = store.has_block(&target_hash).map_err(|e| {
+                    Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+                })?;
+                if !body_present {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_MISC_ERROR,
+                        format!(
+                            "Block height {} not available (pruned data). \
+                             Use a height closer to the current tip.",
+                            target_h
+                        ),
+                    ));
+                }
+            }
+
             // Capture the active-chain block hashes from `target_h+1..=tip`
             // BEFORE we touch the height index. We need these to drive the
             // disconnect walk and the subsequent reconnect walk. If any
