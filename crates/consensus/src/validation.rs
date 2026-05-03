@@ -1795,8 +1795,8 @@ pub fn disconnect_block(
 
 /// Get the script verification flags for a given block height.
 ///
-/// **CRITICAL**: Only returns consensus flags. Adding policy flags here
-/// causes valid blocks to be rejected.
+/// **CRITICAL**: Only returns Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS.
+/// Adding policy flags here causes valid blocks to be rejected.
 ///
 /// Consensus flags by activation height:
 /// - P2SH: BIP-16 (always on after activation)
@@ -1804,13 +1804,16 @@ pub fn disconnect_block(
 /// - CLTV: BIP-65
 /// - CSV: BIP-68/112/113
 /// - WITNESS: BIP-141/143
-/// - NULLDUMMY: BIP-147 (activated with SegWit)
-/// - NULLFAIL: BIP-146 (activated with SegWit)
+/// - NULLDUMMY: BIP-147 (activated with SegWit) — consensus rule
 /// - TAPROOT: BIP-341/342
+///
+/// NULLFAIL (BIP-146) is a STANDARD_SCRIPT_VERIFY_FLAG (policy only) per
+/// Bitcoin Core policy/policy.h:125.  It must NOT appear here.
 fn script_flags_for_height(height: u32, params: &ChainParams) -> ScriptFlags {
     // NOTE: Do NOT add policy flags here!
-    // CLEANSTACK, LOW_S, STRICTENC, MINIMALDATA, MINIMALIF, etc.
-    // are policy-only and must NOT be enforced during block validation.
+    // CLEANSTACK, LOW_S, STRICTENC, MINIMALDATA, MINIMALIF, NULLFAIL,
+    // WITNESS_PUBKEYTYPE, etc. are policy-only and must NOT be enforced
+    // during block validation.  Ref: Bitcoin Core validation.cpp:2250-2289.
 
     ScriptFlags {
         // P2SH is always enabled after its activation
@@ -1823,13 +1826,11 @@ fn script_flags_for_height(height: u32, params: &ChainParams) -> ScriptFlags {
         verify_checksequenceverify: height >= params.csv_height,
         // BIP-141/143: SegWit
         verify_witness: height >= params.segwit_height,
-        // BIP-147: NULLDUMMY (activated with SegWit)
+        // BIP-147: NULLDUMMY (activated with SegWit) — consensus rule
         verify_nulldummy: height >= params.segwit_height,
-        // BIP-146: NULLFAIL (activated with SegWit)
-        verify_nullfail: height >= params.segwit_height,
         // BIP-341/342: Taproot
         verify_taproot: height >= params.taproot_height,
-        // All policy flags stay at default (false)
+        // All policy flags stay at default (false), including verify_nullfail
         ..Default::default()
     }
 }
@@ -2498,19 +2499,23 @@ mod tests {
 
     #[test]
     fn script_flags_no_policy_flags() {
-        // Verify that policy flags are NOT set
+        // Verify that policy flags are NOT set in the consensus block-script-flag
+        // computer.  All of these are STANDARD_SCRIPT_VERIFY_FLAGS (policy only)
+        // per Bitcoin Core policy/policy.h:119-132.
+        // Ref: Bitcoin Core validation.cpp:2250-2289.
         let params = ChainParams::mainnet();
         let flags = script_flags_for_height(800000, &params);
 
-        // These should all be false (policy only)
+        // These should all be false (policy only — never in consensus path)
         assert!(!flags.verify_strictenc);
         assert!(!flags.verify_low_s);
         assert!(!flags.verify_sigpushonly);
         assert!(!flags.verify_minimaldata);
         assert!(!flags.verify_cleanstack);
         assert!(!flags.verify_minimalif);
-        // NOTE: verify_nullfail is now consensus (BIP-146), activated with SegWit
-        assert!(flags.verify_nullfail);
+        // verify_nullfail is policy-only (BIP-146 is NOT a consensus rule).
+        // Bitcoin Core validation.cpp:2250-2289 does NOT set SCRIPT_VERIFY_NULLFAIL.
+        assert!(!flags.verify_nullfail);
     }
 
     // =========================
