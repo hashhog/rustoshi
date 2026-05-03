@@ -1027,4 +1027,110 @@ mod tests {
         dl.set_best_header_height(500);
         assert_eq!(dl.best_header_height(), 500);
     }
+
+    /// Regression: a block consumed by `next_block_to_validate` (e.g. one
+    /// that subsequently FAILED validation in the caller) must be eligible
+    /// for re-enqueue. Without this, a single failed block leaves a
+    /// permanent gap in the download queue and the chain wedges.
+    ///
+    /// This is the "snapshot recovery / gap-fill" scenario: post-snapshot
+    /// load, block H+1 fails validation; the downloader keeps consuming
+    /// later-arriving blocks (whose parents now appear missing); each
+    /// subsequent header arrival in main.rs re-enqueues the gap from the
+    /// validated chainstate tip up to the new header tip — the gap-fill
+    /// ONLY works if the failed block can be re-requested.
+    #[test]
+    fn test_failed_block_can_be_reenqueued() {
+        let mut dl = BlockDownloader::new(0, 100);
+        let peer = PeerId(1);
+        dl.add_peer(peer);
+
+        let block = make_test_block(42);
+        let hash = block.block_hash();
+
+        // Step 1: enqueue + assign + receive.
+        dl.enqueue_blocks(vec![(hash, 1)]);
+        let _requests = dl.assign_requests();
+        assert_eq!(dl.blocks_in_flight(), 1);
+
+        let received = dl.block_received(peer, block.clone());
+        assert_eq!(received, Some(hash));
+        assert_eq!(dl.blocks_in_flight(), 0);
+        assert_eq!(dl.blocks_buffered(), 1);
+
+        // Step 2: consume via next_block_to_validate (simulates entering
+        // the validator).  The downloader assumes the validator
+        // succeeded and advances validated_tip_height — but in the
+        // wedge scenario the caller's process_block returned Err.
+        let popped = dl.next_block_to_validate();
+        assert!(popped.is_some());
+        assert_eq!(dl.blocks_buffered(), 0);
+        assert_eq!(dl.pending_hashes_len(), 0);
+        // Note: validated_tip_height was incremented even though the
+        // caller's validation failed — this is the bug the gap-fill
+        // logic in main.rs works around by trusting chain_state.tip_height
+        // instead of validated_tip_height.
+        assert_eq!(dl.validated_tip_height(), 1);
+
+        // Step 3: re-enqueue the same hash.  Must succeed (not be
+        // silently dropped by dedup) so the gap-fill path can recover
+        // from the failed validation.
+        dl.enqueue_blocks(vec![(hash, 1)]);
+        assert_eq!(dl.pending_hashes_len(), 1);
+        assert_eq!(dl.download_queue_len(), 1);
+
+        // And it must be assignable + receivable again.
+        let requests2 = dl.assign_requests();
+        assert!(!requests2.is_empty(), "re-enqueued block should be assigned");
+        assert_eq!(dl.blocks_in_flight(), 1);
+        let received2 = dl.block_received(peer, block);
+        assert_eq!(received2, Some(hash));
+    }
+
+    /// Regression: simulate the full gap-fill loop main.rs runs after a
+    /// header arrival. Setup: chain state at height H (=10), block
+    /// downloader reports best_header_height=H (only the snapshot tip).
+    /// Header sync advances by 1000 headers (to H+1000=1010). The
+    /// downloader must accept all 1000 (H+1..=H+1000) when
+    /// `enqueue_blocks` is called with the full gap, even if the
+    /// downloader itself thinks its high-water-mark is H.
+    #[test]
+    fn test_gap_fill_enqueues_all_missing_heights() {
+        const CHAIN_TIP: u32 = 10;
+        const HEADER_TIP: u32 = 1010;
+
+        // Chainstate at height 10, downloader's view starts identical.
+        let mut dl = BlockDownloader::new(CHAIN_TIP, CHAIN_TIP);
+        dl.add_peer(PeerId(1));
+        dl.add_peer(PeerId(2));
+        assert_eq!(dl.best_header_height(), CHAIN_TIP);
+        assert_eq!(dl.validated_tip_height(), CHAIN_TIP);
+
+        // After 1000 new headers arrive, main.rs computes the gap and
+        // calls enqueue_blocks for heights 11..=1010 (1000 entries).
+        // Use distinct 4-byte hashes (height encoded as little-endian)
+        // so no two blocks collide and trigger the dedup path.
+        let gap: Vec<(Hash256, u32)> = (CHAIN_TIP + 1..=HEADER_TIP)
+            .map(|h| {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&h.to_le_bytes());
+                (Hash256(bytes), h)
+            })
+            .collect();
+        assert_eq!(gap.len(), 1000);
+        // Distinct hashes (sanity: avoid accidental dedup collisions).
+        let unique: std::collections::HashSet<_> = gap.iter().map(|x| x.0).collect();
+        assert_eq!(unique.len(), 1000);
+
+        dl.set_best_header_height(HEADER_TIP);
+        dl.enqueue_blocks(gap);
+
+        // All 1000 must be in the download queue, NOT just the latest one.
+        assert_eq!(
+            dl.download_queue_len(),
+            1000,
+            "gap-fill must enqueue every missing height between chain tip and header tip"
+        );
+        assert_eq!(dl.pending_hashes_len(), 1000);
+    }
 }
