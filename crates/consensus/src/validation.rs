@@ -757,35 +757,37 @@ pub fn contextual_check_block(
 
 /// Encode a block height for BIP-34 coinbase.
 ///
-/// The height is encoded as a CScriptNum (sign-magnitude, little-endian):
-/// - Height 0: [0x01, 0x00] (1 byte push of 0x00)
-/// - Height 1-127: [0x01, height]
-/// - Height 128-32767: [0x02, low, high] (with possible sign byte)
-/// - etc.
+/// Mirrors Bitcoin Core's CScript() << nHeight (script.h:433-448):
+/// - height == 0  → [0x00]            (OP_0, single byte)
+/// - heights 1..16 → [0x51..0x60]     (OP_1..OP_16, single byte)
+/// - heights 17+  → [len, le_bytes..] (length-prefixed sign-magnitude CScriptNum)
+///
+/// The checker in `contextual_check_block` uses byte-prefix comparison against
+/// this output, so any non-canonical encoding (zero-padded, length-prefixed for
+/// heights 1..16, missing sign byte) will be rejected.
 fn encode_bip34_height(height: u32) -> Vec<u8> {
     if height == 0 {
-        // Special case: push empty or 0x00
-        return vec![0x01, 0x00];
+        // OP_0 — single byte 0x00
+        return vec![0x00];
+    }
+    if height <= 16 {
+        // OP_1..OP_16 — single byte 0x51..0x60
+        return vec![0x50u8 + height as u8];
     }
 
-    let mut h = height as i64;
-    let mut encoded = Vec::new();
-
-    // Encode as minimal little-endian bytes
+    // CScriptNum: minimal little-endian sign-magnitude with length prefix.
+    let mut h = height;
+    let mut le: Vec<u8> = Vec::new();
     while h > 0 {
-        encoded.push((h & 0xFF) as u8);
+        le.push((h & 0xFF) as u8);
         h >>= 8;
     }
-
-    // If the high bit is set, add a zero byte to indicate positive
-    // CScriptNum uses sign-magnitude, so MSB is sign bit
-    if encoded.last().is_some_and(|b| b & 0x80 != 0) {
-        encoded.push(0x00);
+    // If the high bit of the last byte is set, append a zero sign byte.
+    if le.last().is_some_and(|b| b & 0x80 != 0) {
+        le.push(0x00);
     }
-
-    // Prepend the push opcode (length byte)
-    let mut result = vec![encoded.len() as u8];
-    result.extend_from_slice(&encoded);
+    let mut result = vec![le.len() as u8];
+    result.extend_from_slice(&le);
     result
 }
 
@@ -2397,59 +2399,86 @@ mod tests {
 
     // =========================
     // BIP-34 height encoding tests
+    // Reference: Bitcoin Core script.h:433-448 (CScript::push_int64)
     // =========================
 
     #[test]
     fn encode_bip34_height_zero() {
-        let encoded = encode_bip34_height(0);
-        assert_eq!(encoded, vec![0x01, 0x00]);
+        // height 0 → OP_0 (0x00), single byte
+        assert_eq!(encode_bip34_height(0), vec![0x00]);
     }
 
     #[test]
     fn encode_bip34_height_one() {
-        let encoded = encode_bip34_height(1);
-        assert_eq!(encoded, vec![0x01, 0x01]);
+        // height 1 → OP_1 (0x51), single byte
+        assert_eq!(encode_bip34_height(1), vec![0x51]);
+    }
+
+    #[test]
+    fn encode_bip34_height_sixteen() {
+        // height 16 → OP_16 (0x60), single byte
+        assert_eq!(encode_bip34_height(16), vec![0x60]);
+    }
+
+    #[test]
+    fn encode_bip34_height_seventeen() {
+        // height 17 → 1-byte push (0x01 0x11)
+        assert_eq!(encode_bip34_height(17), vec![0x01, 0x11]);
     }
 
     #[test]
     fn encode_bip34_height_100() {
-        let encoded = encode_bip34_height(100);
-        assert_eq!(encoded, vec![0x01, 0x64]);
+        // 100 = 0x64, no sign pad
+        assert_eq!(encode_bip34_height(100), vec![0x01, 0x64]);
     }
 
     #[test]
     fn encode_bip34_height_127() {
         // 127 = 0x7f, high bit not set, so no padding needed
-        let encoded = encode_bip34_height(127);
-        assert_eq!(encoded, vec![0x01, 0x7f]);
+        assert_eq!(encode_bip34_height(127), vec![0x01, 0x7f]);
     }
 
     #[test]
     fn encode_bip34_height_128() {
-        // 128 = 0x80, high bit set, needs padding
-        let encoded = encode_bip34_height(128);
-        assert_eq!(encoded, vec![0x02, 0x80, 0x00]);
+        // 128 = 0x80, high bit set → needs sign pad
+        assert_eq!(encode_bip34_height(128), vec![0x02, 0x80, 0x00]);
+    }
+
+    #[test]
+    fn encode_bip34_height_32768() {
+        // 32768 = 0x8000, high bit of last byte set → sign pad
+        assert_eq!(encode_bip34_height(32768), vec![0x03, 0x00, 0x80, 0x00]);
     }
 
     #[test]
     fn encode_bip34_height_500() {
-        // 500 = 0x01F4 in LE = [0xF4, 0x01]
-        let encoded = encode_bip34_height(500);
-        assert_eq!(encoded, vec![0x02, 0xf4, 0x01]);
+        // 500 = 0x01F4 in LE = [0xF4, 0x01], no sign pad
+        assert_eq!(encode_bip34_height(500), vec![0x02, 0xf4, 0x01]);
     }
 
     #[test]
     fn encode_bip34_height_100000() {
         // 100000 = 0x186A0 in LE = [0xA0, 0x86, 0x01]
-        let encoded = encode_bip34_height(100000);
-        assert_eq!(encoded, vec![0x03, 0xa0, 0x86, 0x01]);
+        assert_eq!(encode_bip34_height(100000), vec![0x03, 0xa0, 0x86, 0x01]);
     }
 
     #[test]
     fn encode_bip34_height_2000000() {
         // 2000000 = 0x1E8480 in LE = [0x80, 0x84, 0x1E]
-        let encoded = encode_bip34_height(2000000);
-        assert_eq!(encoded, vec![0x03, 0x80, 0x84, 0x1e]);
+        assert_eq!(encode_bip34_height(2000000), vec![0x03, 0x80, 0x84, 0x1e]);
+    }
+
+    #[test]
+    fn encode_bip34_rejects_non_canonical_in_check() {
+        // contextual_check_block does byte-prefix comparison; non-canonical
+        // zero-padded encoding must not match height 100's canonical [0x01, 0x64].
+        let canonical = encode_bip34_height(100);
+        let non_canonical = vec![0x02u8, 0x64, 0x00]; // zero-padded
+        assert_ne!(canonical, non_canonical);
+        // Length-prefixed form for height 1 must not match OP_1
+        assert_ne!(encode_bip34_height(1), vec![0x01u8, 0x01]);
+        // Missing sign byte must not match height 128 canonical
+        assert_ne!(vec![0x01u8, 0x80], encode_bip34_height(128));
     }
 
     // =========================
