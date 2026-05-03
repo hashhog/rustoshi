@@ -409,6 +409,18 @@ impl ChainState {
             ));
         }
 
+        // BIP-113 / Core ContextualCheckBlockHeader: block timestamp must be
+        // strictly greater than the median-time-past of the previous 11 blocks.
+        // Reference: bitcoin-core/src/validation.cpp:4092
+        //   `if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())`
+        // `prev_block_mtp` is the MTP of the tip (== parent of `block`).
+        // This check was previously only wired into the header-sync path
+        // (main.rs:2068) but was missing from process_block, causing rustoshi
+        // to accept blocks whose nTime == MTP (off-by-one consensus split).
+        if prev_block_mtp > 0 && block.header.timestamp <= prev_block_mtp {
+            return Err(ValidationError::TimeTooOld);
+        }
+
         // Context-free validation
         check_block(block, &self.params)?;
 
@@ -590,6 +602,12 @@ impl ChainState {
             // into the IsFinalTx call.
             let prev_block_mtp =
                 compute_mtp_via_get_block(&self.tip_hash, get_block);
+            // BIP-113 / Core ContextualCheckBlockHeader: block timestamp must
+            // be strictly greater than MTP of parent.
+            // Reference: bitcoin-core/src/validation.cpp:4092
+            if prev_block_mtp > 0 && block.header.timestamp <= prev_block_mtp {
+                return Err(ValidationError::TimeTooOld);
+            }
             let null_seq_context = ChainStateNullSeqContext;
             let (_undo, _fees) = connect_block_with_sequence_locks(
                 &block,
