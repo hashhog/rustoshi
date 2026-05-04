@@ -8699,13 +8699,14 @@ mod tests {
                 .bip22_string(),
             "bad-cb-length"
         );
-        // Script verification failure -> mandatory-script-verify-flag-failed
+        // Script verification failure -> block-script-verify-flag-failed
+        // (connect-block stage; Core validation.cpp:2122)
         assert_eq!(
             ValidationError::TxValidation(TxValidationError::ScriptFailed(
                 "OP_CHECKSIG failed".to_string()
             ))
             .bip22_string(),
-            "mandatory-script-verify-flag-failed"
+            "block-script-verify-flag-failed"
         );
         // Catch-all: structural errors map to "rejected"
         assert_eq!(
