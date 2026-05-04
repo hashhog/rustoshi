@@ -180,8 +180,12 @@ impl ValidationError {
             ValidationError::BadSubsidy(_, _) => "bad-cb-amount",
             // Sigops budget
             ValidationError::SigopsLimitExceeded(_) => "bad-blk-sigops",
-            // Duplicate tx within block
-            ValidationError::DuplicateTx(_) => "bad-txns-duplicate",
+            // Duplicate tx within block — maps to bad-txns-inputs-missingorspent
+            // (Core parity: ConnectBlock catches the dup-spend via prevout-already-spent,
+            // so Core never emits bad-txns-duplicate for in-block dup-txid.  The
+            // BIP-30 cross-block case (Bip30DuplicateOutput below) still uses
+            // bad-txns-BIP30 which is Core's canonical for that path.)
+            ValidationError::DuplicateTx(_) => "bad-txns-inputs-missingorspent",
             // Non-final transaction
             ValidationError::NonFinalTx => "bad-txns-nonfinal",
             // BIP-30: tx output would overwrite existing UTXO
