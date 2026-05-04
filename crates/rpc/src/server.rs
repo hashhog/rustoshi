@@ -8680,10 +8680,10 @@ mod tests {
             ValidationError::SigopsLimitExceeded(100001).bip22_string(),
             "bad-blk-sigops"
         );
-        // Duplicate transaction within block
+        // Duplicate transaction within block → Core parity (bad-txns-inputs-missingorspent)
         assert_eq!(
             ValidationError::DuplicateTx("abc".to_string()).bip22_string(),
-            "bad-txns-duplicate"
+            "bad-txns-inputs-missingorspent"
         );
         // Non-final transaction
         assert_eq!(ValidationError::NonFinalTx.bip22_string(), "bad-txns-nonfinal");
