@@ -5558,7 +5558,6 @@ impl RpcServerImpl {
         custom_txs: Option<Vec<Transaction>>,
         maxtries: u64,
     ) -> RpcResult<String> {
-        use rustoshi_consensus::block_template::{build_block_template, BlockTemplateConfig};
         use rustoshi_consensus::params::compact_to_target;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5660,28 +5659,33 @@ impl RpcServerImpl {
 
         let block_hash = block.block_hash();
 
-        // Connect the block to the chain
-        // First, validate and connect it
+        // Route through the shared process_block helper — same path as
+        // submit_block, IBD drain, and import-from-file. This ensures that
+        // check_block + contextual_check_block + connect_block_with_sequence_locks
+        // all fire, so a future build_block_template bug (wrong BIP-34 height
+        // encoding, malformed witness commitment, oversized block, etc.) is
+        // caught before bytes are written to chainstate.
+        //
+        // Audit reference: wave-30 re-audit, Gap R1 (server.rs:5676 bypass).
+        let mut chain_state =
+            ChainState::new(state.best_hash, state.best_height, state.params.clone());
         let mut utxo_view = store.utxo_view();
 
-        // Add the block to storage
-        store.put_block(&block_hash, &block).map_err(|e| {
-            Self::rpc_error(
-                rpc_error::RPC_DATABASE_ERROR,
-                format!("Failed to store block: {}", e),
-            )
-        })?;
+        // BIP-113: compute prev-block MTP for the IsFinalTx lock_time_cutoff
+        // (reuses the same module-level helper as submit_block).
+        let prev_block_mtp = compute_prev_block_mtp(&store, &prev_hash);
 
-        // Connect the block (updates UTXO set)
-        let result = rustoshi_consensus::validation::connect_block(
-            &block,
-            height,
-            &mut utxo_view,
-            &state.params,
-        );
-
-        match result {
+        match chain_state.process_block(&block, &mut utxo_view, prev_block_mtp) {
             Ok((_undo_data, _fees)) => {
+                // Store the raw block bytes (after validation succeeds, matching
+                // submit_block's ordering to avoid persisting invalid data).
+                store.put_block(&block_hash, &block).map_err(|e| {
+                    Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("Failed to store block: {}", e),
+                    )
+                })?;
+
                 // Flush UTXO changes
                 utxo_view.flush().map_err(|e| {
                     Self::rpc_error(
