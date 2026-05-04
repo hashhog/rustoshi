@@ -195,6 +195,10 @@ impl ValidationError {
             // Time checks
             ValidationError::TimeTooOld => "time-too-old",
             ValidationError::TimeTooNew => "time-too-new",
+            // Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
+            ValidationError::TxValidation(TxValidationError::NegativeOutput) => {
+                "bad-txns-vout-negative"
+            }
             // Coinbase scriptSig length (consensus/tx_check.cpp — 2..100 bytes)
             ValidationError::TxValidation(TxValidationError::CoinbaseScriptSize(_)) => {
                 "bad-cb-length"
@@ -232,8 +236,14 @@ pub fn check_transaction(tx: &Transaction) -> Result<(), TxValidationError> {
     }
 
     // Check output values
+    // NOTE: value is stored as u64 but wire-encoded as int64; a negative wire value
+    // will deserialize with the high bit set.  Check sign before the upper-bound
+    // check (mirrors Bitcoin Core consensus/tx_check.cpp::CheckTransaction order).
     let mut total_out: u64 = 0;
     for output in &tx.outputs {
+        if (output.value as i64) < 0 {
+            return Err(TxValidationError::NegativeOutput);
+        }
         if output.value > MAX_MONEY {
             return Err(TxValidationError::OutputTooLarge(output.value));
         }
