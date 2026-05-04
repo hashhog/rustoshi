@@ -207,9 +207,12 @@ impl ValidationError {
             ValidationError::TxValidation(TxValidationError::CoinbaseScriptSize(_)) => {
                 "bad-cb-length"
             }
-            // Script verification under mandatory flags
+            // Script verification failure at connect-block stage.
+            // Core validation.cpp:2122: "block-script-verify-flag-failed (%s)"
+            // (not "mandatory-script-verify-flag-failed" which is the mempool
+            // stage path at validation.cpp:2120).
             ValidationError::TxValidation(TxValidationError::ScriptFailed(_)) => {
-                "mandatory-script-verify-flag-failed"
+                "block-script-verify-flag-failed"
             }
             // Catch-all: covers structural/weight/prev-block/chain errors
             _ => "rejected",
