@@ -8693,6 +8693,12 @@ mod tests {
         assert_eq!(ValidationError::TimeTooOld.bip22_string(), "time-too-old");
         // Time-too-new
         assert_eq!(ValidationError::TimeTooNew.bip22_string(), "time-too-new");
+        // Coinbase scriptSig too long -> bad-cb-length
+        assert_eq!(
+            ValidationError::TxValidation(TxValidationError::CoinbaseScriptSize(101))
+                .bip22_string(),
+            "bad-cb-length"
+        );
         // Script verification failure -> mandatory-script-verify-flag-failed
         assert_eq!(
             ValidationError::TxValidation(TxValidationError::ScriptFailed(

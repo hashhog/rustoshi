@@ -191,6 +191,10 @@ impl ValidationError {
             // Time checks
             ValidationError::TimeTooOld => "time-too-old",
             ValidationError::TimeTooNew => "time-too-new",
+            // Coinbase scriptSig length (consensus/tx_check.cpp — 2..100 bytes)
+            ValidationError::TxValidation(TxValidationError::CoinbaseScriptSize(_)) => {
+                "bad-cb-length"
+            }
             // Script verification under mandatory flags
             ValidationError::TxValidation(TxValidationError::ScriptFailed(_)) => {
                 "mandatory-script-verify-flag-failed"
