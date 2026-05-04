@@ -199,6 +199,10 @@ impl ValidationError {
             ValidationError::TxValidation(TxValidationError::NegativeOutput) => {
                 "bad-txns-vout-negative"
             }
+            // Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
+            ValidationError::TxValidation(TxValidationError::OutputTooLarge(_)) => {
+                "bad-txns-vout-toolarge"
+            }
             // Coinbase scriptSig length (consensus/tx_check.cpp — 2..100 bytes)
             ValidationError::TxValidation(TxValidationError::CoinbaseScriptSize(_)) => {
                 "bad-cb-length"
