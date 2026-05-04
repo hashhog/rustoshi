@@ -207,6 +207,12 @@ impl ValidationError {
             ValidationError::TxValidation(TxValidationError::CoinbaseScriptSize(_)) => {
                 "bad-cb-length"
             }
+            // BIP-68 SequenceLocks failure (relative locktime not met).
+            // Core validation.cpp:2558: state.Invalid(BLOCK_CONSENSUS,
+            // "bad-txns-nonfinal", ...) — same string as IsFinalTx (nLockTime).
+            ValidationError::TxValidation(TxValidationError::SequenceLockNotMet) => {
+                "bad-txns-nonfinal"
+            }
             // Script verification failure at connect-block stage.
             // Core validation.cpp:2122: "block-script-verify-flag-failed (%s)"
             // (not "mandatory-script-verify-flag-failed" which is the mempool
