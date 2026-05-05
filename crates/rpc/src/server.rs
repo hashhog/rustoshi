@@ -842,6 +842,42 @@ pub trait RustoshiRpc {
     /// Returns: object with `coins_loaded`, `tip_hash`, `base_height`, and `path`.
     #[method(name = "loadtxoutset")]
     async fn load_tx_outset(&self, path: String) -> RpcResult<serde_json::Value>;
+
+    /// UTXO set statistics. Mirrors Bitcoin Core rpc/blockchain.cpp gettxoutsetinfo.
+    /// Uses the CoinStatsIndex when available; falls back to a lightweight estimate.
+    #[method(name = "gettxoutsetinfo")]
+    async fn get_tx_out_set_info(
+        &self,
+        hash_type: Option<String>,
+    ) -> RpcResult<serde_json::Value>;
+
+    /// Estimated network hash rate over a window of blocks.
+    /// Mirrors Bitcoin Core rpc/mining.cpp GetNetworkHashPS.
+    #[method(name = "getnetworkhashps")]
+    async fn get_network_hash_ps(
+        &self,
+        nblocks: Option<i64>,
+        height: Option<i64>,
+    ) -> RpcResult<f64>;
+
+    /// Generate a merkle proof (CMerkleBlock) for a set of transactions.
+    /// Returns hex-encoded proof. Mirrors Bitcoin Core rpc/blockchain.cpp gettxoutproof.
+    #[method(name = "gettxoutproof")]
+    async fn get_tx_out_proof(
+        &self,
+        txids: Vec<String>,
+        blockhash: Option<String>,
+    ) -> RpcResult<String>;
+
+    /// Verify a merkle proof produced by gettxoutproof.
+    /// Returns the list of proven txids. Mirrors Bitcoin Core rpc/blockchain.cpp verifytxoutproof.
+    #[method(name = "verifytxoutproof")]
+    async fn verify_tx_out_proof(&self, proof: String) -> RpcResult<Vec<String>>;
+
+    /// Return operational RPC server information.
+    /// Mirrors Bitcoin Core rpc/server.cpp getrpcinfo.
+    #[method(name = "getrpcinfo")]
+    async fn get_rpc_info(&self) -> RpcResult<serde_json::Value>;
 }
 
 // ============================================================
@@ -1014,6 +1050,37 @@ fn compact_to_target_f64(bits: u32) -> f64 {
     }
 }
 
+/// Convert compact nBits to a full 64-character hex target string, matching
+/// Bitcoin Core `GetTarget()` / `DeriveTarget()`.  The target is stored as a
+/// little-endian 32-byte value and rendered as a big-endian hex string (same
+/// byte order as block hashes).
+fn compact_to_target_hex(bits: u32) -> String {
+    let exponent = (bits >> 24) as usize;
+    let mantissa = bits & 0x007F_FFFF;
+
+    // Build the 32-byte target in big-endian order (byte[0] = most significant).
+    let mut target = [0u8; 32];
+
+    if exponent == 0 {
+        return "0".repeat(64);
+    }
+
+    // The mantissa occupies 3 bytes.  Place the most-significant byte of the
+    // mantissa at position (32 - exponent), if in range.
+    let byte2 = ((mantissa >> 16) & 0xff) as u8;
+    let byte1 = ((mantissa >> 8) & 0xff) as u8;
+    let byte0 = (mantissa & 0xff) as u8;
+
+    if exponent >= 1 && exponent <= 32 {
+        let pos = 32 - exponent; // index of the most-significant mantissa byte
+        if pos < 32 { target[pos] = byte2; }
+        if pos + 1 < 32 { target[pos + 1] = byte1; }
+        if pos + 2 < 32 { target[pos + 2] = byte0; }
+    }
+
+    hex::encode(target)
+}
+
 // ============================================================
 // SHARED DEPLOYMENT STATE HELPER
 // ============================================================
@@ -1112,13 +1179,16 @@ impl RustoshiRpcServer for RpcServerImpl {
         // `chainwork_opt` is `None` when the block index entry is missing,
         // signalling to `should_exit_ibd` that it should skip the chain-work
         // gate and trust the tip-age gate alone.
-        let (difficulty, mediantime, chainwork_opt, chainwork_hex, tip_timestamp) = {
+        let (difficulty, mediantime, chainwork_opt, chainwork_hex, tip_timestamp, tip_bits, tip_target, tip_time) = {
             let store = BlockStore::new(&state.db);
 
-            let difficulty = if let Ok(Some(header)) = store.get_header(&state.best_hash) {
-                Self::bits_to_difficulty(header.bits)
+            let (difficulty, tip_bits, tip_target, tip_time_val) = if let Ok(Some(header)) = store.get_header(&state.best_hash) {
+                let diff = Self::bits_to_difficulty(header.bits);
+                let bits_hex = format!("{:08x}", header.bits);
+                let target_hex = compact_to_target_hex(header.bits);
+                (diff, bits_hex, target_hex, header.timestamp as u64)
             } else {
-                1.0
+                (1.0, "1d00ffff".to_string(), compact_to_target_hex(0x1d00ffff), 0u64)
             };
 
             // Get median time past, chainwork, and tip timestamp for IBD check
@@ -1130,6 +1200,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                     Some(entry.chain_work),
                     cw_hex,
                     entry.timestamp,
+                    tip_bits,
+                    tip_target,
+                    tip_time_val,
                 )
             } else {
                 // No block index entry: fall back to header for tip_timestamp
@@ -1146,6 +1219,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                     None,
                     "0".repeat(64),
                     fallback_ts,
+                    tip_bits,
+                    tip_target,
+                    tip_time_val,
                 )
             }
         };
@@ -1185,7 +1261,10 @@ impl RustoshiRpcServer for RpcServerImpl {
             blocks: state.best_height,
             headers: state.header_height,
             bestblockhash: state.best_hash.to_hex(),
+            bits: tip_bits,
+            target: tip_target,
             difficulty,
+            time: tip_time,
             mediantime,
             verificationprogress: progress,
             initialblockdownload: state.is_ibd,
@@ -1302,6 +1381,31 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Build response based on verbosity
         let txids: Vec<String> = block.transactions.iter().map(|tx| tx.txid().to_hex()).collect();
 
+        // Build coinbase_tx metadata (Core 27+ field, always present in getblock v=1).
+        // Reference: bitcoin-core/src/rpc/blockchain.cpp coinbaseTxToJSON()
+        let coinbase_tx = if let Some(coinbase) = block.transactions.first() {
+            if let Some(vin0) = coinbase.inputs.first() {
+                let mut cb_obj = serde_json::Map::new();
+                cb_obj.insert("version".to_string(), serde_json::Value::Number(coinbase.version.into()));
+                cb_obj.insert("locktime".to_string(), serde_json::Value::Number(coinbase.lock_time.into()));
+                cb_obj.insert("sequence".to_string(), serde_json::Value::Number(vin0.sequence.into()));
+                cb_obj.insert("coinbase".to_string(), serde_json::Value::String(hex::encode(&vin0.script_sig)));
+                // Include witness[0] if present (segwit coinbase witness reserved value)
+                if let Some(witness_item) = vin0.witness.first() {
+                    cb_obj.insert("witness".to_string(), serde_json::Value::String(hex::encode(witness_item)));
+                }
+                Some(serde_json::Value::Object(cb_obj))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let chainwork_hex = entry.as_ref()
+            .map(|e| hex::encode(e.chain_work))
+            .unwrap_or_else(|| "0".repeat(64));
+
         let block_info = BlockInfo {
             hash: block_hash.to_hex(),
             confirmations,
@@ -1317,11 +1421,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             mediantime: entry.as_ref().map(|e| e.timestamp as u64).unwrap_or(0),
             nonce: block.header.nonce,
             bits: format!("{:08x}", block.header.bits),
+            target: compact_to_target_hex(block.header.bits),
             difficulty: Self::bits_to_difficulty(block.header.bits),
-            chainwork: "0".repeat(64),
+            chainwork: chainwork_hex,
             n_tx: block.transactions.len() as u32,
             previousblockhash: prev_hash,
             nextblockhash: next_hash,
+            coinbase_tx,
         };
 
         Ok(serde_json::to_value(block_info).unwrap())
@@ -2350,10 +2456,12 @@ impl RustoshiRpcServer for RpcServerImpl {
         let state = self.state.read().await;
         let store = BlockStore::new(&state.db);
 
-        let difficulty = if let Ok(Some(header)) = store.get_header(&state.best_hash) {
-            Self::bits_to_difficulty(header.bits)
+        let (difficulty, tip_bits, tip_bits_val) = if let Ok(Some(header)) = store.get_header(&state.best_hash) {
+            let diff = Self::bits_to_difficulty(header.bits);
+            let bits_hex = format!("{:08x}", header.bits);
+            (diff, bits_hex, header.bits)
         } else {
-            1.0
+            (1.0, "1d00ffff".to_string(), 0x1d00ffff_u32)
         };
 
         let chain_name = match state.params.network_id {
@@ -2364,12 +2472,27 @@ impl RustoshiRpcServer for RpcServerImpl {
             NetworkId::Regtest => "regtest",
         };
 
+        // Compute "next" block info: same bits as tip (difficulty adjustment
+        // requires knowing next-retarget height, which we approximate as same).
+        // This matches the data available in a header-only context.
+        let next_height = state.best_height + 1;
+        let next = crate::types::MiningInfoNext {
+            height: next_height,
+            bits: tip_bits.clone(),
+            difficulty,
+            target: compact_to_target_hex(tip_bits_val),
+        };
+
         Ok(MiningInfo {
             blocks: state.best_height,
+            bits: tip_bits,
             difficulty,
+            target: compact_to_target_hex(tip_bits_val),
             networkhashps: 0.0, // would need to compute from recent blocks
             pooledtx: state.mempool.size(),
+            blockmintxfee: 0.00001, // default 1 sat/vByte minimum
             chain: chain_name.to_string(),
+            next,
             warnings: String::new(),
         })
     }
@@ -2405,14 +2528,27 @@ impl RustoshiRpcServer for RpcServerImpl {
                     bip152_hb_to: false,
                     bip152_hb_from: false,
                     startingheight: info.start_height,
+                    presynced_headers: -1,
                     synced_headers: 0,
                     synced_blocks: 0,
+                    inflight: vec![],
+                    addr_relay_enabled: true,
+                    addr_processed: 0,
+                    addr_rate_limited: 0,
+                    permissions: vec![],
+                    minfeefilter: 0.0,
+                    bytessent_per_msg: serde_json::Value::Object(serde_json::Map::new()),
+                    bytesrecv_per_msg: serde_json::Value::Object(serde_json::Map::new()),
                     connection_type: if info.inbound {
                         "inbound"
                     } else {
                         "outbound-full-relay"
                     }
                     .to_string(),
+                    transport_protocol_type: "v1".to_string(),
+                    session_id: String::new(),
+                    last_block: 0,
+                    last_transaction: 0,
                 })
                 .collect();
 
