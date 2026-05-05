@@ -496,6 +496,93 @@ impl Wallet {
         Ok(tx)
     }
 
+    /// Sign a single input of an externally-built transaction with a wallet UTXO.
+    ///
+    /// Used by the `signrawtransactionwithwallet` RPC. Looks up the UTXO that
+    /// `tx.inputs[input_index]` spends in the wallet's UTXO store, derives the
+    /// matching private key, detects the script type from the UTXO's
+    /// `script_pubkey`, and dispatches to the appropriate sighash + signing
+    /// helper. On success, the input's `script_sig` and/or `witness` are
+    /// populated in place.
+    ///
+    /// `all_prev_utxos` MUST be in the same order as `tx.inputs` and is used
+    /// for BIP-341 Taproot multi-input sighash. Pass an empty slice if no
+    /// taproot inputs are present (the function falls back to the per-input
+    /// utxo for non-taproot scripts).
+    ///
+    /// Returns `Err(SigningError)` if no wallet UTXO matches the input's
+    /// `previous_output`, or if the script type is unsupported (P2WSH, bare
+    /// multisig, OP_RETURN, etc. — these would need PSBT-style handling).
+    /// Reference: `bitcoin-core/src/wallet/rpc/spend.cpp::signrawtransactionwithwallet`.
+    pub fn sign_input(
+        &self,
+        tx: &mut Transaction,
+        input_index: usize,
+        all_prev_utxos: &[WalletUtxo],
+    ) -> Result<(), WalletError> {
+        if input_index >= tx.inputs.len() {
+            return Err(WalletError::SigningError(format!(
+                "input_index {} out of range ({} inputs)",
+                input_index,
+                tx.inputs.len()
+            )));
+        }
+
+        // Look up the UTXO this input is spending in the wallet.
+        let outpoint = tx.inputs[input_index].previous_output.clone();
+        let utxo = self
+            .utxos
+            .get(&outpoint)
+            .ok_or_else(|| {
+                WalletError::SigningError(format!(
+                    "UTXO {:?}:{} not in wallet",
+                    outpoint.txid, outpoint.vout
+                ))
+            })?
+            .clone();
+
+        // Get the private key for this UTXO's derivation path.
+        let private_key = self.get_private_key(&utxo.derivation_path)?;
+        let secp = Secp256k1::new();
+
+        // Detect script type from the actual scriptPubKey bytes, NOT
+        // self.address_type — the wallet may have UTXOs of different script
+        // types if it was reconfigured, and a "real" signrawtransaction must
+        // honor the prevout's script.
+        let spk = &utxo.script_pubkey;
+        if is_p2wpkh_spk(spk) {
+            self.sign_p2wpkh_input(tx, input_index, &utxo, &private_key, &secp)?;
+        } else if is_p2pkh_spk(spk) {
+            self.sign_p2pkh_input(tx, input_index, &utxo, &private_key, &secp)?;
+        } else if is_p2sh_spk(spk) {
+            // We only know how to sign P2SH-P2WPKH (BIP-49 wrapped segwit).
+            // The redeem script for a wallet-owned P2SH is reconstructed in
+            // sign_p2sh_p2wpkh_input from the public key derived at the UTXO's
+            // path, so this is correct provided the wallet stored the UTXO as
+            // BIP-49.
+            self.sign_p2sh_p2wpkh_input(tx, input_index, &utxo, &private_key, &secp)?;
+        } else if is_p2tr_spk(spk) {
+            // Taproot key-path. all_prev_utxos must cover every input for the
+            // BIP-341 sighash; if caller passed an empty slice, fall back to a
+            // single-element slice (works for single-input txs).
+            let prevouts: &[WalletUtxo] = if all_prev_utxos.is_empty() {
+                std::slice::from_ref(&utxo)
+            } else {
+                all_prev_utxos
+            };
+            self.sign_p2tr_input(tx, input_index, &utxo, prevouts, &private_key, &secp)?;
+        } else {
+            return Err(WalletError::SigningError(format!(
+                "unsupported scriptPubKey type for input {} (len={}, first byte=0x{:02x})",
+                input_index,
+                spk.len(),
+                spk.first().copied().unwrap_or(0)
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Sign a P2WPKH input (native SegWit).
     fn sign_p2wpkh_input(
         &self,
@@ -847,6 +934,37 @@ impl Wallet {
             .filter(|u| self.is_spendable(u))
             .collect()
     }
+}
+
+// ----------------------------------------------------------------------------
+// Local scriptPubKey type detection (mirrors rustoshi-consensus helpers; we
+// duplicate them here to avoid a wallet → consensus dependency cycle, since
+// only the byte-pattern check is needed for wallet-owned UTXO signing).
+// ----------------------------------------------------------------------------
+
+/// P2PKH: OP_DUP OP_HASH160 <20> 20 bytes OP_EQUALVERIFY OP_CHECKSIG (25 bytes).
+fn is_p2pkh_spk(spk: &[u8]) -> bool {
+    spk.len() == 25
+        && spk[0] == 0x76
+        && spk[1] == 0xa9
+        && spk[2] == 0x14
+        && spk[23] == 0x88
+        && spk[24] == 0xac
+}
+
+/// P2SH: OP_HASH160 <20> 20 bytes OP_EQUAL (23 bytes).
+fn is_p2sh_spk(spk: &[u8]) -> bool {
+    spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87
+}
+
+/// P2WPKH: OP_0 <20> 20 bytes (22 bytes).
+fn is_p2wpkh_spk(spk: &[u8]) -> bool {
+    spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14
+}
+
+/// P2TR: OP_1 <32> 32 bytes (34 bytes).
+fn is_p2tr_spk(spk: &[u8]) -> bool {
+    spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20
 }
 
 /// Estimate the virtual size (vsize) of a transaction.
@@ -1574,5 +1692,193 @@ mod tests {
     fn coinbase_maturity_constant() {
         // Verify the constant matches Bitcoin consensus
         assert_eq!(COINBASE_MATURITY, 100);
+    }
+
+    // ------------------------------------------------------------------
+    // sign_input — `signrawtransactionwithwallet` lying-RPC P0 closure
+    // (CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md)
+    // ------------------------------------------------------------------
+
+    /// Build a wallet + a single owned P2WPKH UTXO, plus a tx spending it to a
+    /// dummy address. Returns (wallet, tx, utxo) ready for sign_input.
+    fn build_p2wpkh_signing_fixture() -> (Wallet, Transaction, WalletUtxo) {
+        let seed = test_seed();
+        let mut wallet = Wallet::from_seed(&seed, Network::Testnet, AddressType::P2WPKH).unwrap();
+        let addr = wallet.get_new_address().unwrap();
+        let addr_obj = Address::from_string(&addr, Some(Network::Testnet)).unwrap();
+        let path = wallet.get_derivation_path(&addr).unwrap().clone();
+
+        let utxo = WalletUtxo {
+            outpoint: OutPoint {
+                txid: rustoshi_primitives::Hash256([0x11u8; 32]),
+                vout: 0,
+            },
+            value: 100_000,
+            script_pubkey: addr_obj.to_script_pubkey(),
+            derivation_path: path,
+            confirmations: 6,
+            is_change: false,
+            is_coinbase: false,
+            height: Some(100),
+        };
+        wallet.add_utxo(utxo.clone());
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: utxo.outpoint.clone(),
+                script_sig: vec![],
+                sequence: 0xFFFFFFFD,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 90_000,
+                script_pubkey: Address::from_string(
+                    "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+                    Some(Network::Testnet),
+                )
+                .unwrap()
+                .to_script_pubkey(),
+            }],
+            lock_time: 0,
+        };
+
+        (wallet, tx, utxo)
+    }
+
+    #[test]
+    fn sign_input_p2wpkh_actually_signs() {
+        // Regression test for the lying-RPC bug: pre-fix
+        // signrawtransactionwithwallet returned complete=true with the input's
+        // witness still empty. After the fix, sign_input must populate the
+        // witness with a real (sig, pubkey) pair.
+        let (wallet, mut tx, utxo) = build_p2wpkh_signing_fixture();
+
+        // Pre-condition: witness empty.
+        assert!(tx.inputs[0].witness.is_empty());
+
+        wallet
+            .sign_input(&mut tx, 0, &[utxo])
+            .expect("P2WPKH sign should succeed");
+
+        // Post-condition: witness has 2 stack items (DER-sig+hashtype, 33-byte
+        // compressed pubkey). This is the byte-level proof that we actually
+        // signed and didn't return the input untouched.
+        assert_eq!(
+            tx.inputs[0].witness.len(),
+            2,
+            "P2WPKH witness must have 2 stack items"
+        );
+        let sig = &tx.inputs[0].witness[0];
+        assert!(sig.len() >= 71 && sig.len() <= 73, "DER sig length sane");
+        assert_eq!(*sig.last().unwrap(), 0x01, "sighash byte is SIGHASH_ALL");
+        let pk = &tx.inputs[0].witness[1];
+        assert_eq!(pk.len(), 33, "compressed pubkey is 33 bytes");
+        assert!(
+            pk[0] == 0x02 || pk[0] == 0x03,
+            "compressed pubkey prefix is 0x02 or 0x03"
+        );
+    }
+
+    #[test]
+    fn sign_input_unknown_utxo_errors() {
+        // Honest-error contract: if the input's prevout is not in the wallet,
+        // sign_input must return Err — never a silent success.
+        let seed = test_seed();
+        let wallet = Wallet::from_seed(&seed, Network::Testnet, AddressType::P2WPKH).unwrap();
+
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: rustoshi_primitives::Hash256([0xdeu8; 32]),
+                    vout: 7,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFD,
+                witness: vec![],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+
+        let result = wallet.sign_input(&mut tx, 0, &[]);
+        assert!(result.is_err(), "must error on unknown UTXO");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not in wallet"),
+            "error message must mention not-in-wallet, got: {}",
+            err
+        );
+
+        // Critical: tx unchanged.
+        assert!(tx.inputs[0].witness.is_empty());
+        assert!(tx.inputs[0].script_sig.is_empty());
+    }
+
+    #[test]
+    fn sign_input_p2pkh_actually_signs() {
+        // Same byte-level proof for the legacy code path, ensuring the
+        // dispatch actually selected sign_p2pkh_input rather than no-oping.
+        let seed = test_seed();
+        let mut wallet = Wallet::from_seed(&seed, Network::Testnet, AddressType::P2PKH).unwrap();
+        let addr = wallet.get_new_address().unwrap();
+        let addr_obj = Address::from_string(&addr, Some(Network::Testnet)).unwrap();
+        let path = wallet.get_derivation_path(&addr).unwrap().clone();
+
+        let utxo = WalletUtxo {
+            outpoint: OutPoint {
+                txid: rustoshi_primitives::Hash256([0x22u8; 32]),
+                vout: 1,
+            },
+            value: 50_000,
+            script_pubkey: addr_obj.to_script_pubkey(),
+            derivation_path: path,
+            confirmations: 6,
+            is_change: false,
+            is_coinbase: false,
+            height: Some(200),
+        };
+        wallet.add_utxo(utxo.clone());
+
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: utxo.outpoint.clone(),
+                script_sig: vec![],
+                sequence: 0xFFFFFFFD,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 40_000,
+                script_pubkey: Address::from_string(
+                    "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+                    Some(Network::Testnet),
+                )
+                .unwrap()
+                .to_script_pubkey(),
+            }],
+            lock_time: 0,
+        };
+
+        wallet
+            .sign_input(&mut tx, 0, &[utxo])
+            .expect("P2PKH sign should succeed");
+
+        // P2PKH: scriptSig populated, witness empty.
+        assert!(
+            !tx.inputs[0].script_sig.is_empty(),
+            "P2PKH scriptSig must be populated"
+        );
+        assert!(
+            tx.inputs[0].witness.is_empty(),
+            "P2PKH leaves witness empty"
+        );
+        // scriptSig shape: <push sig+hashtype> <push pubkey> — at least 71+33+2 bytes.
+        assert!(
+            tx.inputs[0].script_sig.len() > 100,
+            "P2PKH scriptSig should be ~107 bytes, got {}",
+            tx.inputs[0].script_sig.len()
+        );
     }
 }
