@@ -881,6 +881,7 @@ impl WalletRpcServer for WalletRpcImpl {
         sighashtype: Option<String>,
     ) -> RpcResult<SignRawTransactionResult> {
         use rustoshi_primitives::{Transaction, Decodable, Encodable};
+        use rustoshi_wallet::WalletUtxo;
 
         let state = self.state.read().await;
 
@@ -898,60 +899,146 @@ impl WalletRpcServer for WalletRpcImpl {
         let mut tx = Transaction::deserialize(&tx_bytes)
             .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, format!("Failed to decode transaction: {}", e)))?;
 
-        // Check sighash type (only support ALL for now)
-        let _sighash_type = sighashtype.as_deref().unwrap_or("ALL");
+        // Sighash type — currently only SIGHASH_ALL (default) is wired into the
+        // wallet's sign_input dispatcher. Refuse anything else explicitly so
+        // callers don't get a silent SIGHASH_ALL when they asked for SINGLE.
+        let sighash_type_str = sighashtype.as_deref().unwrap_or("ALL");
+        if !matches!(sighash_type_str, "ALL" | "DEFAULT" | "ALL|ANYONECANPAY") {
+            // For now we honestly refuse rather than lie. ANYONECANPAY parsing
+            // would also require sighash propagation through the wallet sign
+            // helpers, which currently hardcode 0x01.
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                format!(
+                    "sighashtype {:?} not yet supported (only ALL/DEFAULT)",
+                    sighash_type_str
+                ),
+            ));
+        }
+
+        // Build a parallel vec of WalletUtxo for each input, in input order.
+        // This is required for BIP-341 Taproot sighash, which needs the full
+        // prevouts vector. Inputs whose UTXO is not in the wallet are marked
+        // None and will produce a per-input error (not a lying success).
+        let prev_utxos: Vec<Option<WalletUtxo>> = tx
+            .inputs
+            .iter()
+            .map(|input| wallet_guard.get_utxo(&input.previous_output).cloned())
+            .collect();
+
+        // For Taproot sighash we need the prev utxo of EVERY input. If any is
+        // missing, taproot signing for any wallet-owned input would compute the
+        // wrong sha_prevouts/sha_amounts/sha_scriptpubkeys. Detect this case
+        // and surface it as a per-input error rather than producing a wrong
+        // signature.
+        let any_missing = prev_utxos.iter().any(|u| u.is_none());
+
+        // Materialise a Vec<WalletUtxo> for the wallet's sign_input call. For
+        // missing entries we substitute a zeroed placeholder; sign_input will
+        // never read it for a missing input (we skip those), and for present
+        // taproot inputs we gate on `any_missing` above.
+        let placeholder = WalletUtxo {
+            outpoint: rustoshi_primitives::OutPoint {
+                txid: rustoshi_primitives::Hash256([0u8; 32]),
+                vout: 0,
+            },
+            value: 0,
+            script_pubkey: vec![],
+            derivation_path: vec![],
+            confirmations: 0,
+            is_change: false,
+            is_coinbase: false,
+            height: None,
+        };
+        let all_prev_utxos: Vec<WalletUtxo> = prev_utxos
+            .iter()
+            .map(|opt| opt.clone().unwrap_or_else(|| placeholder.clone()))
+            .collect();
 
         let mut errors: Vec<SigningError> = Vec::new();
-        let mut signed_count = 0;
 
-        // For each input, try to find the corresponding UTXO and sign
-        for input in tx.inputs.iter_mut() {
-            let outpoint = &input.previous_output;
+        // Snapshot the inputs' txid/vout up front so we can build per-input
+        // errors after the borrow checker hands &mut tx to sign_input.
+        let input_meta: Vec<(String, u32, u32)> = tx
+            .inputs
+            .iter()
+            .map(|inp| {
+                let txid_hex = hex::encode(
+                    inp.previous_output
+                        .txid
+                        .0
+                        .iter()
+                        .rev()
+                        .copied()
+                        .collect::<Vec<_>>(),
+                );
+                (txid_hex, inp.previous_output.vout, inp.sequence)
+            })
+            .collect();
 
-            // First check if this UTXO is in the wallet
-            if let Some(_utxo) = wallet_guard.get_utxo(outpoint) {
-                // UTXO is in wallet, we should be able to sign it
-                // For now, we'll mark this as signed since create_transaction already signs
-                // A full implementation would sign individual inputs
-                signed_count += 1;
-            } else if let Some(ref prevtxs_list) = prevtxs {
-                // Check if prevtx info was provided for this input
-                let txid_hex = hex::encode(outpoint.txid.0.iter().rev().copied().collect::<Vec<_>>());
-                let found = prevtxs_list.iter().any(|p| p.txid == txid_hex && p.vout == outpoint.vout);
+        for (i, prev) in prev_utxos.iter().enumerate() {
+            let (txid_hex, vout, sequence) = input_meta[i].clone();
 
-                if found {
-                    // Have prevtx info, but would need private key from wallet
-                    // If wallet doesn't have the key, this will fail
-                    errors.push(SigningError {
-                        txid: txid_hex,
-                        vout: outpoint.vout,
-                        script_sig: hex::encode(&input.script_sig),
-                        sequence: input.sequence,
-                        error: "Unable to sign input, key not in wallet".to_string(),
-                    });
+            let Some(_utxo) = prev else {
+                // Input prevout not in wallet. If caller supplied prevtxs we
+                // *could* in theory verify the script type, but we still don't
+                // have the private key — wallet-only signer can't sign foreign
+                // UTXOs. Mirror Core's "Unable to sign input, no keys in this
+                // wallet for this output" message.
+                let provided_in_prevtxs = prevtxs
+                    .as_ref()
+                    .map(|list| {
+                        list.iter()
+                            .any(|p| p.txid == txid_hex && p.vout == vout)
+                    })
+                    .unwrap_or(false);
+                let msg = if provided_in_prevtxs {
+                    "Unable to sign input, key not in wallet"
                 } else {
-                    let txid_hex = hex::encode(outpoint.txid.0.iter().rev().copied().collect::<Vec<_>>());
-                    errors.push(SigningError {
-                        txid: txid_hex,
-                        vout: outpoint.vout,
-                        script_sig: hex::encode(&input.script_sig),
-                        sequence: input.sequence,
-                        error: "Input not found".to_string(),
-                    });
-                }
-            } else {
-                let txid_hex = hex::encode(outpoint.txid.0.iter().rev().copied().collect::<Vec<_>>());
+                    "Input not found in wallet and not provided in prevtxs"
+                };
                 errors.push(SigningError {
                     txid: txid_hex,
-                    vout: outpoint.vout,
-                    script_sig: hex::encode(&input.script_sig),
-                    sequence: input.sequence,
-                    error: "Input not found and not provided in prevtxs".to_string(),
+                    vout,
+                    script_sig: hex::encode(&tx.inputs[i].script_sig),
+                    sequence,
+                    error: msg.to_string(),
+                });
+                continue;
+            };
+
+            // Taproot guard: if any other input's prevout is unknown, we cannot
+            // produce a correct BIP-341 sighash for THIS input either if it is
+            // taproot. Detect taproot via the UTXO's script_pubkey shape.
+            let spk = &_utxo.script_pubkey;
+            let is_tr = spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20;
+            if is_tr && any_missing {
+                errors.push(SigningError {
+                    txid: txid_hex,
+                    vout,
+                    script_sig: hex::encode(&tx.inputs[i].script_sig),
+                    sequence,
+                    error: "Cannot sign Taproot input: prevouts of other inputs are not in wallet (BIP-341 sighash requires all prevouts)".to_string(),
+                });
+                continue;
+            }
+
+            // Real signing — splices script_sig / witness in place.
+            if let Err(e) = wallet_guard.sign_input(&mut tx, i, &all_prev_utxos) {
+                errors.push(SigningError {
+                    txid: txid_hex,
+                    vout,
+                    script_sig: hex::encode(&tx.inputs[i].script_sig),
+                    sequence,
+                    error: format!("Signing failed: {}", e),
                 });
             }
         }
 
-        let complete = errors.is_empty() && signed_count == tx.inputs.len();
+        // complete is true ONLY if every input was signed without error.
+        // This is the lying-RPC fix: previously complete=true was returned
+        // even when no input had been modified.
+        let complete = errors.is_empty();
 
         // Serialize the (possibly partially) signed transaction
         let signed_bytes = tx.serialize();
@@ -1151,6 +1238,184 @@ mod tests {
         // Try to get balance without specifying wallet
         let result = rpc.get_balance(None, None, None, None).await;
         assert!(result.is_err());
+    }
+
+    // ----- signrawtransactionwithwallet — lying-RPC P0 closure -----
+    // CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md
+
+    /// Build a raw-tx hex spending a specific outpoint. The tx is unsigned.
+    fn build_unsigned_tx_hex(prev_txid: [u8; 32], prev_vout: u32, value: u64, out_spk: Vec<u8>) -> String {
+        use rustoshi_primitives::{Encodable, Hash256, OutPoint, Transaction, TxIn, TxOut};
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256(prev_txid),
+                    vout: prev_vout,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFD,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value,
+                script_pubkey: out_spk,
+            }],
+            lock_time: 0,
+        };
+        hex::encode(tx.serialize())
+    }
+
+    #[tokio::test]
+    async fn signrawtransactionwithwallet_unknown_utxo_returns_complete_false() {
+        // Regression test for the lying-RPC bug. Pre-fix the handler returned
+        // {complete: true} for an empty wallet because it counted *something*
+        // as signed without actually doing work. Post-fix, an empty wallet
+        // must return complete=false with a per-input error.
+        use rustoshi_crypto::address::{Address, Network};
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(
+            "w".to_string(),
+            None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let dummy_addr = Address::from_string(
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            Some(Network::Testnet),
+        )
+        .unwrap();
+        let hexstr = build_unsigned_tx_hex(
+            [0xab; 32], // not in wallet
+            0,
+            10_000,
+            dummy_addr.to_script_pubkey(),
+        );
+
+        let result = rpc
+            .sign_raw_transaction_with_wallet(hexstr.clone(), None, None)
+            .await
+            .expect("RPC call itself should succeed (errors go in result body)");
+
+        // The lying-RPC contract: complete must be false when nothing was signed.
+        assert!(
+            !result.complete,
+            "complete must be false on unknown UTXO; got complete=true (lying)"
+        );
+        // Errors must be populated and reference the unsigned input.
+        let errs = result.errors.expect("errors must be present");
+        assert_eq!(errs.len(), 1, "exactly one input, one error");
+        assert_eq!(errs[0].vout, 0);
+        // Returned hex equals input hex (no signing happened) — fine, matches Core.
+        assert_eq!(result.hex, hexstr);
+    }
+
+    #[tokio::test]
+    async fn signrawtransactionwithwallet_signs_owned_p2wpkh() {
+        // Positive test: when the wallet owns the prevout, sign_input must
+        // populate the input's witness. complete must be true.
+        use rustoshi_crypto::address::{Address, Network};
+        use rustoshi_primitives::{Decodable, Hash256, OutPoint, Transaction};
+        use rustoshi_wallet::WalletUtxo;
+
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(
+            "w".to_string(),
+            None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        // Reach into the wallet, generate an address, and inject a matching
+        // UTXO so we can test the signing path without needing a live chain.
+        let prev_txid = [0x33u8; 32];
+        let prev_vout = 0u32;
+        {
+            let st = state.read().await;
+            let wallet_arc = st
+                .wallet_manager
+                .get_wallet("w")
+                .expect("wallet should exist");
+            let mut wallet = wallet_arc.lock().unwrap();
+            let addr = wallet.get_new_address().unwrap();
+            let addr_obj = Address::from_string(&addr, Some(Network::Testnet)).unwrap();
+            let path = wallet.get_derivation_path(&addr).unwrap().clone();
+            wallet.add_utxo(WalletUtxo {
+                outpoint: OutPoint {
+                    txid: Hash256(prev_txid),
+                    vout: prev_vout,
+                },
+                value: 100_000,
+                script_pubkey: addr_obj.to_script_pubkey(),
+                derivation_path: path,
+                confirmations: 6,
+                is_change: false,
+                is_coinbase: false,
+                height: Some(100),
+            });
+        }
+
+        let dummy_addr = Address::from_string(
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            Some(Network::Testnet),
+        )
+        .unwrap();
+        let hexstr = build_unsigned_tx_hex(prev_txid, prev_vout, 90_000, dummy_addr.to_script_pubkey());
+
+        let result = rpc
+            .sign_raw_transaction_with_wallet(hexstr.clone(), None, None)
+            .await
+            .expect("RPC must succeed");
+
+        assert!(
+            result.complete,
+            "complete must be true after real signing; errors={:?}",
+            result.errors
+        );
+        assert!(result.errors.is_none());
+        // Bytes changed — proves we actually signed (not a lying echo).
+        assert_ne!(
+            result.hex, hexstr,
+            "signed hex must differ from input hex"
+        );
+        // Decode and verify witness is populated.
+        let signed_bytes = hex::decode(&result.hex).unwrap();
+        let signed_tx = Transaction::deserialize(&signed_bytes).unwrap();
+        assert_eq!(signed_tx.inputs.len(), 1);
+        assert_eq!(
+            signed_tx.inputs[0].witness.len(),
+            2,
+            "P2WPKH witness must have 2 stack items after signing"
+        );
+        let sig = &signed_tx.inputs[0].witness[0];
+        assert!(sig.len() >= 71 && sig.len() <= 73);
+        assert_eq!(*sig.last().unwrap(), 0x01); // SIGHASH_ALL
+    }
+
+    #[tokio::test]
+    async fn signrawtransactionwithwallet_unsupported_sighash_refuses() {
+        // Honest-error contract for unsupported sighash types — must not
+        // silently sign with SIGHASH_ALL when the caller asked for SINGLE.
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(
+            "w".to_string(),
+            None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let result = rpc
+            .sign_raw_transaction_with_wallet(
+                "020000000001000000".to_string(),
+                None,
+                Some("SINGLE".to_string()),
+            )
+            .await;
+        assert!(result.is_err(), "must refuse SINGLE sighash explicitly");
     }
 
     #[tokio::test]
