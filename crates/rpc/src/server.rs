@@ -4505,18 +4505,44 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn wallet_passphrase(&self, _passphrase: String, _timeout: u64) -> RpcResult<()> {
-        // Wallet encryption is not yet implemented; accept the call gracefully.
-        Ok(())
+        // Wallet encryption is not implemented in this build. Mirror Bitcoin
+        // Core's `walletpassphrase` behaviour on an unencrypted wallet
+        // (RPC_WALLET_WRONG_ENC_STATE / -15) so callers don't believe their
+        // wallet is now unlocked when nothing actually changed. Returning
+        // Ok(()) here previously was a "lying RPC" — caller would then try
+        // to sign and silently fail. See cross-impl audit
+        // CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md.
+        Err(Self::rpc_error(
+            -15, // RPC_WALLET_WRONG_ENC_STATE
+            "running with an unencrypted wallet, but walletpassphrase was called \
+             (wallet encryption not implemented in this build)",
+        ))
     }
 
     async fn wallet_lock(&self) -> RpcResult<()> {
-        // Wallet encryption is not yet implemented; accept the call gracefully.
-        Ok(())
+        // Wallet encryption is not implemented; mirror Core's
+        // RPC_WALLET_WRONG_ENC_STATE response on an unencrypted wallet.
+        // See cross-impl audit
+        // CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md.
+        Err(Self::rpc_error(
+            -15, // RPC_WALLET_WRONG_ENC_STATE
+            "running with an unencrypted wallet, but walletlock was called \
+             (wallet encryption not implemented in this build)",
+        ))
     }
 
     async fn set_label(&self, _address: String, _label: String) -> RpcResult<()> {
-        // Label storage is not yet implemented; accept the call gracefully.
-        Ok(())
+        // Label storage is not implemented in this build. Returning Ok(())
+        // was a "lying RPC" — callers expected `getaddressesbylabel` to
+        // surface the address afterwards but it never would. Refuse with a
+        // not-implemented error so the divergence is visible.
+        // See cross-impl audit
+        // CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md.
+        Err(Self::rpc_error(
+            rpc_error::RPC_INTERNAL_ERROR,
+            "setlabel is not implemented in this build (label storage missing). \
+             Call getaddressesbylabel returns the same not-implemented error.",
+        ))
     }
 
     async fn verify_message(
