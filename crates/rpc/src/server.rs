@@ -5240,6 +5240,498 @@ impl RustoshiRpcServer for RpcServerImpl {
             "hash_serialized": computed_core_hash_serialized.to_hex(),
         }))
     }
+
+    async fn get_tx_out_set_info(
+        &self,
+        hash_type: Option<String>,
+    ) -> RpcResult<serde_json::Value> {
+        use rustoshi_storage::CoinStatsIndex;
+        let state = self.state.read().await;
+        let height = state.best_height;
+        let best_hash = state.best_hash;
+
+        // Prefer the per-block CoinStats index if it has an entry at the tip.
+        let stats_index = CoinStatsIndex::new(&state.db);
+        if let Ok(Some(entry)) = stats_index.get_stats(height) {
+            let ht = hash_type.as_deref().unwrap_or("none");
+            let mut result = serde_json::json!({
+                "height": entry.height,
+                "bestblock": entry.block_hash.to_hex(),
+                "txouts": entry.utxo_count,
+                "bogosize": entry.bogo_size,
+                "hash_serialized_3": "",
+                "muhash": "",
+                "total_amount": entry.total_amount as f64 / 1e8,
+                "disk_size": 0u64,
+            });
+            if ht == "muhash" {
+                let mut mh = entry.get_muhash();
+                let fin = mh.finalize();
+                result["muhash"] = serde_json::Value::String(fin.to_hex());
+            }
+            return Ok(result);
+        }
+
+        // Fallback: count via CF_UTXO iterator (expensive on large chains).
+        let txouts = state
+            .db
+            .iter_cf(CF_UTXO)
+            .map(|iter| iter.count() as u64)
+            .unwrap_or(0);
+
+        let ht = hash_type.as_deref().unwrap_or("none");
+        let muhash_str = if ht == "muhash" {
+            // Full scan to compute MuHash — mirrors Core's hash_type=muhash path.
+            use rustoshi_storage::{MuHash3072, indexes::coinstatsindex::serialize_coin_for_muhash};
+            let mut mh = MuHash3072::new();
+            if let Ok(iter) = state.db.iter_cf(CF_UTXO) {
+                for (k, v) in iter {
+                    if let Ok(coin) = serde_json::from_slice::<CoinEntry>(&v) {
+                        if k.len() >= 36 {
+                            let txid = Hash256(k[..32].try_into().unwrap_or([0u8; 32]));
+                            let vout = u32::from_le_bytes([k[32], k[33], k[34], k[35]]);
+                            let bytes = serialize_coin_for_muhash(
+                                &txid, vout, coin.height, coin.is_coinbase,
+                                coin.value, &coin.script_pubkey,
+                            );
+                            mh.insert(&bytes);
+                        }
+                    }
+                }
+            }
+            mh.finalize().to_hex()
+        } else {
+            String::new()
+        };
+
+        Ok(serde_json::json!({
+            "height": height,
+            "bestblock": best_hash.to_hex(),
+            "txouts": txouts,
+            "bogosize": 0u64,
+            "hash_serialized_3": "",
+            "muhash": muhash_str,
+            "total_amount": 0.0f64,
+            "disk_size": 0u64,
+        }))
+    }
+
+    async fn get_network_hash_ps(
+        &self,
+        nblocks: Option<i64>,
+        height: Option<i64>,
+    ) -> RpcResult<f64> {
+        // Mirrors Bitcoin Core src/rpc/mining.cpp GetNetworkHashPS.
+        let state = self.state.read().await;
+        let best_height = state.best_height as i64;
+        let store = BlockStore::new(&state.db);
+
+        let tip_h = match height {
+            Some(h) if h >= 0 && h <= best_height => h as u32,
+            _ => state.best_height,
+        };
+
+        let mut nb = nblocks.unwrap_or(120);
+        if nb <= 0 {
+            // -1 means use the current epoch length
+            nb = (tip_h % 2016) as i64;
+            if nb == 0 {
+                nb = 1;
+            }
+        }
+        if nb as u32 > tip_h {
+            nb = tip_h as i64;
+        }
+        if nb == 0 {
+            return Ok(0.0);
+        }
+
+        let tip_hash = match store.get_hash_by_height(tip_h) {
+            Ok(Some(h)) => h,
+            _ => return Ok(0.0),
+        };
+        let start_hash = match store.get_hash_by_height(tip_h - nb as u32) {
+            Ok(Some(h)) => h,
+            _ => return Ok(0.0),
+        };
+
+        let tip_entry = match store.get_block_index(&tip_hash) {
+            Ok(Some(e)) => e,
+            _ => return Ok(0.0),
+        };
+        let start_entry = match store.get_block_index(&start_hash) {
+            Ok(Some(e)) => e,
+            _ => return Ok(0.0),
+        };
+
+        let time_diff = tip_entry.timestamp as i64 - start_entry.timestamp as i64;
+        if time_diff <= 0 {
+            return Ok(0.0);
+        }
+
+        // chainwork diff: interpret big-endian [u8;32] as u128 (lower 128 bits suffice
+        // for the window sizes we care about; Bitcoin chainwork fits in ~96 bits today).
+        let tip_cw = u128::from_be_bytes(tip_entry.chain_work[16..].try_into().unwrap_or([0u8; 16]));
+        let start_cw = u128::from_be_bytes(start_entry.chain_work[16..].try_into().unwrap_or([0u8; 16]));
+        let work_diff = tip_cw.saturating_sub(start_cw);
+
+        Ok(work_diff as f64 / time_diff as f64)
+    }
+
+    async fn get_tx_out_proof(
+        &self,
+        txids: Vec<String>,
+        blockhash: Option<String>,
+    ) -> RpcResult<String> {
+        if txids.is_empty() {
+            return Err(Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "txids must not be empty"));
+        }
+
+        let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+
+        // Parse txids (display order → internal bytes).
+        let mut target_set = std::collections::HashSet::<[u8; 32]>::new();
+        for txid_hex in &txids {
+            let bytes = hex::decode(txid_hex).map_err(|_| {
+                Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, format!("Invalid txid: {}", txid_hex))
+            })?;
+            if bytes.len() != 32 {
+                return Err(Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "txid must be 32 bytes"));
+            }
+            let mut arr = [0u8; 32];
+            // Display order is big-endian; internal is little-endian — reverse.
+            arr.copy_from_slice(&bytes);
+            arr.reverse();
+            target_set.insert(arr);
+        }
+
+        // Resolve block.
+        let block = if let Some(bh_hex) = blockhash {
+            let bh_bytes = hex::decode(&bh_hex).map_err(|_| {
+                Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "Invalid blockhash")
+            })?;
+            if bh_bytes.len() != 32 {
+                return Err(Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "blockhash must be 32 bytes"));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bh_bytes);
+            arr.reverse();
+            let hash = Hash256(arr);
+            store.get_block(&hash).map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                .ok_or_else(|| Self::rpc_error(rpc_error::RPC_BLOCK_NOT_FOUND, "Block not found"))?
+        } else {
+            // Search backwards from tip (up to 100 blocks).
+            let mut found: Option<Block> = None;
+            let tip = state.best_height;
+            for h in (tip.saturating_sub(100)..=tip).rev() {
+                if let Ok(Some(hash)) = store.get_hash_by_height(h) {
+                    if let Ok(Some(b)) = store.get_block(&hash) {
+                        let block_txids: std::collections::HashSet<[u8; 32]> =
+                            b.transactions.iter().map(|tx| tx.txid().0).collect();
+                        if target_set.iter().any(|t| block_txids.contains(t)) {
+                            found = Some(b);
+                            break;
+                        }
+                    }
+                }
+            }
+            found.ok_or_else(|| Self::rpc_error(rpc_error::RPC_BLOCK_NOT_FOUND, "Transaction not found in chain"))?
+        };
+
+        // Verify all target txids are in the block.
+        let all_txids: Vec<[u8; 32]> = block.transactions.iter().map(|tx| tx.txid().0).collect();
+        for t in &target_set {
+            if !all_txids.contains(t) {
+                let display: Vec<u8> = t.iter().rev().copied().collect();
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                    format!("Transaction {} not found in block", hex::encode(&display)),
+                ));
+            }
+        }
+
+        let matches: Vec<bool> = all_txids.iter().map(|t| target_set.contains(t)).collect();
+
+        // Serialize header (80 bytes).
+        let header_bytes = block.header.serialize();
+
+        // Build partial Merkle tree (CMerkleBlock wire format).
+        let proof = build_partial_merkle_tree_bytes(&header_bytes, &all_txids, &matches);
+        Ok(hex::encode(proof))
+    }
+
+    async fn verify_tx_out_proof(&self, proof: String) -> RpcResult<Vec<String>> {
+        use sha2::Digest;
+        let proof_bytes = hex::decode(&proof).map_err(|_| {
+            Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Invalid hex")
+        })?;
+        if proof_bytes.len() < 84 {
+            return Err(Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Proof too short"));
+        }
+
+        let header_bytes = &proof_bytes[..80];
+        let block_hash_raw = sha2::Sha256::digest(sha2::Sha256::digest(header_bytes));
+        let mut block_hash = [0u8; 32];
+        block_hash.copy_from_slice(&block_hash_raw);
+        // block_hash is little-endian (internal)
+
+        let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+
+        // Confirm block is in our chain.
+        let block = store.get_block(&Hash256(block_hash))
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+            .ok_or_else(|| Self::rpc_error(rpc_error::RPC_BLOCK_NOT_FOUND, "Block not in chain"))?;
+
+        // The merkle root in the header (bytes 36..68) is little-endian.
+        let merkle_root_in_header = &header_bytes[36..68];
+
+        let (matched, computed_root) = parse_partial_merkle_tree(&proof_bytes[80..])
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, e))?;
+
+        if computed_root != merkle_root_in_header {
+            return Err(Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Merkle root mismatch"));
+        }
+
+        // Suppress unused variable warning
+        let _ = block;
+
+        // Return txids in display order (big-endian hex).
+        let result: Vec<String> = matched
+            .iter()
+            .map(|t| {
+                let mut display = *t;
+                display.reverse();
+                hex::encode(display)
+            })
+            .collect();
+        Ok(result)
+    }
+
+    async fn get_rpc_info(&self) -> RpcResult<serde_json::Value> {
+        Ok(serde_json::json!({
+            "active_commands": [],
+            "logpath": "",
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Partial Merkle tree helpers (CMerkleBlock wire format)
+// Mirrors Bitcoin Core src/merkleblock.cpp + ouroboros rpc.py helpers.
+// ---------------------------------------------------------------------------
+
+fn dsha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let first = sha2::Sha256::digest(data);
+    let second = sha2::Sha256::digest(first);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&second);
+    out
+}
+
+fn tree_width(n_tx: usize, height: u32) -> usize {
+    (n_tx + (1 << height) - 1) >> height
+}
+
+fn calc_tree_hash(txids: &[[u8; 32]], n_tx: usize, height: u32, pos: usize) -> [u8; 32] {
+    if height == 0 {
+        return if pos < n_tx { txids[pos] } else { [0u8; 32] };
+    }
+    let left = calc_tree_hash(txids, n_tx, height - 1, pos * 2);
+    let right_pos = pos * 2 + 1;
+    let right = if right_pos < tree_width(n_tx, height - 1) {
+        calc_tree_hash(txids, n_tx, height - 1, right_pos)
+    } else {
+        left
+    };
+    let mut combined = [0u8; 64];
+    combined[..32].copy_from_slice(&left);
+    combined[32..].copy_from_slice(&right);
+    dsha256(&combined)
+}
+
+fn encode_varint(n: usize) -> Vec<u8> {
+    if n < 0xFD {
+        vec![n as u8]
+    } else if n <= 0xFFFF {
+        let mut v = vec![0xFDu8];
+        v.extend_from_slice(&(n as u16).to_le_bytes());
+        v
+    } else if n <= 0xFFFF_FFFF {
+        let mut v = vec![0xFEu8];
+        v.extend_from_slice(&(n as u32).to_le_bytes());
+        v
+    } else {
+        let mut v = vec![0xFFu8];
+        v.extend_from_slice(&(n as u64).to_le_bytes());
+        v
+    }
+}
+
+fn build_partial_merkle_tree_bytes(
+    header_bytes: &[u8],
+    txids: &[[u8; 32]],
+    matches: &[bool],
+) -> Vec<u8> {
+    let n = txids.len();
+    let mut height = 0u32;
+    while (1usize << height) < n {
+        height += 1;
+    }
+
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    let mut bits: Vec<bool> = Vec::new();
+
+    fn traverse(
+        h: u32,
+        pos: usize,
+        txids: &[[u8; 32]],
+        matches: &[bool],
+        n: usize,
+        hashes: &mut Vec<[u8; 32]>,
+        bits: &mut Vec<bool>,
+    ) {
+        let start = pos << h;
+        let end = std::cmp::min((pos + 1) << h, n);
+        let parent_match = (start..end).any(|i| matches[i]);
+        bits.push(parent_match);
+        if h == 0 || !parent_match {
+            if h == 0 {
+                hashes.push(if pos < n { txids[pos] } else { [0u8; 32] });
+            } else {
+                hashes.push(calc_tree_hash(txids, n, h, pos));
+            }
+        } else {
+            traverse(h - 1, pos * 2, txids, matches, n, hashes, bits);
+            if pos * 2 + 1 < tree_width(n, h - 1) {
+                traverse(h - 1, pos * 2 + 1, txids, matches, n, hashes, bits);
+            }
+        }
+    }
+
+    traverse(height, 0, txids, matches, n, &mut hashes, &mut bits);
+
+    let mut result = Vec::with_capacity(80 + 4 + 9 + hashes.len() * 32 + 9 + (bits.len() + 7) / 8);
+    result.extend_from_slice(header_bytes);
+    result.extend_from_slice(&(n as u32).to_le_bytes());
+    result.extend(encode_varint(hashes.len()));
+    for h in &hashes {
+        result.extend_from_slice(h);
+    }
+    let flag_bytes_count = (bits.len() + 7) / 8;
+    result.extend(encode_varint(flag_bytes_count));
+    let mut flag_bytes = vec![0u8; flag_bytes_count];
+    for (i, &b) in bits.iter().enumerate() {
+        if b {
+            flag_bytes[i / 8] |= 1 << (i % 8);
+        }
+    }
+    result.extend(flag_bytes);
+    result
+}
+
+fn read_varint(data: &[u8], offset: usize) -> Result<(usize, usize), String> {
+    if offset >= data.len() {
+        return Err("unexpected end of data reading varint".into());
+    }
+    let first = data[offset];
+    match first {
+        0..=0xFC => Ok((first as usize, offset + 1)),
+        0xFD => {
+            if offset + 3 > data.len() { return Err("short varint".into()); }
+            Ok((u16::from_le_bytes([data[offset+1], data[offset+2]]) as usize, offset + 3))
+        }
+        0xFE => {
+            if offset + 5 > data.len() { return Err("short varint".into()); }
+            Ok((u32::from_le_bytes([data[offset+1], data[offset+2], data[offset+3], data[offset+4]]) as usize, offset + 5))
+        }
+        _ => {
+            if offset + 9 > data.len() { return Err("short varint".into()); }
+            Ok((u64::from_le_bytes(data[offset+1..offset+9].try_into().unwrap()) as usize, offset + 9))
+        }
+    }
+}
+
+fn parse_partial_merkle_tree(data: &[u8]) -> Result<(Vec<[u8; 32]>, Vec<u8>), String> {
+    if data.len() < 4 { return Err("proof payload too short".into()); }
+    let n_tx = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let mut offset = 4;
+
+    let (n_hashes, new_off) = read_varint(data, offset)?;
+    offset = new_off;
+    let mut hashes: Vec<[u8; 32]> = Vec::with_capacity(n_hashes);
+    for _ in 0..n_hashes {
+        if offset + 32 > data.len() { return Err("proof truncated in hashes".into()); }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&data[offset..offset+32]);
+        hashes.push(h);
+        offset += 32;
+    }
+
+    let (n_flag_bytes, new_off) = read_varint(data, offset)?;
+    offset = new_off;
+    if offset + n_flag_bytes > data.len() { return Err("proof truncated in flags".into()); }
+    let flag_bytes_raw = &data[offset..offset + n_flag_bytes];
+    let mut all_bits: Vec<bool> = Vec::with_capacity(n_flag_bytes * 8);
+    for &byte in flag_bytes_raw {
+        for bit in 0..8 {
+            all_bits.push((byte & (1 << bit)) != 0);
+        }
+    }
+
+    let mut height = 0u32;
+    while (1usize << height) < n_tx {
+        height += 1;
+    }
+
+    let mut hash_idx = 0usize;
+    let mut bit_idx = 0usize;
+    let mut matched: Vec<[u8; 32]> = Vec::new();
+
+    fn consume(
+        h: u32,
+        pos: usize,
+        n_tx: usize,
+        hashes: &[[u8; 32]],
+        all_bits: &[bool],
+        hash_idx: &mut usize,
+        bit_idx: &mut usize,
+        matched: &mut Vec<[u8; 32]>,
+    ) -> Result<[u8; 32], String> {
+        if *bit_idx >= all_bits.len() { return Err("bits exhausted".into()); }
+        let parent_match = all_bits[*bit_idx];
+        *bit_idx += 1;
+
+        if h == 0 {
+            let cur = if *hash_idx < hashes.len() { hashes[*hash_idx] } else { [0u8; 32] };
+            *hash_idx += 1;
+            if parent_match { matched.push(cur); }
+            return Ok(cur);
+        }
+
+        if !parent_match {
+            let cur = if *hash_idx < hashes.len() { hashes[*hash_idx] } else { [0u8; 32] };
+            *hash_idx += 1;
+            return Ok(cur);
+        }
+
+        let left = consume(h-1, pos*2, n_tx, hashes, all_bits, hash_idx, bit_idx, matched)?;
+        let right_pos = pos*2+1;
+        let right = if right_pos < tree_width(n_tx, h-1) {
+            consume(h-1, right_pos, n_tx, hashes, all_bits, hash_idx, bit_idx, matched)?
+        } else {
+            left
+        };
+        let mut combined = [0u8; 64];
+        combined[..32].copy_from_slice(&left);
+        combined[32..].copy_from_slice(&right);
+        Ok(dsha256(&combined))
+    }
+
+    let computed = consume(height, 0, n_tx, &hashes, &all_bits, &mut hash_idx, &mut bit_idx, &mut matched)?;
+    Ok((matched, computed.to_vec()))
 }
 
 impl RpcServerImpl {
