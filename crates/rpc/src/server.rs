@@ -1042,6 +1042,308 @@ fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> u32 {
     timestamps[timestamps.len() / 2]
 }
 
+/// Transcribe `validation::UndoData` into the on-disk `storage::UndoData`
+/// shape. The two structs are field-identical; this helper exists only to
+/// bridge the crate boundary so callers don't need to know about the split.
+fn validation_undo_to_storage(
+    undo: &rustoshi_consensus::validation::UndoData,
+) -> rustoshi_storage::block_store::UndoData {
+    rustoshi_storage::block_store::UndoData {
+        spent_coins: undo
+            .spent_coins
+            .iter()
+            .map(|c| rustoshi_storage::block_store::CoinEntry {
+                height: c.height,
+                is_coinbase: c.is_coinbase,
+                value: c.value,
+                script_pubkey: c.script_pubkey.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Mirror in the other direction: `storage::UndoData` -> `validation::UndoData`,
+/// used by the disconnect path which speaks the validation type.
+fn storage_undo_to_validation(
+    undo: &rustoshi_storage::block_store::UndoData,
+) -> rustoshi_consensus::validation::UndoData {
+    rustoshi_consensus::validation::UndoData {
+        spent_coins: undo
+            .spent_coins
+            .iter()
+            .map(|c| rustoshi_consensus::validation::CoinEntry {
+                height: c.height,
+                is_coinbase: c.is_coinbase,
+                value: c.value,
+                script_pubkey: c.script_pubkey.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Disconnect every block in the active chain from `state.best_hash`
+/// (inclusive) back to `target_hash` (exclusive), updating the UTXO set,
+/// chain-state metadata, persisted tip pointer, and height index. Used by
+/// `invalidate_block` and the reorg path before reconnecting onto a new
+/// branch.
+///
+/// On success the caller's `state.best_*` matches `target_hash` /
+/// `target_height` and the persisted UTXO set has been rewound. The block
+/// bodies / headers / index entries for the disconnected blocks remain on
+/// disk so `reconsiderblock` (or a later reorg back) can pick them up.
+///
+/// Reference: `bitcoin-core/src/validation.cpp::DisconnectTip`.
+fn disconnect_to(
+    state: &mut RpcState,
+    target_hash: Hash256,
+    target_height: u32,
+) -> Result<(), String> {
+    use rustoshi_consensus::validation;
+
+    if state.best_hash == target_hash {
+        return Ok(());
+    }
+
+    let db = state.db.clone();
+    let store = BlockStore::new(&db);
+
+    // Walk from current tip to the target. We materialise (block, undo)
+    // tuples up front so the disconnect loop is a pure UTXO mutation.
+    let mut plan: Vec<(u32, Hash256, Block, rustoshi_storage::block_store::UndoData)> =
+        Vec::new();
+    let mut cur = state.best_hash;
+    let original_height = state.best_height;
+    while cur != target_hash {
+        let entry = store
+            .get_block_index(&cur)
+            .map_err(|e| format!("get_block_index({}): {}", cur, e))?
+            .ok_or_else(|| format!("missing block index for {}", cur))?;
+        let block = store
+            .get_block(&cur)
+            .map_err(|e| format!("get_block({}): {}", cur, e))?
+            .ok_or_else(|| format!("missing block body for {}", cur))?;
+        let undo = store
+            .get_undo(&cur)
+            .map_err(|e| format!("get_undo({}): {}", cur, e))?
+            .ok_or_else(|| {
+                format!(
+                    "missing undo data for {} - cannot safely disconnect (block was \
+                     connected before undo persistence landed?)",
+                    cur
+                )
+            })?;
+        plan.push((entry.height, cur, block, undo));
+        cur = entry.prev_hash;
+        if cur == Hash256::ZERO {
+            return Err(format!(
+                "walked off chain at genesis without reaching target {}",
+                target_hash
+            ));
+        }
+    }
+
+    // Apply the disconnects against a single UTXO view, then flush once.
+    let mut utxo_view = store.utxo_view();
+    for (h, hash, block, storage_undo) in plan.iter() {
+        let v_undo = storage_undo_to_validation(storage_undo);
+        validation::disconnect_block(block, &v_undo, &mut utxo_view).map_err(|e| {
+            format!("disconnect_block at height {} ({}): {}", h, hash, e)
+        })?;
+    }
+    utxo_view
+        .flush()
+        .map_err(|e| format!("UTXO flush after disconnect: {}", e))?;
+
+    // Persistent tip pointer + in-memory state.
+    store
+        .set_best_block(&target_hash, target_height)
+        .map_err(|e| format!("set_best_block: {}", e))?;
+
+    // Drop height-index entries for the disconnected range.
+    for h in target_height + 1..=original_height {
+        let _ = store.delete_height_index(h);
+    }
+
+    state.best_hash = target_hash;
+    state.best_height = target_height;
+    Ok(())
+}
+
+/// Try to attach a block whose parent is *not* the active tip but is
+/// somewhere in the block index, then - if the attached branch ends with
+/// strictly more chainwork than the active tip - reorganize onto it.
+///
+/// Returns `Ok(true)` if a reorg happened, `Ok(false)` if the block was
+/// stored on a side-branch but the active tip still has the most work, or
+/// `Err(msg)` if the parent is unknown or a hard error occurred during the
+/// attempt.
+///
+/// This is the production wiring for `chain_state.reorganize`. Counterpart
+/// to Bitcoin Core's `ActivateBestChainStep` for side-branch blocks
+/// (`bitcoin-core/src/validation.cpp::ActivateBestChainStep`).
+fn try_attach_and_reorg(
+    state: &mut RpcState,
+    block: &Block,
+    block_hash: &Hash256,
+) -> Result<bool, String> {
+    use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+    use rustoshi_consensus::validation;
+    use rustoshi_storage::block_store::{
+        BlockIndexEntry as StorageBlockIndexEntry, BlockStatus,
+    };
+
+    let db = state.db.clone();
+    let store = BlockStore::new(&db);
+
+    // Look up parent. If we don't have it, we can't safely store this block -
+    // it might be from a wholly-unknown chain.
+    let parent_entry = store
+        .get_block_index(&block.header.prev_block_hash)
+        .map_err(|e| format!("get_block_index(parent): {}", e))?
+        .ok_or_else(|| {
+            format!(
+                "parent {} not in block index",
+                block.header.prev_block_hash
+            )
+        })?;
+
+    let new_height = parent_entry.height + 1;
+
+    // Compute new branch chainwork.
+    let parent_work = ChainWork::from_be_bytes(parent_entry.chain_work);
+    let this_work = parent_work.saturating_add(&get_block_proof(block.header.bits));
+
+    // Tip chainwork.
+    let tip_entry = store
+        .get_block_index(&state.best_hash)
+        .map_err(|e| format!("get_block_index(tip): {}", e))?
+        .ok_or_else(|| format!("tip {} missing from block index", state.best_hash))?;
+    let tip_work_bytes = tip_entry.chain_work;
+
+    // Persist header, block, and a placeholder block-index entry so the
+    // reorg path's get_block_index closure can find this block. We mark it
+    // HAVE_DATA but not VALID_SCRIPTS - that flag is set by the connect
+    // path on the new chain after `reorganize` re-runs validation.
+    if let Err(e) = store.put_header(block_hash, &block.header) {
+        return Err(format!("put_header: {}", e));
+    }
+    if let Err(e) = store.put_block(block_hash, block) {
+        return Err(format!("put_block: {}", e));
+    }
+    {
+        let mut status = BlockStatus::new();
+        status.set(BlockStatus::HAVE_DATA);
+        let entry = StorageBlockIndexEntry {
+            height: new_height,
+            status,
+            n_tx: block.transactions.len() as u32,
+            timestamp: block.header.timestamp,
+            bits: block.header.bits,
+            nonce: block.header.nonce,
+            version: block.header.version,
+            prev_hash: block.header.prev_block_hash,
+            chain_work: this_work.0,
+        };
+        if let Err(e) = store.put_block_index(block_hash, &entry) {
+            return Err(format!("put_block_index: {}", e));
+        }
+    }
+
+    // If the active tip still has at least as much work, do nothing more -
+    // the block is kept on disk in case the side-branch later overtakes us.
+    if !rustoshi_consensus::chain_manager::compare_chain_work(&this_work.0, &tip_work_bytes)
+        .is_gt()
+    {
+        return Ok(false);
+    }
+
+    // Reorganize onto the new branch.
+    let mut chain_state =
+        ChainState::new(state.best_hash, state.best_height, state.params.clone());
+    let mut utxo_view = store.utxo_view();
+
+    let get_block = |h: &Hash256| -> Option<Block> { store.get_block(h).ok().flatten() };
+    let get_undo = |h: &Hash256| -> Option<validation::UndoData> {
+        store
+            .get_undo(h)
+            .ok()
+            .flatten()
+            .as_ref()
+            .map(storage_undo_to_validation)
+    };
+    let get_block_index = |h: &Hash256| -> Option<validation::BlockIndexEntry> {
+        store
+            .get_block_index(h)
+            .ok()
+            .flatten()
+            .map(|e| validation::BlockIndexEntry {
+                height: e.height,
+                timestamp: e.timestamp,
+                bits: e.bits,
+                prev_hash: e.prev_hash,
+                chain_work: e.chain_work,
+            })
+    };
+
+    let original_tip_height = state.best_height;
+    chain_state
+        .reorganize(
+            *block_hash,
+            &get_block,
+            &get_undo,
+            &get_block_index,
+            &mut utxo_view,
+        )
+        .map_err(|e| format!("reorganize: {}", e))?;
+
+    utxo_view
+        .flush()
+        .map_err(|e| format!("UTXO flush after reorg: {}", e))?;
+
+    // Update height index for the new branch. Walk back from the new tip
+    // overwriting old entries until we reach genesis or run out of index
+    // entries. Stale entries above the new tip are explicitly deleted below.
+    let new_tip_hash = chain_state.tip_hash();
+    let new_tip_height = chain_state.tip_height();
+    let mut walk = new_tip_hash;
+    let mut walk_h = new_tip_height;
+    let mut steps = new_tip_height + original_tip_height + 16;
+    loop {
+        if walk == Hash256::ZERO || steps == 0 {
+            break;
+        }
+        steps -= 1;
+        if let Err(e) = store.put_height_index(walk_h, &walk) {
+            return Err(format!("put_height_index: {}", e));
+        }
+        let entry = match store
+            .get_block_index(&walk)
+            .map_err(|e| format!("get_block_index walk: {}", e))?
+        {
+            Some(e) => e,
+            None => break,
+        };
+        if walk_h == 0 {
+            break;
+        }
+        walk = entry.prev_hash;
+        walk_h -= 1;
+    }
+    if original_tip_height > new_tip_height {
+        for h in new_tip_height + 1..=original_tip_height {
+            let _ = store.delete_height_index(h);
+        }
+    }
+
+    if let Err(e) = store.set_best_block(&new_tip_hash, new_tip_height) {
+        return Err(format!("set_best_block: {}", e));
+    }
+    state.best_hash = new_tip_hash;
+    state.best_height = new_tip_height;
+
+    Ok(true)
+}
+
 /// Convert compact bits to a floating-point target approximation.
 fn compact_to_target_f64(bits: u32) -> f64 {
     let exponent = (bits >> 24) as i32;
@@ -2397,7 +2699,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         let prev_block_mtp = compute_prev_block_mtp(&store, &state.best_hash);
 
         match chain_state.process_block(&block, &mut utxo_view, prev_block_mtp) {
-            Ok((_undo_data, _fees)) => {
+            Ok((undo_data, _fees)) => {
                 // Store header and block data
                 if let Err(e) = store.put_header(&block_hash, &block.header) {
                     tracing::error!("submitblock: failed to store header: {}", e);
@@ -2412,6 +2714,18 @@ impl RustoshiRpcServer for RpcServerImpl {
                 let new_height = state.best_height + 1;
                 if let Err(e) = store.put_height_index(new_height, &block_hash) {
                     tracing::error!("submitblock: failed to store height index: {}", e);
+                    return Ok(Some(format!("database-error: {}", e)));
+                }
+
+                // Persist undo data so future reorgs / `invalidateblock` calls
+                // can disconnect this block correctly. Without this, no
+                // disconnect path on the node has the spent-coin metadata
+                // it needs and the chain becomes effectively non-reorgable.
+                // (Reorg P0 closure 2026-05-05 — see CORE-PARITY-AUDIT
+                // _reorg-correctness-cross-impl-2026-05-05.md.)
+                let storage_undo = validation_undo_to_storage(&undo_data);
+                if let Err(e) = store.put_undo(&block_hash, &storage_undo) {
+                    tracing::error!("submitblock: failed to store undo data: {}", e);
                     return Ok(Some(format!("database-error: {}", e)));
                 }
 
@@ -2446,6 +2760,42 @@ impl RustoshiRpcServer for RpcServerImpl {
 
                 // null means success per BIP22
                 Ok(None)
+            }
+            Err(rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)) => {
+                // The block does not extend our active tip. It may be on a
+                // side-chain. Try to attach it (if we have its parent) and,
+                // if the resulting branch has more work than our current
+                // tip, reorganize onto it.
+                //
+                // Reorg P0 (rustoshi) — wire reorganize() into the live
+                // submitblock path. See CORE-PARITY-AUDIT
+                // _reorg-correctness-cross-impl-2026-05-05.md.
+                drop(utxo_view);
+                drop(chain_state);
+                drop(store);
+                match try_attach_and_reorg(&mut state, &block, &block_hash) {
+                    Ok(true) => {
+                        tracing::info!(
+                            "submitblock: reorganized to block {} at height {}",
+                            block_hash,
+                            state.best_height
+                        );
+                        Ok(None)
+                    }
+                    Ok(false) => {
+                        // Stored on a side-branch but not yet best-work; nothing
+                        // to do. Mirrors Core "inactive" return.
+                        tracing::info!(
+                            "submitblock: stored side-branch block {} (not best work)",
+                            block_hash
+                        );
+                        Ok(Some("inconclusive".to_string()))
+                    }
+                    Err(e) => {
+                        tracing::warn!("submitblock: reorg attempt failed for {}: {}", block_hash, e);
+                        Ok(Some(format!("rejected: {}", e)))
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("submitblock: block {} rejected: {}", block_hash, e);
@@ -3433,27 +3783,30 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         if needs_reorg {
-            // Walk back to find the common ancestor (the block before invalidated)
-            // The new tip is the parent of the invalidated block
+            // Walk back to find the common ancestor (the block before
+            // invalidated). The new tip is the parent of the invalidated
+            // block.
+            //
+            // Reorg P0 (rustoshi) — pre-fix this branch updated the tip
+            // pointer + height index but never rewound the UTXO set,
+            // leaving chainstate in a corrupt state where tip claimed
+            // height H-1 but UTXOs reflected height H. The next connect
+            // would see "double spend" or "missing UTXO" errors. Now we
+            // route through `disconnect_to`, which calls
+            // `validation::disconnect_block` for every block on the path
+            // tip -> parent-of-invalidated. See CORE-PARITY-AUDIT
+            // _reorg-correctness-cross-impl-2026-05-05.md.
             if let Some(entry) = store.get_block_index(&hash).ok().flatten() {
                 new_tip_hash = entry.prev_hash;
                 new_tip_height = block_entry.height.saturating_sub(1);
 
-                // Update best block in database
-                store.set_best_block(&new_tip_hash, new_tip_height).map_err(|e| {
+                drop(store);
+                disconnect_to(&mut state, new_tip_hash, new_tip_height).map_err(|e| {
                     Self::rpc_error(
                         rpc_error::RPC_DATABASE_ERROR,
-                        format!("Failed to update best block: {}", e),
+                        format!("invalidateblock: disconnect failed: {}", e),
                     )
                 })?;
-
-                // Update height index - remove entries from invalidated height onward
-                for h in new_tip_height + 1..=state.best_height {
-                    let _ = store.delete_height_index(h);
-                }
-
-                state.best_hash = new_tip_hash;
-                state.best_height = new_tip_height;
 
                 tracing::info!(
                     "Chain tip rolled back to {} at height {}",
@@ -3463,6 +3816,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         }
 
+        let _ = (new_tip_hash, new_tip_height);
         Ok(())
     }
 
@@ -9370,5 +9724,474 @@ mod tests {
             utxo_count, 0,
             "loadtxoutset RPC must not write any coins to CF_UTXO when the gate refuses activation"
         );
+    }
+
+    // ============================================================
+    // REORG WIRING TESTS — disconnect_to + try_attach_and_reorg
+    //
+    // The audit note in CORE-PARITY-AUDIT/_reorg-correctness-cross-impl-2026-05-05.md
+    // flagged two compounding issues:
+    //   (a) `invalidate_block` updated the tip pointer + height index but
+    //       never called `disconnect_block`, leaving UTXOs stale.
+    //   (b) `chain_state.reorganize` was implemented but had ZERO non-test
+    //       callers — P2P-driven reorgs could not happen.
+    //
+    // Both are now wired through `disconnect_to` (used by invalidateblock)
+    // and `try_attach_and_reorg` (used by submitblock's PrevBlockNotFound
+    // branch). These tests exercise the wiring directly without needing
+    // real PoW.
+    // ============================================================
+
+    /// Build a coinbase tx whose txid is unique per `(height, marker)` so
+    /// each synthetic block produces distinct UTXOs. Mirrors the
+    /// `synth_append_block` helper above but parameterised so we can fork.
+    fn synth_coinbase(h: u32, marker: u8) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: u32::MAX,
+                },
+                script_sig: vec![marker, marker, marker, h as u8, (h >> 8) as u8],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 50_000_000,
+                script_pubkey: vec![0x51], // OP_TRUE
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// Mine a coinbase-only regtest block (bits=0x207fffff, target ~ 2^224)
+    /// extending `prev_hash` at height `h`. The merkle root is filled in
+    /// from the coinbase txid and the nonce is incremented until the hash
+    /// meets target. Regtest difficulty is trivial so this terminates in
+    /// a handful of iterations.
+    fn mine_synth_block(h: u32, prev_hash: Hash256, marker: u8) -> Block {
+        use rustoshi_primitives::BlockHeader;
+        let coinbase = synth_coinbase(h, marker);
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: prev_hash,
+                merkle_root: coinbase.txid(),
+                timestamp: 1_700_000_000 + h,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+        // Iterate until we satisfy regtest PoW. Vary timestamp every 1<<20
+        // iterations as a fallback so we don't cap out at u32::MAX nonces.
+        let mut nonce: u32 = 0;
+        loop {
+            block.header.nonce = nonce;
+            if block.header.validate_pow() {
+                break;
+            }
+            nonce = nonce.wrapping_add(1);
+            if nonce == 0 {
+                block.header.timestamp = block.header.timestamp.wrapping_add(1);
+            }
+        }
+        block
+    }
+
+    /// Persist a side-branch block: header + block + index entry only
+    /// (no UTXO or undo). This is what the reorg connect path needs as
+    /// pre-state — it will compute UTXO + undo itself when connecting.
+    /// Useful for staging "the other chain" the reorg path will switch to.
+    fn synth_persist_side_block(
+        store: &BlockStore,
+        h: u32,
+        prev_hash: Hash256,
+        prev_work: [u8; 32],
+        marker: u8,
+    ) -> (Hash256, Block, [u8; 32]) {
+        use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+        let block = mine_synth_block(h, prev_hash, marker);
+        let block_hash = block.block_hash();
+        let this_work =
+            ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(0x207fffff));
+
+        store.put_block(&block_hash, &block).unwrap();
+        store.put_header(&block_hash, &block.header).unwrap();
+        {
+            use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::HAVE_DATA);
+            let entry = BlockIndexEntry {
+                height: h,
+                status,
+                n_tx: block.transactions.len() as u32,
+                timestamp: block.header.timestamp,
+                bits: block.header.bits,
+                nonce: block.header.nonce,
+                version: block.header.version,
+                prev_hash,
+                chain_work: this_work.0,
+            };
+            store.put_block_index(&block_hash, &entry).unwrap();
+        }
+        (block_hash, block, this_work.0)
+    }
+
+    /// Append a synthetic, fully-populated coinbase-only block and return
+    /// `(block_hash, block, chain_work_vec)` so callers can build heavier
+    /// branches. Persists header + block + height + index entry + undo +
+    /// UTXO so the disconnect / reorg paths have everything they need.
+    fn synth_append_with_work(
+        store: &BlockStore,
+        h: u32,
+        prev_hash: Hash256,
+        prev_work: [u8; 32],
+        marker: u8,
+    ) -> (Hash256, Block, [u8; 32]) {
+        use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+        let block = mine_synth_block(h, prev_hash, marker);
+        let coinbase = block.transactions[0].clone();
+        let block_hash = block.block_hash();
+        let this_work =
+            ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(0x207fffff));
+
+        store.put_block(&block_hash, &block).unwrap();
+        store.put_header(&block_hash, &block.header).unwrap();
+        store.put_height_index(h, &block_hash).unwrap();
+        {
+            use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_SCRIPTS);
+            status.set(BlockStatus::HAVE_DATA);
+            let entry = BlockIndexEntry {
+                height: h,
+                status,
+                n_tx: block.transactions.len() as u32,
+                timestamp: block.header.timestamp,
+                bits: block.header.bits,
+                nonce: block.header.nonce,
+                version: block.header.version,
+                prev_hash,
+                chain_work: this_work.0,
+            };
+            store.put_block_index(&block_hash, &entry).unwrap();
+        }
+
+        // Coinbase-only block: empty undo (no spent coins).
+        store
+            .put_undo(
+                &block_hash,
+                &rustoshi_storage::block_store::UndoData {
+                    spent_coins: vec![],
+                },
+            )
+            .unwrap();
+
+        // Persist the coinbase UTXO so the disconnect path has something
+        // to remove. is_coinbase=true is critical: the disconnect path
+        // must preserve this metadata when rewinding (audit property U).
+        let coinbase_txid = coinbase.txid();
+        store
+            .put_utxo(
+                &OutPoint {
+                    txid: coinbase_txid,
+                    vout: 0,
+                },
+                &rustoshi_storage::block_store::CoinEntry {
+                    height: h,
+                    is_coinbase: true,
+                    value: 50_000_000,
+                    script_pubkey: vec![0x51],
+                },
+            )
+            .unwrap();
+
+        store.set_best_block(&block_hash, h).unwrap();
+        (block_hash, block, this_work.0)
+    }
+
+    /// Test: disconnect_to walks tip -> target, removing UTXOs and
+    /// updating chainstate. Mirrors invalidateblock's expected effect.
+    #[tokio::test]
+    async fn disconnect_to_rewinds_utxos_and_tip() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        // Use mainnet params: BIP-34/SegWit heights are far above the
+        // synthetic blocks (heights 0..3) we mine here, so contextual
+        // checks become no-ops. Regtest activates both at height 1, which
+        // would force every test block to encode BIP-34 height + emit a
+        // valid witness commitment — orthogonal to the reorg wiring this
+        // test exercises.
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // Build a 3-block linear chain G -> A -> B -> C.
+        let (hash_g, _, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a, _, work_a) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xAA)
+        };
+        let (hash_b, _, work_b) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 2, hash_a, work_a, 0xAA)
+        };
+        let (hash_c, _, _work_c) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 3, hash_b, work_b, 0xAA)
+        };
+        rpc_state.best_hash = hash_c;
+        rpc_state.best_height = 3;
+
+        // Sanity: 4 UTXOs (one per coinbase) before disconnect.
+        let count_utxos = |db: &ChainDb| -> usize {
+            db.iter_cf(CF_UTXO)
+                .map(|it| it.filter(|(k, _)| k.len() == 36).count())
+                .unwrap_or(0)
+        };
+        assert_eq!(count_utxos(&db), 4, "expected 4 UTXOs (one coinbase / block)");
+
+        // Roll back to A (height 1) — should remove UTXOs created by B and C.
+        disconnect_to(&mut rpc_state, hash_a, 1).expect("disconnect_to");
+
+        assert_eq!(rpc_state.best_hash, hash_a, "tip hash rolled back");
+        assert_eq!(rpc_state.best_height, 1, "tip height rolled back");
+        assert_eq!(
+            count_utxos(&db),
+            2,
+            "two UTXOs (G + A coinbases) remain after rolling B + C off"
+        );
+
+        // The persisted tip must match the in-memory tip; otherwise on
+        // next restart we'd reload a corrupt state.
+        let store = BlockStore::new(&db);
+        assert_eq!(store.get_best_block_hash().unwrap().unwrap(), hash_a);
+        assert_eq!(store.get_best_height().unwrap().unwrap(), 1);
+    }
+
+    /// Test: disconnect_to refuses when undo data is missing — protects
+    /// against silent UTXO-set corruption.
+    #[tokio::test]
+    async fn disconnect_to_errors_without_undo() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        // Use mainnet params: BIP-34/SegWit heights are far above the
+        // synthetic blocks (heights 0..3) we mine here, so contextual
+        // checks become no-ops. Regtest activates both at height 1, which
+        // would force every test block to encode BIP-34 height + emit a
+        // valid witness commitment — orthogonal to the reorg wiring this
+        // test exercises.
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // G -> A, but delete A's undo afterwards.
+        let (hash_g, _, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a, _, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xAA)
+        };
+        {
+            let store = BlockStore::new(&db);
+            store.delete_undo(&hash_a).unwrap();
+        }
+        rpc_state.best_hash = hash_a;
+        rpc_state.best_height = 1;
+
+        let err = disconnect_to(&mut rpc_state, hash_g, 0).expect_err("must error");
+        assert!(err.contains("missing undo"), "error should call out missing undo: {}", err);
+    }
+
+    /// Test: try_attach_and_reorg attaches a side-branch block and, when it
+    /// has more chainwork than the active tip, reorganizes onto it.
+    #[tokio::test]
+    async fn try_attach_and_reorg_switches_to_heavier_branch() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        // Use mainnet params: BIP-34/SegWit heights are far above the
+        // synthetic blocks (heights 0..3) we mine here, so contextual
+        // checks become no-ops. Regtest activates both at height 1, which
+        // would force every test block to encode BIP-34 height + emit a
+        // valid witness commitment — orthogonal to the reorg wiring this
+        // test exercises.
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // G -> A1 -> A2 (active chain, height 2)
+        //  \-> B1 (side, height 1, parent hash_g) — to make B's branch
+        // outpace A we'll include B1 + B2 + B3 (height 3).
+        let (hash_g, _, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a1, _, work_a1) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xA1)
+        };
+        let (hash_a2, _, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 2, hash_a1, work_a1, 0xA2)
+        };
+        rpc_state.best_hash = hash_a2;
+        rpc_state.best_height = 2;
+
+        // Build a heavier side-branch off G: G -> B1 -> B2. We pre-commit
+        // B1 and B2 to the store as side blocks (header/block/index only —
+        // no UTXO/undo) so the reorganize path can find them and compute
+        // UTXO + undo itself during the connect walk. B3 is the block we
+        // hand to try_attach_and_reorg as the "newly-arrived" block.
+        let (hash_b1, _, work_b1) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 1, hash_g, work_g, 0xB1)
+        };
+        let (hash_b2, _, work_b2) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 2, hash_b1, work_b1, 0xB2)
+        };
+
+        // Now build the new arriving block B3 — extends B2 and is heavier
+        // than the A1->A2 chain (work-wise B3 > A2).
+        let _ = work_b2;
+        let block_b3 = mine_synth_block(3, hash_b2, 0xB3);
+        let hash_b3 = block_b3.block_hash();
+
+        // Pre-condition: tip is A2.
+        assert_eq!(rpc_state.best_hash, hash_a2);
+        assert_eq!(rpc_state.best_height, 2);
+
+        // Wire reorg: B3 has more work (3 blocks of work vs A's 2),
+        // so the reorg should fire and switch to B3.
+        let did_reorg = try_attach_and_reorg(&mut rpc_state, &block_b3, &hash_b3)
+            .expect("try_attach_and_reorg");
+        assert!(did_reorg, "B-chain has more work — reorg must fire");
+        assert_eq!(rpc_state.best_hash, hash_b3, "tip switched to B3");
+        assert_eq!(rpc_state.best_height, 3, "tip height advanced to 3");
+
+        // Persisted state must match — otherwise restart loads a corrupt tip.
+        let store = BlockStore::new(&db);
+        assert_eq!(store.get_best_block_hash().unwrap().unwrap(), hash_b3);
+        assert_eq!(store.get_best_height().unwrap().unwrap(), 3);
+
+        // Height index points to the new chain at the contended heights.
+        let h1 = store.get_hash_by_height(1).unwrap().expect("height 1 must exist");
+        let h2 = store.get_hash_by_height(2).unwrap().expect("height 2 must exist");
+        let h3 = store.get_hash_by_height(3).unwrap().expect("height 3 must exist");
+        assert_eq!(h1, hash_b1, "height 1 now points to B1");
+        assert_eq!(h2, hash_b2, "height 2 now points to B2");
+        assert_eq!(h3, hash_b3, "height 3 points to B3");
+    }
+
+    /// Test: try_attach_and_reorg does NOT switch when the side-branch has
+    /// equal or less work than the active tip. The block is stored on disk
+    /// for a possible later attach but the active tip stays put. Mirrors
+    /// Core's "store but do not activate" branch.
+    #[tokio::test]
+    async fn try_attach_and_reorg_keeps_tip_when_side_branch_lighter() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        // Use mainnet params: BIP-34/SegWit heights are far above the
+        // synthetic blocks (heights 0..3) we mine here, so contextual
+        // checks become no-ops. Regtest activates both at height 1, which
+        // would force every test block to encode BIP-34 height + emit a
+        // valid witness commitment — orthogonal to the reorg wiring this
+        // test exercises.
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // G -> A1 -> A2 (active, height 2). Hand a B1 (height 1) — has
+        // strictly less work than A2.
+        let (hash_g, _, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a1, _, work_a1) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xA1)
+        };
+        let (hash_a2, _, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 2, hash_a1, work_a1, 0xA2)
+        };
+        rpc_state.best_hash = hash_a2;
+        rpc_state.best_height = 2;
+
+        // Construct a competing side-block B1 that extends G — same height
+        // as A1, so total work is less than A2.
+        let block_b1 = mine_synth_block(1, hash_g, 0xB1);
+        let hash_b1 = block_b1.block_hash();
+
+        let did_reorg = try_attach_and_reorg(&mut rpc_state, &block_b1, &hash_b1)
+            .expect("try_attach_and_reorg");
+        assert!(!did_reorg, "lighter branch must NOT trigger a reorg");
+        assert_eq!(rpc_state.best_hash, hash_a2, "tip unchanged");
+        assert_eq!(rpc_state.best_height, 2, "height unchanged");
+
+        // The block must still be persisted so a later extension can
+        // overtake us — Core stores side-branch blocks even when they
+        // don't activate.
+        let store = BlockStore::new(&db);
+        assert!(
+            store.get_block(&hash_b1).unwrap().is_some(),
+            "side-branch block must be persisted on disk"
+        );
+        assert!(
+            store.get_block_index(&hash_b1).unwrap().is_some(),
+            "side-branch index entry must be persisted"
+        );
+    }
+
+    /// Test: try_attach_and_reorg refuses to attach a block whose parent
+    /// is unknown — protects against accepting an unrelated chain blindly.
+    #[tokio::test]
+    async fn try_attach_and_reorg_errors_on_unknown_parent() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        // Use mainnet params: BIP-34/SegWit heights are far above the
+        // synthetic blocks (heights 0..3) we mine here, so contextual
+        // checks become no-ops. Regtest activates both at height 1, which
+        // would force every test block to encode BIP-34 height + emit a
+        // valid witness commitment — orthogonal to the reorg wiring this
+        // test exercises.
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // Genesis-only chain.
+        let (hash_g, _, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        rpc_state.best_hash = hash_g;
+        rpc_state.best_height = 0;
+
+        // Block whose parent (random hash) isn't in our index.
+        let stranger_parent = Hash256::from_bytes([0x99; 32]);
+        let stranger = mine_synth_block(50, stranger_parent, 0xCC);
+        let stranger_hash = stranger.block_hash();
+
+        let err = try_attach_and_reorg(&mut rpc_state, &stranger, &stranger_hash)
+            .expect_err("unknown parent must error");
+        assert!(
+            err.contains("not in block index"),
+            "error must call out the missing parent: {}",
+            err
+        );
+        // Tip is unchanged.
+        assert_eq!(rpc_state.best_hash, hash_g);
     }
 }
