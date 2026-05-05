@@ -1726,6 +1726,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         listen_port: cli.port.unwrap_or(params.default_port),
         listen: cli.listen,
         peer_bloom_filters: cli.peerbloomfilters,
+        // BIP-159: advertise NODE_NETWORK_LIMITED when prune is enabled so peers
+        // know not to request blocks below the recent-288 keep window.
+        prune_mode: cli.prune.map(|n| n > 0).unwrap_or(false),
         data_dir: datadir.clone(),
         ..Default::default()
     };
