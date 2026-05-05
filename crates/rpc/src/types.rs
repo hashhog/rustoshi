@@ -72,8 +72,14 @@ pub struct BlockchainInfo {
     pub headers: u32,
     /// Hash of the current best block.
     pub bestblockhash: String,
+    /// Compact difficulty bits of the tip block (Core 31.99 field).
+    pub bits: String,
+    /// Difficulty target of the tip block as a full-precision hex hash (Core 31.99 field).
+    pub target: String,
     /// Current difficulty.
     pub difficulty: f64,
+    /// Block time of the tip (Unix epoch, Core 31.99 field).
+    pub time: u64,
     /// Median time of the last 11 blocks.
     pub mediantime: u64,
     /// Estimate of verification progress (0.0 to 1.0).
@@ -155,6 +161,8 @@ pub struct BlockInfo {
     pub nonce: u32,
     /// Compact difficulty target (bits).
     pub bits: String,
+    /// Difficulty target as full-precision hex hash (Core 31.99 field).
+    pub target: String,
     /// Current difficulty.
     pub difficulty: f64,
     /// Total chain work up to this block (hex).
@@ -166,6 +174,10 @@ pub struct BlockInfo {
     pub previousblockhash: Option<String>,
     /// Hash of the next block (if available).
     pub nextblockhash: Option<String>,
+    /// Coinbase transaction metadata (Core 27+ field).
+    /// Present in verbosity=1; omitted when block body unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coinbase_tx: Option<serde_json::Value>,
 }
 
 /// Response for `getblockheader` RPC (verbose mode).
@@ -392,16 +404,37 @@ pub struct FeeEstimateResult {
 pub struct MiningInfo {
     /// Current block height.
     pub blocks: u32,
+    /// Compact difficulty bits of the current tip (Core 31.99 field).
+    pub bits: String,
     /// Current difficulty.
     pub difficulty: f64,
+    /// Difficulty target as full-precision hex hash (Core 31.99 field).
+    pub target: String,
     /// Estimated network hash rate.
     pub networkhashps: f64,
     /// Number of transactions in mempool.
     pub pooledtx: usize,
+    /// Minimum feerate of packages selected for block inclusion (BTC/kvB).
+    pub blockmintxfee: f64,
     /// Current network.
     pub chain: String,
+    /// Information about the next block (Core 31.99 field).
+    pub next: MiningInfoNext,
     /// Any warnings.
     pub warnings: String,
+}
+
+/// The `next` sub-object in `getmininginfo` (Core 31.99).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MiningInfoNext {
+    /// Height of the next block.
+    pub height: u32,
+    /// Compact bits of the next block.
+    pub bits: String,
+    /// Difficulty of the next block.
+    pub difficulty: f64,
+    /// Target of the next block as full-precision hex hash.
+    pub target: String,
 }
 
 /// Response for `getblocktemplate` RPC.
@@ -521,12 +554,38 @@ pub struct PeerInfoRpc {
     pub bip152_hb_from: bool,
     /// Starting height when connected.
     pub startingheight: i32,
+    /// Presync height (-1 until headers presync phase is done).
+    pub presynced_headers: i32,
     /// Current synced headers.
     pub synced_headers: i32,
     /// Current synced blocks.
     pub synced_blocks: i32,
+    /// Block heights currently being downloaded from this peer.
+    pub inflight: Vec<u32>,
+    /// Whether addr relay is enabled.
+    pub addr_relay_enabled: bool,
+    /// Number of addresses processed from this peer.
+    pub addr_processed: u64,
+    /// Number of addresses rate-limited from this peer.
+    pub addr_rate_limited: u64,
+    /// Required permissions for this peer.
+    pub permissions: Vec<String>,
+    /// Minimum observed fee filter (BTC/kvB).
+    pub minfeefilter: f64,
+    /// Per-message bytes sent, keyed by message type.
+    pub bytessent_per_msg: serde_json::Value,
+    /// Per-message bytes received, keyed by message type.
+    pub bytesrecv_per_msg: serde_json::Value,
     /// Connection type.
     pub connection_type: String,
+    /// Transport protocol type (v1 or v2).
+    pub transport_protocol_type: String,
+    /// BIP-324 session ID (empty for v1 connections).
+    pub session_id: String,
+    /// Unix timestamp of last block received from this peer.
+    pub last_block: i64,
+    /// Unix timestamp of last transaction received from this peer.
+    pub last_transaction: i64,
 }
 
 /// Response for `getnetworkinfo` RPC.

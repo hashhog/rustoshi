@@ -882,6 +882,21 @@ fn build_block_info(
     // Calculate block weight and stripped size from transactions
     let (weight, stripped_size) = calculate_block_weight(block);
 
+    // Build coinbase_tx metadata for REST response (Core 27+).
+    let coinbase_tx = block.transactions.first().and_then(|coinbase| {
+        coinbase.inputs.first().map(|vin0| {
+            let mut cb_obj = serde_json::Map::new();
+            cb_obj.insert("version".to_string(), serde_json::Value::Number(coinbase.version.into()));
+            cb_obj.insert("locktime".to_string(), serde_json::Value::Number(coinbase.lock_time.into()));
+            cb_obj.insert("sequence".to_string(), serde_json::Value::Number(vin0.sequence.into()));
+            cb_obj.insert("coinbase".to_string(), serde_json::Value::String(hex::encode(&vin0.script_sig)));
+            if let Some(witness_item) = vin0.witness.first() {
+                cb_obj.insert("witness".to_string(), serde_json::Value::String(hex::encode(witness_item)));
+            }
+            serde_json::Value::Object(cb_obj)
+        })
+    });
+
     BlockInfo {
         hash: hash.to_hex(),
         confirmations,
@@ -897,6 +912,7 @@ fn build_block_info(
         mediantime: header.timestamp as u64, // Simplified
         nonce: header.nonce,
         bits: format!("{:08x}", header.bits),
+        target: compact_to_target_hex_rest(header.bits),
         difficulty: bits_to_difficulty(header.bits),
         chainwork: hex::encode(entry.chain_work),
         n_tx: block.transactions.len() as u32,
@@ -906,6 +922,7 @@ fn build_block_info(
             None
         },
         nextblockhash: next_hash,
+        coinbase_tx,
     }
 }
 
@@ -1085,6 +1102,26 @@ fn compact_to_target_f64(bits: u32) -> f64 {
     } else {
         mantissa * 2f64.powi(8 * (exponent - 3))
     }
+}
+
+/// Convert compact nBits to a 64-char hex target string (same logic as server.rs).
+fn compact_to_target_hex_rest(bits: u32) -> String {
+    let exponent = (bits >> 24) as usize;
+    let mantissa = bits & 0x007F_FFFF;
+    let mut target = [0u8; 32];
+    if exponent == 0 {
+        return "0".repeat(64);
+    }
+    let byte2 = ((mantissa >> 16) & 0xff) as u8;
+    let byte1 = ((mantissa >> 8) & 0xff) as u8;
+    let byte0 = (mantissa & 0xff) as u8;
+    if exponent >= 1 && exponent <= 32 {
+        let pos = 32 - exponent;
+        if pos < 32 { target[pos] = byte2; }
+        if pos + 1 < 32 { target[pos + 1] = byte1; }
+        if pos + 2 < 32 { target[pos + 2] = byte0; }
+    }
+    hex::encode(target)
 }
 
 /// Detect script type from scriptPubKey.
