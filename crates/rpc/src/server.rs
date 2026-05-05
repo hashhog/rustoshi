@@ -8523,12 +8523,16 @@ mod tests {
 
     #[tokio::test]
     async fn dumptxoutset_rollback_picks_latest_assumeutxo_below_tip() {
-        // mainnet has assumeutxo entries at 840k, 880k, 910k, 935k. Pretend
-        // we are synced to 945k -> the rollback target should resolve to
-        // 935k. Because the test fixture's chainstate has no actual blocks
-        // at those heights, the rewind path now hard-errors instead of
-        // walking — but the error must still surface the resolved height
-        // so callers can sanity-check the assumeutxo lookup.
+        // mainnet has assumeutxo entries at 840k, 880k, 910k, 935k, plus the
+        // hashhog-local 944183 snapshot (params.rs). Pretend we are synced
+        // to 945k -> the rollback target should resolve to 944183, the
+        // largest height <= tip. Because the test fixture's chainstate has
+        // no actual blocks at those heights, the rewind path now hard-errors
+        // instead of walking — but the error must still surface the resolved
+        // height so callers can sanity-check the assumeutxo lookup.
+        // Mirrors Core's `bitcoin-core/src/rpc/blockchain.cpp::DumpTxoutset`
+        // semantics where the resolver walks `m_assumeutxo_data` and picks
+        // the highest entry below tip.
         let params = rustoshi_consensus::ChainParams::mainnet();
         let (_tmp, server) = dumptxoutset_test_server(params, 945_000).await;
 
@@ -8543,11 +8547,11 @@ mod tests {
             "rollback path must error when there are no blocks to rewind through",
         );
         let msg = err.message().to_string();
-        // The rollback target (935000) is what we resolved to; the error
+        // The rollback target (944183) is what we resolved to; the error
         // text now comes from the chainstate lookup that proves the
-        // resolver did pick 935k.
+        // resolver did pick the latest assumeutxo height.
         assert!(
-            msg.contains("935000"),
+            msg.contains("944183"),
             "error must surface resolved assumeutxo target height: {}",
             msg
         );
