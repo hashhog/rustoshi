@@ -26,14 +26,43 @@
 //! })?;
 //! ```
 
-use crate::params::{DUST_RELAY_TX_FEE, MAX_STANDARD_TX_WEIGHT};
+use crate::block_template::is_final_tx;
+use crate::params::{COINBASE_MATURITY, DUST_RELAY_TX_FEE, MAX_STANDARD_TX_WEIGHT};
 use crate::script::is_p2a;
-use crate::validation::{check_transaction, CoinEntry, TxValidationError};
+use crate::validation::{
+    calculate_sequence_locks, check_sequence_locks, check_transaction, CoinEntry,
+    SequenceLockContext, TxValidationError,
+};
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxOut};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+/// SequenceLockContext for mempool acceptance checks (BIP-68).
+///
+/// Mempool does not have direct DB access, so we use a conservative
+/// approximation: return the current tip's MTP for all coin heights.
+/// For time-based relative locks, using the tip MTP as the "coin time"
+/// makes the check STRICTER (it adds more to the lock_time value), which
+/// may produce false-rejects but never false-admits — safe for mempool.
+struct MempoolSeqLockCtx {
+    tip_mtp: u32,
+}
+
+impl MempoolSeqLockCtx {
+    fn new(tip_mtp_i64: i64) -> Self {
+        Self {
+            tip_mtp: tip_mtp_i64.max(0) as u32,
+        }
+    }
+}
+
+impl SequenceLockContext for MempoolSeqLockCtx {
+    fn get_mtp_at_height(&self, _height: u32) -> u32 {
+        self.tip_mtp
+    }
+}
 
 /// Helper: current wall-clock time as seconds since Unix epoch (i64).
 /// Used for the `time_seconds` field of `MempoolEntry`, which is
@@ -751,6 +780,16 @@ pub enum MempoolError {
 
     #[error("ephemeral: child {0} does not spend all ephemeral dust from parent {1}")]
     EphemeralDustNotFullySpent(Hash256, Hash256),
+
+    // Locktime / sequence-lock errors (BIP-113 / BIP-68)
+    #[error("non-final transaction (nLockTime not satisfied at tip+1)")]
+    NonFinal,
+
+    #[error("non-BIP68-final transaction (sequence locks not satisfied at tip+1)")]
+    SequenceLockNotSatisfied,
+
+    #[error("coinbase output not yet mature (age: {age}, required: {required})")]
+    CoinbaseNotMature { age: u32, required: u32 },
 }
 
 // ============================================================
@@ -884,6 +923,13 @@ pub struct Mempool {
     /// Mining score index: sorted by mining score (lowest first) for eviction.
     /// Key is (mining_score * 1_000_000, txid) for stable ordering.
     mining_score_index: BTreeMap<(u64, Hash256), Hash256>,
+    /// Current chain tip height. Updated via `notify_new_tip`.
+    /// Used by `add_transaction` for IsFinalTx (BIP-113) and
+    /// coinbase-maturity checks. Mempool validates against height+1.
+    pub tip_height: u32,
+    /// Median Time Past of the current chain tip (BIP-113 lock_time_cutoff).
+    /// Updated via `notify_new_tip`. Used by `add_transaction` for IsFinalTx.
+    pub median_time_past: i64,
 }
 
 impl Mempool {
@@ -902,7 +948,20 @@ impl Mempool {
             tx_to_cluster: HashMap::new(),
             next_cluster_id: 0,
             mining_score_index: BTreeMap::new(),
+            tip_height: 0,
+            median_time_past: 0,
         }
+    }
+
+    /// Update the mempool's view of the chain tip.
+    ///
+    /// Call this after every `block_connected` / `block_disconnected` so that
+    /// `add_transaction` can enforce IsFinalTx (BIP-113) and coinbase maturity
+    /// against the correct height and MTP.  Mirrors Bitcoin Core's mempool
+    /// updating its `m_active_chainstate` reference on every tip change.
+    pub fn notify_new_tip(&mut self, height: u32, mtp: i64) {
+        self.tip_height = height;
+        self.median_time_past = mtp;
     }
 
     /// Add a transaction to the mempool.
@@ -948,10 +1007,26 @@ impl Mempool {
         // Check standardness
         self.check_standard(&tx)?;
 
-        // Look up inputs, compute fee, and collect conflicts
+        // IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
+        // Mempool holds txs for the *next* block, so we check against
+        // tip_height+1 and the current chain MTP (median_time_past).
+        // Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip
+        // (validation.cpp:819).
+        let next_height = self.tip_height + 1;
+        if !is_final_tx(&tx, next_height, self.median_time_past) {
+            return Err(MempoolError::NonFinal);
+        }
+
+        // Look up inputs, compute fee, and collect conflicts.
+        // Coinbase maturity (Gap R3) is checked here per-input: any confirmed
+        // coinbase output must have >= COINBASE_MATURITY (100) confirmations.
+        // Mirrors Bitcoin Core MemPoolAccept::PreChecks / CheckTxInputs
+        // (consensus/tx_verify.cpp).
         let mut input_sum: u64 = 0;
         let mut mempool_parents = HashSet::new();
         let mut direct_conflicts = HashSet::new();
+        // Collect per-input confirmed coin heights for BIP-68 check (below).
+        let mut spent_heights: Vec<u32> = Vec::with_capacity(tx.inputs.len());
 
         for input in &tx.inputs {
             // Check for conflicts (double-spends) - collect all of them
@@ -959,6 +1034,17 @@ impl Mempool {
                 direct_conflicts.insert(conflicting);
                 // Still need to look up the value from UTXO set since we're replacing
                 if let Some(coin) = utxo_lookup(&input.previous_output) {
+                    // Coinbase maturity even for conflicting inputs (belt+suspenders).
+                    if coin.is_coinbase {
+                        let age = self.tip_height.saturating_sub(coin.height);
+                        if age < COINBASE_MATURITY {
+                            return Err(MempoolError::CoinbaseNotMature {
+                                age,
+                                required: COINBASE_MATURITY,
+                            });
+                        }
+                    }
+                    spent_heights.push(coin.height);
                     input_sum += coin.value;
                 } else {
                     // The input must be in the UTXO set (not in mempool) for replacement
@@ -970,7 +1056,10 @@ impl Mempool {
                 continue;
             }
 
-            // Try mempool UTXOs first (for chained unconfirmed transactions)
+            // Try mempool UTXOs first (for chained unconfirmed transactions).
+            // Unconfirmed mempool parent outputs use synthetic height tip+1
+            // for BIP-68 sequence-lock calculation (same as Bitcoin Core's
+            // CalculateLockPointsAtTip convention for unconfirmed chains).
             if let Some(parent_txid) = self.created_utxos.get(&input.previous_output) {
                 let parent = self
                     .transactions
@@ -985,13 +1074,45 @@ impl Mempool {
                 }
                 input_sum += parent.tx.outputs[vout].value;
                 mempool_parents.insert(*parent_txid);
+                // Synthetic height for unconfirmed parent (BIP-68 convention).
+                spent_heights.push(self.tip_height + 1);
             } else if let Some(coin) = utxo_lookup(&input.previous_output) {
+                // Coinbase maturity check.
+                if coin.is_coinbase {
+                    let age = self.tip_height.saturating_sub(coin.height);
+                    if age < COINBASE_MATURITY {
+                        return Err(MempoolError::CoinbaseNotMature {
+                            age,
+                            required: COINBASE_MATURITY,
+                        });
+                    }
+                }
+                spent_heights.push(coin.height);
                 input_sum += coin.value;
             } else {
                 return Err(MempoolError::MissingInput(
                     input.previous_output.txid,
                     input.previous_output.vout,
                 ));
+            }
+        }
+
+        // BIP-68 sequence locks: reject txs whose relative-locktime constraints
+        // are not satisfied at the next block.
+        // Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckSequenceLocksAtTip
+        // (validation.cpp:887).
+        //
+        // NOTE: spent_heights may be shorter than tx.inputs.len() if some inputs
+        // hit the conflict path above (they pushed a height too) — the assertion in
+        // calculate_sequence_locks guards this. If inputs with conflicts are present,
+        // we skip the BIP-68 check for those inputs since they're being replaced;
+        // the full BIP-68 check will be re-evaluated after conflicts are removed.
+        if spent_heights.len() == tx.inputs.len() {
+            let seq_ctx = MempoolSeqLockCtx::new(self.median_time_past);
+            let enforce_bip68 = tx.version >= 2;
+            let locks = calculate_sequence_locks(&tx, &spent_heights, &seq_ctx, enforce_bip68);
+            if !check_sequence_locks(&locks, next_height, self.median_time_past) {
+                return Err(MempoolError::SequenceLockNotSatisfied);
             }
         }
 

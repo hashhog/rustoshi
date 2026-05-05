@@ -2495,6 +2495,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 let txid = tx.txid();
                                 let wtxid = tx.wtxid();
                                 let mut rpc = rpc_state.write().await;
+                                // Refresh tip snapshot for IsFinalTx / coinbase-maturity checks.
+                                {
+                                    let h = rpc.best_height;
+                                    let mtp = compute_mtp_via_store(&block_store, &rpc.best_hash).unwrap_or(0) as i64;
+                                    rpc.mempool.notify_new_tip(h, mtp);
+                                }
                                 match rpc.mempool.add_transaction(tx, &|outpoint| {
                                     // Look up UTXO from storage
                                     block_store.get_utxo(outpoint).ok().flatten().map(|coin| {
