@@ -40,7 +40,7 @@ use rustoshi_network::peer_manager::PeerManager;
 use rustoshi_primitives::{Block, Decodable, Encodable, Hash256, OutPoint, Transaction, TxIn, TxOut};
 use rustoshi_storage::{
     block_store::{BlockStore, CoinEntry},
-    snapshot::{SnapshotMetadata, SnapshotReader, SnapshotWriter},
+    snapshot::{SnapshotMetadata, SnapshotWriter},
     ChainDb, Coin, CF_UTXO,
 };
 use rustoshi_wallet::psbt::Psbt;
@@ -62,6 +62,10 @@ pub mod rpc_error {
     pub const RPC_INVALID_REQUEST: i32 = -32600;
     /// Standard JSON-RPC 2.0 invalid params error.
     pub const RPC_INVALID_PARAMS: i32 = -32602;
+    /// Standard JSON-RPC 2.0 internal error. Bitcoin Core uses this for
+    /// `loadtxoutset` failures (`rpc/blockchain.cpp::loadtxoutset` →
+    /// `JSONRPCError(RPC_INTERNAL_ERROR, ...)`).
+    pub const RPC_INTERNAL_ERROR: i32 = -32603;
     /// General-purpose RPC error.
     pub const RPC_MISC_ERROR: i32 = -1;
     /// Type error (e.g. wrong address class for the requested operation).
@@ -5035,210 +5039,82 @@ impl RustoshiRpcServer for RpcServerImpl {
         }))
     }
 
-    async fn load_tx_outset(&self, path: String) -> RpcResult<serde_json::Value> {
-        let mut state = self.state.write().await;
+    async fn load_tx_outset(&self, _path: String) -> RpcResult<serde_json::Value> {
+        let state = self.state.read().await;
 
-        let path_buf = std::path::PathBuf::from(&path);
-        let abs_path = if path_buf.is_absolute() {
-            path_buf
-        } else if let Some(ref dd) = state.data_dir {
-            dd.join(&path)
-        } else {
-            std::env::current_dir()
-                .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?
-                .join(&path)
-        };
-
-        let file = std::fs::File::open(&abs_path).map_err(|e| {
-            Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                format!("Couldn't open file {} for reading: {}", abs_path.display(), e),
-            )
-        })?;
-
-        let mut reader = SnapshotReader::open(file, &state.params.network_magic).map_err(|e| {
-            Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, e.to_string())
-        })?;
-
-        // Validate the snapshot's blockhash against the hardcoded
-        // `assumeutxo_data` set. Unrecognized bases must be rejected.
-        let metadata_blockhash = reader.metadata().base_blockhash;
-        let metadata_coins_count = reader.metadata().coins_count;
-        let assume = state
-            .params
-            .assumeutxo_for_blockhash(&metadata_blockhash)
-            .cloned()
-            .ok_or_else(|| {
-                Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
-                    format!(
-                        "Snapshot blockhash {} is not in chainparams.assumeutxo_data — rejecting.",
-                        metadata_blockhash.to_hex()
-                    ),
-                )
-            })?;
-        let base_height = assume.height;
-
-        // Stream coins into the UTXO column family + accumulate three
-        // hashes in parallel:
-        //   1. legacy rustoshi `compute_utxo_hash` form (back-compat)
-        //   2. Core-compatible `hash_serialized` (sha256d over `TxOutSer`
-        //      bytes; this is what `AssumeutxoData::hash_serialized` is
-        //      anchored to in `bitcoin-core/src/kernel/chainparams.cpp`)
-        //   3. MuHash3072 over the same `TxOutSer` bytes (matches
-        //      `gettxoutsetinfo`'s `muhash` field)
-        let store = BlockStore::new(&state.db);
-        use sha2::Digest as _;
-        let mut legacy_hasher = sha2::Sha256::new();
-        let mut core_hasher = sha2::Sha256::new();
-        let mut muhash = rustoshi_storage::MuHash3072::new();
-        let mut loaded: u64 = 0;
-        while let Some((outpoint, coin)) = reader
-            .read_coin()
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, e.to_string()))?
-        {
-            // Legacy (rustoshi-only) per-coin layout — not Core-compatible
-            // but preserved here so existing snapshots produced by older
-            // dumptxoutset still validate.
-            let mut data = Vec::with_capacity(32 + 4 + 4 + 1 + 8 + coin.tx_out.script_pubkey.len());
-            data.extend_from_slice(outpoint.txid.as_bytes());
-            data.extend_from_slice(&outpoint.vout.to_le_bytes());
-            data.extend_from_slice(&coin.height.to_le_bytes());
-            data.push(if coin.is_coinbase { 1 } else { 0 });
-            data.extend_from_slice(&coin.tx_out.value.to_le_bytes());
-            data.extend_from_slice(&coin.tx_out.script_pubkey);
-            legacy_hasher.update(&data);
-
-            // Core-compatible TxOutSer (kernel/coinstats.cpp::TxOutSer):
-            //   outpoint || u32_LE((height<<1)|coinbase) || i64_LE(value)
-            //   || CompactSize(script.len()) || script
-            let mut core_bytes = Vec::with_capacity(
-                32 + 4 + 4 + 8 + 9 + coin.tx_out.script_pubkey.len(),
-            );
-            core_bytes.extend_from_slice(outpoint.txid.as_bytes());
-            core_bytes.extend_from_slice(&outpoint.vout.to_le_bytes());
-            let code: u32 = (coin.height << 1) | (coin.is_coinbase as u32);
-            core_bytes.extend_from_slice(&code.to_le_bytes());
-            core_bytes.extend_from_slice(&(coin.tx_out.value as i64).to_le_bytes());
-            // CompactSize(script_len)
-            let n = coin.tx_out.script_pubkey.len() as u64;
-            if n < 0xFD {
-                core_bytes.push(n as u8);
-            } else if n <= 0xFFFF {
-                core_bytes.push(0xFD);
-                core_bytes.extend_from_slice(&(n as u16).to_le_bytes());
-            } else if n <= 0xFFFF_FFFF {
-                core_bytes.push(0xFE);
-                core_bytes.extend_from_slice(&(n as u32).to_le_bytes());
-            } else {
-                core_bytes.push(0xFF);
-                core_bytes.extend_from_slice(&n.to_le_bytes());
-            }
-            core_bytes.extend_from_slice(&coin.tx_out.script_pubkey);
-            core_hasher.update(&core_bytes);
-            muhash.insert(&core_bytes);
-
-            let entry = coin.to_entry();
-            store
-                .put_utxo(&outpoint, &entry)
-                .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
-            loaded += 1;
-        }
-        reader
-            .verify_complete()
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, e.to_string()))?;
-
-        if loaded != metadata_coins_count {
+        // ============================================================
+        // RUNTIME-SAFE GATE
+        // ============================================================
+        //
+        // assumeUTXO activation has THREE moving parts that must all be
+        // updated atomically with the live process state:
+        //
+        //   1. The UTXO column family (CF_UTXO) — covered below.
+        //   2. The persisted block-store tip pointer
+        //      (`set_best_block` + `put_block_index` + `put_height_index`)
+        //      so a restart loads the snapshot tip rather than re-running
+        //      IBD from genesis.
+        //   3. The LIVE in-process tip held by `ChainState`,
+        //      `HeaderSync`, and `BlockDownloader` in the main event
+        //      loop.  Without re-pointing those, the download manager
+        //      keeps requesting blocks from its pre-load tip (height 0
+        //      after a fresh start) and silently re-downloads the entire
+        //      chain.
+        //
+        // The CLI `--load-snapshot=<path>` path runs BEFORE those three
+        // structures are constructed, so it can update (1)+(2) and let
+        // construction pick up the new values.  This RPC handler runs
+        // AFTER they are live in the main loop, and the main loop owns
+        // them directly (not via `Arc<RwLock<...>>` reachable from
+        // `RpcServerImpl`), so there is no safe way to push the tip
+        // change into the live download manager without a non-trivial
+        // refactor of `rustoshi/src/main.rs`'s ownership model.
+        //
+        // Until that refactor lands, the RPC handler refuses to run and
+        // points the operator at the CLI flag, which IS safe.  Mirrors
+        // Core's `RPC_INTERNAL_ERROR` return path in
+        // `rpc/blockchain.cpp::loadtxoutset` when activation can't
+        // proceed.
+        //
+        // History: prior to 2026-05-05 this handler ingested the UTXO
+        // set into CF_UTXO and bumped `state.best_hash`/`best_height`
+        // ONLY — skipping (2) and (3).  After it returned, the live
+        // `BlockDownloader` (still at its pre-load tip) re-downloaded
+        // every block from genesis.  The persisted tip pointer was
+        // never updated either, so subsequent restarts also IBD'd from
+        // genesis.  Observed live on rustoshi mainnet 2026-05-05
+        // (recovered via the CLI path).  See
+        // `wave-bip324-live-core-2026-04-29/` and CLAUDE.md "Rustoshi
+        // mainnet datadir broken".
+        let chain_already_populated = state.best_height > 0
+            || state.best_hash != state.params.genesis_hash;
+        if chain_already_populated {
             return Err(Self::rpc_error(
-                rpc_error::RPC_DESERIALIZATION_ERROR,
+                rpc_error::RPC_INTERNAL_ERROR,
                 format!(
-                    "coins_count mismatch: header says {} but body had {}",
-                    metadata_coins_count, loaded
+                    "loadtxoutset RPC cannot activate a snapshot once the chain has data \
+                     (current tip: height={} hash={}). Stop the node and restart with \
+                     --load-snapshot=<path> to activate the snapshot at startup.",
+                    state.best_height,
+                    state.best_hash.to_hex()
                 ),
             ));
         }
-
-        // Final double-SHA256 over the streamed per-coin layout, matching
-        // `compute_utxo_hash`'s output.
-        let first_hash = legacy_hasher.finalize();
-        let mut second = sha2::Sha256::new();
-        second.update(first_hash);
-        let final_hash = second.finalize();
-        let mut final_bytes = [0u8; 32];
-        final_bytes.copy_from_slice(&final_hash);
-        let computed_legacy = Hash256(final_bytes);
-
-        // Final sha256d over the Core TxOutSer bytes — this is the form
-        // `validation.cpp:5912-5914` validates against, modulo the
-        // per-tx-group ordering (which our writer/loader already enforce).
-        let first_core = core_hasher.finalize();
-        let mut second_core = sha2::Sha256::new();
-        second_core.update(first_core);
-        let final_core = second_core.finalize();
-        let mut core_bytes_out = [0u8; 32];
-        core_bytes_out.copy_from_slice(&final_core);
-        let computed_core_hash_serialized = Hash256(core_bytes_out);
-
-        // Finalize the MuHash for completeness (returned in the JSON
-        // response so callers can cross-check against `gettxoutsetinfo`).
-        let computed_muhash = muhash.finalize();
-
-        // Validate against the chainparams entry's hash_serialized.  We
-        // accept either the legacy rustoshi form (back-compat with
-        // existing snapshots) OR the Core HASH_SERIALIZED form.  When
-        // neither matches we report Core's exact wording from
-        // `bitcoin-core/src/validation.cpp:5912-5914`.
-        let expected = assume.hash_serialized.0;
-        if computed_legacy != expected && computed_core_hash_serialized != expected {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_VERIFY_REJECTED,
-                format!(
-                    "Bad snapshot content hash: expected {}, got {}",
-                    expected.to_hex(),
-                    computed_core_hash_serialized.to_hex()
-                ),
-            ));
-        }
-        let computed = if computed_core_hash_serialized == expected {
-            computed_core_hash_serialized
-        } else {
-            computed_legacy
-        };
-
-        // Mark the snapshot as the new chain tip — this is a one-way operation
-        // mirroring Core's `ActivateSnapshot`. A full implementation would
-        // also flag the chainstate as snapshot-derived for later background
-        // validation; for now we update best_hash / best_height so subsequent
-        // RPCs see the loaded tip.
-        state.best_hash = metadata_blockhash;
-        state.best_height = base_height;
-        if state.header_height < base_height {
-            state.header_height = base_height;
-        }
-
-        // Persist a marker in the data dir so a restart can recognize the
-        // snapshot-derived state. Best-effort; failure is non-fatal.
-        if let Some(ref dd) = state.data_dir {
-            let _ = rustoshi_storage::write_snapshot_blockhash(dd, &metadata_blockhash);
-        }
-
-        Ok(serde_json::json!({
-            "coins_loaded": loaded,
-            "tip_hash": metadata_blockhash.to_hex(),
-            "base_height": base_height,
-            "path": abs_path.display().to_string(),
-            // Hash actually used for the chainparams cross-check.  Will be
-            // either the legacy rustoshi form or the Core HASH_SERIALIZED
-            // form, depending on which matched.
-            "txoutset_hash": computed.to_hex(),
-            // Core's gettxoutsetinfo MuHash variant (over the same per-coin
-            // TxOutSer bytes).  Independent of insertion order.
-            "muhash": computed_muhash.to_hex(),
-            // Core's HASH_SERIALIZED variant (sha256d over per-coin
-            // TxOutSer bytes).  This is what `AssumeutxoData::hash_serialized`
-            // is anchored to in Core's chainparams.cpp.
-            "hash_serialized": computed_core_hash_serialized.to_hex(),
-        }))
+        // Even on a genesis-only chain the live `BlockDownloader` /
+        // `HeaderSync` / `ChainState` constructed at startup are pinned
+        // to genesis and cannot be re-pointed from here.  Refusing
+        // unconditionally is correct; the CLI path is the only safe
+        // entry point for assumeUTXO activation in this build.
+        Err(Self::rpc_error(
+            rpc_error::RPC_INTERNAL_ERROR,
+            "loadtxoutset RPC is disabled in this build because the live \
+             block-download manager cannot be re-pointed at the snapshot tip \
+             from inside an RPC handler. Stop the node and restart with \
+             --load-snapshot=<path> to activate the snapshot at startup. \
+             See `rustoshi/src/main.rs` (assumeUTXO activation block) for \
+             the canonical activation sequence."
+                .to_string(),
+        ))
     }
 
     async fn get_tx_out_set_info(
@@ -9360,6 +9236,109 @@ mod tests {
         assert_eq!(
             ValidationError::BlockTooLarge(5_000_000).bip22_string(),
             "rejected"
+        );
+    }
+
+    // ============================================================
+    // loadtxoutset RPC runtime gate
+    // ============================================================
+    //
+    // The RPC handler was refactored on 2026-05-05 to refuse activation
+    // unconditionally and direct the operator to `--load-snapshot=<path>`
+    // at startup. The bug fixed: prior versions wrote UTXOs to CF_UTXO
+    // and bumped `state.best_hash`/`best_height` only — skipping the
+    // three persisted block-store writes (`put_block_index`,
+    // `put_height_index`, `set_best_block`) AND failing to re-point the
+    // live `BlockDownloader` / `HeaderSync` / `ChainState` in the main
+    // event loop. Result: the download manager kept its pre-load tip
+    // and re-downloaded from genesis after the RPC returned.
+    //
+    // These tests pin the gate's behavior so a future refactor that
+    // accidentally re-enables the buggy path fails CI.
+
+    #[tokio::test]
+    async fn test_loadtxoutset_rpc_refuses_on_genesis_only_chain() {
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        // Fresh node, no chain data, no snapshot file even needed —
+        // the gate fires before file I/O.
+        let result = rpc.load_tx_outset("does-not-exist.dat".to_string()).await;
+        let err = result.expect_err("loadtxoutset must refuse on a genesis-only chain");
+        assert_eq!(err.code(), rpc_error::RPC_INTERNAL_ERROR);
+        assert!(
+            err.message().contains("--load-snapshot"),
+            "error message should direct operator to the CLI flag, got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loadtxoutset_rpc_refuses_on_populated_chain() {
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let mut rpc_state = RpcState::new(db, params);
+        // Simulate a chain that has progressed past genesis. The gate
+        // must distinguish this case in the error message so operators
+        // know they cannot use the RPC for activation on an existing
+        // datadir either.
+        rpc_state.best_height = 12345;
+        rpc_state.best_hash = Hash256([0xAB; 32]);
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        let result = rpc.load_tx_outset("does-not-exist.dat".to_string()).await;
+        let err = result.expect_err("loadtxoutset must refuse when chain has data");
+        assert_eq!(err.code(), rpc_error::RPC_INTERNAL_ERROR);
+        let msg = err.message();
+        assert!(
+            msg.contains("12345"),
+            "error must report the live tip height, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("--load-snapshot"),
+            "error must direct operator to the CLI flag, got: {}",
+            msg
+        );
+    }
+
+    /// Regression guard: the RPC handler must NOT touch the UTXO column
+    /// family. Pre-fix, the handler wrote ~150M coins to CF_UTXO before
+    /// returning success without persisting tip metadata, leaving the
+    /// datadir in a half-initialized state. The gate now bails before
+    /// any I/O, so CF_UTXO must remain empty after the call.
+    #[tokio::test]
+    async fn test_loadtxoutset_rpc_does_not_write_utxos() {
+        use rustoshi_storage::{ChainDb, CF_UTXO};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let db_for_check = db.clone();
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        let _ = rpc.load_tx_outset("ignored.dat".to_string()).await;
+
+        let utxo_count = db_for_check
+            .iter_cf(CF_UTXO)
+            .map(|iter| iter.count())
+            .unwrap_or(0);
+        assert_eq!(
+            utxo_count, 0,
+            "loadtxoutset RPC must not write any coins to CF_UTXO when the gate refuses activation"
         );
     }
 }
