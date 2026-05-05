@@ -225,6 +225,13 @@ impl ValidationError {
             ValidationError::TxValidation(TxValidationError::PrematureCoinbaseSpend(_, _)) => {
                 "bad-txns-premature-spend-of-coinbase"
             }
+            // Non-coinbase tx where sum(inputs) < sum(outputs).
+            // Core consensus/tx_verify.cpp::CheckTxInputs:
+            //   state.Invalid(TxValidationResult::TX_CONSENSUS,
+            //                 "bad-txns-in-belowout", ...)
+            ValidationError::TxValidation(TxValidationError::InsufficientFunds(_, _)) => {
+                "bad-txns-in-belowout"
+            }
             // Catch-all: covers structural/weight/prev-block/chain errors
             _ => "rejected",
         }
