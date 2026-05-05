@@ -220,6 +220,11 @@ impl ValidationError {
             ValidationError::TxValidation(TxValidationError::ScriptFailed(_)) => {
                 "block-script-verify-flag-failed"
             }
+            // Coinbase maturity violation (consensus/tx_verify.cpp::CheckTxInputs).
+            // Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase")
+            ValidationError::TxValidation(TxValidationError::PrematureCoinbaseSpend(_, _)) => {
+                "bad-txns-premature-spend-of-coinbase"
+            }
             // Catch-all: covers structural/weight/prev-block/chain errors
             _ => "rejected",
         }
