@@ -1691,6 +1691,17 @@ impl RustoshiRpcServer for RpcServerImpl {
                 })
         };
 
+        // Refresh the mempool's tip snapshot (height + MTP) before admission so
+        // that IsFinalTx (BIP-113) and coinbase-maturity checks use the current
+        // chain tip.  Mirrors Bitcoin Core's m_active_chainstate reference in
+        // MemPoolAccept::PreChecks.
+        {
+            let tip_height = state.best_height;
+            let store = BlockStore::new(&db);
+            let mtp = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+            state.mempool.notify_new_tip(tip_height, mtp);
+        }
+
         // Add to mempool
         match state.mempool.add_transaction(tx, &utxo_lookup) {
             Ok(_) => {
