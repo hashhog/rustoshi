@@ -18,8 +18,8 @@ use crate::eviction::{select_node_to_evict, EvictionCandidate, EvictionCandidate
 use crate::message::{
     parse_message_header, serialize_message, NetAddress, NetworkMessage,
     TimestampedNetAddress, VersionMessage, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
-    MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_NETWORK, NODE_WITNESS, PROTOCOL_VERSION,
-    SENDHEADERS_VERSION,
+    MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_NETWORK, NODE_NETWORK_LIMITED, NODE_WITNESS,
+    PROTOCOL_VERSION, SENDHEADERS_VERSION,
 };
 use crate::v2_transport::{
     constants::{
@@ -75,6 +75,11 @@ pub struct PeerManagerConfig {
     /// Bitcoin Core's `-peerbloomfilters` (default: false; see
     /// `bitcoin-core/src/net_processing.h:44 DEFAULT_PEERBLOOMFILTERS`).
     pub peer_bloom_filters: bool,
+    /// Whether prune mode is enabled. When true, advertise NODE_NETWORK_LIMITED
+    /// (BIP-159) in the version handshake to signal that we serve only the
+    /// most recent ~288 blocks. Mirrors Core's `init.cpp` behaviour where
+    /// `nLocalServices |= NODE_NETWORK_LIMITED` when `IsPruneMode()` is true.
+    pub prune_mode: bool,
     /// Data directory for persistent state (banlist, anchors.dat, etc.).
     pub data_dir: PathBuf,
 }
@@ -97,6 +102,7 @@ impl Default for PeerManagerConfig {
             listen_port: 8333,
             listen: true,
             peer_bloom_filters: false,
+            prune_mode: false,
             data_dir: PathBuf::from("."),
         }
     }
@@ -824,10 +830,15 @@ impl PeerManager {
     /// Service flags advertised by this node (NODE_NETWORK | NODE_WITNESS, plus
     /// NODE_BLOOM when `peer_bloom_filters` is enabled — Bitcoin Core's
     /// `g_local_services` after `init.cpp`'s `-peerbloomfilters` gate).
+    /// When prune mode is on, NODE_NETWORK_LIMITED (BIP-159) is advertised so
+    /// peers know we serve only the recent-288-block window.
     pub fn local_services(&self) -> u64 {
         let mut s = NODE_NETWORK | NODE_WITNESS;
         if self.config.peer_bloom_filters {
             s |= NODE_BLOOM;
+        }
+        if self.config.prune_mode {
+            s |= NODE_NETWORK_LIMITED;
         }
         s
     }
@@ -3128,6 +3139,55 @@ mod tests {
         let version = mgr.build_version_message(addr);
         assert!(version.services & NODE_BLOOM != 0);
         assert!(version.addr_from.services & NODE_BLOOM != 0);
+    }
+
+    /// BIP-159: NODE_NETWORK_LIMITED (1 << 10) must NOT be advertised when
+    /// prune mode is off. Mirrors Core's `init.cpp` (sets the bit only when
+    /// `IsPruneMode()` is true).
+    #[test]
+    fn test_node_network_limited_off_by_default() {
+        let config = PeerManagerConfig::testnet4();
+        assert!(!config.prune_mode);
+        let params = ChainParams::testnet4();
+        let mgr = PeerManager::new(config, params);
+
+        let services = mgr.local_services();
+        assert_eq!(
+            services & NODE_NETWORK_LIMITED,
+            0,
+            "NODE_NETWORK_LIMITED must NOT be advertised when prune_mode=false"
+        );
+
+        let addr: SocketAddr = "192.168.1.1:48333".parse().unwrap();
+        let version = mgr.build_version_message(addr);
+        assert_eq!(version.services & NODE_NETWORK_LIMITED, 0);
+        assert_eq!(version.addr_from.services & NODE_NETWORK_LIMITED, 0);
+    }
+
+    /// BIP-159: when prune mode is enabled the version handshake must
+    /// advertise NODE_NETWORK_LIMITED so peers don't request pre-prune-horizon
+    /// blocks. Core also advertises NODE_NETWORK alongside it (the node still
+    /// has the recent-288 archive), so we keep NODE_NETWORK set as well.
+    #[test]
+    fn test_node_network_limited_advertised_when_prune_on() {
+        let mut config = PeerManagerConfig::testnet4();
+        config.prune_mode = true;
+        let params = ChainParams::testnet4();
+        let mgr = PeerManager::new(config, params);
+
+        let services = mgr.local_services();
+        assert!(
+            services & NODE_NETWORK_LIMITED != 0,
+            "NODE_NETWORK_LIMITED must be advertised when prune_mode=true"
+        );
+        // Core keeps NODE_NETWORK set in the auto-prune case too.
+        assert!(services & NODE_NETWORK != 0);
+        assert!(services & NODE_WITNESS != 0);
+
+        let addr: SocketAddr = "192.168.1.1:48333".parse().unwrap();
+        let version = mgr.build_version_message(addr);
+        assert!(version.services & NODE_NETWORK_LIMITED != 0);
+        assert!(version.addr_from.services & NODE_NETWORK_LIMITED != 0);
     }
 
     #[test]
