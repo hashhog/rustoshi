@@ -36,7 +36,7 @@ use rustoshi_network::{
 };
 use rustoshi_primitives::{Hash256, OutPoint};
 use rustoshi_rpc::{start_rpc_server, PeerState, RpcConfig, RpcState};
-use rustoshi_storage::{block_store::{BlockIndexEntry, BlockStatus}, BlockStore, ChainDb};
+use rustoshi_storage::{block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry}, BlockStore, ChainDb};
 
 // ============================================================
 // CLI DEFINITIONS
@@ -232,6 +232,41 @@ fn compute_mtp_via_store(
     }
     timestamps.sort_unstable();
     Some(timestamps[timestamps.len() / 2])
+}
+
+/// Pattern C0 (txindex-on-connect): persist a `txid -> block_hash` mapping
+/// for every transaction in `block`. Called from every block-connect path
+/// (stdin import, framed import, IBD validation interval, IBD per-block
+/// validation) so that `getrawtransaction` can resolve a tx via the
+/// txindex without an explicit blockhash. Errors are logged but do not
+/// abort the connect — failing to write the txindex is a soft failure
+/// (the block has been validated, the UTXO is correct; the worst case is
+/// that `getrawtransaction(txid)` returns "not found" until the txindex
+/// is rebuilt).
+///
+/// Mirrors `bitcoin-core/src/index/txindex.cpp::CustomAppend` (fired from
+/// `BaseIndex::BlockConnected`).
+///
+/// See CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+/// for the cross-impl finding that motivated this wiring.
+fn write_tx_index_entries(
+    block_store: &BlockStore,
+    block: &rustoshi_primitives::Block,
+    block_hash: rustoshi_primitives::Hash256,
+) {
+    for tx in &block.transactions {
+        let entry = TxIndexEntry {
+            block_hash,
+            tx_offset: 0,
+            tx_length: 0,
+        };
+        if let Err(e) = block_store.put_tx_index(&tx.txid(), &entry) {
+            tracing::warn!(
+                "tx_index write failed for {} in block {}: {}",
+                tx.txid(), block_hash, e
+            );
+        }
+    }
 }
 
 fn resolve_datadir(datadir: &str, params: &ChainParams) -> PathBuf {
@@ -726,6 +761,11 @@ fn run_import_from_blk_files(
             }
         }
 
+        // Pattern C0 (txindex-on-connect): persist tx_index for every tx so
+        // that getrawtransaction works post-IBD. See write_tx_index_entries
+        // for the Core reference + audit-doc citation.
+        write_tx_index_entries(block_store, &block, hash);
+
         // Flush UTXO cache if needed
         if utxo_view.needs_flush() {
             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
@@ -898,6 +938,11 @@ fn run_import_from_stdin(
                 tracing::error!("Failed to store block index at height {}: {}", frame_height, e);
             }
         }
+
+        // Pattern C0 (txindex-on-connect): persist tx_index for every tx in
+        // this block so getrawtransaction works post-IBD. See
+        // `write_tx_index_entries` for the Core reference + audit-doc citation.
+        write_tx_index_entries(block_store, &block, hash);
 
         // Flush UTXO cache if needed
         if utxo_view.needs_flush() {
@@ -1933,6 +1978,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             }
                         }
 
+                        // Pattern C0 (txindex-on-connect): persist tx_index for
+                        // every tx in this block so getrawtransaction works
+                        // post-IBD. See `write_tx_index_entries`.
+                        write_tx_index_entries(&block_store, &block, block_hash);
+
                         if utxo_view.needs_flush() {
                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                             let entries = utxo_view.cache_len();
@@ -2376,6 +2426,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 tracing::error!("Failed to store block index at height {}: {}", height, e);
                                             }
                                         }
+
+                                        // Pattern C0 (txindex-on-connect): persist tx_index for
+                                        // every tx in this block so getrawtransaction works
+                                        // post-IBD. See `write_tx_index_entries`.
+                                        write_tx_index_entries(&block_store, &block, block_hash);
 
                                         // Flush UTXO cache if it exceeds the 2 GiB limit
                                         if utxo_view.needs_flush() {

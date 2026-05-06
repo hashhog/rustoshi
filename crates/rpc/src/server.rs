@@ -1149,6 +1149,23 @@ fn disconnect_to(
         validation::disconnect_block(block, &v_undo, &mut utxo_view).map_err(|e| {
             format!("disconnect_block at height {} ({}): {}", h, hash, e)
         })?;
+
+        // Pattern C (txindex-revert-on-reorg): drop tx_index entries for every
+        // tx in the disconnected block so that `getrawtransaction` no longer
+        // resolves them via the orphaned block_hash. Mirrors Bitcoin Core's
+        // `bitcoin-core/src/index/txindex.cpp::CustomRemove`, fired from
+        // `BaseIndex::BlockDisconnected`.
+        //
+        // Idempotent: `delete_tx_index` is a no-op if the entry was never
+        // written (e.g. blocks indexed before the C0 wiring landed).
+        for tx in &block.transactions {
+            if let Err(e) = store.delete_tx_index(&tx.txid()) {
+                tracing::error!(
+                    "disconnect_to: failed to delete tx index for {}: {}",
+                    tx.txid(), e
+                );
+            }
+        }
     }
     utxo_view
         .flush()
@@ -1420,6 +1437,102 @@ fn try_attach_and_reorg(
     }
     state.best_hash = new_tip_hash;
     state.best_height = new_tip_height;
+
+    // Pattern C (txindex-revert-on-reorg) + Pattern C0 (txindex-on-connect):
+    //   1. Drop tx_index entries for every tx in the now-disconnected blocks
+    //      so that `getrawtransaction` no longer resolves them via the
+    //      orphaned block_hash. Mirrors Core's `BaseIndex::BlockDisconnected`
+    //      -> `txindex.cpp::CustomRemove`.
+    //   2. Write tx_index entries for every tx in the newly-connected blocks
+    //      (the side branch we just attached). Mirrors Core's
+    //      `BaseIndex::BlockConnected` -> `txindex.cpp::CustomAppend`. Without
+    //      step 2, post-reorg `getrawtransaction` returns "not found" for txs
+    //      that are now on the active chain.
+    //
+    // Reference: CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+    // (Pattern C0: rustoshi's submitblock+reorg paths were unwired pre-fix.)
+    {
+        for blk in &disconnected_blocks {
+            for tx in &blk.transactions {
+                if let Err(e) = store.delete_tx_index(&tx.txid()) {
+                    tracing::error!(
+                        "try_attach_and_reorg: failed to delete tx index for {}: {}",
+                        tx.txid(), e
+                    );
+                }
+            }
+        }
+
+        // Walk the newly-active chain from the new tip back to the fork
+        // point and write tx_index entries for every block we connect.
+        // The fork point is whichever ancestor of `new_tip_hash` is also an
+        // ancestor of the original tip. We approximate by walking until we
+        // hit a block that is at-or-below `original_fork_height` —
+        // specifically, walk while the block's height is strictly greater
+        // than the height of the deepest disconnected block's parent.
+        //
+        // Fast path: if no blocks were disconnected, this was a fast-forward
+        // attach (parent == old tip), so only the new block itself needs
+        // an entry — but that case wouldn't go through `try_attach_and_reorg`
+        // at all (`process_block` handles it). Still, be defensive.
+        use rustoshi_storage::block_store::TxIndexEntry;
+        let stop_height: u32 = if disconnected_blocks.is_empty() {
+            new_tip_height // only the tip itself
+        } else {
+            // The fork point's height = (height of deepest disconnected block) - 1.
+            // We walk new chain back to height > fork_point_height (i.e. >=
+            // fork_point_height + 1). The deepest disconnected block has the
+            // lowest height in disconnected_blocks; its parent IS the fork
+            // point. Compute via lookup.
+            let mut deepest_h = new_tip_height; // safe upper bound
+            for blk in &disconnected_blocks {
+                let h = store
+                    .get_block_index(&blk.block_hash())
+                    .ok()
+                    .flatten()
+                    .map(|e| e.height)
+                    .unwrap_or(deepest_h);
+                if h < deepest_h {
+                    deepest_h = h;
+                }
+            }
+            deepest_h
+        };
+
+        let mut walk = new_tip_hash;
+        let mut walk_h = new_tip_height;
+        let mut guard = new_tip_height + 16;
+        loop {
+            if walk == Hash256::ZERO || walk_h < stop_height || guard == 0 {
+                break;
+            }
+            guard -= 1;
+            if let Some(blk) = store.get_block(&walk).ok().flatten() {
+                for tx in &blk.transactions {
+                    let entry = TxIndexEntry {
+                        block_hash: walk,
+                        tx_offset: 0,
+                        tx_length: 0,
+                    };
+                    if let Err(e) = store.put_tx_index(&tx.txid(), &entry) {
+                        tracing::error!(
+                            "try_attach_and_reorg: failed to put tx index for {}: {}",
+                            tx.txid(), e
+                        );
+                    }
+                }
+            }
+            let prev = match store.get_block_index(&walk).ok().flatten() {
+                Some(e) => e.prev_hash,
+                None => break,
+            };
+            if walk_h == 0 {
+                break;
+            }
+            walk = prev;
+            walk_h -= 1;
+        }
+    }
 
     // Pattern B (mempool-refill-on-reorg): re-admit non-coinbase transactions
     // from the disconnected blocks now that the UTXO + tip state reflect the
@@ -2895,6 +3008,42 @@ impl RustoshiRpcServer for RpcServerImpl {
                             e
                         );
                         return Ok(Some(format!("database-error: {}", e)));
+                    }
+                }
+
+                // Pattern C0 (txindex-on-connect): persist a `txid -> block_hash`
+                // mapping for every transaction in the connected block so that
+                // `getrawtransaction` (and the REST equivalent) can resolve the
+                // block via the txindex when the user did not pass an explicit
+                // blockhash. Without this, the txindex CF only ever holds the
+                // genesis tx + entries written by the legacy `generateblocks`
+                // RPC — submitblock-driven IBD never populated it.
+                //
+                // Counterpart on disconnect: `disconnect_to` and
+                // `try_attach_and_reorg` (below) call `store.delete_tx_index`
+                // for every tx in each disconnected block, so the post-reorg
+                // lookup correctly returns "not found" instead of a stale
+                // hit on the orphaned block.
+                //
+                // References:
+                //   - `bitcoin-core/src/index/txindex.cpp::CustomAppend`
+                //   - CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+                //     (rustoshi C0 finding — server.rs:2738 was unwired)
+                {
+                    use rustoshi_storage::block_store::TxIndexEntry;
+                    for tx in &block.transactions {
+                        let entry = TxIndexEntry {
+                            block_hash,
+                            tx_offset: 0,
+                            tx_length: 0,
+                        };
+                        if let Err(e) = store.put_tx_index(&tx.txid(), &entry) {
+                            tracing::error!(
+                                "submitblock: failed to store tx index: {}",
+                                e
+                            );
+                            return Ok(Some(format!("database-error: {}", e)));
+                        }
                     }
                 }
 
@@ -10676,5 +10825,188 @@ mod tests {
             hash_b3,
             "height-index at h=3 must point at B3"
         );
+    }
+
+    // ============================================================
+    // TXINDEX-REVERT-ON-REORG TESTS (Pattern C0 + C closure 2026-05-05)
+    //
+    // Pre-fix: rustoshi's submit_block (server.rs:2738) did NOT call
+    // store.put_tx_index after a successful connect, so the txindex CF
+    // was never populated for any IBD-fetched or RPC-submitted block.
+    // `getrawtransaction(<txid>)` therefore failed with "no such tx"
+    // even when the tx WAS confirmed on the active chain.  And nothing
+    // wrote `delete_tx_index` on disconnect, so even a fix to the
+    // connect side would leave stale hits after a reorg.
+    //
+    // The C0 fix wires put_tx_index into submit_block's accept arm and
+    // into try_attach_and_reorg's "newly-active branch" walk.  The
+    // matching disconnect side calls delete_tx_index in `disconnect_to`
+    // and in try_attach_and_reorg's "now-disconnected blocks" loop.
+    //
+    // Reference: bitcoin-core/src/index/txindex.cpp::CustomAppend +
+    // CustomRemove. Audit: CORE-PARITY-AUDIT/_txindex-revert-on-reorg-
+    // fleet-result-2026-05-05.md.
+    //
+    // Builds on top of today's reorg-via-submitblock P0 closure (fa6ee55).
+    // ============================================================
+
+    /// Test: submit_block writes a tx_index entry for every transaction
+    /// in the accepted block (the C0 fix).  Pre-fix this assertion held
+    /// only for blocks generated via the legacy `generateblocks` RPC.
+    #[tokio::test]
+    async fn submit_block_writes_tx_index_entries_for_accepted_block() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::mainnet();
+        let (db, _state, server) = make_test_server(params.clone());
+
+        let genesis_hash = params.genesis_hash;
+        let block_a1 = mine_synth_block(1, genesis_hash, 0xA1);
+        let hash_a1 = block_a1.block_hash();
+        let coinbase_txid = block_a1.transactions[0].txid();
+
+        // Pre-condition: tx_index lookup for the coinbase txid returns
+        // None (txindex CF is empty modulo the genesis init).
+        let store = BlockStore::new(&db);
+        assert!(
+            store.get_tx_index(&coinbase_txid).unwrap().is_none(),
+            "tx_index must not have an entry for A1.coinbase before submit"
+        );
+        drop(store);
+
+        let res = drive_submit_block(&server, &block_a1).await;
+        assert!(res.is_none(), "expected accept (None), got {:?}", res);
+
+        // Post-condition: the txindex entry exists and points at A1.
+        let store = BlockStore::new(&db);
+        let entry = store
+            .get_tx_index(&coinbase_txid)
+            .unwrap()
+            .expect("submit_block must have written a tx_index entry");
+        assert_eq!(
+            entry.block_hash, hash_a1,
+            "tx_index entry must point at the connecting block"
+        );
+    }
+
+    /// Test: try_attach_and_reorg on a heavier side-branch deletes
+    /// tx_index entries for the disconnected blocks AND writes
+    /// tx_index entries for the newly-active branch.  Mirrors Core's
+    /// BlockDisconnected + BlockConnected callbacks fired by
+    /// ActivateBestChainStep.
+    #[tokio::test]
+    async fn try_attach_and_reorg_revert_and_replay_tx_index() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // G -> A1 -> A2 (active, height 2).
+        let (hash_g, _block_g, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a1, block_a1, work_a1) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xA1)
+        };
+        let (hash_a2, block_a2, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 2, hash_a1, work_a1, 0xA2)
+        };
+        rpc_state.best_hash = hash_a2;
+        rpc_state.best_height = 2;
+
+        // Manually populate tx_index for A1 + A2 to mirror what the
+        // submit_block connect path does on the live system. This is
+        // the pre-state the disconnect side needs to revert.
+        let a1_txid = block_a1.transactions[0].txid();
+        let a2_txid = block_a2.transactions[0].txid();
+        {
+            use rustoshi_storage::block_store::TxIndexEntry;
+            let store = BlockStore::new(&db);
+            store
+                .put_tx_index(
+                    &a1_txid,
+                    &TxIndexEntry {
+                        block_hash: hash_a1,
+                        tx_offset: 0,
+                        tx_length: 0,
+                    },
+                )
+                .unwrap();
+            store
+                .put_tx_index(
+                    &a2_txid,
+                    &TxIndexEntry {
+                        block_hash: hash_a2,
+                        tx_offset: 0,
+                        tx_length: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        // Side-branch B that will outpace A: G -> B1 -> B2 -> B3.
+        let (hash_b1, block_b1, work_b1) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 1, hash_g, work_g, 0xB1)
+        };
+        let (hash_b2, block_b2, _work_b2) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 2, hash_b1, work_b1, 0xB2)
+        };
+        let block_b3 = mine_synth_block(3, hash_b2, 0xB3);
+        let hash_b3 = block_b3.block_hash();
+        let b1_txid = block_b1.transactions[0].txid();
+        let b2_txid = block_b2.transactions[0].txid();
+        let b3_txid = block_b3.transactions[0].txid();
+
+        // Pre-condition: A-chain entries are present, B-chain entries absent.
+        {
+            let store = BlockStore::new(&db);
+            assert!(store.get_tx_index(&a1_txid).unwrap().is_some());
+            assert!(store.get_tx_index(&a2_txid).unwrap().is_some());
+            assert!(store.get_tx_index(&b1_txid).unwrap().is_none());
+            assert!(store.get_tx_index(&b2_txid).unwrap().is_none());
+            assert!(store.get_tx_index(&b3_txid).unwrap().is_none());
+        }
+
+        let did_reorg = try_attach_and_reorg(&mut rpc_state, &block_b3, &hash_b3)
+            .expect("try_attach_and_reorg");
+        assert!(did_reorg, "B-chain has more work — reorg must fire");
+        assert_eq!(rpc_state.best_hash, hash_b3);
+        assert_eq!(rpc_state.best_height, 3);
+
+        // Post-condition (Pattern C - revert): A-chain tx_index entries
+        // are gone — confirmation lookups for them must now miss.
+        let store = BlockStore::new(&db);
+        assert!(
+            store.get_tx_index(&a1_txid).unwrap().is_none(),
+            "A1 tx_index entry must be deleted on disconnect (Pattern C)"
+        );
+        assert!(
+            store.get_tx_index(&a2_txid).unwrap().is_none(),
+            "A2 tx_index entry must be deleted on disconnect (Pattern C)"
+        );
+
+        // Post-condition (Pattern C0 - replay): B-chain tx_index entries
+        // are present and point at the correct block.
+        let e1 = store
+            .get_tx_index(&b1_txid)
+            .unwrap()
+            .expect("B1 tx_index must be written on reorg-connect");
+        assert_eq!(e1.block_hash, hash_b1);
+        let e2 = store
+            .get_tx_index(&b2_txid)
+            .unwrap()
+            .expect("B2 tx_index must be written on reorg-connect");
+        assert_eq!(e2.block_hash, hash_b2);
+        let e3 = store
+            .get_tx_index(&b3_txid)
+            .unwrap()
+            .expect("B3 tx_index must be written on reorg-connect");
+        assert_eq!(e3.block_hash, hash_b3);
     }
 }
