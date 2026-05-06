@@ -30,6 +30,7 @@ pub mod chain_state;
 pub mod fee_estimator;
 pub mod mempool;
 pub mod mempool_persist;
+pub mod orphanage;
 pub mod params;
 pub mod pow;
 pub mod script;
@@ -63,6 +64,10 @@ pub use validation::{
 pub use chain_state::{ChainState, CompressedScript, UtxoCache};
 pub use fee_estimator::{FeeEstimator, RawBucketStats};
 pub use mempool::{Mempool, MempoolConfig, MempoolEntry, MempoolError};
+pub use orphanage::{
+    OrphanEntry, OrphanError, TxOrphanage, MAX_ORPHANS_PER_PEER, MAX_ORPHAN_TRANSACTIONS,
+    MAX_ORPHAN_TX_SIZE,
+};
 pub use mempool_persist::{
     dump_mempool, dump_mempool_with_key, header_size, load_mempool, DumpStats, LoadStats,
     MEMPOOL_DUMP_VERSION, MEMPOOL_DUMP_VERSION_NO_XOR_KEY, OBFUSCATION_KEY_LEN,
