@@ -2729,6 +2729,69 @@ impl RustoshiRpcServer for RpcServerImpl {
                     return Ok(Some(format!("database-error: {}", e)));
                 }
 
+                // Persist a `BlockIndexEntry` (with cumulative chain_work)
+                // so that:
+                //   (a) side-branch blocks arriving via the
+                //       `PrevBlockNotFound` arm below can find their
+                //       parent in the index — without this, a heavier
+                //       fork's first block is rejected with "parent ...
+                //       not in block index" even though the parent IS
+                //       on disk (header + body + undo). This was the
+                //       Pattern Y bug surfaced by the
+                //       `regression/reorg-via-submitblock` corpus
+                //       entry on 2026-05-05.
+                //   (b) `try_attach_and_reorg` can read the active
+                //       tip's chain_work to compare against side-branch
+                //       work without a per-call walk-from-genesis.
+                //   (c) header-tree RPCs (getblockheader, getchaintips,
+                //       getbestchaininfo) return the canonical n_tx /
+                //       chain_work fields Core ships.
+                //
+                // Counterpart to Bitcoin Core's `BlockManager::AcceptBlock`,
+                // which sets `pindexNew->nChainWork` and `BLOCK_HAVE_DATA`
+                // on every accepted block regardless of whether it lives
+                // on the active chain or a side-branch.
+                {
+                    use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+                    use rustoshi_storage::block_store::{
+                        BlockIndexEntry as StorageBlockIndexEntry, BlockStatus,
+                    };
+                    let parent_work = if block.header.prev_block_hash != Hash256::ZERO {
+                        store
+                            .get_block_index(&block.header.prev_block_hash)
+                            .ok()
+                            .flatten()
+                            .map(|e| ChainWork::from_be_bytes(e.chain_work))
+                            .unwrap_or(ChainWork::ZERO)
+                    } else {
+                        ChainWork::ZERO
+                    };
+                    let this_work =
+                        parent_work.saturating_add(&get_block_proof(block.header.bits));
+                    let mut status = BlockStatus::new();
+                    status.set(BlockStatus::VALID_SCRIPTS);
+                    status.set(BlockStatus::HAVE_DATA);
+                    status.set(BlockStatus::HAVE_UNDO);
+                    let entry = StorageBlockIndexEntry {
+                        height: new_height,
+                        status,
+                        n_tx: block.transactions.len() as u32,
+                        timestamp: block.header.timestamp,
+                        bits: block.header.bits,
+                        nonce: block.header.nonce,
+                        version: block.header.version,
+                        prev_hash: block.header.prev_block_hash,
+                        chain_work: this_work.0,
+                    };
+                    if let Err(e) = store.put_block_index(&block_hash, &entry) {
+                        tracing::error!(
+                            "submitblock: failed to store block index: {}",
+                            e
+                        );
+                        return Ok(Some(format!("database-error: {}", e)));
+                    }
+                }
+
                 // Flush UTXO changes to disk
                 if let Err(e) = utxo_view.flush() {
                     tracing::error!("submitblock: UTXO flush failed: {}", e);
@@ -2747,10 +2810,8 @@ impl RustoshiRpcServer for RpcServerImpl {
 
                 // NOTE: IBD latch is re-evaluated on every getblockchaininfo
                 // call (see get_blockchain_info). We deliberately do NOT call
-                // should_exit_ibd here because submitblock does not write a
-                // BlockIndexEntry for the new block, so a lookup would return
-                // None and the check would be dead. The read-path evaluation
-                // handles this case.
+                // should_exit_ibd here; the read-path evaluation handles this
+                // case based on the block_index entry we just persisted above.
 
                 tracing::info!(
                     "submitblock: accepted block {} at height {}",
@@ -10193,5 +10254,321 @@ mod tests {
         );
         // Tip is unchanged.
         assert_eq!(rpc_state.best_hash, hash_g);
+    }
+
+    // ============================================================
+    // SIDE-BRANCH ACCEPTANCE TESTS (Pattern Y closure 2026-05-05)
+    //
+    // The fa6ee55 patch wired `try_attach_and_reorg` into submitblock's
+    // PrevBlockNotFound arm but did NOT make submitblock's HAPPY PATH
+    // write a `BlockIndexEntry`.  That meant when a side-branch block
+    // arrived, `try_attach_and_reorg` could not find its parent in the
+    // block index — even though the parent was a previously-accepted
+    // best-chain block — and rejected with "parent ... not in block
+    // index".  See `tools/diff-test-corpus/regression/reorg-via-submitblock`
+    // and `CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md`.
+    //
+    // Tests below exercise the structural invariant Core enforces in
+    // `BlockManager::AcceptBlock` (validation.cpp): every accepted
+    // block, whether on the active chain or a side-branch, gets
+    // BLOCK_HAVE_DATA + cumulative chain_work in the block index.  We
+    // drive the real `submit_block` async handler via mined regtest
+    // blocks and assert the parent-lookup invariants survive a fork.
+    // ============================================================
+
+    /// Drive the live `submit_block` async handler against an RpcServerImpl
+    /// pinned at genesis. Mirrors how the diff-test harness submits each
+    /// block via JSON-RPC. Returns the BIP-22 result string (None = accept,
+    /// Some(s) = reject reason / "inconclusive" for side-branch).
+    async fn drive_submit_block(server: &RpcServerImpl, block: &Block) -> Option<String> {
+        let hex_str = hex::encode(block.serialize());
+        match server.submit_block(hex_str).await {
+            Ok(v) => v,
+            Err(e) => Some(format!("rpc-error: {}", e.message())),
+        }
+    }
+
+    /// Set up an RpcServerImpl with a fresh regtest datadir and the genesis
+    /// block already initialised. Returns (db handle, state arc, server).
+    fn make_test_server(
+        params: rustoshi_consensus::ChainParams,
+    ) -> (
+        Arc<rustoshi_storage::ChainDb>,
+        Arc<RwLock<RpcState>>,
+        RpcServerImpl,
+    ) {
+        use rustoshi_storage::ChainDb;
+        let tmp = tempfile::tempdir().unwrap();
+        // Leak the tempdir guard for the test lifetime — we don't need to
+        // clean up between tests, the OS does it on process exit.
+        std::mem::forget(tmp);
+        let path = std::env::temp_dir().join(format!(
+            "rustoshi-side-branch-test-{}",
+            uuid_like_suffix()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let db = Arc::new(ChainDb::open(&path).unwrap());
+
+        // Initialize genesis (params-agnostic — sets up CF_BLOCK_INDEX
+        // entry for genesis with chain_work=[0;32]).
+        {
+            let store = BlockStore::new(&db);
+            store.init_genesis(&params).unwrap();
+        }
+
+        let mut rpc_state = RpcState::new(db.clone(), params.clone());
+        let store_for_init = BlockStore::new(&db);
+        rpc_state.best_hash = store_for_init.get_best_block_hash().unwrap().unwrap();
+        rpc_state.best_height = store_for_init.get_best_height().unwrap().unwrap();
+        rpc_state.data_dir = Some(path);
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state.clone(), peer_state);
+        (db, state, server)
+    }
+
+    fn uuid_like_suffix() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:x}-{}", n, std::process::id())
+    }
+
+    /// Test: after submit_block accepts a block on the happy path, the
+    /// block_index entry for that block exists with the expected height
+    /// and a cumulative chain_work strictly greater than the parent's.
+    /// Pre-fix this entry was never written, so the next side-branch
+    /// block whose parent was THIS block would be rejected with
+    /// "parent ... not in block index" — even though the parent is on
+    /// disk (header + body + undo).
+    #[tokio::test]
+    async fn submit_block_writes_block_index_entry_for_accepted_block() {
+        use rustoshi_consensus::pow::ChainWork;
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::mainnet();
+        let (db, state, server) = make_test_server(params.clone());
+
+        // Mine + submit a block on top of genesis. mainnet params at h=1
+        // skip BIP-34 / SegWit / CSV (all activate way later) so a
+        // synthetic OP_TRUE coinbase is accepted.
+        let genesis_hash = params.genesis_hash;
+        let block_a1 = mine_synth_block(1, genesis_hash, 0xA1);
+        let hash_a1 = block_a1.block_hash();
+
+        let res = drive_submit_block(&server, &block_a1).await;
+        assert!(
+            res.is_none(),
+            "expected accept (None) on happy path, got {:?}",
+            res
+        );
+
+        // tip moved.
+        let st = state.read().await;
+        assert_eq!(st.best_hash, hash_a1, "rpc state tip = a1");
+        assert_eq!(st.best_height, 1, "rpc state height = 1");
+        drop(st);
+
+        // The structural invariant we are guarding: block_index has the
+        // entry, with chain_work = parent's chain_work + this block's
+        // proof. Pre-fix, get_block_index(&hash_a1) would return None.
+        let store = BlockStore::new(&db);
+        let entry = store
+            .get_block_index(&hash_a1)
+            .expect("get_block_index ok")
+            .expect("block_index entry must exist for accepted block");
+        assert_eq!(entry.height, 1, "block_index entry height matches");
+        assert_eq!(entry.prev_hash, genesis_hash, "prev_hash threaded through");
+        // chain_work strictly greater than genesis (which has [0;32]).
+        let cw = ChainWork::from_be_bytes(entry.chain_work);
+        assert_ne!(cw.0, [0u8; 32], "chain_work must be nonzero");
+
+        // Status: HAVE_DATA must be set (Core: BLOCK_HAVE_DATA).
+        use rustoshi_storage::block_store::BlockStatus;
+        assert!(
+            entry.status.has(BlockStatus::HAVE_DATA),
+            "HAVE_DATA flag must be set on accepted block"
+        );
+    }
+
+    /// Test: PATTERN Y CLOSURE — submit two blocks at the same height
+    /// whose shared parent is genesis (A1 and B1). Both must store
+    /// successfully; A1 takes the active chain, B1 is stored as a
+    /// side-branch (Core: `inconclusive`). Pre-fix, B1 was rejected
+    /// with "parent ... not in block index" because submit_block's
+    /// happy path never wrote a block_index entry for genesis's only
+    /// child (A1 in this case — well, in real corpus runs it would be
+    /// the base-chain blocks).
+    #[tokio::test]
+    async fn submit_block_accepts_side_branch_block_with_known_parent() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::mainnet();
+        let (db, state, server) = make_test_server(params.clone());
+
+        let genesis_hash = params.genesis_hash;
+
+        // A1 — accepted on happy path, becomes tip.
+        let block_a1 = mine_synth_block(1, genesis_hash, 0xA1);
+        let hash_a1 = block_a1.block_hash();
+        let r = drive_submit_block(&server, &block_a1).await;
+        assert!(r.is_none(), "A1 must accept on happy path: {:?}", r);
+
+        let st = state.read().await;
+        assert_eq!(st.best_hash, hash_a1);
+        drop(st);
+
+        // B1 — same height as A1, parent = genesis. Genesis IS in
+        // block_index (init_genesis writes it). After our fix, A1 is
+        // also in block_index (so future side-branches at h=2 would
+        // also work). For h=1 specifically, the parent lookup would
+        // hit genesis directly. Either way, B1 must store as side-
+        // branch and NOT flip the tip.
+        let block_b1 = mine_synth_block(1, genesis_hash, 0xB1);
+        let hash_b1 = block_b1.block_hash();
+        // Make sure A1 != B1 even though both are at h=1 with same prev.
+        assert_ne!(hash_a1, hash_b1, "marker bytes must produce distinct blocks");
+
+        let r2 = drive_submit_block(&server, &block_b1).await;
+        // Per Core: side-branch with strictly less work than tip → store
+        // and return "inconclusive". Equal work → tip unchanged (`is_gt`
+        // is false), still side-branch stored. We accept either string
+        // here as "stored, not activated".
+        match r2.as_deref() {
+            Some("inconclusive") | None => { /* OK */ }
+            other => panic!("B1 must be stored as side-branch (got {:?})", other),
+        }
+
+        // Tip must NOT have flipped.
+        let st = state.read().await;
+        assert_eq!(st.best_hash, hash_a1, "tip must remain A1 after B1 side-branch");
+        assert_eq!(st.best_height, 1);
+        drop(st);
+
+        // Both blocks are persisted with block_index entries.
+        let store = BlockStore::new(&db);
+        assert!(
+            store.get_block_index(&hash_a1).unwrap().is_some(),
+            "A1 block_index entry must exist (happy-path acceptance)"
+        );
+        assert!(
+            store.get_block_index(&hash_b1).unwrap().is_some(),
+            "B1 block_index entry must exist (side-branch acceptance)"
+        );
+        assert!(
+            store.get_block(&hash_b1).unwrap().is_some(),
+            "B1 block body must be persisted"
+        );
+    }
+
+    /// Test: PATTERN Y CLOSURE END-TO-END — submit A1, A2, B1, B2, B3
+    /// in order. Final tip must be B3, and A1+A2 must remain on disk
+    /// as a stale side-branch. Mirrors the corpus entry
+    /// `regression/reorg-via-submitblock`.
+    ///
+    /// Pre-fix: B1 was rejected at submission time because submit_block
+    /// happy-path never wrote a block_index entry for the parent of B1
+    /// (which is genesis here; in the corpus it's a base-chain block).
+    /// In a multi-block fork, even if h=1's parent (genesis) was in the
+    /// index, B2's parent (B1) is on a side-branch — it can only be
+    /// looked up if try_attach_and_reorg's per-block put_block_index in
+    /// the side-branch arm fired. The fix here makes BOTH paths
+    /// (happy-path AND side-branch) write block_index entries, so the
+    /// reorg dispatcher can ALWAYS walk a fork to find its common
+    /// ancestor.
+    #[tokio::test]
+    async fn submit_block_reorgs_to_heavier_branch_via_extension() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::mainnet();
+        let (db, state, server) = make_test_server(params.clone());
+
+        let genesis_hash = params.genesis_hash;
+
+        // Chain A: 2 blocks. After A1+A2, tip = A2 at h=2.
+        let block_a1 = mine_synth_block(1, genesis_hash, 0xA1);
+        let hash_a1 = block_a1.block_hash();
+        assert!(drive_submit_block(&server, &block_a1).await.is_none());
+        let block_a2 = mine_synth_block(2, hash_a1, 0xA2);
+        let hash_a2 = block_a2.block_hash();
+        assert!(drive_submit_block(&server, &block_a2).await.is_none());
+        {
+            let st = state.read().await;
+            assert_eq!(st.best_hash, hash_a2, "after A1+A2 tip = A2");
+            assert_eq!(st.best_height, 2);
+        }
+
+        // Chain B: 3 blocks. Each shares G as the fork point. After B3
+        // arrives, B has strictly more work than A, so the tip MUST
+        // flip from A2 to B3 via the reorg path.
+        let block_b1 = mine_synth_block(1, genesis_hash, 0xB1);
+        let hash_b1 = block_b1.block_hash();
+        let r_b1 = drive_submit_block(&server, &block_b1).await;
+        // B1 stored as side-branch (less work than A2). Either Some("inconclusive")
+        // or None depending on impl convention; both are accept-as-side-branch.
+        match r_b1.as_deref() {
+            Some("inconclusive") | None => {}
+            other => panic!("B1 must be stored, got {:?}", other),
+        }
+
+        let block_b2 = mine_synth_block(2, hash_b1, 0xB2);
+        let hash_b2 = block_b2.block_hash();
+        let r_b2 = drive_submit_block(&server, &block_b2).await;
+        match r_b2.as_deref() {
+            Some("inconclusive") | None => {}
+            other => panic!("B2 must be stored, got {:?}", other),
+        }
+
+        // Tip must STILL be A2 — B-chain is at h=2, equal work, A wins
+        // the tie-break.
+        {
+            let st = state.read().await;
+            assert_eq!(st.best_hash, hash_a2, "before B3, tip remains A2 (equal work)");
+        }
+
+        let block_b3 = mine_synth_block(3, hash_b2, 0xB3);
+        let hash_b3 = block_b3.block_hash();
+        let r_b3 = drive_submit_block(&server, &block_b3).await;
+        // B3 is the heavier-tip block; must accept (returns None).
+        assert!(
+            r_b3.is_none(),
+            "B3 (heavier branch) must accept and trigger reorg, got {:?}",
+            r_b3
+        );
+
+        // Tip flipped to B3; height = 3.
+        {
+            let st = state.read().await;
+            assert_eq!(st.best_hash, hash_b3, "tip flipped to B3 after reorg");
+            assert_eq!(st.best_height, 3);
+        }
+
+        // The displaced A-chain must remain on disk (BLOCK_HAVE_DATA),
+        // ready to be reactivated by reconsiderblock or another reorg.
+        let store = BlockStore::new(&db);
+        for h in [hash_a1, hash_a2] {
+            let e = store
+                .get_block_index(&h)
+                .unwrap()
+                .expect("displaced A-chain block_index entry must remain");
+            use rustoshi_storage::block_store::BlockStatus;
+            assert!(
+                e.status.has(BlockStatus::HAVE_DATA),
+                "displaced A-chain blocks retain HAVE_DATA"
+            );
+        }
+        // And the new B-chain blocks all have block_index entries.
+        for (h, height) in [(hash_b1, 1), (hash_b2, 2), (hash_b3, 3)] {
+            let e = store
+                .get_block_index(&h)
+                .unwrap()
+                .expect("B-chain block_index entry must exist");
+            assert_eq!(e.height, height);
+        }
+        // Height-index points at the new (B) chain.
+        assert_eq!(
+            store.get_hash_by_height(3).unwrap().unwrap(),
+            hash_b3,
+            "height-index at h=3 must point at B3"
+        );
     }
 }
