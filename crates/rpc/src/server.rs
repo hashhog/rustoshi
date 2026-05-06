@@ -1166,6 +1166,37 @@ fn disconnect_to(
 
     state.best_hash = target_hash;
     state.best_height = target_height;
+
+    // Pattern B (mempool-refill-on-reorg): re-admit non-coinbase transactions
+    // from the disconnected blocks. The UTXO view has been flushed above, so
+    // a fresh `utxo_view()` reads the post-disconnect state.
+    //
+    // Mirrors Bitcoin Core's `validation.cpp::DisconnectTip` →
+    // `MaybeUpdateMempoolForReorg`. Camlcoin reference: `lib/sync.ml::reorganize`
+    // (commit 22667c2). Cross-impl audit:
+    // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
+    //
+    // Plan order is tip-down (highest height first); refill order doesn't
+    // matter — `add_transaction` resolves dependencies via the UTXO view.
+    {
+        // Sync mempool's tip-snapshot to the new tip so that IsFinalTx
+        // (BIP-113) + coinbase-maturity checks during refill use the
+        // post-rewind height + MTP rather than the pre-rewind values.
+        let mtp = compute_prev_block_mtp(&store, &target_hash) as i64;
+        state.mempool.notify_new_tip(target_height, mtp);
+
+        let refill_view = store.utxo_view();
+        let utxo_lookup = |op: &rustoshi_primitives::OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
+            use rustoshi_consensus::validation::UtxoView;
+            refill_view.get_utxo(op)
+        };
+        for (_h, _hash, block, _undo) in plan.iter() {
+            state
+                .mempool
+                .block_disconnected(&block.transactions, &utxo_lookup);
+        }
+    }
+
     Ok(())
 }
 
@@ -1285,6 +1316,55 @@ fn try_attach_and_reorg(
             })
     };
 
+    // Pattern B (mempool-refill-on-reorg) prep: collect blocks on the
+    // SOON-TO-BE-DISCONNECTED chain (current tip -> fork point) so we can
+    // re-admit their non-coinbase txs to mempool *after* reorganize+flush
+    // succeeds. We do this BEFORE reorganize because chain_state.reorganize()
+    // walks the same path internally without surfacing the blocks.
+    //
+    // Walk: from `state.best_hash` back via `prev_hash` until we hit a block
+    // that is also an ancestor of `block_hash` (the new tip). For correctness
+    // we only need a best-effort list — any block we fail to resolve is
+    // simply skipped (mempool refill is advisory, not consensus-critical).
+    //
+    // Cross-impl reference: camlcoin lib/sync.ml::reorganize (commit 22667c2),
+    // which collects `disconnected_txs` during its disconnect pass and then
+    // calls `Mempool.add_transaction` per tx after the UTXO flush.
+    let disconnected_blocks: Vec<Block> = {
+        // Build a set of new-chain ancestor hashes up to/including the genesis
+        // walk-distance bounded by the new height (cheap; tens of entries for
+        // typical reorgs, capped well under 1k for adversarial inputs).
+        let mut new_chain_set: std::collections::HashSet<Hash256> =
+            std::collections::HashSet::new();
+        let mut walk = *block_hash;
+        let mut steps = new_height + 16;
+        while walk != Hash256::ZERO && steps > 0 {
+            new_chain_set.insert(walk);
+            steps -= 1;
+            match get_block_index(&walk) {
+                Some(e) => walk = e.prev_hash,
+                None => break,
+            }
+        }
+        let mut collected: Vec<Block> = Vec::new();
+        let mut old_walk = state.best_hash;
+        let mut old_steps = state.best_height + 16;
+        while old_walk != Hash256::ZERO && old_steps > 0 {
+            if new_chain_set.contains(&old_walk) {
+                break; // hit fork point
+            }
+            old_steps -= 1;
+            if let Some(b) = get_block(&old_walk) {
+                collected.push(b);
+            }
+            match get_block_index(&old_walk) {
+                Some(e) => old_walk = e.prev_hash,
+                None => break,
+            }
+        }
+        collected
+    };
+
     let original_tip_height = state.best_height;
     chain_state
         .reorganize(
@@ -1340,6 +1420,32 @@ fn try_attach_and_reorg(
     }
     state.best_hash = new_tip_hash;
     state.best_height = new_tip_height;
+
+    // Pattern B (mempool-refill-on-reorg): re-admit non-coinbase transactions
+    // from the disconnected blocks now that the UTXO + tip state reflect the
+    // post-reorg chain.  Skipped silently if the collection above came up
+    // empty (e.g. reorg that was effectively a no-op).
+    //
+    // Mirrors `bitcoin-core/src/validation.cpp::DisconnectTip` →
+    // `MaybeUpdateMempoolForReorg`.  Cross-impl audit:
+    // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
+    if !disconnected_blocks.is_empty() {
+        // Sync mempool's tip-snapshot to the new tip before refill — see
+        // disconnect_to() for the same rationale.
+        let mtp = compute_prev_block_mtp(&store, &new_tip_hash) as i64;
+        state.mempool.notify_new_tip(new_tip_height, mtp);
+
+        let refill_view = store.utxo_view();
+        let utxo_lookup = |op: &rustoshi_primitives::OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
+            use rustoshi_consensus::validation::UtxoView;
+            refill_view.get_utxo(op)
+        };
+        for blk in &disconnected_blocks {
+            state
+                .mempool
+                .block_disconnected(&blk.transactions, &utxo_lookup);
+        }
+    }
 
     Ok(true)
 }
