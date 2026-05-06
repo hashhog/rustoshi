@@ -125,6 +125,15 @@ pub enum PeerEvent {
     Message(PeerId, NetworkMessage),
     /// Peer disconnected.
     Disconnected(PeerId, DisconnectReason),
+    /// Peer protocol violation; before/with disconnect.
+    ///
+    /// Spawned read/write tasks (`run_inbound_peer`, `run_outbound_peer`,
+    /// `run_message_loop`) cannot call `PeerManager::misbehaving` directly
+    /// (no `&mut self`).  Instead they emit this event for the main
+    /// dispatcher (`PeerManager::handle_event`) to forward to the
+    /// `MisbehaviorTracker` + `BanManager`.  Reaching the 100-point
+    /// threshold yields a ban + disconnect.
+    Misbehaving(PeerId, crate::misbehavior::MisbehaviorReason),
 }
 
 /// Reason for peer disconnection.
@@ -1581,6 +1590,12 @@ pub async fn run_message_loop(
 
                                     // Validate magic
                                     if magic_bytes != *magic {
+                                        let _ = event_tx.send(PeerEvent::Misbehaving(
+                                            peer_id,
+                                            crate::misbehavior::MisbehaviorReason::ProtocolViolation(
+                                                "bad magic".to_string(),
+                                            ),
+                                        )).await;
                                         let _ = event_tx.send(PeerEvent::Disconnected(
                                             peer_id, DisconnectReason::ProtocolError("bad magic".to_string())
                                         )).await;
@@ -1589,6 +1604,10 @@ pub async fn run_message_loop(
 
                                     // Validate length
                                     if length as usize > MAX_MESSAGE_SIZE {
+                                        let _ = event_tx.send(PeerEvent::Misbehaving(
+                                            peer_id,
+                                            crate::misbehavior::MisbehaviorReason::MessageTooLarge,
+                                        )).await;
                                         let _ = event_tx.send(PeerEvent::Disconnected(
                                             peer_id, DisconnectReason::ProtocolError("message too large".to_string())
                                         )).await;
@@ -1599,6 +1618,12 @@ pub async fn run_message_loop(
                                         // Empty payload, process immediately
                                         let computed = sha256d(&[]);
                                         if checksum != computed.0[..4] {
+                                            let _ = event_tx.send(PeerEvent::Misbehaving(
+                                                peer_id,
+                                                crate::misbehavior::MisbehaviorReason::ProtocolViolation(
+                                                    "checksum mismatch".to_string(),
+                                                ),
+                                            )).await;
                                             let _ = event_tx.send(PeerEvent::Disconnected(
                                                 peer_id, DisconnectReason::ProtocolError("checksum mismatch".to_string())
                                             )).await;
@@ -1608,6 +1633,12 @@ pub async fn run_message_loop(
                                         match handle_message(peer_id, &command, &[], &mut writer, magic, &mut ping_nonce_pending, &event_tx).await {
                                             Ok(()) => {}
                                             Err(e) => {
+                                                let _ = event_tx.send(PeerEvent::Misbehaving(
+                                                    peer_id,
+                                                    crate::misbehavior::MisbehaviorReason::ProtocolViolation(
+                                                        e.to_string(),
+                                                    ),
+                                                )).await;
                                                 let _ = event_tx.send(PeerEvent::Disconnected(
                                                     peer_id, DisconnectReason::ProtocolError(e.to_string())
                                                 )).await;
@@ -1628,6 +1659,12 @@ pub async fn run_message_loop(
                                     // Validate checksum
                                     let computed = sha256d(payload);
                                     if checksum != computed.0[..4] {
+                                        let _ = event_tx.send(PeerEvent::Misbehaving(
+                                            peer_id,
+                                            crate::misbehavior::MisbehaviorReason::ProtocolViolation(
+                                                "checksum mismatch".to_string(),
+                                            ),
+                                        )).await;
                                         let _ = event_tx.send(PeerEvent::Disconnected(
                                             peer_id, DisconnectReason::ProtocolError("checksum mismatch".to_string())
                                         )).await;
@@ -1637,6 +1674,12 @@ pub async fn run_message_loop(
                                     match handle_message(peer_id, &command, payload, &mut writer, magic, &mut ping_nonce_pending, &event_tx).await {
                                         Ok(()) => {}
                                         Err(e) => {
+                                            let _ = event_tx.send(PeerEvent::Misbehaving(
+                                                peer_id,
+                                                crate::misbehavior::MisbehaviorReason::ProtocolViolation(
+                                                    e.to_string(),
+                                                ),
+                                            )).await;
                                             let _ = event_tx.send(PeerEvent::Disconnected(
                                                 peer_id, DisconnectReason::ProtocolError(e.to_string())
                                             )).await;
@@ -1762,6 +1805,12 @@ pub async fn run_message_loop_v2(
                             peer_id, &msg, &mut cipher, &mut writer,
                             &mut ping_nonce_pending, &event_tx,
                         ).await {
+                            let _ = event_tx.send(PeerEvent::Misbehaving(
+                                peer_id,
+                                crate::misbehavior::MisbehaviorReason::ProtocolViolation(
+                                    e.to_string(),
+                                ),
+                            )).await;
                             let _ = event_tx.send(PeerEvent::Disconnected(
                                 peer_id,
                                 DisconnectReason::ProtocolError(e.to_string()),

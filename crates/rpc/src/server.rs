@@ -32,6 +32,7 @@ use rustoshi_consensus::{
     },
     fee_estimator::FeeEstimator,
     mempool::{Mempool, MempoolConfig},
+    orphanage::TxOrphanage,
     versionbits::{get_deployments, DeploymentId},
     ChainParams, ChainState, NetworkId, COIN,
 };
@@ -143,6 +144,10 @@ pub struct RpcState {
     /// `rpc/blockchain.cpp::dumptxoutset`. Peers stay connected; only block
     /// acceptance is gated.
     pub block_submission_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Orphan transaction pool.  Holds txs whose inputs are not yet
+    /// resolvable against the chainstate or mempool, so they can be
+    /// re-tried when a parent arrives.  Capped per Core (`MAX_ORPHAN_*`).
+    pub orphanage: TxOrphanage,
 }
 
 impl RpcState {
@@ -169,6 +174,7 @@ impl RpcState {
             mempool_dat_path: None,
             data_dir: None,
             block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            orphanage: TxOrphanage::new(),
         }
     }
 
@@ -195,6 +201,7 @@ impl RpcState {
             mempool_dat_path: None,
             data_dir: None,
             block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            orphanage: TxOrphanage::new(),
         }
     }
 
