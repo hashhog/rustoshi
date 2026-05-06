@@ -567,6 +567,41 @@ mod tests {
         assert_eq!(entry.tx_length, retrieved.tx_length);
     }
 
+    /// Pattern C (txindex-revert-on-reorg): `delete_tx_index` removes a
+    /// previously-written entry and is idempotent for missing keys.
+    /// Mirrors `bitcoin-core/src/index/txindex.cpp::CustomRemove`.
+    #[test]
+    fn test_delete_tx_index() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let txid = Hash256::from_hex(
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+        )
+        .unwrap();
+        let entry = TxIndexEntry {
+            block_hash: Hash256::from_hex(
+                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+            )
+            .unwrap(),
+            tx_offset: 81,
+            tx_length: 204,
+        };
+
+        // Idempotent on a key that was never written.
+        store.delete_tx_index(&txid).unwrap();
+        assert!(store.get_tx_index(&txid).unwrap().is_none());
+
+        // Round-trip: write, then delete, then verify the entry is gone.
+        store.put_tx_index(&txid, &entry).unwrap();
+        assert!(store.get_tx_index(&txid).unwrap().is_some());
+        store.delete_tx_index(&txid).unwrap();
+        assert!(
+            store.get_tx_index(&txid).unwrap().is_none(),
+            "delete_tx_index must remove the entry"
+        );
+    }
+
     // =========================
     // BlockUndo and TxUndo tests
     // =========================
