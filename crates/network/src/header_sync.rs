@@ -17,6 +17,13 @@ use std::collections::HashMap;
 /// The maximum number of headers to request in a single getheaders message.
 pub const MAX_HEADERS_PER_REQUEST: usize = 2000;
 
+/// Maximum number of unconnecting-headers messages a single peer may send
+/// before we disconnect (and ban). Mirrors Bitcoin Core's
+/// `MAX_NUM_UNCONNECTING_HEADERS_MSGS` from `net_processing.cpp`. Tolerates
+/// honest peers caught in a transient reorg while still bounding the
+/// adversarial DoS surface.
+pub const MAX_NUM_UNCONNECTING_HEADERS_MSGS: u32 = 10;
+
 /// Sync state for header downloading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncState {
@@ -46,6 +53,12 @@ pub struct HeaderSync {
     best_header_hash: Hash256,
     /// Per-peer: their announced best height.
     peer_heights: HashMap<PeerId, i32>,
+    /// Per-peer counter of consecutive unconnecting-headers messages.
+    /// Reset to 0 whenever the peer sends a connecting headers message.
+    /// When the counter would exceed `MAX_NUM_UNCONNECTING_HEADERS_MSGS`,
+    /// the peer is disconnected. Mirrors Core's
+    /// `nUnconnectingHeaders` (net_processing.cpp).
+    unconnecting_headers: HashMap<PeerId, u32>,
 }
 
 impl HeaderSync {
@@ -59,6 +72,7 @@ impl HeaderSync {
             best_header_height: 0,
             best_header_hash: genesis_hash,
             peer_heights: HashMap::new(),
+            unconnecting_headers: HashMap::new(),
         }
     }
 
@@ -80,12 +94,41 @@ impl HeaderSync {
     /// pick a new sync peer.
     pub fn remove_peer(&mut self, peer_id: PeerId) {
         self.peer_heights.remove(&peer_id);
+        self.unconnecting_headers.remove(&peer_id);
         // If we were syncing from this peer, reset state
         if let SyncState::DownloadingHeaders { peer, .. } = &self.state {
             if *peer == peer_id {
                 self.state = SyncState::Idle;
             }
         }
+    }
+
+    /// Increment the unconnecting-headers counter for `peer_id` and return
+    /// `true` if the counter has exceeded `MAX_NUM_UNCONNECTING_HEADERS_MSGS`,
+    /// meaning the caller MUST disconnect (and may ban) the peer. Returns
+    /// `false` to indicate the counter is still under the bound — the caller
+    /// should re-issue `getheaders` to attempt to reconnect the chain rather
+    /// than disconnecting.
+    ///
+    /// Mirrors Bitcoin Core's `nUnconnectingHeaders` accounting in
+    /// `net_processing.cpp::ProcessHeadersMessage` (HEADERS handler).
+    pub fn note_unconnecting_headers(&mut self, peer_id: PeerId) -> bool {
+        let count = self.unconnecting_headers.entry(peer_id).or_insert(0);
+        *count += 1;
+        *count > MAX_NUM_UNCONNECTING_HEADERS_MSGS
+    }
+
+    /// Reset the unconnecting-headers counter for `peer_id` (typically called
+    /// when a peer sends a properly-connecting headers message). Mirrors
+    /// Core's `nUnconnectingHeaders = 0` in the same handler.
+    pub fn reset_unconnecting_headers(&mut self, peer_id: PeerId) {
+        self.unconnecting_headers.remove(&peer_id);
+    }
+
+    /// Read the current unconnecting-headers count for `peer_id`. Used by tests.
+    #[cfg(test)]
+    pub fn unconnecting_headers_count(&self, peer_id: PeerId) -> u32 {
+        self.unconnecting_headers.get(&peer_id).copied().unwrap_or(0)
     }
 
     /// Choose the best peer to sync headers from.
@@ -301,6 +344,11 @@ impl HeaderSync {
         // Update our best header
         self.best_header_height += headers.len() as u32;
         self.best_header_hash = headers.last().unwrap().block_hash();
+
+        // Successful chain extension — reset the unconnecting-headers counter
+        // for this peer (Core: nUnconnectingHeaders = 0 in the headers
+        // handler's success path).
+        self.unconnecting_headers.remove(&peer_id);
 
         // If we received a full batch, there are probably more
         let need_more = headers.len() == MAX_HEADERS_PER_REQUEST;
@@ -787,5 +835,109 @@ mod tests {
 
         assert_eq!(sync.best_header_height(), 12345);
         assert_eq!(sync.best_header_hash(), new_hash);
+    }
+
+    /// Core parity: an unconnecting-headers message should NOT trigger
+    /// disconnect on the first occurrence. The counter must tolerate up to
+    /// `MAX_NUM_UNCONNECTING_HEADERS_MSGS` (10) before recommending disconnect.
+    /// Mirrors Bitcoin Core's `nUnconnectingHeaders` behavior in
+    /// `net_processing.cpp::ProcessHeadersMessage`.
+    #[test]
+    fn test_note_unconnecting_headers_under_threshold() {
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer = PeerId(1);
+
+        // First 10 calls must NOT recommend disconnect (Core: <= 10 tolerated).
+        for i in 1..=MAX_NUM_UNCONNECTING_HEADERS_MSGS {
+            let exceeded = sync.note_unconnecting_headers(peer);
+            assert!(
+                !exceeded,
+                "unconnecting #{} should not yet exceed threshold",
+                i
+            );
+            assert_eq!(sync.unconnecting_headers_count(peer), i);
+        }
+    }
+
+    #[test]
+    fn test_note_unconnecting_headers_exceeds_threshold() {
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer = PeerId(1);
+
+        // Saturate the counter at the threshold.
+        for _ in 0..MAX_NUM_UNCONNECTING_HEADERS_MSGS {
+            assert!(!sync.note_unconnecting_headers(peer));
+        }
+        // 11th unconnecting message MUST recommend disconnect.
+        let exceeded = sync.note_unconnecting_headers(peer);
+        assert!(exceeded, "11th unconnecting header should exceed threshold");
+    }
+
+    #[test]
+    fn test_unconnecting_headers_reset_on_connecting_batch() {
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer = PeerId(1);
+        sync.register_peer(peer, 100);
+
+        // Saturate near the threshold.
+        for _ in 0..(MAX_NUM_UNCONNECTING_HEADERS_MSGS - 1) {
+            assert!(!sync.note_unconnecting_headers(peer));
+        }
+        assert_eq!(
+            sync.unconnecting_headers_count(peer),
+            MAX_NUM_UNCONNECTING_HEADERS_MSGS - 1
+        );
+
+        // A successful connecting batch must reset the counter (Core:
+        // nUnconnectingHeaders = 0 in the success path).
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: genesis_hash,
+        };
+        let headers = make_valid_header_chain(genesis_hash, 3);
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
+        assert!(result.is_ok());
+        assert_eq!(sync.unconnecting_headers_count(peer), 0);
+
+        // The next unconnecting message starts the count fresh from 1.
+        assert!(!sync.note_unconnecting_headers(peer));
+        assert_eq!(sync.unconnecting_headers_count(peer), 1);
+    }
+
+    #[test]
+    fn test_unconnecting_headers_per_peer_independent() {
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer_a = PeerId(1);
+        let peer_b = PeerId(2);
+
+        // Saturate peer A near the threshold.
+        for _ in 0..MAX_NUM_UNCONNECTING_HEADERS_MSGS {
+            assert!(!sync.note_unconnecting_headers(peer_a));
+        }
+        // Peer B is independent — its very first unconnecting message
+        // must NOT trigger disconnect.
+        assert!(!sync.note_unconnecting_headers(peer_b));
+        assert_eq!(sync.unconnecting_headers_count(peer_b), 1);
+        // Peer A's 11th message exceeds the threshold.
+        assert!(sync.note_unconnecting_headers(peer_a));
+    }
+
+    #[test]
+    fn test_unconnecting_headers_reset_on_remove_peer() {
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer = PeerId(1);
+        sync.register_peer(peer, 100);
+
+        for _ in 0..3 {
+            sync.note_unconnecting_headers(peer);
+        }
+        assert_eq!(sync.unconnecting_headers_count(peer), 3);
+        sync.remove_peer(peer);
+        assert_eq!(sync.unconnecting_headers_count(peer), 0);
     }
 }
