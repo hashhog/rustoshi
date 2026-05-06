@@ -7042,17 +7042,16 @@ impl RpcServerImpl {
                     height
                 );
 
-                // Broadcast inv(MSG_BLOCK) to all connected peers
+                // BIP-130: announce the new block to all connected peers,
+                // sending `headers` to peers that opted in via `sendheaders`
+                // and falling back to `inv(MSG_BLOCK | MSG_WITNESS_BLOCK)`
+                // for everyone else.  HSync wave Pattern A.
                 {
                     let ps = self.peer_state.read().await;
                     if let Some(ref pm) = ps.peer_manager {
-                        let inv_msg = NetworkMessage::Inv(vec![InvVector {
-                            inv_type: InvType::MsgBlock,
-                            hash: block_hash,
-                        }]);
-                        pm.broadcast(inv_msg).await;
+                        pm.announce_block(block.header.clone(), block_hash).await;
                         tracing::info!(
-                            "Broadcast block inv {} to peers",
+                            "Announced block {} to peers",
                             block_hash.to_hex()
                         );
                     }
