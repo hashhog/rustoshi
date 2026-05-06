@@ -1275,6 +1275,44 @@ impl PeerManager {
         }
     }
 
+    /// Announce a newly connected block to all established peers, honoring
+    /// BIP-130: peers that have sent us `sendheaders` receive a `headers`
+    /// message containing the new block header; everyone else receives an
+    /// `inv` of MSG_BLOCK (or MSG_WITNESS_BLOCK for witness-aware peers).
+    ///
+    /// Reference: Bitcoin Core `net_processing.cpp::PeerManagerImpl::SendMessages`
+    /// (the per-peer block-announcement loop honoring `m_prefers_headers`).
+    /// Camlcoin's `peer_manager.ml::announce_block` (2026-05-06) is the
+    /// fleet's canonical implementation of this branch.
+    pub async fn announce_block(
+        &self,
+        header: rustoshi_primitives::BlockHeader,
+        block_hash: rustoshi_primitives::Hash256,
+    ) {
+        let headers_msg = NetworkMessage::Headers(vec![header]);
+        for peer in self.peers.values() {
+            if peer.info.state != PeerState::Established {
+                continue;
+            }
+
+            let msg = if peer.info.supports_sendheaders {
+                headers_msg.clone()
+            } else {
+                let inv_type = if peer.info.supports_witness {
+                    crate::message::InvType::MsgWitnessBlock
+                } else {
+                    crate::message::InvType::MsgBlock
+                };
+                NetworkMessage::Inv(vec![crate::message::InvVector {
+                    inv_type,
+                    hash: block_hash,
+                }])
+            };
+
+            let _ = peer.command_tx.send(PeerCommand::SendMessage(msg)).await;
+        }
+    }
+
     /// Disconnect from a specific peer.
     pub async fn disconnect_peer(&mut self, peer_id: PeerId) {
         if let Some(peer) = self.peers.get(&peer_id) {
@@ -1584,6 +1622,16 @@ impl PeerManager {
                                 peer.stale_state.pong_received();
                             }
                         }
+                    }
+                }
+
+                // BIP-130: peer requests headers-style block announcements.
+                // Track the flag so announce_block() can branch on it; without
+                // this hook the flag stays false on inbound peers and Pattern A
+                // (HSync findings doc, 2026-05-06) goes unfixed.
+                if let NetworkMessage::SendHeaders = msg {
+                    if let Some(peer) = self.peers.get_mut(id) {
+                        peer.info.supports_sendheaders = true;
                     }
                 }
             }
@@ -1986,6 +2034,55 @@ impl PeerManager {
     /// Get a mutable reference to the address manager.
     pub fn addr_manager_mut(&mut self) -> &mut AddressManager {
         &mut self.addr_manager
+    }
+
+    /// Test-only: directly insert a peer into the peers map.  Returns the
+    /// receiver side of the command channel so the test can observe what
+    /// `send_to_peer` / `broadcast` / `announce_block` would deliver.
+    #[cfg(test)]
+    pub(crate) fn insert_test_peer(
+        &mut self,
+        peer_id: PeerId,
+        addr: SocketAddr,
+        supports_sendheaders: bool,
+        supports_witness: bool,
+    ) -> mpsc::Receiver<PeerCommand> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        self.peers.insert(
+            peer_id,
+            PeerHandle {
+                info: PeerInfo {
+                    addr,
+                    version: PROTOCOL_VERSION,
+                    services: 0,
+                    user_agent: String::new(),
+                    start_height: 0,
+                    relay: true,
+                    inbound: true,
+                    state: PeerState::Established,
+                    last_send: Instant::now(),
+                    last_recv: Instant::now(),
+                    ping_nonce: None,
+                    ping_time: None,
+                    bytes_sent: 0,
+                    bytes_recv: 0,
+                    time_offset: 0,
+                    supports_witness,
+                    supports_sendheaders,
+                    supports_wtxid_relay: false,
+                    supports_addrv2: false,
+                    feefilter: 0,
+                },
+                command_tx: cmd_tx,
+                conn_type: ConnectionType::Inbound,
+                connected_time: Instant::now(),
+                min_ping_time: None,
+                last_block_time: None,
+                last_tx_time: None,
+                stale_state: StalePeerState::new(),
+            },
+        );
+        cmd_rx
     }
 }
 
@@ -4022,5 +4119,114 @@ mod tests {
         } else {
             std::env::remove_var("RUSTOSHI_BIP324_V2_INBOUND");
         }
+    }
+
+    /// BIP-130: a peer that has sent us `sendheaders` must receive a
+    /// `headers` message at block-announce time; peers that have not
+    /// must continue to receive an `inv(MSG_BLOCK)` (or
+    /// `inv(MSG_WITNESS_BLOCK)` for witness-aware peers).
+    ///
+    /// HSync wave Pattern A — `_header-sync-dos-cross-impl-audit-2026-05-06-part1.md`.
+    /// Reference impl: camlcoin `peer_manager.ml::announce_block`.
+    #[tokio::test]
+    async fn test_announce_block_branches_on_sendheaders() {
+        use rustoshi_primitives::{BlockHeader, Hash256};
+
+        let config = PeerManagerConfig::testnet4();
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        // Peer A: sent sendheaders, no witness.   -> expect Headers
+        // Peer B: no sendheaders, witness peer.   -> expect Inv(MsgWitnessBlock)
+        // Peer C: no sendheaders, no witness.     -> expect Inv(MsgBlock)
+        let mut rx_a = mgr.insert_test_peer(
+            PeerId(1),
+            "192.0.2.1:8333".parse().unwrap(),
+            true,  // supports_sendheaders
+            false, // supports_witness
+        );
+        let mut rx_b = mgr.insert_test_peer(
+            PeerId(2),
+            "192.0.2.2:8333".parse().unwrap(),
+            false,
+            true,
+        );
+        let mut rx_c = mgr.insert_test_peer(
+            PeerId(3),
+            "192.0.2.3:8333".parse().unwrap(),
+            false,
+            false,
+        );
+
+        let header = BlockHeader {
+            version: 1,
+            prev_block_hash: Hash256([1u8; 32]),
+            merkle_root: Hash256([2u8; 32]),
+            timestamp: 1_700_000_000,
+            bits: 0x1d00ffff,
+            nonce: 42,
+        };
+        let block_hash = Hash256([0xab; 32]);
+
+        mgr.announce_block(header.clone(), block_hash).await;
+
+        // Peer A receives a Headers message containing exactly our header.
+        match rx_a.recv().await.expect("peer A should receive a message") {
+            PeerCommand::SendMessage(NetworkMessage::Headers(hs)) => {
+                assert_eq!(hs.len(), 1);
+                assert_eq!(hs[0].nonce, header.nonce);
+                assert_eq!(hs[0].timestamp, header.timestamp);
+            }
+            other => panic!("peer A expected Headers, got {:?}", other),
+        }
+
+        // Peer B receives Inv with MsgWitnessBlock.
+        match rx_b.recv().await.expect("peer B should receive a message") {
+            PeerCommand::SendMessage(NetworkMessage::Inv(inv)) => {
+                assert_eq!(inv.len(), 1);
+                assert_eq!(inv[0].inv_type, crate::message::InvType::MsgWitnessBlock);
+                assert_eq!(inv[0].hash, block_hash);
+            }
+            other => panic!("peer B expected Inv, got {:?}", other),
+        }
+
+        // Peer C receives Inv with plain MsgBlock.
+        match rx_c.recv().await.expect("peer C should receive a message") {
+            PeerCommand::SendMessage(NetworkMessage::Inv(inv)) => {
+                assert_eq!(inv.len(), 1);
+                assert_eq!(inv[0].inv_type, crate::message::InvType::MsgBlock);
+                assert_eq!(inv[0].hash, block_hash);
+            }
+            other => panic!("peer C expected Inv, got {:?}", other),
+        }
+    }
+
+    /// Receiving a `sendheaders` message from a peer must flip the
+    /// `supports_sendheaders` flag, so the next `announce_block` call uses
+    /// the headers branch for that peer.  Without this hook the flag stays
+    /// at its handshake-time value (always `false` for inbound peers in the
+    /// current code path) and Pattern A is unfixed.
+    #[tokio::test]
+    async fn test_sendheaders_message_flips_flag() {
+        let config = PeerManagerConfig::testnet4();
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let peer_id = PeerId(7);
+        let _rx = mgr.insert_test_peer(
+            peer_id,
+            "192.0.2.7:8333".parse().unwrap(),
+            false, // initial supports_sendheaders
+            false,
+        );
+        assert!(!mgr.peers.get(&peer_id).unwrap().info.supports_sendheaders);
+
+        let event = PeerEvent::Message(peer_id, NetworkMessage::SendHeaders);
+        mgr.handle_event(event).await;
+
+        assert!(
+            mgr.peers.get(&peer_id).unwrap().info.supports_sendheaders,
+            "supports_sendheaders must be set after a SendHeaders message"
+        );
     }
 }
