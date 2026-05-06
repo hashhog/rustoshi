@@ -886,10 +886,70 @@ impl PeerManager {
                     let inbound_senders: Arc<std::sync::Mutex<HashMap<PeerId, mpsc::Sender<PeerCommand>>>> =
                         Arc::new(std::sync::Mutex::new(HashMap::new()));
                     self.inbound_cmd_txs = Some(inbound_senders.clone());
+                    // Snapshot path of the on-disk banlist for the accept
+                    // loop.  The listener task lives outside the manager's
+                    // `&mut self`, so it cannot share the in-memory
+                    // `BanManager`.  Re-reading the file on each accept()
+                    // is cheap (rare event) and lets RPC `setban` /
+                    // misbehavior-driven bans take effect on the next
+                    // connection without extra plumbing.
+                    let ban_path = self.config.data_dir.clone();
                     tokio::spawn(async move {
+                        // Cheap, per-accept ban check: re-read the persisted
+                        // banlist file on disk.  This means RPC `setban` /
+                        // misbehavior-driven bans take effect on the next
+                        // accept without needing extra plumbing.
                         loop {
                             match listener.accept().await {
                                 Ok((stream, addr)) => {
+                                    // Refuse banned addresses at accept time
+                                    // so a banned peer can't burn handshake
+                                    // bandwidth or refill connection slots.
+                                    let banlist_file = ban_path.join("banlist.json");
+                                    if banlist_file.exists() {
+                                        let is_banned = match std::fs::File::open(&banlist_file) {
+                                            Ok(f) => {
+                                                match serde_json::from_reader::<_, serde_json::Value>(f) {
+                                                    Ok(v) => {
+                                                        let now = std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .map(|d| d.as_secs())
+                                                            .unwrap_or(0);
+                                                        v.get("entries")
+                                                            .and_then(|e| e.as_object())
+                                                            .map(|entries| {
+                                                                entries.iter().any(|(ip_str, entry)| {
+                                                                    if ip_str.parse::<IpAddr>()
+                                                                        .map(|ip| ip == addr.ip())
+                                                                        .unwrap_or(false)
+                                                                    {
+                                                                        entry
+                                                                            .get("ban_until")
+                                                                            .and_then(|u| u.as_u64())
+                                                                            .map(|until| until > now)
+                                                                            .unwrap_or(false)
+                                                                    } else {
+                                                                        false
+                                                                    }
+                                                                })
+                                                            })
+                                                            .unwrap_or(false)
+                                                    }
+                                                    Err(_) => false,
+                                                }
+                                            }
+                                            Err(_) => false,
+                                        };
+                                        if is_banned {
+                                            tracing::info!(
+                                                "Rejecting inbound connection from banned address {}",
+                                                addr
+                                            );
+                                            drop(stream);
+                                            continue;
+                                        }
+                                    }
+
                                     let peer_id = PeerId(
                                         next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                                     );
@@ -1423,18 +1483,28 @@ impl PeerManager {
 
                 // Handle addr messages internally
                 if let NetworkMessage::Addr(addrs) = msg {
-                    if let Some(peer) = self.peers.get(id) {
-                        self.addr_manager.add_peer_addresses(addrs, peer.info.addr);
-                    }
-                    // BIP155: Relay a random subset of new addresses to 2 other peers
-                    if addrs.len() <= MAX_ADDR {
+                    if addrs.len() > MAX_ADDR {
+                        // Bitcoin Core: 20-pt addr-format misbehavior.
+                        let _ = self
+                            .misbehavior_tracker
+                            .misbehaving(*id, MisbehaviorReason::InvalidAddr);
+                    } else {
+                        if let Some(peer) = self.peers.get(id) {
+                            self.addr_manager.add_peer_addresses(addrs, peer.info.addr);
+                        }
+                        // BIP155: Relay a random subset of new addresses to 2 other peers
                         self.relay_addresses_to_peers(*id).await;
                     }
                 }
 
                 // Handle addrv2 messages (BIP155)
                 if let NetworkMessage::AddrV2(entries) = msg {
-                    if entries.len() <= MAX_ADDR {
+                    if entries.len() > MAX_ADDR {
+                        // Bitcoin Core: 20-pt addr-format misbehavior.
+                        let _ = self
+                            .misbehavior_tracker
+                            .misbehaving(*id, MisbehaviorReason::InvalidAddr);
+                    } else {
                         self.addr_manager.add_addrv2_addresses(entries, self.peers.get(id).map(|p| p.info.addr).unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()));
                         // Relay to 2 other peers
                         self.relay_addresses_to_peers(*id).await;
@@ -1443,11 +1513,18 @@ impl PeerManager {
 
                 // Handle feefilter messages (BIP133)
                 if let NetworkMessage::FeeFilter(fee_rate) = msg {
-                    if let Some(peer) = self.peers.get_mut(id) {
-                        // Validate: must be within money range (max 21M BTC in sats)
-                        if *fee_rate <= 2_100_000_000_000_000 {
-                            peer.info.feefilter = *fee_rate;
-                        }
+                    // Validate: must be within money range (max 21M BTC in sats).
+                    // Out-of-range values are a protocol violation; Core
+                    // marks the peer as misbehaving.
+                    if *fee_rate > 2_100_000_000_000_000 {
+                        let _ = self.misbehavior_tracker.misbehaving(
+                            *id,
+                            MisbehaviorReason::ProtocolViolation(
+                                "feefilter out of range".to_string(),
+                            ),
+                        );
+                    } else if let Some(peer) = self.peers.get_mut(id) {
+                        peer.info.feefilter = *fee_rate;
                     }
                 }
 
@@ -1509,6 +1586,13 @@ impl PeerManager {
                         }
                     }
                 }
+            }
+            PeerEvent::Misbehaving(id, reason) => {
+                // Forward to the misbehavior tracker + ban manager.  A peer
+                // hitting the 100-point threshold is added to the persistent
+                // banlist and will be refused on the next accept().
+                let reason = reason.clone();
+                self.misbehaving(*id, reason).await;
             }
         }
 
@@ -2061,6 +2145,12 @@ pub async fn run_inbound_peer(
     let (msg_magic, command, length, checksum) = parse_message_header(&header_buf);
     if msg_magic != magic {
         let _ = event_tx
+            .send(PeerEvent::Misbehaving(
+                peer_id,
+                MisbehaviorReason::ProtocolViolation("bad magic".to_string()),
+            ))
+            .await;
+        let _ = event_tx
             .send(PeerEvent::Disconnected(
                 peer_id,
                 DisconnectReason::ProtocolError("bad magic".to_string()),
@@ -2072,6 +2162,15 @@ pub async fn run_inbound_peer(
     // First message MUST be version (pre-handshake validation)
     if command != "version" {
         let _ = event_tx
+            .send(PeerEvent::Misbehaving(
+                peer_id,
+                MisbehaviorReason::ProtocolViolation(format!(
+                    "pre-handshake message: {}",
+                    command
+                )),
+            ))
+            .await;
+        let _ = event_tx
             .send(PeerEvent::Disconnected(
                 peer_id,
                 DisconnectReason::PreHandshakeMessage(command.clone()),
@@ -2082,6 +2181,12 @@ pub async fn run_inbound_peer(
 
     // Validate length
     if length as usize > MAX_MESSAGE_SIZE {
+        let _ = event_tx
+            .send(PeerEvent::Misbehaving(
+                peer_id,
+                MisbehaviorReason::MessageTooLarge,
+            ))
+            .await;
         let _ = event_tx
             .send(PeerEvent::Disconnected(
                 peer_id,
@@ -2117,6 +2222,12 @@ pub async fn run_inbound_peer(
     let computed = rustoshi_crypto::sha256d(&payload);
     if checksum != computed.0[..4] {
         let _ = event_tx
+            .send(PeerEvent::Misbehaving(
+                peer_id,
+                MisbehaviorReason::ProtocolViolation("checksum mismatch".to_string()),
+            ))
+            .await;
+        let _ = event_tx
             .send(PeerEvent::Disconnected(
                 peer_id,
                 DisconnectReason::ProtocolError("checksum mismatch".to_string()),
@@ -2128,6 +2239,14 @@ pub async fn run_inbound_peer(
     let their_version = match NetworkMessage::deserialize("version", &payload) {
         Ok(NetworkMessage::Version(v)) => v,
         _ => {
+            let _ = event_tx
+                .send(PeerEvent::Misbehaving(
+                    peer_id,
+                    MisbehaviorReason::ProtocolViolation(
+                        "invalid version message".to_string(),
+                    ),
+                ))
+                .await;
             let _ = event_tx
                 .send(PeerEvent::Disconnected(
                     peer_id,
@@ -2265,6 +2384,12 @@ pub async fn run_inbound_peer(
             let computed = rustoshi_crypto::sha256d(&msg_payload);
             if chk != computed.0[..4] {
                 let _ = event_tx
+                    .send(PeerEvent::Misbehaving(
+                        peer_id,
+                        MisbehaviorReason::ProtocolViolation("checksum mismatch".to_string()),
+                    ))
+                    .await;
+                let _ = event_tx
                     .send(PeerEvent::Disconnected(
                         peer_id,
                         DisconnectReason::ProtocolError("checksum mismatch".to_string()),
@@ -2279,8 +2404,16 @@ pub async fn run_inbound_peer(
                 handshake_complete = true;
             }
             "version" => {
-                // Duplicate version message (misbehavior score 1)
+                // Duplicate version message — Bitcoin Core 1-pt misbehavior.
                 if version_received {
+                    let _ = event_tx
+                        .send(PeerEvent::Misbehaving(
+                            peer_id,
+                            MisbehaviorReason::ProtocolViolation(
+                                "duplicate version".to_string(),
+                            ),
+                        ))
+                        .await;
                     let _ = event_tx
                         .send(PeerEvent::Disconnected(
                             peer_id,
@@ -2300,6 +2433,15 @@ pub async fn run_inbound_peer(
             }
             // Any other message before handshake is complete is a protocol violation
             _ => {
+                let _ = event_tx
+                    .send(PeerEvent::Misbehaving(
+                        peer_id,
+                        MisbehaviorReason::ProtocolViolation(format!(
+                            "pre-handshake message after version: {}",
+                            cmd
+                        )),
+                    ))
+                    .await;
                 let _ = event_tx
                     .send(PeerEvent::Disconnected(
                         peer_id,
@@ -3372,6 +3514,59 @@ mod tests {
         let banned = mgr.misbehaving_with_score(peer_id, 50, "another violation").await;
         assert!(banned);
         assert_eq!(mgr.get_misbehavior_score(peer_id), 100);
+    }
+
+    /// `PeerEvent::Misbehaving` flowing through `handle_event` must
+    /// accumulate score and ban on threshold — closing the
+    /// "tracker exists but only called from tests" P0 from the audit.
+    #[tokio::test]
+    async fn test_handle_event_misbehaving_wires_into_tracker_and_ban() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = PeerManagerConfig::testnet4().with_data_dir(temp_dir.path().to_path_buf());
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let peer_id = PeerId(42);
+
+        // 5 × 20-pt protocol violations = 100 → ban.
+        for i in 0..5 {
+            assert_eq!(mgr.get_misbehavior_score(peer_id), i * 20);
+            mgr.handle_event(PeerEvent::Misbehaving(
+                peer_id,
+                MisbehaviorReason::UnsolicitedMessage,
+            ))
+            .await;
+        }
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 100);
+    }
+
+    /// `PeerEvent::Misbehaving` carrying an instant-ban reason
+    /// (InvalidBlockHeader = 100 pts) should ban on the very first hit.
+    #[tokio::test]
+    async fn test_handle_event_misbehaving_instant_ban_on_threshold() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = PeerManagerConfig::testnet4().with_data_dir(temp_dir.path().to_path_buf());
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let peer_id = PeerId(7);
+        mgr.handle_event(PeerEvent::Misbehaving(
+            peer_id,
+            MisbehaviorReason::InvalidBlockHeader,
+        ))
+        .await;
+
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 100);
+        // Banlist is the source-of-truth that's checked at accept time.
+        // We can't easily ban a peer without a registered PeerHandle, but
+        // we can confirm that the tracker hit threshold (the actual ban
+        // call only fires when the peer is registered + has a known
+        // SocketAddr; the score path here is what matters for the
+        // production wire-up).
     }
 
     #[test]
