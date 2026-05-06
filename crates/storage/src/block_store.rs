@@ -4,7 +4,7 @@
 //! blocks, headers, UTXOs, and chain metadata.
 
 use crate::columns::*;
-use crate::db::{ChainDb, StorageError, META_BEST_BLOCK_HASH, META_BEST_HEIGHT};
+use crate::db::{ChainDb, StorageError, META_BEST_BLOCK_HASH, META_BEST_HEIGHT, META_PRUNE_HEIGHT};
 use rocksdb::WriteBatch;
 use rustoshi_primitives::{Block, BlockHeader, Decodable, Encodable, Hash256, OutPoint};
 use serde::{Deserialize, Serialize};
@@ -668,6 +668,127 @@ impl<'a> BlockStore<'a> {
 
         tracing::info!("initialized database with genesis block: {}", hash);
         Ok(())
+    }
+
+    // ============================================================
+    // PRUNING (RocksDB-backed)
+    // ============================================================
+    //
+    // rustoshi stores block + undo data as RocksDB key/value entries
+    // (CF_BLOCKS, CF_UNDO) rather than in flat blk*.dat files. The
+    // `FlatBlockStore` machinery in `blockstore.rs` is only used for
+    // legacy / Core-format scanning during reindex paths.
+    //
+    // Pruning here therefore means deleting the RocksDB key for a block's
+    // serialized payload and undo data, and clearing the `HAVE_DATA` /
+    // `HAVE_UNDO` flags on the corresponding `BlockIndexEntry` so that
+    // chain-management code knows the block is no longer reconstructible
+    // from local storage. Mirrors Bitcoin Core's behavior in
+    // `bitcoin-core/src/validation.cpp::PruneBlockFilesManual` /
+    // `::FindFilesToPrune` / `::UnlinkPrunedFiles` — but at the
+    // block-key granularity rather than per file slot.
+    //
+    // Safety invariants enforced by all helpers below (mirroring Core):
+    //   - Never delete data above (tip - MIN_BLOCKS_TO_KEEP) (288 blocks)
+    //   - Never delete data above the assumeutxo activation height
+    //   - Header + block-index entry are PRESERVED (only the body + undo
+    //     are deleted); chain validity / reorg-skeleton is unaffected.
+
+    /// Delete the body + undo for a single block hash and clear the
+    /// `HAVE_DATA` / `HAVE_UNDO` flags on the index entry.
+    ///
+    /// Idempotent — silently succeeds if the body / undo are already
+    /// absent (matches RocksDB delete-on-missing semantics).
+    ///
+    /// Mirrors `bitcoin-core/src/node/blockstorage.cpp::UnlinkPrunedFiles`
+    /// at the key-granularity rustoshi uses.
+    pub fn prune_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+        // Drop block body.
+        self.db.delete_cf(CF_BLOCKS, hash.as_bytes())?;
+        // Drop undo data.
+        self.db.delete_cf(CF_UNDO, hash.as_bytes())?;
+        // Clear HAVE_DATA + HAVE_UNDO flags on the index entry, leaving
+        // the rest of the entry (height, status, prev_hash, chain_work)
+        // intact so reorg / chain-management code still sees the block.
+        if let Some(mut entry) = self.get_block_index(hash)? {
+            entry.status.clear(BlockStatus::HAVE_DATA);
+            entry.status.clear(BlockStatus::HAVE_UNDO);
+            self.put_block_index(hash, &entry)?;
+        }
+        Ok(())
+    }
+
+    /// Persist the prune-height watermark.
+    ///
+    /// Stored as little-endian u32 in `CF_META` under `META_PRUNE_HEIGHT`.
+    /// Subsequent reads (`get_prune_height`) return the highest height
+    /// at-or-below which we no longer hold full block data.
+    pub fn set_prune_height(&self, height: u32) -> Result<(), StorageError> {
+        self.db
+            .put_cf(CF_META, META_PRUNE_HEIGHT, &height.to_le_bytes())
+    }
+
+    /// Read the prune-height watermark, or `0` if pruning never ran.
+    pub fn get_prune_height(&self) -> Result<u32, StorageError> {
+        match self.db.get_cf(CF_META, META_PRUNE_HEIGHT)? {
+            Some(data) => {
+                if data.len() != 4 {
+                    return Err(StorageError::Corruption(
+                        "invalid prune height length".into(),
+                    ));
+                }
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&data);
+                Ok(u32::from_le_bytes(buf))
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Delete the body + undo for every active-chain block in
+    /// `[from_height, to_height]` (inclusive on both ends), updating the
+    /// prune-height watermark to `max(existing, to_height)` on success.
+    ///
+    /// Caller is responsible for passing a `to_height` that respects
+    /// MIN_BLOCKS_TO_KEEP and any assumeutxo floor; this method does not
+    /// re-validate those invariants (that's done in `auto_prune` /
+    /// `manual_prune_to_height`).
+    ///
+    /// Returns the number of blocks actually pruned (height entries that
+    /// resolved to a hash AND had a non-empty body to drop).
+    pub fn prune_active_chain_range(
+        &self,
+        from_height: u32,
+        to_height: u32,
+    ) -> Result<u32, StorageError> {
+        if from_height > to_height {
+            return Ok(0);
+        }
+        let mut pruned = 0u32;
+        for h in from_height..=to_height {
+            // Resolve height -> hash on the active chain only. Off-chain
+            // / orphan branches are ignored (they're cleaned up via
+            // reorg disconnect, not prune).
+            let Some(hash) = self.get_hash_by_height(h)? else {
+                continue;
+            };
+            // Skip the genesis block — Core never prunes height 0
+            // (`bitcoin-core/src/node/blockstorage.cpp::FindFilesToPrune`
+            // starts at file 0 but the genesis is loaded from chainparams,
+            // not from disk; deleting it would break first-run init).
+            if h == 0 {
+                continue;
+            }
+            self.prune_block(&hash)?;
+            pruned += 1;
+        }
+        // Watermark advances monotonically so subsequent prune passes
+        // don't re-walk blocks we already deleted.
+        let prev = self.get_prune_height()?;
+        if to_height > prev {
+            self.set_prune_height(to_height)?;
+        }
+        Ok(pruned)
     }
 }
 

@@ -45,6 +45,7 @@ pub mod blockstore;
 pub mod columns;
 pub mod db;
 pub mod indexes;
+pub mod prune;
 pub mod snapshot;
 pub mod undo;
 pub mod utxo_cache;
@@ -55,6 +56,7 @@ pub use blockstore::{
     BLOCKFILE_CHUNK_SIZE, MAX_BLOCKFILE_SIZE, MIN_BLOCKS_TO_KEEP, MIN_DISK_SPACE_FOR_BLOCK_FILES,
     MIN_PRUNE_TARGET_MIB, STORAGE_HEADER_BYTES, UNDOFILE_CHUNK_SIZE,
 };
+pub use prune::{auto_prune, manual_prune_to_height, PruneCoordConfig, PruneOutcome, PRUNE_MANUAL_SENTINEL};
 pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;
 pub use db::{ChainDb, StorageError, CURRENT_DB_VERSION};
@@ -1125,5 +1127,253 @@ mod tests {
 
         let on_disk = store.get_utxo(&outpoint).unwrap().unwrap();
         assert_eq!(on_disk.value, 50_0000_0000);
+    }
+
+    // ============================================================
+    // PRUNE TESTS (RocksDB-backed prune subsystem)
+    // ============================================================
+    //
+    // Validate the dormant prune subsystem is now wired correctly:
+    //   - `prune_block` drops body + undo + clears HAVE_DATA/HAVE_UNDO
+    //   - `prune_active_chain_range` walks height-index correctly
+    //   - watermark advances monotonically
+    //   - `auto_prune` respects MIN_BLOCKS_TO_KEEP=288 + assumeutxo floor
+    //   - `manual_prune_to_height` respects same invariants
+    //   - `-prune=1` manual-only mode disables auto-prune
+    //
+    // Reference: `bitcoin-core/src/validation.cpp::FindFilesToPrune`,
+    // `::PruneBlockFilesManual`, `::UnlinkPrunedFiles`.
+
+    /// Build a synthetic chain of `n` blocks below an arbitrary tip,
+    /// each with valid `BlockIndexEntry` + body + height-index entry.
+    /// Heights are 1..=n (genesis at 0 is initialized via params).
+    fn build_synth_chain(store: &BlockStore<'_>, n: u32) {
+        for h in 1..=n {
+            let header = BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_700_000_000 + h,
+                bits: 0x1d00ffff,
+                nonce: h,
+            };
+            // Make the hash deterministic from height so we don't have
+            // to actually hash the block.
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[0..4].copy_from_slice(&h.to_be_bytes());
+            let hash = Hash256(hash_bytes);
+
+            let block = Block {
+                header: header.clone(),
+                transactions: vec![Transaction {
+                    version: 1,
+                    inputs: vec![TxIn {
+                        previous_output: OutPoint::null(),
+                        script_sig: vec![h as u8],
+                        sequence: 0xFFFFFFFF,
+                        witness: Vec::new(),
+                    }],
+                    outputs: vec![TxOut {
+                        value: 50_0000_0000,
+                        script_pubkey: vec![0x51],
+                    }],
+                    lock_time: 0,
+                }],
+            };
+
+            store.put_header(&hash, &header).unwrap();
+            store.put_block(&hash, &block).unwrap();
+            store.put_height_index(h, &hash).unwrap();
+
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_SCRIPTS);
+            status.set(BlockStatus::HAVE_DATA);
+            status.set(BlockStatus::HAVE_UNDO);
+            let entry = BlockIndexEntry {
+                height: h,
+                status,
+                n_tx: 1,
+                timestamp: header.timestamp,
+                bits: header.bits,
+                nonce: header.nonce,
+                version: header.version,
+                prev_hash: header.prev_block_hash,
+                chain_work: [0u8; 32],
+            };
+            store.put_block_index(&hash, &entry).unwrap();
+            // Stash undo data so the prune path has something to drop.
+            let undo = UndoData { spent_coins: vec![] };
+            store.put_undo(&hash, &undo).unwrap();
+        }
+        // Set tip pointer to the last block.
+        let mut tip_bytes = [0u8; 32];
+        tip_bytes[0..4].copy_from_slice(&n.to_be_bytes());
+        store.set_best_block(&Hash256(tip_bytes), n).unwrap();
+    }
+
+    /// `prune_block` drops body + undo and clears HAVE_DATA/HAVE_UNDO,
+    /// preserving the index entry. Idempotent on a missing body.
+    #[test]
+    fn test_prune_block_drops_body_and_undo() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        build_synth_chain(&store, 1);
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[0..4].copy_from_slice(&1u32.to_be_bytes());
+        let hash = Hash256(hash_bytes);
+
+        // Pre-prune: body, undo, and flags all present.
+        assert!(store.has_block(&hash).unwrap());
+        assert!(store.get_undo(&hash).unwrap().is_some());
+        let entry = store.get_block_index(&hash).unwrap().unwrap();
+        assert!(entry.status.has(BlockStatus::HAVE_DATA));
+        assert!(entry.status.has(BlockStatus::HAVE_UNDO));
+
+        store.prune_block(&hash).unwrap();
+
+        // Post-prune: body + undo gone, flags cleared, index entry kept.
+        assert!(!store.has_block(&hash).unwrap());
+        assert!(store.get_undo(&hash).unwrap().is_none());
+        let entry = store.get_block_index(&hash).unwrap().unwrap();
+        assert!(!entry.status.has(BlockStatus::HAVE_DATA));
+        assert!(!entry.status.has(BlockStatus::HAVE_UNDO));
+        // Header is preserved so reorg-skeleton stays intact.
+        assert!(store.has_header(&hash).unwrap());
+
+        // Idempotent — calling again is a no-op (no error).
+        store.prune_block(&hash).unwrap();
+    }
+
+    /// `auto_prune` fires when tip >= MIN_BLOCKS_TO_KEEP + 1 and
+    /// `-prune=550` is set; respects the keep window.
+    #[test]
+    fn test_auto_prune_fires_above_keep_window() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        // Build a tip well above the keep window.
+        let tip = MIN_BLOCKS_TO_KEEP + 50;
+        build_synth_chain(&store, tip);
+
+        let cfg = PruneCoordConfig::from_mib(Some(550), 0);
+        assert!(cfg.auto_prune_enabled());
+
+        let outcome = auto_prune(&store, &cfg, tip).unwrap().unwrap();
+        // Last block we can prune = tip - MIN_BLOCKS_TO_KEEP - 1
+        let expected_last = tip - MIN_BLOCKS_TO_KEEP - 1;
+        assert_eq!(outcome.new_prune_height, expected_last);
+        assert_eq!(outcome.blocks_pruned, expected_last); // heights 1..=expected_last
+
+        // Verify body deleted at low heights, preserved at high heights.
+        let mut h_low = [0u8; 32];
+        h_low[0..4].copy_from_slice(&1u32.to_be_bytes());
+        assert!(!store.has_block(&Hash256(h_low)).unwrap());
+
+        let mut h_high = [0u8; 32];
+        h_high[0..4].copy_from_slice(&tip.to_be_bytes());
+        assert!(store.has_block(&Hash256(h_high)).unwrap());
+
+        // Watermark persisted.
+        assert_eq!(store.get_prune_height().unwrap(), expected_last);
+
+        // A second pass at the same tip is a no-op (watermark didn't move).
+        assert!(auto_prune(&store, &cfg, tip).unwrap().is_none());
+    }
+
+    /// `auto_prune` is a no-op when tip is inside the keep window.
+    #[test]
+    fn test_auto_prune_noop_inside_keep_window() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        // Tip is below the keep-window boundary -> nothing to prune.
+        build_synth_chain(&store, MIN_BLOCKS_TO_KEEP - 5);
+        let cfg = PruneCoordConfig::from_mib(Some(550), 0);
+        assert!(auto_prune(&store, &cfg, MIN_BLOCKS_TO_KEEP - 5).unwrap().is_none());
+    }
+
+    /// `-prune=1` manual-only mode disables auto-prune entirely; the
+    /// `pruneblockchain`-driven `manual_prune_to_height` path still works.
+    #[test]
+    fn test_prune_manual_only_disables_auto_but_allows_manual() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        let tip = MIN_BLOCKS_TO_KEEP + 50;
+        build_synth_chain(&store, tip);
+
+        let cfg = PruneCoordConfig::from_mib(Some(1), 0);
+        assert!(cfg.is_prune_mode());
+        assert!(cfg.is_manual_only());
+        assert!(!cfg.auto_prune_enabled());
+
+        // Auto-prune is a no-op under manual-only.
+        assert!(auto_prune(&store, &cfg, tip).unwrap().is_none());
+
+        // But manual-prune to a specific height still drops blocks.
+        let target = 10u32;
+        let outcome = manual_prune_to_height(&store, &cfg, tip, target).unwrap();
+        assert_eq!(outcome.new_prune_height, target);
+        assert_eq!(outcome.blocks_pruned, target);
+
+        // Verify low heights got dropped.
+        let mut h_low = [0u8; 32];
+        h_low[0..4].copy_from_slice(&5u32.to_be_bytes());
+        assert!(!store.has_block(&Hash256(h_low)).unwrap());
+        // Heights above target still intact.
+        let mut h_above = [0u8; 32];
+        h_above[0..4].copy_from_slice(&20u32.to_be_bytes());
+        assert!(store.has_block(&Hash256(h_above)).unwrap());
+    }
+
+    /// `manual_prune_to_height` clamps requested height against
+    /// MIN_BLOCKS_TO_KEEP and the assumeutxo floor.
+    #[test]
+    fn test_manual_prune_clamps_to_keep_window_and_assumeutxo() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        let tip = MIN_BLOCKS_TO_KEEP + 100;
+        build_synth_chain(&store, tip);
+
+        let assumeutxo_h = 50;
+        let cfg = PruneCoordConfig::from_mib(Some(550), assumeutxo_h);
+
+        // Request prune well into the keep window — should clamp.
+        let requested = tip; // far above tip - 288
+        let outcome = manual_prune_to_height(&store, &cfg, tip, requested).unwrap();
+        // Effective height is min(keep_window_floor, assumeutxo_h) = 50.
+        assert_eq!(outcome.new_prune_height, assumeutxo_h);
+    }
+
+    /// Genesis (height 0) is never pruned even if requested.
+    #[test]
+    fn test_genesis_never_pruned() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        store.init_genesis(&params).unwrap();
+        let tip = MIN_BLOCKS_TO_KEEP + 5;
+        build_synth_chain(&store, tip);
+
+        // Genesis hash from params.
+        let genesis_hash = params.genesis_hash;
+        assert!(store.has_block(&genesis_hash).unwrap());
+
+        // Force prune with an aggressive range starting at 0.
+        let cfg = PruneCoordConfig::from_mib(Some(550), 0);
+        let _ = manual_prune_to_height(&store, &cfg, tip, 5).unwrap();
+
+        // Genesis still has its body.
+        assert!(store.has_block(&genesis_hash).unwrap());
+    }
+
+    /// The watermark survives across `BlockStore` instances (persisted).
+    #[test]
+    fn test_prune_height_persists_across_block_store_handles() {
+        let (_dir, db) = temp_db();
+        {
+            let store = BlockStore::new(&db);
+            store.set_prune_height(12345).unwrap();
+        }
+        let store2 = BlockStore::new(&db);
+        assert_eq!(store2.get_prune_height().unwrap(), 12345);
     }
 }
