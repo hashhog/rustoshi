@@ -391,6 +391,19 @@ impl<'a> BlockStore<'a> {
         }
     }
 
+    /// Delete a transaction index entry.
+    ///
+    /// Used by the disconnect path (Pattern C: revert-on-reorg) so that
+    /// `getrawtransaction(<txid>, true)` does not return a stale block hash
+    /// after a reorg has disconnected the block that originally contained
+    /// the tx. Mirrors `bitcoin-core/src/index/txindex.cpp::CustomRemove`.
+    ///
+    /// Idempotent — silently succeeds if the entry is absent (matches Core's
+    /// `BatchErase` semantics on a key that isn't there).
+    pub fn delete_tx_index(&self, txid: &Hash256) -> Result<(), StorageError> {
+        self.db.delete_cf(CF_TX_INDEX, txid.as_bytes())
+    }
+
     // ---------------- GENESIS INITIALIZATION ----------------
 
     // ---------------- BLOCK VALIDITY ----------------
