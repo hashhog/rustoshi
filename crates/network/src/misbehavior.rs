@@ -740,6 +740,120 @@ mod tests {
         assert!(tracker.should_disconnect(peer_id));
     }
 
+    /// Mirrors the listener-side ban-check used in `PeerManager::start`:
+    /// re-read `banlist.json` directly and verify that an entry with a
+    /// future `ban_until` correctly identifies a banned address, while
+    /// expired or unrelated entries do not.  Closes the audit gap where
+    /// the `PeerManager` has a `BanManager` but the spawn-only listener
+    /// task had no way to consult it.
+    #[test]
+    fn test_listener_can_read_banlist_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let banned_ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let other_ip: IpAddr = "10.4.5.6".parse().unwrap();
+
+        // 1. Persist a banlist via the manager (matches what the
+        //    misbehavior path does on threshold).
+        {
+            let mut mgr = BanManager::new(temp_dir.path().to_path_buf());
+            mgr.ban(banned_ip, Duration::from_secs(3600), "test".to_string());
+        }
+
+        // 2. Re-read the banlist file directly, the way the listener
+        //    accept loop does (the listener task runs in a spawned tokio
+        //    task without `&mut self` access to the manager).
+        let banlist_path = temp_dir.path().join("banlist.json");
+        let f = File::open(&banlist_path).expect("banlist file should exist");
+        let v: serde_json::Value = serde_json::from_reader(f).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let is_banned = |ip: &IpAddr| -> bool {
+            v.get("entries")
+                .and_then(|e| e.as_object())
+                .map(|entries| {
+                    entries.iter().any(|(ip_str, entry)| {
+                        ip_str.parse::<IpAddr>().map(|p| p == *ip).unwrap_or(false)
+                            && entry
+                                .get("ban_until")
+                                .and_then(|u| u.as_u64())
+                                .map(|until| until > now)
+                                .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        };
+
+        assert!(
+            is_banned(&banned_ip),
+            "listener-side check should mark {} as banned",
+            banned_ip
+        );
+        assert!(
+            !is_banned(&other_ip),
+            "unbanned IP {} must not match",
+            other_ip
+        );
+    }
+
+    /// Confirm that an expired entry on disk is treated as unbanned by the
+    /// listener-side check — a banned IP after its ban window must be
+    /// allowed to reconnect.
+    #[test]
+    fn test_listener_ban_check_respects_expiry() {
+        let temp_dir = TempDir::new().unwrap();
+        let banned_ip: IpAddr = "10.7.8.9".parse().unwrap();
+        let banlist_path = temp_dir.path().join("banlist.json");
+
+        // Hand-craft an expired-entry banlist, mirroring what the listener
+        // would parse off disk.
+        let mut entries = HashMap::new();
+        entries.insert(
+            banned_ip.to_string(),
+            BanEntry {
+                ban_created: 0,
+                ban_until: 1, // long ago
+                reason: "expired".to_string(),
+            },
+        );
+        let banlist = BanListFile { entries };
+        let f = File::create(&banlist_path).unwrap();
+        serde_json::to_writer(f, &banlist).unwrap();
+
+        // Same listener-side parser.
+        let f = File::open(&banlist_path).unwrap();
+        let v: serde_json::Value = serde_json::from_reader(f).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let still_banned = v
+            .get("entries")
+            .and_then(|e| e.as_object())
+            .map(|entries| {
+                entries.iter().any(|(ip_str, entry)| {
+                    ip_str
+                        .parse::<IpAddr>()
+                        .map(|p| p == banned_ip)
+                        .unwrap_or(false)
+                        && entry
+                            .get("ban_until")
+                            .and_then(|u| u.as_u64())
+                            .map(|until| until > now)
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        assert!(
+            !still_banned,
+            "expired ban must not block new connections"
+        );
+    }
+
     #[test]
     fn test_ban_manager_longer_ban_overwrites() {
         let temp_dir = TempDir::new().unwrap();

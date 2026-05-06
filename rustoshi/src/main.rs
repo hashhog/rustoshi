@@ -34,7 +34,7 @@ use rustoshi_network::{
     BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason, NetworkMessage, PeerEvent,
     PeerManager, PeerManagerConfig,
 };
-use rustoshi_primitives::{Hash256, OutPoint};
+use rustoshi_primitives::{Encodable, Hash256, OutPoint};
 use rustoshi_rpc::{start_rpc_server, PeerState, RpcConfig, RpcState};
 use rustoshi_storage::{block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry}, BlockStore, ChainDb};
 
@@ -2389,6 +2389,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     "Block validation failed at height {}: {}",
                                                     height, e
                                                 );
+                                                // DoS: peer sent us an invalid
+                                                // block.  100-pt instant ban
+                                                // (Bitcoin Core: bad-blk-*).
+                                                let mut ps = peer_state.write().await;
+                                                if let Some(ref mut pm) = ps.peer_manager {
+                                                    pm.misbehaving(
+                                                        peer_id,
+                                                        MisbehaviorReason::InvalidBlock,
+                                                    )
+                                                    .await;
+                                                }
                                                 false
                                             }
                                         }
@@ -2475,6 +2486,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             rpc.mempool
                                                 .remove_for_block(&block_txids, &block_spent);
 
+                                            // Same housekeeping for the
+                                            // orphan tx pool: drop orphans
+                                            // that are now invalid (parent
+                                            // outpoint spent) or that the
+                                            // block already includes.
+                                            rpc.orphanage
+                                                .erase_for_block(&block_txids, &block_spent);
+
                                             // Clear recently-rejected filter -- rejection reasons
                                             // may no longer apply after a new block
                                             rpc.recently_rejected.clear();
@@ -2552,6 +2571,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             NetworkMessage::Tx(tx) => {
                                 let txid = tx.txid();
                                 let wtxid = tx.wtxid();
+                                // Capture the wire size up front so we can
+                                // bound the orphanage entry without
+                                // re-serializing.  Falls back to a rough
+                                // upper bound on encode failure (shouldn't
+                                // happen for a tx that just decoded).
+                                let tx_size = {
+                                    let mut buf = Vec::new();
+                                    tx.encode(&mut buf).map(|_| buf.len()).unwrap_or(usize::MAX)
+                                };
                                 let mut rpc = rpc_state.write().await;
                                 // Refresh tip snapshot for IsFinalTx / coinbase-maturity checks.
                                 {
@@ -2559,7 +2587,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     let mtp = compute_mtp_via_store(&block_store, &rpc.best_hash).unwrap_or(0) as i64;
                                     rpc.mempool.notify_new_tip(h, mtp);
                                 }
-                                match rpc.mempool.add_transaction(tx, &|outpoint| {
+                                let result = rpc.mempool.add_transaction(tx.clone(), &|outpoint| {
                                     // Look up UTXO from storage
                                     block_store.get_utxo(outpoint).ok().flatten().map(|coin| {
                                         rustoshi_consensus::CoinEntry {
@@ -2569,9 +2597,55 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             script_pubkey: coin.script_pubkey,
                                         }
                                     })
-                                }) {
+                                });
+                                match result {
                                     Ok(_) => {
                                         tracing::debug!("Added tx {} to mempool", txid);
+
+                                        // Lookup-and-promote: any orphan
+                                        // whose inputs reference this txid
+                                        // may now be admittable.  Walk the
+                                        // orphanage, retry, and erase
+                                        // unconditionally (success ⇒ done;
+                                        // failure ⇒ don't retry on every
+                                        // future parent arrival).
+                                        let children = rpc.orphanage.find_children(&txid);
+                                        for entry in children {
+                                            let child_txid = entry.tx.txid();
+                                            let admit = rpc.mempool.add_transaction(
+                                                (*entry.tx).clone(),
+                                                &|outpoint| {
+                                                    block_store
+                                                        .get_utxo(outpoint)
+                                                        .ok()
+                                                        .flatten()
+                                                        .map(|coin| {
+                                                            rustoshi_consensus::CoinEntry {
+                                                                height: coin.height,
+                                                                is_coinbase: coin.is_coinbase,
+                                                                value: coin.value,
+                                                                script_pubkey: coin.script_pubkey,
+                                                            }
+                                                        })
+                                                },
+                                            );
+                                            match admit {
+                                                Ok(_) => {
+                                                    tracing::debug!(
+                                                        "Promoted orphan tx {} to mempool",
+                                                        child_txid
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::debug!(
+                                                        "Orphan promotion failed for {}: {}",
+                                                        child_txid, e
+                                                    );
+                                                }
+                                            }
+                                            rpc.orphanage.erase(&child_txid);
+                                        }
+
                                         drop(rpc);
                                         // Relay to all peers except the source
                                         let ps = peer_state.read().await;
@@ -2593,6 +2667,32 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     )
                                                     .await;
                                                 }
+                                            }
+                                        }
+                                    }
+                                    Err(rustoshi_consensus::MempoolError::MissingInput(_, _)) => {
+                                        // Orphan: parent UTXO not yet
+                                        // visible.  Cache for a future
+                                        // arrival, capped per Core
+                                        // (MAX_ORPHAN_*).  Per-peer +
+                                        // global limits are enforced by
+                                        // TxOrphanage::add.
+                                        if rpc.orphanage.contains(&txid) {
+                                            tracing::trace!("Already in orphanage: {}", txid);
+                                        } else {
+                                            match rpc.orphanage.add(
+                                                std::sync::Arc::new(tx),
+                                                peer_id.0,
+                                                tx_size,
+                                            ) {
+                                                Ok(()) => tracing::debug!(
+                                                    "Stored orphan tx {} (size={}, peer={})",
+                                                    txid, tx_size, peer_id.0
+                                                ),
+                                                Err(e) => tracing::debug!(
+                                                    "Orphanage refused {}: {:?}",
+                                                    txid, e
+                                                ),
                                             }
                                         }
                                     }
@@ -2910,6 +3010,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     }
                                     Err(e) => {
                                         tracing::warn!("Failed to decode cmpctblock from peer {} ({} bytes): {}", peer_id.0, data.len(), e);
+                                        // DoS: malformed compact block. 100-pt
+                                        // instant ban (Bitcoin Core: bad-cmpctblk).
+                                        let mut ps = peer_state.write().await;
+                                        if let Some(ref mut pm) = ps.peer_manager {
+                                            pm.misbehaving(
+                                                peer_id,
+                                                MisbehaviorReason::InvalidCompactBlock,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             }
@@ -2946,6 +3056,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     }
                                     Err(e) => {
                                         tracing::debug!("Failed to decode blocktxn from peer {}: {}", peer_id.0, e);
+                                        // Malformed compact-block follow-up.
+                                        // 100-pt ban — Core treats this the
+                                        // same as a bad cmpctblock.
+                                        let mut ps = peer_state.write().await;
+                                        if let Some(ref mut pm) = ps.peer_manager {
+                                            pm.misbehaving(
+                                                peer_id,
+                                                MisbehaviorReason::InvalidCompactBlock,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             }
@@ -2964,9 +3085,32 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         tracing::info!("Peer {} disconnected: {:?}", peer_id.0, reason);
                         header_sync.remove_peer(peer_id);
                         block_downloader.remove_peer(peer_id);
+                        // Drop any orphans this peer announced — they're
+                        // unverifiable now that the source is gone, so
+                        // freeing the slot benefits other peers.
+                        {
+                            let mut rpc = rpc_state.write().await;
+                            let n = rpc.orphanage.erase_for_peer(peer_id.0);
+                            if n > 0 {
+                                tracing::debug!(
+                                    "Cleared {} orphan(s) from disconnected peer {}",
+                                    n, peer_id.0
+                                );
+                            }
+                        }
                         let mut ps = peer_state.write().await;
                         if let Some(ref mut pm) = ps.peer_manager {
                             pm.handle_event(PeerEvent::Disconnected(peer_id, reason)).await;
+                        }
+                    }
+
+                    // Forward misbehavior signals from spawned read/write tasks
+                    // (run_inbound_peer / run_outbound_peer / run_message_loop)
+                    // into the peer manager's MisbehaviorTracker + BanManager.
+                    Some(PeerEvent::Misbehaving(peer_id, reason)) => {
+                        let mut ps = peer_state.write().await;
+                        if let Some(ref mut pm) = ps.peer_manager {
+                            pm.handle_event(PeerEvent::Misbehaving(peer_id, reason)).await;
                         }
                     }
 
