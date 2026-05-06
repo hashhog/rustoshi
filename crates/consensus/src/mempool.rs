@@ -1526,6 +1526,57 @@ impl Mempool {
         }
     }
 
+    /// Re-admit transactions from a disconnected block back into the mempool
+    /// after a reorg. Pattern B (mempool-refill-on-reorg) helper.
+    ///
+    /// When a block is rolled off the active chain (reorg), its non-coinbase
+    /// transactions need a chance to re-enter the mempool so they can be
+    /// included in the new tip's child blocks rather than silently dropped.
+    /// Bitcoin Core does this in `validation.cpp::DisconnectTip` →
+    /// `MaybeUpdateMempoolForReorg` (validation.cpp ~line 4400). Camlcoin's
+    /// equivalent is `lib/sync.ml::reorganize` (commit 22667c2).
+    ///
+    /// Scope cap (per CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md):
+    /// this is the *basic* refill — we call `add_transaction` and rely on it
+    /// to re-validate against the *new* tip. Full BIP-113/BIP-68 re-eval
+    /// nuance (e.g. evicting txs whose lock-times are no longer met under
+    /// the new MTP) is whatever `add_transaction` already enforces; if a tx
+    /// fails admission we silently drop it rather than fight to keep it.
+    /// That matches Core's behavior: `removeForReorg` drops anything that
+    /// no longer passes `CheckFinalTxAtTip` / `CheckSequenceLocksAtTip`.
+    ///
+    /// Coinbase txs are skipped — coinbase outputs are never spendable until
+    /// COINBASE_MATURITY confirmations, and the disconnected coinbase itself
+    /// can never appear in mempool.
+    ///
+    /// `utxo_lookup` MUST already reflect the post-disconnect UTXO set
+    /// (i.e. the disconnected block's outputs gone, its spent inputs
+    /// restored). Callers in `crates/rpc/src/server.rs` flush the rewind
+    /// view before invoking this helper — see `disconnect_to`.
+    pub fn block_disconnected<F>(
+        &mut self,
+        block_transactions: &[Transaction],
+        utxo_lookup: &F,
+    ) -> usize
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
+        let mut readded = 0;
+        for tx in block_transactions {
+            if tx.is_coinbase() {
+                continue;
+            }
+            // Best-effort: a tx may legitimately fail re-admit (no longer
+            // final under new MTP, double-spent by a tx already in mempool,
+            // inputs no longer in the UTXO set, etc.). Drop quietly.
+            match self.add_transaction(tx.clone(), utxo_lookup) {
+                Ok(_) => readded += 1,
+                Err(_) => {}
+            }
+        }
+        readded
+    }
+
     /// Get transactions sorted by descendant fee rate for block building.
     ///
     /// Returns txids in priority order (highest fee rate first).
@@ -5594,5 +5645,107 @@ mod tests {
             "Error should mention ephemeral dust, got: {:?}",
             result.package_error
         );
+    }
+
+    /// Pattern B (mempool-refill-on-reorg): the `block_disconnected` helper
+    /// re-admits non-coinbase transactions from a disconnected block back
+    /// into the mempool, skipping coinbase outputs (which can never be in
+    /// mempool).  Counterpart to Bitcoin Core's `MaybeUpdateMempoolForReorg`
+    /// (validation.cpp).  Cross-impl audit:
+    /// CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
+    #[test]
+    fn block_disconnected_refills_non_coinbase_txs() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        // Pretend the chain just rolled back to height 200 with a recent
+        // MTP — exactly what `disconnect_to` will set via `notify_new_tip`
+        // before invoking `block_disconnected`.
+        mempool.notify_new_tip(200, 1_700_000_000);
+
+        // Build a synthetic disconnected block:
+        //   tx0 = coinbase (must be skipped)
+        //   tx1 = non-coinbase spending an external UTXO (must be re-added)
+        //   tx2 = non-coinbase spending a different external UTXO (must be re-added)
+        let prev_txid_a = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000aaa",
+        )
+        .unwrap();
+        let prev_txid_b = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000bbb",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: prev_txid_a, vout: 0 }, 100_000),
+            (OutPoint { txid: prev_txid_b, vout: 0 }, 100_000),
+        ]);
+
+        // Coinbase: input.previous_output.txid == ZERO + vout == u32::MAX.
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: u32::MAX,
+                },
+                script_sig: vec![0x01, 0x00],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 50_000_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                    0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+        assert!(coinbase.is_coinbase());
+
+        let tx1 = make_tx(vec![(prev_txid_a, 0)], vec![90_000], 1);
+        let tx2 = make_tx(vec![(prev_txid_b, 0)], vec![90_000], 1);
+        let txid1 = tx1.txid();
+        let txid2 = tx2.txid();
+
+        let block_txs = vec![coinbase, tx1, tx2];
+
+        // Pre-state: empty mempool.
+        assert_eq!(mempool.size(), 0);
+
+        // Refill.
+        let n = mempool.block_disconnected(&block_txs, &|op| utxos.get(op).cloned());
+
+        // Both non-coinbase txs were re-admitted; coinbase was skipped.
+        assert_eq!(n, 2, "both non-coinbase txs should refill");
+        assert_eq!(mempool.size(), 2);
+        assert!(mempool.contains(&txid1), "tx1 must be re-admitted");
+        assert!(mempool.contains(&txid2), "tx2 must be re-admitted");
+    }
+
+    /// Pattern B follow-up: when the post-reorg UTXO set no longer contains
+    /// a tx's input (e.g. because the new active chain spent it), the helper
+    /// must drop the tx silently rather than panic.  Mirrors Core's
+    /// `MaybeUpdateMempoolForReorg` swallowing `BadInputs` errors.
+    #[test]
+    fn block_disconnected_drops_txs_with_missing_inputs() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+        mempool.notify_new_tip(200, 1_700_000_000);
+
+        let missing_txid = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000deadbeef",
+        )
+        .unwrap();
+        // No UTXO entry for `missing_txid` → add_transaction will fail.
+        let utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+
+        let tx = make_tx(vec![(missing_txid, 0)], vec![90_000], 1);
+        let block_txs = vec![tx];
+
+        let n = mempool.block_disconnected(&block_txs, &|op| utxos.get(op).cloned());
+        assert_eq!(n, 0, "tx with missing inputs must NOT be re-admitted");
+        assert_eq!(mempool.size(), 0);
     }
 }
