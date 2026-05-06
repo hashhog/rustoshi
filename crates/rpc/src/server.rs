@@ -1088,6 +1088,27 @@ fn storage_undo_to_validation(
     }
 }
 
+/// Maximum number of blocks that may participate in a single atomic
+/// reorg or disconnect operation (sum of disconnects + reconnects).
+///
+/// Pattern D fleet-wide closure (2026-05-07): the disconnect + reconnect
+/// sequence accumulates ALL UTXO mutations, height-index updates, and
+/// tx-index puts/deletes into one in-memory `WriteBatch` before
+/// committing. That batch grows roughly linearly in the number of blocks
+/// (and in the per-block tx count). Capping the depth bounds peak heap
+/// usage and matches Bitcoin Core's `MAX_REORG_LENGTH = 100` safety
+/// bound (`bitcoin-core/src/validation.cpp` — Core enforces this on a
+/// 100-block-deep finality assumption rather than purely on memory, but
+/// the practical effect is the same: anything past 100 blocks is either
+/// adversarial or a catastrophic chain-split that requires manual
+/// intervention).
+///
+/// Callers that hit this cap return a graceful error rather than
+/// silently falling back to a non-atomic path — a partial multi-block
+/// commit is precisely the failure mode this constant exists to
+/// prevent.
+pub const MAX_REORG_DEPTH: u32 = 100;
+
 /// Disconnect every block in the active chain from `state.best_hash`
 /// (inclusive) back to `target_hash` (exclusive), updating the UTXO set,
 /// chain-state metadata, persisted tip pointer, and height index. Used by
@@ -1114,12 +1135,27 @@ fn disconnect_to(
     let db = state.db.clone();
     let store = BlockStore::new(&db);
 
+    // Pattern D fleet-wide closure (2026-05-07): cap the disconnect depth
+    // so the in-memory `WriteBatch` we accumulate below is bounded.
+    // Beyond `MAX_REORG_DEPTH` we error out rather than silently
+    // falling back to a per-block-atomic path — a partial multi-block
+    // commit is exactly the failure mode the atomic batch exists to
+    // prevent.
+    let original_height = state.best_height;
+    let depth = original_height.saturating_sub(target_height);
+    if depth > MAX_REORG_DEPTH {
+        return Err(format!(
+            "disconnect_to depth {} exceeds MAX_REORG_DEPTH ({}); refusing \
+             non-atomic fallback",
+            depth, MAX_REORG_DEPTH
+        ));
+    }
+
     // Walk from current tip to the target. We materialise (block, undo)
     // tuples up front so the disconnect loop is a pure UTXO mutation.
     let mut plan: Vec<(u32, Hash256, Block, rustoshi_storage::block_store::UndoData)> =
         Vec::new();
     let mut cur = state.best_hash;
-    let original_height = state.best_height;
     while cur != target_hash {
         let entry = store
             .get_block_index(&cur)
@@ -1412,6 +1448,27 @@ fn try_attach_and_reorg(
     };
 
     let original_tip_height = state.best_height;
+
+    // Pattern D fleet-wide closure (2026-05-07): cap the multi-block reorg
+    // depth so the in-memory `WriteBatch` we accumulate below is bounded.
+    // `reorganize` will disconnect `disconnected_blocks.len()` and connect
+    // `(new_height - fork_height)` blocks; the sum is what loads up the
+    // batch. Beyond `MAX_REORG_DEPTH` we error out rather than silently
+    // splitting the reorg into multiple batches — that would re-introduce
+    // the partial-commit window this refactor exists to close.
+    let approx_disconnect = disconnected_blocks.len() as u32;
+    let approx_connect = new_height.saturating_sub(
+        original_tip_height.saturating_sub(approx_disconnect),
+    );
+    let total = approx_disconnect.saturating_add(approx_connect);
+    if total > MAX_REORG_DEPTH {
+        return Err(format!(
+            "reorg span {} (disconnect={} + connect={}) exceeds \
+             MAX_REORG_DEPTH ({}); refusing non-atomic fallback",
+            total, approx_disconnect, approx_connect, MAX_REORG_DEPTH
+        ));
+    }
+
     chain_state
         .reorganize(
             *block_hash,
@@ -1478,33 +1535,34 @@ fn try_attach_and_reorg(
         .batch_set_best_block(&mut batch, &new_tip_hash, new_tip_height)
         .map_err(|e| format!("batch_set_best_block (reorg): {}", e))?;
 
-    // Single atomic commit — UTXO + height index + tip pointer flip together.
-    store
-        .write_batch(batch)
-        .map_err(|e| format!("write_batch (try_attach_and_reorg): {}", e))?;
-
-    state.best_hash = new_tip_hash;
-    state.best_height = new_tip_height;
-
-    // Pattern C (txindex-revert-on-reorg) + Pattern C0 (txindex-on-connect):
+    // Pattern C (txindex-revert-on-reorg) + Pattern C0 (txindex-on-connect),
+    // staged into the SAME batch so the multi-block reorg's tx-index
+    // updates flip atomically with the UTXO + tip + height-index writes:
     //   1. Drop tx_index entries for every tx in the now-disconnected blocks
     //      so that `getrawtransaction` no longer resolves them via the
     //      orphaned block_hash. Mirrors Core's `BaseIndex::BlockDisconnected`
     //      -> `txindex.cpp::CustomRemove`.
     //   2. Write tx_index entries for every tx in the newly-connected blocks
     //      (the side branch we just attached). Mirrors Core's
-    //      `BaseIndex::BlockConnected` -> `txindex.cpp::CustomAppend`. Without
-    //      step 2, post-reorg `getrawtransaction` returns "not found" for txs
-    //      that are now on the active chain.
+    //      `BaseIndex::BlockConnected` -> `txindex.cpp::CustomAppend`.
+    //
+    // Pattern D fleet-wide closure (2026-05-07): pre-fix these ran as
+    // individual `delete_tx_index` / `put_tx_index` calls AFTER the main
+    // batch committed, so a crash between the two left the chain tip
+    // pointing at the new branch while the tx-index still resolved txs
+    // via the disconnected branch. Now both staged into `batch` and flip
+    // with the rest of the reorg in one `write_batch`.
     //
     // Reference: CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
     // (Pattern C0: rustoshi's submitblock+reorg paths were unwired pre-fix.)
+    // Reference: CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md
+    // (Pattern D: multi-block atomicity.)
     {
         for blk in &disconnected_blocks {
             for tx in &blk.transactions {
-                if let Err(e) = store.delete_tx_index(&tx.txid()) {
+                if let Err(e) = store.batch_delete_tx_index(&mut batch, &tx.txid()) {
                     tracing::error!(
-                        "try_attach_and_reorg: failed to delete tx index for {}: {}",
+                        "try_attach_and_reorg: failed to stage tx index delete for {}: {}",
                         tx.txid(), e
                     );
                 }
@@ -1512,7 +1570,7 @@ fn try_attach_and_reorg(
         }
 
         // Walk the newly-active chain from the new tip back to the fork
-        // point and write tx_index entries for every block we connect.
+        // point and stage tx_index entries for every block we connect.
         // The fork point is whichever ancestor of `new_tip_hash` is also an
         // ancestor of the original tip. We approximate by walking until we
         // hit a block that is at-or-below `original_fork_height` —
@@ -1562,9 +1620,11 @@ fn try_attach_and_reorg(
                         tx_offset: 0,
                         tx_length: 0,
                     };
-                    if let Err(e) = store.put_tx_index(&tx.txid(), &entry) {
+                    if let Err(e) =
+                        store.batch_put_tx_index(&mut batch, &tx.txid(), &entry)
+                    {
                         tracing::error!(
-                            "try_attach_and_reorg: failed to put tx index for {}: {}",
+                            "try_attach_and_reorg: failed to stage tx index put for {}: {}",
                             tx.txid(), e
                         );
                     }
@@ -1581,6 +1641,16 @@ fn try_attach_and_reorg(
             walk_h -= 1;
         }
     }
+
+    // Single atomic commit — UTXO + height index + tip pointer + tx-index
+    // (delete for disconnected branch + put for new branch) flip together.
+    // Pattern D fleet-wide closure: an N+M block reorg lands in one batch.
+    store
+        .write_batch(batch)
+        .map_err(|e| format!("write_batch (try_attach_and_reorg): {}", e))?;
+
+    state.best_hash = new_tip_hash;
+    state.best_height = new_tip_height;
 
     // Pattern B (mempool-refill-on-reorg): re-admit non-coinbase transactions
     // from the disconnected blocks now that the UTXO + tip state reflect the
@@ -11055,5 +11125,280 @@ mod tests {
             .unwrap()
             .expect("B3 tx_index must be written on reorg-connect");
         assert_eq!(e3.block_hash, hash_b3);
+    }
+
+    /// Pattern D fleet-wide closure (2026-05-07): a multi-block reorg
+    /// that disconnects N blocks and reconnects M blocks must commit
+    /// EXACTLY ONE RocksDB `WriteBatch`. We assert this by checking
+    /// `ChainDb::write_batch_count` deltas across `try_attach_and_reorg`.
+    ///
+    /// Without the multi-block atomic batch, each per-block
+    /// `delete_tx_index` / `put_tx_index` would land its own RocksDB
+    /// write — observable as count delta == 1 (UTXO+height-index batch)
+    /// PLUS one per disconnected/reconnected tx (tx-index puts/deletes).
+    ///
+    /// Yesterday's `9ac4fac` made the disconnect path's UTXO+height-index
+    /// flip atomic; today's refactor folds the tx-index updates into the
+    /// SAME batch. So the whole N+M-block reorg sequence is one atomic
+    /// disk write.
+    #[tokio::test]
+    async fn reorg_commits_single_batch_for_multi_block_swap() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // Old chain: G -> A1 -> A2 -> A3 (active, height 3).
+        let (hash_g, _block_g, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a1, block_a1, work_a1) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xA1)
+        };
+        let (hash_a2, block_a2, work_a2) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 2, hash_a1, work_a1, 0xA2)
+        };
+        let (hash_a3, block_a3, _work_a3) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 3, hash_a2, work_a2, 0xA3)
+        };
+        rpc_state.best_hash = hash_a3;
+        rpc_state.best_height = 3;
+
+        // Pre-populate tx_index for A1+A2+A3 (mirrors the connect path).
+        {
+            use rustoshi_storage::block_store::TxIndexEntry;
+            let store = BlockStore::new(&db);
+            for (h, t) in [
+                (hash_a1, &block_a1),
+                (hash_a2, &block_a2),
+                (hash_a3, &block_a3),
+            ] {
+                for tx in &t.transactions {
+                    store
+                        .put_tx_index(
+                            &tx.txid(),
+                            &TxIndexEntry {
+                                block_hash: h,
+                                tx_offset: 0,
+                                tx_length: 0,
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+        }
+
+        // New chain (heavier): G -> B1 -> B2 -> B3 -> B4. Reorg must
+        // disconnect 3 (A3,A2,A1) and connect 4 (B1..B4).
+        let (hash_b1, _block_b1, work_b1) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 1, hash_g, work_g, 0xB1)
+        };
+        let (hash_b2, _block_b2, work_b2) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 2, hash_b1, work_b1, 0xB2)
+        };
+        let (hash_b3, _block_b3, _work_b3) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 3, hash_b2, work_b2, 0xB3)
+        };
+        let block_b4 = mine_synth_block(4, hash_b3, 0xB4);
+        let hash_b4 = block_b4.block_hash();
+
+        // Snapshot the RocksDB write_batch counter immediately before
+        // the reorg fires. The full reorg (3 disconnect + 4 connect, all
+        // with tx-index updates) must add exactly 1 to this count.
+        let pre = db.write_batch_count();
+        let did_reorg = try_attach_and_reorg(&mut rpc_state, &block_b4, &hash_b4)
+            .expect("try_attach_and_reorg");
+        let post = db.write_batch_count();
+        assert!(did_reorg, "B-chain has more work — reorg must fire");
+        assert_eq!(rpc_state.best_hash, hash_b4);
+        assert_eq!(rpc_state.best_height, 4);
+
+        let delta = post - pre;
+        assert_eq!(
+            delta, 1,
+            "multi-block reorg must commit exactly 1 RocksDB batch \
+             (disconnect={}, connect=4); got {} batches",
+            3, delta
+        );
+
+        // Sanity: the reorg actually flipped the chain on disk.
+        let store = BlockStore::new(&db);
+        assert_eq!(store.get_best_block_hash().unwrap().unwrap(), hash_b4);
+        assert_eq!(store.get_best_height().unwrap().unwrap(), 4);
+        // Old branch tx-index entries are gone, new branch entries are
+        // present (and they all flipped in the same batch as the tip).
+        assert!(store.get_tx_index(&block_a1.transactions[0].txid()).unwrap().is_none());
+        assert!(store.get_tx_index(&block_a2.transactions[0].txid()).unwrap().is_none());
+        assert!(store.get_tx_index(&block_a3.transactions[0].txid()).unwrap().is_none());
+    }
+
+    /// Pattern D fleet-wide closure (2026-05-07): if anything fails
+    /// during the reorg accumulation phase (before `write_batch`), the
+    /// on-disk chainstate must be UNCHANGED. We simulate the failure by
+    /// constructing a reorg target whose middle block is missing on
+    /// disk — `chain_state.reorganize` returns
+    /// `ValidationError::PrevBlockNotFound`, propagated as `Err` from
+    /// `try_attach_and_reorg`. The pre-state must survive intact.
+    #[tokio::test]
+    async fn reorg_failure_pre_commit_leaves_chainstate_unchanged() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+        use rustoshi_storage::block_store::TxIndexEntry;
+        use rustoshi_storage::CF_BLOCKS;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // Active chain: G -> A1 -> A2 (height 2).
+        let (hash_g, _block_g, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a1, block_a1, work_a1) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xA1)
+        };
+        let (hash_a2, block_a2, _work_a2) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 2, hash_a1, work_a1, 0xA2)
+        };
+        rpc_state.best_hash = hash_a2;
+        rpc_state.best_height = 2;
+
+        // Tx-index entries for A1 + A2 (the pre-state we care about).
+        let a1_txid = block_a1.transactions[0].txid();
+        let a2_txid = block_a2.transactions[0].txid();
+        {
+            let store = BlockStore::new(&db);
+            for (h, t) in [(hash_a1, &block_a1), (hash_a2, &block_a2)] {
+                for tx in &t.transactions {
+                    store
+                        .put_tx_index(
+                            &tx.txid(),
+                            &TxIndexEntry {
+                                block_hash: h,
+                                tx_offset: 0,
+                                tx_length: 0,
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+        }
+
+        // Side branch: persist B1 + B2 fully, then attempt to reorg to a
+        // B3 whose parent (B2) we will yank from the blocks CF AFTER
+        // staging — `chain_state.reorganize` will call get_block(B2)
+        // during the connect pass and fail.
+        let (hash_b1, _block_b1, work_b1) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 1, hash_g, work_g, 0xB1)
+        };
+        let (hash_b2, _block_b2, _work_b2) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 2, hash_b1, work_b1, 0xB2)
+        };
+        let block_b3 = mine_synth_block(3, hash_b2, 0xB3);
+        let hash_b3 = block_b3.block_hash();
+
+        // Yank B2's block body from disk: index entry remains (so the
+        // chainwork compare succeeds), but get_block(B2) returns None
+        // mid-reorg. This forces `reorganize` to error AFTER staging
+        // some UTXO mutations into the in-memory cache but BEFORE the
+        // outer `write_batch` commits.
+        db.delete_cf(CF_BLOCKS, hash_b2.as_bytes()).unwrap();
+
+        let pre_count = db.write_batch_count();
+        let result = try_attach_and_reorg(&mut rpc_state, &block_b3, &hash_b3);
+        let post_count = db.write_batch_count();
+
+        assert!(
+            result.is_err(),
+            "reorg must error when a side-branch block body is missing"
+        );
+
+        // The whole batch must NOT have committed: write_batch_count
+        // must not have advanced.
+        assert_eq!(
+            post_count, pre_count,
+            "no batch commit on pre-commit failure; got {} -> {}",
+            pre_count, post_count
+        );
+
+        // On-disk chainstate is UNCHANGED.
+        let store = BlockStore::new(&db);
+        assert_eq!(
+            store.get_best_block_hash().unwrap().unwrap(),
+            hash_a2,
+            "tip pointer must still point at the original active chain"
+        );
+        assert_eq!(store.get_best_height().unwrap().unwrap(), 2);
+        assert!(
+            store.get_tx_index(&a1_txid).unwrap().is_some(),
+            "A1 tx-index entry must survive the failed reorg"
+        );
+        assert!(
+            store.get_tx_index(&a2_txid).unwrap().is_some(),
+            "A2 tx-index entry must survive the failed reorg"
+        );
+    }
+
+    /// Pattern D fleet-wide closure (2026-05-07): a reorg whose
+    /// disconnect+reconnect span exceeds `MAX_REORG_DEPTH` must error
+    /// gracefully. Allowing it to proceed would let an unbounded
+    /// `WriteBatch` accumulate in memory; allowing a silent fallback to
+    /// per-block-atomic would re-introduce the partial-commit window
+    /// this whole refactor closes.
+    #[tokio::test]
+    async fn disconnect_to_errors_when_depth_exceeds_cap() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // Synthetic chain: a tip at height MAX_REORG_DEPTH + 5 with
+        // target=0 forces a disconnect span of MAX_REORG_DEPTH + 5.
+        // We don't need the full block bodies — `disconnect_to`'s depth
+        // check fires BEFORE the plan walk. Just set the in-memory
+        // tip + height to the synthetic values.
+        rpc_state.best_hash = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000deadbeef",
+        )
+        .unwrap();
+        rpc_state.best_height = MAX_REORG_DEPTH + 5;
+
+        let target_hash = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000123",
+        )
+        .unwrap();
+
+        let pre_count = db.write_batch_count();
+        let err = disconnect_to(&mut rpc_state, target_hash, 0)
+            .expect_err("must error on excessive depth");
+        let post_count = db.write_batch_count();
+
+        assert!(
+            err.contains("exceeds MAX_REORG_DEPTH"),
+            "error must call out depth cap: {}",
+            err
+        );
+        assert_eq!(
+            post_count, pre_count,
+            "depth-cap rejection must not commit any batch"
+        );
+        // In-memory tip is unchanged too.
+        assert_eq!(rpc_state.best_height, MAX_REORG_DEPTH + 5);
     }
 }

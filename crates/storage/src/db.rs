@@ -6,6 +6,7 @@
 use crate::columns::*;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================
 // METADATA KEYS
@@ -73,6 +74,11 @@ pub enum StorageError {
 /// with support for atomic batch writes.
 pub struct ChainDb {
     db: DB,
+    /// Counter for the number of `write_batch` calls. Used by tests to
+    /// assert the multi-block-atomicity invariant: a multi-block reorg
+    /// must commit exactly one RocksDB batch (Pattern D fleet-wide
+    /// closure, 2026-05-07).
+    write_batch_count: AtomicU64,
 }
 
 impl ChainDb {
@@ -128,7 +134,10 @@ impl ChainDb {
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            write_batch_count: AtomicU64::new(0),
+        })
     }
 
     /// Drop all data from the blocks column family to reclaim disk space.
@@ -182,7 +191,18 @@ impl ChainDb {
     /// ensuring consistency even across multiple column families.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
         self.db.write(batch)?;
+        self.write_batch_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Number of `write_batch` calls observed by this handle.
+    ///
+    /// Exposed for tests that need to assert the multi-block-atomicity
+    /// invariant: a multi-block reorg must commit exactly one batch.
+    /// See `tests::reorg_commits_single_batch_for_multi_block_swap`
+    /// (Pattern D fleet-wide closure, 2026-05-07).
+    pub fn write_batch_count(&self) -> u64 {
+        self.write_batch_count.load(Ordering::Relaxed)
     }
 
     /// Create a new empty WriteBatch for batching multiple writes.
@@ -282,6 +302,9 @@ impl ChainDb {
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            write_batch_count: AtomicU64::new(0),
+        })
     }
 }
