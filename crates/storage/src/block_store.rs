@@ -355,6 +355,29 @@ impl<'a> BlockStore<'a> {
         Ok(())
     }
 
+    /// Stage a tx-index put into `batch` (used during reorg-connect).
+    ///
+    /// Mirrors [`BlockStore::put_tx_index`] but writes into a caller-owned
+    /// `WriteBatch` instead of committing immediately. Used by the reorg
+    /// path (`try_attach_and_reorg`) so the per-block tx-index entries for
+    /// the newly-connected branch flip atomically with the UTXO + tip +
+    /// height-index writes — see Pattern D fleet-wide closure
+    /// (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
+    pub fn batch_put_tx_index(
+        &self,
+        batch: &mut WriteBatch,
+        txid: &Hash256,
+        entry: &TxIndexEntry,
+    ) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_TX_INDEX).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_TX_INDEX))
+        })?;
+        let data =
+            serde_json::to_vec(entry).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        batch.put_cf(cf, txid.as_bytes(), &data);
+        Ok(())
+    }
+
     /// Apply a previously-built RocksDB write batch.
     ///
     /// Convenience passthrough so callers don't have to reach through to
