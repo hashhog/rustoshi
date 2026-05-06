@@ -1142,8 +1142,22 @@ fn disconnect_to(
         }
     }
 
-    // Apply the disconnects against a single UTXO view, then flush once.
+    // Pattern D (post-reorg-consistency, 2026-05-05):
+    // Disconnect must be ALL-OR-NOTHING on disk. Build a single RocksDB
+    // WriteBatch that carries:
+    //   * every UTXO mutation produced by `validation::disconnect_block`
+    //   * every tx-index delete (Pattern C: txindex-revert-on-reorg)
+    //   * the new best-block tip pointer
+    //   * the height-index deletes for the disconnected range
+    // and commit it in one `write_batch` call. Mirrors
+    // `bitcoin-core/src/validation.cpp::DisconnectTip`'s use of a single
+    // `CDBBatch`. Without this, a crash between `flush()` and the
+    // post-flush `set_best_block` / `delete_height_index` loop would
+    // leave the height index pointing at disconnected blocks while the
+    // UTXO set was already pre-disconnect — see
+    // CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md.
     let mut utxo_view = store.utxo_view();
+    let mut batch = store.new_batch();
     for (h, hash, block, storage_undo) in plan.iter() {
         let v_undo = storage_undo_to_validation(storage_undo);
         validation::disconnect_block(block, &v_undo, &mut utxo_view).map_err(|e| {
@@ -1156,30 +1170,38 @@ fn disconnect_to(
         // `bitcoin-core/src/index/txindex.cpp::CustomRemove`, fired from
         // `BaseIndex::BlockDisconnected`.
         //
-        // Idempotent: `delete_tx_index` is a no-op if the entry was never
-        // written (e.g. blocks indexed before the C0 wiring landed).
+        // Staged into the same atomic batch as the UTXO mutations so that a
+        // crash mid-disconnect can never leave tx-index entries pointing at
+        // disconnected blocks while the UTXO set has rolled back.
         for tx in &block.transactions {
-            if let Err(e) = store.delete_tx_index(&tx.txid()) {
+            if let Err(e) = store.batch_delete_tx_index(&mut batch, &tx.txid()) {
                 tracing::error!(
-                    "disconnect_to: failed to delete tx index for {}: {}",
+                    "disconnect_to: failed to stage tx index delete for {}: {}",
                     tx.txid(), e
                 );
             }
         }
     }
+    // Stage UTXO writes into the same batch (drains the in-memory cache).
     utxo_view
-        .flush()
-        .map_err(|e| format!("UTXO flush after disconnect: {}", e))?;
+        .flush_into_batch(&mut batch)
+        .map_err(|e| format!("flush utxo view into batch: {}", e))?;
 
-    // Persistent tip pointer + in-memory state.
+    // Stage the new tip pointer into the batch.
     store
-        .set_best_block(&target_hash, target_height)
-        .map_err(|e| format!("set_best_block: {}", e))?;
+        .batch_set_best_block(&mut batch, &target_hash, target_height)
+        .map_err(|e| format!("batch_set_best_block: {}", e))?;
 
-    // Drop height-index entries for the disconnected range.
+    // Stage the height-index deletes for the disconnected range.
     for h in target_height + 1..=original_height {
-        let _ = store.delete_height_index(h);
+        let _ = store.batch_delete_height_index(&mut batch, h);
     }
+
+    // Single atomic RocksDB write — UTXO + tx-index + tip + height-index
+    // either all land or none do.
+    store
+        .write_batch(batch)
+        .map_err(|e| format!("write_batch (disconnect_to): {}", e))?;
 
     state.best_hash = target_hash;
     state.best_height = target_height;
@@ -1393,48 +1415,67 @@ fn try_attach_and_reorg(
         )
         .map_err(|e| format!("reorganize: {}", e))?;
 
+    // Pattern D (post-reorg-consistency, 2026-05-05):
+    // The reorg commit must be ALL-OR-NOTHING on disk. Build a single
+    // RocksDB WriteBatch carrying the UTXO mutations from `reorganize`,
+    // every height-index put for the new branch, the height-index
+    // deletes for the now-shorter disconnected suffix, and the new tip
+    // pointer. Mirrors `bitcoin-core/src/validation.cpp`'s use of one
+    // `CDBBatch` across `DisconnectTip` + `ConnectTip` so the chain
+    // metadata can never observe a partial reorg after a crash.
+    // See CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md.
+    let new_tip_hash = chain_state.tip_hash();
+    let new_tip_height = chain_state.tip_height();
+
+    let mut batch = store.new_batch();
     utxo_view
-        .flush()
-        .map_err(|e| format!("UTXO flush after reorg: {}", e))?;
+        .flush_into_batch(&mut batch)
+        .map_err(|e| format!("flush utxo view into batch (reorg): {}", e))?;
 
     // Update height index for the new branch. Walk back from the new tip
     // overwriting old entries until we reach genesis or run out of index
     // entries. Stale entries above the new tip are explicitly deleted below.
-    let new_tip_hash = chain_state.tip_hash();
-    let new_tip_height = chain_state.tip_height();
-    let mut walk = new_tip_hash;
-    let mut walk_h = new_tip_height;
-    let mut steps = new_tip_height + original_tip_height + 16;
-    loop {
-        if walk == Hash256::ZERO || steps == 0 {
-            break;
+    {
+        let mut walk = new_tip_hash;
+        let mut walk_h = new_tip_height;
+        let mut steps = new_tip_height + original_tip_height + 16;
+        loop {
+            if walk == Hash256::ZERO || steps == 0 {
+                break;
+            }
+            steps -= 1;
+            store
+                .batch_put_height_index(&mut batch, walk_h, &walk)
+                .map_err(|e| format!("batch_put_height_index: {}", e))?;
+            let entry = match store
+                .get_block_index(&walk)
+                .map_err(|e| format!("get_block_index walk: {}", e))?
+            {
+                Some(e) => e,
+                None => break,
+            };
+            if walk_h == 0 {
+                break;
+            }
+            walk = entry.prev_hash;
+            walk_h -= 1;
         }
-        steps -= 1;
-        if let Err(e) = store.put_height_index(walk_h, &walk) {
-            return Err(format!("put_height_index: {}", e));
-        }
-        let entry = match store
-            .get_block_index(&walk)
-            .map_err(|e| format!("get_block_index walk: {}", e))?
-        {
-            Some(e) => e,
-            None => break,
-        };
-        if walk_h == 0 {
-            break;
-        }
-        walk = entry.prev_hash;
-        walk_h -= 1;
     }
     if original_tip_height > new_tip_height {
         for h in new_tip_height + 1..=original_tip_height {
-            let _ = store.delete_height_index(h);
+            let _ = store.batch_delete_height_index(&mut batch, h);
         }
     }
 
-    if let Err(e) = store.set_best_block(&new_tip_hash, new_tip_height) {
-        return Err(format!("set_best_block: {}", e));
-    }
+    store
+        .batch_set_best_block(&mut batch, &new_tip_hash, new_tip_height)
+        .map_err(|e| format!("batch_set_best_block (reorg): {}", e))?;
+
+    // Single atomic commit — UTXO + height index + tip pointer flip together.
+    store
+        .write_batch(batch)
+        .map_err(|e| format!("write_batch (try_attach_and_reorg): {}", e))?;
+
     state.best_hash = new_tip_hash;
     state.best_height = new_tip_height;
 
