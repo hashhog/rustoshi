@@ -92,6 +92,14 @@ pub struct BlockchainInfo {
     pub size_on_disk: u64,
     /// Whether the blockchain is pruned.
     pub pruned: bool,
+    /// Lowest-height complete block stored (only present when pruning is on).
+    /// Mirrors Core's `getblockchaininfo.pruneheight`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pruneheight: Option<u32>,
+    /// Configured target size for pruning (bytes, only present when pruning is on).
+    /// Mirrors Core's `getblockchaininfo.prune_target_size`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prune_target_size: Option<u64>,
     /// Soft fork deployment state, keyed by deployment name.
     /// Populated from the same canonical source as `getdeploymentinfo`.
     #[serde(default)]
@@ -1093,6 +1101,8 @@ mod tests {
             chainwork: "00000000".to_string(),
             size_on_disk: 1000000,
             pruned: false,
+            pruneheight: None,
+            prune_target_size: None,
             softforks: serde_json::Value::Object(serde_json::Map::new()),
             warnings: "".to_string(),
         };
@@ -1326,6 +1336,8 @@ mod tests {
             chainwork: "00000000000000000000000000000000000000007b0e".to_string(),
             size_on_disk: 600_000_000_000,
             pruned: false,
+            pruneheight: None,
+            prune_target_size: None,
             softforks: serde_json::Value::Object(serde_json::Map::new()),
             warnings: String::new(),
         };
@@ -1362,6 +1374,8 @@ mod tests {
             chainwork: "0".repeat(64),
             size_on_disk: 1_000_000_000,
             pruned: false,
+            pruneheight: None,
+            prune_target_size: None,
             softforks: serde_json::Value::Object(serde_json::Map::new()),
             warnings: String::new(),
         };

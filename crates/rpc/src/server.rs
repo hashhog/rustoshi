@@ -1899,6 +1899,25 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Build softforks from the same canonical source as getdeploymentinfo.
         let softforks_map = build_softforks_map(&state.params, state.best_height);
 
+        // BIP-159: report prune watermark + target when in prune mode.
+        // Mirrors `bitcoin-core/src/rpc/blockchain.cpp::getblockchaininfo`
+        // which adds `pruneheight` and `prune_target_size` ONLY when
+        // pruning is enabled. The `pruneheight` field is the height of
+        // the lowest block whose data we still hold (= prune_height + 1
+        // post-pass; we expose the watermark + 1 to match Core's
+        // "lowest-complete-block" semantics).
+        let (pruneheight, prune_target_size) = if state.prune_mode {
+            let store = BlockStore::new(&state.db);
+            let watermark = store.get_prune_height().unwrap_or(0);
+            // Core reports the height of the lowest block we still have.
+            // If we've pruned through `watermark`, the lowest-complete is
+            // `watermark + 1` (or 0 if we've never pruned anything).
+            let lowest_complete = if watermark == 0 { 0 } else { watermark + 1 };
+            (Some(lowest_complete), Some(state.prune_target))
+        } else {
+            (None, None)
+        };
+
         Ok(BlockchainInfo {
             chain: chain_name.to_string(),
             blocks: state.best_height,
@@ -1914,6 +1933,8 @@ impl RustoshiRpcServer for RpcServerImpl {
             chainwork: chainwork_hex,
             size_on_disk: 0,           // would need filesystem stat
             pruned: state.prune_mode,
+            pruneheight,
+            prune_target_size,
             softforks: serde_json::Value::Object(softforks_map),
             warnings: String::new(),
         })
@@ -3655,7 +3676,9 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn prune_blockchain(&self, height: u32) -> RpcResult<u32> {
         let state = self.state.read().await;
 
-        // Check if pruning is enabled
+        // Check if pruning is enabled — covers both `-prune=N` (auto)
+        // and `-prune=1` (manual-only). The latter is the ONLY path that
+        // actually drops data when manual-mode is set.
         if !state.prune_mode {
             return Err(Self::rpc_error(
                 rpc_error::RPC_MISC_ERROR,
@@ -3677,21 +3700,48 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
-        // The actual pruning happens in the main event loop when blocks are processed.
-        // For the RPC, we return the effective prune height.
-        // In a full implementation, we would trigger the pruning here and wait for completion.
+        // Drive the prune coordinator synchronously. Mirrors Core's
+        // `bitcoin-core/src/rpc/blockchain.cpp::pruneblockchain` arc:
+        // resolve target -> call `PruneBlockFilesManual` -> return the
+        // last-pruned height. For rustoshi this means deleting every
+        // active-chain block-body + undo entry up to the effective
+        // height (clamped against MIN_BLOCKS_TO_KEEP + assumeutxo floor)
+        // and updating META_PRUNE_HEIGHT.
         //
-        // For now, return the height that would be pruned to.
-        // The main loop will do the actual pruning based on the prune target.
-        let effective_prune_height = height.min(max_prune_height);
+        // Honors `-prune=1` manual-only mode: this is the only code
+        // path that fires when the operator chose manual-only — auto-
+        // prune is disabled in that configuration.
+        //
+        // Pull the assumeutxo floor from chain params (highest snapshot
+        // base height); 0 if none is configured for this network.
+        let assumeutxo_height = state
+            .params
+            .assumeutxo_data
+            .iter()
+            .map(|d| d.height)
+            .max()
+            .unwrap_or(0);
+        let prune_cfg = rustoshi_storage::PruneCoordConfig {
+            target_bytes: state.prune_target.max(rustoshi_storage::PRUNE_MANUAL_SENTINEL),
+            assumeutxo_height,
+        };
+        let store = BlockStore::new(&state.db);
+        let outcome = rustoshi_storage::manual_prune_to_height(
+            &store,
+            &prune_cfg,
+            state.best_height,
+            height,
+        )
+        .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, format!("prune failed: {}", e)))?;
 
         tracing::info!(
-            "pruneblockchain RPC: requested height {}, effective height {}",
+            "pruneblockchain RPC: requested height {}, dropped {} blocks, watermark={}",
             height,
-            effective_prune_height
+            outcome.blocks_pruned,
+            outcome.new_prune_height
         );
 
-        Ok(effective_prune_height)
+        Ok(outcome.new_prune_height)
     }
 
     async fn submit_package(
@@ -11400,5 +11450,195 @@ mod tests {
         );
         // In-memory tip is unchanged too.
         assert_eq!(rpc_state.best_height, MAX_REORG_DEPTH + 5);
+    }
+
+    // ============================================================
+    // PRUNE WIRING (BIP-159 / Core parity)
+    // ============================================================
+
+    /// `getblockchaininfo` reports `pruned=false` when prune mode is off
+    /// and OMITS `pruneheight` / `prune_target_size` (matches Core).
+    #[tokio::test]
+    async fn test_getblockchaininfo_prune_off_omits_prune_fields() {
+        use rustoshi_storage::ChainDb;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+
+        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        let info = rpc.get_blockchain_info().await.expect("getblockchaininfo");
+        assert!(!info.pruned);
+        assert!(info.pruneheight.is_none());
+        assert!(info.prune_target_size.is_none());
+
+        // JSON serialization must omit the optional fields when None.
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("\"pruneheight\""), "pruneheight must be absent: {}", json);
+        assert!(!json.contains("\"prune_target_size\""), "prune_target_size must be absent: {}", json);
+        assert!(json.contains("\"pruned\":false"));
+    }
+
+    /// `getblockchaininfo` with prune mode reports `pruned=true`,
+    /// `pruneheight`, and `prune_target_size`.
+    #[tokio::test]
+    async fn test_getblockchaininfo_prune_on_reports_prune_fields() {
+        use rustoshi_storage::ChainDb;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+
+        let prune_target = 550 * 1024 * 1024;
+        let state = Arc::new(RwLock::new(RpcState::with_prune_config(db, params, prune_target)));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        let info = rpc.get_blockchain_info().await.expect("getblockchaininfo");
+        assert!(info.pruned);
+        // Watermark starts at 0 -> lowest-complete = 0 (we've never pruned).
+        assert_eq!(info.pruneheight, Some(0));
+        assert_eq!(info.prune_target_size, Some(prune_target));
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"pruned\":true"));
+        assert!(json.contains("\"pruneheight\":0"));
+        assert!(json.contains(&format!("\"prune_target_size\":{}", prune_target)));
+    }
+
+    /// `pruneblockchain` RPC rejects when prune mode is off (Core parity).
+    #[tokio::test]
+    async fn test_pruneblockchain_rpc_rejects_when_prune_off() {
+        use rustoshi_storage::ChainDb;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+
+        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        let err = rpc.prune_blockchain(0).await.expect_err("should reject");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not in prune mode"),
+            "error must call out prune-mode requirement: {}",
+            msg
+        );
+    }
+
+    /// `pruneblockchain` RPC honors `-prune=1` manual-only mode: it
+    /// returns successfully and drives the prune coordinator.
+    #[tokio::test]
+    async fn test_pruneblockchain_rpc_honors_manual_only_mode() {
+        use rustoshi_storage::{ChainDb, BlockStatus, BlockIndexEntry, UndoData, MIN_BLOCKS_TO_KEEP, PRUNE_MANUAL_SENTINEL};
+        use rustoshi_primitives::{Block, BlockHeader, Transaction, TxIn, TxOut, OutPoint, Hash256};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+
+        // Build a synthetic chain so manual prune has something to drop.
+        {
+            let store = BlockStore::new(&db);
+            let tip = MIN_BLOCKS_TO_KEEP + 50;
+            for h in 1..=tip {
+                let header = BlockHeader {
+                    version: 1,
+                    prev_block_hash: Hash256::ZERO,
+                    merkle_root: Hash256::ZERO,
+                    timestamp: 1_700_000_000 + h,
+                    bits: 0x1d00ffff,
+                    nonce: h,
+                };
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes[0..4].copy_from_slice(&h.to_be_bytes());
+                let hash = Hash256(hash_bytes);
+                let block = Block {
+                    header: header.clone(),
+                    transactions: vec![Transaction {
+                        version: 1,
+                        inputs: vec![TxIn {
+                            previous_output: OutPoint::null(),
+                            script_sig: vec![h as u8],
+                            sequence: 0xFFFFFFFF,
+                            witness: Vec::new(),
+                        }],
+                        outputs: vec![TxOut {
+                            value: 50_0000_0000,
+                            script_pubkey: vec![0x51],
+                        }],
+                        lock_time: 0,
+                    }],
+                };
+                store.put_header(&hash, &header).unwrap();
+                store.put_block(&hash, &block).unwrap();
+                store.put_height_index(h, &hash).unwrap();
+                let mut status = BlockStatus::new();
+                status.set(BlockStatus::VALID_SCRIPTS);
+                status.set(BlockStatus::HAVE_DATA);
+                status.set(BlockStatus::HAVE_UNDO);
+                store
+                    .put_block_index(
+                        &hash,
+                        &BlockIndexEntry {
+                            height: h,
+                            status,
+                            n_tx: 1,
+                            timestamp: header.timestamp,
+                            bits: header.bits,
+                            nonce: header.nonce,
+                            version: header.version,
+                            prev_hash: header.prev_block_hash,
+                            chain_work: [0u8; 32],
+                        },
+                    )
+                    .unwrap();
+                store.put_undo(&hash, &UndoData { spent_coins: vec![] }).unwrap();
+            }
+            let mut tip_bytes = [0u8; 32];
+            tip_bytes[0..4].copy_from_slice(&tip.to_be_bytes());
+            store.set_best_block(&Hash256(tip_bytes), tip).unwrap();
+        }
+
+        // RpcState in `-prune=1` manual-only mode.
+        let mut rpc_state = RpcState::with_prune_config(db.clone(), params, PRUNE_MANUAL_SENTINEL);
+        rpc_state.init_from_db().unwrap();
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        // Manual prune to height 5.
+        let returned = rpc.prune_blockchain(5).await.expect("prune");
+        assert_eq!(returned, 5);
+
+        // Verify low blocks dropped, high blocks intact.
+        let store = BlockStore::new(&db);
+        let mut h_low = [0u8; 32];
+        h_low[0..4].copy_from_slice(&3u32.to_be_bytes());
+        assert!(!store.has_block(&Hash256(h_low)).unwrap());
+
+        let mut h_high = [0u8; 32];
+        h_high[0..4].copy_from_slice(&50u32.to_be_bytes());
+        assert!(store.has_block(&Hash256(h_high)).unwrap());
+
+        // Watermark advanced and getblockchaininfo reflects it.
+        assert_eq!(store.get_prune_height().unwrap(), 5);
+        let info = rpc.get_blockchain_info().await.expect("info");
+        assert!(info.pruned);
+        assert_eq!(info.pruneheight, Some(6)); // lowest-complete = watermark + 1
+        assert_eq!(info.prune_target_size, Some(PRUNE_MANUAL_SENTINEL));
     }
 }

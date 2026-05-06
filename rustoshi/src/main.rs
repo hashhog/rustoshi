@@ -1445,8 +1445,29 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         cli.rpcbind.clone()
     };
 
-    // Initialize RPC state
-    let mut rpc_state_inner = RpcState::new(db.clone(), params.clone());
+    // Initialize RPC state.
+    //
+    // BIP-159 / Core-parity: when `--prune=N` is set, route through
+    // `with_prune_config` so `getblockchaininfo` reports `pruned: true`
+    // (and `pruneheight` / `prune_target_size`), and so the
+    // `pruneblockchain` RPC handler (and the auto-prune trigger in the
+    // connect-block loop below) actually fire. `prune_target_bytes`
+    // mirrors Core's `nPruneTarget` (bytes, not MiB):
+    //   - None / Some(0)   → 0          → pruning disabled
+    //   - Some(1)          → 1          → manual-only sentinel
+    //   - Some(N) ≥ 550    → N * MiB    → auto-prune target
+    //   - Some(2..=549)    → 1          → defensive collapse to manual
+    let prune_target_bytes: u64 = match cli.prune {
+        None | Some(0) => 0,
+        Some(1) => rustoshi_storage::PRUNE_MANUAL_SENTINEL,
+        Some(n) if n < 550 => rustoshi_storage::PRUNE_MANUAL_SENTINEL,
+        Some(n) => n.saturating_mul(1024 * 1024),
+    };
+    let mut rpc_state_inner = if prune_target_bytes > 0 {
+        rustoshi_rpc::RpcState::with_prune_config(db.clone(), params.clone(), prune_target_bytes)
+    } else {
+        RpcState::new(db.clone(), params.clone())
+    };
     rpc_state_inner.data_dir = Some(datadir.clone());
     rpc_state_inner.init_from_db().map_err(|e| anyhow::anyhow!(e))?;
 
@@ -1739,6 +1760,29 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let rpc_state = Arc::new(RwLock::new(rpc_state_inner));
 
+    // Build the prune coordinator config once. Re-used by every
+    // auto-prune trigger in the connect-block loop below. The
+    // assumeutxo floor mirrors Core's `m_chainman.GetSnapshotBaseHeight()`
+    // — we never delete data above the highest configured snapshot base
+    // height, because the background-validation chain may need to
+    // rendezvous against it.
+    let assumeutxo_floor: u32 = params
+        .assumeutxo_data
+        .iter()
+        .map(|d| d.height)
+        .max()
+        .unwrap_or(0);
+    let prune_cfg = rustoshi_storage::PruneCoordConfig::from_mib(cli.prune, assumeutxo_floor);
+    if prune_cfg.is_prune_mode() {
+        tracing::info!(
+            "Prune mode enabled: target={}B (manual_only={}, auto={}), assumeutxo_floor={}",
+            prune_cfg.target_bytes,
+            prune_cfg.is_manual_only(),
+            prune_cfg.auto_prune_enabled(),
+            prune_cfg.assumeutxo_height,
+        );
+    }
+
     // Initialize peer state (empty for now, will be updated)
     let peer_state = Arc::new(RwLock::new(PeerState::default()));
 
@@ -2005,6 +2049,21 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             if height > rpc.best_height {
                                 rpc.best_height = height;
                                 rpc.best_hash = block_hash;
+                            }
+                        }
+
+                        // Auto-prune trigger (BIP-159 / Core parity).
+                        // Only fires under `-prune=N` size mode (NOT under
+                        // `-prune=1` manual-only); throttled to once per
+                        // 100 connected blocks to avoid re-walking the
+                        // index every block during IBD. See
+                        // `bitcoin-core/src/validation.cpp::FlushStateToDisk`'s
+                        // `fFlushForPrune` cadence.
+                        if prune_cfg.auto_prune_enabled()
+                            && (height.is_multiple_of(100) || height == prune_cfg.assumeutxo_height)
+                        {
+                            if let Err(e) = rustoshi_storage::auto_prune(&block_store, &prune_cfg, height) {
+                                tracing::warn!("auto-prune failed at height {}: {}", height, e);
                             }
                         }
 
@@ -2515,6 +2574,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             // Clear recently-rejected filter -- rejection reasons
                                             // may no longer apply after a new block
                                             rpc.recently_rejected.clear();
+                                        }
+
+                                        // Auto-prune trigger (BIP-159 / Core parity).
+                                        // Mirrors the trigger in the foreground IBD
+                                        // path above. Throttled to 1-in-100 connected
+                                        // blocks to avoid re-walking the index every
+                                        // block.
+                                        if prune_cfg.auto_prune_enabled()
+                                            && (height.is_multiple_of(100) || height == prune_cfg.assumeutxo_height)
+                                        {
+                                            if let Err(e) = rustoshi_storage::auto_prune(&block_store, &prune_cfg, height) {
+                                                tracing::warn!("auto-prune failed at height {}: {}", height, e);
+                                            }
                                         }
 
                                         // Progress logging
