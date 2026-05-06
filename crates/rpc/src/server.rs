@@ -769,20 +769,38 @@ pub trait RustoshiRpc {
         message: String,
     ) -> RpcResult<bool>;
 
-    /// Sign a message with a private key.
+    /// Sign a message with the wallet's key for the given address.
     ///
-    /// Bitcoin Core's `signmessage` accepts an address and looks up the
-    /// matching private key in the loaded wallet. Rustoshi's RPC layer does
-    /// not yet share a per-address keystore, so this method accepts the
-    /// signing key directly via the `privkey` parameter (either a 64-char
-    /// hex-encoded raw private key, or a Base58Check WIF). For wallet-based
-    /// signing, callers can use the wallet RPCs to export the WIF first.
+    /// Mirrors Bitcoin Core's `signmessage`
+    /// (`bitcoin-core/src/wallet/rpc/signmessage.cpp:14-69`):
+    ///   - parameters: `(address, message)` (NOT a WIF / privkey)
+    ///   - address must be a P2PKH address held by the loaded wallet
+    ///   - returns the base64-encoded 65-byte compact-recoverable signature
     ///
-    /// Returns: Base64-encoded compact-recoverable signature (65 bytes) over
-    /// `SHA256d("\x18Bitcoin Signed Message:\n" || compact-size(msg) || msg)`
-    /// per `bitcoin-core/src/rpc/signmessage.cpp`.
+    /// Errors:
+    /// - `RPC_INVALID_ADDRESS_OR_KEY` for unparseable addresses or unknown keys
+    /// - `RPC_TYPE_ERROR` for non-P2PKH addresses
+    /// - `RPC_WALLET_NOT_FOUND` (-18) if no wallet is loaded
+    ///
+    /// For raw-key signing without a wallet, use `signmessagewithprivkey`.
     #[method(name = "signmessage")]
-    async fn sign_message(&self, privkey: String, message: String) -> RpcResult<String>;
+    async fn sign_message(&self, address: String, message: String) -> RpcResult<String>;
+
+    /// Sign a message with the given private key (no wallet involved).
+    ///
+    /// Mirrors Bitcoin Core's util RPC
+    /// `bitcoin-core/src/rpc/signmessage.cpp::signmessagewithprivkey`. Accepts
+    /// either a Base58Check WIF or a 64-char hex-encoded raw private key, and
+    /// returns the standard base64 compact-recoverable signature.
+    ///
+    /// This was rustoshi's previous `signmessage` behaviour; the rename brings
+    /// the surface in line with Core's contract.
+    #[method(name = "signmessagewithprivkey")]
+    async fn sign_message_with_privkey(
+        &self,
+        privkey: String,
+        message: String,
+    ) -> RpcResult<String>;
 
     /// Get the server uptime in seconds.
     #[method(name = "uptime")]
@@ -5292,7 +5310,11 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getmininginfo" => "getmininginfo\nReturns a json object containing mining-related information.",
                 "estimatesmartfee" => "estimatesmartfee conf_target ( \"estimate_mode\" )\nEstimates the approximate fee per kilobyte.",
                 "estimaterawfee" => "estimaterawfee conf_target ( threshold )\nReturns the underlying fee bucket statistics for a target.",
-                "signmessage" => "signmessage \"privkey\" \"message\"\nSigns a message with the given private key (hex or WIF). Returns base64 sig.",
+                "signmessage" => "signmessage \"address\" \"message\"\nSign a message with the wallet's key for the given address. Returns base64 sig.",
+                "signmessagewithprivkey" => "signmessagewithprivkey \"privkey\" \"message\"\nSign a message with the given private key (hex or WIF). Returns base64 sig.",
+                "lockunspent" => "lockunspent unlock ([{\"txid\":..,\"vout\":..},...]) (persistent)\nLock or unlock UTXOs from automatic coin selection.",
+                "listlockunspent" => "listlockunspent\nReturns the list of currently locked UTXOs.",
+                "walletcreatefundedpsbt" => "walletcreatefundedpsbt [{\"txid\":..,\"vout\":..},...] [{addr:amt},...] ( locktime options bip32derivs )\nCreate and fund a PSBT.",
                 "stop" => "stop\nRequest a graceful shutdown.",
                 "help" => "help ( \"command\" )\nList all commands, or get help for a specified command.",
                 "walletpassphrase" => "walletpassphrase \"passphrase\" timeout\nStores the wallet decryption key in memory for 'timeout' seconds.",
@@ -5328,15 +5350,16 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getrawtransaction", "sendrawtransaction",
                 "",
                 "== Wallet ==",
-                "deriveaddresses", "getdescriptorinfo", "setlabel", "validateaddress",
-                "walletlock", "walletpassphrase",
+                "deriveaddresses", "getdescriptorinfo", "listlockunspent", "lockunspent",
+                "setlabel", "signmessage", "signmessagewithprivkey", "validateaddress",
+                "walletcreatefundedpsbt", "walletlock", "walletpassphrase",
                 "",
                 "== PSBT ==",
                 "combinepsbt", "createpsbt", "decodepsbt", "finalizepsbt",
                 "",
                 "== Util ==",
                 "estimaterawfee", "estimatesmartfee", "getnettotals", "help",
-                "signmessage", "stop", "uptime", "verifymessage",
+                "signmessagewithprivkey", "stop", "uptime", "verifymessage",
             ];
             Ok(commands.join("\n"))
         }
@@ -5443,7 +5466,53 @@ impl RustoshiRpcServer for RpcServerImpl {
         Ok(recovered_hash == expected_hash)
     }
 
-    async fn sign_message(&self, privkey: String, message: String) -> RpcResult<String> {
+    async fn sign_message(&self, address: String, message: String) -> RpcResult<String> {
+        use rustoshi_crypto::address::Address;
+
+        // Mirrors `bitcoin-core/src/wallet/rpc/signmessage.cpp:38-67`.
+        if address.is_empty() {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                "Invalid address",
+            ));
+        }
+        let parsed = Address::from_string(&address, None).map_err(|_| {
+            Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "Invalid address")
+        })?;
+        // Core gates signmessage on PKHash (legacy P2PKH). We mirror exactly
+        // so callers get the same RPC_TYPE_ERROR for bech32/segwit input.
+        let _pkh = match parsed {
+            Address::P2PKH { hash, .. } => hash,
+            _ => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    "Address does not refer to key",
+                ));
+            }
+        };
+
+        // Look up the wallet's key for this address.
+        //
+        // The RPC server currently has no shared wallet keystore (the wallet
+        // RPC module ships separately and isn't wired into the live router).
+        // Until that is plumbed through, we surface an honest "no wallet
+        // available" error rather than silently fall back to the old
+        // privkey-based signing — that fallback was the lying-RPC behaviour
+        // the audit flagged. Operators wanting to sign without a loaded
+        // wallet should call `signmessagewithprivkey` instead.
+        let _ = message; // silence unused-warn until wallet wiring lands.
+        Err(Self::rpc_error(
+            -18, // RPC_WALLET_NOT_FOUND, matches Core's "no wallet" surface.
+            "Method needs a loaded wallet (none available in this build). \
+             Use signmessagewithprivkey for raw-key signing.",
+        ))
+    }
+
+    async fn sign_message_with_privkey(
+        &self,
+        privkey: String,
+        message: String,
+    ) -> RpcResult<String> {
         use base64::Engine;
 
         // Accept either a 64-char hex raw private key or a Base58Check WIF.
@@ -9223,8 +9292,12 @@ mod tests {
 
     #[tokio::test]
     async fn signmessage_verifymessage_roundtrip_compressed() {
-        // Sign with a hex private key, then derive its compressed P2PKH address
-        // and verify the signature in the same RPC server.
+        // Sign with a hex private key (via Core's `signmessagewithprivkey`),
+        // then derive its compressed P2PKH address and verify the signature
+        // in the same RPC server. `signmessage` in this server returns
+        // RPC_WALLET_NOT_FOUND because no wallet is wired through (Core
+        // contract: signmessage requires a loaded wallet); the raw-key path
+        // is what callers use without one.
         use rustoshi_consensus::ChainParams;
         use rustoshi_storage::ChainDb;
 
@@ -9242,9 +9315,9 @@ mod tests {
             "1111111111111111111111111111111111111111111111111111111111111111".to_string();
         let msg = "hello rustoshi".to_string();
         let sig_b64 = server
-            .sign_message(hex_key.clone(), msg.clone())
+            .sign_message_with_privkey(hex_key.clone(), msg.clone())
             .await
-            .expect("signmessage");
+            .expect("signmessagewithprivkey");
 
         // Derive the matching compressed mainnet P2PKH address from the secret.
         let secret =
