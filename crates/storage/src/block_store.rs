@@ -5,6 +5,7 @@
 
 use crate::columns::*;
 use crate::db::{ChainDb, StorageError, META_BEST_BLOCK_HASH, META_BEST_HEIGHT};
+use rocksdb::WriteBatch;
 use rustoshi_primitives::{Block, BlockHeader, Decodable, Encodable, Hash256, OutPoint};
 use serde::{Deserialize, Serialize};
 
@@ -273,6 +274,99 @@ impl<'a> BlockStore<'a> {
         self.db
             .put_cf(CF_META, META_BEST_HEIGHT, &height.to_le_bytes())?;
         Ok(())
+    }
+
+    // ---------------- BATCH-FRIENDLY HELPERS (cross-CF atomic writes) ----------------
+    //
+    // These mirror the per-key public APIs above (put_height_index,
+    // delete_height_index, set_best_block) but stage their writes into a
+    // caller-provided `rocksdb::WriteBatch` instead of executing them
+    // immediately. Combined with `BlockStoreUtxoView::flush_into_batch`
+    // they let the disconnect / reorg paths package "UTXO changes + height
+    // index updates + new tip pointer" into a single atomic RocksDB write,
+    // matching `bitcoin-core/src/validation.cpp::DisconnectTip`'s use of
+    // a single `CDBBatch`.
+    //
+    // A crash partway through a multi-step disconnect previously left
+    // height-index entries pointing at disconnected blocks while the UTXO
+    // set was already pre-disconnect — see CORE-PARITY-AUDIT
+    // `_post-reorg-consistency-fleet-result-2026-05-05.md` (Pattern D).
+
+    /// Stage a height-index put into `batch`.
+    ///
+    /// No DB write happens until the caller invokes
+    /// [`ChainDb::write_batch`]. Returns an error only if the column
+    /// family handle is missing (corruption).
+    pub fn batch_put_height_index(
+        &self,
+        batch: &mut WriteBatch,
+        height: u32,
+        hash: &Hash256,
+    ) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_HEIGHT_INDEX).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_HEIGHT_INDEX))
+        })?;
+        batch.put_cf(cf, height.to_be_bytes(), hash.as_bytes());
+        Ok(())
+    }
+
+    /// Stage a height-index delete into `batch`.
+    pub fn batch_delete_height_index(
+        &self,
+        batch: &mut WriteBatch,
+        height: u32,
+    ) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_HEIGHT_INDEX).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_HEIGHT_INDEX))
+        })?;
+        batch.delete_cf(cf, height.to_be_bytes());
+        Ok(())
+    }
+
+    /// Stage the best-block (tip) pointer write into `batch`.
+    ///
+    /// Mirrors [`BlockStore::set_best_block`] — writes both
+    /// `META_BEST_BLOCK_HASH` and `META_BEST_HEIGHT` so that on commit the
+    /// hash + height pair are flipped together.
+    pub fn batch_set_best_block(
+        &self,
+        batch: &mut WriteBatch,
+        hash: &Hash256,
+        height: u32,
+    ) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_META).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_META))
+        })?;
+        batch.put_cf(cf, META_BEST_BLOCK_HASH, hash.as_bytes());
+        batch.put_cf(cf, META_BEST_HEIGHT, height.to_le_bytes());
+        Ok(())
+    }
+
+    /// Stage a tx-index delete into `batch` (used during disconnect).
+    pub fn batch_delete_tx_index(
+        &self,
+        batch: &mut WriteBatch,
+        txid: &Hash256,
+    ) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_TX_INDEX).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_TX_INDEX))
+        })?;
+        batch.delete_cf(cf, txid.as_bytes());
+        Ok(())
+    }
+
+    /// Apply a previously-built RocksDB write batch.
+    ///
+    /// Convenience passthrough so callers don't have to reach through to
+    /// `self.db` directly when staging cross-CF batches via the
+    /// `batch_*` helpers above.
+    pub fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.db.write_batch(batch)
+    }
+
+    /// Create a fresh empty `WriteBatch` keyed against this store's DB.
+    pub fn new_batch(&self) -> WriteBatch {
+        self.db.new_batch()
     }
 
     /// Get the best (tip) block hash.
@@ -632,7 +726,33 @@ impl<'a> BlockStoreUtxoView<'a> {
             return Ok(());
         }
         let mut batch = self.store.db.new_batch();
-        let cf = self.store.db.cf_handle(CF_UTXO)
+        self.flush_into_batch(&mut batch)?;
+        self.store.db.write_batch(batch)?;
+        Ok(())
+    }
+
+    /// Stage all cached UTXO changes into the caller-provided WriteBatch.
+    ///
+    /// Drains the cache (resetting `estimated_mem`) but does NOT execute
+    /// the batch — the caller is responsible for committing it via
+    /// [`ChainDb::write_batch`] (or [`BlockStore::write_batch`]). This is
+    /// the building block for atomic cross-CF commits in the disconnect
+    /// and reorg paths, where height-index updates + new tip pointer
+    /// must land in the same RocksDB write as the UTXO mutations to
+    /// avoid the Pattern D crash window
+    /// (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
+    ///
+    /// Mirrors `bitcoin-core/src/validation.cpp::DisconnectTip` —
+    /// Core flushes its `CCoinsViewCache` into a single `CDBBatch` that
+    /// also carries the `BlockTreeDB` index updates, then commits once.
+    pub fn flush_into_batch(&mut self, batch: &mut WriteBatch) -> Result<(), StorageError> {
+        if self.cache.is_empty() {
+            return Ok(());
+        }
+        let cf = self
+            .store
+            .db
+            .cf_handle(CF_UTXO)
             .ok_or_else(|| StorageError::Corruption("missing UTXO column family".into()))?;
         for (outpoint, coin) in self.cache.drain() {
             let key = outpoint_key(&outpoint);
@@ -647,7 +767,6 @@ impl<'a> BlockStoreUtxoView<'a> {
                 }
             }
         }
-        self.store.db.write_batch(batch)?;
         self.estimated_mem = 0;
         Ok(())
     }

@@ -789,4 +789,341 @@ mod tests {
         assert!(final_entry.status.has(BlockStatus::HAVE_DATA));
         assert!(final_entry.status.has(BlockStatus::VALID_SCRIPTS));
     }
+
+    // =====================================================================
+    // Pattern D (post-reorg-consistency) — atomic disconnect/reorg batch
+    // =====================================================================
+    //
+    // Verifies that the building blocks the disconnect/reorg paths use to
+    // commit "UTXO mutations + tx-index deletes + height-index updates +
+    // best-block tip pointer" land as a single RocksDB write — all-or-
+    // nothing — matching `bitcoin-core/src/validation.cpp::DisconnectTip`'s
+    // `CDBBatch` semantics.
+    //
+    // Today's static audit
+    // (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md)
+    // found that pre-fix rustoshi ran `utxo_view.flush()` and the
+    // height-index/tip writes in two separate RocksDB calls; a crash
+    // between them left the height index pointing at disconnected blocks
+    // while the UTXO set was already pre-disconnect. The fix merges them
+    // into a single WriteBatch via `BlockStoreUtxoView::flush_into_batch`
+    // + `BlockStore::batch_*` helpers + `ChainDb::write_batch`.
+
+    /// `flush_into_batch` MUST not touch RocksDB — observable state only
+    /// changes when the caller commits the batch. Inversely, before the
+    /// commit, the cache MUST be drained (so a second commit attempt can
+    /// not double-write).
+    #[test]
+    fn test_flush_into_batch_defers_disk_writes_until_commit() {
+        use rustoshi_consensus::validation::UtxoView;
+
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let outpoint = OutPoint {
+            txid: Hash256::from_hex(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap(),
+            vout: 7,
+        };
+        let coin = rustoshi_consensus::validation::CoinEntry {
+            height: 42,
+            is_coinbase: false,
+            value: 12345,
+            script_pubkey: vec![0x51],
+        };
+
+        let mut view = store.utxo_view();
+        view.add_utxo(&outpoint, coin.clone());
+
+        // Before flush_into_batch + commit, the UTXO is NOT in RocksDB.
+        assert!(
+            store.get_utxo(&outpoint).unwrap().is_none(),
+            "cache hit must not be visible to fresh DB readers"
+        );
+
+        // Stage into a batch — still no disk write.
+        let mut batch = store.new_batch();
+        view.flush_into_batch(&mut batch).unwrap();
+        assert!(
+            store.get_utxo(&outpoint).unwrap().is_none(),
+            "flush_into_batch alone must not commit anything to disk"
+        );
+        // Cache has been drained.
+        assert_eq!(view.cache_len(), 0);
+
+        // Commit the batch — now the UTXO is visible.
+        store.write_batch(batch).unwrap();
+        let on_disk = store.get_utxo(&outpoint).unwrap().unwrap();
+        assert_eq!(on_disk.value, 12345);
+    }
+
+    /// Atomicity contract: the disconnect path's full set of writes
+    /// (UTXO mutations + tx-index deletes + height-index deletes + new
+    /// tip pointer) staged via `flush_into_batch` + `batch_*` helpers
+    /// must all become visible after a single `write_batch`, and none
+    /// must be visible before. This is the cross-CF guarantee that
+    /// makes a Pattern D crash safe.
+    #[test]
+    fn test_atomic_disconnect_batch_all_or_nothing() {
+        use rustoshi_consensus::validation::UtxoView;
+
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        // Pre-disconnect ground truth on disk:
+        //   * UTXO at outpoint_kept exists (will survive)
+        //   * UTXO at outpoint_spent exists (will be re-spent ... no, in a
+        //     real disconnect we'd RE-CREATE a spent UTXO; but for the
+        //     batch-atomicity contract we only care that the cross-CF
+        //     ops staged below all flip together)
+        //   * Height index has h=10 -> hash_old (pre-disconnect tip)
+        //   * Best block points at hash_old / h=10
+        //   * Tx-index has an entry that the disconnect will revoke.
+        let hash_old = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000aa",
+        )
+        .unwrap();
+        let hash_new = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000bb",
+        )
+        .unwrap();
+        let outpoint_create = OutPoint {
+            txid: Hash256::from_hex(
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            )
+            .unwrap(),
+            vout: 0,
+        };
+        let outpoint_remove = OutPoint {
+            txid: Hash256::from_hex(
+                "3333333333333333333333333333333333333333333333333333333333333333",
+            )
+            .unwrap(),
+            vout: 0,
+        };
+        let txid_evicted = Hash256::from_hex(
+            "4444444444444444444444444444444444444444444444444444444444444444",
+        )
+        .unwrap();
+
+        // Initialize pre-disconnect state directly (no batch, just the
+        // pre-existing per-key APIs — this is the "before crash" snapshot).
+        let pre_existing = CoinEntry {
+            height: 5,
+            is_coinbase: false,
+            value: 999,
+            script_pubkey: vec![0x76],
+        };
+        store.put_utxo(&outpoint_remove, &pre_existing).unwrap();
+        store.put_height_index(10, &hash_old).unwrap();
+        store.set_best_block(&hash_old, 10).unwrap();
+        store
+            .put_tx_index(
+                &txid_evicted,
+                &TxIndexEntry {
+                    block_hash: hash_old,
+                    tx_offset: 0,
+                    tx_length: 0,
+                },
+            )
+            .unwrap();
+
+        // Now build the disconnect batch the same way `disconnect_to`
+        // does: UTXO add (re-create the disconnected coin) + UTXO spend
+        // (delete a coin that the disconnected block had created) +
+        // tx-index delete + height-index delete + best-block flip.
+        let mut view = store.utxo_view();
+        view.add_utxo(
+            &outpoint_create,
+            rustoshi_consensus::validation::CoinEntry {
+                height: 9,
+                is_coinbase: false,
+                value: 5_0000_0000,
+                script_pubkey: vec![0x51],
+            },
+        );
+        view.spend_utxo(&outpoint_remove);
+
+        let mut batch = store.new_batch();
+        store
+            .batch_delete_tx_index(&mut batch, &txid_evicted)
+            .unwrap();
+        view.flush_into_batch(&mut batch).unwrap();
+        store
+            .batch_set_best_block(&mut batch, &hash_new, 9)
+            .unwrap();
+        store.batch_delete_height_index(&mut batch, 10).unwrap();
+
+        // Atomicity contract: NOTHING is visible yet.
+        assert_eq!(
+            store.get_best_block_hash().unwrap().unwrap(),
+            hash_old,
+            "tip must not flip before write_batch"
+        );
+        assert_eq!(store.get_best_height().unwrap().unwrap(), 10);
+        assert!(
+            store.get_utxo(&outpoint_create).unwrap().is_none(),
+            "added coin must not be visible before write_batch"
+        );
+        assert!(
+            store.get_utxo(&outpoint_remove).unwrap().is_some(),
+            "spent coin must still exist before write_batch"
+        );
+        assert_eq!(
+            store
+                .get_hash_by_height(10)
+                .unwrap()
+                .expect("pre-batch height-10 entry should still exist"),
+            hash_old,
+        );
+        assert!(
+            store.get_tx_index(&txid_evicted).unwrap().is_some(),
+            "tx-index entry must survive until write_batch"
+        );
+
+        // Commit. After this, EVERYTHING flips together.
+        store.write_batch(batch).unwrap();
+
+        assert_eq!(store.get_best_block_hash().unwrap().unwrap(), hash_new);
+        assert_eq!(store.get_best_height().unwrap().unwrap(), 9);
+        assert_eq!(
+            store.get_utxo(&outpoint_create).unwrap().unwrap().value,
+            5_0000_0000,
+            "added coin must be visible after write_batch"
+        );
+        assert!(
+            store.get_utxo(&outpoint_remove).unwrap().is_none(),
+            "spent coin must be deleted after write_batch"
+        );
+        assert!(
+            store.get_hash_by_height(10).unwrap().is_none(),
+            "height-index entry must be deleted after write_batch"
+        );
+        assert!(
+            store.get_tx_index(&txid_evicted).unwrap().is_none(),
+            "tx-index entry must be deleted after write_batch"
+        );
+    }
+
+    /// Symmetric test for the reorg arm: UTXO mutations + height-index
+    /// puts (new branch) + height-index deletes (old suffix) + best-block
+    /// pointer all flip in a single batch.
+    #[test]
+    fn test_atomic_reorg_batch_all_or_nothing() {
+        use rustoshi_consensus::validation::UtxoView;
+
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let hash_old = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000011",
+        )
+        .unwrap();
+        let hash_new_a = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000022",
+        )
+        .unwrap();
+        let hash_new_b = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000033",
+        )
+        .unwrap();
+
+        // Old chain: tip at h=8 / hash_old, with stale entries at h=7..=8.
+        store
+            .put_height_index(
+                7,
+                &Hash256::from_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000077",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store.put_height_index(8, &hash_old).unwrap();
+        store.set_best_block(&hash_old, 8).unwrap();
+
+        let outpoint = OutPoint {
+            txid: Hash256::from_hex(
+                "5555555555555555555555555555555555555555555555555555555555555555",
+            )
+            .unwrap(),
+            vout: 1,
+        };
+
+        // Reorg target: new tip at h=9 / hash_new_b, parent hash_new_a at h=8.
+        let mut view = store.utxo_view();
+        view.add_utxo(
+            &outpoint,
+            rustoshi_consensus::validation::CoinEntry {
+                height: 9,
+                is_coinbase: false,
+                value: 7_0000_0000,
+                script_pubkey: vec![0x52],
+            },
+        );
+
+        let mut batch = store.new_batch();
+        view.flush_into_batch(&mut batch).unwrap();
+        store
+            .batch_put_height_index(&mut batch, 8, &hash_new_a)
+            .unwrap();
+        store
+            .batch_put_height_index(&mut batch, 9, &hash_new_b)
+            .unwrap();
+        store
+            .batch_set_best_block(&mut batch, &hash_new_b, 9)
+            .unwrap();
+
+        // Pre-commit: nothing has changed.
+        assert_eq!(store.get_best_block_hash().unwrap().unwrap(), hash_old);
+        assert_eq!(store.get_hash_by_height(8).unwrap().unwrap(), hash_old);
+        assert!(store.get_utxo(&outpoint).unwrap().is_none());
+
+        store.write_batch(batch).unwrap();
+
+        // Post-commit: everything has flipped together.
+        assert_eq!(store.get_best_block_hash().unwrap().unwrap(), hash_new_b);
+        assert_eq!(store.get_best_height().unwrap().unwrap(), 9);
+        assert_eq!(store.get_hash_by_height(8).unwrap().unwrap(), hash_new_a);
+        assert_eq!(store.get_hash_by_height(9).unwrap().unwrap(), hash_new_b);
+        assert_eq!(
+            store.get_utxo(&outpoint).unwrap().unwrap().value,
+            7_0000_0000,
+        );
+    }
+
+    /// `flush()` (the convenience wrapper) MUST still write everything
+    /// in one batch. Regression guard: keep the wrapper API working
+    /// after refactoring `flush()` to delegate to `flush_into_batch`.
+    #[test]
+    fn test_flush_wrapper_still_commits() {
+        use rustoshi_consensus::validation::UtxoView;
+
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let outpoint = OutPoint {
+            txid: Hash256::from_hex(
+                "6666666666666666666666666666666666666666666666666666666666666666",
+            )
+            .unwrap(),
+            vout: 2,
+        };
+
+        let mut view = store.utxo_view();
+        view.add_utxo(
+            &outpoint,
+            rustoshi_consensus::validation::CoinEntry {
+                height: 1,
+                is_coinbase: true,
+                value: 50_0000_0000,
+                script_pubkey: vec![0x21],
+            },
+        );
+        view.flush().unwrap();
+
+        let on_disk = store.get_utxo(&outpoint).unwrap().unwrap();
+        assert_eq!(on_disk.value, 50_0000_0000);
+    }
 }
