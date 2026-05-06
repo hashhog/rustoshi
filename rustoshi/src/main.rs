@@ -2299,35 +2299,53 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     Err(e) => {
                                         tracing::warn!("Header sync error from peer {}: {}", peer_id.0, e);
 
-                                        // Score misbehavior based on the error type
-                                        {
-                                            let mut ps = peer_state.write().await;
-                                            if let Some(ref mut pm) = ps.peer_manager {
-                                                if e.contains("not connected") || e.contains("not in our chain") {
+                                        // Classify the error: unconnecting-headers vs
+                                        // genuinely-invalid-content (PoW etc).
+                                        let is_unconnecting =
+                                            e.contains("not connected") || e.contains("not in our chain");
+                                        let is_invalid_pow = e.contains("proof of work");
+
+                                        if is_unconnecting {
+                                            // Core (net_processing.cpp::ProcessHeadersMessage)
+                                            // tolerates up to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10
+                                            // unconnecting-headers messages from a single peer
+                                            // before disconnecting.  Until that bound is reached
+                                            // we send `getheaders` to try to find a common
+                                            // ancestor instead of banning.  This avoids tripping
+                                            // honest peers caught in a transient reorg.
+                                            let exceeded = header_sync.note_unconnecting_headers(peer_id);
+                                            if exceeded {
+                                                tracing::warn!(
+                                                    "Peer {} exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS=10, disconnecting",
+                                                    peer_id.0
+                                                );
+                                                let mut ps = peer_state.write().await;
+                                                if let Some(ref mut pm) = ps.peer_manager {
                                                     pm.misbehaving(peer_id, MisbehaviorReason::HeadersDontConnect).await;
-                                                } else if e.contains("proof of work") {
-                                                    pm.misbehaving(peer_id, MisbehaviorReason::InvalidBlockHeader).await;
+                                                }
+                                            } else {
+                                                // Re-issue getheaders with a full block locator
+                                                // so the peer can find our fork point
+                                                // (Core's FindForkInGlobalIndex behavior).
+                                                tracing::info!(
+                                                    "Re-requesting headers from peer {} with block locator to find fork point",
+                                                    peer_id.0
+                                                );
+                                                if let Some((target, msg)) = header_sync.start_sync(|h| {
+                                                    block_store.get_hash_by_height(h).ok().flatten()
+                                                }) {
+                                                    let ps = peer_state.read().await;
+                                                    if let Some(ref pm) = ps.peer_manager {
+                                                        pm.send_to_peer(target, msg).await;
+                                                    }
                                                 }
                                             }
-                                        }
-
-                                        // When the first header doesn't connect to our tip,
-                                        // the peer may have reorged or we're on a stale fork.
-                                        // Re-request headers with a full block locator so the
-                                        // peer can find our fork point (like Bitcoin Core's
-                                        // FindForkInGlobalIndex behavior).
-                                        if e.contains("not in our chain") {
-                                            tracing::info!(
-                                                "Re-requesting headers from peer {} with block locator to find fork point",
-                                                peer_id.0
-                                            );
-                                            if let Some((target, msg)) = header_sync.start_sync(|h| {
-                                                block_store.get_hash_by_height(h).ok().flatten()
-                                            }) {
-                                                let ps = peer_state.read().await;
-                                                if let Some(ref pm) = ps.peer_manager {
-                                                    pm.send_to_peer(target, msg).await;
-                                                }
+                                        } else if is_invalid_pow {
+                                            // PoW failure is genuinely-invalid content —
+                                            // ban-score immediately (Core +100 on bad PoW).
+                                            let mut ps = peer_state.write().await;
+                                            if let Some(ref mut pm) = ps.peer_manager {
+                                                pm.misbehaving(peer_id, MisbehaviorReason::InvalidBlockHeader).await;
                                             }
                                         }
                                     }
