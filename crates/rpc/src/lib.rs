@@ -38,7 +38,7 @@ pub mod types;
 pub mod wallet;
 pub mod zmq;
 
-pub use rest::{rest_router, RestState};
+pub use rest::{rest_router, start_rest_server, RestConfig, RestServerHandle, RestState};
 pub use server::{start_rpc_server, PeerState, RpcServerImpl, RpcState, RustoshiRpcServer};
 pub use types::*;
 pub use wallet::{
