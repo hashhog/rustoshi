@@ -35,7 +35,7 @@ use rustoshi_network::{
     PeerManager, PeerManagerConfig,
 };
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
-use rustoshi_rpc::{start_rpc_server, PeerState, RpcConfig, RpcState};
+use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
 use rustoshi_storage::{block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry}, BlockStore, ChainDb};
 
 // ============================================================
@@ -165,6 +165,24 @@ struct Cli {
     /// rejected and the node continues a normal genesis IBD.
     #[arg(long = "load-snapshot", value_name = "PATH")]
     load_snapshot: Option<String>,
+
+    /// Enable the unauthenticated REST HTTP server.
+    /// Mirrors Bitcoin Core's `-rest` (default off; see
+    /// `bitcoin-core/src/init.cpp DEFAULT_REST_ENABLE = false`). When set,
+    /// rustoshi binds an axum server on `--restbind` exposing the same
+    /// `/rest/*` URI surface as Core 31.99 (`bitcoin-core/src/rest.cpp`).
+    #[arg(long = "rest", default_value = "false")]
+    rest: bool,
+
+    /// REST bind address (e.g. `127.0.0.1:8333`). Defaults to the RPC bind
+    /// IP with the RPC port + 100 — i.e. mainnet 127.0.0.1:8432, testnet4
+    /// 127.0.0.1:48432. Bitcoin Core multiplexes REST on the same port as
+    /// JSON-RPC; rustoshi uses a separate port because the underlying RPC
+    /// server (`jsonrpsee 0.22`) owns its listener and does not expose a
+    /// hookable HTTP router. The REST surface is otherwise byte-compatible
+    /// with Core's. Has no effect unless `--rest` is also set.
+    #[arg(long = "restbind", value_name = "ADDR")]
+    restbind: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1095,6 +1113,8 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
     merge_opt_str!(debug_categories, "debug");
     merge_bool!(printtoconsole, "printtoconsole");
     merge_opt_str!(debuglogfile, "debuglogfile");
+    merge_bool!(rest, "rest");
+    merge_opt_str!(restbind, "restbind");
 }
 
 /// Locate a config file path: explicit `--conf`, then `<datadir>/rustoshi.conf`,
@@ -1800,6 +1820,40 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     };
     let rpc_handle = start_rpc_server(rpc_config, rpc_state.clone(), peer_state.clone()).await?;
     tracing::info!("RPC server listening on {}", rpc_bind);
+
+    // Start unauthenticated REST HTTP server (Bitcoin Core `-rest`).
+    // Default off, matching Core's `DEFAULT_REST_ENABLE = false`. When enabled,
+    // we bind axum on `--restbind` (or `<rpc_ip>:<rpc_port + 100>` if not set)
+    // and serve the same `/rest/*` URI surface as Core. Held in `_rest_handle`
+    // so the listener task keeps running for the lifetime of `main`.
+    let _rest_handle = if cli.rest {
+        let restbind = match cli.restbind.clone() {
+            Some(addr) => addr,
+            None => {
+                // Default: same IP as RPC bind, port+100 (so 8332→8432, 48332→48432)
+                let (ip, port) = rpc_bind
+                    .rsplit_once(':')
+                    .map(|(i, p)| (i.to_string(), p.parse::<u16>().unwrap_or(0)))
+                    .unwrap_or_else(|| ("127.0.0.1".to_string(), 8432));
+                format!("{}:{}", ip, port.saturating_add(100))
+            }
+        };
+        let rest_cfg = RestConfig {
+            bind_address: restbind.clone(),
+        };
+        match start_rest_server(rest_cfg, rpc_state.clone()).await {
+            Ok(handle) => {
+                tracing::info!("REST server listening on {}", restbind);
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::error!("Failed to start REST server on {}: {}", restbind, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Start Prometheus metrics server
     tokio::spawn(start_metrics_server(
