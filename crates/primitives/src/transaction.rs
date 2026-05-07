@@ -18,7 +18,27 @@ const MAX_TX_OUT_COUNT: usize = 25_000;
 /// larger in witness but we cap at the block weight limit for safety).
 const MAX_SCRIPT_SIZE: u64 = 10_000;
 /// Maximum number of witness items per input.
-const MAX_WITNESS_ITEMS: usize = 500;
+///
+/// Bitcoin Core imposes no explicit `CompactSize` cap on witness item counts;
+/// the only bounds are:
+///
+///   - wire-level `MAX_SIZE = 0x02000000` (32 MiB) on the length prefix
+///   - the 4 MiB block-weight envelope
+///   - `MAX_STACK_SIZE = 1000` at script-execution time (runtime, not
+///     deserialize)
+///
+/// The earlier cap of 500 was a DoS guard that turned out far tighter than
+/// consensus: mainnet block 761249 carries an input with 500,003 witness
+/// items (a legitimate Ordinals-style inscription envelope) which wedged
+/// blockbrew at that height until every peer that relayed the block got
+/// banned. Rustoshi exhibited the same class of wedge at h=938,374 on
+/// 2026-05-05. 4,000,000 is a hard upper bound derived from
+/// `MAX_BLOCK_SERIALIZED_SIZE / min-item-size` (each item costs ≥ 1 byte of
+/// witness data plus a length prefix), so this still shuts down the "peer
+/// sends a 100 GB witness count" DoS without rejecting valid mainnet blocks.
+///
+/// Mirrors blockbrew's `923727f` precedent (Apr 23 2026, 100_000 → 4_000_000).
+const MAX_WITNESS_ITEMS: usize = 4_000_000;
 /// Maximum size of a single witness item (capped at max block weight = 4MB).
 const MAX_WITNESS_ITEM_SIZE: u64 = 4_000_000;
 
@@ -663,6 +683,62 @@ mod tests {
         let txid = tx.txid();
         let wtxid = tx.wtxid();
         assert_ne!(txid, wtxid, "txid and wtxid should differ for segwit tx");
+    }
+
+    #[test]
+    fn high_witness_item_count_deserializes() {
+        // Regression: rustoshi's MAX_WITNESS_ITEMS used to be 500, which
+        // rejected mainnet blocks like 761249 that carry inputs with
+        // ~500k witness items (Ordinals inscription envelopes). After the
+        // bump to 4_000_000 (mirrors blockbrew 923727f), the deserializer
+        // must accept a tx with a witness item count well above 500.
+        //
+        // We use 1000 items here — enough to exercise the path that used
+        // to bail out at the cap, while keeping the test fast. Each item
+        // is a single byte so block-weight constraints stay irrelevant.
+        const ITEM_COUNT: usize = 1000;
+        let mut witness: Vec<Vec<u8>> = Vec::with_capacity(ITEM_COUNT);
+        for i in 0..ITEM_COUNT {
+            witness.push(vec![(i & 0xff) as u8]);
+        }
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::from_hex(
+                        "2222222222222222222222222222222222222222222222222222222222222222",
+                    )
+                    .unwrap(),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+                witness,
+            }],
+            outputs: vec![TxOut {
+                value: 10_000_000,
+                script_pubkey: vec![0x00, 0x14],
+            }],
+            lock_time: 0,
+        };
+
+        // Sanity: previous cap would have been blown.
+        assert!(tx.inputs[0].witness.len() > 500);
+
+        let encoded = tx.serialize();
+        let decoded = Transaction::deserialize(&encoded)
+            .expect("tx with >500 witness items must deserialize after the cap bump");
+        assert_eq!(decoded.inputs[0].witness.len(), ITEM_COUNT);
+        assert_eq!(decoded, tx);
+    }
+
+    #[test]
+    fn witness_item_count_at_cap_is_accepted_in_principle() {
+        // Direct check that the constant matches the documented bump.
+        // (Constructing a real 4M-item tx would exceed block-weight bounds;
+        // this just guards the constant from regressing.)
+        assert_eq!(MAX_WITNESS_ITEMS, 4_000_000);
     }
 
     #[test]
