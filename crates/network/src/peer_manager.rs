@@ -1067,7 +1067,7 @@ impl PeerManager {
     ///
     /// This enforces network group diversity: no two IPv4/IPv6 outbound connections
     /// may share the same /16 (IPv4) or /32 (IPv6) network group.
-    async fn fill_outbound_connections(&mut self) {
+    pub async fn fill_outbound_connections(&mut self) {
         // Count full-relay outbound connections
         let full_relay_count = self
             .peers
@@ -2034,6 +2034,63 @@ impl PeerManager {
     /// Get a mutable reference to the address manager.
     pub fn addr_manager_mut(&mut self) -> &mut AddressManager {
         &mut self.addr_manager
+    }
+
+    /// Test-only: insert an outbound full-relay peer with a back-dated
+    /// `connected_time` so MINIMUM_CONNECT_TIME does not protect it from
+    /// the stalled-peer eviction path.  Used by the maintenance-tick
+    /// integration test (`test_check_for_stale_peers_disconnects_zombie`).
+    #[cfg(test)]
+    pub(crate) fn insert_test_outbound_peer_old(
+        &mut self,
+        peer_id: PeerId,
+        addr: SocketAddr,
+    ) -> mpsc::Receiver<PeerCommand> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let old_connected = Instant::now() - Duration::from_secs(120);
+        self.peers.insert(
+            peer_id,
+            PeerHandle {
+                info: PeerInfo {
+                    addr,
+                    version: PROTOCOL_VERSION,
+                    services: 0,
+                    user_agent: String::new(),
+                    start_height: 0,
+                    relay: true,
+                    inbound: false,
+                    state: PeerState::Established,
+                    last_send: Instant::now(),
+                    last_recv: Instant::now(),
+                    ping_nonce: None,
+                    ping_time: None,
+                    bytes_sent: 0,
+                    bytes_recv: 0,
+                    time_offset: 0,
+                    supports_witness: false,
+                    supports_sendheaders: false,
+                    supports_wtxid_relay: false,
+                    supports_addrv2: false,
+                    feefilter: 0,
+                },
+                command_tx: cmd_tx,
+                conn_type: ConnectionType::FullRelay,
+                connected_time: old_connected,
+                min_ping_time: None,
+                last_block_time: None,
+                last_tx_time: None,
+                stale_state: StalePeerState::new(),
+            },
+        );
+        cmd_rx
+    }
+
+    /// Test-only: force the stale-detector's `last_stale_check` clock back
+    /// in time so the next `check_for_stale_peers` call passes the
+    /// EXTRA_PEER_CHECK_INTERVAL gate without sleeping.
+    #[cfg(test)]
+    pub(crate) fn force_stale_check_due(&mut self) {
+        self.last_stale_check = Instant::now() - Duration::from_secs(60);
     }
 
     /// Test-only: directly insert a peer into the peers map.  Returns the
@@ -3856,6 +3913,68 @@ mod tests {
 
         // Initially should not try extra outbound
         assert!(!mgr.should_try_extra_outbound());
+    }
+
+    /// Regression: a zombie outbound peer (TCP alive but not advancing the
+    /// chain) must be evicted by the maintenance-tick path that calls
+    /// `check_for_stale_peers`.  Pre-2026-05-07, this routine existed but
+    /// was never invoked outside tests; rustoshi mainnet froze for 6+
+    /// hours at h=948271 with one such zombie peer.
+    ///
+    /// The test drives the same call sequence that the main loop's
+    /// 45-second maintenance tick now performs:
+    ///   1. update_tip_height(our_tip)
+    ///   2. check_for_stale_peers(blocks_in_flight=0)
+    /// and asserts the stalled peer is evicted (PeerCommand::Disconnect
+    /// arrives on its command channel).
+    #[tokio::test]
+    async fn test_check_for_stale_peers_disconnects_zombie() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = PeerManagerConfig::testnet4().with_data_dir(temp_dir.path().to_path_buf());
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        // Our tip is at height 100; peer is way behind at 50 with the
+        // chain-sync timeout already past.  Mirrors a peer that
+        // completed the version handshake and then went silent at the
+        // application layer.
+        mgr.update_tip_height(100);
+
+        let peer_id = PeerId(42);
+        let mut rx = mgr.insert_test_outbound_peer_old(
+            peer_id,
+            "192.0.2.42:8333".parse().unwrap(),
+        );
+
+        // Pre-arm the stalled-peer state: peer is behind, timeout has
+        // fired, getheaders was already sent (so the next tick should
+        // disconnect rather than just send another getheaders).
+        if let Some(state) = mgr.get_peer_stale_state_mut(peer_id) {
+            state.best_known_height = 50;
+            state.chain_sync.set_timeout(100, Duration::from_millis(1));
+            state.chain_sync.sent_getheaders = true;
+            // Backdate the timeout so is_timed_out() returns true now.
+            state.chain_sync.timeout =
+                Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        // Skip the EXTRA_PEER_CHECK_INTERVAL gate so we run synchronously.
+        mgr.force_stale_check_due();
+
+        let result = mgr.check_for_stale_peers(0).await;
+        assert!(
+            result.chain_sync_failures.contains(&peer_id),
+            "stalled outbound peer must appear in chain_sync_failures, got {:?}",
+            result.chain_sync_failures
+        );
+
+        // The peer's command channel must receive a Disconnect.
+        let cmd = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for Disconnect command");
+        assert!(matches!(cmd, Some(PeerCommand::Disconnect)));
     }
 
     #[test]
