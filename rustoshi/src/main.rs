@@ -1989,6 +1989,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let mut validation_interval = tokio::time::interval(std::time::Duration::from_millis(100));
     validation_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // P2P maintenance tick — fires every 45s (Bitcoin Core's
+    // EXTRA_PEER_CHECK_INTERVAL).  Drives stalled-peer eviction,
+    // outbound-fill top-up, and re-issues `getheaders` if header sync
+    // got stuck on a half-dead peer.  Without this tick the
+    // peer_manager's StalePeerDetector + fill_outbound_connections
+    // are never called outside the initial start() / Disconnected
+    // events, so a peer that completes the version handshake and
+    // then goes silent at the TCP layer wedges sync indefinitely
+    // (observed 2026-05-07: 6+ hour freeze with one zombie peer).
+    let mut maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(45));
+    maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             // Fast validation tick — process buffered blocks frequently.
@@ -3305,6 +3317,68 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             for (peer, msg) in requests {
                                 pm.send_to_peer(peer, msg).await;
                             }
+                        }
+                    }
+                }
+            }
+
+            // P2P maintenance tick: drive stalled-peer eviction, outbound
+            // fill, and header-sync recovery.  Mirrors Bitcoin Core's
+            // PeerManagerImpl::CheckForStaleTipAndEvictPeers + the
+            // ThreadOpenConnections fill-outbound loop, except condensed
+            // into one 45s tick because rustoshi has a single main loop
+            // rather than Core's per-thread structure.
+            //
+            // Without this tick the StalePeerDetector and
+            // fill_outbound_connections never run outside of startup +
+            // reactive disconnects, so a peer that goes silent post-
+            // handshake (TCP alive but no application messages) wedges
+            // sync indefinitely (observed 2026-05-07: rustoshi froze
+            // for 6+ hours at h=948271 with one zombie peer).
+            _ = maintenance_interval.tick() => {
+                let validated_tip = block_downloader.validated_tip_height();
+                let in_flight = block_downloader.in_flight_count();
+
+                // 1. Run the stale-peer / chain-sync-timeout detector,
+                //    refresh fill-outbound to the configured target,
+                //    and snapshot peer count for sync-recovery logic.
+                let (stale_result, peer_count) = {
+                    let mut ps = peer_state.write().await;
+                    if let Some(ref mut pm) = ps.peer_manager {
+                        pm.update_tip_height(validated_tip);
+                        let stale = pm.check_for_stale_peers(in_flight).await;
+                        pm.fill_outbound_connections().await;
+                        (stale, pm.peer_count())
+                    } else {
+                        (Default::default(), 0)
+                    }
+                };
+
+                let _: rustoshi_network::StalePeerCheckResult = stale_result;
+
+                // 2. Disconnect notifications for peers the stale
+                //    detector evicted are delivered via the normal
+                //    PeerEvent::Disconnected path; header_sync /
+                //    block_downloader peer state is cleaned up there.
+                //    Here we only need to recover header sync if the
+                //    chosen sync peer was the one that just got
+                //    evicted, OR if we were never syncing because
+                //    the prior peer was a zombie.
+                let header_sync_idle = matches!(
+                    header_sync.state(),
+                    rustoshi_network::SyncState::Idle
+                );
+                if peer_count > 0 && header_sync_idle {
+                    if let Some((target, msg)) = header_sync.start_sync(|h| {
+                        block_store.get_hash_by_height(h).ok().flatten()
+                    }) {
+                        tracing::info!(
+                            "Maintenance: re-issuing getheaders to peer {} (idle sync)",
+                            target.0
+                        );
+                        let ps = peer_state.read().await;
+                        if let Some(ref pm) = ps.peer_manager {
+                            pm.send_to_peer(target, msg).await;
                         }
                     }
                 }
