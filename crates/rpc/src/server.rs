@@ -6120,70 +6120,164 @@ impl RustoshiRpcServer for RpcServerImpl {
         let height = state.best_height;
         let best_hash = state.best_hash;
 
-        // Prefer the per-block CoinStats index if it has an entry at the tip.
+        // Default per Core: hash_serialized_3 (set in rpc/blockchain.cpp:1017
+        // RPCArg::Default{"hash_serialized_3"}).
+        let ht = hash_type.as_deref().unwrap_or("hash_serialized_3");
+
+        // Fast path via the per-tip CoinStats index, but only for muhash /
+        // none — hash_serialized_3 is NOT pre-indexed (Core throws when
+        // queried for a specific block too).
         let stats_index = CoinStatsIndex::new(&state.db);
-        if let Ok(Some(entry)) = stats_index.get_stats(height) {
-            let ht = hash_type.as_deref().unwrap_or("none");
-            let mut result = serde_json::json!({
-                "height": entry.height,
-                "bestblock": entry.block_hash.to_hex(),
-                "txouts": entry.utxo_count,
-                "bogosize": entry.bogo_size,
-                "hash_serialized_3": "",
-                "muhash": "",
-                "total_amount": entry.total_amount as f64 / 1e8,
-                "disk_size": 0u64,
-            });
-            if ht == "muhash" {
-                let mut mh = entry.get_muhash();
-                let fin = mh.finalize();
-                result["muhash"] = serde_json::Value::String(fin.to_hex());
+        if ht == "muhash" || ht == "none" {
+            if let Ok(Some(entry)) = stats_index.get_stats(height) {
+                let mut result = serde_json::json!({
+                    "height": entry.height,
+                    "bestblock": entry.block_hash.to_hex(),
+                    "txouts": entry.utxo_count,
+                    "bogosize": entry.bogo_size,
+                    "total_amount": entry.total_amount as f64 / 1e8,
+                    "disk_size": 0u64,
+                });
+                if ht == "muhash" {
+                    let mut mh = entry.get_muhash();
+                    let fin = mh.finalize();
+                    result["muhash"] = serde_json::Value::String(fin.to_hex());
+                }
+                return Ok(result);
             }
-            return Ok(result);
         }
 
-        // Fallback: count via CF_UTXO iterator (expensive on large chains).
-        let txouts = state
-            .db
-            .iter_cf(CF_UTXO)
-            .map(|iter| iter.count() as u64)
-            .unwrap_or(0);
+        // Full scan path: walk CF_UTXO and produce the requested hash.
+        //
+        // Wave 11 (2026-05-07): hash_serialized_3 added.  Bitcoin Core
+        // path:
+        //   `kernel/coinstats.cpp::ComputeUTXOStats` builds a HashWriter
+        //   (== sha256d), feeds each (outpoint, coin) via TxOutSer:
+        //     1. txid  : 32 bytes (internal little-endian, NO reversal)
+        //     2. vout  :  4 bytes uint32 LE
+        //     3. code  :  4 bytes uint32 LE = (height << 1) | coinbase
+        //     4. value :  8 bytes int64  LE  (coin.out.nValue)
+        //     5. spk   :  CompactSize(len) || raw script bytes
+        //   then GetHash() returns a double-SHA256 over the stream.
+        //
+        // The on-disk UTXO key in rustoshi is `txid (32 bytes internal)
+        // || vout (4 BE)` (see `block_store::outpoint_key`).  Iterating
+        // RocksDB in lexicographic byte order yields txid-ASC then
+        // vout-ASC, which matches Core's iteration order
+        // (`std::map<uint32_t, Coin>` per txid, in vout-ASC).  So a
+        // straightforward iter feeds bytes in the canonical order.
+        //
+        // Pre-existing latent bug noted in passing: the muhash branch
+        // decoded vout via `u32::from_le_bytes` despite outpoint_key
+        // writing BE.  muhash is commutative so the wrong vout produces
+        // a stable but Core-incompatible value.  This commit switches
+        // the decode to BE for both hash types; a separate audit can
+        // re-verify any pre-W11 muhash values against Core.
+        use sha2::{Digest, Sha256};
+        use rustoshi_primitives::serialize::write_compact_size;
 
-        let ht = hash_type.as_deref().unwrap_or("none");
-        let muhash_str = if ht == "muhash" {
-            // Full scan to compute MuHash — mirrors Core's hash_type=muhash path.
-            use rustoshi_storage::{MuHash3072, indexes::coinstatsindex::serialize_coin_for_muhash};
-            let mut mh = MuHash3072::new();
-            if let Ok(iter) = state.db.iter_cf(CF_UTXO) {
-                for (k, v) in iter {
-                    if let Ok(coin) = serde_json::from_slice::<CoinEntry>(&v) {
-                        if k.len() >= 36 {
-                            let txid = Hash256(k[..32].try_into().unwrap_or([0u8; 32]));
-                            let vout = u32::from_le_bytes([k[32], k[33], k[34], k[35]]);
-                            let bytes = serialize_coin_for_muhash(
-                                &txid, vout, coin.height, coin.is_coinbase,
-                                coin.value, &coin.script_pubkey,
-                            );
-                            mh.insert(&bytes);
-                        }
-                    }
+        let mut hash_ser_state: Option<Sha256> = None;
+        let mut muhash_state: Option<rustoshi_storage::MuHash3072> = None;
+
+        match ht {
+            "hash_serialized_3" | "hash_serialized_2" | "hash_serialized" => {
+                hash_ser_state = Some(Sha256::new());
+            }
+            "muhash" => {
+                muhash_state = Some(rustoshi_storage::MuHash3072::new());
+            }
+            "none" => {} // counters only, no hash
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!("'{}' is not a valid hash_type", other),
+                ));
+            }
+        }
+
+        let mut txouts: u64 = 0;
+        let mut bogosize: u64 = 0;
+        let mut total_amount_sats: u64 = 0;
+
+        if let Ok(iter) = state.db.iter_cf(CF_UTXO) {
+            for (k, v) in iter {
+                if k.len() < 36 {
+                    continue;
+                }
+                let coin: CoinEntry = match serde_json::from_slice(&v) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                txouts += 1;
+                total_amount_sats = total_amount_sats.saturating_add(coin.value);
+                // Bogosize matches Core's `GetBogoSize` formula:
+                // 32 (txid) + 4 (vout) + 4 (height) + 8 (amount) + 2 (spk len) + spk.len()
+                bogosize += 32 + 4 + 4 + 8 + 2 + coin.script_pubkey.len() as u64;
+
+                // Decode vout (BE encoded by `outpoint_key`).
+                let vout = u32::from_be_bytes([k[32], k[33], k[34], k[35]]);
+                let txid_bytes: [u8; 32] = k[..32].try_into().unwrap_or([0u8; 32]);
+
+                if let Some(ref mut h) = hash_ser_state {
+                    // Build TxOutSer in a small reusable buffer.
+                    let mut buf = Vec::with_capacity(36 + 4 + 8 + 9 + coin.script_pubkey.len());
+                    buf.extend_from_slice(&txid_bytes);
+                    buf.extend_from_slice(&vout.to_le_bytes());
+                    let code = (coin.height as u32) << 1
+                        | if coin.is_coinbase { 1u32 } else { 0u32 };
+                    buf.extend_from_slice(&code.to_le_bytes());
+                    buf.extend_from_slice(&coin.value.to_le_bytes());
+                    write_compact_size(&mut buf, coin.script_pubkey.len() as u64)
+                        .map_err(|e| Self::rpc_error(
+                            rpc_error::RPC_INTERNAL_ERROR,
+                            format!("write_compact_size: {}", e),
+                        ))?;
+                    buf.extend_from_slice(&coin.script_pubkey);
+                    h.update(&buf);
+                }
+
+                if let Some(ref mut mh) = muhash_state {
+                    use rustoshi_storage::indexes::coinstatsindex::serialize_coin_for_muhash;
+                    let txid = Hash256(txid_bytes);
+                    let bytes = serialize_coin_for_muhash(
+                        &txid, vout, coin.height, coin.is_coinbase,
+                        coin.value, &coin.script_pubkey,
+                    );
+                    mh.insert(&bytes);
                 }
             }
-            mh.finalize().to_hex()
-        } else {
-            String::new()
-        };
+        }
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "height": height,
             "bestblock": best_hash.to_hex(),
             "txouts": txouts,
-            "bogosize": 0u64,
-            "hash_serialized_3": "",
-            "muhash": muhash_str,
-            "total_amount": 0.0f64,
+            "bogosize": bogosize,
+            "total_amount": total_amount_sats as f64 / 1e8,
             "disk_size": 0u64,
-        }))
+        });
+
+        if let Some(h) = hash_ser_state {
+            // Double-SHA256: feed the first SHA into a new SHA, take that.
+            let first = h.finalize();
+            let second = Sha256::digest(first);
+            // Core emits this as `GetHex()` → reverse-byte hex (uint256
+            // little-endian internal, displayed big-endian). Match that.
+            let mut display = second.to_vec();
+            display.reverse();
+            let hex_str = hex::encode(display);
+            result["hash_serialized_3"] = serde_json::Value::String(hex_str.clone());
+            // Back-compat alias for older clients / diff-test tolerance.
+            result["hash_serialized_2"] = serde_json::Value::String(hex_str);
+        }
+
+        if let Some(mut mh) = muhash_state {
+            let fin = mh.finalize();
+            result["muhash"] = serde_json::Value::String(fin.to_hex());
+        }
+
+        Ok(result)
     }
 
     async fn get_network_hash_ps(
