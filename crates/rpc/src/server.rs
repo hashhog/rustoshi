@@ -3327,55 +3327,116 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_peer_info(&self) -> RpcResult<Vec<PeerInfoRpc>> {
         let peer_state = self.peer_state.read().await;
 
+        // Read our own chain tip so we can publish it as `synced_blocks`
+        // for each peer (Core publishes the per-peer height-sync state,
+        // but at our layer the best granular thing we can offer is the
+        // tip we've connected — bumped per peer-source — and the peer's
+        // announced height as `synced_headers`).
+        let our_best_height = {
+            let s = self.state.read().await;
+            s.best_height as i32
+        };
+
+        use std::sync::atomic::Ordering;
+
         if let Some(ref pm) = peer_state.peer_manager {
             let peers: Vec<PeerInfoRpc> = pm
-                .connected_peers()
-                .iter()
-                .map(|(id, info)| PeerInfoRpc {
-                    id: id.0,
-                    addr: info.addr.to_string(),
-                    addrbind: None,
-                    addrlocal: None,
-                    network: "ipv4".to_string(),
-                    services: format!("{:016x}", info.services),
-                    servicesnames: decode_services(info.services),
-                    relaytxes: info.relay,
-                    lastsend: info.last_send.elapsed().as_secs(),
-                    lastrecv: info.last_recv.elapsed().as_secs(),
-                    bytessent: info.bytes_sent,
-                    bytesrecv: info.bytes_recv,
-                    conntime: 0, // would need connection start time
-                    timeoffset: info.time_offset,
-                    pingtime: info.ping_time.map(|d| d.as_secs_f64()),
-                    minping: info.ping_time.map(|d| d.as_secs_f64()),
-                    pingwait: None,
-                    version: info.version,
-                    subver: info.user_agent.clone(),
-                    inbound: info.inbound,
-                    bip152_hb_to: false,
-                    bip152_hb_from: false,
-                    startingheight: info.start_height,
-                    presynced_headers: -1,
-                    synced_headers: 0,
-                    synced_blocks: 0,
-                    inflight: vec![],
-                    addr_relay_enabled: true,
-                    addr_processed: 0,
-                    addr_rate_limited: 0,
-                    permissions: vec![],
-                    minfeefilter: 0.0,
-                    bytessent_per_msg: serde_json::Value::Object(serde_json::Map::new()),
-                    bytesrecv_per_msg: serde_json::Value::Object(serde_json::Map::new()),
-                    connection_type: if info.inbound {
-                        "inbound"
-                    } else {
-                        "outbound-full-relay"
+                .connected_peers_with_stats()
+                .into_iter()
+                .map(|snap| {
+                    let info = &snap.info;
+                    let stats = &snap.stats;
+                    let bytes_sent = stats.bytes_sent.load(Ordering::Relaxed);
+                    let bytes_recv = stats.bytes_recv.load(Ordering::Relaxed);
+                    let last_send_unix = stats.last_send_unix.load(Ordering::Relaxed);
+                    let last_recv_unix = stats.last_recv_unix.load(Ordering::Relaxed);
+                    let conn_time_unix = stats.conn_time_unix.load(Ordering::Relaxed);
+
+                    // Histograms → JSON object: { "ping": 240, "block": 1234567, ... }
+                    let bytessent_per_msg = histogram_to_json(stats.snapshot_sent_per_msg());
+                    let bytesrecv_per_msg = histogram_to_json(stats.snapshot_recv_per_msg());
+
+                    // Connection type: Core distinguishes inbound vs the
+                    // various outbound flavors. We surface the manager's
+                    // ConnectionType enum directly.
+                    let connection_type = match snap.conn_type {
+                        rustoshi_network::ConnectionType::Inbound => "inbound",
+                        rustoshi_network::ConnectionType::FullRelay => "outbound-full-relay",
+                        rustoshi_network::ConnectionType::BlockRelayOnly => "block-relay-only",
                     }
-                    .to_string(),
-                    transport_protocol_type: "v1".to_string(),
-                    session_id: String::new(),
-                    last_block: 0,
-                    last_transaction: 0,
+                    .to_string();
+
+                    // last_block / last_transaction are unix timestamps
+                    // of the most recent block / tx received from this
+                    // peer. We have *durations ago* (Instant-based);
+                    // convert to absolute unix using `now - dur`.
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let last_block = snap
+                        .last_block_time
+                        .map(|d| now_unix.saturating_sub(d.as_secs() as i64))
+                        .unwrap_or(0);
+                    let last_transaction = snap
+                        .last_tx_time
+                        .map(|d| now_unix.saturating_sub(d.as_secs() as i64))
+                        .unwrap_or(0);
+
+                    // Synced state.  We don't own a per-peer header-sync
+                    // FSM at the manager layer (that's in `HeaderSync`
+                    // in main.rs), so we approximate:
+                    //   synced_headers = peer.start_height (announced
+                    //                    best height at handshake; Core
+                    //                    does similarly until BIP-130
+                    //                    presync supersedes it)
+                    //   synced_blocks  = our best chain height
+                    //   presynced_headers = -1 (we don't run the BIP-130
+                    //                          presync state machine yet)
+                    let synced_headers = info.start_height;
+                    let synced_blocks = our_best_height;
+
+                    PeerInfoRpc {
+                        id: snap.peer_id.0,
+                        addr: info.addr.to_string(),
+                        addrbind: None,
+                        addrlocal: None,
+                        network: "ipv4".to_string(),
+                        services: format!("{:016x}", info.services),
+                        servicesnames: decode_services(info.services),
+                        relaytxes: info.relay,
+                        lastsend: last_send_unix as u64,
+                        lastrecv: last_recv_unix as u64,
+                        bytessent: bytes_sent,
+                        bytesrecv: bytes_recv,
+                        conntime: conn_time_unix as u64,
+                        timeoffset: info.time_offset,
+                        pingtime: info.ping_time.map(|d| d.as_secs_f64()),
+                        minping: snap.min_ping_time.map(|d| d.as_secs_f64()),
+                        pingwait: None,
+                        version: info.version,
+                        subver: info.user_agent.clone(),
+                        inbound: info.inbound,
+                        bip152_hb_to: false,
+                        bip152_hb_from: false,
+                        startingheight: info.start_height,
+                        presynced_headers: -1,
+                        synced_headers,
+                        synced_blocks,
+                        inflight: vec![],
+                        addr_relay_enabled: true,
+                        addr_processed: 0,
+                        addr_rate_limited: 0,
+                        permissions: vec![],
+                        minfeefilter: (info.feefilter as f64) / 1e8,
+                        bytessent_per_msg,
+                        bytesrecv_per_msg,
+                        connection_type,
+                        transport_protocol_type: "v1".to_string(),
+                        session_id: String::new(),
+                        last_block,
+                        last_transaction,
+                    }
                 })
                 .collect();
 
@@ -7352,6 +7413,22 @@ fn hash_less_than_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
 // ============================================================
 // HELPER FUNCTIONS
 // ============================================================
+
+/// Render a per-msg-type byte histogram as the
+/// `bytessent_per_msg` / `bytesrecv_per_msg` shape that Bitcoin Core
+/// emits in `getpeerinfo`. Core's actual format is
+/// `{ "ping": 240, "block": 1234567 }` (a flat map of bytes), so we
+/// match that.
+fn histogram_to_json(map: std::collections::HashMap<&'static str, u64>) -> serde_json::Value {
+    let mut out = serde_json::Map::with_capacity(map.len());
+    // Stable ordering for snapshot tests.
+    let mut entries: Vec<_> = map.into_iter().collect();
+    entries.sort_by_key(|(k, _)| *k);
+    for (k, v) in entries {
+        out.insert(k.to_string(), serde_json::Value::Number(v.into()));
+    }
+    serde_json::Value::Object(out)
+}
 
 /// Decode service flags to names.
 fn decode_services(services: u64) -> Vec<String> {

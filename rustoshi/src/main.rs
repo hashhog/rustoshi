@@ -2164,12 +2164,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             // Handle peer events (polled without holding any locks)
             event = event_rx.recv() => {
                 match event {
-                    Some(PeerEvent::Connected(peer_id, info)) => {
+                    Some(PeerEvent::Connected(peer_id, info, stats)) => {
                         // Register inbound peer handle in PeerManager
                         {
                             let mut ps = peer_state.write().await;
                             if let Some(ref mut pm) = ps.peer_manager {
-                                pm.handle_event(PeerEvent::Connected(peer_id, info.clone())).await;
+                                pm.handle_event(PeerEvent::Connected(
+                                    peer_id,
+                                    info.clone(),
+                                    std::sync::Arc::clone(&stats),
+                                )).await;
                             }
                         }
 
