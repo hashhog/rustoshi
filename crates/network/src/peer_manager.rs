@@ -726,6 +726,28 @@ impl StalePeerCheckResult {
     }
 }
 
+/// One peer's RPC-visible state, as returned by
+/// [`PeerManager::connected_peers_with_stats`].  Combines:
+///
+/// - the long-lived [`PeerInfo`] (addr, version, services, …),
+/// - the live `Arc<PeerStats>` from the spawned peer task (bytes /
+///   per-msg histograms / conn-time / last-send-recv),
+/// - and a few scalars that the manager owns but `PeerInfo` doesn't
+///   carry (connection type, min ping, last block / tx ages).
+///
+/// Designed to be cheap to assemble (one Arc clone per peer + cheap
+/// scalar copies) so that `getpeerinfo` on a 100-peer fleet does not
+/// hold the manager lock for long.
+pub struct PeerInfoSnapshot {
+    pub peer_id: PeerId,
+    pub info: PeerInfo,
+    pub stats: std::sync::Arc<crate::peer::PeerStats>,
+    pub conn_type: ConnectionType,
+    pub min_ping_time: Option<Duration>,
+    pub last_block_time: Option<Duration>,
+    pub last_tx_time: Option<Duration>,
+}
+
 /// Handle for a connected peer, held by the peer manager.
 struct PeerHandle {
     /// Peer metadata.
@@ -744,6 +766,11 @@ struct PeerHandle {
     last_tx_time: Option<Instant>,
     /// Stale peer detection state.
     stale_state: StalePeerState,
+    /// Live atomic counters for `getpeerinfo` accounting fields.
+    /// Populated when the spawned peer task fires `PeerEvent::Connected`.
+    /// Pre-handshake / Connecting handles get a fresh empty `PeerStats`
+    /// so the RPC path always sees a well-formed value.
+    stats: std::sync::Arc<crate::peer::PeerStats>,
 }
 
 /// The peer manager coordinates all peer connections.
@@ -1206,6 +1233,8 @@ impl PeerManager {
                 last_block_time: None,
                 last_tx_time: None,
                 stale_state: StalePeerState::new(),
+                // Placeholder; replaced when PeerEvent::Connected fires.
+                stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
             },
         );
     }
@@ -1423,7 +1452,7 @@ impl PeerManager {
     /// Returns the event for external processing if needed.
     pub async fn handle_event(&mut self, event: PeerEvent) -> Option<PeerEvent> {
         match &event {
-            PeerEvent::Connected(id, info) => {
+            PeerEvent::Connected(id, info, stats) => {
                 tracing::info!(
                     "Peer {} connected: {} ({})",
                     id.0,
@@ -1448,6 +1477,7 @@ impl PeerManager {
                                     last_block_time: None,
                                     last_tx_time: None,
                                     stale_state: StalePeerState::new(),
+                                    stats: std::sync::Arc::clone(stats),
                                 },
                             );
                             self.addr_manager.mark_inbound_success(&info.addr);
@@ -1466,6 +1496,10 @@ impl PeerManager {
                 if let Some(peer) = self.peers.get_mut(id) {
                     peer.info = info.clone();
                     peer.connected_time = Instant::now();
+                    // Replace placeholder stats Arc with the live one
+                    // produced by the spawned peer task. From here on
+                    // every write/read updates these counters.
+                    peer.stats = std::sync::Arc::clone(stats);
                 }
 
                 // BIP133: Send initial feefilter after handshake
@@ -1992,6 +2026,31 @@ impl PeerManager {
             .collect()
     }
 
+    /// Snapshot of every established peer's stats handle, plus a few
+    /// peer_manager-side scalars that aren't covered by [`PeerStats`]
+    /// itself (connection type, min ping, last block/tx times).
+    /// Used by the RPC `getpeerinfo` handler to populate the wire
+    /// fields with live atomically-updated values rather than the
+    /// hard-coded zeros that shipped before W11.
+    pub fn connected_peers_with_stats(&self) -> Vec<PeerInfoSnapshot> {
+        let now = Instant::now();
+        self.peers
+            .iter()
+            .filter(|(_, h)| h.info.state == PeerState::Established)
+            .map(|(id, h)| PeerInfoSnapshot {
+                peer_id: *id,
+                info: h.info.clone(),
+                stats: std::sync::Arc::clone(&h.stats),
+                conn_type: h.conn_type,
+                min_ping_time: h.min_ping_time,
+                last_block_time: h
+                    .last_block_time
+                    .map(|t| now.saturating_duration_since(t)),
+                last_tx_time: h.last_tx_time.map(|t| now.saturating_duration_since(t)),
+            })
+            .collect()
+    }
+
     /// Get list of all peers (including connecting).
     pub fn all_peers(&self) -> Vec<(PeerId, &PeerInfo)> {
         self.peers.iter().map(|(id, h)| (*id, &h.info)).collect()
@@ -2080,6 +2139,7 @@ impl PeerManager {
                 last_block_time: None,
                 last_tx_time: None,
                 stale_state: StalePeerState::new(),
+                stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
             },
         );
         cmd_rx
@@ -2137,6 +2197,7 @@ impl PeerManager {
                 last_block_time: None,
                 last_tx_time: None,
                 stale_state: StalePeerState::new(),
+                stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
             },
         );
         cmd_rx
@@ -2635,19 +2696,34 @@ pub async fn run_inbound_peer(
         feefilter: 0,
     };
 
+    // Per-peer atomic counters; populated for the entire post-handshake
+    // session.  Pre-handshake bytes are not retroactively credited but
+    // that's negligible (tens of bytes vs MB-scale block traffic).
+    let stats = std::sync::Arc::new(crate::peer::PeerStats::new());
+    stats.mark_connected();
+
     let _ = event_tx
-        .send(PeerEvent::Connected(peer_id, peer_info))
+        .send(PeerEvent::Connected(
+            peer_id,
+            peer_info,
+            std::sync::Arc::clone(&stats),
+        ))
         .await;
 
     // BIP 130: sendheaders - request headers announcements instead of inv
     if their_version.version >= SENDHEADERS_VERSION {
         let msg = serialize_message(&magic, &NetworkMessage::SendHeaders);
-        let _ = writer.write_all(&msg).await;
+        if writer.write_all(&msg).await.is_ok() {
+            stats.record_send("sendheaders", msg.len() as u64);
+        }
     }
     let _ = writer.flush().await;
 
     // Full message loop — same as outbound peers
-    crate::peer::run_message_loop(peer_id, &magic, reader, writer, event_tx, command_rx).await;
+    crate::peer::run_message_loop_tracked(
+        peer_id, &magic, reader, writer, event_tx, command_rx, stats,
+    )
+    .await;
 }
 
 /// Drive a BIP-324 v2 inbound handshake to cipher-handshake-complete.
@@ -3007,8 +3083,15 @@ async fn run_inbound_v2_peer(
         feefilter: 0,
     };
 
+    let stats = std::sync::Arc::new(crate::peer::PeerStats::new());
+    stats.mark_connected();
+
     let _ = event_tx
-        .send(PeerEvent::Connected(peer_id, peer_info))
+        .send(PeerEvent::Connected(
+            peer_id,
+            peer_info,
+            std::sync::Arc::clone(&stats),
+        ))
         .await;
 
     tracing::info!(
@@ -3021,7 +3104,7 @@ async fn run_inbound_v2_peer(
     );
 
     // ----- Main v2 message loop over the cipher. -----
-    crate::peer::run_message_loop_v2(
+    crate::peer::run_message_loop_v2_tracked(
         peer_id,
         &magic,
         cipher,
@@ -3029,6 +3112,7 @@ async fn run_inbound_v2_peer(
         writer,
         event_tx,
         _command_rx,
+        stats,
     )
     .await;
 }
