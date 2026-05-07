@@ -23,14 +23,217 @@ use crate::v2_transport::{
     Bip324Cipher, EllSwiftPubKey,
 };
 use rustoshi_crypto::sha256d;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration, Instant};
+
+/// Live, atomic per-peer accounting counters.
+///
+/// Mirrors the subset of `bitcoin-core/src/net.h::CNode` that appears in
+/// `getpeerinfo`'s response: send/recv byte totals, per-message-type
+/// histograms, last-send/last-recv UNIX timestamps, and the connection
+/// timestamp (CNode::nTimeConnected).
+///
+/// Held inside an `Arc` so the spawned peer task (which actually performs
+/// the read/write) and the `PeerManager` (which exposes RPC) can update
+/// and read the same counters without any cross-task locking on the hot
+/// path. Per-message-type maps are guarded by a `Mutex` because
+/// histograms are too cardinality-heavy to keep as fixed atomics; the
+/// lock is only taken once per message and is uncontended in practice
+/// (one writer, one reader).
+///
+/// Wave 11 (2026-05-07): introduced to fix `getpeerinfo` returning
+/// hard-coded zeros for `bytessent`, `bytesrecv`, `conntime`,
+/// `bytessent_per_msg`, `bytesrecv_per_msg`. Pre-fix, the fields on
+/// `PeerInfo` existed but were never updated after construction.
+pub struct PeerStats {
+    /// Total bytes sent on this connection (header + payload, every
+    /// frame). v2: ciphertext bytes (the value the peer's TCP stack
+    /// sees). Matches Core's `nSendBytes` semantics.
+    pub bytes_sent: AtomicU64,
+    /// Total bytes received on this connection.
+    pub bytes_recv: AtomicU64,
+    /// UNIX timestamp (seconds) of the last successful send. 0 = never.
+    pub last_send_unix: AtomicI64,
+    /// UNIX timestamp (seconds) of the last successful recv. 0 = never.
+    pub last_recv_unix: AtomicI64,
+    /// UNIX timestamp (seconds) when the TCP connection completed
+    /// (handshake done). 0 = pre-handshake. Matches Core's
+    /// `nTimeConnected`.
+    pub conn_time_unix: AtomicI64,
+    /// Per-message-type byte totals for outbound traffic. Keys are the
+    /// canonical command strings from `NetworkMessage::command()`.
+    pub bytes_sent_per_msg: Mutex<HashMap<&'static str, u64>>,
+    /// Per-message-type byte totals for inbound traffic.
+    pub bytes_recv_per_msg: Mutex<HashMap<&'static str, u64>>,
+}
+
+impl PeerStats {
+    /// Construct a fresh zeroed stats block. The `conn_time_unix` is
+    /// zero until [`Self::mark_connected`] fires.
+    pub fn new() -> Self {
+        Self {
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            last_send_unix: AtomicI64::new(0),
+            last_recv_unix: AtomicI64::new(0),
+            conn_time_unix: AtomicI64::new(0),
+            bytes_sent_per_msg: Mutex::new(HashMap::new()),
+            bytes_recv_per_msg: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Stamp the connection-established time. Called once per peer task
+    /// after handshake completes (mirrors Core's `nTimeConnected = now`
+    /// in `CConnman::AcceptConnection`/`OpenNetworkConnection`).
+    pub fn mark_connected(&self) {
+        let now = current_unix_secs();
+        // Only set once; ignore if already non-zero (defensive against a
+        // task accidentally re-stamping post-reconnect).
+        let _ = self.conn_time_unix.compare_exchange(
+            0,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Record an outbound write of `nbytes` (full framed bytes, header +
+    /// payload for v1; ciphertext bytes for v2). `cmd` is the canonical
+    /// command string (e.g. "version", "ping") or `"<raw>"` for the
+    /// pre-handshake serialized handshake bytes that don't have a
+    /// `NetworkMessage` value handy.
+    pub fn record_send(&self, cmd: &'static str, nbytes: u64) {
+        self.bytes_sent.fetch_add(nbytes, Ordering::Relaxed);
+        self.last_send_unix
+            .store(current_unix_secs(), Ordering::Relaxed);
+        if let Ok(mut map) = self.bytes_sent_per_msg.lock() {
+            *map.entry(cmd).or_insert(0) += nbytes;
+        }
+    }
+
+    /// Record an inbound read of `nbytes`. `cmd` is the canonical
+    /// command string parsed from the message header (or `"<raw>"`
+    /// during pre-handshake or for malformed frames where parsing
+    /// failed but bytes still hit the socket).
+    pub fn record_recv(&self, cmd: &'static str, nbytes: u64) {
+        self.bytes_recv.fetch_add(nbytes, Ordering::Relaxed);
+        self.last_recv_unix
+            .store(current_unix_secs(), Ordering::Relaxed);
+        if let Ok(mut map) = self.bytes_recv_per_msg.lock() {
+            *map.entry(cmd).or_insert(0) += nbytes;
+        }
+    }
+
+    /// Snapshot of the per-msg-type send histogram. Cheap (one lock +
+    /// clone of a small map). Only invoked from the RPC path.
+    pub fn snapshot_sent_per_msg(&self) -> HashMap<&'static str, u64> {
+        self.bytes_sent_per_msg
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of the per-msg-type recv histogram.
+    pub fn snapshot_recv_per_msg(&self) -> HashMap<&'static str, u64> {
+        self.bytes_recv_per_msg
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Default for PeerStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for PeerStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerStats")
+            .field("bytes_sent", &self.bytes_sent.load(Ordering::Relaxed))
+            .field("bytes_recv", &self.bytes_recv.load(Ordering::Relaxed))
+            .field(
+                "last_send_unix",
+                &self.last_send_unix.load(Ordering::Relaxed),
+            )
+            .field(
+                "last_recv_unix",
+                &self.last_recv_unix.load(Ordering::Relaxed),
+            )
+            .field(
+                "conn_time_unix",
+                &self.conn_time_unix.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+/// Map a [`NetworkMessage`] command string to a `&'static str`. Most
+/// commands are spelled out as constants in the match arm so the
+/// returned string is genuinely `'static`. Unknown commands collapse to
+/// `"<other>"` to keep the histogram cardinality bounded (otherwise a
+/// hostile peer could inflate the map).
+pub fn command_static_str(cmd: &str) -> &'static str {
+    match cmd {
+        "version" => "version",
+        "verack" => "verack",
+        "ping" => "ping",
+        "pong" => "pong",
+        "getheaders" => "getheaders",
+        "headers" => "headers",
+        "getblocks" => "getblocks",
+        "inv" => "inv",
+        "getdata" => "getdata",
+        "block" => "block",
+        "tx" => "tx",
+        "addr" => "addr",
+        "addrv2" => "addrv2",
+        "getaddr" => "getaddr",
+        "notfound" => "notfound",
+        "reject" => "reject",
+        "feefilter" => "feefilter",
+        "sendheaders" => "sendheaders",
+        "sendcmpct" => "sendcmpct",
+        "cmpctblock" => "cmpctblock",
+        "getblocktxn" => "getblocktxn",
+        "blocktxn" => "blocktxn",
+        "mempool" => "mempool",
+        "wtxidrelay" => "wtxidrelay",
+        "sendaddrv2" => "sendaddrv2",
+        "sendtxrcncl" => "sendtxrcncl",
+        "reqrecon" => "reqrecon",
+        "sketch" => "sketch",
+        "reconcildiff" => "reconcildiff",
+        "filterload" => "filterload",
+        "filteradd" => "filteradd",
+        "filterclear" => "filterclear",
+        "merkleblock" => "merkleblock",
+        "getcfilters" => "getcfilters",
+        "cfilter" => "cfilter",
+        "getcfheaders" => "getcfheaders",
+        "cfheaders" => "cfheaders",
+        "getcfcheckpt" => "getcfcheckpt",
+        "cfcheckpt" => "cfcheckpt",
+        "" => "<empty>",
+        _ => "<other>",
+    }
+}
+
+/// UNIX seconds, monotonically clamped to >= 0.
+fn current_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Timeout for establishing TCP connection.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -120,7 +323,12 @@ pub struct PeerId(pub u64);
 #[derive(Debug)]
 pub enum PeerEvent {
     /// Peer connection established (handshake complete).
-    Connected(PeerId, PeerInfo),
+    ///
+    /// The third field carries the live atomic-counter handle for this
+    /// peer task. Both the spawned task and the manager keep a clone of
+    /// the `Arc`; the task increments on every send/recv and the
+    /// manager reads it on every `getpeerinfo` RPC. See [`PeerStats`].
+    Connected(PeerId, PeerInfo, Arc<PeerStats>),
     /// Message received from peer.
     Message(PeerId, NetworkMessage),
     /// Peer disconnected.
@@ -427,6 +635,12 @@ pub async fn run_outbound_peer(
     event_tx: mpsc::Sender<PeerEvent>,
     command_rx: mpsc::Receiver<PeerCommand>,
 ) {
+    // Per-peer atomic counters. Created here so v2 and v1 paths share
+    // the same `Arc`; if v2 falls back to v1 the counters keep
+    // accumulating across the failed v2 probe (which is desirable: any
+    // bytes the v2 prefix wrote to the network really did leave us).
+    let stats = Arc::new(PeerStats::new());
+
     // BIP-324 v2 outbound probe path.  When enabled and the address is
     // not in the v1-only LRU cache, attempt the v2 cipher handshake on a
     // dedicated socket first.  On any failure, mark v1-only, drop the
@@ -450,6 +664,7 @@ pub async fn run_outbound_peer(
                     writer,
                     event_tx,
                     command_rx,
+                    stats,
                 )
                 .await;
                 return;
@@ -506,6 +721,7 @@ pub async fn run_outbound_peer(
             .await;
         return;
     }
+    stats.record_send("version", data.len() as u64);
     if writer.flush().await.is_err() {
         let _ = event_tx
             .send(PeerEvent::Disconnected(
@@ -520,7 +736,7 @@ pub async fn run_outbound_peer(
     let our_nonce = our_version.nonce;
     let handshake_result = timeout(
         HANDSHAKE_TIMEOUT,
-        perform_handshake(&mut reader, &mut writer, &magic, our_nonce),
+        perform_handshake_tracked(&mut reader, &mut writer, &magic, our_nonce, &stats),
     )
     .await;
 
@@ -579,8 +795,12 @@ pub async fn run_outbound_peer(
         feefilter: 0,
     };
 
+    // Stamp connection-established time before publishing the event so
+    // the manager sees a non-zero `conntime` immediately.
+    stats.mark_connected();
+
     let _ = event_tx
-        .send(PeerEvent::Connected(peer_id, peer_info))
+        .send(PeerEvent::Connected(peer_id, peer_info, Arc::clone(&stats)))
         .await;
 
     // 5. Send post-handshake feature negotiation messages
@@ -589,7 +809,9 @@ pub async fn run_outbound_peer(
     // BIP 130: sendheaders - request headers announcements instead of inv
     if their_version.version >= SENDHEADERS_VERSION {
         let msg = serialize_message(&magic, &NetworkMessage::SendHeaders);
-        let _ = writer.write_all(&msg).await;
+        if writer.write_all(&msg).await.is_ok() {
+            stats.record_send("sendheaders", msg.len() as u64);
+        }
     }
     // BIP 152: sendcmpct - signal compact block relay support (version 2 = segwit)
     // announce=false means low-bandwidth mode (we receive inv/headers first)
@@ -601,12 +823,14 @@ pub async fn run_outbound_peer(
                 version: 2,
             }),
         );
-        let _ = writer.write_all(&msg).await;
+        if writer.write_all(&msg).await.is_ok() {
+            stats.record_send("sendcmpct", msg.len() as u64);
+        }
     }
     let _ = writer.flush().await;
 
     // 6. Main message loop
-    run_message_loop(peer_id, &magic, reader, writer, event_tx, command_rx).await;
+    run_message_loop_tracked(peer_id, &magic, reader, writer, event_tx, command_rx, stats).await;
 }
 
 /// Errors specific to the outbound BIP-324 v2 cipher handshake.
@@ -1206,6 +1430,7 @@ async fn run_outbound_v2_peer(
     mut writer: BufWriter<OwnedWriteHalf>,
     event_tx: mpsc::Sender<PeerEvent>,
     command_rx: mpsc::Receiver<PeerCommand>,
+    stats: Arc<PeerStats>,
 ) {
     // 1. Application-layer version/verack over the cipher.
     let hs_result = match timeout(
@@ -1266,8 +1491,10 @@ async fn run_outbound_v2_peer(
         feefilter: 0,
     };
 
+    stats.mark_connected();
+
     let _ = event_tx
-        .send(PeerEvent::Connected(peer_id, peer_info))
+        .send(PeerEvent::Connected(peer_id, peer_info, Arc::clone(&stats)))
         .await;
 
     tracing::info!(
@@ -1282,25 +1509,119 @@ async fn run_outbound_v2_peer(
 
     // 2. Post-handshake feature negotiation.
     if their_version.version >= SENDHEADERS_VERSION {
-        let _ = v2_send_message(&mut cipher, &mut writer, &NetworkMessage::SendHeaders).await;
+        let _ = v2_send_message_tracked(
+            &mut cipher,
+            &mut writer,
+            &NetworkMessage::SendHeaders,
+            &stats,
+        )
+        .await;
     }
     if their_version.version >= SENDCMPCT_VERSION {
-        let _ = v2_send_message(
+        let _ = v2_send_message_tracked(
             &mut cipher,
             &mut writer,
             &NetworkMessage::SendCmpct(SendCmpctMessage {
                 announce: false,
                 version: 2,
             }),
+            &stats,
         )
         .await;
     }
 
     // 3. Main message loop over the cipher.
-    run_message_loop_v2(
-        peer_id, &magic, cipher, reader, writer, event_tx, command_rx,
+    run_message_loop_v2_tracked(
+        peer_id, &magic, cipher, reader, writer, event_tx, command_rx, stats,
     )
     .await;
+}
+
+/// Like [`v2_send_message`] but updates `stats` with the encoded
+/// ciphertext length on success.
+pub(crate) async fn v2_send_message_tracked<W: tokio::io::AsyncWrite + Unpin>(
+    cipher: &mut Bip324Cipher,
+    writer: &mut W,
+    msg: &NetworkMessage,
+    stats: &Arc<PeerStats>,
+) -> std::io::Result<()> {
+    let payload = msg.serialize_payload();
+    let contents = encode_message_type_and_payload(msg.command(), &payload);
+    let frame_len = contents.len() + EXPANSION;
+    let mut frame = vec![0u8; frame_len];
+    cipher
+        .encrypt(&contents, &[], false, &mut frame)
+        .map_err(|e| std::io::Error::other(format!("v2 encrypt: {}", e)))?;
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+    stats.record_send(command_static_str(msg.command()), frame_len as u64);
+    Ok(())
+}
+
+/// Like [`v2_recv_message`] but updates `stats` with the ciphertext
+/// length consumed (length cipher + AEAD packet) before returning the
+/// decrypted message.
+pub(crate) async fn v2_recv_message_tracked<R: tokio::io::AsyncRead + Unpin>(
+    cipher: &mut Bip324Cipher,
+    reader: &mut R,
+    stats: &Arc<PeerStats>,
+) -> std::io::Result<NetworkMessage> {
+    loop {
+        // Step 1: 3-byte length cipher → plain length.
+        let mut enc_len = [0u8; LENGTH_LEN];
+        reader.read_exact(&mut enc_len).await?;
+        let plain_len = cipher.decrypt_length(&enc_len).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("v2 length decrypt: {}", e),
+            )
+        })? as usize;
+
+        if plain_len > MAX_MESSAGE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("v2 packet too large: {}", plain_len),
+            ));
+        }
+
+        // Step 2: AEAD ciphertext (header + contents + tag).
+        let aead_len = HEADER_LEN + plain_len + TAG_LEN;
+        let mut aead_buf = vec![0u8; aead_len];
+        reader.read_exact(&mut aead_buf).await?;
+
+        // Account: total ciphertext bytes = LENGTH_LEN + aead_len (matches
+        // what hits the TCP recv buffer for this packet).
+        let bytes_total = (LENGTH_LEN + aead_len) as u64;
+
+        let mut contents = vec![0u8; plain_len];
+        let ignore = cipher
+            .decrypt(&aead_buf, &[], &mut contents)
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("v2 AEAD decrypt: {}", e),
+                )
+            })?;
+
+        if ignore {
+            // Decoy: still account the bytes (peer did make us read
+            // them), but use a synthetic histogram bucket.
+            stats.record_recv("<decoy>", bytes_total);
+            continue;
+        }
+
+        // Step 3: decode v2 envelope (short id / 12-byte command + payload).
+        let (command, payload) =
+            decode_message_type_and_payload(&contents).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("v2 envelope: {}", e),
+                )
+            })?;
+
+        stats.record_recv(command_static_str(&command), bytes_total);
+        return NetworkMessage::deserialize(&command, &payload);
+    }
 }
 
 /// Result of handshake validation.
@@ -1377,14 +1698,29 @@ pub struct HandshakeResult {
 /// 3. Send/receive VERACK
 ///
 /// Returns HandshakeResult containing the peer's version and BIP negotiation flags.
+#[allow(dead_code)]
 async fn perform_handshake(
     reader: &mut BufReader<OwnedReadHalf>,
     writer: &mut BufWriter<OwnedWriteHalf>,
     magic: &[u8; 4],
     our_nonce: u64,
 ) -> Result<HandshakeResult, HandshakeError> {
+    perform_handshake_tracked(reader, writer, magic, our_nonce, &Arc::new(PeerStats::new())).await
+}
+
+/// Like [`perform_handshake`] but updates `stats` for every byte read or
+/// written during the handshake. Used by [`run_outbound_peer`] to keep
+/// `getpeerinfo`'s `bytessent`/`bytesrecv` accurate from the very first
+/// version frame, not just the post-handshake message loop.
+async fn perform_handshake_tracked(
+    reader: &mut BufReader<OwnedReadHalf>,
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    magic: &[u8; 4],
+    our_nonce: u64,
+    stats: &Arc<PeerStats>,
+) -> Result<HandshakeResult, HandshakeError> {
     // Read their version message
-    let their_version_msg = read_message_simple(reader, magic).await?;
+    let their_version_msg = read_message_simple_tracked(reader, magic, stats).await?;
     let their_version = match their_version_msg {
         NetworkMessage::Version(v) => v,
         other => {
@@ -1407,15 +1743,18 @@ async fn perform_handshake(
     if their_version.version >= WTXID_RELAY_VERSION {
         let wtxid_msg = serialize_message(magic, &NetworkMessage::WtxidRelay);
         writer.write_all(&wtxid_msg).await?;
+        stats.record_send("wtxidrelay", wtxid_msg.len() as u64);
     }
     // BIP 155: sendaddrv2 - signal support for addrv2 messages
     // Send to all peers (protocol version >= 70016 is a courtesy, not a requirement)
     let addrv2_msg = serialize_message(magic, &NetworkMessage::SendAddrV2);
     writer.write_all(&addrv2_msg).await?;
+    stats.record_send("sendaddrv2", addrv2_msg.len() as u64);
 
     // Send verack
     let verack_data = serialize_message(magic, &NetworkMessage::Verack);
     writer.write_all(&verack_data).await?;
+    stats.record_send("verack", verack_data.len() as u64);
     writer.flush().await?;
 
     // Track whether we've received version (to detect duplicates)
@@ -1430,7 +1769,7 @@ async fn perform_handshake(
     // - verack (completes handshake)
     // - wtxidrelay, sendaddrv2, sendtxrcncl (BIP negotiation, must be before verack)
     loop {
-        let msg = read_message_simple(reader, magic).await?;
+        let msg = read_message_simple_tracked(reader, magic, stats).await?;
         match msg {
             NetworkMessage::Verack => break,
             NetworkMessage::Version(_) => {
@@ -1465,9 +1804,20 @@ async fn perform_handshake(
 }
 
 /// Simple message reading for handshake phase (no select! cancellation concerns).
+#[allow(dead_code)]
 async fn read_message_simple(
     reader: &mut BufReader<OwnedReadHalf>,
     expected_magic: &[u8; 4],
+) -> std::io::Result<NetworkMessage> {
+    let dummy = Arc::new(PeerStats::new());
+    read_message_simple_tracked(reader, expected_magic, &dummy).await
+}
+
+/// Like [`read_message_simple`] but updates `stats` for every byte read.
+async fn read_message_simple_tracked(
+    reader: &mut BufReader<OwnedReadHalf>,
+    expected_magic: &[u8; 4],
+    stats: &Arc<PeerStats>,
 ) -> std::io::Result<NetworkMessage> {
     // Read 24-byte header
     let mut header_buf = [0u8; MESSAGE_HEADER_SIZE];
@@ -1496,6 +1846,10 @@ async fn read_message_simple(
         reader.read_exact(&mut payload).await?;
     }
 
+    // Account: header + payload bytes (one frame).
+    let cmd_static = command_static_str(&command);
+    stats.record_recv(cmd_static, (MESSAGE_HEADER_SIZE + payload.len()) as u64);
+
     // Validate checksum
     let computed_checksum = sha256d(&payload);
     if checksum != computed_checksum.0[..4] {
@@ -1516,10 +1870,27 @@ async fn read_message_simple(
 pub async fn run_message_loop(
     peer_id: PeerId,
     magic: &[u8; 4],
+    reader: BufReader<OwnedReadHalf>,
+    writer: BufWriter<OwnedWriteHalf>,
+    event_tx: mpsc::Sender<PeerEvent>,
+    command_rx: mpsc::Receiver<PeerCommand>,
+) {
+    let stats = Arc::new(PeerStats::new());
+    run_message_loop_tracked(peer_id, magic, reader, writer, event_tx, command_rx, stats).await;
+}
+
+/// Same as [`run_message_loop`] but updates `stats` on every send/recv.
+/// Used by the production peer-task callers; the un-tracked
+/// [`run_message_loop`] wrapper is preserved for tests that don't care
+/// about per-peer counters.
+pub async fn run_message_loop_tracked(
+    peer_id: PeerId,
+    magic: &[u8; 4],
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: BufWriter<OwnedWriteHalf>,
     event_tx: mpsc::Sender<PeerEvent>,
     mut command_rx: mpsc::Receiver<PeerCommand>,
+    stats: Arc<PeerStats>,
 ) {
     let mut last_ping = Instant::now();
     let mut ping_nonce_pending: Option<(u64, Instant)> = None;
@@ -1557,6 +1928,7 @@ pub async fn run_message_loop(
                             )).await;
                             return;
                         }
+                        stats.record_send(command_static_str(msg.command()), data.len() as u64);
                     }
                     Some(PeerCommand::Disconnect) | None => {
                         let _ = event_tx.send(PeerEvent::Disconnected(
@@ -1630,7 +2002,13 @@ pub async fn run_message_loop(
                                             return;
                                         }
 
-                                        match handle_message(peer_id, &command, &[], &mut writer, magic, &mut ping_nonce_pending, &event_tx).await {
+                                        // Account: header bytes only (no payload).
+                                        stats.record_recv(
+                                            command_static_str(&command),
+                                            MESSAGE_HEADER_SIZE as u64,
+                                        );
+
+                                        match handle_message_tracked(peer_id, &command, &[], &mut writer, magic, &mut ping_nonce_pending, &event_tx, &stats).await {
                                             Ok(()) => {}
                                             Err(e) => {
                                                 let _ = event_tx.send(PeerEvent::Misbehaving(
@@ -1671,7 +2049,13 @@ pub async fn run_message_loop(
                                         return;
                                     }
 
-                                    match handle_message(peer_id, &command, payload, &mut writer, magic, &mut ping_nonce_pending, &event_tx).await {
+                                    // Account: header + payload bytes for this frame.
+                                    stats.record_recv(
+                                        command_static_str(&command),
+                                        (MESSAGE_HEADER_SIZE + payload.len()) as u64,
+                                    );
+
+                                    match handle_message_tracked(peer_id, &command, payload, &mut writer, magic, &mut ping_nonce_pending, &event_tx, &stats).await {
                                         Ok(()) => {}
                                         Err(e) => {
                                             let _ = event_tx.send(PeerEvent::Misbehaving(
@@ -1725,6 +2109,7 @@ pub async fn run_message_loop(
                         )).await;
                         return;
                     }
+                    stats.record_send("ping", ping.len() as u64);
                     ping_nonce_pending = Some((nonce, Instant::now()));
                     last_ping = Instant::now();
                 }
@@ -1761,11 +2146,30 @@ pub async fn run_message_loop(
 pub async fn run_message_loop_v2(
     peer_id: PeerId,
     magic: &[u8; 4],
+    cipher: Bip324Cipher,
+    reader: BufReader<OwnedReadHalf>,
+    writer: BufWriter<OwnedWriteHalf>,
+    event_tx: mpsc::Sender<PeerEvent>,
+    command_rx: mpsc::Receiver<PeerCommand>,
+) {
+    let stats = Arc::new(PeerStats::new());
+    run_message_loop_v2_tracked(
+        peer_id, magic, cipher, reader, writer, event_tx, command_rx, stats,
+    )
+    .await;
+}
+
+/// Same as [`run_message_loop_v2`] but updates `stats` on every send/recv.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_message_loop_v2_tracked(
+    peer_id: PeerId,
+    magic: &[u8; 4],
     mut cipher: Bip324Cipher,
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: BufWriter<OwnedWriteHalf>,
     event_tx: mpsc::Sender<PeerEvent>,
     mut command_rx: mpsc::Receiver<PeerCommand>,
+    stats: Arc<PeerStats>,
 ) {
     let _ = magic; // kept for parity with v1 signature; v2 doesn't use network magic post-handshake
     let mut last_ping = Instant::now();
@@ -1779,7 +2183,7 @@ pub async fn run_message_loop_v2(
             cmd = command_rx.recv() => {
                 match cmd {
                     Some(PeerCommand::SendMessage(msg)) => {
-                        if let Err(e) = v2_send_message(&mut cipher, &mut writer, &msg).await {
+                        if let Err(e) = v2_send_message_tracked(&mut cipher, &mut writer, &msg, &stats).await {
                             let _ = event_tx.send(PeerEvent::Disconnected(
                                 peer_id,
                                 DisconnectReason::IoError(format!("v2 send: {}", e)),
@@ -1798,12 +2202,12 @@ pub async fn run_message_loop_v2(
             }
 
             // Read next encrypted packet → NetworkMessage.
-            recv = v2_recv_message(&mut cipher, &mut reader) => {
+            recv = v2_recv_message_tracked(&mut cipher, &mut reader, &stats) => {
                 match recv {
                     Ok(msg) => {
-                        if let Err(e) = handle_message_v2(
+                        if let Err(e) = handle_message_v2_tracked(
                             peer_id, &msg, &mut cipher, &mut writer,
-                            &mut ping_nonce_pending, &event_tx,
+                            &mut ping_nonce_pending, &event_tx, &stats,
                         ).await {
                             let _ = event_tx.send(PeerEvent::Misbehaving(
                                 peer_id,
@@ -1846,8 +2250,8 @@ pub async fn run_message_loop_v2(
                     }
                 } else {
                     let nonce: u64 = rand::random();
-                    if let Err(e) = v2_send_message(
-                        &mut cipher, &mut writer, &NetworkMessage::Ping(nonce),
+                    if let Err(e) = v2_send_message_tracked(
+                        &mut cipher, &mut writer, &NetworkMessage::Ping(nonce), &stats,
                     ).await {
                         let _ = event_tx.send(PeerEvent::Disconnected(
                             peer_id,
@@ -1867,6 +2271,7 @@ pub async fn run_message_loop_v2(
 /// and forward to the main event loop.  Unlike the v1 path the inbound
 /// message is already deserialized (`v2_recv_message` does that), so we
 /// match on the variant directly.
+#[allow(dead_code)]
 async fn handle_message_v2(
     peer_id: PeerId,
     msg: &NetworkMessage,
@@ -1875,9 +2280,34 @@ async fn handle_message_v2(
     ping_nonce_pending: &mut Option<(u64, Instant)>,
     event_tx: &mpsc::Sender<PeerEvent>,
 ) -> std::io::Result<()> {
+    let dummy = Arc::new(PeerStats::new());
+    handle_message_v2_tracked(
+        peer_id,
+        msg,
+        cipher,
+        writer,
+        ping_nonce_pending,
+        event_tx,
+        &dummy,
+    )
+    .await
+}
+
+/// Like [`handle_message_v2`] but updates `stats` for any pong written
+/// in response to an inbound ping.
+#[allow(clippy::too_many_arguments)]
+async fn handle_message_v2_tracked(
+    peer_id: PeerId,
+    msg: &NetworkMessage,
+    cipher: &mut Bip324Cipher,
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    ping_nonce_pending: &mut Option<(u64, Instant)>,
+    event_tx: &mpsc::Sender<PeerEvent>,
+    stats: &Arc<PeerStats>,
+) -> std::io::Result<()> {
     match msg {
         NetworkMessage::Ping(nonce) => {
-            v2_send_message(cipher, writer, &NetworkMessage::Pong(*nonce)).await?;
+            v2_send_message_tracked(cipher, writer, &NetworkMessage::Pong(*nonce), stats).await?;
         }
         NetworkMessage::Pong(nonce) => {
             if let Some((pending_nonce, sent_at)) = ping_nonce_pending {
@@ -1901,6 +2331,7 @@ async fn handle_message_v2(
 }
 
 /// Handle a received message, sending pong for ping and tracking pong RTT.
+#[allow(dead_code)]
 async fn handle_message(
     peer_id: PeerId,
     command: &str,
@@ -1910,6 +2341,33 @@ async fn handle_message(
     ping_nonce_pending: &mut Option<(u64, Instant)>,
     event_tx: &mpsc::Sender<PeerEvent>,
 ) -> std::io::Result<()> {
+    let dummy = Arc::new(PeerStats::new());
+    handle_message_tracked(
+        peer_id,
+        command,
+        payload,
+        writer,
+        magic,
+        ping_nonce_pending,
+        event_tx,
+        &dummy,
+    )
+    .await
+}
+
+/// Like [`handle_message`] but updates `stats` for any pong written in
+/// response to a ping.
+#[allow(clippy::too_many_arguments)]
+async fn handle_message_tracked(
+    peer_id: PeerId,
+    command: &str,
+    payload: &[u8],
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    magic: &[u8; 4],
+    ping_nonce_pending: &mut Option<(u64, Instant)>,
+    event_tx: &mpsc::Sender<PeerEvent>,
+    stats: &Arc<PeerStats>,
+) -> std::io::Result<()> {
     let msg = NetworkMessage::deserialize(command, payload)?;
 
     match &msg {
@@ -1918,6 +2376,7 @@ async fn handle_message(
             let pong = serialize_message(magic, &NetworkMessage::Pong(*nonce));
             writer.write_all(&pong).await?;
             writer.flush().await?;
+            stats.record_send("pong", pong.len() as u64);
         }
         NetworkMessage::Pong(nonce) => {
             // Check if this matches our pending ping
@@ -2316,7 +2775,7 @@ mod tests {
         };
 
         let events = [
-            PeerEvent::Connected(peer_id, peer_info),
+            PeerEvent::Connected(peer_id, peer_info, Arc::new(PeerStats::new())),
             PeerEvent::Message(peer_id, NetworkMessage::Verack),
             PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout),
         ];
@@ -2452,7 +2911,7 @@ mod tests {
             .expect("channel should not be closed");
 
         match event {
-            PeerEvent::Connected(id, info) => {
+            PeerEvent::Connected(id, info, stats) => {
                 assert_eq!(id, peer_id);
                 assert_eq!(info.version, PROTOCOL_VERSION);
                 assert_eq!(info.user_agent, "/mock:1.0/");
@@ -2460,6 +2919,20 @@ mod tests {
                 assert!(info.supports_witness);
                 assert!(!info.inbound);
                 assert_eq!(info.state, PeerState::Established);
+                // Sanity check: PeerStats Arc is non-null and has been
+                // marked connected during handshake (conntime > 0).
+                assert!(
+                    stats.conn_time_unix.load(Ordering::Relaxed) > 0,
+                    "PeerStats.conn_time_unix should be stamped after handshake"
+                );
+                assert!(
+                    stats.bytes_sent.load(Ordering::Relaxed) > 0,
+                    "PeerStats.bytes_sent should be > 0 after sending VERSION"
+                );
+                assert!(
+                    stats.bytes_recv.load(Ordering::Relaxed) > 0,
+                    "PeerStats.bytes_recv should be > 0 after reading VERSION"
+                );
             }
             _ => panic!("expected Connected event, got {:?}", event),
         }
@@ -2978,7 +3451,7 @@ mod tests {
             .expect("channel should not be closed");
 
         match event {
-            PeerEvent::Connected(id, info) => {
+            PeerEvent::Connected(id, info, _stats) => {
                 assert_eq!(id, peer_id);
                 assert_eq!(info.version, PROTOCOL_VERSION);
                 assert_eq!(info.user_agent, "/mock:1.0/");
