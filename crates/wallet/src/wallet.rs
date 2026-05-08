@@ -14,8 +14,10 @@ use std::collections::{HashMap, HashSet};
 use rustoshi_crypto::{
     address::{Address, Network},
     hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash, tagged_hash,
+    taproot::{compute_taproot_sighash as crypto_compute_taproot_sighash, TaprootPrevouts,
+              SIGHASH_DEFAULT},
 };
-use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut, Encodable, write_compact_size};
+use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut};
 use secp256k1::{Message, Secp256k1};
 
 use crate::hd::{ExtendedPrivKey, WalletError, HARDENED_FLAG};
@@ -766,8 +768,30 @@ impl Wallet {
         let tweaked_keypair = keypair.add_xonly_tweak(secp, &tweak)
             .map_err(|_| WalletError::SigningError("tweak failed".to_string()))?;
 
-        // Compute BIP-341 Taproot sighash
-        let sighash = self.compute_taproot_sighash(tx, input_index, all_utxos, 0x00)?;
+        // Compute BIP-341 Taproot sighash via the canonical helper in
+        // `rustoshi-crypto::taproot` (W27-C P0-1). The wallet used to
+        // ship its own copy that diverged on SIGHASH_SINGLE (it placed
+        // the single-output digest at field 9 instead of after fields
+        // 11+12 per BIP-341), so any tx the wallet signed under
+        // SIGHASH_SINGLE was rejected by the consensus layer. Going
+        // through the same helper consensus uses guarantees parity.
+        let amounts: Vec<u64> = all_utxos.iter().map(|u| u.value).collect();
+        let scripts_owned: Vec<&[u8]> =
+            all_utxos.iter().map(|u| u.script_pubkey.as_slice()).collect();
+        let prevouts = TaprootPrevouts {
+            amounts: &amounts,
+            scripts: &scripts_owned,
+        };
+
+        let sighash = crypto_compute_taproot_sighash(
+            tx,
+            input_index,
+            prevouts,
+            SIGHASH_DEFAULT,
+            None, // annex (none from this wallet path)
+            None, // script_path (key-path only)
+        )
+        .map_err(|e| WalletError::SigningError(format!("taproot sighash: {:?}", e)))?;
 
         // Create Schnorr signature
         let msg = Message::from_digest(sighash);
@@ -781,116 +805,6 @@ impl Wallet {
         tx.inputs[input_index].witness = vec![sig_bytes];
 
         Ok(())
-    }
-
-    /// Compute BIP-341 Taproot sighash for key-path spending.
-    fn compute_taproot_sighash(
-        &self,
-        tx: &Transaction,
-        input_index: usize,
-        prevouts: &[WalletUtxo],
-        hash_type: u8,
-    ) -> Result<[u8; 32], WalletError> {
-        use std::io::Write;
-
-        // Epoch byte (0x00 for Taproot)
-        let epoch = 0x00u8;
-
-        // Hash type handling
-        // 0x00 = SIGHASH_DEFAULT (treated as SIGHASH_ALL for signing)
-        let sighash_type = if hash_type == 0x00 { 0x01 } else { hash_type as u32 };
-        let anyone_can_pay = (sighash_type & 0x80) != 0;
-        let sighash_none = (sighash_type & 0x03) == 0x02;
-        let sighash_single = (sighash_type & 0x03) == 0x03;
-
-        let mut preimage = Vec::with_capacity(200);
-
-        // 1. Epoch (1 byte)
-        preimage.push(epoch);
-
-        // 2. Hash type (1 byte) - write the original hash_type, not sighash_type
-        preimage.push(hash_type);
-
-        // 3. Version (4 bytes LE)
-        preimage.write_all(&tx.version.to_le_bytes()).unwrap();
-
-        // 4. Locktime (4 bytes LE)
-        preimage.write_all(&tx.lock_time.to_le_bytes()).unwrap();
-
-        // 5-7. sha_prevouts, sha_amounts, sha_scriptpubkeys, sha_sequences
-        if !anyone_can_pay {
-            // sha_prevouts
-            let mut prevouts_data = Vec::new();
-            for input in &tx.inputs {
-                input.previous_output.encode(&mut prevouts_data).unwrap();
-            }
-            let sha_prevouts = rustoshi_crypto::sha256(&prevouts_data);
-            preimage.write_all(&sha_prevouts).unwrap();
-
-            // sha_amounts
-            let mut amounts_data = Vec::new();
-            for utxo in prevouts {
-                amounts_data.write_all(&utxo.value.to_le_bytes()).unwrap();
-            }
-            let sha_amounts = rustoshi_crypto::sha256(&amounts_data);
-            preimage.write_all(&sha_amounts).unwrap();
-
-            // sha_scriptpubkeys
-            let mut scripts_data = Vec::new();
-            for utxo in prevouts {
-                write_compact_size(&mut scripts_data, utxo.script_pubkey.len() as u64).unwrap();
-                scripts_data.write_all(&utxo.script_pubkey).unwrap();
-            }
-            let sha_scriptpubkeys = rustoshi_crypto::sha256(&scripts_data);
-            preimage.write_all(&sha_scriptpubkeys).unwrap();
-
-            // sha_sequences
-            let mut sequences_data = Vec::new();
-            for input in &tx.inputs {
-                sequences_data.write_all(&input.sequence.to_le_bytes()).unwrap();
-            }
-            let sha_sequences = rustoshi_crypto::sha256(&sequences_data);
-            preimage.write_all(&sha_sequences).unwrap();
-        }
-
-        // 8. sha_outputs
-        if !sighash_none && !sighash_single {
-            let mut outputs_data = Vec::new();
-            for output in &tx.outputs {
-                output.encode(&mut outputs_data).unwrap();
-            }
-            let sha_outputs = rustoshi_crypto::sha256(&outputs_data);
-            preimage.write_all(&sha_outputs).unwrap();
-        } else if sighash_single && input_index < tx.outputs.len() {
-            let mut output_data = Vec::new();
-            tx.outputs[input_index].encode(&mut output_data).unwrap();
-            let sha_outputs = rustoshi_crypto::sha256(&output_data);
-            preimage.write_all(&sha_outputs).unwrap();
-        }
-
-        // 9. Spend type (1 byte)
-        // ext_flag = 0 for key-path, annex_present = 0
-        let spend_type = 0x00u8;
-        preimage.push(spend_type);
-
-        // 10. Input-specific data
-        if anyone_can_pay {
-            // Serialize the specific prevout
-            let input = &tx.inputs[input_index];
-            input.previous_output.encode(&mut preimage).unwrap();
-            preimage.write_all(&prevouts[input_index].value.to_le_bytes()).unwrap();
-            write_compact_size(&mut preimage, prevouts[input_index].script_pubkey.len() as u64).unwrap();
-            preimage.write_all(&prevouts[input_index].script_pubkey).unwrap();
-            preimage.write_all(&input.sequence.to_le_bytes()).unwrap();
-        } else {
-            // Input index (4 bytes LE)
-            preimage.write_all(&(input_index as u32).to_le_bytes()).unwrap();
-        }
-
-        // No annex or script-path data for key-path spending
-
-        // Compute tagged hash
-        Ok(tagged_hash("TapSighash", &preimage))
     }
 
     /// Check if an address belongs to this wallet.
