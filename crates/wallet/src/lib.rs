@@ -40,6 +40,7 @@
 //! println!("Balance: {} sats", wallet.balance());
 //! ```
 
+pub mod bip39;
 pub mod coin_selection;
 pub mod db;
 pub mod descriptor;
@@ -49,6 +50,9 @@ pub mod miniscript;
 pub mod psbt;
 pub mod wallet;
 
+pub use bip39::{
+    entropy_to_mnemonic, mnemonic_to_entropy, mnemonic_to_seed, validate_mnemonic, Bip39Error,
+};
 pub use coin_selection::{
     select_coins, select_coins_bnb, select_coins_knapsack, select_coins_largest_first,
     CoinSelectionParams, SelectionAlgorithm, SelectionResult,
