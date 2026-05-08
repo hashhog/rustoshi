@@ -12,6 +12,7 @@ pub mod bech32;
 pub mod hashes;
 pub mod hwaccel;
 pub mod keys;
+pub mod p2sh;
 pub mod sha256;
 pub mod sighash;
 pub mod taproot;
@@ -23,6 +24,7 @@ pub use bech32::{
     Bech32Error, Bech32Variant,
 };
 pub use hashes::{hash160, merkle_root, sha256, sha256d, tagged_hash};
+pub use p2sh::{is_p2sh, is_p2wsh, verify_p2sh_commitment, verify_p2wsh_commitment, CommitmentError};
 pub use hwaccel::{sha256_capabilities, Sha256Capabilities};
 pub use sha256::sha256_implementation;
 pub use keys::{
