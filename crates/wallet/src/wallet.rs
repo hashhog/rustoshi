@@ -946,6 +946,42 @@ impl Wallet {
                         .to_string(),
                 )
             })?;
+
+        // ============================================================
+        // W41 — A2 (CVE-2020-14199 amount-oracle defense).
+        //
+        // BIP-143 segwit-v0 commits to the spent amount in the sighash
+        // ("hashOutputs" + per-input value). A hostile PSBT can pair a
+        // truthful `non_witness_utxo` (full prev tx, hash-checked at
+        // deserialize) with a TAMPERED `witness_utxo` whose `value` /
+        // `script_pubkey` differ. If we sighash on `witness_utxo.value`
+        // alone, we sign for an amount the on-chain prevtx never paid;
+        // the resulting signature can be replayed by the attacker
+        // against the real (smaller) prevout to lift fees. Same
+        // confused-deputy class as the W31 commitment bug — different
+        // field.
+        //
+        // Mitigation: when both UTXO views are present, require they
+        // agree on the spent output. Bitcoin Core's
+        // `PSBTInput::IsSane`-aware paths read non_witness_utxo first
+        // and fall through to witness_utxo only when non_witness is
+        // missing; we enforce mutual consistency on the same intent.
+        if let Some(ref nw) = psbt.inputs[input_index].non_witness_utxo {
+            let vout = psbt.unsigned_tx.inputs[input_index].previous_output.vout as usize;
+            if vout >= nw.outputs.len() {
+                return Err(WalletError::SigningError(
+                    "PSBT non_witness_utxo prevout vout out of range \
+                     (W41 amount-oracle defense)"
+                        .to_string(),
+                ));
+            }
+            if nw.outputs[vout].value != witness_utxo.value
+                || nw.outputs[vout].script_pubkey != witness_utxo.script_pubkey
+            {
+                return Err(crate::psbt::PsbtError::WitnessUtxoMismatch.into());
+            }
+        }
+
         let value = witness_utxo.value;
         let prevout_spk = witness_utxo.script_pubkey.clone();
 
