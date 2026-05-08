@@ -1200,8 +1200,12 @@ impl Psbt {
                 key.push(PSBT_GLOBAL_XPUB);
                 key.extend_from_slice(&xpub.data);
 
+                // BIP-174: value is the raw key origin bytes
+                // (4-byte fingerprint + N*4 path indices, all little-endian).
+                // The outer record length is supplied by write_kv_pair itself;
+                // an inner CompactSize prefix here would not interoperate with
+                // Bitcoin Core's decodepsbt (W36, mirrors nimrod W34-C).
                 let mut value = Vec::new();
-                write_compact_size(&mut value, origin.serialized_size() as u64)?;
                 origin.encode(&mut value)?;
                 len += write_kv_pair(writer, &key, &value)?;
             }
@@ -1212,8 +1216,10 @@ impl Psbt {
             if v > 0 {
                 key.clear();
                 key.push(PSBT_GLOBAL_VERSION);
+                // BIP-174: value is exactly 4 LE bytes (a u32). The outer
+                // record length comes from write_kv_pair; no inner
+                // CompactSize prefix (W36, mirrors nimrod W34-C).
                 let mut value = Vec::new();
-                write_compact_size(&mut value, 4)?;
                 value.extend_from_slice(&v.to_le_bytes());
                 len += write_kv_pair(writer, &key, &value)?;
             }
@@ -1298,8 +1304,10 @@ fn encode_psbt_input<W: Write>(writer: &mut W, input: &PsbtInput) -> io::Result<
         for (pubkey, origin) in &input.bip32_derivation {
             let mut key = vec![PSBT_IN_BIP32_DERIVATION];
             key.extend_from_slice(pubkey);
+            // BIP-174: value is the raw key origin (fingerprint + path),
+            // no inner CompactSize. The outer record length comes from
+            // write_kv_pair (W36, mirrors nimrod W34-C).
             let mut value = Vec::new();
-            write_compact_size(&mut value, origin.serialized_size() as u64)?;
             origin.encode(&mut value)?;
             len += write_kv_pair(writer, &key, &value)?;
         }
@@ -1434,8 +1442,10 @@ fn encode_psbt_output<W: Write>(writer: &mut W, output: &PsbtOutput) -> io::Resu
     for (pubkey, origin) in &output.bip32_derivation {
         let mut key = vec![PSBT_OUT_BIP32_DERIVATION];
         key.extend_from_slice(pubkey);
+        // BIP-174: value is the raw key origin (fingerprint + path),
+        // no inner CompactSize. The outer record length comes from
+        // write_kv_pair (W36, mirrors nimrod W34-C).
         let mut value = Vec::new();
-        write_compact_size(&mut value, origin.serialized_size() as u64)?;
         origin.encode(&mut value)?;
         len += write_kv_pair(writer, &key, &value)?;
     }
@@ -1570,10 +1580,11 @@ impl Psbt {
                     xpub_data.copy_from_slice(&key[1..79]);
                     let xpub = ExtPubKey::from_bytes(xpub_data);
 
-                    // Decode key origin from value
+                    // BIP-174: value is the raw key origin (fingerprint +
+                    // path), no inner CompactSize prefix. The total length
+                    // is value.len() itself (W36, mirrors nimrod W34-C).
                     let mut value_cursor = Cursor::new(&value);
-                    let origin_len = read_compact_size(&mut value_cursor)?;
-                    let origin = KeyOrigin::decode_with_len(&mut value_cursor, origin_len as usize)?;
+                    let origin = KeyOrigin::decode_with_len(&mut value_cursor, value.len())?;
 
                     xpubs
                         .entry(origin)
@@ -1588,23 +1599,16 @@ impl Psbt {
                             got: key.len(),
                         });
                     }
-                    if value.len() < 4 {
-                        return Err(PsbtError::Io(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "version value too short",
-                        )));
-                    }
-                    // Value is length-prefixed
-                    let mut value_cursor = Cursor::new(&value);
-                    let v_len = read_compact_size(&mut value_cursor)?;
-                    if v_len != 4 {
+                    // BIP-174: value is exactly 4 LE bytes (a u32). No
+                    // inner CompactSize prefix (W36, mirrors nimrod W34-C).
+                    if value.len() != 4 {
                         return Err(PsbtError::Io(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "invalid version length",
                         )));
                     }
                     let mut v_bytes = [0u8; 4];
-                    value_cursor.read_exact(&mut v_bytes)?;
+                    v_bytes.copy_from_slice(&value);
                     let v = u32::from_le_bytes(v_bytes);
                     if v > PSBT_HIGHEST_VERSION {
                         return Err(PsbtError::UnsupportedVersion(v));
@@ -1791,10 +1795,11 @@ fn decode_psbt_input<R: Read>(reader: &mut R) -> Result<PsbtInput, PsbtError> {
                 let mut pubkey = [0u8; 33];
                 pubkey.copy_from_slice(&key[1..34]);
 
-                // Value is length-prefixed key origin
+                // BIP-174: value is the raw key origin (fingerprint +
+                // path), no inner CompactSize. Total length is
+                // value.len() (W36, mirrors nimrod W34-C).
                 let mut value_cursor = Cursor::new(&value);
-                let origin_len = read_compact_size(&mut value_cursor)?;
-                let origin = KeyOrigin::decode_with_len(&mut value_cursor, origin_len as usize)?;
+                let origin = KeyOrigin::decode_with_len(&mut value_cursor, value.len())?;
                 input.bip32_derivation.insert(pubkey, origin);
             }
             PSBT_IN_SCRIPTSIG => {
@@ -2089,9 +2094,11 @@ fn decode_psbt_output<R: Read>(reader: &mut R) -> Result<PsbtOutput, PsbtError> 
                 let mut pubkey = [0u8; 33];
                 pubkey.copy_from_slice(&key[1..34]);
 
+                // BIP-174: value is the raw key origin (fingerprint +
+                // path), no inner CompactSize. Total length is
+                // value.len() (W36, mirrors nimrod W34-C).
                 let mut value_cursor = Cursor::new(&value);
-                let origin_len = read_compact_size(&mut value_cursor)?;
-                let origin = KeyOrigin::decode_with_len(&mut value_cursor, origin_len as usize)?;
+                let origin = KeyOrigin::decode_with_len(&mut value_cursor, value.len())?;
                 output.bip32_derivation.insert(pubkey, origin);
             }
             PSBT_OUT_TAP_INTERNAL_KEY => {
@@ -2390,5 +2397,357 @@ mod tests {
         // Check the witness UTXO value (test vector value from Bitcoin Core)
         let utxo = psbt.inputs[0].witness_utxo.as_ref().unwrap();
         assert_eq!(utxo.value, 2200000000000000);
+    }
+
+    /// Regression test for W36 (rustoshi analog of nimrod W34-C).
+    ///
+    /// BIP-174 specifies that PSBT_GLOBAL_XPUB, PSBT_GLOBAL_VERSION,
+    /// PSBT_IN_BIP32_DERIVATION, and PSBT_OUT_BIP32_DERIVATION values are
+    /// raw bytes (no inner CompactSize length prefix); the only length
+    /// prefix is the OUTER CompactSize that the generic key-value framer
+    /// writes around every value. rustoshi previously wrapped each of
+    /// these four value fields in an extra inner CompactSize on both
+    /// sides, so self-round-trip passed but cross-impl byte-identity vs
+    /// Bitcoin Core failed.
+    ///
+    /// This test asserts the on-wire byte layout for all four sites with
+    /// a hand-constructed golden vector derived from BIP-174's spec, so
+    /// any future regression on either the encode or decode side breaks
+    /// it. Self-round-trip alone is intentionally insufficient — that's
+    /// exactly what masked the original bug.
+    #[test]
+    fn test_w36_bip174_no_inner_compactsize_on_bip32_values() {
+        // ------------------------------------------------------------------
+        // Build a PSBT exercising all four bug sites:
+        //   * PSBT_GLOBAL_XPUB
+        //   * PSBT_GLOBAL_VERSION
+        //   * PSBT_IN_BIP32_DERIVATION
+        //   * PSBT_OUT_BIP32_DERIVATION
+        // ------------------------------------------------------------------
+        let tx = create_test_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+
+        let origin = KeyOrigin {
+            fingerprint: [0xDE, 0xAD, 0xBE, 0xEF],
+            // m/84'/0'/0' — three hardened path components (12 bytes).
+            path: vec![0x80000054, 0x80000000, 0x80000000],
+        };
+        // Expected raw on-wire origin = fingerprint || LE(path[i])
+        // 4 + 3*4 = 16 bytes.
+        let expected_origin_bytes: [u8; 16] = [
+            0xDE, 0xAD, 0xBE, 0xEF,
+            0x54, 0x00, 0x00, 0x80,
+            0x00, 0x00, 0x00, 0x80,
+            0x00, 0x00, 0x00, 0x80,
+        ];
+        assert_eq!(origin.serialized_size(), expected_origin_bytes.len());
+
+        // Use a recognisable canary pubkey so we can locate the record in
+        // the on-wire byte stream without parsing the whole PSBT.
+        let mut input_pubkey = [0u8; 33];
+        input_pubkey[0] = 0x02;
+        for (i, b) in input_pubkey.iter_mut().enumerate().skip(1) {
+            *b = 0xA0 | (i as u8 & 0x0F);
+        }
+
+        let mut output_pubkey = [0u8; 33];
+        output_pubkey[0] = 0x03;
+        for (i, b) in output_pubkey.iter_mut().enumerate().skip(1) {
+            *b = 0xB0 | (i as u8 & 0x0F);
+        }
+
+        // 78-byte BIP32 extended key blob (canary pattern). The actual
+        // contents do not need to be a valid xpub for byte-layout testing.
+        let mut xpub_bytes = [0u8; 78];
+        for (i, b) in xpub_bytes.iter_mut().enumerate() {
+            *b = 0xC0 | (i as u8 & 0x0F);
+        }
+        let xpub = ExtPubKey::from_bytes(xpub_bytes);
+
+        psbt.xpubs
+            .entry(origin.clone())
+            .or_default()
+            .insert(xpub);
+        // Note: rustoshi only supports PSBT version 0 (BIP-174 v0); the
+        // encoder skips the GLOBAL_VERSION record when v == 0. We use a
+        // separate hand-built golden vector below to cover the
+        // GLOBAL_VERSION value-layout (the same bug-shape).
+        psbt.add_input_derivation(0, input_pubkey, origin.clone()).unwrap();
+        psbt.add_output_derivation(0, output_pubkey, origin.clone()).unwrap();
+
+        let bytes = psbt.serialize();
+
+        // ------------------------------------------------------------------
+        // Helper: scan for `<keylen-compactsize> <type> <key-tail...>` and
+        // return the offset of the first byte of the value-length CompactSize
+        // immediately after the key blob.
+        // ------------------------------------------------------------------
+        fn find_record_value_offset(
+            bytes: &[u8],
+            type_byte: u8,
+            key_tail: &[u8],
+        ) -> Option<(usize, usize)> {
+            // For all the records we test here, the keylen fits in a single
+            // byte (keylen < 0xFD), so the CompactSize is one byte equal to
+            // 1 + key_tail.len().
+            let keylen = 1 + key_tail.len();
+            assert!(keylen < 0xFD, "test keys must use single-byte CompactSize");
+            let prefix = keylen as u8;
+            let needle_len = 1 + 1 + key_tail.len(); // keylen + type + tail
+            for i in 0..=(bytes.len().saturating_sub(needle_len)) {
+                if bytes[i] != prefix {
+                    continue;
+                }
+                if bytes[i + 1] != type_byte {
+                    continue;
+                }
+                if &bytes[i + 2..i + 2 + key_tail.len()] != key_tail {
+                    continue;
+                }
+                // Position of the value-length CompactSize.
+                let val_len_off = i + needle_len;
+                return Some((i, val_len_off));
+            }
+            None
+        }
+
+        // ------------------------------------------------------------------
+        // 1. PSBT_GLOBAL_XPUB: value MUST be exactly the 16 origin bytes.
+        //    Old buggy layout would emit value-len = 17 (16 + 1 inner
+        //    CompactSize) and the value would start with 0x10 (CompactSize
+        //    for 16) followed by the fingerprint.
+        // ------------------------------------------------------------------
+        let (_, val_len_off) = find_record_value_offset(
+            &bytes,
+            PSBT_GLOBAL_XPUB,
+            &xpub_bytes,
+        )
+        .expect("global xpub record not found");
+
+        assert_eq!(
+            bytes[val_len_off], 16u8,
+            "global xpub value-length CompactSize must be 16 (origin size); \
+             a value of 17 indicates the buggy inner CompactSize prefix is \
+             back (W36 regression)"
+        );
+        let val_start = val_len_off + 1;
+        assert_eq!(
+            &bytes[val_start..val_start + 16],
+            &expected_origin_bytes,
+            "global xpub value bytes must be raw origin (no inner prefix)"
+        );
+        // Defensive: ensure the value does NOT start with 0x10 followed by
+        // the fingerprint (the exact buggy on-wire pattern).
+        assert!(
+            !(bytes[val_start] == 0x10 && bytes[val_start + 1] == 0xDE),
+            "global xpub value starts with 0x10|0xDE — buggy inner \
+             CompactSize prefix is back (W36 regression)"
+        );
+
+        // ------------------------------------------------------------------
+        // 2. PSBT_IN_BIP32_DERIVATION: value MUST be the 16 origin bytes.
+        // ------------------------------------------------------------------
+        let (_, val_len_off) = find_record_value_offset(
+            &bytes,
+            PSBT_IN_BIP32_DERIVATION,
+            &input_pubkey,
+        )
+        .expect("input bip32 derivation record not found");
+
+        assert_eq!(
+            bytes[val_len_off], 16u8,
+            "input BIP32 derivation value-length must be 16 (origin size); \
+             a value of 17 indicates the buggy inner CompactSize prefix is \
+             back (W36 regression)"
+        );
+        let val_start = val_len_off + 1;
+        assert_eq!(
+            &bytes[val_start..val_start + 16],
+            &expected_origin_bytes,
+            "input BIP32 derivation value bytes must be raw origin"
+        );
+
+        // ------------------------------------------------------------------
+        // 3. PSBT_OUT_BIP32_DERIVATION: value MUST be the 16 origin bytes.
+        // ------------------------------------------------------------------
+        let (_, val_len_off) = find_record_value_offset(
+            &bytes,
+            PSBT_OUT_BIP32_DERIVATION,
+            &output_pubkey,
+        )
+        .expect("output bip32 derivation record not found");
+
+        assert_eq!(
+            bytes[val_len_off], 16u8,
+            "output BIP32 derivation value-length must be 16 (origin size); \
+             a value of 17 indicates the buggy inner CompactSize prefix is \
+             back (W36 regression)"
+        );
+        let val_start = val_len_off + 1;
+        assert_eq!(
+            &bytes[val_start..val_start + 16],
+            &expected_origin_bytes,
+            "output BIP32 derivation value bytes must be raw origin"
+        );
+
+        // ------------------------------------------------------------------
+        // 4. Self-round-trip MUST still work (the new layout decodes
+        //    correctly through our own deserializer).
+        // ------------------------------------------------------------------
+        let restored = Psbt::deserialize(&bytes).unwrap();
+        assert_eq!(restored.xpubs.len(), 1);
+        let restored_origin = restored.xpubs.keys().next().unwrap();
+        assert_eq!(restored_origin.fingerprint, origin.fingerprint);
+        assert_eq!(restored_origin.path, origin.path);
+
+        let in_origin = restored.inputs[0]
+            .bip32_derivation
+            .get(&input_pubkey)
+            .expect("input derivation lost in round-trip");
+        assert_eq!(in_origin.fingerprint, origin.fingerprint);
+        assert_eq!(in_origin.path, origin.path);
+
+        let out_origin = restored.outputs[0]
+            .bip32_derivation
+            .get(&output_pubkey)
+            .expect("output derivation lost in round-trip");
+        assert_eq!(out_origin.fingerprint, origin.fingerprint);
+        assert_eq!(out_origin.path, origin.path);
+    }
+
+    /// Regression test for W36 GLOBAL_VERSION byte layout (encode side).
+    ///
+    /// PSBT_HIGHEST_VERSION is currently 0 in this crate, so we cannot
+    /// round-trip a non-zero version (the deserializer rejects it). We
+    /// drive the encoder directly with version=Some(1) and assert the
+    /// on-wire bytes match BIP-174 (raw 4-byte LE u32, no inner
+    /// CompactSize), which is the W36 fix.
+    #[test]
+    fn test_w36_global_version_byte_layout_encode() {
+        let tx = create_test_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.version = Some(1);
+
+        let bytes = psbt.serialize();
+
+        // Locate `<keylen=1> <type=PSBT_GLOBAL_VERSION>`.
+        let mut found = None;
+        for i in 0..bytes.len().saturating_sub(2) {
+            if bytes[i] == 0x01 && bytes[i + 1] == PSBT_GLOBAL_VERSION {
+                found = Some(i);
+                break;
+            }
+        }
+        let i = found.expect("global version record not found");
+        let val_len_off = i + 2;
+        assert!(val_len_off < bytes.len());
+        assert_eq!(
+            bytes[val_len_off], 4u8,
+            "global version value-length must be 4 (raw LE u32); a value \
+             of 5 indicates the buggy inner CompactSize prefix is back \
+             (W36 regression)"
+        );
+        let val_start = val_len_off + 1;
+        assert_eq!(
+            &bytes[val_start..val_start + 4],
+            &1u32.to_le_bytes(),
+            "global version value must be raw LE u32 (no inner prefix)"
+        );
+    }
+
+    /// Regression test for W36 GLOBAL_VERSION byte layout (decode side).
+    ///
+    /// Hand-construct two byte streams: one in BIP-174-correct layout
+    /// (raw 4-byte LE u32 value) and one in the old buggy layout (value
+    /// is a CompactSize=4 followed by 4 bytes). The post-W36 decoder
+    /// must accept the first and reject the second.
+    #[test]
+    fn test_w36_global_version_byte_layout_decode() {
+        // Build a minimal PSBT with the unsigned tx + a GLOBAL_VERSION
+        // record. We construct the bytes by hand to avoid the encoder
+        // path entirely.
+        let tx = create_test_tx();
+        let tx_bytes = tx.serialize_no_witness();
+
+        let make_psbt = |version_value: &[u8]| -> Vec<u8> {
+            let mut out = Vec::new();
+            // Magic: 0x70 0x73 0x62 0x74 0xff
+            out.extend_from_slice(&[0x70, 0x73, 0x62, 0x74, 0xff]);
+            // Global: PSBT_GLOBAL_UNSIGNED_TX
+            out.push(0x01); // keylen = 1
+            out.push(PSBT_GLOBAL_UNSIGNED_TX);
+            write_compact_size(&mut out, tx_bytes.len() as u64).unwrap();
+            out.extend_from_slice(&tx_bytes);
+            // Global: PSBT_GLOBAL_VERSION
+            out.push(0x01); // keylen = 1
+            out.push(PSBT_GLOBAL_VERSION);
+            write_compact_size(&mut out, version_value.len() as u64).unwrap();
+            out.extend_from_slice(version_value);
+            // Global separator
+            out.push(0x00);
+            // One input separator (matches create_test_tx's 1 input).
+            out.push(0x00);
+            // One output separator (matches create_test_tx's 1 output).
+            out.push(0x00);
+            out
+        };
+
+        // Spec-correct: value is exactly 4 bytes = LE u32 of version 0.
+        let good = make_psbt(&0u32.to_le_bytes());
+        let parsed = Psbt::deserialize(&good).expect("BIP-174 layout must parse");
+        assert_eq!(parsed.version, Some(0));
+
+        // Buggy layout: value is <CompactSize=4> || <4 bytes>. Total = 5.
+        let mut bad_value = vec![0x04u8];
+        bad_value.extend_from_slice(&0u32.to_le_bytes());
+        let bad = make_psbt(&bad_value);
+        let res = Psbt::deserialize(&bad);
+        assert!(
+            res.is_err(),
+            "post-W36 the decoder must reject the old buggy layout \
+             (5-byte value with leading CompactSize); got {:?}",
+            res.map(|p| p.version)
+        );
+    }
+
+    /// Regression test for W36: rejecting the OLD buggy on-wire layout.
+    ///
+    /// Until W36, rustoshi accepted (and produced) PSBTs whose
+    /// PSBT_IN_BIP32_DERIVATION / PSBT_OUT_BIP32_DERIVATION /
+    /// PSBT_GLOBAL_VERSION values had an inner CompactSize prefix. After
+    /// the fix, those values are interpreted strictly per BIP-174, so
+    /// any leading inner CompactSize is parsed as origin bytes — which
+    /// means the path will end up containing a stray `0x00000010`
+    /// component derived from the leading CompactSize (0x10 + 3 zeros
+    /// from the start of the fingerprint), proving the decode side
+    /// genuinely parses the new layout and rejects the old one.
+    ///
+    /// This is the key piece that nimrod's W34-C test added: a check
+    /// that breaks if either side reverts.
+    #[test]
+    fn test_w36_buggy_layout_no_longer_decoded_as_clean_origin() {
+        // Construct a PSBT_IN_BIP32_DERIVATION value field in the OLD
+        // buggy on-wire shape: <CompactSize=16> || <fingerprint> || <path>.
+        // Total length = 1 + 16 = 17.
+        let buggy_value: Vec<u8> = {
+            let mut v = vec![0x10u8];          // inner CompactSize = 16
+            v.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            v.extend_from_slice(&0x80000054u32.to_le_bytes());
+            v.extend_from_slice(&0x80000000u32.to_le_bytes());
+            v.extend_from_slice(&0x80000000u32.to_le_bytes());
+            v
+        };
+
+        // Decode strictly per BIP-174 (post-W36 path): the whole 17 bytes
+        // is the origin. 17 is NOT a multiple of 4, so KeyOrigin's strict
+        // length check rejects it outright.
+        let mut cur = Cursor::new(&buggy_value);
+        let res = KeyOrigin::decode_with_len(&mut cur, buggy_value.len());
+        assert!(
+            res.is_err(),
+            "the old buggy layout (17-byte value with leading 0x10) must \
+             no longer parse as a clean BIP-174 origin; if this passes, \
+             the decode-side fix has regressed (W36)"
+        );
     }
 }
