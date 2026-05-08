@@ -151,6 +151,13 @@ pub enum PsbtError {
     #[error("non-witness UTXO hash mismatch")]
     UtxoHashMismatch,
 
+    /// witness_utxo and non_witness_utxo disagree on the spent output
+    /// (CVE-2020-14199 amount-oracle defense — the spending wallet must
+    /// not trust the witness_utxo amount/scriptPubKey when both fields are
+    /// present and they conflict).
+    #[error("witness_utxo and non_witness_utxo disagree on amount or scriptPubKey")]
+    WitnessUtxoMismatch,
+
     /// UTXO index out of range
     #[error("UTXO index out of range")]
     UtxoIndexOutOfRange,
@@ -791,8 +798,24 @@ impl Psbt {
         }
 
         // Merge inputs
+        //
+        // W41 — A1 (combiner-role): if `other` carries a non_witness_utxo
+        // we don't yet have, verify its txid against `self.unsigned_tx`
+        // BEFORE adopting it. PSBTs sharing the same unsigned tx must
+        // share the same prevout txids by construction; checking here
+        // means a wire-tampered counterparty PSBT can't poison our
+        // non_witness_utxo via combinepsbt. Mirrors Core's
+        // `PSBTInput::Merge` constraint that the spent prevtx hash is
+        // immutable across roles.
         for (i, other_input) in other.inputs.iter().enumerate() {
             if i < self.inputs.len() {
+                if self.inputs[i].non_witness_utxo.is_none() {
+                    if let Some(ref nw) = other_input.non_witness_utxo {
+                        if nw.txid() != self.unsigned_tx.inputs[i].previous_output.txid {
+                            return Err(PsbtError::UtxoHashMismatch);
+                        }
+                    }
+                }
                 self.inputs[i].merge(other_input);
             }
         }
@@ -1652,6 +1675,30 @@ impl Psbt {
         let mut outputs = Vec::with_capacity(num_outputs);
         for _ in 0..num_outputs {
             outputs.push(decode_psbt_output(reader)?);
+        }
+
+        // ============================================================
+        // W41 — A1: NON_WITNESS_UTXO txid sanity at deserialize time.
+        //
+        // BIP-174 (and Bitcoin Core's `PSBTInput::IsSane`-style checks at
+        // src/psbt.cpp `GetInputUTXO` / `SignPSBTInput`) require that, if
+        // `non_witness_utxo` is present for input i, its txid must equal
+        // `unsigned_tx.inputs[i].previous_output.txid`. Without this
+        // check, a malicious provider can hand the wallet a fake prevtx,
+        // and any downstream code that reads `non_witness_utxo.outputs[
+        // prevout.vout].value` to feed segwit-v0 sighashing trusts an
+        // attacker-controlled amount (CVE-2020-14199 / "amount oracle").
+        //
+        // The Updater-role helper `Psbt::set_non_witness_utxo` already
+        // enforces this on the in-process API; mirror it on the wire so
+        // we can never construct a `Psbt` value where an input claims a
+        // prevtx that doesn't hash to its prevout.
+        for (i, input) in inputs.iter().enumerate() {
+            if let Some(ref nw) = input.non_witness_utxo {
+                if nw.txid() != unsigned_tx.inputs[i].previous_output.txid {
+                    return Err(PsbtError::UtxoHashMismatch);
+                }
+            }
         }
 
         Ok(Self {
@@ -2749,5 +2796,310 @@ mod tests {
              no longer parse as a clean BIP-174 origin; if this passes, \
              the decode-side fix has regressed (W36)"
         );
+    }
+
+    // ====================================================================
+    // W41 — regression tests for PSBT NON_WITNESS_UTXO consistency
+    // (Bugs A1 + A2, ref bitcoin-core/src/psbt.cpp `GetInputUTXO` /
+    // `PSBTInput::IsSane`) and BIP32 key-origin decoder against the live
+    // W40-C multi-input fixture (Core's rpc_psbt.json signer[0].psbt).
+    // Following the W36 / `906ec31` golden-vector pattern — ASYMMETRIC
+    // bytes per axis to break self-round-trip blindness.
+    // ====================================================================
+
+    /// Build a minimal `Transaction` whose 1st output has the given amount
+    /// and an asymmetric 4-byte scriptPubKey. Returns (tx, txid).
+    /// `nonce` lets a caller produce DISTINCT prevtxs (different txids)
+    /// for the txid-mismatch tests.
+    fn make_prevtx(value: u64, spk_marker: u8, nonce: u32) -> (Transaction, Hash256) {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256([nonce as u8; 32]),
+                    vout: nonce,  // also salt vout to force distinct hashes
+                },
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut {
+                    value,
+                    // Asymmetric SPK: leading byte differs from any
+                    // trailing byte to expose endian-flip / reversed-copy
+                    // bugs. (W36 lesson: `0x01 02 03 04` is palindrome-
+                    // safe-looking but its reverse differs, which is the
+                    // whole point.)
+                    script_pubkey: vec![0xAA, 0xBB, 0xCC, spk_marker],
+                },
+                TxOut { value: 7777, script_pubkey: vec![0x00] },
+            ],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        (tx, txid)
+    }
+
+    /// Construct a Psbt whose unsigned_tx spends a fabricated prevout.
+    fn make_psbt_spending(prev_txid: Hash256, prev_vout: u32) -> Psbt {
+        let spending = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: prev_vout },
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 5000,
+                script_pubkey: vec![0x00, 0x14, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA,
+                                    0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02, 0x03,
+                                    0x04, 0x05, 0x06, 0x07, 0x08, 0x09],
+            }],
+            lock_time: 0,
+        };
+        Psbt::from_unsigned_tx(spending).unwrap()
+    }
+
+    /// W41 Bug A1 — wire deserializer must reject a NON_WITNESS_UTXO
+    /// whose txid does not match the spending PSBT's prevout.
+    ///
+    /// Mirrors Core's `GetInputUTXO` (psbt.cpp:80) and the Updater
+    /// helper `Psbt::set_non_witness_utxo` (psbt.rs:672-675).
+    #[test]
+    fn test_w41_a1_deserializer_rejects_nonwitness_txid_mismatch() {
+        // Honest prevout the PSBT claims to spend.
+        let (honest_tx, honest_txid) = make_prevtx(100_000, 0xAA, 1);
+        // Attacker's lying prevtx — DIFFERENT txid by construction.
+        let (attacker_tx, attacker_txid) = make_prevtx(999_999, 0xBB, 2);
+        assert_ne!(honest_txid, attacker_txid, "fixture must produce distinct txids");
+
+        let psbt = make_psbt_spending(honest_txid, 0);
+
+        // Hand-craft on-wire bytes: serialize an honest psbt, then patch
+        // the non_witness_utxo entry to carry the attacker's tx instead.
+        // Easier: build via the API, then forcibly install attacker_tx
+        // bypassing the Updater check, encode, decode, and assert reject.
+        let mut tampered = psbt.clone();
+        tampered.inputs[0].non_witness_utxo = Some(attacker_tx);  // direct field write skips set_non_witness_utxo's check
+        let bytes = tampered.serialize();
+
+        let res = Psbt::deserialize(&bytes);
+        assert!(matches!(res, Err(PsbtError::UtxoHashMismatch)),
+            "deserializer must reject mismatched non_witness_utxo (A1); got {:?}", res);
+
+        // Sanity: an honestly-built PSBT round-trips fine.
+        let mut clean = psbt.clone();
+        clean.set_non_witness_utxo(0, honest_tx).unwrap();
+        let bytes_clean = clean.serialize();
+        Psbt::deserialize(&bytes_clean).expect("honest PSBT must round-trip");
+    }
+
+    /// W41 Bug A1 (combiner) — `Psbt::merge` must reject importing a
+    /// NON_WITNESS_UTXO from `other` when its txid disagrees with our
+    /// `unsigned_tx.inputs[i].previous_output.txid`. Stops a malicious
+    /// counterparty from poisoning a Combiner via combinepsbt.
+    #[test]
+    fn test_w41_a1_combiner_rejects_nonwitness_txid_mismatch() {
+        let (honest_tx, honest_txid) = make_prevtx(50_000, 0xCC, 3);
+        let (attacker_tx, attacker_txid) = make_prevtx(50_000, 0xDD, 4);
+        assert_ne!(honest_txid, attacker_txid);
+
+        // Both PSBTs share the same unsigned_tx (spending honest_txid:0)
+        // — that's the precondition for combinepsbt. The attacker's
+        // PSBT slips in a wrong-txid prevtx in slot 0.
+        let mut self_psbt = make_psbt_spending(honest_txid, 0);
+        let mut attacker_psbt = make_psbt_spending(honest_txid, 0);
+        // Direct field write — skips set_non_witness_utxo's update-time
+        // check, simulating a counterparty whose own deserializer is
+        // pre-W41 (or they hand-crafted bytes).
+        attacker_psbt.inputs[0].non_witness_utxo = Some(attacker_tx);
+
+        let res = self_psbt.merge(&attacker_psbt);
+        assert!(matches!(res, Err(PsbtError::UtxoHashMismatch)),
+            "Psbt::merge must reject txid-mismatched non_witness_utxo (A1 combiner); got {:?}", res);
+
+        // Sanity: a same-tx counterparty PSBT merges fine.
+        let mut clean_other = make_psbt_spending(honest_txid, 0);
+        clean_other.set_non_witness_utxo(0, honest_tx).unwrap();
+        let mut self2 = make_psbt_spending(honest_txid, 0);
+        self2.merge(&clean_other).expect("clean merge must succeed");
+        assert!(self2.inputs[0].non_witness_utxo.is_some());
+    }
+
+    /// W41 Bug A2 — CVE-2020-14199 amount-oracle defense.
+    ///
+    /// When a P2WSH PSBT input ships BOTH `witness_utxo` and
+    /// `non_witness_utxo`, the wallet must NOT trust witness_utxo's
+    /// amount/script if it disagrees with the on-chain prev tx
+    /// (which is hash-checked at deserialize per Bug A1). A pre-fix
+    /// rustoshi would happily produce a BIP-143 sighash over the
+    /// inflated witness_utxo.value; the resulting signature is then
+    /// replayable against the real (smaller) prevout.
+    ///
+    /// Triggered through the actual `sign_psbt_input` codepath — not
+    /// just a unit-level check — so the test catches accidental
+    /// bypasses (e.g. a future signer caller that re-fetches
+    /// witness_utxo without going through the guard).
+    #[test]
+    fn test_w41_a2_witness_nonwitness_amount_mismatch_rejected() {
+        use crate::wallet::{AddressType, Wallet};
+        use crate::hd::WalletError;
+        use rustoshi_crypto::address::Network;
+        use rustoshi_crypto::sha256;
+        use secp256k1::{Secp256k1, SecretKey};
+
+        // 2-of-2 multisig witness_script with two arbitrary pubkeys.
+        let secp = Secp256k1::new();
+        let sk1 = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let sk2 = SecretKey::from_slice(&[0x22u8; 32]).unwrap();
+        let pk1 = secp256k1::PublicKey::from_secret_key(&secp, &sk1).serialize();
+        let pk2 = secp256k1::PublicKey::from_secret_key(&secp, &sk2).serialize();
+        let mut witness_script = Vec::new();
+        witness_script.push(0x52); // OP_2
+        witness_script.push(0x21); witness_script.extend_from_slice(&pk1);
+        witness_script.push(0x21); witness_script.extend_from_slice(&pk2);
+        witness_script.push(0x52); // OP_2
+        witness_script.push(0xae); // OP_CHECKMULTISIG
+
+        // P2WSH prevout SPK = OP_0 PUSH32 SHA256(witness_script).
+        let ws_hash = sha256(&witness_script);
+        let mut p2wsh_spk = vec![0x00, 0x20];
+        p2wsh_spk.extend_from_slice(&ws_hash);
+
+        // Honest prevout pays 100_000 sats to the P2WSH SPK.
+        let honest_prevtx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([0x33; 32]), vout: 0 },
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 100_000,
+                script_pubkey: p2wsh_spk.clone(),
+            }],
+            lock_time: 0,
+        };
+        let prev_txid = honest_prevtx.txid();
+
+        let mut psbt = make_psbt_spending(prev_txid, 0);
+        psbt.set_non_witness_utxo(0, honest_prevtx).unwrap();
+        psbt.inputs[0].witness_script = Some(witness_script);
+
+        // ── Honest case — witness_utxo agrees with non_witness_utxo. ──
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: 100_000,
+            script_pubkey: p2wsh_spk.clone(),
+        });
+        let wallet = Wallet::from_seed(&[0x77u8; 32], Network::Mainnet, AddressType::P2WPKH).unwrap();
+        let r = wallet.sign_psbt_input(&mut psbt, 0, &[sk1], 0x01);
+        assert!(r.is_ok(), "honest agreement must sign cleanly: {:?}", r);
+
+        // ── Attack case — witness_utxo lies about the amount. ──
+        psbt.inputs[0].partial_sigs.clear();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: 999_999_999,                 // INFLATED
+            script_pubkey: p2wsh_spk.clone(),
+        });
+        let r = wallet.sign_psbt_input(&mut psbt, 0, &[sk1], 0x01);
+        match r {
+            Err(WalletError::Io(ref e))
+                if e.to_string().contains("witness_utxo and non_witness_utxo disagree") => {}
+            other => panic!("A2 amount-mismatch must be rejected; got {:?}", other),
+        }
+
+        // ── Attack case — witness_utxo lies about the SPK. ──
+        psbt.inputs[0].partial_sigs.clear();
+        let mut tampered_spk = p2wsh_spk.clone();
+        tampered_spk[2] ^= 0xFF;                // flip a SPK byte
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: 100_000,
+            script_pubkey: tampered_spk,
+        });
+        let r = wallet.sign_psbt_input(&mut psbt, 0, &[sk1], 0x01);
+        match r {
+            Err(WalletError::Io(ref e))
+                if e.to_string().contains("witness_utxo and non_witness_utxo disagree") => {}
+            other => panic!("A2 SPK-mismatch must be rejected; got {:?}", other),
+        }
+    }
+
+    /// W41 Fix 3 — BIP32 key-origin decoder MUST accept the W40-C
+    /// canonical fixture (Bitcoin Core 31.99 `rpc_psbt.json` signer[0]
+    /// — a 2-input/2-output asymmetric P2SH-multisig + P2SH-P2WSH-
+    /// multisig PSBT with 4 input + 2 output BIP32_DERIVATION entries,
+    /// each value=16 bytes = 4-byte fingerprint + 3 path indexes).
+    ///
+    /// Pre-W36 the decoder treated the value as <CompactSize len> ||
+    /// <fingerprint>||<path>, yielding "invalid key origin length" for
+    /// any well-formed Core PSBT. W36 (commit 906ec31) switched to the
+    /// BIP-174 "raw" encoding (no inner CompactSize). This test pins
+    /// the canonical fixture so future strictness tweaks can't silently
+    /// re-break it.
+    #[test]
+    fn test_w41_fix3_decode_w40c_multi_input_fixture() {
+        use base64::Engine;
+        // Canonical signer[0] PSBT from
+        // bitcoin-core/test/functional/data/rpc_psbt.json
+        // (2-in / 2-out, P2SH-multisig + P2SH-P2WSH-multisig).
+        let psbt_b64 = "cHNidP8BAJoCAAAAAljoeiG1ba8MI76OcHBFbDNvfLqlyHV5JPVFiHuyq911\
+                        AAAAAAD/////g40EJ9DsZQpoqka7CwmK6kQiwHGyyng1Kgd5WdB86h0BAAAAAP////\
+                        8CcKrwCAAAAAAWABTYXCtx0AYLCcmIauuBXlCZHdoSTQDh9QUAAAAAFgAUAK6pouXw\
+                        +HaliN9VRuh0LR2HAI8AAAAAAAEAuwIAAAABqtc5MQGL0l+ErkALaISL4J23BurCrB\
+                        gpi6vucatlb4sAAAAASEcwRAIgWPb8fGoz4bMVSNSByCbAFb0wE1qtQs1neQ2rZtKt\
+                        JDsCIEoc7SYExnNbY5PltBaR3XiwDwxZQvufdRhW+qk4FX26Af7///8CgPD6AgAAAA\
+                        AXqRQPuUY0IWlrgsgzryQceMF9295JNIfQ8gonAQAAABepFCnKdPigj4GZlCgYXJe1\
+                        2FLkBj9hh2UAAAAiAgKVg785rgpgl0etGZrd1jT6YQhVnWxc05tMIYPxq5bgf0cwRA\
+                        IgdAGK1BgAl7hzMjwAFXILNoTMgSOJEEjn282bVa1nnJkCIHPTabdA4+tT3O+jOCPI\
+                        BwUUylWn3ZVE8VfBZ5EyYRGMASICAtq2H/SaFNtqfQKwzR+7ePxLGDErW05U2uTbov\
+                        v+9TbXSDBFAiEA9hA4swjcHahlo0hSdG8BV3KTQgjG0kRUOTzZm98iF3cCIAVuZ1pn\
+                        Wm0KArhbFOXikHTYolqbV2C+ooFvZhkQoAbqAQEDBAEAAAABBEdSIQKVg785rgpgl0\
+                        etGZrd1jT6YQhVnWxc05tMIYPxq5bgfyEC2rYf9JoU22p9ArDNH7t4/EsYMStbTlTa\
+                        5Nui+/71NtdSriIGApWDvzmuCmCXR60Zmt3WNPphCFWdbFzTm0whg/GrluB/ENkMak\
+                        8AAACAAAAAgAAAAIAiBgLath/0mhTban0CsM0fu3j8SxgxK1tOVNrk26L7/vU21xDZ\
+                        DGpPAAAAgAAAAIABAACAAAEBIADC6wsAAAAAF6kUt/X69A49QKWkWbHbNTXyty+pIe\
+                        iHIgIDCJ3BDHrG21T5EymvYXMz2ziM6tDCMfcjN50bmQMLAtxHMEQCIGLrelVhB6fH\
+                        P0WsSrWh3d9vcHX7EnWWmn84Pv/3hLyyAiAMBdu3Rw2/LwhVfdNWxzJcHtMJE+mWzT\
+                        hAlF2xIijaXwEiAgI63ZBPPW3PWd25BrDe4jUpt/+57VDl6GFRkmhgIh8Oc0cwRAIg\
+                        ZfRbpZmLWaJ//hp77QFq8fH5DVSzqo90UKpfVqJRA70CIH9yRwOtHtuWaAsoS1bU/8\
+                        uI9/t1nqu+CKow8puFE4PSAQEDBAEAAAABBCIAIIwjUxc3Q7WV37Sge3K6jkLjeX2n\
+                        Tof+fZ10l+OyAokDAQVHUiEDCJ3BDHrG21T5EymvYXMz2ziM6tDCMfcjN50bmQMLAt\
+                        whAjrdkE89bc9Z3bkGsN7iNSm3/7ntUOXoYVGSaGAiHw5zUq4iBgI63ZBPPW3PWd25\
+                        BrDe4jUpt/+57VDl6GFRkmhgIh8OcxDZDGpPAAAAgAAAAIADAACAIgYDCJ3BDHrG21\
+                        T5EymvYXMz2ziM6tDCMfcjN50bmQMLAtwQ2QxqTwAAAIAAAACAAgAAgAAiAgOppMN/\
+                        WZbTqiXbrGtXCvBlA5RJKUJGCzVHU+2e7KWHcRDZDGpPAAAAgAAAAIAEAACAACICAn\
+                        9jmXV9Lv9VoTatAsaEsYOLZVbl8bazQoKpS2tQBRCWENkMak8AAACAAAAAgAUAAIAA";
+        let cleaned: String = psbt_b64.chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(cleaned.as_bytes()).unwrap();
+
+        let psbt = Psbt::deserialize(&bytes)
+            .expect("W40-C canonical fixture must decode (Fix 3 regression)");
+
+        // Shape assertions: 2-in / 2-out, asymmetric.
+        assert_eq!(psbt.unsigned_tx.inputs.len(), 2, "2 inputs expected");
+        assert_eq!(psbt.unsigned_tx.outputs.len(), 2, "2 outputs expected");
+        assert_eq!(psbt.inputs.len(), 2);
+        assert_eq!(psbt.outputs.len(), 2);
+
+        // Each input has 2 BIP32 derivations; outputs have 1 each.
+        assert_eq!(psbt.inputs[0].bip32_derivation.len(), 2);
+        assert_eq!(psbt.inputs[1].bip32_derivation.len(), 2);
+        assert_eq!(psbt.outputs[0].bip32_derivation.len(), 1);
+        assert_eq!(psbt.outputs[1].bip32_derivation.len(), 1);
+
+        // All key origins use the same fingerprint d90c6a4f and 3-deep
+        // BIP44-style paths (m/0'/0'/N'). Spot-check one entry.
+        let any_origin = psbt.inputs[0].bip32_derivation.values().next().unwrap();
+        assert_eq!(any_origin.fingerprint, [0xd9, 0x0c, 0x6a, 0x4f]);
+        assert_eq!(any_origin.path.len(), 3, "BIP44 m/0'/0'/N' = 3 indexes");
+
+        // Round-trip: re-encode, re-decode must succeed (no wire-format
+        // regression).
+        let reenc = psbt.serialize();
+        Psbt::deserialize(&reenc).expect("re-encoded PSBT must round-trip");
     }
 }
