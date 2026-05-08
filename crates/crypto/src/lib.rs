@@ -14,6 +14,7 @@ pub mod hwaccel;
 pub mod keys;
 pub mod sha256;
 pub mod sighash;
+pub mod taproot;
 
 pub use address::{Address, AddressError, Network};
 pub use base58::{base58check_decode, base58check_encode, Base58Error};
