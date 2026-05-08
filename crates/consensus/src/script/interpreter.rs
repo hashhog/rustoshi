@@ -2696,88 +2696,41 @@ fn verify_witness_program(
 
                     let internal_key = &control_block[1..33];
 
-                    // Compute tapleaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script) || script)
-                    let tapleaf_hash = {
-                        use sha2::{Sha256, Digest};
-                        let tag = Sha256::digest(b"TapLeaf");
-                        let mut data = Vec::new();
-                        data.push(leaf_version);
-                        // compact_size encoding of script length
-                        let slen = tap_script.len();
-                        if slen < 0xfd {
-                            data.push(slen as u8);
-                        } else if slen <= 0xffff {
-                            data.push(0xfd);
-                            data.push((slen & 0xff) as u8);
-                            data.push(((slen >> 8) & 0xff) as u8);
-                        } else {
-                            data.push(0xfe);
-                            data.push((slen & 0xff) as u8);
-                            data.push(((slen >> 8) & 0xff) as u8);
-                            data.push(((slen >> 16) & 0xff) as u8);
-                            data.push(((slen >> 24) & 0xff) as u8);
-                        }
-                        data.extend_from_slice(tap_script);
-                        let mut hasher = Sha256::new();
-                        hasher.update(tag);
-                        hasher.update(tag);
-                        hasher.update(&data);
-                        let result: [u8; 32] = hasher.finalize().into();
-                        result
-                    };
+                    // Compute tapleaf hash via the canonical helper in
+                    // `rustoshi-crypto`. This guarantees the wallet, the
+                    // descriptor builder, and consensus all encode the
+                    // script-length CompactSize the same way (W27-C P0-2).
+                    let tapleaf_hash = rustoshi_crypto::taproot::compute_tapleaf_hash(
+                        leaf_version,
+                        tap_script,
+                    );
 
                     // Compute merkle root from tapleaf hash and merkle path
                     let merkle_path_len = (control_block.len() - 33) / 32;
                     let mut k = tapleaf_hash;
                     for j in 0..merkle_path_len {
-                        let node = &control_block[33 + j * 32..33 + (j + 1) * 32];
-                        use sha2::{Sha256, Digest};
-                        let tag = Sha256::digest(b"TapBranch");
-                        let mut hasher = Sha256::new();
-                        hasher.update(tag);
-                        hasher.update(tag);
-                        // Sort: lexicographically smaller one first
-                        if k < *<&[u8; 32]>::try_from(node).unwrap() {
-                            hasher.update(k);
-                            hasher.update(node);
-                        } else {
-                            hasher.update(node);
-                            hasher.update(k);
-                        }
-                        k = hasher.finalize().into();
+                        let node_slice = &control_block[33 + j * 32..33 + (j + 1) * 32];
+                        let node: [u8; 32] = node_slice.try_into().unwrap();
+                        k = rustoshi_crypto::taproot::compute_tapbranch_hash(&k, &node);
                     }
 
-                    // Compute tweaked output key and verify against program
-                    let secp = secp256k1::Secp256k1::new();
+                    // Compute tweaked output key and verify against program.
                     let internal_xonly = match secp256k1::XOnlyPublicKey::from_slice(internal_key) {
                         Ok(k) => k,
                         Err(_) => return Err(ScriptError::WitnessProgramMismatch),
                     };
 
-                    // TapTweak = tagged_hash("TapTweak", internal_key || merkle_root)
-                    let tweak_hash = {
-                        use sha2::{Sha256, Digest};
-                        let tag = Sha256::digest(b"TapTweak");
-                        let mut hasher = Sha256::new();
-                        hasher.update(tag);
-                        hasher.update(tag);
-                        hasher.update(internal_key);
-                        hasher.update(k);
-                        let result: [u8; 32] = hasher.finalize().into();
-                        result
-                    };
-
-                    let tweak_scalar = match secp256k1::Scalar::from_be_bytes(tweak_hash) {
-                        Ok(s) => s,
-                        Err(_) => return Err(ScriptError::WitnessProgramMismatch),
-                    };
-
-                    let (output_key, output_parity) = internal_xonly
-                        .add_tweak(&secp, &tweak_scalar)
-                        .map_err(|_| ScriptError::WitnessProgramMismatch)?;
+                    let (output_key_serialized, output_parity) =
+                        match rustoshi_crypto::taproot::compute_taproot_output_key(
+                            &internal_xonly,
+                            Some(&k),
+                        ) {
+                            Ok(t) => t,
+                            Err(_) => return Err(ScriptError::WitnessProgramMismatch),
+                        };
 
                     // Verify the tweaked key matches the witness program
-                    if output_key.serialize() != program {
+                    if output_key_serialized != program {
                         return Err(ScriptError::WitnessProgramMismatch);
                     }
 
