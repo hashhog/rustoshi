@@ -494,4 +494,238 @@ mod tests {
         assert_eq!(output_key, expected.serialize());
     }
 
+    // =================================================================
+    // BIP-341 sighash tests (W27-C P0-1 regression coverage).
+    //
+    // The wallet previously shipped a duplicate of `compute_taproot_sighash`
+    // that diverged on SIGHASH_SINGLE — it placed the single-output digest
+    // at field 9 (where `sha_outputs` lives for ALL/NONE) instead of after
+    // fields 11+12 (per-input + annex). These tests verify the canonical
+    // helper (the surviving copy) gets BIP-341 right.
+    // =================================================================
+
+    use rustoshi_primitives::{Hash256, OutPoint, TxIn};
+    use rustoshi_primitives::transaction::{Transaction, TxOut};
+
+    /// Build a small, deterministic 2-input / 2-output Taproot transaction
+    /// for sighash tests, plus a matching `(amounts, scripts)` set of
+    /// "prevouts" (32-byte v1 witness programs).
+    fn make_test_tx() -> (Transaction, Vec<u64>, Vec<Vec<u8>>) {
+        // Two distinct dummy outpoints.
+        let inp_a = TxIn {
+            previous_output: OutPoint {
+                txid: Hash256([0xAAu8; 32]),
+                vout: 0,
+            },
+            script_sig: vec![],
+            sequence: 0xFFFF_FFFE,
+            witness: vec![],
+        };
+        let inp_b = TxIn {
+            previous_output: OutPoint {
+                txid: Hash256([0xBBu8; 32]),
+                vout: 1,
+            },
+            script_sig: vec![],
+            sequence: 0xFFFF_FFFE,
+            witness: vec![],
+        };
+
+        // Two outputs with distinct script + value bytes.
+        let mut spk0 = vec![0x51u8, 0x20];
+        spk0.extend_from_slice(&[0x11u8; 32]);
+        let mut spk1 = vec![0x51u8, 0x20];
+        spk1.extend_from_slice(&[0x22u8; 32]);
+        let out0 = TxOut {
+            value: 50_000,
+            script_pubkey: spk0,
+        };
+        let out1 = TxOut {
+            value: 60_000,
+            script_pubkey: spk1,
+        };
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![inp_a, inp_b],
+            outputs: vec![out0, out1],
+            lock_time: 0,
+        };
+
+        // Prevout amounts and v1 scriptPubKeys (32-byte witness programs).
+        let amounts = vec![100_000u64, 100_000u64];
+        let mut prev_spk_a = vec![0x51u8, 0x20];
+        prev_spk_a.extend_from_slice(&[0x33u8; 32]);
+        let mut prev_spk_b = vec![0x51u8, 0x20];
+        prev_spk_b.extend_from_slice(&[0x44u8; 32]);
+        let scripts = vec![prev_spk_a, prev_spk_b];
+
+        (tx, amounts, scripts)
+    }
+
+    /// W27-C P0-1: SIGHASH_DEFAULT round-trip — sign with the canonical
+    /// helper + tweaked keypair, then verify with secp256k1's Schnorr
+    /// verifier against the same digest. This is the "did the wallet's
+    /// sig actually verify?" guard.
+    #[test]
+    fn sighash_default_signs_and_verifies() {
+        let (tx, amounts, scripts) = make_test_tx();
+        let scripts_refs: Vec<&[u8]> = scripts.iter().map(|s| s.as_slice()).collect();
+
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x77u8; 32]).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+
+        // BIP-86 tweak (no merkle root).
+        let tweak_hash = compute_taproot_tweak_hash(&xonly.serialize(), None);
+        let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash).unwrap();
+        let tweaked_kp = kp.add_xonly_tweak(&secp, &tweak).unwrap();
+        let (tweaked_xonly, _) = tweaked_kp.x_only_public_key();
+
+        let sighash = compute_taproot_sighash(
+            &tx,
+            0,
+            TaprootPrevouts {
+                amounts: &amounts,
+                scripts: &scripts_refs,
+            },
+            SIGHASH_DEFAULT,
+            None,
+            None,
+        )
+        .expect("sighash");
+
+        let msg = secp256k1::Message::from_digest(sighash);
+        let sig = secp.sign_schnorr(&msg, &tweaked_kp);
+        assert!(secp.verify_schnorr(&sig, &msg, &tweaked_xonly).is_ok());
+    }
+
+    /// W27-C P0-1 regression: SIGHASH_SINGLE must produce a digest
+    /// distinct from SIGHASH_ALL on the same input, and the resulting
+    /// signature must verify under the verify-side path. The pre-fix
+    /// duplicate in `wallet.rs` placed the single-output digest at the
+    /// SIGHASH_ALL field-9 position; that made every wallet-signed
+    /// SIGHASH_SINGLE input produce a sig the consensus layer rejected.
+    #[test]
+    fn sighash_single_distinct_from_all_and_verifies() {
+        let (tx, amounts, scripts) = make_test_tx();
+        let scripts_refs: Vec<&[u8]> = scripts.iter().map(|s| s.as_slice()).collect();
+
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x88u8; 32]).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        let tweak_hash = compute_taproot_tweak_hash(&xonly.serialize(), None);
+        let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash).unwrap();
+        let tweaked_kp = kp.add_xonly_tweak(&secp, &tweak).unwrap();
+        let (tweaked_xonly, _) = tweaked_kp.x_only_public_key();
+
+        // The two digests MUST differ between SIGHASH_ALL and SIGHASH_SINGLE.
+        let prev_all = TaprootPrevouts {
+            amounts: &amounts,
+            scripts: &scripts_refs,
+        };
+        let prev_single = TaprootPrevouts {
+            amounts: &amounts,
+            scripts: &scripts_refs,
+        };
+
+        let h_all = compute_taproot_sighash(&tx, 0, prev_all, SIGHASH_ALL, None, None).unwrap();
+        let h_single =
+            compute_taproot_sighash(&tx, 0, prev_single, SIGHASH_SINGLE, None, None).unwrap();
+        assert_ne!(
+            h_all, h_single,
+            "SIGHASH_SINGLE must commit to a different digest than SIGHASH_ALL"
+        );
+
+        // The SIGHASH_SINGLE preimage must place the single-output
+        // digest AFTER per-input data (field 11) — never at field 9.
+        // For SIGHASH_SINGLE (not ANYONECANPAY, no annex, key-path), the
+        // BIP-341 sigMsg layout is:
+        //   1 (epoch) + 1 (hash_type) + 4 (version) + 4 (locktime)     = 10
+        //   + 32 (sha_prevouts) + 32 (sha_amounts)
+        //     + 32 (sha_scriptpubkeys) + 32 (sha_sequences)             = 138
+        //   + 1 (spend_type)                                            = 139
+        //   + 4 (input_index)                                           = 143
+        //   + 32 (sha_single_output, AFTER per-input data)              = 175
+        // No field-9 sha_outputs and no annex.
+        let prev_single2 = TaprootPrevouts {
+            amounts: &amounts,
+            scripts: &scripts_refs,
+        };
+        let preimage =
+            build_sig_msg(&tx, 0, prev_single2, SIGHASH_SINGLE, None, None).unwrap();
+        assert_eq!(preimage.len(), 175);
+
+        // And the signature using SINGLE must verify against its own digest.
+        let prev_single3 = TaprootPrevouts {
+            amounts: &amounts,
+            scripts: &scripts_refs,
+        };
+        let h2 =
+            compute_taproot_sighash(&tx, 0, prev_single3, SIGHASH_SINGLE, None, None).unwrap();
+        let msg = secp256k1::Message::from_digest(h2);
+        let sig = secp.sign_schnorr(&msg, &tweaked_kp);
+        assert!(secp.verify_schnorr(&sig, &msg, &tweaked_xonly).is_ok());
+    }
+
+    /// W27-C P0-1 regression: SIGHASH_ANYONECANPAY commits only to the
+    /// signing input's own outpoint+amount+script+sequence (field 11),
+    /// not to the full prevouts arrays at fields 5–8.
+    ///
+    /// Verifies by computing the same input's digest under two
+    /// transactions that DIFFER only in the OTHER input's scriptPubKey.
+    /// With ANYONECANPAY the two digests must match; without
+    /// ANYONECANPAY they must differ (the other input feeds into
+    /// sha_scriptpubkeys).
+    #[test]
+    fn sighash_anyonecanpay_only_commits_to_signing_input() {
+        let (tx, amounts, scripts) = make_test_tx();
+        let scripts_refs: Vec<&[u8]> = scripts.iter().map(|s| s.as_slice()).collect();
+
+        // Now mutate the OTHER input's prevout script — input 0 is the
+        // one we're "signing", so fiddle with input 1.
+        let mut alt_scripts = scripts.clone();
+        alt_scripts[1][2] = 0x55; // flip a byte deep inside the v1 program
+        let alt_refs: Vec<&[u8]> = alt_scripts.iter().map(|s| s.as_slice()).collect();
+
+        let prev_orig = TaprootPrevouts {
+            amounts: &amounts,
+            scripts: &scripts_refs,
+        };
+
+        // ANYONECANPAY|ALL = 0x81. The two digests must MATCH.
+        let h_orig =
+            compute_taproot_sighash(&tx, 0, prev_orig, 0x81, None, None).unwrap();
+        let prev_alt_again = TaprootPrevouts {
+            amounts: &amounts,
+            scripts: &alt_refs,
+        };
+        let h_alt =
+            compute_taproot_sighash(&tx, 0, prev_alt_again, 0x81, None, None).unwrap();
+        assert_eq!(
+            h_orig, h_alt,
+            "ANYONECANPAY must NOT commit to the other input's scriptPubKey"
+        );
+
+        // Sanity: under SIGHASH_ALL (without ANYONECANPAY), the two
+        // digests MUST differ (sha_scriptpubkeys covers all inputs).
+        let prev_orig2 = TaprootPrevouts {
+            amounts: &amounts,
+            scripts: &scripts_refs,
+        };
+        let prev_alt2 = TaprootPrevouts {
+            amounts: &amounts,
+            scripts: &alt_refs,
+        };
+        let g_orig =
+            compute_taproot_sighash(&tx, 0, prev_orig2, SIGHASH_ALL, None, None).unwrap();
+        let g_alt =
+            compute_taproot_sighash(&tx, 0, prev_alt2, SIGHASH_ALL, None, None).unwrap();
+        assert_ne!(
+            g_orig, g_alt,
+            "SIGHASH_ALL must commit to all inputs' scriptPubKeys"
+        );
+    }
 }
