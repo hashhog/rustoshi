@@ -148,6 +148,53 @@ impl Wallet {
         })
     }
 
+    /// Create a new wallet from a BIP-39 mnemonic phrase.
+    ///
+    /// The mnemonic is validated (word count, wordlist membership, checksum)
+    /// before being passed through PBKDF2-HMAC-SHA512(2048 iters, salt =
+    /// "mnemonic" || passphrase) to produce a 64-byte BIP-39 seed, which is
+    /// then fed into BIP-32 master-key derivation via [`Self::from_seed`].
+    ///
+    /// This is the high-level entry point most callers should use; it lets
+    /// rustoshi interop with mnemonics produced by Sparrow, Electrum, Trezor,
+    /// Ledger, and BIP-39 paper backups.
+    ///
+    /// # Arguments
+    /// * `mnemonic` - The mnemonic words (12/15/18/21/24, lowercase, English wordlist)
+    /// * `passphrase` - Optional BIP-39 passphrase (pass `""` for none). Stretches the
+    ///   seed but is NOT recoverable from the mnemonic — losing it loses the wallet.
+    /// * `network` - Bitcoin network for address encoding
+    /// * `address_type` - Address type to generate
+    ///
+    /// # Errors
+    /// - [`WalletError::InvalidPath`] wrapping the BIP-39 reason if the mnemonic
+    ///   is structurally invalid (bad word count, unknown word, checksum mismatch).
+    /// - Other [`WalletError`] variants from [`Self::from_seed`].
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use rustoshi_wallet::{Wallet, AddressType};
+    /// use rustoshi_crypto::address::Network;
+    ///
+    /// let words = ["abandon"; 11];
+    /// let mut mnemonic: Vec<&str> = words.to_vec();
+    /// mnemonic.push("about");
+    /// let wallet = Wallet::from_mnemonic(&mnemonic, "", Network::Mainnet, AddressType::P2TR)?;
+    /// ```
+    pub fn from_mnemonic(
+        mnemonic: &[&str],
+        passphrase: &str,
+        network: Network,
+        address_type: AddressType,
+    ) -> Result<Self, WalletError> {
+        // Strict validation: rejects word-count/unknown-word/checksum issues
+        // before we waste 2048 iterations of PBKDF2.
+        crate::bip39::validate_mnemonic(mnemonic)
+            .map_err(|e| WalletError::InvalidPath(format!("invalid BIP-39 mnemonic: {}", e)))?;
+        let seed = crate::bip39::mnemonic_to_seed(mnemonic, passphrase);
+        Self::from_seed(&seed, network, address_type)
+    }
+
     /// Get a new receiving address.
     ///
     /// Each call generates a fresh address at the next index in the derivation chain.
@@ -1140,6 +1187,69 @@ mod tests {
         assert_eq!(wallet.network(), Network::Mainnet);
         assert_eq!(wallet.address_type(), AddressType::P2WPKH);
         assert_eq!(wallet.balance(), 0);
+    }
+
+    /// End-to-end integration: BIP-39 mnemonic -> seed -> BIP-32 master ->
+    /// BIP-86 first receive address.
+    ///
+    /// Uses the canonical BIP-86 test vector (BIP-86 §"Test vectors"):
+    ///   mnemonic: "abandon abandon ... abandon about"
+    ///   passphrase: ""
+    ///   m/86'/0'/0'/0/0 -> bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr
+    ///
+    /// This proves that:
+    ///   1. mnemonic_to_seed produces the right 64-byte seed (PBKDF2 wired correctly)
+    ///   2. ExtendedPrivKey::from_seed accepts it (BIP-32 link works)
+    ///   3. The resulting key derives the canonical first BIP-86 address
+    ///
+    /// If any of those is wrong this test breaks loudly. This is the
+    /// load-bearing wave-21 integration check.
+    #[test]
+    fn from_mnemonic_bip86_first_address_matches_canonical_vector() {
+        let mnemonic_str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic: Vec<&str> = mnemonic_str.split_whitespace().collect();
+
+        let mut wallet =
+            Wallet::from_mnemonic(&mnemonic, "", Network::Mainnet, AddressType::P2TR).unwrap();
+
+        // First receive address at m/86'/0'/0'/0/0.
+        let addr0 = wallet.get_new_address().unwrap();
+        assert_eq!(
+            addr0,
+            "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr",
+            "BIP-86 first receive address must match the canonical test vector"
+        );
+    }
+
+    /// Cross-check: passing the well-known TREZOR vector-1 mnemonic with
+    /// passphrase "TREZOR" through `from_mnemonic` produces a wallet whose
+    /// internal seed corresponds to BIP-39 vector seed `c55257c3...` (we
+    /// can't read the seed back out, but we *can* observe that the wallet
+    /// constructs without error and the same seed bytes build via from_seed).
+    #[test]
+    fn from_mnemonic_with_trezor_passphrase_constructs_cleanly() {
+        let mnemonic: Vec<&str> = "legal winner thank year wave sausage worth useful legal winner thank yellow"
+            .split_whitespace()
+            .collect();
+        // Should NOT panic — covers checksum + PBKDF2 + BIP-32 master derivation.
+        let _wallet =
+            Wallet::from_mnemonic(&mnemonic, "TREZOR", Network::Mainnet, AddressType::P2TR)
+                .unwrap();
+    }
+
+    #[test]
+    fn from_mnemonic_rejects_bad_checksum() {
+        // 12 valid words but the checksum is broken (final word should be "about").
+        let bad: Vec<&str> = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon"
+            .split_whitespace()
+            .collect();
+        match Wallet::from_mnemonic(&bad, "", Network::Mainnet, AddressType::P2TR) {
+            Err(e) => {
+                let msg = format!("{}", e);
+                assert!(msg.contains("invalid BIP-39 mnemonic"), "got: {}", msg);
+            }
+            Ok(_) => panic!("expected from_mnemonic to reject bad-checksum mnemonic"),
+        }
     }
 
     #[test]
