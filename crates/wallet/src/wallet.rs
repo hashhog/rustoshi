@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use rustoshi_crypto::{
     address::{Address, Network},
-    hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash,
+    hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash, sha256,
     taproot::{compute_taproot_sighash as crypto_compute_taproot_sighash, TaprootPrevouts,
               SIGHASH_DEFAULT},
 };
@@ -609,6 +609,17 @@ impl Wallet {
         let spk = &utxo.script_pubkey;
         if is_p2wpkh_spk(spk) {
             self.sign_p2wpkh_input(tx, input_index, &utxo, &private_key, &secp)?;
+        } else if is_p2wsh_spk(spk) {
+            // P2WSH cannot be signed from a single-key wallet UTXO — the
+            // signer needs the witness_script and (for multisig) multiple
+            // private keys. Callers must drive this through PSBT (where
+            // witness_script + key-origin info live) and use
+            // `sign_p2wsh_input` directly.
+            return Err(WalletError::SigningError(format!(
+                "input {} is P2WSH; sign via PSBT or call sign_p2wsh_input \
+                 directly with the witness script and signing keys",
+                input_index
+            )));
         } else if is_p2pkh_spk(spk) {
             self.sign_p2pkh_input(tx, input_index, &utxo, &private_key, &secp)?;
         } else if is_p2sh_spk(spk) {
@@ -616,7 +627,8 @@ impl Wallet {
             // The redeem script for a wallet-owned P2SH is reconstructed in
             // sign_p2sh_p2wpkh_input from the public key derived at the UTXO's
             // path, so this is correct provided the wallet stored the UTXO as
-            // BIP-49.
+            // BIP-49. Wallets that hold P2SH-P2WSH UTXOs must drive signing
+            // through PSBT (witness_script lives there).
             self.sign_p2sh_p2wpkh_input(tx, input_index, &utxo, &private_key, &secp)?;
         } else if is_p2tr_spk(spk) {
             // Taproot key-path. all_prev_utxos must cover every input for the
@@ -733,6 +745,229 @@ impl Wallet {
         tx.inputs[input_index].witness = vec![sig_bytes, pubkey.serialize().to_vec()];
 
         Ok(())
+    }
+
+    /// Sign a P2WSH input (BIP-143 segwit-v0 with arbitrary witness script).
+    ///
+    /// Computes the BIP-143 segwit-v0 sighash with `witness_script` as
+    /// scriptCode, signs once per supplied key, and assembles the witness:
+    ///
+    /// - **CHECKMULTISIG (M-of-N):** witness =
+    ///   `[<empty>, sig1, ..., sigM, witness_script]`. The leading empty push
+    ///   is the legacy `OP_CHECKMULTISIG` off-by-one stack pad and is required
+    ///   for any multisig witness script. Signatures are appended in the order
+    ///   `sign_keys` are supplied, which the caller must order to match the
+    ///   pubkey order in the witness script (Core enforces this in
+    ///   `script/sign.cpp::SignStep`).
+    /// - **Single-key CHECKSIG:** witness = `[sig, witness_script]`.
+    ///
+    /// `value` is the prevout amount (committed in the BIP-143 preimage).
+    /// `hash_type` is the sighash byte (e.g. 0x01 = SIGHASH_ALL).
+    ///
+    /// Reference: `bitcoin-core/src/script/sign.cpp::ProduceSignature` +
+    /// `wallet/scriptpubkeyman.cpp::SignTransaction`.
+    pub fn sign_p2wsh_input(
+        &self,
+        tx: &mut Transaction,
+        input_index: usize,
+        witness_script: &[u8],
+        value: u64,
+        sign_keys: &[secp256k1::SecretKey],
+        hash_type: u8,
+    ) -> Result<(), WalletError> {
+        if input_index >= tx.inputs.len() {
+            return Err(WalletError::SigningError(format!(
+                "input_index {} out of range ({} inputs)",
+                input_index,
+                tx.inputs.len()
+            )));
+        }
+        if sign_keys.is_empty() {
+            return Err(WalletError::SigningError(
+                "sign_p2wsh_input requires at least one signing key".to_string(),
+            ));
+        }
+
+        let secp = Secp256k1::new();
+        let sighash = segwit_v0_sighash(
+            tx,
+            input_index,
+            witness_script,
+            value,
+            hash_type as u32,
+        );
+        let msg = Message::from_digest(sighash.0);
+
+        let sigs: Vec<Vec<u8>> = sign_keys
+            .iter()
+            .map(|sk| {
+                let sig = secp.sign_ecdsa(&msg, sk);
+                let mut out = sig.serialize_der().to_vec();
+                out.push(hash_type);
+                out
+            })
+            .collect();
+
+        let mut witness: Vec<Vec<u8>> = Vec::with_capacity(sigs.len() + 2);
+        if is_multisig_witness_script(witness_script) {
+            // CHECKMULTISIG bug-compat: leading empty stack item.
+            witness.push(Vec::new());
+            witness.extend(sigs);
+        } else {
+            // Single-CHECKSIG: caller is responsible for any prefix items
+            // (e.g. pubkey for OP_DUP OP_HASH160 ... CHECKSIG) but for the
+            // common bare-CHECKSIG-on-pubkey shape that's just <sig>.
+            witness.extend(sigs);
+        }
+        witness.push(witness_script.to_vec());
+
+        tx.inputs[input_index].witness = witness;
+        tx.inputs[input_index].script_sig = Vec::new();
+        Ok(())
+    }
+
+    /// Sign a P2SH-P2WSH input (legacy P2SH wrapping a P2WSH inner script).
+    ///
+    /// The outer P2SH commits to `redeem_script = OP_0 <SHA256(witness_script)>`.
+    /// The witness is computed exactly as in [`Self::sign_p2wsh_input`]; the
+    /// scriptSig is set to a single push of the redeem script (the only thing
+    /// the legacy P2SH consensus check looks at — it then unwraps the redeem
+    /// script as if it were the scriptPubKey).
+    ///
+    /// Reference: BIP-141 §"Backward compatibility" + `script/interpreter.cpp::EvalScript`
+    /// (the P2SH unwrap branch when the redeem script is a witness program).
+    pub fn sign_p2sh_p2wsh_input(
+        &self,
+        tx: &mut Transaction,
+        input_index: usize,
+        witness_script: &[u8],
+        value: u64,
+        sign_keys: &[secp256k1::SecretKey],
+        hash_type: u8,
+    ) -> Result<(), WalletError> {
+        // Inner P2WSH witness assembly (sets tx.inputs[idx].witness).
+        self.sign_p2wsh_input(tx, input_index, witness_script, value, sign_keys, hash_type)?;
+
+        // Build the outer P2SH redeem script: OP_0 <0x20> <SHA256(witness_script)>.
+        let ws_hash = sha256(witness_script);
+        let mut redeem_script = Vec::with_capacity(34);
+        redeem_script.push(0x00); // OP_0
+        redeem_script.push(0x20); // push 32 bytes
+        redeem_script.extend_from_slice(&ws_hash);
+
+        // scriptSig is a single push of the 34-byte redeem script.
+        let mut script_sig = Vec::with_capacity(35);
+        script_sig.push(redeem_script.len() as u8);
+        script_sig.extend_from_slice(&redeem_script);
+        tx.inputs[input_index].script_sig = script_sig;
+        Ok(())
+    }
+
+    /// Sign one PSBT input by populating `partial_sigs` for every supplied key
+    /// whose pubkey appears in the input's `witness_script`.
+    ///
+    /// Drives the BIP-174 Signer role for P2WSH and P2SH-P2WSH inputs:
+    /// reads `psbt.inputs[idx].witness_utxo` for the spent value, computes the
+    /// BIP-143 segwit-v0 sighash with `witness_script` as scriptCode, signs
+    /// once per matching key, and writes `(pubkey -> der_sig||hashtype)` into
+    /// `partial_sigs`. The finalizer (`Psbt::finalize_input`) then assembles
+    /// the witness in script-pubkey order with the CHECKMULTISIG pad.
+    ///
+    /// `hash_type` is the sighash byte (e.g. 0x01 = SIGHASH_ALL). Returns the
+    /// number of signatures added (0 if none of the keys' pubkeys appear in
+    /// the witness script — caller's choice whether that's an error).
+    pub fn sign_psbt_input(
+        &self,
+        psbt: &mut crate::psbt::Psbt,
+        input_index: usize,
+        sign_keys: &[secp256k1::SecretKey],
+        hash_type: u8,
+    ) -> Result<usize, WalletError> {
+        if input_index >= psbt.inputs.len() {
+            return Err(WalletError::SigningError(format!(
+                "input_index {} out of range ({} inputs)",
+                input_index,
+                psbt.inputs.len()
+            )));
+        }
+        let witness_script = psbt.inputs[input_index]
+            .witness_script
+            .clone()
+            .ok_or_else(|| {
+                WalletError::SigningError(
+                    "PSBT input is missing witness_script (only P2WSH / P2SH-P2WSH \
+                     are wired through this signer)"
+                        .to_string(),
+                )
+            })?;
+        let value = psbt.inputs[input_index]
+            .witness_utxo
+            .as_ref()
+            .map(|u| u.value)
+            .ok_or_else(|| {
+                WalletError::SigningError(
+                    "PSBT input is missing witness_utxo (P2WSH segwit-v0 sighash \
+                     requires the prevout amount)"
+                        .to_string(),
+                )
+            })?;
+
+        // Collect script pubkeys (33-byte compressed only — Core forbids
+        // uncompressed in segwit-v0 via WITNESS_PUBKEYTYPE).
+        let script_pks: Vec<[u8; 33]> = {
+            let mut out = Vec::new();
+            let mut i = 1usize;
+            if witness_script.len() >= 4 {
+                let end = witness_script.len().saturating_sub(2);
+                while i < end {
+                    let push_len = witness_script[i] as usize;
+                    if push_len != 33 && push_len != 65 {
+                        break;
+                    }
+                    i += 1;
+                    if i + push_len > end {
+                        break;
+                    }
+                    if push_len == 33 {
+                        let mut pk = [0u8; 33];
+                        pk.copy_from_slice(&witness_script[i..i + 33]);
+                        out.push(pk);
+                    }
+                    i += push_len;
+                }
+            }
+            out
+        };
+
+        // Compute the BIP-143 sighash once — same digest signs for all
+        // matching keys.
+        let secp = Secp256k1::new();
+        let sighash = segwit_v0_sighash(
+            &psbt.unsigned_tx,
+            input_index,
+            &witness_script,
+            value,
+            hash_type as u32,
+        );
+        let msg = Message::from_digest(sighash.0);
+
+        let mut added = 0usize;
+        for sk in sign_keys {
+            let pk = secp256k1::PublicKey::from_secret_key(&secp, sk);
+            let pk_bytes: [u8; 33] = pk.serialize();
+            if !script_pks.iter().any(|p| p == &pk_bytes) {
+                continue; // key not in this script
+            }
+            let sig = secp.sign_ecdsa(&msg, sk);
+            let mut sig_bytes = sig.serialize_der().to_vec();
+            sig_bytes.push(hash_type);
+            psbt.add_partial_sig(input_index, pk_bytes, sig_bytes)
+                .map_err(|e| {
+                    WalletError::SigningError(format!("PSBT add_partial_sig: {:?}", e))
+                })?;
+            added += 1;
+        }
+        Ok(added)
     }
 
     /// Sign a P2TR input (Taproot key-path spending).
@@ -1029,9 +1264,64 @@ fn is_p2wpkh_spk(spk: &[u8]) -> bool {
     spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14
 }
 
+/// P2WSH: OP_0 <32> 32 bytes (34 bytes).
+fn is_p2wsh_spk(spk: &[u8]) -> bool {
+    spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20
+}
+
 /// P2TR: OP_1 <32> 32 bytes (34 bytes).
 fn is_p2tr_spk(spk: &[u8]) -> bool {
     spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20
+}
+
+/// Detect a bare CHECKMULTISIG witness/redeem script of the form
+/// `<M> <pk1> ... <pkN> <N> OP_CHECKMULTISIG` where M and N are encoded as
+/// OP_1..OP_16 (0x51..0x60). Returns true only for the simple shape Core
+/// recognises in `solver()` (`bitcoin-core/src/script/solver.cpp::MatchMultisig`).
+///
+/// Used by the P2WSH signer to decide whether to prepend the empty CHECKMULTISIG
+/// off-by-one stack pad and how many sig stack slots to fill.
+fn is_multisig_witness_script(script: &[u8]) -> bool {
+    if script.len() < 4 {
+        return false;
+    }
+    if *script.last().unwrap() != 0xae {
+        // OP_CHECKMULTISIG
+        return false;
+    }
+    // Last byte before OP_CHECKMULTISIG must be OP_1..OP_16 (the N count).
+    let n_op = script[script.len() - 2];
+    if !(0x51..=0x60).contains(&n_op) {
+        return false;
+    }
+    // First byte must be OP_1..OP_16 (the M count).
+    let m_op = script[0];
+    if !(0x51..=0x60).contains(&m_op) {
+        return false;
+    }
+    let m = (m_op - 0x50) as usize;
+    let n = (n_op - 0x50) as usize;
+    if m == 0 || m > n || n > 20 {
+        return false;
+    }
+    // Walk N pubkey pushes between [1 .. len-2). Each push starts with the
+    // length (compressed=33 → 0x21, uncompressed=65 → 0x41).
+    let mut i = 1usize;
+    let end = script.len() - 2;
+    let mut keys_seen = 0usize;
+    while i < end {
+        let push_len = script[i] as usize;
+        if push_len != 33 && push_len != 65 {
+            return false;
+        }
+        i += 1;
+        if i + push_len > end {
+            return false;
+        }
+        i += push_len;
+        keys_seen += 1;
+    }
+    keys_seen == n
 }
 
 /// Estimate the virtual size (vsize) of a transaction.
@@ -2087,5 +2377,301 @@ mod tests {
         // it, so this must miss.
         let s2 = wallet.private_key_for_address(&other);
         assert!(s2.is_none(), "unknown address must not return a key");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase-2 segwit-v0 P2WSH + P2SH-P2WSH signers (W29-B)
+    // (CORE-PARITY-AUDIT/_design-per-impl-wallet-phase2-segwit-v0-2026-05-08.md)
+    // ------------------------------------------------------------------
+
+    /// Build a deterministic K-of-N CHECKMULTISIG witness script:
+    /// `<M> <pk1> ... <pkN> <N> OP_CHECKMULTISIG`. Pubkeys are 33-byte
+    /// compressed.
+    fn build_multisig_script(m: u8, pubkeys: &[[u8; 33]]) -> Vec<u8> {
+        assert!(m >= 1 && m as usize <= pubkeys.len());
+        assert!(pubkeys.len() <= 16);
+        let mut script = Vec::with_capacity(2 + pubkeys.len() * 34);
+        script.push(0x50 + m); // OP_M
+        for pk in pubkeys {
+            script.push(33);
+            script.extend_from_slice(pk);
+        }
+        script.push(0x50 + pubkeys.len() as u8); // OP_N
+        script.push(0xae); // OP_CHECKMULTISIG
+        script
+    }
+
+    /// Build an unsigned 1-input/1-output spending transaction for a P2WSH
+    /// (or P2SH-P2WSH) prevout. Returns the unsigned tx.
+    fn build_unsigned_p2wsh_tx(prev_txid: [u8; 32], prev_vout: u32) -> Transaction {
+        Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: rustoshi_primitives::Hash256(prev_txid),
+                    vout: prev_vout,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFD,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 90_000,
+                script_pubkey: Address::from_string(
+                    "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+                    Some(Network::Testnet),
+                )
+                .unwrap()
+                .to_script_pubkey(),
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// Verify a CHECKMULTISIG-shaped witness using the embedded signatures.
+    /// Confirms each `<sig>` after the empty pad is a valid ECDSA over the
+    /// BIP-143 sighash with `witness_script` as scriptCode for the matching
+    /// pubkey in script-pubkey order.
+    fn verify_multisig_witness_p2wsh(
+        tx: &Transaction,
+        input_index: usize,
+        witness_script: &[u8],
+        value: u64,
+    ) {
+        let witness = &tx.inputs[input_index].witness;
+        assert!(
+            witness.len() >= 3,
+            "P2WSH multisig witness needs >= 3 stack items (pad + sig + script)"
+        );
+        assert!(
+            witness[0].is_empty(),
+            "first witness item must be the CHECKMULTISIG empty pad"
+        );
+        assert_eq!(
+            witness.last().unwrap().as_slice(),
+            witness_script,
+            "last witness item must be the witness_script"
+        );
+
+        // Recompute sighash and walk pubkeys in order, matching against sigs.
+        let sighash = segwit_v0_sighash(tx, input_index, witness_script, value, 0x01);
+        let msg = Message::from_digest(sighash.0);
+        let secp = Secp256k1::verification_only();
+
+        let sigs: &[Vec<u8>] = &witness[1..witness.len() - 1];
+
+        // Walk pubkeys embedded in the script.
+        let mut script_pks: Vec<[u8; 33]> = Vec::new();
+        let mut i = 1usize;
+        let end = witness_script.len() - 2;
+        while i < end {
+            let push_len = witness_script[i] as usize;
+            i += 1;
+            if push_len == 33 {
+                let mut pk = [0u8; 33];
+                pk.copy_from_slice(&witness_script[i..i + 33]);
+                script_pks.push(pk);
+            }
+            i += push_len;
+        }
+
+        // Match each sig against the next-in-order pubkey that verifies.
+        let mut sig_idx = 0;
+        let mut pk_idx = 0;
+        while sig_idx < sigs.len() && pk_idx < script_pks.len() {
+            let sig = &sigs[sig_idx];
+            assert!(*sig.last().unwrap() == 0x01, "sighash byte = SIGHASH_ALL");
+            let der = &sig[..sig.len() - 1];
+            let parsed_sig = secp256k1::ecdsa::Signature::from_der(der)
+                .expect("DER-encoded signature");
+            let parsed_pk = secp256k1::PublicKey::from_slice(&script_pks[pk_idx])
+                .expect("compressed pubkey");
+            if secp.verify_ecdsa(&msg, &parsed_sig, &parsed_pk).is_ok() {
+                sig_idx += 1;
+            }
+            pk_idx += 1;
+        }
+        assert_eq!(
+            sig_idx,
+            sigs.len(),
+            "every signature in the witness must verify against an in-order pubkey"
+        );
+    }
+
+    /// Test 1 (Wave 28 design-doc gate vector #1): native 2-of-3 P2WSH
+    /// multisig sign + verify against the BIP-143 segwit-v0 sighash.
+    #[test]
+    fn sign_p2wsh_2_of_3_multisig_verifies() {
+        // Three deterministic signing keys. Using small distinct scalars so
+        // the test is fully deterministic and doesn't depend on rng.
+        let secp = Secp256k1::new();
+        let sk1 = secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let sk2 = secp256k1::SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let sk3 = secp256k1::SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let pk1: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk1).serialize();
+        let pk2: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk2).serialize();
+        let pk3: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk3).serialize();
+
+        let witness_script = build_multisig_script(2, &[pk1, pk2, pk3]);
+        // 2-of-3 P2WSH script length is 1+34*3+1+1 = 105 bytes.
+        assert_eq!(witness_script.len(), 105);
+        // Sanity: detector recognises this shape.
+        assert!(is_multisig_witness_script(&witness_script));
+
+        // The wallet object isn't strictly needed for sign_p2wsh_input
+        // (the keys come from the caller), but we instantiate one to mirror
+        // how a real signer pipeline would look.
+        let wallet =
+            Wallet::from_seed(&test_seed(), Network::Testnet, AddressType::P2WPKH).unwrap();
+        let mut tx = build_unsigned_p2wsh_tx([0xab; 32], 0);
+        let value: u64 = 100_000;
+
+        // Sign with keys 1 and 3 (skip the middle key on purpose to exercise
+        // partial-multisig — Core honors any M-of-N order at verify time).
+        wallet
+            .sign_p2wsh_input(&mut tx, 0, &witness_script, value, &[sk1, sk3], 0x01)
+            .expect("P2WSH 2-of-3 sign should succeed");
+
+        // Witness must be [empty, sig_sk1, sig_sk3, witness_script].
+        let witness = &tx.inputs[0].witness;
+        assert_eq!(
+            witness.len(),
+            4,
+            "2-of-3 P2WSH witness = [pad, sig1, sig2, script]"
+        );
+        assert!(witness[0].is_empty(), "leading CHECKMULTISIG empty pad");
+        assert_eq!(witness[3], witness_script);
+
+        // Both signatures must verify — and they verify against pk1 + pk3,
+        // not pk2 (which we didn't sign with).
+        verify_multisig_witness_p2wsh(&tx, 0, &witness_script, value);
+
+        // scriptSig must be empty for native P2WSH.
+        assert!(
+            tx.inputs[0].script_sig.is_empty(),
+            "native P2WSH scriptSig must be empty"
+        );
+    }
+
+    /// Test 2 (Wave 28 design-doc gate vector #2): P2SH-P2WSH 2-of-2 multisig
+    /// wrap. Witness must match the inner P2WSH; scriptSig must be a single
+    /// push of the redeem script `OP_0 <sha256(witness_script)>`.
+    #[test]
+    fn sign_p2sh_p2wsh_2_of_2_wrap_verifies() {
+        let secp = Secp256k1::new();
+        let sk1 = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let sk2 = secp256k1::SecretKey::from_slice(&[8u8; 32]).unwrap();
+        let pk1: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk1).serialize();
+        let pk2: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk2).serialize();
+
+        let witness_script = build_multisig_script(2, &[pk1, pk2]);
+        // 2-of-2 P2WSH script length is 1+34*2+1+1 = 71 bytes.
+        assert_eq!(witness_script.len(), 71);
+
+        let wallet =
+            Wallet::from_seed(&test_seed(), Network::Testnet, AddressType::P2WPKH).unwrap();
+        let mut tx = build_unsigned_p2wsh_tx([0xcd; 32], 1);
+        let value: u64 = 200_000;
+
+        wallet
+            .sign_p2sh_p2wsh_input(&mut tx, 0, &witness_script, value, &[sk1, sk2], 0x01)
+            .expect("P2SH-P2WSH 2-of-2 sign should succeed");
+
+        // Witness identical shape to native P2WSH.
+        verify_multisig_witness_p2wsh(&tx, 0, &witness_script, value);
+        assert_eq!(tx.inputs[0].witness.len(), 4);
+
+        // scriptSig: one push of OP_0 <sha256(witness_script)>. That's
+        // 1 (length-prefix=34) + 34 (redeem_script) = 35 bytes.
+        let script_sig = &tx.inputs[0].script_sig;
+        assert_eq!(
+            script_sig.len(),
+            35,
+            "P2SH-P2WSH scriptSig is 35 bytes (push of 34-byte redeem)"
+        );
+        assert_eq!(script_sig[0], 34, "first byte = 0x22 push of 34");
+        assert_eq!(script_sig[1], 0x00, "redeem byte 0 = OP_0");
+        assert_eq!(script_sig[2], 0x20, "redeem byte 1 = push 32");
+        // Bytes 3..35 = SHA256(witness_script).
+        let expected_hash = sha256(&witness_script);
+        assert_eq!(&script_sig[3..35], &expected_hash[..]);
+    }
+
+    /// Test 3 (Wave 28 parallel-impl-drift sentinel, mirrors W27-D blockbrew
+    /// pattern): PSBT-vs-raw-tx round-trip. Build the same 2-of-2 P2WSH spend
+    /// two ways — directly via `sign_p2wsh_input` on a Transaction, and as a
+    /// PSBT signed via `sign_psbt_input` + `finalize_input` + `extract_tx` —
+    /// and assert the two extracted transactions are byte-identical.
+    #[test]
+    fn p2wsh_psbt_roundtrip_matches_raw_signer() {
+        let secp = Secp256k1::new();
+        let sk1 = secp256k1::SecretKey::from_slice(&[0x21; 32]).unwrap();
+        let sk2 = secp256k1::SecretKey::from_slice(&[0x22; 32]).unwrap();
+        let pk1: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk1).serialize();
+        let pk2: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk2).serialize();
+        let witness_script = build_multisig_script(2, &[pk1, pk2]);
+        let value: u64 = 150_000;
+        let prev_txid = [0xefu8; 32];
+        let prev_vout = 2u32;
+
+        let wallet =
+            Wallet::from_seed(&test_seed(), Network::Testnet, AddressType::P2WPKH).unwrap();
+
+        // Path A: raw-tx signing directly.
+        let mut tx_raw = build_unsigned_p2wsh_tx(prev_txid, prev_vout);
+        wallet
+            .sign_p2wsh_input(&mut tx_raw, 0, &witness_script, value, &[sk1, sk2], 0x01)
+            .expect("raw P2WSH sign");
+
+        // Path B: PSBT signing through the BIP-174 Signer + Finalizer +
+        // Extractor roles.
+        let unsigned_b = build_unsigned_p2wsh_tx(prev_txid, prev_vout);
+        let mut psbt = crate::psbt::Psbt::from_unsigned_tx(unsigned_b).unwrap();
+        // Build the witness UTXO: the actual P2WSH scriptPubKey is
+        // OP_0 <sha256(witness_script)>.
+        let ws_hash = sha256(&witness_script);
+        let mut p2wsh_spk = Vec::with_capacity(34);
+        p2wsh_spk.push(0x00);
+        p2wsh_spk.push(0x20);
+        p2wsh_spk.extend_from_slice(&ws_hash);
+        psbt.set_witness_utxo(
+            0,
+            TxOut {
+                value,
+                script_pubkey: p2wsh_spk,
+            },
+        )
+        .unwrap();
+        psbt.set_input_witness_script(0, witness_script.clone())
+            .unwrap();
+
+        // Sign with both keys.
+        let n1 = wallet
+            .sign_psbt_input(&mut psbt, 0, &[sk1], 0x01)
+            .expect("PSBT sign sk1");
+        let n2 = wallet
+            .sign_psbt_input(&mut psbt, 0, &[sk2], 0x01)
+            .expect("PSBT sign sk2");
+        assert_eq!(n1, 1, "sk1 signed exactly once");
+        assert_eq!(n2, 1, "sk2 signed exactly once");
+        assert_eq!(psbt.inputs[0].partial_sigs.len(), 2);
+
+        psbt.finalize_input(0).expect("finalize");
+        let tx_psbt = psbt.extract_tx().expect("extract");
+
+        // Byte-identity. ECDSA signing is deterministic in libsecp256k1
+        // (RFC 6979) so the two paths must agree exactly.
+        assert_eq!(
+            tx_raw.inputs[0].witness, tx_psbt.inputs[0].witness,
+            "PSBT witness must match raw-tx witness byte-for-byte"
+        );
+        assert_eq!(
+            tx_raw.inputs[0].script_sig, tx_psbt.inputs[0].script_sig,
+            "P2WSH scriptSig is empty on both paths"
+        );
+
+        // Sanity: both verify.
+        verify_multisig_witness_p2wsh(&tx_psbt, 0, &witness_script, value);
+        verify_multisig_witness_p2wsh(&tx_raw, 0, &witness_script, value);
     }
 }
