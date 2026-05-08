@@ -726,6 +726,22 @@ impl Wallet {
         let mut redeem_script = vec![0x00, 0x14];
         redeem_script.extend_from_slice(&pubkey_hash.0);
 
+        // Defense-in-depth (W31): the redeem_script is reconstructed from
+        // *our* private key, so this check is always tautologically true on
+        // the safe path. But a future refactor that lets the caller supply
+        // a redeem_script would silently turn this into the same confused-
+        // deputy bug as `sign_psbt_input` had pre-W31. Verify the P2SH
+        // commitment now and have the assertion fail loud if anything
+        // changes.
+        rustoshi_crypto::verify_p2sh_commitment(&redeem_script, &utxo.script_pubkey).map_err(
+            |e| {
+                WalletError::SigningError(format!(
+                    "P2SH-P2WPKH commitment verification failed: {}",
+                    e
+                ))
+            },
+        )?;
+
         // Script code for signing (same as P2WPKH)
         let script_code = p2wpkh_script_code(&pubkey_hash.0);
 
@@ -834,6 +850,14 @@ impl Wallet {
     /// the legacy P2SH consensus check looks at — it then unwraps the redeem
     /// script as if it were the scriptPubKey).
     ///
+    /// `prevout_spk` is the 23-byte P2SH scriptPubKey of the UTXO being
+    /// spent. We verify that `HASH160(redeem_script) == prevout_spk[2..22]`
+    /// before signing; without that check a caller that hands us a
+    /// `witness_script` unrelated to the prevout can extract a valid
+    /// SIGHASH_ALL signature and steal funds (the
+    /// hotbuns/W30-rustoshi-PSBT bug class). See
+    /// `rustoshi_crypto::p2sh::verify_p2sh_commitment`.
+    ///
     /// Reference: BIP-141 §"Backward compatibility" + `script/interpreter.cpp::EvalScript`
     /// (the P2SH unwrap branch when the redeem script is a witness program).
     pub fn sign_p2sh_p2wsh_input(
@@ -844,16 +868,28 @@ impl Wallet {
         value: u64,
         sign_keys: &[secp256k1::SecretKey],
         hash_type: u8,
+        prevout_spk: &[u8],
     ) -> Result<(), WalletError> {
-        // Inner P2WSH witness assembly (sets tx.inputs[idx].witness).
-        self.sign_p2wsh_input(tx, input_index, witness_script, value, sign_keys, hash_type)?;
-
         // Build the outer P2SH redeem script: OP_0 <0x20> <SHA256(witness_script)>.
         let ws_hash = sha256(witness_script);
         let mut redeem_script = Vec::with_capacity(34);
         redeem_script.push(0x00); // OP_0
         redeem_script.push(0x20); // push 32 bytes
         redeem_script.extend_from_slice(&ws_hash);
+
+        // W31: verify the P2SH commitment BEFORE producing any signature.
+        // If the caller-supplied witness_script doesn't actually unlock the
+        // prevout, signing it would just hand an attacker a SIGHASH_ALL
+        // signature for an unrelated script.
+        rustoshi_crypto::verify_p2sh_commitment(&redeem_script, prevout_spk).map_err(|e| {
+            WalletError::SigningError(format!(
+                "P2SH-P2WSH commitment verification failed: {}",
+                e
+            ))
+        })?;
+
+        // Inner P2WSH witness assembly (sets tx.inputs[idx].witness).
+        self.sign_p2wsh_input(tx, input_index, witness_script, value, sign_keys, hash_type)?;
 
         // scriptSig is a single push of the 34-byte redeem script.
         let mut script_sig = Vec::with_capacity(35);
@@ -900,10 +936,9 @@ impl Wallet {
                         .to_string(),
                 )
             })?;
-        let value = psbt.inputs[input_index]
+        let witness_utxo = psbt.inputs[input_index]
             .witness_utxo
             .as_ref()
-            .map(|u| u.value)
             .ok_or_else(|| {
                 WalletError::SigningError(
                     "PSBT input is missing witness_utxo (P2WSH segwit-v0 sighash \
@@ -911,6 +946,62 @@ impl Wallet {
                         .to_string(),
                 )
             })?;
+        let value = witness_utxo.value;
+        let prevout_spk = witness_utxo.script_pubkey.clone();
+
+        // ============================================================
+        // W31 PRIMARY FIX — verify the caller-supplied witness_script is
+        // actually committed to by the prevout's scriptPubKey BEFORE
+        // signing.
+        //
+        // Threat model: a malicious PSBT can hand us any witness_script
+        // whose multisig pubkey set happens to include one of our keys.
+        // Without this check, `sign_psbt_input` produces a valid
+        // SIGHASH_ALL signature against an unrelated script — the
+        // attacker then drops that sig into a transaction the user never
+        // approved and broadcasts. This is the same hotbuns
+        // confused-deputy bug class found in the 2026-04 wallet audit
+        // and called out in the W30-rustoshi audit
+        // (`tasks/a4313ea8dbcf71339`).
+        //
+        // Two valid commitments here:
+        //  - P2WSH:      prevout_spk = OP_0 PUSH32 <SHA256(witness_script)>
+        //  - P2SH-P2WSH: prevout_spk = OP_HASH160 PUSH20
+        //                <HASH160(OP_0 PUSH32 SHA256(witness_script))>
+        //                OP_EQUAL
+        // Anything else, refuse to sign.
+        if rustoshi_crypto::is_p2wsh(&prevout_spk) {
+            rustoshi_crypto::verify_p2wsh_commitment(&witness_script, &prevout_spk)
+                .map_err(|e| {
+                    WalletError::SigningError(format!(
+                        "PSBT P2WSH commitment verification failed: {}",
+                        e
+                    ))
+                })?;
+        } else if rustoshi_crypto::is_p2sh(&prevout_spk) {
+            // For P2SH-P2WSH the redeem_script committed to in the
+            // outer P2SH is the inner P2WSH scriptPubKey shape, i.e.
+            // OP_0 PUSH32 SHA256(witness_script).
+            let ws_hash = sha256(&witness_script);
+            let mut redeem_script = Vec::with_capacity(34);
+            redeem_script.push(0x00); // OP_0
+            redeem_script.push(0x20); // PUSH32
+            redeem_script.extend_from_slice(&ws_hash);
+            rustoshi_crypto::verify_p2sh_commitment(&redeem_script, &prevout_spk).map_err(
+                |e| {
+                    WalletError::SigningError(format!(
+                        "PSBT P2SH-P2WSH commitment verification failed: {}",
+                        e
+                    ))
+                },
+            )?;
+        } else {
+            return Err(WalletError::SigningError(
+                "PSBT witness_utxo.script_pubkey is neither P2WSH nor P2SH-P2WSH; \
+                 refusing to sign caller-supplied witness_script (W31 commitment check)"
+                    .to_string(),
+            ));
+        }
 
         // Collect script pubkeys (33-byte compressed only — Core forbids
         // uncompressed in segwit-v0 via WITNESS_PUBKEYTYPE).
@@ -2573,8 +2664,30 @@ mod tests {
         let mut tx = build_unsigned_p2wsh_tx([0xcd; 32], 1);
         let value: u64 = 200_000;
 
+        // Build the canonical P2SH-P2WSH prevout scriptPubKey:
+        //   OP_HASH160 PUSH20 <HASH160(OP_0 PUSH32 SHA256(witness_script))> OP_EQUAL
+        let ws_hash = sha256(&witness_script);
+        let mut redeem = Vec::with_capacity(34);
+        redeem.push(0x00);
+        redeem.push(0x20);
+        redeem.extend_from_slice(&ws_hash);
+        let redeem_h160 = hash160(&redeem);
+        let mut prevout_spk = Vec::with_capacity(23);
+        prevout_spk.push(0xa9);
+        prevout_spk.push(0x14);
+        prevout_spk.extend_from_slice(&redeem_h160.0);
+        prevout_spk.push(0x87);
+
         wallet
-            .sign_p2sh_p2wsh_input(&mut tx, 0, &witness_script, value, &[sk1, sk2], 0x01)
+            .sign_p2sh_p2wsh_input(
+                &mut tx,
+                0,
+                &witness_script,
+                value,
+                &[sk1, sk2],
+                0x01,
+                &prevout_spk,
+            )
             .expect("P2SH-P2WSH 2-of-2 sign should succeed");
 
         // Witness identical shape to native P2WSH.
@@ -2673,5 +2786,189 @@ mod tests {
         // Sanity: both verify.
         verify_multisig_witness_p2wsh(&tx_psbt, 0, &witness_script, value);
         verify_multisig_witness_p2wsh(&tx_raw, 0, &witness_script, value);
+    }
+
+    // ====================================================================
+    // W31 — P2SH/P2WSH commitment-check tests
+    //
+    // Threat: PSBT path consumes caller-supplied witness_script. Without a
+    // commitment check, an attacker substitutes a witness_script that
+    // happens to embed our pubkey, gets us to sign with SIGHASH_ALL, and
+    // walks off with the signature for an unrelated prevout. These tests
+    // assert that we (a) still sign happily on a correctly-built PSBT,
+    // and (b) refuse loudly when the witness_script doesn't commit to the
+    // prevout's scriptPubKey.
+    // ====================================================================
+
+    /// W31 positive: a correctly-built P2SH-P2WSH PSBT with a matching
+    /// witness_script must sign successfully (no regression on the
+    /// happy path).
+    #[test]
+    fn w31_psbt_p2sh_p2wsh_correct_commitment_signs_ok() {
+        let secp = Secp256k1::new();
+        let sk1 = secp256k1::SecretKey::from_slice(&[0x31; 32]).unwrap();
+        let sk2 = secp256k1::SecretKey::from_slice(&[0x32; 32]).unwrap();
+        let pk1: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk1).serialize();
+        let pk2: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk2).serialize();
+
+        let witness_script = build_multisig_script(2, &[pk1, pk2]);
+        let value: u64 = 333_000;
+
+        // Canonical P2SH-P2WSH scriptPubKey:
+        //   OP_HASH160 PUSH20 HASH160(OP_0 PUSH32 SHA256(ws)) OP_EQUAL.
+        let ws_hash = sha256(&witness_script);
+        let mut redeem = Vec::with_capacity(34);
+        redeem.push(0x00);
+        redeem.push(0x20);
+        redeem.extend_from_slice(&ws_hash);
+        let redeem_h160 = hash160(&redeem);
+        let mut p2sh_spk = Vec::with_capacity(23);
+        p2sh_spk.push(0xa9);
+        p2sh_spk.push(0x14);
+        p2sh_spk.extend_from_slice(&redeem_h160.0);
+        p2sh_spk.push(0x87);
+
+        let wallet =
+            Wallet::from_seed(&test_seed(), Network::Testnet, AddressType::P2WPKH).unwrap();
+        let unsigned = build_unsigned_p2wsh_tx([0xa1; 32], 0);
+        let mut psbt = crate::psbt::Psbt::from_unsigned_tx(unsigned).unwrap();
+        psbt.set_witness_utxo(
+            0,
+            TxOut {
+                value,
+                script_pubkey: p2sh_spk,
+            },
+        )
+        .unwrap();
+        psbt.set_input_witness_script(0, witness_script.clone())
+            .unwrap();
+
+        let n1 = wallet
+            .sign_psbt_input(&mut psbt, 0, &[sk1], 0x01)
+            .expect("PSBT P2SH-P2WSH must sign on a matching commitment");
+        let n2 = wallet
+            .sign_psbt_input(&mut psbt, 0, &[sk2], 0x01)
+            .expect("PSBT P2SH-P2WSH must sign on a matching commitment");
+        assert_eq!(n1, 1);
+        assert_eq!(n2, 1);
+        assert_eq!(psbt.inputs[0].partial_sigs.len(), 2);
+    }
+
+    /// W31 negative — P2SH-P2WSH: a PSBT whose `witness_utxo.script_pubkey`
+    /// is P2SH-shaped but doesn't commit to the supplied `witness_script`
+    /// must be REFUSED, not signed. This is the genuinely-vulnerable path.
+    #[test]
+    fn w31_psbt_p2sh_p2wsh_forged_witness_script_rejected() {
+        let secp = Secp256k1::new();
+        let sk_atk = secp256k1::SecretKey::from_slice(&[0x33; 32]).unwrap();
+        let sk_us = secp256k1::SecretKey::from_slice(&[0x34; 32]).unwrap();
+        let pk_atk: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk_atk).serialize();
+        let pk_us: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk_us).serialize();
+
+        // The "real" prevout is a P2SH-P2WSH on a multisig of (atk, atk):
+        let real_witness_script = build_multisig_script(1, &[pk_atk, pk_atk]);
+        let real_ws_hash = sha256(&real_witness_script);
+        let mut real_redeem = vec![0x00, 0x20];
+        real_redeem.extend_from_slice(&real_ws_hash);
+        let real_redeem_h160 = hash160(&real_redeem);
+        let mut real_p2sh_spk = Vec::with_capacity(23);
+        real_p2sh_spk.push(0xa9);
+        real_p2sh_spk.push(0x14);
+        real_p2sh_spk.extend_from_slice(&real_redeem_h160.0);
+        real_p2sh_spk.push(0x87);
+
+        // Attacker hands us a forged witness_script that includes OUR
+        // pubkey (so the sign-key match fires). It does not commit to
+        // real_p2sh_spk.
+        let forged_witness_script = build_multisig_script(1, &[pk_us, pk_atk]);
+
+        let wallet =
+            Wallet::from_seed(&test_seed(), Network::Testnet, AddressType::P2WPKH).unwrap();
+        let unsigned = build_unsigned_p2wsh_tx([0xa2; 32], 0);
+        let mut psbt = crate::psbt::Psbt::from_unsigned_tx(unsigned).unwrap();
+        psbt.set_witness_utxo(
+            0,
+            TxOut {
+                value: 100_000,
+                script_pubkey: real_p2sh_spk,
+            },
+        )
+        .unwrap();
+        psbt.set_input_witness_script(0, forged_witness_script)
+            .unwrap();
+
+        // Pre-W31 this would have succeeded and produced a valid sig.
+        // Post-W31 it MUST fail on the commitment check.
+        let res = wallet.sign_psbt_input(&mut psbt, 0, &[sk_us], 0x01);
+        let err = res.expect_err("forged witness_script must be rejected");
+        match err {
+            WalletError::SigningError(msg) => {
+                assert!(
+                    msg.contains("P2SH-P2WSH commitment verification failed"),
+                    "expected commitment-failure error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected SigningError, got {:?}", other),
+        }
+        // Critically: no partial_sig must have been written.
+        assert!(
+            psbt.inputs[0].partial_sigs.is_empty(),
+            "no signature should leak when the commitment check rejects"
+        );
+    }
+
+    /// W31 negative — bare P2WSH: same threat, simpler shape. Forged
+    /// `witness_script` whose SHA256 doesn't equal the witness program in
+    /// the prevout's P2WSH scriptPubKey must be refused.
+    #[test]
+    fn w31_psbt_p2wsh_forged_witness_script_rejected() {
+        let secp = Secp256k1::new();
+        let sk_atk = secp256k1::SecretKey::from_slice(&[0x35; 32]).unwrap();
+        let sk_us = secp256k1::SecretKey::from_slice(&[0x36; 32]).unwrap();
+        let pk_atk: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk_atk).serialize();
+        let pk_us: [u8; 33] = secp256k1::PublicKey::from_secret_key(&secp, &sk_us).serialize();
+
+        // Real prevout: P2WSH committed to a 1-of-2 (atk, atk) script.
+        let real_ws = build_multisig_script(1, &[pk_atk, pk_atk]);
+        let real_ws_hash = sha256(&real_ws);
+        let mut real_p2wsh_spk = Vec::with_capacity(34);
+        real_p2wsh_spk.push(0x00);
+        real_p2wsh_spk.push(0x20);
+        real_p2wsh_spk.extend_from_slice(&real_ws_hash);
+
+        // Attacker substitutes a witness_script that names US instead.
+        let forged_ws = build_multisig_script(1, &[pk_us, pk_atk]);
+
+        let wallet =
+            Wallet::from_seed(&test_seed(), Network::Testnet, AddressType::P2WPKH).unwrap();
+        let unsigned = build_unsigned_p2wsh_tx([0xa3; 32], 0);
+        let mut psbt = crate::psbt::Psbt::from_unsigned_tx(unsigned).unwrap();
+        psbt.set_witness_utxo(
+            0,
+            TxOut {
+                value: 100_000,
+                script_pubkey: real_p2wsh_spk,
+            },
+        )
+        .unwrap();
+        psbt.set_input_witness_script(0, forged_ws).unwrap();
+
+        let res = wallet.sign_psbt_input(&mut psbt, 0, &[sk_us], 0x01);
+        let err = res.expect_err("forged P2WSH witness_script must be rejected");
+        match err {
+            WalletError::SigningError(msg) => {
+                assert!(
+                    msg.contains("P2WSH commitment verification failed"),
+                    "expected commitment-failure error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected SigningError, got {:?}", other),
+        }
+        assert!(
+            psbt.inputs[0].partial_sigs.is_empty(),
+            "no signature should leak when the commitment check rejects"
+        );
     }
 }
