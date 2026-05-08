@@ -40,7 +40,7 @@
 //! ```
 
 use rustoshi_crypto::address::{Address, Network};
-use rustoshi_crypto::hashes::{hash160, sha256, tagged_hash};
+use rustoshi_crypto::hashes::{hash160, sha256};
 use rustoshi_primitives::Hash160;
 use secp256k1::PublicKey;
 use std::fmt;
@@ -854,36 +854,25 @@ fn make_p2wsh_script(witness_script: &[u8]) -> Vec<u8> {
 }
 
 /// Create a P2TR script: OP_1 <32-byte-output-key>
+///
+/// W27-C: delegates the tweak math to `rustoshi-crypto::taproot` so all
+/// 3 BIP-86 tweak sites (wallet derive_address, wallet sign_p2tr_input,
+/// descriptor make_p2tr_script) share one source of truth.
 fn make_p2tr_script(internal_key: &PublicKey, merkle_root: Option<&[u8; 32]>) -> Result<Vec<u8>, DescriptorError> {
     // Get x-only internal key (32 bytes)
     let internal_bytes = internal_key.serialize();
-    let x_only = &internal_bytes[1..33];
-
-    // Compute tweak
-    let tweak = if let Some(root) = merkle_root {
-        let mut data = Vec::with_capacity(64);
-        data.extend_from_slice(x_only);
-        data.extend_from_slice(root);
-        tagged_hash("TapTweak", &data)
-    } else {
-        tagged_hash("TapTweak", x_only)
-    };
-
-    // Tweak the internal key
-    let secp = secp256k1::Secp256k1::new();
-    let tweak_scalar = secp256k1::Scalar::from_be_bytes(tweak)
-        .map_err(|_| DescriptorError::KeyDerivation)?;
-    let tweaked = internal_key
-        .add_exp_tweak(&secp, &tweak_scalar)
+    let mut x_only_arr = [0u8; 32];
+    x_only_arr.copy_from_slice(&internal_bytes[1..33]);
+    let internal_xonly = secp256k1::XOnlyPublicKey::from_slice(&x_only_arr)
         .map_err(|_| DescriptorError::KeyDerivation)?;
 
-    // Get x-only output key
-    let output_bytes = tweaked.serialize();
-    let output_x_only = &output_bytes[1..33];
+    let (output_x_only, _parity) =
+        rustoshi_crypto::taproot::compute_taproot_output_key(&internal_xonly, merkle_root)
+            .map_err(|_| DescriptorError::KeyDerivation)?;
 
     // Build P2TR script: OP_1 <32-byte-key>
     let mut script = vec![0x51, 0x20]; // OP_1 <push 32>
-    script.extend_from_slice(output_x_only);
+    script.extend_from_slice(&output_x_only);
     Ok(script)
 }
 
@@ -939,45 +928,37 @@ fn compute_taproot_merkle_root(
         return Err(DescriptorError::InvalidScript("empty script tree".into()));
     }
 
-    // Simplified: compute leaf hashes and combine them
-    // Full implementation would build proper Huffman tree
+    // W27-C P0-2 fix: use the canonical CompactSize-correct tapleaf
+    // hasher in `rustoshi-crypto::taproot`. The previous implementation
+    // here erroneously rejected scripts of 253 bytes or more — the same
+    // bug class that hit clearbit at h=947,960 (Ordinals tapscript
+    // >65535B → wrong tapleaf hash).
+    //
+    // Simplified tree shape: still computes leaf hashes pairwise.
+    // Full Huffman tree construction is a separate concern.
     let mut hashes: Vec<[u8; 32]> = Vec::new();
 
     for (desc, _depth) in tree {
-        // Get the script for this leaf
         let scripts = desc.derive_scripts(0, Network::Mainnet)?;
         let script = &scripts[0];
 
-        // Compute leaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script) || script)
         let leaf_version = 0xc0u8; // Tapscript
-        let mut leaf_data = Vec::new();
-        leaf_data.push(leaf_version);
-        // Add compact size
-        if script.len() < 0xfd {
-            leaf_data.push(script.len() as u8);
-        } else {
-            return Err(DescriptorError::InvalidScript("script too large".into()));
-        }
-        leaf_data.extend_from_slice(script);
-        hashes.push(tagged_hash("TapLeaf", &leaf_data));
+        hashes.push(rustoshi_crypto::taproot::compute_tapleaf_hash(
+            leaf_version,
+            script,
+        ));
     }
 
-    // Combine hashes into Merkle root
+    // Combine hashes into Merkle root via the canonical helper.
     while hashes.len() > 1 {
         let mut new_hashes = Vec::new();
         let mut i = 0;
         while i < hashes.len() {
             if i + 1 < hashes.len() {
-                // Combine two hashes (sort lexicographically)
-                let (left, right) = if hashes[i] < hashes[i + 1] {
-                    (&hashes[i], &hashes[i + 1])
-                } else {
-                    (&hashes[i + 1], &hashes[i])
-                };
-                let mut combined = Vec::with_capacity(64);
-                combined.extend_from_slice(left);
-                combined.extend_from_slice(right);
-                new_hashes.push(tagged_hash("TapBranch", &combined));
+                new_hashes.push(rustoshi_crypto::taproot::compute_tapbranch_hash(
+                    &hashes[i],
+                    &hashes[i + 1],
+                ));
                 i += 2;
             } else {
                 new_hashes.push(hashes[i]);

@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use rustoshi_crypto::{
     address::{Address, Network},
-    hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash, tagged_hash,
+    hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash,
     taproot::{compute_taproot_sighash as crypto_compute_taproot_sighash, TaprootPrevouts,
               SIGHASH_DEFAULT},
 };
@@ -306,21 +306,16 @@ impl Wallet {
     /// For BIP-86 key-path only spending, the tweak is computed as:
     /// tweak = tagged_hash("TapTweak", internal_key)
     /// output_key = internal_key + tweak * G
+    ///
+    /// W27-C P1: delegates to the canonical helper in
+    /// `rustoshi-crypto::taproot` so all 3 BIP-86 tweak sites
+    /// (this, `sign_p2tr_input`, `descriptor::make_p2tr_script`)
+    /// share one source of truth.
     fn compute_taproot_output_key(&self, internal_key: &secp256k1::XOnlyPublicKey) -> [u8; 32] {
-        let secp = Secp256k1::new();
-
-        // Compute tweak: t = tagged_hash("TapTweak", internal_key)
-        let tweak_hash = tagged_hash("TapTweak", &internal_key.serialize());
-
-        // Create the tweak scalar
-        let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash)
-            .expect("tweak should be valid scalar");
-
-        // Compute the tweaked key pair (output key)
-        let (output_key, _parity) = internal_key.add_tweak(&secp, &tweak)
-            .expect("tweak should not overflow");
-
-        output_key.serialize()
+        let (output_key, _parity) =
+            rustoshi_crypto::taproot::compute_taproot_output_key(internal_key, None)
+                .expect("BIP-86 tweak should not overflow on a valid x-only key");
+        output_key
     }
 
     /// Get the private key for a derivation path (for signing).
@@ -759,8 +754,13 @@ impl Wallet {
         let keypair = secp256k1::Keypair::from_secret_key(secp, private_key);
         let (xonly_pubkey, _parity) = keypair.x_only_public_key();
 
-        // Compute the tweak (same as in derive_address)
-        let tweak_hash = tagged_hash("TapTweak", &xonly_pubkey.serialize());
+        // Compute the tweak via the canonical BIP-86 helper (W27-C P1
+        // dedup — same call shape as `derive_address` and the
+        // descriptor builder).
+        let tweak_hash = rustoshi_crypto::taproot::compute_taproot_tweak_hash(
+            &xonly_pubkey.serialize(),
+            None,
+        );
         let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash)
             .map_err(|_| WalletError::SigningError("invalid tweak".to_string()))?;
 
