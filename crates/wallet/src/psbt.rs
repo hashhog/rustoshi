@@ -863,6 +863,25 @@ impl Psbt {
             return Ok(());
         }
 
+        // P2WSH and P2SH-P2WSH: presence of witness_script is the
+        // unambiguous signal. Assemble a Core-shape witness from
+        // partial_sigs in pubkey-order-of-the-script, prepending an empty
+        // pad for CHECKMULTISIG.
+        if let Some(ref witness_script) = input.witness_script.clone() {
+            let witness = build_p2wsh_witness(witness_script, &input.partial_sigs)?;
+            input.final_script_witness = Some(witness);
+
+            // P2SH-P2WSH wrap: scriptSig is a single push of the redeem
+            // script (which is OP_0 <sha256(witness_script)>).
+            if let Some(ref redeem_script) = input.redeem_script {
+                let mut script_sig = Vec::with_capacity(redeem_script.len() + 1);
+                script_sig.push(redeem_script.len() as u8);
+                script_sig.extend_from_slice(redeem_script);
+                input.final_script_sig = Some(script_sig);
+            }
+            return Ok(());
+        }
+
         // Check for P2WPKH (single sig in partial_sigs, no witness_script)
         if input.witness_script.is_none() && input.partial_sigs.len() == 1 {
             let (pubkey, sig) = input.partial_sigs.iter().next().unwrap();
@@ -1028,6 +1047,114 @@ impl Psbt {
             .decode(s)
             .map_err(|e| PsbtError::Base64(e.to_string()))?;
         Self::deserialize(&bytes)
+    }
+}
+
+// ============================================================================
+// P2WSH witness assembly (shared by finalizer + raw-tx signer)
+// ============================================================================
+
+/// Walk a `<M> <pk1> ... <pkN> <N> OP_CHECKMULTISIG` script and return the
+/// embedded compressed/uncompressed pubkeys in script-pubkey order, plus the
+/// declared M (signature threshold). Returns `None` if `script` doesn't match
+/// the canonical Core multisig solver shape (mirrors
+/// `bitcoin-core/src/script/solver.cpp::MatchMultisig`).
+fn parse_multisig_script(script: &[u8]) -> Option<(usize, Vec<Vec<u8>>)> {
+    if script.len() < 4 {
+        return None;
+    }
+    if *script.last()? != 0xae {
+        // OP_CHECKMULTISIG
+        return None;
+    }
+    let m_op = *script.first()?;
+    if !(0x51..=0x60).contains(&m_op) {
+        return None;
+    }
+    let m = (m_op - 0x50) as usize;
+    let n_op = script[script.len() - 2];
+    if !(0x51..=0x60).contains(&n_op) {
+        return None;
+    }
+    let n = (n_op - 0x50) as usize;
+    if m == 0 || m > n || n > 20 {
+        return None;
+    }
+
+    let mut keys = Vec::with_capacity(n);
+    let mut i = 1usize;
+    let end = script.len() - 2;
+    while i < end {
+        let push_len = script[i] as usize;
+        if push_len != 33 && push_len != 65 {
+            return None;
+        }
+        i += 1;
+        if i + push_len > end {
+            return None;
+        }
+        keys.push(script[i..i + push_len].to_vec());
+        i += push_len;
+    }
+    if keys.len() != n {
+        return None;
+    }
+    Some((m, keys))
+}
+
+/// Assemble a P2WSH witness stack from a witness script + partial signatures
+/// gathered by a Signer. For CHECKMULTISIG, picks signatures in the
+/// pubkey-order embedded in the script (Core enforces stack order in
+/// `script/sign.cpp::SignStep`) and prepends the empty CHECKMULTISIG pad.
+/// For non-multisig (single CHECKSIG / CHECKSIGVERIFY) scripts, takes the
+/// only available signature.
+pub(crate) fn build_p2wsh_witness(
+    witness_script: &[u8],
+    partial_sigs: &BTreeMap<[u8; 33], Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, PsbtError> {
+    if let Some((m, keys)) = parse_multisig_script(witness_script) {
+        // Walk pubkeys in script order; emit signatures only for those
+        // we actually have. Stop after M signatures (Core's CHECKMULTISIG
+        // is strict about extra pushes failing the script).
+        let mut sigs: Vec<Vec<u8>> = Vec::with_capacity(m);
+        for pk in &keys {
+            if pk.len() != 33 {
+                // Uncompressed pubkey in a witness script — Core forbids
+                // this in segwit-v0 (CLEANSTACK + WITNESS_PUBKEYTYPE).
+                // We don't even bother trying to match.
+                continue;
+            }
+            let mut pk33 = [0u8; 33];
+            pk33.copy_from_slice(pk);
+            if let Some(sig) = partial_sigs.get(&pk33) {
+                sigs.push(sig.clone());
+                if sigs.len() == m {
+                    break;
+                }
+            }
+        }
+        if sigs.len() < m {
+            return Err(PsbtError::CannotFinalize(format!(
+                "P2WSH multisig: have {} signatures, need {}",
+                sigs.len(),
+                m
+            )));
+        }
+        let mut witness: Vec<Vec<u8>> = Vec::with_capacity(m + 2);
+        witness.push(Vec::new()); // CHECKMULTISIG bug-compat empty pad
+        witness.extend(sigs);
+        witness.push(witness_script.to_vec());
+        Ok(witness)
+    } else {
+        // Single-CHECKSIG style. We expect exactly one partial sig.
+        if partial_sigs.len() != 1 {
+            return Err(PsbtError::CannotFinalize(format!(
+                "P2WSH non-multisig: expected exactly 1 partial sig, got {}",
+                partial_sigs.len()
+            )));
+        }
+        let sig = partial_sigs.values().next().unwrap().clone();
+        Ok(vec![sig, witness_script.to_vec()])
     }
 }
 
