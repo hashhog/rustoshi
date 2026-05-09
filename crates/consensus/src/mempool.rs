@@ -589,6 +589,10 @@ pub struct MempoolConfig {
     /// Incremental relay fee rate (satoshis per virtual byte).
     /// Replacement must pay at least this much additional fee per vbyte.
     pub incremental_relay_fee: u64,
+    /// Maximum total bytes across all OP_RETURN (NULL_DATA) outputs per tx.
+    /// None = reject all OP_RETURN outputs (-datacarrier=0 in Core).
+    /// Default: Some(100_000) — mirrors `-datacarriersize` default (MAX_OP_RETURN_RELAY).
+    pub max_datacarrier_bytes: Option<usize>,
 }
 
 impl Default for MempoolConfig {
@@ -603,6 +607,8 @@ impl Default for MempoolConfig {
             max_descendant_size: 101_000,
             full_rbf: true, // Bitcoin Core v28+ default
             incremental_relay_fee: DEFAULT_INCREMENTAL_RELAY_FEE,
+            // MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR = 100_000
+            max_datacarrier_bytes: Some(100_000),
         }
     }
 }
@@ -1612,13 +1618,41 @@ impl Mempool {
             return Err(MempoolError::NonStandard("tx too large".into()));
         }
 
-        // Each output scriptPubKey must be a standard type
+        // Each output scriptPubKey must be a standard type.
+        // For OP_RETURN outputs we also track total bytes against the
+        // per-tx datacarrier budget (mirrors IsStandardTx datacarrier_bytes_left).
+        let mut datacarrier_bytes_left: usize =
+            self.config.max_datacarrier_bytes.unwrap_or(0);
         for (i, output) in tx.outputs.iter().enumerate() {
             if !is_standard_script(&output.script_pubkey) {
                 return Err(MempoolError::NonStandard(format!(
                     "non-standard output script at index {}",
                     i
                 )));
+            }
+
+            // OP_RETURN / NULL_DATA: enforce the per-tx datacarrier byte budget.
+            // Core counts scriptPubKey.size() (total bytes including the 0x6a opcode).
+            // None means -datacarrier=0: all OP_RETURN outputs are non-standard.
+            if !output.script_pubkey.is_empty() && output.script_pubkey[0] == 0x6a {
+                let size = output.script_pubkey.len();
+                match self.config.max_datacarrier_bytes {
+                    None => {
+                        return Err(MempoolError::NonStandard(format!(
+                            "datacarrier output at index {} (datacarrier disabled)",
+                            i
+                        )));
+                    }
+                    Some(_) => {
+                        if size > datacarrier_bytes_left {
+                            return Err(MempoolError::NonStandard(format!(
+                                "datacarrier output at index {} exceeds datacarrier byte limit",
+                                i
+                            )));
+                        }
+                        datacarrier_bytes_left -= size;
+                    }
+                }
             }
 
             // Dust check
@@ -3126,11 +3160,79 @@ impl Mempool {
 // HELPER FUNCTIONS
 // ============================================================
 
+/// Returns true iff the bytes following OP_RETURN (script[1..]) form a valid
+/// push-only sequence.  Mirrors CScript::IsPushOnly(script.begin()+1) from
+/// bitcoin-core/src/script/solver.cpp:185.
+fn mempool_script_is_push_only_after_op_return(script: &[u8]) -> bool {
+    let mut j = 1usize;
+    while j < script.len() {
+        let op = script[j] as usize;
+        if op == 0x00 || (0x51..=0x60).contains(&op) || op == 0x4f {
+            // OP_0, OP_1..OP_16, OP_1NEGATE — valid zero/small push
+            j += 1;
+        } else if (0x01..=0x4b).contains(&op) {
+            // Direct push of 1..75 bytes
+            if j + 1 + op > script.len() {
+                return false; // truncated
+            }
+            j += 1 + op;
+        } else if op == 0x4c {
+            // OP_PUSHDATA1
+            if j + 1 >= script.len() {
+                return false;
+            }
+            let dlen = script[j + 1] as usize;
+            if j + 2 + dlen > script.len() {
+                return false;
+            }
+            j += 2 + dlen;
+        } else if op == 0x4d {
+            // OP_PUSHDATA2
+            if j + 2 >= script.len() {
+                return false;
+            }
+            let dlen = u16::from_le_bytes([script[j + 1], script[j + 2]]) as usize;
+            if j + 3 + dlen > script.len() {
+                return false;
+            }
+            j += 3 + dlen;
+        } else if op == 0x4e {
+            // OP_PUSHDATA4
+            if j + 4 >= script.len() {
+                return false;
+            }
+            let dlen = u32::from_le_bytes([
+                script[j + 1],
+                script[j + 2],
+                script[j + 3],
+                script[j + 4],
+            ]) as usize;
+            if j + 5 + dlen > script.len() {
+                return false;
+            }
+            j += 5 + dlen;
+        } else {
+            // Non-push opcode — not push-only
+            return false;
+        }
+    }
+    true
+}
+
 /// Check if a scriptPubKey is a standard type.
+///
+/// Note: OP_RETURN (NULL_DATA) scripts are only checked for structural validity
+/// here (push-only bytes after 0x6a).  The per-tx datacarrier byte budget is
+/// enforced separately in `Mempool::check_standard`, mirroring Core's
+/// `IsStandardTx` / `max_datacarrier_bytes` logic.
 fn is_standard_script(script: &[u8]) -> bool {
-    // OP_RETURN (data carrier) - always standard up to 83 bytes
-    if !script.is_empty() && script[0] == 0x6a && script.len() <= 83 {
-        return true;
+    // OP_RETURN (data carrier): structural check only.
+    // The post-OP_RETURN bytes must form a valid push-only sequence.
+    // A truncated push or non-push opcode makes the script nonstandard.
+    // Mirrors bitcoin-core/src/script/solver.cpp Solver():
+    //   scriptPubKey.IsPushOnly(scriptPubKey.begin()+1) → TxoutType::NULL_DATA
+    if !script.is_empty() && script[0] == 0x6a {
+        return mempool_script_is_push_only_after_op_return(script);
     }
 
     // P2PKH: 25 bytes, OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
@@ -3857,6 +3959,196 @@ mod tests {
         // Non-standard (random bytes)
         let non_standard = vec![0x01, 0x02, 0x03, 0x04, 0x05];
         assert!(!is_standard_script(&non_standard));
+    }
+
+    // -----------------------------------------------------------------------
+    // W58 regression: OP_RETURN / NULL_DATA classification + mempool policy
+    // -----------------------------------------------------------------------
+
+    /// `6a04deadbeef` → well-formed NULL_DATA (OP_RETURN + 4-byte push).
+    /// Mirrors bitcoin-core/src/script/solver.cpp Solver() NULL_DATA branch.
+    #[test]
+    fn test_op_return_well_formed_is_standard() {
+        // OP_RETURN + PUSH4 + 4 data bytes — valid push-only sequence after 0x6a
+        let script = vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef];
+        assert!(
+            is_standard_script(&script),
+            "well-formed OP_RETURN must be standard"
+        );
+    }
+
+    /// `6a09deadbeef` → truncated push (claims 9 bytes but only 3 follow OP_RETURN).
+    /// Pre-W58 bug: the bare `script[0] == 0x6a && len <= 83` check accepted this.
+    /// Fixed: mempool_script_is_push_only_after_op_return catches the truncation.
+    #[test]
+    fn test_op_return_truncated_push_is_nonstandard() {
+        // OP_RETURN + PUSH9 (claims 9 data bytes) + only 3 bytes follow → truncated
+        let script = vec![0x6a, 0x09, 0xde, 0xad, 0xbe];
+        assert!(
+            !is_standard_script(&script),
+            "OP_RETURN with truncated push must be nonstandard (W58 regression)"
+        );
+    }
+
+    /// Bare OP_RETURN (just `0x6a`) is valid NULL_DATA: empty push sequence is push-only.
+    #[test]
+    fn test_op_return_bare_is_standard() {
+        let script = vec![0x6a];
+        assert!(is_standard_script(&script), "bare OP_RETURN must be standard");
+    }
+
+    /// Mempool must reject a tx whose OP_RETURN output has a truncated push.
+    /// This is the PATH B mempool-policy integration test.
+    #[test]
+    fn test_mempool_rejects_tx_with_truncated_op_return() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000099")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // Build a tx: one normal input, one OP_RETURN output with truncated push.
+        // script = OP_RETURN + PUSH9 (0x09) + only 3 bytes of data → truncated
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x6a, 0x09, 0xde, 0xad, 0xbe], // truncated
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "mempool must reject tx with truncated OP_RETURN push (got {:?})",
+            result
+        );
+    }
+
+    /// Mempool must ACCEPT a tx with a valid OP_RETURN output.
+    #[test]
+    fn test_mempool_accepts_tx_with_valid_op_return() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("000000000000000000000000000000000000000000000000000000000000009a")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // Build a tx: normal input + valid OP_RETURN + change output with sufficient value
+        // script = OP_RETURN + PUSH4 + 4 data bytes — well-formed
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 0,
+                    script_pubkey: vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef], // valid
+                },
+                TxOut {
+                    // Change output above dust threshold; fee = 100_000 - 90_000 = 10_000
+                    value: 90_000,
+                    script_pubkey: vec![
+                        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                        0xac,
+                    ],
+                },
+            ],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            result.is_ok(),
+            "mempool must accept tx with valid OP_RETURN (got {:?})",
+            result
+        );
+    }
+
+    /// Mempool must reject a tx whose OP_RETURN output exceeds the datacarrier byte limit.
+    #[test]
+    fn test_mempool_rejects_op_return_over_datacarrier_limit() {
+        // Set a tiny datacarrier limit (5 bytes total) to trigger the check.
+        let config = MempoolConfig { max_datacarrier_bytes: Some(5), ..MempoolConfig::default() };
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("000000000000000000000000000000000000000000000000000000000000009b")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // script = OP_RETURN + PUSH4 + 4 bytes = 6 bytes total > 5-byte limit
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef], // 6 bytes
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "mempool must reject OP_RETURN exceeding datacarrier limit (got {:?})",
+            result
+        );
+    }
+
+    /// When max_datacarrier_bytes is None (-datacarrier=0), all OP_RETURN outputs are rejected.
+    #[test]
+    fn test_mempool_rejects_op_return_when_datacarrier_disabled() {
+        let config = MempoolConfig { max_datacarrier_bytes: None, ..MempoolConfig::default() };
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("000000000000000000000000000000000000000000000000000000000000009c")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef],
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "mempool must reject OP_RETURN when datacarrier disabled (got {:?})",
+            result
+        );
     }
 
     #[test]
