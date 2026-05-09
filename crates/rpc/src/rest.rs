@@ -597,30 +597,40 @@ async fn rest_getutxos(
         match store.get_utxo(outpoint) {
             Ok(Some(coin)) => {
                 hits.push(true);
-                utxos.push(UtxoInfo {
-                    height: coin.height,
-                    value: coin.value as f64 / COIN as f64,
-                    script_pubkey: ScriptPubKeyInfo {
-                        asm: disassemble_script(&coin.script_pubkey),
-                        hex: hex::encode(&coin.script_pubkey),
-                        script_type: detect_script_type(&coin.script_pubkey),
-                        address: None, // Would need address encoding
-                    },
-                });
+                {
+                    use rustoshi_wallet::descriptor::add_checksum;
+                    let raw_desc = format!("raw({})", hex::encode(&coin.script_pubkey));
+                    let desc = add_checksum(&raw_desc).unwrap_or(raw_desc);
+                    utxos.push(UtxoInfo {
+                        height: coin.height,
+                        value: coin.value as f64 / COIN as f64,
+                        script_pubkey: ScriptPubKeyInfo {
+                            asm: disassemble_script(&coin.script_pubkey),
+                            desc,
+                            hex: hex::encode(&coin.script_pubkey),
+                            address: None,
+                            script_type: detect_script_type(&coin.script_pubkey),
+                        },
+                    });
+                }
             }
             Ok(None) => {
                 // Check mempool for unconfirmed outputs
                 if check_mempool {
                     if let Some(tx_output) = rpc_state.mempool.get_utxo(outpoint) {
                         hits.push(true);
+                        use rustoshi_wallet::descriptor::add_checksum;
+                        let raw_desc = format!("raw({})", hex::encode(&tx_output.script_pubkey));
+                        let desc = add_checksum(&raw_desc).unwrap_or(raw_desc);
                         utxos.push(UtxoInfo {
                             height: 0, // Mempool
                             value: tx_output.value as f64 / COIN as f64,
                             script_pubkey: ScriptPubKeyInfo {
                                 asm: disassemble_script(&tx_output.script_pubkey),
+                                desc,
                                 hex: hex::encode(&tx_output.script_pubkey),
-                                script_type: detect_script_type(&tx_output.script_pubkey),
                                 address: None,
+                                script_type: detect_script_type(&tx_output.script_pubkey),
                             },
                         });
                         continue;
@@ -1031,15 +1041,21 @@ fn build_tx_info(tx: &Transaction, block_hash: Option<Hash256>, height: Option<u
             .outputs
             .iter()
             .enumerate()
-            .map(|(n, output)| RestTxOutput {
-                value: output.value as f64 / COIN as f64,
-                n: n as u32,
-                script_pubkey: ScriptPubKeyInfo {
-                    asm: disassemble_script(&output.script_pubkey),
-                    hex: hex::encode(&output.script_pubkey),
-                    script_type: detect_script_type(&output.script_pubkey),
-                    address: None,
-                },
+            .map(|(n, output)| {
+                use rustoshi_wallet::descriptor::add_checksum;
+                let raw_desc = format!("raw({})", hex::encode(&output.script_pubkey));
+                let desc = add_checksum(&raw_desc).unwrap_or(raw_desc);
+                RestTxOutput {
+                    value: output.value as f64 / COIN as f64,
+                    n: n as u32,
+                    script_pubkey: ScriptPubKeyInfo {
+                        asm: disassemble_script(&output.script_pubkey),
+                        desc,
+                        hex: hex::encode(&output.script_pubkey),
+                        address: None,
+                        script_type: detect_script_type(&output.script_pubkey),
+                    },
+                }
             })
             .collect(),
         hex: hex::encode(&serialized),
