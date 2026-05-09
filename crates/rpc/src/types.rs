@@ -1027,6 +1027,52 @@ pub struct FinalizePsbtResult {
     pub complete: bool,
 }
 
+/// Per-input result of `analyzepsbt` (W48).
+///
+/// Mirrors Bitcoin Core's JSON shape from
+/// `bitcoin-core/src/rpc/rawtransaction.cpp::analyzepsbt` (lines
+/// 1937-1967): each input emits `has_utxo`, `is_final`, `next`, and
+/// optionally a `missing` sub-object listing what the next role still
+/// needs. We currently emit only `missing.signatures` (hex pubkeys whose
+/// partial sig is absent) — Core also emits `missing.pubkeys`,
+/// `missing.redeemscript`, and `missing.witnessscript` from a full
+/// descriptor walk; the W40-C harness asserts only on the top-level
+/// `next` field.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AnalyzePsbtInput {
+    pub has_utxo: bool,
+    pub is_final: bool,
+    pub next: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing: Option<AnalyzePsbtInputMissing>,
+}
+
+/// `missing` sub-object inside an [`AnalyzePsbtInput`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AnalyzePsbtInputMissing {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<Vec<String>>,
+}
+
+/// Response for `analyzepsbt` RPC (W48).
+///
+/// PSBT-level `next` is the minimum per-input role under Core's order
+/// `creator < updater < signer < finalizer < extractor`
+/// (`bitcoin-core/src/node/psbt.cpp:91-95`).
+///
+/// We do not yet emit Core's optional `estimated_vsize`, `estimated_feerate`,
+/// `fee`, or `error` fields — those require a full dummy-sign / fee
+/// computation pass that is out of scope for the W48 cross-impl harness.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AnalyzePsbtResult {
+    /// Per-input analysis. Omitted (Core: empty array → drop key) when
+    /// the PSBT has zero inputs, but the RPC will reject that upstream.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<AnalyzePsbtInput>,
+    /// Next role required to make progress (lowest in Core's ordering).
+    pub next: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
