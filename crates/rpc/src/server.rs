@@ -5261,96 +5261,152 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn decode_script(&self, hex_str: String) -> RpcResult<serde_json::Value> {
-        let bytes = Self::parse_hex(&hex_str)?;
+        // Reference: bitcoin-core/src/rpc/rawtransaction.cpp `decodescript` handler.
+        //
+        // Shape mirrors ScriptToUniv(script, /*include_hex=*/false) for top level:
+        //   { asm, desc, type, address? }  — NO top-level `hex` field.
+        //
+        // can_wrap types (Core's switch statement + validity checks):
+        //   pubkey, pubkeyhash, multisig, nonstandard,
+        //   witness_v0_keyhash, witness_v0_scripthash
+        //   + must NOT be unspendable (OP_RETURN prefix)
+        //   + must NOT contain OP_CHECKSIGADD
+        //   → emits `p2sh` wrap address
+        //
+        // can_wrap_P2WSH (subset of can_wrap):
+        //   pubkey: only if pubkey is compressed (33 bytes)
+        //   multisig: only if all pubkeys are compressed
+        //   pubkeyhash, nonstandard: always
+        //   witness_v0_keyhash, witness_v0_scripthash: never (already segwit)
+        //   → emits `segwit` sub-object (WITH `hex` field)
+        //
+        // segwit script construction:
+        //   pubkey    → P2WPKH(Hash160(pubkey))
+        //   pubkeyhash → P2WPKH(raw 20-byte hash from script[3..23])
+        //   others    → P2WSH(SHA256(script))
+        use rustoshi_crypto::address::{Address, Network};
+        use rustoshi_crypto::hashes::{hash160, sha256};
 
-        // Disassemble script to ASM
-        let mut asm_parts = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            let op = bytes[i];
-            if op == 0x00 {
-                asm_parts.push("0".to_string());
-                i += 1;
-            } else if (0x01..=0x4b).contains(&op) {
-                let len = op as usize;
-                if i + 1 + len <= bytes.len() {
-                    asm_parts.push(hex::encode(&bytes[i + 1..i + 1 + len]));
-                    i += 1 + len;
-                } else {
-                    asm_parts.push("[error]".to_string());
-                    break;
+        let bytes = if hex_str.is_empty() {
+            Vec::new()
+        } else {
+            Self::parse_hex(&hex_str)?
+        };
+
+        let params = {
+            let state = self.state.read().await;
+            state.params.clone()
+        };
+
+        let network = match params.network_id {
+            NetworkId::Mainnet => Network::Mainnet,
+            NetworkId::Regtest => Network::Regtest,
+            _ => Network::Testnet,
+        };
+
+        let script_type = classify_script(&bytes);
+        let asm = disassemble_script(&bytes);
+        let desc = infer_descriptor(&bytes, &params);
+        let address = script_to_address(&bytes, &params);
+
+        // Build top-level object (no `hex` field — ScriptToUniv include_hex=false).
+        let mut result = serde_json::Map::new();
+        result.insert("asm".to_string(), serde_json::Value::String(asm));
+        result.insert("desc".to_string(), serde_json::Value::String(desc));
+        result.insert("type".to_string(), serde_json::Value::String(script_type.clone()));
+        if let Some(addr) = address {
+            result.insert("address".to_string(), serde_json::Value::String(addr));
+        }
+
+        // Determine can_wrap.
+        let is_unspendable = !bytes.is_empty() && bytes[0] == 0x6a;
+        let has_checksigadd = bytes.contains(&0xba);
+        let can_wrap = !is_unspendable && !has_checksigadd && matches!(
+            script_type.as_str(),
+            "pubkey" | "pubkeyhash" | "multisig" | "nonstandard"
+            | "witness_v0_keyhash" | "witness_v0_scripthash"
+        );
+
+        if can_wrap {
+            // P2SH wrap address = Base58Check(version || Hash160(script))
+            let h160 = hash160(&bytes);
+            let p2sh_addr = Address::P2SH {
+                hash: h160,
+                network,
+            }.encode();
+            result.insert("p2sh".to_string(), serde_json::Value::String(p2sh_addr));
+
+            // Determine can_wrap_P2WSH.
+            let can_wrap_p2wsh = match script_type.as_str() {
+                "pubkey" => {
+                    // Compressed pubkey only (33 bytes, prefix 0x02 or 0x03).
+                    let pk = decodescript_extract_pk(&bytes);
+                    pk.len() == 33
                 }
-            } else if op == 0x4c {
-                // OP_PUSHDATA1
-                if i + 1 < bytes.len() {
-                    let len = bytes[i + 1] as usize;
-                    if i + 2 + len <= bytes.len() {
-                        asm_parts.push(hex::encode(&bytes[i + 2..i + 2 + len]));
-                        i += 2 + len;
-                    } else {
-                        asm_parts.push("[error]".to_string());
-                        break;
+                "multisig" => {
+                    let pks = decodescript_extract_multisig_pks(&bytes);
+                    pks.iter().all(|pk| pk.len() == 33)
+                }
+                "pubkeyhash" | "nonstandard" => true,
+                // witness_v0_keyhash, witness_v0_scripthash: already segwit
+                _ => false,
+            };
+
+            if can_wrap_p2wsh {
+                // Build the segwit witness program script.
+                let segwit_script: Vec<u8> = match script_type.as_str() {
+                    "pubkey" => {
+                        // P2WPKH: OP_0 <Hash160(pubkey)>
+                        let pk = decodescript_extract_pk(&bytes);
+                        let h = hash160(&pk);
+                        let mut s = vec![0x00u8, 0x14];
+                        s.extend_from_slice(&h.0);
+                        s
                     }
-                } else {
-                    break;
-                }
-            } else {
-                // Named opcode
-                let name = match op {
-                    0x51..=0x60 => format!("OP_{}", op - 0x50),
-                    0x63 => "OP_IF".to_string(),
-                    0x64 => "OP_NOTIF".to_string(),
-                    0x67 => "OP_ELSE".to_string(),
-                    0x68 => "OP_ENDIF".to_string(),
-                    0x69 => "OP_VERIFY".to_string(),
-                    0x6a => "OP_RETURN".to_string(),
-                    0x75 => "OP_DROP".to_string(),
-                    0x76 => "OP_DUP".to_string(),
-                    0x87 => "OP_EQUAL".to_string(),
-                    0x88 => "OP_EQUALVERIFY".to_string(),
-                    0xa9 => "OP_HASH160".to_string(),
-                    0xaa => "OP_HASH256".to_string(),
-                    0xab => "OP_CODESEPARATOR".to_string(),
-                    0xac => "OP_CHECKSIG".to_string(),
-                    0xad => "OP_CHECKSIGVERIFY".to_string(),
-                    0xae => "OP_CHECKMULTISIG".to_string(),
-                    0xaf => "OP_CHECKMULTISIGVERIFY".to_string(),
-                    _ => format!("OP_UNKNOWN[0x{:02x}]", op),
+                    "pubkeyhash" => {
+                        // P2WPKH: OP_0 <raw 20-byte hash from script[3..23]>
+                        let mut s = vec![0x00u8, 0x14];
+                        s.extend_from_slice(&bytes[3..23]);
+                        s
+                    }
+                    _ => {
+                        // P2WSH: OP_0 <SHA256(script)>
+                        let h = sha256(&bytes);
+                        let mut s = vec![0x00u8, 0x20];
+                        s.extend_from_slice(&h);
+                        s
+                    }
                 };
-                asm_parts.push(name);
-                i += 1;
+
+                // Build inner segwit object (ScriptToUniv with include_hex=true).
+                let sw_type = classify_script(&segwit_script);
+                let sw_asm = disassemble_script(&segwit_script);
+                let sw_desc = infer_descriptor(&segwit_script, &params);
+                let sw_address = script_to_address(&segwit_script, &params);
+                let sw_hex = hex::encode(&segwit_script);
+
+                // p2sh-segwit = P2SH wrap of the witness script
+                let sw_h160 = hash160(&segwit_script);
+                let p2sh_segwit_addr = Address::P2SH {
+                    hash: sw_h160,
+                    network,
+                }.encode();
+
+                let mut sw = serde_json::Map::new();
+                sw.insert("asm".to_string(), serde_json::Value::String(sw_asm));
+                sw.insert("desc".to_string(), serde_json::Value::String(sw_desc));
+                sw.insert("hex".to_string(), serde_json::Value::String(sw_hex));
+                sw.insert("type".to_string(), serde_json::Value::String(sw_type));
+                if let Some(addr) = sw_address {
+                    sw.insert("address".to_string(), serde_json::Value::String(addr));
+                }
+                sw.insert("p2sh-segwit".to_string(), serde_json::Value::String(p2sh_segwit_addr));
+
+                result.insert("segwit".to_string(), serde_json::Value::Object(sw));
             }
         }
 
-        // Classify script type
-        let script_type = if bytes.len() == 25
-            && bytes[0] == 0x76
-            && bytes[1] == 0xa9
-            && bytes[2] == 0x14
-            && bytes[23] == 0x88
-            && bytes[24] == 0xac
-        {
-            "pubkeyhash"
-        } else if bytes.len() == 23 && bytes[0] == 0xa9 && bytes[1] == 0x14 && bytes[22] == 0x87 {
-            "scripthash"
-        } else if bytes.len() == 22 && bytes[0] == 0x00 && bytes[1] == 0x14 {
-            "witness_v0_keyhash"
-        } else if bytes.len() == 34 && bytes[0] == 0x00 && bytes[1] == 0x20 {
-            "witness_v0_scripthash"
-        } else if bytes.len() == 34 && bytes[0] == 0x51 && bytes[1] == 0x20 {
-            "witness_v1_taproot"
-        } else if !bytes.is_empty() && bytes[0] == 0x6a {
-            "nulldata"
-        } else {
-            "nonstandard"
-        };
-
-        Ok(serde_json::json!({
-            "asm": asm_parts.join(" "),
-            "type": script_type,
-            "p2sh": "", // Would require address encoding
-            "segwit": null
-        }))
+        Ok(serde_json::Value::Object(result))
     }
 
     async fn get_chain_tips(&self) -> RpcResult<serde_json::Value> {
@@ -7754,9 +7810,13 @@ fn detect_script_type(script: &[u8]) -> String {
         return "witness_v1_taproot".to_string();
     }
 
-    // OP_RETURN
+    // OP_RETURN: nulldata only when post-OP_RETURN bytes are push-only.
     if !script.is_empty() && script[0] == 0x6a {
-        return "nulldata".to_string();
+        if script_is_push_only_after_op_return(script) {
+            return "nulldata".to_string();
+        } else {
+            return "nonstandard".to_string();
+        }
     }
 
     "nonstandard".to_string()
@@ -8007,7 +8067,7 @@ fn disassemble_script(script: &[u8]) -> String {
                     }
                     i += len;
                 } else {
-                    result.push("[error: truncated push]".to_string());
+                    result.push("[error]".to_string());
                     break;
                 }
             }
@@ -8024,11 +8084,11 @@ fn disassemble_script(script: &[u8]) -> String {
                         }
                         i += 1 + len;
                     } else {
-                        result.push("[error: truncated pushdata1]".to_string());
+                        result.push("[error]".to_string());
                         break;
                     }
                 } else {
-                    result.push("[error: truncated pushdata1]".to_string());
+                    result.push("[error]".to_string());
                     break;
                 }
             }
@@ -8045,11 +8105,11 @@ fn disassemble_script(script: &[u8]) -> String {
                         }
                         i += 2 + len;
                     } else {
-                        result.push("[error: truncated pushdata2]".to_string());
+                        result.push("[error]".to_string());
                         break;
                     }
                 } else {
-                    result.push("[error: truncated pushdata2]".to_string());
+                    result.push("[error]".to_string());
                     break;
                 }
             }
@@ -8071,11 +8131,11 @@ fn disassemble_script(script: &[u8]) -> String {
                         }
                         i += 4 + len;
                     } else {
-                        result.push("[error: truncated pushdata4]".to_string());
+                        result.push("[error]".to_string());
                         break;
                     }
                 } else {
-                    result.push("[error: truncated pushdata4]".to_string());
+                    result.push("[error]".to_string());
                     break;
                 }
             }
@@ -8406,9 +8466,15 @@ fn classify_script(script: &[u8]) -> String {
         return "witness_v1_taproot".to_string();
     }
 
-    // OP_RETURN
+    // OP_RETURN: nulldata only if the post-OP_RETURN bytes are well-formed push-only.
+    // Mirrors Bitcoin Core's Solver: IsPushOnly(script.begin() + 1, script.end()).
+    // A truncated push or a non-push opcode (> 0x60) makes it nonstandard.
     if !script.is_empty() && script[0] == 0x6a {
-        return "nulldata".to_string();
+        if script_is_push_only_after_op_return(script) {
+            return "nulldata".to_string();
+        } else {
+            return "nonstandard".to_string();
+        }
     }
 
     // Raw pubkey
@@ -8420,6 +8486,101 @@ fn classify_script(script: &[u8]) -> String {
     }
 
     "nonstandard".to_string()
+}
+
+/// Returns true iff the bytes following OP_RETURN (script[1..]) form a valid
+/// push-only sequence.  Mirrors CScript::IsPushOnly from bitcoin-core.
+fn script_is_push_only_after_op_return(script: &[u8]) -> bool {
+    let mut j = 1usize;
+    while j < script.len() {
+        let op = script[j] as usize;
+        if op == 0x00 || (0x51..=0x60).contains(&op) || op == 0x4f {
+            // OP_0, OP_1..OP_16, OP_1NEGATE — valid zero/small push
+            j += 1;
+        } else if (0x01..=0x4b).contains(&op) {
+            // Direct push of 1..75 bytes
+            if j + 1 + op > script.len() {
+                return false; // truncated
+            }
+            j += 1 + op;
+        } else if op == 0x4c {
+            // OP_PUSHDATA1
+            if j + 1 >= script.len() {
+                return false;
+            }
+            let dlen = script[j + 1] as usize;
+            if j + 2 + dlen > script.len() {
+                return false;
+            }
+            j += 2 + dlen;
+        } else if op == 0x4d {
+            // OP_PUSHDATA2
+            if j + 2 >= script.len() {
+                return false;
+            }
+            let dlen = u16::from_le_bytes([script[j + 1], script[j + 2]]) as usize;
+            if j + 3 + dlen > script.len() {
+                return false;
+            }
+            j += 3 + dlen;
+        } else if op == 0x4e {
+            // OP_PUSHDATA4
+            if j + 4 >= script.len() {
+                return false;
+            }
+            let dlen = u32::from_le_bytes([
+                script[j + 1],
+                script[j + 2],
+                script[j + 3],
+                script[j + 4],
+            ]) as usize;
+            if j + 5 + dlen > script.len() {
+                return false;
+            }
+            j += 5 + dlen;
+        } else {
+            // Non-push opcode (> 0x60, excluding the push family)
+            return false;
+        }
+    }
+    true
+}
+
+/// Extract the raw pubkey bytes from a P2PK script (<pushLen> <pubkey> OP_CHECKSIG).
+/// Returns empty vec if the script is not a valid P2PK.
+fn decodescript_extract_pk(script: &[u8]) -> Vec<u8> {
+    if script.len() < 35 {
+        return Vec::new();
+    }
+    let push_len = script[0] as usize;
+    if (push_len == 33 || push_len == 65) && script.len() == push_len + 2 && script[push_len + 1] == 0xac {
+        script[1..1 + push_len].to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Extract pubkey slices from a multisig script (OP_M <pubkeys> OP_N OP_CHECKMULTISIG).
+/// Returns empty vec if parsing fails or the script doesn't look like multisig.
+fn decodescript_extract_multisig_pks(script: &[u8]) -> Vec<Vec<u8>> {
+    // Minimum: OP_M(1) + push(1)+pk(33) + OP_N(1) + OP_CHECKMULTISIG(1) = 37 bytes
+    if script.len() < 4 || script[script.len() - 1] != 0xae {
+        return Vec::new();
+    }
+    let mut pks = Vec::new();
+    let mut i = 1usize; // skip OP_M
+    while i < script.len().saturating_sub(2) {
+        let push_len = script[i] as usize;
+        if push_len == 0 {
+            break;
+        }
+        if i + 1 + push_len > script.len() {
+            return Vec::new(); // malformed
+        }
+        pks.push(script[i + 1..i + 1 + push_len].to_vec());
+        i += 1 + push_len;
+    }
+    pks
 }
 
 /// Convert a script to an address string if possible.
