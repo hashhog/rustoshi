@@ -998,8 +998,12 @@ pub struct GlobalXpub {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DecodePsbtInput {
     /// Non-witness UTXO (full previous transaction).
+    ///
+    /// Stored as a pre-serialized `RawValue` so that `BtcAmount` values such as
+    /// `2.00000000` survive the round-trip without being collapsed to `2.0` by
+    /// `serde_json::to_value` (which converts all numbers through f64).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub non_witness_utxo: Option<serde_json::Value>,
+    pub non_witness_utxo: Option<Box<serde_json::value::RawValue>>,
     /// Witness UTXO.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness_utxo: Option<WitnessUtxo>,
@@ -1018,8 +1022,8 @@ pub struct DecodePsbtInput {
     /// BIP32 derivation paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bip32_derivs: Option<Vec<Bip32Deriv>>,
-    /// Final scriptSig.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Final scriptSig — Core uses "final_scriptSig" (capital S in Sig).
+    #[serde(rename = "final_scriptSig", skip_serializing_if = "Option::is_none")]
     pub final_scriptsig: Option<ScriptInfo>,
     /// Final scriptWitness.
     #[serde(skip_serializing_if = "Option::is_none")]
