@@ -928,6 +928,92 @@ impl Psbt {
             return Ok(());
         }
 
+        // Legacy P2SH-multisig (W46, M-tier closure of W42-A diagnostic).
+        //
+        // Detect: redeem_script is present, witness_script is absent, and
+        // the redeem_script parses as <M> <pk1> ... <pkN> <N> CHECKMULTISIG
+        // (the canonical Core multisig solver shape). Assemble the
+        // legacy scriptSig:
+        //
+        //     OP_0  push(sig1)  ...  push(sigM)  push(redeem_script)
+        //
+        // OP_0 is the empty-pad bug-compat byte for CHECKMULTISIG. The
+        // signatures MUST be ordered to match the pubkey order in the
+        // redeem_script — NOT insertion order, NOT pubkey-byte sort,
+        // NOT partial_sigs map order. Mirrors `bitcoin-core/src/script/
+        // sign.cpp::ProduceSignature` (legacy P2SH branch) and the
+        // pubkey-order discipline already used by `build_p2wsh_witness`.
+        if input.witness_script.is_none() {
+            if let Some(ref redeem_script) = input.redeem_script.clone() {
+                if let Some((m, keys)) = parse_multisig_script(redeem_script) {
+                    // Walk pubkeys in script order; pick the first M for
+                    // which we hold a partial_sig. Stop at M (extra pushes
+                    // would fail CHECKMULTISIG strictness).
+                    let mut sigs: Vec<Vec<u8>> = Vec::with_capacity(m);
+                    for pk in &keys {
+                        // Legacy P2SH multisig allows uncompressed (65B)
+                        // pubkeys, unlike segwit-v0. We only key
+                        // partial_sigs by 33-byte compressed pubkeys
+                        // today, so an uncompressed key in the redeem
+                        // script will simply not match — the signer
+                        // would have rejected it earlier.
+                        if pk.len() != 33 {
+                            continue;
+                        }
+                        let mut pk33 = [0u8; 33];
+                        pk33.copy_from_slice(pk);
+                        if let Some(sig) = input.partial_sigs.get(&pk33) {
+                            sigs.push(sig.clone());
+                            if sigs.len() == m {
+                                break;
+                            }
+                        }
+                    }
+                    if sigs.len() < m {
+                        return Err(PsbtError::CannotFinalize(format!(
+                            "P2SH multisig: have {} signatures, need {}",
+                            sigs.len(),
+                            m
+                        )));
+                    }
+
+                    // Assemble scriptSig. Use OP_PUSHDATA1 for any push
+                    // body > 75 bytes (large redeem scripts in N-of-N
+                    // can exceed this; sigs themselves are 70-72B + 1B
+                    // sighash, well under the limit).
+                    let mut script_sig: Vec<u8> = Vec::new();
+                    script_sig.push(0x00); // OP_0 — CHECKMULTISIG empty pad
+                    for sig in &sigs {
+                        push_to_script_sig(&mut script_sig, sig);
+                    }
+                    push_to_script_sig(&mut script_sig, redeem_script);
+
+                    // CRITICAL (W43-1 regression-avoidance):
+                    // set final_script_sig BEFORE clearing producer
+                    // fields. Clearing first leaves the input in a
+                    // half-baked state if a later step panics, and the
+                    // ouroboros W43-1 regression showed a blockbrew
+                    // variant of exactly this bug class. The local
+                    // `script_sig` snapshot above means we don't need
+                    // to read producer fields after this point either.
+                    input.final_script_sig = Some(script_sig);
+
+                    // Clear producer fields per BIP-174 finalizer role
+                    // (lunarblock W41 + ouroboros W43 pattern). The
+                    // encoder already skips them once final_script_sig
+                    // is set, but clearing keeps the in-memory PsbtInput
+                    // honest for downstream consumers.
+                    input.partial_sigs.clear();
+                    input.redeem_script = None;
+                    input.witness_script = None;
+                    input.bip32_derivation.clear();
+                    input.sighash_type = None;
+
+                    return Ok(());
+                }
+            }
+        }
+
         Err(PsbtError::CannotFinalize(
             "insufficient data or unsupported script type".to_string(),
         ))
@@ -1076,6 +1162,34 @@ impl Psbt {
 // ============================================================================
 // P2WSH witness assembly (shared by finalizer + raw-tx signer)
 // ============================================================================
+
+/// Append a length-prefixed push of `data` to a script body, using the
+/// minimal Bitcoin script encoding (1-byte length for <=75B, OP_PUSHDATA1
+/// for 76..=255, OP_PUSHDATA2 for 256..=65535). Used by the legacy
+/// P2SH-multisig finalizer (W46) to emit signatures + redeem_script
+/// pushes in `final_script_sig`. Mirrors `CScript::operator<<` in
+/// `bitcoin-core/src/script/script.h`.
+fn push_to_script_sig(script: &mut Vec<u8>, data: &[u8]) {
+    let len = data.len();
+    if len == 0 {
+        script.push(0x00); // OP_0 / OP_FALSE — empty push
+    } else if len <= 75 {
+        script.push(len as u8);
+        script.extend_from_slice(data);
+    } else if len <= 255 {
+        script.push(0x4c); // OP_PUSHDATA1
+        script.push(len as u8);
+        script.extend_from_slice(data);
+    } else if len <= 65535 {
+        script.push(0x4d); // OP_PUSHDATA2
+        script.extend_from_slice(&(len as u16).to_le_bytes());
+        script.extend_from_slice(data);
+    } else {
+        script.push(0x4e); // OP_PUSHDATA4
+        script.extend_from_slice(&(len as u32).to_le_bytes());
+        script.extend_from_slice(data);
+    }
+}
 
 /// Walk a `<M> <pk1> ... <pkN> <N> OP_CHECKMULTISIG` script and return the
 /// embedded compressed/uncompressed pubkeys in script-pubkey order, plus the
@@ -3101,5 +3215,176 @@ mod tests {
         // regression).
         let reenc = psbt.serialize();
         Psbt::deserialize(&reenc).expect("re-encoded PSBT must round-trip");
+    }
+
+    /// W46 — legacy P2SH-multisig finalize MUST emit signatures in
+    /// script-pubkey order, NOT partial_sigs map order, NOT insertion
+    /// order, NOT pubkey-byte sort. Insert in REVERSE order to make
+    /// the wrong-ordering bug observable. Mirrors `bitcoin-core/src/
+    /// script/sign.cpp::ProduceSignature`.
+    #[test]
+    fn test_w46_p2sh_multisig_finalize_script_order() {
+        // Two asymmetric 33-byte compressed pubkeys (no palindromes;
+        // W32-B fixture rule). Different prefix bytes so a byte-sort
+        // would also reorder them.
+        let pk1: [u8; 33] = [
+            0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+            0xbb, 0xcc, 0xdd, 0xee, 0xf0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x12,
+        ];
+        let pk2: [u8; 33] = [
+            0x03, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0x0a, 0x1b,
+            0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71, 0x82, 0x93, 0xa4, 0xb5, 0xc6,
+            0xd7, 0xe8, 0xf9, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71,
+        ];
+
+        // 2-of-2 redeem script: OP_2 <pk1> OP_2 OP_CHECKMULTISIG... wait,
+        // actually OP_2 <pk1> <pk2> OP_2 OP_CHECKMULTISIG.
+        let mut redeem_script = Vec::new();
+        redeem_script.push(0x52); // OP_2
+        redeem_script.push(33);
+        redeem_script.extend_from_slice(&pk1);
+        redeem_script.push(33);
+        redeem_script.extend_from_slice(&pk2);
+        redeem_script.push(0x52); // OP_2
+        redeem_script.push(0xae); // OP_CHECKMULTISIG
+
+        // Two distinct DER-shaped sigs (asymmetric, no palindromes).
+        let sig1: Vec<u8> = vec![
+            0x30, 0x44, 0x02, 0x20, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xf0, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x12, 0x13, 0x02, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+            0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+            0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b,
+            0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x01,
+        ];
+        let sig2: Vec<u8> = vec![
+            0x30, 0x44, 0x02, 0x20, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+            0x89, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71, 0x82, 0x93,
+            0xa4, 0xb5, 0xc6, 0xd7, 0xe8, 0xf9, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e,
+            0x5f, 0x60, 0x71, 0x82, 0x02, 0x20, 0x99, 0x88, 0x77, 0x66, 0x55,
+            0x44, 0x33, 0x22, 0x11, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb,
+            0xdc, 0xed, 0xfe, 0x01, 0x12, 0x01,
+        ];
+
+        let tx = create_test_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+
+        psbt.inputs[0].redeem_script = Some(redeem_script.clone());
+        // Insert in REVERSE script order. BTreeMap sorts by pubkey
+        // bytes regardless, so this also exercises the script-order
+        // discipline against the sort-order bug.
+        psbt.inputs[0].partial_sigs.insert(pk2, sig2.clone());
+        psbt.inputs[0].partial_sigs.insert(pk1, sig1.clone());
+        psbt.inputs[0].sighash_type = Some(0x01);
+
+        psbt.finalize_input(0).expect("legacy P2SH-multisig finalize must succeed");
+
+        // Must be finalized (W46 close).
+        assert!(psbt.inputs[0].is_finalized());
+        let script_sig = psbt.inputs[0]
+            .final_script_sig
+            .as_ref()
+            .expect("W46: final_script_sig must be set");
+
+        // scriptSig layout:
+        //   OP_0 (0x00)
+        //   <push sig1>      [pk1 first in script]
+        //   <push sig2>      [pk2 second in script]
+        //   <push redeem_script>
+        let mut expected = Vec::new();
+        expected.push(0x00);
+        expected.push(sig1.len() as u8);
+        expected.extend_from_slice(&sig1);
+        expected.push(sig2.len() as u8);
+        expected.extend_from_slice(&sig2);
+        expected.push(redeem_script.len() as u8);
+        expected.extend_from_slice(&redeem_script);
+
+        assert_eq!(
+            script_sig, &expected,
+            "W46: signatures must be emitted in script-pubkey order (sig1 before sig2), \
+             not partial_sigs/BTreeMap byte order, not insertion order"
+        );
+    }
+
+    /// W46 — after legacy P2SH-multisig finalize, the producer fields
+    /// (partial_sigs, redeem_script, witness_script, bip32_derivation,
+    /// sighash_type) MUST be cleared. Mirrors lunarblock W41 + ouroboros
+    /// W43. Also re-checks that the cleanup happens AFTER setting
+    /// final_script_sig (W43-1 regression-avoidance).
+    #[test]
+    fn test_w46_p2sh_multisig_clears_producer_fields() {
+        let pk1: [u8; 33] = [
+            0x02, 0xaa, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+            0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let pk2: [u8; 33] = [
+            0x03, 0xbb, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+            0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34,
+            0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+        ];
+
+        let mut redeem_script = Vec::new();
+        redeem_script.push(0x52); // OP_2
+        redeem_script.push(33);
+        redeem_script.extend_from_slice(&pk1);
+        redeem_script.push(33);
+        redeem_script.extend_from_slice(&pk2);
+        redeem_script.push(0x52); // OP_2
+        redeem_script.push(0xae); // OP_CHECKMULTISIG
+
+        let sig1: Vec<u8> = vec![0x30, 0x05, 0x02, 0x01, 0x42, 0x02, 0x01, 0x43, 0x01];
+        let sig2: Vec<u8> = vec![0x30, 0x05, 0x02, 0x01, 0x77, 0x02, 0x01, 0x88, 0x01];
+
+        let tx = create_test_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+
+        psbt.inputs[0].redeem_script = Some(redeem_script);
+        psbt.inputs[0].partial_sigs.insert(pk1, sig1);
+        psbt.inputs[0].partial_sigs.insert(pk2, sig2);
+        psbt.inputs[0].sighash_type = Some(0x01);
+
+        // Add a bip32 derivation entry to verify it gets cleared too.
+        psbt.inputs[0].bip32_derivation.insert(
+            pk1,
+            KeyOrigin::new([0xab, 0xcd, 0xef, 0x01], vec![0, 1, 2]),
+        );
+
+        psbt.finalize_input(0).expect("legacy P2SH-multisig finalize must succeed");
+
+        // final_script_sig is set ...
+        assert!(
+            psbt.inputs[0].final_script_sig.is_some(),
+            "W46/W43-1: final_script_sig must be set"
+        );
+
+        // ... AND all producer fields are cleared.
+        assert!(
+            psbt.inputs[0].partial_sigs.is_empty(),
+            "W46: partial_sigs must be cleared post-finalize"
+        );
+        assert!(
+            psbt.inputs[0].redeem_script.is_none(),
+            "W46: redeem_script must be cleared post-finalize"
+        );
+        assert!(
+            psbt.inputs[0].witness_script.is_none(),
+            "W46: witness_script must be cleared post-finalize"
+        );
+        assert!(
+            psbt.inputs[0].bip32_derivation.is_empty(),
+            "W46: bip32_derivation must be cleared post-finalize"
+        );
+        assert!(
+            psbt.inputs[0].sighash_type.is_none(),
+            "W46: sighash_type must be cleared post-finalize"
+        );
+
+        // is_finalized() should return true now.
+        assert!(psbt.inputs[0].is_finalized());
     }
 }
