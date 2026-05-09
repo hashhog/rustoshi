@@ -1028,6 +1028,24 @@ pub struct DecodePsbtInput {
     /// Final scriptWitness.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_scriptwitness: Option<Vec<String>>,
+    /// Taproot key-path signature (BIP-371, PSBT_IN_TAP_KEY_SIG = 0x13).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taproot_key_path_sig: Option<String>,
+    /// Taproot script-path signatures (BIP-371, PSBT_IN_TAP_SCRIPT_SIG = 0x14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taproot_script_path_sigs: Option<Vec<TaprootScriptPathSig>>,
+    /// Taproot leaf scripts (BIP-371, PSBT_IN_TAP_LEAF_SCRIPT = 0x15).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taproot_scripts: Option<Vec<TaprootLeafScript>>,
+    /// Taproot BIP32 derivation paths (BIP-371, PSBT_IN_TAP_BIP32_DERIVATION = 0x16).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taproot_bip32_derivs: Option<Vec<TaprootBip32Deriv>>,
+    /// Taproot internal key (BIP-371, PSBT_IN_TAP_INTERNAL_KEY = 0x17).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taproot_internal_key: Option<String>,
+    /// Taproot merkle root (BIP-371, PSBT_IN_TAP_MERKLE_ROOT = 0x18).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taproot_merkle_root: Option<String>,
     /// Unknown key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unknown: Option<serde_json::Value>,
@@ -1066,6 +1084,47 @@ pub struct Bip32Deriv {
     pub path: String,
 }
 
+/// BIP-371 taproot script-path signature entry (PSBT_IN_TAP_SCRIPT_SIG).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaprootScriptPathSig {
+    pub pubkey: String,
+    pub leaf_hash: String,
+    pub sig: String,
+}
+
+/// BIP-371 taproot leaf script entry (PSBT_IN_TAP_LEAF_SCRIPT).
+/// Sorted by (script_hex, leaf_ver); control_blocks sorted lexicographically.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaprootLeafScript {
+    pub script: String,
+    pub leaf_ver: u64,
+    pub control_blocks: Vec<String>,
+}
+
+/// BIP-371 taproot BIP32 derivation path entry (input/output).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaprootBip32Deriv {
+    pub pubkey: String,
+    pub master_fingerprint: String,
+    pub path: String,
+    pub leaf_hashes: Vec<String>,
+}
+
+/// BIP-371 taproot tree entry (PSBT_OUT_TAP_TREE = 0x06).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaprootTreeEntry {
+    pub depth: u64,
+    pub leaf_ver: u64,
+    pub script: String,
+}
+
+/// MuSig2 participant public keys entry (PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Musig2ParticipantPubkeys {
+    pub aggregate_pubkey: String,
+    pub participant_pubkeys: Vec<String>,
+}
+
 /// Output in decoded PSBT.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DecodePsbtOutput {
@@ -1078,6 +1137,18 @@ pub struct DecodePsbtOutput {
     /// BIP32 derivation paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bip32_derivs: Option<Vec<Bip32Deriv>>,
+    /// Taproot internal key (BIP-371, PSBT_OUT_TAP_INTERNAL_KEY = 0x05).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taproot_internal_key: Option<String>,
+    /// Taproot script tree (BIP-371, PSBT_OUT_TAP_TREE = 0x06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taproot_tree: Option<Vec<TaprootTreeEntry>>,
+    /// Taproot BIP32 derivation paths (BIP-371, PSBT_OUT_TAP_BIP32_DERIVATION = 0x07).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taproot_bip32_derivs: Option<Vec<TaprootBip32Deriv>>,
+    /// MuSig2 participant public keys (PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub musig2_participant_pubkeys: Option<Vec<Musig2ParticipantPubkeys>>,
     /// Unknown key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unknown: Option<serde_json::Value>,
