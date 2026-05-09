@@ -1630,8 +1630,20 @@ fn encode_psbt_input<W: Write>(writer: &mut W, input: &PsbtInput) -> io::Result<
 
     // Only write signing data if not finalized
     if input.final_script_sig.is_none() && input.final_script_witness.is_none() {
-        // Partial signatures
-        for (pubkey, sig) in &input.partial_sigs {
+        // Partial signatures.
+        //
+        // W49: emit in HASH160(pubkey) order to match Bitcoin Core's
+        // `std::map<CKeyID, SigPair>` (CKeyID = HASH160 of pubkey),
+        // see bitcoin-core/src/psbt.h:270. The in-memory storage is a
+        // BTreeMap keyed by raw 33-byte pubkey, so we extract, sort by
+        // hash160, and emit in that canonical order.
+        //
+        // Closes the rustoshi T2 combinepsbt byte-divergence; mirrors
+        // ouroboros W46-4 (3d44478) and blockbrew W45 (e000f9b).
+        let mut sig_keys: Vec<&[u8; 33]> = input.partial_sigs.keys().collect();
+        sig_keys.sort_by_key(|pk| rustoshi_crypto::hash160(pk.as_ref()).0);
+        for pubkey in sig_keys {
+            let sig = &input.partial_sigs[pubkey];
             let mut key = vec![PSBT_IN_PARTIAL_SIG];
             key.extend_from_slice(pubkey);
             len += write_kv_pair(writer, &key, sig)?;
@@ -3723,6 +3735,93 @@ mod tests {
             analysis.next,
             PsbtRole::Extractor,
             "W48: finalized PSBT-level next must be Extractor"
+        );
+    }
+
+    /// W49: partial_sigs MUST be emitted on the wire in HASH160(pubkey)
+    /// order (Core's `std::map<CKeyID, SigPair>`, see
+    /// bitcoin-core/src/psbt.h:270), NOT raw-pubkey order
+    /// (BTreeMap iteration order). This closes the rustoshi T2
+    /// combinepsbt byte-divergence and brings the fleet to 50/50 on
+    /// W40-C parity vs Bitcoin Core 31.99. Mirrors ouroboros W46-4
+    /// (3d44478) and blockbrew W45 (e000f9b).
+    ///
+    /// Test pubkeys are chosen so that raw byte order DIFFERS from
+    /// HASH160 byte order — without this, the test passes vacuously
+    /// (per ouroboros W46-4 lesson):
+    ///   pk_a < pk_b   bytewise  (BTreeMap order, raw)
+    ///   h160(pk_a) > h160(pk_b) (Core's CKeyID order)
+    /// so the on-wire sig for pk_b MUST appear before pk_a.
+    #[test]
+    fn test_w49_partial_sigs_emitted_in_hash160_order() {
+        // pk_a / pk_b: shape-valid 33-byte compressed-pubkey arrays.
+        // The PSBT serializer treats these as opaque bytes; they do
+        // NOT need to be on-curve for a wire-format test.
+        let pk_a: [u8; 33] = [
+            0x02, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+            0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+            0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+            0x42, 0x42, 0x00,
+        ];
+        let pk_b: [u8; 33] = [
+            0x02, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+            0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+            0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+            0x42, 0x42, 0x01,
+        ];
+
+        // Sanity: raw and hash160 orders disagree (the whole point of
+        // the test). If a future libsecp / hash refactor accidentally
+        // makes these agree, this assert turns the test into an
+        // INCONCLUSIVE rather than a vacuous pass.
+        let h_a = rustoshi_crypto::hash160(&pk_a).0;
+        let h_b = rustoshi_crypto::hash160(&pk_b).0;
+        assert!(pk_a < pk_b, "test setup: raw pk_a < pk_b");
+        assert!(
+            h_a > h_b,
+            "test setup: hash160(pk_a) > hash160(pk_b) so the test \
+             actually distinguishes raw-order from hash160-order"
+        );
+
+        // Two distinct DER-shaped sigs. Asymmetric, no palindromes.
+        let sig_a: Vec<u8> = vec![
+            0x30, 0x05, 0x02, 0x01, 0x11, 0x02, 0x01, 0x22, 0x01,
+        ];
+        let sig_b: Vec<u8> = vec![
+            0x30, 0x05, 0x02, 0x01, 0x33, 0x02, 0x01, 0x44, 0x01,
+        ];
+
+        let tx = create_test_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        // Insert a-then-b. BTreeMap stores them in raw-pubkey order
+        // (a then b). Without the W49 fix, the wire layout follows
+        // raw order. With the fix, on-wire order is hash160 order
+        // (b then a) — matching Core.
+        psbt.inputs[0].partial_sigs.insert(pk_a, sig_a.clone());
+        psbt.inputs[0].partial_sigs.insert(pk_b, sig_b.clone());
+
+        let wire = psbt.serialize();
+
+        // Find both PSBT_IN_PARTIAL_SIG records by scanning for the
+        // signature payload — robust against reordering of unrelated
+        // input fields. Returns the offset of the first byte of the
+        // sig (i.e. the start of the kv-pair value).
+        fn find_sig_offset(wire: &[u8], sig: &[u8]) -> usize {
+            wire.windows(sig.len())
+                .position(|w| w == sig)
+                .expect("sig must appear in serialized PSBT")
+        }
+        let off_a = find_sig_offset(&wire, &sig_a);
+        let off_b = find_sig_offset(&wire, &sig_b);
+
+        // hash160(pk_b) < hash160(pk_a), so pk_b's record (and thus
+        // sig_b) MUST appear before pk_a's on the wire.
+        assert!(
+            off_b < off_a,
+            "W49: partial_sigs must be emitted in HASH160(pubkey) \
+             order, not BTreeMap raw-pubkey order. \
+             got off_b={} off_a={} (Core std::map<CKeyID,SigPair>)",
+            off_b, off_a
         );
     }
 }
