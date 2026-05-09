@@ -4658,8 +4658,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             };
 
             // Non-witness UTXO
+            // Serialize via to_string first, then wrap as RawValue to avoid
+            // serde_json::to_value() collapsing BtcAmount's "2.00000000" to
+            // the f64 representation "2.0". RawValue preserves the exact bytes.
             if let Some(ref utxo_tx) = input.non_witness_utxo {
-                decoded_input.non_witness_utxo = Some(serde_json::to_value(build_decoded_raw_transaction(utxo_tx, Some(&state.params))).unwrap());
+                let json_str = serde_json::to_string(&build_decoded_raw_transaction(utxo_tx, Some(&state.params))).unwrap();
+                decoded_input.non_witness_utxo = serde_json::value::RawValue::from_string(json_str).ok();
 
                 // Extract value from the referenced output
                 let vout = psbt.unsigned_tx.inputs[i].previous_output.vout as usize;
@@ -4739,10 +4743,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                 decoded_input.bip32_derivs = Some(derivs);
             }
 
-            // Final scriptSig
+            // Final scriptSig — asm uses sighash-decode mode (fAttemptSighashDecode=true).
+            // Reference: bitcoin-core/src/rpc/rawtransaction.cpp line 1201:
+            //   scriptsig.pushKV("asm", ScriptToAsmStr(input.final_script_sig, true))
+            // DER-encoded sigs get their sighash byte stripped + "[ALL]"/etc. suffix.
             if let Some(ref script) = input.final_script_sig {
                 decoded_input.final_scriptsig = Some(ScriptInfo {
-                    asm: disassemble_script(script),
+                    asm: disassemble_script_sig_asm(script),
                     hex: hex::encode(script),
                     script_type: None,
                 });
@@ -8040,6 +8047,193 @@ fn disassemble_script(script: &[u8]) -> String {
     result.join(" ")
 }
 
+/// Returns true iff `vch` looks like a valid DER signature + sighash byte.
+///
+/// Mirrors bitcoin-core/src/script/interpreter.cpp IsValidSignatureEncoding.
+/// Used by `disassemble_script_sig_asm` to decide whether to strip the last
+/// byte and append a "[TYPE]" sighash label.
+fn is_valid_der_sig_encoding(vch: &[u8]) -> bool {
+    if vch.len() < 9 || vch.len() > 73 {
+        return false;
+    }
+    if vch[0] != 0x30 {
+        return false;
+    }
+    if vch[1] as usize != vch.len() - 3 {
+        return false;
+    }
+    let len_r = vch[3] as usize;
+    if 5 + len_r >= vch.len() {
+        return false;
+    }
+    let len_s = vch[5 + len_r] as usize;
+    if len_r + len_s + 7 != vch.len() {
+        return false;
+    }
+    if vch[2] != 0x02 {
+        return false;
+    }
+    if len_r == 0 {
+        return false;
+    }
+    if (vch[4] & 0x80) != 0 {
+        return false;
+    }
+    if len_r > 1 && vch[4] == 0x00 && (vch[5] & 0x80) == 0 {
+        return false;
+    }
+    if vch[len_r + 4] != 0x02 {
+        return false;
+    }
+    if len_s == 0 {
+        return false;
+    }
+    if (vch[len_r + 6] & 0x80) != 0 {
+        return false;
+    }
+    if len_s > 1 && vch[len_r + 6] == 0x00 && (vch[len_r + 7] & 0x80) == 0 {
+        return false;
+    }
+    true
+}
+
+/// Disassemble a scriptSig with sighash-type decoding enabled.
+///
+/// Mirrors bitcoin-core/src/core_io.cpp ScriptToAsmStr(script, /*fAttemptSighashDecode=*/true).
+///
+/// For push-data operands whose length > 4:
+///   1. Check IsValidSignatureEncoding (DER format + sighash byte).
+///   2. If it passes, strip the last byte, map via sighash_to_string, and
+///      append "[TYPE]" suffix if the type is defined.
+/// For push-data operands ≤ 4 bytes: emit as CScriptNum decimal.
+/// Non-push opcodes: same as disassemble_script.
+///
+/// Used for final_scriptSig.asm in decodepsbt, where Core's C++ passes
+/// fAttemptSighashDecode=true to ScriptToAsmStr (rawtransaction.cpp line 1201).
+fn disassemble_script_sig_asm(script: &[u8]) -> String {
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < script.len() {
+        let opcode = script[i];
+
+        // Extract push-data payload (returns None for non-push opcodes).
+        let push_data: Option<&[u8]> = match opcode {
+            0x01..=0x4b => {
+                let len = opcode as usize;
+                if i + 1 + len <= script.len() {
+                    let d = &script[i + 1..i + 1 + len];
+                    i += len;
+                    Some(d)
+                } else {
+                    result.push("[error]".to_string());
+                    break;
+                }
+            }
+            0x4c => {
+                if i + 1 >= script.len() { result.push("[error]".to_string()); break; }
+                let len = script[i + 1] as usize;
+                if i + 2 + len > script.len() { result.push("[error]".to_string()); break; }
+                let d = &script[i + 2..i + 2 + len];
+                i += 1 + len;
+                Some(d)
+            }
+            0x4d => {
+                if i + 2 >= script.len() { result.push("[error]".to_string()); break; }
+                let len = u16::from_le_bytes([script[i + 1], script[i + 2]]) as usize;
+                if i + 3 + len > script.len() { result.push("[error]".to_string()); break; }
+                let d = &script[i + 3..i + 3 + len];
+                i += 2 + len;
+                Some(d)
+            }
+            0x4e => {
+                if i + 4 >= script.len() { result.push("[error]".to_string()); break; }
+                let len = u32::from_le_bytes([
+                    script[i + 1], script[i + 2], script[i + 3], script[i + 4],
+                ]) as usize;
+                if i + 5 + len > script.len() { result.push("[error]".to_string()); break; }
+                let d = &script[i + 5..i + 5 + len];
+                i += 4 + len;
+                Some(d)
+            }
+            _ => None,
+        };
+
+        if let Some(vch) = push_data {
+            if vch.len() <= 4 {
+                // CScriptNum decimal (same rule as disassemble_script).
+                result.push(decode_script_num(vch).to_string());
+            } else {
+                // Attempt sighash decode: if the push looks like a DER sig,
+                // strip the last byte and append "[TYPE]" suffix.
+                if is_valid_der_sig_encoding(vch) {
+                    let sighash_byte = vch[vch.len() - 1];
+                    let label = sighash_to_string(sighash_byte as u32);
+                    let stripped_hex = hex::encode(&vch[..vch.len() - 1]);
+                    if label.is_empty() {
+                        result.push(stripped_hex);
+                    } else {
+                        result.push(format!("{}[{}]", stripped_hex, label));
+                    }
+                } else {
+                    result.push(hex::encode(vch));
+                }
+            }
+        } else {
+            // Non-push opcode: delegate to the same table as disassemble_script.
+            // We re-use a small inline match here to avoid code duplication.
+            let token = match opcode {
+                0x00 => "0",
+                0x4f => "-1",
+                0x50 => "OP_RESERVED",
+                0x51 => "1",  0x52 => "2",  0x53 => "3",  0x54 => "4",
+                0x55 => "5",  0x56 => "6",  0x57 => "7",  0x58 => "8",
+                0x59 => "9",  0x5a => "10", 0x5b => "11", 0x5c => "12",
+                0x5d => "13", 0x5e => "14", 0x5f => "15", 0x60 => "16",
+                0x61 => "OP_NOP",          0x63 => "OP_IF",
+                0x64 => "OP_NOTIF",        0x67 => "OP_ELSE",
+                0x68 => "OP_ENDIF",        0x69 => "OP_VERIFY",
+                0x6a => "OP_RETURN",       0x6b => "OP_TOALTSTACK",
+                0x6c => "OP_FROMALTSTACK", 0x6d => "OP_2DROP",
+                0x6e => "OP_2DUP",         0x6f => "OP_3DUP",
+                0x70 => "OP_2OVER",        0x71 => "OP_2ROT",
+                0x72 => "OP_2SWAP",        0x73 => "OP_IFDUP",
+                0x74 => "OP_DEPTH",        0x75 => "OP_DROP",
+                0x76 => "OP_DUP",          0x77 => "OP_NIP",
+                0x78 => "OP_OVER",         0x79 => "OP_PICK",
+                0x7a => "OP_ROLL",         0x7b => "OP_ROT",
+                0x7c => "OP_SWAP",         0x7d => "OP_TUCK",
+                0x82 => "OP_SIZE",         0x87 => "OP_EQUAL",
+                0x88 => "OP_EQUALVERIFY",  0x8b => "OP_1ADD",
+                0x8c => "OP_1SUB",         0x8f => "OP_NEGATE",
+                0x90 => "OP_ABS",          0x91 => "OP_NOT",
+                0x92 => "OP_0NOTEQUAL",    0x93 => "OP_ADD",
+                0x94 => "OP_SUB",          0x9a => "OP_BOOLAND",
+                0x9b => "OP_BOOLOR",       0x9c => "OP_NUMEQUAL",
+                0x9d => "OP_NUMEQUALVERIFY", 0x9e => "OP_NUMNOTEQUAL",
+                0x9f => "OP_LESSTHAN",     0xa0 => "OP_GREATERTHAN",
+                0xa1 => "OP_LESSTHANOREQUAL", 0xa2 => "OP_GREATERTHANOREQUAL",
+                0xa3 => "OP_MIN",          0xa4 => "OP_MAX",
+                0xa5 => "OP_WITHIN",       0xa6 => "OP_RIPEMD160",
+                0xa7 => "OP_SHA1",         0xa8 => "OP_SHA256",
+                0xa9 => "OP_HASH160",      0xaa => "OP_HASH256",
+                0xab => "OP_CODESEPARATOR", 0xac => "OP_CHECKSIG",
+                0xad => "OP_CHECKSIGVERIFY", 0xae => "OP_CHECKMULTISIG",
+                0xaf => "OP_CHECKMULTISIGVERIFY", 0xb0 => "OP_NOP1",
+                0xb1 => "OP_CHECKLOCKTIMEVERIFY", 0xb2 => "OP_CHECKSEQUENCEVERIFY",
+                0xb3 => "OP_NOP4", 0xb4 => "OP_NOP5", 0xb5 => "OP_NOP6",
+                0xb6 => "OP_NOP7", 0xb7 => "OP_NOP8", 0xb8 => "OP_NOP9",
+                0xb9 => "OP_NOP10", 0xba => "OP_CHECKSIGADD",
+                _ => { result.push(format!("OP_UNKNOWN[{:#04x}]", opcode)); i += 1; continue; }
+            };
+            result.push(token.to_string());
+        }
+        i += 1;
+    }
+
+    result.join(" ")
+}
+
 /// Classify a script into its type.
 fn classify_script(script: &[u8]) -> String {
     if script.len() == 25
@@ -8182,23 +8376,27 @@ fn address_to_script_pubkey(address: &str, params: &ChainParams) -> Result<Vec<u
     Ok(decoded.to_script_pubkey())
 }
 
-/// Convert a sighash type to a string.
+/// Convert a sighash type byte to its Bitcoin Core string label.
+///
+/// Mirrors bitcoin-core/src/core_io.cpp SighashToStr (line ~343).
+/// The map covers exactly the 6 defined SIGHASH values; anything else
+/// returns an empty string.  0x00 is NOT in the table.
+///
+/// This function is used in two places:
+///  1. PSBT input sighash field (decodepsbt) — PSBT stores a 4-byte LE uint32;
+///     we pass the low byte via `(sighash & 0xff)`.
+///  2. DER signature sighash-decode in disassemble_script_sig_asm — we pass
+///     the last byte of the signature directly.
 fn sighash_to_string(sighash: u32) -> String {
-    let base = sighash & 0x1f;
-    let anyonecanpay = (sighash & 0x80) != 0;
-
-    let base_str = match base {
-        0x00 => "DEFAULT",
-        0x01 => "ALL",
-        0x02 => "NONE",
-        0x03 => "SINGLE",
-        _ => "UNKNOWN",
-    };
-
-    if anyonecanpay {
-        format!("{}|ANYONECANPAY", base_str)
-    } else {
-        base_str.to_string()
+    // Use only the low byte — the high byte is unused in all defined types.
+    match sighash & 0xff {
+        0x01 => "ALL".to_string(),
+        0x02 => "NONE".to_string(),
+        0x03 => "SINGLE".to_string(),
+        0x81 => "ALL|ANYONECANPAY".to_string(),
+        0x82 => "NONE|ANYONECANPAY".to_string(),
+        0x83 => "SINGLE|ANYONECANPAY".to_string(),
+        _ => String::new(),
     }
 }
 
@@ -8247,8 +8445,10 @@ fn build_decoded_raw_transaction(
                 TxInputInfo {
                     txid: Some(input.previous_output.txid.to_hex()),
                     vout: Some(input.previous_output.vout),
+                    // TxToUniv calls ScriptToAsmStr(txin.scriptSig, /*fAttemptSighashDecode=*/true)
+                    // (core_io.cpp line 460), so use the sighash-decode variant here.
                     script_sig: Some(ScriptSigInfo {
-                        asm: disassemble_script(&input.script_sig),
+                        asm: disassemble_script_sig_asm(&input.script_sig),
                         hex: hex::encode(&input.script_sig),
                     }),
                     coinbase: None,
