@@ -234,7 +234,7 @@ pub struct BlockInfo {
 }
 
 /// Response for `getblockheader` RPC (verbose mode).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 pub struct BlockHeaderInfo {
     /// Block hash.
     pub hash: String,
@@ -257,8 +257,17 @@ pub struct BlockHeaderInfo {
     pub nonce: u32,
     /// Compact difficulty target.
     pub bits: String,
+    /// Expanded target from compact bits — 64-char lowercase hex, zero-padded.
+    /// Mirrors Core's `GetTarget()` / `target` field (added Bitcoin Core 27+).
+    pub target: String,
     /// Current difficulty.
-    pub difficulty: f64,
+    ///
+    /// Serialised as a raw JSON number with 16 significant digits to match
+    /// Bitcoin Core's `std::setprecision(16)` in `GetDifficulty()`.  We use
+    /// `Box<serde_json::value::RawValue>` so serde does not re-format the
+    /// pre-computed decimal string through its own f64 serialiser (ryu),
+    /// which would produce a different number of digits.
+    pub difficulty: Box<serde_json::value::RawValue>,
     /// Total chain work (hex).
     pub chainwork: String,
     /// Number of transactions.
