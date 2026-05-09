@@ -373,7 +373,7 @@ pub trait RustoshiRpc {
 
     /// Decode a raw transaction without broadcasting.
     #[method(name = "decoderawtransaction")]
-    async fn decode_raw_transaction(&self, hex: String) -> RpcResult<serde_json::Value>;
+    async fn decode_raw_transaction(&self, hex: String) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Get mempool information.
     #[method(name = "getmempoolinfo")]
@@ -2614,7 +2614,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
-    async fn decode_raw_transaction(&self, hex: String) -> RpcResult<serde_json::Value> {
+    async fn decode_raw_transaction(&self, hex: String) -> RpcResult<Box<serde_json::value::RawValue>> {
         let tx_bytes = Self::parse_hex(&hex)?;
 
         let tx = Transaction::deserialize(&tx_bytes).map_err(|_| {
@@ -2626,7 +2626,12 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         let state = self.state.read().await;
         let decoded = build_decoded_raw_transaction(&tx, Some(&state.params));
-        Ok(serde_json::to_value(decoded).unwrap())
+        // Serialize via to_string first so that BtcAmount's RawValue tokens
+        // (e.g. "6.38687680") are preserved byte-for-byte.  serde_json::to_value()
+        // would round-trip through Value::Number and collapse trailing zeros.
+        // This matches the non_witness_utxo path in decodepsbt (server.rs ~4701).
+        let json_str = serde_json::to_string(&decoded).unwrap();
+        Ok(serde_json::value::RawValue::from_string(json_str).unwrap())
     }
 
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
