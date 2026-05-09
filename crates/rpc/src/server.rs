@@ -2624,67 +2624,8 @@ impl RustoshiRpcServer for RpcServerImpl {
             )
         })?;
 
-        let decoded = DecodedRawTransaction {
-            txid: tx.txid().to_hex(),
-            hash: tx.wtxid().to_hex(),
-            size: tx.serialize().len() as u32,
-            vsize: tx.vsize() as u32,
-            weight: tx.weight() as u32,
-            version: tx.version,
-            locktime: tx.lock_time,
-            vin: tx
-                .inputs
-                .iter()
-                .map(|input| {
-                    if input.previous_output.is_null() {
-                        TxInputInfo {
-                            txid: None,
-                            vout: None,
-                            script_sig: None,
-                            coinbase: Some(hex::encode(&input.script_sig)),
-                            txinwitness: if input.witness.is_empty() {
-                                None
-                            } else {
-                                Some(input.witness.iter().map(hex::encode).collect())
-                            },
-                            sequence: input.sequence,
-                        }
-                    } else {
-                        TxInputInfo {
-                            txid: Some(input.previous_output.txid.to_hex()),
-                            vout: Some(input.previous_output.vout),
-                            script_sig: Some(ScriptSigInfo {
-                                asm: String::new(), // simplified
-                                hex: hex::encode(&input.script_sig),
-                            }),
-                            coinbase: None,
-                            txinwitness: if input.witness.is_empty() {
-                                None
-                            } else {
-                                Some(input.witness.iter().map(hex::encode).collect())
-                            },
-                            sequence: input.sequence,
-                        }
-                    }
-                })
-                .collect(),
-            vout: tx
-                .outputs
-                .iter()
-                .enumerate()
-                .map(|(n, output)| TxOutputInfo {
-                    value: output.value as f64 / COIN as f64,
-                    n: n as u32,
-                    script_pubkey: ScriptPubKeyInfo {
-                        asm: String::new(),
-                        hex: hex::encode(&output.script_pubkey),
-                        script_type: detect_script_type(&output.script_pubkey),
-                        address: None, // would need address encoding
-                    },
-                })
-                .collect(),
-        };
-
+        let state = self.state.read().await;
+        let decoded = build_decoded_raw_transaction(&tx, Some(&state.params));
         Ok(serde_json::to_value(decoded).unwrap())
     }
 
@@ -3653,15 +3594,18 @@ impl RustoshiRpcServer for RpcServerImpl {
         if include_mempool {
             if let Some(entry) = state.mempool.get(&tx_hash) {
                 if let Some(output) = entry.tx.outputs.get(vout as usize) {
+                    let addr = script_to_address(&output.script_pubkey, &state.params);
+                    let desc = infer_descriptor(&output.script_pubkey, &state.params);
                     return Ok(Some(TxOutResult {
                         bestblock: state.best_hash.to_hex(),
                         confirmations: 0,
-                        value: output.value as f64 / COIN as f64,
+                        value: BtcAmount::from_sats(output.value),
                         script_pubkey: ScriptPubKeyInfo {
-                            asm: String::new(),
+                            asm: disassemble_script(&output.script_pubkey),
+                            desc,
                             hex: hex::encode(&output.script_pubkey),
-                            script_type: detect_script_type(&output.script_pubkey),
-                            address: None,
+                            address: addr,
+                            script_type: classify_script(&output.script_pubkey),
                         },
                         coinbase: false,
                     }));
@@ -3677,15 +3621,18 @@ impl RustoshiRpcServer for RpcServerImpl {
                 0
             };
 
+            let addr = script_to_address(&coin.script_pubkey, &state.params);
+            let desc = infer_descriptor(&coin.script_pubkey, &state.params);
             return Ok(Some(TxOutResult {
                 bestblock: state.best_hash.to_hex(),
                 confirmations,
-                value: coin.value as f64 / COIN as f64,
+                value: BtcAmount::from_sats(coin.value),
                 script_pubkey: ScriptPubKeyInfo {
-                    asm: String::new(),
+                    asm: disassemble_script(&coin.script_pubkey),
+                    desc,
                     hex: hex::encode(&coin.script_pubkey),
-                    script_type: detect_script_type(&coin.script_pubkey),
-                    address: None,
+                    address: addr,
+                    script_type: classify_script(&coin.script_pubkey),
                 },
                 coinbase: coin.is_coinbase,
             }));
@@ -4688,9 +4635,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, format!("Invalid PSBT: {}", e))
         })?;
 
-        // Build the transaction info
+        // Build the transaction info (W52: pass params for addr/desc).
         let tx = &psbt.unsigned_tx;
-        let tx_info = build_decoded_raw_transaction(tx);
+        let tx_info = build_decoded_raw_transaction(tx, Some(&state.params));
 
         // Build inputs info
         let mut inputs = Vec::with_capacity(psbt.inputs.len());
@@ -4712,7 +4659,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
             // Non-witness UTXO
             if let Some(ref utxo_tx) = input.non_witness_utxo {
-                decoded_input.non_witness_utxo = Some(serde_json::to_value(build_decoded_raw_transaction(utxo_tx)).unwrap());
+                decoded_input.non_witness_utxo = Some(serde_json::to_value(build_decoded_raw_transaction(utxo_tx, Some(&state.params))).unwrap());
 
                 // Extract value from the referenced output
                 let vout = psbt.unsigned_tx.inputs[i].previous_output.vout as usize;
@@ -4727,14 +4674,16 @@ impl RustoshiRpcServer for RpcServerImpl {
             if let Some(ref utxo) = input.witness_utxo {
                 let script_type = classify_script(&utxo.script_pubkey);
                 let address = script_to_address(&utxo.script_pubkey, &state.params);
+                let desc = infer_descriptor(&utxo.script_pubkey, &state.params);
 
                 decoded_input.witness_utxo = Some(WitnessUtxo {
-                    amount: utxo.value as f64 / COIN as f64,
+                    amount: BtcAmount::from_sats(utxo.value),
                     script_pubkey: ScriptPubKeyInfo {
                         asm: disassemble_script(&utxo.script_pubkey),
+                        desc,
                         hex: hex::encode(&utxo.script_pubkey),
-                        script_type,
                         address,
+                        script_type,
                     },
                 });
 
@@ -4870,21 +4819,37 @@ impl RustoshiRpcServer for RpcServerImpl {
             outputs.push(decoded_output);
         }
 
-        // Calculate fee if possible
+        // Calculate fee if possible.  Emit as BtcAmount (Core's ValueFromAmount
+        // %d.%08d format — W52).
         let total_output_value: u64 = tx.outputs.iter().map(|o| o.value).sum();
-        let fee = total_input_value.map(|input| {
+        let fee = total_input_value.and_then(|input| {
             if input >= total_output_value {
-                (input - total_output_value) as f64 / COIN as f64
+                Some(BtcAmount::from_sats(input - total_output_value))
             } else {
-                0.0
+                None
             }
         });
 
+        // global_xpubs: parse from PSBT.  Core always emits this key even when
+        // empty (W52).  psbt.xpubs is BTreeMap<KeyOrigin, BTreeSet<ExtPubKey>>;
+        // each ExtPubKey.data is a 78-byte serialised xpub already containing
+        // the version bytes, so base58check_encode gives the standard string.
+        let global_xpubs: Vec<GlobalXpub> = psbt.xpubs.iter().flat_map(|(origin, xpub_set)| {
+            xpub_set.iter().map(move |xpub| {
+                GlobalXpub {
+                    xpub: rustoshi_crypto::base58check_encode(&xpub.data),
+                    master_fingerprint: hex::encode(origin.fingerprint),
+                    path: format_derivation_path(&origin.path),
+                }
+            })
+        }).collect();
+
         Ok(DecodePsbtResult {
             tx: tx_info,
-            global_xpubs: None, // Simplified - could be expanded
+            global_xpubs,
             psbt_version: psbt.get_version(),
-            unknown: None,
+            proprietary: Vec::new(),
+            unknown: serde_json::Value::Object(serde_json::Map::new()),
             inputs,
             outputs,
             fee,
@@ -7716,15 +7681,21 @@ fn build_tx_info(
             .outputs
             .iter()
             .enumerate()
-            .map(|(n, output)| TxOutputInfo {
-                value: output.value as f64 / COIN as f64,
-                n: n as u32,
-                script_pubkey: ScriptPubKeyInfo {
-                    asm: String::new(),
-                    hex: hex::encode(&output.script_pubkey),
-                    script_type: detect_script_type(&output.script_pubkey),
-                    address: None,
-                },
+            .map(|(n, output)| {
+                use rustoshi_wallet::descriptor::add_checksum;
+                let raw_desc = format!("raw({})", hex::encode(&output.script_pubkey));
+                let desc = add_checksum(&raw_desc).unwrap_or(raw_desc);
+                TxOutputInfo {
+                    value: BtcAmount::from_sats(output.value),
+                    n: n as u32,
+                    script_pubkey: ScriptPubKeyInfo {
+                        asm: String::new(),
+                        desc,
+                        hex: hex::encode(&output.script_pubkey),
+                        address: None,
+                        script_type: detect_script_type(&output.script_pubkey),
+                    },
+                }
             })
             .collect(),
         hex: hex::encode(tx.serialize()),
@@ -7796,15 +7767,19 @@ fn build_tx_info_verbose(
             .iter()
             .enumerate()
             .map(|(n, output)| {
+                use rustoshi_wallet::descriptor::add_checksum;
                 let script_type = detect_script_type(&output.script_pubkey);
+                let raw_desc = format!("raw({})", hex::encode(&output.script_pubkey));
+                let desc = add_checksum(&raw_desc).unwrap_or(raw_desc);
                 TxOutputInfo {
-                    value: output.value as f64 / COIN as f64,
+                    value: BtcAmount::from_sats(output.value),
                     n: n as u32,
                     script_pubkey: ScriptPubKeyInfo {
                         asm: disassemble_script(&output.script_pubkey),
+                        desc,
                         hex: hex::encode(&output.script_pubkey),
+                        address: None,
                         script_type,
-                        address: None, // Address encoding would require bech32/base58 logic
                     },
                 }
             })
@@ -7815,6 +7790,51 @@ fn build_tx_info_verbose(
         blocktime,
         time: blocktime, // time is the same as blocktime for confirmed txs
     }
+}
+
+// ============================================================
+// W52: SCRIPT / DESCRIPTOR HELPERS
+// ============================================================
+
+/// Decode a CScriptNum (signed little-endian with sign bit in MSB of last
+/// byte) to an i64.  Mirrors the `GetScriptNum`/`CScriptNum` logic in
+/// Bitcoin Core `script/script.h`.  Used by `disassemble_script` to emit
+/// push-data tokens of ≤4 bytes as decimal integers rather than hex, which
+/// is what Core's `ScriptToAsmStr` does.
+fn decode_script_num(data: &[u8]) -> i64 {
+    if data.is_empty() {
+        return 0;
+    }
+    let mut result: i64 = 0;
+    for (i, &byte) in data.iter().enumerate() {
+        result |= (byte as i64) << (8 * i);
+    }
+    // The sign bit is the MSB of the last byte.
+    let last = *data.last().unwrap();
+    if last & 0x80 != 0 {
+        // Clear the sign bit and negate.
+        let bit_pos = 8 * (data.len() - 1) + 7;
+        result &= !((1i64) << bit_pos);
+        result = -result;
+    }
+    result
+}
+
+/// Build a BIP-380 descriptor string for a scriptPubKey, mirroring Bitcoin
+/// Core's `InferDescriptor` (script/descriptor.cpp) in the no-keys path:
+///   `addr(<address>)#<csum>`  for standard address-encodable scripts
+///   `raw(<hex>)#<csum>`       otherwise
+///
+/// Reference: bitcoin-core/src/script/descriptor.cpp `InferDescriptor`.
+fn infer_descriptor(script: &[u8], params: &ChainParams) -> String {
+    use rustoshi_wallet::descriptor::add_checksum;
+    let payload = match script_to_address(script, params) {
+        Some(addr) => format!("addr({})", addr),
+        None       => format!("raw({})", hex::encode(script)),
+    };
+    // `add_checksum` is infallible for addr/hex payloads (only valid charset
+    // chars); fall back to the payload without checksum if it ever fails.
+    add_checksum(&payload).unwrap_or(payload)
 }
 
 /// Disassemble a script into human-readable form.
@@ -7829,10 +7849,18 @@ fn disassemble_script(script: &[u8]) -> String {
             // Push data opcodes
             0x00 => result.push("0".to_string()),
             0x01..=0x4b => {
-                // Direct push of 1-75 bytes
+                // Direct push of 1-75 bytes.
+                // Core's ScriptToAsmStr (core_io.cpp): pushes of ≤4 bytes
+                // are decoded as a CScriptNum (signed little-endian integer)
+                // and emitted as a decimal string; longer pushes stay as hex.
                 let len = opcode as usize;
                 if i + 1 + len <= script.len() {
-                    result.push(hex::encode(&script[i + 1..i + 1 + len]));
+                    let data = &script[i + 1..i + 1 + len];
+                    if len <= 4 {
+                        result.push(decode_script_num(data).to_string());
+                    } else {
+                        result.push(hex::encode(data));
+                    }
                     i += len;
                 } else {
                     result.push("[error: truncated push]".to_string());
@@ -7840,11 +7868,16 @@ fn disassemble_script(script: &[u8]) -> String {
                 }
             }
             0x4c => {
-                // OP_PUSHDATA1
+                // OP_PUSHDATA1 — same CScriptNum rule as direct push
                 if i + 1 < script.len() {
                     let len = script[i + 1] as usize;
                     if i + 2 + len <= script.len() {
-                        result.push(hex::encode(&script[i + 2..i + 2 + len]));
+                        let data = &script[i + 2..i + 2 + len];
+                        if len <= 4 {
+                            result.push(decode_script_num(data).to_string());
+                        } else {
+                            result.push(hex::encode(data));
+                        }
                         i += 1 + len;
                     } else {
                         result.push("[error: truncated pushdata1]".to_string());
@@ -7856,11 +7889,16 @@ fn disassemble_script(script: &[u8]) -> String {
                 }
             }
             0x4d => {
-                // OP_PUSHDATA2
+                // OP_PUSHDATA2 — same CScriptNum rule
                 if i + 2 < script.len() {
                     let len = u16::from_le_bytes([script[i + 1], script[i + 2]]) as usize;
                     if i + 3 + len <= script.len() {
-                        result.push(hex::encode(&script[i + 3..i + 3 + len]));
+                        let data = &script[i + 3..i + 3 + len];
+                        if len <= 4 {
+                            result.push(decode_script_num(data).to_string());
+                        } else {
+                            result.push(hex::encode(data));
+                        }
                         i += 2 + len;
                     } else {
                         result.push("[error: truncated pushdata2]".to_string());
@@ -7872,7 +7910,7 @@ fn disassemble_script(script: &[u8]) -> String {
                 }
             }
             0x4e => {
-                // OP_PUSHDATA4
+                // OP_PUSHDATA4 — same CScriptNum rule
                 if i + 4 < script.len() {
                     let len = u32::from_le_bytes([
                         script[i + 1],
@@ -7881,7 +7919,12 @@ fn disassemble_script(script: &[u8]) -> String {
                         script[i + 4],
                     ]) as usize;
                     if i + 5 + len <= script.len() {
-                        result.push(hex::encode(&script[i + 5..i + 5 + len]));
+                        let data = &script[i + 5..i + 5 + len];
+                        if len <= 4 {
+                            result.push(decode_script_num(data).to_string());
+                        } else {
+                            result.push(hex::encode(data));
+                        }
                         i += 4 + len;
                     } else {
                         result.push("[error: truncated pushdata4]".to_string());
@@ -7892,25 +7935,26 @@ fn disassemble_script(script: &[u8]) -> String {
                     break;
                 }
             }
-            // Small integers
-            0x4f => result.push("OP_1NEGATE".to_string()),
+            // Small integers — Core's ScriptToAsmStr emits numeric tokens,
+            // not "OP_1NEGATE" / "OP_1" / … (core_io.cpp).
+            0x4f => result.push("-1".to_string()),
             0x50 => result.push("OP_RESERVED".to_string()),
-            0x51 => result.push("OP_1".to_string()),
-            0x52 => result.push("OP_2".to_string()),
-            0x53 => result.push("OP_3".to_string()),
-            0x54 => result.push("OP_4".to_string()),
-            0x55 => result.push("OP_5".to_string()),
-            0x56 => result.push("OP_6".to_string()),
-            0x57 => result.push("OP_7".to_string()),
-            0x58 => result.push("OP_8".to_string()),
-            0x59 => result.push("OP_9".to_string()),
-            0x5a => result.push("OP_10".to_string()),
-            0x5b => result.push("OP_11".to_string()),
-            0x5c => result.push("OP_12".to_string()),
-            0x5d => result.push("OP_13".to_string()),
-            0x5e => result.push("OP_14".to_string()),
-            0x5f => result.push("OP_15".to_string()),
-            0x60 => result.push("OP_16".to_string()),
+            0x51 => result.push("1".to_string()),
+            0x52 => result.push("2".to_string()),
+            0x53 => result.push("3".to_string()),
+            0x54 => result.push("4".to_string()),
+            0x55 => result.push("5".to_string()),
+            0x56 => result.push("6".to_string()),
+            0x57 => result.push("7".to_string()),
+            0x58 => result.push("8".to_string()),
+            0x59 => result.push("9".to_string()),
+            0x5a => result.push("10".to_string()),
+            0x5b => result.push("11".to_string()),
+            0x5c => result.push("12".to_string()),
+            0x5d => result.push("13".to_string()),
+            0x5e => result.push("14".to_string()),
+            0x5f => result.push("15".to_string()),
+            0x60 => result.push("16".to_string()),
             // Flow control
             0x61 => result.push("OP_NOP".to_string()),
             0x63 => result.push("OP_IF".to_string()),
@@ -8172,7 +8216,15 @@ fn format_derivation_path(path: &[u32]) -> String {
 }
 
 /// Build a DecodedRawTransaction from a Transaction.
-fn build_decoded_raw_transaction(tx: &Transaction) -> DecodedRawTransaction {
+///
+/// When `params` is provided the scriptPubKey gains an `address` field and a
+/// BIP-380 `desc` field (W52).  When `params` is `None` (e.g. decodepsbt
+/// non_witness_utxo path that doesn't have network context), desc falls
+/// back to `raw(...)#<csum>` and address is omitted.
+fn build_decoded_raw_transaction(
+    tx: &Transaction,
+    params: Option<&ChainParams>,
+) -> DecodedRawTransaction {
     let vin: Vec<TxInputInfo> = tx
         .inputs
         .iter()
@@ -8217,14 +8269,26 @@ fn build_decoded_raw_transaction(tx: &Transaction) -> DecodedRawTransaction {
         .enumerate()
         .map(|(i, output)| {
             let script_type = classify_script(&output.script_pubkey);
+            let (address, desc) = if let Some(p) = params {
+                let addr = script_to_address(&output.script_pubkey, p);
+                let d = infer_descriptor(&output.script_pubkey, p);
+                (addr, d)
+            } else {
+                // No params: skip address; desc falls back to raw(...)#csum.
+                use rustoshi_wallet::descriptor::add_checksum;
+                let raw_desc = format!("raw({})", hex::encode(&output.script_pubkey));
+                let d = add_checksum(&raw_desc).unwrap_or(raw_desc);
+                (None, d)
+            };
             TxOutputInfo {
-                value: output.value as f64 / COIN as f64,
+                value: BtcAmount::from_sats(output.value),
                 n: i as u32,
                 script_pubkey: ScriptPubKeyInfo {
                     asm: disassemble_script(&output.script_pubkey),
+                    desc,
                     hex: hex::encode(&output.script_pubkey),
+                    address,
                     script_type,
-                    address: None,
                 },
             }
         })

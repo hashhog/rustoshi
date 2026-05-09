@@ -3,7 +3,52 @@
 //! This module defines all the types used in JSON-RPC responses, matching
 //! the Bitcoin Core RPC format for compatibility with existing tooling.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
+
+// ============================================================
+// BTC AMOUNT FORMATTING (W52)
+// ============================================================
+
+/// A Bitcoin amount (in satoshis) that serializes as Bitcoin Core's
+/// `ValueFromAmount` format: `%s%d.%08d` (always 8 fractional digits,
+/// e.g. `1.00000000`, never `1` or `1.0`).
+///
+/// Reference: bitcoin-core/src/core_io.cpp `ValueFromAmount` (line ~285).
+///
+/// The custom `Serialize` impl emits the pre-formatted decimal string as an
+/// unquoted JSON number token via `serde_json::value::RawValue::from_string`,
+/// which requires the `raw_value` feature on `serde_json`.
+#[derive(Deserialize, Debug, Clone, Copy)]
+pub struct BtcAmount(pub i64);
+
+impl BtcAmount {
+    /// Construct from a satoshi value (unsigned; amounts are never negative
+    /// in normal tx outputs).
+    #[inline]
+    pub fn from_sats(sats: u64) -> Self {
+        BtcAmount(sats as i64)
+    }
+}
+
+impl Serialize for BtcAmount {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let sats = self.0;
+        let neg = sats < 0;
+        let abs = sats.unsigned_abs();
+        let whole = abs / 100_000_000;
+        let frac = abs % 100_000_000;
+        let text = if neg {
+            format!("-{}.{:08}", whole, frac)
+        } else {
+            format!("{}.{:08}", whole, frac)
+        };
+        // Emit as an unquoted JSON number token preserving the exact decimal
+        // text (e.g. "1.00000000") — float would lose trailing zeros.
+        let raw = serde_json::value::RawValue::from_string(text)
+            .map_err(serde::ser::Error::custom)?;
+        raw.serialize(serializer)
+    }
+}
 
 // ============================================================
 // RPC CONFIGURATION
@@ -268,15 +313,20 @@ pub struct TransactionInfo {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TxInputInfo {
     /// Previous transaction ID (null for coinbase).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub txid: Option<String>,
     /// Previous output index (null for coinbase).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vout: Option<u32>,
     /// Script signature info.
     #[serde(rename = "scriptSig")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub script_sig: Option<ScriptSigInfo>,
     /// Coinbase data (for coinbase transactions).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub coinbase: Option<String>,
     /// Witness data.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub txinwitness: Option<Vec<String>>,
     /// Sequence number.
     pub sequence: u32,
@@ -294,8 +344,8 @@ pub struct ScriptSigInfo {
 /// Transaction output information.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TxOutputInfo {
-    /// Value in BTC.
-    pub value: f64,
+    /// Value in BTC — serialized as Core's ValueFromAmount `%d.%08d`.
+    pub value: BtcAmount,
     /// Output index.
     pub n: u32,
     /// ScriptPubKey information.
@@ -304,17 +354,24 @@ pub struct TxOutputInfo {
 }
 
 /// ScriptPubKey information.
+///
+/// Field order matches Bitcoin Core's `ScriptPubKeyToUniv` / `ScriptToUniv`:
+/// `asm`, `desc`, `hex`, `address` (optional), `type`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ScriptPubKeyInfo {
-    /// Disassembled script.
+    /// Disassembled script (Core's ScriptToAsmStr).
     pub asm: String,
+    /// BIP-380 descriptor with 8-char checksum
+    /// (`addr(...)#<csum>` or `raw(...)#<csum>`).
+    pub desc: String,
     /// Raw hex.
     pub hex: String,
+    /// Address (omitted for pubkey/multisig/OP_RETURN/nonstandard).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
     /// Script type (pubkeyhash, scripthash, witness_v0_keyhash, etc.).
     #[serde(rename = "type")]
     pub script_type: String,
-    /// Address (if applicable).
-    pub address: Option<String>,
 }
 
 // ============================================================
@@ -694,8 +751,8 @@ pub struct TxOutResult {
     pub bestblock: String,
     /// Number of confirmations.
     pub confirmations: u32,
-    /// Value in BTC.
-    pub value: f64,
+    /// Value in BTC — serialized as Core's ValueFromAmount `%d.%08d`.
+    pub value: BtcAmount,
     /// ScriptPubKey info.
     #[serde(rename = "scriptPubKey")]
     pub script_pubkey: ScriptPubKeyInfo,
@@ -897,25 +954,33 @@ pub struct CreatePsbtInput {
 }
 
 /// Response for `decodepsbt` RPC.
+///
+/// Field order matches Bitcoin Core's JSON shape from
+/// `bitcoin-core/src/rpc/rawtransaction.cpp` `decodepsbt`:
+/// tx → global_xpubs → psbt_version → proprietary → unknown →
+/// inputs → outputs → fee.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DecodePsbtResult {
     /// The underlying unsigned transaction.
     pub tx: DecodedRawTransaction,
-    /// Global extended public keys.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub global_xpubs: Option<Vec<GlobalXpub>>,
+    /// Global extended public keys (always emitted, even if empty).
+    pub global_xpubs: Vec<GlobalXpub>,
     /// PSBT version (0 if not specified).
     pub psbt_version: u32,
-    /// Unknown global key-value pairs (hex-encoded).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unknown: Option<serde_json::Value>,
+    /// Proprietary global key-value pairs (always emitted as empty array
+    /// unless populated).
+    pub proprietary: Vec<serde_json::Value>,
+    /// Unknown global key-value pairs (always emitted as empty object
+    /// unless populated).
+    pub unknown: serde_json::Value,
     /// Input information.
     pub inputs: Vec<DecodePsbtInput>,
     /// Output information.
     pub outputs: Vec<DecodePsbtOutput>,
-    /// Transaction fee in BTC (if calculable).
+    /// Transaction fee in BTC — serialized as Core's ValueFromAmount
+    /// `%d.%08d` (omitted when not calculable).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee: Option<f64>,
+    pub fee: Option<BtcAmount>,
 }
 
 /// Global extended public key in decoded PSBT.
@@ -967,8 +1032,8 @@ pub struct DecodePsbtInput {
 /// Witness UTXO in decoded PSBT input.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WitnessUtxo {
-    /// Amount in BTC.
-    pub amount: f64,
+    /// Amount in BTC — serialized as Core's ValueFromAmount `%d.%08d`.
+    pub amount: BtcAmount,
     /// Script pubkey info.
     #[serde(rename = "scriptPubKey")]
     pub script_pubkey: ScriptPubKeyInfo,
