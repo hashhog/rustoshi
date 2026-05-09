@@ -44,7 +44,7 @@ use rustoshi_storage::{
     snapshot::{SnapshotMetadata, SnapshotWriter},
     ChainDb, Coin, CF_UTXO,
 };
-use rustoshi_wallet::psbt::Psbt;
+use rustoshi_wallet::psbt::{Psbt, PsbtRole};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,6 +96,19 @@ pub mod rpc_error {
 // ============================================================
 // RPC STATE
 // ============================================================
+
+/// Map a [`PsbtRole`] to the lowercase Bitcoin Core JSON name used by
+/// `analyzepsbt` (`bitcoin-core/src/psbt.cpp::PSBTRoleName`).
+fn psbt_role_to_str(role: PsbtRole) -> &'static str {
+    match role {
+        PsbtRole::Creator => "creator",
+        PsbtRole::Updater => "updater",
+        PsbtRole::Signer => "signer",
+        PsbtRole::Combiner => "combiner",
+        PsbtRole::Finalizer => "finalizer",
+        PsbtRole::Extractor => "extractor",
+    }
+}
 
 /// Shared state accessible by all RPC handlers.
 pub struct RpcState {
@@ -663,6 +676,21 @@ pub trait RustoshiRpc {
         psbt: String,
         extract: Option<bool>,
     ) -> RpcResult<FinalizePsbtResult>;
+
+    /// Analyze a PSBT and report what role is needed to make progress.
+    ///
+    /// Parameters:
+    /// - psbt: Base64-encoded PSBT
+    ///
+    /// Returns: `{inputs: [...], next: "creator"|"updater"|"signer"|
+    ///                                  "finalizer"|"extractor"}`
+    ///
+    /// Per-input verdict mirrors Bitcoin Core's `AnalyzePSBT`
+    /// (`src/node/psbt.cpp`); PSBT-level `next` is the minimum per-input
+    /// role under Core's order `creator < updater < signer < finalizer
+    /// < extractor`. Closes T5 N/A on `tools/psbt-multi-input-test.sh`.
+    #[method(name = "analyzepsbt")]
+    async fn analyzepsbt(&self, psbt: String) -> RpcResult<AnalyzePsbtResult>;
 
     // ============================================================
     // MISSING RPCs (added for full coverage)
@@ -4934,6 +4962,49 @@ impl RustoshiRpcServer for RpcServerImpl {
                 complete,
             })
         }
+    }
+
+    async fn analyzepsbt(&self, psbt_str: String) -> RpcResult<AnalyzePsbtResult> {
+        // Decode the PSBT — same error code Core uses
+        // (`rpc/rawtransaction.cpp::analyzepsbt:1929`).
+        let psbt = Psbt::from_base64(&psbt_str).map_err(|e| {
+            Self::rpc_error(
+                rpc_error::RPC_DESERIALIZATION_ERROR,
+                format!("TX decode failed {}", e),
+            )
+        })?;
+
+        let analysis = psbt.analyze();
+
+        let inputs = analysis
+            .inputs
+            .into_iter()
+            .map(|inp| {
+                let missing = if !inp.missing_signatures.is_empty() {
+                    Some(AnalyzePsbtInputMissing {
+                        signatures: Some(
+                            inp.missing_signatures
+                                .iter()
+                                .map(hex::encode)
+                                .collect(),
+                        ),
+                    })
+                } else {
+                    None
+                };
+                AnalyzePsbtInput {
+                    has_utxo: inp.has_utxo,
+                    is_final: inp.is_final,
+                    next: psbt_role_to_str(inp.next).to_string(),
+                    missing,
+                }
+            })
+            .collect();
+
+        Ok(AnalyzePsbtResult {
+            inputs,
+            next: psbt_role_to_str(analysis.next).to_string(),
+        })
     }
 
     // ============================================================

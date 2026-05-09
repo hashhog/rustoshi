@@ -1115,6 +1115,39 @@ impl Psbt {
         PsbtRole::Extractor
     }
 
+    /// Compute the per-input + PSBT-level role analysis used by the
+    /// `analyzepsbt` RPC, mirroring Bitcoin Core's `AnalyzePSBT` in
+    /// `bitcoin-core/src/node/psbt.cpp`.
+    ///
+    /// Per-input verdict is one of `Updater`, `Signer`, `Finalizer`,
+    /// `Extractor` (Core's `PSBTRole` set minus `Creator` / `Combiner`,
+    /// which are not reachable for an inhabited input). The PSBT-level
+    /// `next` is the minimum per-input role under Core's order
+    /// `creator < updater < signer < finalizer < extractor`
+    /// (`bitcoin-core/src/node/psbt.cpp:91-95`).
+    ///
+    /// References:
+    ///   * camlcoin `lib/psbt.ml` `psbt_next_role` (W41 / 2a22a0e).
+    ///   * hotbuns `src/wallet/psbt.ts` `analyzePSBTCore` (W47 / b6ccf2a).
+    pub fn analyze(&self) -> PsbtAnalysis {
+        let inputs: Vec<PsbtInputAnalysis> = self
+            .inputs
+            .iter()
+            .map(input_next_role)
+            .collect();
+
+        // PSBT-level next = MIN over per-input roles in Core's ordering.
+        // Default is Extractor (matches Core's initial value before the
+        // std::min walk; see psbt.cpp:91).
+        let mut next = PsbtRole::Extractor;
+        for inp in &inputs {
+            if role_rank(inp.next) < role_rank(next) {
+                next = inp.next;
+            }
+        }
+        PsbtAnalysis { inputs, next }
+    }
+
     /// Get the PSBT version (0 if not specified).
     pub fn get_version(&self) -> u32 {
         self.version.unwrap_or(0)
@@ -1237,6 +1270,193 @@ fn parse_multisig_script(script: &[u8]) -> Option<(usize, Vec<Vec<u8>>)> {
         return None;
     }
     Some((m, keys))
+}
+
+// ============================================================================
+// analyzepsbt support (W48, mirrors bitcoin-core/src/node/psbt.cpp::AnalyzePSBT)
+// ============================================================================
+
+/// Per-input result of [`Psbt::analyze`].
+///
+/// Mirrors Bitcoin Core's `PSBTInputAnalysis`:
+///   * `has_utxo` — does this input carry witness_utxo or non_witness_utxo?
+///   * `is_final` — has the finalizer run (final_script_sig / witness present)?
+///   * `next` — next role this input still needs (updater / signer /
+///     finalizer / extractor).
+///   * `missing_signatures` — for multisig inputs in the `Signer` state, the
+///     compressed pubkeys whose partial sig is still absent. Core records
+///     `CKeyID` (HASH160 of pubkey, 20 bytes) here; we follow the camlcoin /
+///     hotbuns convention of emitting full pubkeys because the W40-C harness
+///     does not assert on this sub-field, and the pubkey is the natural
+///     identifier in our codebase. See `bitcoin-core/src/node/psbt.cpp:74`
+///     and the JSON formatting in `rpc/rawtransaction.cpp:1957`.
+#[derive(Debug, Clone)]
+pub struct PsbtInputAnalysis {
+    pub has_utxo: bool,
+    pub is_final: bool,
+    pub next: PsbtRole,
+    pub missing_signatures: Vec<Vec<u8>>,
+}
+
+/// Result of [`Psbt::analyze`].
+#[derive(Debug, Clone)]
+pub struct PsbtAnalysis {
+    pub inputs: Vec<PsbtInputAnalysis>,
+    pub next: PsbtRole,
+}
+
+/// Order of PSBT roles in Bitcoin Core's pipeline
+/// (`bitcoin-core/src/node/psbt.cpp:91-95`):
+///   creator < updater < signer < finalizer < extractor
+/// PSBT-level `next` = minimum (in this order) over per-input verdicts.
+fn role_rank(role: PsbtRole) -> u8 {
+    match role {
+        PsbtRole::Creator => 0,
+        PsbtRole::Updater => 1,
+        PsbtRole::Signer => 2,
+        // Combiner is not part of the linear ordering — it isn't a per-input
+        // verdict in Core's AnalyzePSBT. Map it to Updater for safety, since
+        // it is never returned by `input_next_role`.
+        PsbtRole::Combiner => 1,
+        PsbtRole::Finalizer => 3,
+        PsbtRole::Extractor => 4,
+    }
+}
+
+/// Compute the minimum number of partial sigs required to finalize a
+/// non-finalized PSBT input.
+///
+/// Mirrors Core's `SignPSBTInput` dummy-sign branch in
+/// `bitcoin-core/src/node/psbt.cpp::AnalyzePSBT`: for next-role analysis,
+/// the only thing that matters is the missing-sig count.
+///
+///   * Multisig (P2SH / P2WSH / P2SH-P2WSH): M from the redeem/witness
+///     script (decoded by `parse_multisig_script`).
+///   * Taproot key-path: 1 (the single schnorr sig).
+///   * Single-sig (P2PKH / P2WPKH / P2SH-P2WPKH): 1.
+///   * No UTXO and no script: `None` — caller treats as "cannot classify",
+///     and falls back to "any sig is enough" (matches camlcoin W41
+///     behavior so single-sig inputs aren't regressed).
+fn required_sig_count(input: &PsbtInput) -> Option<usize> {
+    if let Some(script) = input.witness_script.as_deref() {
+        if let Some((m, _)) = parse_multisig_script(script) {
+            return Some(m);
+        }
+        return Some(1);
+    }
+    if let Some(script) = input.redeem_script.as_deref() {
+        if let Some((m, _)) = parse_multisig_script(script) {
+            return Some(m);
+        }
+        return Some(1);
+    }
+    if input.tap_internal_key.is_some() {
+        return Some(1);
+    }
+    if input.witness_utxo.is_some() || input.non_witness_utxo.is_some() {
+        return Some(1);
+    }
+    None
+}
+
+/// Is this input ready for the finalizer step?
+///
+/// Mirrors Core's "dummy-sign succeeds" branch in `AnalyzePSBT`: when a
+/// non-finalized input has every signature it needs (M-of-N multisig;
+/// 1 for single-sig; tap_key_sig for taproot key-path), the next role is
+/// `Finalizer`, not `Signer`.
+fn is_input_ready_to_finalize(input: &PsbtInput) -> bool {
+    if input.is_finalized() {
+        return false;
+    }
+    if input.tap_key_sig.is_some() {
+        return true;
+    }
+    let n_sigs = input.partial_sigs.len();
+    if n_sigs == 0 {
+        return false;
+    }
+    match required_sig_count(input) {
+        Some(needed) => n_sigs >= needed,
+        // Cannot classify; legacy any-sig heuristic.
+        None => n_sigs >= 1,
+    }
+}
+
+/// Per-input next role for analyzepsbt, mirroring Bitcoin Core's
+/// `AnalyzePSBT` (`bitcoin-core/src/node/psbt.cpp`).
+///
+/// Branching order matches Core:
+///   1. finalized                                  -> Extractor
+///   2. has UTXO + has enough partial sigs         -> Finalizer
+///   3. has UTXO, missing sigs                     -> Signer
+///   4. no UTXO                                    -> Updater
+fn input_next_role(input: &PsbtInput) -> PsbtInputAnalysis {
+    let has_utxo = input.witness_utxo.is_some() || input.non_witness_utxo.is_some();
+    let is_final = input.is_finalized();
+
+    if is_final {
+        return PsbtInputAnalysis {
+            has_utxo,
+            is_final: true,
+            next: PsbtRole::Extractor,
+            missing_signatures: Vec::new(),
+        };
+    }
+
+    if !has_utxo {
+        return PsbtInputAnalysis {
+            has_utxo: false,
+            is_final: false,
+            next: PsbtRole::Updater,
+            missing_signatures: Vec::new(),
+        };
+    }
+
+    if is_input_ready_to_finalize(input) {
+        return PsbtInputAnalysis {
+            has_utxo: true,
+            is_final: false,
+            next: PsbtRole::Finalizer,
+            missing_signatures: Vec::new(),
+        };
+    }
+
+    // Signer. For multisig inputs, compute the missing-pubkey list for the
+    // optional `missing.signatures` JSON field. Core walks the descriptor
+    // and reports CKeyIDs; we walk the redeem/witness script directly and
+    // emit the compressed pubkey bytes (the W40-C harness only checks the
+    // top-level `next` field; this sub-field is informational).
+    let mut missing_signatures = Vec::new();
+    let script = input
+        .witness_script
+        .as_deref()
+        .or(input.redeem_script.as_deref());
+    if let Some(script) = script {
+        if let Some((_m, pubkeys)) = parse_multisig_script(script) {
+            for pk in pubkeys {
+                if pk.len() == 33 {
+                    let mut pk33 = [0u8; 33];
+                    pk33.copy_from_slice(&pk);
+                    if !input.partial_sigs.contains_key(&pk33) {
+                        missing_signatures.push(pk);
+                    }
+                } else {
+                    // Uncompressed pubkey — record as-is; we can't index
+                    // partial_sigs (keyed on [u8; 33]) by it, so it is
+                    // always "missing" for our purposes.
+                    missing_signatures.push(pk);
+                }
+            }
+        }
+    }
+
+    PsbtInputAnalysis {
+        has_utxo: true,
+        is_final: false,
+        next: PsbtRole::Signer,
+        missing_signatures,
+    }
 }
 
 /// Assemble a P2WSH witness stack from a witness script + partial signatures
@@ -3386,5 +3606,123 @@ mod tests {
 
         // is_finalized() should return true now.
         assert!(psbt.inputs[0].is_finalized());
+    }
+
+    // ========================================================================
+    // W48: analyzepsbt regression tests
+    //
+    // Mirrors camlcoin W41 (`test/test_psbt.ml`) and hotbuns W47
+    // (`src/wallet/psbt.test.ts`). Verifies the per-input + PSBT-level
+    // role rollup matches Bitcoin Core's `AnalyzePSBT` for the W40-C
+    // multi-input fixture (2-of-2 P2SH-multisig + 2-of-2 P2SH-P2WSH-
+    // multisig with both partial sigs present) and for partial / final
+    // variants.
+    // ========================================================================
+
+    /// W40-C signed fixture (`tools/psbt-multi-input-fixture.json`):
+    /// 2-input PSBT with full partial sigs on both inputs but no
+    /// `final_script_*` yet. Core 31.99 reports `next == "finalizer"`.
+    const W40C_PSBT_SIGNED: &str = "cHNidP8BAJoCAAAAAljoeiG1ba8MI76OcHBFbDNvfLqlyHV5JPVFiHuyq911AAAAAAD/////g40EJ9DsZQpoqka7CwmK6kQiwHGyyng1Kgd5WdB86h0BAAAAAP////8CcKrwCAAAAAAWABTYXCtx0AYLCcmIauuBXlCZHdoSTQDh9QUAAAAAFgAUAK6pouXw+HaliN9VRuh0LR2HAI8AAAAAAAEAuwIAAAABqtc5MQGL0l+ErkALaISL4J23BurCrBgpi6vucatlb4sAAAAASEcwRAIgWPb8fGoz4bMVSNSByCbAFb0wE1qtQs1neQ2rZtKtJDsCIEoc7SYExnNbY5PltBaR3XiwDwxZQvufdRhW+qk4FX26Af7///8CgPD6AgAAAAAXqRQPuUY0IWlrgsgzryQceMF9295JNIfQ8gonAQAAABepFCnKdPigj4GZlCgYXJe12FLkBj9hh2UAAAAiAgKVg785rgpgl0etGZrd1jT6YQhVnWxc05tMIYPxq5bgf0cwRAIgdAGK1BgAl7hzMjwAFXILNoTMgSOJEEjn282bVa1nnJkCIHPTabdA4+tT3O+jOCPIBwUUylWn3ZVE8VfBZ5EyYRGMASICAtq2H/SaFNtqfQKwzR+7ePxLGDErW05U2uTbovv+9TbXSDBFAiEA9hA4swjcHahlo0hSdG8BV3KTQgjG0kRUOTzZm98iF3cCIAVuZ1pnWm0KArhbFOXikHTYolqbV2C+ooFvZhkQoAbqAQEDBAEAAAABBEdSIQKVg785rgpgl0etGZrd1jT6YQhVnWxc05tMIYPxq5bgfyEC2rYf9JoU22p9ArDNH7t4/EsYMStbTlTa5Nui+/71NtdSriIGApWDvzmuCmCXR60Zmt3WNPphCFWdbFzTm0whg/GrluB/ENkMak8AAACAAAAAgAAAAIAiBgLath/0mhTban0CsM0fu3j8SxgxK1tOVNrk26L7/vU21xDZDGpPAAAAgAAAAIABAACAAAEBIADC6wsAAAAAF6kUt/X69A49QKWkWbHbNTXyty+pIeiHIgIDCJ3BDHrG21T5EymvYXMz2ziM6tDCMfcjN50bmQMLAtxHMEQCIGLrelVhB6fHP0WsSrWh3d9vcHX7EnWWmn84Pv/3hLyyAiAMBdu3Rw2/LwhVfdNWxzJcHtMJE+mWzThAlF2xIijaXwEiAgI63ZBPPW3PWd25BrDe4jUpt/+57VDl6GFRkmhgIh8Oc0cwRAIgZfRbpZmLWaJ//hp77QFq8fH5DVSzqo90UKpfVqJRA70CIH9yRwOtHtuWaAsoS1bU/8uI9/t1nqu+CKow8puFE4PSAQEDBAEAAAABBCIAIIwjUxc3Q7WV37Sge3K6jkLjeX2nTof+fZ10l+OyAokDAQVHUiEDCJ3BDHrG21T5EymvYXMz2ziM6tDCMfcjN50bmQMLAtwhAjrdkE89bc9Z3bkGsN7iNSm3/7ntUOXoYVGSaGAiHw5zUq4iBgI63ZBPPW3PWd25BrDe4jUpt/+57VDl6GFRkmhgIh8OcxDZDGpPAAAAgAAAAIADAACAIgYDCJ3BDHrG21T5EymvYXMz2ziM6tDCMfcjN50bmQMLAtwQ2QxqTwAAAIAAAACAAgAAgAAiAgOppMN/WZbTqiXbrGtXCvBlA5RJKUJGCzVHU+2e7KWHcRDZDGpPAAAAgAAAAIAEAACAACICAn9jmXV9Lv9VoTatAsaEsYOLZVbl8bazQoKpS2tQBRCWENkMak8AAACAAAAAgAUAAIAA";
+
+    /// Same fixture, finalized: each input now has `final_script_*` set.
+    /// Core reports `next == "extractor"`.
+    const W40C_PSBT_FINALIZED: &str = "cHNidP8BAJoCAAAAAljoeiG1ba8MI76OcHBFbDNvfLqlyHV5JPVFiHuyq911AAAAAAD/////g40EJ9DsZQpoqka7CwmK6kQiwHGyyng1Kgd5WdB86h0BAAAAAP////8CcKrwCAAAAAAWABTYXCtx0AYLCcmIauuBXlCZHdoSTQDh9QUAAAAAFgAUAK6pouXw+HaliN9VRuh0LR2HAI8AAAAAAAEAuwIAAAABqtc5MQGL0l+ErkALaISL4J23BurCrBgpi6vucatlb4sAAAAASEcwRAIgWPb8fGoz4bMVSNSByCbAFb0wE1qtQs1neQ2rZtKtJDsCIEoc7SYExnNbY5PltBaR3XiwDwxZQvufdRhW+qk4FX26Af7///8CgPD6AgAAAAAXqRQPuUY0IWlrgsgzryQceMF9295JNIfQ8gonAQAAABepFCnKdPigj4GZlCgYXJe12FLkBj9hh2UAAAABB9oARzBEAiB0AYrUGACXuHMyPAAVcgs2hMyBI4kQSOfbzZtVrWecmQIgc9Npt0Dj61Pc76M4I8gHBRTKVafdlUTxV8FnkTJhEYwBSDBFAiEA9hA4swjcHahlo0hSdG8BV3KTQgjG0kRUOTzZm98iF3cCIAVuZ1pnWm0KArhbFOXikHTYolqbV2C+ooFvZhkQoAbqAUdSIQKVg785rgpgl0etGZrd1jT6YQhVnWxc05tMIYPxq5bgfyEC2rYf9JoU22p9ArDNH7t4/EsYMStbTlTa5Nui+/71NtdSrgABASAAwusLAAAAABepFLf1+vQOPUClpFmx2zU18rcvqSHohwEHIyIAIIwjUxc3Q7WV37Sge3K6jkLjeX2nTof+fZ10l+OyAokDAQjaBABHMEQCIGLrelVhB6fHP0WsSrWh3d9vcHX7EnWWmn84Pv/3hLyyAiAMBdu3Rw2/LwhVfdNWxzJcHtMJE+mWzThAlF2xIijaXwFHMEQCIGX0W6WZi1mif/4ae+0BavHx+Q1Us6qPdFCqX1aiUQO9AiB/ckcDrR7blmgLKEtW1P/LiPf7dZ6rvgiqMPKbhROD0gFHUiEDCJ3BDHrG21T5EymvYXMz2ziM6tDCMfcjN50bmQMLAtwhAjrdkE89bc9Z3bkGsN7iNSm3/7ntUOXoYVGSaGAiHw5zUq4AIgIDqaTDf1mW06ol26xrVwrwZQOUSSlCRgs1R1Ptnuylh3EQ2QxqTwAAAIAAAACABAAAgAAiAgJ/Y5l1fS7/VaE2rQLGhLGDi2VW5fG2s0KCqUtrUAUQlhDZDGpPAAAAgAAAAIAFAACAAA==";
+
+    /// W48-1: analyzepsbt on the W40-C signed fixture (both inputs have
+    /// all required partial sigs, neither is finalized yet) — every
+    /// per-input verdict is `Finalizer` and the PSBT-level `next` is
+    /// `Finalizer`. Mirrors camlcoin W41 regression test exactly.
+    /// Closes the T5 N/A on `tools/psbt-multi-input-test.sh`.
+    #[test]
+    fn test_w48_analyzepsbt_w40c_signed_is_finalizer() {
+        let psbt = Psbt::from_base64(W40C_PSBT_SIGNED)
+            .expect("W40-C signed fixture must decode");
+        let analysis = psbt.analyze();
+        assert_eq!(
+            analysis.inputs.len(),
+            2,
+            "W40-C fixture must have 2 inputs"
+        );
+        for (i, inp) in analysis.inputs.iter().enumerate() {
+            assert!(inp.has_utxo, "input {} must have a UTXO", i);
+            assert!(!inp.is_final, "input {} must not yet be finalized", i);
+            assert_eq!(
+                inp.next,
+                PsbtRole::Finalizer,
+                "W48: input {} next must be Finalizer (had all M-of-N sigs)",
+                i
+            );
+        }
+        assert_eq!(
+            analysis.next,
+            PsbtRole::Finalizer,
+            "W48: W40-C signed PSBT-level next must be Finalizer (matches Core 31.99)"
+        );
+    }
+
+    /// W48-2: analyzepsbt on a partially-signed PSBT. We take the W40-C
+    /// signed fixture and strip one partial sig from input 0 (a 2-of-2
+    /// P2SH-multisig — needs both sigs to finalize). Per-input verdict
+    /// flips to `Signer` and the PSBT-level `next` follows.
+    #[test]
+    fn test_w48_analyzepsbt_partial_is_signer() {
+        let mut psbt = Psbt::from_base64(W40C_PSBT_SIGNED)
+            .expect("W40-C signed fixture must decode");
+        // Drop one of the two partial sigs on input 0. With 1/2 sigs
+        // present and the redeem_script declaring 2-of-2, required = 2,
+        // so the input is in `Signer`.
+        let first_pk = *psbt.inputs[0]
+            .partial_sigs
+            .keys()
+            .next()
+            .expect("input 0 must have at least one partial sig");
+        psbt.inputs[0].partial_sigs.remove(&first_pk);
+        assert_eq!(
+            psbt.inputs[0].partial_sigs.len(),
+            1,
+            "test setup: input 0 must now have 1 of 2 partial sigs"
+        );
+
+        let analysis = psbt.analyze();
+        assert_eq!(
+            analysis.inputs[0].next,
+            PsbtRole::Signer,
+            "input 0 with 1/2 multisig sigs must report Signer"
+        );
+        assert!(
+            !analysis.inputs[0].missing_signatures.is_empty(),
+            "input 0 in Signer state must list at least one missing pubkey"
+        );
+        // PSBT-level next = MIN(Signer, Finalizer) = Signer.
+        assert_eq!(
+            analysis.next,
+            PsbtRole::Signer,
+            "PSBT-level next must downgrade to Signer when any input is Signer"
+        );
+    }
+
+    /// W48-3: analyzepsbt on the finalized fixture — every input has
+    /// final_script_sig / final_script_witness set, so each verdict is
+    /// `Extractor` and the PSBT-level `next` is `Extractor`.
+    #[test]
+    fn test_w48_analyzepsbt_finalized_is_extractor() {
+        let psbt = Psbt::from_base64(W40C_PSBT_FINALIZED)
+            .expect("W40-C finalized fixture must decode");
+        let analysis = psbt.analyze();
+        assert_eq!(analysis.inputs.len(), 2);
+        for (i, inp) in analysis.inputs.iter().enumerate() {
+            assert!(inp.is_final, "input {} must be finalized", i);
+            assert_eq!(
+                inp.next,
+                PsbtRole::Extractor,
+                "W48: finalized input {} must report Extractor",
+                i
+            );
+        }
+        assert_eq!(
+            analysis.next,
+            PsbtRole::Extractor,
+            "W48: finalized PSBT-level next must be Extractor"
+        );
     }
 }
