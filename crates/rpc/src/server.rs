@@ -4654,27 +4654,25 @@ impl RustoshiRpcServer for RpcServerImpl {
                 bip32_derivs: None,
                 final_scriptsig: None,
                 final_scriptwitness: None,
+                taproot_key_path_sig: None,
+                taproot_script_path_sigs: None,
+                taproot_scripts: None,
+                taproot_bip32_derivs: None,
+                taproot_internal_key: None,
+                taproot_merkle_root: None,
                 unknown: None,
             };
 
-            // Non-witness UTXO
-            // Serialize via to_string first, then wrap as RawValue to avoid
-            // serde_json::to_value() collapsing BtcAmount's "2.00000000" to
-            // the f64 representation "2.0". RawValue preserves the exact bytes.
-            if let Some(ref utxo_tx) = input.non_witness_utxo {
-                let json_str = serde_json::to_string(&build_decoded_raw_transaction(utxo_tx, Some(&state.params))).unwrap();
-                decoded_input.non_witness_utxo = serde_json::value::RawValue::from_string(json_str).ok();
+            // Non-witness UTXO and witness UTXO — fee accounting mirrors Core's
+            // single `txout` variable that gets overwritten by whichever branch
+            // runs last (rawtransaction.cpp:1122-1156).  We track one winning
+            // value per input; non_witness_utxo wins when both are present.
+            //
+            // Reference: bitcoin-core/src/rpc/rawtransaction.cpp lines 1122-1156.
+            let mut have_utxo = false;
+            let mut input_utxo_value: u64 = 0;
 
-                // Extract value from the referenced output
-                let vout = psbt.unsigned_tx.inputs[i].previous_output.vout as usize;
-                if vout < utxo_tx.outputs.len() {
-                    if let Some(ref mut total) = total_input_value {
-                        *total += utxo_tx.outputs[vout].value;
-                    }
-                }
-            }
-
-            // Witness UTXO
+            // Witness UTXO (runs first; may be overwritten by non_witness_utxo below)
             if let Some(ref utxo) = input.witness_utxo {
                 let script_type = classify_script(&utxo.script_pubkey);
                 let address = script_to_address(&utxo.script_pubkey, &state.params);
@@ -4691,10 +4689,31 @@ impl RustoshiRpcServer for RpcServerImpl {
                     },
                 });
 
-                if let Some(ref mut total) = total_input_value {
-                    *total += utxo.value;
+                input_utxo_value = utxo.value;
+                have_utxo = true;
+            }
+
+            // Non-witness UTXO
+            // Serialize via to_string first, then wrap as RawValue to avoid
+            // serde_json::to_value() collapsing BtcAmount's "2.00000000" to
+            // the f64 representation "2.0". RawValue preserves the exact bytes.
+            if let Some(ref utxo_tx) = input.non_witness_utxo {
+                let json_str = serde_json::to_string(&build_decoded_raw_transaction(utxo_tx, Some(&state.params))).unwrap();
+                decoded_input.non_witness_utxo = serde_json::value::RawValue::from_string(json_str).ok();
+
+                // non_witness_utxo overwrites the winning value (same as Core's txout overwrite)
+                let vout = psbt.unsigned_tx.inputs[i].previous_output.vout as usize;
+                if vout < utxo_tx.outputs.len() {
+                    input_utxo_value = utxo_tx.outputs[vout].value;
+                    have_utxo = true;
                 }
-            } else if input.non_witness_utxo.is_none() {
+            }
+
+            if have_utxo {
+                if let Some(ref mut total) = total_input_value {
+                    *total += input_utxo_value;
+                }
+            } else {
                 // No UTXO info, can't calculate fee
                 total_input_value = None;
             }
@@ -4771,6 +4790,63 @@ impl RustoshiRpcServer for RpcServerImpl {
                 decoded_input.unknown = Some(serde_json::Value::Object(unknown_map));
             }
 
+            // BIP-371 taproot input fields — emit only when non-empty.
+
+            // taproot_key_path_sig (0x13)
+            if let Some(ref sig) = input.tap_key_sig {
+                decoded_input.taproot_key_path_sig = Some(hex::encode(sig));
+            }
+
+            // taproot_script_path_sigs (0x14) — sorted by (xonly_pubkey, leaf_hash)
+            // Core iterates std::map<(XOnlyPubKey, uint256), ...) — BTreeMap order is lex.
+            if !input.tap_script_sigs.is_empty() {
+                let sigs: Vec<TaprootScriptPathSig> = input.tap_script_sigs.iter()
+                    .map(|((xonly, leaf_hash), sig)| TaprootScriptPathSig {
+                        pubkey: hex::encode(xonly),
+                        leaf_hash: hex::encode(leaf_hash),
+                        sig: hex::encode(sig),
+                    })
+                    .collect();
+                decoded_input.taproot_script_path_sigs = Some(sigs);
+            }
+
+            // taproot_scripts (0x15) — sorted by (script, leaf_ver); control_blocks lex sorted
+            // Core iterates std::map<(CScript, int), std::set<...>> — BTreeMap order is lex.
+            if !input.tap_leaf_scripts.is_empty() {
+                let scripts: Vec<TaprootLeafScript> = input.tap_leaf_scripts.iter()
+                    .map(|((script, leaf_ver), control_blocks)| TaprootLeafScript {
+                        script: hex::encode(script),
+                        leaf_ver: u64::from(*leaf_ver),
+                        control_blocks: control_blocks.iter().map(hex::encode).collect(),
+                    })
+                    .collect();
+                decoded_input.taproot_scripts = Some(scripts);
+            }
+
+            // taproot_bip32_derivs (0x16) — sorted by x-only pubkey (BTreeMap lex order)
+            // Core iterates std::map<XOnlyPubKey, ...> — same lex order.
+            if !input.tap_bip32_derivation.is_empty() {
+                let derivs: Vec<TaprootBip32Deriv> = input.tap_bip32_derivation.iter()
+                    .map(|(xonly, (leaf_hashes, origin))| TaprootBip32Deriv {
+                        pubkey: hex::encode(xonly),
+                        master_fingerprint: hex::encode(origin.fingerprint),
+                        path: format_derivation_path(&origin.path),
+                        leaf_hashes: leaf_hashes.iter().map(hex::encode).collect(),
+                    })
+                    .collect();
+                decoded_input.taproot_bip32_derivs = Some(derivs);
+            }
+
+            // taproot_internal_key (0x17)
+            if let Some(ref ik) = input.tap_internal_key {
+                decoded_input.taproot_internal_key = Some(hex::encode(ik));
+            }
+
+            // taproot_merkle_root (0x18)
+            if let Some(ref mr) = input.tap_merkle_root {
+                decoded_input.taproot_merkle_root = Some(hex::encode(mr));
+            }
+
             inputs.push(decoded_input);
         }
 
@@ -4781,6 +4857,10 @@ impl RustoshiRpcServer for RpcServerImpl {
                 redeem_script: None,
                 witness_script: None,
                 bip32_derivs: None,
+                taproot_internal_key: None,
+                taproot_tree: None,
+                taproot_bip32_derivs: None,
+                musig2_participant_pubkeys: None,
                 unknown: None,
             };
 
@@ -4812,6 +4892,51 @@ impl RustoshiRpcServer for RpcServerImpl {
                     }
                 }).collect();
                 decoded_output.bip32_derivs = Some(derivs);
+            }
+
+            // BIP-371 taproot output fields.
+
+            // taproot_internal_key (PSBT_OUT_TAP_INTERNAL_KEY = 0x05)
+            if let Some(ref ik) = output.tap_internal_key {
+                decoded_output.taproot_internal_key = Some(hex::encode(ik));
+            }
+
+            // taproot_tree (PSBT_OUT_TAP_TREE = 0x06)
+            if !output.tap_tree.is_empty() {
+                let tree: Vec<TaprootTreeEntry> = output.tap_tree.iter()
+                    .map(|(depth, leaf_ver, script)| TaprootTreeEntry {
+                        depth: u64::from(*depth),
+                        leaf_ver: u64::from(*leaf_ver),
+                        script: hex::encode(script),
+                    })
+                    .collect();
+                decoded_output.taproot_tree = Some(tree);
+            }
+
+            // taproot_bip32_derivs (PSBT_OUT_TAP_BIP32_DERIVATION = 0x07)
+            // BTreeMap provides lex order by x-only pubkey — matches Core's std::map.
+            if !output.tap_bip32_derivation.is_empty() {
+                let derivs: Vec<TaprootBip32Deriv> = output.tap_bip32_derivation.iter()
+                    .map(|(xonly, (leaf_hashes, origin))| TaprootBip32Deriv {
+                        pubkey: hex::encode(xonly),
+                        master_fingerprint: hex::encode(origin.fingerprint),
+                        path: format_derivation_path(&origin.path),
+                        leaf_hashes: leaf_hashes.iter().map(hex::encode).collect(),
+                    })
+                    .collect();
+                decoded_output.taproot_bip32_derivs = Some(derivs);
+            }
+
+            // musig2_participant_pubkeys (PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08)
+            // BTreeMap provides lex order by aggregate_pubkey — matches Core's std::map.
+            if !output.musig2_participant_pubkeys.is_empty() {
+                let musig: Vec<Musig2ParticipantPubkeys> = output.musig2_participant_pubkeys.iter()
+                    .map(|(agg, participants)| Musig2ParticipantPubkeys {
+                        aggregate_pubkey: hex::encode(agg),
+                        participant_pubkeys: participants.iter().map(hex::encode).collect(),
+                    })
+                    .collect();
+                decoded_output.musig2_participant_pubkeys = Some(musig);
             }
 
             // Unknown
@@ -7835,9 +7960,16 @@ fn decode_script_num(data: &[u8]) -> i64 {
 /// Reference: bitcoin-core/src/script/descriptor.cpp `InferDescriptor`.
 fn infer_descriptor(script: &[u8], params: &ChainParams) -> String {
     use rustoshi_wallet::descriptor::add_checksum;
-    let payload = match script_to_address(script, params) {
-        Some(addr) => format!("addr({})", addr),
-        None       => format!("raw({})", hex::encode(script)),
+    // For OP_1 <32-byte x-only key> (witness_v1_taproot) Core's InferDescriptor
+    // wraps it in RawTrDescriptor rather than AddressDescriptor.
+    // (bitcoin-core/src/script/descriptor.cpp — RawTrDescriptor path).
+    let payload = if script.len() == 34 && script[0] == 0x51 && script[1] == 0x20 {
+        format!("rawtr({})", hex::encode(&script[2..34]))
+    } else {
+        match script_to_address(script, params) {
+            Some(addr) => format!("addr({})", addr),
+            None       => format!("raw({})", hex::encode(script)),
+        }
     };
     // `add_checksum` is infallible for addr/hex payloads (only valid charset
     // chars); fall back to the payload without checksum if it ever fails.
