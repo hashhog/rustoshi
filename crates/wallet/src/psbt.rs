@@ -86,6 +86,7 @@ pub const PSBT_OUT_BIP32_DERIVATION: u8 = 0x02;
 pub const PSBT_OUT_TAP_INTERNAL_KEY: u8 = 0x05;
 pub const PSBT_OUT_TAP_TREE: u8 = 0x06;
 pub const PSBT_OUT_TAP_BIP32_DERIVATION: u8 = 0x07;
+pub const PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS: u8 = 0x08;
 pub const PSBT_OUT_PROPRIETARY: u8 = 0xFC;
 
 // ============================================================================
@@ -525,6 +526,10 @@ pub struct PsbtOutput {
     /// Taproot BIP32 derivation: x-only pubkey -> (leaf hashes, key origin)
     pub tap_bip32_derivation: BTreeMap<[u8; 32], (BTreeSet<[u8; 32]>, KeyOrigin)>,
 
+    /// MuSig2 participant public keys (BIP-327 / PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08)
+    /// aggregate_pubkey (33 bytes) -> Vec of participant pubkeys (33 bytes each)
+    pub musig2_participant_pubkeys: BTreeMap<[u8; 33], Vec<[u8; 33]>>,
+
     /// Proprietary key-value pairs
     pub proprietary: BTreeSet<Proprietary>,
 
@@ -541,6 +546,7 @@ impl PsbtOutput {
             && self.tap_internal_key.is_none()
             && self.tap_tree.is_empty()
             && self.tap_bip32_derivation.is_empty()
+            && self.musig2_participant_pubkeys.is_empty()
             && self.proprietary.is_empty()
             && self.unknown.is_empty()
     }
@@ -2565,6 +2571,35 @@ fn decode_psbt_output<R: Read>(reader: &mut R) -> Result<PsbtOutput, PsbtError> 
                 let remaining = value.len() - value_cursor.position() as usize;
                 let origin = KeyOrigin::decode_with_len(&mut value_cursor, remaining)?;
                 output.tap_bip32_derivation.insert(xonly, (leaf_hashes, origin));
+            }
+            PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS => {
+                // key = [type_byte(1)] + [aggregate_pubkey(33)] — total 34 bytes
+                // value = concatenated participant pubkeys (33 bytes each)
+                if key.len() != 34 {
+                    return Err(PsbtError::InvalidKeySize {
+                        key_type,
+                        expected: 34,
+                        got: key.len(),
+                    });
+                }
+                let mut agg = [0u8; 33];
+                agg.copy_from_slice(&key[1..34]);
+
+                if value.len() % 33 != 0 {
+                    return Err(PsbtError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "musig2 participant pubkeys value size is not a multiple of 33",
+                    )));
+                }
+                let mut participants = Vec::new();
+                let mut pos = 0;
+                while pos + 33 <= value.len() {
+                    let mut pk = [0u8; 33];
+                    pk.copy_from_slice(&value[pos..pos + 33]);
+                    participants.push(pk);
+                    pos += 33;
+                }
+                output.musig2_participant_pubkeys.insert(agg, participants);
             }
             PSBT_OUT_PROPRIETARY => {
                 let mut key_cursor = Cursor::new(&key[1..]);
