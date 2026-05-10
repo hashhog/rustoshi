@@ -31,13 +31,13 @@ use crate::params::{
     ANNEX_TAG, COINBASE_MATURITY, DUST_RELAY_TX_FEE, MAX_STANDARD_P2WSH_SCRIPT_SIZE,
     MAX_STANDARD_P2WSH_STACK_ITEMS, MAX_STANDARD_P2WSH_STACK_ITEM_SIZE,
     MAX_STANDARD_SCRIPTSIG_SIZE, MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE,
-    MAX_STANDARD_TX_WEIGHT, MIN_STANDARD_TX_NONWITNESS_SIZE, TAPROOT_LEAF_MASK,
-    TAPROOT_LEAF_TAPSCRIPT,
+    MAX_STANDARD_TX_SIGOPS_COST, MAX_STANDARD_TX_WEIGHT, MIN_STANDARD_TX_NONWITNESS_SIZE,
+    TAPROOT_LEAF_MASK, TAPROOT_LEAF_TAPSCRIPT,
 };
-use crate::script::{is_p2a, is_p2sh, parse_witness_program};
+use crate::script::{is_p2a, is_p2sh, parse_witness_program, ScriptFlags};
 use crate::validation::{
     calculate_sequence_locks, check_sequence_locks, check_transaction, CoinEntry,
-    SequenceLockContext, TxValidationError,
+    get_transaction_sigop_cost, SequenceLockContext, TxValidationError,
 };
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxOut};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1126,6 +1126,36 @@ impl Mempool {
         if !tx.is_coinbase() && prevout_scripts.len() == tx.inputs.len() {
             if let Err(reason) = is_witness_standard(&tx, &prevout_scripts) {
                 return Err(MempoolError::NonStandard(reason));
+            }
+        }
+
+        // GetTransactionSigOpCost policy gate: reject if sigop cost exceeds
+        // MAX_STANDARD_TX_SIGOPS_COST (16,000).
+        // Mirrors Bitcoin Core MemPoolAccept::PreChecks → GetTransactionSigOpCost
+        // (validation.cpp:908-943, policy/policy.h:44).
+        // Must run after the UTXO loop so we have prevout scriptPubKeys for P2SH
+        // and witness-sigop counting.  Uses STANDARD_SCRIPT_VERIFY_FLAGS (P2SH +
+        // WITNESS active) matching Core's STANDARD_SCRIPT_VERIFY_FLAGS.
+        if !tx.is_coinbase() && prevout_scripts.len() == tx.inputs.len() {
+            let std_flags = ScriptFlags::standard_flags();
+            let sigop_cost = get_transaction_sigop_cost(&tx, |outpoint| {
+                for (idx, input) in tx.inputs.iter().enumerate() {
+                    if input.previous_output == *outpoint {
+                        return Some(CoinEntry {
+                            height: 0,          // not needed for sigop counting
+                            is_coinbase: false, // not needed for sigop counting
+                            value: 0,           // not needed for sigop counting
+                            script_pubkey: prevout_scripts[idx].clone(),
+                        });
+                    }
+                }
+                None
+            }, &std_flags);
+            if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
+                return Err(MempoolError::NonStandard(format!(
+                    "bad-txns-too-many-sigops: cost {} > limit {}",
+                    sigop_cost, MAX_STANDARD_TX_SIGOPS_COST
+                )));
             }
         }
 
@@ -7563,6 +7593,277 @@ mod tests {
         assert!(
             matches!(result, Err(MempoolError::NonStandard(_))),
             "mempool must reject P2WSH oversized witness script (got {:?})",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // W74: MAX_STANDARD_TX_SIGOPS_COST policy gate — regression tests
+    // Mirrors Bitcoin Core MemPoolAccept::PreChecks → GetTransactionSigOpCost
+    // (validation.cpp:908-943, policy/policy.h:44).
+    // MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5 = 16,000.
+    //
+    // Strategy: use P2SH inputs with a redeemScript of n OP_CHECKSIG opcodes.
+    // P2SH sigop cost = n_sigops (accurate) × WITNESS_SCALE_FACTOR (4) per input.
+    // A redeemScript of 100 OP_CHECKSIG = 100 accurate sigops × 4 = 400 per input.
+    // 40 such inputs → 40 × 400 = 16,000 (exactly at limit, must accept).
+    // 41 such inputs → 41 × 400 = 16,400 > 16,000 (must reject).
+    // -----------------------------------------------------------------------
+
+    /// Build a P2SH input spending a redeemScript of `n_checksig` OP_CHECKSIG ops.
+    ///
+    /// scriptSig: OP_0 (dummy) OP_PUSHDATA1 <len> <redeemScript>
+    /// prevout scriptPubKey: OP_HASH160 <20 bytes hash> OP_EQUAL (P2SH pattern)
+    ///
+    /// Returns (TxIn, CoinEntry for the prevout, value=10_000_000 sats).
+    fn make_p2sh_checksig_input(txid_seed: u8, n_checksig: usize) -> (TxIn, OutPoint, CoinEntry) {
+        // RedeemScript: n_checksig × OP_CHECKSIG
+        let redeem_script: Vec<u8> = std::iter::repeat(0xacu8).take(n_checksig).collect();
+
+        // scriptSig: OP_0 (0x00) + PUSHDATA1 + len + redeemScript
+        let mut script_sig = vec![0x00u8]; // OP_0 dummy element for CHECKMULTISIG
+        if redeem_script.len() <= 75 {
+            script_sig.push(redeem_script.len() as u8); // direct push
+        } else {
+            script_sig.push(0x4cu8); // OP_PUSHDATA1
+            script_sig.push(redeem_script.len() as u8);
+        }
+        script_sig.extend_from_slice(&redeem_script);
+
+        // P2SH scriptPubKey: OP_HASH160 (0xa9) PUSH20 (0x14) <20 bytes> OP_EQUAL (0x87)
+        let p2sh_spk: Vec<u8> = {
+            let mut s = vec![0xa9u8, 0x14u8];
+            s.extend(std::iter::repeat(txid_seed).take(20));
+            s.push(0x87u8);
+            s
+        };
+
+        let txid = Hash256::from_bytes([txid_seed; 32]);
+        let outpoint = OutPoint { txid, vout: 0 };
+
+        let txin = TxIn {
+            previous_output: outpoint.clone(),
+            script_sig,
+            sequence: 0xffff_ffff,
+            witness: vec![],
+        };
+
+        let coin = CoinEntry {
+            height: 100,
+            is_coinbase: false,
+            value: 10_000_000,
+            script_pubkey: p2sh_spk,
+        };
+
+        (txin, outpoint, coin)
+    }
+
+    /// Build a tx spending `n_inputs` P2SH inputs, each with `sigs_per_input`
+    /// OP_CHECKSIG in the redeemScript.
+    fn make_p2sh_multi_input_tx(
+        n_inputs: usize,
+        sigs_per_input: usize,
+    ) -> (Transaction, HashMap<OutPoint, CoinEntry>) {
+        let mut inputs = Vec::new();
+        let mut utxos = HashMap::new();
+        let mut total_value = 0u64;
+
+        for i in 0..n_inputs {
+            let seed = (i % 200 + 10) as u8; // avoid seed 0 (would be null txid)
+            let (txin, outpoint, coin) = make_p2sh_checksig_input(seed, sigs_per_input);
+            total_value += coin.value;
+            utxos.insert(outpoint, coin);
+            inputs.push(txin);
+        }
+
+        let tx = Transaction {
+            version: 1,
+            inputs,
+            outputs: vec![TxOut {
+                value: total_value.saturating_sub(10_000), // leave 10_000 sats as fee
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14,
+                    0xbb,0xbb,0xbb,0xbb,0xbb,0xbb,0xbb,0xbb,
+                    0xbb,0xbb,0xbb,0xbb,0xbb,0xbb,0xbb,0xbb,
+                    0xbb,0xbb,0xbb,0xbb,
+                    0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        (tx, utxos)
+    }
+
+    /// Tx with P2SH sigop cost exactly at MAX_STANDARD_TX_SIGOPS_COST (16,000) must be accepted.
+    ///
+    /// 40 inputs × 100 OP_CHECKSIG redeemScript = 40 × 100 × 4 = 16,000 P2SH sigop cost.
+    /// Plus 1 legacy sigop from the P2PKH output × 4 = 4 → total 16,004 ... wait.
+    ///
+    /// Recalculate: 40 inputs × 100 accurate sigops × 4 = 16,000.
+    /// Legacy: output P2PKH = 1 sigop × 4 = 4. Total = 16,004 > 16,000 → rejected!
+    ///
+    /// So use 39 inputs: 39 × 100 × 4 = 15,600. Plus 4 legacy = 15,604 < 16,000 → accepted.
+    /// And 41 inputs: 41 × 100 × 4 = 16,400. Plus 4 legacy = 16,404 > 16,000 → rejected.
+    ///
+    /// Ref: Bitcoin Core validation.cpp:941 strict `>` (=16,000 passes, >16,000 fails).
+    #[test]
+    fn test_mempool_sigops_p2sh_under_limit_accepted() {
+        let mut config = MempoolConfig::default();
+        config.min_fee_rate = 0;
+        let mut mempool = Mempool::new(config);
+        mempool.tip_height = 800_000;
+        mempool.median_time_past = 0;
+
+        // 39 P2SH inputs × 100 OP_CHECKSIG × 4 = 15,600 P2SH cost.
+        // + P2PKH output 1 sigop × 4 = 4 legacy cost.
+        // Total: 15,604 ≤ 16,000 → must be accepted.
+        let (tx, utxos) = make_p2sh_multi_input_tx(39, 100);
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            result.is_ok(),
+            "39-input P2SH tx with 15,604 sigop cost must be accepted (got {:?})",
+            result
+        );
+    }
+
+    /// Tx with P2SH sigop cost over MAX_STANDARD_TX_SIGOPS_COST must be rejected.
+    ///
+    /// 41 P2SH inputs × 100 OP_CHECKSIG × 4 = 16,400. Plus 4 legacy = 16,404 > 16,000.
+    /// Ref: Bitcoin Core validation.cpp:941-943.
+    #[test]
+    fn test_mempool_sigops_p2sh_over_limit_rejected() {
+        let mut config = MempoolConfig::default();
+        config.min_fee_rate = 0;
+        let mut mempool = Mempool::new(config);
+        mempool.tip_height = 800_000;
+        mempool.median_time_past = 0;
+
+        // 41 P2SH inputs × 100 OP_CHECKSIG × 4 = 16,400 P2SH cost.
+        // + P2PKH output 1 sigop × 4 = 4 legacy cost.
+        // Total: 16,404 > 16,000 → must be rejected.
+        let (tx, utxos) = make_p2sh_multi_input_tx(41, 100);
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(ref s)) if s.contains("bad-txns-too-many-sigops")),
+            "41-input P2SH tx with 16,404 sigop cost must be rejected with bad-txns-too-many-sigops (got {:?})",
+            result
+        );
+    }
+
+    /// Tx with 0 sigops is well within the limit and must be accepted (sanity check).
+    /// Uses a simple P2PKH prevout (no P2SH or witness sigops).
+    #[test]
+    fn test_mempool_sigops_zero_accepted() {
+        let mut config = MempoolConfig::default();
+        config.min_fee_rate = 0;
+        let mut mempool = Mempool::new(config);
+        mempool.tip_height = 800_000;
+        mempool.median_time_past = 0;
+
+        let prevout_txid = Hash256::from_bytes([0xddu8; 32]);
+        let prevout = OutPoint { txid: prevout_txid, vout: 0 };
+
+        // P2PKH prevout — no P2SH, no witness sigops
+        let coin = CoinEntry {
+            height: 100,
+            is_coinbase: false,
+            value: 100_000_000,
+            script_pubkey: vec![
+                0x76, 0xa9, 0x14,
+                0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,
+                0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,
+                0xaa,0xaa,0xaa,0xaa,
+                0x88, 0xac,
+            ],
+        };
+        let mut utxos = HashMap::new();
+        utxos.insert(prevout.clone(), coin);
+
+        // Minimal valid tx: push 65 bytes scriptSig (standard), P2PKH output
+        let mut script_sig = vec![0x41u8]; // push 65 bytes
+        script_sig.extend([0u8; 65]);
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: prevout,
+                script_sig,
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 99_000_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14,
+                    0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,
+                    0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,0xaa,
+                    0xaa,0xaa,0xaa,0xaa,
+                    0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            result.is_ok(),
+            "simple P2PKH tx with minimal sigops must be accepted (got {:?})",
+            result
+        );
+    }
+
+    /// P2WPKH input adds 1 witness sigop (unscaled), nowhere near the 16,000 limit.
+    /// Sanity check that witness sigops don't interfere with normal acceptance.
+    #[test]
+    fn test_mempool_sigops_p2wpkh_accepted() {
+        let mut config = MempoolConfig::default();
+        config.min_fee_rate = 0;
+        let mut mempool = Mempool::new(config);
+        mempool.tip_height = 800_000;
+        mempool.median_time_past = 0;
+
+        let prevout_txid = Hash256::from_bytes([0xeeu8; 32]);
+        let prevout = OutPoint { txid: prevout_txid, vout: 0 };
+        // P2WPKH: OP_0 <20 bytes>
+        let p2wpkh_spk = {
+            let mut s = vec![0x00u8, 0x14u8];
+            s.extend([0xbbu8; 20]);
+            s
+        };
+        let coin = CoinEntry {
+            height: 100,
+            is_coinbase: false,
+            value: 100_000_000,
+            script_pubkey: p2wpkh_spk,
+        };
+        let mut utxos = HashMap::new();
+        utxos.insert(prevout.clone(), coin);
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: prevout,
+                script_sig: vec![],
+                sequence: 0xffff_ffff,
+                witness: vec![vec![0u8; 72], vec![0u8; 33]],
+            }],
+            outputs: vec![TxOut {
+                value: 99_000_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14,
+                    0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,
+                    0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,
+                    0xcc,0xcc,0xcc,0xcc,
+                    0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            result.is_ok(),
+            "P2WPKH tx with 1 witness sigop must be accepted (got {:?})",
             result
         );
     }
