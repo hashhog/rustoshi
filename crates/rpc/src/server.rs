@@ -840,6 +840,22 @@ pub trait RustoshiRpc {
         message: String,
     ) -> RpcResult<String>;
 
+    /// Create a multisig address from N keys, requiring M signatures.
+    ///
+    /// Parameters:
+    /// - nrequired: Number of signatures required (1..N)
+    /// - keys: Array of compressed hex-encoded public keys (1..16)
+    /// - address_type: "legacy" (default, P2SH), "bech32" (P2WSH), or "p2sh-segwit" (P2SH-P2WSH)
+    ///
+    /// Returns: {address, redeemScript, descriptor}
+    #[method(name = "createmultisig")]
+    async fn create_multisig(
+        &self,
+        nrequired: u32,
+        keys: Vec<String>,
+        address_type: Option<String>,
+    ) -> RpcResult<CreateMultisigResult>;
+
     /// Get the server uptime in seconds.
     #[method(name = "uptime")]
     async fn uptime(&self) -> RpcResult<u64>;
@@ -6467,7 +6483,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getrawtransaction", "sendrawtransaction",
                 "",
                 "== Wallet ==",
-                "deriveaddresses", "getdescriptorinfo", "listlockunspent", "lockunspent",
+                "createmultisig", "deriveaddresses", "getdescriptorinfo", "listlockunspent", "lockunspent",
                 "setlabel", "signmessage", "signmessagewithprivkey", "validateaddress",
                 "walletcreatefundedpsbt", "walletlock", "walletpassphrase",
                 "",
@@ -6640,6 +6656,165 @@ impl RustoshiRpcServer for RpcServerImpl {
         // raw hex the safe Core-compatible default is compressed.
         let sig = rustoshi_crypto::sign_message_compact(&secret.0, message.as_bytes(), secret.1);
         Ok(base64::engine::general_purpose::STANDARD.encode(sig))
+    }
+
+    async fn create_multisig(
+        &self,
+        nrequired: u32,
+        keys: Vec<String>,
+        address_type: Option<String>,
+    ) -> RpcResult<CreateMultisigResult> {
+        use rustoshi_crypto::{
+            address::{Address, Network},
+            hash160, sha256,
+            keys::parse_public_key,
+        };
+        use rustoshi_wallet::descriptor::add_checksum;
+
+        let addr_type = address_type.as_deref().unwrap_or("legacy");
+
+        // Validate address_type
+        match addr_type {
+            "legacy" | "bech32" | "p2sh-segwit" => {}
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!("Unknown address_type '{}'", other),
+                ));
+            }
+        }
+
+        let n_keys = keys.len();
+
+        // Validate key count (1..=16)
+        if n_keys < 1 || n_keys > 16 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                format!("Number of keys {} is not in range [1..16]", n_keys),
+            ));
+        }
+
+        // Validate nrequired (1..=n_keys)
+        let n_required = nrequired as usize;
+        if n_required < 1 || n_required > n_keys {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                format!(
+                    "Multisig threshold {} is not in range [1..{}]",
+                    n_required, n_keys
+                ),
+            ));
+        }
+
+        // Parse and validate each pubkey (must be 33-byte compressed secp256k1)
+        let mut pubkey_bytes: Vec<Vec<u8>> = Vec::with_capacity(n_keys);
+        for (i, pk_hex) in keys.iter().enumerate() {
+            let pk_raw = hex::decode(pk_hex).map_err(|_| {
+                Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!("Pubkey {} is not valid hex", i),
+                )
+            })?;
+            if pk_raw.len() != 33 {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!("Pubkey {} is not compressed (must be 33 bytes)", i),
+                ));
+            }
+            // Verify the point is on the secp256k1 curve
+            parse_public_key(&pk_raw).map_err(|_| {
+                Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!("Pubkey {} is not a valid secp256k1 public key", i),
+                )
+            })?;
+            pubkey_bytes.push(pk_raw);
+        }
+
+        // Build redeemScript: OP_M || (0x21 || pk)*N || OP_N || OP_CHECKMULTISIG
+        // OP_1..OP_16 = 0x51..0x60
+        let rs_capacity = 1 + n_keys * (1 + 33) + 1 + 1;
+        let mut rs: Vec<u8> = Vec::with_capacity(rs_capacity);
+        rs.push(0x50u8 + n_required as u8); // OP_M
+        for pk in &pubkey_bytes {
+            rs.push(0x21); // push 33 bytes
+            rs.extend_from_slice(pk);
+        }
+        rs.push(0x50u8 + n_keys as u8); // OP_N
+        rs.push(0xae); // OP_CHECKMULTISIG
+
+        let rs_hex = hex::encode(&rs);
+
+        // Determine network
+        let state = self.state.read().await;
+        let network = match state.params.network_id {
+            NetworkId::Mainnet => Network::Mainnet,
+            NetworkId::Testnet3 | NetworkId::Testnet4 | NetworkId::Signet => Network::Testnet,
+            NetworkId::Regtest => Network::Regtest,
+        };
+        drop(state);
+
+        // Derive address per address_type
+        let addr_str = match addr_type {
+            "legacy" => {
+                // P2SH: HASH160(redeemScript)
+                let h160 = hash160(&rs);
+                Address::P2SH {
+                    hash: h160,
+                    network,
+                }
+                .encode()
+            }
+            "bech32" => {
+                // P2WSH: SHA256(redeemScript)
+                let sha256_rs = sha256(&rs);
+                Address::P2WSH {
+                    hash: Hash256(sha256_rs),
+                    network,
+                }
+                .encode()
+            }
+            "p2sh-segwit" => {
+                // P2SH-P2WSH: HASH160(OP_0 OP_PUSH32 SHA256(redeemScript))
+                let sha256_rs = sha256(&rs);
+                let mut witness_script = Vec::with_capacity(34);
+                witness_script.push(0x00); // OP_0
+                witness_script.push(0x20); // push 32 bytes
+                witness_script.extend_from_slice(&sha256_rs);
+                let h160 = hash160(&witness_script);
+                Address::P2SH {
+                    hash: h160,
+                    network,
+                }
+                .encode()
+            }
+            _ => unreachable!(),
+        };
+
+        // Build descriptor: multi(M, pk1, pk2, ...) inner expression
+        let mut multi_expr = format!("multi({}", n_required);
+        for pk_hex in &keys {
+            multi_expr.push(',');
+            multi_expr.push_str(pk_hex);
+        }
+        multi_expr.push(')');
+
+        let desc_body = match addr_type {
+            "legacy" => format!("sh({})", multi_expr),
+            "bech32" => format!("wsh({})", multi_expr),
+            "p2sh-segwit" => format!("sh(wsh({}))", multi_expr),
+            _ => unreachable!(),
+        };
+
+        let descriptor = add_checksum(&desc_body).ok_or_else(|| {
+            Self::rpc_error(rpc_error::RPC_MISC_ERROR, "Failed to compute descriptor checksum")
+        })?;
+
+        Ok(CreateMultisigResult {
+            address: addr_str,
+            redeem_script: rs_hex,
+            descriptor,
+        })
     }
 
     async fn uptime(&self) -> RpcResult<u64> {
