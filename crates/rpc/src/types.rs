@@ -3,7 +3,7 @@
 //! This module defines all the types used in JSON-RPC responses, matching
 //! the Bitcoin Core RPC format for compatibility with existing tooling.
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 // ============================================================
 // BTC AMOUNT FORMATTING (W52)
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize, Serializer};
 /// The custom `Serialize` impl emits the pre-formatted decimal string as an
 /// unquoted JSON number token via `serde_json::value::RawValue::from_string`,
 /// which requires the `raw_value` feature on `serde_json`.
-#[derive(Deserialize, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct BtcAmount(pub i64);
 
 impl BtcAmount {
@@ -27,6 +27,51 @@ impl BtcAmount {
     #[inline]
     pub fn from_sats(sats: u64) -> Self {
         BtcAmount(sats as i64)
+    }
+
+    /// Construct from a signed satoshi value (for negative amounts such as
+    /// wallet send amounts).
+    #[inline]
+    pub fn from_sats_signed(sats: i64) -> Self {
+        BtcAmount(sats)
+    }
+
+    /// Construct from a BTC value expressed as f64 (e.g. a fee rate in BTC/kvB).
+    ///
+    /// Rounds to the nearest satoshi.  This avoids the precision-collapse that
+    /// occurs when storing BTC values directly as f64 and relying on serde's
+    /// default f64 serialiser (which uses shortest-representation / ryu and will
+    /// emit `0.00001` instead of `0.00001000`).
+    #[inline]
+    pub fn from_btc(btc: f64) -> Self {
+        BtcAmount((btc * 100_000_000.0).round() as i64)
+    }
+}
+
+impl<'de> Deserialize<'de> for BtcAmount {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Accept either:
+        //   - an integer (satoshis), e.g. from internal storage
+        //   - a floating-point number in BTC (the serialised wire form), e.g. 0.00001000
+        // In both cases produce BtcAmount(satoshis).
+        struct V;
+        impl<'de> de::Visitor<'de> for V {
+            type Value = BtcAmount;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a BTC amount as float (e.g. 1.00000000) or integer satoshis")
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<BtcAmount, E> {
+                Ok(BtcAmount(v))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<BtcAmount, E> {
+                Ok(BtcAmount(v as i64))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<BtcAmount, E> {
+                // BTC float → round to nearest satoshi.
+                Ok(BtcAmount((v * 100_000_000.0).round() as i64))
+            }
+        }
+        deserializer.deserialize_any(V)
     }
 }
 
@@ -398,16 +443,16 @@ pub struct MempoolInfo {
     pub bytes: usize,
     /// Total memory usage in bytes.
     pub usage: usize,
-    /// Total fees in BTC.
-    pub total_fee: f64,
+    /// Total fees in BTC — serialized as Core's ValueFromAmount `%d.%08d`.
+    pub total_fee: BtcAmount,
     /// Maximum mempool size in bytes.
     pub maxmempool: usize,
-    /// Minimum fee rate to enter mempool (BTC/kvB).
-    pub mempoolminfee: f64,
-    /// Minimum relay fee rate (BTC/kvB).
-    pub minrelaytxfee: f64,
-    /// Minimum fee rate increment for mempool limiting or replacement (BTC/kvB).
-    pub incrementalrelayfee: f64,
+    /// Minimum fee rate to enter mempool (BTC/kvB) — serialized as `%d.%08d`.
+    pub mempoolminfee: BtcAmount,
+    /// Minimum relay fee rate (BTC/kvB) — serialized as `%d.%08d`.
+    pub minrelaytxfee: BtcAmount,
+    /// Minimum fee rate increment for mempool limiting or replacement (BTC/kvB) — serialized as `%d.%08d`.
+    pub incrementalrelayfee: BtcAmount,
     /// Number of transactions not depending on others.
     pub unbroadcastcount: usize,
     /// Whether the mempool accepts RBF without signaling.
@@ -421,10 +466,10 @@ pub struct MempoolEntry {
     pub vsize: u32,
     /// Transaction weight.
     pub weight: u32,
-    /// Transaction fee in BTC.
-    pub fee: f64,
-    /// Modified fee for mining prioritization.
-    pub modifiedfee: f64,
+    /// Transaction fee in BTC — serialized as Core's ValueFromAmount `%d.%08d`.
+    pub fee: BtcAmount,
+    /// Modified fee for mining prioritization — serialized as `%d.%08d`.
+    pub modifiedfee: BtcAmount,
     /// Time transaction entered mempool.
     pub time: u64,
     /// Block height when entered mempool.
@@ -461,9 +506,11 @@ pub struct MempoolEntry {
 /// Response for `estimatesmartfee` RPC.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FeeEstimateResult {
-    /// Estimated fee rate in BTC/kvB.
-    pub feerate: Option<f64>,
+    /// Estimated fee rate in BTC/kvB — serialized as Core's ValueFromAmount `%d.%08d`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feerate: Option<BtcAmount>,
     /// Errors during estimation.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<String>>,
     /// Target number of blocks for confirmation.
     pub blocks: u32,
@@ -488,8 +535,8 @@ pub struct MiningInfo {
     pub networkhashps: f64,
     /// Number of transactions in mempool.
     pub pooledtx: usize,
-    /// Minimum feerate of packages selected for block inclusion (BTC/kvB).
-    pub blockmintxfee: f64,
+    /// Minimum feerate of packages selected for block inclusion (BTC/kvB) — serialized as `%d.%08d`.
+    pub blockmintxfee: BtcAmount,
     /// Current network.
     pub chain: String,
     /// Information about the next block (Core 31.99 field).
@@ -644,8 +691,8 @@ pub struct PeerInfoRpc {
     pub addr_rate_limited: u64,
     /// Required permissions for this peer.
     pub permissions: Vec<String>,
-    /// Minimum observed fee filter (BTC/kvB).
-    pub minfeefilter: f64,
+    /// Minimum observed fee filter (BTC/kvB) — serialized as Core's ValueFromAmount `%d.%08d`.
+    pub minfeefilter: BtcAmount,
     /// Per-message bytes sent, keyed by message type.
     pub bytessent_per_msg: serde_json::Value,
     /// Per-message bytes received, keyed by message type.
@@ -689,10 +736,10 @@ pub struct NetworkInfo {
     pub networkactive: bool,
     /// List of network interfaces.
     pub networks: Vec<NetworkInterface>,
-    /// Minimum relay fee.
-    pub relayfee: f64,
-    /// Incremental relay fee.
-    pub incrementalfee: f64,
+    /// Minimum relay fee (BTC/kvB) — serialized as Core's ValueFromAmount `%d.%08d`.
+    pub relayfee: BtcAmount,
+    /// Incremental relay fee (BTC/kvB) — serialized as `%d.%08d`.
+    pub incrementalfee: BtcAmount,
     /// Local addresses.
     pub localaddresses: Vec<LocalAddress>,
     /// Any warnings.
@@ -850,11 +897,11 @@ pub struct PackageTxResultRpc {
 /// Fee information for a transaction in a package.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PackageFees {
-    /// Base fee in BTC.
-    pub base: f64,
-    /// Effective fee rate in BTC/kvB.
+    /// Base fee in BTC — serialized as Core's ValueFromAmount `%d.%08d`.
+    pub base: BtcAmount,
+    /// Effective fee rate in BTC/kvB — serialized as `%d.%08d`.
     #[serde(rename = "effective-feerate")]
-    pub effective_feerate: f64,
+    pub effective_feerate: BtcAmount,
     /// List of transaction IDs this effective fee rate applies to.
     #[serde(rename = "effective-includes")]
     pub effective_includes: Vec<String>,
@@ -863,8 +910,9 @@ pub struct PackageFees {
 /// Response for `submitpackage` RPC.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubmitPackageResult {
-    /// Aggregate package fee rate in BTC/kvB.
-    pub package_feerate: Option<f64>,
+    /// Aggregate package fee rate in BTC/kvB — serialized as `%d.%08d`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_feerate: Option<BtcAmount>,
     /// Message describing the result.
     pub package_msg: String,
     /// Per-transaction results, keyed by wtxid.
@@ -1337,16 +1385,20 @@ mod tests {
             size: 100,
             bytes: 50000,
             usage: 100000,
-            total_fee: 0.001,
+            total_fee: BtcAmount::from_btc(0.001),
             maxmempool: 300000000,
-            mempoolminfee: 0.00001,
-            minrelaytxfee: 0.00001,
-            incrementalrelayfee: 0.00001,
+            mempoolminfee: BtcAmount::from_btc(0.00001),
+            minrelaytxfee: BtcAmount::from_btc(0.00001),
+            incrementalrelayfee: BtcAmount::from_btc(0.00001),
             unbroadcastcount: 0,
             fullrbf: false,
         };
 
         let json = serde_json::to_string(&info).unwrap();
+        // Verify 8-decimal precision is preserved.
+        assert!(json.contains("\"mempoolminfee\":0.00001000"), "mempoolminfee precision: {}", json);
+        assert!(json.contains("\"minrelaytxfee\":0.00001000"), "minrelaytxfee precision: {}", json);
+        assert!(json.contains("\"incrementalrelayfee\":0.00001000"), "incrementalrelayfee precision: {}", json);
         let parsed: MempoolInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.size, 100);
         assert_eq!(parsed.loaded, true);
@@ -1355,7 +1407,7 @@ mod tests {
     #[test]
     fn test_fee_estimate_result_with_feerate() {
         let result = FeeEstimateResult {
-            feerate: Some(0.00001),
+            feerate: Some(BtcAmount::from_btc(0.00001)),
             errors: None,
             blocks: 6,
         };
@@ -1412,7 +1464,7 @@ mod tests {
             addr_processed: 0,
             addr_rate_limited: 0,
             permissions: vec![],
-            minfeefilter: 0.0,
+            minfeefilter: BtcAmount::from_sats(0),
             bytessent_per_msg: serde_json::Value::Object(serde_json::Map::new()),
             bytesrecv_per_msg: serde_json::Value::Object(serde_json::Map::new()),
             connection_type: "outbound-full-relay".to_string(),
@@ -1470,9 +1522,10 @@ mod tests {
         let result = TxOutResult {
             bestblock: "000000000000".to_string(),
             confirmations: 100,
-            value: 1.5,
+            value: BtcAmount::from_sats(150_000_000), // 1.5 BTC
             script_pubkey: ScriptPubKeyInfo {
                 asm: "OP_DUP OP_HASH160 ... OP_EQUALVERIFY OP_CHECKSIG".to_string(),
+                desc: "addr(1A...)#00000000".to_string(),
                 hex: "76a914...88ac".to_string(),
                 script_type: "pubkeyhash".to_string(),
                 address: Some("1A...".to_string()),
@@ -1482,7 +1535,8 @@ mod tests {
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"confirmations\":100"));
-        assert!(json.contains("\"value\":1.5"));
+        // Must preserve 8 decimal places — not "1.5"
+        assert!(json.contains("\"value\":1.50000000"), "value precision: {}", json);
     }
 
     #[test]
@@ -1494,7 +1548,7 @@ mod tests {
             target: "0".repeat(64),
             networkhashps: 450000000000000000.0,
             pooledtx: 5000,
-            blockmintxfee: 0.00001,
+            blockmintxfee: BtcAmount::from_btc(0.00001),
             chain: "main".to_string(),
             next: MiningInfoNext {
                 height: 800001,
@@ -1525,8 +1579,8 @@ mod tests {
             connections_out: 8,
             networkactive: true,
             networks: vec![],
-            relayfee: 0.00001,
-            incrementalfee: 0.00001,
+            relayfee: BtcAmount::from_btc(0.00001),
+            incrementalfee: BtcAmount::from_btc(0.00001),
             localaddresses: vec![],
             warnings: "".to_string(),
         };
@@ -1534,6 +1588,8 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"connections\":10"));
         assert!(json.contains("\"networkactive\":true"));
+        assert!(json.contains("\"relayfee\":0.00001000"), "relayfee precision: {}", json);
+        assert!(json.contains("\"incrementalfee\":0.00001000"), "incrementalfee precision: {}", json);
     }
 
     // ============================================================
@@ -1693,11 +1749,11 @@ mod tests {
             size: 5000,
             bytes: 2_500_000,
             usage: 5_000_000,
-            total_fee: 0.05,
+            total_fee: BtcAmount::from_btc(0.05),
             maxmempool: 300_000_000,
-            mempoolminfee: 0.00001,
-            minrelaytxfee: 0.00001,
-            incrementalrelayfee: 0.00001,
+            mempoolminfee: BtcAmount::from_btc(0.00001),
+            minrelaytxfee: BtcAmount::from_btc(0.00001),
+            incrementalrelayfee: BtcAmount::from_btc(0.00001),
             unbroadcastcount: 10,
             fullrbf: false,
         };
@@ -1724,8 +1780,8 @@ mod tests {
         let entry = MempoolEntry {
             vsize: 250,
             weight: 1000,
-            fee: 0.000025,
-            modifiedfee: 0.000025,
+            fee: BtcAmount::from_btc(0.000025),
+            modifiedfee: BtcAmount::from_btc(0.000025),
             time: 1710000000,
             height: 850000,
             descendantcount: 1,
@@ -1746,8 +1802,8 @@ mod tests {
         // Bitcoin Core mempool entry fields
         assert!(json.contains("\"vsize\":250"));
         assert!(json.contains("\"weight\":1000"));
-        assert!(json.contains("\"fee\":"));
-        assert!(json.contains("\"modifiedfee\":"));
+        assert!(json.contains("\"fee\":0.00002500"), "fee precision: {}", json);
+        assert!(json.contains("\"modifiedfee\":0.00002500"), "modifiedfee precision: {}", json);
         assert!(json.contains("\"time\":"));
         assert!(json.contains("\"height\":850000"));
         assert!(json.contains("\"descendantcount\":1"));
@@ -1766,17 +1822,17 @@ mod tests {
     #[test]
     fn test_estimatesmartfee_success() {
         let result = FeeEstimateResult {
-            feerate: Some(0.00015),
+            feerate: Some(BtcAmount::from_btc(0.00015)),
             errors: None,
             blocks: 6,
         };
 
         let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("\"feerate\":0.00015"));
+        // Must emit 8 decimal places, not stripped form.
+        assert!(json.contains("\"feerate\":0.00015000"), "feerate precision: {}", json);
         assert!(json.contains("\"blocks\":6"));
-        // errors should be null, not present
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed["errors"].is_null());
+        // errors should be absent (skip_serializing_if = None).
+        assert!(!json.contains("\"errors\""), "errors should be absent: {}", json);
     }
 
     #[test]
@@ -1794,9 +1850,8 @@ mod tests {
         assert!(json.contains("\"blocks\":2"));
         assert!(json.contains("\"errors\":"));
         assert!(json.contains("Insufficient data"));
-        // feerate should be null
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed["feerate"].is_null());
+        // feerate should be absent (skip_serializing_if = None).
+        assert!(!json.contains("\"feerate\""), "feerate should be absent: {}", json);
     }
 
     // ============================================================
@@ -1913,7 +1968,7 @@ mod tests {
             addr_processed: 0,
             addr_rate_limited: 0,
             permissions: vec![],
-            minfeefilter: 0.0,
+            minfeefilter: BtcAmount::from_sats(0),
             bytessent_per_msg: serde_json::Value::Object(serde_json::Map::new()),
             bytesrecv_per_msg: serde_json::Value::Object(serde_json::Map::new()),
             connection_type: "outbound-full-relay".to_string(),
@@ -1979,7 +2034,7 @@ mod tests {
             addr_processed: 0,
             addr_rate_limited: 0,
             permissions: vec![],
-            minfeefilter: 0.0,
+            minfeefilter: BtcAmount::from_sats(0),
             bytessent_per_msg: serde_json::Value::Object(serde_json::Map::new()),
             bytesrecv_per_msg: serde_json::Value::Object(serde_json::Map::new()),
             connection_type: "inbound".to_string(),
