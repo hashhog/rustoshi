@@ -538,6 +538,12 @@ pub enum Descriptor {
 
     /// combo(KEY) - P2PK + P2PKH + P2WPKH + P2SH-P2WPKH.
     Combo(KeyProvider),
+
+    /// rawtr(KEY) - Raw Taproot output key (BIP-386).
+    ///
+    /// Unlike `tr(KEY)` which applies the BIP-86 key tweak, `rawtr(KEY)` uses
+    /// the key as-is as the output key with no tweak.
+    Rawtr(KeyProvider),
 }
 
 impl Descriptor {
@@ -548,6 +554,7 @@ impl Descriptor {
             | Descriptor::Pkh(k)
             | Descriptor::Wpkh(k)
             | Descriptor::TrKeyOnly(k)
+            | Descriptor::Rawtr(k)
             | Descriptor::Combo(k) => k.is_range(),
             Descriptor::Sh(inner) | Descriptor::Wsh(inner) => inner.is_range(),
             Descriptor::TrWithTree { internal_key, tree } => {
@@ -613,6 +620,11 @@ impl Descriptor {
             Descriptor::TrKeyOnly(key) => {
                 let pubkey = key.get_pubkey(pos)?;
                 let script = make_p2tr_script(&pubkey, None)?;
+                Ok(vec![script])
+            }
+            Descriptor::Rawtr(key) => {
+                let pubkey = key.get_pubkey(pos)?;
+                let script = make_rawtr_script(&pubkey)?;
                 Ok(vec![script])
             }
             Descriptor::TrWithTree { internal_key, tree } => {
@@ -696,7 +708,7 @@ impl Descriptor {
                 }
             }
             Descriptor::Wsh(_) => Some(OutputType::Wsh),
-            Descriptor::TrKeyOnly(_) | Descriptor::TrWithTree { .. } => Some(OutputType::Tr),
+            Descriptor::TrKeyOnly(_) | Descriptor::TrWithTree { .. } | Descriptor::Rawtr(_) => Some(OutputType::Tr),
             Descriptor::Multi { .. } | Descriptor::SortedMulti { .. } => Some(OutputType::Bare),
             Descriptor::Addr(addr) => match addr {
                 Address::P2PKH { .. } => Some(OutputType::Pkh),
@@ -744,6 +756,7 @@ impl fmt::Display for Descriptor {
             Descriptor::Addr(addr) => write!(f, "addr({})", addr),
             Descriptor::Raw(script) => write!(f, "raw({})", hex::encode(script)),
             Descriptor::Combo(key) => write!(f, "combo({})", key.to_public_string()),
+            Descriptor::Rawtr(key) => write!(f, "rawtr({})", key.to_public_string()),
         }
     }
 }
@@ -790,16 +803,66 @@ pub struct DescriptorInfo {
 
 impl DescriptorInfo {
     /// Get info for a parsed descriptor.
+    ///
+    /// Per BIP-380:
+    /// - `descriptor` returns the canonical form with checksum appended.
+    /// - `issolvable` is false for `addr()` and `raw()` (no script template to solve).
+    /// - `hasprivatekeys` is true when any key expression embeds a WIF or xprv.
     pub fn from_descriptor(desc: &Descriptor) -> Self {
         let descriptor_str = desc.to_string();
         let checksum = descriptor_checksum(&descriptor_str).unwrap_or_default();
+        // Canonical form includes the checksum (matches Bitcoin Core behaviour)
+        let descriptor_with_checksum = format!("{}#{}", descriptor_str, checksum);
+
+        // addr() and raw() are not solvable — no script template exists
+        let is_solvable = !matches!(desc, Descriptor::Addr(_) | Descriptor::Raw(_));
+
+        // Walk all key providers; any Xprv or WIF-loaded Const means private keys present
+        let has_private_keys = descriptor_has_private_keys(desc);
+
         Self {
-            descriptor: descriptor_str,
+            descriptor: descriptor_with_checksum,
             checksum,
             is_range: desc.is_range(),
-            is_solvable: true, // Most descriptors are solvable
-            has_private_keys: false, // Would need to check key providers
+            is_solvable,
+            has_private_keys,
         }
+    }
+}
+
+/// Recursively check whether any key expression in the descriptor embeds a private key
+/// (xprv or WIF constant).
+fn descriptor_has_private_keys(desc: &Descriptor) -> bool {
+    match desc {
+        Descriptor::Pk(k)
+        | Descriptor::Pkh(k)
+        | Descriptor::Wpkh(k)
+        | Descriptor::TrKeyOnly(k)
+        | Descriptor::Rawtr(k)
+        | Descriptor::Combo(k) => key_provider_has_private(k),
+        Descriptor::Sh(inner) | Descriptor::Wsh(inner) => descriptor_has_private_keys(inner),
+        Descriptor::TrWithTree { internal_key, tree } => {
+            key_provider_has_private(internal_key)
+                || tree.iter().any(|(d, _)| descriptor_has_private_keys(d))
+        }
+        Descriptor::Multi { keys, .. } | Descriptor::SortedMulti { keys, .. } => {
+            keys.iter().any(key_provider_has_private)
+        }
+        Descriptor::Addr(_) | Descriptor::Raw(_) => false,
+    }
+}
+
+/// Returns true if the key provider embeds a private key (Xprv or WIF-loaded Const).
+fn key_provider_has_private(kp: &KeyProvider) -> bool {
+    match kp {
+        KeyProvider::Xprv { .. } => true,
+        // Const is always a public key after parsing; WIF is converted to pubkey on parse
+        // so we can never recover "was this originally WIF?" without extra tracking.
+        // For now, Const is always public — match Bitcoin Core which checks for actual
+        // secret material, not reconstructed pubkeys.
+        KeyProvider::Const { .. } => false,
+        KeyProvider::Xpub { .. } => false,
+        KeyProvider::WithOrigin { inner, .. } => key_provider_has_private(inner),
     }
 }
 
@@ -873,6 +936,19 @@ fn make_p2tr_script(internal_key: &PublicKey, merkle_root: Option<&[u8; 32]>) ->
     // Build P2TR script: OP_1 <32-byte-key>
     let mut script = vec![0x51, 0x20]; // OP_1 <push 32>
     script.extend_from_slice(&output_x_only);
+    Ok(script)
+}
+
+/// Create a P2TR script for rawtr(): OP_1 <32-byte-output-key> with NO tweak.
+///
+/// rawtr(KEY) uses the x-only pubkey directly as the output key without applying
+/// the BIP-86 key tweak. This differs from tr(KEY) which applies taproot_tweak_pubkey.
+fn make_rawtr_script(pubkey: &PublicKey) -> Result<Vec<u8>, DescriptorError> {
+    // Get x-only key bytes (32 bytes, skip the 0x02/0x03 prefix)
+    let pubkey_bytes = pubkey.serialize();
+    // Build P2TR script: OP_1 <push 32> <x-only-key>
+    let mut script = vec![0x51, 0x20]; // OP_1 <push 32>
+    script.extend_from_slice(&pubkey_bytes[1..33]);
     Ok(script)
 }
 
@@ -1244,9 +1320,9 @@ fn parse_descriptor_inner(desc: &str) -> Result<Descriptor, DescriptorError> {
             Ok(Descriptor::Combo(key))
         }
         "rawtr" => {
-            // Raw Taproot output key
+            // Raw Taproot output key (BIP-386): key used as-is, no BIP-86 tweak
             let key = parse_key_expression(args)?;
-            Ok(Descriptor::TrKeyOnly(key))
+            Ok(Descriptor::Rawtr(key))
         }
         _ => Err(DescriptorError::UnsupportedType(func_name.into())),
     }
