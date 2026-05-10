@@ -914,6 +914,18 @@ pub struct DeriveAddressesResult {
     pub addresses: Vec<String>,
 }
 
+/// Response for `createmultisig` RPC.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CreateMultisigResult {
+    /// The P2SH/P2WSH/P2SH-P2WSH address.
+    pub address: String,
+    /// The hex-encoded redeem script.
+    #[serde(rename = "redeemScript")]
+    pub redeem_script: String,
+    /// The descriptor string with BIP-380 checksum.
+    pub descriptor: String,
+}
+
 /// Request for `importdescriptors` RPC.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ImportDescriptorRequest {
