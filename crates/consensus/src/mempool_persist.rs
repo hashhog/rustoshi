@@ -448,6 +448,19 @@ mod tests {
     use std::collections::HashMap;
 
     fn make_dummy_tx(prev_txid: Hash256, prev_vout: u32, value: u64) -> Transaction {
+        // The output must be non-dust and the tx must meet MIN_STANDARD_TX_NONWITNESS_SIZE (65 B).
+        // P2PKH output (25 bytes) gives base_size = 85 B > 65 B.
+        //   Layout: 4(ver) + 1(in_count) + 41(in) + 1(out_count) + 34(out) + 4(lock_time) = 85 B
+        //   where out = 8(value) + 1(script_len) + 25(P2PKH scriptPubKey)
+        // (was 61 B with empty scriptSig + 1-byte OP_RETURN; 65-B gate would have rejected it.)
+        #[rustfmt::skip]
+        let p2pkh_script = vec![
+            0x76, 0xa9, 0x14,                          // OP_DUP OP_HASH160 OP_DATA20
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // 20-byte hash (dummy)
+            0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,       // 20 bytes total
+            0x88, 0xac,                                 // OP_EQUALVERIFY OP_CHECKSIG
+        ];
         Transaction {
             version: 2,
             inputs: vec![TxIn {
@@ -461,7 +474,7 @@ mod tests {
             }],
             outputs: vec![TxOut {
                 value,
-                script_pubkey: vec![0x6a], // OP_RETURN, simplest standard-ish
+                script_pubkey: p2pkh_script,
             }],
             lock_time: 0,
         }

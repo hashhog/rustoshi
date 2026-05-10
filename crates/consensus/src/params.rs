@@ -107,6 +107,14 @@ pub const DUST_RELAY_TX_FEE: u64 = 3_000;
 /// Maximum standard transaction sigops cost.
 pub const MAX_STANDARD_TX_SIGOPS_COST: u64 = 16_000;
 
+/// Minimum non-witness serialized size for a standard transaction (CVE-2017-12842).
+/// Transactions with base size < 65 bytes can be used to fake SPV proofs.
+pub const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
+
+/// Maximum scriptSig size for a standard input.
+/// Mirrors Bitcoin Core MAX_STANDARD_SCRIPTSIG_SIZE = 1650.
+pub const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1650;
+
 /// Maximum number of signature check operations per input (SegWit).
 pub const MAX_STANDARD_P2WSH_STACK_ITEMS: usize = 100;
 pub const MAX_STANDARD_P2WSH_STACK_ITEM_SIZE: usize = 80;
