@@ -3061,6 +3061,553 @@ mod tests {
     }
 
     // =========================
+    // W74 comprehensive sigops tests (Core parity)
+    // =========================
+
+    /// count_script_sigops: CHECKSIGVERIFY counts 1 sigop, same as CHECKSIG.
+    /// Ref: Bitcoin Core script.cpp:168-169.
+    #[test]
+    fn count_script_sigops_checksigverify() {
+        // OP_CHECKSIGVERIFY = 0xad
+        let script = [0xadu8];
+        assert_eq!(count_script_sigops(&script, false), 1);
+        assert_eq!(count_script_sigops(&script, true), 1);
+    }
+
+    /// count_script_sigops accurate=false: CHECKMULTISIG always counts 20.
+    /// Ref: Bitcoin Core script.cpp:170-175.
+    #[test]
+    fn count_script_sigops_multisig_inaccurate_always_20() {
+        // OP_1 OP_CHECKMULTISIG — without accurate counting, this is still 20
+        let script = [0x51u8, 0xaeu8]; // OP_1, OP_CHECKMULTISIG
+        assert_eq!(count_script_sigops(&script, false), 20);
+    }
+
+    /// count_script_sigops accurate=true: CHECKMULTISIG uses OP_n preceding opcode.
+    /// All 16 possible OP_1..OP_16 values.
+    /// Ref: Bitcoin Core script.cpp:172-173, DecodeOP_N().
+    #[test]
+    fn count_script_sigops_multisig_accurate_op1_through_op16() {
+        for n in 1u8..=16 {
+            let op_n = 0x50u8 + n; // OP_1..OP_16 = 0x51..0x60
+            let script = [op_n, 0xaeu8]; // OP_n OP_CHECKMULTISIG
+            assert_eq!(
+                count_script_sigops(&script, true),
+                n as u32,
+                "OP_{n} OP_CHECKMULTISIG accurate should give {n} sigops"
+            );
+        }
+    }
+
+    /// count_script_sigops accurate=true with OP_0 preceding CHECKMULTISIG:
+    /// OP_0 is 0x00, NOT in OP_1..OP_16 range, so falls through to 20.
+    /// Ref: Bitcoin Core script.cpp:172 `lastOpcode >= OP_1 && lastOpcode <= OP_16`.
+    #[test]
+    fn count_script_sigops_multisig_accurate_op0_uses_20() {
+        // OP_0 (0x00) OP_CHECKMULTISIG — lastOpcode = 0x00, not in OP_1..OP_16
+        let script = [0x00u8, 0xaeu8];
+        assert_eq!(count_script_sigops(&script, true), 20);
+    }
+
+    /// count_script_sigops: CHECKMULTISIGVERIFY counts same as CHECKMULTISIG.
+    /// Ref: Bitcoin Core script.cpp:170 (handles both 0xae and 0xaf).
+    #[test]
+    fn count_script_sigops_checkmultisigverify_accurate() {
+        // OP_3 OP_CHECKMULTISIGVERIFY = 0xaf
+        let script = [0x53u8, 0xafu8];
+        assert_eq!(count_script_sigops(&script, false), 20);
+        assert_eq!(count_script_sigops(&script, true), 3);
+    }
+
+    /// lastOpcode tracking: a pushdata opcode before CHECKMULTISIG is NOT in
+    /// OP_1..OP_16 range, so accurate count falls back to 20.
+    /// This verifies that "push 3 bytes" (opcode 0x03) is not treated as OP_3.
+    /// Ref: Bitcoin Core script.cpp:177 `lastOpcode = opcode` (includes push opcodes).
+    #[test]
+    fn count_script_sigops_pushdata_not_treated_as_opn() {
+        // opcode 0x03 = push 3 bytes of data, NOT OP_3 (0x53)
+        let script = [0x03u8, 0x01u8, 0x02u8, 0x03u8, 0xaeu8]; // push3 <data> OP_CHECKMULTISIG
+        // last_opcode = 0x03 (push 3 bytes), not in 0x51..0x60
+        assert_eq!(count_script_sigops(&script, true), 20);
+    }
+
+    /// lastOpcode tracking: initial value (OP_INVALIDOPCODE) is not in OP_1..OP_16,
+    /// so CHECKMULTISIG as first opcode uses 20.
+    /// Ref: Bitcoin Core script.cpp:162 `lastOpcode = OP_INVALIDOPCODE`.
+    #[test]
+    fn count_script_sigops_multisig_no_preceding_op_uses_20() {
+        // OP_CHECKMULTISIG with nothing before it
+        let script = [0xaeu8];
+        assert_eq!(count_script_sigops(&script, true), 20);
+        assert_eq!(count_script_sigops(&script, false), 20);
+    }
+
+    /// count_script_sigops: empty script returns 0.
+    #[test]
+    fn count_script_sigops_empty_script() {
+        assert_eq!(count_script_sigops(&[], false), 0);
+        assert_eq!(count_script_sigops(&[], true), 0);
+    }
+
+    /// count_script_sigops: multiple CHECKSIG and CHECKMULTISIG in one script.
+    /// Ref: Bitcoin Core script.cpp — n is accumulated across the whole script.
+    #[test]
+    fn count_script_sigops_multiple_checksig_and_multisig() {
+        // OP_CHECKSIG OP_CHECKSIG OP_1 OP_CHECKMULTISIG
+        // false: 1 + 1 + 20 = 22
+        // true:  1 + 1 + 1 = 3
+        let script = [0xacu8, 0xacu8, 0x51u8, 0xaeu8];
+        assert_eq!(count_script_sigops(&script, false), 22);
+        assert_eq!(count_script_sigops(&script, true), 3);
+    }
+
+    /// get_legacy_sigop_count: counts scriptSig and ALL outputs (including coinbase).
+    /// Uses inaccurate counting (false) for both inputs and outputs.
+    /// Ref: Bitcoin Core tx_verify.cpp:112-124, uses GetSigOpCount(false).
+    #[test]
+    fn get_legacy_sigop_count_includes_inputs_and_outputs() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        // Input scriptSig: OP_CHECKSIG (1 sigop)
+        // Output scriptPubKey: OP_1 OP_CHECKMULTISIG (20 sigops, inaccurate)
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0xacu8], // OP_CHECKSIG
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x51u8, 0xaeu8], // OP_1 OP_CHECKMULTISIG
+            }],
+            lock_time: 0,
+        };
+        // 1 (from scriptSig) + 20 (from output, inaccurate) = 21
+        assert_eq!(get_legacy_sigop_count(&tx), 21);
+    }
+
+    /// get_legacy_sigop_count: coinbase is NOT skipped (Core tx_verify.cpp:113-124
+    /// iterates vin unconditionally, including coinbase).
+    #[test]
+    fn get_legacy_sigop_count_includes_coinbase() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        // Coinbase tx with OP_CHECKSIG in scriptSig
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(), // coinbase null prevout
+                script_sig: vec![0x03u8, 0x01u8, 0x02u8, 0x03u8, 0xacu8], // push3 <data> OP_CHECKSIG
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 5_000_000_000,
+                script_pubkey: vec![], // no sigops
+            }],
+            lock_time: 0,
+        };
+        // OP_CHECKSIG in the coinbase scriptSig counts
+        assert_eq!(get_legacy_sigop_count(&tx), 1);
+    }
+
+    /// get_p2sh_sigop_count: coinbase short-circuit returns 0.
+    /// Ref: Bitcoin Core tx_verify.cpp:128-129.
+    #[test]
+    fn get_p2sh_sigop_count_coinbase_returns_zero() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x01u8, 0x00u8], // minimal coinbase script
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: vec![],
+            }],
+            lock_time: 0,
+        };
+        assert!(tx.is_coinbase());
+        assert_eq!(get_p2sh_sigop_count(&tx, |_| None), 0);
+    }
+
+    /// get_p2sh_sigop_count: P2SH input with 2-of-3 multisig redeem script.
+    /// Ref: Bitcoin Core tx_verify.cpp:136-139, CScript::GetSigOpCount(scriptSig).
+    #[test]
+    fn get_p2sh_sigop_count_multisig_redeem_script() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        // Build a 2-of-3 multisig redeem script: OP_2 <pk1> <pk2> <pk3> OP_3 OP_CHECKMULTISIG
+        let mut redeem = vec![0x52u8]; // OP_2
+        for _ in 0..3 {
+            redeem.push(0x21u8); // push 33 bytes
+            redeem.extend([0u8; 33]);
+        }
+        redeem.push(0x53u8); // OP_3
+        redeem.push(0xaeu8); // OP_CHECKMULTISIG
+
+        // Build scriptSig: OP_0 <redeem_script pushed with PUSHDATA1>
+        let mut script_sig = vec![0x00u8]; // OP_0 (dummy for CHECKMULTISIG)
+        // Push redeem script (length > 75 bytes, use PUSHDATA1)
+        script_sig.push(0x4cu8); // OP_PUSHDATA1
+        script_sig.push(redeem.len() as u8);
+        script_sig.extend_from_slice(&redeem);
+
+        // P2SH scriptPubKey: OP_HASH160 <20 bytes> OP_EQUAL
+        let p2sh_spk = [
+            0xa9u8, 0x14u8,
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 20 bytes hash
+            0x87u8,
+        ];
+
+        let txid = Hash256::from_bytes([9u8; 32]);
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig,
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+
+        let coin = CoinEntry {
+            height: 1,
+            is_coinbase: false,
+            value: 1000,
+            script_pubkey: p2sh_spk.to_vec(),
+        };
+
+        // Accurate count of 2-of-3 multisig redeem: OP_3 precedes CHECKMULTISIG → 3 sigops
+        let count = get_p2sh_sigop_count(&tx, |op| {
+            if op.txid == txid && op.vout == 0 {
+                Some(coin.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(count, 3, "2-of-3 P2SH multisig should have 3 accurate sigops");
+    }
+
+    /// get_p2sh_sigop_count: non-P2SH prevout is ignored.
+    /// Ref: Bitcoin Core tx_verify.cpp:137 `if (prevout.scriptPubKey.IsPayToScriptHash())`.
+    #[test]
+    fn get_p2sh_sigop_count_skips_non_p2sh_prevouts() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        let txid = Hash256::from_bytes([5u8; 32]);
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: vec![0xacu8], // OP_CHECKSIG (would be 1 sigop if P2SH)
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+
+        // P2PKH prevout — NOT P2SH, so get_p2sh_sigop_count skips it
+        let coin = CoinEntry {
+            height: 1,
+            is_coinbase: false,
+            value: 1000,
+            // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+            script_pubkey: vec![
+                0x76u8, 0xa9u8, 0x14u8,
+                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                0x88u8, 0xacu8,
+            ],
+        };
+        let count = get_p2sh_sigop_count(&tx, |op| {
+            if op.txid == txid { Some(coin.clone()) } else { None }
+        });
+        assert_eq!(count, 0, "P2PKH prevout must not be counted by get_p2sh_sigop_count");
+    }
+
+    /// witness_sigops: P2WPKH (20-byte program) counts as 1 sigop.
+    /// Ref: Bitcoin Core interpreter.cpp:2126-2127, WitnessSigOps().
+    #[test]
+    fn witness_sigops_p2wpkh_is_1() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        let txid = Hash256::from_bytes([2u8; 32]);
+        // P2WPKH: OP_0 <20 bytes>
+        let p2wpkh_spk = {
+            let mut s = vec![0x00u8, 0x14u8];
+            s.extend([0u8; 20]);
+            s
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: vec![],
+                sequence: 0xffffffff,
+                witness: vec![vec![0u8; 72], vec![0u8; 33]], // sig + pubkey
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        let flags = ScriptFlags { verify_p2sh: true, verify_witness: true, ..Default::default() };
+        let coin = CoinEntry { height: 1, is_coinbase: false, value: 1000, script_pubkey: p2wpkh_spk };
+        let cost = get_transaction_sigop_cost(&tx, |op| {
+            if op.txid == txid { Some(coin.clone()) } else { None }
+        }, &flags);
+        // Legacy: 0, P2SH: 0, Witness: 1 (unscaled)
+        assert_eq!(cost, 1, "P2WPKH witness sigop cost must be 1 (unscaled)");
+    }
+
+    /// witness_sigops: P2WSH (32-byte program) with 2-of-3 witness script.
+    /// The witness script is the last item in the witness stack.
+    /// Ref: Bitcoin Core interpreter.cpp:2129-2131, subscript.GetSigOpCount(true).
+    #[test]
+    fn witness_sigops_p2wsh_counts_accurate_sigops_in_witness_script() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        let txid = Hash256::from_bytes([3u8; 32]);
+        // P2WSH: OP_0 <32 bytes>
+        let p2wsh_spk = {
+            let mut s = vec![0x00u8, 0x20u8];
+            s.extend([0u8; 32]);
+            s
+        };
+        // Witness script: OP_2 <pk1> <pk2> <pk3> OP_3 OP_CHECKMULTISIG
+        let mut witness_script = vec![0x52u8]; // OP_2
+        for _ in 0..3 {
+            witness_script.push(0x21u8);
+            witness_script.extend([0u8; 33]);
+        }
+        witness_script.push(0x53u8); // OP_3
+        witness_script.push(0xaeu8); // OP_CHECKMULTISIG
+        // Accurate: OP_3 before CHECKMULTISIG → 3 sigops
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: vec![],
+                sequence: 0xffffffff,
+                // witness: [sig1, sig2, witness_script]
+                witness: vec![vec![0u8; 72], vec![0u8; 72], witness_script.clone()],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        let flags = ScriptFlags { verify_p2sh: true, verify_witness: true, ..Default::default() };
+        let coin = CoinEntry { height: 1, is_coinbase: false, value: 1000, script_pubkey: p2wsh_spk };
+        let cost = get_transaction_sigop_cost(&tx, |op| {
+            if op.txid == txid { Some(coin.clone()) } else { None }
+        }, &flags);
+        // Legacy: 0, P2SH: 0, Witness: 3 (accurate, unscaled)
+        assert_eq!(cost, 3, "P2WSH 2-of-3 witness sigop cost must be 3 (accurate, unscaled)");
+    }
+
+    /// witness_sigops: unknown witness version → 0 sigops (future upgrade path).
+    /// Ref: Bitcoin Core interpreter.cpp:2135-2136.
+    #[test]
+    fn witness_sigops_unknown_version_is_zero() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        let txid = Hash256::from_bytes([4u8; 32]);
+        // Version 2 witness program: OP_2 <20 bytes>
+        let future_spk = {
+            let mut s = vec![0x52u8, 0x14u8]; // OP_2 + push 20 bytes
+            s.extend([0u8; 20]);
+            s
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: vec![],
+                sequence: 0xffffffff,
+                witness: vec![vec![0u8; 32]],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        let flags = ScriptFlags { verify_p2sh: true, verify_witness: true, ..Default::default() };
+        let coin = CoinEntry { height: 1, is_coinbase: false, value: 1000, script_pubkey: future_spk };
+        let cost = get_transaction_sigop_cost(&tx, |op| {
+            if op.txid == txid { Some(coin.clone()) } else { None }
+        }, &flags);
+        // Unknown witness version → 0 witness sigops; no legacy/P2SH sigops
+        assert_eq!(cost, 0, "Unknown witness version must yield 0 sigops");
+    }
+
+    /// get_transaction_sigop_cost: 4× multiplier on legacy sigops.
+    /// Ref: Bitcoin Core tx_verify.cpp:145 `GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR`.
+    #[test]
+    fn sigop_cost_legacy_scaled_by_4() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        // Output scriptPubKey with 1 OP_CHECKSIG
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x01u8, 0x00u8],
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                // P2PKH: 1 OP_CHECKSIG
+                script_pubkey: vec![
+                    0x76u8, 0xa9u8, 0x14u8,
+                    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                    0x88u8, 0xacu8,
+                ],
+            }],
+            lock_time: 0,
+        };
+        let flags = ScriptFlags { verify_p2sh: true, verify_witness: true, ..Default::default() };
+        // is_coinbase() is true (null prevout), so returns after legacy only
+        // Legacy: 1 sigop from output scriptPubKey × 4 = 4
+        let cost = get_transaction_sigop_cost(&tx, |_| None, &flags);
+        assert_eq!(cost, 4, "1 legacy sigop must cost 4 (× WITNESS_SCALE_FACTOR=4)");
+    }
+
+    /// get_transaction_sigop_cost: coinbase short-circuit skips P2SH and witness.
+    /// Ref: Bitcoin Core tx_verify.cpp:147-148.
+    #[test]
+    fn sigop_cost_coinbase_short_circuits_p2sh_and_witness() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        // Coinbase with no legacy sigops
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x01u8, 0x00u8], // no sigops
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        assert!(tx.is_coinbase());
+        let flags = ScriptFlags { verify_p2sh: true, verify_witness: true, ..Default::default() };
+        // The get_coin closure would have returned P2WSH data, but coinbase exits early
+        let cost = get_transaction_sigop_cost(&tx, |_| panic!("should not be called for coinbase"), &flags);
+        assert_eq!(cost, 0, "coinbase with no legacy sigops should cost 0");
+    }
+
+    /// get_transaction_sigop_cost: P2SH sigops scaled by 4, witness unscaled.
+    /// Ref: Bitcoin Core tx_verify.cpp:150-161.
+    #[test]
+    fn sigop_cost_p2sh_scaled_witness_unscaled() {
+        use rustoshi_primitives::{TxIn, TxOut};
+        // We use a non-coinbase tx with one P2SH input containing a 1-key multisig
+        // redeem script (accurate: 1 sigop) and one P2WPKH input (1 witness sigop).
+        let txid_p2sh = Hash256::from_bytes([10u8; 32]);
+        let txid_p2wpkh = Hash256::from_bytes([11u8; 32]);
+
+        // Redeem script: OP_1 OP_CHECKMULTISIG (accurate: 1 sigop)
+        let redeem = vec![0x51u8, 0xaeu8]; // OP_1 OP_CHECKMULTISIG
+        // scriptSig for P2SH: OP_0 <redeem>
+        let mut script_sig_p2sh = vec![0x00u8]; // OP_0
+        script_sig_p2sh.push(redeem.len() as u8); // direct push (2 bytes)
+        script_sig_p2sh.extend_from_slice(&redeem);
+
+        let p2sh_spk: Vec<u8> = vec![0xa9u8, 0x14u8, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0x87u8];
+        let p2wpkh_spk: Vec<u8> = {
+            let mut s = vec![0x00u8, 0x14u8];
+            s.extend([0u8; 20]);
+            s
+        };
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint { txid: txid_p2sh, vout: 0 },
+                    script_sig: script_sig_p2sh,
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint { txid: txid_p2wpkh, vout: 0 },
+                    script_sig: vec![],
+                    sequence: 0xffffffff,
+                    witness: vec![vec![0u8; 72], vec![0u8; 33]],
+                },
+            ],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+
+        let p2sh_coin = CoinEntry { height: 1, is_coinbase: false, value: 1000, script_pubkey: p2sh_spk };
+        let p2wpkh_coin = CoinEntry { height: 1, is_coinbase: false, value: 1000, script_pubkey: p2wpkh_spk };
+
+        let flags = ScriptFlags { verify_p2sh: true, verify_witness: true, ..Default::default() };
+        let cost = get_transaction_sigop_cost(&tx, |op| {
+            if op.txid == txid_p2sh { Some(p2sh_coin.clone()) }
+            else if op.txid == txid_p2wpkh { Some(p2wpkh_coin.clone()) }
+            else { None }
+        }, &flags);
+
+        // Legacy: 0 sigops × 4 = 0
+        // P2SH: 1 redeem-script sigop × 4 = 4
+        // Witness: 1 P2WPKH sigop × 1 = 1
+        // Total: 5
+        assert_eq!(cost, 5, "P2SH(1 sigop)×4 + P2WPKH(1 sigop)×1 = 5");
+    }
+
+    /// count_script_sigops: verify OP_16 (0x60) is correctly treated as 16 in accurate mode.
+    /// Boundary test: OP_16 = 0x60, just inside the 0x51..=0x60 range.
+    /// Ref: Bitcoin Core script.cpp:172 `lastOpcode <= OP_16`.
+    #[test]
+    fn count_script_sigops_op16_boundary() {
+        // OP_16 (0x60) OP_CHECKMULTISIG
+        let script = [0x60u8, 0xaeu8];
+        assert_eq!(count_script_sigops(&script, true), 16);
+        assert_eq!(count_script_sigops(&script, false), 20);
+    }
+
+    /// MAX_BLOCK_SIGOPS_COST = 80,000 boundary: count_block_sigops via get_legacy_sigop_count.
+    /// Each OP_CHECKSIG = 1 legacy sigop; block-level cost = sigops × WITNESS_SCALE_FACTOR.
+    /// At 20,000 legacy sigops the cost is exactly 80,000 (must not fail).
+    /// At 20,001 the cost is 80,004 (must exceed MAX_BLOCK_SIGOPS_COST).
+    /// Ref: Bitcoin Core consensus/consensus.h:17, tx_verify.cpp:112-124.
+    #[test]
+    fn block_sigops_80000_boundary() {
+        use rustoshi_primitives::TxIn;
+
+        // Build a coinbase tx with `n` OP_CHECKSIG in its output scriptPubKey.
+        let make_cb = |n: usize| -> Transaction {
+            Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: vec![0x01u8, 0x42u8],
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                }],
+                outputs: vec![TxOut {
+                    value: 0,
+                    script_pubkey: std::iter::repeat(0xacu8).take(n).collect(),
+                }],
+                lock_time: 0,
+            }
+        };
+
+        // At the exact limit: 20,000 OP_CHECKSIG → 20,000 legacy sigops × 4 = 80,000
+        let cb = make_cb(20_000);
+        let cost = get_legacy_sigop_count(&cb) as u64 * WITNESS_SCALE_FACTOR;
+        assert_eq!(cost, MAX_BLOCK_SIGOPS_COST, "20,000 legacy sigops must yield exactly 80,000 cost");
+
+        // One above: 20,001 OP_CHECKSIG → 80,004 > 80,000
+        let cb_over = make_cb(20_001);
+        let cost_over = get_legacy_sigop_count(&cb_over) as u64 * WITNESS_SCALE_FACTOR;
+        assert!(
+            cost_over > MAX_BLOCK_SIGOPS_COST,
+            "20,001 legacy sigops must yield cost {} > {MAX_BLOCK_SIGOPS_COST}",
+            cost_over
+        );
+    }
+
+    // =========================
     // is_final_tx tests (Core parity: ContextualCheckBlock, validation.cpp:4146)
     // =========================
 
