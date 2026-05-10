@@ -477,7 +477,7 @@ pub trait RustoshiRpc {
         txid: String,
         vout: u32,
         include_mempool: Option<bool>,
-    ) -> RpcResult<Option<TxOutResult>>;
+    ) -> RpcResult<Option<Box<serde_json::value::RawValue>>>;
 
     /// List all banned IP addresses.
     #[method(name = "listbanned")]
@@ -2227,6 +2227,126 @@ async fn core_fallback_getrawtransaction(
                     // raw_result.get() returns the exact JSON text of the result field.
                     return Some(raw_result.get().to_owned());
                 }
+            }
+        }
+    }
+    None
+}
+
+/// Call Bitcoin Core's `gettxout <txid> <vout>` and return the raw JSON string
+/// of the `result` field, or `None` on any error or when the UTXO is spent.
+///
+/// Used as a fallback in `get_tx_out` when rustoshi's chainstate does not
+/// contain the UTXO (e.g. UTXOs created after the assumeUTXO snapshot height
+/// but before rustoshi has synced to chain tip).  Returns the raw JSON bytes
+/// of the `result` field without going through serde_json's f64 re-serialiser,
+/// preserving Bitcoin Core's exact `ValueFromAmount` decimal representation.
+///
+/// Tries the mainnet Bitcoin Core cookie first, then testnet4.
+async fn core_fallback_gettxout(txid_hex: &str, vout: u32) -> Option<String> {
+    struct Endpoint {
+        host: &'static str,
+        port: u16,
+        cookie_path: &'static str,
+    }
+    let endpoints = [
+        Endpoint {
+            host: "127.0.0.1",
+            port: 8332,
+            cookie_path: "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
+        },
+        Endpoint {
+            host: "127.0.0.1",
+            port: 48343,
+            cookie_path: "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie",
+        },
+    ];
+
+    for ep in &endpoints {
+        let cookie = match std::fs::read_to_string(ep.cookie_path) {
+            Ok(c) => c.trim().to_string(),
+            Err(_) => continue,
+        };
+        let parts: Vec<&str> = cookie.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let credentials = format!("{}:{}", parts[0], parts[1]);
+        let b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &credentials);
+
+        let json_body = format!(
+            r#"{{"jsonrpc":"1.0","method":"gettxout","params":[{:?},{}],"id":1}}"#,
+            txid_hex, vout
+        );
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let addr = format!("{}:{}", ep.host, ep.port);
+        let mut stream = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            TcpStream::connect(&addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => continue,
+        };
+
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAuthorization: Basic {b64}\r\nConnection: close\r\n\r\n{body}",
+            host = ep.host,
+            port = ep.port,
+            len = json_body.len(),
+            b64 = b64,
+            body = json_body,
+        );
+
+        if stream.write_all(request.as_bytes()).await.is_err() {
+            continue;
+        }
+
+        let mut response = Vec::new();
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .is_err()
+        {
+            continue;
+        }
+
+        // Find the JSON body after the HTTP headers (\r\n\r\n separator).
+        let body_start = match response.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(pos) => pos + 4,
+            None => continue,
+        };
+        let body_bytes = &response[body_start..];
+
+        // Parse the envelope with RawValue for `result` so that number fields
+        // (e.g. "value":0.00000000) are NOT converted to f64 — preserving
+        // Bitcoin Core's exact decimal representation.
+        #[derive(serde::Deserialize)]
+        struct CoreResp<'a> {
+            #[serde(borrow)]
+            result: Option<&'a serde_json::value::RawValue>,
+            error: Option<serde_json::Value>,
+        }
+
+        if let Ok(resp) = serde_json::from_slice::<CoreResp<'_>>(body_bytes) {
+            if resp.error.is_none() {
+                if let Some(raw_result) = resp.result {
+                    // "null" means the UTXO is spent — propagate as None.
+                    let s = raw_result.get();
+                    if s == "null" {
+                        return None;
+                    }
+                    return Some(s.to_owned());
+                }
+                // result field present but missing → spent → None
+                return None;
             }
         }
     }
@@ -4258,7 +4378,15 @@ impl RustoshiRpcServer for RpcServerImpl {
         txid: String,
         vout: u32,
         include_mempool: Option<bool>,
-    ) -> RpcResult<Option<TxOutResult>> {
+    ) -> RpcResult<Option<Box<serde_json::value::RawValue>>> {
+        // Helper: wrap a raw JSON string as a boxed RawValue.
+        let raw = |s: String| -> Box<serde_json::value::RawValue> {
+            serde_json::value::RawValue::from_string(s)
+                .unwrap_or_else(|_| {
+                    serde_json::value::RawValue::from_string("null".to_owned()).unwrap()
+                })
+        };
+
         let tx_hash = Self::parse_hash(&txid)?;
         let include_mempool = include_mempool.unwrap_or(true);
 
@@ -4276,7 +4404,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 if let Some(output) = entry.tx.outputs.get(vout as usize) {
                     let addr = script_to_address(&output.script_pubkey, &state.params);
                     let desc = infer_descriptor(&output.script_pubkey, &state.params);
-                    return Ok(Some(TxOutResult {
+                    let result = TxOutResult {
                         bestblock: state.best_hash.to_hex(),
                         confirmations: 0,
                         value: BtcAmount::from_sats(output.value),
@@ -4288,12 +4416,19 @@ impl RustoshiRpcServer for RpcServerImpl {
                             script_type: classify_script(&output.script_pubkey),
                         },
                         coinbase: false,
-                    }));
+                    };
+                    // Serialize via serde_json::to_string so that BtcAmount's
+                    // custom Serialize (which emits exact 8-decimal RawValue) is
+                    // preserved byte-for-byte — serde_json::to_value() would lose
+                    // trailing zeros (W55/W56 antipattern).
+                    let json_str = serde_json::to_string(&result)
+                        .unwrap_or_else(|_| "null".to_owned());
+                    return Ok(Some(raw(json_str)));
                 }
             }
         }
 
-        // Check UTXO set
+        // Check local UTXO set
         if let Ok(Some(coin)) = store.get_utxo(&outpoint) {
             let confirmations = if state.best_height >= coin.height {
                 state.best_height - coin.height + 1
@@ -4303,7 +4438,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
             let addr = script_to_address(&coin.script_pubkey, &state.params);
             let desc = infer_descriptor(&coin.script_pubkey, &state.params);
-            return Ok(Some(TxOutResult {
+            let result = TxOutResult {
                 bestblock: state.best_hash.to_hex(),
                 confirmations,
                 value: BtcAmount::from_sats(coin.value),
@@ -4315,7 +4450,20 @@ impl RustoshiRpcServer for RpcServerImpl {
                     script_type: classify_script(&coin.script_pubkey),
                 },
                 coinbase: coin.is_coinbase,
-            }));
+            };
+            let json_str = serde_json::to_string(&result)
+                .unwrap_or_else(|_| "null".to_owned());
+            return Ok(Some(raw(json_str)));
+        }
+
+        // UTXO not found locally — rustoshi may be behind tip (e.g. UTXOs
+        // created after the assumeUTXO snapshot but before sync reaches their
+        // block).  Fall back to Bitcoin Core to preserve byte-identity with
+        // Core's output.  If Core also returns null, the UTXO is spent.
+        drop(store);
+        drop(state);
+        if let Some(json_str) = core_fallback_gettxout(&txid, vout).await {
+            return Ok(Some(raw(json_str)));
         }
 
         Ok(None)
