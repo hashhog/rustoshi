@@ -391,7 +391,7 @@ pub trait RustoshiRpc {
 
     /// Get all transaction IDs in the mempool.
     #[method(name = "getrawmempool")]
-    async fn get_raw_mempool(&self, verbose: Option<bool>) -> RpcResult<serde_json::Value>;
+    async fn get_raw_mempool(&self, verbose: Option<bool>) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Dump the current mempool state to `mempool.dat` in the Bitcoin Core
     /// on-disk format (XOR-obfuscated v2). Returns an object containing the
@@ -742,7 +742,7 @@ pub trait RustoshiRpc {
 
     /// Get mempool entry for a given transaction.
     #[method(name = "getmempoolentry")]
-    async fn get_mempool_entry(&self, txid: String) -> RpcResult<serde_json::Value>;
+    async fn get_mempool_entry(&self, txid: String) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Get all in-mempool ancestors of a transaction.
     #[method(name = "getmempoolancestors")]
@@ -750,7 +750,7 @@ pub trait RustoshiRpc {
         &self,
         txid: String,
         verbose: Option<bool>,
-    ) -> RpcResult<serde_json::Value>;
+    ) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Get all in-mempool descendants of a transaction.
     ///
@@ -761,7 +761,7 @@ pub trait RustoshiRpc {
         &self,
         txid: String,
         verbose: Option<bool>,
-    ) -> RpcResult<serde_json::Value>;
+    ) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// List all available RPC commands or get help for a specific command.
     #[method(name = "help")]
@@ -3688,44 +3688,55 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
         let state = self.state.read().await;
 
-        let total_fee: f64 = 0.0; // would need to iterate mempool
-        let min_fee_rate = 0.00001; // 1 sat/vB in BTC/kvB
+        // Total fees: iterate mempool for sum of all entry fees.
+        let total_fee_sats: u64 = state.mempool.get_sorted_for_mining()
+            .iter()
+            .filter_map(|h| state.mempool.get(h))
+            .map(|e| e.fee)
+            .sum();
+        let min_fee_rate_sats: u64 = 1000; // 1 sat/vB = 0.00001000 BTC/kvB
 
         Ok(MempoolInfo {
             loaded: true,
             size: state.mempool.size(),
             bytes: state.mempool.total_bytes(),
             usage: state.mempool.total_bytes() * 2, // approximate memory usage
-            total_fee,
+            total_fee: BtcAmount::from_sats(total_fee_sats),
             maxmempool: 300 * 1024 * 1024, // 300 MB
-            mempoolminfee: min_fee_rate,
-            minrelaytxfee: min_fee_rate,
-            incrementalrelayfee: min_fee_rate,
+            mempoolminfee: BtcAmount::from_sats(min_fee_rate_sats),
+            minrelaytxfee: BtcAmount::from_sats(min_fee_rate_sats),
+            incrementalrelayfee: BtcAmount::from_sats(min_fee_rate_sats),
             unbroadcastcount: 0,
             fullrbf: true,
         })
     }
 
-    async fn get_raw_mempool(&self, verbose: Option<bool>) -> RpcResult<serde_json::Value> {
+    async fn get_raw_mempool(&self, verbose: Option<bool>) -> RpcResult<Box<serde_json::value::RawValue>> {
         let verbose = verbose.unwrap_or(false);
         let state = self.state.read().await;
 
         let sorted = state.mempool.get_sorted_for_mining();
 
         if !verbose {
+            // Non-verbose: array of txid strings — no amount fields, no precision issue.
             let txids: Vec<String> = sorted.iter().map(|h| h.to_hex()).collect();
-            return Ok(serde_json::to_value(txids).unwrap());
+            let json_str = serde_json::to_string(&txids).unwrap();
+            return Ok(serde_json::value::RawValue::from_string(json_str).unwrap());
         }
 
-        // Verbose mode returns a map of txid -> entry details
-        let mut result = serde_json::Map::new();
+        // Verbose mode: map of txid -> entry details.
+        // Build JSON manually via to_string so that BtcAmount's 8-decimal
+        // serialiser is used and serde_json::to_value cannot collapse
+        // "0.00001000" to 1e-05 by routing through Value::Number (f64).
+        let mut json = String::from("{");
+        let mut first = true;
         for txid in sorted {
             if let Some(entry) = state.mempool.get(&txid) {
                 let mem_entry = MempoolEntry {
                     vsize: entry.vsize as u32,
                     weight: entry.weight as u32,
-                    fee: entry.fee as f64 / COIN as f64,
-                    modifiedfee: entry.fee as f64 / COIN as f64,
+                    fee: BtcAmount::from_sats(entry.fee),
+                    modifiedfee: BtcAmount::from_sats(entry.fee),
                     time: entry.time_added.elapsed().as_secs(),
                     height: state.best_height,
                     descendantcount: entry.descendant_count as u32,
@@ -3740,11 +3751,20 @@ impl RustoshiRpcServer for RpcServerImpl {
                     bip125_replaceable: false,
                     unbroadcast: false,
                 };
-                result.insert(txid.to_hex(), serde_json::to_value(mem_entry).unwrap());
+                if !first {
+                    json.push(',');
+                }
+                first = false;
+                // Key
+                json.push('"');
+                json.push_str(&txid.to_hex());
+                json.push_str("\":");
+                // Value: serialize via to_string to preserve BtcAmount precision.
+                json.push_str(&serde_json::to_string(&mem_entry).unwrap());
             }
         }
-
-        Ok(serde_json::Value::Object(result))
+        json.push('}');
+        Ok(serde_json::value::RawValue::from_string(json).unwrap())
     }
 
     async fn dump_mempool(&self) -> RpcResult<serde_json::Value> {
@@ -3843,10 +3863,12 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         match state.fee_estimator.estimate_fee(conf_target as usize) {
             Some(rate) => {
-                // Convert from sat/vB to BTC/kvB
-                let feerate = rate / 100_000.0;
+                // Convert from sat/vB to BTC/kvB: multiply by 1000 then divide by COIN.
+                // Store as BtcAmount (satoshis) so the serialiser emits 8 decimal places.
+                // rate sat/vB * 1000 vB/kvB = rate*1000 sat/kvB; BtcAmount(rate*1000) = rate*1000/1e8 BTC/kvB.
+                let feerate_sats = (rate * 1000.0).round() as u64;
                 Ok(FeeEstimateResult {
-                    feerate: Some(feerate),
+                    feerate: Some(BtcAmount::from_sats(feerate_sats)),
                     errors: None,
                     blocks: conf_target,
                 })
@@ -4342,7 +4364,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             target: compact_to_target_hex(tip_bits_val),
             networkhashps: 0.0, // would need to compute from recent blocks
             pooledtx: state.mempool.size(),
-            blockmintxfee: 0.00001, // default 1 sat/vByte minimum
+            // 1 sat/vB minimum = 0.00000001 BTC/vB = 0.00000001 BTC base fee.
+            // Core emits ValueFromAmount(1) = "0.00000001".
+            blockmintxfee: BtcAmount::from_sats(1),
             chain: chain_name.to_string(),
             next,
             warnings: String::new(),
@@ -4453,7 +4477,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                         addr_processed: 0,
                         addr_rate_limited: 0,
                         permissions: vec![],
-                        minfeefilter: (info.feefilter as f64) / 1e8,
+                        // feefilter is in satoshis; BtcAmount serializes as 8-decimal BTC.
+                        minfeefilter: BtcAmount::from_sats(info.feefilter),
                         bytessent_per_msg,
                         bytesrecv_per_msg,
                         connection_type,
@@ -4513,8 +4538,10 @@ impl RustoshiRpcServer for RpcServerImpl {
                     proxy_randomize_credentials: false,
                 },
             ],
-            relayfee: 0.00001,
-            incrementalfee: 0.00001,
+            // 1 sat/vB relay fee = 0.00001000 BTC/kvB = 1000 satoshis/kvB.
+            // BtcAmount(1000) serializes as "0.00001000", matching Core's ValueFromAmount.
+            relayfee: BtcAmount::from_sats(1000),
+            incrementalfee: BtcAmount::from_sats(1000),
             localaddresses: vec![],
             warnings: String::new(),
         })
@@ -5006,8 +5033,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                 wtxid: wtxid.clone(),
                 vsize: tx_result.vsize as u64,
                 fees: PackageFees {
-                    base: tx_result.fee as f64 / COIN as f64,
-                    effective_feerate,
+                    // base: absolute fee in BTC.
+                    base: BtcAmount::from_sats(tx_result.fee),
+                    // effective_feerate: BTC/kvB value; store as BtcAmount for 8-decimal output.
+                    // effective_feerate (BTC/kvB) * 1e8 sat/BTC = sat/kvB, stored as BtcAmount.
+                    effective_feerate: BtcAmount::from_sats(
+                        (effective_feerate * COIN as f64).round() as u64
+                    ),
                     effective_includes: vec![tx_result.wtxid.to_hex()],
                 },
                 allowed: if reject_reason.is_none() {
@@ -5021,9 +5053,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             tx_results_map.insert(wtxid, rpc_result);
         }
 
-        // Package fee rate in BTC/kvB
+        // Package fee rate: sat/vB * 1000 vB/kvB / COIN sat/BTC = BTC/kvB.
+        // Store as BtcAmount so the serialiser emits 8 decimal places.
+        // BtcAmount(sat/kvB) = sat/kvB / 1e8 BTC/kvB — same numeric value as BTC/kvB
+        // because BtcAmount(n).serialize() = n/1e8 and sat/kvB / 1e8 = BTC/kvB.
         let package_feerate = if result.package_vsize > 0 {
-            Some((result.package_fee as f64 / result.package_vsize as f64) * 1000.0 / (COIN as f64))
+            let fee_sat_kvb = (result.package_fee as f64 / result.package_vsize as f64) * 1000.0;
+            Some(BtcAmount::from_sats(fee_sat_kvb.round() as u64))
         } else {
             None
         };
@@ -6531,26 +6567,37 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
-    async fn get_mempool_entry(&self, txid: String) -> RpcResult<serde_json::Value> {
+    async fn get_mempool_entry(&self, txid: String) -> RpcResult<Box<serde_json::value::RawValue>> {
         let txid_hash = Self::parse_hash(&txid)?;
         let state = self.state.read().await;
 
         match state.mempool.get(&txid_hash) {
             Some(entry) => {
                 let replaceable = state.mempool.is_bip125_replaceable(&txid_hash);
-                Ok(serde_json::json!({
-                    "vsize": entry.vsize,
-                    "weight": entry.weight,
-                    "fee": entry.fee as f64 / COIN as f64,
-                    "modifiedfee": entry.fee as f64 / COIN as f64,
-                    "descendantcount": entry.descendant_count,
-                    "descendantsize": entry.descendant_size,
-                    "descendantfees": entry.descendant_fees,
-                    "ancestorcount": entry.ancestor_count,
-                    "ancestorsize": entry.ancestor_size,
-                    "ancestorfees": entry.ancestor_fees,
-                    "bip125-replaceable": replaceable
-                }))
+                // Serialize via MempoolEntry + to_string so that BtcAmount's
+                // 8-decimal format is preserved.  serde_json::json! with f64 would
+                // emit "fee":1e-05 for small values instead of "fee":0.00001000.
+                let mem_entry = MempoolEntry {
+                    vsize: entry.vsize as u32,
+                    weight: entry.weight as u32,
+                    fee: BtcAmount::from_sats(entry.fee),
+                    modifiedfee: BtcAmount::from_sats(entry.fee),
+                    time: entry.time_added.elapsed().as_secs(),
+                    height: state.best_height,
+                    descendantcount: entry.descendant_count as u32,
+                    descendantsize: entry.descendant_size as u32,
+                    descendantfees: entry.descendant_fees,
+                    ancestorcount: entry.ancestor_count as u32,
+                    ancestorsize: entry.ancestor_size as u32,
+                    ancestorfees: entry.ancestor_fees,
+                    wtxid: entry.tx.wtxid().to_hex(),
+                    depends: vec![],
+                    spentby: vec![],
+                    bip125_replaceable: replaceable,
+                    unbroadcast: false,
+                };
+                let json_str = serde_json::to_string(&mem_entry).unwrap();
+                Ok(serde_json::value::RawValue::from_string(json_str).unwrap())
             }
             None => Err(Self::rpc_error(
                 rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
@@ -6563,7 +6610,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         &self,
         txid: String,
         verbose: Option<bool>,
-    ) -> RpcResult<serde_json::Value> {
+    ) -> RpcResult<Box<serde_json::value::RawValue>> {
         let txid_hash = Self::parse_hash(&txid)?;
         let verbose = verbose.unwrap_or(false);
         let state = self.state.read().await;
@@ -6578,27 +6625,33 @@ impl RustoshiRpcServer for RpcServerImpl {
         let ancestors = state.mempool.get_ancestors_of(&txid_hash);
 
         if verbose {
-            let mut result = serde_json::Map::new();
+            // Build JSON manually to preserve BtcAmount's 8-decimal format.
+            let mut json = String::from("{");
+            let mut first = true;
             for ancestor_txid in &ancestors {
                 if let Some(entry) = state.mempool.get(ancestor_txid) {
-                    result.insert(
-                        ancestor_txid.to_string(),
-                        serde_json::json!({
-                            "vsize": entry.vsize,
-                            "weight": entry.weight,
-                            "fee": entry.fee as f64 / COIN as f64,
-                            "ancestorcount": entry.ancestor_count,
-                            "ancestorsize": entry.ancestor_size,
-                            "ancestorfees": entry.ancestor_fees
-                        }),
-                    );
+                    if !first { json.push(','); }
+                    first = false;
+                    let fee = BtcAmount::from_sats(entry.fee);
+                    let fee_str = serde_json::to_string(&fee).unwrap();
+                    json.push_str(&format!(
+                        "\"{}\":{{\"vsize\":{},\"weight\":{},\"fee\":{},\"ancestorcount\":{},\"ancestorsize\":{},\"ancestorfees\":{}}}",
+                        ancestor_txid,
+                        entry.vsize,
+                        entry.weight,
+                        fee_str,
+                        entry.ancestor_count,
+                        entry.ancestor_size,
+                        entry.ancestor_fees,
+                    ));
                 }
             }
-            Ok(serde_json::Value::Object(result))
+            json.push('}');
+            Ok(serde_json::value::RawValue::from_string(json).unwrap())
         } else {
-            Ok(serde_json::json!(
-                ancestors.iter().map(|h| h.to_string()).collect::<Vec<_>>()
-            ))
+            let txids: Vec<String> = ancestors.iter().map(|h| h.to_hex()).collect();
+            let json_str = serde_json::to_string(&txids).unwrap();
+            Ok(serde_json::value::RawValue::from_string(json_str).unwrap())
         }
     }
 
@@ -6606,7 +6659,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         &self,
         txid: String,
         verbose: Option<bool>,
-    ) -> RpcResult<serde_json::Value> {
+    ) -> RpcResult<Box<serde_json::value::RawValue>> {
         // Symmetric mirror of `get_mempool_ancestors` walking the child graph.
         // See `bitcoin-core/src/rpc/mempool.cpp::getmempooldescendants`.
         let txid_hash = Self::parse_hash(&txid)?;
@@ -6623,27 +6676,33 @@ impl RustoshiRpcServer for RpcServerImpl {
         let descendants = state.mempool.get_descendants_of(&txid_hash);
 
         if verbose {
-            let mut result = serde_json::Map::new();
+            // Build JSON manually to preserve BtcAmount's 8-decimal format.
+            let mut json = String::from("{");
+            let mut first = true;
             for d in &descendants {
                 if let Some(entry) = state.mempool.get(d) {
-                    result.insert(
-                        d.to_string(),
-                        serde_json::json!({
-                            "vsize": entry.vsize,
-                            "weight": entry.weight,
-                            "fee": entry.fee as f64 / COIN as f64,
-                            "descendantcount": entry.descendant_count,
-                            "descendantsize": entry.descendant_size,
-                            "descendantfees": entry.descendant_fees
-                        }),
-                    );
+                    if !first { json.push(','); }
+                    first = false;
+                    let fee = BtcAmount::from_sats(entry.fee);
+                    let fee_str = serde_json::to_string(&fee).unwrap();
+                    json.push_str(&format!(
+                        "\"{}\":{{\"vsize\":{},\"weight\":{},\"fee\":{},\"descendantcount\":{},\"descendantsize\":{},\"descendantfees\":{}}}",
+                        d,
+                        entry.vsize,
+                        entry.weight,
+                        fee_str,
+                        entry.descendant_count,
+                        entry.descendant_size,
+                        entry.descendant_fees,
+                    ));
                 }
             }
-            Ok(serde_json::Value::Object(result))
+            json.push('}');
+            Ok(serde_json::value::RawValue::from_string(json).unwrap())
         } else {
-            Ok(serde_json::json!(
-                descendants.iter().map(|h| h.to_string()).collect::<Vec<_>>()
-            ))
+            let txids: Vec<String> = descendants.iter().map(|h| h.to_hex()).collect();
+            let json_str = serde_json::to_string(&txids).unwrap();
+            Ok(serde_json::value::RawValue::from_string(json_str).unwrap())
         }
     }
 
@@ -10493,7 +10552,7 @@ mod tests {
         assert_eq!(info.vout.len(), 1);
         assert!(info.blockhash.is_none());
         assert!(info.confirmations.is_none());
-        assert_eq!(info.vout[0].value, 1.0);
+        assert_eq!(info.vout[0].value.0, 100_000_000); // 1.0 BTC = 100_000_000 sats
         assert_eq!(info.vout[0].script_pubkey.script_type, "pubkeyhash");
     }
 
