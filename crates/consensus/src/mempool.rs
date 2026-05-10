@@ -27,7 +27,10 @@
 //! ```
 
 use crate::block_template::is_final_tx;
-use crate::params::{COINBASE_MATURITY, DUST_RELAY_TX_FEE, MAX_STANDARD_TX_WEIGHT};
+use crate::params::{
+    COINBASE_MATURITY, DUST_RELAY_TX_FEE, MAX_STANDARD_SCRIPTSIG_SIZE,
+    MAX_STANDARD_TX_WEIGHT, MIN_STANDARD_TX_NONWITNESS_SIZE,
+};
 use crate::script::is_p2a;
 use crate::validation::{
     calculate_sequence_locks, check_sequence_locks, check_transaction, CoinEntry,
@@ -593,6 +596,9 @@ pub struct MempoolConfig {
     /// None = reject all OP_RETURN outputs (-datacarrier=0 in Core).
     /// Default: Some(100_000) — mirrors `-datacarriersize` default (MAX_OP_RETURN_RELAY).
     pub max_datacarrier_bytes: Option<usize>,
+    /// Whether to relay/accept bare multisig outputs.
+    /// Mirrors Bitcoin Core `-permitbaremultisig` (default: true).
+    pub permit_bare_multisig: bool,
 }
 
 impl Default for MempoolConfig {
@@ -609,6 +615,8 @@ impl Default for MempoolConfig {
             incremental_relay_fee: DEFAULT_INCREMENTAL_RELAY_FEE,
             // MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR = 100_000
             max_datacarrier_bytes: Some(100_000),
+            // Mirrors Bitcoin Core DEFAULT_PERMIT_BAREMULTISIG = true.
+            permit_bare_multisig: true,
         }
     }
 }
@@ -1605,7 +1613,15 @@ impl Mempool {
 
     /// Check transaction standardness rules.
     fn check_standard(&self, tx: &Transaction) -> Result<(), MempoolError> {
+        // Coinbase transactions are never accepted into the mempool.
+        // Mirrors Bitcoin Core MemPoolAccept::PreChecks → tx.IsCoinBase() early reject
+        // (validation.cpp).
+        if tx.is_coinbase() {
+            return Err(MempoolError::NonStandard("coinbase".into()));
+        }
+
         // Version must be 1, 2, or 3 (v3 = TRUC)
+        // Mirrors Bitcoin Core IsStandardTx: TX_MIN_STANDARD_VERSION=1, TX_MAX_STANDARD_VERSION=3
         if tx.version < 1 || tx.version > TRUC_VERSION {
             return Err(MempoolError::NonStandard(format!(
                 "bad version: {}",
@@ -1613,52 +1629,96 @@ impl Mempool {
             )));
         }
 
-        // Weight must not exceed MAX_STANDARD_TX_WEIGHT
+        // Weight must not exceed MAX_STANDARD_TX_WEIGHT (400_000 wu).
+        // Mirrors Bitcoin Core IsStandardTx: GetTransactionWeight(tx) > MAX_STANDARD_TX_WEIGHT
         if tx.weight() as u64 > MAX_STANDARD_TX_WEIGHT {
-            return Err(MempoolError::NonStandard("tx too large".into()));
+            return Err(MempoolError::NonStandard("tx-size".into()));
+        }
+
+        // Non-witness (base) size must be >= 65 bytes (CVE-2017-12842).
+        // A 64-byte transaction can collide with an internal merkle node, enabling
+        // fake SPV proofs. Mirrors Bitcoin Core IsStandardTx:
+        //   MIN_STANDARD_TX_NONWITNESS_SIZE check (policy.h:40).
+        if tx.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
+            return Err(MempoolError::NonStandard("tx-size-small".into()));
+        }
+
+        // Per-input scriptSig checks: size and push-only.
+        // Mirrors Bitcoin Core IsStandardTx input loop:
+        //   txin.scriptSig.size() > MAX_STANDARD_SCRIPTSIG_SIZE → "scriptsig-size"
+        //   !txin.scriptSig.IsPushOnly()                        → "scriptsig-not-pushonly"
+        for (i, input) in tx.inputs.iter().enumerate() {
+            if input.script_sig.len() > MAX_STANDARD_SCRIPTSIG_SIZE {
+                return Err(MempoolError::NonStandard(format!(
+                    "scriptsig-size at input {}",
+                    i
+                )));
+            }
+            if !script_sig_is_push_only(&input.script_sig) {
+                return Err(MempoolError::NonStandard(format!(
+                    "scriptsig-not-pushonly at input {}",
+                    i
+                )));
+            }
         }
 
         // Each output scriptPubKey must be a standard type.
         // For OP_RETURN outputs we also track total bytes against the
         // per-tx datacarrier budget (mirrors IsStandardTx datacarrier_bytes_left).
+        // For bare multisig, enforce the permit_bare_multisig gate.
         let mut datacarrier_bytes_left: usize =
             self.config.max_datacarrier_bytes.unwrap_or(0);
         for (i, output) in tx.outputs.iter().enumerate() {
-            if !is_standard_script(&output.script_pubkey) {
-                return Err(MempoolError::NonStandard(format!(
-                    "non-standard output script at index {}",
-                    i
-                )));
-            }
-
-            // OP_RETURN / NULL_DATA: enforce the per-tx datacarrier byte budget.
-            // Core counts scriptPubKey.size() (total bytes including the 0x6a opcode).
-            // None means -datacarrier=0: all OP_RETURN outputs are non-standard.
-            if !output.script_pubkey.is_empty() && output.script_pubkey[0] == 0x6a {
-                let size = output.script_pubkey.len();
-                match self.config.max_datacarrier_bytes {
-                    None => {
-                        return Err(MempoolError::NonStandard(format!(
-                            "datacarrier output at index {} (datacarrier disabled)",
-                            i
-                        )));
-                    }
-                    Some(_) => {
-                        if size > datacarrier_bytes_left {
+            let script_type = classify_standard_script(&output.script_pubkey);
+            match script_type {
+                StandardScriptType::NonStandard => {
+                    return Err(MempoolError::NonStandard(format!(
+                        "scriptpubkey at index {}",
+                        i
+                    )));
+                }
+                StandardScriptType::NullData => {
+                    // OP_RETURN / NULL_DATA: enforce the per-tx datacarrier byte budget.
+                    // Core counts scriptPubKey.size() (total bytes including the 0x6a opcode).
+                    // None means -datacarrier=0: all OP_RETURN outputs are non-standard.
+                    let size = output.script_pubkey.len();
+                    match self.config.max_datacarrier_bytes {
+                        None => {
                             return Err(MempoolError::NonStandard(format!(
-                                "datacarrier output at index {} exceeds datacarrier byte limit",
+                                "datacarrier at index {} (datacarrier disabled)",
                                 i
                             )));
                         }
-                        datacarrier_bytes_left -= size;
+                        Some(_) => {
+                            if size > datacarrier_bytes_left {
+                                return Err(MempoolError::NonStandard(format!(
+                                    "datacarrier at index {} exceeds budget",
+                                    i
+                                )));
+                            }
+                            datacarrier_bytes_left -= size;
+                        }
+                    }
+                    // OP_RETURN outputs are unspendable — never dust, skip dust check.
+                    continue;
+                }
+                StandardScriptType::BareMultisig => {
+                    // Mirrors Bitcoin Core IsStandardTx:
+                    //   (whichType == MULTISIG) && (!permit_bare_multisig) → "bare-multisig"
+                    if !self.config.permit_bare_multisig {
+                        return Err(MempoolError::NonStandard(format!(
+                            "bare-multisig at index {}",
+                            i
+                        )));
                     }
                 }
+                _ => {}
             }
 
-            // Dust check
+            // Dust check (skip for OP_RETURN — handled above with early continue).
             if is_dust(output, self.config.min_fee_rate) {
                 return Err(MempoolError::NonStandard(format!(
-                    "dust output at index {}",
+                    "dust at index {}",
                     i
                 )));
             }
@@ -3219,23 +3279,47 @@ fn mempool_script_is_push_only_after_op_return(script: &[u8]) -> bool {
     true
 }
 
-/// Check if a scriptPubKey is a standard type.
+/// Output script type classification for standard-tx policy.
 ///
-/// Note: OP_RETURN (NULL_DATA) scripts are only checked for structural validity
-/// here (push-only bytes after 0x6a).  The per-tx datacarrier byte budget is
-/// enforced separately in `Mempool::check_standard`, mirroring Core's
-/// `IsStandardTx` / `max_datacarrier_bytes` logic.
-fn is_standard_script(script: &[u8]) -> bool {
-    // OP_RETURN (data carrier): structural check only.
-    // The post-OP_RETURN bytes must form a valid push-only sequence.
-    // A truncated push or non-push opcode makes the script nonstandard.
-    // Mirrors bitcoin-core/src/script/solver.cpp Solver():
-    //   scriptPubKey.IsPushOnly(scriptPubKey.begin()+1) → TxoutType::NULL_DATA
+/// Mirrors Bitcoin Core's TxoutType as returned by Solver() + IsStandard().
+#[derive(Debug, PartialEq, Eq)]
+enum StandardScriptType {
+    /// P2PKH (pay-to-pubkey-hash): OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    P2PKH,
+    /// P2SH (pay-to-script-hash): OP_HASH160 <20> OP_EQUAL
+    P2SH,
+    /// P2WPKH (segwit v0 keyhash): OP_0 <20>
+    P2WPKH,
+    /// P2WSH (segwit v0 scripthash): OP_0 <32>
+    P2WSH,
+    /// P2TR (taproot): OP_1 <32>
+    P2TR,
+    /// P2A (pay-to-anchor): OP_1 <0x4e73>
+    P2A,
+    /// Bare multisig: OP_m <pubkeys…> OP_n OP_CHECKMULTISIG (n ∈ [1,3], m ∈ [1,n])
+    BareMultisig,
+    /// OP_RETURN (null data carrier): 0x6a …
+    NullData,
+    /// Witness unknown (v2–v16 programs): standard output, non-standard input spend
+    WitnessUnknown,
+    /// Non-standard / unrecognised
+    NonStandard,
+}
+
+/// Classify a scriptPubKey into its standard-policy type.
+///
+/// Mirrors Bitcoin Core Solver() → IsStandard(), used in check_standard to
+/// enforce per-type policy rules (bare-multisig gate, datacarrier budget, dust).
+fn classify_standard_script(script: &[u8]) -> StandardScriptType {
+    // OP_RETURN (NULL_DATA)
     if !script.is_empty() && script[0] == 0x6a {
-        return mempool_script_is_push_only_after_op_return(script);
+        if mempool_script_is_push_only_after_op_return(script) {
+            return StandardScriptType::NullData;
+        }
+        return StandardScriptType::NonStandard;
     }
 
-    // P2PKH: 25 bytes, OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG (25 bytes)
     if script.len() == 25
         && script[0] == 0x76
         && script[1] == 0xa9
@@ -3243,62 +3327,193 @@ fn is_standard_script(script: &[u8]) -> bool {
         && script[23] == 0x88
         && script[24] == 0xac
     {
-        return true;
+        return StandardScriptType::P2PKH;
     }
 
-    // P2SH: 23 bytes, OP_HASH160 <20> OP_EQUAL
+    // P2SH: OP_HASH160 <20> OP_EQUAL (23 bytes)
     if script.len() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87 {
-        return true;
+        return StandardScriptType::P2SH;
     }
 
-    // P2WPKH: 22 bytes, OP_0 <20>
+    // P2WPKH: OP_0 <20> (22 bytes)
     if script.len() == 22 && script[0] == 0x00 && script[1] == 0x14 {
-        return true;
+        return StandardScriptType::P2WPKH;
     }
 
-    // P2WSH: 34 bytes, OP_0 <32>
+    // P2WSH: OP_0 <32> (34 bytes)
     if script.len() == 34 && script[0] == 0x00 && script[1] == 0x20 {
-        return true;
+        return StandardScriptType::P2WSH;
     }
 
-    // P2TR: 34 bytes, OP_1 <32>
-    if script.len() == 34 && script[0] == 0x51 && script[1] == 0x20 {
-        return true;
-    }
-
-    // P2A (Pay-to-Anchor): 4 bytes, OP_1 <0x4e73>
-    // Anyone-can-spend output for CPFP fee bumping
+    // P2A (pay-to-anchor): OP_1 <0x4e73> (4 bytes)
     if is_p2a(script) {
-        return true;
+        return StandardScriptType::P2A;
     }
 
-    // Bare multisig (1-of-3 max for standard)
-    // OP_m <pubkey>... OP_n OP_CHECKMULTISIG
+    // P2TR: OP_1 <32> (34 bytes)
+    if script.len() == 34 && script[0] == 0x51 && script[1] == 0x20 {
+        return StandardScriptType::P2TR;
+    }
+
+    // Bare multisig: OP_m <pubkey>... OP_n OP_CHECKMULTISIG
+    // Standard: n ∈ [1,3], m ∈ [1,n]. Mirrors Bitcoin Core IsStandard() MULTISIG branch.
+    // Layout: [OP_m] [pk1_push len] [pk1 bytes] ... [OP_n] [OP_CHECKMULTISIG]
     if script.len() >= 35 && script.last() == Some(&0xae) {
-        // Check for OP_1 through OP_3 at start
-        let m = script.first();
-        if let Some(&m_op) = m {
-            if (0x51..=0x53).contains(&m_op) {
-                // This is a simplified check; real implementation would validate structure
-                return true;
-            }
+        if let Some(script_type) = try_classify_bare_multisig(script) {
+            return script_type;
         }
     }
 
-    // Witness version 1+ programs (future SegWit versions) - up to 40 bytes
-    // OP_1..OP_16 followed by 2-40 bytes push
+    // Witness unknown: OP_1..OP_16 followed by a 2–40 byte push.
+    // These are standard outputs (mirrors Core Solver() → WITNESS_UNKNOWN → IsStandard=true)
+    // but spending them is non-standard (ValidateInputsStandardness rejects them).
+    // Excludes OP_1 (0x51) because OP_1 <32> is P2TR (handled above) and OP_1 <2> is P2A.
     if script.len() >= 4 && script.len() <= 42 {
         let version = script[0];
-        if (0x51..=0x60).contains(&version) {
-            // OP_1 through OP_16
+        // OP_2 (0x52) through OP_16 (0x60) — v2..=v16 witness programs
+        if (0x52..=0x60).contains(&version) {
             let push_len = script[1] as usize;
             if (2..=40).contains(&push_len) && script.len() == 2 + push_len {
-                return true;
+                return StandardScriptType::WitnessUnknown;
             }
         }
     }
 
-    false
+    StandardScriptType::NonStandard
+}
+
+/// Try to classify a script ending in OP_CHECKMULTISIG as bare multisig.
+///
+/// Mirrors Bitcoin Core Solver() MULTISIG branch + IsStandard() MULTISIG validation:
+///   n ∈ [1,3], m ∈ [1,n], each pubkey push is 33 bytes (compressed) or 65 bytes (uncompressed).
+fn try_classify_bare_multisig(script: &[u8]) -> Option<StandardScriptType> {
+    let n = script.len();
+    // Minimum: OP_1 <33-byte push> OP_1 OP_CHECKMULTISIG = 1+1+33+1+1 = 37 bytes
+    if n < 37 {
+        return None;
+    }
+    // Last byte must be OP_CHECKMULTISIG (0xae)
+    if script[n - 1] != 0xae {
+        return None;
+    }
+    // Second-to-last byte is OP_n
+    let op_n = script[n - 2];
+    if !(0x51..=0x53).contains(&op_n) {
+        // n must be 1..=3
+        return None;
+    }
+    let count_n = (op_n - 0x50) as usize; // 1, 2, or 3
+
+    // First byte is OP_m
+    let op_m = script[0];
+    if !(0x51..=0x60).contains(&op_m) {
+        return None;
+    }
+    let count_m = (op_m - 0x50) as usize;
+    if count_m < 1 || count_m > count_n {
+        return None;
+    }
+
+    // Walk the pubkey pushes between OP_m and OP_n.
+    // Each push must be exactly 33 or 65 bytes (compressed / uncompressed public key).
+    let mut pos = 1usize;
+    let mut found_keys = 0usize;
+    while pos < n - 2 {
+        let push_len_byte = script[pos] as usize;
+        // Only direct 1-byte-length pushes (0x21=33, 0x41=65) are valid pubkey pushes.
+        let pk_len = if push_len_byte == 0x21 {
+            33
+        } else if push_len_byte == 0x41 {
+            65
+        } else {
+            return None;
+        };
+        let end = pos + 1 + pk_len;
+        if end > n - 2 {
+            return None;
+        }
+        pos = end;
+        found_keys += 1;
+    }
+
+    if pos != n - 2 || found_keys != count_n {
+        return None;
+    }
+
+    Some(StandardScriptType::BareMultisig)
+}
+
+/// Check whether a scriptSig is push-only (IsPushOnly in Bitcoin Core).
+///
+/// A scriptSig is push-only if every opcode is a data-push: OP_0, OP_1..OP_16,
+/// OP_1NEGATE, direct byte pushes (0x01..0x4b), PUSHDATA1/2/4.
+/// Mirrors CScript::IsPushOnly() (script/script.cpp).
+fn script_sig_is_push_only(script: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < script.len() {
+        let op = script[i] as usize;
+        if op == 0x00 || (0x51..=0x60).contains(&op) || op == 0x4f {
+            // OP_0, OP_1..OP_16, OP_1NEGATE
+            i += 1;
+        } else if (0x01..=0x4b).contains(&op) {
+            // Direct push of 1..75 bytes
+            if i + 1 + op > script.len() {
+                return false;
+            }
+            i += 1 + op;
+        } else if op == 0x4c {
+            // OP_PUSHDATA1
+            if i + 1 >= script.len() {
+                return false;
+            }
+            let dlen = script[i + 1] as usize;
+            if i + 2 + dlen > script.len() {
+                return false;
+            }
+            i += 2 + dlen;
+        } else if op == 0x4d {
+            // OP_PUSHDATA2
+            if i + 2 >= script.len() {
+                return false;
+            }
+            let dlen = u16::from_le_bytes([script[i + 1], script[i + 2]]) as usize;
+            if i + 3 + dlen > script.len() {
+                return false;
+            }
+            i += 3 + dlen;
+        } else if op == 0x4e {
+            // OP_PUSHDATA4
+            if i + 4 >= script.len() {
+                return false;
+            }
+            let dlen = u32::from_le_bytes([
+                script[i + 1],
+                script[i + 2],
+                script[i + 3],
+                script[i + 4],
+            ]) as usize;
+            if i + 5 + dlen > script.len() {
+                return false;
+            }
+            i += 5 + dlen;
+        } else {
+            // Non-push opcode
+            return false;
+        }
+    }
+    true
+}
+
+/// Check if a scriptPubKey is a standard type.
+///
+/// Note: OP_RETURN (NULL_DATA) scripts are only checked for structural validity
+/// here (push-only bytes after 0x6a).  The per-tx datacarrier byte budget is
+/// enforced separately in `Mempool::check_standard`, mirroring Core's
+/// `IsStandardTx` / `max_datacarrier_bytes` logic.
+/// Boolean wrapper around [`classify_standard_script`] — used in unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_standard_script(script: &[u8]) -> bool {
+    classify_standard_script(script) != StandardScriptType::NonStandard
 }
 
 /// Check if an output is dust.
@@ -6039,5 +6254,338 @@ mod tests {
         let n = mempool.block_disconnected(&block_txs, &|op| utxos.get(op).cloned());
         assert_eq!(n, 0, "tx with missing inputs must NOT be re-admitted");
         assert_eq!(mempool.size(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // W71: comprehensive IsStandardTx audit — missing-gate regression tests
+    // -----------------------------------------------------------------------
+
+    /// Coinbase transactions must never be admitted to the mempool.
+    /// Mirrors Bitcoin Core MemPoolAccept::PreChecks → tx.IsCoinBase() early reject.
+    #[test]
+    fn test_mempool_rejects_coinbase_tx() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let coinbase_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                // Null prevout = coinbase
+                previous_output: OutPoint { txid: Hash256::from_bytes([0u8; 32]), vout: 0xFFFF_FFFF },
+                script_sig: vec![0x03, 0x01, 0x00, 0x00], // BIP-34 height push
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 5_000_000_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        assert!(coinbase_tx.is_coinbase(), "must be recognised as coinbase");
+        let utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+        let result = mempool.add_transaction(coinbase_tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "mempool must reject coinbase tx (got {:?})",
+            result
+        );
+    }
+
+    /// Transactions with base (non-witness) size < 65 bytes must be rejected (CVE-2017-12842).
+    /// A 64-byte tx can collide with a merkle tree internal node, enabling fake SPV proofs.
+    /// Mirrors Bitcoin Core IsStandardTx MIN_STANDARD_TX_NONWITNESS_SIZE check.
+    #[test]
+    fn test_mempool_rejects_tx_below_min_nonwitness_size() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000071")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // Minimal tx: 1-in (empty scriptSig) + 1-out (bare OP_RETURN) = ~61 bytes base.
+        // 4(ver) + 1(in_cnt) + 36(prevout) + 1(scriptSig_len) + 0(scriptSig) + 4(seq)
+        // + 1(out_cnt) + 8(value) + 1(script_len) + 1(OP_RETURN) + 4(locktime) = 61 B < 65 B
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x6a], // bare OP_RETURN, 1 byte
+            }],
+            lock_time: 0,
+        };
+
+        // Verify the test fixture is actually below the gate.
+        assert!(
+            tx.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE,
+            "fixture must be < 65 B (got {} B)",
+            tx.base_size()
+        );
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "mempool must reject tx with base size < 65 B (CVE-2017-12842) (got {:?})",
+            result
+        );
+    }
+
+    /// Transactions with all base-size >= 65 bytes must not be rejected by the size gate.
+    #[test]
+    fn test_mempool_accepts_tx_meeting_min_nonwitness_size() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000072")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // Standard P2PKH tx — base_size = 85 B >= 65 B.
+        let tx = make_tx(vec![(prev_txid, 0)], vec![90_000], 1);
+        assert!(
+            tx.base_size() >= MIN_STANDARD_TX_NONWITNESS_SIZE,
+            "fixture must be >= 65 B (got {} B)",
+            tx.base_size()
+        );
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(result.is_ok(), "standard tx should pass min-size gate (got {:?})", result);
+    }
+
+    /// scriptSig size > MAX_STANDARD_SCRIPTSIG_SIZE (1650) must be rejected.
+    /// Mirrors Bitcoin Core IsStandardTx: scriptsig-size check.
+    #[test]
+    fn test_mempool_rejects_oversized_scriptsig() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000073")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // Build a scriptSig that is push-only but exceeds 1650 bytes.
+        // Use PUSHDATA2 to push 1651 bytes of zeros:
+        // 0x4d <len_lo> <len_hi> <1651 zero bytes> — total scriptSig = 3+1651 = 1654 bytes.
+        let payload_len: u16 = 1651;
+        let mut big_scriptsig = vec![0x4d, (payload_len & 0xff) as u8, (payload_len >> 8) as u8];
+        big_scriptsig.extend(std::iter::repeat(0u8).take(payload_len as usize));
+        assert!(big_scriptsig.len() > MAX_STANDARD_SCRIPTSIG_SIZE);
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: big_scriptsig,
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 90_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "mempool must reject oversized scriptSig (got {:?})",
+            result
+        );
+    }
+
+    /// Non-push-only scriptSig must be rejected.
+    /// Mirrors Bitcoin Core IsStandardTx: scriptsig-not-pushonly check.
+    #[test]
+    fn test_mempool_rejects_non_pushonly_scriptsig() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000074")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // scriptSig with OP_ADD (0x93) — not a push opcode.
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![0x51, 0x93], // OP_1 OP_ADD — not push-only
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 90_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "mempool must reject non-push-only scriptSig (got {:?})",
+            result
+        );
+    }
+
+    /// Bare multisig must be accepted when permit_bare_multisig=true (default).
+    #[test]
+    fn test_mempool_accepts_bare_multisig_when_permitted() {
+        let config = MempoolConfig { permit_bare_multisig: true, ..MempoolConfig::default() };
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000075")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // 1-of-1 bare multisig: OP_1 <33-byte pubkey> OP_1 OP_CHECKMULTISIG
+        let mut bare_ms: Vec<u8> = vec![0x51]; // OP_1
+        bare_ms.push(0x21); // push 33 bytes
+        bare_ms.extend([0x02u8; 33]); // compressed pubkey (dummy)
+        bare_ms.push(0x51); // OP_1
+        bare_ms.push(0xae); // OP_CHECKMULTISIG
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![0x51], // OP_1
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 90_000,
+                script_pubkey: bare_ms,
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            result.is_ok(),
+            "bare multisig should be accepted when permit_bare_multisig=true (got {:?})",
+            result
+        );
+    }
+
+    /// Bare multisig must be rejected when permit_bare_multisig=false.
+    /// Mirrors Bitcoin Core IsStandardTx: bare-multisig check.
+    #[test]
+    fn test_mempool_rejects_bare_multisig_when_not_permitted() {
+        let config = MempoolConfig { permit_bare_multisig: false, ..MempoolConfig::default() };
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000076")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // 1-of-1 bare multisig output.
+        let mut bare_ms: Vec<u8> = vec![0x51]; // OP_1
+        bare_ms.push(0x21);
+        bare_ms.extend([0x02u8; 33]);
+        bare_ms.push(0x51);
+        bare_ms.push(0xae);
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 90_000,
+                script_pubkey: bare_ms,
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "bare multisig must be rejected when permit_bare_multisig=false (got {:?})",
+            result
+        );
+    }
+
+    /// Bare multisig with n > 3 must be nonstandard regardless of permit_bare_multisig.
+    /// Mirrors Bitcoin Core IsStandard() MULTISIG branch: n ∈ [1,3].
+    #[test]
+    fn test_bare_multisig_n_gt_3_is_nonstandard() {
+        // 1-of-4: OP_1 <4 pubkeys> OP_4 OP_CHECKMULTISIG — n=4 is nonstandard.
+        let mut script: Vec<u8> = vec![0x51]; // OP_1 (m=1)
+        for _ in 0..4 {
+            script.push(0x21);
+            script.extend([0x02u8; 33]);
+        }
+        script.push(0x54); // OP_4 (n=4) — outside [1,3]
+        script.push(0xae); // OP_CHECKMULTISIG
+
+        assert!(
+            !is_standard_script(&script),
+            "1-of-4 bare multisig must be nonstandard (n=4 > 3)"
+        );
+    }
+
+    /// Bare multisig with m > n must be nonstandard.
+    /// Mirrors Bitcoin Core IsStandard() MULTISIG branch: m ∈ [1,n].
+    #[test]
+    fn test_bare_multisig_m_gt_n_is_nonstandard() {
+        // 3-of-1: OP_3 <1 pubkey> OP_1 OP_CHECKMULTISIG — m=3 > n=1, nonstandard.
+        let mut script: Vec<u8> = vec![0x53]; // OP_3 (m=3)
+        script.push(0x21);
+        script.extend([0x02u8; 33]);
+        script.push(0x51); // OP_1 (n=1)
+        script.push(0xae);
+
+        assert!(
+            !is_standard_script(&script),
+            "3-of-1 bare multisig must be nonstandard (m > n)"
+        );
+    }
+
+    /// Valid 1-of-1, 1-of-2, 1-of-3, 2-of-3 bare multisig must be standard.
+    #[test]
+    fn test_bare_multisig_valid_variants_are_standard() {
+        for (m, n) in [(1u8, 1u8), (1, 2), (1, 3), (2, 3)] {
+            let mut script: Vec<u8> = vec![0x50 + m]; // OP_m
+            for _ in 0..n {
+                script.push(0x21);
+                script.extend([0x02u8; 33]);
+            }
+            script.push(0x50 + n); // OP_n
+            script.push(0xae); // OP_CHECKMULTISIG
+            assert!(
+                is_standard_script(&script),
+                "{}-of-{} bare multisig must be standard",
+                m,
+                n
+            );
+        }
     }
 }
