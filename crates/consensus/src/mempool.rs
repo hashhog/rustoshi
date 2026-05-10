@@ -1977,25 +1977,37 @@ impl Mempool {
 
     /// Check RBF rules for a replacement transaction.
     ///
-    /// Implements BIP-125 replacement rules (with full RBF support):
-    /// 1. (Skipped with full_rbf=true) Original must signal RBF
-    /// 2. New tx cannot spend outputs of transactions it's replacing
-    /// 3. New tx pays higher absolute fee than sum of all directly conflicting txs
-    /// 4. New tx's fee rate is higher than all directly conflicting txs
-    /// 5. Total evictions (direct conflicts + descendants) <= MAX_REPLACEMENT_CANDIDATES
-    /// 6. New tx pays for its own bandwidth: additional_fee >= incremental_relay_fee * new_vsize
+    /// Implements BIP-125 replacement rules (with full RBF support).
+    /// Mirrors Bitcoin Core policy/rbf.cpp + validation.cpp:PreChecks/ReplacementChecks.
+    ///
+    /// Rule #1 (Core rbf.cpp:24-50 / validation.cpp:839): Original must signal RBF, or full_rbf
+    ///          is enabled.
+    /// Rule #2 (Core validation.cpp:1349-1361, EntriesAndTxidsDisjoint): The replacement's
+    ///          full ancestor set must not intersect the direct conflict set — i.e., the
+    ///          replacement cannot spend outputs created by transactions it is replacing.
+    /// Rule #3 (Core policy/rbf.cpp:109-112, PaysForRBF): replacement_fees >= original_fees
+    ///          (strictly less-than; equal is allowed — the bandwidth check handles the
+    ///          edge case where additional_fee == 0).
+    /// Rule #4 (Core policy/rbf.cpp:114-123, PaysForRBF): additional_fees must cover the
+    ///          replacement's own relay bandwidth: additional_fee >= relay_fee * replacement_vsize.
+    /// Rule #5 (Core policy/rbf.cpp:64-75, GetEntriesForConflicts): total evictions
+    ///          (direct conflicts + all descendants) <= MAX_REPLACEMENT_CANDIDATES.
+    ///
+    /// Note: Core's ImprovesFeerateDiagram (cluster-mempool, Core 27+) is not implemented
+    /// because rustoshi does not yet have a cluster mempool. Deferred.
     fn check_rbf_rules(
         &self,
         _new_tx: &Transaction,
         new_fee: u64,
-        new_fee_rate: f64,
+        _new_fee_rate: f64,
         new_vsize: usize,
         direct_conflicts: &HashSet<Hash256>,
         mempool_parents: &HashSet<Hash256>,
     ) -> Result<(), MempoolError> {
-        // Rule 1: Check if replacement is allowed (signaling or full_rbf)
+        // Rule #1: Check if replacement is allowed (signaling or full_rbf).
+        // Core validation.cpp:839; policy/rbf.cpp:24-50.
         if !self.config.full_rbf {
-            // All directly conflicting transactions must signal RBF or have an ancestor that does
+            // All directly conflicting transactions must signal RBF or have an ancestor that does.
             for conflict_txid in direct_conflicts {
                 if !self.is_bip125_replaceable(conflict_txid) {
                     return Err(MempoolError::RbfNotSignaling);
@@ -2003,32 +2015,31 @@ impl Mempool {
             }
         }
 
-        // Collect all transactions that will be evicted (direct conflicts + descendants)
+        // Collect all transactions that will be evicted (direct conflicts + descendants).
+        // Core policy/rbf.cpp:77-82.
         let mut all_to_evict = HashSet::new();
         let mut conflicting_fees: u64 = 0;
-        let mut highest_conflicting_fee_rate: f64 = 0.0;
 
         for conflict_txid in direct_conflicts {
             all_to_evict.insert(*conflict_txid);
             if let Some(entry) = self.transactions.get(conflict_txid) {
                 conflicting_fees += entry.fee;
-                if entry.fee_rate > highest_conflicting_fee_rate {
-                    highest_conflicting_fee_rate = entry.fee_rate;
-                }
             }
 
-            // Add all descendants
+            // Add all descendants.
             for desc in self.get_all_descendants(conflict_txid) {
                 if all_to_evict.insert(desc) {
                     if let Some(entry) = self.transactions.get(&desc) {
                         conflicting_fees += entry.fee;
-                        // Descendants count toward total fees but not the fee rate check
                     }
                 }
             }
         }
 
-        // Rule 5: Limit total evictions
+        // Rule #5: Limit total evictions to MAX_REPLACEMENT_CANDIDATES.
+        // Core policy/rbf.cpp:69-75 (GetEntriesForConflicts).
+        // NOTE: Core 27+ uses unique cluster count; pre-cluster-mempool Core used eviction count.
+        // Rustoshi uses the eviction-count approach (pre-cluster-mempool compatible).
         if all_to_evict.len() > MAX_REPLACEMENT_CANDIDATES {
             return Err(MempoolError::RbfTooManyReplacements(
                 all_to_evict.len(),
@@ -2036,29 +2047,39 @@ impl Mempool {
             ));
         }
 
-        // Rule 2: New tx cannot spend outputs created by transactions it's replacing
-        // This is checked by verifying that mempool_parents doesn't contain any to-be-evicted txs
-        for parent_txid in mempool_parents {
-            if all_to_evict.contains(parent_txid) {
+        // Rule #2: The replacement's ancestors must not intersect the direct conflict set.
+        // Core validation.cpp:1349-1361, EntriesAndTxidsDisjoint (policy/rbf.cpp:85-98).
+        //
+        // This prevents a replacement from spending outputs that would be destroyed by the
+        // replacement itself (pathological case). Core walks the full ancestor set of the
+        // replacement tx and checks intersection with ws.m_conflicts (direct conflicts only,
+        // NOT the full eviction set).
+        //
+        // We compute the full ancestor set of the replacement: mempool_parents + their ancestors.
+        let replacement_ancestors = self.get_all_ancestors(mempool_parents);
+        for ancestor_txid in &replacement_ancestors {
+            if direct_conflicts.contains(ancestor_txid) {
                 return Err(MempoolError::RbfSpendsConflicting);
             }
         }
 
-        // Rule 3: New tx must pay higher absolute fee
-        if new_fee <= conflicting_fees {
+        // Rule #3: Replacement fees must be >= original fees.
+        // Core policy/rbf.cpp:109-112 (PaysForRBF): `if (replacement_fees < original_fees)`.
+        // Equal fees are allowed here; Rule #4 (bandwidth) then enforces the economic constraint.
+        if new_fee < conflicting_fees {
             return Err(MempoolError::RbfInsufficientAbsoluteFee(new_fee, conflicting_fees));
         }
 
-        // Rule 4: New tx's fee rate must be higher than all directly conflicting txs
-        if new_fee_rate <= highest_conflicting_fee_rate {
-            return Err(MempoolError::RbfInsufficientFeeRate(
-                new_fee_rate,
-                highest_conflicting_fee_rate,
-            ));
-        }
-
-        // Rule 6: New tx must pay for its own bandwidth
-        // additional_fee >= incremental_relay_fee * new_vsize
+        // Rule #4: Replacement must pay for its own bandwidth.
+        // Core policy/rbf.cpp:114-123 (PaysForRBF):
+        //   additional_fees = replacement_fees - original_fees
+        //   additional_fees >= relay_fee.GetFee(replacement_vsize)
+        //
+        // This is the only fee-rate gate in BIP-125. There is NO rule requiring the
+        // replacement's fee rate to exceed the original's fee rate. That spurious check
+        // has been removed.
+        //
+        // Safety: new_fee >= conflicting_fees guaranteed by Rule #3 above, so no underflow.
         let additional_fee = new_fee - conflicting_fees;
         let required_bandwidth_fee = self.config.incremental_relay_fee * new_vsize as u64;
         if additional_fee < required_bandwidth_fee {
@@ -5152,8 +5173,18 @@ mod tests {
     }
 
     #[test]
-    fn test_rbf_insufficient_fee_rate() {
-        let config = MempoolConfig::default();
+    fn test_rbf_equal_fee_rejected_by_bandwidth() {
+        // Core PaysForRBF (policy/rbf.cpp:109-123):
+        //   Rule #3: replacement_fees < original_fees → reject (equal is ALLOWED).
+        //   Rule #4: additional_fees < relay_fee * vsize → reject.
+        //
+        // BIP-125 has NO rule requiring the replacement's fee RATE to exceed the original.
+        // A replacement with the same absolute fee passes Rule #3 but fails Rule #4
+        // (additional_fee = 0 < relay_fee * vsize) via RbfInsufficientBandwidthFee.
+        //
+        // Previously rustoshi had a spurious `new_fee_rate <= highest_conflicting_fee_rate`
+        // gate that is not in Core; it has been removed.
+        let config = MempoolConfig::default(); // incremental_relay_fee = 1 sat/vB
         let mut mempool = Mempool::new(config);
 
         let prev_txid =
@@ -5161,22 +5192,65 @@ mod tests {
                 .unwrap();
         let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
 
-        // First tx: 10k fee, ~86 vB = ~116 sat/vB fee rate
+        // First tx: 10k fee
         let tx1 = make_tx(vec![(prev_txid, 0)], vec![90_000], 1);
-        let tx1_fee = 10_000u64;
         let tx1_vsize = tx1.vsize();
+        let tx1_fee = 10_000u64;
         let tx1_fee_rate = tx1_fee as f64 / tx1_vsize as f64;
         mempool.add_transaction(tx1, &|op| utxos.get(op).cloned()).unwrap();
 
-        // Replacement: use version 2 to get a different txid, pay same fee (10k)
-        // Same fee = same fee rate, should fail fee rate check (not strictly higher)
-        let tx2 = make_tx(vec![(prev_txid, 0)], vec![90_000], 2);
+        // Replacement with same absolute fee (additional_fee = 0 < 1 sat/vB * vsize).
+        // Must fail RbfInsufficientBandwidthFee, NOT a spurious fee-rate check.
+        let tx2 = make_tx(vec![(prev_txid, 0)], vec![90_000], 2); // same fee, different version
         let result = mempool.add_transaction(tx2, &|op| utxos.get(op).cloned());
 
-        // Should reject because fee rate is not HIGHER than original
-        assert!(matches!(result, Err(MempoolError::RbfInsufficientAbsoluteFee(_, _))
-                        | Err(MempoolError::RbfInsufficientFeeRate(_, _))),
-            "Should reject equal fee/fee rate, got: {:?} (tx1_fee_rate={:.2})", result, tx1_fee_rate);
+        assert!(matches!(result, Err(MempoolError::RbfInsufficientBandwidthFee(_, _))),
+            "Equal fee must be rejected by bandwidth gate (Rule #4), not a spurious fee-rate gate. \
+             Got: {:?} (tx1_fee_rate={:.2} sat/vB)", result, tx1_fee_rate);
+    }
+
+    #[test]
+    fn test_rbf_equal_fee_allowed_by_rule3() {
+        // Core policy/rbf.cpp:109: `if (replacement_fees < original_fees)` — strictly less-than.
+        // Equal fees pass Rule #3. With a generous bandwidth margin they will then also
+        // pass Rule #4, so the replacement succeeds.
+        //
+        // Scenario: original fee = 0 (degenerate), replacement fee = vsize sat
+        // so additional_fee (vsize) >= relay_fee (1) * vsize. Both rules pass.
+        let config = MempoolConfig {
+            incremental_relay_fee: 1,
+            min_fee_rate: 0, // allow 0-fee original
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // Original tx: 0 fee (outputs == inputs)
+        let tx1 = make_tx(vec![(prev_txid, 0)], vec![100_000], 1);
+        mempool.add_transaction(tx1.clone(), &|op| utxos.get(op).cloned()).unwrap();
+
+        // Replacement with same fee (0): additional_fee=0 < relay_fee*vsize → bandwidth fail.
+        // This shows equal fees pass Rule #3 but still need to survive Rule #4.
+        let tx2 = make_tx(vec![(prev_txid, 0)], vec![100_000], 2);
+        let result = mempool.add_transaction(tx2, &|op| utxos.get(op).cloned());
+        assert!(matches!(result, Err(MempoolError::RbfInsufficientBandwidthFee(_, _))),
+            "0-fee equal replacement should fail bandwidth, got: {:?}", result);
+
+        // Replacement with fee = vsize (enough to cover bandwidth): must succeed.
+        let tx1_vsize = tx1.vsize();
+        // Outputs = 100_000 - tx1_vsize; fee = tx1_vsize >= relay_fee * vsize.
+        let replacement_output = 100_000u64.saturating_sub(tx1_vsize as u64);
+        let tx3 = make_tx(vec![(prev_txid, 0)], vec![replacement_output], 3);
+        let txid3 = tx3.txid();
+        let result3 = mempool.add_transaction(tx3, &|op| utxos.get(op).cloned());
+        assert!(result3.is_ok(),
+            "Replacement with fee >= relay bandwidth should succeed (Rule #3 equal allowed), got: {:?}",
+            result3);
+        assert!(mempool.contains(&txid3));
     }
 
     #[test]
@@ -5344,6 +5418,196 @@ mod tests {
 
         assert!(matches!(result, Err(MempoolError::RbfSpendsConflicting)),
             "Should reject tx that spends output of tx it's replacing, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_rbf_cannot_spend_conflicting_via_grandparent() {
+        // Core validation.cpp:1349-1361, EntriesAndTxidsDisjoint:
+        // The full ANCESTOR set of the replacement must not overlap the direct-conflict set.
+        // Previously rustoshi only checked immediate parents (mempool_parents); this test
+        // ensures the fix walks the full ancestor graph.
+        //
+        // Graph:  utxo → conflict_tx (grandparent of replacement)
+        //                      └─→ intermediate_tx (parent of replacement)
+        //                                └─→ replacement_tx  (also conflicts with conflict_tx)
+        //
+        // replacement_tx conflicts with conflict_tx (spends same utxo) AND
+        // has conflict_tx as a grandparent (via intermediate_tx).
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxo2_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo_txid, vout: 0 }, 500_000),
+            (OutPoint { txid: utxo2_txid, vout: 0 }, 500_000),
+        ]);
+
+        // conflict_tx: spends utxo, has two outputs (one for intermediate, one unused)
+        let conflict_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: utxo_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 490_000,
+                    script_pubkey: vec![
+                        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                        0xac,
+                    ],
+                },
+            ],
+            lock_time: 0,
+        };
+        let conflict_txid = conflict_tx.txid();
+        mempool.add_transaction(conflict_tx, &|op| utxos.get(op).cloned()).unwrap();
+
+        // intermediate_tx: spends conflict_tx output[0]
+        // (uses mempool UTXO lookup)
+        let intermediate_tx = make_tx(vec![(conflict_txid, 0)], vec![480_000], 1);
+        let intermediate_txid = intermediate_tx.txid();
+        mempool.add_transaction(intermediate_tx, &|op| utxos.get(op).cloned()).unwrap();
+
+        // replacement_tx:
+        //  - Conflicts with conflict_tx (spends utxo_txid:0 → direct conflict)
+        //  - ALSO spends intermediate_tx output[0] (making conflict_tx a grandparent)
+        //  This is the EntriesAndTxidsDisjoint case: ancestor conflict_tx ∈ direct_conflicts.
+        let replacement_tx = Transaction {
+            version: 2,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint { txid: utxo_txid, vout: 0 }, // conflicts with conflict_tx
+                    script_sig: vec![0x51],
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint { txid: intermediate_txid, vout: 0 }, // intermediate is a parent
+                    script_sig: vec![0x51],
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![],
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 960_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                    0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(replacement_tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::RbfSpendsConflicting)),
+            "Replacement that has a direct conflict as an ancestor (via grandparent) must be \
+             rejected by EntriesAndTxidsDisjoint (Rule #2). Got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rbf_rule3_strictly_less_than() {
+        // Core policy/rbf.cpp:109: `if (replacement_fees < original_fees)` — strict less-than.
+        // A replacement with strictly lower absolute fee must be rejected.
+        // A replacement with EQUAL fee must NOT be rejected by Rule #3 (it may still fail
+        // Rule #4 bandwidth, but that is a separate check).
+        let config = MempoolConfig {
+            incremental_relay_fee: 0, // disable bandwidth gate so we can isolate Rule #3
+            min_fee_rate: 0,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
+
+        // Original: 10k fee
+        let tx1 = make_tx(vec![(prev_txid, 0)], vec![90_000], 1);
+        mempool.add_transaction(tx1, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Replacement with SAME absolute fee (10k). Rule #3 must NOT reject this.
+        // (Rule #4 with relay_fee=0 also passes → replacement accepted.)
+        let tx2 = make_tx(vec![(prev_txid, 0)], vec![90_000], 2);
+        let txid2 = tx2.txid();
+        let result = mempool.add_transaction(tx2, &|op| utxos.get(op).cloned());
+        assert!(
+            result.is_ok(),
+            "Replacement with equal fee must pass Rule #3 (< not <=). Got: {:?}",
+            result
+        );
+        assert!(mempool.contains(&txid2));
+
+        // Replacement with LOWER fee must be rejected.
+        let tx3 = make_tx(vec![(prev_txid, 0)], vec![95_000], 3); // 5k fee < 10k
+        let result3 = mempool.add_transaction(tx3, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result3, Err(MempoolError::RbfInsufficientAbsoluteFee(_, _))),
+            "Replacement with lower fee must fail Rule #3, got: {:?}",
+            result3
+        );
+    }
+
+    #[test]
+    fn test_rbf_signaling_boundary_0xfffffffd() {
+        // Core util/rbf.cpp:12: `txin.nSequence <= MAX_BIP125_RBF_SEQUENCE` (unsigned <=).
+        // MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD = SEQUENCE_FINAL - 2.
+        // Verify the boundary values using unsigned u32 comparison.
+        // W70 found a signed-int wrap bug in camlcoin; ensure rustoshi's u32 is correct.
+        let config = MempoolConfig {
+            full_rbf: false, // require signaling so is_bip125_replaceable matters
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 1_000_000)]);
+
+        // 0xFFFFFFFD (= MAX_BIP125_RBF_SEQUENCE): must signal RBF (== threshold, <= passes).
+        let tx_at = make_tx_with_sequence(vec![(utxo_txid, 0, MAX_BIP125_RBF_SEQUENCE)], vec![990_000], 1);
+        let txid_at = tx_at.txid();
+        mempool.add_transaction(tx_at, &|op| utxos.get(op).cloned()).unwrap();
+        assert!(mempool.is_bip125_replaceable(&txid_at),
+            "sequence 0xFFFFFFFD must be RBF-signaling (at threshold)");
+        mempool.clear();
+
+        // 0xFFFFFFFE (SEQUENCE_FINAL - 1): must NOT signal (> threshold, <= false).
+        let tx_above = make_tx_with_sequence(vec![(utxo_txid, 0, 0xFFFFFFFE)], vec![990_000], 1);
+        let txid_above = tx_above.txid();
+        mempool.add_transaction(tx_above, &|op| utxos.get(op).cloned()).unwrap();
+        assert!(!mempool.is_bip125_replaceable(&txid_above),
+            "sequence 0xFFFFFFFE must NOT signal RBF (one above threshold)");
+        mempool.clear();
+
+        // 0xFFFFFFFF (SEQUENCE_FINAL): must NOT signal.
+        let tx_max = make_tx_with_sequence(vec![(utxo_txid, 0, 0xFFFFFFFF)], vec![990_000], 1);
+        let txid_max = tx_max.txid();
+        mempool.add_transaction(tx_max, &|op| utxos.get(op).cloned()).unwrap();
+        assert!(!mempool.is_bip125_replaceable(&txid_max),
+            "sequence 0xFFFFFFFF must NOT signal RBF");
+        mempool.clear();
+
+        // 0x00000000: must signal RBF (minimum sequence value, well below threshold).
+        let tx_min = make_tx_with_sequence(vec![(utxo_txid, 0, 0x00000000)], vec![990_000], 1);
+        let txid_min = tx_min.txid();
+        mempool.add_transaction(tx_min, &|op| utxos.get(op).cloned()).unwrap();
+        assert!(mempool.is_bip125_replaceable(&txid_min),
+            "sequence 0x00000000 must signal RBF");
     }
 
     #[test]
