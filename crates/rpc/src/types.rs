@@ -734,19 +734,30 @@ pub struct LocalAddress {
 pub struct ValidateAddressResult {
     /// Whether the address is valid.
     pub isvalid: bool,
-    /// The address (if valid).
+    /// The address (if valid). Not emitted for invalid addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    /// The scriptPubKey (hex).
-    #[serde(rename = "scriptPubKey")]
+    /// The scriptPubKey (hex). Not emitted for invalid addresses.
+    #[serde(rename = "scriptPubKey", skip_serializing_if = "Option::is_none")]
     pub script_pubkey: Option<String>,
-    /// Whether it's a script address.
+    /// Whether it's a script address. Not emitted for invalid addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub isscript: Option<bool>,
-    /// Whether it's a witness address.
+    /// Whether it's a witness address. Not emitted for invalid addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub iswitness: Option<bool>,
-    /// Witness version (0-16).
+    /// Witness version (0-16). Only emitted for witness addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub witness_version: Option<u8>,
-    /// Witness program (hex).
+    /// Witness program (hex). Only emitted for witness addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub witness_program: Option<String>,
+    /// Error message for invalid addresses (Core 27+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Error locations for invalid addresses (Core 27+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_locations: Option<Vec<serde_json::Value>>,
 }
 
 // ============================================================
@@ -1414,6 +1425,8 @@ mod tests {
             iswitness: Some(true),
             witness_version: Some(0),
             witness_program: Some("751e76e8199196d454941c45d1b3a323f1433bd6".to_string()),
+            error: None,
+            error_locations: None,
         };
 
         let json = serde_json::to_string(&valid).unwrap();
@@ -1431,10 +1444,13 @@ mod tests {
             iswitness: None,
             witness_version: None,
             witness_program: None,
+            error: Some("Invalid or unsupported Segwit (Bech32) or Base58 encoding.".to_string()),
+            error_locations: Some(vec![]),
         };
 
         let json = serde_json::to_string(&invalid).unwrap();
         assert!(json.contains("\"isvalid\":false"));
+        assert!(json.contains("\"error\""));
     }
 
     #[test]
@@ -1785,6 +1801,8 @@ mod tests {
             iswitness: Some(true),
             witness_version: Some(0),
             witness_program: Some("751e76e8199196d454941c45d1b3a323f1433bd6".to_string()),
+            error: None,
+            error_locations: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -1809,6 +1827,8 @@ mod tests {
             witness_program: Some(
                 "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c".to_string(),
             ),
+            error: None,
+            error_locations: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -1828,12 +1848,15 @@ mod tests {
             iswitness: Some(false),
             witness_version: None,
             witness_program: None,
+            error: None,
+            error_locations: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"isvalid\":true"));
         assert!(json.contains("\"iswitness\":false"));
-        assert!(json.contains("\"witness_version\":null"));
+        // witness_version is None so it should NOT appear in output (skip_serializing_if)
+        assert!(!json.contains("\"witness_version\""));
     }
 
     // ============================================================
