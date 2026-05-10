@@ -4320,57 +4320,61 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn validate_address(&self, address: String) -> RpcResult<ValidateAddressResult> {
-        // Basic address validation
-        // In a full implementation, would decode bech32/base58 and validate
+        use rustoshi_crypto::address::Address;
 
-        // Check for bech32 testnet prefix
-        if address.starts_with("tb1") || address.starts_with("bc1") {
-            // Looks like a bech32 address
-            if address.len() >= 42 {
-                let _is_p2wpkh = address.len() == 42 || address.len() == 43;
-                let is_p2wsh = address.len() == 62 || address.len() == 63;
-                let is_p2tr = is_p2wsh; // same length for P2WSH and P2TR
+        // Attempt to parse the address without network constraint (accept any network).
+        match Address::from_string(&address, None) {
+            Ok(addr) => {
+                let script_pubkey = hex::encode(addr.to_script_pubkey());
 
-                return Ok(ValidateAddressResult {
+                let (isscript, iswitness, witness_version, witness_program) = match &addr {
+                    Address::P2PKH { .. } => (false, false, None, None),
+                    Address::P2SH { .. } => (true, false, None, None),
+                    Address::P2WPKH { hash, .. } => {
+                        // witness_program = 20-byte hash; isscript = program.len() > 20
+                        let prog = hex::encode(&hash.0);
+                        (false, true, Some(0u8), Some(prog))
+                    }
+                    Address::P2WSH { hash, .. } => {
+                        // 32-byte program > 20 bytes → isscript = true
+                        let prog = hex::encode(&hash.0);
+                        (true, true, Some(0u8), Some(prog))
+                    }
+                    Address::P2TR { output_key, .. } => {
+                        // 32-byte program > 20 bytes → isscript = true
+                        let prog = hex::encode(output_key);
+                        (true, true, Some(1u8), Some(prog))
+                    }
+                };
+
+                Ok(ValidateAddressResult {
                     isvalid: true,
                     address: Some(address),
+                    script_pubkey: Some(script_pubkey),
+                    isscript: Some(isscript),
+                    iswitness: Some(iswitness),
+                    witness_version,
+                    witness_program,
+                    error: None,
+                    error_locations: None,
+                })
+            }
+            Err(_err) => {
+                Ok(ValidateAddressResult {
+                    isvalid: false,
+                    address: None,
                     script_pubkey: None,
-                    isscript: Some(is_p2wsh),
-                    iswitness: Some(true),
-                    witness_version: Some(if is_p2tr { 1 } else { 0 }),
+                    isscript: None,
+                    iswitness: None,
+                    witness_version: None,
                     witness_program: None,
-                });
+                    error: Some(
+                        "Invalid or unsupported Segwit (Bech32) or Base58 encoding.".to_string(),
+                    ),
+                    error_locations: Some(vec![]),
+                })
             }
         }
-
-        // Check for legacy address (base58)
-        if (address.starts_with('1') || address.starts_with('3') || address.starts_with('m')
-            || address.starts_with('n') || address.starts_with('2'))
-            && address.len() >= 25
-            && address.len() <= 35
-        {
-            let is_p2sh = address.starts_with('3') || address.starts_with('2');
-
-            return Ok(ValidateAddressResult {
-                isvalid: true,
-                address: Some(address),
-                script_pubkey: None,
-                isscript: Some(is_p2sh),
-                iswitness: Some(false),
-                witness_version: None,
-                witness_program: None,
-            });
-        }
-
-        Ok(ValidateAddressResult {
-            isvalid: false,
-            address: None,
-            script_pubkey: None,
-            isscript: None,
-            iswitness: None,
-            witness_version: None,
-            witness_program: None,
-        })
     }
 
     async fn get_tx_out(
