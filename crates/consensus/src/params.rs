@@ -115,10 +115,27 @@ pub const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 /// Mirrors Bitcoin Core MAX_STANDARD_SCRIPTSIG_SIZE = 1650.
 pub const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1650;
 
-/// Maximum number of signature check operations per input (SegWit).
+/// Maximum number of witness stack items for P2WSH inputs (policy).
+/// Mirrors Bitcoin Core MAX_STANDARD_P2WSH_STACK_ITEMS = 100.
 pub const MAX_STANDARD_P2WSH_STACK_ITEMS: usize = 100;
+/// Maximum size of each P2WSH witness stack item (policy).
+/// Mirrors Bitcoin Core MAX_STANDARD_P2WSH_STACK_ITEM_SIZE = 80.
 pub const MAX_STANDARD_P2WSH_STACK_ITEM_SIZE: usize = 80;
+/// Maximum serialized size of the witness script in a P2WSH input (policy).
+/// Mirrors Bitcoin Core MAX_STANDARD_P2WSH_SCRIPT_SIZE = 3600.
 pub const MAX_STANDARD_P2WSH_SCRIPT_SIZE: usize = 3600;
+/// Maximum size of a tapscript witness stack item (policy, BIP-342).
+/// Mirrors Bitcoin Core MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE = 80.
+pub const MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE: usize = 80;
+/// Annex tag byte: a witness item is an annex if its first byte is 0x50.
+/// Mirrors Bitcoin Core ANNEX_TAG = 0x50 (policy.h).
+pub const ANNEX_TAG: u8 = 0x50;
+/// Mask to extract the leaf version from a Taproot control block byte.
+/// Mirrors Bitcoin Core TAPROOT_LEAF_MASK = 0xfe (script/interpreter.h).
+pub const TAPROOT_LEAF_MASK: u8 = 0xfe;
+/// Leaf version for BIP-342 tapscript leaves (control_block[0] & TAPROOT_LEAF_MASK).
+/// Mirrors Bitcoin Core TAPROOT_LEAF_TAPSCRIPT = 0xc0 (script/interpreter.h).
+pub const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
 
 /// Maximum number of tapscript sigops: sigops_budget = 50 + (tx_size)
 pub const TAPROOT_SIGOPS_PER_BYTE: u64 = 50;

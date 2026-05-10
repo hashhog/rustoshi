@@ -28,10 +28,13 @@
 
 use crate::block_template::is_final_tx;
 use crate::params::{
-    COINBASE_MATURITY, DUST_RELAY_TX_FEE, MAX_STANDARD_SCRIPTSIG_SIZE,
-    MAX_STANDARD_TX_WEIGHT, MIN_STANDARD_TX_NONWITNESS_SIZE,
+    ANNEX_TAG, COINBASE_MATURITY, DUST_RELAY_TX_FEE, MAX_STANDARD_P2WSH_SCRIPT_SIZE,
+    MAX_STANDARD_P2WSH_STACK_ITEMS, MAX_STANDARD_P2WSH_STACK_ITEM_SIZE,
+    MAX_STANDARD_SCRIPTSIG_SIZE, MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE,
+    MAX_STANDARD_TX_WEIGHT, MIN_STANDARD_TX_NONWITNESS_SIZE, TAPROOT_LEAF_MASK,
+    TAPROOT_LEAF_TAPSCRIPT,
 };
-use crate::script::is_p2a;
+use crate::script::{is_p2a, is_p2sh, parse_witness_program};
 use crate::validation::{
     calculate_sequence_locks, check_sequence_locks, check_transaction, CoinEntry,
     SequenceLockContext, TxValidationError,
@@ -1041,6 +1044,8 @@ impl Mempool {
         let mut direct_conflicts = HashSet::new();
         // Collect per-input confirmed coin heights for BIP-68 check (below).
         let mut spent_heights: Vec<u32> = Vec::with_capacity(tx.inputs.len());
+        // Collect per-input prevout scriptPubKeys for IsWitnessStandard check (below).
+        let mut prevout_scripts: Vec<Vec<u8>> = Vec::with_capacity(tx.inputs.len());
 
         for input in &tx.inputs {
             // Check for conflicts (double-spends) - collect all of them
@@ -1059,6 +1064,7 @@ impl Mempool {
                         }
                     }
                     spent_heights.push(coin.height);
+                    prevout_scripts.push(coin.script_pubkey);
                     input_sum += coin.value;
                 } else {
                     // The input must be in the UTXO set (not in mempool) for replacement
@@ -1086,6 +1092,7 @@ impl Mempool {
                         input.previous_output.vout,
                     ));
                 }
+                prevout_scripts.push(parent.tx.outputs[vout].script_pubkey.clone());
                 input_sum += parent.tx.outputs[vout].value;
                 mempool_parents.insert(*parent_txid);
                 // Synthetic height for unconfirmed parent (BIP-68 convention).
@@ -1102,12 +1109,23 @@ impl Mempool {
                     }
                 }
                 spent_heights.push(coin.height);
+                prevout_scripts.push(coin.script_pubkey);
                 input_sum += coin.value;
             } else {
                 return Err(MempoolError::MissingInput(
                     input.previous_output.txid,
                     input.previous_output.vout,
                 ));
+            }
+        }
+
+        // IsWitnessStandard: check witness policy for all inputs that have non-empty witnesses.
+        // Mirrors Bitcoin Core MemPoolAccept::PreChecks → IsWitnessStandard (policy/policy.cpp:265).
+        // Must run after the UTXO loop so we have all prevout scriptPubKeys.
+        // Coinbase txs are skipped at the top of check_standard; this guard is belt-and-suspenders.
+        if !tx.is_coinbase() && prevout_scripts.len() == tx.inputs.len() {
+            if let Err(reason) = is_witness_standard(&tx, &prevout_scripts) {
+                return Err(MempoolError::NonStandard(reason));
             }
         }
 
@@ -3502,6 +3520,263 @@ fn script_sig_is_push_only(script: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Policy check mirroring Bitcoin Core `IsWitnessStandard` (policy/policy.cpp:265–351).
+///
+/// Returns `Ok(())` if the witness data is policy-standard, or `Err(reason)` otherwise.
+///
+/// Gates enforced (matching Core exactly):
+/// 1. P2A with non-empty witness → reject "bad-witness-nonstandard"
+/// 2. P2SH-wrapped: parse redeemScript from scriptSig push stack; reject if empty
+/// 3. Non-witness prevScript + non-empty witness → reject "bad-witness-nonstandard"
+/// 4. P2WSH v0 32B: script ≤ 3600; stack items (excl. script) ≤ 100; each item ≤ 80
+/// 5. P2TR v1 32B (not P2SH): annex 0x50 reject; tapscript 0xc0 → each item ≤ 80; empty stack reject
+/// 6. Coinbase inputs are exempt (call site guards with `tx.is_coinbase()`)
+///
+/// `prevout_scripts[i]` is the scriptPubKey of the UTXO spent by `tx.inputs[i]`.
+/// The caller must guarantee `prevout_scripts.len() == tx.inputs.len()`.
+fn is_witness_standard(
+    tx: &Transaction,
+    prevout_scripts: &[Vec<u8>],
+) -> Result<(), String> {
+    debug_assert_eq!(tx.inputs.len(), prevout_scripts.len());
+
+    for (i, input) in tx.inputs.iter().enumerate() {
+        // Skip inputs with empty witness — nothing to check.
+        // Core: "We don't care if witness for this input is empty, since it must not be bloated."
+        if input.witness.is_empty() {
+            continue;
+        }
+
+        let prev_script = &prevout_scripts[i];
+
+        // Gate 1: P2A (pay-to-anchor) + any witness → reject.
+        // Core policy.cpp:283-285: prevScript.IsPayToAnchor() → return false.
+        if is_p2a(prev_script) {
+            return Err(format!(
+                "bad-witness-nonstandard: P2A input {} has witness",
+                i
+            ));
+        }
+
+        // Gate 2: P2SH-wrapped — extract redeemScript from scriptSig push stack.
+        // Core policy.cpp:287-299: EvalScript(scriptSig, SCRIPT_VERIFY_NONE) → top of stack.
+        let effective_script: Vec<u8>;
+        let p2sh: bool;
+        if is_p2sh(prev_script) {
+            // Parse the P2SH redeemScript from the scriptSig.
+            // The scriptSig for P2SH-wrapped segwit is a single push of the redeemScript.
+            // We do a minimal parse: walk push-only opcodes and take the last pushed data.
+            // Core uses EvalScript with SCRIPT_VERIFY_NONE; we replicate the result
+            // (last stack element after executing the scriptSig as push-only).
+            let redeem = parse_p2sh_redeem_script_from_scriptsig(&input.script_sig);
+            match redeem {
+                None => {
+                    // EvalScript failed or stack empty → reject.
+                    return Err(format!(
+                        "bad-witness-nonstandard: P2SH input {} scriptSig eval failed",
+                        i
+                    ));
+                }
+                Some(r) => {
+                    effective_script = r;
+                    p2sh = true;
+                }
+            }
+        } else {
+            effective_script = prev_script.clone();
+            p2sh = false;
+        }
+
+        // Gate 3: non-witness program + non-empty witness → reject.
+        // Core policy.cpp:304-306: !prevScript.IsWitnessProgram() → return false.
+        let witness_prog = parse_witness_program(&effective_script);
+        if witness_prog.is_none() {
+            return Err(format!(
+                "bad-witness-nonstandard: input {} has witness but no witness program",
+                i
+            ));
+        }
+
+        let (version, program) = witness_prog.unwrap();
+
+        // Gate 4: P2WSH v0 32-byte program.
+        // Core policy.cpp:308-318.
+        if version == 0 && program.len() == 32 {
+            // P2WSH: witness stack = [items..., witness_script]
+            // The last item is the witness script.
+            let stack = &input.witness;
+            if stack.is_empty() {
+                // No witness script at all — consensus will reject this, but guard anyway.
+                return Err(format!(
+                    "bad-witness-nonstandard: P2WSH input {} has empty witness stack",
+                    i
+                ));
+            }
+            let witness_script = stack.last().unwrap();
+            if witness_script.len() > MAX_STANDARD_P2WSH_SCRIPT_SIZE {
+                return Err(format!(
+                    "bad-witness-nonstandard: P2WSH input {} witness script size {} > {}",
+                    i,
+                    witness_script.len(),
+                    MAX_STANDARD_P2WSH_SCRIPT_SIZE
+                ));
+            }
+            // Items excluding the trailing witness script.
+            let n_items = stack.len() - 1;
+            if n_items > MAX_STANDARD_P2WSH_STACK_ITEMS {
+                return Err(format!(
+                    "bad-witness-nonstandard: P2WSH input {} has {} stack items > {}",
+                    i,
+                    n_items,
+                    MAX_STANDARD_P2WSH_STACK_ITEMS
+                ));
+            }
+            for (j, item) in stack[..n_items].iter().enumerate() {
+                if item.len() > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE {
+                    return Err(format!(
+                        "bad-witness-nonstandard: P2WSH input {} stack item {} size {} > {}",
+                        i,
+                        j,
+                        item.len(),
+                        MAX_STANDARD_P2WSH_STACK_ITEM_SIZE
+                    ));
+                }
+            }
+        }
+
+        // Gate 5: P2TR v1 32-byte program (only non-P2SH-wrapped).
+        // Core policy.cpp:323-348.
+        if version == 1 && program.len() == 32 && !p2sh {
+            let stack = &input.witness;
+
+            // Check for annex: if ≥2 items and last item starts with 0x50 → reject.
+            // Core: stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG
+            if stack.len() >= 2 {
+                let last = stack.last().unwrap();
+                if !last.is_empty() && last[0] == ANNEX_TAG {
+                    return Err(format!(
+                        "bad-witness-nonstandard: P2TR input {} has annex",
+                        i
+                    ));
+                }
+            }
+
+            if stack.len() >= 2 {
+                // Script-path spend: [script_items..., script, control_block]
+                // After removing the optional annex (already rejected above), last = control_block.
+                let control_block = stack.last().unwrap();
+                if control_block.is_empty() {
+                    return Err(format!(
+                        "bad-witness-nonstandard: P2TR input {} has empty control block",
+                        i
+                    ));
+                }
+                // Check leaf version for tapscript (BIP-342).
+                if (control_block[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSCRIPT {
+                    // script_items = stack[0..len-2] (everything before script and control_block)
+                    let script_items_end = stack.len().saturating_sub(2);
+                    for (j, item) in stack[..script_items_end].iter().enumerate() {
+                        if item.len() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE {
+                            return Err(format!(
+                                "bad-witness-nonstandard: tapscript input {} stack item {} size {} > {}",
+                                i,
+                                j,
+                                item.len(),
+                                MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE
+                            ));
+                        }
+                    }
+                }
+            } else if stack.len() == 1 {
+                // Key-path spend: 1 stack element. No policy limits apply.
+            } else {
+                // 0 stack elements → invalid by consensus, reject here too.
+                return Err(format!(
+                    "bad-witness-nonstandard: P2TR input {} has empty witness stack",
+                    i
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract the redeemScript from a P2SH scriptSig by simulating a push-only evaluation.
+///
+/// P2SH scriptSig is a sequence of push operations; the last pushed value is the redeemScript.
+/// This mirrors Core's `EvalScript(stack, scriptSig, SCRIPT_VERIFY_NONE, ...)` which simply
+/// executes pushes and returns the final stack, from which `stack.back()` is taken.
+///
+/// Returns `None` if the scriptSig is empty or contains any non-push opcode.
+fn parse_p2sh_redeem_script_from_scriptsig(script_sig: &[u8]) -> Option<Vec<u8>> {
+    let mut last: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < script_sig.len() {
+        let op = script_sig[i];
+        i += 1;
+        if op == 0x00 {
+            // OP_0 pushes an empty vector.
+            last = Some(Vec::new());
+        } else if op <= 0x4b {
+            // Direct push: next `op` bytes.
+            let len = op as usize;
+            if i + len > script_sig.len() {
+                return None;
+            }
+            last = Some(script_sig[i..i + len].to_vec());
+            i += len;
+        } else if op == 0x4c {
+            // OP_PUSHDATA1
+            if i >= script_sig.len() {
+                return None;
+            }
+            let len = script_sig[i] as usize;
+            i += 1;
+            if i + len > script_sig.len() {
+                return None;
+            }
+            last = Some(script_sig[i..i + len].to_vec());
+            i += len;
+        } else if op == 0x4d {
+            // OP_PUSHDATA2
+            if i + 2 > script_sig.len() {
+                return None;
+            }
+            let len = u16::from_le_bytes([script_sig[i], script_sig[i + 1]]) as usize;
+            i += 2;
+            if i + len > script_sig.len() {
+                return None;
+            }
+            last = Some(script_sig[i..i + len].to_vec());
+            i += len;
+        } else if op == 0x4e {
+            // OP_PUSHDATA4
+            if i + 4 > script_sig.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([
+                script_sig[i],
+                script_sig[i + 1],
+                script_sig[i + 2],
+                script_sig[i + 3],
+            ]) as usize;
+            i += 4;
+            if i + len > script_sig.len() {
+                return None;
+            }
+            last = Some(script_sig[i..i + len].to_vec());
+            i += len;
+        } else {
+            // Non-push opcode: Core's EvalScript with SCRIPT_VERIFY_NONE would fail
+            // on any actual execution opcode. Treat as failure.
+            return None;
+        }
+    }
+    // Stack must be non-empty (Core: if (stack.empty()) return false).
+    last
 }
 
 /// Check if a scriptPubKey is a standard type.
@@ -6587,5 +6862,444 @@ mod tests {
                 n
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // W72: IsWitnessStandard audit — 6-gate regression tests
+    // Mirrors Bitcoin Core policy/policy.cpp:265-351.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a minimal valid transaction spending a single input with a given witness.
+    fn make_witness_tx(
+        prevout_script: Vec<u8>,
+        witness: Vec<Vec<u8>>,
+        script_sig: Vec<u8>,
+    ) -> (Transaction, Vec<Vec<u8>>) {
+        let prev_txid =
+            Hash256::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig,
+                sequence: 0xFFFF_FFFF,
+                witness,
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                // Standard P2PKH output so check_standard output loop passes.
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00,
+                    0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+        let prevout_scripts = vec![prevout_script];
+        (tx, prevout_scripts)
+    }
+
+    /// Gate 1: P2A + any witness → reject "bad-witness-nonstandard".
+    /// Core policy.cpp:283-285: prevScript.IsPayToAnchor() → return false.
+    #[test]
+    fn test_witness_standard_gate1_p2a_with_witness_rejected() {
+        // P2A scriptPubKey: OP_1 PUSHBYTES_2 0x4e 0x73
+        let p2a_script = vec![0x51, 0x02, 0x4e, 0x73];
+        let witness = vec![vec![0xde, 0xad]]; // non-empty witness
+        let (tx, prevout_scripts) = make_witness_tx(p2a_script, witness, vec![]);
+        let result = is_witness_standard(&tx, &prevout_scripts);
+        assert!(
+            result.is_err(),
+            "P2A with witness must be rejected (gate 1), got {:?}",
+            result
+        );
+        assert!(
+            result.unwrap_err().contains("bad-witness-nonstandard"),
+            "error must say bad-witness-nonstandard"
+        );
+    }
+
+    /// Gate 1 inverse: P2A with empty witness must pass.
+    #[test]
+    fn test_witness_standard_gate1_p2a_no_witness_ok() {
+        let p2a_script = vec![0x51, 0x02, 0x4e, 0x73];
+        let (tx, prevout_scripts) = make_witness_tx(p2a_script, vec![], vec![]);
+        assert!(
+            is_witness_standard(&tx, &prevout_scripts).is_ok(),
+            "P2A with empty witness must pass gate 1"
+        );
+    }
+
+    /// Gate 3: non-witness prevScript + non-empty witness → reject.
+    /// Core policy.cpp:304-306: !prevScript.IsWitnessProgram() → return false.
+    #[test]
+    fn test_witness_standard_gate3_nonwitness_prevscript_with_witness_rejected() {
+        // P2PKH is not a witness program.
+        let p2pkh = vec![
+            0x76, 0xa9, 0x14,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x88, 0xac,
+        ];
+        let witness = vec![vec![0x30u8; 71], vec![0x02u8; 33]]; // looks like a sig+pubkey
+        let (tx, prevout_scripts) = make_witness_tx(p2pkh, witness, vec![]);
+        let result = is_witness_standard(&tx, &prevout_scripts);
+        assert!(
+            result.is_err(),
+            "Non-witness prevScript with witness must be rejected (gate 3), got {:?}",
+            result
+        );
+    }
+
+    /// Gate 3 inverse: P2WPKH prevScript + witness passes gate 3.
+    #[test]
+    fn test_witness_standard_gate3_p2wpkh_with_witness_ok() {
+        // P2WPKH: OP_0 <20-byte hash>
+        let p2wpkh: Vec<u8> = {
+            let mut s = vec![0x00, 0x14];
+            s.extend([0xabu8; 20]);
+            s
+        };
+        let witness = vec![vec![0x30u8; 71], vec![0x02u8; 33]];
+        let (tx, prevout_scripts) = make_witness_tx(p2wpkh, witness, vec![]);
+        assert!(
+            is_witness_standard(&tx, &prevout_scripts).is_ok(),
+            "P2WPKH with witness must pass gate 3"
+        );
+    }
+
+    /// Gate 4: P2WSH witness script size > 3600 → reject.
+    /// Core policy.cpp:310-311.
+    #[test]
+    fn test_witness_standard_gate4_p2wsh_script_too_large() {
+        // P2WSH: OP_0 <32-byte hash>
+        let p2wsh: Vec<u8> = {
+            let mut s = vec![0x00, 0x20];
+            s.extend([0xbbu8; 32]);
+            s
+        };
+        // Witness: [item, oversized_witness_script]
+        let oversized_script = vec![0x51u8; MAX_STANDARD_P2WSH_SCRIPT_SIZE + 1]; // 3601 bytes
+        let witness = vec![vec![0x01], oversized_script];
+        let (tx, prevout_scripts) = make_witness_tx(p2wsh, witness, vec![]);
+        let result = is_witness_standard(&tx, &prevout_scripts);
+        assert!(
+            result.is_err(),
+            "P2WSH with witness script > 3600 must be rejected (gate 4), got {:?}",
+            result
+        );
+    }
+
+    /// Gate 4: P2WSH witness script exactly 3600 bytes → accept.
+    #[test]
+    fn test_witness_standard_gate4_p2wsh_script_at_limit_ok() {
+        let p2wsh: Vec<u8> = {
+            let mut s = vec![0x00, 0x20];
+            s.extend([0xbbu8; 32]);
+            s
+        };
+        let at_limit_script = vec![0x51u8; MAX_STANDARD_P2WSH_SCRIPT_SIZE]; // exactly 3600
+        let witness = vec![vec![0x01], at_limit_script];
+        let (tx, prevout_scripts) = make_witness_tx(p2wsh, witness, vec![]);
+        assert!(
+            is_witness_standard(&tx, &prevout_scripts).is_ok(),
+            "P2WSH with witness script == 3600 must be accepted (gate 4)"
+        );
+    }
+
+    /// Gate 4: P2WSH stack items (excl. script) > 100 → reject.
+    /// Core policy.cpp:312-314.
+    #[test]
+    fn test_witness_standard_gate4_p2wsh_too_many_stack_items() {
+        let p2wsh: Vec<u8> = {
+            let mut s = vec![0x00, 0x20];
+            s.extend([0xbbu8; 32]);
+            s
+        };
+        // 101 stack items + 1 witness script = 102 total; items excl. script = 101 > 100.
+        let mut witness: Vec<Vec<u8>> = (0..=MAX_STANDARD_P2WSH_STACK_ITEMS)
+            .map(|_| vec![0x01u8])
+            .collect();
+        witness.push(vec![0x51u8]); // witness script at end
+        let (tx, prevout_scripts) = make_witness_tx(p2wsh, witness, vec![]);
+        let result = is_witness_standard(&tx, &prevout_scripts);
+        assert!(
+            result.is_err(),
+            "P2WSH with >100 stack items must be rejected (gate 4), got {:?}",
+            result
+        );
+    }
+
+    /// Gate 4: P2WSH individual stack item > 80 bytes → reject.
+    /// Core policy.cpp:315-318.
+    #[test]
+    fn test_witness_standard_gate4_p2wsh_stack_item_too_large() {
+        let p2wsh: Vec<u8> = {
+            let mut s = vec![0x00, 0x20];
+            s.extend([0xbbu8; 32]);
+            s
+        };
+        let oversized_item = vec![0x01u8; MAX_STANDARD_P2WSH_STACK_ITEM_SIZE + 1]; // 81 bytes
+        let witness = vec![oversized_item, vec![0x51u8]]; // [item, witness_script]
+        let (tx, prevout_scripts) = make_witness_tx(p2wsh, witness, vec![]);
+        let result = is_witness_standard(&tx, &prevout_scripts);
+        assert!(
+            result.is_err(),
+            "P2WSH with stack item > 80 bytes must be rejected (gate 4), got {:?}",
+            result
+        );
+    }
+
+    /// Gate 4: P2WSH within all limits → accept.
+    #[test]
+    fn test_witness_standard_gate4_p2wsh_within_limits_ok() {
+        let p2wsh: Vec<u8> = {
+            let mut s = vec![0x00, 0x20];
+            s.extend([0xbbu8; 32]);
+            s
+        };
+        let item = vec![0x01u8; MAX_STANDARD_P2WSH_STACK_ITEM_SIZE]; // exactly 80 bytes
+        let witness = vec![item, vec![0x51u8]]; // [item, witness_script]
+        let (tx, prevout_scripts) = make_witness_tx(p2wsh, witness, vec![]);
+        assert!(
+            is_witness_standard(&tx, &prevout_scripts).is_ok(),
+            "P2WSH within all limits must be accepted (gate 4)"
+        );
+    }
+
+    /// Gate 5: P2TR with annex (last item starts with 0x50, ≥2 items) → reject.
+    /// Core policy.cpp:327-329.
+    #[test]
+    fn test_witness_standard_gate5_p2tr_annex_rejected() {
+        // P2TR: OP_1 <32-byte program>
+        let p2tr: Vec<u8> = {
+            let mut s = vec![0x51, 0x20];
+            s.extend([0xaau8; 32]);
+            s
+        };
+        // Witness with annex: [item, annex] where annex starts with 0x50.
+        let annex = {
+            let mut a = vec![0x50u8]; // ANNEX_TAG
+            a.extend([0x01u8; 10]);
+            a
+        };
+        let witness = vec![vec![0x01u8; 64], annex]; // key-path + annex
+        let (tx, prevout_scripts) = make_witness_tx(p2tr, witness, vec![]);
+        let result = is_witness_standard(&tx, &prevout_scripts);
+        assert!(
+            result.is_err(),
+            "P2TR with annex must be rejected (gate 5), got {:?}",
+            result
+        );
+    }
+
+    /// Gate 5: P2TR tapscript stack item > 80 bytes → reject.
+    /// Core policy.cpp:336-340: leaf version 0xc0 → per-item ≤ 80 bytes.
+    #[test]
+    fn test_witness_standard_gate5_p2tr_tapscript_item_too_large() {
+        let p2tr: Vec<u8> = {
+            let mut s = vec![0x51, 0x20];
+            s.extend([0xaau8; 32]);
+            s
+        };
+        // Script-path spend: [oversized_item, script, control_block]
+        // control_block[0] & 0xfe == 0xc0 → tapscript leaf version.
+        let control_block = vec![0xc0u8, 0x01, 0x02, 0x03]; // leaf version 0xc0
+        let oversized_item = vec![0xffu8; MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE + 1]; // 81 bytes
+        let witness_script = vec![0x51u8]; // dummy script
+        let witness = vec![oversized_item, witness_script, control_block];
+        let (tx, prevout_scripts) = make_witness_tx(p2tr, witness, vec![]);
+        let result = is_witness_standard(&tx, &prevout_scripts);
+        assert!(
+            result.is_err(),
+            "Tapscript stack item > 80 bytes must be rejected (gate 5), got {:?}",
+            result
+        );
+    }
+
+    /// Gate 5: P2TR tapscript with item exactly 80 bytes → accept.
+    #[test]
+    fn test_witness_standard_gate5_p2tr_tapscript_item_at_limit_ok() {
+        let p2tr: Vec<u8> = {
+            let mut s = vec![0x51, 0x20];
+            s.extend([0xaau8; 32]);
+            s
+        };
+        let control_block = vec![0xc0u8, 0x01, 0x02]; // leaf version 0xc0
+        let at_limit_item = vec![0xffu8; MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE]; // exactly 80
+        let witness_script = vec![0x51u8];
+        let witness = vec![at_limit_item, witness_script, control_block];
+        let (tx, prevout_scripts) = make_witness_tx(p2tr, witness, vec![]);
+        assert!(
+            is_witness_standard(&tx, &prevout_scripts).is_ok(),
+            "Tapscript stack item == 80 bytes must be accepted (gate 5)"
+        );
+    }
+
+    /// Gate 5: P2TR key-path spend (1 stack item) → accept (no limits apply).
+    /// Core policy.cpp:342-344: "Key path spend (1 stack element after removing optional annex)".
+    #[test]
+    fn test_witness_standard_gate5_p2tr_key_path_ok() {
+        let p2tr: Vec<u8> = {
+            let mut s = vec![0x51, 0x20];
+            s.extend([0xaau8; 32]);
+            s
+        };
+        // Key-path spend: single Schnorr signature (64 bytes).
+        let witness = vec![vec![0x01u8; 64]];
+        let (tx, prevout_scripts) = make_witness_tx(p2tr, witness, vec![]);
+        assert!(
+            is_witness_standard(&tx, &prevout_scripts).is_ok(),
+            "P2TR key-path spend must be accepted (gate 5)"
+        );
+    }
+
+    /// Gate 5: P2TR with 0 witness items → reject (empty stack is invalid by consensus).
+    /// Core policy.cpp:345-348: stack.size() == 0 → return false.
+    #[test]
+    fn test_witness_standard_gate5_p2tr_empty_witness_rejected() {
+        let p2tr: Vec<u8> = {
+            let mut s = vec![0x51, 0x20];
+            s.extend([0xaau8; 32]);
+            s
+        };
+        // Non-empty witness slice but P2TR input — wait, gate fires on is_empty() first.
+        // We need a tx where input.witness is non-empty (so the outer loop runs)
+        // but the stack has 0 items after we check inside gate 5.
+        // Actually: the outer check is input.witness.is_empty() — if that's true we skip.
+        // For gate 5 empty-stack to fire, we need witness = [[]] (one empty item)? No.
+        // The gate fires when witness.len() == 0 after we enter the branch.
+        // But the outer `if input.witness.is_empty() { continue; }` would skip a truly empty witness.
+        // This means gate 5 empty-stack path requires witness.len() == 0 *inside* the P2TR branch,
+        // which can't happen because we already skipped if witness.is_empty().
+        // Core has the same structure: the outer check is scriptWitness.IsNull(), which is true
+        // when the witness vector is empty. So gate 5 empty-stack is dead code in both Core and
+        // rustoshi — the outer skip fires first. We test that Core-consistent behavior:
+        // a P2TR input with a completely empty witness stack is skipped (not flagged).
+        let (tx, prevout_scripts) = make_witness_tx(p2tr, vec![], vec![]);
+        assert!(
+            is_witness_standard(&tx, &prevout_scripts).is_ok(),
+            "P2TR with no witness items: outer loop skips (empty witness), must pass"
+        );
+    }
+
+    /// End-to-end: mempool must reject a tx with witness bloat on a P2A input.
+    /// This validates the full add_transaction integration path for IsWitnessStandard.
+    #[test]
+    fn test_mempool_rejects_witness_bloat_on_p2a_via_add_transaction() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+
+        // P2A prevout scriptPubKey.
+        let p2a_script = vec![0x51, 0x02, 0x4e, 0x73];
+
+        // Build the UTXO set: P2A output with 10,000 sat.
+        let mut utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+        utxos.insert(
+            OutPoint { txid: prev_txid, vout: 0 },
+            CoinEntry {
+                height: 800_000,
+                is_coinbase: false,
+                value: 10_000,
+                script_pubkey: p2a_script,
+            },
+        );
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                // Non-empty witness on a P2A input = witness stuffing.
+                witness: vec![vec![0xde, 0xad]],
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14,
+                    0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                    0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                    0xab, 0xab, 0xab, 0xab,
+                    0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "mempool must reject P2A witness bloat via IsWitnessStandard (got {:?})",
+            result
+        );
+    }
+
+    /// End-to-end: mempool must reject a tx with oversized P2WSH witness script.
+    #[test]
+    fn test_mempool_rejects_p2wsh_oversized_witness_script_via_add_transaction() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let prev_txid =
+            Hash256::from_hex("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+                .unwrap();
+
+        // P2WSH prevout scriptPubKey: OP_0 <32-byte hash>
+        let p2wsh: Vec<u8> = {
+            let mut s = vec![0x00u8, 0x20];
+            s.extend([0xddu8; 32]);
+            s
+        };
+
+        let mut utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+        utxos.insert(
+            OutPoint { txid: prev_txid, vout: 0 },
+            CoinEntry {
+                height: 800_000,
+                is_coinbase: false,
+                value: 10_000,
+                script_pubkey: p2wsh,
+            },
+        );
+
+        // Witness: [item, oversized_witness_script (3601 bytes)]
+        let oversized_script = vec![0x51u8; MAX_STANDARD_P2WSH_SCRIPT_SIZE + 1];
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![vec![0x01u8], oversized_script],
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14,
+                    0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                    0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                    0xab, 0xab, 0xab, 0xab,
+                    0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::NonStandard(_))),
+            "mempool must reject P2WSH oversized witness script (got {:?})",
+            result
+        );
     }
 }
