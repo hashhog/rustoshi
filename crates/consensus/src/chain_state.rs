@@ -27,8 +27,8 @@
 use crate::params::{ChainParams, MEDIAN_TIME_PAST_WINDOW};
 use crate::validation::{
     check_block, connect_block_with_sequence_locks, contextual_check_block, disconnect_block,
-    BlockIndexEntry, CoinEntry, SequenceLockContext, StubChainContext, UndoData, UtxoView,
-    ValidationError,
+    BlockIndexEntry, CoinEntry, DisconnectResult, SequenceLockContext, StubChainContext,
+    UndoData, UtxoView, ValidationError,
 };
 use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint};
 use std::collections::HashMap;
@@ -557,7 +557,18 @@ impl ChainState {
             new_chain.len()
         );
 
-        // Disconnect old blocks (tip to fork point)
+        // Disconnect old blocks (tip to fork point).
+        //
+        // `disconnect_block` now mirrors Core's full `DisconnectBlock`
+        // semantics: it returns `DisconnectResult` with three variants.
+        // We treat `Failed` as a hard error (abort reorg) and `Unclean`
+        // as a warning (the chainstate was already inconsistent with
+        // this block before disconnect — Core schedules a reindex on
+        // startup if this is observed, mirroring `BLOCK_FAILED_VALID`).
+        //
+        // Reference: bitcoin-core/src/validation.cpp:2945-2955 — the
+        // caller (`Chainstate::DisconnectTip`) similarly aborts on
+        // FAILED and logs on UNCLEAN.
         for hash in &old_chain {
             let block = get_block(hash).ok_or_else(|| {
                 ValidationError::PrevBlockNotFound(format!("missing block for disconnect: {}", hash))
@@ -565,7 +576,26 @@ impl ChainState {
             let undo = get_undo(hash).ok_or_else(|| {
                 ValidationError::PrevBlockNotFound(format!("missing undo data for: {}", hash))
             })?;
-            disconnect_block(&block, &undo, utxo_cache)?;
+            let result = disconnect_block(
+                &block,
+                &undo,
+                utxo_cache,
+                self.tip_height,
+                &self.params,
+            )?;
+            match result {
+                DisconnectResult::Failed => {
+                    return Err(ValidationError::InvalidChain);
+                }
+                DisconnectResult::Unclean => {
+                    tracing::warn!(
+                        "disconnect_block returned UNCLEAN for {} at height {}",
+                        hash,
+                        self.tip_height,
+                    );
+                }
+                DisconnectResult::Ok => {}
+            }
             self.tip_height -= 1;
         }
 
@@ -672,8 +702,24 @@ impl ChainState {
             return Err(ValidationError::InvalidChain);
         }
 
-        // Perform the disconnection
-        disconnect_block(block, undo, utxo_cache)?;
+        // Perform the disconnection.
+        //
+        // Bug 1 (W92): the old signature dropped `height` and `params`, so the
+        // BIP-30 disconnect-side exception for blocks 91722+91812 (mainnet)
+        // could not be honored. Pass them through so Core-compatible
+        // behavior is exercised even via this thin wrapper.
+        let result = disconnect_block(block, undo, utxo_cache, self.tip_height, &self.params)?;
+        match result {
+            DisconnectResult::Failed => return Err(ValidationError::InvalidChain),
+            DisconnectResult::Unclean => {
+                tracing::warn!(
+                    "disconnect_block returned UNCLEAN for {} at height {}",
+                    block_hash,
+                    self.tip_height,
+                );
+            }
+            DisconnectResult::Ok => {}
+        }
 
         // Update chain tip to previous block
         self.tip_hash = block.header.prev_block_hash;
