@@ -3947,15 +3947,91 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Get the current tip's bits and timestamp for difficulty and MTP
         let store = BlockStore::new(&state.db);
-        let tip_header = store.get_header(&state.best_hash).ok().flatten();
-        let bits = tip_header.as_ref().map(|h| h.bits).unwrap_or(0x1d00ffff);
 
-        // Compute median-time-past (simplified: use tip timestamp as approximation)
-        // A full implementation would compute the median of the last 11 block timestamps
-        let median_time_past = tip_header
-            .as_ref()
-            .map(|h| h.timestamp as i64)
-            .unwrap_or(timestamp as i64);
+        // Compute the real median-time-past (MTP) of the prev block using the
+        // same helper as submitblock / mine_single_block.  Bitcoin Core
+        // miner.cpp:148 `m_lock_time_cutoff = pindexPrev->GetMedianTimePast()`.
+        // The old code used tip.timestamp as an approximation — wrong for the
+        // IsFinalTx lock_time_cutoff and for the mintime RPC field.
+        let median_time_past = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+
+        // Compute the next block's nBits via GetNextWorkRequired.  The old
+        // code returned prev_block.bits unchanged, which is wrong at retarget
+        // boundaries.  Bitcoin Core miner.cpp:220.
+        use rustoshi_consensus::pow::get_next_work_required;
+        let bits = {
+            // Build a minimal BlockIndex chain from stored headers so that
+            // get_next_work_required can walk the ancestor chain.
+            use rustoshi_consensus::pow::BlockIndex as PowBlockIndex;
+
+            // Collect headers needed for difficulty calculation (up to
+            // DIFFICULTY_ADJUSTMENT_INTERVAL + a small buffer).
+            use rustoshi_consensus::params::DIFFICULTY_ADJUSTMENT_INTERVAL;
+            let needed = (DIFFICULTY_ADJUSTMENT_INTERVAL + 2) as usize;
+            let mut headers = Vec::with_capacity(needed);
+            let mut cursor = state.best_hash;
+            for _ in 0..needed {
+                match store.get_header(&cursor) {
+                    Ok(Some(hdr)) => {
+                        let prev = hdr.prev_block_hash;
+                        headers.push(hdr);
+                        if prev == Hash256::ZERO {
+                            break;
+                        }
+                        cursor = prev;
+                    }
+                    _ => break,
+                }
+            }
+
+            if headers.is_empty() {
+                0x1d00ffff // genesis fallback
+            } else {
+                // Build a linked BlockIndex chain (last header = chain tip).
+                struct SimpleBlockIndex {
+                    height: u32,
+                    timestamp: u32,
+                    bits: u32,
+                    prev: Option<Box<SimpleBlockIndex>>,
+                }
+                impl PowBlockIndex for SimpleBlockIndex {
+                    fn height(&self) -> u32 { self.height }
+                    fn timestamp(&self) -> u32 { self.timestamp }
+                    fn bits(&self) -> u32 { self.bits }
+                    fn prev(&self) -> Option<&Self> { self.prev.as_deref() }
+                    fn ancestor(&self, target_height: u32) -> Option<&Self> {
+                        if self.height == target_height { return Some(self); }
+                        if let Some(p) = &self.prev {
+                            if target_height <= self.height {
+                                return p.ancestor(target_height);
+                            }
+                        }
+                        None
+                    }
+                }
+
+                // headers[0] = tip, headers[n-1] = oldest.
+                let tip_height = state.best_height;
+                let mut node: Option<Box<SimpleBlockIndex>> = None;
+                for (i, hdr) in headers.iter().enumerate().rev() {
+                    let h = tip_height.saturating_sub(i as u32);
+                    node = Some(Box::new(SimpleBlockIndex {
+                        height: h,
+                        timestamp: hdr.timestamp,
+                        bits: hdr.bits,
+                        prev: node,
+                    }));
+                }
+                match node {
+                    Some(tip_node) => get_next_work_required(
+                        &*tip_node,
+                        timestamp,
+                        &state.params,
+                    ),
+                    None => 0x1d00ffff,
+                }
+            }
+        };
 
         let config = BlockTemplateConfig {
             coinbase_script_pubkey: vec![0x51], // OP_1 (anyone can spend for testing)
@@ -4037,7 +4113,10 @@ impl RustoshiRpcServer for RpcServerImpl {
             coinbasevalue: template.coinbase_tx.outputs.first().map(|o| o.value).unwrap_or(0),
             longpollid: format!("{}:{}", state.best_hash.to_hex(), state.best_height),
             target: hex::encode(template.target),
-            mintime: timestamp.saturating_sub(7200),
+            // mintime = MTP + 1: the earliest valid timestamp for the new block
+            // (BIP-113 requires nTime > MTP of prev block).
+            // Bitcoin Core rpc/mining.cpp returns pindexPrev->GetMedianTimePast()+1.
+            mintime: (median_time_past + 1) as u32,
             mutable: vec!["time".to_string(), "transactions".to_string(), "prevblock".to_string()],
             noncerange: "00000000ffffffff".to_string(),
             sigoplimit: 80000,
