@@ -105,6 +105,11 @@ pub enum ValidationError {
     #[error("bad subsidy: block creates {0} satoshis but max is {1}")]
     BadSubsidy(u64, u64),
 
+    /// Accumulated transaction fees in the block exceeded MAX_MONEY.
+    /// Bitcoin Core: validation.cpp:2543-2547 "bad-txns-accumulated-fee-outofrange"
+    #[error("accumulated fee in block out of range: {0}")]
+    FeesOutOfRange(u64),
+
     #[error("block weight {0} exceeds maximum {MAX_BLOCK_WEIGHT}")]
     WeightExceeded(u64),
 
@@ -251,6 +256,47 @@ impl ValidationError {
             ValidationError::TxValidation(TxValidationError::InsufficientFunds(_, _)) => {
                 "bad-txns-in-belowout"
             }
+            // Empty vin — Bitcoin Core tx_check.cpp:14-15: "bad-txns-vin-empty"
+            ValidationError::TxValidation(TxValidationError::EmptyInputs) => {
+                "bad-txns-vin-empty"
+            }
+            // Empty vout — Bitcoin Core tx_check.cpp:16-17: "bad-txns-vout-empty"
+            ValidationError::TxValidation(TxValidationError::EmptyOutputs) => {
+                "bad-txns-vout-empty"
+            }
+            // Stripped size × WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+            // Bitcoin Core tx_check.cpp:19-21: "bad-txns-oversize"
+            ValidationError::TxValidation(TxValidationError::TooLarge(_)) => {
+                "bad-txns-oversize"
+            }
+            // Total output value > MAX_MONEY (cumulative overflow).
+            // Bitcoin Core tx_check.cpp:32-33: "bad-txns-txouttotal-toolarge"
+            ValidationError::TxValidation(TxValidationError::TotalOutputTooLarge(_)) => {
+                "bad-txns-txouttotal-toolarge"
+            }
+            // Duplicate inputs (CVE-2018-17144 — inflation bug).
+            // Bitcoin Core tx_check.cpp:43-44: "bad-txns-inputs-duplicate"
+            ValidationError::TxValidation(TxValidationError::DuplicateInputs) => {
+                "bad-txns-inputs-duplicate"
+            }
+            // Non-coinbase prevout.IsNull().
+            // Bitcoin Core tx_check.cpp:55-56: "bad-txns-prevout-null"
+            ValidationError::TxValidation(TxValidationError::NullPrevout) => {
+                "bad-txns-prevout-null"
+            }
+            // Missing or already-spent input.
+            // Bitcoin Core tx_verify.cpp:167-170: "bad-txns-inputs-missingorspent"
+            ValidationError::TxValidation(TxValidationError::MissingInput(_, _)) => {
+                "bad-txns-inputs-missingorspent"
+            }
+            // Per-coin or cumulative input value out of MoneyRange.
+            // Bitcoin Core tx_verify.cpp:186-188: "bad-txns-inputvalues-outofrange"
+            ValidationError::TxValidation(TxValidationError::InputValueOverflow) => {
+                "bad-txns-inputvalues-outofrange"
+            }
+            // Accumulated block fees exceeded MAX_MONEY.
+            // Bitcoin Core validation.cpp:2543-2547: "bad-txns-accumulated-fee-outofrange"
+            ValidationError::FeesOutOfRange(_) => "bad-txns-accumulated-fee-outofrange",
             // Catch-all: covers structural/weight/prev-block/chain errors
             _ => "rejected",
         }
@@ -1412,9 +1458,17 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
                 .into());
             }
 
-            // Add to input sum
+            // Check per-coin MoneyRange and accumulated input value MoneyRange.
+            // Bitcoin Core consensus/tx_verify.cpp:185-188:
+            //   nValueIn += coin.out.nValue;
+            //   if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn))
+            //       return state.Invalid(..., "bad-txns-inputvalues-outofrange");
+            if coin.value > MAX_MONEY {
+                return Err(TxValidationError::InputValueOverflow.into());
+            }
             input_sum = input_sum
                 .checked_add(coin.value)
+                .filter(|&s| s <= MAX_MONEY)
                 .ok_or(TxValidationError::InputValueOverflow)?;
 
             spent_heights.push(coin.height);
@@ -1527,7 +1581,15 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
             return Err(TxValidationError::InsufficientFunds(input_sum, output_sum).into());
         }
 
-        total_fees += input_sum - output_sum;
+        // Accumulate fees with MoneyRange enforcement.
+        // Bitcoin Core validation.cpp:2542-2547:
+        //   nFees += txfee;
+        //   if (!MoneyRange(nFees)) return state.Invalid(..., "bad-txns-accumulated-fee-outofrange");
+        let tx_fee = input_sum - output_sum;
+        total_fees = total_fees
+            .checked_add(tx_fee)
+            .filter(|&f| f <= MAX_MONEY)
+            .ok_or(ValidationError::FeesOutOfRange(total_fees.saturating_add(tx_fee)))?;
 
         // Add outputs to UTXO set (for intra-block spending)
         let txid = tx.txid();
@@ -1557,9 +1619,15 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
         return Err(ValidationError::SigopsLimitExceeded(block_sigop_cost));
     }
 
-    // Verify coinbase doesn't exceed allowed value (subsidy + fees)
+    // Verify coinbase doesn't exceed allowed value (subsidy + fees).
+    // Bitcoin Core validation.cpp:2610-2614:
+    //   CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params);
+    //   if (block.vtx[0]->GetValueOut() > blockReward)
+    //       state.Invalid(..., "bad-cb-amount", ...)
+    // Both subsidy and total_fees are MoneyRange-validated at this point, so
+    // their sum fits in u64, but guard with checked_add for correctness.
     let subsidy = block_subsidy(height, params.subsidy_halving_interval);
-    let max_coinbase_value = subsidy + total_fees;
+    let max_coinbase_value = subsidy.saturating_add(total_fees);
     let coinbase_value: u64 = block.transactions[0]
         .outputs
         .iter()
@@ -5542,6 +5610,672 @@ mod tests {
         assert!(
             !matches!(res, Err(ValidationError::UnexpectedWitness)),
             "pre-segwit block must not trigger unexpected-witness: {res:?}"
+        );
+    }
+
+    // ============================================================
+    // W84: CheckTransaction + CVE-2018-17144 + CVE-2010-5139 + amount/subsidy
+    // Reference: bitcoin-core/src/consensus/tx_check.cpp (full file)
+    //            bitcoin-core/src/consensus/tx_verify.cpp:164-214
+    //            bitcoin-core/src/validation.cpp:1839-1850 (GetBlockSubsidy)
+    //            bitcoin-core/src/validation.cpp:2610-2614 (block reward check)
+    //            bitcoin-core/src/consensus/amount.h (MAX_MONEY, MoneyRange)
+    // ============================================================
+
+    // ---- bip22_string mapping tests (check every canonical Core reject string) ----
+
+    #[test]
+    fn bip22_string_vin_empty() {
+        // Core tx_check.cpp:14-15: "bad-txns-vin-empty"
+        let e = ValidationError::TxValidation(TxValidationError::EmptyInputs);
+        assert_eq!(e.bip22_string(), "bad-txns-vin-empty");
+    }
+
+    #[test]
+    fn bip22_string_vout_empty() {
+        // Core tx_check.cpp:16-17: "bad-txns-vout-empty"
+        let e = ValidationError::TxValidation(TxValidationError::EmptyOutputs);
+        assert_eq!(e.bip22_string(), "bad-txns-vout-empty");
+    }
+
+    #[test]
+    fn bip22_string_oversize() {
+        // Core tx_check.cpp:19-21: "bad-txns-oversize"
+        let e = ValidationError::TxValidation(TxValidationError::TooLarge(99_999_999));
+        assert_eq!(e.bip22_string(), "bad-txns-oversize");
+    }
+
+    #[test]
+    fn bip22_string_vout_negative() {
+        // Core tx_check.cpp:27-28: "bad-txns-vout-negative"
+        let e = ValidationError::TxValidation(TxValidationError::NegativeOutput);
+        assert_eq!(e.bip22_string(), "bad-txns-vout-negative");
+    }
+
+    #[test]
+    fn bip22_string_vout_toolarge() {
+        // Core tx_check.cpp:29-30: "bad-txns-vout-toolarge"
+        let e = ValidationError::TxValidation(TxValidationError::OutputTooLarge(MAX_MONEY + 1));
+        assert_eq!(e.bip22_string(), "bad-txns-vout-toolarge");
+    }
+
+    #[test]
+    fn bip22_string_txouttotal_toolarge() {
+        // Core tx_check.cpp:32-33: "bad-txns-txouttotal-toolarge"
+        let e = ValidationError::TxValidation(TxValidationError::TotalOutputTooLarge(MAX_MONEY + 1));
+        assert_eq!(e.bip22_string(), "bad-txns-txouttotal-toolarge");
+    }
+
+    #[test]
+    fn bip22_string_inputs_duplicate() {
+        // Core tx_check.cpp:43-44: "bad-txns-inputs-duplicate" (CVE-2018-17144)
+        let e = ValidationError::TxValidation(TxValidationError::DuplicateInputs);
+        assert_eq!(e.bip22_string(), "bad-txns-inputs-duplicate");
+    }
+
+    #[test]
+    fn bip22_string_cb_length() {
+        // Core tx_check.cpp:49-50: "bad-cb-length"
+        let e = ValidationError::TxValidation(TxValidationError::CoinbaseScriptSize(1));
+        assert_eq!(e.bip22_string(), "bad-cb-length");
+    }
+
+    #[test]
+    fn bip22_string_prevout_null() {
+        // Core tx_check.cpp:55-56: "bad-txns-prevout-null"
+        let e = ValidationError::TxValidation(TxValidationError::NullPrevout);
+        assert_eq!(e.bip22_string(), "bad-txns-prevout-null");
+    }
+
+    #[test]
+    fn bip22_string_inputs_missingorspent() {
+        // Core tx_verify.cpp:167-170: "bad-txns-inputs-missingorspent"
+        let txid = Hash256::from_bytes([0u8; 32]);
+        let e = ValidationError::TxValidation(TxValidationError::MissingInput(txid, 0));
+        assert_eq!(e.bip22_string(), "bad-txns-inputs-missingorspent");
+    }
+
+    #[test]
+    fn bip22_string_inputvalues_outofrange() {
+        // Core tx_verify.cpp:186-188: "bad-txns-inputvalues-outofrange"
+        let e = ValidationError::TxValidation(TxValidationError::InputValueOverflow);
+        assert_eq!(e.bip22_string(), "bad-txns-inputvalues-outofrange");
+    }
+
+    #[test]
+    fn bip22_string_accumulated_fee_outofrange() {
+        // Core validation.cpp:2543-2547: "bad-txns-accumulated-fee-outofrange"
+        let e = ValidationError::FeesOutOfRange(MAX_MONEY + 1);
+        assert_eq!(e.bip22_string(), "bad-txns-accumulated-fee-outofrange");
+    }
+
+    #[test]
+    fn bip22_string_bad_cb_amount() {
+        // Core validation.cpp:2611-2614: "bad-cb-amount"
+        let e = ValidationError::BadSubsidy(5_000_000_001, 5_000_000_000);
+        assert_eq!(e.bip22_string(), "bad-cb-amount");
+    }
+
+    // ---- CVE-2010-5139: negative and overflow output values ----
+
+    #[test]
+    fn check_transaction_rejects_negative_output_value() {
+        // CVE-2010-5139: per-output negative value must be rejected.
+        // Core tx_check.cpp:27-28: "bad-txns-vout-negative"
+        // In wire encoding, a negative int64 has its high bit set; in rustoshi
+        // value is u64 so we cast: if (value as i64) < 0 → reject.
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00, 0x00],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: i64::MIN as u64, // high bit set → negative when cast to i64
+                script_pubkey: vec![],
+            }],
+            lock_time: 0,
+        };
+        assert!(
+            matches!(check_transaction(&tx), Err(TxValidationError::NegativeOutput)),
+            "negative output value must be rejected"
+        );
+    }
+
+    #[test]
+    fn check_transaction_rejects_output_exactly_max_money_plus_one() {
+        // Core tx_check.cpp:29-30: value > MAX_MONEY → "bad-txns-vout-toolarge"
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00, 0x00],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: MAX_MONEY + 1,
+                script_pubkey: vec![],
+            }],
+            lock_time: 0,
+        };
+        assert!(
+            matches!(check_transaction(&tx), Err(TxValidationError::OutputTooLarge(_))),
+            "value = MAX_MONEY+1 must be rejected as OutputTooLarge"
+        );
+    }
+
+    #[test]
+    fn check_transaction_accepts_output_exactly_max_money() {
+        // Core tx_check.cpp:29-30: value == MAX_MONEY is valid (MoneyRange inclusive).
+        // This is a coinbase so no prevout-null check fires.
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00, 0x00], // 2-byte cb script (minimum)
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: MAX_MONEY,
+                script_pubkey: vec![],
+            }],
+            lock_time: 0,
+        };
+        assert!(
+            check_transaction(&tx).is_ok(),
+            "value = MAX_MONEY must be accepted"
+        );
+    }
+
+    #[test]
+    fn check_transaction_rejects_cumulative_output_overflow() {
+        // Core tx_check.cpp:31-33: cumulative nValueOut > MAX_MONEY →
+        // "bad-txns-txouttotal-toolarge".
+        // Two outputs each of MAX_MONEY/2 + 1 overflow the total.
+        let half_plus = MAX_MONEY / 2 + 1;
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00, 0x00],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut { value: half_plus, script_pubkey: vec![] },
+                TxOut { value: half_plus, script_pubkey: vec![] },
+            ],
+            lock_time: 0,
+        };
+        assert!(
+            matches!(
+                check_transaction(&tx),
+                Err(TxValidationError::TotalOutputTooLarge(_))
+            ),
+            "cumulative output overflow must be rejected as TotalOutputTooLarge"
+        );
+    }
+
+    // ---- CVE-2018-17144: duplicate inputs (inflation bug) ----
+
+    #[test]
+    fn check_transaction_cve_2018_17144_duplicate_inputs_same_vout() {
+        // CVE-2018-17144: tx with vin[0] == vin[1] (same txid AND same vout) must
+        // be rejected. Core tx_check.cpp:41-44: "bad-txns-inputs-duplicate"
+        let outpoint = OutPoint {
+            txid: Hash256::from_bytes([0xABu8; 32]),
+            vout: 0,
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    previous_output: outpoint.clone(),
+                    script_sig: vec![],
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: outpoint,
+                    script_sig: vec![],
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![],
+                },
+            ],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        assert!(
+            matches!(check_transaction(&tx), Err(TxValidationError::DuplicateInputs)),
+            "CVE-2018-17144: duplicate inputs must be rejected"
+        );
+    }
+
+    #[test]
+    fn check_transaction_cve_2018_17144_same_txid_different_vout_is_ok() {
+        // Same txid but different vout — these are DISTINCT outpoints (not duplicates).
+        // Core std::set<COutPoint> considers (txid, vout) as the key.
+        let txid = Hash256::from_bytes([0xABu8; 32]);
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint { txid, vout: 0 },
+                    script_sig: vec![],
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint { txid, vout: 1 },
+                    script_sig: vec![],
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![],
+                },
+            ],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        // Must NOT be rejected as DuplicateInputs (different vout = different outpoint).
+        assert!(
+            !matches!(check_transaction(&tx), Err(TxValidationError::DuplicateInputs)),
+            "same txid but different vout must NOT be treated as duplicate"
+        );
+    }
+
+    // ---- Coinbase scriptSig length boundaries ----
+
+    #[test]
+    fn check_transaction_coinbase_script_length_1_rejected() {
+        // Core tx_check.cpp:49: scriptSig.size() < 2 → "bad-cb-length"
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00], // 1 byte — too short
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        assert!(
+            matches!(
+                check_transaction(&tx),
+                Err(TxValidationError::CoinbaseScriptSize(1))
+            ),
+            "coinbase scriptSig of 1 byte must be rejected"
+        );
+    }
+
+    #[test]
+    fn check_transaction_coinbase_script_length_2_accepted() {
+        // Core tx_check.cpp:49: >= 2 passes the lower bound.
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00, 0x00], // 2 bytes — minimum valid
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        assert!(
+            check_transaction(&tx).is_ok(),
+            "coinbase scriptSig of 2 bytes must be accepted"
+        );
+    }
+
+    #[test]
+    fn check_transaction_coinbase_script_length_100_accepted() {
+        // Core tx_check.cpp:49: <= 100 passes the upper bound.
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00; 100], // 100 bytes — maximum valid
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        assert!(
+            check_transaction(&tx).is_ok(),
+            "coinbase scriptSig of 100 bytes must be accepted"
+        );
+    }
+
+    #[test]
+    fn check_transaction_coinbase_script_length_101_rejected() {
+        // Core tx_check.cpp:49: size > 100 → "bad-cb-length"
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x00; 101], // 101 bytes — too long
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+            lock_time: 0,
+        };
+        assert!(
+            matches!(
+                check_transaction(&tx),
+                Err(TxValidationError::CoinbaseScriptSize(101))
+            ),
+            "coinbase scriptSig of 101 bytes must be rejected"
+        );
+    }
+
+    // ---- MoneyRange boundaries ----
+
+    #[test]
+    fn money_range_values() {
+        use crate::params::{COIN, MAX_MONEY};
+        // MAX_MONEY = 21_000_000 * COIN = 2_100_000_000_000_000
+        assert_eq!(MAX_MONEY, 21_000_000 * COIN);
+        assert_eq!(MAX_MONEY, 2_100_000_000_000_000u64);
+
+        // MoneyRange: 0 and MAX_MONEY are valid, MAX_MONEY+1 is not.
+        // In Rust we check (value as i64) >= 0 && value <= MAX_MONEY.
+        let is_money_range = |v: u64| (v as i64) >= 0 && v <= MAX_MONEY;
+        assert!(is_money_range(0));
+        assert!(is_money_range(1));
+        assert!(is_money_range(MAX_MONEY - 1));
+        assert!(is_money_range(MAX_MONEY));
+        assert!(!is_money_range(MAX_MONEY + 1));
+        // Negative i64 representation
+        assert!(!is_money_range(i64::MIN as u64));
+    }
+
+    // ---- GetBlockSubsidy: halving boundaries ----
+
+    #[test]
+    fn block_subsidy_halving_boundaries() {
+        use crate::params::{block_subsidy, COIN, SUBSIDY_HALVING_INTERVAL};
+
+        // h=0 → 50 BTC
+        assert_eq!(block_subsidy(0, SUBSIDY_HALVING_INTERVAL), 50 * COIN);
+        // h=209,999 → still 50 BTC (one before first halving)
+        assert_eq!(block_subsidy(209_999, SUBSIDY_HALVING_INTERVAL), 50 * COIN);
+        // h=210,000 → 25 BTC (first halving)
+        assert_eq!(block_subsidy(210_000, SUBSIDY_HALVING_INTERVAL), 25 * COIN);
+        // h=419,999 → still 25 BTC (one before second halving)
+        assert_eq!(block_subsidy(419_999, SUBSIDY_HALVING_INTERVAL), 25 * COIN);
+        // h=420,000 → 12.5 BTC (second halving)
+        assert_eq!(block_subsidy(420_000, SUBSIDY_HALVING_INTERVAL), 1_250_000_000);
+        // h=6_300_000 → 30th halving = 50 * COIN >> 30 = 46 sat (floor division)
+        let expected_30 = 50 * COIN >> 30;
+        assert_eq!(block_subsidy(6_300_000, SUBSIDY_HALVING_INTERVAL), expected_30);
+        // h=13_440_000 → 64th halving → return 0 (avoid UB on right-shift by ≥64)
+        assert_eq!(block_subsidy(13_440_000, SUBSIDY_HALVING_INTERVAL), 0);
+        // Beyond 64 halvings
+        assert_eq!(block_subsidy(14_000_000, SUBSIDY_HALVING_INTERVAL), 0);
+        assert_eq!(
+            block_subsidy(u32::MAX, SUBSIDY_HALVING_INTERVAL),
+            0,
+            "any height that would require ≥64 halvings must return 0"
+        );
+    }
+
+    // ---- Coinbase maturity: boundary tests at depth 99, 100, 101 ----
+
+    /// Build a minimal regtest-like params with no assumed_valid (so scripts run)
+    /// but with the PoW limit relaxed so any block hash is valid.
+    fn maturity_test_params() -> ChainParams {
+        let mut p = ChainParams::regtest();
+        let mut limit = [0xffu8; 32];
+        limit[0] = 0x7f;
+        p.pow_limit = limit;
+        p.assumed_valid_height = None; // do not skip scripts
+        p
+    }
+
+    /// Build a simple UTXO view with a pre-existing coinbase coin at `coin_height`.
+    fn coinbase_utxo(spend_txid: Hash256, coin_height: u32, value: u64) -> Bip30Utxo {
+        let mut u = Bip30Utxo::new();
+        u.0.insert(
+            OutPoint { txid: spend_txid, vout: 0 },
+            CoinEntry {
+                height: coin_height,
+                is_coinbase: true, // maturity rule applies
+                value,
+                script_pubkey: vec![0x51], // OP_1 (anyone-can-spend)
+            },
+        );
+        u
+    }
+
+    /// Build a block at `block_height` with a coinbase + a spending tx that spends
+    /// the given outpoint using an OP_1 scriptSig (matches OP_1 scriptPubKey).
+    fn make_spend_block(block_height: u32, spend_txid: Hash256, cb_value: u64) -> Block {
+        let coinbase = make_coinbase_tx(block_height, cb_value);
+        let spend_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: spend_txid, vout: 0 },
+                script_sig: vec![0x51], // OP_1
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: cb_value - 1_000, script_pubkey: vec![0x51] }],
+            lock_time: 0,
+        };
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, spend_tx],
+        }
+    }
+
+    #[test]
+    fn coinbase_maturity_depth_99_rejected() {
+        // Spending a coinbase coin at depth 99 (coin at height 1, spend at height 100)
+        // must be rejected: 100 - 1 = 99 < COINBASE_MATURITY (100).
+        // Core consensus/tx_verify.cpp:179-182: "bad-txns-premature-spend-of-coinbase"
+        let coin_txid = Hash256::from_bytes([0xCCu8; 32]);
+        let params = maturity_test_params();
+        let mut utxo = coinbase_utxo(coin_txid, 1, 5_000_000_000);
+        let block = make_spend_block(100, coin_txid, 5_000_000_000);
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(&block, 100, &mut utxo, &params, &null_ctx, 0);
+        assert!(
+            matches!(
+                result,
+                Err(ValidationError::TxValidation(TxValidationError::PrematureCoinbaseSpend(_, _)))
+            ),
+            "depth 99 coinbase spend must be rejected; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn coinbase_maturity_depth_100_accepted() {
+        // Spending at depth 100 (coin at height 1, spend at height 101) is the
+        // first valid spend: 101 - 1 = 100 == COINBASE_MATURITY → allowed.
+        // Core: `nSpendHeight - coin.nHeight < COINBASE_MATURITY` → 100 < 100 is false.
+        let coin_txid = Hash256::from_bytes([0xDDu8; 32]);
+        let params = maturity_test_params();
+        let mut utxo = coinbase_utxo(coin_txid, 1, 5_000_000_000);
+        let block = make_spend_block(101, coin_txid, 5_000_000_000);
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(&block, 101, &mut utxo, &params, &null_ctx, 0);
+        assert!(
+            !matches!(
+                result,
+                Err(ValidationError::TxValidation(TxValidationError::PrematureCoinbaseSpend(_, _)))
+            ),
+            "depth 100 coinbase spend must NOT be rejected for maturity; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn coinbase_maturity_depth_101_accepted() {
+        // Depth 101 is well past maturity — must pass.
+        let coin_txid = Hash256::from_bytes([0xEEu8; 32]);
+        let params = maturity_test_params();
+        let mut utxo = coinbase_utxo(coin_txid, 1, 5_000_000_000);
+        let block = make_spend_block(102, coin_txid, 5_000_000_000);
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(&block, 102, &mut utxo, &params, &null_ctx, 0);
+        assert!(
+            !matches!(
+                result,
+                Err(ValidationError::TxValidation(TxValidationError::PrematureCoinbaseSpend(_, _)))
+            ),
+            "depth 101 coinbase spend must NOT be rejected for maturity; got: {result:?}"
+        );
+    }
+
+    // ---- Block reward: coinbase claims more than subsidy+fees ----
+
+    #[test]
+    fn block_reward_coinbase_claims_too_much() {
+        // Core validation.cpp:2610-2614: coinbase.GetValueOut() > nFees + subsidy
+        // → "bad-cb-amount"
+        // At h=0 on regtest, subsidy = 50 BTC, fees = 0 (no non-coinbase txs).
+        // Coinbase claiming 50 BTC + 1 sat must be rejected.
+        let params = maturity_test_params();
+        let subsidy = 50 * 100_000_000u64; // 50 BTC
+        let coinbase = make_coinbase_tx(0, subsidy + 1); // 1 satoshi too many
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+        let null_ctx = NullSequenceLockContext;
+        let mut utxo = Bip30Utxo::new();
+        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0);
+        assert!(
+            matches!(result, Err(ValidationError::BadSubsidy(_, _))),
+            "coinbase claiming subsidy+1 must be rejected as BadSubsidy; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn block_reward_coinbase_claims_exactly_subsidy_accepted() {
+        // Coinbase claiming exactly the subsidy (no fees) must be accepted.
+        let params = maturity_test_params();
+        let subsidy = 50 * 100_000_000u64;
+        let coinbase = make_coinbase_tx(0, subsidy);
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+        let null_ctx = NullSequenceLockContext;
+        let mut utxo = Bip30Utxo::new();
+        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0);
+        assert!(
+            !matches!(result, Err(ValidationError::BadSubsidy(_, _))),
+            "coinbase claiming exactly subsidy must NOT fail BadSubsidy; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn block_reward_coinbase_can_claim_less_than_subsidy() {
+        // Core: coinbase.GetValueOut() <= blockReward (NOT ==; miner can burn fees).
+        let params = maturity_test_params();
+        let subsidy = 50 * 100_000_000u64;
+        let coinbase = make_coinbase_tx(0, subsidy - 1_000); // 1000 sat below subsidy
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+        let null_ctx = NullSequenceLockContext;
+        let mut utxo = Bip30Utxo::new();
+        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0);
+        assert!(
+            !matches!(result, Err(ValidationError::BadSubsidy(_, _))),
+            "coinbase claiming less than subsidy must be valid; got: {result:?}"
+        );
+    }
+
+    // ---- Per-coin and cumulative input MoneyRange (CVE-2010-5139 class) ----
+
+    #[test]
+    fn input_value_overflow_per_coin_above_max_money() {
+        // Core tx_verify.cpp:186-188: if !MoneyRange(coin.out.nValue)
+        // → "bad-txns-inputvalues-outofrange"
+        // Inject a UTXO with value = MAX_MONEY + 1 (invalid coin).
+        let coin_txid = Hash256::from_bytes([0x01u8; 32]);
+        let params = maturity_test_params();
+
+        // Manually build a UTXO with a value > MAX_MONEY
+        let mut u = Bip30Utxo::new();
+        u.0.insert(
+            OutPoint { txid: coin_txid, vout: 0 },
+            CoinEntry {
+                height: 1,
+                is_coinbase: false,
+                value: MAX_MONEY + 1, // beyond MoneyRange
+                script_pubkey: vec![0x51],
+            },
+        );
+
+        let coinbase = make_coinbase_tx(200, 5_000_000_000);
+        let spend_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: coin_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1_000, script_pubkey: vec![0x51] }],
+            lock_time: 0,
+        };
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, spend_tx],
+        };
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(&block, 200, &mut u, &params, &null_ctx, 0);
+        assert!(
+            matches!(
+                result,
+                Err(ValidationError::TxValidation(TxValidationError::InputValueOverflow))
+            ),
+            "per-coin value > MAX_MONEY must be rejected; got: {result:?}"
         );
     }
 }
