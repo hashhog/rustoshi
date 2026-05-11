@@ -188,8 +188,54 @@ pub const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 /// Sequence locktime mask (BIP 68).
 pub const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
 
-/// Minimum transaction weight (60 weight units).
-pub const MIN_TRANSACTION_WEIGHT: u64 = 60;
+/// Minimum transaction weight (weight units).
+///
+/// BIP-141 / Core consensus.h:23: `WITNESS_SCALE_FACTOR * 60`.
+/// 60 bytes is the lower bound for a valid serialized CTransaction; multiplied
+/// by 4 gives 240 weight units.  Rustoshi previously stored the un-scaled 60,
+/// which is the raw byte-count, not the weight.
+///
+/// Mirrors: `static const size_t MIN_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 60;`
+pub const MIN_TRANSACTION_WEIGHT: u64 = WITNESS_SCALE_FACTOR * 60; // = 240
+
+/// Minimum serializable transaction weight (weight units).
+///
+/// BIP-141 / Core consensus.h:24: `WITNESS_SCALE_FACTOR * 10`.
+/// Used as the divisor when bounding tx-count in compact blocks.
+///
+/// Mirrors: `static const size_t MIN_SERIALIZABLE_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 10;`
+pub const MIN_SERIALIZABLE_TRANSACTION_WEIGHT: u64 = WITNESS_SCALE_FACTOR * 10; // = 40
+
+/// Default bytes per sigop for the sigop-adjusted vsize calculation.
+///
+/// Core policy.h:50: `static constexpr unsigned int DEFAULT_BYTES_PER_SIGOP{20};`
+/// Used in `GetSigOpsAdjustedWeight` and `GetVirtualTransactionSize`.
+/// When a transaction has high sigop cost, the effective vsize is:
+///   `ceil(max(weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP) / 4)`
+pub const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
+
+/// Compute the sigop-adjusted weight for a transaction.
+///
+/// Core policy.cpp:390-393 (`GetSigOpsAdjustedWeight`):
+///   `return std::max(weight, sigop_cost * bytes_per_sigop);`
+///
+/// When a transaction has many sigops its effective weight is inflated so that
+/// the miner fee-rate calculation penalises sigop-heavy transactions.
+pub fn get_sigops_adjusted_weight(weight: u64, sigop_cost: u64, bytes_per_sigop: u64) -> u64 {
+    weight.max(sigop_cost * bytes_per_sigop)
+}
+
+/// Compute the virtual transaction size (vsize) in virtual bytes.
+///
+/// Core policy.cpp:395-398 (`GetVirtualTransactionSize`):
+///   `return (GetSigOpsAdjustedWeight(nWeight, nSigOpCost, bytes_per_sigop) + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;`
+///
+/// Uses integer ceiling division: `(x + 3) / 4`.  A `weight` of 11 → vsize 3,
+/// not 2 (floor would give the wrong answer).
+pub fn get_virtual_transaction_size(weight: u64, sigop_cost: u64, bytes_per_sigop: u64) -> u64 {
+    let adj = get_sigops_adjusted_weight(weight, sigop_cost, bytes_per_sigop);
+    adj.div_ceil(WITNESS_SCALE_FACTOR)
+}
 
 /// Calculate the block subsidy for a given height.
 ///
@@ -2028,5 +2074,89 @@ mod tests {
                 entry.height
             );
         }
+    }
+
+    // ── W76 BIP-141 weight / vsize constant and function tests ─────────────
+
+    /// MIN_TRANSACTION_WEIGHT must equal WITNESS_SCALE_FACTOR × 60 = 240.
+    /// Core consensus.h:23: `WITNESS_SCALE_FACTOR * 60`.
+    #[test]
+    fn test_min_transaction_weight_is_240() {
+        assert_eq!(MIN_TRANSACTION_WEIGHT, 240);
+        assert_eq!(MIN_TRANSACTION_WEIGHT, WITNESS_SCALE_FACTOR * 60);
+    }
+
+    /// MIN_SERIALIZABLE_TRANSACTION_WEIGHT must equal WITNESS_SCALE_FACTOR × 10 = 40.
+    /// Core consensus.h:24: `WITNESS_SCALE_FACTOR * 10`.
+    #[test]
+    fn test_min_serializable_transaction_weight_is_40() {
+        assert_eq!(MIN_SERIALIZABLE_TRANSACTION_WEIGHT, 40);
+        assert_eq!(MIN_SERIALIZABLE_TRANSACTION_WEIGHT, WITNESS_SCALE_FACTOR * 10);
+    }
+
+    /// DEFAULT_BYTES_PER_SIGOP must equal 20.
+    /// Core policy.h:50: `static constexpr unsigned int DEFAULT_BYTES_PER_SIGOP{20};`
+    #[test]
+    fn test_default_bytes_per_sigop_is_20() {
+        assert_eq!(DEFAULT_BYTES_PER_SIGOP, 20);
+    }
+
+    /// get_sigops_adjusted_weight — no-sigop path returns the raw weight.
+    /// Core policy.cpp:390-393: `std::max(weight, sigop_cost * bytes_per_sigop)`.
+    #[test]
+    fn test_get_sigops_adjusted_weight_no_sigops() {
+        let weight = 1000_u64;
+        let adj = get_sigops_adjusted_weight(weight, 0, DEFAULT_BYTES_PER_SIGOP);
+        assert_eq!(adj, weight);
+    }
+
+    /// get_sigops_adjusted_weight — high sigops path inflates weight.
+    #[test]
+    fn test_get_sigops_adjusted_weight_high_sigops() {
+        let weight = 1000_u64;
+        let sigop_cost = 100_u64; // 100 * 20 = 2000 > 1000
+        let adj = get_sigops_adjusted_weight(weight, sigop_cost, DEFAULT_BYTES_PER_SIGOP);
+        assert_eq!(adj, 2000);
+    }
+
+    /// get_virtual_transaction_size — ceil rounding: weight 11 → vsize 3, not 2.
+    /// Core: `(x + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR`.
+    #[test]
+    fn test_get_virtual_transaction_size_ceil_rounding() {
+        // weight 11: ceil(11/4) = 3 (floor would give 2)
+        let vsize = get_virtual_transaction_size(11, 0, DEFAULT_BYTES_PER_SIGOP);
+        assert_eq!(vsize, 3);
+
+        // weight 12: ceil(12/4) = 3 exactly
+        let vsize = get_virtual_transaction_size(12, 0, DEFAULT_BYTES_PER_SIGOP);
+        assert_eq!(vsize, 3);
+
+        // weight 13: ceil(13/4) = 4
+        let vsize = get_virtual_transaction_size(13, 0, DEFAULT_BYTES_PER_SIGOP);
+        assert_eq!(vsize, 4);
+
+        // weight 0: edge case
+        let vsize = get_virtual_transaction_size(0, 0, DEFAULT_BYTES_PER_SIGOP);
+        assert_eq!(vsize, 0);
+    }
+
+    /// get_virtual_transaction_size — sigop-heavy tx: sigops dominate vsize.
+    #[test]
+    fn test_get_virtual_transaction_size_sigop_dominated() {
+        // weight=400, sigop_cost=100, bytes_per_sigop=20
+        // adjusted = max(400, 100*20) = max(400, 2000) = 2000
+        // vsize = ceil(2000/4) = 500
+        let vsize = get_virtual_transaction_size(400, 100, DEFAULT_BYTES_PER_SIGOP);
+        assert_eq!(vsize, 500);
+    }
+
+    /// get_virtual_transaction_size — weight-heavy tx: weight dominates.
+    #[test]
+    fn test_get_virtual_transaction_size_weight_dominated() {
+        // weight=1000, sigop_cost=1, bytes_per_sigop=20
+        // adjusted = max(1000, 20) = 1000
+        // vsize = ceil(1000/4) = 250
+        let vsize = get_virtual_transaction_size(1000, 1, DEFAULT_BYTES_PER_SIGOP);
+        assert_eq!(vsize, 250);
     }
 }
