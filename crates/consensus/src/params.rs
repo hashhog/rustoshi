@@ -443,8 +443,22 @@ pub struct ChainParams {
     pub segwit_height: u32,
     pub taproot_height: u32,
 
-    // BIP-30: duplicate transaction check (heights where duplicates exist)
-    pub bip30_exception_heights: Vec<u32>,
+    // BIP-30: blocks that are permanently exempt from the duplicate-coinbase check
+    // because they ARE the known duplicates (h=91842 and h=91880 on mainnet).
+    // Each entry is (height, block_hash).  Both height AND hash must match for the
+    // exemption to apply — matching height alone is insufficient (IsBIP30Repeat in
+    // Bitcoin Core validation.cpp:6189-6192).
+    pub bip30_exception_blocks: Vec<(u32, Hash256)>,
+
+    // BIP-34 canonical chain hash: the block hash at BIP34Height on the canonical
+    // chain.  Used to confirm we are on the known chain before skipping the BIP-30
+    // duplicate-UTXO check for heights >= BIP34Height.  None means the check cannot
+    // be short-circuited (safe: enforces BIP-30 at all heights below
+    // BIP34_IMPLIES_BIP30_LIMIT).
+    //
+    // Mainnet: block 227,931 hash = 000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8
+    // (Bitcoin Core kernel/chainparams.cpp:89-90)
+    pub bip34_hash: Option<Hash256>,
 
     // Assumed-valid block hash (skip script verification before this)
     pub assumed_valid_block: Option<Hash256>,
@@ -496,7 +510,33 @@ impl ChainParams {
             csv_height: 419_328,
             segwit_height: 481_824,
             taproot_height: 709_632,
-            bip30_exception_heights: vec![91842, 91880],
+            // BIP-30 exception blocks: the two historical duplicate-coinbase blocks
+            // on mainnet.  Verified against IsBIP30Repeat() in Bitcoin Core
+            // validation.cpp:6189-6192.
+            bip30_exception_blocks: vec![
+                (
+                    91842,
+                    Hash256::from_hex(
+                        "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec",
+                    )
+                    .expect("valid bip30 exception hash"),
+                ),
+                (
+                    91880,
+                    Hash256::from_hex(
+                        "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
+                    )
+                    .expect("valid bip30 exception hash"),
+                ),
+            ],
+            // BIP-34 canonical chain hash at height 227,931 (mainnet).
+            // Bitcoin Core kernel/chainparams.cpp:89-90.
+            bip34_hash: Some(
+                Hash256::from_hex(
+                    "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8",
+                )
+                .expect("valid bip34 hash"),
+            ),
             // Bitcoin Core default assumevalid block (height 938343)
             assumed_valid_block: Some(
                 Hash256::from_hex("00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac")
@@ -634,7 +674,14 @@ impl ChainParams {
             csv_height: 770112,
             segwit_height: 834624,
             taproot_height: 2032291, // testnet3 taproot approximate
-            bip30_exception_heights: vec![],
+            bip30_exception_blocks: vec![],
+            // Testnet3 BIP34Hash from Bitcoin Core kernel/chainparams.cpp:213
+            bip34_hash: Some(
+                Hash256::from_hex(
+                    "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8",
+                )
+                .expect("valid testnet3 bip34 hash"),
+            ),
             assumed_valid_block: None,
             assumed_valid_height: None,
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for testnet3
@@ -683,7 +730,10 @@ impl ChainParams {
             csv_height: 1,
             segwit_height: 1,
             taproot_height: 1,
-            bip30_exception_heights: vec![],
+            bip30_exception_blocks: vec![],
+            // Testnet4: BIP34 active from genesis with null hash (Bitcoin Core
+            // kernel/chainparams.cpp:455-456 — BIP34Hash = uint256{}).
+            bip34_hash: None,
             assumed_valid_block: Some(
                 Hash256::from_hex("0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a")
                     .expect("valid testnet4 assume-valid hash"),
@@ -766,7 +816,9 @@ impl ChainParams {
             csv_height: 1,
             segwit_height: 1,
             taproot_height: 1,
-            bip30_exception_heights: vec![],
+            bip30_exception_blocks: vec![],
+            // Signet: BIP34 active from genesis with null hash.
+            bip34_hash: None,
             assumed_valid_block: None,
             assumed_valid_height: None,
             // From Bitcoin Core chainparams.cpp - minimum accepted chainwork for signet
@@ -804,7 +856,10 @@ impl ChainParams {
             csv_height: 1,
             segwit_height: 1,
             taproot_height: 1,
-            bip30_exception_heights: vec![],
+            bip30_exception_blocks: vec![],
+            // Regtest: BIP34 always active from height 1; null BIP34Hash
+            // (Bitcoin Core kernel/chainparams.cpp:536-537).
+            bip34_hash: None,
             assumed_valid_block: None,
             assumed_valid_height: None,
             minimum_chain_work: [0u8; 32],
