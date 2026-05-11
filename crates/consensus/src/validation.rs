@@ -86,6 +86,18 @@ pub enum ValidationError {
     #[error("bad witness commitment")]
     BadWitnessCommitment,
 
+    /// Coinbase witness stack is not exactly 1 item of exactly 32 bytes.
+    /// Bitcoin Core: CheckWitnessMalleation → "bad-witness-nonce-size"
+    /// (validation.cpp:3880-3884).
+    #[error("bad witness nonce size")]
+    BadWitnessNonceSize,
+
+    /// A transaction carries witness data in a block that has no witness commitment.
+    /// Bitcoin Core: CheckWitnessMalleation → "unexpected-witness"
+    /// (validation.cpp:3906-3912).
+    #[error("unexpected witness data")]
+    UnexpectedWitness,
+
     #[error("sigops limit exceeded: {0} > {MAX_BLOCK_SIGOPS_COST}")]
     SigopsLimitExceeded(u64),
 
@@ -176,6 +188,12 @@ impl ValidationError {
             ValidationError::BadMerkleRoot => "bad-txnmrklroot",
             // Witness commitment (BIP-141)
             ValidationError::BadWitnessCommitment => "bad-witness-merkle-match",
+            // Coinbase witness stack not exactly [32-byte nonce]
+            // Bitcoin Core: "bad-witness-nonce-size" (validation.cpp:3883)
+            ValidationError::BadWitnessNonceSize => "bad-witness-nonce-size",
+            // Witness data found in a block without a witness commitment
+            // Bitcoin Core: "unexpected-witness" (validation.cpp:3910)
+            ValidationError::UnexpectedWitness => "unexpected-witness",
             // Coinbase value / subsidy
             ValidationError::BadSubsidy(_, _) => "bad-cb-amount",
             // Sigops budget
@@ -943,66 +961,75 @@ pub(crate) fn encode_bip34_height(height: u32) -> Vec<u8> {
 
 /// Check the SegWit witness commitment in a block.
 ///
-/// The commitment is an OP_RETURN output in the coinbase with:
-/// - `OP_RETURN OP_PUSHBYTES_36 0xaa21a9ed <commitment_hash>`
+/// Mirrors Bitcoin Core `CheckWitnessMalleation` (validation.cpp:3870-3916).
 ///
-/// The commitment hash is: SHA256d(witness_root || witness_nonce)
-/// where witness_nonce is from the coinbase witness (or all zeros).
+/// The commitment is an OP_RETURN output in the coinbase with:
+/// - `OP_RETURN (0x6a) OP_PUSHBYTES_36 (0x24) 0xaa21a9ed <32-byte hash>`  (38 bytes total)
+///
+/// The commitment hash is: SHA256d(witness_root || witness_nonce) where:
+/// - witness_root = BlockWitnessMerkleRoot (coinbase wtxid = 32 zeros, others = wtxid)
+/// - witness_nonce = coinbase.inputs[0].witness.stack[0] (must be exactly 1 × 32 bytes)
+///
+/// Gate selection (called when segwit is active, i.e. height >= segwit_height):
+/// 1. Scan ALL coinbase outputs; the LAST matching output wins (Core overwrites commitpos
+///    in the loop — validation.h:147-165 GetWitnessCommitmentIndex).
+/// 2. If a commitment output is found:
+///    a. Coinbase vin[0].witness stack must be exactly 1 item of exactly 32 bytes
+///       → else `bad-witness-nonce-size` (Core:3880-3884).
+///    b. Compute SHA256d(witness_root || nonce) and compare bytes [6..38] in the output
+///       → else `bad-witness-merkle-match` (Core:3893-3898).
+/// 3. If NO commitment output found: every transaction (including coinbase) must have
+///    no witness data → else `unexpected-witness` (Core:3906-3912).
 fn check_witness_commitment(block: &Block) -> Result<(), ValidationError> {
     let coinbase = &block.transactions[0];
 
-    // Look for witness commitment in coinbase outputs (scan in reverse, use last one)
-    let commitment_header: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
-    let mut commitment_found = false;
+    // Scan ALL coinbase outputs forward, overwrite commitpos on each match so the
+    // LAST matching output wins (Core GetWitnessCommitmentIndex behaviour).
+    // Minimum 38 bytes: 1 (OP_RETURN) + 1 (0x24 push-36) + 4 (magic) + 32 (hash).
+    const MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+    let mut commit_out_idx: Option<usize> = None;
 
-    for output in coinbase.outputs.iter().rev() {
-        // Format: OP_RETURN (0x6a) OP_PUSHBYTES_36 (0x24) 0xaa21a9ed <32-byte hash>
-        if output.script_pubkey.len() >= 38
-            && output.script_pubkey[0] == 0x6a
-            && output.script_pubkey[1] == 0x24
-            && output.script_pubkey[2..6] == commitment_header
+    for (i, output) in coinbase.outputs.iter().enumerate() {
+        let s = &output.script_pubkey;
+        if s.len() >= 38
+            && s[0] == 0x6a   // OP_RETURN
+            && s[1] == 0x24   // push 36 bytes
+            && s[2..6] == MAGIC
         {
-            // Found a witness commitment, verify it
-            let witness_root = block.compute_witness_root();
-
-            // Get witness nonce from coinbase (first witness item, or all zeros)
-            let nonce = if coinbase.inputs[0].witness.is_empty() {
-                [0u8; 32]
-            } else {
-                let first_witness = &coinbase.inputs[0].witness[0];
-                if first_witness.len() == 32 {
-                    let mut n = [0u8; 32];
-                    n.copy_from_slice(first_witness);
-                    n
-                } else {
-                    [0u8; 32]
-                }
-            };
-
-            // Compute expected commitment
-            let mut preimage = Vec::with_capacity(64);
-            preimage.extend_from_slice(witness_root.as_bytes());
-            preimage.extend_from_slice(&nonce);
-            let computed = sha256d(&preimage);
-
-            // Compare with commitment in output
-            if output.script_pubkey[6..38] != computed.0[..] {
-                return Err(ValidationError::BadWitnessCommitment);
-            }
-
-            commitment_found = true;
-            break;
+            commit_out_idx = Some(i); // overwrite — last match wins
         }
     }
 
-    // If no commitment found, check that no transaction has witness data
-    // (except coinbase which can have a witness for the nonce)
-    if !commitment_found {
-        let has_witness = block.transactions[1..]
-            .iter()
-            .any(|tx| tx.has_witness());
-        if has_witness {
+    if let Some(idx) = commit_out_idx {
+        // Gate 6 (Core:3880-3884): coinbase vin[0] witness must be exactly
+        // 1 stack item of exactly 32 bytes ("bad-witness-nonce-size").
+        let witness_stack = &coinbase.inputs[0].witness;
+        if witness_stack.len() != 1 || witness_stack[0].len() != 32 {
+            return Err(ValidationError::BadWitnessNonceSize);
+        }
+
+        // Gate 5: witness merkle root — coinbase wtxid is 32 zeros.
+        let witness_root = block.compute_witness_root();
+
+        // Gate 7: SHA256d(witness_root || nonce) — double SHA256, not single.
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(witness_root.as_bytes());
+        preimage[32..].copy_from_slice(&witness_stack[0]);
+        let computed = sha256d(&preimage);
+
+        // Gate 10: compare bytes [6..38] of the commitment output script.
+        if coinbase.outputs[idx].script_pubkey[6..38] != computed.0 {
             return Err(ValidationError::BadWitnessCommitment);
+        }
+
+        return Ok(());
+    }
+
+    // Gate 9: no commitment found — NO transaction (including coinbase) may carry
+    // witness data. Core loops `for (const auto& tx : block.vtx)` (validation.cpp:3906).
+    for tx in &block.transactions {
+        if tx.has_witness() {
+            return Err(ValidationError::UnexpectedWitness);
         }
     }
 
@@ -4395,6 +4422,349 @@ mod tests {
             !matches!(result, Err(ValidationError::NonFinalTx)),
             "pre-CSV (h=100,000) timestamp-locktime tx must validate against the \
              block timestamp, not prev_block_mtp; got: {result:?}"
+        );
+    }
+
+    // =======================================================================
+    // W77 — BIP-141 witness commitment comprehensive audit tests
+    // =======================================================================
+
+    /// Helper: build a 38-byte witness commitment script given a 32-byte hash.
+    fn make_commit_script(hash: [u8; 32]) -> Vec<u8> {
+        let mut s = Vec::with_capacity(38);
+        s.push(0x6a); // OP_RETURN
+        s.push(0x24); // push 36 bytes
+        s.extend_from_slice(&[0xaa, 0x21, 0xa9, 0xed]);
+        s.extend_from_slice(&hash);
+        s
+    }
+
+    /// Helper: build a valid segwit block (coinbase with correct commitment +
+    /// nonce, plus one witness-bearing non-coinbase tx).
+    fn make_valid_segwit_block(height: u32) -> Block {
+        // The witness root for a 2-tx block where coinbase wtxid = zeros and
+        // the non-coinbase tx carries witness data.
+        let mut non_coinbase = make_simple_tx(Hash256::from_bytes([2u8; 32]), 0, 50);
+        non_coinbase.inputs[0].witness = vec![vec![0xde; 32]]; // 32-byte item
+
+        // Compute witness root: merkle([zeros, wtxid_of_non_coinbase])
+        let wtxids = vec![Hash256::ZERO, non_coinbase.wtxid()];
+        let witness_root = rustoshi_crypto::merkle_root(&wtxids);
+
+        // witness_nonce = 32 zeros
+        let nonce = [0u8; 32];
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(witness_root.as_bytes());
+        preimage[32..].copy_from_slice(&nonce);
+        let commitment = sha256d(&preimage);
+
+        let mut coinbase = make_coinbase_tx(height, 5_000_000_000);
+        coinbase.inputs[0].witness = vec![nonce.to_vec()];
+        coinbase.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: make_commit_script(commitment.0),
+        });
+
+        Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase, non_coinbase],
+        }
+    }
+
+    /// W77-1: MINIMUM_WITNESS_COMMITMENT = 38 bytes.
+    /// A script of only 37 bytes must NOT be recognised as a commitment.
+    /// If no commitment is found and no tx has witness, block is valid.
+    #[test]
+    fn w77_minimum_witness_commitment_is_38_bytes() {
+        // 37-byte script: OP_RETURN + 0x24 + 4 magic + 31 bytes (too short)
+        let mut too_short = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        too_short.extend_from_slice(&[0u8; 31]); // only 37 total
+        assert_eq!(too_short.len(), 37);
+
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        coinbase.outputs.push(TxOut { value: 0, script_pubkey: too_short });
+
+        // No witness anywhere → should be fine (no commitment recognised, no witness data)
+        let block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        assert!(res.is_ok(), "37-byte script must not be treated as commitment; got: {res:?}");
+    }
+
+    /// W77-2: GetWitnessCommitmentIndex returns the LAST matching output.
+    /// If two commitment-shaped outputs are present, the second one is canonical.
+    #[test]
+    fn w77_last_commitment_output_wins() {
+        // Build a block with two commitment outputs; only the second hash is correct.
+        let mut non_coinbase = make_simple_tx(Hash256::from_bytes([3u8; 32]), 0, 50);
+        non_coinbase.inputs[0].witness = vec![vec![0u8; 32]];
+
+        let wtxids = vec![Hash256::ZERO, non_coinbase.wtxid()];
+        let witness_root = rustoshi_crypto::merkle_root(&wtxids);
+        let nonce = [0u8; 32];
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(witness_root.as_bytes());
+        preimage[32..].copy_from_slice(&nonce);
+        let correct_commitment = sha256d(&preimage);
+
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        coinbase.inputs[0].witness = vec![nonce.to_vec()];
+        // First output: wrong hash
+        coinbase.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: make_commit_script([0xff; 32]),
+        });
+        // Second output: correct hash (this one should win)
+        coinbase.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: make_commit_script(correct_commitment.0),
+        });
+
+        let block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase, non_coinbase],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        assert!(res.is_ok(), "last commitment output must win (correct second hash): {res:?}");
+    }
+
+    /// W77-3: Coinbase wtxid is 32 zeros in the witness merkle tree.
+    /// A block where the witness root is computed using the actual coinbase
+    /// wtxid (non-zero) instead of zeros must be rejected.
+    #[test]
+    fn w77_coinbase_wtxid_must_be_zeros_in_witness_merkle() {
+        let mut non_coinbase = make_simple_tx(Hash256::from_bytes([4u8; 32]), 0, 50);
+        non_coinbase.inputs[0].witness = vec![vec![0xab; 32]];
+
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        coinbase.inputs[0].witness = vec![vec![0u8; 32]];
+
+        // Intentionally use the REAL coinbase wtxid instead of zeros — wrong
+        let real_coinbase_wtxid = coinbase.wtxid();
+        let bad_wtxids = vec![real_coinbase_wtxid, non_coinbase.wtxid()];
+        let bad_witness_root = rustoshi_crypto::merkle_root(&bad_wtxids);
+
+        let nonce = [0u8; 32];
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(bad_witness_root.as_bytes());
+        preimage[32..].copy_from_slice(&nonce);
+        let wrong_commitment = sha256d(&preimage);
+
+        coinbase.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: make_commit_script(wrong_commitment.0),
+        });
+
+        let block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase, non_coinbase],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        // The commitment computed with real coinbase wtxid won't match the one computed
+        // with zeros (unless the coinbase wtxid happens to be zero, which it isn't).
+        assert!(
+            matches!(res, Err(ValidationError::BadWitnessCommitment)),
+            "commitment using real coinbase wtxid instead of zeros must fail: {res:?}"
+        );
+    }
+
+    /// W77-4: SHA256d (double SHA256), not single SHA256, for commitment.
+    #[test]
+    fn w77_commitment_uses_sha256d_not_single_sha256() {
+        let mut non_coinbase = make_simple_tx(Hash256::from_bytes([5u8; 32]), 0, 50);
+        non_coinbase.inputs[0].witness = vec![vec![0xcd; 32]];
+
+        let wtxids = vec![Hash256::ZERO, non_coinbase.wtxid()];
+        let witness_root = rustoshi_crypto::merkle_root(&wtxids);
+        let nonce = [0u8; 32];
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(witness_root.as_bytes());
+        preimage[32..].copy_from_slice(&nonce);
+
+        // Compute single-SHA256 (wrong) commitment
+        use sha2::{Digest, Sha256};
+        let single_sha = Sha256::digest(&preimage);
+        let single_sha_commitment: [u8; 32] = single_sha.into();
+
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        coinbase.inputs[0].witness = vec![nonce.to_vec()];
+        coinbase.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: make_commit_script(single_sha_commitment),
+        });
+
+        let block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase, non_coinbase],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        assert!(
+            matches!(res, Err(ValidationError::BadWitnessCommitment)),
+            "single-SHA256 commitment must fail; only SHA256d is valid: {res:?}"
+        );
+    }
+
+    /// W77-5 (Bug fix): bad-witness-nonce-size — coinbase witness stack is empty.
+    /// Core: validation.cpp:3880-3884. Must reject with BadWitnessNonceSize.
+    #[test]
+    fn w77_bad_witness_nonce_size_empty_stack() {
+        let mut non_coinbase = make_simple_tx(Hash256::from_bytes([6u8; 32]), 0, 50);
+        non_coinbase.inputs[0].witness = vec![vec![0u8; 32]];
+
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        // Empty witness stack — must be rejected
+        coinbase.inputs[0].witness = vec![];
+        // Put any commitment output (hash doesn't matter — nonce check fires first)
+        coinbase.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: make_commit_script([0u8; 32]),
+        });
+
+        let block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase, non_coinbase],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        assert!(
+            matches!(res, Err(ValidationError::BadWitnessNonceSize)),
+            "empty witness stack must produce BadWitnessNonceSize: {res:?}"
+        );
+    }
+
+    /// W77-5 (Bug fix): bad-witness-nonce-size — coinbase witness item is not 32 bytes.
+    #[test]
+    fn w77_bad_witness_nonce_size_wrong_length() {
+        let mut non_coinbase = make_simple_tx(Hash256::from_bytes([7u8; 32]), 0, 50);
+        non_coinbase.inputs[0].witness = vec![vec![0u8; 32]];
+
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        // 31-byte nonce (not 32) — must be rejected
+        coinbase.inputs[0].witness = vec![vec![0u8; 31]];
+        coinbase.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: make_commit_script([0u8; 32]),
+        });
+
+        let block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase, non_coinbase],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        assert!(
+            matches!(res, Err(ValidationError::BadWitnessNonceSize)),
+            "31-byte nonce must produce BadWitnessNonceSize: {res:?}"
+        );
+    }
+
+    /// W77-5 (Bug fix): bad-witness-nonce-size — two items in witness stack (must be 1).
+    #[test]
+    fn w77_bad_witness_nonce_size_two_stack_items() {
+        let mut non_coinbase = make_simple_tx(Hash256::from_bytes([8u8; 32]), 0, 50);
+        non_coinbase.inputs[0].witness = vec![vec![0u8; 32]];
+
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        // Two items (each 32 bytes) — stack size must be exactly 1
+        coinbase.inputs[0].witness = vec![vec![0u8; 32], vec![0u8; 32]];
+        coinbase.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: make_commit_script([0u8; 32]),
+        });
+
+        let block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase, non_coinbase],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        assert!(
+            matches!(res, Err(ValidationError::BadWitnessNonceSize)),
+            "two-item witness stack must produce BadWitnessNonceSize: {res:?}"
+        );
+    }
+
+    /// W77-6 (Bug fix): unexpected-witness gate includes coinbase.
+    /// Core loops ALL vtx. A coinbase with witness data and no commitment output
+    /// must be rejected with UnexpectedWitness.
+    #[test]
+    fn w77_unexpected_witness_fires_for_coinbase_with_witness() {
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        // Coinbase has witness but NO commitment output in its outputs
+        coinbase.inputs[0].witness = vec![vec![0u8; 32]];
+        // No commitment output added — commitment_found will be false
+
+        let block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase],
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        assert!(
+            matches!(res, Err(ValidationError::UnexpectedWitness)),
+            "coinbase with witness but no commitment must produce UnexpectedWitness: {res:?}"
+        );
+    }
+
+    /// W77-6 (Bug fix): unexpected-witness error string.
+    /// The bip22_string() for UnexpectedWitness must be "unexpected-witness".
+    #[test]
+    fn w77_unexpected_witness_bip22_string() {
+        let err = ValidationError::UnexpectedWitness;
+        assert_eq!(err.bip22_string(), "unexpected-witness");
+    }
+
+    /// W77 bip22_string for bad-witness-nonce-size.
+    #[test]
+    fn w77_bad_witness_nonce_size_bip22_string() {
+        let err = ValidationError::BadWitnessNonceSize;
+        assert_eq!(err.bip22_string(), "bad-witness-nonce-size");
+    }
+
+    /// W77 happy-path: a correctly formed segwit block passes.
+    #[test]
+    fn w77_valid_segwit_block_passes() {
+        let block = make_valid_segwit_block(1);
+        let params = ChainParams::regtest();
+        let res = contextual_check_block(&block, 1, &StubChainContext, &params);
+        assert!(res.is_ok(), "correctly formed segwit block must pass: {res:?}");
+    }
+
+    /// W77: pre-segwit blocks (below segwit_height) are not checked for commitment.
+    #[test]
+    fn w77_pre_segwit_witness_in_tx_is_not_checked() {
+        // Below segwit_height → check_witness_commitment is NOT called at all.
+        // A non-coinbase tx with witness data must NOT trigger unexpected-witness
+        // in the pre-segwit path.
+        let mut non_coinbase = make_simple_tx(Hash256::from_bytes([9u8; 32]), 0, 50);
+        non_coinbase.inputs[0].witness = vec![vec![0x01; 32]];
+
+        let coinbase = make_coinbase_tx(0, 5_000_000_000);
+
+        let block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase, non_coinbase],
+        };
+        // height 0 is below regtest segwit_height (0 is the segwit_height for regtest,
+        // so use a mainnet-like check: test at height below segwit_height).
+        // For regtest segwit_height=0, ALL heights are >= segwit_height. Use mainnet
+        // params where segwit activated at height 481,824.
+        let params = ChainParams::mainnet();
+        // height 0 is pre-segwit for mainnet
+        let res = contextual_check_block(&block, 0, &StubChainContext, &params);
+        // BIP-34 requires height in coinbase (height 0 → segwit also 0 for mainnet
+        // means segwit IS active at 481,824 but NOT at 0). So witness in tx at h=0
+        // should be fine (no commitment check triggered).
+        // The block may fail BIP-34 but not for witness reasons.
+        assert!(
+            !matches!(res, Err(ValidationError::UnexpectedWitness)),
+            "pre-segwit block must not trigger unexpected-witness: {res:?}"
         );
     }
 }
