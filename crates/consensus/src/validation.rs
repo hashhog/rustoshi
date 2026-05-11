@@ -30,6 +30,7 @@ use crate::params::{
     MAX_BLOCK_WEIGHT, MAX_MONEY, MAX_PUBKEYS_PER_MULTISIG, SEQUENCE_LOCKTIME_DISABLE_FLAG,
     SEQUENCE_LOCKTIME_MASK, SEQUENCE_LOCKTIME_TYPE_FLAG, WITNESS_SCALE_FACTOR,
 };
+use crate::pow::check_proof_of_work;
 use crate::script::{
     is_p2sh, is_push_only, parse_witness_program, verify_script, ScriptFlags, SigVersion,
     SignatureChecker,
@@ -346,7 +347,7 @@ pub fn check_transaction(tx: &Transaction) -> Result<(), TxValidationError> {
 /// - Block weight is within limits
 /// - Sigops don't exceed limit
 /// - No duplicate transactions
-pub fn check_block(block: &Block, _params: &ChainParams) -> Result<(), ValidationError> {
+pub fn check_block(block: &Block, params: &ChainParams) -> Result<(), ValidationError> {
     // Must have at least one transaction
     if block.transactions.is_empty() {
         return Err(ValidationError::NoTransactions);
@@ -378,8 +379,13 @@ pub fn check_block(block: &Block, _params: &ChainParams) -> Result<(), Validatio
         check_transaction(tx)?;
     }
 
-    // Validate proof of work
-    if !block.header.validate_pow() {
+    // Validate proof of work.
+    // Use check_proof_of_work (not just validate_pow) so we also verify that the
+    // encoded target does not exceed pow_limit. Core's DeriveTarget enforces this
+    // as part of CheckProofOfWork (pow.cpp:154-155). A block with bits encoding a
+    // target above pow_limit must be rejected even if its hash is below that target.
+    let block_hash = block.header.block_hash();
+    if !check_proof_of_work(&block_hash.0, block.header.bits, params) {
         return Err(ValidationError::BadProofOfWork);
     }
 
