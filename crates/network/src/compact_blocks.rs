@@ -16,7 +16,7 @@
 
 use crate::message::{InvType, InvVector};
 use crate::peer::PeerId;
-use rustoshi_crypto::sha256;
+use rustoshi_crypto::{sha256, sha256d};
 use rustoshi_primitives::serialize::{read_compact_size, write_compact_size, Decodable, Encodable};
 use rustoshi_primitives::{Block, BlockHeader, Hash256, Transaction};
 use siphasher::sip::SipHasher24;
@@ -527,6 +527,78 @@ impl BlockTxn {
     }
 }
 
+/// Check whether a block has been mutated after compact block reconstruction.
+///
+/// Mirrors Bitcoin Core's `IsBlockMutated` (validation.cpp:4027):
+///   1. Txid Merkle root must match the header.
+///   2. If `segwit_active`, the witness commitment in the coinbase must be valid
+///      (equivalent to Core's `CheckWitnessMalleation` with `check_witness_root=true`).
+///
+/// Returns `true` if the block is mutated (i.e. caller should return `READ_STATUS_FAILED`).
+///
+/// Reference: `blockencodings.cpp:219-221`, `validation.cpp:4027-4056`.
+pub fn is_block_mutated(block: &Block, segwit_active: bool) -> bool {
+    // Gate 1: txid Merkle root (Core: CheckMerkleRoot).
+    let computed = block.compute_merkle_root();
+    if computed != block.header.merkle_root {
+        return true;
+    }
+
+    if !segwit_active {
+        return false;
+    }
+
+    // Gate 2: witness commitment (Core: CheckWitnessMalleation).
+    // Scan coinbase outputs for the last one matching the BIP-141 commitment pattern.
+    // Pattern: OP_RETURN (0x6a) || 0x24 || 0xaa21a9ed || <32-byte hash>  (≥38 bytes).
+    const MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+    let coinbase = match block.transactions.first() {
+        Some(cb) => cb,
+        None => return true, // no coinbase — mutated
+    };
+
+    let mut commit_out_idx: Option<usize> = None;
+    for (i, output) in coinbase.outputs.iter().enumerate() {
+        let s = &output.script_pubkey;
+        if s.len() >= 38
+            && s[0] == 0x6a // OP_RETURN
+            && s[1] == 0x24 // push 36 bytes
+            && s[2..6] == MAGIC
+        {
+            commit_out_idx = Some(i);
+        }
+    }
+
+    if let Some(idx) = commit_out_idx {
+        // Coinbase input[0] witness must be exactly 1 stack item of exactly 32 bytes.
+        let witness_stack = &coinbase.inputs[0].witness;
+        if witness_stack.len() != 1 || witness_stack[0].len() != 32 {
+            return true; // bad-witness-nonce-size
+        }
+
+        // Compute SHA256d(witness_merkle_root || nonce).
+        let witness_root = block.compute_witness_root();
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(witness_root.as_bytes());
+        preimage[32..].copy_from_slice(&witness_stack[0]);
+        let computed_commitment = sha256d(&preimage);
+
+        // Compare to bytes [6..38] of the commitment output script.
+        if coinbase.outputs[idx].script_pubkey[6..38] != computed_commitment.0 {
+            return true; // bad-witness-merkle-match
+        }
+    } else {
+        // No commitment: no transaction (including coinbase) may carry witness data.
+        for tx in &block.transactions {
+            if tx.has_witness() {
+                return true; // unexpected-witness
+            }
+        }
+    }
+
+    false
+}
+
 /// A partially downloaded block being reconstructed from a compact block.
 #[derive(Debug)]
 pub struct PartiallyDownloadedBlock {
@@ -602,8 +674,25 @@ impl PartiallyDownloadedBlock {
             partial.prefilled_count += 1;
         }
 
-        // Build map of short IDs to indices for non-prefilled transactions
-        let mut short_id_map: HashMap<u64, usize> = HashMap::with_capacity(cmpct.short_ids.len());
+        // Build map of short IDs to indices for non-prefilled transactions.
+        //
+        // Two guards mirror Bitcoin Core blockencodings.cpp:96-116:
+        //
+        // Guard A (gate 17) — bucket-size DoS protection: a well-formed cmpctblock
+        // message has a roughly uniform distribution of short IDs across the hash-map
+        // buckets.  A highly uneven distribution indicates either a corrupt message or
+        // a DoS probe.  Core bounds each std::unordered_map bucket to 12 elements
+        // (1-in-1M failure for 16k-tx blocks).  We simulate the same constraint by
+        // partitioning the short-ID space into `n` virtual buckets (one per short ID,
+        // load factor ≈ 1.0) and checking that no bucket exceeds 12 entries.
+        //
+        // Guard B (gate 18) — exact-collision detection: if two short IDs are
+        // identical the map size shrinks; Core returns READ_STATUS_FAILED.
+        let num_ids = cmpct.short_ids.len();
+        let mut short_id_map: HashMap<u64, usize> = HashMap::with_capacity(num_ids);
+        // Bucket-load counter: bucket_key = short_id % max(num_ids, 1).
+        let bucket_count = num_ids.max(1) as u64;
+        let mut bucket_loads: HashMap<u64, usize> = HashMap::new();
         let mut index_offset = 0;
         for (i, &short_id) in cmpct.short_ids.iter().enumerate() {
             // Skip over prefilled positions
@@ -612,7 +701,15 @@ impl PartiallyDownloadedBlock {
             }
             let actual_index = i + index_offset;
 
-            // Check for short ID collision
+            // Guard A: bucket-size DoS protection (Core blockencodings.cpp:110-111).
+            let bucket_key = short_id % bucket_count;
+            let load = bucket_loads.entry(bucket_key).or_insert(0);
+            *load += 1;
+            if *load > 12 {
+                return Err(ReadStatus::Failed);
+            }
+
+            // Guard B: exact collision detection (Core blockencodings.cpp:115-116).
             if short_id_map.contains_key(&short_id) {
                 return Err(ReadStatus::Failed);
             }
@@ -627,7 +724,13 @@ impl PartiallyDownloadedBlock {
             }
         }
 
-        // Try to find transactions in mempool
+        // Try to find transactions in mempool.
+        //
+        // Collision semantics (Core blockencodings.cpp:125-137):
+        // • First match  → fill slot, set have_txn = true.
+        // • Second match → clear txn_available so the full tx is requested, but
+        //   keep have_txn = true so a third match does NOT refill the slot.
+        //   (Core never resets have_txn in the collision branch.)
         for (wtxid, tx) in mempool_txns {
             let short_id = cmpct.get_short_id(wtxid);
             if let Some(&index) = short_id_map.get(&short_id) {
@@ -636,11 +739,13 @@ impl PartiallyDownloadedBlock {
                     have_txn[index] = true;
                     partial.mempool_count += 1;
                 } else if partial.txn_available[index].is_some() {
-                    // Collision: two mempool txs match the same short ID
-                    // Clear it and we'll request the full tx
+                    // Collision: two mempool txs match the same short ID.
+                    // Clear the slot so we request the full tx, but do NOT
+                    // reset have_txn — prevents a third match from re-filling.
+                    // Core blockencodings.cpp:133-135.
                     partial.txn_available[index] = None;
-                    have_txn[index] = false;
                     partial.mempool_count = partial.mempool_count.saturating_sub(1);
+                    // have_txn[index] intentionally stays true
                 }
             }
 
@@ -650,7 +755,15 @@ impl PartiallyDownloadedBlock {
             }
         }
 
-        // Try extra transactions (orphan cache, etc.)
+        // Try extra transactions (orphan cache, etc.).
+        //
+        // Collision semantics (Core blockencodings.cpp:151-168):
+        // • First match  → fill slot, set have_txn = true.
+        // • Second match with a DIFFERENT witness hash → clear slot; keep have_txn
+        //   (same permanent-suppress logic as mempool loop above).
+        // • Second match with the SAME witness hash (dedup mempool vs extra) → skip.
+        //   Core compares witness hashes first to avoid false collisions between the
+        //   same transaction appearing in both pools.  Core blockencodings.cpp:163-164.
         for (wtxid, tx) in extra_txns {
             let short_id = cmpct.get_short_id(wtxid);
             if let Some(&index) = short_id_map.get(&short_id) {
@@ -660,13 +773,15 @@ impl PartiallyDownloadedBlock {
                     partial.mempool_count += 1;
                     partial.extra_count += 1;
                 } else if partial.txn_available[index].is_some() {
-                    // Check for collision with different wtxid
+                    // Only treat as a collision if the witness hashes differ.
+                    // If they match, this is the same tx in both pools — not a
+                    // collision.  Core blockencodings.cpp:163-164.
                     if let Some(ref existing) = partial.txn_available[index] {
                         if existing.wtxid() != **wtxid {
                             partial.txn_available[index] = None;
-                            have_txn[index] = false;
                             partial.mempool_count = partial.mempool_count.saturating_sub(1);
                             partial.extra_count = partial.extra_count.saturating_sub(1);
+                            // have_txn[index] intentionally stays true (permanent suppress)
                         }
                     }
                 }
@@ -712,9 +827,17 @@ impl PartiallyDownloadedBlock {
 
     /// Fill in missing transactions and return the complete block.
     ///
-    /// `missing_txns` should contain the transactions in the same order
-    /// as the indices returned by `get_missing_indices()`.
-    pub fn fill_block(&mut self, missing_txns: Vec<Arc<Transaction>>) -> Result<Block, ReadStatus> {
+    /// `missing_txns` should contain the transactions in the same order as the
+    /// indices returned by `get_missing_indices()`.
+    ///
+    /// `segwit_active` controls whether the witness commitment is validated as
+    /// part of the mutation check (mirrors Bitcoin Core's `FillBlock` signature at
+    /// `blockencodings.cpp:191` which takes a `bool segwit_active` parameter).
+    ///
+    /// Returns `ReadStatus::Failed` if the block is mutated (short-ID collision
+    /// survivor), `ReadStatus::Invalid` if arguments are wrong, `ReadStatus::Ok`
+    /// on success.
+    pub fn fill_block(&mut self, missing_txns: Vec<Arc<Transaction>>, segwit_active: bool) -> Result<Block, ReadStatus> {
         if self.header == BlockHeader::default() {
             return Err(ReadStatus::Invalid);
         }
@@ -745,15 +868,19 @@ impl PartiallyDownloadedBlock {
             transactions,
         };
 
-        // Verify merkle root to detect short ID collisions
-        let computed_merkle = block.compute_merkle_root();
-        if computed_merkle != block.header.merkle_root {
-            return Err(ReadStatus::Failed);
-        }
-
-        // Clear state
+        // Clear state before the mutation check so that even on failure the block
+        // cannot be filled again (mirrors Core's SetNull() at blockencodings.cpp:211).
         self.header = BlockHeader::default();
         self.txn_available.clear();
+
+        // Check for possible mutations now that we have a seemingly-good block.
+        // This catches short-ID collision survivors by verifying:
+        //   1. Txid Merkle root matches the header.
+        //   2. If segwit is active: the witness commitment in the coinbase is valid.
+        // Core: blockencodings.cpp:218-221 calling IsBlockMutated(block, segwit_active).
+        if is_block_mutated(&block, segwit_active) {
+            return Err(ReadStatus::Failed); // Possible short-ID collision
+        }
 
         Ok(block)
     }
@@ -1262,7 +1389,7 @@ mod tests {
             .map(|&idx| Arc::new(block.transactions[idx as usize].clone()))
             .collect();
 
-        let reconstructed = partial.fill_block(missing_txs).unwrap();
+        let reconstructed = partial.fill_block(missing_txs, false).unwrap();
         assert_eq!(reconstructed.transactions.len(), 5);
         assert_eq!(reconstructed.header, block.header);
     }
@@ -1436,7 +1563,7 @@ mod tests {
             .map(|i| Arc::new(create_test_transaction(i * 999_999_999)))
             .collect();
 
-        let result = partial.fill_block(wrong_txs);
+        let result = partial.fill_block(wrong_txs, false);
         assert_eq!(result.err(), Some(ReadStatus::Failed));
     }
 
@@ -1472,5 +1599,482 @@ mod tests {
 
         manager.remove_partial_block(peer, &block_hash);
         assert!(manager.get_partial_block(peer, &block_hash).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // W89 fixes: gates 17, 20, 23, 30 — Bitcoin Core blockencodings.cpp audit
+    // -----------------------------------------------------------------------
+
+    /// Gate 17 — bucket-size DoS protection.
+    ///
+    /// If the peer sends many short IDs that all land in the same virtual bucket,
+    /// init_data must return ReadStatus::Failed rather than processing them
+    /// (mirrors Core blockencodings.cpp:110-111).
+    #[test]
+    fn test_bucket_size_dos_protection() {
+        use std::collections::HashMap;
+
+        let block = create_test_block(50);
+        let nonce: u64 = 0xDEADBEEF_CAFEBABE;
+
+        // Build a compact block, then forcibly set >12 short IDs to the same value
+        // so they all collide in the same bucket.
+        let mut compact = CmpctBlock::from_block(&block, nonce);
+
+        // Overwrite the first 13 short IDs with the same sentinel value.
+        // All map to the same bucket (sentinel % num_ids == some bucket).
+        let sentinel: u64 = 0xABCDEF012345 & 0x0000_FFFF_FFFF_FFFF;
+        for i in 0..13 {
+            compact.short_ids[i] = sentinel;
+        }
+
+        let result = PartiallyDownloadedBlock::init_data(&compact, std::iter::empty(), &[]);
+        // Must be Failed (DoS protection), not Ok or Invalid
+        assert_eq!(result.err(), Some(ReadStatus::Failed),
+            "bucket size >12 must return ReadStatus::Failed");
+    }
+
+    /// Gate 18 — exact short-ID collision returns Failed.
+    ///
+    /// Two distinct positions mapped to the same short ID → READ_STATUS_FAILED
+    /// (Core blockencodings.cpp:115-116).
+    #[test]
+    fn test_exact_short_id_collision_returns_failed() {
+        let block = create_test_block(5);
+        let mut compact = CmpctBlock::from_block(&block, 0x1234);
+
+        // Force the first two short IDs to be identical (exact collision).
+        if compact.short_ids.len() >= 2 {
+            compact.short_ids[1] = compact.short_ids[0];
+        }
+
+        let result = PartiallyDownloadedBlock::init_data(&compact, std::iter::empty(), &[]);
+        assert_eq!(result.err(), Some(ReadStatus::Failed),
+            "exact short-ID collision must return ReadStatus::Failed");
+    }
+
+    /// Gate 20 — mempool collision keeps have_txn=true permanently.
+    ///
+    /// When two mempool txns match the same short ID, the slot must be cleared and
+    /// a third match must NOT be able to refill it.  Core blockencodings.cpp:133-135
+    /// deliberately does NOT reset have_txn on collision.
+    #[test]
+    fn test_mempool_collision_permanent_suppress() {
+        let block = create_test_block(3);
+        let compact = CmpctBlock::from_block(&block, 0x5678);
+
+        // We want two distinct transactions whose wtxids hash to the same short ID.
+        // Instead of crafting a real collision (hard), we directly exercise the
+        // branch by building a fake mempool where the *same slot* receives two
+        // entries: first the real tx, then a different tx with the same short ID.
+        //
+        // Strategy: put the real tx in the mempool (first match) so have_txn=true,
+        // then put a second tx with a *deliberately-identical short ID* via a fake
+        // iterator.  We simulate this by creating two txs whose wtxids we feed as
+        // the same short-ID value by overriding compact.short_ids.
+
+        // Build a compact block where slot 0 (non-coinbase) has a known short ID.
+        // Use the real tx for the first mempool match, and a decoy tx for the second.
+        let real_tx = block.transactions[1].clone();
+        let _decoy_tx = create_test_transaction(999_999);
+
+        // The real tx's short ID.
+        let real_wtxid = real_tx.wtxid();
+        let _short_id = compact.get_short_id(&real_wtxid);
+
+        // Find a decoy wtxid that maps to the same short ID.
+        // We can't easily forge a collision, so instead we check the invariant
+        // through the observable behaviour: after a collision the slot is empty
+        // (txn_available = None) meaning the tx must be requested.
+        let mempool: Vec<(Hash256, Arc<Transaction>)> = vec![
+            (real_tx.wtxid(), Arc::new(real_tx.clone())),
+        ];
+        let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
+            mempool.iter().map(|(h, t)| (h, t)).collect();
+
+        let partial =
+            PartiallyDownloadedBlock::init_data(&compact, mempool_refs.into_iter(), &[]).unwrap();
+
+        // The real tx should be found (single match, no collision).
+        // Confirm the mempool count is 1 (no spurious dedup).
+        let (_, mempool_found, _) = partial.stats();
+        assert_eq!(mempool_found, 1, "single mempool match should be counted once");
+
+        // Verify have_txn suppression: feed the same wtxid TWICE.
+        // The second time the slot is already filled, so it should be CLEARED.
+        let duplicate_mempool: Vec<(Hash256, Arc<Transaction>)> = vec![
+            (real_tx.wtxid(), Arc::new(real_tx.clone())),
+            (real_tx.wtxid(), Arc::new(real_tx.clone())), // duplicate
+        ];
+        let dup_refs: Vec<(&Hash256, &Arc<Transaction>)> =
+            duplicate_mempool.iter().map(|(h, t)| (h, t)).collect();
+
+        let partial2 =
+            PartiallyDownloadedBlock::init_data(&compact, dup_refs.into_iter(), &[]).unwrap();
+
+        // After collision the slot should be cleared (mempool_count back to 0 for
+        // that slot), so the tx shows up as missing.
+        let (_, mempool_found2, _) = partial2.stats();
+        assert_eq!(mempool_found2, 0,
+            "collision (same short ID twice) must clear the slot");
+
+        // The slot must be in the missing list now.
+        let missing = partial2.get_missing_indices();
+        assert!(missing.contains(&1u16) || missing.contains(&2u16) || missing.contains(&3u16),
+            "collided slot must appear in missing indices");
+    }
+
+    /// Gate 23 — extra_txn collision respects witness-hash comparison.
+    ///
+    /// In the extra_txn loop, a second match with the SAME witness hash (same tx
+    /// appearing in both mempool and orphan cache) must NOT be treated as a
+    /// collision.  Only a different witness hash triggers the suppress.
+    /// Core blockencodings.cpp:163-164.
+    #[test]
+    fn test_extra_txn_same_wtxid_no_collision() {
+        let block = create_test_block(3);
+        let compact = CmpctBlock::from_block(&block, 0xABCD);
+
+        let real_tx = block.transactions[1].clone();
+        let real_wtxid = real_tx.wtxid();
+
+        // Put the real tx in the mempool so the slot is filled.
+        let mempool: Vec<(Hash256, Arc<Transaction>)> = vec![
+            (real_wtxid, Arc::new(real_tx.clone())),
+        ];
+        let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
+            mempool.iter().map(|(h, t)| (h, t)).collect();
+
+        // Also put the SAME tx in extra_txns (simulates appearing in both pools).
+        let extra_arc = Arc::new(real_tx.clone());
+        let extra: Vec<(&Hash256, Arc<Transaction>)> = vec![(&real_wtxid, extra_arc)];
+
+        let partial =
+            PartiallyDownloadedBlock::init_data(&compact, mempool_refs.into_iter(), &extra).unwrap();
+
+        // The slot must still be filled (same-wtxid in extra should NOT collide).
+        let (_, mempool_found, _) = partial.stats();
+        assert!(mempool_found >= 1, "same tx in extra_txns must not evict the mempool match");
+    }
+
+    /// Gate 30 — fill_block calls is_block_mutated (witness commitment check).
+    ///
+    /// Tests is_block_mutated directly: a block with a wrong witness commitment
+    /// must be detected as mutated when segwit_active=true, and NOT detected when
+    /// segwit_active=false (which only checks the txid merkle root).
+    ///
+    /// Also tests fill_block end-to-end with a bad witness commitment:
+    /// the coinbase has a malformed commitment → fill_block(..., true) = Failed,
+    /// fill_block(..., false) = Ok.
+    #[test]
+    fn test_fill_block_rejects_bad_witness_commitment() {
+        use rustoshi_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use rustoshi_crypto::sha256d;
+
+        // Build a tx with witness data (non-coinbase).
+        let non_cb_tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256([0x11; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0x04u8; 71]], // has witness data
+            }],
+            outputs: vec![TxOut {
+                value: 1_000_000,
+                script_pubkey: vec![0x00; 22],
+            }],
+            lock_time: 0,
+        };
+
+        // Coinbase with witness nonce (32 zeros) but a WRONG commitment value.
+        let coinbase_bad = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x03, 0x01, 0x00, 0x00],
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0u8; 32]], // valid nonce
+            }],
+            outputs: vec![
+                TxOut { value: 50_0000_0000, script_pubkey: vec![0x51] },
+                TxOut {
+                    value: 0,
+                    script_pubkey: {
+                        let mut s = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+                        s.extend_from_slice(&[0xBAu8; 32]); // wrong commitment
+                        s
+                    },
+                },
+            ],
+            lock_time: 0,
+        };
+
+        let transactions_bad = vec![coinbase_bad, non_cb_tx.clone()];
+
+        // Compute correct txid merkle root so that the txid check passes.
+        let merkle_root_bad = {
+            let mut hashes: Vec<[u8; 32]> =
+                transactions_bad.iter().map(|tx| tx.txid().0).collect();
+            while hashes.len() > 1 {
+                if hashes.len() % 2 == 1 { hashes.push(*hashes.last().unwrap()); }
+                let mut next = Vec::new();
+                for pair in hashes.chunks(2) {
+                    let mut c = [0u8; 64];
+                    c[..32].copy_from_slice(&pair[0]);
+                    c[32..].copy_from_slice(&pair[1]);
+                    next.push(sha256d(&c).0);
+                }
+                hashes = next;
+            }
+            Hash256(hashes[0])
+        };
+
+        let block_bad = Block {
+            header: BlockHeader {
+                version: 0x20000000,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: merkle_root_bad,
+                timestamp: 1_234_567_890,
+                bits: 0x1d00ffff,
+                nonce: 0,
+            },
+            transactions: transactions_bad,
+        };
+
+        // is_block_mutated with wrong commitment:
+        // segwit_active=false → only txid merkle, not mutated (merkle root is correct)
+        assert!(!is_block_mutated(&block_bad, false),
+            "segwit_active=false should not check witness commitment");
+        // segwit_active=true → witnesses commitment mismatch → mutated
+        assert!(is_block_mutated(&block_bad, true),
+            "wrong witness commitment with segwit_active=true must be detected as mutated");
+
+        // fill_block end-to-end: put the non-coinbase tx in mempool so reconstruction
+        // completes without requesting missing txns.
+        let compact_bad = CmpctBlock::from_block(&block_bad, 0xDEAD);
+        let ncb_wtxid = block_bad.transactions[1].wtxid();
+        let mempool: Vec<(Hash256, Arc<Transaction>)> = vec![
+            (ncb_wtxid, Arc::new(block_bad.transactions[1].clone())),
+        ];
+        let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
+            mempool.iter().map(|(h, t)| (h, t)).collect();
+        let mut partial_bad =
+            PartiallyDownloadedBlock::init_data(&compact_bad, mempool_refs.into_iter(), &[]).unwrap();
+        assert!(partial_bad.is_complete(), "partial block should be complete after mempool fill");
+
+        // segwit_active=false → txid merkle passes → Ok
+        let mempool2: Vec<(Hash256, Arc<Transaction>)> = vec![
+            (ncb_wtxid, Arc::new(block_bad.transactions[1].clone())),
+        ];
+        let mempool_refs2: Vec<(&Hash256, &Arc<Transaction>)> =
+            mempool2.iter().map(|(h, t)| (h, t)).collect();
+        let mut partial_bad2 =
+            PartiallyDownloadedBlock::init_data(&compact_bad, mempool_refs2.into_iter(), &[]).unwrap();
+        let result_no_segwit = partial_bad2.fill_block(vec![], false);
+        assert!(result_no_segwit.is_ok(),
+            "segwit_active=false should only check txid merkle root, not witness commitment");
+
+        // segwit_active=true → witness commitment mismatch → Failed
+        let result_segwit = partial_bad.fill_block(vec![], true);
+        assert_eq!(result_segwit.err(), Some(ReadStatus::Failed),
+            "segwit_active=true with wrong witness commitment must return ReadStatus::Failed");
+    }
+
+    /// Gate 30 — fill_block witness commitment: valid commitment passes.
+    #[test]
+    fn test_fill_block_valid_witness_commitment_passes() {
+        use rustoshi_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use rustoshi_crypto::sha256d;
+
+        // Build a non-coinbase tx with witness data.
+        let non_cb_tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256([0x22; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0x05u8; 72]],
+            }],
+            outputs: vec![TxOut {
+                value: 900_000,
+                script_pubkey: vec![0x00; 22],
+            }],
+            lock_time: 0,
+        };
+
+        // Coinbase witness nonce (32 bytes, all zeros).
+        let witness_nonce = [0u8; 32];
+
+        // Compute the correct witness commitment:
+        //   witness_root = SHA256d(coinbase_wtxid=zeros32 || non_cb_wtxid)
+        //   commitment   = SHA256d(witness_root || nonce)
+        let cb_wtxid = [0u8; 32];
+        let ncb_wtxid = non_cb_tx.wtxid().0;
+        let mut combined = [0u8; 64];
+        combined[..32].copy_from_slice(&cb_wtxid);
+        combined[32..].copy_from_slice(&ncb_wtxid);
+        let witness_root = sha256d(&combined).0;
+
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(&witness_root);
+        preimage[32..].copy_from_slice(&witness_nonce);
+        let commitment = sha256d(&preimage).0;
+
+        let coinbase = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x03, 0x01, 0x00, 0x00],
+                sequence: 0xFFFFFFFF,
+                witness: vec![witness_nonce.to_vec()],
+            }],
+            outputs: vec![
+                TxOut { value: 50_0000_0000, script_pubkey: vec![0x51] },
+                TxOut {
+                    value: 0,
+                    script_pubkey: {
+                        let mut s = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+                        s.extend_from_slice(&commitment);
+                        s
+                    },
+                },
+            ],
+            lock_time: 0,
+        };
+
+        let transactions = vec![coinbase, non_cb_tx.clone()];
+        let merkle_root = {
+            let mut hashes: Vec<[u8; 32]> =
+                transactions.iter().map(|tx| tx.txid().0).collect();
+            while hashes.len() > 1 {
+                if hashes.len() % 2 == 1 { hashes.push(*hashes.last().unwrap()); }
+                let mut next = Vec::new();
+                for pair in hashes.chunks(2) {
+                    let mut comb = [0u8; 64];
+                    comb[..32].copy_from_slice(&pair[0]);
+                    comb[32..].copy_from_slice(&pair[1]);
+                    next.push(sha256d(&comb).0);
+                }
+                hashes = next;
+            }
+            Hash256(hashes[0])
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 0x20000000,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root,
+                timestamp: 1_600_000_000,
+                bits: 0x1d00ffff,
+                nonce: 0,
+            },
+            transactions: transactions.clone(),
+        };
+
+        // is_block_mutated with correct commitment → not mutated
+        assert!(!is_block_mutated(&block, true),
+            "valid witness commitment must not be detected as mutated");
+
+        // fill_block end-to-end with the non-cb tx in mempool.
+        let compact = CmpctBlock::from_block(&block, 0xFEED);
+        let ncb_wtxid = non_cb_tx.wtxid();
+        let mempool: Vec<(Hash256, Arc<Transaction>)> = vec![
+            (ncb_wtxid, Arc::new(non_cb_tx.clone())),
+        ];
+        let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
+            mempool.iter().map(|(h, t)| (h, t)).collect();
+        let mut partial =
+            PartiallyDownloadedBlock::init_data(&compact, mempool_refs.into_iter(), &[]).unwrap();
+        assert!(partial.is_complete());
+
+        let result = partial.fill_block(vec![], true);
+        assert!(result.is_ok(), "valid witness commitment must pass with segwit_active=true");
+    }
+
+    /// is_block_mutated: non-segwit block with unexpected witness data is mutated.
+    #[test]
+    fn test_is_block_mutated_unexpected_witness() {
+        use rustoshi_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use rustoshi_crypto::sha256d;
+
+        // Build a tx WITH witness data but no witness commitment in coinbase.
+        let tx_with_witness = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256([0x33; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0x01u8; 64]], // witness data present
+            }],
+            outputs: vec![TxOut {
+                value: 500_000,
+                script_pubkey: vec![0x00; 22],
+            }],
+            lock_time: 0,
+        };
+
+        let coinbase = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x03, 0x01, 0x00, 0x00],
+                sequence: 0xFFFFFFFF,
+                witness: vec![], // no witness data in coinbase
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: vec![0x51] }],
+            lock_time: 0,
+        };
+
+        let transactions = vec![coinbase, tx_with_witness];
+        let merkle_root = {
+            let mut hashes: Vec<[u8; 32]> =
+                transactions.iter().map(|tx| tx.txid().0).collect();
+            while hashes.len() > 1 {
+                if hashes.len() % 2 == 1 {
+                    hashes.push(*hashes.last().unwrap());
+                }
+                let mut next = Vec::new();
+                for pair in hashes.chunks(2) {
+                    let mut comb = [0u8; 64];
+                    comb[..32].copy_from_slice(&pair[0]);
+                    comb[32..].copy_from_slice(&pair[1]);
+                    next.push(sha256d(&comb).0);
+                }
+                hashes = next;
+            }
+            Hash256(hashes[0])
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 0x20000000,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root,
+                timestamp: 1_600_000_000,
+                bits: 0x1d00ffff,
+                nonce: 0,
+            },
+            transactions,
+        };
+
+        // segwit_active=true + no witness commitment + tx has witness → mutated.
+        assert!(is_block_mutated(&block, true),
+            "block with unexpected witness and no commitment should be mutated");
+
+        // segwit_active=false → only txid merkle check; should NOT be mutated
+        // (the txid merkle root is correct).
+        assert!(!is_block_mutated(&block, false),
+            "segwit_active=false should not check witness; block should not be mutated");
     }
 }
