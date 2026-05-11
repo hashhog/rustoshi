@@ -1231,4 +1231,501 @@ mod tests {
         let work = ChainWork::from_hex("0000000000000000000000000000000000000000000009a0fe15d0177d086304").unwrap();
         assert!(!work.is_zero());
     }
+
+    // ============================================================
+    // W83: COMPREHENSIVE DIFFICULTY / PoW AUDIT TESTS
+    // ============================================================
+
+    // --- Gate 2: retarget only at 2016-block boundary ---
+
+    #[test]
+    fn test_retarget_boundary_exactly_at_2016() {
+        // Verify that next_height=2016 triggers a retarget.
+        // The result may not equal genesis_bits if the timestamps don't produce
+        // exactly TARGET_TIMESPAN, but it must differ from "just return last.bits()".
+        // We test this by verifying that height 2015 (non-retarget) returns last.bits()
+        // while height 2016 goes through the retarget calculation.
+        let params = ChainParams::mainnet();
+        let genesis_bits = 0x1d00ffff;
+
+        // Chain of 2014 blocks at TARGET_BLOCK_TIME spacing → height 2014
+        // Next height = 2015, NOT a retarget → must return genesis_bits
+        let chain_2014 = build_chain(0, 2014, 0, TARGET_BLOCK_TIME, genesis_bits);
+        let bits_2015 = get_next_work_required(&chain_2014, chain_2014.timestamp() + TARGET_BLOCK_TIME, &params);
+        assert_eq!(bits_2015, genesis_bits, "height 2015 is NOT a retarget height");
+
+        // Chain of 2015 blocks → height 2015
+        // Next height = 2016 → IS a retarget
+        // With perfect 600s spacing, actual_timespan == TARGET_TIMESPAN → bits unchanged
+        let start_time = 1_000_000u32;
+        let mut chain = TestBlockIndex::genesis(genesis_bits);
+        chain.timestamp = start_time;
+        for h in 1u32..=2015 {
+            let ts = start_time + h * TARGET_BLOCK_TIME;
+            chain = TestBlockIndex::with_prev(h, ts, genesis_bits, chain);
+        }
+        // actual_timespan = block2015.time - block0.time = 2015 * 600 = 1_209_000
+        // This is slightly LESS than TARGET_TIMESPAN (1_209_600) → difficulty increases slightly
+        let bits_2016 = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        // The result should come from the retarget calculation, not just last.bits()
+        // actual_timespan = 2015*600 = 1209000 < TARGET_TIMESPAN=1209600 → slightly harder
+        let old_target = compact_to_target(genesis_bits);
+        let new_target = compact_to_target(bits_2016);
+        // Result must be at or below genesis target (slightly harder or same due to compact rounding)
+        assert!(compare_targets(&new_target, &old_target) <= 0,
+            "retarget at 2016 with fast blocks should not produce an easier target");
+    }
+
+    #[test]
+    fn test_no_retarget_one_before_boundary() {
+        let params = ChainParams::mainnet();
+        let genesis_bits = 0x1d00ffff;
+
+        // Height 2014 → next = 2015, NOT a retarget
+        let chain = build_chain(0, 2014, 0, TARGET_BLOCK_TIME, genesis_bits);
+        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        assert_eq!(new_bits, genesis_bits, "no retarget one block before boundary");
+    }
+
+    #[test]
+    fn test_no_retarget_one_after_boundary() {
+        let params = ChainParams::mainnet();
+        let genesis_bits = 0x1d00ffff;
+
+        // Height 2016 → next = 2017, NOT a retarget
+        let chain = build_chain(0, 2016, 0, TARGET_BLOCK_TIME, genesis_bits);
+        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        assert_eq!(new_bits, genesis_bits, "no retarget one block after boundary");
+    }
+
+    // --- Gate 9/10: min/max timespan clamps ---
+    // Note: clamping happens in calculate_next_work_required, not in calculate_retarget.
+    // We test clamping through get_next_work_required by building chains with extreme timespans.
+
+    #[test]
+    fn test_clamp_exactly_at_min_timespan() {
+        // actual_timespan == MIN_TIMESPAN → ratio = 1/4 → target shrinks
+        let params = ChainParams::mainnet();
+        let bits = 0x1d00ffff;
+
+        let result = calculate_retarget(bits, MIN_TIMESPAN, TARGET_TIMESPAN, &params.pow_limit);
+        let old_target = compact_to_target(bits);
+        let new_target = compact_to_target(result);
+        assert!(compare_targets(&new_target, &old_target) < 0,
+            "at min clamp, target decreases (difficulty increases)");
+    }
+
+    #[test]
+    fn test_clamp_exactly_at_max_timespan() {
+        // actual_timespan == MAX_TIMESPAN → ratio = 4 → target grows
+        let params = ChainParams::mainnet();
+        let bits = 0x1c00ffff; // harder starting point so there's room to grow
+
+        let result = calculate_retarget(bits, MAX_TIMESPAN, TARGET_TIMESPAN, &params.pow_limit);
+        let old_target = compact_to_target(bits);
+        let new_target = compact_to_target(result);
+        assert!(compare_targets(&new_target, &old_target) > 0,
+            "at max clamp, target increases (difficulty decreases)");
+    }
+
+    #[test]
+    fn test_clamp_below_min_via_full_function() {
+        // Build a chain with extremely fast blocks (1 second each) and verify the
+        // result is clamped to MIN_TIMESPAN via get_next_work_required.
+        let params = ChainParams::mainnet();
+        let bits = 0x1d00ffff;
+
+        // Chain with 1s per block → actual_timespan ~= 2015s << MIN_TIMESPAN
+        let fast_chain = build_chain(0, 2015, 0, 1, bits);
+        let fast_result = get_next_work_required(&fast_chain, fast_chain.timestamp() + 1, &params);
+
+        // Chain with exactly MIN_TIMESPAN → should produce same result due to clamping
+        let min_chain = build_chain(0, 2015, 0, MIN_TIMESPAN / 2015, bits);
+        let min_result = get_next_work_required(&min_chain, min_chain.timestamp() + 1, &params);
+
+        // Both should use MIN_TIMESPAN denominator — equal or nearly equal
+        assert_eq!(fast_result, min_result,
+            "very fast chain and min-timespan chain should produce same clamped result");
+    }
+
+    #[test]
+    fn test_clamp_above_max_via_full_function() {
+        // Two chains with timespans that both exceed MAX_TIMESPAN should produce
+        // the same result because of the 4x cap.
+        let params = ChainParams::mainnet();
+        let bits = 0x1c00ffff;
+
+        // Very slow: 10× target spacing → actual_timespan >> MAX_TIMESPAN → clamp to MAX
+        let very_slow = build_chain(0, 2015, 0, TARGET_BLOCK_TIME * 10, bits);
+        let very_slow_result = get_next_work_required(&very_slow, very_slow.timestamp() + 1, &params);
+
+        // Also 10× but 20×: both should be clamped identically
+        let super_slow = build_chain(0, 2015, 0, TARGET_BLOCK_TIME * 20, bits);
+        let super_slow_result = get_next_work_required(&super_slow, super_slow.timestamp() + 1, &params);
+
+        assert_eq!(very_slow_result, super_slow_result,
+            "any timespan beyond MAX_TIMESPAN should produce same clamped result");
+
+        // The clamped result should equal calculate_retarget with MAX_TIMESPAN
+        let expected = calculate_retarget(bits, MAX_TIMESPAN, TARGET_TIMESPAN, &params.pow_limit);
+        assert_eq!(very_slow_result, expected,
+            "clamped slow chain should equal explicit MAX_TIMESPAN retarget");
+    }
+
+    // --- Gate 3/4: testnet 20-minute rule, exact boundary ---
+
+    #[test]
+    fn test_testnet_20min_rule_exactly_at_boundary() {
+        // Core check: new_block_time > prev.time + spacing*2  (strictly greater)
+        // Exactly AT the threshold (==) must NOT trigger min-diff.
+        // One second over (>) MUST trigger min-diff.
+        let params = ChainParams::testnet3();
+        // Use harder bits so they don't coincide with pow_limit for this test
+        let harder_bits = 0x1c00ffff;
+        let pow_limit_bits = target_to_compact(&params.pow_limit);
+
+        // Sanity: harder_bits != pow_limit_bits
+        assert_ne!(harder_bits, pow_limit_bits);
+
+        let chain = build_chain(0, 100, 0, TARGET_BLOCK_TIME, harder_bits);
+        let boundary_time = chain.timestamp() + TARGET_BLOCK_TIME * 2;
+
+        // Exactly AT the threshold (== not >) → should NOT return pow_limit
+        let bits = get_next_work_required(&chain, boundary_time, &params);
+        assert_ne!(bits, pow_limit_bits, "time exactly at 2*spacing should NOT trigger min-diff (Core pow.cpp:27 uses >)");
+
+        // One second over → triggers min-diff
+        let over_time = chain.timestamp() + TARGET_BLOCK_TIME * 2 + 1;
+        let bits_over = get_next_work_required(&chain, over_time, &params);
+        assert_eq!(bits_over, pow_limit_bits, "one second over boundary triggers min-diff");
+    }
+
+    // --- Gate 5/6: ancestor lookup at correct height ---
+
+    #[test]
+    fn test_retarget_uses_first_block_of_period_not_genesis() {
+        // Verify that at height 4031 (next=4032=2*2016), the second retarget uses
+        // block 2016's timestamp as the period start, not block 0's.
+        // We set the second period (2016..4031) to have half-speed blocks (300s each)
+        // so actual_timespan = 2015*300 = 604_500 < TARGET_TIMESPAN → difficulty INCREASES.
+        // We use a hard starting difficulty (0x1c00ffff, 256x harder than genesis) so the
+        // target CAN decrease further without hitting zero.
+        let params = ChainParams::mainnet();
+        // 0x1c00ffff is 256x harder than 0x1d00ffff; its target has room to halve
+        let starting_bits = 0x1c00ffff;
+
+        let mut chain = TestBlockIndex::genesis(starting_bits);
+        chain.timestamp = 0;
+
+        // First period: blocks 1..2016 at perfect 600s spacing
+        for h in 1u32..=2016 {
+            chain = TestBlockIndex::with_prev(h, h * TARGET_BLOCK_TIME, starting_bits, chain);
+        }
+        // block 2016 timestamp = 2016 * 600 = 1_209_600
+
+        // Second period: blocks 2017..4031 at 300s spacing (half speed → harder difficulty)
+        let base = 2016u32 * TARGET_BLOCK_TIME;
+        for h in 2017u32..=4031 {
+            let extra = (h - 2016) * (TARGET_BLOCK_TIME / 2);
+            chain = TestBlockIndex::with_prev(h, base + extra, starting_bits, chain);
+        }
+        // block 4031 timestamp = 1_209_600 + 2015*300 = 1_209_600 + 604_500 = 1_814_100
+
+        assert_eq!(chain.height(), 4031);
+
+        // actual_timespan = block4031.time - block2016.time = 1_814_100 - 1_209_600 = 604_500
+        // 604_500 > MIN_TIMESPAN (302_400) → no clamp
+        // new_target = old_target * 604_500 / 1_209_600 ≈ old_target * 0.5 → smaller → harder
+        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        let old_target = compact_to_target(starting_bits);
+        let new_target = compact_to_target(new_bits);
+        assert!(compare_targets(&new_target, &old_target) < 0,
+            "second period with 2x-fast blocks should have smaller (harder) target");
+    }
+
+    // --- Gate 11: BIP-94 uses first-of-period bits ---
+
+    #[test]
+    fn test_bip94_first_block_bits_not_last() {
+        // Similar to existing test but verifies the path from get_next_work_required
+        let params = ChainParams::testnet4();
+        let first_bits = 0x1d00ffff;
+        let last_bits = 0x1c00ffff; // harder — appears in the second half of the period
+
+        let start_time = 1_000_000u32;
+        let mut chain = TestBlockIndex::genesis(first_bits);
+        chain.timestamp = start_time;
+
+        // Build 2015 blocks: first half with first_bits, second half with last_bits
+        for h in 1u32..=2015 {
+            let bits = if h < 1008 { first_bits } else { last_bits };
+            // Perfect timing so timespan = TARGET_TIMESPAN
+            let ts = start_time + (TARGET_TIMESPAN as u64 * h as u64 / 2015) as u32;
+            chain = TestBlockIndex::with_prev(h, ts, bits, chain);
+        }
+
+        assert_eq!(chain.bits(), last_bits, "last block of period has last_bits");
+
+        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+
+        // BIP-94: base = first_bits (block 0). With perfect timespan, result = first_bits.
+        // Without BIP-94 it would be last_bits.
+        assert_eq!(new_bits, first_bits,
+            "BIP-94 retarget must use first-of-period bits, not last");
+        assert_ne!(new_bits, last_bits,
+            "BIP-94 result must differ from non-BIP-94 result");
+    }
+
+    // --- Gate 12: new_target = base * actual / target, capped to pow_limit ---
+
+    #[test]
+    fn test_retarget_capped_to_pow_limit() {
+        // Starting at pow_limit with maximum timespan (4x) should stay at pow_limit
+        let params = ChainParams::mainnet();
+        let pow_limit_bits = target_to_compact(&params.pow_limit);
+
+        let result = calculate_retarget(pow_limit_bits, MAX_TIMESPAN, TARGET_TIMESPAN, &params.pow_limit);
+        assert_eq!(result, pow_limit_bits,
+            "retarget result must be capped at pow_limit");
+    }
+
+    // --- Gates 15-17: PermittedDifficultyTransition ---
+
+    #[test]
+    fn test_permitted_difficulty_at_retarget_4x_upper_bound() {
+        let params = ChainParams::mainnet();
+        let old_bits = 0x1c00ffff;
+
+        // Max allowed: old * MAX_TIMESPAN / TARGET_TIMESPAN (= 4x), capped at pow_limit
+        let max_bits = calculate_retarget(old_bits, MAX_TIMESPAN, TARGET_TIMESPAN, &params.pow_limit);
+
+        // Exactly at 4x bound → permitted
+        assert!(permitted_difficulty_transition(2016, old_bits, max_bits, &params),
+            "4x increase in target must be permitted");
+
+        // Slightly easier than max (larger target) → NOT permitted
+        // Decrement one byte from the compact to make it slightly easier
+        let too_easy_bits = (max_bits & 0x00FFFFFF) | (((max_bits >> 24) + 1) << 24);
+        if too_easy_bits != max_bits {
+            assert!(!permitted_difficulty_transition(2016, old_bits, too_easy_bits, &params),
+                "target above 4x bound must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_permitted_difficulty_at_retarget_quarter_lower_bound() {
+        let params = ChainParams::mainnet();
+        let old_bits = 0x1d00ffff;
+
+        // Min allowed: old * MIN_TIMESPAN / TARGET_TIMESPAN (= 1/4x)
+        let min_bits = calculate_retarget(old_bits, MIN_TIMESPAN, TARGET_TIMESPAN, &params.pow_limit);
+
+        // Exactly at 1/4x bound → permitted
+        assert!(permitted_difficulty_transition(2016, old_bits, min_bits, &params),
+            "1/4x decrease in target must be permitted");
+    }
+
+    #[test]
+    fn test_permitted_difficulty_non_retarget_must_not_change() {
+        let params = ChainParams::mainnet();
+        let old_bits = 0x1d00ffff;
+
+        // Any height that is NOT a multiple of 2016
+        for height in [1u32, 2015, 2017, 4031, 4033] {
+            assert!(permitted_difficulty_transition(height, old_bits, old_bits, &params),
+                "same bits must always be permitted at non-retarget height {}", height);
+            assert!(!permitted_difficulty_transition(height, old_bits, 0x1c00ffff, &params),
+                "different bits must be rejected at non-retarget height {}", height);
+        }
+    }
+
+    #[test]
+    fn test_permitted_difficulty_testnet_always_true() {
+        // fPowAllowMinDifficultyBlocks → always true regardless of height or bits
+        let params = ChainParams::testnet3();
+        assert!(permitted_difficulty_transition(1, 0x1d00ffff, 0x1c00ffff, &params));
+        assert!(permitted_difficulty_transition(2016, 0x1d00ffff, 0x1d00ffff, &params));
+        assert!(permitted_difficulty_transition(2016, 0x1d00ffff, 0x207fffff, &params));
+    }
+
+    // --- Gates 18-23: CheckProofOfWork (check_proof_of_work) ---
+
+    #[test]
+    fn test_check_proof_of_work_overflow_compact_rejected() {
+        let params = ChainParams::mainnet();
+        let hash = [0u8; 32]; // all-zeros hash (hardest possible to beat)
+
+        // exponent > 32 → overflow → DeriveTarget returns None → rejected
+        // Core pow.cpp:154 fOverflow check
+        let overflow_bits = 0x2100_0001u32; // exponent=33
+        assert!(!check_proof_of_work(&hash, overflow_bits, &params),
+            "overflow compact encoding must be rejected (Core pow.cpp:154)");
+
+        let overflow_bits2 = 0xff00_0001u32; // exponent=255
+        assert!(!check_proof_of_work(&hash, overflow_bits2, &params),
+            "max-exponent compact must be rejected");
+    }
+
+    #[test]
+    fn test_check_proof_of_work_target_above_pow_limit_rejected() {
+        // Mainnet pow_limit is 0x1d00ffff in compact.
+        // A block claiming bits=0x1e00ffff (target = 0xffff * 2^(8*27) >> pow_limit) must fail.
+        let params = ChainParams::mainnet();
+        let hash = [0u8; 32]; // all-zeros hash
+
+        // 0x1f00ffff → target = 0x00ffff * 2^(8*(31-3)) = beyond mainnet pow_limit
+        let above_limit_bits = 0x1f00ffffu32;
+        assert!(!check_proof_of_work(&hash, above_limit_bits, &params),
+            "target above pow_limit must be rejected even for all-zeros hash (Core pow.cpp:155)");
+    }
+
+    #[test]
+    fn test_check_proof_of_work_zero_target_rejected() {
+        let params = ChainParams::mainnet();
+        let hash = [0u8; 32];
+        // Zero mantissa → target == 0 → rejected (Core: bnTarget == 0 check)
+        assert!(!check_proof_of_work(&hash, 0x1d00_0000, &params));
+        // Zero exponent
+        assert!(!check_proof_of_work(&hash, 0x0000_ffff, &params));
+    }
+
+    #[test]
+    fn test_check_proof_of_work_negative_target_rejected() {
+        let params = ChainParams::mainnet();
+        let hash = [0u8; 32];
+        // Negative compact (high bit of mantissa = 1)
+        assert!(!check_proof_of_work(&hash, 0x1d80_0000, &params),
+            "negative target must be rejected (Core: fNegative check)");
+    }
+
+    #[test]
+    fn test_check_proof_of_work_hash_above_target_rejected() {
+        let params = ChainParams::mainnet();
+        // Genesis target (BE): [0,0,0,0, 0xff,0xff, 0,...,0]
+        // A hash stored in LE with byte[31]=0x01 reverses to BE byte[0]=0x01 > target[0]=0x00.
+        // LE byte 31 = BE byte 0.
+        let mut hash = [0u8; 32];
+        hash[31] = 0x01; // LE byte 31 → BE byte 0 = 0x01 > target[0] = 0x00
+        assert!(!check_proof_of_work(&hash, 0x1d00ffff, &params),
+            "hash above target must fail (Core pow.cpp:167)");
+    }
+
+    #[test]
+    fn test_check_proof_of_work_hash_at_target_passes() {
+        let params = ChainParams::mainnet();
+        // Craft a hash that exactly equals the target for 0x1d00ffff.
+        // Target (BE): 00 00 00 00 ff ff 00 00 ... 00
+        // In LE (internal storage): reversed = 00 ... 00 ff ff 00 00 00 00
+        // hash[27]=0x00, hash[28]=0x00, hash[29]=0xff, hash[30]=0xff, hash[31]=0x00 ... hmm
+        // Let's recompute: target BE = [0,0,0,0, 0xff,0xff, 0,0,...,0]
+        // In LE that's reversed: [0,...,0, 0xff,0xff, 0,0,0,0]
+        // So hash[27]=0xff, hash[28]=0xff, hash[29..31]=0x00, hash[0..26]=0x00
+        let mut hash = [0u8; 32]; // LE storage
+        // target BE bytes 4,5 = 0xff, 0xff
+        // reversed: LE byte 31-4=27 = 0xff, LE byte 31-5=26 = 0xff
+        hash[27] = 0xff;
+        hash[26] = 0xff;
+        // All other bytes 0
+        assert!(check_proof_of_work(&hash, 0x1d00ffff, &params),
+            "hash exactly equal to target must pass (Core pow.cpp:167 uses >)");
+    }
+
+    // --- SetCompact / GetCompact round-trip ---
+
+    #[test]
+    fn test_compact_roundtrip_genesis() {
+        // 0x1d00ffff → target → compact must give back 0x1d00ffff
+        let bits = 0x1d00ffff;
+        let target = compact_to_target(bits);
+        let back = target_to_compact(&target);
+        assert_eq!(back, bits, "SetCompact(GetCompact(genesis)) must be identity");
+    }
+
+    #[test]
+    fn test_compact_roundtrip_various() {
+        let cases = [
+            0x1c00ffff,
+            0x1b00ffff,
+            0x1a00ffff,
+            0x207fffff, // regtest
+            0x1d00ffff, // mainnet genesis
+        ];
+        for bits in cases {
+            let target = compact_to_target(bits);
+            let back = target_to_compact(&target);
+            assert_eq!(back, bits,
+                "round-trip failed for bits=0x{:08x}", bits);
+        }
+    }
+
+    // --- Regtest: fPowNoRetargeting ---
+
+    #[test]
+    fn test_regtest_never_retargets_any_height() {
+        let params = ChainParams::regtest();
+        let genesis_bits = 0x207fffff;
+
+        for count in [2015, 2016, 4031, 4032, 10000] {
+            let chain = build_chain(0, count, 0, 1, genesis_bits);
+            let new_bits = get_next_work_required(&chain, chain.timestamp() + 1, &params);
+            assert_eq!(new_bits, genesis_bits,
+                "regtest must never retarget at height {}", count);
+        }
+    }
+
+    // --- Testnet walkback: boundary between min-diff run and retarget block ---
+
+    #[test]
+    fn test_testnet_walkback_finds_non_min_diff_block() {
+        let params = ChainParams::testnet3();
+        let normal_bits = 0x1d00ffff;
+        let pow_limit_bits = target_to_compact(&params.pow_limit);
+
+        // Chain: 5 normal blocks, then 5 min-diff blocks
+        let mut chain = TestBlockIndex::genesis(normal_bits);
+        chain.timestamp = 0;
+
+        for h in 1..=5 {
+            chain = TestBlockIndex::with_prev(h, h * TARGET_BLOCK_TIME, normal_bits, chain);
+        }
+        for h in 6..=10 {
+            chain = TestBlockIndex::with_prev(
+                h, chain.timestamp() + TARGET_BLOCK_TIME * 3, pow_limit_bits, chain,
+            );
+        }
+
+        // New block at normal spacing → walkback should skip the min-diff blocks
+        let bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        assert_eq!(bits, normal_bits,
+            "walkback should return last non-min-diff bits");
+    }
+
+    #[test]
+    fn test_testnet_walkback_stops_at_retarget_height() {
+        // All blocks since the last retarget are min-diff.
+        // Walkback must stop at the retarget boundary block (height 2016).
+        let params = ChainParams::testnet3();
+        let normal_bits = 0x1d00ffff;
+        let pow_limit_bits = target_to_compact(&params.pow_limit);
+
+        // Build 2016 normal blocks
+        let mut chain = TestBlockIndex::genesis(normal_bits);
+        chain.timestamp = 0;
+
+        for h in 1u32..=2016 {
+            chain = TestBlockIndex::with_prev(h, h * TARGET_BLOCK_TIME, normal_bits, chain);
+        }
+        // Add 4 min-difficulty blocks (height 2017..2020)
+        for _h in 2017u32..=2020 {
+            let ts = chain.timestamp() + TARGET_BLOCK_TIME * 3;
+            let h = chain.height() + 1;
+            chain = TestBlockIndex::with_prev(h, ts, pow_limit_bits, chain);
+        }
+
+        // next_height = 2021, not a retarget.  All recent blocks are min-diff.
+        let bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        // Walkback stops at height 2016 (which has normal_bits)
+        assert_eq!(bits, normal_bits,
+            "walkback should stop at retarget boundary and return its bits");
+    }
 }

@@ -48,13 +48,18 @@ impl BlockHeader {
     /// target = mantissa * 2^(8 * (exponent - 3))
     ///
     /// The result is a 256-bit big-endian integer stored in a 32-byte array.
+    /// Returns all-zeros for invalid or overflowing compact values, matching
+    /// Bitcoin Core's `SetCompact` + `DeriveTarget` semantics (pow.cpp).
     pub fn target(&self) -> [u8; 32] {
         let exponent = (self.bits >> 24) as usize;
         let mantissa = self.bits & 0x007F_FFFF;
         let negative = (self.bits & 0x0080_0000) != 0;
 
-        // Invalid targets
-        if negative || mantissa == 0 || exponent == 0 {
+        // Invalid targets: negative, zero mantissa, zero exponent (Core pow.cpp DeriveTarget).
+        // Overflow: exponent > 32 means the value would exceed 256 bits. Guard here to
+        // prevent usize underflow on the `32 - exponent` index below (panics in debug,
+        // wraps in release). Core rejects these via fOverflow in SetCompact.
+        if negative || mantissa == 0 || exponent == 0 || exponent > 32 {
             return [0u8; 32];
         }
 
@@ -75,7 +80,8 @@ impl BlockHeader {
         } else {
             // Position where mantissa starts (big-endian, so from the left)
             // exponent tells us the total byte length from the right
-            // so start position = 32 - exponent
+            // so start position = 32 - exponent.
+            // exponent <= 32 is guaranteed by the guard above, so start >= 0.
             let start = 32 - exponent;
             if start < 32 {
                 target[start] = ((mantissa >> 16) & 0xFF) as u8;
@@ -91,14 +97,25 @@ impl BlockHeader {
         target
     }
 
-    /// Check that the block hash is at or below the target encoded in `bits`.
+    /// Check that the block hash is at or below the target encoded in `bits`,
+    /// and that the target itself is valid (non-zero, non-negative, non-overflow).
+    ///
+    /// Does NOT enforce the pow_limit bound — callers that have access to
+    /// `ChainParams` should use `check_proof_of_work()` from the consensus crate
+    /// which additionally verifies `target <= pow_limit` (Core pow.cpp DeriveTarget).
     pub fn validate_pow(&self) -> bool {
         let hash = self.block_hash();
         let target = self.target();
 
-        // Compare hash against target
-        // Hash is stored in little-endian (internal byte order)
-        // Target is big-endian, so we reverse hash for comparison
+        // target() returns all-zeros for negative/zero/overflow compact values.
+        // Reject those here — a zero target would incorrectly accept only a zero hash.
+        if target == [0u8; 32] {
+            return false;
+        }
+
+        // Compare hash against target.
+        // Hash is stored in little-endian (internal byte order).
+        // Target is big-endian, so we reverse hash for comparison.
         let mut hash_be = hash.0;
         hash_be.reverse();
 
@@ -365,6 +382,89 @@ mod tests {
         };
 
         assert!(genesis_header.validate_pow());
+    }
+
+    // --- W83: compact encoding + validate_pow edge cases ---
+
+    /// Zero mantissa is an invalid compact encoding — must be rejected.
+    #[test]
+    fn target_zero_mantissa_rejected() {
+        let header = BlockHeader { bits: 0x1d00_0000, ..Default::default() };
+        // target() returns [0u8; 32] for zero mantissa
+        assert_eq!(header.target(), [0u8; 32]);
+        // validate_pow rejects zero target (would accept any-zero hash otherwise)
+        assert!(!header.validate_pow());
+    }
+
+    /// Negative compact target (high bit of mantissa set) is invalid.
+    #[test]
+    fn target_negative_rejected() {
+        let header = BlockHeader { bits: 0x1d80_0000, ..Default::default() };
+        assert_eq!(header.target(), [0u8; 32]);
+        assert!(!header.validate_pow());
+    }
+
+    /// Exponent 0 is an invalid compact encoding.
+    #[test]
+    fn target_zero_exponent_rejected() {
+        let header = BlockHeader { bits: 0x0000_ffff, ..Default::default() };
+        assert_eq!(header.target(), [0u8; 32]);
+        assert!(!header.validate_pow());
+    }
+
+    /// Exponent > 32 would overflow the 256-bit target array.
+    /// Before W83 this caused usize underflow (panic in debug, wrap in release).
+    /// After the fix, target() returns [0u8;32] and validate_pow() returns false.
+    #[test]
+    fn target_overflow_exponent_rejected() {
+        // exponent = 33 (0x21) — exceeds 32-byte array
+        let header = BlockHeader { bits: 0x2100_0001, ..Default::default() };
+        assert_eq!(header.target(), [0u8; 32]);
+        assert!(!header.validate_pow());
+
+        // exponent = 0xff (max) — should also be safely rejected
+        let header2 = BlockHeader { bits: 0xff00_0001, ..Default::default() };
+        assert_eq!(header2.target(), [0u8; 32]);
+        assert!(!header2.validate_pow());
+    }
+
+    /// Exponent exactly 32 (the boundary) must be accepted when mantissa is valid.
+    #[test]
+    fn target_exponent_32_accepted() {
+        // exponent = 32, mantissa = 0x000001 — the value is 1 * 2^(8*(32-3)) = 2^232
+        // This is a very large target (almost 2^232) but within the 256-bit range.
+        let header = BlockHeader { bits: 0x2000_0001, ..Default::default() };
+        let target = header.target();
+        // target[0] should be 0x00, target[1] = 0x00, target[2] = 0x01 (MSB at offset 32-32=0)
+        // Actually byte [0] = mantissa>>16 = 0x00, [1] = mantissa>>8 = 0x00, [2] = mantissa&0xff = 0x01
+        assert_eq!(target[0], 0x00);
+        assert_eq!(target[1], 0x00);
+        assert_eq!(target[2], 0x01);
+        // All subsequent bytes should be zero
+        for i in 3..32 {
+            assert_eq!(target[i], 0x00);
+        }
+        // Not all-zeros so no early rejection in target()
+        assert_ne!(target, [0u8; 32]);
+    }
+
+    /// Small exponent target decodes correctly (byte positions verified against Core).
+    #[test]
+    fn target_small_exponent_decodes_correctly() {
+        // bits = 0x03012345: exponent=3, mantissa=0x012345
+        // exponent <= 3: shift = 8*(3-3) = 0, m = 0x012345
+        // target[31] = 0x45, target[30] = 0x23, target[29] = 0x01 (since exponent>=3)
+        let header = BlockHeader { bits: 0x0301_2345, ..Default::default() };
+        let target = header.target();
+        assert_ne!(target, [0u8; 32]);
+        assert_eq!(target[31], 0x45);
+        assert_eq!(target[30], 0x23);
+        assert_eq!(target[29], 0x01);
+        // All other bytes zero
+        for i in 0..29 {
+            assert_eq!(target[i], 0x00);
+        }
+        assert_eq!(target[32 - 1], 0x45); // sanity
     }
 
     #[test]
