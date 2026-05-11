@@ -4641,4 +4641,161 @@ mod tests {
                 "byte 0x{b:02x} should NOT be OP_SUCCESS");
         }
     }
+
+    // ================================================================
+    // W81: BIP-65 OP_CHECKLOCKTIMEVERIFY opcode gates (interpreter.cpp:522-558)
+    // ================================================================
+
+    /// A checker that always approves check_locktime — used to isolate opcode
+    /// gate logic from the CheckLockTime implementation.
+    struct AlwaysOkLocktime;
+    impl SignatureChecker for AlwaysOkLocktime {
+        fn check_sig(&self, _: &[u8], _: &[u8], _: &[u8], _: SigVersion) -> bool { false }
+        fn check_locktime(&self, _: i64) -> bool { true }
+        fn check_sequence(&self, _: i64) -> bool { false }
+    }
+
+    /// A checker that always rejects check_locktime — isolates the fail path.
+    struct AlwaysFailLocktime;
+    impl SignatureChecker for AlwaysFailLocktime {
+        fn check_sig(&self, _: &[u8], _: &[u8], _: &[u8], _: SigVersion) -> bool { false }
+        fn check_locktime(&self, _: i64) -> bool { false }
+        fn check_sequence(&self, _: i64) -> bool { false }
+    }
+
+    /// Gate 1: CLTV flag not set → treat as NOP2 (falls through without error).
+    /// interpreter.cpp:524-526
+    #[test]
+    fn cltv_gate1_nop2_when_flag_not_set() {
+        // Script: OP_1 OP_CHECKLOCKTIMEVERIFY (0x51 0xb1)
+        let script = [0x51, 0xb1];
+        let mut stack = Stack::new();
+        let mut flags = ScriptFlags::default();
+        flags.verify_checklocktimeverify = false; // not activated
+        let checker = AlwaysFailLocktime; // would fail if activated
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(result.is_ok(), "CLTV without flag must act as NOP2: {result:?}");
+        assert_eq!(stack.len(), 1, "stack should still have OP_1 value (not consumed)");
+    }
+
+    /// Gate 2: Empty stack → error (SCRIPT_ERR_INVALID_STACK_OPERATION / StackUnderflow).
+    /// interpreter.cpp:529-530
+    #[test]
+    fn cltv_gate2_empty_stack_error() {
+        // Script: OP_CHECKLOCKTIMEVERIFY with nothing on stack (0xb1)
+        let script = [0xb1];
+        let mut stack = Stack::new(); // empty
+        let mut flags = ScriptFlags::default();
+        flags.verify_checklocktimeverify = true;
+        let checker = AlwaysOkLocktime;
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(result.is_err(), "CLTV on empty stack must fail");
+    }
+
+    /// Gate 3: 5-byte ScriptNum with fRequireMinimal — large value (4-byte overflow,
+    /// 5-byte acceptable). Verifies LOCKTIME_MAX_NUM_SIZE=5 is used.
+    /// interpreter.cpp:546
+    #[test]
+    fn cltv_gate3_5byte_scriptnum_accepted() {
+        // Encode 500_000_001 as a minimal 4-byte script num and push it.
+        // This is a valid 4-byte value (< 2^31) and well below u32::MAX.
+        // A value that requires 5 bytes: 2^31 = 2_147_483_648.
+        // encode_script_num(2_147_483_648) should produce 5 bytes.
+        let large_val: i64 = 2_147_483_648;
+        let encoded = encode_script_num(large_val);
+        assert_eq!(encoded.len(), 5, "2^31 requires 5 bytes");
+
+        // Build script: PUSH <5-byte-num> OP_CHECKLOCKTIMEVERIFY
+        let mut script = vec![(encoded.len() as u8)]; // push N bytes
+        script.extend_from_slice(&encoded);
+        script.push(0xb1); // OP_CHECKLOCKTIMEVERIFY
+
+        let mut stack = Stack::new();
+        let mut flags = ScriptFlags::default();
+        flags.verify_checklocktimeverify = true;
+        flags.verify_minimaldata = false; // no minimal requirement for this test
+        let checker = AlwaysOkLocktime; // approves locktime
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(result.is_ok(), "5-byte locktime must be accepted by CLTV: {result:?}");
+    }
+
+    /// Gate 3b: 5-byte non-minimal encoding with fRequireMinimal → must fail.
+    #[test]
+    fn cltv_gate3b_non_minimal_rejected_with_requireminimal() {
+        // [0x01, 0x00, 0x00, 0x00, 0x00] is a non-minimal encoding of 1 (5 bytes)
+        let non_minimal = vec![0x01, 0x00, 0x00, 0x00, 0x00];
+        let mut script = vec![non_minimal.len() as u8];
+        script.extend_from_slice(&non_minimal);
+        script.push(0xb1); // OP_CHECKLOCKTIMEVERIFY
+
+        let mut stack = Stack::new();
+        let mut flags = ScriptFlags::default();
+        flags.verify_checklocktimeverify = true;
+        flags.verify_minimaldata = true; // require minimal encoding
+        let checker = AlwaysOkLocktime;
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(result.is_err(), "non-minimal 5-byte encoding with MINIMALDATA must fail");
+    }
+
+    /// Gate 4: Negative operand → SCRIPT_ERR_NEGATIVE_LOCKTIME.
+    /// interpreter.cpp:551-552
+    #[test]
+    fn cltv_gate4_negative_operand_error() {
+        // OP_1NEGATE (-1) OP_CHECKLOCKTIMEVERIFY
+        let script = [0x4f, 0xb1]; // OP_1NEGATE=0x4f, CLTV=0xb1
+        let mut stack = Stack::new();
+        let mut flags = ScriptFlags::default();
+        flags.verify_checklocktimeverify = true;
+        let checker = AlwaysOkLocktime;
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(
+            matches!(result, Err(ScriptError::NegativeLocktime)),
+            "negative locktime must return NegativeLocktime: {result:?}"
+        );
+    }
+
+    /// Gate 5: check_locktime returns false → SCRIPT_ERR_UNSATISFIED_LOCKTIME.
+    /// interpreter.cpp:555-556
+    #[test]
+    fn cltv_gate5_unsatisfied_locktime_error() {
+        // OP_1 (locktime=1) OP_CHECKLOCKTIMEVERIFY with AlwaysFailLocktime
+        let script = [0x51, 0xb1]; // OP_1, CLTV
+        let mut stack = Stack::new();
+        let mut flags = ScriptFlags::default();
+        flags.verify_checklocktimeverify = true;
+        let checker = AlwaysFailLocktime;
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(
+            matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "failed check_locktime must return UnsatisfiedLocktime: {result:?}"
+        );
+    }
+
+    /// Gate 6: Stack value is preserved (peek not pop) after CLTV.
+    /// interpreter.cpp:558 — falls through, leaving stacktop(-1) intact.
+    #[test]
+    fn cltv_gate6_stack_preserved_after_success() {
+        // OP_1 OP_CHECKLOCKTIMEVERIFY — if success, OP_1 must still be on stack
+        let script = [0x51, 0xb1]; // OP_1, CLTV
+        let mut stack = Stack::new();
+        let mut flags = ScriptFlags::default();
+        flags.verify_checklocktimeverify = true;
+        let checker = AlwaysOkLocktime;
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(result.is_ok(), "CLTV success must not error: {result:?}");
+        assert_eq!(stack.len(), 1, "CLTV must leave stack item (peek not pop)");
+        assert_eq!(stack[0], encode_script_num(1), "stack top must still be 1 after CLTV");
+    }
+
+    /// CLTV as NOP2 also preserves stack (no flag = NOP, no side effects).
+    #[test]
+    fn cltv_nop2_preserves_stack() {
+        let script = [0x52, 0xb1]; // OP_2, CLTV-as-NOP2
+        let mut stack = Stack::new();
+        let mut flags = ScriptFlags::default();
+        flags.verify_checklocktimeverify = false;
+        let checker = DummyChecker;
+        eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base).unwrap();
+        assert_eq!(stack.len(), 1, "NOP2 must leave OP_2 on stack");
+    }
 }
