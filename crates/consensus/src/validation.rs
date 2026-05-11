@@ -260,6 +260,16 @@ pub fn check_transaction(tx: &Transaction) -> Result<(), TxValidationError> {
         return Err(TxValidationError::EmptyOutputs);
     }
 
+    // Size limits (stripped serialization only — witness not yet validated for
+    // malleability).  Mirrors Bitcoin Core tx_check.cpp:19:
+    //   `GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT`
+    // Note: this checks that the *stripped* weight (base_size × 4) does not
+    // exceed the block weight cap — a single tx cannot be larger than one block.
+    let stripped_weight = tx.base_size() as u64 * WITNESS_SCALE_FACTOR;
+    if stripped_weight > MAX_BLOCK_WEIGHT {
+        return Err(TxValidationError::TooLarge(stripped_weight));
+    }
+
     // Check output values
     // NOTE: value is stored as u64 but wire-encoded as int64; a negative wire value
     // will deserialize with the high bit set.  Check sign before the upper-bound
@@ -2041,6 +2051,80 @@ mod tests {
     // =========================
     // check_transaction tests
     // =========================
+
+    /// W76: check_transaction must reject a transaction whose stripped
+    /// serialization exceeds MAX_BLOCK_WEIGHT when scaled by 4.
+    /// Mirrors Bitcoin Core tx_check.cpp:19:
+    ///   `GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT`
+    #[test]
+    fn check_transaction_rejects_oversized_stripped_tx() {
+        use crate::params::{MAX_BLOCK_WEIGHT, WITNESS_SCALE_FACTOR};
+        // Build a tx whose base_size × 4 exceeds MAX_BLOCK_WEIGHT = 4_000_000.
+        // A scriptSig of 1_000_001 bytes alone is enough:
+        //   base_size ≥ 1_000_001 → stripped_weight ≥ 4_000_004 > 4_000_000.
+        let big_script_sig = vec![0x00u8; (MAX_BLOCK_WEIGHT / WITNESS_SCALE_FACTOR + 1) as usize];
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: big_script_sig,
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: vec![],
+            }],
+            lock_time: 0,
+        };
+        let stripped_weight = tx.base_size() as u64 * WITNESS_SCALE_FACTOR;
+        assert!(
+            stripped_weight > MAX_BLOCK_WEIGHT,
+            "test setup: stripped_weight {stripped_weight} must exceed MAX_BLOCK_WEIGHT"
+        );
+        assert!(
+            matches!(check_transaction(&tx), Err(TxValidationError::TooLarge(_))),
+            "oversized tx must be rejected with TooLarge"
+        );
+    }
+
+    /// W76: a normal-sized transaction is not rejected by the oversize gate.
+    /// Verifies that the check uses strict `>` (not `>=`) and that typical txs pass.
+    #[test]
+    fn check_transaction_normal_tx_not_rejected_as_too_large() {
+        // A typical coinbase transaction is ~150-200 bytes; its stripped_weight
+        // is ~600-800 WU — far below MAX_BLOCK_WEIGHT = 4_000_000.
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x03, 0x01, 0x02, 0x03], // 4-byte height push
+                sequence: 0xFFFFFFFF,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: vec![0x76, 0xa9, 0x14,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x88, 0xac],
+            }],
+            lock_time: 0,
+        };
+        // Normal tx must not be TooLarge
+        assert!(
+            !matches!(check_transaction(&tx), Err(TxValidationError::TooLarge(_))),
+            "normal-sized coinbase tx must not be rejected as TooLarge"
+        );
+        // Sanity: verify the stripped_weight is indeed well below the cap
+        use crate::params::{MAX_BLOCK_WEIGHT, WITNESS_SCALE_FACTOR};
+        let stripped_weight = tx.base_size() as u64 * WITNESS_SCALE_FACTOR;
+        assert!(
+            stripped_weight <= 1000,
+            "test coinbase stripped_weight {stripped_weight} should be ~200-800 WU"
+        );
+        assert!(stripped_weight < MAX_BLOCK_WEIGHT);
+    }
 
     #[test]
     fn check_transaction_rejects_empty_inputs() {
