@@ -1524,7 +1524,15 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
             .as_ref()
             .map(|_| true) // bip34_hash present → trust the height gate (IBD context)
             .unwrap_or(false);
-    let enforce_bip30 = !is_bip30_exception && !bip34_short_circuit;
+    // Match Core's combined gate at validation.cpp:2467:
+    //   if (fEnforceBIP30 || pindex->nHeight >= BIP34_IMPLIES_BIP30_LIMIT)
+    // The `>= LIMIT` branch re-enables BIP-30 unconditionally once we are
+    // past height 1,983,702 — even on the canonical chain — because
+    // BIP-34's modular-arithmetic block-height encoding (3-byte CScriptNum)
+    // wraps and starts repeating pre-BIP34 coinbase scripts, reintroducing
+    // the possibility of a duplicate-coinbase BIP-30 violation.
+    let enforce_bip30 = (!is_bip30_exception && !bip34_short_circuit)
+        || height >= bip34_implies_bip30_limit;
     if enforce_bip30 {
         for tx in &block.transactions {
             let txid = tx.txid();
@@ -1541,20 +1549,33 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     for tx in &block.transactions {
         // Skip coinbase for input validation (it has no real inputs)
         if tx.is_coinbase() {
-            // Count coinbase sigops (legacy only, no inputs)
+            // Count coinbase sigops (legacy only, no inputs).
+            //
+            // W93 fix: enforce the cumulative `MAX_BLOCK_SIGOPS_COST` cap
+            // inline, matching Core's per-tx break in ConnectBlock
+            // (validation.cpp:2569-2572) instead of deferring to a single
+            // post-loop check.  Equivalent accept/reject decision, but the
+            // reject path here surfaces `bad-blk-sigops` as soon as the
+            // threshold is crossed, instead of doing extra (failing) work
+            // for later txs that may produce a different error type first.
             block_sigop_cost += get_legacy_sigop_count(tx) as u64 * WITNESS_SCALE_FACTOR;
+            if block_sigop_cost > MAX_BLOCK_SIGOPS_COST {
+                return Err(ValidationError::SigopsLimitExceeded(block_sigop_cost));
+            }
 
             // Add coinbase outputs to UTXO set immediately
             // (for potential intra-block spending in future soft forks, though
-            // currently coinbase outputs can't be spent until maturity)
+            // currently coinbase outputs can't be spent until maturity).
+            //
+            // W93 fix: filter via Core's full `CScript::IsUnspendable` predicate
+            // (script.h:563) — OP_RETURN OR size > MAX_SCRIPT_SIZE — instead of
+            // an ad-hoc OP_RETURN-only filter that also dropped legitimate
+            // `(empty-script, value=0)` outputs (which Core would insert).
+            // Mirrors `CCoinsViewCache::AddCoin` in Core (coins.cpp:89-91):
+            //   if (coin.out.scriptPubKey.IsUnspendable()) return;
             let txid = tx.txid();
             for (vout, output) in tx.outputs.iter().enumerate() {
-                // Skip empty OP_RETURN outputs
-                if output.script_pubkey.is_empty() && output.value == 0 {
-                    continue;
-                }
-                // Also skip standard OP_RETURN (they're unspendable)
-                if !output.script_pubkey.is_empty() && output.script_pubkey[0] == 0x6a {
+                if is_unspendable(&output.script_pubkey) {
                     continue;
                 }
                 let outpoint = OutPoint {
@@ -1632,6 +1653,13 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
             get_transaction_sigop_cost(tx, get_coin, &flags)
         };
         block_sigop_cost += tx_sigop_cost;
+        // W93 fix: enforce sigops cap inline, matching Core's per-tx
+        // break in ConnectBlock (validation.cpp:2569-2572).  Without this
+        // we did the entire UTXO update and script verification for every
+        // remaining tx before rejecting at the bottom of the function.
+        if block_sigop_cost > MAX_BLOCK_SIGOPS_COST {
+            return Err(ValidationError::SigopsLimitExceeded(block_sigop_cost));
+        }
 
         // BIP-68: Check sequence locks
         // BIP-68 only applies if tx version >= 2 and CSV is active.
@@ -1731,11 +1759,15 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
             .filter(|&f| f <= MAX_MONEY)
             .ok_or(ValidationError::FeesOutOfRange(total_fees.saturating_add(tx_fee)))?;
 
-        // Add outputs to UTXO set (for intra-block spending)
+        // Add outputs to UTXO set (for intra-block spending).
+        //
+        // W93 fix: filter via Core's full `CScript::IsUnspendable` predicate
+        // (script.h:563) — OP_RETURN OR size > MAX_SCRIPT_SIZE — instead of
+        // an OP_RETURN-only filter.  Mirrors `CCoinsViewCache::AddCoin`
+        // (coins.cpp:89-91): `if (coin.out.scriptPubKey.IsUnspendable()) return;`
         let txid = tx.txid();
         for (vout, output) in tx.outputs.iter().enumerate() {
-            // Skip unspendable outputs
-            if !output.script_pubkey.is_empty() && output.script_pubkey[0] == 0x6a {
+            if is_unspendable(&output.script_pubkey) {
                 continue;
             }
             let outpoint = OutPoint {
@@ -1766,13 +1798,21 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     //       state.Invalid(..., "bad-cb-amount", ...)
     // Both subsidy and total_fees are MoneyRange-validated at this point, so
     // their sum fits in u64, but guard with checked_add for correctness.
+    //
+    // W93 fix: mirror Core's `CTransaction::GetValueOut` which checks
+    // MoneyRange on every output and on the running total (consensus/amount.h
+    // + primitives/transaction.cpp).  CheckBlock already enforces per-output
+    // MoneyRange but a malicious caller could construct an in-memory block
+    // (test/fuzz) that bypasses CheckBlock, so we defend in depth with
+    // `checked_add` here.  Overflow → treat as exceeding the cap and reject
+    // with `bad-cb-amount`.
     let subsidy = block_subsidy(height, params.subsidy_halving_interval);
     let max_coinbase_value = subsidy.saturating_add(total_fees);
     let coinbase_value: u64 = block.transactions[0]
         .outputs
         .iter()
-        .map(|o| o.value)
-        .sum();
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+        .unwrap_or(u64::MAX);
 
     if coinbase_value > max_coinbase_value {
         return Err(ValidationError::BadSubsidy(coinbase_value, max_coinbase_value));
@@ -8058,5 +8098,335 @@ mod tests {
         let view = W92Utxo::new();
         let txid = Hash256::from_bytes([0xff; 32]);
         assert!(view.access_by_txid(&txid).is_none());
+    }
+
+    // ============================================================
+    // W93: ConnectBlock + UpdateCoins audit tests
+    //
+    // Mirrors Bitcoin Core validation.cpp ConnectBlock (2295-2673),
+    // UpdateCoins (1999-2012), and CCoinsViewCache::AddCoin (coins.cpp:89-91).
+    // ============================================================
+
+    /// W93 — Oversized coinbase output (script.len() > MAX_SCRIPT_SIZE) must
+    /// NOT be inserted into the UTXO set.  Core's `CCoinsViewCache::AddCoin`
+    /// short-circuits on `IsUnspendable`, which covers BOTH `OP_RETURN` AND
+    /// size > MAX_SCRIPT_SIZE.  Prior to W93 the connect path filtered
+    /// OP_RETURN only and would have stored a 10,001-byte coinbase output.
+    #[test]
+    fn w93_coinbase_oversized_script_not_added_to_utxo() {
+        let params = maturity_test_params();
+        let subsidy = 50 * 100_000_000u64;
+        let mut coinbase = make_coinbase_tx(1, subsidy);
+        // Replace the OP_1 output with an oversized script (10_001 bytes).
+        coinbase.outputs[0].script_pubkey = vec![0x51u8; MAX_SCRIPT_SIZE + 1];
+        let coinbase_txid = coinbase.txid();
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        let null_ctx = NullSequenceLockContext;
+        let mut utxo = Bip30Utxo::new();
+        let _ = connect_block_with_sequence_locks(
+            &block, 1, &mut utxo, &params, &null_ctx, 0,
+        )
+        .expect("oversized-script coinbase output should not fail validation");
+
+        // The (txid, 0) outpoint must NOT be in the UTXO set — it is unspendable.
+        let out = OutPoint { txid: coinbase_txid, vout: 0 };
+        assert!(
+            utxo.get_utxo(&out).is_none(),
+            "oversized coinbase output must be filtered as IsUnspendable",
+        );
+    }
+
+    /// W93 — Empty-script, value-0 coinbase output is SPENDABLE per Core's
+    /// `IsUnspendable` (returns false for empty scripts) and must be inserted
+    /// into the UTXO set.  Prior to W93 rustoshi had an ad-hoc filter that
+    /// dropped these, diverging from Core for fuzz-constructed blocks.
+    #[test]
+    fn w93_coinbase_empty_script_zero_value_added_to_utxo() {
+        let params = maturity_test_params();
+        let mut coinbase = make_coinbase_tx(1, 0);
+        coinbase.outputs[0].script_pubkey = vec![]; // empty, value already 0
+        let coinbase_txid = coinbase.txid();
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        let null_ctx = NullSequenceLockContext;
+        let mut utxo = Bip30Utxo::new();
+        let _ = connect_block_with_sequence_locks(
+            &block, 1, &mut utxo, &params, &null_ctx, 0,
+        )
+        .expect("0-value empty-script coinbase must pass connect");
+
+        let out = OutPoint { txid: coinbase_txid, vout: 0 };
+        assert!(
+            utxo.get_utxo(&out).is_some(),
+            "empty-script (size=0) coinbase output is spendable per IsUnspendable; \
+             must be inserted into the UTXO set (Core coins.cpp:89-91 + script.h:563)",
+        );
+    }
+
+    /// W93 — OP_RETURN coinbase output is unspendable and must NOT be in UTXO.
+    /// This is the unchanged behavior; the test ensures the new is_unspendable()
+    /// call path still filters OP_RETURN coinbases identically to the old code.
+    #[test]
+    fn w93_coinbase_op_return_filtered() {
+        let params = maturity_test_params();
+        let subsidy = 50 * 100_000_000u64;
+        let mut coinbase = make_coinbase_tx(1, subsidy);
+        coinbase.outputs[0].script_pubkey = vec![0x6a, 0x01, 0xde]; // OP_RETURN + push
+        let coinbase_txid = coinbase.txid();
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        let null_ctx = NullSequenceLockContext;
+        let mut utxo = Bip30Utxo::new();
+        let _ = connect_block_with_sequence_locks(
+            &block, 1, &mut utxo, &params, &null_ctx, 0,
+        )
+        .expect("OP_RETURN coinbase must pass connect");
+
+        let out = OutPoint { txid: coinbase_txid, vout: 0 };
+        assert!(
+            utxo.get_utxo(&out).is_none(),
+            "OP_RETURN coinbase output must be filtered as IsUnspendable",
+        );
+    }
+
+    /// W93 — Non-coinbase OP_RETURN output must NOT be added to UTXO.
+    /// Verifies the non-coinbase add-outputs path also routes through
+    /// `is_unspendable`.
+    #[test]
+    fn w93_non_coinbase_op_return_filtered() {
+        let params = maturity_test_params();
+        // Seed a prior UTXO for the non-coinbase to spend.
+        let prev_txid = Hash256::from_bytes([0x77u8; 32]);
+        let mut utxo = coinbase_utxo(prev_txid, 1, 5_000_000_000);
+
+        // Regtest halves every 150 blocks, so use a height before the first
+        // halving where subsidy = 50 BTC still applies. h=120 is past
+        // COINBASE_MATURITY (100) so the seeded coinbase coin at h=1 has matured.
+        let height = 120u32;
+
+        // At h=120 subsidy = 50 BTC; fees from spender are 5_000_000_000 - 4_000_000_000.
+        // coinbase value cap = subsidy + fees = 50 BTC + 1 BTC.  Claim only subsidy.
+        let coinbase = make_coinbase_tx(height, 5_000_000_000);
+        let mut spender = make_simple_tx(prev_txid, 0, 4_000_000_000);
+        // Replace OP_1 output with OP_RETURN
+        spender.outputs[0].script_pubkey = vec![0x6a, 0x02, 0xbe, 0xef];
+        let spender_txid = spender.txid();
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, spender],
+        };
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, height, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(result.is_ok(), "block should connect; got: {result:?}");
+
+        let out = OutPoint { txid: spender_txid, vout: 0 };
+        assert!(
+            utxo.get_utxo(&out).is_none(),
+            "non-coinbase OP_RETURN output must NOT be inserted into UTXO",
+        );
+    }
+
+    /// W93 — Per-tx sigops cap inside the connect loop (Core 2569-2572).
+    /// A coinbase whose scriptSig encodes >MAX_BLOCK_SIGOPS_COST/4 legacy
+    /// sigops should be rejected with `bad-blk-sigops` on the FIRST tx,
+    /// before any non-coinbase work runs.
+    #[test]
+    fn w93_sigops_cap_breaks_on_coinbase() {
+        let params = maturity_test_params();
+        // Legacy sigops are counted from BOTH scriptSig and scriptPubKey.
+        // We pack OP_CHECKMULTISIG (0xae) into the coinbase scriptSig.
+        // Each OP_CHECKMULTISIG counts as MAX_PUBKEYS_PER_MULTISIG = 20 sigops.
+        // Cost = legacy * WITNESS_SCALE_FACTOR(=4). We need cost > 80_000.
+        // → legacy > 20_000 → OP_CHECKMULTISIG count > 1_000.
+        let mut coinbase = make_coinbase_tx(1, 5_000_000_000);
+        // 2_000 OP_CHECKMULTISIG → 40_000 legacy sigops → cost 160_000 > 80_000.
+        // But coinbase scriptSig has a 2..100 byte size cap (BIP-34/regtest).
+        // Use scriptPubKey instead — coinbase coinbase output is fine.
+        coinbase.outputs[0].script_pubkey = vec![0xaeu8; 2_000];
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+        let null_ctx = NullSequenceLockContext;
+        let mut utxo = Bip30Utxo::new();
+        // CheckBlock may reject for other reasons (script size, etc.); we
+        // bypass CheckBlock by calling connect directly.  Connect must reject
+        // with SigopsLimitExceeded.
+        let result = connect_block_with_sequence_locks(
+            &block, 1, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(
+            matches!(result, Err(ValidationError::SigopsLimitExceeded(_))),
+            "coinbase with > MAX_BLOCK_SIGOPS_COST/4 legacy sigops must reject \
+             with SigopsLimitExceeded inside the per-tx loop; got: {result:?}",
+        );
+    }
+
+    /// W93 — coinbase value overflow defends against u64 wraparound.
+    /// CheckBlock should catch per-output MoneyRange, but connect_block
+    /// must defend in depth: if a fuzz-constructed block bypasses CheckBlock
+    /// and presents coinbase outputs that sum to overflow u64, treat as
+    /// `bad-cb-amount` rather than silently accepting via wraparound.
+    #[test]
+    fn w93_coinbase_value_overflow_rejects_bad_cb_amount() {
+        let params = maturity_test_params();
+        let mut coinbase = make_coinbase_tx(0, u64::MAX);
+        // Push a second output that overflows when added.
+        coinbase.outputs.push(TxOut {
+            value: u64::MAX,
+            script_pubkey: vec![0x51],
+        });
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+        let null_ctx = NullSequenceLockContext;
+        let mut utxo = Bip30Utxo::new();
+        let result = connect_block_with_sequence_locks(
+            &block, 0, &mut utxo, &params, &null_ctx, 0,
+        );
+        // Either BadSubsidy directly, or some earlier rejection.  Crucially
+        // we must NOT accept silently (which would be the case with the
+        // naive .sum::<u64>() wraparound).
+        assert!(
+            matches!(result, Err(ValidationError::BadSubsidy(_, _))),
+            "coinbase value overflow must reject with BadSubsidy; got: {result:?}",
+        );
+    }
+
+    /// W93 — Verify W92 spent-coins undo accounting still works for a 2-tx
+    /// block (a coinbase + a single spender).  `UndoData.spent_coins`
+    /// must contain exactly the inputs of the non-coinbase tx, in order;
+    /// the coinbase contributes nothing to the undo (Core's `undoDummy`).
+    #[test]
+    fn w93_undo_excludes_coinbase_includes_spent_inputs() {
+        let params = maturity_test_params();
+        let prev_txid = Hash256::from_bytes([0x33u8; 32]);
+        let mut utxo = coinbase_utxo(prev_txid, 1, 5_000_000_000);
+
+        // Regtest halves every 150 blocks. h=120 keeps subsidy=50 BTC and is
+        // past COINBASE_MATURITY (100), so the seeded coin at h=1 has matured.
+        let height = 120u32;
+        let coinbase = make_coinbase_tx(height, 5_000_000_000);
+        let spender = make_simple_tx(prev_txid, 0, 4_999_000_000);
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, spender],
+        };
+
+        let null_ctx = NullSequenceLockContext;
+        let (undo, _fees) = connect_block_with_sequence_locks(
+            &block, height, &mut utxo, &params, &null_ctx, 0,
+        )
+        .expect("must connect");
+
+        // The single non-coinbase tx has 1 input → exactly 1 spent coin.
+        // Coinbase contributes nothing (Core's `undoDummy`).
+        assert_eq!(
+            undo.spent_coins.len(),
+            1,
+            "undo.spent_coins must have exactly 1 entry (1 non-coinbase input), \
+             matching Core's per-tx vtxundo where coinbase contributes undoDummy",
+        );
+        assert_eq!(undo.spent_coins[0].value, 5_000_000_000);
+    }
+
+    /// W93 — BIP-30 enforcement at h >= 1_983_702 ALWAYS runs, even when
+    /// the block is in `bip30_exception_blocks` (defensive: in Core the
+    /// `|| height >= LIMIT` clause unconditionally re-enables BIP-30).
+    ///
+    /// This is a defense-in-depth test: in practice no exception block
+    /// will ever be at h >= 1_983_702, but the gate must match Core's
+    /// shape so a hypothetical future exception entry above the limit
+    /// would still get BIP-30 checked.
+    #[test]
+    fn w93_bip30_limit_overrides_exception_above_1_983_702() {
+        let params = bip34_shortcircuit_params();
+        let coinbase = make_coinbase_tx(2_000_000, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+        let block_hash = block.block_hash();
+
+        // Synthesize an exception entry for h=2_000_000 with this block's hash.
+        let mut p = params;
+        p.bip30_exception_blocks.push((2_000_000, block_hash));
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid);
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 2_000_000, &mut utxo, &p, &null_ctx, 0,
+        );
+        // Despite the exception entry, BIP-30 must be enforced because
+        // 2_000_000 >= BIP34_IMPLIES_BIP30_LIMIT (1_983_702).
+        assert!(
+            matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "h >= 1_983_702 must enforce BIP-30 regardless of exception entry; \
+             got: {result:?}",
+        );
     }
 }
