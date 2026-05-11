@@ -637,11 +637,17 @@ fn is_compressed_or_uncompressed_pubkey(pubkey: &[u8]) -> bool {
 ///
 /// Valid hashtypes: SIGHASH_ALL(1), SIGHASH_NONE(2), SIGHASH_SINGLE(3),
 /// optionally combined with SIGHASH_ANYONECANPAY(0x80).
+///
+/// The mask is `~SIGHASH_ANYONECANPAY = ~0x80 = 0x7f` (Core interpreter.cpp:194).
+/// Using 0x1f would incorrectly accept values like 0x21/0x41/0x61 as valid.
 fn is_defined_hashtype(sig: &[u8]) -> bool {
     if sig.is_empty() {
-        return true;
+        return false;
     }
-    let hashtype = sig[sig.len() - 1] & 0x1f;
+    // Strip the SIGHASH_ANYONECANPAY bit (0x80) before range check.
+    // The remaining byte must be in [SIGHASH_ALL(1), SIGHASH_SINGLE(3)].
+    // Core: nHashType = vchSig.back() & (~SIGHASH_ANYONECANPAY) (interpreter.cpp:194)
+    let hashtype = sig[sig.len() - 1] & !0x80u8;
     (1..=3).contains(&hashtype)
 }
 
@@ -4797,5 +4803,489 @@ mod tests {
         let checker = DummyChecker;
         eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base).unwrap();
         assert_eq!(stack.len(), 1, "NOP2 must leave OP_2 on stack");
+    }
+
+    // =====================================================================
+    // W82 BIP-66 + signature/pubkey encoding comprehensive audit tests
+    // Reference: Bitcoin Core interpreter.cpp:64-227, 335-345, 1150-1210
+    // =====================================================================
+
+    // -----------------------------------------------------------------------
+    // Helper: build a minimal valid DER-encoded signature with the given
+    // hashtype byte appended.  R = [0x01], S = [0x01] (both 1-byte, positive).
+    // Total: 30 06 02 01 01 02 01 01 <hashtype> = 9 bytes (minimum valid).
+    // -----------------------------------------------------------------------
+    fn minimal_sig(hashtype: u8) -> Vec<u8> {
+        vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, hashtype]
+    }
+
+    // -----------------------------------------------------------------------
+    // IsValidSignatureEncoding — 13 structural rejects + 1 accept (BIP-66)
+    // Core interpreter.cpp:108-171
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bip66_minimum_valid_9_bytes() {
+        // 9-byte minimum: 30 06 02 01 R 02 01 S hashtype — must be valid
+        assert!(is_valid_signature_encoding(&minimal_sig(0x01)));
+    }
+
+    #[test]
+    fn bip66_size_below_minimum_rejected() {
+        // 8 bytes — must fail (Core line 122: size < 9)
+        let sig = [0x30u8, 0x05, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_size_above_maximum_rejected() {
+        // 74 bytes — must fail (Core line 123: size > 73)
+        let mut sig = vec![0u8; 74];
+        sig[0] = 0x30;
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_maximum_valid_73_bytes() {
+        // 73-byte maximum: R=33 bytes, S=33 bytes
+        // Layout: 30 [total_len] 02 21 [R×33] 02 21 [S×33] [hashtype]
+        // total_len = 73 - 3 = 70 = 0x46
+        let mut sig = vec![0x30u8, 0x46, 0x02, 0x21]; // compound, total_len=0x46, R-tag, lenR=33
+        sig.push(0x01); // R[0] — positive (no high bit)
+        sig.extend([0x42u8; 32]); // R[1..32]
+        sig.push(0x02); sig.push(0x21); // S-tag, lenS=33
+        sig.push(0x01); // S[0] — positive
+        sig.extend([0x42u8; 32]); // S[1..32]
+        sig.push(0x01); // hashtype SIGHASH_ALL
+        assert_eq!(sig.len(), 73);
+        assert!(is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_compound_marker_wrong_rejected() {
+        // sig[0] != 0x30 — Core line 126
+        let mut sig = minimal_sig(0x01);
+        sig[0] = 0x31;
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_total_length_mismatch_rejected() {
+        // sig[1] != sig.len() - 3 — Core line 129
+        let mut sig = minimal_sig(0x01);
+        sig[1] = 0x07; // off by 1
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_r_integer_marker_wrong_rejected() {
+        // sig[2] != 0x02 — Core line 145
+        let mut sig = minimal_sig(0x01);
+        sig[2] = 0x03;
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_r_zero_length_rejected() {
+        // lenR == 0 — Core line 148
+        // 30 05 02 00 02 01 01 hashtype  — but we need total_len to be consistent
+        // Build manually: 30 05 02 00 [empty R] 02 01 01 01
+        // total_len = sig.len() - 3 = 9 - 3 = 6? Let's compute properly.
+        // sig = 30 LEN 02 00 02 01 01 hashtype => len=8, LEN=8-3=5
+        let sig = [0x30u8, 0x05, 0x02, 0x00, 0x02, 0x01, 0x01, 0x01];
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_r_negative_rejected() {
+        // sig[4] & 0x80 != 0 — Core line 151
+        let mut sig = minimal_sig(0x01);
+        sig[4] = 0x80; // high bit set — negative
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_r_excess_zero_padding_rejected() {
+        // lenR > 1, sig[4] == 0x00, sig[5] & 0x80 == 0 — Core line 155
+        // Build sig with R = [0x00, 0x01] (excess zero prefix on non-negative)
+        // 30 07 02 02 00 01 02 01 01 01 — len=10, total_len=7
+        let sig = [0x30u8, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01, 0x01];
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_r_necessary_zero_padding_accepted() {
+        // lenR > 1, sig[4] == 0x00, sig[5] & 0x80 != 0 — necessary zero (negative R without it)
+        // R = [0x00, 0x80] (necessary zero prefix because 0x80 & 0x80 != 0)
+        // 30 07 02 02 00 80 02 01 01 01 — len=10, total_len=7
+        let sig = [0x30u8, 0x07, 0x02, 0x02, 0x00, 0x80, 0x02, 0x01, 0x01, 0x01];
+        assert!(is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_s_integer_marker_wrong_rejected() {
+        // sig[lenR+4] != 0x02 — Core line 158
+        let mut sig = minimal_sig(0x01);
+        sig[5] = 0x03; // lenR=1, so s_marker at offset 4+1=5
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_s_zero_length_rejected() {
+        // lenS == 0 — Core line 161
+        // Build: 30 05 02 01 01 02 00 01 — len=8, total_len=5
+        let sig = [0x30u8, 0x05, 0x02, 0x01, 0x01, 0x02, 0x00, 0x01];
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_s_negative_rejected() {
+        // sig[lenR+6] & 0x80 != 0 — Core line 164
+        let mut sig = minimal_sig(0x01);
+        sig[7] = 0x80; // lenR=1, s_data at offset 4+1+2=7
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_s_excess_zero_padding_rejected() {
+        // lenS > 1, sig[lenR+6] == 0x00, sig[lenR+7] & 0x80 == 0 — Core line 168
+        // R = [0x01], S = [0x00, 0x01]
+        // 30 07 02 01 01 02 02 00 01 01 — len=10, total_len=7
+        let sig = [0x30u8, 0x07, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x01, 0x01];
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_s_necessary_zero_padding_accepted() {
+        // lenS > 1, sig[lenR+6] == 0x00, sig[lenR+7] & 0x80 != 0 — necessary zero
+        // R = [0x01], S = [0x00, 0x80]
+        // 30 07 02 01 01 02 02 00 80 01 — len=10, total_len=7
+        let sig = [0x30u8, 0x07, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x80, 0x01];
+        assert!(is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_len_r_plus_len_s_mismatch_rejected() {
+        // lenR + lenS + 7 != sig.len() — Core line 142
+        // Build a sig where 5 + lenR < sig.len() passes but total length is off
+        // R=2 bytes, S=1 byte claimed but sig has 2 S bytes: 30 07 02 02 01 01 02 01 01 01 01
+        let sig = [0x30u8, 0x07, 0x02, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01, 0x01];
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    #[test]
+    fn bip66_s_position_bound_check() {
+        // 5 + lenR >= sig.len() — Core line 135 (strict <)
+        // R length claims to extend past end of sig
+        let mut sig = minimal_sig(0x01); // len=9, R at offset 3 has len=1
+        sig[3] = 0x08; // lenR=8, 5+8=13 >= 9 → reject
+        assert!(!is_valid_signature_encoding(&sig));
+    }
+
+    // -----------------------------------------------------------------------
+    // IsDefinedHashtypeSignature — Core interpreter.cpp:190-199
+    // THE BUG FIXED HERE: mask was 0x1f, must be 0x7f (~SIGHASH_ANYONECANPAY)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hashtype_sighash_all_valid() {
+        // SIGHASH_ALL = 0x01 — valid
+        assert!(is_defined_hashtype(&minimal_sig(0x01)));
+    }
+
+    #[test]
+    fn hashtype_sighash_none_valid() {
+        // SIGHASH_NONE = 0x02 — valid
+        assert!(is_defined_hashtype(&minimal_sig(0x02)));
+    }
+
+    #[test]
+    fn hashtype_sighash_single_valid() {
+        // SIGHASH_SINGLE = 0x03 — valid
+        assert!(is_defined_hashtype(&minimal_sig(0x03)));
+    }
+
+    #[test]
+    fn hashtype_anyonecanpay_all_valid() {
+        // SIGHASH_ALL | SIGHASH_ANYONECANPAY = 0x81 — valid
+        assert!(is_defined_hashtype(&minimal_sig(0x81)));
+    }
+
+    #[test]
+    fn hashtype_anyonecanpay_none_valid() {
+        // SIGHASH_NONE | SIGHASH_ANYONECANPAY = 0x82 — valid
+        assert!(is_defined_hashtype(&minimal_sig(0x82)));
+    }
+
+    #[test]
+    fn hashtype_anyonecanpay_single_valid() {
+        // SIGHASH_SINGLE | SIGHASH_ANYONECANPAY = 0x83 — valid
+        assert!(is_defined_hashtype(&minimal_sig(0x83)));
+    }
+
+    #[test]
+    fn hashtype_value_0_invalid() {
+        // 0x00 stripped → 0x00 — not in [1,3] → invalid
+        assert!(!is_defined_hashtype(&minimal_sig(0x00)));
+    }
+
+    #[test]
+    fn hashtype_value_4_invalid() {
+        // 0x04 stripped → 0x04 — not in [1,3] → invalid (Core)
+        assert!(!is_defined_hashtype(&minimal_sig(0x04)));
+    }
+
+    #[test]
+    fn hashtype_value_0x21_invalid() {
+        // 0x21 & 0x7f = 0x21 (33) — NOT in [1,3] → INVALID
+        // BUG: 0x21 & 0x1f = 0x01 → would have been ACCEPTED before fix
+        assert!(!is_defined_hashtype(&minimal_sig(0x21)));
+    }
+
+    #[test]
+    fn hashtype_value_0x22_invalid() {
+        // 0x22 & 0x7f = 0x22 (34) — NOT in [1,3] → INVALID
+        assert!(!is_defined_hashtype(&minimal_sig(0x22)));
+    }
+
+    #[test]
+    fn hashtype_value_0x23_invalid() {
+        // 0x23 & 0x7f = 0x23 (35) — NOT in [1,3] → INVALID
+        assert!(!is_defined_hashtype(&minimal_sig(0x23)));
+    }
+
+    #[test]
+    fn hashtype_value_0x41_invalid() {
+        // 0x41 & 0x7f = 0x41 (65) — NOT in [1,3] → INVALID
+        // BUG: 0x41 & 0x1f = 0x01 → would have been ACCEPTED before fix
+        assert!(!is_defined_hashtype(&minimal_sig(0x41)));
+    }
+
+    #[test]
+    fn hashtype_value_0x61_invalid() {
+        // 0x61 & 0x7f = 0x61 (97) — NOT in [1,3] → INVALID
+        // BUG: 0x61 & 0x1f = 0x01 → would have been ACCEPTED before fix
+        assert!(!is_defined_hashtype(&minimal_sig(0x61)));
+    }
+
+    #[test]
+    fn hashtype_value_0xa1_invalid() {
+        // 0xa1 & 0x7f = 0x21 (33) — NOT in [1,3] → INVALID (has ANYONECANPAY set, wrong base)
+        // BUG: 0xa1 & 0x1f = 0x01 → would have been ACCEPTED before fix
+        assert!(!is_defined_hashtype(&minimal_sig(0xa1)));
+    }
+
+    #[test]
+    fn hashtype_empty_sig_returns_false() {
+        // Empty sig: Core returns false (interpreter.cpp:191-192)
+        assert!(!is_defined_hashtype(&[]));
+    }
+
+    // -----------------------------------------------------------------------
+    // IsDefinedHashtypeSignature integration: check_signature_encoding
+    // with STRICTENC flag rejects invalid hashtype (gate 23)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strictenc_invalid_hashtype_rejected_via_checksig() {
+        // 0x21 is invalid hashtype: STRICTENC should reject it via check_signature_encoding
+        // Using DummyChecker that fails sig (so NULLFAIL is the concern, but STRICTENC fires first)
+        let bad_hashtype_sig = minimal_sig(0x21);
+        let pubkey = vec![0x02u8; 33];
+        let mut stack = vec![bad_hashtype_sig, pubkey];
+        let mut flags = ScriptFlags::default();
+        flags.verify_strictenc = true;
+        let checker = DummyChecker;
+        let script = [0xac]; // OP_CHECKSIG
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(
+            matches!(result, Err(ScriptError::SigHashType)),
+            "STRICTENC must reject hashtype 0x21: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strictenc_valid_hashtype_0x81_accepted_via_checksig() {
+        // 0x81 (SIGHASH_ALL | ANYONECANPAY) is valid
+        let valid_sig = minimal_sig(0x81);
+        let pubkey = vec![0x02u8; 33];
+        let mut stack = vec![valid_sig, pubkey];
+        let mut flags = ScriptFlags::default();
+        flags.verify_strictenc = true;
+        let checker = DummyChecker; // sig fails, but hashtype is OK
+        let script = [0xac]; // OP_CHECKSIG
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        // DummyChecker returns false → sig fails → NullFail not set (flags not set) → push false
+        assert!(result.is_ok(), "hashtype 0x81 must pass STRICTENC: {result:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // IsCompressedOrUncompressedPubKey — gate 24 (STRICTENC)
+    // Core interpreter.cpp:64-84
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pubkey_compressed_02_accepted() {
+        let pubkey: Vec<u8> = std::iter::once(0x02u8).chain([0x42u8; 32]).collect();
+        assert!(is_compressed_or_uncompressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn pubkey_compressed_03_accepted() {
+        let pubkey: Vec<u8> = std::iter::once(0x03u8).chain([0x42u8; 32]).collect();
+        assert!(is_compressed_or_uncompressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn pubkey_uncompressed_04_accepted() {
+        let pubkey: Vec<u8> = std::iter::once(0x04u8).chain([0x42u8; 64]).collect();
+        assert!(is_compressed_or_uncompressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn pubkey_hybrid_06_rejected() {
+        // Hybrid key prefix 0x06 — rejected (Core line 80: "neither compressed nor uncompressed")
+        let pubkey: Vec<u8> = std::iter::once(0x06u8).chain([0x42u8; 64]).collect();
+        assert!(!is_compressed_or_uncompressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn pubkey_hybrid_07_rejected() {
+        let pubkey: Vec<u8> = std::iter::once(0x07u8).chain([0x42u8; 64]).collect();
+        assert!(!is_compressed_or_uncompressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn pubkey_wrong_length_02_prefix_rejected() {
+        // 0x02 prefix but 34 bytes — not 33
+        let pubkey: Vec<u8> = std::iter::once(0x02u8).chain([0x42u8; 33]).collect();
+        assert!(!is_compressed_or_uncompressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn pubkey_wrong_length_04_prefix_rejected() {
+        // 0x04 prefix but 33 bytes — not 65
+        let pubkey: Vec<u8> = std::iter::once(0x04u8).chain([0x42u8; 32]).collect();
+        assert!(!is_compressed_or_uncompressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn pubkey_too_short_rejected() {
+        // 32 bytes (< COMPRESSED_SIZE=33) — Core line 65
+        let pubkey = [0x02u8; 32];
+        assert!(!is_compressed_or_uncompressed_pubkey(&pubkey));
+    }
+
+    // -----------------------------------------------------------------------
+    // IsCompressedPubKey (WITNESS_PUBKEYTYPE gate) — gate 25
+    // Core interpreter.cpp:86-96
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compressed_pubkey_02_33bytes_accepted() {
+        let pubkey: Vec<u8> = std::iter::once(0x02u8).chain([0x42u8; 32]).collect();
+        assert!(is_compressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn compressed_pubkey_03_33bytes_accepted() {
+        let pubkey: Vec<u8> = std::iter::once(0x03u8).chain([0x42u8; 32]).collect();
+        assert!(is_compressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn compressed_pubkey_04_65bytes_rejected() {
+        // Uncompressed key — rejected for WITNESS_PUBKEYTYPE
+        let pubkey: Vec<u8> = std::iter::once(0x04u8).chain([0x42u8; 64]).collect();
+        assert!(!is_compressed_pubkey(&pubkey));
+    }
+
+    #[test]
+    fn compressed_pubkey_wrong_length_rejected() {
+        // 0x02 prefix but 34 bytes — rejected
+        let pubkey: Vec<u8> = std::iter::once(0x02u8).chain([0x42u8; 33]).collect();
+        assert!(!is_compressed_pubkey(&pubkey));
+    }
+
+    // -----------------------------------------------------------------------
+    // CheckSignatureEncoding (gate 20-23) — empty sig always OK (gate 20)
+    // Core interpreter.cpp:201-216
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_sig_encoding_empty_sig_always_ok() {
+        // Gate 20: empty sig returns Ok regardless of flags (Core line 204)
+        let flags = ScriptFlags::standard_flags();
+        assert!(check_signature_encoding(&[], &flags).is_ok());
+    }
+
+    #[test]
+    fn check_sig_encoding_dersig_rejects_malformed() {
+        // Gate 21: DERSIG flag triggers IsValidSignatureEncoding
+        let bad_sig = [0x31u8, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01]; // wrong compound marker
+        let mut flags = ScriptFlags::default();
+        flags.verify_dersig = true;
+        assert!(matches!(
+            check_signature_encoding(&bad_sig, &flags),
+            Err(ScriptError::SigDer)
+        ));
+    }
+
+    #[test]
+    fn check_sig_encoding_strictenc_rejects_malformed_der() {
+        // Gate 21: STRICTENC also triggers IsValidSignatureEncoding
+        let bad_sig = [0x31u8, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01];
+        let mut flags = ScriptFlags::default();
+        flags.verify_strictenc = true;
+        assert!(matches!(
+            check_signature_encoding(&bad_sig, &flags),
+            Err(ScriptError::SigDer)
+        ));
+    }
+
+    #[test]
+    fn check_sig_encoding_strictenc_rejects_invalid_hashtype() {
+        // Gate 23: STRICTENC → IsDefinedHashtypeSignature
+        let bad_hashtype = minimal_sig(0x04); // hashtype 4: invalid
+        let mut flags = ScriptFlags::default();
+        flags.verify_strictenc = true;
+        assert!(matches!(
+            check_signature_encoding(&bad_hashtype, &flags),
+            Err(ScriptError::SigHashType)
+        ));
+    }
+
+    #[test]
+    fn check_sig_encoding_strictenc_rejects_0x21_hashtype() {
+        // Regression for the 0x1f→0x7f mask fix: 0x21 must be rejected
+        let bad_hashtype = minimal_sig(0x21);
+        let mut flags = ScriptFlags::default();
+        flags.verify_strictenc = true;
+        assert!(matches!(
+            check_signature_encoding(&bad_hashtype, &flags),
+            Err(ScriptError::SigHashType)
+        ));
+    }
+
+    #[test]
+    fn check_sig_encoding_strictenc_accepts_anyonecanpay_variants() {
+        // 0x81/0x82/0x83 are valid ANYONECANPAY variants
+        let mut flags = ScriptFlags::default();
+        flags.verify_strictenc = true;
+        for ht in [0x81u8, 0x82, 0x83] {
+            let sig = minimal_sig(ht);
+            assert!(
+                check_signature_encoding(&sig, &flags).is_ok(),
+                "hashtype 0x{ht:02x} must be accepted by STRICTENC"
+            );
+        }
+    }
+
+    #[test]
+    fn check_sig_encoding_no_flags_accepts_anything_nonempty() {
+        // No flags set: any non-empty sig passes encoding (Core: (flags & DERSIG|LOW_S|STRICTENC) == 0)
+        let bad_sig = [0x99u8; 9];
+        let flags = ScriptFlags::default(); // all false
+        assert!(check_signature_encoding(&bad_sig, &flags).is_ok());
     }
 }
