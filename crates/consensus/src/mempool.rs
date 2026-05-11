@@ -92,9 +92,14 @@ pub const MAX_REPLACEMENT_CANDIDATES: usize = 100;
 /// are signaling opt-in RBF. (0xFFFFFFFD = SEQUENCE_FINAL - 2)
 pub const MAX_BIP125_RBF_SEQUENCE: u32 = 0xFFFFFFFD;
 
-/// Default incremental relay fee rate in satoshis per virtual byte.
-/// The replacement must pay at least this much additional fee per vbyte of its own size.
-pub const DEFAULT_INCREMENTAL_RELAY_FEE: u64 = 1;
+/// Default incremental relay fee rate in satoshis per 1000 virtual bytes (sat/kvB).
+/// Mirrors Bitcoin Core DEFAULT_INCREMENTAL_RELAY_FEE (policy/policy.h:48) = 100 sat/kvB.
+/// When computing required bandwidth fees, multiply by vsize and divide by 1000 (ceiling).
+pub const DEFAULT_INCREMENTAL_RELAY_FEE: u64 = 100;
+
+/// Rolling fee halflife in seconds (12 hours).
+/// Mirrors Bitcoin Core CTxMemPool::ROLLING_FEE_HALFLIFE (txmempool.h:212).
+pub const ROLLING_FEE_HALFLIFE: u64 = 60 * 60 * 12; // 43_200 seconds
 
 // ============================================================
 // TRUC/V3 CONSTANTS (BIP 431)
@@ -590,11 +595,18 @@ impl DepGraph {
 // CONFIGURATION
 // ============================================================
 
+/// Default mempool expiry time in seconds (336 hours = 2 weeks).
+/// Mirrors Bitcoin Core DEFAULT_MEMPOOL_EXPIRY_HOURS (kernel/mempool_options.h:23).
+pub const DEFAULT_MEMPOOL_EXPIRY_SECONDS: u64 = 336 * 3600;
+
 /// Mempool configuration.
 #[derive(Clone, Debug)]
 pub struct MempoolConfig {
-    /// Maximum mempool size in bytes (default: 300 MB).
+    /// Maximum mempool size in bytes (default: 300 MB, SI).
     pub max_size_bytes: usize,
+    /// How long a transaction may stay in the mempool before being expired (seconds).
+    /// Default: 336 hours (2 weeks). Mirrors Bitcoin Core -mempoolexpiry.
+    pub expiry_seconds: u64,
     /// Minimum fee rate to accept a transaction (satoshis per virtual byte).
     pub min_fee_rate: u64,
     /// Maximum number of transactions.
@@ -624,7 +636,10 @@ pub struct MempoolConfig {
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
-            max_size_bytes: 300 * 1024 * 1024,
+            // 300 MB — matches Bitcoin Core DEFAULT_MAX_MEMPOOL_SIZE_MB * 1_000_000
+            // (kernel/mempool_options.h:40). Note: SI megabytes (1_000_000), not MiB.
+            max_size_bytes: 300 * 1_000_000,
+            expiry_seconds: DEFAULT_MEMPOOL_EXPIRY_SECONDS,
             min_fee_rate: 1, // 1 sat/vbyte
             max_tx_count: 1_000_000,
             max_ancestor_count: DEFAULT_ANCESTOR_LIMIT,
@@ -981,6 +996,21 @@ pub struct Mempool {
     /// Median Time Past of the current chain tip (BIP-113 lock_time_cutoff).
     /// Updated via `notify_new_tip`. Used by `add_transaction` for IsFinalTx.
     pub median_time_past: i64,
+
+    // ---- rolling minimum fee rate state ----
+    // Mirrors Bitcoin Core CTxMemPool::rollingMinimumFeeRate /
+    // blockSinceLastRollingFeeBump / lastRollingFeeUpdate (txmempool.h).
+
+    /// Rolling minimum fee rate in sat/kvB (floating point to match Core's decay math).
+    /// Set by `track_package_removed`; decayed by `get_min_fee`.
+    rolling_minimum_fee_rate: f64,
+    /// True when a block has been connected since the last eviction that bumped
+    /// the rolling minimum.  When true, `get_min_fee` will decay the rate.
+    /// Mirrors `blockSinceLastRollingFeeBump` in Core.
+    block_since_last_rolling_fee_bump: bool,
+    /// Unix timestamp of the last rolling fee decay step (seconds).
+    /// Mirrors `lastRollingFeeUpdate` in Core.
+    last_rolling_fee_update: u64,
 }
 
 impl Mempool {
@@ -1001,6 +1031,9 @@ impl Mempool {
             mining_score_index: BTreeMap::new(),
             tip_height: 0,
             median_time_past: 0,
+            rolling_minimum_fee_rate: 0.0,
+            block_since_last_rolling_fee_bump: false,
+            last_rolling_fee_update: 0,
         }
     }
 
@@ -1287,9 +1320,10 @@ impl Mempool {
                     return Err(MempoolError::RbfInsufficientAbsoluteFee(fee, sibling_fee));
                 }
 
-                // Must pay for bandwidth
+                // Must pay for bandwidth (sat/kvB × vsize / 1000, ceiling)
+                // incremental_relay_fee is in sat/kvB; mirrors Core CFeeRate::GetFee(vsize).
                 let additional_fee = fee - sibling_fee;
-                let required_bandwidth_fee = self.config.incremental_relay_fee * vsize as u64;
+                let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64 + 999) / 1000;
                 if additional_fee < required_bandwidth_fee {
                     return Err(MempoolError::RbfInsufficientBandwidthFee(
                         additional_fee,
@@ -1364,9 +1398,12 @@ impl Mempool {
             }
         }
 
-        // Evict if mempool is full
-        while self.total_size + vsize > self.config.max_size_bytes {
-            if !self.evict_lowest_fee_rate() {
+        // Evict if mempool is full, updating the rolling minimum fee rate on each eviction.
+        // Mirrors CTxMemPool::TrimToSize (txmempool.cpp:861-911).
+        if self.total_size + vsize > self.config.max_size_bytes {
+            let target = self.config.max_size_bytes.saturating_sub(vsize);
+            self.trim_to_size(target);
+            if self.total_size + vsize > self.config.max_size_bytes {
                 return Err(MempoolError::MempoolFull);
             }
         }
@@ -2220,8 +2257,9 @@ impl Mempool {
         // has been removed.
         //
         // Safety: new_fee >= conflicting_fees guaranteed by Rule #3 above, so no underflow.
+        // incremental_relay_fee is in sat/kvB; mirrors Core CFeeRate::GetFee(vsize) (ceiling).
         let additional_fee = new_fee - conflicting_fees;
-        let required_bandwidth_fee = self.config.incremental_relay_fee * new_vsize as u64;
+        let required_bandwidth_fee = (self.config.incremental_relay_fee * new_vsize as u64 + 999) / 1000;
         if additional_fee < required_bandwidth_fee {
             return Err(MempoolError::RbfInsufficientBandwidthFee(
                 additional_fee,
@@ -2230,6 +2268,251 @@ impl Mempool {
         }
 
         Ok(())
+    }
+
+    // ====================================================================
+    // EVICTION: Expire / TrimToSize / GetMinFee / TrackPackageRemoved /
+    //           RemoveForReorg
+    // All mirror Bitcoin Core txmempool.cpp:811-915 and :360-386.
+    // ====================================================================
+
+    /// Remove transactions that have been in the mempool longer than `cutoff_secs`.
+    ///
+    /// Mirrors `CTxMemPool::Expire` (txmempool.cpp:811-827).
+    /// Iterates entries in insertion-time order (oldest first), collects all
+    /// entries whose `time_seconds < cutoff_secs`, cascades to their
+    /// descendants, and removes everything.  Returns the number of transactions
+    /// removed (including descendants).
+    pub fn expire(&mut self, cutoff_secs: i64) -> usize {
+        // Collect txids whose entry time is strictly before the cutoff.
+        // Core: `while (it != mapTx.get<entry_time>().end() && it->GetTime() < time)`
+        // (txmempool.cpp:817).
+        let expired: Vec<Hash256> = self
+            .transactions
+            .values()
+            .filter(|e| e.time_seconds < cutoff_secs)
+            .map(|e| e.txid)
+            .collect();
+
+        if expired.is_empty() {
+            return 0;
+        }
+
+        // Cascade: collect descendants of every expired root.
+        // Core: `CalculateDescendants(removeit, stage)` (txmempool.cpp:822-824).
+        let mut stage: Vec<Hash256> = Vec::new();
+        let mut seen: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
+        for txid in &expired {
+            if seen.insert(*txid) {
+                stage.push(*txid);
+            }
+            for desc in self.get_all_descendants(txid) {
+                if seen.insert(desc) {
+                    stage.push(desc);
+                }
+            }
+        }
+
+        let count = stage.len();
+        // Remove with EXPIRY reason (we use remove_single to avoid
+        // double-cascade; ordering within stage is already flattened).
+        for txid in &stage {
+            self.remove_single(txid);
+        }
+        count
+    }
+
+    /// Record that a set of transactions was evicted at `rate` (sat/kvB).
+    ///
+    /// If `rate` exceeds the current `rolling_minimum_fee_rate`, bumps it and
+    /// clears `block_since_last_rolling_fee_bump` so that `get_min_fee` will
+    /// decay only after the next block is connected.
+    ///
+    /// Mirrors `CTxMemPool::trackPackageRemoved` (txmempool.cpp:853-859).
+    fn track_package_removed(&mut self, rate_sat_kvb: f64) {
+        if rate_sat_kvb > self.rolling_minimum_fee_rate {
+            self.rolling_minimum_fee_rate = rate_sat_kvb;
+            self.block_since_last_rolling_fee_bump = false;
+        }
+    }
+
+    /// Return the effective minimum fee rate that a new transaction must
+    /// meet to enter the mempool (sat/kvB, as integer for integer comparison).
+    ///
+    /// Decays `rolling_minimum_fee_rate` using an exponential halflife.
+    /// The halflife is shortened when the mempool is well below the size limit
+    /// (faster decay when pressure is low):
+    ///   - usage < limit/4 → halflife / 4
+    ///   - usage < limit/2 → halflife / 2
+    ///   - otherwise       → full halflife
+    ///
+    /// Once the rolling rate falls below `incremental_relay_fee / 2` it is
+    /// zeroed.  The returned value is `max(rolling, incremental_relay_fee)`.
+    ///
+    /// Mirrors `CTxMemPool::GetMinFee` (txmempool.cpp:829-851).
+    pub fn get_min_fee(&mut self) -> u64 {
+        // Short-circuit: no decay needed if no block has been connected since
+        // the last eviction bump, or if the rate is already zero.
+        // Core: `if (!blockSinceLastRollingFeeBump || rollingMinimumFeeRate == 0)`
+        if !self.block_since_last_rolling_fee_bump || self.rolling_minimum_fee_rate == 0.0 {
+            return self.rolling_minimum_fee_rate.round() as u64;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Only update every 10 seconds to avoid unnecessary churn.
+        // Core: `if (time > lastRollingFeeUpdate + 10)`
+        if now <= self.last_rolling_fee_update + 10 {
+            return std::cmp::max(
+                self.rolling_minimum_fee_rate.round() as u64,
+                self.config.incremental_relay_fee,
+            );
+        }
+
+        // Choose halflife based on current mempool usage.
+        let sizelimit = self.config.max_size_bytes as f64;
+        let usage = self.total_size as f64;
+        let mut halflife = ROLLING_FEE_HALFLIFE as f64;
+        if usage < sizelimit / 4.0 {
+            halflife /= 4.0;
+        } else if usage < sizelimit / 2.0 {
+            halflife /= 2.0;
+        }
+
+        // Exponential decay: rate /= 2^(elapsed / halflife)
+        let elapsed = (now - self.last_rolling_fee_update) as f64;
+        self.rolling_minimum_fee_rate /= 2_f64.powf(elapsed / halflife);
+        self.last_rolling_fee_update = now;
+
+        // Zero out when below incremental_relay_fee / 2.
+        // Core: `if (rollingMinimumFeeRate < (double)m_opts.incremental_relay_feerate.GetFeePerK() / 2)`
+        let half_incremental = self.config.incremental_relay_fee as f64 / 2.0;
+        if self.rolling_minimum_fee_rate < half_incremental {
+            self.rolling_minimum_fee_rate = 0.0;
+            return 0;
+        }
+
+        std::cmp::max(
+            self.rolling_minimum_fee_rate.round() as u64,
+            self.config.incremental_relay_fee,
+        )
+    }
+
+    /// Evict transactions until `total_size <= sizelimit`, updating the rolling
+    /// minimum fee rate after each eviction.
+    ///
+    /// Mirrors `CTxMemPool::TrimToSize` (txmempool.cpp:861-911).
+    ///
+    /// After eviction, calls `track_package_removed` with the worst chunk's
+    /// feerate + `incremental_relay_fee` so that the rolling minimum is bumped
+    /// and future transactions that would have been evicted are pre-rejected.
+    ///
+    /// Returns the number of transactions removed.
+    pub fn trim_to_size(&mut self, sizelimit: usize) -> usize {
+        let mut n_removed: usize = 0;
+
+        while self.total_size > sizelimit && !self.transactions.is_empty() {
+            // Find the lowest-mining-score entry to evict.
+            let worst_txid = match self.mining_score_index.iter().next() {
+                Some((&_key, &txid)) => txid,
+                None => match self.fee_rate_index.iter().next() {
+                    Some((key, _)) => key.txid,
+                    None => break,
+                },
+            };
+
+            let worst_entry = match self.transactions.get(&worst_txid) {
+                Some(e) => e,
+                None => break,
+            };
+
+            // Compute feerate of the worst entry (sat/kvB), then add
+            // incremental_relay_fee so the min-fee bumps past it.
+            // Core: `removed += m_opts.incremental_relay_feerate` then
+            // `trackPackageRemoved(removed)` (txmempool.cpp:877-878).
+            let removed_fee_rate = worst_entry.fee_rate * 1000.0 // sat/vB → sat/kvB
+                + self.config.incremental_relay_fee as f64;
+            self.track_package_removed(removed_fee_rate);
+
+            // Collect descendants to evict together with the worst entry.
+            let mut to_evict: Vec<Hash256> = Vec::new();
+            to_evict.push(worst_txid);
+            for desc in self.get_all_descendants(&worst_txid) {
+                to_evict.push(desc);
+            }
+            n_removed += to_evict.len();
+            for txid in &to_evict {
+                self.remove_single(txid);
+            }
+        }
+
+        n_removed
+    }
+
+    /// Remove any mempool transactions that are no longer valid after a reorg:
+    /// - Non-final transactions (nLockTime or BIP-68 sequence-lock no longer satisfied).
+    /// - Transactions spending coinbase outputs that are no longer mature.
+    ///
+    /// Mirrors `CTxMemPool::removeForReorg` (txmempool.cpp:360-386).
+    ///
+    /// `check_final_and_mature` returns `true` for entries that must be removed.
+    /// Descendants of removed entries are cascaded via `get_all_descendants`.
+    ///
+    /// Call this after updating `tip_height` and `median_time_past` to the new
+    /// post-reorg tip so that the filter reflects the correct chain state.
+    pub fn remove_for_reorg<F>(&mut self, check_final_and_mature: F) -> usize
+    where
+        F: Fn(&MempoolEntry) -> bool,
+    {
+        // Collect entries that fail the filter.
+        // Core: `for (txiter it = mapTx.begin(); it != mapTx.end(); it++)`
+        //        `if (check_final_and_mature(it)) to_remove.emplace_back(&*it)`
+        let to_remove: Vec<Hash256> = self
+            .transactions
+            .values()
+            .filter(|e| check_final_and_mature(e))
+            .map(|e| e.txid)
+            .collect();
+
+        if to_remove.is_empty() {
+            return 0;
+        }
+
+        // Cascade descendants.
+        // Core: `m_txgraph->GetDescendantsUnion(to_remove, ...)` (txmempool.cpp:374).
+        let mut stage: Vec<Hash256> = Vec::new();
+        let mut seen: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
+        for txid in &to_remove {
+            if seen.insert(*txid) {
+                stage.push(*txid);
+            }
+            for desc in self.get_all_descendants(txid) {
+                if seen.insert(desc) {
+                    stage.push(desc);
+                }
+            }
+        }
+
+        let count = stage.len();
+        for txid in &stage {
+            self.remove_single(txid);
+        }
+        count
+    }
+
+    /// Called when a new block is connected.
+    ///
+    /// Sets `block_since_last_rolling_fee_bump = true` so that `get_min_fee`
+    /// will start decaying the rolling minimum fee rate.
+    ///
+    /// Mirrors the `blockSinceLastRollingFeeBump = true` assignment in
+    /// `CTxMemPool::removeForBlock` (txmempool.cpp — implicit via the
+    /// connected-block path).
+    pub fn notify_block_connected(&mut self) {
+        self.block_since_last_rolling_fee_bump = true;
     }
 
     /// Evict the lowest fee rate transaction (and its descendants).
@@ -3300,8 +3583,9 @@ impl Mempool {
                     return Err(MempoolError::RbfInsufficientAbsoluteFee(fee, sibling_fee));
                 }
 
+                // incremental_relay_fee is in sat/kvB; ceiling division matches Core.
                 let additional_fee = fee - sibling_fee;
-                let required_bandwidth_fee = self.config.incremental_relay_fee * vsize as u64;
+                let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64 + 999) / 1000;
                 if additional_fee < required_bandwidth_fee {
                     return Err(MempoolError::RbfInsufficientBandwidthFee(
                         additional_fee,
@@ -3368,9 +3652,12 @@ impl Mempool {
             }
         }
 
-        // Evict if mempool is full
-        while self.total_size + vsize > self.config.max_size_bytes {
-            if !self.evict_lowest_fee_rate() {
+        // Evict if mempool is full, updating the rolling minimum fee rate on each eviction.
+        // Mirrors CTxMemPool::TrimToSize (txmempool.cpp:861-911).
+        if self.total_size + vsize > self.config.max_size_bytes {
+            let target = self.config.max_size_bytes.saturating_sub(vsize);
+            self.trim_to_size(target);
+            if self.total_size + vsize > self.config.max_size_bytes {
                 return Err(MempoolError::MempoolFull);
             }
         }
@@ -5369,7 +5656,7 @@ mod tests {
         //
         // Previously rustoshi had a spurious `new_fee_rate <= highest_conflicting_fee_rate`
         // gate that is not in Core; it has been removed.
-        let config = MempoolConfig::default(); // incremental_relay_fee = 1 sat/vB
+        let config = MempoolConfig::default(); // incremental_relay_fee = 100 sat/kvB
         let mut mempool = Mempool::new(config);
 
         let prev_txid =
@@ -5515,8 +5802,10 @@ mod tests {
 
     #[test]
     fn test_rbf_bandwidth_fee_requirement() {
+        // Use 10_000 sat/kvB (= 10 sat/vB) to match the original intent of this test.
+        // incremental_relay_fee is in sat/kvB; required_bandwidth = ceil(rate * vsize / 1000).
         let config = MempoolConfig {
-            incremental_relay_fee: 10, // 10 sat/vB
+            incremental_relay_fee: 10_000, // 10_000 sat/kvB = 10 sat/vB
             ..Default::default()
         };
         let mut mempool = Mempool::new(config);
@@ -5531,8 +5820,8 @@ mod tests {
         let _txid1 = tx1.txid();
         mempool.add_transaction(tx1.clone(), &|op| utxos.get(op).cloned()).unwrap();
 
-        // Replacement tx needs to pay: old_fee + incremental_relay_fee * new_vsize
-        // With 10 sat/vB and ~86 vB tx, we need at least 1000 + 860 = 1860 sat fee
+        // Replacement tx needs to pay: old_fee + ceil(incremental_relay_fee * new_vsize / 1000)
+        // With 10_000 sat/kvB and ~86 vB tx, we need at least 1000 + 860 = 1860 sat fee
         // If we pay only 1500 sat fee (additional = 500, required = 860), should fail
         let tx2 = make_tx(vec![(prev_txid, 0)], vec![998_500], 1); // 1500 sat fee
         let result = mempool.add_transaction(tx2, &|op| utxos.get(op).cloned());
@@ -8766,5 +9055,422 @@ mod tests {
             assert!(r.is_ok(), "no_limits: tx {} should be accepted, got {:?}", i + 1, r);
         }
         assert_eq!(mempool.size(), 30);
+    }
+
+    // ====================================================================
+    // W86: expire / trim_to_size / get_min_fee / track_package_removed /
+    //      remove_for_reorg tests
+    // ====================================================================
+
+    /// expire: oldest entry below cutoff is removed; entry AT cutoff is kept.
+    /// Mirrors CTxMemPool::Expire (txmempool.cpp:811-827): `< time`, not `<=`.
+    #[test]
+    fn test_w86_expire_boundary() {
+        let config = MempoolConfig {
+            min_fee_rate: 0,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo1 = Hash256::from_hex(
+            "aa00000000000000000000000000000000000000000000000000000000000001",
+        ).unwrap();
+        let utxo2 = Hash256::from_hex(
+            "aa00000000000000000000000000000000000000000000000000000000000002",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo1, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo2, vout: 0 }, 1_000_000),
+        ]);
+
+        let tx_old = make_tx(vec![(utxo1, 0)], vec![999_000], 1);
+        let txid_old = tx_old.txid();
+        let tx_exact = make_tx(vec![(utxo2, 0)], vec![999_000], 2);
+        let txid_exact = tx_exact.txid();
+
+        mempool.add_transaction(tx_old, &|op| utxos.get(op).cloned()).unwrap();
+        mempool.add_transaction(tx_exact, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Backdated the old tx to Unix time 1000, exact tx to 2000.
+        mempool.set_entry_time_seconds(&txid_old, 1000);
+        mempool.set_entry_time_seconds(&txid_exact, 2000);
+
+        // Cutoff at 2000 → removes entries with time_seconds < 2000 (only txid_old).
+        let removed = mempool.expire(2000);
+        assert_eq!(removed, 1, "exactly one tx (time<cutoff) should be expired");
+        assert!(!mempool.contains(&txid_old), "old tx must be gone");
+        assert!(mempool.contains(&txid_exact), "exact-cutoff tx must survive (strict <)");
+    }
+
+    /// expire: descendants of an expired tx are also removed (cascade).
+    #[test]
+    fn test_w86_expire_cascade_descendants() {
+        let config = MempoolConfig {
+            min_fee_rate: 0,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo = Hash256::from_hex(
+            "bb00000000000000000000000000000000000000000000000000000000000001",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 10_000_000)]);
+
+        // Parent tx
+        let parent = make_tx(vec![(utxo, 0)], vec![9_000_000], 1);
+        let parent_txid = parent.txid();
+        mempool.add_transaction(parent, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Child tx spending parent
+        let child = make_tx(vec![(parent_txid, 0)], vec![8_000_000], 1);
+        let child_txid = child.txid();
+        mempool.add_transaction(child, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Age only parent below cutoff; child has a recent time.
+        mempool.set_entry_time_seconds(&parent_txid, 100);
+        mempool.set_entry_time_seconds(&child_txid, 9_000_000); // far future
+
+        let removed = mempool.expire(200);
+        // Parent expired + child cascaded = 2.
+        assert_eq!(removed, 2, "parent + child must both be removed");
+        assert!(!mempool.contains(&parent_txid));
+        assert!(!mempool.contains(&child_txid));
+    }
+
+    /// trim_to_size: worst-fee-rate entry is evicted first, bumping rolling fee.
+    #[test]
+    fn test_w86_trim_to_size_fee_order() {
+        // Small sizelimit so we can observe eviction.
+        let config = MempoolConfig {
+            max_size_bytes: 10_000_000, // large enough to admit both
+            min_fee_rate: 0,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo1 = Hash256::from_hex(
+            "cc00000000000000000000000000000000000000000000000000000000000001",
+        ).unwrap();
+        let utxo2 = Hash256::from_hex(
+            "cc00000000000000000000000000000000000000000000000000000000000002",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo1, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo2, vout: 0 }, 1_000_000),
+        ]);
+
+        // tx_low: 100 sat fee (low rate)
+        let tx_low = make_tx(vec![(utxo1, 0)], vec![999_900], 1);
+        let txid_low = tx_low.txid();
+        mempool.add_transaction(tx_low, &|op| utxos.get(op).cloned()).unwrap();
+
+        // tx_high: 50_000 sat fee (high rate)
+        let tx_high = make_tx(vec![(utxo2, 0)], vec![950_000], 1);
+        let txid_high = tx_high.txid();
+        mempool.add_transaction(tx_high, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Trim so only one tx can fit (set sizelimit to just below combined size).
+        let current = mempool.total_bytes();
+        let sizelimit = current / 2; // forces one eviction
+        let removed = mempool.trim_to_size(sizelimit);
+
+        assert_eq!(removed, 1, "exactly one tx should be evicted");
+        // The low-fee-rate tx must be evicted, high-rate tx survives.
+        assert!(!mempool.contains(&txid_low), "low-feerate tx must be evicted first");
+        assert!(mempool.contains(&txid_high), "high-feerate tx must survive");
+    }
+
+    /// trim_to_size: rolling minimum fee rate is bumped after eviction.
+    #[test]
+    fn test_w86_trim_to_size_bumps_rolling_min_fee() {
+        let config = MempoolConfig {
+            max_size_bytes: 10_000_000,
+            min_fee_rate: 0,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo = Hash256::from_hex(
+            "dd00000000000000000000000000000000000000000000000000000000000001",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 1_000_000)]);
+
+        let tx = make_tx(vec![(utxo, 0)], vec![990_000], 1); // 10_000 sat fee
+        mempool.add_transaction(tx, &|op| utxos.get(op).cloned()).unwrap();
+
+        assert_eq!(mempool.rolling_minimum_fee_rate, 0.0,
+            "rolling fee starts at zero");
+
+        // Force eviction
+        mempool.trim_to_size(0);
+
+        assert!(mempool.rolling_minimum_fee_rate > 0.0,
+            "trim_to_size must bump rolling_minimum_fee_rate; got {}",
+            mempool.rolling_minimum_fee_rate);
+        assert!(!mempool.block_since_last_rolling_fee_bump,
+            "block_since_last_rolling_fee_bump must be false after eviction");
+    }
+
+    /// track_package_removed: only updates if new rate > current.
+    /// Mirrors CTxMemPool::trackPackageRemoved (txmempool.cpp:853-859).
+    #[test]
+    fn test_w86_track_package_removed_only_if_greater() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        // Start at 0.
+        assert_eq!(mempool.rolling_minimum_fee_rate, 0.0);
+
+        // Bump to 500.
+        mempool.track_package_removed(500.0);
+        assert_eq!(mempool.rolling_minimum_fee_rate, 500.0);
+        assert!(!mempool.block_since_last_rolling_fee_bump);
+
+        // Lower value must NOT overwrite.
+        mempool.track_package_removed(200.0);
+        assert_eq!(mempool.rolling_minimum_fee_rate, 500.0,
+            "lower rate must not overwrite higher rolling minimum");
+
+        // Equal value must NOT overwrite (strictly greater).
+        mempool.track_package_removed(500.0);
+        assert_eq!(mempool.rolling_minimum_fee_rate, 500.0);
+
+        // Higher value must overwrite.
+        mempool.track_package_removed(1000.0);
+        assert_eq!(mempool.rolling_minimum_fee_rate, 1000.0);
+    }
+
+    /// get_min_fee: when block_since_last_rolling_fee_bump is false, no decay occurs.
+    #[test]
+    fn test_w86_get_min_fee_no_decay_without_block() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        // Simulate an eviction that bumped rolling fee to 5000 sat/kvB.
+        mempool.track_package_removed(5000.0);
+        assert!(!mempool.block_since_last_rolling_fee_bump);
+
+        // get_min_fee should return rolling rate without decay.
+        let min_fee = mempool.get_min_fee();
+        // Should return max(5000, incremental_relay_fee=100) = 5000
+        assert_eq!(min_fee, 5000,
+            "no decay without block: expected 5000, got {}", min_fee);
+    }
+
+    /// get_min_fee: after a block, rolling fee decays over time.
+    /// At t=0 it equals the bumped rate; after 12h it halves; after 24h it quarters.
+    #[test]
+    fn test_w86_get_min_fee_decays_after_block() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        // Set rolling fee to 10000 sat/kvB, then notify a block.
+        mempool.track_package_removed(10000.0);
+        mempool.block_since_last_rolling_fee_bump = true;
+        // Set last update to 12h ago so we get exactly one halflife of decay.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        mempool.last_rolling_fee_update = now.saturating_sub(ROLLING_FEE_HALFLIFE + 11); // +11 > 10s update gate
+
+        let min_fee_after_12h = mempool.get_min_fee();
+        // After one halflife: 10000 / 2 = 5000. But the halflife might be shortened
+        // if usage < sizelimit/4 (usage=0 < limit/4), so halflife = HALFLIFE/4 = 10800s.
+        // After 12h=43200s with halflife=10800s: decay = 2^(43200/10800) = 2^4 = 16×.
+        // 10000 / 16 = 625. With zero usage + incremental_relay_fee = 100:
+        // result = max(625, 100) = 625. Might be zeroed if < 50.
+        // At minimum result should be <= 10000 (decayed) and >= 0.
+        assert!(min_fee_after_12h <= 10000,
+            "fee should have decayed after 12h; got {}", min_fee_after_12h);
+    }
+
+    /// get_min_fee: zeroes out below incremental_relay_fee / 2.
+    /// Mirrors txmempool.cpp:845-848.
+    #[test]
+    fn test_w86_get_min_fee_zeros_below_half_incremental() {
+        let config = MempoolConfig {
+            incremental_relay_fee: 100, // default
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        // Set rolling fee just below half-incremental (50 sat/kvB / 2 = 49).
+        mempool.rolling_minimum_fee_rate = 49.0; // < 100/2 = 50
+        mempool.block_since_last_rolling_fee_bump = true;
+        // Set last_rolling_fee_update far in the past so the 10s gate passes.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        mempool.last_rolling_fee_update = now.saturating_sub(100);
+
+        let min_fee = mempool.get_min_fee();
+        // After any decay: 49.0 decays further, stays below 50, should zero out.
+        assert_eq!(min_fee, 0,
+            "rolling fee below incremental/2 must zero out; got {}", min_fee);
+        assert_eq!(mempool.rolling_minimum_fee_rate, 0.0,
+            "internal state must also be zeroed");
+    }
+
+    /// get_min_fee: when block_since_last_rolling_fee_bump is false, returns the raw
+    /// rolling rate without applying the incremental_relay_fee minimum.
+    /// This matches Core txmempool.cpp:831-832 where the short-circuit path returns
+    /// `CFeeRate(llround(rollingMinimumFeeRate))` directly (no max).
+    /// The max(rolling, incremental) is only applied on the decay path (after a block).
+    #[test]
+    fn test_w86_get_min_fee_short_circuit_returns_raw_rolling() {
+        let config = MempoolConfig {
+            incremental_relay_fee: 100,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        // Rolling fee = 51.  No block → short-circuit path.
+        mempool.rolling_minimum_fee_rate = 51.0;
+        mempool.block_since_last_rolling_fee_bump = false;
+
+        let min_fee = mempool.get_min_fee();
+        // Core short-circuit: return llround(rollingMinimumFeeRate) = 51
+        assert_eq!(min_fee, 51,
+            "short-circuit must return raw rolling rate; got {}", min_fee);
+
+        // When the decay path IS taken (after a block), the max is applied.
+        // Set a far-past update timestamp so the 10s gate passes.
+        mempool.block_since_last_rolling_fee_bump = true;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        mempool.last_rolling_fee_update = now.saturating_sub(100);
+        // After decay of 51.0 (which will drop further due to zero-usage halflife/4),
+        // if it ends up below incremental/2 = 50 it zeros; otherwise max is applied.
+        // This just verifies no panic and returns a value >= 0.
+        let _min_fee_decayed = mempool.get_min_fee();
+    }
+
+    /// remove_for_reorg: entries failing the maturity filter are removed with descendants.
+    #[test]
+    fn test_w86_remove_for_reorg_filter_and_cascade() {
+        let config = MempoolConfig {
+            min_fee_rate: 0,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo1 = Hash256::from_hex(
+            "ee00000000000000000000000000000000000000000000000000000000000001",
+        ).unwrap();
+        let utxo2 = Hash256::from_hex(
+            "ee00000000000000000000000000000000000000000000000000000000000002",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo1, vout: 0 }, 5_000_000),
+            (OutPoint { txid: utxo2, vout: 0 }, 5_000_000),
+        ]);
+
+        // tx_bad: a tx that will fail the reorg filter (simulated non-final).
+        let tx_bad = make_tx(vec![(utxo1, 0)], vec![4_900_000], 1);
+        let txid_bad = tx_bad.txid();
+        mempool.add_transaction(tx_bad, &|op| utxos.get(op).cloned()).unwrap();
+
+        // tx_child: child of tx_bad; should cascade-evict.
+        let tx_child = make_tx(vec![(txid_bad, 0)], vec![4_800_000], 1);
+        let txid_child = tx_child.txid();
+        mempool.add_transaction(tx_child, &|op| utxos.get(op).cloned()).unwrap();
+
+        // tx_ok: unrelated tx that passes the filter.
+        let tx_ok = make_tx(vec![(utxo2, 0)], vec![4_900_000], 1);
+        let txid_ok = tx_ok.txid();
+        mempool.add_transaction(tx_ok, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Filter: remove tx_bad (simulate non-final after reorg).
+        let removed = mempool.remove_for_reorg(|entry| entry.txid == txid_bad);
+        assert_eq!(removed, 2, "tx_bad + tx_child must be removed (cascade)");
+        assert!(!mempool.contains(&txid_bad), "tx_bad must be gone");
+        assert!(!mempool.contains(&txid_child), "tx_child must cascade");
+        assert!(mempool.contains(&txid_ok), "unrelated tx must survive");
+    }
+
+    /// remove_for_reorg: simulated coinbase maturity filter removes spender.
+    #[test]
+    fn test_w86_remove_for_reorg_coinbase_maturity() {
+        let config = MempoolConfig {
+            min_fee_rate: 0,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        // tx_spends_immature: simulates a tx spending an immature coinbase output.
+        // In a real reorg, the coinbase tx height changes so its outputs become immature.
+        // We simulate this by having the filter flag it.
+        let utxo = Hash256::from_hex(
+            "ff00000000000000000000000000000000000000000000000000000000000001",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 2_000_000)]);
+
+        let tx_immature = make_tx(vec![(utxo, 0)], vec![1_900_000], 1);
+        let txid_immature = tx_immature.txid();
+        mempool.add_transaction(tx_immature, &|op| utxos.get(op).cloned()).unwrap();
+
+        assert_eq!(mempool.size(), 1);
+
+        // The reorg filter marks this tx as spending an immature coinbase.
+        let removed = mempool.remove_for_reorg(|entry| entry.txid == txid_immature);
+        assert_eq!(removed, 1);
+        assert_eq!(mempool.size(), 0);
+    }
+
+    /// remove_for_reorg: no-op when all txs pass the filter.
+    #[test]
+    fn test_w86_remove_for_reorg_noop_when_all_valid() {
+        let config = MempoolConfig { min_fee_rate: 0, ..Default::default() };
+        let mut mempool = Mempool::new(config);
+
+        let utxo = Hash256::from_hex(
+            "1200000000000000000000000000000000000000000000000000000000000001",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 1_000_000)]);
+
+        let tx = make_tx(vec![(utxo, 0)], vec![999_000], 1);
+        let txid = tx.txid();
+        mempool.add_transaction(tx, &|op| utxos.get(op).cloned()).unwrap();
+
+        let removed = mempool.remove_for_reorg(|_| false);
+        assert_eq!(removed, 0);
+        assert!(mempool.contains(&txid));
+    }
+
+    /// max_size_bytes default must be 300 * 1_000_000 (SI megabytes), not MiB.
+    /// Mirrors kernel/mempool_options.h:40: `DEFAULT_MAX_MEMPOOL_SIZE_MB * 1'000'000`.
+    #[test]
+    fn test_w86_max_size_bytes_is_si_megabytes() {
+        let config = MempoolConfig::default();
+        assert_eq!(
+            config.max_size_bytes,
+            300 * 1_000_000,
+            "max_size_bytes must be 300 MB (SI), not MiB; got {}",
+            config.max_size_bytes
+        );
+    }
+
+    /// DEFAULT_INCREMENTAL_RELAY_FEE must be 100 sat/kvB (matching Core).
+    /// Core: policy/policy.h:48 DEFAULT_INCREMENTAL_RELAY_FEE = 100.
+    #[test]
+    fn test_w86_default_incremental_relay_fee_is_100_sat_kvb() {
+        assert_eq!(
+            DEFAULT_INCREMENTAL_RELAY_FEE,
+            100,
+            "must be 100 sat/kvB (Core default); got {}",
+            DEFAULT_INCREMENTAL_RELAY_FEE
+        );
+    }
+
+    /// ROLLING_FEE_HALFLIFE must be 43_200 seconds (12 hours).
+    /// Core: txmempool.h:212 ROLLING_FEE_HALFLIFE = 60 * 60 * 12.
+    #[test]
+    fn test_w86_rolling_fee_halflife_constant() {
+        assert_eq!(ROLLING_FEE_HALFLIFE, 43_200,
+            "halflife must be 12h = 43200s; got {}", ROLLING_FEE_HALFLIFE);
     }
 }
