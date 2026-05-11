@@ -158,6 +158,13 @@ pub const MIN_TIMESPAN: u32 = TARGET_TIMESPAN / 4;
 /// Maximum future block time: 2 hours (7200 seconds) ahead of median time.
 pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 
+/// BIP-94 timewarp attack threshold: 10 minutes (600 seconds).
+///
+/// On testnet4/regtest with `enforce_bip94`, the first block of each
+/// difficulty period must have `timestamp >= prev_timestamp - MAX_TIMEWARP`.
+/// Mirrors Bitcoin Core consensus/consensus.h:35 `MAX_TIMEWARP`.
+pub const MAX_TIMEWARP: i64 = 600;
+
 /// Median time past window: 11 blocks.
 pub const MEDIAN_TIME_PAST_WINDOW: usize = 11;
 
