@@ -1170,7 +1170,12 @@ impl Mempool {
         // Must run after the UTXO loop so we have prevout scriptPubKeys for P2SH
         // and witness-sigop counting.  Uses STANDARD_SCRIPT_VERIFY_FLAGS (P2SH +
         // WITNESS active) matching Core's STANDARD_SCRIPT_VERIFY_FLAGS.
-        if !tx.is_coinbase() && prevout_scripts.len() == tx.inputs.len() {
+        //
+        // We lift `sigop_cost` outside the branch so it feeds into the
+        // sigop-adjusted vsize calculation below (Core txmempool.cpp:1017 /
+        // mempool_entry.h:112).  Coinbase txs are not in the mempool, but we
+        // keep the guard so the path is consistent with Core.
+        let tx_sigop_cost: u64 = if !tx.is_coinbase() && prevout_scripts.len() == tx.inputs.len() {
             let std_flags = ScriptFlags::standard_flags();
             let sigop_cost = get_transaction_sigop_cost(&tx, |outpoint| {
                 for (idx, input) in tx.inputs.iter().enumerate() {
@@ -1191,7 +1196,10 @@ impl Mempool {
                     sigop_cost, MAX_STANDARD_TX_SIGOPS_COST
                 )));
             }
-        }
+            sigop_cost
+        } else {
+            0
+        };
 
         // BIP-68 sequence locks: reject txs whose relative-locktime constraints
         // are not satisfied at the next block.
@@ -1218,7 +1226,18 @@ impl Mempool {
         }
         let fee = input_sum - output_sum;
 
-        let vsize = tx.vsize();
+        // Sigop-adjusted vsize.  Mirrors Bitcoin Core's CTxMemPoolEntry::GetTxSize()
+        // (kernel/mempool_entry.h:112):
+        //   `GetVirtualTransactionSize(nTxWeight, sigOpCost, ::nBytesPerSigOp)`
+        // and FeePerWeight construction (txmempool.cpp:1017):
+        //   `GetSigOpsAdjustedWeight(GetTransactionWeight(*tx), sigops_cost, ::nBytesPerSigOp)`
+        // When sigop_cost is zero (coinbase or unknown inputs), falls back to the
+        // plain `ceil(weight / 4)` which equals `tx.vsize()`.
+        let vsize = crate::params::get_virtual_transaction_size(
+            tx.weight() as u64,
+            tx_sigop_cost,
+            crate::params::DEFAULT_BYTES_PER_SIGOP,
+        ) as usize;
         let fee_rate = fee as f64 / vsize as f64;
 
         if (fee_rate as u64) < self.config.min_fee_rate {
