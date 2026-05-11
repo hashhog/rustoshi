@@ -1917,26 +1917,50 @@ impl<'a> SignatureChecker for TransactionSignatureChecker<'a> {
         const DISABLE_FLAG: u32 = 1 << 31;
         const TYPE_FLAG: u32 = 1 << 22;
         const MASK: u32 = 0x0000FFFF;
+        const LOCK_TIME_MASK: u32 = TYPE_FLAG | MASK;
 
         // If disable flag is set in the required sequence, always succeed
         if sequence & DISABLE_FLAG != 0 {
             return true;
         }
 
+        // BIP-68 (Bitcoin Core interpreter.cpp:1790): fail if the transaction's
+        // version number is not set high enough to trigger BIP-68 rules.
+        // A v1 transaction must not be able to satisfy OP_CHECKSEQUENCEVERIFY.
+        if self.tx.version < 2 {
+            return false;
+        }
+
         let tx_sequence = self.tx.inputs[self.input_index].sequence;
 
-        // If the tx sequence has disable flag set, fail
+        // Sequence numbers with their most significant bit set are not
+        // consensus constrained. Testing that the transaction's sequence
+        // number do not have this bit set prevents using this property
+        // to get around a CHECKSEQUENCEVERIFY check.
+        // (Bitcoin Core interpreter.cpp:1797)
         if tx_sequence & DISABLE_FLAG != 0 {
             return false;
         }
 
-        // Type must match (blocks vs time)
-        if (sequence & TYPE_FLAG) != (tx_sequence & TYPE_FLAG) {
+        // Mask off any bits that do not have consensus-enforced meaning
+        // before doing the integer comparisons.
+        // (Bitcoin Core interpreter.cpp:1802-1804)
+        let tx_sequence_masked = tx_sequence & LOCK_TIME_MASK;
+        let sequence_masked = sequence & LOCK_TIME_MASK;
+
+        // There are two kinds of nSequence: lock-by-blockheight and
+        // lock-by-blocktime, distinguished by whether the masked value is
+        // < SEQUENCE_LOCKTIME_TYPE_FLAG. Fail unless both are the same type
+        // (apples-to-apples comparison). (Bitcoin Core interpreter.cpp:1813-1818)
+        if !((tx_sequence_masked < TYPE_FLAG && sequence_masked < TYPE_FLAG)
+            || (tx_sequence_masked >= TYPE_FLAG && sequence_masked >= TYPE_FLAG))
+        {
             return false;
         }
 
-        // Required sequence must not exceed tx sequence
-        if (sequence & MASK) > (tx_sequence & MASK) {
+        // Now that we know we're comparing apples-to-apples, the comparison
+        // is a simple numeric one. (Bitcoin Core interpreter.cpp:1822)
+        if sequence_masked > tx_sequence_masked {
             return false;
         }
 
@@ -2974,6 +2998,132 @@ mod tests {
         // Should return no locks
         assert_eq!(locks.min_height, -1);
         assert_eq!(locks.min_time, -1);
+    }
+
+    // =========================
+    // BIP-112 / CheckSequence tests
+    // =========================
+
+    fn make_tx_v1_sequence(sequence: u32) -> Transaction {
+        make_tx_with_sequence(1, &[sequence])
+    }
+
+    fn make_tx_v2_sequence(sequence: u32) -> Transaction {
+        make_tx_with_sequence(2, &[sequence])
+    }
+
+    /// BIP-112 gate 16: tx.version < 2 must fail in check_sequence.
+    /// (Bitcoin Core interpreter.cpp:1790)
+    #[test]
+    fn check_sequence_version_1_fails() {
+        // v1 transaction must not satisfy OP_CSV regardless of sequence values.
+        let tx = make_tx_v1_sequence(100); // 100 block relative lock
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
+
+        // Script operand requests 1-block lock; tx is v1 → must fail
+        assert!(!checker.check_sequence(1));
+        // Even requesting a 0-lock should fail on v1
+        assert!(!checker.check_sequence(0));
+    }
+
+    /// BIP-112 gate 16: tx.version >= 2 must proceed with comparison.
+    #[test]
+    fn check_sequence_version_2_succeeds_when_satisfied() {
+        let tx = make_tx_v2_sequence(100); // 100 block relative lock
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
+
+        // Script operand <= tx sequence: pass
+        assert!(checker.check_sequence(100));
+        assert!(checker.check_sequence(1));
+        // Script operand > tx sequence: fail
+        assert!(!checker.check_sequence(101));
+    }
+
+    /// BIP-112 gate 19: apples-to-apples type check.
+    /// Height-type operand vs time-type tx sequence must fail, and vice versa.
+    /// (Bitcoin Core interpreter.cpp:1813-1818)
+    #[test]
+    fn check_sequence_type_mismatch_fails() {
+        const TYPE_FLAG: u32 = 1 << 22; // SEQUENCE_LOCKTIME_TYPE_FLAG
+
+        // tx sequence is height-type (no TYPE_FLAG), operand is time-type → fail
+        let tx_height = make_tx_v2_sequence(100); // height-based: 100 blocks
+        let checker_h = TransactionSignatureChecker::new(&tx_height, 0, 0, &[], &[]);
+        // Operand with TYPE_FLAG set is time-based; tx is height-based → type mismatch
+        assert!(!checker_h.check_sequence((TYPE_FLAG | 1) as i64));
+
+        // tx sequence is time-type (TYPE_FLAG set), operand is height-type → fail
+        let tx_time = make_tx_v2_sequence(TYPE_FLAG | 100); // time-based
+        let checker_t = TransactionSignatureChecker::new(&tx_time, 0, 0, &[], &[]);
+        // Operand without TYPE_FLAG is height-based; tx is time-based → type mismatch
+        assert!(!checker_t.check_sequence(1));
+    }
+
+    /// BIP-112 gate 19: same type must succeed when operand <= tx sequence.
+    #[test]
+    fn check_sequence_same_type_time_succeeds() {
+        const TYPE_FLAG: u32 = 1 << 22;
+        // tx: time-based, 100 units
+        let tx = make_tx_v2_sequence(TYPE_FLAG | 100);
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
+
+        // Same type, operand <= tx: pass
+        assert!(checker.check_sequence((TYPE_FLAG | 100) as i64));
+        assert!(checker.check_sequence((TYPE_FLAG | 50) as i64));
+        // Same type, operand > tx: fail
+        assert!(!checker.check_sequence((TYPE_FLAG | 101) as i64));
+    }
+
+    /// BIP-112 gate 17: txToSequence with DISABLE_FLAG set must fail.
+    /// (Bitcoin Core interpreter.cpp:1797)
+    #[test]
+    fn check_sequence_tx_disable_flag_fails() {
+        // tx sequence has disable flag set (bit 31)
+        const DISABLE_FLAG: u32 = 1 << 31;
+        let tx = make_tx_v2_sequence(DISABLE_FLAG | 100);
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
+
+        // Even though operand doesn't have disable flag, tx sequence does → fail
+        assert!(!checker.check_sequence(1));
+    }
+
+    /// BIP-112 gate 14: operand with DISABLE_FLAG is a NOP (return true).
+    /// (Bitcoin Core interpreter.cpp:585-586)
+    #[test]
+    fn check_sequence_operand_disable_flag_is_nop() {
+        const DISABLE_FLAG: u32 = 1 << 31;
+        // Even a v1 tx or impossible sequence value should pass when disable flag set
+        let tx = make_tx_v1_sequence(0xFFFFFFFF);
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
+
+        // Operand has disable flag → always succeed (NOP for forward compat)
+        assert!(checker.check_sequence((DISABLE_FLAG | 999) as i64));
+    }
+
+    /// BIP-112 gate 13: negative operand must return false from check_sequence.
+    /// (Bitcoin Core interpreter.cpp:579-580; the negative check is in the opcode
+    /// handler but check_sequence also guards defensively)
+    #[test]
+    fn check_sequence_negative_operand_fails() {
+        let tx = make_tx_v2_sequence(100);
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
+        assert!(!checker.check_sequence(-1));
+        assert!(!checker.check_sequence(-100));
+    }
+
+    /// BIP-112 gate 20: masked comparison is purely numeric after type strip.
+    /// Verify that bits outside TYPE_FLAG | MASK are ignored in operand and tx.
+    #[test]
+    fn check_sequence_ignores_bits_outside_mask() {
+        // tx sequence: bits 16-21 are set (above MASK, below TYPE_FLAG) — should be ignored
+        // low 16 bits = 50
+        let tx = make_tx_v2_sequence(0x003F_0032); // bits 16-21 set, low=50
+        let checker = TransactionSignatureChecker::new(&tx, 0, 0, &[], &[]);
+
+        // Operand 50 (height-type) must succeed because masked tx value = 50
+        assert!(checker.check_sequence(50));
+        // Operand 51 must fail
+        assert!(!checker.check_sequence(51));
     }
 
     // =========================
