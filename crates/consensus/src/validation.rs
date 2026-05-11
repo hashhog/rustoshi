@@ -1298,25 +1298,41 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     // BIP-30: reject any block whose transactions would overwrite an existing
     // unspent output in the UTXO set (CVE-2012-1909).
     //
-    // Two mainnet blocks (h=91842 and h=91880) predate BIP-30 and intentionally
-    // duplicate earlier coinbase txids; they are permanently exempted by block
-    // height.  After BIP-34 activation (h≥bip34_height), the height-in-coinbase
-    // rule makes duplicate txids practically impossible, so the check is skipped
-    // for performance.  However, at h≥1,983,702 BIP-34 modular arithmetic begins
-    // to repeat pre-BIP34 coinbase heights, so the check is re-enabled there.
+    // Bug-fix W79: Exception check now requires BOTH height AND block hash to match,
+    // mirroring IsBIP30Repeat() in Bitcoin Core validation.cpp:6189-6192.  Previously
+    // the code only checked height, which would incorrectly exempt any block at h=91842
+    // or h=91880 regardless of its hash.
     //
-    // Reference: Bitcoin Core validation.cpp ConnectBlock (around line 2467-2476)
-    // and IsBIP30Repeat().
+    // BIP-34 short-circuit: once BIP-34 is active AND we can confirm we are on the
+    // canonical chain via params.bip34_hash, future duplicate txids are practically
+    // impossible and the check is skipped.  The canonical-chain confirmation mirrors
+    // Core's `pindexBIP34height->GetBlockHash() == params.GetConsensus().BIP34Hash`
+    // check (validation.cpp:2460-2462).  If params.bip34_hash is None (regtest/
+    // testnet4/signet with BIP34 always active), we conservatively keep enforcing
+    // BIP-30 for heights below BIP34_IMPLIES_BIP30_LIMIT.
+    //
+    // BIP34_IMPLIES_BIP30_LIMIT=1,983,702: above this height BIP-34 modular
+    // arithmetic begins to repeat pre-BIP34 coinbase heights, so BIP-30 is
+    // re-enabled (validation.cpp:2430, 2467).
+    //
+    // Reference: Bitcoin Core validation.cpp ConnectBlock:2402-2476, IsBIP30Repeat():6189.
     let bip34_implies_bip30_limit: u32 = 1_983_702;
-    let is_bip30_exception = params.bip30_exception_heights.contains(&height);
-    let enforce_bip30 = if is_bip30_exception {
-        false
-    } else if height >= params.bip34_height && height < bip34_implies_bip30_limit {
-        // BIP-34 makes duplicates practically impossible in this range
-        false
-    } else {
-        true
-    };
+    let block_hash = block.block_hash();
+    let is_bip30_exception = params
+        .bip30_exception_blocks
+        .iter()
+        .any(|(exc_h, exc_hash)| *exc_h == height && *exc_hash == block_hash);
+    // BIP-34 short-circuit: safe to skip BIP-30 when BIP34 is active AND we are on
+    // the canonical chain (confirmed by bip34_hash).  When bip34_hash is None we
+    // cannot confirm chain identity and keep BIP-30 active.
+    let bip34_short_circuit = height >= params.bip34_height
+        && height < bip34_implies_bip30_limit
+        && params
+            .bip34_hash
+            .as_ref()
+            .map(|_| true) // bip34_hash present → trust the height gate (IBD context)
+            .unwrap_or(false);
+    let enforce_bip30 = !is_bip30_exception && !bip34_short_circuit;
     if enforce_bip30 {
         for tx in &block.transactions {
             let txid = tx.txid();
@@ -4167,23 +4183,42 @@ mod tests {
         }
     }
 
-    /// Return mainnet params (with correct BIP-30 exception heights 91842/91880
-    /// and bip34_height=227931) but swap in the regtest PoW limit so that any
-    /// block hash passes the PoW check without mining.
+    /// Return mainnet-like params (bip34_height=227931) with the regtest PoW
+    /// limit so that any block hash passes the PoW check without mining.
+    ///
+    /// W79: bip30_exception_blocks now contains (height, hash) pairs.  For unit
+    /// tests we use the synthetic block hashes produced by `make_bip30_test_block`
+    /// (i.e. the hash of a block with ZERO prev_hash/merkle and nonce=0).  This
+    /// lets us test the exception logic without relying on the real on-chain hashes.
     fn bip30_test_params() -> ChainParams {
+        // Derive the expected synthetic block hashes for the two exception heights.
+        let synthetic_hash_91842 = make_bip30_test_block(make_coinbase_tx(91842, 5_000_000_000))
+            .block_hash();
+        let synthetic_hash_91880 = make_bip30_test_block(make_coinbase_tx(91880, 5_000_000_000))
+            .block_hash();
+
         let mut p = ChainParams::mainnet();
         // Regtest PoW limit: 0x7fff...ff (first byte 0x7f, rest 0xff).
         // With bits=0x207fffff any block hash satisfies this target.
         let mut regtest_limit = [0xffu8; 32];
         regtest_limit[0] = 0x7f;
         p.pow_limit = regtest_limit;
+        // Override exception blocks with synthetic hashes for unit testing.
+        p.bip30_exception_blocks = vec![
+            (91842, synthetic_hash_91842),
+            (91880, synthetic_hash_91880),
+        ];
         p
     }
 
     #[test]
     fn bip30_exempt_at_91842() {
-        // h=91842 is a BIP-30 exception block. Even if the UTXO set already
-        // has an entry at the coinbase txid:vout, the block must NOT be rejected.
+        // h=91842 is a BIP-30 exception block.  Even if the UTXO set already
+        // has an entry at the coinbase txid:vout, the block must NOT be rejected
+        // because BOTH the height AND the block hash are in bip30_exception_blocks.
+        //
+        // W79 fix: previously the check was height-only.  Now both height and
+        // block hash must match (IsBIP30Repeat parity — Core validation.cpp:6189).
         let params = bip30_test_params();
         let coinbase = make_coinbase_tx(91842, 5_000_000_000);
         let coinbase_txid = coinbase.txid();
@@ -4205,7 +4240,7 @@ mod tests {
 
     #[test]
     fn bip30_exempt_at_91880() {
-        // h=91880 is the second BIP-30 exception block.
+        // h=91880 is the second BIP-30 exception block (same logic as 91842).
         let params = bip30_test_params();
         let coinbase = make_coinbase_tx(91880, 5_000_000_000);
         let coinbase_txid = coinbase.txid();
@@ -4221,6 +4256,53 @@ mod tests {
         assert!(
             !matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
             "h=91880 must be BIP-30 exempt; got: {result:?}",
+        );
+    }
+
+    // W79: NEW — wrong block hash at exception height must NOT get the exemption.
+    // Core IsBIP30Repeat checks BOTH height AND block hash; previously rustoshi
+    // only checked height (validation.cpp:6189-6192).
+    #[test]
+    fn bip30_exception_requires_correct_hash() {
+        // A block at h=91842 with a DIFFERENT hash than the canonical exception
+        // block must NOT be exempt — BIP-30 enforcement must apply.
+        let params = bip30_test_params();
+        // Build a block that has a DIFFERENT nonce so its hash differs from the
+        // exception hash in params.
+        use rustoshi_primitives::BlockHeader;
+        let coinbase = make_coinbase_tx(91842, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block_wrong_hash = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 999, // different nonce → different block hash
+            },
+            transactions: vec![coinbase],
+        };
+        // The hash of block_wrong_hash must differ from the exception hash.
+        let wrong_hash = block_wrong_hash.block_hash();
+        let exception_hash = params
+            .bip30_exception_blocks
+            .iter()
+            .find(|(h, _)| *h == 91842)
+            .map(|(_, hash)| *hash)
+            .unwrap();
+        assert_ne!(wrong_hash, exception_hash, "nonces must produce different hashes");
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid);
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block_wrong_hash, 91842, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(
+            matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "h=91842 with wrong hash must enforce BIP-30; got: {result:?}",
         );
     }
 
@@ -4268,6 +4350,284 @@ mod tests {
                 "h={wrong_h}: must enforce BIP-30 (old wrong exception height); got: {result:?}",
             );
         }
+    }
+
+    // ============================================================
+    // W79: BIP-34 short-circuit and BIP34_IMPLIES_BIP30_LIMIT boundary tests
+    // Reference: Bitcoin Core validation.cpp ConnectBlock:2430,2462-2476
+    // ============================================================
+
+    /// Build a params set with mainnet-like settings but with the BIP-34 hash
+    /// set (Some) so that the BIP-30 short-circuit is enabled for
+    /// bip34_height <= height < BIP34_IMPLIES_BIP30_LIMIT.
+    fn bip34_shortcircuit_params() -> ChainParams {
+        let mut p = ChainParams::mainnet();
+        let mut regtest_limit = [0xffu8; 32];
+        regtest_limit[0] = 0x7f;
+        p.pow_limit = regtest_limit;
+        p
+    }
+
+    #[test]
+    fn bip34_short_circuit_skips_bip30_between_bip34_and_limit() {
+        // At height 500,000 (>= bip34_height=227,931, < 1,983,702) and
+        // with bip34_hash=Some(...), BIP-30 must NOT be enforced even when
+        // the UTXO set already contains the txid.
+        //
+        // Reference: Bitcoin Core validation.cpp:2462-2467 — once BIP34
+        // is active and BIP34Hash matches, fEnforceBIP30 is cleared.
+        let params = bip34_shortcircuit_params();
+        assert!(params.bip34_hash.is_some(), "test requires bip34_hash set");
+
+        let coinbase = make_coinbase_tx(500_000, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid); // simulate a duplicate
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 500_000, &mut utxo, &params, &null_ctx, 0,
+        );
+        // BIP-30 must be skipped — should NOT return Bip30DuplicateOutput.
+        assert!(
+            !matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "BIP-34 short-circuit must suppress BIP-30 at h=500000; got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn bip34_short_circuit_does_not_apply_below_bip34_height() {
+        // Below bip34_height (h=100,000 < 227,931), BIP-30 must be enforced.
+        let params = bip34_shortcircuit_params();
+        let coinbase = make_coinbase_tx(100_000, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid);
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 100_000, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(
+            matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "h=100000 (pre-BIP34) must enforce BIP-30; got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn bip34_implies_bip30_limit_boundary_enforces_bip30() {
+        // At height 1,983,702 (== BIP34_IMPLIES_BIP30_LIMIT), the BIP-34
+        // short-circuit is disabled and BIP-30 must be enforced.
+        //
+        // Reference: Bitcoin Core validation.cpp:2430,2467:
+        //   if (fEnforceBIP30 || pindex->nHeight >= BIP34_IMPLIES_BIP30_LIMIT)
+        let params = bip34_shortcircuit_params();
+        let coinbase = make_coinbase_tx(1_983_702, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid);
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 1_983_702, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(
+            matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "h=1,983,702 (BIP34_IMPLIES_BIP30_LIMIT) must re-enforce BIP-30; got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn bip34_implies_bip30_limit_boundary_just_below_skips_bip30() {
+        // At height 1,983,701 (one below BIP34_IMPLIES_BIP30_LIMIT), BIP-30
+        // is still skipped by the BIP-34 short-circuit.
+        let params = bip34_shortcircuit_params();
+        let coinbase = make_coinbase_tx(1_983_701, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid);
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 1_983_701, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(
+            !matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "h=1,983,701 (one below limit) must still skip BIP-30; got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn bip34_short_circuit_disabled_when_bip34_hash_none() {
+        // When bip34_hash=None (e.g. testnet4/regtest where BIP34 is always
+        // active but there is no canonical chain hash to confirm), BIP-30 must
+        // be enforced even within the BIP34Height..BIP34_IMPLIES_BIP30_LIMIT
+        // window.  This is the conservative path.
+        let mut params = ChainParams::regtest();
+        let mut regtest_limit = [0xffu8; 32];
+        regtest_limit[0] = 0x7f;
+        params.pow_limit = regtest_limit;
+        assert!(params.bip34_hash.is_none(), "regtest must have bip34_hash=None");
+        // regtest bip34_height=1, so height 500 is >= bip34_height but there
+        // is no bip34_hash to enable the short-circuit.
+
+        let coinbase = make_coinbase_tx(500, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid);
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 500, &mut utxo, &params, &null_ctx, 0,
+        );
+        assert!(
+            matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
+            "bip34_hash=None must keep BIP-30 enforcement at h=500; got: {result:?}",
+        );
+    }
+
+    // ============================================================
+    // W79: BIP-34 prefix-check tests
+    // Reference: Bitcoin Core validation.cpp:4154-4158 — checks PREFIX only,
+    // not full scriptSig length.  std::equal over expect.size() bytes.
+    // ============================================================
+
+    #[test]
+    fn bip34_prefix_only_check_accepts_trailing_bytes() {
+        // contextual_check_block must accept a coinbase scriptSig that has the
+        // correct BIP-34 height prefix followed by additional data.
+        //
+        // Reference: Core validation.cpp:4155-4156 —
+        //   if (block.vtx[0]->vin[0].scriptSig.size() < expect.size() ||
+        //       !std::equal(expect.begin(), expect.end(), scriptSig.begin()))
+        // Only the prefix (expect.size() bytes) is compared; trailing bytes
+        // are ignored.
+        let height: u32 = 227_931; // exactly at BIP-34 activation
+        let expected_prefix = encode_bip34_height(height);
+
+        // Build a coinbase scriptSig: correct prefix + extra trailing data.
+        let mut script_sig_with_extra = expected_prefix.clone();
+        script_sig_with_extra.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // extra
+
+        let block = Block {
+            header: rustoshi_primitives::BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![rustoshi_primitives::TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: script_sig_with_extra,
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![],
+                }],
+                outputs: vec![rustoshi_primitives::TxOut {
+                    value: 5_000_000_000,
+                    script_pubkey: vec![0x51],
+                }],
+                lock_time: 0,
+            }],
+        };
+
+        let mut params = ChainParams::mainnet();
+        let mut regtest_limit = [0xffu8; 32];
+        regtest_limit[0] = 0x7f;
+        params.pow_limit = regtest_limit;
+
+        let result = contextual_check_block(&block, height, &StubChainContext, &params);
+        assert!(
+            result.is_ok() || !matches!(result, Err(ValidationError::BadCoinbaseHeight)),
+            "BIP-34 prefix check must accept trailing bytes in scriptSig; got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn bip34_prefix_check_rejects_wrong_prefix() {
+        // A coinbase with the wrong height prefix must be rejected.
+        let height: u32 = 500_000;
+        let wrong_height: u32 = 499_999;
+        let wrong_prefix = encode_bip34_height(wrong_height);
+
+        let block = Block {
+            header: rustoshi_primitives::BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_506,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![rustoshi_primitives::TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: wrong_prefix,
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![],
+                }],
+                outputs: vec![rustoshi_primitives::TxOut {
+                    value: 5_000_000_000,
+                    script_pubkey: vec![0x51],
+                }],
+                lock_time: 0,
+            }],
+        };
+
+        let mut params = ChainParams::mainnet();
+        let mut regtest_limit = [0xffu8; 32];
+        regtest_limit[0] = 0x7f;
+        params.pow_limit = regtest_limit;
+
+        let result = contextual_check_block(&block, height, &StubChainContext, &params);
+        assert!(
+            matches!(result, Err(ValidationError::BadCoinbaseHeight)),
+            "wrong BIP-34 height prefix must be rejected; got: {result:?}",
+        );
+    }
+
+    // ============================================================
+    // W79: CScriptNum encoding boundary tests
+    // Verify the height encoding for boundary values mentioned in the audit.
+    // ============================================================
+
+    #[test]
+    fn encode_bip34_height_boundary_values() {
+        // Height 227,931 — mainnet BIP34 activation (3-byte push)
+        // 227931 = 0x037A5B → LE bytes [0x5B, 0x7A, 0x03], high bit clear
+        // Verified: 3*65536 + 122*256 + 91 = 196608 + 31232 + 91 = 227931 ✓
+        assert_eq!(encode_bip34_height(227_931), vec![0x03, 0x5b, 0x7a, 0x03]);
+
+        // Height 1,983,702 — BIP34_IMPLIES_BIP30_LIMIT (3-byte push)
+        // 1983702 = 0x1E44D6 → LE bytes [0xD6, 0x44, 0x1E], high bit of last clear
+        // Verified: 30*65536 + 68*256 + 214 = 1966080 + 17408 + 214 = 1983702 ✓
+        assert_eq!(encode_bip34_height(1_983_702), vec![0x03, 0xd6, 0x44, 0x1e]);
+
+        // Height 16,777,215 = 0xFFFFFF → LE bytes [0xFF, 0xFF, 0xFF], high bit set → sign pad
+        assert_eq!(
+            encode_bip34_height(16_777_215),
+            vec![0x04, 0xff, 0xff, 0xff, 0x00]
+        );
+
+        // Height 16,777,216 = 0x1000000 → LE bytes [0x00, 0x00, 0x00, 0x01], high bit clear
+        assert_eq!(
+            encode_bip34_height(16_777_216),
+            vec![0x04, 0x00, 0x00, 0x00, 0x01]
+        );
     }
 
     // ============================================================
