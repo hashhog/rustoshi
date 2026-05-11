@@ -3108,9 +3108,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 match CmpctBlock::decode(&mut std::io::Cursor::new(&data)) {
                                     Ok(cmpct) => {
                                         let block_hash = cmpct.block_hash();
-                                        let mempool_txns = {
+                                        let (mempool_txns, segwit_active) = {
                                             let rpc = rpc_state.read().await;
-                                            rpc.mempool.collect_for_compact_block()
+                                            let seg = rpc.params.is_segwit_active(rpc.best_height);
+                                            (rpc.mempool.collect_for_compact_block(), seg)
                                         };
                                         let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
                                             mempool_txns.iter().map(|(h, t)| (h, t)).collect();
@@ -3121,7 +3122,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 let missing = partial.get_missing_indices();
                                                 let (prefilled, from_mempool, _extra) = partial.stats();
                                                 if missing.is_empty() {
-                                                    match partial.fill_block(vec![]) {
+                                                    match partial.fill_block(vec![], segwit_active) {
                                                         Ok(block) => {
                                                             tracing::info!(
                                                                 "Compact block {} reconstructed (prefilled={}, mempool={})",
