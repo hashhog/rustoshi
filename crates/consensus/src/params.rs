@@ -457,6 +457,17 @@ pub struct ChainParams {
     // Bitcoin Core validation.cpp:6189-6192).
     pub bip30_exception_blocks: Vec<(u32, Hash256)>,
 
+    // BIP-30: blocks that are exempt from the *disconnect-side* output-mismatch
+    // check.  These are the BLOCKS WHOSE COINBASE OUTPUTS WERE LATER OVERWRITTEN
+    // (the predecessors of the duplicates above) — h=91722 and h=91812 on mainnet.
+    // When we disconnect these blocks in reverse during a reorg, their outputs no
+    // longer match the live UTXO set (because the duplicate coinbase clobbered
+    // them when it was connected), so the output verification must be skipped.
+    // Each entry is (height, block_hash).
+    //
+    // Reference: Bitcoin Core validation.cpp:2201-2202 (DisconnectBlock).
+    pub bip30_disconnect_exception_blocks: Vec<(u32, Hash256)>,
+
     // BIP-34 canonical chain hash: the block hash at BIP34Height on the canonical
     // chain.  Used to confirm we are on the known chain before skipping the BIP-30
     // duplicate-UTXO check for heights >= BIP34Height.  None means the check cannot
@@ -534,6 +545,25 @@ impl ChainParams {
                         "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
                     )
                     .expect("valid bip30 exception hash"),
+                ),
+            ],
+            // BIP-30 disconnect-side exceptions: the predecessor blocks whose
+            // coinbase outputs were later overwritten by the duplicates above
+            // (Bitcoin Core validation.cpp:2201-2202 DisconnectBlock).
+            bip30_disconnect_exception_blocks: vec![
+                (
+                    91722,
+                    Hash256::from_hex(
+                        "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+                    )
+                    .expect("valid bip30 disconnect exception hash"),
+                ),
+                (
+                    91812,
+                    Hash256::from_hex(
+                        "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f",
+                    )
+                    .expect("valid bip30 disconnect exception hash"),
                 ),
             ],
             // BIP-34 canonical chain hash at height 227,931 (mainnet).
@@ -682,6 +712,7 @@ impl ChainParams {
             segwit_height: 834624,
             taproot_height: 2032291, // testnet3 taproot approximate
             bip30_exception_blocks: vec![],
+            bip30_disconnect_exception_blocks: vec![],
             // Testnet3 BIP34Hash from Bitcoin Core kernel/chainparams.cpp:213
             bip34_hash: Some(
                 Hash256::from_hex(
@@ -738,6 +769,7 @@ impl ChainParams {
             segwit_height: 1,
             taproot_height: 1,
             bip30_exception_blocks: vec![],
+            bip30_disconnect_exception_blocks: vec![],
             // Testnet4: BIP34 active from genesis with null hash (Bitcoin Core
             // kernel/chainparams.cpp:455-456 — BIP34Hash = uint256{}).
             bip34_hash: None,
@@ -824,6 +856,7 @@ impl ChainParams {
             segwit_height: 1,
             taproot_height: 1,
             bip30_exception_blocks: vec![],
+            bip30_disconnect_exception_blocks: vec![],
             // Signet: BIP34 active from genesis with null hash.
             bip34_hash: None,
             assumed_valid_block: None,
@@ -864,6 +897,7 @@ impl ChainParams {
             segwit_height: 1,
             taproot_height: 1,
             bip30_exception_blocks: vec![],
+            bip30_disconnect_exception_blocks: vec![],
             // Regtest: BIP34 always active from height 1; null BIP34Hash
             // (Bitcoin Core kernel/chainparams.cpp:536-537).
             bip34_hash: None,

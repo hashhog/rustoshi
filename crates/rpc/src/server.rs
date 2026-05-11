@@ -1301,9 +1301,31 @@ fn disconnect_to(
     let mut batch = store.new_batch();
     for (h, hash, block, storage_undo) in plan.iter() {
         let v_undo = storage_undo_to_validation(storage_undo);
-        validation::disconnect_block(block, &v_undo, &mut utxo_view).map_err(|e| {
-            format!("disconnect_block at height {} ({}): {}", h, hash, e)
-        })?;
+        let result = validation::disconnect_block(
+            block,
+            &v_undo,
+            &mut utxo_view,
+            *h,
+            &state.params,
+        )
+        .map_err(|e| format!("disconnect_block at height {} ({}): {}", h, hash, e))?;
+        match result {
+            validation::DisconnectResult::Failed => {
+                return Err(format!(
+                    "disconnect_block at height {} ({}): DISCONNECT_FAILED \
+                     (undo size mismatch or unrecoverable metadata gap)",
+                    h, hash
+                ));
+            }
+            validation::DisconnectResult::Unclean => {
+                tracing::warn!(
+                    "disconnect_to: UNCLEAN at height {} ({}); proceeding but \
+                     chainstate may need recheck",
+                    h, hash,
+                );
+            }
+            validation::DisconnectResult::Ok => {}
+        }
 
         // Pattern C (txindex-revert-on-reorg): drop tx_index entries for every
         // tx in the disconnected block so that `getrawtransaction` no longer
@@ -8451,16 +8473,41 @@ impl RpcServerImpl {
                         })
                         .collect(),
                 };
-                rustoshi_consensus::validation::disconnect_block(block, &v_undo, &mut utxo_view)
-                    .map_err(|e| {
-                        Self::rpc_error(
+                let result = rustoshi_consensus::validation::disconnect_block(
+                    block,
+                    &v_undo,
+                    &mut utxo_view,
+                    *h,
+                    &state.params,
+                )
+                .map_err(|e| {
+                    Self::rpc_error(
+                        rpc_error::RPC_MISC_ERROR,
+                        format!(
+                            "rollback aborted at height {} ({}): disconnect_block failed: {}",
+                            h, hash, e
+                        ),
+                    )
+                })?;
+                match result {
+                    rustoshi_consensus::validation::DisconnectResult::Failed => {
+                        return Err(Self::rpc_error(
                             rpc_error::RPC_MISC_ERROR,
                             format!(
-                                "rollback aborted at height {} ({}): disconnect_block failed: {}",
-                                h, hash, e
+                                "rollback aborted at height {} ({}): DISCONNECT_FAILED",
+                                h, hash
                             ),
-                        )
-                    })?;
+                        ));
+                    }
+                    rustoshi_consensus::validation::DisconnectResult::Unclean => {
+                        tracing::warn!(
+                            "rollback: UNCLEAN at height {} ({}); proceeding",
+                            h,
+                            hash
+                        );
+                    }
+                    rustoshi_consensus::validation::DisconnectResult::Ok => {}
+                }
             }
             utxo_view.flush().map_err(|e| {
                 Self::rpc_error(
