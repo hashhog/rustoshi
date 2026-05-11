@@ -123,9 +123,26 @@ pub const TRUC_CHILD_MAX_VSIZE: usize = 1_000;
 // CLUSTER MEMPOOL CONSTANTS
 // ============================================================
 
+/// Default maximum number of ancestors (including self) for a transaction.
+/// From Bitcoin Core: DEFAULT_ANCESTOR_LIMIT = 25 (policy/policy.h:76).
+pub const DEFAULT_ANCESTOR_LIMIT: usize = 25;
+
+/// Default maximum number of descendants (including self) for a transaction.
+/// From Bitcoin Core: DEFAULT_DESCENDANT_LIMIT = 25 (policy/policy.h:78).
+pub const DEFAULT_DESCENDANT_LIMIT: usize = 25;
+
 /// Maximum number of transactions in a cluster.
-/// Replaces ancestor/descendant limits with cluster size limits.
-pub const MAX_CLUSTER_SIZE: usize = 100;
+/// From Bitcoin Core: DEFAULT_CLUSTER_LIMIT = 64 (policy/policy.h:72).
+pub const MAX_CLUSTER_SIZE: usize = 64;
+
+/// CPFP carve-out: one extra descendant is allowed when the incoming transaction
+/// has exactly one in-mempool ancestor AND its virtual size is at or below this limit.
+///
+/// From Bitcoin Core: EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10000 (policy/policy.h:90).
+/// This lets a small CPFP bump child bypass the descendant count limit when the
+/// ancestor package is otherwise at the limit.  Applies only to the
+/// descendant-count gate; the ancestor-count gate is not waived.
+pub const EXTRA_DESCENDANT_TX_SIZE_LIMIT: usize = 10_000;
 
 // ============================================================
 // PACKAGE CONSTANTS
@@ -610,9 +627,9 @@ impl Default for MempoolConfig {
             max_size_bytes: 300 * 1024 * 1024,
             min_fee_rate: 1, // 1 sat/vbyte
             max_tx_count: 1_000_000,
-            max_ancestor_count: 25,
+            max_ancestor_count: DEFAULT_ANCESTOR_LIMIT,
             max_ancestor_size: 101_000,
-            max_descendant_count: 25,
+            max_descendant_count: DEFAULT_DESCENDANT_LIMIT,
             max_descendant_size: 101_000,
             full_rbf: true, // Bitcoin Core v28+ default
             incremental_relay_fee: DEFAULT_INCREMENTAL_RELAY_FEE,
@@ -620,6 +637,23 @@ impl Default for MempoolConfig {
             max_datacarrier_bytes: Some(100_000),
             // Mirrors Bitcoin Core DEFAULT_PERMIT_BAREMULTISIG = true.
             permit_bare_multisig: true,
+        }
+    }
+}
+
+impl MempoolConfig {
+    /// Return a config with all chain-length limits disabled (counts and sizes set to usize::MAX).
+    ///
+    /// Equivalent to `kernel::MemPoolLimits::NoLimits()` in Bitcoin Core
+    /// (kernel/mempool_limits.h:31-35).  Useful for tests that need to admit
+    /// arbitrarily deep chains without hitting policy limits.
+    pub fn no_limits() -> Self {
+        Self {
+            max_ancestor_count: usize::MAX,
+            max_ancestor_size: usize::MAX,
+            max_descendant_count: usize::MAX,
+            max_descendant_size: usize::MAX,
+            ..Default::default()
         }
     }
 }
@@ -1275,13 +1309,28 @@ impl Mempool {
             ));
         }
 
-        // Check descendant limits for ALL ancestors (not just direct parents)
-        // Adding this transaction would increase their descendant counts
-        // We must check every ancestor, as any of them exceeding the limit causes rejection
+        // Check descendant limits for ALL ancestors (not just direct parents).
+        // Adding this transaction would increase their descendant counts.
+        // We must check every ancestor, as any of them exceeding the limit causes rejection.
+        //
+        // CPFP carve-out (Core policy/policy.h:86-90, EXTRA_DESCENDANT_TX_SIZE_LIMIT):
+        // Allow one extra descendant when the new transaction has exactly ONE in-mempool
+        // ancestor AND its vsize is at or below EXTRA_DESCENDANT_TX_SIZE_LIMIT (10 000 vB).
+        // This lets a small CPFP child bypass the descendant-count gate for the ancestor.
+        // The carve-out does NOT waive the ancestor-count gate or size gates.
+        let cpfp_carve_out_eligible =
+            ancestor_count == 1 && vsize <= EXTRA_DESCENDANT_TX_SIZE_LIMIT;
+
         let all_ancestors = self.get_all_ancestors(&mempool_parents);
         for ancestor_txid in &all_ancestors {
             if let Some(ancestor_entry) = self.transactions.get(ancestor_txid) {
-                if ancestor_entry.descendant_count + 1 > self.config.max_descendant_count {
+                // Descendant count gate — relaxed by 1 for carve-out eligible transactions.
+                let effective_desc_limit = if cpfp_carve_out_eligible {
+                    self.config.max_descendant_count.saturating_add(1)
+                } else {
+                    self.config.max_descendant_count
+                };
+                if ancestor_entry.descendant_count + 1 > effective_desc_limit {
                     return Err(MempoolError::TooManyDescendants(
                         ancestor_entry.descendant_count + 1,
                         self.config.max_descendant_count,
@@ -3194,11 +3243,21 @@ impl Mempool {
             ));
         }
 
-        // Check descendant limits
+        // Check descendant limits.
+        // CPFP carve-out: allow +1 descendant when new tx has exactly one in-mempool
+        // ancestor and vsize <= EXTRA_DESCENDANT_TX_SIZE_LIMIT (Core policy/policy.h:90).
+        let cpfp_carve_out_eligible =
+            ancestor_count == 1 && vsize <= EXTRA_DESCENDANT_TX_SIZE_LIMIT;
+
         let all_ancestors = self.get_all_ancestors(&mempool_parents);
         for ancestor_txid in &all_ancestors {
             if let Some(ancestor_entry) = self.transactions.get(ancestor_txid) {
-                if ancestor_entry.descendant_count + 1 > self.config.max_descendant_count {
+                let effective_desc_limit = if cpfp_carve_out_eligible {
+                    self.config.max_descendant_count.saturating_add(1)
+                } else {
+                    self.config.max_descendant_count
+                };
+                if ancestor_entry.descendant_count + 1 > effective_desc_limit {
                     return Err(MempoolError::TooManyDescendants(
                         ancestor_entry.descendant_count + 1,
                         self.config.max_descendant_count,
@@ -7866,5 +7925,316 @@ mod tests {
             "P2WPKH tx with 1 witness sigop must be accepted (got {:?})",
             result
         );
+    }
+
+    // ============================================================
+    // W75 ANCESTOR/DESCENDANT/CLUSTER LIMITS AUDIT TESTS
+    // ============================================================
+
+    /// DEFAULT_ANCESTOR_LIMIT and DEFAULT_DESCENDANT_LIMIT constants must equal 25.
+    /// Core: policy/policy.h:76-78.
+    #[test]
+    fn test_w75_named_constants_values() {
+        assert_eq!(DEFAULT_ANCESTOR_LIMIT, 25, "DEFAULT_ANCESTOR_LIMIT must be 25 (Core policy.h:76)");
+        assert_eq!(DEFAULT_DESCENDANT_LIMIT, 25, "DEFAULT_DESCENDANT_LIMIT must be 25 (Core policy.h:78)");
+        assert_eq!(MAX_CLUSTER_SIZE, 64, "MAX_CLUSTER_SIZE must be 64 (Core DEFAULT_CLUSTER_LIMIT policy.h:72)");
+        assert_eq!(EXTRA_DESCENDANT_TX_SIZE_LIMIT, 10_000, "EXTRA_DESCENDANT_TX_SIZE_LIMIT must be 10000 (Core policy.h:90)");
+    }
+
+    /// Default MempoolConfig must use DEFAULT_ANCESTOR_LIMIT=25 and DEFAULT_DESCENDANT_LIMIT=25.
+    #[test]
+    fn test_w75_default_config_limits() {
+        let cfg = MempoolConfig::default();
+        assert_eq!(cfg.max_ancestor_count, DEFAULT_ANCESTOR_LIMIT);
+        assert_eq!(cfg.max_descendant_count, DEFAULT_DESCENDANT_LIMIT);
+    }
+
+    /// MempoolConfig::no_limits() must have unlimited chain depth — analogous to
+    /// Core MemPoolLimits::NoLimits() (kernel/mempool_limits.h:31-35).
+    #[test]
+    fn test_w75_no_limits_constructor() {
+        let cfg = MempoolConfig::no_limits();
+        assert_eq!(cfg.max_ancestor_count, usize::MAX);
+        assert_eq!(cfg.max_ancestor_size, usize::MAX);
+        assert_eq!(cfg.max_descendant_count, usize::MAX);
+        assert_eq!(cfg.max_descendant_size, usize::MAX);
+    }
+
+    /// A chain of exactly 25 transactions (self counts as one ancestor) must be accepted.
+    /// 25th tx: ancestor_count = 25 = limit. Core policy/policy.h:76.
+    #[test]
+    fn test_w75_chain_25_accepted() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid = Hash256::from_hex(
+            "aa00000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000)]);
+
+        let mut prev_txid = utxo_txid;
+        let mut prev_val = 100_000_000u64;
+        for i in 0..25 {
+            let tx = make_tx(vec![(prev_txid, 0)], vec![prev_val - 1000], 1);
+            prev_txid = tx.txid();
+            prev_val -= 1000;
+            let r = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+            assert!(r.is_ok(), "tx {} of 25 should be accepted, got {:?}", i + 1, r);
+        }
+        assert_eq!(mempool.size(), 25);
+        // The 25th tx should report ancestor_count = 25 (self + 24 ancestors).
+        // (We only verify it accepted; counting is verified in test_chain_of_25_transactions_passes.)
+    }
+
+    /// A chain of 26 transactions must be rejected: ancestor_count would be 26 > 25.
+    /// Error must be TooManyAncestors. Core policy/policy.h:76.
+    #[test]
+    fn test_w75_chain_26_rejected() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid = Hash256::from_hex(
+            "bb00000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 200_000_000)]);
+
+        let mut prev_txid = utxo_txid;
+        let mut prev_val = 200_000_000u64;
+        for _ in 0..25 {
+            let tx = make_tx(vec![(prev_txid, 0)], vec![prev_val - 1000], 1);
+            prev_txid = tx.txid();
+            prev_val -= 1000;
+            mempool.add_transaction(tx, &|op| utxos.get(op).cloned()).unwrap();
+        }
+
+        let tx26 = make_tx(vec![(prev_txid, 0)], vec![prev_val - 1000], 1);
+        let r = mempool.add_transaction(tx26, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(r, Err(MempoolError::TooManyAncestors(26, 25))),
+            "26th tx must be rejected TooManyAncestors(26,25), got {:?}", r
+        );
+    }
+
+    /// Descendant-count check: when an ancestor already has 25 descendants (including
+    /// itself), adding another child must fail TooManyDescendants.
+    /// Core: txmempool.cpp CheckMemPoolPolicyLimits / CalculateDescendantData.
+    #[test]
+    fn test_w75_descendant_26_rejected() {
+        let config = MempoolConfig {
+            max_ancestor_count: 50, // High: we're testing descendant gate
+            max_descendant_count: 25,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid = Hash256::from_hex(
+            "cc00000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 300_000_000)]);
+
+        // Build chain of 25 (root + 24 children): root will have 25 descendants (incl. self).
+        let mut prev_txid = utxo_txid;
+        let mut prev_val = 300_000_000u64;
+        for _ in 0..25 {
+            let tx = make_tx(vec![(prev_txid, 0)], vec![prev_val - 1000], 1);
+            prev_txid = tx.txid();
+            prev_val -= 1000;
+            mempool.add_transaction(tx, &|op| utxos.get(op).cloned()).unwrap();
+        }
+
+        // Root's descendant_count should be 25 now.
+        // Adding tx26 would make root's descendant_count = 26 > 25 → reject.
+        let tx26 = make_tx(vec![(prev_txid, 0)], vec![prev_val - 1000], 1);
+        let r = mempool.add_transaction(tx26, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(r, Err(MempoolError::TooManyDescendants(_, _))),
+            "tx26 should fail TooManyDescendants, got {:?}", r
+        );
+    }
+
+    /// CPFP carve-out: a small tx (vsize <= 10000) with exactly ONE in-mempool
+    /// ancestor is allowed past the descendant-count gate even when the ancestor
+    /// is already at the default limit.
+    ///
+    /// Core: EXTRA_DESCENDANT_TX_SIZE_LIMIT, policy/policy.h:86-90.
+    #[test]
+    fn test_w75_cpfp_carve_out_one_ancestor_small_tx_allowed() {
+        // Use a descendant limit of 2 so we can reach the limit cheaply.
+        let config = MempoolConfig {
+            max_ancestor_count: 50,
+            max_descendant_count: 2,
+            max_descendant_size: usize::MAX,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        // Two UTXOs: utxo0 feeds the root (which has 2 outputs), utxo1 feeds child1.
+        let utxo_txid = Hash256::from_hex(
+            "dd00000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        // Root tx has TWO outputs so we can spend each independently from separate children.
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000)]);
+
+        // Standard P2PKH scriptpubkey used by make_tx helper.
+        let p2pkh = vec![
+            0x76u8, 0xa9, 0x14,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x88, 0xac,
+        ];
+
+        // Root tx: 2 outputs — output 0 will be spent by child1, output 1 by the carve-out child.
+        let root = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: utxo_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut { value: 49_000_000, script_pubkey: p2pkh.clone() },
+                TxOut { value: 49_000_000, script_pubkey: p2pkh.clone() },
+            ],
+            lock_time: 0,
+        };
+        let root_txid = root.txid();
+        mempool.add_transaction(root, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Child1 spends output 0 of root — root now has descendant_count = 2 = limit.
+        let child1 = make_tx(vec![(root_txid, 0)], vec![48_000_000], 1);
+        let child1_txid = child1.txid();
+        mempool.add_transaction(child1, &|op| utxos.get(op).cloned()).unwrap();
+        assert_eq!(mempool.get(&root_txid).unwrap().descendant_count, 2);
+
+        // Verify that child2 spending child1 (2 ancestors: root+child1) is NOT carve-out eligible.
+        let child2 = make_tx(vec![(child1_txid, 0)], vec![47_000_000], 1);
+        let r = mempool.add_transaction(child2, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(r, Err(MempoolError::TooManyDescendants(_, _))),
+            "child2 with 2 ancestors should NOT get carve-out, got {:?}", r
+        );
+
+        // Carve-out child: spends output 1 of root — exactly ONE in-mempool ancestor (root).
+        // Root is at descendant_count = 2 = limit, but carve-out raises effective limit to 3.
+        // This should be accepted.
+        let carve_out_child = make_tx(vec![(root_txid, 1)], vec![48_500_000], 1);
+        let r2 = mempool.add_transaction(carve_out_child, &|op| utxos.get(op).cloned());
+        assert!(
+            r2.is_ok(),
+            "CPFP carve-out: small tx with exactly 1 ancestor should bypass descendant limit, got {:?}", r2
+        );
+    }
+
+    /// CPFP carve-out does NOT apply when new tx is larger than EXTRA_DESCENDANT_TX_SIZE_LIMIT.
+    /// Core: EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10000 vB (policy/policy.h:90).
+    ///
+    /// Note: standard test txs are ~86 vB, well below 10000. This test verifies the
+    /// eligibility logic: a tx with >1 ancestor is NOT eligible regardless of size.
+    #[test]
+    fn test_w75_cpfp_carve_out_two_ancestors_not_eligible() {
+        let config = MempoolConfig {
+            max_ancestor_count: 50,
+            max_descendant_count: 2,
+            max_descendant_size: usize::MAX,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid = Hash256::from_hex(
+            "ee00000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000)]);
+
+        // grandparent → parent → new tx: new tx has 2 in-mempool ancestors → no carve-out.
+        let grandparent = make_tx(vec![(utxo_txid, 0)], vec![99_000_000], 1);
+        let gp_txid = grandparent.txid();
+        mempool.add_transaction(grandparent, &|op| utxos.get(op).cloned()).unwrap();
+
+        let parent = make_tx(vec![(gp_txid, 0)], vec![98_000_000], 1);
+        let p_txid = parent.txid();
+        mempool.add_transaction(parent, &|op| utxos.get(op).cloned()).unwrap();
+
+        // grandparent now has 2 descendants (itself + parent) = limit.
+        assert_eq!(mempool.get(&gp_txid).unwrap().descendant_count, 2);
+
+        // new tx has 2 ancestors (grandparent + parent) → not eligible for carve-out.
+        let new_tx = make_tx(vec![(p_txid, 0)], vec![97_000_000], 1);
+        let r = mempool.add_transaction(new_tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(r, Err(MempoolError::TooManyDescendants(_, _))),
+            "tx with 2 ancestors must NOT get CPFP carve-out, got {:?}", r
+        );
+    }
+
+    /// Cluster size limit: a cluster growing beyond MAX_CLUSTER_SIZE (64) must be rejected.
+    /// Core: DEFAULT_CLUSTER_LIMIT = 64 (policy/policy.h:72).
+    #[test]
+    fn test_w75_cluster_size_limit_64() {
+        // The cluster check fires before ancestor/descendant, so we need a wide fan-out
+        // that doesn't hit ancestor/descendant limits first.
+        // Use a branching structure: root → 64 children (each new child is its own 1-tx cluster
+        // merging into root's cluster when added).  Root starts alone (cluster size 1).
+        // After child 63 is added, root cluster size = 64 = MAX_CLUSTER_SIZE.
+        // Child 64 would make it 65 > 64 → ClusterSizeLimitExceeded.
+        let config = MempoolConfig {
+            max_ancestor_count: 200,
+            max_ancestor_size: usize::MAX,
+            max_descendant_count: 200,
+            max_descendant_size: usize::MAX,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        // Root with 65 outputs.
+        let utxo_txid = Hash256::from_hex(
+            "ff00000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 1_000_000_000)]);
+
+        // Root tx: 65 outputs (each child will spend one).
+        let root_outputs: Vec<u64> = (0..65).map(|_| 10_000_000).collect();
+        let root = make_tx(vec![(utxo_txid, 0)], root_outputs, 1);
+        let root_txid = root.txid();
+        mempool.add_transaction(root, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Add 63 children — cluster grows to 64 (root + 63 children).
+        for i in 0..63u32 {
+            let child = make_tx(vec![(root_txid, i)], vec![9_000_000], 1);
+            let r = mempool.add_transaction(child, &|op| utxos.get(op).cloned());
+            assert!(r.is_ok(), "child {} should be accepted (cluster size {}), got {:?}", i + 1, i + 2, r);
+        }
+
+        // 64th child would make cluster size 65 > 64 → reject.
+        let child64 = make_tx(vec![(root_txid, 63)], vec![9_000_000], 1);
+        let r = mempool.add_transaction(child64, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(r, Err(MempoolError::ClusterSizeLimitExceeded(65, 64))),
+            "65th cluster member must be rejected ClusterSizeLimitExceeded(65,64), got {:?}", r
+        );
+    }
+
+    /// no_limits() config must allow chains far beyond the default limits.
+    #[test]
+    fn test_w75_no_limits_admits_deep_chain() {
+        let config = MempoolConfig::no_limits();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid = Hash256::from_hex(
+            "1100000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 1_000_000_000)]);
+
+        let mut prev_txid = utxo_txid;
+        let mut prev_val = 1_000_000_000u64;
+        // Build a chain of 30 — well beyond the default limit of 25.
+        for i in 0..30 {
+            let tx = make_tx(vec![(prev_txid, 0)], vec![prev_val - 1000], 1);
+            prev_txid = tx.txid();
+            prev_val -= 1000;
+            let r = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+            assert!(r.is_ok(), "no_limits: tx {} should be accepted, got {:?}", i + 1, r);
+        }
+        assert_eq!(mempool.size(), 30);
     }
 }
