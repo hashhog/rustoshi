@@ -406,17 +406,17 @@ pub fn get_state_for<B: VersionbitsBlockInfo>(
                 }
             }
             ThresholdState::Started => {
-                // Check for timeout first
-                if period_end_block.median_time() >= deployment.timeout {
+                // Count signaling blocks in this period first.
+                // Bitcoin Core versionbits.cpp:87-97: threshold check takes
+                // priority over timeout — if count >= threshold the deployment
+                // locks in even if MTP also >= timeout in the same period.
+                let count = count_signaling_blocks(block, period_start, height, deployment);
+                if count >= deployment.threshold {
+                    ThresholdState::LockedIn
+                } else if period_end_block.median_time() >= deployment.timeout {
                     ThresholdState::Failed
                 } else {
-                    // Count signaling blocks in this period
-                    let count = count_signaling_blocks(block, period_start, height, deployment);
-                    if count >= deployment.threshold {
-                        ThresholdState::LockedIn
-                    } else {
-                        ThresholdState::Started
-                    }
+                    ThresholdState::Started
                 }
             }
             ThresholdState::LockedIn => {
@@ -1149,5 +1149,491 @@ mod tests {
 
         let deployment = BIP9Deployment::never_active(1);
         assert!(!is_deployment_active(Some(&chain), &deployment, None));
+    }
+
+    // ----------------------------------------------------------------
+    // W91 comprehensive gate tests (Core versionbits.cpp parity)
+    // ----------------------------------------------------------------
+
+    /// Gate 1-2: ALWAYS_ACTIVE sentinel → Active; NEVER_ACTIVE sentinel → Failed.
+    /// Core versionbits.cpp:35-42.
+    #[test]
+    fn test_w91_always_active_shortcut() {
+        let deployment = BIP9Deployment::always_active(5);
+        // Even with None (genesis) the shortcut fires before the None check.
+        assert_eq!(
+            get_state_for::<TestBlock>(None, &deployment, None),
+            ThresholdState::Active,
+        );
+        let chain = build_chain(10, 1, 0, 600);
+        assert_eq!(
+            get_state_for(Some(&chain), &deployment, None),
+            ThresholdState::Active,
+        );
+    }
+
+    #[test]
+    fn test_w91_never_active_shortcut() {
+        let deployment = BIP9Deployment::never_active(5);
+        assert_eq!(
+            get_state_for::<TestBlock>(None, &deployment, None),
+            ThresholdState::Failed,
+        );
+        let chain = build_chain(10, 0x20000020, 0, 600);
+        assert_eq!(
+            get_state_for(Some(&chain), &deployment, None),
+            ThresholdState::Failed,
+        );
+    }
+
+    /// Gate 4: Period alignment — every block within the same period resolves
+    /// to the same state as the period boundary of the PREVIOUS period.
+    /// Core versionbits.cpp:46: pindexPrev = ancestor(h - ((h+1) % nPeriod)).
+    ///
+    /// Concretely: blocks h=200..298 (mid-period-2) all align to h=199
+    /// (end of period-1), so they all see LOCKED_IN.  Only at h=299 (period-2
+    /// boundary) does the LOCKED_IN→ACTIVE transition fire.
+    #[test]
+    fn test_w91_period_alignment_same_state() {
+        let period: u32 = 100;
+        let deployment = BIP9Deployment {
+            bit: 0,
+            start_time: 0,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            period,
+            threshold: 75,
+        };
+        let signaling = 0x20000001i32;
+
+        // Build 3 periods: period-0 (STARTED), period-1 full signaling (LOCKED_IN),
+        // period-2 boundary at h=299 triggers LOCKED_IN→ACTIVE.
+        let mut chain = TestBlock::genesis(1);
+        for h in 1..300u32 {
+            let v = if h >= 100 && h < 200 { signaling } else { 1 };
+            chain = TestBlock::with_prev(h, v, h as i64 + 1, chain);
+        }
+
+        // Period-2 boundary (h=299) → ACTIVE (processes LOCKED_IN transition).
+        let state_at_boundary = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(state_at_boundary, ThresholdState::Active, "period-2 boundary must be ACTIVE");
+
+        // Mid-period-2 (h=250) aligns to h=199 (period-1 end) → still LOCKED_IN.
+        // This is correct Core behaviour: state transitions happen at period boundaries.
+        let chain_mid = chain.ancestor(250).unwrap();
+        let state_mid = get_state_for(Some(chain_mid), &deployment, None);
+        assert_eq!(state_mid, ThresholdState::LockedIn, "h=250 aligns to h=199 (period-1 end) → LOCKED_IN");
+
+        // h=199 (period-1 end) → LOCKED_IN.
+        let chain_p1_end = chain.ancestor(199).unwrap();
+        let state_p1_end = get_state_for(Some(chain_p1_end), &deployment, None);
+        assert_eq!(state_p1_end, ThresholdState::LockedIn, "period-1 end must be LOCKED_IN");
+
+        // h=150 (mid-period-1) also aligns to h=99 (period-0 end) → STARTED.
+        let chain_p1_mid = chain.ancestor(150).unwrap();
+        let state_p1_mid = get_state_for(Some(chain_p1_mid), &deployment, None);
+        assert_eq!(state_p1_mid, ThresholdState::Started, "h=150 aligns to h=99 → STARTED");
+    }
+
+    /// Gate 7: MTP optimization — if MTP < start_time we cache DEFINED and
+    /// stop the backward walk without visiting earlier periods.
+    /// Core versionbits.cpp:57-60.
+    #[test]
+    fn test_w91_mtp_optimization_stops_walk() {
+        let deployment = BIP9Deployment {
+            bit: 0,
+            start_time: 99999,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            period: 100,
+            threshold: 75,
+        };
+        // All blocks have low median_time < start_time; chain must stay DEFINED.
+        let chain = build_chain(300, 1, 0, 1);
+        let state = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(state, ThresholdState::Defined);
+
+        // With cache, the DEFINED entry must be populated so a second call is fast.
+        let cache = VersionbitsCache::new();
+        let state2 = get_state_for(Some(&chain), &deployment, Some(&cache));
+        assert_eq!(state2, ThresholdState::Defined);
+        // Cache must contain at least one DEFINED entry for this deployment bit.
+        // The period boundary is h=199 (last complete period within h=299 chain).
+        // We don't check exact height here because the walk may have cached the
+        // MTP-boundary block instead; just verify a re-call returns DEFINED.
+        let state3 = get_state_for(Some(&chain), &deployment, Some(&cache));
+        assert_eq!(state3, ThresholdState::Defined);
+    }
+
+    /// Gate 8: DEFINED → STARTED exactly at MTP boundary.
+    /// Core versionbits.cpp:77-81.
+    #[test]
+    fn test_w91_defined_to_started_at_mtp_boundary() {
+        let start_time = 2000i64;
+        let period: u32 = 100;
+        let deployment = BIP9Deployment {
+            bit: 0,
+            start_time,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            period,
+            threshold: 75,
+        };
+
+        // Period-0 ends at h=99; give it MTP just below start_time → DEFINED.
+        let mut chain = TestBlock::genesis(0);
+        for h in 1..100u32 {
+            chain = TestBlock::with_prev(h, 1, start_time - 1, chain);
+        }
+        let state = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(state, ThresholdState::Defined, "below start_time → DEFINED");
+
+        // Period-1 ends at h=199; give it MTP exactly == start_time → STARTED.
+        for h in 100..200u32 {
+            chain = TestBlock::with_prev(h, 1, start_time, chain);
+        }
+        let state = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(state, ThresholdState::Started, "at start_time → STARTED");
+    }
+
+    /// Gate 9: STARTED → LOCKED_IN at exact threshold (count == threshold).
+    /// Core versionbits.cpp:87-94.
+    #[test]
+    fn test_w91_started_to_lockedin_exact_threshold() {
+        let period: u32 = 100;
+        let threshold: u32 = 75;
+        let deployment = BIP9Deployment {
+            bit: 0,
+            start_time: 0,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            period,
+            threshold,
+        };
+        let signaling = 0x20000001i32;
+
+        // Period-0: STARTED.
+        let mut chain = TestBlock::genesis(1);
+        for h in 1..100u32 {
+            chain = TestBlock::with_prev(h, 1, h as i64 + 1, chain);
+        }
+
+        // Period-1: exactly threshold-1 signaling blocks → stays STARTED.
+        for h in 100..200u32 {
+            let v = if h < 100 + threshold - 1 { signaling } else { 1 };
+            chain = TestBlock::with_prev(h, v, h as i64 + 1, chain);
+        }
+        let state = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(state, ThresholdState::Started, "threshold-1 → STARTED");
+
+        // Period-2: exactly threshold signaling blocks → LOCKED_IN.
+        for h in 200..300u32 {
+            let v = if h < 200 + threshold { signaling } else { 1 };
+            chain = TestBlock::with_prev(h, v, h as i64 + 1, chain);
+        }
+        let state = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(state, ThresholdState::LockedIn, "exactly threshold → LOCKED_IN");
+    }
+
+    /// Gate 10: STARTED → FAILED when MTP >= timeout and count < threshold.
+    /// Core versionbits.cpp:95-97.
+    #[test]
+    fn test_w91_started_to_failed_on_timeout() {
+        let timeout = 500i64;
+        let period: u32 = 100;
+        let deployment = BIP9Deployment {
+            bit: 0,
+            start_time: 0,
+            timeout,
+            min_activation_height: 0,
+            period,
+            threshold: 75,
+        };
+
+        // Period-0: STARTED (no signaling).
+        let mut chain = TestBlock::genesis(1);
+        for h in 1..100u32 {
+            chain = TestBlock::with_prev(h, 1, h as i64 + 1, chain);
+        }
+
+        // Period-1: no signaling, MTP at end >= timeout → FAILED.
+        for h in 100..200u32 {
+            let mtp = if h == 199 { timeout + 1 } else { h as i64 + 1 };
+            chain = TestBlock::with_prev(h, 1, mtp, chain);
+        }
+        let state = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(state, ThresholdState::Failed);
+    }
+
+    /// Critical gate: threshold takes priority over timeout.
+    /// If count >= threshold AND MTP >= timeout in the same period,
+    /// Core gives LOCKED_IN, not FAILED.
+    /// Core versionbits.cpp:87-97: threshold branch is evaluated first.
+    #[test]
+    fn test_w91_threshold_beats_timeout_priority() {
+        let timeout = 500i64;
+        let period: u32 = 100;
+        let threshold: u32 = 75;
+        let deployment = BIP9Deployment {
+            bit: 0,
+            start_time: 0,
+            timeout,
+            min_activation_height: 0,
+            period,
+            threshold,
+        };
+        let signaling = 0x20000001i32;
+
+        // Period-0: STARTED.
+        let mut chain = TestBlock::genesis(1);
+        for h in 1..100u32 {
+            chain = TestBlock::with_prev(h, 1, h as i64 + 1, chain);
+        }
+
+        // Period-1: threshold signaling blocks AND MTP >= timeout at period end.
+        // Both conditions fire; Core requires LOCKED_IN (threshold wins).
+        for h in 100..200u32 {
+            let v = if h < 100 + threshold { signaling } else { 1 };
+            // All blocks have MTP well above timeout.
+            chain = TestBlock::with_prev(h, v, timeout + 100, chain);
+        }
+
+        let state = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(
+            state,
+            ThresholdState::LockedIn,
+            "threshold >= count must lock in even when MTP >= timeout (Core versionbits.cpp:87-97)"
+        );
+    }
+
+    /// Gate 11: LOCKED_IN → ACTIVE at min_activation_height boundary.
+    /// Core versionbits.cpp:100-105.
+    #[test]
+    fn test_w91_lockedin_to_active_min_activation_height_boundary() {
+        let period: u32 = 100;
+        let min_activation_height: u32 = 350; // period boundary at h=349 just before
+        let deployment = BIP9Deployment {
+            bit: 0,
+            start_time: 0,
+            timeout: i64::MAX,
+            min_activation_height,
+            period,
+            threshold: 75,
+        };
+        let signaling = 0x20000001i32;
+
+        // Period-0 (h=0..99): STARTED.
+        let mut chain = TestBlock::genesis(1);
+        for h in 1..100u32 {
+            chain = TestBlock::with_prev(h, 1, h as i64 + 1, chain);
+        }
+
+        // Period-1 (h=100..199): full signaling → LOCKED_IN.
+        for h in 100..200u32 {
+            chain = TestBlock::with_prev(h, signaling, h as i64 + 1, chain);
+        }
+
+        // Period-2 (h=200..299): still LOCKED_IN (next block h=300 < 350).
+        for h in 200..300u32 {
+            chain = TestBlock::with_prev(h, 1, h as i64 + 1, chain);
+        }
+        let state = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(state, ThresholdState::LockedIn, "h=299 → next=300 < 350 → still LOCKED_IN");
+
+        // Period-3 (h=300..399): end of period next block = h=400 >= 350 → ACTIVE.
+        for h in 300..400u32 {
+            chain = TestBlock::with_prev(h, 1, h as i64 + 1, chain);
+        }
+        let state = get_state_for(Some(&chain), &deployment, None);
+        assert_eq!(state, ThresholdState::Active, "h=399 → next=400 >= 350 → ACTIVE");
+    }
+
+    /// Gate 12/21-23: Terminal states — ACTIVE and FAILED do NOT transition.
+    /// Core versionbits.cpp:107-111.
+    #[test]
+    fn test_w91_terminal_states_do_not_transition() {
+        let period: u32 = 100;
+
+        // ACTIVE stays ACTIVE regardless of future blocks.
+        let always = BIP9Deployment::always_active(0);
+        let chain = build_chain(500, 1, 0, 1);
+        assert_eq!(get_state_for(Some(&chain), &always, None), ThresholdState::Active);
+
+        // FAILED stays FAILED even if all blocks signal.
+        let never = BIP9Deployment::never_active(0);
+        let chain_sig = build_chain(500, 0x20000001i32, 0, 1);
+        assert_eq!(get_state_for(Some(&chain_sig), &never, None), ThresholdState::Failed);
+
+        // Explicitly: build a deployment that timed out, then extend with signaling.
+        let timed_out = BIP9Deployment {
+            bit: 0,
+            start_time: 0,
+            timeout: 50,
+            min_activation_height: 0,
+            period,
+            threshold: 75,
+        };
+        let mut chain2 = TestBlock::genesis(1);
+        for h in 1..200u32 {
+            // period-1 hits timeout with no signaling → FAILED
+            chain2 = TestBlock::with_prev(h, 1, 100, chain2);
+        }
+        let state = get_state_for(Some(&chain2), &timed_out, None);
+        assert_eq!(state, ThresholdState::Failed, "timed out deployment is FAILED");
+        // Extend with full signaling — must remain FAILED.
+        let signaling = 0x20000001i32;
+        for h in 200..400u32 {
+            chain2 = TestBlock::with_prev(h, signaling, 200, chain2);
+        }
+        let state2 = get_state_for(Some(&chain2), &timed_out, None);
+        assert_eq!(state2, ThresholdState::Failed, "FAILED is a terminal state");
+    }
+
+    /// Gates 13-14: Condition check — both prefix AND bit required.
+    /// Core versionbits_impl.h:81.
+    #[test]
+    fn test_w91_condition_both_prefix_and_bit_required() {
+        let deployment = BIP9Deployment::new_mainnet(2, 0, i64::MAX);
+
+        // Correct prefix (001) + correct bit → signals.
+        assert!(deployment.signals(0x20000004i32));
+
+        // Wrong prefix (010) + correct bit → does NOT signal.
+        assert!(!deployment.signals(0x40000004i32));
+
+        // Correct prefix + wrong bit → does NOT signal.
+        assert!(!deployment.signals(0x20000002i32));
+
+        // Correct prefix + no bit → does NOT signal.
+        assert!(!deployment.signals(0x20000000i32));
+
+        // All-zeros → does NOT signal.
+        assert!(!deployment.signals(0i32));
+
+        // Old-style version 4 → does NOT signal.
+        assert!(!deployment.signals(4i32));
+    }
+
+    /// Gates 19-23: ComputeBlockVersion signals exactly STARTED and LOCKED_IN,
+    /// not DEFINED, ACTIVE, or FAILED.
+    /// Core versionbits.cpp:265-279.
+    #[test]
+    fn test_w91_compute_block_version_signals_only_started_lockedin() {
+        let period: u32 = 100;
+        let threshold: u32 = 75;
+
+        // Deployment A on bit 0 will stay DEFINED (start_time far in future).
+        let dep_defined = BIP9Deployment {
+            bit: 0,
+            start_time: 999999,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            period,
+            threshold,
+        };
+
+        // Deployment B on bit 1 will be STARTED after period-0.
+        let dep_started = BIP9Deployment {
+            bit: 1,
+            start_time: 0,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            period,
+            threshold,
+        };
+
+        // Deployment C on bit 2 will be LOCKED_IN (threshold met in period-1).
+        let dep_lockedin = BIP9Deployment {
+            bit: 2,
+            start_time: 0,
+            timeout: i64::MAX,
+            min_activation_height: 999999, // delay activation so we stop at LOCKED_IN
+            period,
+            threshold,
+        };
+
+        // Deployment D on bit 3 will be ACTIVE (min_activation_height=0, two periods).
+        let dep_active = BIP9Deployment {
+            bit: 3,
+            start_time: 0,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            period,
+            threshold,
+        };
+
+        // Deployment E on bit 4 timed out → FAILED.
+        let dep_failed = BIP9Deployment {
+            bit: 4,
+            start_time: 0,
+            timeout: 50,
+            min_activation_height: 0,
+            period,
+            threshold,
+        };
+
+        // Bits 2, 3, 4 signal in period-1; bit 1 never signals.
+        let mut chain = TestBlock::genesis(1);
+        for h in 1..100u32 {
+            // Period-0: no signaling; dep_started/C/D/E all become STARTED.
+            chain = TestBlock::with_prev(h, 1, h as i64 + 1, chain);
+        }
+        for h in 100..200u32 {
+            // Period-1: bits 2, 3, 4 signal (>= threshold = 75 blocks).
+            let v = if h < 175 { 0x2000001Ci32 } else { 1 }; // bits 2+3+4 = 0x1C
+            chain = TestBlock::with_prev(h, v, h as i64 + 1, chain);
+        }
+        // After period-1: dep_lockedin=LOCKED_IN, dep_active=LOCKED_IN,
+        // dep_failed=FAILED (MTP >> 50), dep_started=STARTED.
+        // After period-2, dep_active → ACTIVE (min_activation=0 → h+1=200 >= 0).
+        for h in 200..300u32 {
+            chain = TestBlock::with_prev(h, 1, h as i64 + 1, chain);
+        }
+
+        let deployments = [
+            (&DeploymentId::Custom(0), &dep_defined),
+            (&DeploymentId::Custom(1), &dep_started),
+            (&DeploymentId::Custom(2), &dep_lockedin),
+            (&DeploymentId::Custom(3), &dep_active),
+            (&DeploymentId::Custom(4), &dep_failed),
+        ];
+
+        let version = compute_block_version(Some(&chain), &deployments, None);
+
+        let top_bits = (version as u32) & VERSIONBITS_TOP_MASK;
+        assert_eq!(top_bits, VERSIONBITS_TOP_BITS, "version must start with 0x20000000");
+
+        // DEFINED (bit 0) must NOT be signaled.
+        assert_eq!(version & (1 << 0), 0, "DEFINED must not signal");
+
+        // STARTED (bit 1) MUST be signaled.
+        assert_ne!(version & (1 << 1), 0, "STARTED must signal");
+
+        // LOCKED_IN (bit 2) MUST be signaled.
+        assert_ne!(version & (1 << 2), 0, "LOCKED_IN must signal");
+
+        // ACTIVE (bit 3) must NOT be signaled.
+        assert_eq!(version & (1 << 3), 0, "ACTIVE must not signal");
+
+        // FAILED (bit 4) must NOT be signaled.
+        assert_eq!(version & (1 << 4), 0, "FAILED must not signal");
+    }
+
+    /// Verify that the base version is always VERSIONBITS_TOP_BITS = 0x20000000
+    /// even when no deployments are signaling.
+    /// Core versionbits.cpp:267.
+    #[test]
+    fn test_w91_compute_block_version_base_is_top_bits() {
+        let chain = build_chain(10, 1, 0, 600);
+
+        // No deployments at all.
+        let version = compute_block_version::<TestBlock>(Some(&chain), &[], None);
+        assert_eq!(version as u32, VERSIONBITS_TOP_BITS);
+
+        // NEVER_ACTIVE deployment should not change version.
+        let dep = BIP9Deployment::never_active(0);
+        let deployments = [(&DeploymentId::Custom(0), &dep)];
+        let version2 = compute_block_version(Some(&chain), &deployments, None);
+        assert_eq!(version2 as u32, VERSIONBITS_TOP_BITS);
     }
 }
