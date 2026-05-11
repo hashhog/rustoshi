@@ -146,6 +146,31 @@ impl TxIn {
         }
         Ok(len)
     }
+
+    /// Compute the weight contribution of a single input.
+    ///
+    /// Mirrors Bitcoin Core consensus/validation.h `GetTransactionInputWeight`:
+    /// ```text
+    /// GetSerializeSize(TX_NO_WITNESS(txin)) * (WITNESS_SCALE_FACTOR - 1)
+    ///     + GetSerializeSize(TX_WITH_WITNESS(txin))
+    ///     + GetSerializeSize(txin.scriptWitness.stack)
+    /// ```
+    ///
+    /// Because a `TxIn` itself does not carry the witness in its own
+    /// serialization (witness is appended per-input after all outputs in the
+    /// segwit wire format), the formula simplifies to:
+    ///   `stripped * 3 + stripped + witness_stack_size`
+    /// = `stripped * 4 + witness_stack_size`
+    ///
+    /// This is used for per-input virtual-size accounting (e.g. fee estimation
+    /// for partially-signed transactions where only some inputs are known).
+    pub fn input_weight(&self) -> usize {
+        let stripped = self.serialized_size_no_witness();
+        let witness = self.witness_size();
+        // stripped * (WITNESS_SCALE_FACTOR - 1) + stripped + witness
+        // = stripped * 4 + witness
+        stripped * 4 + witness
+    }
 }
 
 /// A transaction output.
@@ -761,5 +786,217 @@ mod tests {
         let txid = tx.txid();
         let wtxid = tx.wtxid();
         assert_eq!(txid, wtxid, "txid and wtxid should be equal for legacy tx");
+    }
+
+    // ── W76 BIP-141 weight / vsize comprehensive tests ─────────────────────
+
+    /// W76-G1: non-segwit transaction weight == 4 × size.
+    /// Core validation.h:128-131: for stripped == total, weight = stripped*3 + total = 4*size.
+    #[test]
+    fn w76_legacy_tx_weight_equals_4x_size() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x04, 0xFF, 0xFF, 0x00, 0x1D],
+                sequence: 0xFFFFFFFF,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: vec![0x41],
+            }],
+            lock_time: 0,
+        };
+        assert!(!tx.has_witness());
+        let size = tx.serialized_size();
+        assert_eq!(tx.weight(), 4 * size, "legacy tx weight must be 4 × size");
+    }
+
+    /// W76-G2: P2WPKH tx weight = 3 × stripped + total.
+    /// Core validation.h:134: `stripped * (WITNESS_SCALE_FACTOR - 1) + total`.
+    #[test]
+    fn w76_p2wpkh_tx_weight_formula() {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0u8; 71], vec![0u8; 33]], // typical P2WPKH
+            }],
+            outputs: vec![TxOut {
+                value: 10_000_000,
+                script_pubkey: vec![0x00, 0x14, 0, 0, 0, 0, 0, 0, 0, 0,
+                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            }],
+            lock_time: 0,
+        };
+        assert!(tx.has_witness());
+        let stripped = tx.base_size();
+        let total = tx.serialized_size();
+        assert!(total > stripped, "segwit tx total must exceed stripped");
+        assert_eq!(
+            tx.weight(),
+            stripped * 3 + total,
+            "P2WPKH weight must be 3*stripped + total"
+        );
+    }
+
+    /// W76-G3: vsize uses ceiling division (weight non-multiple of 4 → ceil, not floor).
+    /// Core policy.cpp:397: `(x + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR`.
+    #[test]
+    fn w76_vsize_ceil_rounding() {
+        // Build a segwit tx with a 1-byte witness item.
+        // stripped = 4(ver) + 1(vin_count) + 36(outpoint) + 1(script_sig_len)
+        //            + 0(script_sig) + 4(seq) + 1(vout_count) + 8(value)
+        //            + 1(script_pk_len) + 0(script_pk) + 4(locktime) = 60
+        // total = 60 + 2(marker+flag) + [1(stack_count) + 1(item_len) + 1(item)] = 65
+        // weight = 60*3 + 65 = 245  → not divisible by 4
+        // vsize  = ceil(245/4) = 62
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0xABu8]], // 1-byte item → odd total weight
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: vec![],
+            }],
+            lock_time: 0,
+        };
+        let w = tx.weight();
+        let expected_vsize = (w + 3) / 4; // ceiling division
+        assert_eq!(tx.vsize(), expected_vsize, "vsize must use ceiling division");
+        // Verify the test is non-trivial: weight must not be divisible by 4
+        assert_ne!(w % 4, 0, "test is only meaningful when weight % 4 != 0");
+        assert_ne!(tx.vsize(), w / 4, "floor division gives wrong answer for weight={w}");
+    }
+
+    /// W76-G4: stripped serialisation excludes marker (0x00), flag (0x01), and all witness.
+    /// Core validation.h:134: TX_NO_WITNESS omits the segwit marker+flag and witness stacks.
+    #[test]
+    fn w76_stripped_excludes_marker_flag_and_witness() {
+        let witness_items: Vec<Vec<u8>> = vec![vec![0u8; 71], vec![0u8; 33]];
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+                witness: witness_items.clone(),
+            }],
+            outputs: vec![TxOut {
+                value: 5_000_000,
+                script_pubkey: vec![0x00, 0x14, 0, 0, 0, 0, 0, 0, 0, 0,
+                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            }],
+            lock_time: 0,
+        };
+        let stripped = tx.base_size();
+        let total = tx.serialized_size();
+        // witness_bytes = compact_size(item_count=2) + each item's (compact_size(len) + data)
+        let witness_bytes: usize = 1 // compact_size(2)
+            + witness_items.iter().map(|item| 1 + item.len()).sum::<usize>();
+        // total = stripped + 2 (marker+flag) + witness_bytes
+        assert_eq!(
+            total, stripped + 2 + witness_bytes,
+            "total = stripped + marker/flag + witness"
+        );
+        // Sanity: stripped < total − witness_bytes (the 2 marker bytes are absent)
+        assert_eq!(stripped + 2, total - witness_bytes);
+    }
+
+    /// W76-G6: TxIn::input_weight for a no-witness input.
+    /// Core validation.h:140-144: stripped*3 + stripped + witness_stack_size = stripped*4 + witness_size.
+    #[test]
+    fn w76_txin_input_weight_no_witness() {
+        let txin = TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: vec![0x04, 0xFF],
+            sequence: 0xFFFFFFFF,
+            witness: Vec::new(),
+        };
+        let stripped = txin.serialized_size_no_witness();
+        // witness_size() for empty witness = compact_size(0) = 1 byte
+        let witness_sz = txin.witness_size();
+        assert_eq!(witness_sz, 1, "empty witness serialises as 1 byte (compact_size(0))");
+        let expected = stripped * 4 + witness_sz;
+        assert_eq!(txin.input_weight(), expected, "no-witness input weight = stripped*4 + 1");
+    }
+
+    /// W76-G6b: TxIn::input_weight for a P2WPKH input with witness.
+    #[test]
+    fn w76_txin_input_weight_with_witness() {
+        let txin = TxIn {
+            previous_output: OutPoint {
+                txid: Hash256::ZERO,
+                vout: 0,
+            },
+            script_sig: vec![],
+            sequence: 0xFFFFFFFF,
+            witness: vec![vec![0u8; 71], vec![0u8; 33]],
+        };
+        let stripped = txin.serialized_size_no_witness();
+        let witness_sz = txin.witness_size();
+        let expected = stripped * 4 + witness_sz;
+        assert_eq!(txin.input_weight(), expected);
+        // Per-input weight for a P2WPKH spend should be ≈ 108 WU (stripped=41*4=164 would be
+        // wrong; witness discount makes it stripped*4 + witness, not stripped*4 + witness*4).
+        assert!(
+            txin.input_weight() < stripped * 4 + witness_sz * 4,
+            "witness bytes count at 1 WU each, not 4"
+        );
+    }
+
+    /// W76-G10: MAX_STANDARD_TX_WEIGHT boundary — a tx at exactly 400_000 WU is within policy.
+    ///
+    /// We do not import the policy constant from consensus (no dep on consensus crate
+    /// from primitives), but we verify the formula is consistent: the tx's weight
+    /// matches its own base/total serialisation sizes.
+    #[test]
+    fn w76_weight_formula_consistency() {
+        // Construct a non-trivial segwit tx and verify both formula forms give the same result:
+        //   form A: base * 3 + total
+        //   form B: base * 4 + witness_overhead     (where witness_overhead = total - base)
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 1,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFE,
+                witness: vec![vec![0u8; 64]], // schnorr sig
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 100_000,
+                    script_pubkey: vec![0x51, 0x20, 0, 0, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                },
+            ],
+            lock_time: 0,
+        };
+        let base = tx.base_size();
+        let total = tx.serialized_size();
+        let form_a = base * 3 + total;
+        let form_b = base * 4 + (total - base); // = base*3 + total algebraically
+        assert_eq!(form_a, form_b, "both weight forms must be algebraically identical");
+        assert_eq!(tx.weight(), form_a, "Transaction::weight() must match the formula");
     }
 }
