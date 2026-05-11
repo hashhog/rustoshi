@@ -46,10 +46,34 @@ use crate::params::{
     WITNESS_SCALE_FACTOR,
 };
 use crate::validation::get_legacy_sigop_count;
+use crate::versionbits::{
+    BIP9Deployment, DeploymentId, VersionbitsBlockInfo, compute_block_version, get_deployments,
+};
 use rustoshi_crypto::merkle_root;
 use rustoshi_primitives::{BlockHeader, Hash256, OutPoint, Transaction, TxIn, TxOut};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
+
+// ============================================================
+// BLOCK TEMPLATE CONSTANTS (mirroring Bitcoin Core miner.cpp / policy.h)
+// ============================================================
+
+/// Default reserved weight for the block header, tx-count varint, and coinbase.
+/// See Bitcoin Core policy.h `DEFAULT_BLOCK_RESERVED_WEIGHT`.
+pub const DEFAULT_BLOCK_RESERVED_WEIGHT: u64 = 8_000;
+
+/// Minimum allowed value for block_reserved_weight.
+/// See Bitcoin Core policy.h `MINIMUM_BLOCK_RESERVED_WEIGHT`.
+pub const MINIMUM_BLOCK_RESERVED_WEIGHT: u64 = 2_000;
+
+/// Bail-out heuristic: give up after this many consecutive failed chunks.
+/// See Bitcoin Core miner.cpp `MAX_CONSECUTIVE_FAILURES`.
+pub const MAX_CONSECUTIVE_FAILURES: u64 = 1_000;
+
+/// Near-full threshold: stop early if we're within this many weight units of
+/// the limit and have been failing for MAX_CONSECUTIVE_FAILURES iterations.
+/// See Bitcoin Core miner.cpp `BLOCK_FULL_ENOUGH_WEIGHT_DELTA`.
+pub const BLOCK_FULL_ENOUGH_WEIGHT_DELTA: u64 = 4_000;
 
 // ============================================================
 // SEQUENCE CONSTANTS
@@ -114,10 +138,27 @@ pub struct BlockTemplateConfig {
     /// Extra data to include in coinbase (e.g., pool name).
     /// Max 100 bytes total in coinbase scriptSig.
     pub coinbase_extra_data: Vec<u8>,
-    /// Maximum block weight (default: MAX_BLOCK_WEIGHT - 4000 for safety margin).
+    /// Maximum block weight. Clamped to
+    /// [block_reserved_weight, MAX_BLOCK_WEIGHT] (Core: ClampOptions).
+    /// Default: MAX_BLOCK_WEIGHT - DEFAULT_BLOCK_RESERVED_WEIGHT = 3,992,000.
     pub max_weight: u64,
     /// Maximum block sigops cost.
     pub max_sigops: u64,
+    /// Minimum feerate (sat/vbyte) for transactions to be included.
+    /// The selection loop STOPs (returns early) when the next chunk's
+    /// feerate falls below this threshold — matching Core's `addChunks`
+    /// which does `return` (not `continue`) on a below-minimum chunk.
+    /// Default: 1 sat/vbyte (Bitcoin Core DEFAULT_BLOCK_MIN_TX_FEE).
+    /// See Bitcoin Core policy.h `DEFAULT_BLOCK_MIN_TX_FEE`.
+    pub block_min_fee_rate: f64,
+    /// Block header version to use in the template.
+    /// When `Some(v)` the caller supplies a pre-computed versionbits version
+    /// (e.g. from `compute_block_version`).  When `None` the function falls
+    /// back to `VERSIONBITS_TOP_BITS` (0x20000000 — no active soft-forks).
+    /// Callers that have access to the chain tip *should* compute and pass
+    /// the version using `compute_block_version` + `get_deployments`.
+    /// See Bitcoin Core miner.cpp:140 (`ComputeBlockVersion`).
+    pub block_version: Option<i32>,
 }
 
 impl Default for BlockTemplateConfig {
@@ -125,9 +166,16 @@ impl Default for BlockTemplateConfig {
         Self {
             coinbase_script_pubkey: vec![],
             coinbase_extra_data: b"/rustoshi/".to_vec(),
-            // Leave 4000 weight units margin for coinbase transaction
-            max_weight: MAX_BLOCK_WEIGHT - 4000,
+            // Reserve DEFAULT_BLOCK_RESERVED_WEIGHT (8000) for block header,
+            // tx-count varint, and coinbase tx.  Bitcoin Core: policy.h
+            // DEFAULT_BLOCK_RESERVED_WEIGHT = 8000; miner.cpp ClampOptions /
+            // resetBlock sets nBlockMaxWeight = MAX_BLOCK_WEIGHT -
+            // block_reserved_weight.
+            max_weight: MAX_BLOCK_WEIGHT - DEFAULT_BLOCK_RESERVED_WEIGHT,
             max_sigops: MAX_BLOCK_SIGOPS_COST,
+            // DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/vbyte (Bitcoin Core policy.h).
+            block_min_fee_rate: 1.0,
+            block_version: None,
         }
     }
 }
@@ -256,7 +304,15 @@ pub fn build_block_template(
     // the coinbase; the coinbase entry is prepended after selection).
     let mut selected_sigops: Vec<u64> = Vec::new();
     let mut total_fees: u64 = 0;
-    let mut total_weight: u64 = 0;
+    // nBlockWeight starts at block_reserved_weight (not 0) to account for the
+    // fixed-size block header, tx-count varint, and coinbase tx — mirroring
+    // Bitcoin Core `BlockAssembler::resetBlock()` (`nBlockWeight =
+    // *Assert(m_options.block_reserved_weight)`, miner.cpp:114).
+    // We derive the reservation from max_weight: max_weight =
+    // MAX_BLOCK_WEIGHT - block_reserved_weight, so
+    // block_reserved_weight = MAX_BLOCK_WEIGHT - max_weight.
+    let block_reserved_weight = MAX_BLOCK_WEIGHT.saturating_sub(config.max_weight);
+    let mut total_weight: u64 = block_reserved_weight;
     // Bitcoin Core's `BlockAssembler` reserves a small sigop budget for the
     // coinbase output (it can contain commitments that themselves count toward
     // the block sigop limit). We mirror that with a conservative reservation:
@@ -266,10 +322,6 @@ pub fn build_block_template(
     // reservation here just guards against last-tx overshoot.
     let coinbase_sigop_reserve: u64 = 0;
     let mut total_sigops: u64 = coinbase_sigop_reserve;
-
-    // Reserve space for coinbase transaction
-    let coinbase_weight = estimate_coinbase_weight(height, &config.coinbase_extra_data);
-    total_weight += coinbase_weight;
 
     // Build priority queue from mempool
     let mut heap = BinaryHeap::new();
@@ -299,44 +351,81 @@ pub fn build_block_template(
 
     // Select transactions, enforcing both the block weight and sigop limits.
     //
-    // Reference: Bitcoin Core `BlockAssembler::TestChunkBlockLimits` /
-    // `AddToBlock` in `src/node/miner.cpp` — both `nBlockWeight` and
-    // `nBlockSigOpsCost` are checked before adding, and incremented after.
+    // This mirrors Bitcoin Core `BlockAssembler::addChunks` (miner.cpp:279):
+    //   1. If chunk feerate < blockMinFeeRate → STOP (return), not skip.
+    //      Everything remaining in the heap has even lower feerate.
+    //   2. TestChunkBlockLimits: uses strict `>=` comparisons (miner.cpp:241,244).
+    //   3. MAX_CONSECUTIVE_FAILURES + BLOCK_FULL_ENOUGH_WEIGHT_DELTA bail-out
+    //      heuristic (miner.cpp:284-286,314-318).
     let max_sigops = config.max_sigops;
+    let max_weight = config.max_weight;
+    let mut n_consecutive_failed: u64 = 0;
+
     while let Some(priority) = heap.pop() {
-        // Skip if already selected
+        // Skip if already selected (dedup from ancestor chain)
         if selected_txids.contains(&priority.txid) {
             continue;
         }
 
-        // Check weight limit
-        if total_weight + priority.weight > config.max_weight {
-            continue; // try next (smaller) transaction
+        // blockMinFeeRate gate: STOP (return early), not skip.
+        // Bitcoin Core miner.cpp:298-300: `if (chunk_feerate_vsize <<
+        // m_options.blockMinFeeRate.GetFeePerVSize()) { return; }`
+        // All remaining entries have lower or equal feerate, so selection
+        // is complete.
+        if priority.ancestor_fee_rate < config.block_min_fee_rate {
+            break;
+        }
+
+        // Check weight limit: strict >= mirrors Core's
+        // TestChunkBlockLimits (miner.cpp:241):
+        //   `if (nBlockWeight + chunk_feerate.size >= m_options.nBlockMaxWeight)`
+        // Note: MAX_BLOCK_WEIGHT is the absolute ceiling; max_weight =
+        // MAX_BLOCK_WEIGHT - block_reserved_weight, so the comparison below
+        // correctly treats max_weight as the usable ceiling.
+        let weight_fails = total_weight + priority.weight >= MAX_BLOCK_WEIGHT;
+
+        // Compute the sigop cost of this transaction. We don't have UTXO
+        // context here so we use the inaccurate legacy sigop count (which
+        // also ignores P2SH and witness sigops) scaled by the witness
+        // factor — the same approximation `count_block_sigops` uses in
+        // `validation.rs`. Block consensus validation later applies the
+        // tighter accurate count; if we under-estimate here, the block
+        // would be rejected by validation, but in practice legacy sigops
+        // dominate the budget and the approximation is conservative
+        // enough for a budget gate.
+        let tx_sigops = if let Some(entry) = mempool.get(&priority.txid) {
+            get_legacy_sigop_count(&entry.tx) as u64 * WITNESS_SCALE_FACTOR
+        } else {
+            0
+        };
+
+        // Sigops limit: strict >= mirrors Core's TestChunkBlockLimits
+        // (miner.cpp:244): `if (nBlockSigOpsCost + chunk_sigops_cost >=
+        // MAX_BLOCK_SIGOPS_COST) { return false; }`
+        let sigops_fails = total_sigops + tx_sigops >= max_sigops;
+
+        if weight_fails || sigops_fails {
+            // This tx doesn't fit; increment failure counter for the
+            // bail-out heuristic.
+            n_consecutive_failed += 1;
+
+            // MAX_CONSECUTIVE_FAILURES bail-out: if the block is close to
+            // full and we've been failing for a long time, give up.
+            // Bitcoin Core miner.cpp:314-318.
+            if n_consecutive_failed > MAX_CONSECUTIVE_FAILURES
+                && total_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > max_weight
+            {
+                break;
+            }
+            continue;
         }
 
         // Add the transaction
         if let Some(entry) = mempool.get(&priority.txid) {
             // Double-check finality (in case mempool state changed)
             if !is_final_tx(&entry.tx, height, median_time_past) {
+                n_consecutive_failed += 1;
                 continue;
-            }
-
-            // Compute the sigop cost of this transaction. We don't have UTXO
-            // context here so we use the inaccurate legacy sigop count (which
-            // also ignores P2SH and witness sigops) scaled by the witness
-            // factor — the same approximation `count_block_sigops` uses in
-            // `validation.rs`. Block consensus validation later applies the
-            // tighter accurate count; if we under-estimate here, the block
-            // would be rejected by validation, but in practice legacy sigops
-            // dominate the budget and the approximation is conservative
-            // enough for a budget gate.
-            let tx_sigops = get_legacy_sigop_count(&entry.tx) as u64 * WITNESS_SCALE_FACTOR;
-
-            // Skip if adding this tx would exceed the sigop budget. Match the
-            // strict-less-than-MAX semantics of Bitcoin Core's
-            // `TestChunkBlockLimits` (`>= MAX_BLOCK_SIGOPS_COST` rejects).
-            if total_sigops + tx_sigops > max_sigops {
-                continue; // try next (smaller-sigop) transaction
             }
 
             selected_txs.push(entry.tx.clone());
@@ -345,6 +434,7 @@ pub fn build_block_template(
             total_fees += entry.fee;
             total_weight += entry.weight as u64;
             total_sigops += tx_sigops;
+            n_consecutive_failed = 0; // reset on success
         }
     }
 
@@ -380,9 +470,36 @@ pub fn build_block_template(
     let txids: Vec<Hash256> = all_txs.iter().map(|tx| tx.txid()).collect();
     let computed_merkle_root = merkle_root(&txids);
 
+    // Block version: use caller-supplied version when available, otherwise
+    // compute from chain params via versionbits.  Bitcoin Core miner.cpp:140
+    // calls `m_chainstate.m_chainman.m_versionbitscache.ComputeBlockVersion`.
+    let block_version = config.block_version.unwrap_or_else(|| {
+        // A zero-size phantom type that satisfies VersionbitsBlockInfo; used
+        // only so that compute_block_version can be called with block=None
+        // (the function never dereferences the type when block is None).
+        struct NoBlock;
+        impl VersionbitsBlockInfo for NoBlock {
+            fn height(&self) -> u32 { unreachable!() }
+            fn version(&self) -> i32 { unreachable!() }
+            fn median_time(&self) -> i64 { unreachable!() }
+            fn prev(&self) -> Option<&Self> { unreachable!() }
+            fn ancestor(&self, _: u32) -> Option<&Self> { unreachable!() }
+        }
+
+        let deployments_map = get_deployments(params);
+        // Build the slice expected by compute_block_version.
+        let pairs: Vec<(&DeploymentId, &BIP9Deployment)> =
+            deployments_map.iter().collect();
+        // No prev-block chain context available without a full block index;
+        // use the None overload which signals all STARTED/LOCKED_IN forks
+        // based on params alone.  Callers with chain access should pass
+        // block_version explicitly via BlockTemplateConfig::block_version.
+        compute_block_version::<NoBlock>(None, &pairs, None)
+    });
+
     // Build block header
     let header = BlockHeader {
-        version: 0x20000000, // BIP-9 version bits base
+        version: block_version,
         prev_block_hash: prev_hash,
         merkle_root: computed_merkle_root,
         timestamp,
@@ -434,16 +551,25 @@ fn build_coinbase_tx(
     extra_data: &[u8],
     selected_txs: &[Transaction],
 ) -> Transaction {
-    // BIP-34: encode block height in coinbase scriptSig
+    // BIP-34: encode block height in coinbase scriptSig.
+    // Bitcoin Core miner.cpp:186: `coinbaseTx.vin[0].scriptSig = CScript() << nHeight`
+    // For heights 1-16, CScript() << nHeight produces a single opcode byte
+    // (OP_1=0x51 through OP_16=0x60) — exactly 1 byte.  That alone would
+    // violate `bad-cb-length` (requires ≥ 2 bytes, consensus/tx_check.cpp:49).
+    // Bitcoin Core miner.cpp:187-193 appends OP_0 (0x00) as a dummy extranonce
+    // at heights ≤ 16 to bring the scriptSig to 2 bytes.
     let mut coinbase_script = Vec::new();
     let height_bytes = encode_coinbase_height(height);
     coinbase_script.extend_from_slice(&height_bytes);
-    coinbase_script.extend_from_slice(extra_data);
 
-    // Pad to minimum 2 bytes if needed (very rare edge case)
-    while coinbase_script.len() < 2 {
-        coinbase_script.push(0);
+    // Append OP_0 dummy at heights 1-16 to satisfy bad-cb-length (≥ 2 bytes).
+    // Height 0 never occurs in practice (genesis is pre-created), but we guard
+    // it anyway: encode_coinbase_height(0) already returns 2 bytes.
+    if height >= 1 && height <= 16 {
+        coinbase_script.push(0x00); // OP_0 dummy extranonce
     }
+
+    coinbase_script.extend_from_slice(extra_data);
 
     // Check if any transaction has witness data
     let has_witness = selected_txs.iter().any(|tx| tx.has_witness());
@@ -532,35 +658,41 @@ fn build_witness_commitment(txs: &[Transaction], nonce: &[u8]) -> Vec<u8> {
 
 /// Encode block height for coinbase scriptSig (BIP-34).
 ///
-/// Uses minimally-encoded CScriptNum format:
-/// - Heights 1-16: OP_1 through OP_16
-/// - Height 0: OP_0
-/// - Otherwise: push the minimal encoding
+/// Mirrors `CScript() << nHeight` in Bitcoin Core (script.h `push_int64`):
+/// - Height 0:    OP_0 (0x00), single byte.
+/// - Heights 1-16: OP_1..OP_16 (0x51..0x60), single byte.
+///   **These produce a 1-byte script.  The caller must append a dummy OP_0
+///   extranonce to satisfy the `bad-cb-length` consensus rule (≥ 2 bytes)
+///   when height ≤ 16.**
+/// - Heights 17+: CScriptNum minimal push:
+///     `<len_byte> <value in little-endian sign-magnitude>`
 ///
-/// The encoding is sign-magnitude with the high bit as sign.
-/// For positive heights, if the high bit of the last byte is set,
-/// an extra 0x00 byte is appended.
+/// Reference: Bitcoin Core script.h:433-447 (`push_int64`).
 pub fn encode_coinbase_height(height: u32) -> Vec<u8> {
     if height == 0 {
-        // OP_0 would be 0x00, but BIP-34 requires push, so push empty
-        return vec![0x01, 0x00]; // push 1 byte: 0x00
+        // CScript() << 0  ⟹  push_back(OP_0) = 0x00
+        return vec![0x00];
     }
 
-    // Encode as little-endian bytes, trimmed
+    if height <= 16 {
+        // CScript() << n (1 ≤ n ≤ 16)  ⟹  push_back(n + OP_1 - 1)
+        // OP_1 = 0x51, so the byte is 0x51 + (height - 1) = 0x50 + height.
+        return vec![0x50u8 + height as u8];
+    }
+
+    // Heights ≥ 17: CScriptNum minimal encoding (sign-magnitude little-endian).
+    // Equivalent to CScript() << CScriptNum::serialize(height) in Core.
     let mut h = height;
     let mut encoded = Vec::new();
-
     while h > 0 {
         encoded.push((h & 0xFF) as u8);
         h >>= 8;
     }
-
-    // If high bit set, append 0x00 to indicate positive
+    // If the high bit of the last byte is set, append 0x00 to mark positive.
     if encoded.last().is_some_and(|b| b & 0x80 != 0) {
         encoded.push(0x00);
     }
-
-    // Prepend length byte
+    // Prepend length byte (CScript pushdata).
     let mut result = vec![encoded.len() as u8];
     result.extend_from_slice(&encoded);
     result
@@ -652,16 +784,39 @@ mod tests {
             .collect()
     }
 
+    // ============================================================
+    // ENCODE_COINBASE_HEIGHT TESTS  (mirrors CScript() << nHeight)
+    // ============================================================
+
+    /// Height 0  →  OP_0 (0x00), 1 byte.
+    /// CScript::push_int64(0) → push_back(OP_0).
     #[test]
     fn test_encode_coinbase_height_zero() {
         let encoded = encode_coinbase_height(0);
-        assert_eq!(encoded, vec![0x01, 0x00]);
+        assert_eq!(encoded, vec![0x00]); // OP_0
     }
 
+    /// Heights 1-16  →  single opcode OP_1..OP_16 (0x51..0x60), 1 byte.
+    /// CScript::push_int64(n) for 1≤n≤16 → push_back(n + OP_1 - 1).
+    /// **1-byte result; caller must append OP_0 dummy to reach 2-byte minimum.**
     #[test]
     fn test_encode_coinbase_height_one() {
         let encoded = encode_coinbase_height(1);
-        assert_eq!(encoded, vec![0x01, 0x01]); // push 1 byte: 0x01
+        assert_eq!(encoded, vec![0x51]); // OP_1
+    }
+
+    #[test]
+    fn test_encode_coinbase_height_16() {
+        let encoded = encode_coinbase_height(16);
+        assert_eq!(encoded, vec![0x60]); // OP_16
+    }
+
+    /// Height 17 is the first value that gets push-encoding, not an opcode.
+    /// 17 = 0x11 → [0x01, 0x11] (push 1 byte: 0x11).
+    #[test]
+    fn test_encode_coinbase_height_17() {
+        let encoded = encode_coinbase_height(17);
+        assert_eq!(encoded, vec![0x01, 0x11]);
     }
 
     #[test]
@@ -695,6 +850,54 @@ mod tests {
         let encoded = encode_coinbase_height(0x7fffffff);
         // 0x7fffffff = 2147483647, little-endian: ff ff ff 7f
         assert_eq!(encoded, vec![0x04, 0xff, 0xff, 0xff, 0x7f]);
+    }
+
+    // ============================================================
+    // BIP-34 scriptSig prefix / bad-cb-length / bad-cb-height
+    // ============================================================
+
+    /// At heights 1-16 the encoded height is 1 byte (OP_1..OP_16).  The
+    /// build_coinbase_tx helper must append an OP_0 dummy so the scriptSig
+    /// reaches the 2-byte minimum required by `bad-cb-length`.
+    /// It must also start with the correct opcode to pass `bad-cb-height`.
+    #[test]
+    fn test_coinbase_scriptsig_height_1_has_op_dummy_and_correct_prefix() {
+        // Height 1 → OP_1 (0x51) + OP_0 dummy (0x00)
+        let coinbase = build_coinbase_tx(1, 5_000_000_000, &[0x51], b"", &[]);
+        let sig = &coinbase.inputs[0].script_sig;
+        assert!(sig.len() >= 2, "bad-cb-length: scriptSig must be ≥ 2 bytes");
+        assert_eq!(sig[0], 0x51, "bad-cb-height: prefix must be OP_1 for height 1");
+        assert_eq!(sig[1], 0x00, "OP_0 dummy extranonce must follow at height 1");
+    }
+
+    #[test]
+    fn test_coinbase_scriptsig_height_16_has_op_dummy_and_correct_prefix() {
+        // Height 16 → OP_16 (0x60) + OP_0 dummy (0x00)
+        let coinbase = build_coinbase_tx(16, 5_000_000_000, &[0x51], b"", &[]);
+        let sig = &coinbase.inputs[0].script_sig;
+        assert!(sig.len() >= 2, "bad-cb-length: scriptSig must be ≥ 2 bytes");
+        assert_eq!(sig[0], 0x60, "bad-cb-height: prefix must be OP_16 for height 16");
+        assert_eq!(sig[1], 0x00, "OP_0 dummy extranonce must follow at height 16");
+    }
+
+    #[test]
+    fn test_coinbase_scriptsig_height_17_no_dummy_needed() {
+        // Height 17 → push-encoded [0x01, 0x11] — already 2 bytes; no dummy.
+        let coinbase = build_coinbase_tx(17, 5_000_000_000, &[0x51], b"", &[]);
+        let sig = &coinbase.inputs[0].script_sig;
+        assert!(sig.len() >= 2, "bad-cb-length: scriptSig must be ≥ 2 bytes");
+        assert_eq!(sig[0], 0x01, "length byte for height 17");
+        assert_eq!(sig[1], 0x11, "value byte 0x11 = 17");
+    }
+
+    #[test]
+    fn test_coinbase_scriptsig_height_100_push_encoded() {
+        // Height 100 → push-encoded: [0x01, 0x64] (100 = 0x64)
+        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"", &[]);
+        let sig = &coinbase.inputs[0].script_sig;
+        assert!(sig.len() >= 2, "bad-cb-length: scriptSig must be ≥ 2 bytes");
+        assert_eq!(sig[0], 0x01, "length byte 1");
+        assert_eq!(sig[1], 0x64, "value byte 0x64 = 100");
     }
 
     #[test]
@@ -1349,6 +1552,12 @@ mod tests {
                 .unwrap();
         let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
 
+        // Set tip_height high enough that the tx is final at mempool admission
+        // (locktime=200 < tip_height+1=301 → admitted), but NOT final at the
+        // template-build height of 100 (locktime=200 >= 100 → rejected by
+        // build_block_template's IsFinalTx guard).
+        mempool.tip_height = 300;
+
         // Add transaction with locktime 200 (not final at height 100)
         let tx_non_final = make_tx_with_locktime(
             vec![(utxo, 0)],
@@ -1393,6 +1602,9 @@ mod tests {
             Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
                 .unwrap();
         let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+
+        // Set tip_height so that locktime=50 is final at admission (50 < 101).
+        mempool.tip_height = 100;
 
         // Add transaction with locktime 50 (final at height 100)
         let tx_final = make_tx_with_locktime(
@@ -1818,5 +2030,265 @@ mod tests {
         let expected_commitment = sha256d(&data);
 
         assert_eq!(&script[6..], &expected_commitment.0);
+    }
+
+    // ================================================================
+    // W87 audit: block_reserved_weight, strict >= gates, blockMinFeeRate
+    // ================================================================
+
+    /// total_weight starts at block_reserved_weight = MAX_BLOCK_WEIGHT -
+    /// max_weight, not at 0. Even an empty mempool must reflect this.
+    /// Reference: Bitcoin Core miner.cpp:114 `resetBlock`.
+    #[test]
+    fn test_total_weight_starts_at_block_reserved_weight() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        let params = ChainParams::testnet4();
+        let template_config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            // max_weight = MAX_BLOCK_WEIGHT - 8000 = 3,992,000 (default).
+            ..Default::default()
+        };
+
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800,
+            &params,
+            &template_config,
+        );
+
+        // With an empty mempool the template contains only the coinbase.
+        // total_weight ≥ block_reserved_weight (8000) because we initialise
+        // it there and then add the coinbase sigops placeholder.
+        let expected_reserved = MAX_BLOCK_WEIGHT - template_config.max_weight; // 8000
+        assert!(
+            template.total_weight >= expected_reserved,
+            "total_weight {} < block_reserved_weight {}",
+            template.total_weight,
+            expected_reserved,
+        );
+    }
+
+    /// Default max_weight must reserve DEFAULT_BLOCK_RESERVED_WEIGHT (8000)
+    /// units, not 4000 (the old wrong default).
+    #[test]
+    fn test_default_max_weight_reserves_8000() {
+        let config = BlockTemplateConfig::default();
+        assert_eq!(
+            config.max_weight,
+            MAX_BLOCK_WEIGHT - DEFAULT_BLOCK_RESERVED_WEIGHT,
+            "default max_weight must be MAX_BLOCK_WEIGHT - 8000 = 3,992,000"
+        );
+    }
+
+    /// The weight gate uses strict >= (same as Core miner.cpp:241).
+    /// A transaction whose weight would bring total to exactly MAX_BLOCK_WEIGHT
+    /// must be rejected.
+    #[test]
+    fn test_weight_gate_strict_gte_rejects_at_max_block_weight() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+        let tx = make_tx(vec![(utxo, 0)], vec![90_000], 1);
+        mempool
+            .add_transaction(tx, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        let params = ChainParams::testnet4();
+        // Set max_weight such that any non-trivial tx would put total_weight
+        // exactly at or beyond MAX_BLOCK_WEIGHT.  Set it to 0 so that
+        // block_reserved_weight = MAX_BLOCK_WEIGHT and any tx (non-zero weight)
+        // would reach the ceiling.
+        let template_config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            max_weight: 0, // block_reserved = MAX_BLOCK_WEIGHT
+            ..Default::default()
+        };
+
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800,
+            &params,
+            &template_config,
+        );
+
+        // The one mempool tx must have been rejected because
+        // total_weight (≥ MAX_BLOCK_WEIGHT) + priority.weight ≥ MAX_BLOCK_WEIGHT.
+        assert_eq!(
+            template.transactions.len(),
+            1,
+            "no tx should fit when block is already at/above MAX_BLOCK_WEIGHT"
+        );
+    }
+
+    /// The sigops gate uses strict >= (same as Core miner.cpp:244).
+    /// A transaction whose sigops would bring the total to exactly max_sigops
+    /// must be rejected.
+    #[test]
+    fn test_sigops_gate_strict_gte_rejects_at_exact_budget() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+        let params = ChainParams::testnet4();
+
+        let utxo =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+        // P2PKH output → 1 legacy sigop → cost 4 (with WITNESS_SCALE_FACTOR).
+        let tx = make_tx(vec![(utxo, 0)], vec![90_000], 1);
+        mempool
+            .add_transaction(tx, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        // Set max_sigops = 4. The tx itself has cost 4.  Strict >= means
+        // 0 + 4 >= 4 is true → must reject.
+        let template_config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            max_sigops: 4, // exactly the cost of one P2PKH tx
+            ..Default::default()
+        };
+
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800,
+            &params,
+            &template_config,
+        );
+
+        // The tx must have been rejected because 0 + 4 >= 4.
+        assert_eq!(
+            template.transactions.len(),
+            1,
+            "tx with sigop cost == max_sigops must be rejected (strict >=)"
+        );
+    }
+
+    /// blockMinFeeRate gate: selection STOPS (returns early) when the next
+    /// entry's feerate falls below the minimum.  This means transactions that
+    /// are above the minimum but come after the sub-minimum one in the heap
+    /// are NOT included (the whole suffix is abandoned).
+    ///
+    /// Reference: Bitcoin Core miner.cpp:298-300 (`return`, not `continue`).
+    #[test]
+    fn test_block_min_fee_rate_stops_selection() {
+        // Use min_fee_rate=0 in the mempool so that zero-fee txs can be
+        // admitted.  The block_min_fee_rate gate we are testing lives in
+        // build_block_template, not in the mempool.
+        let mut mempool_config = MempoolConfig::default();
+        mempool_config.min_fee_rate = 0;
+        let mut mempool = Mempool::new(mempool_config);
+        let params = ChainParams::testnet4();
+
+        // Add a zero-fee transaction (feerate = 0 sat/vbyte).
+        let utxo1 =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos1 = mock_utxo_set(vec![(OutPoint { txid: utxo1, vout: 0 }, 100_000)]);
+        // Output = input (zero fee); lock_time=0 so always final.
+        let tx_zero_fee = make_tx(vec![(utxo1, 0)], vec![100_000], 1);
+        mempool
+            .add_transaction(tx_zero_fee, &|op| utxos1.get(op).cloned())
+            .unwrap();
+
+        // Set block_min_fee_rate above zero — the zero-fee tx must be excluded
+        // by build_block_template's feerate gate.
+        let template_config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            block_min_fee_rate: 1.0, // 1 sat/vbyte
+            ..Default::default()
+        };
+
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800,
+            &params,
+            &template_config,
+        );
+
+        // Zero-fee tx must have been excluded.
+        assert_eq!(
+            template.transactions.len(),
+            1,
+            "zero-fee tx must be excluded by blockMinFeeRate gate"
+        );
+    }
+
+    /// block_version from config overrides the default compute_block_version
+    /// result.  When block_version = Some(v), the template header must carry v.
+    #[test]
+    fn test_block_version_from_config_overrides_default() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        let params = ChainParams::testnet4();
+        let config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            block_version: Some(0x20000004), // bit 2 set (hypothetical deployment)
+            ..Default::default()
+        };
+
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800,
+            &params,
+            &config,
+        );
+
+        assert_eq!(
+            template.header.version, 0x20000004,
+            "block_version from config must be used verbatim"
+        );
+    }
+
+    /// When block_version is None the default is at least VERSIONBITS_TOP_BITS
+    /// (0x20000000).
+    #[test]
+    fn test_block_version_default_is_versionbits_top_bits() {
+        use crate::versionbits::VERSIONBITS_TOP_BITS;
+
+        let mempool = Mempool::new(MempoolConfig::default());
+        let params = ChainParams::testnet4();
+        let config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            block_version: None,
+            ..Default::default()
+        };
+
+        let template = build_block_template(
+            &mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800,
+            &params,
+            &config,
+        );
+
+        assert!(
+            template.header.version >= VERSIONBITS_TOP_BITS as i32,
+            "block version must be at least VERSIONBITS_TOP_BITS when block_version=None"
+        );
     }
 }
