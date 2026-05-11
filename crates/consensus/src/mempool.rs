@@ -2073,6 +2073,40 @@ impl Mempool {
         false
     }
 
+    /// Check if a mempool transaction is replaceable under BIP-431 TRUC rules.
+    ///
+    /// Per BIP-431, any v3 (TRUC) transaction is always implicitly replaceable,
+    /// regardless of sequence number signaling.  This mirrors Bitcoin Core's
+    /// design where TRUC transactions skip the BIP-125 signaling gate: they
+    /// are handled through the TRUC policy path which unconditionally allows
+    /// replacement (validation.cpp:970-972 comment: "not checking whether it
+    /// opts in to replaceability via BIP125 or TRUC").
+    ///
+    /// A v3 transaction OR any transaction whose unconfirmed ancestors include
+    /// a v3 transaction is considered TRUC-replaceable.
+    pub fn is_truc_replaceable(&self, txid: &Hash256) -> bool {
+        if let Some(entry) = self.transactions.get(txid) {
+            if entry.tx.version == TRUC_VERSION {
+                return true;
+            }
+        }
+
+        // Check ancestors: if any unconfirmed ancestor is v3, the whole chain
+        // is subject to TRUC rules and is implicitly replaceable.
+        if let Some(parents) = self.parents.get(txid) {
+            let ancestors = self.get_all_ancestors(parents);
+            for ancestor_txid in ancestors {
+                if let Some(entry) = self.transactions.get(&ancestor_txid) {
+                    if entry.tx.version == TRUC_VERSION {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     /// Check RBF rules for a replacement transaction.
     ///
     /// Implements BIP-125 replacement rules (with full RBF support).
@@ -2104,10 +2138,18 @@ impl Mempool {
     ) -> Result<(), MempoolError> {
         // Rule #1: Check if replacement is allowed (signaling or full_rbf).
         // Core validation.cpp:839; policy/rbf.cpp:24-50.
+        // BIP-431: v3 (TRUC) transactions are always implicitly replaceable,
+        // so we also accept replacements of v3 conflicts even without full_rbf
+        // or BIP-125 sequence signaling.  Mirrors Core's design where TRUC
+        // transactions bypass the BIP-125 signaling gate (validation.cpp:970-972).
         if !self.config.full_rbf {
-            // All directly conflicting transactions must signal RBF or have an ancestor that does.
+            // All directly conflicting transactions must signal RBF (BIP-125),
+            // be v3 (TRUC — implicitly always replaceable per BIP-431), or have
+            // an ancestor that satisfies one of those conditions.
             for conflict_txid in direct_conflicts {
-                if !self.is_bip125_replaceable(conflict_txid) {
+                if !self.is_bip125_replaceable(conflict_txid)
+                    && !self.is_truc_replaceable(conflict_txid)
+                {
                     return Err(MempoolError::RbfNotSignaling);
                 }
             }
@@ -3131,16 +3173,22 @@ impl Mempool {
         // Check standardness
         self.check_standard(&tx)?;
 
-        // Look up inputs, compute fee, and collect conflicts
+        // Look up inputs, compute fee, and collect conflicts.
+        // We also collect prevout_scripts so we can compute the sigop-adjusted
+        // vsize (mirrors the normal add_transaction path, which feeds sigop_cost
+        // into get_virtual_transaction_size). TRUC size gates (10000 vB / 1000 vB)
+        // are defined in terms of sigop-adjusted vsize per truc_policy.h:29-34.
         let mut input_sum: u64 = 0;
         let mut mempool_parents = HashSet::new();
         let mut direct_conflicts = HashSet::new();
+        let mut prevout_scripts: Vec<Vec<u8>> = Vec::with_capacity(tx.inputs.len());
 
         for input in &tx.inputs {
             // Check for conflicts (double-spends)
             if let Some(&conflicting) = self.spent_outpoints.get(&input.previous_output) {
                 direct_conflicts.insert(conflicting);
                 if let Some(coin) = utxo_lookup(&input.previous_output) {
+                    prevout_scripts.push(coin.script_pubkey.clone());
                     input_sum += coin.value;
                 } else {
                     return Err(MempoolError::MissingInput(
@@ -3164,9 +3212,11 @@ impl Mempool {
                         input.previous_output.vout,
                     ));
                 }
+                prevout_scripts.push(parent.tx.outputs[vout].script_pubkey.clone());
                 input_sum += parent.tx.outputs[vout].value;
                 mempool_parents.insert(*parent_txid);
             } else if let Some(coin) = utxo_lookup(&input.previous_output) {
+                prevout_scripts.push(coin.script_pubkey.clone());
                 input_sum += coin.value;
             } else {
                 return Err(MempoolError::MissingInput(
@@ -3182,7 +3232,34 @@ impl Mempool {
         }
         let fee = input_sum - output_sum;
 
-        let vsize = tx.vsize();
+        // Compute sigop-adjusted vsize, mirroring the normal add_transaction path.
+        // TRUC size caps (TRUC_MAX_VSIZE=10000 vB, TRUC_CHILD_MAX_VSIZE=1000 vB)
+        // are defined in terms of sigop-adjusted virtual size (truc_policy.h:29,33).
+        // Using raw tx.vsize() here would allow a TRUC tx with many sigops to slip
+        // past the cap via a high-sigop-cost script. Bug: raw vsize used pre-fix.
+        let tx_sigop_cost: u64 = if !tx.is_coinbase() && prevout_scripts.len() == tx.inputs.len() {
+            let std_flags = ScriptFlags::standard_flags();
+            get_transaction_sigop_cost(&tx, |outpoint| {
+                for (idx, input) in tx.inputs.iter().enumerate() {
+                    if input.previous_output == *outpoint {
+                        return Some(CoinEntry {
+                            height: 0,
+                            is_coinbase: false,
+                            value: 0,
+                            script_pubkey: prevout_scripts[idx].clone(),
+                        });
+                    }
+                }
+                None
+            }, &std_flags)
+        } else {
+            0
+        };
+        let vsize = crate::params::get_virtual_transaction_size(
+            tx.weight() as u64,
+            tx_sigop_cost,
+            crate::params::DEFAULT_BYTES_PER_SIGOP,
+        ) as usize;
         let fee_rate = fee as f64 / vsize as f64;
 
         // For package validation, use the PACKAGE fee rate for the minimum check
@@ -6310,14 +6387,14 @@ mod tests {
         let txid2 = tx2.txid();
         let result = mempool.add_transaction(tx2, &|op| utxos.get(op).cloned());
 
-        // Note: v3 implicit RBF is not implemented yet - this test documents intended behavior
-        // Currently this will fail with RbfNotSignaling because we haven't added
-        // the implicit RBF for v3. For now, we test that with full_rbf=true it works.
-        // TODO: Implement implicit RBF for v3 transactions
-        if result.is_err() {
-            // This is expected until implicit v3 RBF is implemented
-            return;
-        }
+        // BIP-431: v3 transactions are always implicitly replaceable regardless of
+        // sequence number signaling.  Fix (W78): is_truc_replaceable() now short-
+        // circuits the BIP-125 signaling gate in check_rbf_rules.
+        assert!(
+            result.is_ok(),
+            "v3 tx should be replaceable without BIP-125 signaling (BIP-431 implicit RBF), got: {:?}",
+            result
+        );
         assert!(mempool.contains(&txid2));
     }
 
@@ -6389,6 +6466,440 @@ mod tests {
         let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
         assert!(result.is_ok(), "v3 tx spending confirmed should be accepted, got: {:?}", result);
         assert!(mempool.contains(&txid));
+    }
+
+    // ============================================================
+    // W78: Additional TRUC boundary and coverage tests
+    // ============================================================
+
+    /// Helper: build a v3 tx whose vsize is as close to `target_vsize` as possible
+    /// by stuffing OP_RETURN padding in the last output.  The caller supplies the
+    /// input outpoint and available value; the function creates a single change
+    /// output of value `change` plus one OP_RETURN output with `pad_bytes` of
+    /// data.  This allows precise control over vsize.
+    fn make_v3_tx_with_vsize(
+        prev_txid: Hash256,
+        prev_vout: u32,
+        change: u64,
+        pad_bytes: usize,
+    ) -> Transaction {
+        // OP_RETURN <data>: 1-byte opcode + 1-byte push + pad_bytes data
+        let mut op_return_script = vec![0x6a]; // OP_RETURN
+        if pad_bytes <= 75 {
+            op_return_script.push(pad_bytes as u8);
+        } else if pad_bytes <= 255 {
+            op_return_script.push(0x4c); // OP_PUSHDATA1
+            op_return_script.push(pad_bytes as u8);
+        } else {
+            op_return_script.push(0x4d); // OP_PUSHDATA2
+            op_return_script.push((pad_bytes & 0xff) as u8);
+            op_return_script.push((pad_bytes >> 8) as u8);
+        }
+        op_return_script.extend(vec![0x00u8; pad_bytes]);
+
+        Transaction {
+            version: TRUC_VERSION,
+            inputs: vec![rustoshi_primitives::TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: prev_vout },
+                script_sig: vec![0x51], // OP_1
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut {
+                    value: change,
+                    script_pubkey: vec![
+                        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                        0xac,
+                    ],
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: op_return_script,
+                },
+            ],
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn test_truc_max_vsize_boundary_accepted() {
+        // A v3 tx at exactly TRUC_MAX_VSIZE (10 000 vB) must be accepted.
+        // Verifies Core truc_policy.h:30 / truc_policy.cpp:200 boundary (strict >).
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 1_000_000_000)]);
+
+        // Build a tx near 10 000 vB via OP_RETURN padding.
+        // A minimal 1-in-2-out tx without padding is ~88 bytes; we need ~9912 more.
+        // Start with a large padding and trim to hit the limit exactly.
+        let base = make_v3_tx_with_vsize(utxo_txid, 0, 500_000_000, 0);
+        let base_vsize = base.vsize();
+        let pad = TRUC_MAX_VSIZE.saturating_sub(base_vsize + 4); // +4 for pushdata2 overhead
+        let tx = make_v3_tx_with_vsize(utxo_txid, 0, 500_000_000, pad);
+        let actual_vsize = tx.vsize();
+        assert!(
+            actual_vsize <= TRUC_MAX_VSIZE,
+            "Test tx must be at or below the limit, got {} vB",
+            actual_vsize
+        );
+
+        let txid = tx.txid();
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            result.is_ok(),
+            "v3 tx at/below 10 000 vB must be accepted, got: {:?}",
+            result
+        );
+        assert!(mempool.contains(&txid));
+    }
+
+    #[test]
+    fn test_truc_max_vsize_boundary_rejected() {
+        // A v3 tx at TRUC_MAX_VSIZE + 1 (10 001 vB) must be rejected.
+        // Verifies Core truc_policy.cpp:200 "is too big" check.
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 1_000_000_000)]);
+
+        // Build a tx that is definitely over 10 000 vB.
+        let tx = make_v3_tx_with_vsize(utxo_txid, 0, 500_000_000, TRUC_MAX_VSIZE + 100);
+        let actual_vsize = tx.vsize();
+        assert!(
+            actual_vsize > TRUC_MAX_VSIZE,
+            "Test tx must exceed limit, got {} vB",
+            actual_vsize
+        );
+
+        let txid = tx.txid();
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::TrucTxTooLarge(id, _, _)) if id == txid),
+            "v3 tx over 10 000 vB must be rejected with TrucTxTooLarge, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_truc_child_max_vsize_boundary_accepted() {
+        // A v3 child at exactly TRUC_CHILD_MAX_VSIZE (1 000 vB) must be accepted.
+        // Verifies Core truc_policy.cpp:223-227 boundary (strict >).
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000003")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 1_000_000_000)]);
+
+        // v3 parent (small, confirmed inputs only)
+        let parent = make_tx(vec![(utxo_txid, 0)], vec![999_000_000], TRUC_VERSION);
+        let parent_txid = parent.txid();
+        mempool.add_transaction(parent, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Child at or below 1000 vB
+        let base = make_v3_tx_with_vsize(parent_txid, 0, 900_000_000, 0);
+        let base_vsize = base.vsize();
+        let pad = TRUC_CHILD_MAX_VSIZE.saturating_sub(base_vsize + 4);
+        let child = make_v3_tx_with_vsize(parent_txid, 0, 900_000_000, pad);
+        let child_vsize = child.vsize();
+        assert!(
+            child_vsize <= TRUC_CHILD_MAX_VSIZE,
+            "Test child must be at or below 1000 vB, got {} vB",
+            child_vsize
+        );
+
+        let child_txid = child.txid();
+        let result = mempool.add_transaction(child, &|op| utxos.get(op).cloned());
+        assert!(
+            result.is_ok(),
+            "v3 child at/below 1000 vB must be accepted, got: {:?}",
+            result
+        );
+        assert!(mempool.contains(&child_txid));
+    }
+
+    #[test]
+    fn test_truc_child_max_vsize_boundary_rejected() {
+        // A v3 child at TRUC_CHILD_MAX_VSIZE + 1 (1001 vB) must be rejected.
+        // Verifies Core truc_policy.cpp:223-227 "child is too big" check.
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000004")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 1_000_000_000)]);
+
+        // v3 parent
+        let parent = make_tx(vec![(utxo_txid, 0)], vec![999_000_000], TRUC_VERSION);
+        let parent_txid = parent.txid();
+        mempool.add_transaction(parent, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Child definitively over 1000 vB
+        let child = make_v3_tx_with_vsize(parent_txid, 0, 900_000_000, TRUC_CHILD_MAX_VSIZE + 100);
+        let child_vsize = child.vsize();
+        assert!(
+            child_vsize > TRUC_CHILD_MAX_VSIZE,
+            "Test child must exceed 1000 vB, got {} vB",
+            child_vsize
+        );
+
+        let child_txid = child.txid();
+        let result = mempool.add_transaction(child, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::TrucChildTooLarge(id, _, _)) if id == child_txid),
+            "v3 child over 1000 vB must be rejected with TrucChildTooLarge, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_truc_v3_implicit_rbf_no_bip125_signaling() {
+        // BIP-431 §6: v3 txs are always implicitly replaceable even without
+        // BIP-125 sequence-number signaling and even when full_rbf is disabled.
+        // Fix (W78): is_truc_replaceable() now allows this in check_rbf_rules.
+        // Mirrors Core validation.cpp:970 comment.
+        let config = MempoolConfig {
+            full_rbf: false, // Explicitly disabled — must still allow v3 replacement
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000005")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 1_000_000)]);
+
+        // Add a v3 tx with MAX sequence (no BIP-125 signaling).
+        let tx1 = make_tx_with_sequence(
+            vec![(utxo_txid, 0, 0xFFFF_FFFF)],
+            vec![900_000],
+            TRUC_VERSION,
+        );
+        let txid1 = tx1.txid();
+        mempool.add_transaction(tx1, &|op| utxos.get(op).cloned()).unwrap();
+
+        // Sanity: tx1 does NOT signal BIP-125.
+        assert!(
+            !mempool.is_bip125_replaceable(&txid1),
+            "tx1 must not signal BIP-125 for this test to be meaningful"
+        );
+        // But it IS TRUC-replaceable.
+        assert!(
+            mempool.is_truc_replaceable(&txid1),
+            "v3 tx must report as TRUC-replaceable"
+        );
+
+        // Replacement: same input, higher fee.
+        let tx2 = make_tx(vec![(utxo_txid, 0)], vec![800_000], TRUC_VERSION);
+        let txid2 = tx2.txid();
+        let result = mempool.add_transaction(tx2, &|op| utxos.get(op).cloned());
+
+        assert!(
+            result.is_ok(),
+            "v3 tx must be replaceable without BIP-125 signaling (BIP-431), got: {:?}",
+            result
+        );
+        assert!(!mempool.contains(&txid1), "replaced tx must be gone");
+        assert!(mempool.contains(&txid2), "replacement tx must be present");
+    }
+
+    #[test]
+    fn test_truc_three_generations_rejected() {
+        // Ancestor set of 3 TRUC txs: GP → P → C should reject C because
+        // ancestor count would be 3 > TRUC_ANCESTOR_LIMIT (2).
+        // Verifies Core truc_policy.cpp:207,217 path for the grandchild.
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000006")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 10_000_000)]);
+
+        let gp = make_tx(vec![(utxo_txid, 0)], vec![9_000_000], TRUC_VERSION);
+        let gp_txid = gp.txid();
+        mempool.add_transaction(gp, &|op| utxos.get(op).cloned()).unwrap();
+
+        let parent = make_tx(vec![(gp_txid, 0)], vec![8_000_000], TRUC_VERSION);
+        let parent_txid = parent.txid();
+        mempool.add_transaction(parent, &|op| utxos.get(op).cloned()).unwrap();
+
+        let child = make_tx(vec![(parent_txid, 0)], vec![7_000_000], TRUC_VERSION);
+        let child_txid = child.txid();
+        let result = mempool.add_transaction(child, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(result, Err(MempoolError::TrucTooManyAncestors(id, _, _)) if id == child_txid),
+            "grandchild must be rejected: ancestor count would be 3, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_truc_sibling_ineligible_for_eviction_has_descendant() {
+        // Sibling eviction is NOT applicable when the existing sibling itself has
+        // a descendant (i.e. descendant_count > 1 for the sibling).  In that case
+        // the new child must be hard-rejected with TrucTooManyDescendants.
+        // Mirrors Core truc_policy.cpp:249 condition
+        //   `pool.GetDescendantCount(parent_entry) == 2 &&
+        //    pool.GetAncestorCount(**descendants.begin()) == 2`.
+        //
+        // Topology: utxo → parent → child1 → grandchild1
+        //                                   (descendant_count of child1 = 2)
+        //           parent → child2 (attempt, must fail; sibling eviction not possible)
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000007")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 10_000_000)]);
+
+        // Parent with 2 outputs
+        let parent = Transaction {
+            version: TRUC_VERSION,
+            inputs: vec![rustoshi_primitives::TxIn {
+                previous_output: OutPoint { txid: utxo_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 4_000_000,
+                    script_pubkey: vec![
+                        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                        0xac,
+                    ],
+                },
+                TxOut {
+                    value: 4_000_000,
+                    script_pubkey: vec![
+                        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                        0xac,
+                    ],
+                },
+            ],
+            lock_time: 0,
+        };
+        let parent_txid = parent.txid();
+        mempool.add_transaction(parent, &|op| utxos.get(op).cloned()).unwrap();
+
+        // child1 (spends vout 0)
+        let child1 = make_tx(vec![(parent_txid, 0)], vec![3_000_000], TRUC_VERSION);
+        let child1_txid = child1.txid();
+        mempool.add_transaction(child1, &|op| utxos.get(op).cloned()).unwrap();
+
+        // child1's own child: this is a 3rd generation which TRUC rejects
+        // (child1 now has ancestor_count=2, grandchild would have ancestor_count=3).
+        // So grandchild1 cannot enter the mempool — TRUC prevents it.
+        // Instead we test the sibling ineligibility via the parent's descendant count:
+        // parent has desc_count=2 (itself + child1). Adding child2 (vout=1) would
+        // be sibling eviction territory. child1 has desc_count=1 (no grandchild)
+        // and ancestor_count=2, so it IS eligible for sibling eviction normally.
+        //
+        // To make child1 ineligible (desc_count=2), we need a grandchild.
+        // But TRUC blocks grandchildren. So we simulate it by directly mutating
+        // the descendant_count of child1 in the mempool entry to 2.
+        //
+        // The practical scenario (reorg) where this guard matters is documented
+        // in Core truc_policy.cpp:234-238. We verify the guard exists by directly
+        // checking the condition logic at the entry level.
+        if let Some(entry) = mempool.transactions.get_mut(&child1_txid) {
+            entry.descendant_count = 2; // Simulate a grandchild existing (e.g. post-reorg)
+        }
+
+        // Now child2 (vout=1): sibling eviction should be ineligible because
+        // child1 has descendant_count=2 (has a child of its own).
+        let child2 = make_tx(vec![(parent_txid, 1)], vec![2_000_000], TRUC_VERSION);
+        let child2_txid = child2.txid();
+        let result = mempool.add_transaction(child2, &|op| utxos.get(op).cloned());
+
+        // Expect TrucTooManyDescendants (sibling eviction not possible)
+        // rather than RbfInsufficientAbsoluteFee (sibling eviction attempted but fee low).
+        assert!(
+            matches!(result, Err(MempoolError::TrucTooManyDescendants(_))),
+            "child2 must be hard-rejected (sibling ineligible, has own descendant), got: {:?}",
+            result
+        );
+        assert!(!mempool.contains(&child2_txid));
+    }
+
+    #[test]
+    fn test_truc_sibling_eviction_round_trip() {
+        // Full round-trip: parent → child1 (in mempool) → child2 evicts child1
+        // → verify child1 gone, child2 present, parent still present, size correct.
+        // Mirrors the sibling-eviction case from Core truc_policy.cpp:244-258.
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000008")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 10_000_000)]);
+
+        // Parent with 2 outputs
+        let parent = Transaction {
+            version: TRUC_VERSION,
+            inputs: vec![rustoshi_primitives::TxIn {
+                previous_output: OutPoint { txid: utxo_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 4_000_000,
+                    script_pubkey: vec![
+                        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                        0xac,
+                    ],
+                },
+                TxOut {
+                    value: 4_000_000,
+                    script_pubkey: vec![
+                        0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88,
+                        0xac,
+                    ],
+                },
+            ],
+            lock_time: 0,
+        };
+        let parent_txid = parent.txid();
+        mempool.add_transaction(parent, &|op| utxos.get(op).cloned()).unwrap();
+
+        // child1: low fee (1 000 000 sat fee)
+        let child1 = make_tx(vec![(parent_txid, 0)], vec![3_000_000], TRUC_VERSION);
+        let child1_txid = child1.txid();
+        mempool.add_transaction(child1, &|op| utxos.get(op).cloned()).unwrap();
+        assert!(mempool.contains(&parent_txid));
+        assert!(mempool.contains(&child1_txid));
+        assert_eq!(mempool.size(), 2);
+
+        // child2: higher fee (2 000 000 sat fee) → evicts child1
+        let child2 = make_tx(vec![(parent_txid, 1)], vec![2_000_000], TRUC_VERSION);
+        let child2_txid = child2.txid();
+        let result = mempool.add_transaction(child2, &|op| utxos.get(op).cloned());
+
+        assert!(result.is_ok(), "sibling eviction must succeed, got: {:?}", result);
+        assert!(mempool.contains(&parent_txid), "parent must remain");
+        assert!(!mempool.contains(&child1_txid), "child1 must be evicted");
+        assert!(mempool.contains(&child2_txid), "child2 must be present");
+        assert_eq!(mempool.size(), 2, "mempool must have exactly parent+child2");
     }
 
     // ============================================================
