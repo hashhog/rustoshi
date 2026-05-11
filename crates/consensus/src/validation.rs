@@ -26,9 +26,10 @@
 //! not after all transactions are validated.
 
 use crate::params::{
-    block_subsidy, ChainParams, COINBASE_MATURITY, LOCKTIME_THRESHOLD, MAX_BLOCK_SIGOPS_COST,
-    MAX_BLOCK_WEIGHT, MAX_MONEY, MAX_PUBKEYS_PER_MULTISIG, SEQUENCE_LOCKTIME_DISABLE_FLAG,
-    SEQUENCE_LOCKTIME_MASK, SEQUENCE_LOCKTIME_TYPE_FLAG, WITNESS_SCALE_FACTOR,
+    block_subsidy, ChainParams, COINBASE_MATURITY, DIFFICULTY_ADJUSTMENT_INTERVAL,
+    LOCKTIME_THRESHOLD, MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT, MAX_MONEY, MAX_PUBKEYS_PER_MULTISIG,
+    MAX_TIMEWARP, SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_MASK,
+    SEQUENCE_LOCKTIME_TYPE_FLAG, WITNESS_SCALE_FACTOR,
 };
 use crate::pow::check_proof_of_work;
 use crate::script::{
@@ -72,8 +73,21 @@ pub enum ValidationError {
     #[error("timestamp too far in the future")]
     TimeTooNew,
 
-    #[error("bad block version")]
-    BadVersion,
+    /// Block nVersion is below the minimum required after a BIP-34/66/65
+    /// soft fork activates.
+    ///
+    /// Carries the raw nVersion value (as i32 — the wire type) so that
+    /// callers can format the Core-compatible string `bad-version(0xNNNNNNNN)`.
+    /// Bitcoin Core: validation.cpp:4116 `strprintf("bad-version(0x%08x)", block.nVersion)`.
+    #[error("bad block version 0x{0:08x}")]
+    BadVersion(i32),
+
+    /// Block timestamp is too early on a difficulty-adjustment block (BIP-94).
+    ///
+    /// Only enforced on testnet4/regtest when `enforce_bip94` is set.
+    /// Bitcoin Core: validation.cpp:4102 `"time-timewarp-attack"`.
+    #[error("timewarp attack: timestamp too early on diff-adjustment block")]
+    TimeTimewarpAttack,
 
     #[error("duplicate transaction: {0}")]
     DuplicateTx(String),
@@ -186,119 +200,131 @@ impl ValidationError {
     /// rejection rather than verbose internal error messages.  This method
     /// provides the canonical mapping so that the RPC layer can stay clean and
     /// every new validation variant gets an explicit string assignment.
-    pub fn bip22_string(&self) -> &'static str {
+    ///
+    /// Returns `String` (not `&'static str`) so that dynamic variants such as
+    /// `BadVersion(0x%08x)` can produce their Core-identical formatting.
+    pub fn bip22_string(&self) -> String {
         match self {
             // PoW
-            ValidationError::BadProofOfWork => "high-hash",
+            ValidationError::BadProofOfWork => "high-hash".to_string(),
             // Merkle root
-            ValidationError::BadMerkleRoot => "bad-txnmrklroot",
+            ValidationError::BadMerkleRoot => "bad-txnmrklroot".to_string(),
             // Witness commitment (BIP-141)
-            ValidationError::BadWitnessCommitment => "bad-witness-merkle-match",
+            ValidationError::BadWitnessCommitment => "bad-witness-merkle-match".to_string(),
             // Coinbase witness stack not exactly [32-byte nonce]
             // Bitcoin Core: "bad-witness-nonce-size" (validation.cpp:3883)
-            ValidationError::BadWitnessNonceSize => "bad-witness-nonce-size",
+            ValidationError::BadWitnessNonceSize => "bad-witness-nonce-size".to_string(),
             // Witness data found in a block without a witness commitment
             // Bitcoin Core: "unexpected-witness" (validation.cpp:3910)
-            ValidationError::UnexpectedWitness => "unexpected-witness",
+            ValidationError::UnexpectedWitness => "unexpected-witness".to_string(),
             // Coinbase value / subsidy
-            ValidationError::BadSubsidy(_, _) => "bad-cb-amount",
+            ValidationError::BadSubsidy(_, _) => "bad-cb-amount".to_string(),
             // Sigops budget
-            ValidationError::SigopsLimitExceeded(_) => "bad-blk-sigops",
+            ValidationError::SigopsLimitExceeded(_) => "bad-blk-sigops".to_string(),
             // Duplicate tx within block — maps to bad-txns-inputs-missingorspent
             // (Core parity: ConnectBlock catches the dup-spend via prevout-already-spent,
             // so Core never emits bad-txns-duplicate for in-block dup-txid.  The
             // BIP-30 cross-block case (Bip30DuplicateOutput below) still uses
             // bad-txns-BIP30 which is Core's canonical for that path.)
-            ValidationError::DuplicateTx(_) => "bad-txns-inputs-missingorspent",
+            ValidationError::DuplicateTx(_) => "bad-txns-inputs-missingorspent".to_string(),
             // Non-final transaction
-            ValidationError::NonFinalTx => "bad-txns-nonfinal",
+            ValidationError::NonFinalTx => "bad-txns-nonfinal".to_string(),
             // BIP-30: tx output would overwrite existing UTXO
-            ValidationError::Bip30DuplicateOutput => "bad-txns-BIP30",
+            ValidationError::Bip30DuplicateOutput => "bad-txns-BIP30".to_string(),
             // BIP-34 coinbase height encoding
-            ValidationError::BadCoinbaseHeight => "bad-cb-height",
+            ValidationError::BadCoinbaseHeight => "bad-cb-height".to_string(),
             // Time checks
-            ValidationError::TimeTooOld => "time-too-old",
-            ValidationError::TimeTooNew => "time-too-new",
+            ValidationError::TimeTooOld => "time-too-old".to_string(),
+            ValidationError::TimeTooNew => "time-too-new".to_string(),
+            // BIP-94 timewarp attack (testnet4/regtest only).
+            // Bitcoin Core: validation.cpp:4102 "time-timewarp-attack".
+            ValidationError::TimeTimewarpAttack => "time-timewarp-attack".to_string(),
+            // nVersion too low after BIP-34/66/65 activation.
+            // Bitcoin Core: validation.cpp:4116
+            //   strprintf("bad-version(0x%08x)", block.nVersion)
+            // nVersion is i32 on the wire; %08x in C treats the bits as
+            // unsigned for printing, so we cast to u32 before formatting.
+            ValidationError::BadVersion(v) => format!("bad-version(0x{:08x})", *v as u32),
             // Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
             ValidationError::TxValidation(TxValidationError::NegativeOutput) => {
-                "bad-txns-vout-negative"
+                "bad-txns-vout-negative".to_string()
             }
             // Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
             ValidationError::TxValidation(TxValidationError::OutputTooLarge(_)) => {
-                "bad-txns-vout-toolarge"
+                "bad-txns-vout-toolarge".to_string()
             }
             // Coinbase scriptSig length (consensus/tx_check.cpp — 2..100 bytes)
             ValidationError::TxValidation(TxValidationError::CoinbaseScriptSize(_)) => {
-                "bad-cb-length"
+                "bad-cb-length".to_string()
             }
             // BIP-68 SequenceLocks failure (relative locktime not met).
             // Core validation.cpp:2558: state.Invalid(BLOCK_CONSENSUS,
             // "bad-txns-nonfinal", ...) — same string as IsFinalTx (nLockTime).
             ValidationError::TxValidation(TxValidationError::SequenceLockNotMet) => {
-                "bad-txns-nonfinal"
+                "bad-txns-nonfinal".to_string()
             }
             // Script verification failure at connect-block stage.
             // Core validation.cpp:2122: "block-script-verify-flag-failed (%s)"
             // (not "mandatory-script-verify-flag-failed" which is the mempool
             // stage path at validation.cpp:2120).
             ValidationError::TxValidation(TxValidationError::ScriptFailed(_)) => {
-                "block-script-verify-flag-failed"
+                "block-script-verify-flag-failed".to_string()
             }
             // Coinbase maturity violation (consensus/tx_verify.cpp::CheckTxInputs).
             // Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase")
             ValidationError::TxValidation(TxValidationError::PrematureCoinbaseSpend(_, _)) => {
-                "bad-txns-premature-spend-of-coinbase"
+                "bad-txns-premature-spend-of-coinbase".to_string()
             }
             // Non-coinbase tx where sum(inputs) < sum(outputs).
             // Core consensus/tx_verify.cpp::CheckTxInputs:
             //   state.Invalid(TxValidationResult::TX_CONSENSUS,
             //                 "bad-txns-in-belowout", ...)
             ValidationError::TxValidation(TxValidationError::InsufficientFunds(_, _)) => {
-                "bad-txns-in-belowout"
+                "bad-txns-in-belowout".to_string()
             }
             // Empty vin — Bitcoin Core tx_check.cpp:14-15: "bad-txns-vin-empty"
             ValidationError::TxValidation(TxValidationError::EmptyInputs) => {
-                "bad-txns-vin-empty"
+                "bad-txns-vin-empty".to_string()
             }
             // Empty vout — Bitcoin Core tx_check.cpp:16-17: "bad-txns-vout-empty"
             ValidationError::TxValidation(TxValidationError::EmptyOutputs) => {
-                "bad-txns-vout-empty"
+                "bad-txns-vout-empty".to_string()
             }
             // Stripped size × WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
             // Bitcoin Core tx_check.cpp:19-21: "bad-txns-oversize"
             ValidationError::TxValidation(TxValidationError::TooLarge(_)) => {
-                "bad-txns-oversize"
+                "bad-txns-oversize".to_string()
             }
             // Total output value > MAX_MONEY (cumulative overflow).
             // Bitcoin Core tx_check.cpp:32-33: "bad-txns-txouttotal-toolarge"
             ValidationError::TxValidation(TxValidationError::TotalOutputTooLarge(_)) => {
-                "bad-txns-txouttotal-toolarge"
+                "bad-txns-txouttotal-toolarge".to_string()
             }
             // Duplicate inputs (CVE-2018-17144 — inflation bug).
             // Bitcoin Core tx_check.cpp:43-44: "bad-txns-inputs-duplicate"
             ValidationError::TxValidation(TxValidationError::DuplicateInputs) => {
-                "bad-txns-inputs-duplicate"
+                "bad-txns-inputs-duplicate".to_string()
             }
             // Non-coinbase prevout.IsNull().
             // Bitcoin Core tx_check.cpp:55-56: "bad-txns-prevout-null"
             ValidationError::TxValidation(TxValidationError::NullPrevout) => {
-                "bad-txns-prevout-null"
+                "bad-txns-prevout-null".to_string()
             }
             // Missing or already-spent input.
             // Bitcoin Core tx_verify.cpp:167-170: "bad-txns-inputs-missingorspent"
             ValidationError::TxValidation(TxValidationError::MissingInput(_, _)) => {
-                "bad-txns-inputs-missingorspent"
+                "bad-txns-inputs-missingorspent".to_string()
             }
             // Per-coin or cumulative input value out of MoneyRange.
             // Bitcoin Core tx_verify.cpp:186-188: "bad-txns-inputvalues-outofrange"
             ValidationError::TxValidation(TxValidationError::InputValueOverflow) => {
-                "bad-txns-inputvalues-outofrange"
+                "bad-txns-inputvalues-outofrange".to_string()
             }
             // Accumulated block fees exceeded MAX_MONEY.
             // Bitcoin Core validation.cpp:2543-2547: "bad-txns-accumulated-fee-outofrange"
-            ValidationError::FeesOutOfRange(_) => "bad-txns-accumulated-fee-outofrange",
+            ValidationError::FeesOutOfRange(_) => "bad-txns-accumulated-fee-outofrange".to_string(),
             // Catch-all: covers structural/weight/prev-block/chain errors
-            _ => "rejected",
+            _ => "rejected".to_string(),
         }
     }
 }
@@ -857,31 +883,72 @@ pub trait ChainContext {
 pub fn contextual_check_block_header(
     header: &BlockHeader,
     height: u32,
-    _prev_entry: &BlockIndexEntry,
+    prev_entry: &BlockIndexEntry,
     context: &dyn ChainContext,
     params: &ChainParams,
     current_time: u64,
 ) -> Result<(), ValidationError> {
-    // Check timestamp against median-time-past
+    // Gate 1 (Core:4092): Block timestamp must be strictly greater than
+    // the median-time-past of the previous 11 blocks (BIP-113).
+    // Uses `<=` — block-time must be strictly greater than MTP.
+    // Reference: bitcoin-core/src/validation.cpp:4092
+    //   `if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())`
     let mtp = context.get_median_time_past(&header.prev_block_hash);
     if header.timestamp <= mtp {
         return Err(ValidationError::TimeTooOld);
     }
 
-    // BIP-113 / Core: header.timestamp must not be > now + 2h.
+    // Gate 2 (Core:4097-4105): BIP-94 timewarp protection.
+    // Testnet4/regtest only (`enforce_bip94`).
+    // At the first block of each difficulty-adjustment period (height % 2016 == 0),
+    // the new block's timestamp must not be more than MAX_TIMEWARP (600 s)
+    // behind the previous block's timestamp.
+    // Reference: bitcoin-core/src/validation.cpp:4097-4105
+    //   `if (nHeight % DifficultyAdjustmentInterval() == 0) {`
+    //   `  if (block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP)`
+    if params.enforce_bip94
+        && height > 0
+        && height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0
+    {
+        let prev_time = prev_entry.timestamp as i64;
+        let block_time = header.timestamp as i64;
+        if block_time < prev_time - MAX_TIMEWARP {
+            return Err(ValidationError::TimeTimewarpAttack);
+        }
+    }
+
+    // Gate 3 (Core:4108-4110): Block timestamp must not be more than
+    // MAX_FUTURE_BLOCK_TIME (7200 s) ahead of wall-clock time.
+    // Core returns BLOCK_TIME_FUTURE here (not BLOCK_INVALID_HEADER), which
+    // affects retry semantics in headers-sync (such headers are not permanently
+    // marked invalid but are retried after time passes).
     // Skipped when current_time == 0 (test-only path).
+    // Reference: bitcoin-core/src/validation.cpp:4108-4110
+    //   `if (block.Time() > NodeClock::now() + std::chrono::seconds{MAX_FUTURE_BLOCK_TIME})`
     if current_time != 0
         && (header.timestamp as u64) > current_time + crate::params::MAX_FUTURE_BLOCK_TIME
     {
         return Err(ValidationError::TimeTooNew);
     }
 
-    // BIP-65: Block version must be >= 4 after activation
-    // Note: We only enforce the soft fork rule, not reject lower versions entirely
-    // The version check is a simplification; real BIP-9 deployment is more complex
-    if height >= params.bip65_height {
-        // After activation, we just need scripts to be valid with CLTV
-        // The version bits deployment is handled separately
+    // Gates 4-6 (Core:4113-4118): Reject blocks with outdated nVersion after
+    // BIP-34 (height-in-coinbase), BIP-66 (strict DER), BIP-65 (CLTV) activate.
+    // nVersion is treated as a signed i32 in Bitcoin; we cast the u32 wire field
+    // to i32 before comparison to match Core's `block.nVersion` semantics.
+    // Reference: bitcoin-core/src/validation.cpp:4113-4118
+    //   `if ((block.nVersion < 2 && DeploymentActiveAfter(pindexPrev, DEPLOYMENT_HEIGHTINCB)) ||`
+    //   `    (block.nVersion < 3 && DeploymentActiveAfter(pindexPrev, DEPLOYMENT_DERSIG))   ||`
+    //   `    (block.nVersion < 4 && DeploymentActiveAfter(pindexPrev, DEPLOYMENT_CLTV)))`
+    //
+    // `DeploymentActiveAfter(pindexPrev, ...)` means active at the *child* block
+    // (== height), not at pindexPrev (== height - 1).  Equivalent to:
+    //   height >= bip34_height / bip66_height / bip65_height
+    let version = header.version as i32;
+    if (version < 2 && height >= params.bip34_height)
+        || (version < 3 && height >= params.bip66_height)
+        || (version < 4 && height >= params.bip65_height)
+    {
+        return Err(ValidationError::BadVersion(header.version));
     }
 
     Ok(())
@@ -4436,7 +4503,7 @@ mod tests {
         mtp.insert(prev_hash, 1_700_000_000);
         let ctx = MtpStubContext { mtp_by_hash: mtp };
         let header = BlockHeader {
-            version: 1,
+            version: 4, // >= 4 satisfies all BIP-34/66/65 version gates on regtest
             prev_block_hash: prev_hash,
             merkle_root: Hash256::ZERO,
             timestamp: 1_700_000_001, // > MTP → accept
@@ -4495,7 +4562,7 @@ mod tests {
         let ctx = MtpStubContext { mtp_by_hash: mtp };
         let now: u64 = 1_700_000_000;
         let header = BlockHeader {
-            version: 1,
+            version: 4, // >= 4 satisfies all BIP-34/66/65 version gates on regtest
             prev_block_hash: prev_hash,
             merkle_root: Hash256::ZERO,
             timestamp: (now + 3600) as u32, // 1h in future, < 2h threshold
@@ -4512,6 +4579,565 @@ mod tests {
             now,
         );
         assert!(res.is_ok(), "header within drift window must be accepted: {res:?}");
+    }
+
+    // ============================================================
+    // W85: time-too-new exact boundary tests
+    // ============================================================
+
+    /// time-too-new: timestamp exactly at now+7200 must be ACCEPTED.
+    /// Core gate: `block.Time() > NodeClock::now() + 7200s` (strict `>`).
+    #[test]
+    fn contextual_check_block_header_time_too_new_exactly_7200_accepted() {
+        let prev_hash = Hash256::from_bytes([0x01; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let now: u64 = 1_700_000_000;
+        let header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: (now + 7200) as u32, // exactly +7200 → still accepted (not strictly >)
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            now,
+        );
+        assert!(res.is_ok(),
+            "timestamp == now+7200 must be accepted (boundary is strict >): {res:?}");
+    }
+
+    /// time-too-new: timestamp at now+7199 must be ACCEPTED.
+    #[test]
+    fn contextual_check_block_header_time_too_new_7199_accepted() {
+        let prev_hash = Hash256::from_bytes([0x02; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let now: u64 = 1_700_000_000;
+        let header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: (now + 7199) as u32, // one second inside window → accept
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            now,
+        );
+        assert!(res.is_ok(),
+            "timestamp == now+7199 must be accepted: {res:?}");
+    }
+
+    /// time-too-new: timestamp at now+7201 must be REJECTED.
+    #[test]
+    fn contextual_check_block_header_time_too_new_7201_rejected() {
+        let prev_hash = Hash256::from_bytes([0x03; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let now: u64 = 1_700_000_000;
+        let header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: (now + 7201) as u32, // one second over the limit → reject
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            now,
+        );
+        assert!(matches!(res, Err(ValidationError::TimeTooNew)),
+            "timestamp == now+7201 must be rejected: {res:?}");
+    }
+
+    // ============================================================
+    // W85: time-too-old strict `<=` tests
+    // ============================================================
+
+    /// time-too-old: timestamp exactly equal to MTP must be REJECTED.
+    /// Core: `if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())` — strict `<=`.
+    #[test]
+    fn contextual_check_block_header_time_too_old_equal_mtp_rejected() {
+        let prev_hash = Hash256::from_bytes([0x04; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 1_700_000_000u32);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 1_700_000_000u32, // exactly == MTP → reject (Core: <=)
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(matches!(res, Err(ValidationError::TimeTooOld)),
+            "timestamp == MTP must be rejected (strict <=): {res:?}");
+    }
+
+    /// time-too-old: timestamp one second above MTP must be ACCEPTED.
+    #[test]
+    fn contextual_check_block_header_time_too_old_one_above_mtp_accepted() {
+        let prev_hash = Hash256::from_bytes([0x05; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 1_700_000_000u32);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 1_700_000_001u32, // one above MTP → accept
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::regtest();
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(res.is_ok(), "timestamp == MTP+1 must be accepted: {res:?}");
+    }
+
+    // ============================================================
+    // W85: BIP-94 timewarp tests
+    // ============================================================
+
+    /// Make a prev_entry with a specific timestamp.
+    fn prev_entry_with_ts(ts: u32) -> BlockIndexEntry {
+        BlockIndexEntry {
+            height: 0,
+            timestamp: ts,
+            bits: 0,
+            prev_hash: Hash256::ZERO,
+            chain_work: [0u8; 32],
+        }
+    }
+
+    /// BIP-94: timewarp attack rejected at retarget boundary.
+    /// Block at height 2016 (first retarget) with timestamp < prev - 600.
+    ///
+    /// Key setup: block_ts must be > MTP (to pass time-too-old) but also
+    /// < prev_ts - 600 (to trigger timewarp).  We set:
+    ///   prev_ts = 1_700_010_000
+    ///   block_ts = prev_ts - 601 = 1_700_009_399  (triggers timewarp)
+    ///   MTP = 1_700_009_000                        (< block_ts, passes time-too-old)
+    #[test]
+    fn contextual_check_block_header_bip94_timewarp_rejected() {
+        let prev_hash = Hash256::from_bytes([0x10; 32]);
+        let prev_ts: u32 = 1_700_010_000;
+        // block_ts is 601s behind prev_ts; MTP is 399s before block_ts.
+        let block_ts: u32 = prev_ts - 601; // = 1_700_009_399
+        let mtp_val: u32 = block_ts - 400; // = 1_700_008_999 < block_ts
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, mtp_val);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: block_ts,
+            bits: 0,
+            nonce: 0,
+        };
+        // testnet4 params enforce_bip94=true; height 2016 = first retarget.
+        let params = ChainParams::testnet4();
+        let res = contextual_check_block_header(
+            &header,
+            2016, // height % 2016 == 0 → retarget boundary
+            &prev_entry_with_ts(prev_ts),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(matches!(res, Err(ValidationError::TimeTimewarpAttack)),
+            "timewarp at retarget boundary must be rejected: {res:?}");
+    }
+
+    /// BIP-94: at exactly prev - MAX_TIMEWARP (600) is ACCEPTED (not strictly <).
+    /// Core: `if (block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP)`
+    ///
+    /// block_ts = prev_ts - 600 (exactly at limit, should pass)
+    /// MTP = block_ts - 1 (< block_ts, passes time-too-old)
+    #[test]
+    fn contextual_check_block_header_bip94_timewarp_exactly_limit_accepted() {
+        let prev_hash = Hash256::from_bytes([0x11; 32]);
+        let prev_ts: u32 = 1_700_010_000;
+        // Exactly at prev - 600 → OK (Core uses strict `<`, so == is allowed).
+        let block_ts: u32 = prev_ts - 600; // = 1_700_009_400
+        let mtp_val: u32 = block_ts - 1; // = 1_700_009_399 < block_ts
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, mtp_val);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: block_ts,
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::testnet4();
+        let res = contextual_check_block_header(
+            &header,
+            2016,
+            &prev_entry_with_ts(prev_ts),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(res.is_ok(),
+            "timestamp == prev - MAX_TIMEWARP must be accepted (strict <): {res:?}");
+    }
+
+    /// BIP-94: timewarp check is NOT enforced on mainnet (enforce_bip94=false).
+    /// Same layout as the rejected case, but mainnet params → should pass.
+    #[test]
+    fn contextual_check_block_header_bip94_not_enforced_on_mainnet() {
+        let prev_hash = Hash256::from_bytes([0x12; 32]);
+        let prev_ts: u32 = 1_700_010_000;
+        let block_ts: u32 = prev_ts - 601; // would fail BIP-94 if enforced
+        let mtp_val: u32 = block_ts - 400;
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, mtp_val);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: block_ts,
+            bits: 0,
+            nonce: 0,
+        };
+        // mainnet has enforce_bip94=false, so the check must not fire.
+        let params = ChainParams::mainnet();
+        let res = contextual_check_block_header(
+            &header,
+            2016,
+            &prev_entry_with_ts(prev_ts),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(res.is_ok(),
+            "timewarp must not be enforced on mainnet: {res:?}");
+    }
+
+    /// BIP-94: timewarp check is NOT enforced outside retarget boundaries.
+    #[test]
+    fn contextual_check_block_header_bip94_not_at_non_retarget_height() {
+        let prev_hash = Hash256::from_bytes([0x13; 32]);
+        let prev_ts: u32 = 1_700_010_000;
+        let block_ts: u32 = prev_ts - 601; // would fail BIP-94 at retarget boundary
+        let mtp_val: u32 = block_ts - 400;
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, mtp_val);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: block_ts,
+            bits: 0,
+            nonce: 0,
+        };
+        let params = ChainParams::testnet4(); // enforce_bip94=true
+        let res = contextual_check_block_header(
+            &header,
+            2017, // NOT a retarget boundary (2017 % 2016 = 1)
+            &prev_entry_with_ts(prev_ts),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(res.is_ok(),
+            "timewarp must not be enforced at non-retarget heights: {res:?}");
+    }
+
+    // ============================================================
+    // W85: nVersion gate tests (BIP-34, BIP-66, BIP-65)
+    // Reference: bitcoin-core/src/validation.cpp:4113-4118
+    // ============================================================
+
+    /// Helper: build params with specific activation heights.
+    /// Uses regtest base but overrides the three soft fork heights.
+    fn params_with_version_heights(bip34: u32, bip66: u32, bip65: u32) -> ChainParams {
+        let mut p = ChainParams::regtest();
+        p.bip34_height = bip34;
+        p.bip66_height = bip66;
+        p.bip65_height = bip65;
+        p
+    }
+
+    /// nVersion < 2 after BIP-34 activation → bad-version.
+    #[test]
+    fn contextual_check_block_header_bad_version_bip34() {
+        let prev_hash = Hash256::from_bytes([0x20; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0u32);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 1, // < 2 → bad version after BIP-34 activates
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 100,
+            bits: 0,
+            nonce: 0,
+        };
+        let params = params_with_version_heights(100, 200, 300);
+        let res = contextual_check_block_header(
+            &header,
+            100, // == bip34_height → active
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(matches!(res, Err(ValidationError::BadVersion(1))),
+            "nVersion=1 at bip34_height must be rejected: {res:?}");
+    }
+
+    /// nVersion == 2 after BIP-34 activation → accepted (exactly meets minimum).
+    #[test]
+    fn contextual_check_block_header_version2_at_bip34_accepted() {
+        let prev_hash = Hash256::from_bytes([0x21; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0u32);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 2, // meets BIP-34 minimum
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 100,
+            bits: 0,
+            nonce: 0,
+        };
+        let params = params_with_version_heights(100, 200, 300);
+        let res = contextual_check_block_header(
+            &header,
+            100,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(res.is_ok(), "nVersion=2 at bip34_height must be accepted: {res:?}");
+    }
+
+    /// nVersion < 3 after BIP-66 activation → bad-version.
+    #[test]
+    fn contextual_check_block_header_bad_version_bip66() {
+        let prev_hash = Hash256::from_bytes([0x22; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0u32);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 2, // < 3 → bad version after BIP-66 activates
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 100,
+            bits: 0,
+            nonce: 0,
+        };
+        let params = params_with_version_heights(50, 200, 300);
+        let res = contextual_check_block_header(
+            &header,
+            200, // == bip66_height → active
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(matches!(res, Err(ValidationError::BadVersion(2))),
+            "nVersion=2 at bip66_height must be rejected: {res:?}");
+    }
+
+    /// nVersion < 4 after BIP-65 activation → bad-version.
+    #[test]
+    fn contextual_check_block_header_bad_version_bip65() {
+        let prev_hash = Hash256::from_bytes([0x23; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0u32);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 3, // < 4 → bad version after BIP-65 activates
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 100,
+            bits: 0,
+            nonce: 0,
+        };
+        let params = params_with_version_heights(50, 100, 300);
+        let res = contextual_check_block_header(
+            &header,
+            300, // == bip65_height → active
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(matches!(res, Err(ValidationError::BadVersion(3))),
+            "nVersion=3 at bip65_height must be rejected: {res:?}");
+    }
+
+    /// nVersion=1 before BIP-34 activation → accepted.
+    #[test]
+    fn contextual_check_block_header_version1_before_bip34_accepted() {
+        let prev_hash = Hash256::from_bytes([0x24; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 0u32);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let header = BlockHeader {
+            version: 1,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 100,
+            bits: 0,
+            nonce: 0,
+        };
+        let params = params_with_version_heights(100, 200, 300);
+        let res = contextual_check_block_header(
+            &header,
+            99, // one block before bip34_height → not yet active
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            0,
+        );
+        assert!(res.is_ok(),
+            "nVersion=1 before BIP-34 activation must be accepted: {res:?}");
+    }
+
+    // ============================================================
+    // W85: bad-version bip22_string format
+    // Reference: bitcoin-core/src/validation.cpp:4116
+    //   strprintf("bad-version(0x%08x)", block.nVersion)
+    // ============================================================
+
+    /// bad-version(0x00000001) — nVersion=1 formatted as Core does.
+    #[test]
+    fn bad_version_bip22_string_version1() {
+        assert_eq!(
+            ValidationError::BadVersion(1).bip22_string(),
+            "bad-version(0x00000001)"
+        );
+    }
+
+    /// bad-version(0xffffffff) — nVersion=-1 (negative i32) formatted unsigned.
+    #[test]
+    fn bad_version_bip22_string_negative_version() {
+        assert_eq!(
+            ValidationError::BadVersion(-1).bip22_string(),
+            "bad-version(0xffffffff)"
+        );
+    }
+
+    /// bad-version(0x00000002) — nVersion=2.
+    #[test]
+    fn bad_version_bip22_string_version2() {
+        assert_eq!(
+            ValidationError::BadVersion(2).bip22_string(),
+            "bad-version(0x00000002)"
+        );
+    }
+
+    /// time-timewarp-attack bip22_string.
+    #[test]
+    fn time_timewarp_attack_bip22_string() {
+        assert_eq!(
+            ValidationError::TimeTimewarpAttack.bip22_string(),
+            "time-timewarp-attack"
+        );
+    }
+
+    // ============================================================
+    // W85: GetMedianTimePast (compute_mtp_via_get_block) tests
+    // Reference: bitcoin-core/src/chain.h:233-245
+    // ============================================================
+
+    use super::super::chain_state::compute_mtp_via_get_block_test;
+
+    /// MTP with N=11 ancestors: median is sorted[5] (0-indexed, 6th element).
+    /// Core: `pbegin[(pend - pbegin) / 2]` with 11 items = index 5.
+    #[test]
+    fn compute_mtp_n11_median_is_index5() {
+        // 11 blocks with timestamps 1,2,3,...,11 (already sorted order)
+        // Median of [1..11] is index 5 → value 6.
+        let timestamps: Vec<u32> = (1..=11).collect();
+        let result = compute_mtp_via_get_block_test(&timestamps);
+        assert_eq!(result, 6, "N=11 median must be sorted[5]=6");
+    }
+
+    /// MTP with N=1 (genesis): returns the only timestamp.
+    #[test]
+    fn compute_mtp_n1_returns_single_timestamp() {
+        let result = compute_mtp_via_get_block_test(&[1_296_688_602u32]);
+        assert_eq!(result, 1_296_688_602, "N=1 median must be the single timestamp");
+    }
+
+    /// MTP with N=5: median is sorted[2] (0-indexed, 3rd element).
+    /// 5/2 = 2 → index 2.
+    #[test]
+    fn compute_mtp_n5_median_is_index2() {
+        // timestamps out of order to verify sorting
+        let timestamps = vec![300u32, 100, 500, 200, 400];
+        let result = compute_mtp_via_get_block_test(&timestamps);
+        // sorted: [100, 200, 300, 400, 500], index 2 = 300
+        assert_eq!(result, 300, "N=5 median must be sorted[2]=300");
+    }
+
+    /// MTP with N=10: median is sorted[5] (10/2=5, 6th element).
+    #[test]
+    fn compute_mtp_n10_median_is_index5() {
+        let timestamps: Vec<u32> = (1..=10).collect();
+        let result = compute_mtp_via_get_block_test(&timestamps);
+        // sorted [1..10], index 5 = 6
+        assert_eq!(result, 6, "N=10 median must be sorted[5]=6");
+    }
+
+    /// MTP with N=12: uses 11 (window cap), returns sorted[5] of first 11 seen.
+    /// Note: compute_mtp_via_get_block walks at most 11 ancestors.
+    #[test]
+    fn compute_mtp_n12_capped_at_11() {
+        // Walk only 11 of 12; the test helper takes up to MEDIAN_TIME_PAST_WINDOW items
+        let timestamps: Vec<u32> = (1..=12).collect();
+        let result = compute_mtp_via_get_block_test(&timestamps);
+        // First 11 collected: [1,2,...,11]. sorted[5] = 6.
+        assert_eq!(result, 6, "N=12 must cap walk at 11: sorted[5]=6");
     }
 
     #[test]

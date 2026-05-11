@@ -776,6 +776,61 @@ where
     timestamps[timestamps.len() / 2]
 }
 
+/// Test-only wrapper around `compute_mtp_via_get_block` that takes a slice of
+/// timestamps (ordered from newest to oldest, like a real chain walk) and
+/// builds a fake chain from them.  Exposed via `#[cfg(test)]` so that
+/// validation.rs tests can exercise the MTP sorting logic directly without
+/// needing a full `ChainState`.
+#[cfg(test)]
+pub(crate) fn compute_mtp_via_get_block_test(timestamps: &[u32]) -> u32 {
+    use rustoshi_primitives::{Block, BlockHeader, Hash256};
+    use crate::params::MEDIAN_TIME_PAST_WINDOW;
+
+    // Build a linked list of fake blocks where each block's prev_block_hash
+    // is the hash of the *next* entry in `timestamps`.  We use sequential
+    // hashes [0x01, 0x02, ...] so each block has a unique hash.
+    let count = timestamps.len().min(MEDIAN_TIME_PAST_WINDOW + 1); // one extra to test cap
+    let mut blocks: std::collections::HashMap<Hash256, Block> = Default::default();
+
+    for (i, &ts) in timestamps.iter().take(count).enumerate() {
+        let hash = Hash256::from_bytes({
+            let mut b = [0u8; 32];
+            b[0] = (i + 1) as u8;
+            b[1] = ((i + 1) >> 8) as u8;
+            b
+        });
+        let prev_hash = if i + 1 < count {
+            Hash256::from_bytes({
+                let mut b = [0u8; 32];
+                b[0] = (i + 2) as u8;
+                b[1] = ((i + 2) >> 8) as u8;
+                b
+            })
+        } else {
+            Hash256::ZERO // genesis sentinel
+        };
+        blocks.insert(hash, Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: prev_hash,
+                merkle_root: Hash256::ZERO,
+                timestamp: ts,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+        });
+    }
+
+    // Tip is the first entry (newest block).
+    let tip_hash = Hash256::from_bytes({
+        let mut b = [0u8; 32];
+        b[0] = 1u8;
+        b
+    });
+    compute_mtp_via_get_block(&tip_hash, &|h| blocks.get(h).cloned())
+}
+
 /// `SequenceLockContext` impl used by `process_block` for the time-based
 /// component of BIP-68 sequence-lock checks.
 ///
