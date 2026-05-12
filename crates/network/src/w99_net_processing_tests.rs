@@ -27,7 +27,7 @@
 //!   G20 - PASS: pre-handshake non-version messages → PreHandshakeMessage disconnect
 //!   G21 - BUG (CORRECTNESS): inbound v1 path does not track WtxidRelay flag between version/verack
 //!   G22 - BUG (CORRECTNESS): NODE_COMPACT_FILTERS never set in local_services()
-//!   G23 - PASS: MAX_MESSAGE_SIZE=4MiB enforced at header parse stage
+//!   G23 - FIXED: MAX_MESSAGE_SIZE=4_000_000 (4MB decimal) per Core net.h:65 (was 32 MiB)
 //!   G24 - PASS: unknown msg → NetworkMessage::Unknown variant, forwarded without Misbehaving
 //!   G25 - FIXED: wtxid-relay peers now get MSG_WTX(5) per BIP-339 (was MSG_WITNESS_TX(0x40000001))
 //!   G26 - BUG (CORRECTNESS): InvType::Error (unknown inv type) silently accepted, not filtered
@@ -421,13 +421,20 @@ mod tests {
             "constant value must match BIP-157 definition");
     }
 
-    // ─── G23: MAX_MESSAGE_SIZE = 4 MiB ───────────────────────────────────────
+    // ─── G23: MAX_MESSAGE_SIZE = 4 MB (decimal) ──────────────────────────────
 
-    /// G23 PASS: MAX_MESSAGE_SIZE is exactly 4 MiB.
+    /// G23 FIXED: MAX_MESSAGE_SIZE is exactly 4,000,000 bytes (decimal 4 MB),
+    /// matching Bitcoin Core's `MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000`
+    /// (net.h:65).  Was 32 * 1024 * 1024 = 33,554,432 bytes (32 MiB) — 8.4×
+    /// too large; a peer could force ~8× more memory allocation per message
+    /// than Core allows.
     #[test]
-    fn g23_max_message_size_is_4mib() {
-        assert_eq!(MAX_MESSAGE_SIZE, 4 * 1024 * 1024,
-            "must be exactly 4 MiB per Core MAX_PROTOCOL_MESSAGE_LENGTH");
+    fn g23_max_message_size_is_4mb_decimal() {
+        assert_eq!(MAX_MESSAGE_SIZE, 4_000_000,
+            "must be exactly 4,000,000 bytes per Core MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000");
+        // Explicitly not 4 * 1024 * 1024 (= 4,194,304 MiB) — Core uses decimal MB.
+        assert_ne!(MAX_MESSAGE_SIZE, 4 * 1024 * 1024,
+            "must NOT be 4 MiB binary; Core net.h uses 4 * 1000 * 1000 not 4 * 1024 * 1024");
     }
 
     // ─── G24: unknown message type → Unknown variant, no Misbehaving ──────────
