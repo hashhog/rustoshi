@@ -1156,8 +1156,13 @@ impl V2Transport {
                     consumed += to_copy;
 
                     if self.recv_buffer.len() >= V1_PREFIX_LEN {
-                        // Check if this looks like V1 (magic + "version\0\0\0\0\0")
-                        if self.recv_buffer[..4] == self.network_magic {
+                        // Check if this looks like V1 (magic + "version\0\0\0\0\0").
+                        // BIP-324: compare ALL 16 bytes (4-byte magic followed by
+                        // the 12-byte "version\0\0\0\0\0" command field).  Checking
+                        // only the 4-byte magic was the pre-fix bug (W98 G13/G14):
+                        // a V2 EllSwift pubkey whose first 4 bytes equal the network
+                        // magic would be misclassified as V1 (1-in-2^32 failure).
+                        if looks_like_v1_version(&self.recv_buffer, &self.network_magic) {
                             // Looks like V1, fall back
                             self.recv_state = RecvState::V1;
                             self.send_state = SendState::V1;
@@ -1883,20 +1888,19 @@ mod tests {
     // Pins correct spec behaviour for each gate. Failing tests mark known bugs.
     // =========================================================================
 
-    /// G13-BUG: V2Transport::receive_bytes KeyMaybeV1 state checks only the
-    /// 4-byte network magic, not the full 16-byte V1 prefix (magic +
-    /// `"version\0\0\0\0\0"`).  A V1 peer whose first message is NOT `version`
-    /// (protocol violation) will be misclassified as V2 by V2Transport; however
-    /// the *real-world* path in peer_manager.rs correctly calls
-    /// `looks_like_v1_version` (which checks all 16 bytes), so only the
-    /// V2Transport state machine itself is wrong.  This test pins the correct
-    /// behaviour: magic-only match with a non-version command must NOT be
-    /// treated as V1.
+    /// G13: V2Transport::receive_bytes KeyMaybeV1 state must check the full
+    /// 16-byte V1 prefix (magic + `"version\0\0\0\0\0"`), not just the 4-byte
+    /// network magic.  A stream whose first 4 bytes equal the magic but whose
+    /// next 12 bytes are NOT `"version\0\0\0\0\0"` is a non-version V1 message
+    /// (protocol violation) or a V2 EllSwift pubkey — both must be treated as
+    /// V2 (rejected/ignored), not as V1 fallback.
+    ///
+    /// Fix (W98 G13/G14): replaced `recv_buffer[..4] == network_magic` with
+    /// `looks_like_v1_version(&recv_buffer, &network_magic)`.
     #[test]
     fn test_g13_v1_detection_requires_full_16_byte_prefix() {
-        // The function looks_like_v1_version() already implements the correct
-        // spec check (magic + "version\0\0\0\0\0").  We verify it rejects a
-        // magic-only match and accepts the full prefix.
+        // looks_like_v1_version() implements the correct spec check.
+        // Verify it rejects a magic-only match and accepts the full prefix.
         let magic = [0xf9, 0xbe, 0xb4, 0xd9u8];
 
         // Magic-only match with "inv\0\0\0\0\0\0\0\0\0" must NOT be V1.
@@ -1917,20 +1921,52 @@ mod tests {
             "G13: magic + 'version\\0\\0\\0\\0\\0' must classify as V1"
         );
 
-        // V2Transport::receive_bytes KeyMaybeV1 state currently only checks
-        // the 4-byte magic (bug).  This documents the intended behaviour:
-        // a buf with magic + non-version cmd must NOT go to RecvState::V1.
+        // V2Transport::receive_bytes KeyMaybeV1 state now uses
+        // looks_like_v1_version() (full 16-byte check).  A magic-only prefix
+        // with a non-version command must NOT advance to RecvState::V1.
         let mut transport = V2Transport::new(0, false, magic);
-        // Feed the bad_v1 prefix into the state machine.
         let result = transport.receive_bytes(&bad_v1);
         assert!(result.is_ok());
-        // Correct outcome: should have advanced to Key (V2 path), not V1.
-        // BUG: currently advances to V1 because only magic is checked.
-        // When this test fails it means the bug has been fixed.
+        // After fix: magic + non-version-cmd advances to RecvState::Key (V2).
         assert_ne!(
             transport.recv_state, RecvState::V1,
-            "G13 BUG CONFIRMED: V2Transport misclassifies magic-only match as V1; \
+            "G13: V2Transport must NOT misclassify magic-only match as V1; \
              full 16-byte version-prefix check is required"
+        );
+        assert_eq!(
+            transport.recv_state, RecvState::Key,
+            "G13: magic-only match must advance to RecvState::Key (V2 path)"
+        );
+    }
+
+    /// G14: V2Transport::receive_bytes must NOT misclassify a V2 EllSwift
+    /// pubkey whose first 4 bytes happen to equal the network magic as a V1
+    /// stream.  After the fix the state machine uses the full 16-byte check
+    /// (`looks_like_v1_version`), so only a genuine magic + "version…" prefix
+    /// triggers V1 fallback.
+    #[test]
+    fn test_g14_v2_pubkey_starting_with_magic_not_misclassified_as_v1() {
+        let magic = [0xf9, 0xbe, 0xb4, 0xd9u8];
+
+        // Craft a 16-byte prefix whose first 4 bytes equal the network magic
+        // but bytes 4-15 are NOT "version\0\0\0\0\0" (simulating a V2 EllSwift
+        // pubkey that begins with the magic bytes — the 1-in-2^32 collision).
+        let mut v2_like = [0u8; 16];
+        v2_like[..4].copy_from_slice(&magic);
+        // Bytes 4-15: arbitrary non-version bytes (e.g. all 0xAA)
+        v2_like[4..16].fill(0xAA);
+
+        let mut transport = V2Transport::new(0, false, magic);
+        let result = transport.receive_bytes(&v2_like);
+        assert!(result.is_ok(), "G14: should not error on V2 pubkey prefix");
+        // Must be treated as V2 (Key state), NOT V1 fallback.
+        assert_ne!(
+            transport.recv_state, RecvState::V1,
+            "G14: V2 EllSwift pubkey starting with magic must NOT be classified as V1"
+        );
+        assert_eq!(
+            transport.recv_state, RecvState::Key,
+            "G14: V2 EllSwift pubkey starting with magic must advance to RecvState::Key"
         );
     }
 
