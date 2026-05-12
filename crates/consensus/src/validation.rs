@@ -150,6 +150,19 @@ pub enum ValidationError {
     /// "bad-txns-BIP30" when HaveCoin() is true for any output of a block tx.
     #[error("bad-txns-BIP30: tried to overwrite transaction")]
     Bip30DuplicateOutput,
+
+    /// Header's accumulated chain work is below the network minimum.
+    ///
+    /// Bitcoin Core: `AcceptBlockHeader` (validation.cpp:4229):
+    ///   `if (!min_pow_checked) {`
+    ///   `    return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork");`
+    ///   `}`
+    /// Only fired when `min_pow_checked == false` (i.e. the header did NOT go
+    /// through the PRESYNC/REDOWNLOAD pipeline that already validates accumulated
+    /// work).  Prevents a peer from feeding millions of low-work headers and
+    /// burning CPU/memory without the early reject gate.
+    #[error("too-little-chainwork: header chain work below minimum")]
+    TooLittleChainwork,
 }
 
 /// Errors that can occur during transaction validation.
@@ -337,6 +350,10 @@ impl ValidationError {
             // path (it is a silent early-return, not a state.Invalid call), so
             // we map to "rejected" for BIP-22 consumers.
             ValidationError::BlockTooFarAhead(_, _) => "rejected".to_string(),
+            // G8: header work below network minimum.
+            // Bitcoin Core: BLOCK_HEADER_LOW_WORK → "too-little-chainwork"
+            // (validation.cpp:4229-4231).
+            ValidationError::TooLittleChainwork => "too-little-chainwork".to_string(),
             // Catch-all: covers structural/weight/prev-block/chain errors
             _ => "rejected".to_string(),
         }
@@ -963,6 +980,59 @@ pub fn contextual_check_block_header(
         || (version < 4 && height >= params.bip65_height)
     {
         return Err(ValidationError::BadVersion(header.version));
+    }
+
+    Ok(())
+}
+
+/// Accept-or-reject gate for a single block header (G8 / `AcceptBlockHeader`).
+///
+/// Mirrors Bitcoin Core `ChainstateManager::AcceptBlockHeader`
+/// (validation.cpp:4229-4231):
+///
+/// ```cpp
+/// if (!min_pow_checked) {
+///     return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK,
+///                          "too-little-chainwork");
+/// }
+/// ```
+///
+/// # Arguments
+/// * `header_chain_work` — The *accumulated* chain work for this header
+///   (parent chain_work + `get_block_proof(header.bits)`).  Stored as a
+///   big-endian `[u8; 32]` matching `BlockIndexEntry::chain_work`.
+/// * `min_pow_checked` — `true` when the PRESYNC/REDOWNLOAD pipeline has
+///   already validated that the chain has sufficient work.  Callers that go
+///   through the PRESYNC anti-DoS pipeline pass `true`.  Direct callers
+///   (header messages without PRESYNC, `submitblock` RPC, test harnesses)
+///   pass `false` so that the low-work gate fires.
+/// * `params` — Chain parameters carrying `minimum_chain_work`.
+///
+/// # Returns
+/// * `Ok(())` if the header passes the gate.
+/// * `Err(ValidationError::TooLittleChainwork)` if `min_pow_checked` is
+///   `false` and `header_chain_work < params.minimum_chain_work`.
+///
+/// **This function only implements G8.**  Callers are responsible for the
+/// other `AcceptBlockHeader` gates (G1-G7, G9-G10).
+pub fn accept_block_header_chain_work(
+    header_chain_work: &[u8; 32],
+    min_pow_checked: bool,
+    params: &ChainParams,
+) -> Result<(), ValidationError> {
+    if min_pow_checked {
+        // PRESYNC/REDOWNLOAD already validated accumulated work — skip.
+        return Ok(());
+    }
+
+    // G8: Reject headers whose accumulated chain work is below the network
+    // minimum.  Big-endian byte-wise comparison (same order as the stored
+    // values); lower byte index = more-significant byte.
+    //
+    // Bitcoin Core: `pindex->nChainWork < MinimumChainWork()`
+    // (validation.cpp:4229, AcceptBlockHeader).
+    if header_chain_work < &params.minimum_chain_work {
+        return Err(ValidationError::TooLittleChainwork);
     }
 
     Ok(())
