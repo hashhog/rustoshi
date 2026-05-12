@@ -14,8 +14,9 @@ use std::io::{Cursor, Read};
 /// Size of the message header in bytes.
 pub const MESSAGE_HEADER_SIZE: usize = 24;
 
-/// Maximum message payload size (32 MB).
-pub const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+/// Maximum message payload size (4 MB decimal, matching Bitcoin Core's
+/// `MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000`).
+pub const MAX_MESSAGE_SIZE: usize = 4 * 1000 * 1000; // = 4_000_000
 
 /// Maximum number of inventory items in a single message.
 pub const MAX_INV_SIZE: usize = 50_000;
