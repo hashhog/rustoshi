@@ -584,9 +584,10 @@ impl PeerRelayState {
                 continue;
             }
 
-            // Create inv entry with appropriate type
+            // Create inv entry with appropriate type.
+            // BIP-339: wtxid-relay peers expect MSG_WTX (5), not MSG_WITNESS_TX (0x40000001).
             let inv_type = if self.supports_wtxid_relay {
-                InvType::MsgWitnessTx
+                InvType::MsgWtx
             } else {
                 InvType::MsgTx
             };
@@ -952,7 +953,8 @@ mod tests {
 
         let inv = state.get_pending_inv(10);
         assert_eq!(inv.len(), 1);
-        assert_eq!(inv[0].inv_type, InvType::MsgWitnessTx);
+        // BIP-339: wtxid-relay peers expect MSG_WTX (5), not MSG_WITNESS_TX (0x40000001).
+        assert_eq!(inv[0].inv_type, InvType::MsgWtx);
     }
 
     #[test]

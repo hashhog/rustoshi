@@ -43,6 +43,8 @@ pub enum InvType {
     MsgFilteredBlock = 3,
     /// Compact block (BIP 152).
     MsgCmpctBlock = 4,
+    /// Witness transaction by wtxid (BIP 339).
+    MsgWtx = 5,
     /// Witness transaction (BIP 144).
     MsgWitnessTx = 0x40000001,
     /// Witness block (BIP 144).
@@ -60,6 +62,7 @@ impl InvType {
             2 => InvType::MsgBlock,
             3 => InvType::MsgFilteredBlock,
             4 => InvType::MsgCmpctBlock,
+            5 => InvType::MsgWtx,
             0x40000001 => InvType::MsgWitnessTx,
             0x40000002 => InvType::MsgWitnessBlock,
             0x40000003 => InvType::MsgWitnessFilteredBlock,
