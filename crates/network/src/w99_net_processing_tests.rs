@@ -6,7 +6,7 @@
 //!
 //! Gate summary (bugs found):
 //!   G1  - BUG (DOS): score-accumulation model instead of single-event discourage
-//!   G2  - BUG (DOS): no noban/manual/local protection in ban_peer_with_reason
+//!   G2  - FIXED: noban/manual/local protection added to ban_peer_with_reason
 //!   G3  - PASS: banlist persisted to banlist.json via BanManager
 //!   G4  - PASS: MAX_HEADERS_PER_REQUEST=2000 cap enforced in header_sync
 //!   G5  - PASS: PRESYNC/REDOWNLOAD pipeline present in headers_presync.rs
@@ -71,39 +71,154 @@ mod tests {
         // This test documents the divergence — rustoshi requires 100 pts.
     }
 
-    // ─── G2: noban/manual/local protection MISSING in ban path ───────────────
+    // ─── G2: noban/manual/local protection in ban path (FIXED) ─────────────
+    //
+    // Fix: ban_peer_with_reason() now mirrors Core's MaybeDiscourageAndDisconnect:
+    //   NoBan peer   → no-op (not disconnected, not discouraged)
+    //   Manual peer  → no-op (not disconnected, not discouraged)
+    //   Local peer   → disconnect only (no discourage list write)
+    //   Regular peer → disconnect + discourage (ban list written)
+    //
+    // Reference: bitcoin-core/src/net_processing.cpp:5083
 
-    /// G2 BUG (DOS): ban_peer_with_reason() bans any peer unconditionally.
-    /// Core's MaybeDiscourageAndDisconnect checks NoBan permission, IsManualConn()
-    /// and addr.IsLocal() before persisting a discourage/ban.
-    /// rustoshi has no such check — a manually-configured peer or whitelisted
-    /// peer would be incorrectly banned.
-    #[test]
-    fn g2_ban_has_no_noban_protection_documented() {
-        // We cannot call ban_peer_with_reason without a real async runtime +
-        // live peer.  This unit test documents the missing gate by confirming
-        // ConnectionType has no Manual or Local variant.
-        use crate::peer_manager::ConnectionType;
+    use crate::peer_manager::{ConnectionType, PeerManager, PeerManagerConfig};
+    use rustoshi_consensus::ChainParams;
+    use std::net::SocketAddr;
 
-        // Only FullRelay, BlockRelayOnly, Inbound exist.
-        // There is NO ConnectionType::Manual or ConnectionType::Local.
-        // Therefore ban_peer_with_reason() has no way to guard manual peers.
-        let types = [
-            ConnectionType::FullRelay,
-            ConnectionType::BlockRelayOnly,
+    fn make_test_manager_in(tmp: &TempDir) -> PeerManager {
+        let config = PeerManagerConfig::testnet4()
+            .with_data_dir(tmp.path().to_path_buf());
+        PeerManager::new(config, ChainParams::testnet4())
+    }
+
+    /// G2 FIXED — NoBan peer: ban_peer_with_reason is a no-op.
+    ///
+    /// A peer with `noban=true` (whitelist permission) must NOT be disconnected
+    /// or written to the ban-list, regardless of misbehavior.
+    /// Core: `if (pnode.HasPermission(NetPermissionFlags::NoBan)) return false;`
+    #[tokio::test]
+    async fn g2_noban_peer_not_banned() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = make_test_manager_in(&tmp);
+        let peer_id = PeerId(1);
+        let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+
+        // Insert a noban=true peer.
+        let _cmd_rx = mgr.insert_test_peer_with_flags(
+            peer_id,
+            addr,
             ConnectionType::Inbound,
-        ];
-        // Demonstrate that Manual is absent by exhaustive match (would not
-        // compile if a new variant were added without updating this test).
-        for t in &types {
-            match t {
-                ConnectionType::FullRelay => {}
-                ConnectionType::BlockRelayOnly => {}
-                ConnectionType::Inbound => {}
-            }
-        }
-        // If ConnectionType::Manual existed, the match above would warn/error.
-        // The absence confirms G2 is unfixed.
+            true, // noban
+        );
+
+        // Attempt to ban — must be a no-op.
+        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string()).await;
+
+        // Peer must still be in the peers map (not disconnected).
+        let peers = mgr.connected_peers();
+        assert!(
+            peers.iter().any(|(id, _)| *id == peer_id),
+            "NoBan peer must NOT be removed from peers map after ban attempt"
+        );
+
+        // Ban-list must NOT contain this address.
+        assert!(
+            !mgr.is_banned(&addr.ip()),
+            "NoBan peer address must NOT appear in the ban-list"
+        );
+    }
+
+    /// G2 FIXED — Manual peer: ban_peer_with_reason is a no-op.
+    ///
+    /// Manual (addnode/-addnode) peers are never banned or disconnected.
+    /// Core: `if (pnode.IsManualConn()) return false;`
+    #[tokio::test]
+    async fn g2_manual_peer_not_banned() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = make_test_manager_in(&tmp);
+        let peer_id = PeerId(2);
+        let addr: SocketAddr = "192.0.2.50:8333".parse().unwrap();
+
+        // Insert a Manual connection.
+        let _cmd_rx = mgr.insert_test_peer_with_flags(
+            peer_id,
+            addr,
+            ConnectionType::Manual,
+            false, // noban not needed; Manual alone is sufficient
+        );
+
+        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string()).await;
+
+        // Peer must still be in the peers map.
+        let peers = mgr.connected_peers();
+        assert!(
+            peers.iter().any(|(id, _)| *id == peer_id),
+            "Manual peer must NOT be removed from peers map after ban attempt"
+        );
+
+        // Ban-list must NOT contain this address.
+        assert!(
+            !mgr.is_banned(&addr.ip()),
+            "Manual peer address must NOT appear in the ban-list"
+        );
+    }
+
+    /// G2 FIXED — Local (loopback) peer: disconnect-only, no discourage list write.
+    ///
+    /// Core: "disconnect but don't discourage (don't pollute Discourage list
+    /// with local addrs)" — pnode.fDisconnect = true but no m_banman->Discourage().
+    #[tokio::test]
+    async fn g2_local_peer_disconnects_without_ban() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = make_test_manager_in(&tmp);
+        let peer_id = PeerId(3);
+        // 127.0.0.1 is loopback — treated as local.
+        let addr: SocketAddr = "127.0.0.1:8333".parse().unwrap();
+
+        let _cmd_rx = mgr.insert_test_peer_with_flags(
+            peer_id,
+            addr,
+            ConnectionType::Inbound,
+            false,
+        );
+
+        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string()).await;
+
+        // Ban-list must NOT contain the loopback address.
+        assert!(
+            !mgr.is_banned(&addr.ip()),
+            "Local peer address must NOT appear in the ban-list (disconnect-only)"
+        );
+        // Note: the peer is disconnected (command sent over channel) but we
+        // cannot assert removal here because the peer task that would call
+        // PeerEvent::Disconnected is not running in this unit test.
+    }
+
+    /// G2 FIXED — Regular inbound peer: discouraged AND disconnected.
+    ///
+    /// A standard inbound peer with no special flags must be written to the
+    /// ban-list AND have a Disconnect command sent.
+    #[tokio::test]
+    async fn g2_regular_inbound_peer_is_banned() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = make_test_manager_in(&tmp);
+        let peer_id = PeerId(4);
+        let addr: SocketAddr = "203.0.113.7:8333".parse().unwrap();
+
+        let _cmd_rx = mgr.insert_test_peer_with_flags(
+            peer_id,
+            addr,
+            ConnectionType::Inbound,
+            false, // no noban permission
+        );
+
+        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string()).await;
+
+        // Ban-list MUST contain this address.
+        assert!(
+            mgr.is_banned(&addr.ip()),
+            "Regular inbound peer must be written to the ban-list on misbehavior"
+        );
     }
 
     // ─── G3: banlist persistence ──────────────────────────────────────────────
