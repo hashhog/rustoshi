@@ -127,6 +127,15 @@ pub enum ValidationError {
     #[error("block weight {0} exceeds maximum {MAX_BLOCK_WEIGHT}")]
     WeightExceeded(u64),
 
+    /// Block's claimed height exceeds `active_tip + MIN_BLOCKS_TO_KEEP` on an
+    /// unrequested path.  Anti-DoS gate matching Bitcoin Core's `fTooFarAhead`
+    /// check in `AcceptBlock` (validation.cpp:4325-4330).
+    ///
+    /// `0`: claimed height of the rejected block.
+    /// `1`: current active-chain tip height at the time of rejection.
+    #[error("block too far ahead: claimed height {0} > active tip {1} + MIN_BLOCKS_TO_KEEP")]
+    BlockTooFarAhead(u32, u32),
+
     #[error("previous block not found: {0}")]
     PrevBlockNotFound(String),
 
@@ -323,6 +332,11 @@ impl ValidationError {
             // Accumulated block fees exceeded MAX_MONEY.
             // Bitcoin Core validation.cpp:2543-2547: "bad-txns-accumulated-fee-outofrange"
             ValidationError::FeesOutOfRange(_) => "bad-txns-accumulated-fee-outofrange".to_string(),
+            // Anti-DoS: block too far ahead of active chain tip (fTooFarAhead).
+            // Core AcceptBlock returns `false` without an error string on this
+            // path (it is a silent early-return, not a state.Invalid call), so
+            // we map to "rejected" for BIP-22 consumers.
+            ValidationError::BlockTooFarAhead(_, _) => "rejected".to_string(),
             // Catch-all: covers structural/weight/prev-block/chain errors
             _ => "rejected".to_string(),
         }
