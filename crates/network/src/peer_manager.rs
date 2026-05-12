@@ -691,6 +691,11 @@ pub fn testnet4_fallback_peers() -> Vec<SocketAddr> {
 // ============================================================
 
 /// Connection type for outbound connections.
+///
+/// Mirrors Bitcoin Core `net.h::ConnectionType`.  The `Manual` variant is used
+/// for peers added via `addnode` RPC / `-addnode` CLI flag.  Core's
+/// `MaybeDiscourageAndDisconnect` exempts Manual peers from the ban/discourage
+/// path — they are never written to the ban-list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionType {
     /// Full-relay connection (relays blocks and transactions).
@@ -699,6 +704,9 @@ pub enum ConnectionType {
     BlockRelayOnly,
     /// Inbound connection.
     Inbound,
+    /// Manually configured connection (addnode / -addnode).
+    /// Core: ConnectionType::MANUAL — never banned or discouraged.
+    Manual,
 }
 
 /// Result of checking for stale peers.
@@ -756,6 +764,13 @@ struct PeerHandle {
     command_tx: mpsc::Sender<PeerCommand>,
     /// Connection type.
     conn_type: ConnectionType,
+    /// NoBan permission flag.
+    ///
+    /// When true this peer is exempt from ban/discourage regardless of misbehavior
+    /// score — mirroring Bitcoin Core's `NetPermissionFlags::NoBan` check in
+    /// `MaybeDiscourageAndDisconnect` (net_processing.cpp:5083).  Set for
+    /// whitelisted peers; currently always `false` for non-whitelisted peers.
+    noban: bool,
     /// Time when connection was established.
     connected_time: Instant,
     /// Minimum observed ping time.
@@ -1228,6 +1243,7 @@ impl PeerManager {
                 },
                 command_tx: cmd_tx,
                 conn_type,
+                noban: false,
                 connected_time: Instant::now(),
                 min_ping_time: None,
                 last_block_time: None,
@@ -1355,12 +1371,63 @@ impl PeerManager {
     }
 
     /// Ban a peer with a specific reason.
+    ///
+    /// Mirrors Bitcoin Core `MaybeDiscourageAndDisconnect` (net_processing.cpp:5083):
+    ///
+    /// * **NoBan** (`noban == true`) → no-op: whitelisted peers are never
+    ///   written to the ban/discourage list and are not disconnected.
+    /// * **Manual** (`ConnectionType::Manual`) → no-op: manually-configured
+    ///   peers (addnode/-addnode) are never banned; Core returns `false`
+    ///   immediately for `IsManualConn()`.
+    /// * **Local address** (loopback / link-local / site-local) → disconnect
+    ///   only, no discourage: avoids polluting the ban-list with local addrs.
+    /// * **All other peers** → write to discourage/ban-list AND disconnect.
     pub async fn ban_peer_with_reason(&mut self, peer_id: PeerId, reason: String) {
-        if let Some(peer) = self.peers.get(&peer_id) {
-            let addr = peer.info.addr;
+        let peer = match self.peers.get(&peer_id) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // NoBan permission → never ban, never disconnect (Core parity).
+        if peer.noban {
+            tracing::debug!(
+                "Peer {} has NoBan permission, skipping ban (reason: {})",
+                peer_id.0, reason
+            );
+            return;
+        }
+
+        // Manual connection → never ban, never disconnect (Core parity).
+        if peer.conn_type == ConnectionType::Manual {
+            tracing::debug!(
+                "Peer {} is a manual connection, skipping ban (reason: {})",
+                peer_id.0, reason
+            );
+            return;
+        }
+
+        let addr = peer.info.addr;
+        let is_local = addr.ip().is_loopback()
+            || matches!(addr.ip(),
+                std::net::IpAddr::V4(v4) if v4.is_link_local() || v4.is_private()
+            );
+
+        if is_local {
+            // Local address: disconnect only, do NOT write to the ban/discourage
+            // list (Core: "don't pollute Discourage list with local addrs").
+            tracing::debug!(
+                "Peer {} has local address {}, disconnecting without ban (reason: {})",
+                peer_id.0, addr, reason
+            );
+            let _ = peer.command_tx.send(PeerCommand::Disconnect).await;
+        } else {
+            // Regular inbound/outbound: discourage + disconnect.
             self.addr_manager.ban(&addr, self.config.ban_duration);
             self.ban_manager.ban_addr(addr, self.config.ban_duration, reason);
-            let _ = peer.command_tx.send(PeerCommand::Disconnect).await;
+            let _ = self.peers[&peer_id]
+                .command_tx
+                .send(PeerCommand::Disconnect)
+                .await;
         }
     }
 
@@ -1472,6 +1539,7 @@ impl PeerManager {
                                     info: info.clone(),
                                     command_tx: cmd_tx,
                                     conn_type: ConnectionType::Inbound,
+                                    noban: false,
                                     connected_time: Instant::now(),
                                     min_ping_time: None,
                                     last_block_time: None,
@@ -2134,6 +2202,7 @@ impl PeerManager {
                 },
                 command_tx: cmd_tx,
                 conn_type: ConnectionType::FullRelay,
+                noban: false,
                 connected_time: old_connected,
                 min_ping_time: None,
                 last_block_time: None,
@@ -2192,6 +2261,58 @@ impl PeerManager {
                 },
                 command_tx: cmd_tx,
                 conn_type: ConnectionType::Inbound,
+                noban: false,
+                connected_time: Instant::now(),
+                min_ping_time: None,
+                last_block_time: None,
+                last_tx_time: None,
+                stale_state: StalePeerState::new(),
+                stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+            },
+        );
+        cmd_rx
+    }
+
+    /// Test-only: insert a peer with specific connection type and noban flag.
+    /// Used by W99 G2 unit tests to exercise the ban-exemption logic without
+    /// a live async runtime.
+    #[cfg(test)]
+    pub(crate) fn insert_test_peer_with_flags(
+        &mut self,
+        peer_id: PeerId,
+        addr: SocketAddr,
+        conn_type: ConnectionType,
+        noban: bool,
+    ) -> mpsc::Receiver<PeerCommand> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        self.peers.insert(
+            peer_id,
+            PeerHandle {
+                info: PeerInfo {
+                    addr,
+                    version: PROTOCOL_VERSION,
+                    services: 0,
+                    user_agent: String::new(),
+                    start_height: 0,
+                    relay: true,
+                    inbound: conn_type == ConnectionType::Inbound,
+                    state: PeerState::Established,
+                    last_send: Instant::now(),
+                    last_recv: Instant::now(),
+                    ping_nonce: None,
+                    ping_time: None,
+                    bytes_sent: 0,
+                    bytes_recv: 0,
+                    time_offset: 0,
+                    supports_witness: false,
+                    supports_sendheaders: false,
+                    supports_wtxid_relay: false,
+                    supports_addrv2: false,
+                    feefilter: 0,
+                },
+                command_tx: cmd_tx,
+                conn_type,
+                noban,
                 connected_time: Instant::now(),
                 min_ping_time: None,
                 last_block_time: None,
