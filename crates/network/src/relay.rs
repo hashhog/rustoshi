@@ -819,6 +819,21 @@ pub fn create_block_inv(block_hash: Hash256, witness: bool) -> InvVector {
     }
 }
 
+/// Build the correct inv entry for a transaction announcement to a single peer.
+///
+/// Per BIP-339 and Bitcoin Core `net_processing.cpp` RelayTransaction:
+/// - `supports_wtxid_relay=true`  → `MSG_WTX (5)` keyed by `wtxid`
+/// - `supports_wtxid_relay=false` → `MSG_TX  (1)` keyed by `txid`
+///
+/// `MSG_WITNESS_TX (0x40000001)` is a BIP-144 getdata flag, not a valid inv type.
+pub fn build_tx_inv_entry(supports_wtxid_relay: bool, txid: Hash256, wtxid: Hash256) -> InvVector {
+    if supports_wtxid_relay {
+        InvVector { inv_type: InvType::MsgWtx, hash: wtxid }
+    } else {
+        InvVector { inv_type: InvType::MsgTx, hash: txid }
+    }
+}
+
 /// Shuffle a slice using Fisher-Yates algorithm.
 ///
 /// Used to randomize the order of transaction announcements.
