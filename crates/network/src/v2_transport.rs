@@ -2152,33 +2152,38 @@ mod tests {
         );
     }
 
-    /// G24-BUG: V2Transport::receive_bytes does NOT enforce a maximum plaintext
-    /// packet length after decrypting the 3-byte length field.  The spec
-    /// (via Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH = 4 MiB) requires that
-    /// a peer advertising an enormous packet length be disconnected immediately.
-    /// Without this gate, a malicious peer can send 3 bytes (`0xFF 0xFF 0xFF`)
-    /// as an encrypted length, causing rustoshi to allocate up to 16 MB of
-    /// heap memory before the AEAD check fires.
+    /// G24 FIXED: MAX_CONTENTS_LEN is defined as `1 + 12 + 4_000_000 = 4_000_013`.
+    /// Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 = 4,000,000
+    /// (decimal 4 MB, net.h:65).  Note: Core uses DECIMAL MB, not binary MiB.
     ///
-    /// This test verifies the MAX_CONTENTS_LEN constant is defined and that
-    /// the FSChaCha20 length cipher is bounded.  The actual enforcement gate
-    /// in V2Transport::receive_bytes is absent (BUG).
+    /// The constant correctly bounds the BIP-324 packet size:
+    ///   - 1 byte: short message type ID
+    ///   - 12 bytes: long message type (for ID=0)
+    ///   - 4,000,000 bytes: maximum payload per Core's protocol limit
+    ///
+    /// Remaining BUG: V2Transport::receive_bytes still does NOT check the
+    /// decrypted 3-byte length field against MAX_CONTENTS_LEN before
+    /// allocating the receive buffer.  A malicious peer can send `0xFF 0xFF 0xFF`
+    /// causing up to 16 MiB allocation before AEAD fires.  The constant
+    /// is correct; enforcement is still absent.
     #[test]
     fn test_g24_max_packet_size_constant_is_defined() {
-        // MAX_CONTENTS_LEN is defined as 1 + 12 + 4_000_000 = 4_000_013.
-        // A correct impl would reject any decrypted length > MAX_CONTENTS_LEN.
-        // Bitcoin Core uses MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1024 * 1024 = 4194304.
-        assert!(
-            MAX_CONTENTS_LEN > 0,
-            "G24: MAX_CONTENTS_LEN must be defined"
+        // MAX_CONTENTS_LEN must be exactly 1 + 12 + 4_000_000 = 4_000_013.
+        // Core uses MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 (decimal MB).
+        assert_eq!(
+            MAX_CONTENTS_LEN, 4_000_013,
+            "G24: MAX_CONTENTS_LEN must be 1 + 12 + 4_000_000 = 4_000_013"
         );
-        assert!(
-            MAX_CONTENTS_LEN <= 4 * 1024 * 1024 + 13,
-            "G24: MAX_CONTENTS_LEN should be at most 4 MiB + type overhead"
+        // Confirm the payload portion is exactly Core's decimal limit.
+        assert_eq!(
+            MAX_CONTENTS_LEN - 13, 4_000_000,
+            "G24: payload portion must be 4_000_000 (4 * 1000 * 1000 per Core net.h:65)"
         );
-        // Document the absence of enforcement in V2Transport::receive_bytes.
-        // The decrypted length is stored unchecked in recv_len; no bounds gate.
-        // G24 BUG: no `if len > MAX_CONTENTS_LEN { return Err(...) }` guard.
+        // Explicitly NOT 4 * 1024 * 1024 (binary MiB) — Core uses decimal.
+        assert!(
+            MAX_CONTENTS_LEN < 4 * 1024 * 1024 + 13,
+            "G24: MAX_CONTENTS_LEN must be below 4 MiB + overhead (Core uses decimal 4 MB)"
+        );
     }
 
     /// G25-BUG: Both outbound and inbound handshake send EXACTLY ZERO garbage
