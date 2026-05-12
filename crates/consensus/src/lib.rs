@@ -92,8 +92,8 @@ pub use versionbits::{
     ALWAYS_ACTIVE, NEVER_ACTIVE, NO_TIMEOUT,
 };
 pub use chain_manager::{
-    block_status, compare_chain_work, find_descendants, get_ancestor, is_ancestor,
-    is_ancestor_or_descendant, BlockMeta, ChainManagementError, ChainManagerState,
-    InvalidateBlockResult, PreciousBlockResult, ReconsiderBlockResult,
+    block_status, compare_chain_work, compare_chain_work_with_tiebreak, find_descendants,
+    get_ancestor, is_ancestor, is_ancestor_or_descendant, BlockMeta, ChainManagementError,
+    ChainManagerState, InvalidateBlockResult, PreciousBlockResult, ReconsiderBlockResult,
 };
 pub use sig_cache::{SigCache, DEFAULT_MAX_ENTRIES};
