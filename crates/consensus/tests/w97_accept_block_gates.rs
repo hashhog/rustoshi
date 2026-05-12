@@ -23,11 +23,12 @@
 //! - CORRECTNESS:         bad input handling but no fork risk
 //! - OBSERVABILITY:       wrong error string / log / metric
 
-use rustoshi_consensus::params::ChainParams;
+use rustoshi_consensus::chain_state::{ChainState, UtxoCache};
+use rustoshi_consensus::params::{ChainParams, MIN_BLOCKS_TO_KEEP};
 use rustoshi_consensus::validation::{
     contextual_check_block_header, BlockIndexEntry, ChainContext, CoinEntry, ValidationError,
 };
-use rustoshi_primitives::{BlockHeader, Hash256, OutPoint};
+use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint};
 use std::collections::HashMap;
 
 // ----------------------------------------------------------------------
@@ -277,19 +278,109 @@ fn g18_already_have_short_circuit() {
     );
 }
 
-/// G19c: fTooFarAhead gate (MIN_BLOCKS_TO_KEEP = 288).
+// G19c: fTooFarAhead gate (MIN_BLOCKS_TO_KEEP = 288).
+//
+// Bitcoin Core AcceptBlock (validation.cpp:4325-4330):
+//   bool fTooFarAhead = (pindex->nHeight > ActiveHeight() + MIN_BLOCKS_TO_KEEP);
+//   if (!fRequested) {
+//       ...
+//       if (fTooFarAhead) return true;   // silent early-return, no error state
+//       ...
+//   }
+//
+// rustoshi equivalent: process_block_at_height with f_requested=false and
+// claimed_height > tip_height + MIN_BLOCKS_TO_KEEP returns BlockTooFarAhead.
+
+/// Helper: build a minimal block that passes no validation (used for gate tests
+/// where we just need the fTooFarAhead check to fire *before* any other check).
+fn build_minimal_block(prev_hash: Hash256) -> Block {
+    Block {
+        header: BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 1_700_000_000,
+            bits: 0x207fffff,
+            nonce: 0,
+        },
+        transactions: vec![],
+    }
+}
+
+/// G19c case 1: unrequested block with claimed nHeight = tip + 289 is rejected.
 ///
-/// Core's AcceptBlock returns `false` without persisting the block if
-/// `nHeight > ActiveHeight + 288`.  This is an anti-DoS gate that
-/// prevents far-future side-branches from being stored.  Constant 288
-/// is only referenced in rustoshi's service-bit comments — never as a
-/// gate.
+/// A peer can lie about a block's height.  If rustoshi would download, validate,
+/// and store such a block, it wastes bandwidth and CPU.  The fTooFarAhead gate
+/// must reject BEFORE any validation work is done.
 ///
 /// Severity: DOS.
 #[test]
-#[ignore = "G19c: no fTooFarAhead check; main.rs only mentions MIN_BLOCKS_TO_KEEP in NODE_NETWORK_LIMITED service-bit comment"]
-fn g19c_too_far_ahead_anti_dos() {
-    assert!(false, "no caller rejects nHeight > tip + 288");
+fn g19c_unrequested_block_too_far_ahead_rejected() {
+    let params = ChainParams::regtest();
+    let genesis_hash = params.genesis_hash;
+    let mut state = ChainState::new(genesis_hash, 0, params);
+    let mut cache = UtxoCache::new(|_: &OutPoint| None, 1000);
+
+    // Block whose prev_hash == tip (would extend), but claimed height is 289.
+    // tip_height=0, claimed_height=289 → 289 > 0 + 288, so fTooFarAhead fires.
+    let claimed_height = MIN_BLOCKS_TO_KEEP + 1; // 289
+    let block = build_minimal_block(genesis_hash);
+
+    let result = state.process_block_at_height(&block, &mut cache, 0, false, claimed_height);
+    assert!(
+        matches!(result, Err(ValidationError::BlockTooFarAhead(289, 0))),
+        "unrequested block at claimed height {claimed_height} (> tip 0 + MIN_BLOCKS_TO_KEEP {MIN_BLOCKS_TO_KEEP}) \
+         must return BlockTooFarAhead; got: {result:?}"
+    );
+    // Tip must not advance
+    assert_eq!(state.tip_height(), 0, "rejected block must not advance tip");
+}
+
+/// G19c case 2: unrequested block with claimed nHeight = tip + 288 (at gate) is
+/// not rejected by fTooFarAhead (may fail for other reasons, but NOT BlockTooFarAhead).
+///
+/// Core: `>` not `>=`, so exactly tip + MIN_BLOCKS_TO_KEEP is allowed.
+#[test]
+fn g19c_unrequested_block_at_gate_not_too_far() {
+    let params = ChainParams::regtest();
+    let genesis_hash = params.genesis_hash;
+    let mut state = ChainState::new(genesis_hash, 0, params);
+    let mut cache = UtxoCache::new(|_: &OutPoint| None, 1000);
+
+    // claimed_height == MIN_BLOCKS_TO_KEEP (288): 288 > 0 + 288 is false → gate does NOT fire.
+    let claimed_height = MIN_BLOCKS_TO_KEEP; // exactly 288
+    let block = build_minimal_block(genesis_hash);
+
+    let result = state.process_block_at_height(&block, &mut cache, 0, false, claimed_height);
+    assert!(
+        !matches!(result, Err(ValidationError::BlockTooFarAhead(_, _))),
+        "block at claimed height {claimed_height} (== tip 0 + {MIN_BLOCKS_TO_KEEP}) \
+         must NOT be rejected by fTooFarAhead; got: {result:?}"
+    );
+}
+
+/// G19c case 3: requested block with claimed nHeight = tip + 289 is NOT rejected.
+///
+/// The fTooFarAhead gate only applies to unrequested blocks (f_requested=false).
+/// A block actively requested via getdata (f_requested=true) must not be rejected
+/// even if its claimed height exceeds tip + MIN_BLOCKS_TO_KEEP.
+#[test]
+fn g19c_requested_block_far_ahead_accepted_past_gate() {
+    let params = ChainParams::regtest();
+    let genesis_hash = params.genesis_hash;
+    let mut state = ChainState::new(genesis_hash, 0, params);
+    let mut cache = UtxoCache::new(|_: &OutPoint| None, 1000);
+
+    // claimed_height = 289 (> tip 0 + 288), but f_requested=true → gate skipped.
+    let claimed_height = MIN_BLOCKS_TO_KEEP + 1; // 289
+    let block = build_minimal_block(genesis_hash);
+
+    let result = state.process_block_at_height(&block, &mut cache, 0, true, claimed_height);
+    assert!(
+        !matches!(result, Err(ValidationError::BlockTooFarAhead(_, _))),
+        "requested block at claimed height {claimed_height} must NOT be rejected \
+         by fTooFarAhead even though it exceeds tip + MIN_BLOCKS_TO_KEEP; got: {result:?}"
+    );
 }
 
 /// G19d: anti-low-work block-side gate.
