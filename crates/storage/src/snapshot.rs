@@ -44,7 +44,7 @@
 
 use crate::db::StorageError;
 use crate::utxo_cache::{Coin, CoinsView};
-use rustoshi_consensus::{AssumeutxoHash, NetworkMagic};
+use rustoshi_consensus::{AssumeutxoHash, NetworkMagic, MAX_MONEY};
 use rustoshi_primitives::{Hash256, OutPoint, TxOut};
 use sha2::{Digest, Sha256};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -237,6 +237,13 @@ pub struct SnapshotReader<R: Read> {
     current_txid: Option<Hash256>,
     /// Number of coins remaining for the active txid.
     coins_remaining_in_txid: u64,
+    /// Optional base height for per-coin validation.
+    ///
+    /// When set, `read_coin` rejects any coin whose recorded height exceeds
+    /// this value, mirroring Bitcoin Core's `PopulateAndValidateSnapshot`
+    /// check at `validation.cpp:5814`:
+    ///   `if (coin.nHeight > base_height)` → error
+    base_height: Option<u32>,
 }
 
 impl<R: Read> SnapshotReader<R> {
@@ -255,7 +262,21 @@ impl<R: Read> SnapshotReader<R> {
             coins_read: 0,
             current_txid: None,
             coins_remaining_in_txid: 0,
+            base_height: None,
         })
+    }
+
+    /// Set the snapshot base block height for per-coin validation.
+    ///
+    /// When set, every call to `read_coin` will reject coins whose recorded
+    /// height exceeds `base_height` with `SnapshotError::MalformedCoin`,
+    /// matching Bitcoin Core's `PopulateAndValidateSnapshot` guard at
+    /// `validation.cpp:5814-5819`.
+    ///
+    /// Call this immediately after `open` before reading any coins.
+    pub fn with_base_height(mut self, base_height: u32) -> Self {
+        self.base_height = Some(base_height);
+        self
     }
 
     /// Get the snapshot metadata.
@@ -322,6 +343,30 @@ impl<R: Read> SnapshotReader<R> {
 
         // ScriptCompression
         let script_pubkey = read_compressed_script(&mut self.reader)?;
+
+        // G8 guard 1: coin.height must not exceed the snapshot's base height.
+        // Mirrors Bitcoin Core validation.cpp::PopulateAndValidateSnapshot L5814-5819:
+        //   if (coin.nHeight > base_height)
+        //     return error("Snapshot UTXO entry has height N greater than snapshot block height M")
+        if let Some(bh) = self.base_height {
+            if height > bh {
+                return Err(SnapshotError::MalformedCoin(format!(
+                    "Snapshot UTXO entry has height {} greater than snapshot block height {}",
+                    height, bh
+                )));
+            }
+        }
+
+        // G8 guard 2: MoneyRange check — value must not exceed 21,000,000 BTC.
+        // Mirrors Bitcoin Core validation.cpp::PopulateAndValidateSnapshot L5820-5822:
+        //   if (!MoneyRange(coin.out.nValue))
+        //     return error("Snapshot UTXO entry has value out of range")
+        if value > MAX_MONEY {
+            return Err(SnapshotError::MalformedCoin(format!(
+                "Snapshot UTXO entry has value out of range: {} > MAX_MONEY ({})",
+                value, MAX_MONEY
+            )));
+        }
 
         let txid = self
             .current_txid
