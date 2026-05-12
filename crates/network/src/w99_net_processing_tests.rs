@@ -20,8 +20,9 @@
 //!   G13 - PASS: find_children() present for orphan recursive resolution
 //!   G14 - FIXED: orphan primary key txid → wtxid per BIP-339 (Core PR #18044 + #28196)
 //!   G15 - BUG (CORRECTNESS): min_pow_checked flag absent in block processing call site
-//!   G16 - BUG (CORRECTNESS): BLOCK_MUTATED → Misbehaving not implemented fleet-side
-//!   G17 - BUG (CORRECTNESS): BLOCK_INVALID_HEADER → Misbehaving not implemented
+//!   G16 - FIXED: BLOCK_MUTATED → MisbehaviorReason::MutatedBlock (100 pts, "mutated-block")
+//!   G17 - FIXED: BLOCK_INVALID_HEADER → MisbehaviorReason::InvalidBlockHeader for ALL
+//!         non-unconnecting header errors (was: only PoW failures; now: all invalid headers)
 //!   G18 - PASS: no InvalidateBlock on side-branch (no such call found)
 //!   G19 - PASS: duplicate version → disconnect (DuplicateVersion) in both v1 and v2 paths
 //!   G20 - PASS: pre-handshake non-version messages → PreHandshakeMessage disconnect
@@ -410,6 +411,101 @@ mod tests {
         assert_eq!(o.len(), 1, "after erasing wtxid_a, one orphan remains");
         assert!(!o.contains(&wtxid_a), "wtxid_a must be gone after erase");
         assert!(o.contains(&wtxid_b), "wtxid_b must survive after wtxid_a erasure");
+    }
+
+    // ─── G16: BLOCK_MUTATED → MisbehaviorReason::MutatedBlock (FIXED) ──────────
+
+    /// G16 FIXED: a peer sending a block whose merkle root is corrupted (or whose
+    /// witness commitment / nonce / unexpected-witness flag is wrong) now triggers
+    /// MisbehaviorReason::MutatedBlock (100-pt instant ban, display "mutated-block"),
+    /// matching Bitcoin Core MaybePunishNodeForBlock BLOCK_MUTATED branch.
+    ///
+    /// Root cause: the block-processing Err() path in main.rs called
+    /// MisbehaviorReason::InvalidBlock for ALL failures, conflating mutated blocks
+    /// with other validation errors.  The fix adds a match on ValidationError
+    /// variants (BadMerkleRoot, BadWitnessCommitment, BadWitnessNonceSize,
+    /// UnexpectedWitness) that selects MutatedBlock instead.
+    ///
+    /// This test asserts the MutatedBlock variant:
+    ///   1. Exists in the enum.
+    ///   2. Has score 100 (instant ban).
+    ///   3. Displays "mutated-block" (Core's string).
+    ///   4. Triggers an instant ban through MisbehaviorTracker.
+    #[test]
+    fn g16_mutated_block_reason_bans_at_100pts() {
+        use crate::misbehavior::MisbehaviorReason;
+
+        // 1. Variant exists and is distinct from InvalidBlock.
+        let reason = MisbehaviorReason::MutatedBlock;
+        assert_ne!(reason, MisbehaviorReason::InvalidBlock,
+            "MutatedBlock must be a separate variant from InvalidBlock");
+
+        // 2. Score is 100 (instant ban, matching Core).
+        assert_eq!(reason.score(), 100,
+            "BLOCK_MUTATED must be a 100-pt instant ban per Core MaybePunishNodeForBlock");
+
+        // 3. Display string matches Core's Misbehaving() message.
+        assert_eq!(reason.to_string(), "mutated-block",
+            "display must be 'mutated-block' to match Core log output");
+
+        // 4. MisbehaviorTracker reaches ban threshold on first hit.
+        let mut tracker = MisbehaviorTracker::new();
+        let peer = PeerId(99);
+        let banned = tracker.misbehaving(peer, MisbehaviorReason::MutatedBlock);
+        assert!(banned,
+            "peer sending mutated block must be banned immediately (score=100 >= BAN_THRESHOLD=100)");
+        assert!(tracker.should_disconnect(peer),
+            "peer must be marked for disconnect after MutatedBlock");
+        assert_eq!(tracker.get_score(peer), 100);
+    }
+
+    // ─── G17: BLOCK_INVALID_HEADER → Misbehaving for all bad headers (FIXED) ──
+
+    /// G17 FIXED: ALL non-unconnecting header errors now trigger
+    /// MisbehaviorReason::InvalidBlockHeader (100-pt instant ban, display "bad-header").
+    ///
+    /// Root cause: main.rs header Err() path checked `e.contains("proof of work")`
+    /// and only fired Misbehaving for PoW failures.  Every other invalid-header
+    /// error (bad version, time-too-new, time-too-old, too-many-headers,
+    /// validate_and_store failures, etc.) was silently ignored — peer could flood
+    /// any number of bad headers at zero ban cost provided they weren't PoW failures.
+    ///
+    /// Fix: removed the `is_invalid_pow` guard; the `else` branch now fires for
+    /// ALL non-unconnecting header errors.
+    ///
+    /// This test asserts the InvalidBlockHeader variant:
+    ///   1. Has score 100 (instant ban).
+    ///   2. Displays "bad-header" (Core's string).
+    ///   3. Triggers instant ban through MisbehaviorTracker.
+    ///   4. The display is distinct from "invalid block header" (old string) to
+    ///      confirm the Display impl was updated to match Core.
+    #[test]
+    fn g17_invalid_block_header_reason_bans_at_100pts() {
+        use crate::misbehavior::MisbehaviorReason;
+
+        let reason = MisbehaviorReason::InvalidBlockHeader;
+
+        // 1. Score is 100 (instant ban).
+        assert_eq!(reason.score(), 100,
+            "BLOCK_INVALID_HEADER must be a 100-pt instant ban per Core MaybePunishNodeForBlock");
+
+        // 2. Display string matches Core's Misbehaving() message ("bad-header").
+        assert_eq!(reason.to_string(), "bad-header",
+            "display must be 'bad-header' to match Core log output");
+
+        // 3. MisbehaviorTracker reaches ban threshold on first hit.
+        let mut tracker = MisbehaviorTracker::new();
+        let peer = PeerId(98);
+        let banned = tracker.misbehaving(peer, MisbehaviorReason::InvalidBlockHeader);
+        assert!(banned,
+            "peer sending invalid block header must be banned immediately");
+        assert!(tracker.should_disconnect(peer),
+            "peer must be marked for disconnect after InvalidBlockHeader");
+        assert_eq!(tracker.get_score(peer), 100);
+
+        // 4. Distinct from old "invalid block header" string (pre-fix display).
+        assert_ne!(reason.to_string(), "invalid block header",
+            "display must have been updated from old 'invalid block header' to 'bad-header'");
     }
 
     // ─── G19: duplicate version → disconnect ─────────────────────────────────
