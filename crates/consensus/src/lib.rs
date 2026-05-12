@@ -66,7 +66,7 @@ pub use validation::{
 };
 pub use chain_state::{ChainState, CompressedScript, UtxoCache};
 pub use fee_estimator::{FeeEstimator, RawBucketStats};
-pub use mempool::{Mempool, MempoolConfig, MempoolEntry, MempoolError};
+pub use mempool::{AtmpOptions, Mempool, MempoolConfig, MempoolEntry, MempoolError};
 pub use orphanage::{
     OrphanEntry, OrphanError, TxOrphanage, MAX_ORPHANS_PER_PEER, MAX_ORPHAN_TRANSACTIONS,
     MAX_ORPHAN_TX_SIZE,

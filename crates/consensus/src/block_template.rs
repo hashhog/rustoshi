@@ -768,6 +768,16 @@ mod tests {
 
     /// Create a mock UTXO set.
     fn mock_utxo_set(utxos: Vec<(OutPoint, u64)>) -> HashMap<OutPoint, CoinEntry> {
+        // W96: use a P2PKH scriptPubKey (standard) so the new
+        // AreInputsStandard gate accepts these mempool fixtures.  See the
+        // matching `mock_utxo_set` in mempool.rs tests.
+        let p2pkh_spk: Vec<u8> = {
+            let mut v = vec![0x76, 0xa9, 0x14];
+            v.extend_from_slice(&[0x42u8; 20]);
+            v.push(0x88);
+            v.push(0xac);
+            v
+        };
         utxos
             .into_iter()
             .map(|(outpoint, value)| {
@@ -777,7 +787,7 @@ mod tests {
                         height: 100,
                         is_coinbase: false,
                         value,
-                        script_pubkey: vec![0x51], // OP_1
+                        script_pubkey: p2pkh_spk.clone(),
                     },
                 )
             })
