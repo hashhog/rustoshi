@@ -24,7 +24,7 @@
 //!   header sync process updates header_tip; block validation updates chain_tip.
 //!   Mixing them up causes the sync coordinator to lose track of progress.
 
-use crate::params::{ChainParams, MEDIAN_TIME_PAST_WINDOW};
+use crate::params::{ChainParams, MEDIAN_TIME_PAST_WINDOW, MIN_BLOCKS_TO_KEEP};
 use crate::validation::{
     check_block, connect_block_with_sequence_locks, contextual_check_block, disconnect_block,
     BlockIndexEntry, CoinEntry, DisconnectResult, SequenceLockContext, StubChainContext,
@@ -397,9 +397,64 @@ impl ChainState {
         block: &Block,
         utxo_cache: &mut U,
         prev_block_mtp: u32,
+        f_requested: bool,
+    ) -> Result<(UndoData, u64), ValidationError> {
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None)
+    }
+
+    /// Variant of `process_block` that accepts an explicit `claimed_height`.
+    ///
+    /// Use this when a caller has a block-index entry with a pre-assigned height
+    /// (e.g. from the header-sync chain) and wants the `fTooFarAhead` gate to
+    /// fire based on that height rather than `tip_height + 1`.
+    ///
+    /// Mirrors Bitcoin Core `AcceptBlock` (validation.cpp:4325) where
+    /// `pindex->nHeight` is the height assigned during header processing.
+    pub fn process_block_at_height<U: UtxoView>(
+        &mut self,
+        block: &Block,
+        utxo_cache: &mut U,
+        prev_block_mtp: u32,
+        f_requested: bool,
+        claimed_height: u32,
+    ) -> Result<(UndoData, u64), ValidationError> {
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, Some(claimed_height))
+    }
+
+    fn process_block_inner<U: UtxoView>(
+        &mut self,
+        block: &Block,
+        utxo_cache: &mut U,
+        prev_block_mtp: u32,
+        f_requested: bool,
+        claimed_height: Option<u32>,
     ) -> Result<(UndoData, u64), ValidationError> {
         let hash = block.block_hash();
         let new_height = self.tip_height + 1;
+
+        // G19c: fTooFarAhead anti-DoS gate.
+        //
+        // Mirrors Bitcoin Core `AcceptBlock` (validation.cpp:4325-4330):
+        //   bool fTooFarAhead = (pindex->nHeight > ActiveHeight() + MIN_BLOCKS_TO_KEEP);
+        //   if (!fRequested) {
+        //       ...
+        //       if (fTooFarAhead) return true;   // silent early-return, no error
+        //       ...
+        //   }
+        //
+        // `claimed_height` is the height that the caller's block index
+        // has assigned to this block (from header-first sync).  When absent,
+        // we default to `new_height = tip_height + 1` (the only height
+        // process_block can actually connect), which can never exceed
+        // tip_height + MIN_BLOCKS_TO_KEEP (1 ≤ 288).
+        //
+        // The gate fires when a peer pushes block body data for a side-branch
+        // that is 289+ blocks ahead of our current active chain tip, forcing
+        // us to download and validate it before we have the intervening chain.
+        let height_to_check = claimed_height.unwrap_or(new_height);
+        if !f_requested && height_to_check > self.tip_height.saturating_add(MIN_BLOCKS_TO_KEEP) {
+            return Err(ValidationError::BlockTooFarAhead(height_to_check, self.tip_height));
+        }
 
         // Verify it extends our chain
         if block.header.prev_block_hash != self.tip_hash {
@@ -1092,7 +1147,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache, 0);
+        let result = state.process_block(&block, &mut cache, 0, true);
 
         assert!(result.is_err());
         match result {
@@ -1182,7 +1237,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache, 0);
+        let result = state.process_block(&block, &mut cache, 0, true);
         if let Err(ValidationError::PrevBlockNotFound(h)) = &result {
             panic!(
                 "ChainState::new(snapshot_hash, snapshot_height) did not bind \
@@ -1256,7 +1311,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache, 0);
+        let result = state.process_block(&block, &mut cache, 0, true);
 
         // We may get *some* validation error (e.g. the merkle root may be
         // computed differently, or PoW may fail), but we MUST NOT get
@@ -2013,7 +2068,7 @@ mod tests {
         // Recompute merkle root so we don't fail check_block first.
         block.header.merkle_root = block.compute_merkle_root();
 
-        let result = state.process_block(&block, &mut cache, 0);
+        let result = state.process_block(&block, &mut cache, 0, true);
         // Either BadWitnessCommitment surfaces, or pow check fires first
         // (depends on regtest params).  We accept either rejection — the
         // critical thing is that the block is NOT silently accepted.
