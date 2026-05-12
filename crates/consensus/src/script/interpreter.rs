@@ -367,6 +367,15 @@ pub enum ScriptError {
     /// validation MUST NOT set that flag; it is only for relay/mempool.
     #[error("discouraged upgradable taproot version")]
     DiscourageUpgradableTaprootVersion,
+    /// Mirrors Bitcoin Core `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_PUBKEYTYPE`
+    /// (script/script_error.h, interpreter.cpp:379-381). Returned when a
+    /// tapscript CHECKSIG/CHECKSIGVERIFY/CHECKSIGADD encounters a pubkey
+    /// whose size is neither 0 nor 32 (i.e. an upgradable future-version
+    /// pubkey type) AND the policy flag
+    /// `verify_discourage_upgradable_pubkeytype` is set. Consensus
+    /// validation MUST NOT set that flag; it is only for relay/mempool.
+    #[error("discouraged upgradable pubkey type")]
+    DiscourageUpgradablePubkeyType,
 }
 
 /// Signature version for sighash computation.
@@ -1557,9 +1566,20 @@ fn eval_script_internal(
                         }
                         ctx.push(bool_to_stack(success))?;
                     } else {
-                        // Unknown pubkey type in tapscript: succeeds unconditionally
-                        // (soft-fork safe: future key types)
-                        ctx.push(bool_to_stack(true))?;
+                        // BIP-342: unknown pubkey type (length != 0 and != 32).
+                        // Bitcoin Core (interpreter.cpp:347-385 `EvalChecksigTapscript`)
+                        // sets `success = !sig.empty()` BEFORE the pubkey-size
+                        // branching, and does NOT modify success for the unknown
+                        // pubkey branch (lines 373-382). So:
+                        //   - empty sig + unknown pubkey  -> push false
+                        //   - non-empty sig + unknown pkt -> push true
+                        // PLUS: if SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+                        // is set (Core lines 379-381), fail-fast with the dedicated
+                        // error regardless of sig emptiness.
+                        if ctx.flags.verify_discourage_upgradable_pubkeytype {
+                            return Err(ScriptError::DiscourageUpgradablePubkeyType);
+                        }
+                        ctx.push(bool_to_stack(!sig.is_empty()))?;
                     }
                 } else {
                     // Legacy / SegWit v0 CHECKSIG
@@ -1629,8 +1649,24 @@ fn eval_script_internal(
                         if !success {
                             return Err(ScriptError::CheckSigVerifyFailed);
                         }
+                    } else {
+                        // BIP-342 unknown pubkey type — same semantics as
+                        // CHECKSIG above. Core's CHECKSIGVERIFY is just
+                        // CHECKSIG followed by an implicit VERIFY: if the
+                        // pushed boolean is false, error with
+                        // SCRIPT_ERR_CHECKSIGVERIFY (interpreter.cpp:1074-1080).
+                        // For an unknown pubkey type, `success = !sig.empty()`
+                        // from Core line 357, never modified for the unknown
+                        // branch (lines 373-382). So empty sig MUST error.
+                        if ctx.flags.verify_discourage_upgradable_pubkeytype {
+                            return Err(ScriptError::DiscourageUpgradablePubkeyType);
+                        }
+                        if sig.is_empty() {
+                            return Err(ScriptError::CheckSigVerifyFailed);
+                        }
+                        // Non-empty sig + unknown pubkey: Core pushes true
+                        // then VERIFY pops it. No stack effect, no error.
                     }
-                    // Unknown pubkey type: succeeds unconditionally
                 } else {
                     // STRICTENC/DERSIG/LOW_S signature encoding checks
                     check_signature_encoding(&sig, ctx.flags)?;
@@ -1993,10 +2029,19 @@ fn eval_script_internal(
                         false
                     }
                 } else {
-                    // BIP-342: unknown pubkey type — succeed unconditionally
-                    // (soft-fork safe). DISCOURAGE_UPGRADABLE_PUBKEYTYPE
-                    // is a SegWit-v0 flag and does NOT apply to tapscript.
-                    true
+                    // BIP-342: unknown pubkey type (length != 0 and != 32).
+                    // Bitcoin Core `EvalChecksigTapscript` (interpreter.cpp:347-385)
+                    // sets `success = !sig.empty()` at line 357 before the
+                    // pubkey-size branching and never modifies it in the
+                    // unknown-pubkey branch (lines 373-382). The previous
+                    // `true` here was wrong: it caused CHECKSIGADD to add 1
+                    // even with an empty signature against a future-version
+                    // pubkey type, diverging from Core. DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+                    // IS a tapscript-applicable flag (Core lines 379-381).
+                    if ctx.flags.verify_discourage_upgradable_pubkeytype {
+                        return Err(ScriptError::DiscourageUpgradablePubkeyType);
+                    }
+                    !sig.is_empty()
                 };
 
                 if !success && !sig.is_empty() {
@@ -5811,6 +5856,201 @@ mod tests {
         assert!(
             matches!(result, Err(ScriptError::PushSize)),
             "v0 P2WPKH with oversized witness item must reject: {result:?}"
+        );
+    }
+
+    // ==================================================================
+    // W95 BIP-340 Schnorr — tapscript unknown-pubkey-type semantics
+    //
+    // Core sets `success = !sig.empty()` BEFORE the pubkey-size branching
+    // (interpreter.cpp:357), and the unknown-pubkey branch (lines 373-382)
+    // never modifies `success`. Therefore:
+    //   - empty sig + unknown pubkey:  success=false  → CHECKSIG pushes false,
+    //                                  CHECKSIGVERIFY errors,
+    //                                  CHECKSIGADD adds 0.
+    //   - non-empty sig + unknown pkt: success=true   → CHECKSIG pushes true,
+    //                                  CHECKSIGVERIFY pops the true,
+    //                                  CHECKSIGADD adds 1.
+    // Pre-fix rustoshi treated ALL unknown-pubkey paths as unconditional
+    // success regardless of sig emptiness — wrong for the empty-sig case.
+    // ==================================================================
+
+    /// CHECKSIG with empty sig + 33-byte pubkey (unknown type) must push
+    /// FALSE. Pre-fix it pushed TRUE.
+    #[test]
+    fn w95_tapscript_checksig_unknown_pkt_empty_sig_pushes_false() {
+        let pubkey = vec![0x02u8; 33];
+        let mut stack: Stack = vec![vec![], pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xacu8]; // OP_CHECKSIG
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 1000);
+        assert!(res.is_ok(), "must not error: {res:?}");
+        assert!(
+            !stack_bool(&stack[0]),
+            "empty sig + unknown pubkey must push FALSE (Core line 357: success = !sig.empty())"
+        );
+    }
+
+    /// CHECKSIG with non-empty sig + 33-byte pubkey (unknown type) must
+    /// push TRUE — soft-fork-safe future signature schemes.
+    #[test]
+    fn w95_tapscript_checksig_unknown_pkt_nonempty_sig_pushes_true() {
+        let pubkey = vec![0x02u8; 33];
+        let sig = vec![0x42u8; 64];
+        let mut stack: Stack = vec![sig, pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xacu8]; // OP_CHECKSIG
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 1000);
+        assert!(res.is_ok(), "must not error: {res:?}");
+        assert!(
+            stack_bool(&stack[0]),
+            "non-empty sig + unknown pubkey must push TRUE (soft-fork safe)"
+        );
+    }
+
+    /// CHECKSIGVERIFY with empty sig + 33-byte pubkey (unknown type) MUST
+    /// error with CheckSigVerifyFailed (Core: success=false → SCRIPT_ERR_CHECKSIGVERIFY
+    /// at line 1079). Pre-fix it silently succeeded.
+    #[test]
+    fn w95_tapscript_checksigverify_unknown_pkt_empty_sig_errors() {
+        let pubkey = vec![0x02u8; 33];
+        let mut stack: Stack = vec![vec![], pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xadu8]; // OP_CHECKSIGVERIFY
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 1000);
+        assert!(
+            matches!(res, Err(ScriptError::CheckSigVerifyFailed)),
+            "empty sig + unknown pubkey under CHECKSIGVERIFY must fail: {res:?}"
+        );
+    }
+
+    /// CHECKSIGVERIFY with non-empty sig + 33-byte pubkey (unknown type)
+    /// MUST succeed (Core: success=true → VERIFY pops the true).
+    #[test]
+    fn w95_tapscript_checksigverify_unknown_pkt_nonempty_sig_succeeds() {
+        let pubkey = vec![0x02u8; 33];
+        let sig = vec![0x42u8; 64];
+        // OP_CHECKSIGVERIFY followed by OP_TRUE so we have something on
+        // the stack to assert against. (Bare CHECKSIGVERIFY leaves the
+        // stack empty when it succeeds and `eval_script_tapscript` would
+        // then fail the clean-stack-at-end script-result check.)
+        let mut stack: Stack = vec![sig, pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xadu8, 0x51u8]; // OP_CHECKSIGVERIFY OP_1
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 1000);
+        assert!(res.is_ok(), "non-empty sig + unknown pubkey must succeed: {res:?}");
+    }
+
+    /// CHECKSIGADD with empty sig + 33-byte pubkey (unknown type) must
+    /// ADD 0, not 1. Pre-fix the unknown-pubkey branch hard-coded
+    /// `success = true`, causing the counter to spuriously increment.
+    #[test]
+    fn w95_tapscript_checksigadd_unknown_pkt_empty_sig_adds_zero() {
+        let pubkey = vec![0x02u8; 33];
+        let num = vec![0x05u8]; // num = 5
+        // Stack (bottom → top): sig, num, pubkey
+        let mut stack: Stack = vec![vec![], num, pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xbau8]; // OP_CHECKSIGADD
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 1000);
+        assert!(res.is_ok(), "must not error: {res:?}");
+        let pushed = decode_script_num(&stack[0], false, 4).unwrap();
+        assert_eq!(
+            pushed, 5,
+            "empty sig + unknown pubkey: CHECKSIGADD must leave num unchanged"
+        );
+    }
+
+    /// CHECKSIGADD with non-empty sig + 33-byte pubkey (unknown type)
+    /// must ADD 1 (soft-fork-safe future scheme treated as valid).
+    #[test]
+    fn w95_tapscript_checksigadd_unknown_pkt_nonempty_sig_adds_one() {
+        let pubkey = vec![0x02u8; 33];
+        let num = vec![0x05u8];
+        let sig = vec![0x42u8; 64];
+        let mut stack: Stack = vec![sig, num, pubkey];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xbau8];
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 1000);
+        assert!(res.is_ok(), "must not error: {res:?}");
+        let pushed = decode_script_num(&stack[0], false, 4).unwrap();
+        assert_eq!(pushed, 6, "non-empty sig + unknown pubkey: +1");
+    }
+
+    /// DISCOURAGE_UPGRADABLE_PUBKEYTYPE: when set (relay/mempool), an
+    /// unknown pubkey type errors out instead of being treated as
+    /// soft-fork-safe success. Core: interpreter.cpp:379-381.
+    #[test]
+    fn w95_tapscript_checksig_discourage_upgradable_pubkeytype_errors() {
+        let pubkey = vec![0x02u8; 33];
+        let sig = vec![0x42u8; 64];
+        let mut stack: Stack = vec![sig, pubkey];
+        let mut flags = ScriptFlags::default();
+        flags.verify_discourage_upgradable_pubkeytype = true;
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xacu8];
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 1000);
+        assert!(
+            matches!(res, Err(ScriptError::DiscourageUpgradablePubkeyType)),
+            "DISCOURAGE flag must reject unknown pubkey type: {res:?}"
+        );
+    }
+
+    /// Same DISCOURAGE flag, but on CHECKSIGADD.
+    #[test]
+    fn w95_tapscript_checksigadd_discourage_upgradable_pubkeytype_errors() {
+        let pubkey = vec![0x02u8; 33];
+        let num = vec![];
+        let sig = vec![0x42u8; 64];
+        let mut stack: Stack = vec![sig, num, pubkey];
+        let mut flags = ScriptFlags::default();
+        flags.verify_discourage_upgradable_pubkeytype = true;
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xbau8];
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 1000);
+        assert!(
+            matches!(res, Err(ScriptError::DiscourageUpgradablePubkeyType)),
+            "DISCOURAGE flag must reject unknown pubkey type on CHECKSIGADD: {res:?}"
+        );
+    }
+
+    /// Empty pubkey is always SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY,
+    /// regardless of sig emptiness or DISCOURAGE flag (Core line 367-368).
+    /// Pre-fix this was already correct; this test pins the contract.
+    #[test]
+    fn w95_tapscript_checksig_empty_pubkey_errors() {
+        let mut stack: Stack = vec![vec![0u8; 64], vec![]];
+        let flags = ScriptFlags::default();
+        let checker = AlwaysTrueSchnorrChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let script = [0xacu8];
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 1000);
+        assert!(
+            matches!(res, Err(ScriptError::TapscriptEmptyPubkey)),
+            "empty pubkey must trigger TapscriptEmptyPubkey: {res:?}"
         );
     }
 }
