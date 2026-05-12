@@ -28,7 +28,8 @@
 
 use crate::block_template::is_final_tx;
 use crate::params::{
-    ANNEX_TAG, COINBASE_MATURITY, DUST_RELAY_TX_FEE, MAX_STANDARD_P2WSH_SCRIPT_SIZE,
+    ANNEX_TAG, COINBASE_MATURITY, DUST_RELAY_TX_FEE, MAX_P2SH_SIGOPS,
+    MAX_STANDARD_P2WSH_SCRIPT_SIZE,
     MAX_STANDARD_P2WSH_STACK_ITEMS, MAX_STANDARD_P2WSH_STACK_ITEM_SIZE,
     MAX_STANDARD_SCRIPTSIG_SIZE, MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE,
     MAX_STANDARD_TX_SIGOPS_COST, MAX_STANDARD_TX_WEIGHT, MIN_STANDARD_TX_NONWITNESS_SIZE,
@@ -38,8 +39,8 @@ use crate::params::MAX_MONEY;
 use crate::script::{is_p2a, is_p2sh, parse_witness_program, verify_script, ScriptFlags};
 use crate::validation::{
     calculate_sequence_locks, check_sequence_locks, check_transaction, CoinEntry,
-    get_transaction_sigop_cost, SequenceLockContext, TransactionSignatureChecker,
-    TxValidationError,
+    count_script_sigops, get_transaction_sigop_cost, SequenceLockContext,
+    TransactionSignatureChecker, TxValidationError,
 };
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxOut};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1562,6 +1563,28 @@ impl Mempool {
                     StandardScriptType::NonStandard | StandardScriptType::WitnessUnknown
                 ) {
                     return Err(MempoolError::InputsNonStandard(i));
+                }
+
+                // P2SH redeem-script sigops gate: mirrors Core policy.cpp:241-258.
+                // For P2SH prevouts, extract the redeemScript from the scriptSig
+                // (last push element) and count accurate sigops.  If sigops > 15
+                // (MAX_P2SH_SIGOPS), reject as non-standard.  This is distinct from
+                // the block-level sigop cost gate (MAX_STANDARD_TX_SIGOPS_COST = 16,000)
+                // which counts scaled sigop cost; this gate limits per-redeemScript
+                // unscaled sigops to 15 so a single P2SH input cannot be a
+                // sigop-bomb.
+                if kind == StandardScriptType::P2SH {
+                    let input = &tx.inputs[i];
+                    let redeem_opt = parse_p2sh_redeem_script_from_scriptsig(&input.script_sig);
+                    if let Some(redeem) = redeem_opt {
+                        let sigop_count = count_script_sigops(&redeem, true);
+                        if sigop_count > MAX_P2SH_SIGOPS {
+                            return Err(MempoolError::InputsNonStandard(i));
+                        }
+                    }
+                    // If the scriptSig is empty/malformed we cannot extract the
+                    // redeemScript; leave the sigops check unenforced for now
+                    // (script verification will catch it later in PolicyScriptChecks).
                 }
             }
         }
@@ -10272,6 +10295,113 @@ mod tests {
         let result = mempool.add_transaction(tx, &|op| nonstd_utxos.get(op).cloned());
         assert!(matches!(result, Err(MempoolError::InputsNonStandard(0))),
             "spending non-standard prevout must be rejected, got {:?}", result);
+    }
+
+    /// W96 gate 12 (WITNESS_UNKNOWN): spending a future witness version (v2-v16)
+    /// prevout is rejected as non-standard.
+    ///
+    /// Mirrors Core policy.cpp:234-238: whichType == TxoutType::WITNESS_UNKNOWN →
+    /// TX_INPUTS_NOT_STANDARD "input {} witness program is undefined".
+    #[test]
+    fn test_w96_inputs_witness_unknown_rejected() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let prev = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000cd"
+        ).unwrap();
+        // WITNESS_UNKNOWN scriptPubKey: OP_2 (0x52) + PUSH32 (0x20) + 32 zero bytes.
+        // This matches a v2 witness program (reserved for future soft forks).
+        // classify_standard_script returns WitnessUnknown for OP_2..OP_16 + 2-40 byte push.
+        let witness_unknown_spk: Vec<u8> = {
+            let mut s = vec![0x52u8, 0x20u8]; // OP_2, PUSH32
+            s.extend_from_slice(&[0u8; 32]);   // 32-byte program
+            s
+        };
+        let utxos: HashMap<OutPoint, CoinEntry> = {
+            let mut m = HashMap::new();
+            m.insert(
+                OutPoint { txid: prev, vout: 0 },
+                CoinEntry {
+                    height: 100,
+                    is_coinbase: false,
+                    value: 100_000,
+                    script_pubkey: witness_unknown_spk,
+                },
+            );
+            m
+        };
+        let tx = make_tx(vec![(prev, 0)], vec![90_000], 1);
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(matches!(result, Err(MempoolError::InputsNonStandard(0))),
+            "spending WITNESS_UNKNOWN prevout must be rejected, got {:?}", result);
+    }
+
+    /// W96 gate 12 (P2SH sigops): spending a P2SH prevout whose redeemScript
+    /// has more than MAX_P2SH_SIGOPS (15) accurate sigops is rejected.
+    ///
+    /// Mirrors Core policy.cpp:241-258: P2SH redeemScript sigop_count > MAX_P2SH_SIGOPS →
+    /// TX_INPUTS_NOT_STANDARD "p2sh redeemscript sigops exceed limit".
+    #[test]
+    fn test_w96_inputs_p2sh_sigops_over_limit_rejected() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+
+        // Build a P2SH prevout whose redeemScript has 16 OP_CHECKSIG (> 15 limit).
+        let prev = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000ce"
+        ).unwrap();
+
+        // redeemScript: 16 × OP_CHECKSIG (0xac) → 16 accurate sigops
+        let redeem_script: Vec<u8> = vec![0xacu8; 16];
+
+        // scriptSig: direct-push of redeemScript (len = 16 ≤ 75, so 1-byte push)
+        let mut script_sig = Vec::new();
+        script_sig.push(redeem_script.len() as u8); // 0x10 = PUSH16
+        script_sig.extend_from_slice(&redeem_script);
+
+        // P2SH scriptPubKey: OP_HASH160 PUSH20 <20 bytes> OP_EQUAL
+        let p2sh_spk: Vec<u8> = {
+            let mut s = vec![0xa9u8, 0x14u8];
+            s.extend_from_slice(&[0xabu8; 20]);
+            s.push(0x87u8);
+            s
+        };
+
+        let utxos: HashMap<OutPoint, CoinEntry> = {
+            let mut m = HashMap::new();
+            m.insert(
+                OutPoint { txid: prev, vout: 0 },
+                CoinEntry {
+                    height: 100,
+                    is_coinbase: false,
+                    value: 100_000,
+                    script_pubkey: p2sh_spk,
+                },
+            );
+            m
+        };
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev, vout: 0 },
+                script_sig,
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 90_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(matches!(result, Err(MempoolError::InputsNonStandard(0))),
+            "P2SH redeemScript with 16 sigops (> MAX_P2SH_SIGOPS=15) must be rejected, got {:?}", result);
     }
 
     /// W96 gate 4: 65-byte CVE-2017-12842 cap — a 64-byte tx must be
