@@ -141,12 +141,18 @@ impl std::fmt::Display for MisbehaviorReason {
 }
 
 /// Per-peer misbehavior tracking.
+///
+/// Follows Bitcoin Core PR #25974 (2022): any Misbehaving() call sets
+/// m_should_discourage = true immediately — no score accumulation to a
+/// threshold.  The score field is retained for logging only.
 #[derive(Debug, Clone)]
 pub struct PeerMisbehavior {
-    /// Accumulated misbehavior score.
+    /// Accumulated misbehavior score (retained for log context only;
+    /// NOT used to gate disconnection — any non-zero score discourages).
     pub score: u32,
-    /// Whether this peer should be disconnected.
-    pub should_disconnect: bool,
+    /// Set to true on the first Misbehaving() call — single-event model
+    /// matching Core's m_should_discourage.
+    pub should_discourage: bool,
 }
 
 impl Default for PeerMisbehavior {
@@ -160,19 +166,17 @@ impl PeerMisbehavior {
     pub fn new() -> Self {
         Self {
             score: 0,
-            should_disconnect: false,
+            should_discourage: false,
         }
     }
 
-    /// Add misbehavior points. Returns true if threshold reached.
+    /// Record a misbehavior event. Sets should_discourage=true immediately
+    /// (single-event model, Core PR #25974). Score is accumulated for logging.
+    /// Always returns true — one call is always enough to discourage.
     pub fn add_score(&mut self, howmuch: u32) -> bool {
         self.score = self.score.saturating_add(howmuch);
-        if self.score >= BAN_THRESHOLD {
-            self.should_disconnect = true;
-            true
-        } else {
-            false
-        }
+        self.should_discourage = true;
+        true
     }
 }
 
@@ -450,35 +454,28 @@ impl MisbehaviorTracker {
 
     /// Record misbehavior for a peer.
     ///
-    /// Returns true if the peer should be disconnected and banned.
+    /// Per Core PR #25974 (2022): always returns true — one Misbehaving call
+    /// immediately sets should_discourage=true and triggers disconnection.
     pub fn misbehaving(&mut self, peer_id: PeerId, reason: MisbehaviorReason) -> bool {
         let score = reason.score();
         let peer = self.peers.entry(peer_id).or_default();
-        let should_ban = peer.add_score(score);
+        peer.add_score(score);
 
-        if should_ban {
-            tracing::info!(
-                "Misbehaving: peer={} score={} reason={}",
-                peer_id.0,
-                peer.score,
-                reason
-            );
-        } else {
-            tracing::debug!(
-                "Misbehaving: peer={} score={} (+{}) reason={}",
-                peer_id.0,
-                peer.score,
-                score,
-                reason
-            );
-        }
+        tracing::info!(
+            "Misbehaving: peer={} score={} (+{}) reason={} (discouraging immediately)",
+            peer_id.0,
+            peer.score,
+            score,
+            reason
+        );
 
-        should_ban
+        true
     }
 
     /// Record misbehavior with a custom score.
     ///
-    /// Returns true if the peer should be disconnected and banned.
+    /// Per Core PR #25974 (2022): always returns true — one Misbehaving call
+    /// immediately sets should_discourage=true and triggers disconnection.
     pub fn misbehaving_with_score(
         &mut self,
         peer_id: PeerId,
@@ -486,7 +483,7 @@ impl MisbehaviorTracker {
         message: &str,
     ) -> bool {
         let peer = self.peers.entry(peer_id).or_default();
-        let should_ban = peer.add_score(howmuch);
+        peer.add_score(howmuch);
 
         let message_suffix = if message.is_empty() {
             String::new()
@@ -494,24 +491,15 @@ impl MisbehaviorTracker {
             format!(": {}", message)
         };
 
-        if should_ban {
-            tracing::info!(
-                "Misbehaving: peer={} score={}{}",
-                peer_id.0,
-                peer.score,
-                message_suffix
-            );
-        } else {
-            tracing::debug!(
-                "Misbehaving: peer={} score={} (+{}){}",
-                peer_id.0,
-                peer.score,
-                howmuch,
-                message_suffix
-            );
-        }
+        tracing::info!(
+            "Misbehaving: peer={} score={} (+{}){}  (discouraging immediately)",
+            peer_id.0,
+            peer.score,
+            howmuch,
+            message_suffix
+        );
 
-        should_ban
+        true
     }
 
     /// Get the current score for a peer.
@@ -519,11 +507,13 @@ impl MisbehaviorTracker {
         self.peers.get(&peer_id).map(|p| p.score).unwrap_or(0)
     }
 
-    /// Check if a peer should be disconnected.
+    /// Check if a peer should be discouraged (disconnected + banned).
+    ///
+    /// Returns true once any Misbehaving call has been recorded for this peer.
     pub fn should_disconnect(&self, peer_id: PeerId) -> bool {
         self.peers
             .get(&peer_id)
-            .map(|p| p.should_disconnect)
+            .map(|p| p.should_discourage)
             .unwrap_or(false)
     }
 
@@ -544,35 +534,36 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_peer_misbehavior_score_accumulation() {
+    fn test_peer_misbehavior_single_event_discourage() {
+        // Core PR #25974 (2022): any Misbehaving call sets should_discourage=true
+        // immediately, regardless of score value.
         let mut peer = PeerMisbehavior::new();
         assert_eq!(peer.score, 0);
-        assert!(!peer.should_disconnect);
+        assert!(!peer.should_discourage);
 
-        // Add small score
-        assert!(!peer.add_score(10));
+        // A single low-score call must discourage immediately (not wait for 100).
+        assert!(peer.add_score(10), "first add_score must return true (single-event)");
         assert_eq!(peer.score, 10);
-        assert!(!peer.should_disconnect);
+        assert!(peer.should_discourage, "should_discourage must be true after first call");
 
-        // Add more
-        assert!(!peer.add_score(50));
+        // Score accumulates for logging purposes.
+        assert!(peer.add_score(50));
         assert_eq!(peer.score, 60);
-        assert!(!peer.should_disconnect);
+        assert!(peer.should_discourage);
 
-        // Cross threshold
         assert!(peer.add_score(40));
         assert_eq!(peer.score, 100);
-        assert!(peer.should_disconnect);
+        assert!(peer.should_discourage);
     }
 
     #[test]
     fn test_peer_misbehavior_instant_ban() {
         let mut peer = PeerMisbehavior::new();
 
-        // 100 points = instant ban
+        // 100 points — discouraged immediately (same as any other value).
         assert!(peer.add_score(100));
         assert_eq!(peer.score, 100);
-        assert!(peer.should_disconnect);
+        assert!(peer.should_discourage);
     }
 
     #[test]
@@ -581,18 +572,16 @@ mod tests {
         let peer1 = PeerId(1);
         let peer2 = PeerId(2);
 
-        // Peer 1: invalid transaction (10 points)
-        assert!(!tracker.misbehaving(peer1, MisbehaviorReason::InvalidTransaction));
+        // Peer 1: invalid transaction (10 points) — single-event: discouraged immediately.
+        assert!(tracker.misbehaving(peer1, MisbehaviorReason::InvalidTransaction),
+            "single-event: first Misbehaving call must return true");
         assert_eq!(tracker.get_score(peer1), 10);
+        assert!(tracker.should_disconnect(peer1), "peer1 must be marked for discourage on first call");
 
-        // Peer 2: invalid block header (instant ban)
+        // Peer 2: invalid block header (instant ban).
         assert!(tracker.misbehaving(peer2, MisbehaviorReason::InvalidBlockHeader));
         assert_eq!(tracker.get_score(peer2), 100);
         assert!(tracker.should_disconnect(peer2));
-
-        // Peer 1 not affected
-        assert_eq!(tracker.get_score(peer1), 10);
-        assert!(!tracker.should_disconnect(peer1));
     }
 
     #[test]
@@ -745,12 +734,15 @@ mod tests {
         let mut tracker = MisbehaviorTracker::new();
         let peer_id = PeerId(1);
 
-        // Custom score of 50
-        assert!(!tracker.misbehaving_with_score(peer_id, 50, "custom reason"));
+        // Single-event: first call immediately triggers discourage, regardless of score.
+        assert!(tracker.misbehaving_with_score(peer_id, 50, "custom reason"),
+            "single-event: first misbehaving_with_score must return true");
         assert_eq!(tracker.get_score(peer_id), 50);
+        assert!(tracker.should_disconnect(peer_id), "should_disconnect after first call");
 
-        // Another 50 should trigger ban
+        // Subsequent calls continue accumulating score for log context.
         assert!(tracker.misbehaving_with_score(peer_id, 50, "another reason"));
+        assert_eq!(tracker.get_score(peer_id), 100);
         assert!(tracker.should_disconnect(peer_id));
     }
 

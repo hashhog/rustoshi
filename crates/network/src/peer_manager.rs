@@ -1431,9 +1431,10 @@ impl PeerManager {
         }
     }
 
-    /// Record misbehavior for a peer. Returns true if the peer was banned.
+    /// Record misbehavior for a peer. Always returns true (single-event model).
     ///
-    /// If the misbehavior score reaches 100, the peer is disconnected and banned.
+    /// Per Core PR #25974 (2022): any Misbehaving call immediately discourages
+    /// the peer — no score accumulation to a threshold required.
     pub async fn misbehaving(&mut self, peer_id: PeerId, reason: MisbehaviorReason) -> bool {
         let should_ban = self.misbehavior_tracker.misbehaving(peer_id, reason.clone());
 
@@ -1444,9 +1445,9 @@ impl PeerManager {
         should_ban
     }
 
-    /// Record misbehavior with a custom score and message. Returns true if the peer was banned.
+    /// Record misbehavior with a custom score and message. Always returns true (single-event model).
     ///
-    /// This mirrors Bitcoin Core's Misbehaving(peer, howmuch, message) signature.
+    /// Per Core PR #25974 (2022): any Misbehaving call immediately discourages the peer.
     pub async fn misbehaving_with_score(
         &mut self,
         peer_id: PeerId,
@@ -3786,12 +3787,12 @@ mod tests {
         // Initial score should be 0
         assert_eq!(mgr.get_misbehavior_score(peer_id), 0);
 
-        // Record a minor violation (10 points)
+        // Single-event (Core PR #25974): first Misbehaving call discourages immediately.
         let banned = mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction).await;
-        assert!(!banned);
+        assert!(banned, "single-event: first call must return true");
         assert_eq!(mgr.get_misbehavior_score(peer_id), 10);
 
-        // Record more violations
+        // Subsequent calls accumulate score for log context.
         mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction).await;
         mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction).await;
         assert_eq!(mgr.get_misbehavior_score(peer_id), 30);
@@ -3864,20 +3865,19 @@ mod tests {
 
         let peer_id = PeerId(1);
 
-        // Add 50 points with custom message
+        // Single-event (Core PR #25974): first call discourages immediately.
         let banned = mgr.misbehaving_with_score(peer_id, 50, "custom violation").await;
-        assert!(!banned);
+        assert!(banned, "single-event: first misbehaving_with_score must return true");
         assert_eq!(mgr.get_misbehavior_score(peer_id), 50);
 
-        // Add 50 more points - should trigger ban
+        // Subsequent calls accumulate score for log context.
         let banned = mgr.misbehaving_with_score(peer_id, 50, "another violation").await;
         assert!(banned);
         assert_eq!(mgr.get_misbehavior_score(peer_id), 100);
     }
 
     /// `PeerEvent::Misbehaving` flowing through `handle_event` must
-    /// accumulate score and ban on threshold — closing the
-    /// "tracker exists but only called from tests" P0 from the audit.
+    /// discourage immediately on the first call — single-event model (Core PR #25974).
     #[tokio::test]
     async fn test_handle_event_misbehaving_wires_into_tracker_and_ban() {
         use tempfile::TempDir;
@@ -3889,9 +3889,18 @@ mod tests {
 
         let peer_id = PeerId(42);
 
-        // 5 × 20-pt protocol violations = 100 → ban.
-        for i in 0..5 {
-            assert_eq!(mgr.get_misbehavior_score(peer_id), i * 20);
+        // Single-event (Core PR #25974): first PeerEvent::Misbehaving discourages immediately.
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 0);
+        mgr.handle_event(PeerEvent::Misbehaving(
+            peer_id,
+            MisbehaviorReason::UnsolicitedMessage,
+        ))
+        .await;
+        assert_eq!(mgr.get_misbehavior_score(peer_id), 20,
+            "score accumulated to 20 (for logging)");
+
+        // Subsequent calls keep accumulating score for log context.
+        for _ in 0..4 {
             mgr.handle_event(PeerEvent::Misbehaving(
                 peer_id,
                 MisbehaviorReason::UnsolicitedMessage,
