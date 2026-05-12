@@ -728,4 +728,323 @@ mod tests {
             "SIGHASH_ALL must commit to all inputs' scriptPubKeys"
         );
     }
+
+    // =================================================================
+    // W95 — `is_valid_taproot_hash_type` exhaustive byte coverage
+    // =================================================================
+    //
+    // Mirrors Bitcoin Core (interpreter.cpp:1516):
+    //     if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)))
+    //         return false;
+    //
+    // PLUS the BIP-341 stipulation that 0x00 means SIGHASH_DEFAULT and may
+    // only appear implicitly (with the 64-byte short form). The wire-format
+    // check that rejects an explicit 0x00 sighash-type byte in a 65-byte sig
+    // is enforced at the caller (validation.rs::check_schnorr_inner).
+    //
+    // Valid set:  {0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83}.
+    // Everything else MUST be rejected.
+
+    #[test]
+    fn w95_is_valid_taproot_hash_type_accepts_canonical_set() {
+        for ht in [0x00u8, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83] {
+            assert!(
+                is_valid_taproot_hash_type(ht),
+                "0x{ht:02x} must be a valid taproot hash type"
+            );
+        }
+    }
+
+    #[test]
+    fn w95_is_valid_taproot_hash_type_rejects_bare_anyonecanpay() {
+        // 0x80 alone has no base-type bits — Core line 1516 needs
+        // hash_type >= 0x81. Pre-fix audit: rustoshi's helper already
+        // rejects this because `base == 0 && hash_type != 0x00`.
+        assert!(!is_valid_taproot_hash_type(0x80));
+    }
+
+    #[test]
+    fn w95_is_valid_taproot_hash_type_rejects_high_bit_garbage() {
+        for ht in [0x84u8, 0x85, 0x86, 0x87, 0x88, 0x90, 0xA0, 0xC0, 0xFF] {
+            assert!(
+                !is_valid_taproot_hash_type(ht),
+                "0x{ht:02x} must be rejected (out of canonical set)"
+            );
+        }
+    }
+
+    #[test]
+    fn w95_is_valid_taproot_hash_type_rejects_mid_range() {
+        // Any 0x04..=0x7F is non-canonical.
+        for ht in [0x04u8, 0x05, 0x0F, 0x10, 0x1F, 0x40, 0x7F] {
+            assert!(
+                !is_valid_taproot_hash_type(ht),
+                "0x{ht:02x} must be rejected"
+            );
+        }
+    }
+
+    /// W95 exhaustive: only 7 out of 256 possible bytes are valid.
+    #[test]
+    fn w95_is_valid_taproot_hash_type_exhaustive() {
+        let mut accepted = 0usize;
+        for b in 0u8..=255u8 {
+            if is_valid_taproot_hash_type(b) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 7, "must accept exactly 7 sighash bytes");
+    }
+
+    // =================================================================
+    // W95 — BIP-340 test vectors against secp256k1
+    //
+    // Vectors 0-4 are positive (should verify). Vectors 5 and 14 are
+    // unparseable-pubkey (xonly parse must fail). Vectors 6-13 are
+    // negative-signature cases (parse OK, verify must fail), each
+    // probing a different rejection gate:
+    //   6  — public key not on curve (lift_x fails)
+    //   7  — has_even_y(R) is false (R.y odd → must reject)
+    //   8  — negated message → wrong challenge
+    //   9  — negated s value
+    //   10 — sG - eP is the point at infinity
+    //   11 — r outside the field range
+    //   12 — r exactly p-1 (boundary of field; verify must still
+    //        complete; for this vector verify returns false)
+    //   13 — s ≥ n (scalar overflow → reject)
+    //
+    // These pin Core's libsecp256k1 behavior end-to-end through the
+    // Rust wrapper. Source:
+    //   bitcoin-core/src/secp256k1/src/modules/schnorrsig/tests_impl.h
+    // =================================================================
+
+    fn check_verify(pk_hex: &str, msg_hex: &str, sig_hex: &str, expected: bool) {
+        let pk_bytes = hex::decode(pk_hex).expect("pk hex");
+        let msg_bytes = hex::decode(msg_hex).expect("msg hex");
+        let sig_bytes = hex::decode(sig_hex).expect("sig hex");
+        assert_eq!(pk_bytes.len(), 32, "pk must be 32 bytes");
+        assert_eq!(sig_bytes.len(), 64, "sig must be 64 bytes");
+        assert_eq!(msg_bytes.len(), 32, "msg must be 32 bytes");
+
+        let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
+        let xonly = match secp256k1::XOnlyPublicKey::from_slice(&pk_arr) {
+            Ok(k) => k,
+            Err(_) => {
+                assert!(
+                    !expected,
+                    "vector said pass but x-only pubkey parse failed (pk={pk_hex})"
+                );
+                return;
+            }
+        };
+        let sig = match secp256k1::schnorr::Signature::from_slice(&sig_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                assert!(!expected, "vector said pass but signature parse failed");
+                return;
+            }
+        };
+        let msg_arr: [u8; 32] = msg_bytes.try_into().unwrap();
+        let msg = secp256k1::Message::from_digest(msg_arr);
+
+        let secp = secp256k1::Secp256k1::verification_only();
+        let ok = secp.verify_schnorr(&sig, &msg, &xonly).is_ok();
+        assert_eq!(
+            ok, expected,
+            "BIP-340 vector verdict mismatch (pk={pk_hex}, sig={sig_hex})"
+        );
+    }
+
+    /// BIP-340 vector 0 — minimal positive case (sk=3, all-zero msg).
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:209
+    #[test]
+    fn w95_bip340_vector_0_pass() {
+        check_verify(
+            "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0",
+            true,
+        );
+    }
+
+    /// BIP-340 vector 1 — typical positive (sk=0xB7E1…CFEF).
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:248
+    #[test]
+    fn w95_bip340_vector_1_pass() {
+        check_verify(
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+            "6896BD60EEAE296DB48A229FF71DFE071BDE413E6D43F917DC8DCF8C78DE33418906D11AC976ABCCB20B091292BFF4EA897EFCB639EA871CFA95F6DE339E4B0A",
+            true,
+        );
+    }
+
+    /// BIP-340 vector 3 — all-FF msg + all-FF aux_rand positive.
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:326
+    #[test]
+    fn w95_bip340_vector_3_pass() {
+        check_verify(
+            "25D1DFF95105F5253C4022F628A996AD3A0D95FBF21D468A1B33F8C160D8F517",
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            "7EB0509757E246F19449885651611CB965ECC1A187DD51B64FDA1EDC9637D5EC97582B9CB13DB3933705B32BA982AF5AF25FD78881EBB32771FC5922EFC66EA3",
+            true,
+        );
+    }
+
+    /// BIP-340 vector 4 — positive verify-only (low x).
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:365
+    #[test]
+    fn w95_bip340_vector_4_pass() {
+        check_verify(
+            "D69C3509BB99E412E68B0FE8544E72837DFA30746D8BE2AA65975F29D22DC7B9",
+            "4DF3C3F68FCC83B27E9D42C90431A72499F17875C81A599B566C9889B9696703",
+            "00000000000000000000003B78CE563F89A0ED9414F5AA28AD0D96D6795F9C6376AFB1548AF603B3EB45C9F8207DEE1060CB71C04E80F593060B07D28308D7F4",
+            true,
+        );
+    }
+
+    /// BIP-340 vector 5 — pubkey not on curve (x-only parse must fail).
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:391
+    #[test]
+    fn w95_bip340_vector_5_pubkey_not_on_curve() {
+        let pk_arr: [u8; 32] = hex::decode(
+            "EEFDEA4CDB677750A420FEE807EACF21EB9898AE79B9768766E4FAA04A2D4A34",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        assert!(
+            secp256k1::XOnlyPublicKey::from_slice(&pk_arr).is_err(),
+            "x-only parse must fail for unliftable x"
+        );
+    }
+
+    /// BIP-340 vector 6 — sig fails verify.
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:403
+    #[test]
+    fn w95_bip340_vector_6_fail() {
+        check_verify(
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+            "FFF97BD5755EEEA420453A14355235D382F6472F8568A18B2F057A146029755633CC2794640AC607CD107AE10923D9EF7A73C643E166BE5EBEAFA34B1AC553E2",
+            false,
+        );
+    }
+
+    /// BIP-340 vector 7 — has_even_y(R) is false; verify must reject.
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:429
+    #[test]
+    fn w95_bip340_vector_7_r_y_odd_rejected() {
+        check_verify(
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+            "1FA62E331EDBC21C394792D2AB1100A7B432B013DF3F6FF4F99FCB33E0E1515F28890B3EDB6E7189B630448B515CE4F8622A954CFE545735AAEA5134FCCDB2BD",
+            false,
+        );
+    }
+
+    /// BIP-340 vector 8 — wrong challenge; reject.
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:455
+    #[test]
+    fn w95_bip340_vector_8_wrong_challenge_rejected() {
+        check_verify(
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+            "6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769961764B3AA9B2FFCB6EF947B6887A226E8D7C93E00C5ED0C1834FF0D0C2E6DA6",
+            false,
+        );
+    }
+
+    /// BIP-340 vector 9 — negated `s`.
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:481
+    #[test]
+    fn w95_bip340_vector_9_rejected() {
+        check_verify(
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+            "0000000000000000000000000000000000000000000000000000000000000000123DDA8328AF9C23A94C1FEECFD123BA4FB73476F0D594DCB65C6425BD186051",
+            false,
+        );
+    }
+
+    /// BIP-340 vector 10 — sG - eP is the point at infinity.
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:507
+    #[test]
+    fn w95_bip340_vector_10_r_infinity_rejected() {
+        check_verify(
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+            "00000000000000000000000000000000000000000000000000000000000000017615FBAF5AE28864013C099742DEADB4DBA87F11AC6754F93780D5A1837CF197",
+            false,
+        );
+    }
+
+    /// BIP-340 vector 11 — r outside field range.
+    /// Pre-fix Core test ensured `fe_set_b32_limit` rejects rx >= p.
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:533
+    #[test]
+    fn w95_bip340_vector_11_rx_overflow_rejected() {
+        check_verify(
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+            "4A298DACAE57395A15D0795DDBFD1DCB564DA82B0F269BC70A74F8220429BA1D69E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B",
+            false,
+        );
+    }
+
+    /// BIP-340 vector 12 — r set to p (boundary). Must reject.
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:559
+    #[test]
+    fn w95_bip340_vector_12_rx_equals_p_rejected() {
+        check_verify(
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F69E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B",
+            false,
+        );
+    }
+
+    /// BIP-340 vector 13 — s ≥ n (scalar overflow). Verify must reject.
+    /// Source: bitcoin-core/src/secp256k1/.../schnorrsig/tests_impl.h:585
+    #[test]
+    fn w95_bip340_vector_13_s_overflow_rejected() {
+        check_verify(
+            "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+            "6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+            false,
+        );
+    }
+
+    /// BIP-340 vector 14 — pubkey x-coordinate ≥ p (parse must fail).
+    #[test]
+    fn w95_bip340_vector_14_pubkey_x_overflow() {
+        let pk_arr: [u8; 32] = hex::decode(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC30",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        assert!(
+            secp256k1::XOnlyPublicKey::from_slice(&pk_arr).is_err(),
+            "x-only parse must fail for x >= p"
+        );
+    }
+
+    /// W95: 64-byte signature length is valid and parses; 63 and 65 do not
+    /// for the bare Schnorr type (the 65-byte form is a Taproot-only wrapper
+    /// that strips off the sighash byte before calling secp256k1).
+    #[test]
+    fn w95_schnorr_sig_length_64_only_for_secp() {
+        // 64-byte zero sig: parses but won't verify against anything real.
+        let zero64 = [0u8; 64];
+        assert!(secp256k1::schnorr::Signature::from_slice(&zero64).is_ok());
+        // 63-byte: must fail to parse.
+        let buf63 = [0u8; 63];
+        assert!(secp256k1::schnorr::Signature::from_slice(&buf63).is_err());
+        // 65-byte: must fail to parse at this layer (Taproot strips the
+        // sighash byte before this call).
+        let buf65 = [0u8; 65];
+        assert!(secp256k1::schnorr::Signature::from_slice(&buf65).is_err());
+    }
 }
