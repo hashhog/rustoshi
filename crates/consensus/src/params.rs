@@ -118,6 +118,10 @@ pub const DUST_RELAY_TX_FEE: u64 = 3_000;
 /// Maximum standard transaction sigops cost.
 pub const MAX_STANDARD_TX_SIGOPS_COST: u64 = 16_000;
 
+/// Maximum accurate sigops in a P2SH redeemScript (ValidateInputsStandardness).
+/// Mirrors Bitcoin Core policy/policy.h::MAX_P2SH_SIGOPS = 15.
+pub const MAX_P2SH_SIGOPS: u32 = 15;
+
 /// Minimum non-witness serialized size for a standard transaction (CVE-2017-12842).
 /// Transactions with base size < 65 bytes can be used to fake SPV proofs.
 pub const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
