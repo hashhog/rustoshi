@@ -29,6 +29,9 @@ pub mod scores {
     pub const INVALID_BLOCK_HEADER: u32 = 100;
     /// Invalid block (instant ban).
     pub const INVALID_BLOCK: u32 = 100;
+    /// Mutated block: merkle root mismatch or witness commitment mismatch (instant ban).
+    /// Bitcoin Core: MaybePunishNodeForBlock BLOCK_MUTATED → Misbehaving(peer, "mutated-block").
+    pub const MUTATED_BLOCK: u32 = 100;
     /// Invalid transaction.
     pub const INVALID_TRANSACTION: u32 = 10;
     /// Unsolicited message.
@@ -62,6 +65,10 @@ pub enum MisbehaviorReason {
     InvalidBlockHeader,
     /// Invalid block received.
     InvalidBlock,
+    /// Mutated block received: merkle root mismatch, witness commitment mismatch,
+    /// unexpected witness data, or bad witness nonce size.
+    /// Bitcoin Core: MaybePunishNodeForBlock BLOCK_MUTATED → Misbehaving(peer, "mutated-block").
+    MutatedBlock,
     /// Invalid transaction received.
     InvalidTransaction,
     /// Unsolicited block/transaction.
@@ -94,6 +101,7 @@ impl MisbehaviorReason {
         match self {
             MisbehaviorReason::InvalidBlockHeader => scores::INVALID_BLOCK_HEADER,
             MisbehaviorReason::InvalidBlock => scores::INVALID_BLOCK,
+            MisbehaviorReason::MutatedBlock => scores::MUTATED_BLOCK,
             MisbehaviorReason::InvalidTransaction => scores::INVALID_TRANSACTION,
             MisbehaviorReason::UnsolicitedMessage => scores::UNSOLICITED_MESSAGE,
             MisbehaviorReason::ProtocolViolation(_) => scores::PROTOCOL_VIOLATION,
@@ -113,8 +121,9 @@ impl MisbehaviorReason {
 impl std::fmt::Display for MisbehaviorReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MisbehaviorReason::InvalidBlockHeader => write!(f, "invalid block header"),
+            MisbehaviorReason::InvalidBlockHeader => write!(f, "bad-header"),
             MisbehaviorReason::InvalidBlock => write!(f, "invalid block"),
+            MisbehaviorReason::MutatedBlock => write!(f, "mutated-block"),
             MisbehaviorReason::InvalidTransaction => write!(f, "invalid transaction"),
             MisbehaviorReason::UnsolicitedMessage => write!(f, "unsolicited message"),
             MisbehaviorReason::ProtocolViolation(msg) => write!(f, "protocol violation: {}", msg),
@@ -709,6 +718,7 @@ mod tests {
     fn test_misbehavior_reason_scores() {
         assert_eq!(MisbehaviorReason::InvalidBlockHeader.score(), 100);
         assert_eq!(MisbehaviorReason::InvalidBlock.score(), 100);
+        assert_eq!(MisbehaviorReason::MutatedBlock.score(), 100);
         assert_eq!(MisbehaviorReason::InvalidTransaction.score(), 10);
         assert_eq!(MisbehaviorReason::UnsolicitedMessage.score(), 20);
         assert_eq!(MisbehaviorReason::ProtocolViolation("test".to_string()).score(), 10);
@@ -718,7 +728,11 @@ mod tests {
     fn test_misbehavior_reason_display() {
         assert_eq!(
             MisbehaviorReason::InvalidBlockHeader.to_string(),
-            "invalid block header"
+            "bad-header"
+        );
+        assert_eq!(
+            MisbehaviorReason::MutatedBlock.to_string(),
+            "mutated-block"
         );
         assert_eq!(
             MisbehaviorReason::ProtocolViolation("bad message".to_string()).to_string(),
