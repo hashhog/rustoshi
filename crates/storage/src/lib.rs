@@ -48,6 +48,7 @@ pub mod indexes;
 pub mod prune;
 pub mod snapshot;
 pub mod undo;
+pub mod w102_assumeutxo_gates;
 pub mod utxo_cache;
 
 pub use block_store::{BlockIndexEntry, BlockStatus, BlockStore, BlockStoreUtxoView, CoinEntry, TxIndexEntry, UndoData};
