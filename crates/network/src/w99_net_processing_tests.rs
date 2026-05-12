@@ -18,7 +18,7 @@
 //!   G11 - PASS: MAX_ORPHAN_TRANSACTIONS=100 in orphanage.rs
 //!   G12 - BUG (CORRECTNESS): orphanage has NO time-based expiry (only count-based eviction)
 //!   G13 - PASS: find_children() present for orphan recursive resolution
-//!   G14 - BUG (CORRECTNESS): orphan keyed by txid, NOT wtxid (witness malleability attack)
+//!   G14 - FIXED: orphan primary key txid → wtxid per BIP-339 (Core PR #18044 + #28196)
 //!   G15 - BUG (CORRECTNESS): min_pow_checked flag absent in block processing call site
 //!   G16 - BUG (CORRECTNESS): BLOCK_MUTATED → Misbehaving not implemented fleet-side
 //!   G17 - BUG (CORRECTNESS): BLOCK_INVALID_HEADER → Misbehaving not implemented
@@ -325,38 +325,91 @@ mod tests {
         todo!("G12: add OrphanEntry::inserted_at and sweep entries older than 5 min");
     }
 
-    // ─── G14: orphan keyed by txid not wtxid ─────────────────────────────────
+    // ─── G14: orphan keyed by wtxid (FIXED) ─────────────────────────────────
 
-    /// G14 BUG (CORRECTNESS): TxOrphanage is keyed by Transaction::txid().
-    /// Core's orphanage since BIP-339 is keyed by wtxid (witness txid), which
-    /// prevents witness-malleability attacks where an attacker substitutes a
-    /// different witness to poison the orphan cache.
+    /// G14 FIXED: TxOrphanage primary key is now wtxid per BIP-339
+    /// (Core PR #18044 + #28196).
+    ///
+    /// Two transactions with the same non-witness txid but different witnesses
+    /// (witness malleation) are admitted as distinct orphan entries.  A
+    /// witness-malleated retransmit no longer poisons the orphan cache.
+    ///
+    /// This test asserts:
+    ///   1. Two txs with same txid / different wtxids both enter the pool
+    ///      (wtxid dedup, not txid dedup).
+    ///   2. Each can be found by its own wtxid (contains()).
+    ///   3. find_children() by parent txid still returns both, because it
+    ///      scans TxIn::previous_output.txid (child-parent resolution by txid
+    ///      is preserved via the secondary index).
     #[test]
-    fn g14_orphan_keyed_by_txid_not_wtxid() {
+    fn g14_orphan_keyed_by_wtxid_not_txid() {
         use rustoshi_consensus::orphanage::TxOrphanage;
         use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
         use std::sync::Arc;
 
         let mut o = TxOrphanage::new();
         let prev_hash = Hash256::from([0xab; 32]);
-        let tx = Arc::new(Transaction {
+
+        // tx_a: same inputs/outputs as tx_b, but different witness.
+        // Both have the same stripped txid (witness is excluded from txid).
+        let tx_a = Arc::new(Transaction {
             version: 2,
             inputs: vec![TxIn {
                 previous_output: OutPoint { txid: prev_hash, vout: 0 },
                 script_sig: vec![],
                 sequence: 0xffffffff,
-                witness: vec![],
+                witness: vec![vec![0x01u8]], // witness item: [0x01]
             }],
             outputs: vec![TxOut { value: 1000, script_pubkey: vec![] }],
             lock_time: 0,
         });
 
-        // The add() call and contains() call use txid() — not witness_hash().
-        // If the orphanage were wtxid-keyed, we'd need a different lookup.
-        let txid = tx.txid();
-        o.add(tx.clone(), 1, 200).unwrap();
-        assert!(o.contains(&txid), "orphan found by txid (non-wtxid keying confirmed)");
-        // In a wtxid-keyed store, lookup by txid would fail for witness txs.
+        // tx_b: same structure as tx_a but different witness (malleated).
+        let tx_b = Arc::new(Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_hash, vout: 0 },
+                script_sig: vec![],
+                sequence: 0xffffffff,
+                witness: vec![vec![0x02u8]], // different witness item: [0x02]
+            }],
+            outputs: vec![TxOut { value: 1000, script_pubkey: vec![] }],
+            lock_time: 0,
+        });
+
+        let txid_a = tx_a.txid();
+        let txid_b = tx_b.txid();
+        let wtxid_a = tx_a.wtxid();
+        let wtxid_b = tx_b.wtxid();
+
+        // Both transactions must have the same txid (same non-witness content).
+        assert_eq!(txid_a, txid_b, "malleated txs must share the same stripped txid");
+        // But they must have different wtxids (different witness data).
+        assert_ne!(wtxid_a, wtxid_b, "malleated txs must have different wtxids");
+
+        // 1. Both are admitted (wtxid dedup — different wtxids are not duplicates).
+        o.add(tx_a.clone(), 1, 200).unwrap();
+        o.add(tx_b.clone(), 2, 200).unwrap();
+        assert_eq!(o.len(), 2, "both malleated copies must be in the pool");
+
+        // 2. Each is found by its own wtxid.
+        assert!(o.contains(&wtxid_a), "tx_a must be found by wtxid_a");
+        assert!(o.contains(&wtxid_b), "tx_b must be found by wtxid_b");
+
+        // 3. find_children() by parent txid returns both (child-parent resolution
+        //    by txid is preserved — TxIn::previous_output.txid is non-witness).
+        let children = o.find_children(&prev_hash);
+        assert_eq!(children.len(), 2, "find_children by parent txid must return both malleated orphans");
+        let returned_wtxids: std::collections::HashSet<Hash256> =
+            children.iter().map(|e| e.tx.wtxid()).collect();
+        assert!(returned_wtxids.contains(&wtxid_a), "wtxid_a must be in find_children result");
+        assert!(returned_wtxids.contains(&wtxid_b), "wtxid_b must be in find_children result");
+
+        // 4. Erase one; the other survives.
+        o.erase(&wtxid_a);
+        assert_eq!(o.len(), 1, "after erasing wtxid_a, one orphan remains");
+        assert!(!o.contains(&wtxid_a), "wtxid_a must be gone after erase");
+        assert!(o.contains(&wtxid_b), "wtxid_b must survive after wtxid_a erasure");
     }
 
     // ─── G19: duplicate version → disconnect ─────────────────────────────────
