@@ -25,8 +25,10 @@
 
 use rustoshi_consensus::chain_state::{ChainState, UtxoCache};
 use rustoshi_consensus::params::{ChainParams, MIN_BLOCKS_TO_KEEP};
+use rustoshi_consensus::pow::{get_block_proof, ChainWork};
 use rustoshi_consensus::validation::{
-    contextual_check_block_header, BlockIndexEntry, ChainContext, CoinEntry, ValidationError,
+    accept_block_header_chain_work, contextual_check_block_header, BlockIndexEntry, ChainContext,
+    CoinEntry, ValidationError,
 };
 use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint};
 use std::collections::HashMap;
@@ -219,22 +221,89 @@ fn g3_g6_duplicate_invalid_and_bad_prevblk_short_circuit() {
     );
 }
 
-/// G8: `too-little-chainwork` / BLOCK_HEADER_LOW_WORK gate.
+/// G8 case (a): low-work header with `min_pow_checked=false` → rejected with
+/// `TooLittleChainwork`.
 ///
-/// Core's AcceptBlockHeader rejects headers whose accumulated chain
-/// work is below `nMinimumChainWork`, returning `too-little-chainwork`.
-/// rustoshi stores `minimum_chain_work` in `ChainParams` (params.rs:519)
-/// but never consults it during header / block acceptance.
+/// A peer feeding headers whose accumulated chain work is below
+/// `params.minimum_chain_work` must be rejected when the PRESYNC pipeline
+/// has NOT already validated the chain work.
 ///
-/// Severity: DOS (a peer can feed millions of low-work headers and
-/// burn CPU + memory in the header tree without ever being rejected
-/// by the early gate).
+/// Bitcoin Core: `AcceptBlockHeader` (validation.cpp:4229-4231):
+///   `if (!min_pow_checked) {`
+///   `    return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork");`
+///   `}`
+///
+/// Severity: DOS.
 #[test]
-#[ignore = "G8: params.minimum_chain_work is dead code outside snapshot-anchor"]
-fn g8_too_little_chainwork_gate_present() {
+fn g8_low_work_header_without_presync_rejected() {
+    let mut params = ChainParams::regtest();
+    // Set minimum_chain_work to a non-zero value so low-work headers can be
+    // tested.  Use mainnet's minimum_chain_work (a real non-trivial value).
+    let mainnet = ChainParams::mainnet();
+    params.minimum_chain_work = mainnet.minimum_chain_work;
+
+    // Simulate a header with bits=0x207fffff (regtest easy difficulty).
+    // Its block proof is tiny — far below mainnet's minimum_chain_work.
+    let easy_bits = 0x207fffff_u32;
+    let header_proof = get_block_proof(easy_bits);
+
+    // accumulated chain_work = genesis_work + header_proof (still tiny)
+    let accumulated = ChainWork::ZERO.saturating_add(&header_proof);
+
+    let result = accept_block_header_chain_work(&accumulated.0, false, &params);
     assert!(
-        false,
-        "no caller checks chain_work < params.minimum_chain_work during acceptance"
+        matches!(result, Err(ValidationError::TooLittleChainwork)),
+        "low-work header with min_pow_checked=false must be rejected TooLittleChainwork; \
+         got: {result:?}"
+    );
+}
+
+/// G8 case (b): low-work header with `min_pow_checked=true` → accepted.
+///
+/// When the PRESYNC/REDOWNLOAD pipeline already validated accumulated chain
+/// work, the per-header gate is skipped.  This mirrors Core's behaviour:
+/// headers that passed PRESYNC get `min_pow_checked=true` and bypass G8.
+///
+/// Severity: n/a — this is the correct fast path.
+#[test]
+fn g8_low_work_header_with_presync_accepted() {
+    let mut params = ChainParams::regtest();
+    let mainnet = ChainParams::mainnet();
+    params.minimum_chain_work = mainnet.minimum_chain_work;
+
+    let easy_bits = 0x207fffff_u32;
+    let header_proof = get_block_proof(easy_bits);
+    let accumulated = ChainWork::ZERO.saturating_add(&header_proof);
+
+    // min_pow_checked=true → PRESYNC already validated; gate is skipped.
+    let result = accept_block_header_chain_work(&accumulated.0, true, &params);
+    assert!(
+        result.is_ok(),
+        "low-work header with min_pow_checked=true must be accepted (PRESYNC bypass); \
+         got: {result:?}"
+    );
+}
+
+/// G8 case (c): high-work header with `min_pow_checked=false` → accepted.
+///
+/// A header whose accumulated chain work meets or exceeds
+/// `params.minimum_chain_work` must pass even without PRESYNC validation.
+/// This is the normal mainnet case once the chain has sufficient work.
+///
+/// Severity: n/a — correct behaviour.
+#[test]
+fn g8_high_work_header_without_presync_accepted() {
+    let params = ChainParams::mainnet();
+
+    // Build an accumulated work value that is >= minimum_chain_work by
+    // setting it to exactly minimum_chain_work (lower-bound edge case).
+    let sufficient_work = params.minimum_chain_work;
+
+    let result = accept_block_header_chain_work(&sufficient_work, false, &params);
+    assert!(
+        result.is_ok(),
+        "header with chain_work == minimum_chain_work and min_pow_checked=false \
+         must be accepted; got: {result:?}"
     );
 }
 
