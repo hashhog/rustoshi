@@ -151,6 +151,34 @@ pub fn compare_chain_work(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
+/// Compare two chain candidates by chain work, with a deterministic hash-based tiebreak.
+///
+/// Mirrors Bitcoin Core's `CBlockIndexWorkComparator`: first sort by total chain work
+/// (descending), then break ties using the block hash (lexicographic, ascending) so
+/// that equal-work chains always produce the same winner deterministically.
+///
+/// Core uses `nSequenceId` then pointer address; rustoshi has no live block index
+/// object to compare pointers, so the block hash — which is a stable persistent
+/// identifier — provides an equivalent deterministic tiebreak.
+///
+/// Returns `Ordering::Greater` if candidate `a` is preferred over `b`.
+pub fn compare_chain_work_with_tiebreak(
+    work_a: &[u8; 32],
+    hash_a: &Hash256,
+    work_b: &[u8; 32],
+    hash_b: &Hash256,
+) -> std::cmp::Ordering {
+    // Primary: higher chain work wins.
+    let cmp = compare_chain_work(work_a, work_b);
+    if cmp != std::cmp::Ordering::Equal {
+        return cmp;
+    }
+    // Tiebreak: lower hash value wins (lexicographic, ascending — deterministic).
+    // A block with a lower hash is considered "greater" (preferred) so that
+    // equal-work candidates always resolve to the same winner.
+    hash_b.0.cmp(&hash_a.0)
+}
+
 /// Check if `potential_ancestor` is an ancestor of `block` in the chain.
 ///
 /// Uses the block index to walk back from `block` to verify ancestry.
