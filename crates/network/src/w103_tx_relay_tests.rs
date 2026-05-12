@@ -24,6 +24,7 @@
 //!   G18 - MISSING: no mempool query rate-limit (attack vector: unlimited mempool flooding)
 //!   G19 - BUG (CORRECTNESS): ProcessOrphanTx never called after tx accepted to mempool
 //!   G20 - BUG (CORRECTNESS): RelayTransaction / broadcast after mempool acceptance absent
+//!   G20a- FIXED: tx relay inv wire format uses MSG_WTX(5) not MSG_WITNESS_TX(0x40000001); build_tx_inv_entry helper added
 //!   G21 - PASS: MAX_ORPHAN_TRANSACTIONS=100 enforced in orphanage.rs
 //!   G22 - MISSING: no EvictExpiredOrphans / time-based 5min orphan expiry
 //!   G23 - PASS: orphanage primary key is wtxid (BIP-339) — orphanage.rs by_wtxid map
@@ -46,7 +47,7 @@ mod tests {
         TxOrphanage, MAX_ORPHAN_TRANSACTIONS, MAX_ORPHANS_PER_PEER, OrphanEntry, OrphanError,
     };
     use crate::relay::{
-        InventoryTrickle, PeerRelayState, INVENTORY_BROADCAST_MAX,
+        build_tx_inv_entry, InventoryTrickle, PeerRelayState, INVENTORY_BROADCAST_MAX,
         INBOUND_INVENTORY_BROADCAST_INTERVAL, OUTBOUND_INVENTORY_BROADCAST_INTERVAL,
     };
     use crate::peer::PeerId;
@@ -617,6 +618,55 @@ mod tests {
         let children = orphanage.find_children(&parent_txid);
         assert_eq!(children.len(), 1, "find_children works but is never called automatically");
         // Fix: after ATMP success, call orphanage.find_children(txid) and retry each child.
+    }
+
+    // ─── G20a: tx relay inv wire format — MSG_WTX(5) not MSG_WITNESS_TX(0x40000001) ──
+
+    /// G20a FIXED: tx relay inv announcements use MSG_WTX(5) keyed by wtxid for
+    /// BIP-339 peers, and MSG_TX(1) keyed by txid for legacy peers.
+    ///
+    /// Root cause (now fixed): the relay path was using MSG_WITNESS_TX(0x40000001)
+    /// — a BIP-144 getdata witness flag — as the inv type for wtxid-relay peers.
+    /// Core peers silently discard inv entries with that type, making rustoshi
+    /// invisible as a relay source to all modern peers.
+    ///
+    /// Reference: Bitcoin Core `protocol.h:481,486`; BIP-339; `net_processing.cpp`
+    /// `RelayTransaction` and `m_relay_to_set` handling.
+    #[test]
+    fn g20a_tx_relay_wire_format_msg_wtx_not_msg_witness_tx() {
+        let txid  = Hash256([0xaa; 32]);
+        let wtxid = Hash256([0xbb; 32]);
+
+        // 1. wtxid-relay peer: inv type must be MSG_WTX(5), hash must be wtxid.
+        let inv_wtxid = build_tx_inv_entry(true, txid, wtxid);
+        assert_eq!(inv_wtxid.inv_type, InvType::MsgWtx,
+            "wtxid-relay peer must receive MSG_WTX(5), not MSG_WITNESS_TX(0x40000001)");
+        assert_eq!(inv_wtxid.inv_type as u32, 5,
+            "MSG_WTX wire value must be 5 per BIP-339 / Core protocol.h:481");
+        assert_eq!(inv_wtxid.hash, wtxid,
+            "wtxid-relay peer inv hash must be the wtxid, not txid");
+
+        // 2. Legacy (txid-relay) peer: inv type must be MSG_TX(1), hash must be txid.
+        let inv_txid = build_tx_inv_entry(false, txid, wtxid);
+        assert_eq!(inv_txid.inv_type, InvType::MsgTx,
+            "legacy peer must receive MSG_TX(1) keyed by txid");
+        assert_eq!(inv_txid.inv_type as u32, 1);
+        assert_eq!(inv_txid.hash, txid,
+            "legacy peer inv hash must be the txid");
+
+        // 3. Verify MSG_WITNESS_TX(0x40000001) is NOT used for any relay inv.
+        assert_ne!(inv_wtxid.inv_type, InvType::MsgWitnessTx,
+            "MSG_WITNESS_TX(0x40000001) is a getdata flag, not a valid inv type");
+        assert_ne!(inv_txid.inv_type, InvType::MsgWitnessTx);
+
+        // 4. trickle queue agrees: wtxid-relay peer gets MsgWtx from get_pending_inv.
+        let mut state = PeerRelayState::new(false, true, true);
+        state.queue_transaction(wtxid);
+        let inv = state.get_pending_inv(10);
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0].inv_type, InvType::MsgWtx,
+            "PeerRelayState::get_pending_inv must also use MSG_WTX for wtxid-relay peers");
+        assert_eq!(inv[0].hash, wtxid);
     }
 
     // ─── G20: RelayTransaction / broadcast after acceptance absent ────────────
