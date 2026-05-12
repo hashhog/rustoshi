@@ -5,7 +5,7 @@
 //! binary compiles but the missing behaviour is clearly flagged.
 //!
 //! Gate summary (bugs found):
-//!   G1  - BUG (DOS): score-accumulation model instead of single-event discourage
+//!   G1  - FIXED: single-event discourage per Core PR #25974 (was score-accumulation)
 //!   G2  - FIXED: noban/manual/local protection added to ban_peer_with_reason
 //!   G3  - PASS: banlist persisted to banlist.json via BanManager
 //!   G4  - PASS: MAX_HEADERS_PER_REQUEST=2000 cap enforced in header_sync
@@ -40,7 +40,7 @@
 #[cfg(test)]
 mod tests {
     use crate::misbehavior::{
-        BanManager, MisbehaviorTracker, PeerMisbehavior,
+        BanManager, MisbehaviorReason, MisbehaviorTracker, PeerMisbehavior,
     };
     use crate::peer::{PeerId, PING_TIMEOUT};
     use crate::header_sync::{HeaderSync, MAX_HEADERS_PER_REQUEST, MAX_NUM_UNCONNECTING_HEADERS_MSGS};
@@ -50,26 +50,60 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    // ─── G1: score-accumulation model (BUG — should be single-event) ─────────
+    // ─── G1: single-event discourage model (FIXED — Core PR #25974) ─────────
 
-    /// G1 BUG (DOS): rustoshi uses score-accumulation (threshold 100) instead
-    /// of Core's 2022+ single-event m_should_discourage flag.
-    /// A peer accumulating 10-point violations 9 times is NOT disconnected here,
-    /// whereas Core would discourage on the *first* `Misbehaving()` call.
+    /// G1 FIXED: rustoshi now uses Core's 2022+ single-event m_should_discourage
+    /// model (PR #25974).  Any Misbehaving() call sets should_discourage=true
+    /// immediately; a peer making even a single 1-pt violation is discouraged.
+    ///
+    /// Root cause: old code accumulated score and only banned at total >= 100.
+    /// A peer making 9 × 10-pt violations (total 90 pts) was never disconnected.
+    ///
+    /// Fix: add_score() always returns true and sets should_discourage=true on
+    /// the first call, matching Core's `peer.m_should_discourage = true`.
+    /// FIX-2 G2 noban/manual/local exemptions are preserved in ban_peer_with_reason().
     #[test]
-    fn g1_score_accumulation_not_single_event() {
+    fn g1_single_event_discourage() {
         let mut peer = PeerMisbehavior::new();
-        // 9 × 10-point violations (total 90) — NOT banned yet
-        for _ in 0..9 {
-            let banned = peer.add_score(10);
-            assert!(!banned, "90 pts should not yet ban (score-accumulation model)");
-        }
-        // 10th violation crosses 100 — now banned
-        let banned = peer.add_score(10);
-        assert!(banned, "100 pts should trigger ban in accumulation model");
 
-        // Core: EVERY violation sets m_should_discourage=true immediately.
-        // This test documents the divergence — rustoshi requires 100 pts.
+        // First call with a low score (10 pts) must discourage immediately.
+        let discouraged = peer.add_score(10);
+        assert!(
+            discouraged,
+            "single-event: 1 × 10-pt violation must set should_discourage immediately"
+        );
+        assert!(
+            peer.should_discourage,
+            "should_discourage must be true after first add_score call"
+        );
+        assert_eq!(peer.score, 10, "score accumulates for log context");
+
+        // Additional calls: still discouraged, score keeps accumulating for logging.
+        let peer2 = PeerMisbehavior::new();
+        let mut p = peer2;
+        for i in 1..=9 {
+            let discouraged = p.add_score(10);
+            assert!(
+                discouraged,
+                "call #{}: every add_score call must return true (single-event)",
+                i
+            );
+        }
+        assert_eq!(p.score, 90, "score accumulated to 90 for log context");
+        assert!(p.should_discourage, "should_discourage set on first of 9 calls");
+
+        // Verify via MisbehaviorTracker too.
+        let mut tracker = MisbehaviorTracker::new();
+        let peer_id = PeerId(42);
+        let discouraged = tracker.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction);
+        assert!(
+            discouraged,
+            "MisbehaviorTracker::misbehaving must return true on first call (single-event)"
+        );
+        assert!(
+            tracker.should_disconnect(peer_id),
+            "tracker.should_disconnect must be true after one Misbehaving call"
+        );
     }
 
     // ─── G2: noban/manual/local protection in ban path (FIXED) ─────────────
@@ -723,14 +757,18 @@ mod tests {
 
     // ─── Misbehaving tracker: custom-score path ───────────────────────────────
 
-    /// Supplemental: misbehaving_with_score reaches threshold and signals ban.
+    /// Supplemental: misbehaving_with_score discourages immediately (single-event).
     #[test]
     fn misbehavior_tracker_custom_score_threshold() {
         let mut tracker = MisbehaviorTracker::new();
         let id = PeerId(42);
-        assert!(!tracker.misbehaving_with_score(id, 50, "half"));
+        // Single-event: first call immediately discourages, regardless of score.
+        assert!(tracker.misbehaving_with_score(id, 50, "half"),
+            "single-event: first misbehaving_with_score must return true");
         assert_eq!(tracker.get_score(id), 50);
+        assert!(tracker.should_disconnect(id), "should_disconnect after first call");
         assert!(tracker.misbehaving_with_score(id, 50, "full"));
+        assert_eq!(tracker.get_score(id), 100);
         assert!(tracker.should_disconnect(id));
     }
 
