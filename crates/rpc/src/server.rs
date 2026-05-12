@@ -5480,7 +5480,11 @@ impl RustoshiRpcServer for RpcServerImpl {
             )
         })?;
 
-        // Find and mark all descendants as FAILED_CHILD
+        // Find and mark all descendants as FAILED_VALID (matching Bitcoin Core's
+        // InvalidateBlock semantics: out-of-chain descendants of the invalidated
+        // block get BLOCK_FAILED_VALID, not BLOCK_FAILED_CHILD — see
+        // validation.cpp:3618-3619).  FAILED_CHILD is reserved for blocks whose
+        // parent was already invalid when the block was first processed.
         let all_hashes = store.get_all_block_hashes().map_err(|e| {
             Self::rpc_error(
                 rpc_error::RPC_DATABASE_ERROR,
@@ -5506,7 +5510,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         );
 
         for desc_hash in &descendants {
-            store.mark_block_failed_child(desc_hash).map_err(|e| {
+            store.mark_block_invalid(desc_hash).map_err(|e| {
                 Self::rpc_error(
                     rpc_error::RPC_DATABASE_ERROR,
                     format!("Failed to mark descendant invalid: {}", e),
