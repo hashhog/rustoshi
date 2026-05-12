@@ -29,7 +29,7 @@
 //!   G22 - BUG (CORRECTNESS): NODE_COMPACT_FILTERS never set in local_services()
 //!   G23 - PASS: MAX_MESSAGE_SIZE=4MiB enforced at header parse stage
 //!   G24 - PASS: unknown msg → NetworkMessage::Unknown variant, forwarded without Misbehaving
-//!   G25 - BUG (DOS/CORRECTNESS): wtxid-relay peers get MSG_WITNESS_TX(0x40000001) not MSG_WTX(5)
+//!   G25 - FIXED: wtxid-relay peers now get MSG_WTX(5) per BIP-339 (was MSG_WITNESS_TX(0x40000001))
 //!   G26 - BUG (CORRECTNESS): InvType::Error (unknown inv type) silently accepted, not filtered
 //!   G27 - BUG (CORRECTNESS): getdata handler not implemented; no pruning check
 //!   G28 - PASS: MAX_ADDR=1000 cap per addr/addrv2 message; no per-time relay rate limit (minor)
@@ -331,26 +331,57 @@ mod tests {
         }
     }
 
-    // ─── G25: wtxid-relay inv type wrong ─────────────────────────────────────
+    // ─── G25: wtxid-relay inv type (FIXED) ───────────────────────────────────
 
-    /// G25 BUG (DOS/CORRECTNESS): relay.rs uses MsgWitnessTx (0x40000001) for
-    /// wtxid-relay peers.  BIP-339 + Core use MSG_WTX = 5 (not 0x40000001).
-    /// Peers expecting MSG_WTX will ignore these announcements.
+    /// G25 FIXED: relay.rs now uses MsgWtx (5) for wtxid-relay peers per BIP-339.
+    ///
+    /// Root cause: relay.rs used MsgWitnessTx (0x40000001) instead of MSG_WTX (5).
+    /// Core peers expecting MSG_WTX (5) silently discarded ALL of rustoshi's tx
+    /// announcements — rustoshi was invisible as a relay source to all Core peers.
+    ///
+    /// Fix:
+    /// - Added InvType::MsgWtx = 5 variant to the enum (message.rs).
+    /// - relay.rs announce path now dispatches to MsgWtx for wtxidrelay peers.
+    /// - Non-wtxidrelay peers continue to receive MsgTx (1) keyed by txid.
     #[test]
-    fn g25_wtxid_relay_inv_type_is_wrong() {
-        // Core: MSG_WTX = 5 (protocol.h:481)
-        // rustoshi: MsgWitnessTx = 0x40000001, MsgTx = 1
-        // For a wtxid-relay peer, rustoshi sends MsgWitnessTx; Core sends MSG_WTX.
+    fn g25_wtxid_relay_inv_type_is_msg_wtx_5() {
+        use crate::relay::PeerRelayState;
+
+        // 1. Constant: MsgWtx must be 5 per BIP-339 / Core protocol.h:481.
+        assert_eq!(InvType::MsgWtx as u32, 5,
+            "MSG_WTX must be 5 per BIP-339");
+
+        // 2. MsgWitnessTx is still 0x40000001 (BIP-144, block download) — not BIP-339.
         assert_eq!(InvType::MsgWitnessTx as u32, 0x40000001,
-            "MsgWitnessTx = 0x40000001 (wrong for BIP-339 wtxid relay)");
-        // MSG_WTX should be 5, but rustoshi has no InvType::MsgWtx variant.
-        // Verify the absence:
-        let has_msg_wtx = matches!(
-            InvType::from_u32(5),
-            InvType::Error  // 5 is not a known InvType in rustoshi
-        );
-        assert!(has_msg_wtx,
-            "InvType 5 (MSG_WTX per BIP-339) is unrecognised in rustoshi — G25 confirmed");
+            "MsgWitnessTx must remain 0x40000001 (BIP-144 block download)");
+
+        // 3. from_u32 round-trip for both types.
+        assert_eq!(InvType::from_u32(5), InvType::MsgWtx,
+            "InvType::from_u32(5) must return MsgWtx");
+        assert_eq!(InvType::from_u32(0x40000001), InvType::MsgWitnessTx,
+            "InvType::from_u32(0x40000001) must return MsgWitnessTx");
+
+        // 4. wtxid-relay peer gets MsgWtx(5) keyed by wtxid.
+        let wtxid = Hash256([0xaa; 32]);
+        let mut state_wtxid = PeerRelayState::new(false, true, true); // supports_wtxid_relay=true
+        state_wtxid.queue_transaction(wtxid);
+        let inv = state_wtxid.get_pending_inv(10);
+        assert_eq!(inv.len(), 1, "should have one pending inv item");
+        assert_eq!(inv[0].inv_type, InvType::MsgWtx,
+            "wtxid-relay peer must receive MSG_WTX (5), not MSG_WITNESS_TX (0x40000001)");
+        assert_eq!(inv[0].hash, wtxid,
+            "hash must be the wtxid for wtxid-relay peers");
+
+        // 5. Non-wtxid-relay peer gets MsgTx(1) keyed by txid.
+        let txid = Hash256([0xbb; 32]);
+        let mut state_txid = PeerRelayState::new(false, false, true); // supports_wtxid_relay=false
+        state_txid.queue_transaction(txid);
+        let inv2 = state_txid.get_pending_inv(10);
+        assert_eq!(inv2.len(), 1, "should have one pending inv item");
+        assert_eq!(inv2[0].inv_type, InvType::MsgTx,
+            "non-wtxid-relay peer must receive MSG_TX (1) keyed by txid");
+        assert_eq!(inv2[0].hash, txid,
+            "hash must be the txid for non-wtxid-relay peers");
     }
 
     // ─── G26: InvType::Error not filtered ────────────────────────────────────
