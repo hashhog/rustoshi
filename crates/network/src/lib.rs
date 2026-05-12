@@ -22,6 +22,9 @@ pub mod v2_transport;
 #[cfg(test)]
 pub(crate) mod v2_test_lock;
 
+#[cfg(test)]
+mod w99_net_processing_tests;
+
 pub use addr::*;
 pub use block_download::*;
 pub use compact_blocks::*;
