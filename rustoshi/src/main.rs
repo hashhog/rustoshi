@@ -1507,7 +1507,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         tracing::info!("Loading UTXO snapshot from {}", path.display());
         let file = std::fs::File::open(&path)
             .map_err(|e| anyhow::anyhow!("open snapshot {}: {}", path.display(), e))?;
-        let mut reader = rustoshi_storage::SnapshotReader::open(file, &params.network_magic)
+        let reader = rustoshi_storage::SnapshotReader::open(file, &params.network_magic)
             .map_err(|e| anyhow::anyhow!("snapshot header parse: {}", e))?;
 
         let blockhash = reader.metadata().base_blockhash;
@@ -1527,6 +1527,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             coins_total,
             assume.hash_serialized.0.to_hex()
         );
+
+        // G8: wire base_height now that assume.height is known; read_coin will
+        // reject any coin whose recorded height exceeds the snapshot tip.
+        // Mirrors Core validation.cpp::PopulateAndValidateSnapshot L5814-5819.
+        let mut reader = reader.with_base_height(assume.height);
 
         let store = BlockStore::new(&db);
         use sha2::Digest as _;
@@ -1611,6 +1616,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 loaded
             ));
         }
+        // G8 trailing-bytes guard: reject snapshot files with appended garbage.
+        // Mirrors Bitcoin Core validation.cpp::PopulateAndValidateSnapshot L5872-5883:
+        //   "Snapshot file has trailing data"
+        reader
+            .verify_complete()
+            .map_err(|e| anyhow::anyhow!("snapshot trailing data check: {}", e))?;
         let finalize_sha256d = |h: sha2::Sha256| -> rustoshi_primitives::Hash256 {
             let first = h.finalize();
             let mut second = sha2::Sha256::new();

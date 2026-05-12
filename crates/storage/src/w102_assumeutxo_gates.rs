@@ -354,40 +354,36 @@ mod tests {
     // G8 — PopulateAndValidateSnapshot: per-coin height/MoneyRange checks (MISSING)
     // ================================================================
 
-    /// G8 BUG: coin.height > snapshot_height must be rejected.
-    /// Bitcoin Core rejects: `if (coin.nHeight > base_height)` in PopulateAndValidateSnapshot.
-    /// Rustoshi currently stores the coin unconditionally. This test documents the bug
-    /// and is #[ignore]d until the check is added.
+    /// G8: coin.height > snapshot_height must be rejected.
+    /// Bitcoin Core rejects: `if (coin.nHeight > base_height)` in PopulateAndValidateSnapshot
+    /// (validation.cpp:5814-5819). Guard is wired via `SnapshotReader::with_base_height`.
     #[test]
-    #[ignore = "G8 BUG: coin.height > snapshot_height not validated — main.rs:1554-1596 stores coins unconditionally"]
     fn g8_coin_height_above_snapshot_base_must_be_rejected() {
         // Build a snapshot claiming base height=100, but include a coin at height=200.
         let magic = mainnet_magic();
         let blockhash = dummy_blockhash(0x08);
         let op = make_outpoint(0x08, 0);
-        let future_coin = make_coin(1000, 200, false); // height 200 > snapshot height 100
-        // For the test to work, we'd need the reader to reject it during loading.
-        // Right now read_coin() happily returns it.
-        let buf = build_snapshot(blockhash, magic, &[(op, future_coin.clone())]);
+        let future_coin = make_coin(1000, 200, false); // height 200 > snapshot base height 100
+        let buf = build_snapshot(blockhash, magic, &[(op, future_coin)]);
         let cursor = Cursor::new(buf);
-        let mut reader = SnapshotReader::open(cursor, &magic).unwrap();
-        let result = reader.read_coin().unwrap();
-        // This should fail or the caller should check -- but currently it succeeds.
-        assert!(result.is_none() || result.unwrap().1.height <= 100,
-            "coin with height > snapshot base height should be rejected");
+        // Wire base_height=100; the coin at height=200 must be rejected.
+        let mut reader = SnapshotReader::open(cursor, &magic).unwrap().with_base_height(100);
+        let result = reader.read_coin();
+        assert!(
+            result.is_err(),
+            "coin with height > snapshot base height must be rejected, got {:?}", result
+        );
     }
 
-    /// G8 BUG: MoneyRange check is missing — values above 21 M BTC must be rejected.
-    /// Bitcoin Core: `if (!MoneyRange(coin.out.nValue))` in PopulateAndValidateSnapshot.
+    /// G8: MoneyRange check — values above 21 M BTC must be rejected.
+    /// Bitcoin Core: `if (!MoneyRange(coin.out.nValue))` in PopulateAndValidateSnapshot
+    /// (validation.cpp:5820-5822). Guard fires in `SnapshotReader::read_coin`.
     #[test]
-    #[ignore = "G8 BUG: MoneyRange not checked during snapshot coin load — main.rs:1554-1596"]
     fn g8_coin_over_max_money_must_be_rejected() {
-        // MAX_MONEY = 21_000_000 * 100_000_000 sat. A value above this should fail.
-        // Currently the coin is stored without any value range check.
+        // MAX_MONEY = 21_000_000 * 100_000_000 sat. A value above this must be rejected.
         let magic = mainnet_magic();
         let blockhash = dummy_blockhash(0x09);
         let op = make_outpoint(0x09, 0);
-        // Build a snapshot with an over-limit coin; the reader should reject it.
         let overlimit_coin = Coin {
             tx_out: TxOut {
                 // 21_000_001 BTC > MAX_MONEY
@@ -400,9 +396,8 @@ mod tests {
         let buf = build_snapshot(blockhash, magic, &[(op, overlimit_coin)]);
         let cursor = Cursor::new(buf);
         let mut reader = SnapshotReader::open(cursor, &magic).unwrap();
-        // Should error on read or the coin should fail a MoneyRange check at ingestion time.
         let result = reader.read_coin();
-        assert!(result.is_err(), "coin with value > MAX_MONEY should be rejected");
+        assert!(result.is_err(), "coin with value > MAX_MONEY must be rejected, got {:?}", result);
     }
 
     // ================================================================
