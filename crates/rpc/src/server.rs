@@ -4513,12 +4513,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                     // Connection type: Core distinguishes inbound vs the
                     // various outbound flavors. We surface the manager's
                     // ConnectionType enum directly.
-                    let connection_type = match snap.conn_type {
-                        rustoshi_network::ConnectionType::Inbound => "inbound",
-                        rustoshi_network::ConnectionType::FullRelay => "outbound-full-relay",
-                        rustoshi_network::ConnectionType::BlockRelayOnly => "block-relay-only",
-                    }
-                    .to_string();
+                    let connection_type =
+                        connection_type_str(snap.conn_type).to_string();
 
                     // last_block / last_transaction are unix timestamps
                     // of the most recent block / tx received from this
@@ -10323,6 +10319,21 @@ pub async fn start_rpc_server(
 }
 
 // ============================================================
+// HELPERS
+// ============================================================
+
+/// Map a `ConnectionType` to the Core-compatible `connection_type` string
+/// used in `getpeerinfo` responses (e.g. `"manual"`, `"inbound"`, …).
+fn connection_type_str(ct: rustoshi_network::ConnectionType) -> &'static str {
+    match ct {
+        rustoshi_network::ConnectionType::Inbound => "inbound",
+        rustoshi_network::ConnectionType::FullRelay => "outbound-full-relay",
+        rustoshi_network::ConnectionType::BlockRelayOnly => "block-relay-only",
+        rustoshi_network::ConnectionType::Manual => "manual",
+    }
+}
+
+// ============================================================
 // TESTS
 // ============================================================
 
@@ -13973,5 +13984,20 @@ mod tests {
         assert!(info.pruned);
         assert_eq!(info.pruneheight, Some(6)); // lowest-complete = watermark + 1
         assert_eq!(info.prune_target_size, Some(PRUNE_MANUAL_SENTINEL));
+    }
+
+    #[test]
+    fn test_connection_type_str() {
+        use rustoshi_network::ConnectionType;
+        assert_eq!(connection_type_str(ConnectionType::Inbound), "inbound");
+        assert_eq!(
+            connection_type_str(ConnectionType::FullRelay),
+            "outbound-full-relay"
+        );
+        assert_eq!(
+            connection_type_str(ConnectionType::BlockRelayOnly),
+            "block-relay-only"
+        );
+        assert_eq!(connection_type_str(ConnectionType::Manual), "manual");
     }
 }
