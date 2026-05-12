@@ -10101,6 +10101,92 @@ mod tests {
             "duplicate wtxid must produce WtxidAlreadyInMempool, got {:?}", result);
     }
 
+    /// W96 gate 7: witness-malleated duplicate → "txn-same-nonwitness-data-in-mempool".
+    ///
+    /// When a tx is already in the mempool and a second tx arrives with the *same*
+    /// txid (same inputs/outputs/version/locktime) but *different* witness data, Core
+    /// returns TX_CONFLICT "txn-same-nonwitness-data-in-mempool" (validation.cpp:829).
+    /// This is distinct from gate 6 (exact wtxid match → "txn-already-in-mempool").
+    ///
+    /// BIP-339 relay: a peer that got `wtxid_relay` expects the precise error string
+    /// so it knows the tx is not novel — just witness-malleated — and can suppress
+    /// further re-requests.  Collapsing both cases into a single string breaks that.
+    #[test]
+    fn test_w96_witness_malleated_same_txid_returns_nonwitness_error() {
+        let prev = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000099"
+        ).unwrap();
+        // Use a P2PKH UTXO; require_standard=false bypasses IsWitnessStandard so
+        // we can attach arbitrary witness data without a matching witness program.
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev, vout: 0 }, 100_000)]);
+
+        // Build tx1 with a non-empty witness stack.
+        let tx1 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev, vout: 0 },
+                script_sig: vec![0x51], // OP_1 (push-only, passes check_standard)
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0xAA, 0xBB]], // witness item A
+            }],
+            outputs: vec![TxOut {
+                value: 90_000,
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x88, 0xac,
+                ],
+            }],
+            lock_time: 0,
+        };
+
+        // tx2 is a witness-malleated variant: same non-witness data (txid == tx1.txid())
+        // but a different witness stack (wtxid != tx1.wtxid()).
+        let tx2 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev, vout: 0 },
+                script_sig: vec![0x51], // identical to tx1
+                sequence: 0xFFFFFFFF,
+                witness: vec![vec![0xCC, 0xDD]], // different witness item
+            }],
+            outputs: tx1.outputs.clone(), // identical outputs
+            lock_time: 0,
+        };
+
+        // Sanity: same txid, different wtxid.
+        let txid1 = tx1.txid();
+        let txid2 = tx2.txid();
+        let wtxid1 = tx1.wtxid();
+        let wtxid2 = tx2.wtxid();
+        assert_eq!(txid1, txid2, "txids must be equal (same non-witness data)");
+        assert_ne!(wtxid1, wtxid2, "wtxids must differ (different witness)");
+
+        let opts_no_std = AtmpOptions {
+            require_standard: false,
+            ..AtmpOptions::default()
+        };
+
+        let mut mempool = Mempool::new(MempoolConfig::default());
+
+        // First admit: tx1 enters the mempool.
+        let r1 = mempool.add_transaction_with_options(
+            tx1, &|op| utxos.get(op).cloned(), opts_no_std.clone(),
+        );
+        assert!(r1.is_ok(), "first admit must succeed, got {:?}", r1);
+
+        // Second admit: tx2 shares the txid but differs in witness → gate 7.
+        let r2 = mempool.add_transaction_with_options(
+            tx2, &|op| utxos.get(op).cloned(), opts_no_std,
+        );
+        assert!(
+            matches!(r2, Err(MempoolError::TxidSameNonwitnessData)),
+            "witness-malleated duplicate must return TxidSameNonwitnessData \
+             (txn-same-nonwitness-data-in-mempool), got {:?}",
+            r2,
+        );
+    }
+
     /// W96 gate 8: bip125-replacement-disallowed when allow_replacement=false.
     /// Mirrors validation.cpp:837-840.
     #[test]
