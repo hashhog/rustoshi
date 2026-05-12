@@ -30,6 +30,11 @@
 //! mempool acceptance but NOT during block validation. Adding policy flags
 //! to consensus causes valid blocks to be rejected!
 
+use crate::params::{
+    ANNEX_TAG, TAPROOT_CONTROL_BASE_SIZE, TAPROOT_CONTROL_MAX_SIZE, TAPROOT_CONTROL_NODE_SIZE,
+    TAPROOT_LEAF_MASK, TAPROOT_LEAF_TAPSCRIPT, VALIDATION_WEIGHT_OFFSET,
+    VALIDATION_WEIGHT_PER_SIGOP_PASSED, WITNESS_V1_TAPROOT_SIZE,
+};
 use crate::script::num::{
     bool_to_stack, decode_script_num, encode_script_num, stack_bool, ScriptNumError,
     DEFAULT_MAX_NUM_SIZE, LOCKTIME_MAX_NUM_SIZE,
@@ -339,6 +344,29 @@ pub enum ScriptError {
     WitnessProgramMismatch2,
     #[error("discouraged OP_SUCCESS")]
     DiscourageOpSuccess,
+    /// Mirrors Bitcoin Core `SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY`
+    /// (script/script_error.h). Returned when the witness stack is
+    /// completely empty for a P2WSH / Taproot input.  Distinct from
+    /// `WitnessProgramMismatch` so cross-impl byte-identical error
+    /// reporting can pinpoint "stack was empty" vs "stack non-empty but
+    /// commitment mismatched".
+    #[error("witness program witness empty")]
+    WitnessProgramWitnessEmpty,
+    /// Mirrors Bitcoin Core `SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE`
+    /// (script/script_error.h, interpreter.cpp:1971). Returned when the
+    /// BIP-341 control block is not in the range
+    /// `[TAPROOT_CONTROL_BASE_SIZE, TAPROOT_CONTROL_MAX_SIZE]` or its
+    /// length minus 33 is not a multiple of 32.
+    #[error("taproot control block wrong size")]
+    TaprootWrongControlSize,
+    /// Mirrors Bitcoin Core `SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION`
+    /// (script/script_error.h, interpreter.cpp:1985-1987). Returned when
+    /// a tapleaf carries a leaf version other than `TAPROOT_LEAF_TAPSCRIPT`
+    /// (0xc0) AND the policy flag
+    /// `verify_discourage_upgradable_taproot_version` is set. Consensus
+    /// validation MUST NOT set that flag; it is only for relay/mempool.
+    #[error("discouraged upgradable taproot version")]
+    DiscourageUpgradableTaprootVersion,
 }
 
 /// Signature version for sighash computation.
@@ -763,8 +791,8 @@ impl<'a> ExecContext<'a> {
         }
     }
 
-    /// Decrement the BIP-342 validation-weight counter by 50 (one
-    /// `VALIDATION_WEIGHT_PER_SIGOP_PASSED`). Returns
+    /// Decrement the BIP-342 validation-weight counter by
+    /// `VALIDATION_WEIGHT_PER_SIGOP_PASSED` (50). Returns
     /// `TapscriptValidationWeight` if the residue would go negative,
     /// matching Core's `m_validation_weight_left -= 50; if (... < 0) ...`
     /// at interpreter.cpp:362-365. Caller must only invoke this when
@@ -772,7 +800,7 @@ impl<'a> ExecContext<'a> {
     /// `interpreter.cpp`'s `success = !sig.empty()` gate.
     fn consume_validation_weight(&mut self) -> Result<(), ScriptError> {
         debug_assert!(self.validation_weight_init);
-        self.validation_weight_left -= 50;
+        self.validation_weight_left -= VALIDATION_WEIGHT_PER_SIGOP_PASSED;
         if self.validation_weight_left < 0 {
             return Err(ScriptError::TapscriptValidationWeight);
         }
@@ -2167,17 +2195,41 @@ pub fn eval_script_tapscript(
         if flags.verify_discourage_op_success {
             return Err(ScriptError::DiscourageOpSuccess);
         }
-        // Per BIP-342 + Core: leave the stack in a state where the
-        // post-eval cleanstack / top-of-stack-true checks at the call
-        // site (verify_witness_program) accept.  Core's set_success
-        // returns immediately without running the cleanstack rule, but
-        // we have to cooperate with our rust caller which DOES enforce
-        // single-element-truthy after the call returns.  Replacing the
-        // stack with a single truthy entry achieves the same observable
-        // outcome.
+        // Per BIP-342 + Core: OP_SUCCESSx processing overrides
+        // everything, including stack-element size limits and the
+        // initial stack-size cap (interpreter.cpp:1837 comment).
+        // Leave the stack in a state where the post-eval cleanstack /
+        // top-of-stack-true checks at the call site
+        // (verify_witness_program) accept.  Core's set_success returns
+        // immediately without running the cleanstack rule, but we
+        // cooperate with our rust caller which DOES enforce
+        // single-element-truthy after the call returns.  Replacing
+        // the stack with a single truthy entry achieves the same
+        // observable outcome.
         stack.clear();
         stack.push(vec![0x01]);
         return Ok(());
+    }
+
+    // BIP-342 tapscript pre-eval gates — Core interpreter.cpp:1854-1861
+    // (ExecuteWitnessScript), AFTER the OP_SUCCESS scan (which would
+    // bypass these checks):
+    //
+    //   1. Initial stack size cap: `stack.size() > MAX_STACK_SIZE`
+    //      rejects with SCRIPT_ERR_STACK_SIZE. Catches the case where
+    //      the witness arrived with >1000 items but no OP_SUCCESS.
+    //      Pre-fix rustoshi would only have caught this when a `push`
+    //      tried to grow past the cap, missing pure-pop scripts.
+    //   2. Per-element size cap: every initial stack item must fit in
+    //      MAX_SCRIPT_ELEMENT_SIZE (520) bytes. Wire-installed witness
+    //      stack items bypass the per-push checks inside EvalScript.
+    if stack.len() > MAX_STACK_SIZE {
+        return Err(ScriptError::StackOverflow);
+    }
+    for elem in stack.iter() {
+        if elem.len() > MAX_SCRIPT_ELEMENT_SIZE {
+            return Err(ScriptError::PushSize);
+        }
     }
 
     let mut ctx = ExecContext::with_stack_tapscript(
@@ -2493,7 +2545,14 @@ pub fn verify_script(
         // Start with the remaining stack (everything except the redeem script)
         let mut p2sh_stack: Stack = stack_copy[..stack_copy.len() - 1].to_vec();
 
-        // Check for P2SH-wrapped SegWit
+        // Check for P2SH-wrapped SegWit.
+        //
+        // CRITICAL: BIP-341 forbids Taproot inside P2SH — Core
+        // script/interpreter.cpp:1947 explicitly gates the Taproot
+        // verifier on `!is_p2sh`. Pass `is_p2sh = true` here so a
+        // P2SH redeem script encoding `OP_1 <32 bytes>` falls through
+        // to the upgradable-witness path rather than activating the
+        // BIP-341 verifier (which would diverge from Core).
         if flags.verify_witness {
             if let Some((version, program)) = parse_witness_program(redeem_script) {
                 verify_witness_program(
@@ -2502,6 +2561,7 @@ pub fn verify_script(
                     program,
                     flags,
                     checker,
+                    /* is_p2sh = */ true,
                 )?;
 
                 // For P2SH-SegWit, the p2sh_stack should be empty after redeem script
@@ -2543,7 +2603,14 @@ pub fn verify_script(
                 return Err(ScriptError::WitnessMalleated);
             }
 
-            verify_witness_program(witness, version, program, flags, checker)?;
+            verify_witness_program(
+                witness,
+                version,
+                program,
+                flags,
+                checker,
+                /* is_p2sh = */ false,
+            )?;
 
             // Clean stack already handled by witness verification
             return Ok(());
@@ -2564,12 +2631,19 @@ pub fn verify_script(
 }
 
 /// Verify a witness program.
+///
+/// `is_p2sh` matches Core's `VerifyWitnessProgram(... bool is_p2sh)`
+/// argument (script/interpreter.cpp:1917). It MUST be `true` when the
+/// witness program is encoded inside a P2SH redeem script (see
+/// interpreter.cpp:1947 — Taproot is forbidden inside P2SH per BIP-341).
+/// Native SegWit calls pass `is_p2sh = false`.
 fn verify_witness_program(
     witness: &[Vec<u8>],
     version: u8,
     program: &[u8],
     flags: &ScriptFlags,
     checker: &dyn SignatureChecker,
+    is_p2sh: bool,
 ) -> Result<(), ScriptError> {
     match version {
         0 => {
@@ -2578,6 +2652,20 @@ fn verify_witness_program(
                 // P2WPKH
                 if witness.len() != 2 {
                     return Err(ScriptError::WitnessProgramMismatch);
+                }
+
+                // BIP-141: every witness stack item must fit in
+                // MAX_SCRIPT_ELEMENT_SIZE (520) bytes. Core
+                // interpreter.cpp:1858-1861 enforces this at
+                // ExecuteWitnessScript entry, before EvalScript runs.
+                // Without this gate a 521-byte sig/pubkey would slip
+                // through to the per-op size check inside EvalScript,
+                // which only fires on push opcodes — but here we install
+                // the stack directly from the wire.
+                for elem in witness.iter() {
+                    if elem.len() > MAX_SCRIPT_ELEMENT_SIZE {
+                        return Err(ScriptError::PushSize);
+                    }
                 }
 
                 // Construct the implicit P2PKH script
@@ -2610,7 +2698,11 @@ fn verify_witness_program(
             } else if program.len() == 32 {
                 // P2WSH
                 if witness.is_empty() {
-                    return Err(ScriptError::WitnessProgramMismatch);
+                    // Core script/interpreter.cpp:1927 returns
+                    // SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY here
+                    // (distinct from MISMATCH). Pre-fix rustoshi
+                    // collapsed both to WitnessProgramMismatch.
+                    return Err(ScriptError::WitnessProgramWitnessEmpty);
                 }
 
                 // Last witness item is the witness script
@@ -2625,6 +2717,13 @@ fn verify_witness_program(
                 // Stack is everything except the witness script
                 // Witness items are bottom-to-top: index 0 = bottom, last = top
                 let mut stack: Stack = witness[..witness.len() - 1].to_vec();
+
+                // Per-element size gate (see P2WPKH branch above).
+                for elem in stack.iter() {
+                    if elem.len() > MAX_SCRIPT_ELEMENT_SIZE {
+                        return Err(ScriptError::PushSize);
+                    }
+                }
 
                 eval_script(&mut stack, witness_script, flags, checker, SigVersion::WitnessV0)?;
 
@@ -2645,15 +2744,38 @@ fn verify_witness_program(
             }
         }
         1 => {
-            // SegWit v1 (Taproot / BIP-341)
-            if flags.verify_taproot && program.len() == 32 {
+            // SegWit v1 (Taproot / BIP-341).
+            //
+            // Mirrors Bitcoin Core script/interpreter.cpp:1947 —
+            //   witversion == 1 && program.size() == WITNESS_V1_TAPROOT_SIZE && !is_p2sh
+            // is the ONLY combination that enters the Taproot/tapscript
+            // verifier. BIP-341 explicitly forbids Taproot inside P2SH
+            // (an upgrade soft-fork would change that), so a v1+32
+            // wrapped in P2SH falls through to the upgradable-witness
+            // tail below — which is the BIP-141 forward-compat "anyone
+            // can spend" path with optional relay-only DISCOURAGE.
+            if program.len() == WITNESS_V1_TAPROOT_SIZE && !is_p2sh {
+                // Per Core line 1949: if SCRIPT_VERIFY_TAPROOT is NOT
+                // set the verifier returns set_success unconditionally
+                // — NO discourage check, no length check, no annex
+                // parsing. This is the soft-fork-pre-activation behavior
+                // and MUST come before any of the actual Taproot logic
+                // below, to avoid spuriously activating consensus rules
+                // (or DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) on a
+                // chain/height where Taproot has not yet activated.
+                if !flags.verify_taproot {
+                    return Ok(());
+                }
+
                 if witness.is_empty() {
-                    return Err(ScriptError::WitnessProgramMismatch);
+                    // Core script/interpreter.cpp:1950 returns
+                    // SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY here.
+                    return Err(ScriptError::WitnessProgramWitnessEmpty);
                 }
 
                 // Check for annex (last witness item starting with 0x50)
                 let has_annex = witness.len() >= 2 && !witness.last().unwrap().is_empty()
-                    && witness.last().unwrap()[0] == 0x50;
+                    && witness.last().unwrap()[0] == ANNEX_TAG;
                 let effective_witness = if has_annex {
                     &witness[..witness.len() - 1]
                 } else {
@@ -2683,24 +2805,35 @@ fn verify_witness_program(
                         Err(ScriptError::EvalFalse)
                     }
                 } else if effective_witness.len() >= 2 {
-                    // Script-path spending
-                    // Last element = control block, second-to-last = script
+                    // Script-path spending — Core script/interpreter.cpp:1966-1989.
+                    // Last element = control block, second-to-last = script.
                     let control_block = &effective_witness[effective_witness.len() - 1];
                     let tap_script = &effective_witness[effective_witness.len() - 2];
 
-                    if control_block.is_empty() {
-                        return Err(ScriptError::WitnessProgramMismatch);
+                    // BIP-341 control-block size constraints (Core line 1970):
+                    //   - size >= TAPROOT_CONTROL_BASE_SIZE (33)
+                    //   - size <= TAPROOT_CONTROL_MAX_SIZE (4129)
+                    //   - (size - 33) % TAPROOT_CONTROL_NODE_SIZE == 0
+                    // Returns SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE (NOT the
+                    // generic mismatch). The upper bound is a real consensus
+                    // gate — pre-fix rustoshi accepted control blocks with
+                    // arbitrarily long merkle paths, which would diverge
+                    // from Core on any tx with >128 path nodes.
+                    if control_block.len() < TAPROOT_CONTROL_BASE_SIZE
+                        || control_block.len() > TAPROOT_CONTROL_MAX_SIZE
+                        || (control_block.len() - TAPROOT_CONTROL_BASE_SIZE)
+                            % TAPROOT_CONTROL_NODE_SIZE
+                            != 0
+                    {
+                        return Err(ScriptError::TaprootWrongControlSize);
                     }
 
-                    let leaf_version = control_block[0] & 0xfe;
+                    // Leaf version is the control byte with parity stripped.
+                    // Tapscript leaves use TAPROOT_LEAF_TAPSCRIPT (0xc0);
+                    // any other value is a forward-compat upgradable leaf.
+                    let leaf_version = control_block[0] & TAPROOT_LEAF_MASK;
 
-                    // Control block: 1 byte version+parity, 32 bytes internal key,
-                    // then 0..N 32-byte merkle path nodes
-                    if control_block.len() < 33 || (control_block.len() - 33) % 32 != 0 {
-                        return Err(ScriptError::WitnessProgramMismatch);
-                    }
-
-                    let internal_key = &control_block[1..33];
+                    let internal_key = &control_block[1..TAPROOT_CONTROL_BASE_SIZE];
 
                     // Compute tapleaf hash via the canonical helper in
                     // `rustoshi-crypto`. This guarantees the wallet, the
@@ -2712,11 +2845,18 @@ fn verify_witness_program(
                     );
 
                     // Compute merkle root from tapleaf hash and merkle path
-                    let merkle_path_len = (control_block.len() - 33) / 32;
+                    // — mirrors Core ComputeTaprootMerkleRoot
+                    // (script/interpreter.cpp:1888-1901). The path is
+                    // `(size - 33) / 32` nodes laid out contiguously after
+                    // the internal key.
+                    let merkle_path_len = (control_block.len() - TAPROOT_CONTROL_BASE_SIZE)
+                        / TAPROOT_CONTROL_NODE_SIZE;
                     let mut k = tapleaf_hash;
                     for j in 0..merkle_path_len {
-                        let node_slice = &control_block[33 + j * 32..33 + (j + 1) * 32];
-                        let node: [u8; 32] = node_slice.try_into().unwrap();
+                        let start =
+                            TAPROOT_CONTROL_BASE_SIZE + j * TAPROOT_CONTROL_NODE_SIZE;
+                        let end = start + TAPROOT_CONTROL_NODE_SIZE;
+                        let node: [u8; 32] = control_block[start..end].try_into().unwrap();
                         k = rustoshi_crypto::taproot::compute_tapbranch_hash(&k, &node);
                     }
 
@@ -2750,8 +2890,17 @@ fn verify_witness_program(
                         return Err(ScriptError::WitnessProgramMismatch);
                     }
 
-                    // Only execute leaf version 0xc0 (tapscript)
-                    if leaf_version == 0xc0 {
+                    // Only execute leaf version TAPROOT_LEAF_TAPSCRIPT (0xc0).
+                    // Any other leaf version is reserved for future
+                    // soft-forks — Core lines 1985-1988:
+                    //   if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION)
+                    //       return set_error(SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION);
+                    //   return set_success(serror);
+                    // Consensus MUST treat them as anyone-can-spend
+                    // (forward soft-fork safety); the DISCOURAGE flag is
+                    // relay-only and signals the wallet that this output
+                    // should not be used yet.
+                    if leaf_version == TAPROOT_LEAF_TAPSCRIPT {
                         // Execute the tapscript
                         // Stack = all witness items except script and control block
                         let mut stack: Stack = effective_witness[..effective_witness.len() - 2].to_vec();
@@ -2774,7 +2923,8 @@ fn verify_witness_program(
                         // passes to `::GetSerializeSize(witness.stack)` at
                         // interpreter.cpp:1981.
                         let validation_weight_left =
-                            get_serialize_size_of_witness_stack(witness) as i64 + 50;
+                            get_serialize_size_of_witness_stack(witness) as i64
+                                + VALIDATION_WEIGHT_OFFSET;
                         eval_script_tapscript(
                             &mut stack,
                             tap_script,
@@ -2793,11 +2943,20 @@ fn verify_witness_program(
                         if !stack_bool(&stack[0]) {
                             return Err(ScriptError::EvalFalse);
                         }
+                    } else if flags.verify_discourage_upgradable_taproot_version {
+                        // Relay-only soft-fork hint: this leaf carries an
+                        // unrecognised leaf version (anything other than
+                        // 0xc0 after masking parity). Standard mempool
+                        // policy rejects it; consensus does NOT.
+                        return Err(ScriptError::DiscourageUpgradableTaprootVersion);
                     }
-                    // Other leaf versions: anyone-can-spend (soft-fork safe)
+                    // Other leaf versions: anyone-can-spend (soft-fork safe).
 
                     Ok(())
                 } else {
+                    // Unreachable: annex-stripped witness has at least one
+                    // element (`witness.is_empty()` is checked upfront,
+                    // and annex stripping only fires when `witness.len() >= 2`).
                     Err(ScriptError::WitnessProgramMismatch)
                 }
             } else if program.len() == 2 && program[0] == 0x4e && program[1] == 0x73 {
@@ -3604,7 +3763,7 @@ mod tests {
         let checker = DummyChecker;
 
         // This will fail at signature verification, but the cleanstack logic is correct
-        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
         // Expect failure due to signature check, not cleanstack
         assert!(result.is_err());
     }
@@ -3622,7 +3781,7 @@ mod tests {
         let flags = ScriptFlags::standard_flags();
         let checker = DummyChecker;
 
-        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
         assert!(matches!(result, Err(ScriptError::CleanStack)));
     }
 
@@ -3639,7 +3798,7 @@ mod tests {
         let flags = ScriptFlags::standard_flags();
         let checker = DummyChecker;
 
-        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
         assert!(matches!(result, Err(ScriptError::CleanStack)));
     }
 
@@ -3656,7 +3815,7 @@ mod tests {
         let flags = ScriptFlags::standard_flags();
         let checker = DummyChecker;
 
-        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
         assert!(matches!(result, Err(ScriptError::EvalFalse)));
     }
 
@@ -3673,7 +3832,7 @@ mod tests {
         let flags = ScriptFlags::standard_flags();
         let checker = DummyChecker;
 
-        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
         assert!(result.is_ok());
     }
 
@@ -3693,7 +3852,7 @@ mod tests {
         let checker = DummyChecker;
 
         // Should still fail with CleanStack because witness cleanstack is implicit
-        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
         assert!(matches!(result, Err(ScriptError::CleanStack)));
     }
 
@@ -3713,7 +3872,7 @@ mod tests {
         let flags = ScriptFlags::standard_flags();
         let checker = DummyChecker;
 
-        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
         assert!(matches!(result, Err(ScriptError::CleanStack)));
     }
 
@@ -3730,7 +3889,7 @@ mod tests {
         let flags = ScriptFlags::standard_flags();
         let checker = DummyChecker;
 
-        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
         // Should be CleanStack because len != 1, not EvalFalse
         assert!(matches!(result, Err(ScriptError::CleanStack)));
     }
@@ -4320,7 +4479,7 @@ mod tests {
         flags.verify_taproot = true;
         flags.verify_witness = true;
         let checker = DummyChecker;
-        let result = verify_witness_program(&witness, 1, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
         assert!(result.is_ok(), "P2A spend should succeed: {result:?}");
     }
 
@@ -4335,7 +4494,7 @@ mod tests {
         flags.verify_witness = true;
         flags.verify_discourage_upgradable_witness_program = true;
         let checker = DummyChecker;
-        let result = verify_witness_program(&witness, 1, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
         assert!(result.is_ok(), "P2A must bypass DISCOURAGE flag: {result:?}");
     }
 
@@ -4348,7 +4507,7 @@ mod tests {
         flags.verify_taproot = true;
         flags.verify_witness = true;
         let checker = DummyChecker;
-        let result = verify_witness_program(&witness, 1, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
         assert!(result.is_ok(), "v1 + 4-byte program must succeed: {result:?}");
     }
 
@@ -4362,7 +4521,7 @@ mod tests {
         flags.verify_witness = true;
         flags.verify_discourage_upgradable_witness_program = true;
         let checker = DummyChecker;
-        let result = verify_witness_program(&witness, 1, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
         assert!(matches!(result, Err(ScriptError::WitnessProgramLength)),
             "DISCOURAGE flag must reject v1+30-byte: {result:?}");
     }
@@ -4379,7 +4538,7 @@ mod tests {
         let mut flags = ScriptFlags::default();
         flags.verify_witness = true;
         let checker = DummyChecker;
-        let result = verify_witness_program(&witness, 0, &program, &flags, &checker);
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
         assert!(matches!(result, Err(ScriptError::WitnessProgramLength)),
             "v0 + non-20/non-32 must still fail wrong-length: {result:?}");
     }
@@ -5287,5 +5446,371 @@ mod tests {
         let bad_sig = [0x99u8; 9];
         let flags = ScriptFlags::default(); // all false
         assert!(check_signature_encoding(&bad_sig, &flags).is_ok());
+    }
+
+    // ===================================================================
+    // W94 — BIP-341 / BIP-342 Taproot dispatch regression tests.
+    // ===================================================================
+    //
+    // These cover the gates around `verify_witness_program`'s v1 path
+    // that were missing or wrong pre-W94:
+    //   * `is_p2sh` forwarding (P2SH-wrapped Taproot must NOT activate
+    //     the BIP-341 verifier — Core line 1947's `!is_p2sh` gate).
+    //   * `TAPROOT_CONTROL_MAX_SIZE` upper bound on the control block
+    //     (Core line 1970 — pre-fix rustoshi accepted any size that
+    //     was `>= 33` and a multiple of 32 after the prefix, so a
+    //     4-MiB control block was a consensus divergence).
+    //   * `SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE` distinct error vs the
+    //     generic mismatch (Core line 1971).
+    //   * `SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY` distinct error
+    //     (Core lines 1927 and 1950).
+    //   * `SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION`
+    //     enforcement on non-0xc0 leaves (Core lines 1985-1987).
+    //   * `SCRIPT_VERIFY_TAPROOT == 0` returns set_success
+    //     unconditionally for v1+32+!p2sh — NO discourage flag check
+    //     applies (Core line 1949).
+    //   * Tapscript entry-time stack-size and per-element-size caps
+    //     (Core lines 1855 and 1858-1861).
+    //   * Constants match Core (TAPROOT_CONTROL_BASE_SIZE = 33,
+    //     TAPROOT_CONTROL_MAX_SIZE = 4129, etc).
+
+    /// Constants must equal Core's `script/interpreter.h` values.
+    #[test]
+    fn w94_taproot_constants_match_core() {
+        assert_eq!(TAPROOT_CONTROL_BASE_SIZE, 33);
+        assert_eq!(TAPROOT_CONTROL_NODE_SIZE, 32);
+        assert_eq!(TAPROOT_CONTROL_MAX_SIZE, 33 + 32 * 128);
+        assert_eq!(TAPROOT_CONTROL_MAX_SIZE, 4129);
+        assert_eq!(WITNESS_V1_TAPROOT_SIZE, 32);
+        assert_eq!(TAPROOT_LEAF_MASK, 0xfe);
+        assert_eq!(TAPROOT_LEAF_TAPSCRIPT, 0xc0);
+        assert_eq!(ANNEX_TAG, 0x50);
+        assert_eq!(VALIDATION_WEIGHT_OFFSET, 50);
+        assert_eq!(VALIDATION_WEIGHT_PER_SIGOP_PASSED, 50);
+    }
+
+    /// W94 Bug #1: P2SH-wrapped Taproot must NOT activate the BIP-341
+    /// verifier. Pass `is_p2sh = true` on a v1+32 program and observe
+    /// soft-fork success (no Taproot check, no error from the empty
+    /// witness — because the BIP-341 verifier never runs).
+    #[test]
+    fn w94_v1_32byte_inside_p2sh_does_not_activate_taproot() {
+        let program = [0x42u8; 32];
+        let witness: Vec<Vec<u8>> = vec![]; // would be WITNESS_EMPTY if Taproot activated
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+
+        // is_p2sh = true → fall through to upgradable-witness-program
+        // path, which (without DISCOURAGE) is `Ok(())`.
+        let result =
+            verify_witness_program(&witness, 1, &program, &flags, &checker, /* is_p2sh */ true);
+        assert!(
+            result.is_ok(),
+            "P2SH-wrapped v1+32 must fall through (not activate Taproot): {result:?}"
+        );
+    }
+
+    /// W94 Bug #1 (cont.): native (is_p2sh=false) v1+32+empty-witness
+    /// MUST reach the BIP-341 path and emit WITNESS_EMPTY.
+    #[test]
+    fn w94_v1_32byte_native_empty_witness_errors() {
+        let program = [0x42u8; 32];
+        let witness: Vec<Vec<u8>> = vec![];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
+        assert!(
+            matches!(result, Err(ScriptError::WitnessProgramWitnessEmpty)),
+            "native v1+32+empty must return WITNESS_EMPTY: {result:?}"
+        );
+    }
+
+    /// W94 Bug #4: v0 P2WSH empty-witness must return
+    /// `WitnessProgramWitnessEmpty`, NOT the generic mismatch.
+    #[test]
+    fn w94_v0_p2wsh_empty_witness_uses_distinct_error() {
+        let program = [0xAAu8; 32];
+        let witness: Vec<Vec<u8>> = vec![];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
+        assert!(
+            matches!(result, Err(ScriptError::WitnessProgramWitnessEmpty)),
+            "v0 P2WSH+empty must return WITNESS_EMPTY: {result:?}"
+        );
+    }
+
+    /// W94 Bug #6: when `verify_taproot=false`, a v1+32+!p2sh program
+    /// MUST return success unconditionally — even with
+    /// `verify_discourage_upgradable_witness_program=true`. Core line
+    /// 1949 returns set_success BEFORE applying any discourage logic.
+    #[test]
+    fn w94_v1_32byte_taproot_inactive_succeeds_even_with_discourage() {
+        let program = [0xCCu8; 32];
+        let witness: Vec<Vec<u8>> = vec![vec![0u8; 64]]; // arbitrary witness
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = false;
+        flags.verify_witness = true;
+        flags.verify_discourage_upgradable_witness_program = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
+        assert!(
+            result.is_ok(),
+            "v1+32+!verify_taproot must succeed unconditionally (no DISCOURAGE applied): {result:?}"
+        );
+    }
+
+    /// W94 Bug #2/#3: control block exceeding TAPROOT_CONTROL_MAX_SIZE
+    /// must return `TaprootWrongControlSize`, NOT the generic mismatch.
+    /// 4129 is the legal maximum; 4161 = 4129 + 32 is 1 node past it.
+    #[test]
+    fn w94_control_block_oversize_errors() {
+        let program = [0xDDu8; 32];
+        // Build a control block of 4161 bytes (one more 32-byte node
+        // than the max-depth allows). The contents don't matter — the
+        // size check fires before any cryptography runs.
+        let oversize_control = vec![0xc0u8; TAPROOT_CONTROL_MAX_SIZE + TAPROOT_CONTROL_NODE_SIZE];
+        // Script path needs at least 2 stack items: script + control.
+        let dummy_script = vec![0x51u8]; // OP_1
+        let witness: Vec<Vec<u8>> = vec![dummy_script, oversize_control];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
+        assert!(
+            matches!(result, Err(ScriptError::TaprootWrongControlSize)),
+            "oversize control block must return TaprootWrongControlSize: {result:?}"
+        );
+    }
+
+    /// W94 Bug #2/#3: undersize control block also returns the
+    /// distinct TaprootWrongControlSize.
+    #[test]
+    fn w94_control_block_undersize_errors() {
+        let program = [0xDDu8; 32];
+        let undersize_control = vec![0xc0u8; TAPROOT_CONTROL_BASE_SIZE - 1]; // 32 bytes
+        let dummy_script = vec![0x51u8];
+        let witness: Vec<Vec<u8>> = vec![dummy_script, undersize_control];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
+        assert!(
+            matches!(result, Err(ScriptError::TaprootWrongControlSize)),
+            "undersize control block must return TaprootWrongControlSize: {result:?}"
+        );
+    }
+
+    /// W94 Bug #2/#3: control block whose `(size - 33) % 32 != 0` is
+    /// also TaprootWrongControlSize (a malformed merkle path).
+    #[test]
+    fn w94_control_block_misaligned_errors() {
+        let program = [0xDDu8; 32];
+        // 33 + 17 = 50 bytes: misaligned (17 % 32 != 0).
+        let misaligned_control = vec![0xc0u8; 50];
+        let dummy_script = vec![0x51u8];
+        let witness: Vec<Vec<u8>> = vec![dummy_script, misaligned_control];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
+        assert!(
+            matches!(result, Err(ScriptError::TaprootWrongControlSize)),
+            "misaligned control block must return TaprootWrongControlSize: {result:?}"
+        );
+    }
+
+    /// W94 Bug #2/#3 BOUNDARY: 33-byte control block (0 merkle nodes,
+    /// just version+parity+internal-key) is well-formed by size — the
+    /// failure mode must be the Taproot commitment mismatch or some
+    /// downstream check, NOT `TaprootWrongControlSize`.
+    #[test]
+    fn w94_control_block_minimum_size_is_well_formed() {
+        let program = [0xDDu8; 32];
+        let minimum_control = vec![0xc0u8; TAPROOT_CONTROL_BASE_SIZE]; // 33 bytes
+        let dummy_script = vec![0x51u8];
+        let witness: Vec<Vec<u8>> = vec![dummy_script, minimum_control];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
+        // The internal pubkey 0xc0..0xc0 is not on the curve, so
+        // x_only_from_slice will fail and we'll get the generic
+        // commitment mismatch. The key assertion: NOT TaprootWrongControlSize.
+        assert!(
+            !matches!(result, Err(ScriptError::TaprootWrongControlSize)),
+            "minimum-size (33B) control block must not be flagged as wrong-size: {result:?}"
+        );
+    }
+
+    /// W94 Bug #2/#3 BOUNDARY: 4129-byte control block (128 merkle
+    /// nodes, the maximum) is well-formed by size — same as the
+    /// minimum-size boundary test.
+    #[test]
+    fn w94_control_block_maximum_size_is_well_formed() {
+        let program = [0xDDu8; 32];
+        let maximum_control = vec![0xc0u8; TAPROOT_CONTROL_MAX_SIZE]; // 4129 bytes
+        let dummy_script = vec![0x51u8];
+        let witness: Vec<Vec<u8>> = vec![dummy_script, maximum_control];
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
+        assert!(
+            !matches!(result, Err(ScriptError::TaprootWrongControlSize)),
+            "max-size (4129B) control block must not be flagged as wrong-size: {result:?}"
+        );
+    }
+
+    /// W94 Bug #5: control_block[0] with a non-0xc0 leaf version is a
+    /// forward soft-fork; without the discourage flag it must
+    /// succeed (anyone-can-spend), with the flag it must
+    /// return DiscourageUpgradableTaprootVersion.
+    ///
+    /// We build a valid 1-node control block whose merkle commitment
+    /// is constructed correctly so the size + commitment checks pass
+    /// — then assert dispatch on `leaf_version` alone.
+    #[test]
+    fn w94_unknown_leaf_version_succeeds_without_discourage() {
+        // Use a fresh internal key + a 33-byte control (no merkle path).
+        // Leaf version = 0xc2 (any non-0xc0 even byte).
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x99u8; 32]).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        let tap_script = vec![0x51u8]; // OP_1
+        // Leaf version 0xc2: bits 0xfe → 0xc2, parity bit 0x01 sourced from output_parity.
+        let tapleaf =
+            rustoshi_crypto::taproot::compute_tapleaf_hash(0xc2, &tap_script);
+        let (output_key, parity) = rustoshi_crypto::taproot::compute_taproot_output_key(
+            &xonly,
+            Some(&tapleaf),
+        )
+        .expect("tweak");
+        let parity_bit: u8 = match parity {
+            secp256k1::Parity::Even => 0,
+            secp256k1::Parity::Odd => 1,
+        };
+        // control_block = leaf_version | parity || internal_xonly
+        let mut control = Vec::with_capacity(33);
+        control.push(0xc2 | parity_bit);
+        control.extend_from_slice(&xonly.serialize());
+        assert_eq!(control.len(), 33);
+        let witness: Vec<Vec<u8>> = vec![tap_script, control];
+
+        let mut flags = ScriptFlags::default();
+        flags.verify_taproot = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+
+        // Without the discourage flag: unknown leaf version =
+        // anyone-can-spend = Ok.
+        let result = verify_witness_program(&witness, 1, &output_key, &flags, &checker, false);
+        assert!(
+            result.is_ok(),
+            "unknown leaf version + no DISCOURAGE must succeed: {result:?}"
+        );
+
+        // With the discourage flag: must reject with the W94 new error.
+        flags.verify_discourage_upgradable_taproot_version = true;
+        let result2 =
+            verify_witness_program(&witness, 1, &output_key, &flags, &checker, false);
+        assert!(
+            matches!(result2, Err(ScriptError::DiscourageUpgradableTaprootVersion)),
+            "unknown leaf version + DISCOURAGE must reject: {result2:?}"
+        );
+    }
+
+    /// W94 Bug #7: tapscript entry-time stack-size cap. A witness
+    /// installing 1001+ stack items must trip `StackOverflow` (Core's
+    /// `SCRIPT_ERR_STACK_SIZE`) at tapscript entry, before the first
+    /// opcode runs.
+    #[test]
+    fn w94_tapscript_initial_stack_size_cap() {
+        let mut stack: Stack = (0..(MAX_STACK_SIZE + 1)).map(|_| vec![0x00u8]).collect();
+        assert!(stack.len() > MAX_STACK_SIZE);
+        let script = [0x51u8]; // OP_1
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(
+            matches!(res, Err(ScriptError::StackOverflow)),
+            "tapscript entry with >MAX_STACK_SIZE items must reject: {res:?}"
+        );
+    }
+
+    /// W94 Bug #8: tapscript entry-time per-element size cap. A
+    /// witness item exceeding `MAX_SCRIPT_ELEMENT_SIZE` (520) must
+    /// trip `PushSize` (Core's `SCRIPT_ERR_PUSH_SIZE`) at tapscript
+    /// entry, before the first opcode runs.
+    #[test]
+    fn w94_tapscript_initial_element_size_cap() {
+        let mut stack: Stack = vec![vec![0xAAu8; MAX_SCRIPT_ELEMENT_SIZE + 1]];
+        let script = [0x51u8]; // OP_1
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(
+            matches!(res, Err(ScriptError::PushSize)),
+            "tapscript entry with element > MAX_SCRIPT_ELEMENT_SIZE must reject: {res:?}"
+        );
+    }
+
+    /// W94 Bug #8 corollary: when a tapscript has an OP_SUCCESS, the
+    /// per-element size cap is OVERRIDDEN (Core line 1837 comment:
+    /// "OP_SUCCESSx processing overrides everything, including stack
+    /// element size limits"). Build a witness with a 1000-byte
+    /// initial element and an OP_SUCCESS tapscript — must succeed.
+    #[test]
+    fn w94_tapscript_op_success_overrides_element_size_cap() {
+        let mut stack: Stack = vec![vec![0xAAu8; MAX_SCRIPT_ELEMENT_SIZE + 1]];
+        // 0x50 (OP_RESERVED) is an OP_SUCCESS byte in tapscript.
+        let script = [0x50u8];
+        let flags = ScriptFlags::default();
+        let checker = DummyChecker;
+        let tapleaf = [0u8; 32];
+        let ts = TapscriptCtx { tapleaf_hash: &tapleaf, annex: None };
+        let res = eval_script_tapscript(&mut stack, &script, &flags, &checker, ts, 100_000);
+        assert!(
+            res.is_ok(),
+            "OP_SUCCESS must override the entry-time element size cap: {res:?}"
+        );
+    }
+
+    /// W94 Bug #11 corollary: same gate for V0 P2WPKH. A witness sig
+    /// or pubkey > 520 bytes installed directly from the wire must
+    /// trip `PushSize` at entry. Pre-fix, those went straight to the
+    /// stack and slipped through.
+    #[test]
+    fn w94_v0_p2wpkh_oversize_witness_item_rejected() {
+        let program = [0xEEu8; 20];
+        // Witness for P2WPKH = [sig, pubkey]. Inflate the "sig" past
+        // MAX_SCRIPT_ELEMENT_SIZE; the pubkey doesn't matter because
+        // the entry-time check fires before the script runs.
+        let big_sig = vec![0xBBu8; MAX_SCRIPT_ELEMENT_SIZE + 1];
+        let pubkey = vec![0x02u8; 33];
+        let witness: Vec<Vec<u8>> = vec![big_sig, pubkey];
+        let mut flags = ScriptFlags::default();
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+        let result = verify_witness_program(&witness, 0, &program, &flags, &checker, false);
+        assert!(
+            matches!(result, Err(ScriptError::PushSize)),
+            "v0 P2WPKH with oversized witness item must reject: {result:?}"
+        );
     }
 }

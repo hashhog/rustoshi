@@ -137,6 +137,38 @@ pub const TAPROOT_LEAF_MASK: u8 = 0xfe;
 /// Mirrors Bitcoin Core TAPROOT_LEAF_TAPSCRIPT = 0xc0 (script/interpreter.h).
 pub const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
 
+/// BIP-341 control-block fixed-prefix size: 1 byte version+parity + 32-byte
+/// internal x-only pubkey. Mirrors Bitcoin Core
+/// `TAPROOT_CONTROL_BASE_SIZE = 33` (script/interpreter.h).
+pub const TAPROOT_CONTROL_BASE_SIZE: usize = 33;
+/// BIP-341 merkle-path node size: each intermediate node is a 32-byte
+/// SHA256 hash. Mirrors Bitcoin Core
+/// `TAPROOT_CONTROL_NODE_SIZE = 32` (script/interpreter.h).
+pub const TAPROOT_CONTROL_NODE_SIZE: usize = 32;
+/// BIP-341 maximum merkle-path depth: 128 nodes (= 32-bit address space).
+/// Mirrors Bitcoin Core
+/// `TAPROOT_CONTROL_MAX_NODE_COUNT = 128` (script/interpreter.h).
+pub const TAPROOT_CONTROL_MAX_NODE_COUNT: usize = 128;
+/// BIP-341 maximum control-block size: base + 128 * node = 33 + 4096 = 4129.
+/// Control blocks larger than this MUST be rejected
+/// (`SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE`).
+/// Mirrors Bitcoin Core
+/// `TAPROOT_CONTROL_MAX_SIZE = TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * TAPROOT_CONTROL_MAX_NODE_COUNT`
+/// (script/interpreter.h).
+pub const TAPROOT_CONTROL_MAX_SIZE: usize =
+    TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * TAPROOT_CONTROL_MAX_NODE_COUNT;
+/// BIP-141 witness v1 program length (Taproot output key). Mirrors
+/// Bitcoin Core `WITNESS_V1_TAPROOT_SIZE = 32` (script/interpreter.h).
+pub const WITNESS_V1_TAPROOT_SIZE: usize = 32;
+/// BIP-342 tapscript validation-weight constants. The budget is seeded
+/// to `serialize_size(witness.stack) + VALIDATION_WEIGHT_OFFSET` and
+/// decremented by `VALIDATION_WEIGHT_PER_SIGOP_PASSED` for every
+/// non-empty CHECKSIG / CHECKSIGVERIFY / CHECKSIGADD. Mirrors Bitcoin
+/// Core `VALIDATION_WEIGHT_PER_SIGOP_PASSED` and `VALIDATION_WEIGHT_OFFSET`
+/// (script/script.h:61-64).
+pub const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
+pub const VALIDATION_WEIGHT_OFFSET: i64 = 50;
+
 /// Maximum number of tapscript sigops: sigops_budget = 50 + (tx_size)
 pub const TAPROOT_SIGOPS_PER_BYTE: u64 = 50;
 
