@@ -7,8 +7,13 @@
 //! DoS-bound on memory if any path inadvertently buffers them.
 //!
 //! This is a lean Rust port of `bitcoin-core/src/node/txorphanage.cpp`'s
-//! pre-2024 shape:
+//! BIP-339 wtxid-keyed shape (Core PR #18044 + #28196):
 //!
+//! - **Primary key is wtxid** (witness txid).  Two transactions with the same
+//!   non-witness txid but different witnesses (witness malleation) are tracked
+//!   as separate orphan entries, mirroring Core's behaviour since BIP-339.
+//! - Secondary txid → wtxid index enables `find_children()` to resolve orphan
+//!   children by the parent's txid (as referenced in `TxIn::previous_output`).
 //! - Per-orphan size cap (`MAX_ORPHAN_TX_SIZE` = 100_000 bytes) to bound the
 //!   maximum memory of a single orphan.
 //! - Global count cap (`MAX_ORPHAN_TRANSACTIONS` = 100) — when full, evict
@@ -56,7 +61,7 @@ pub const MAX_ORPHANS_PER_PEER: usize = 100;
 /// A single orphan entry.
 ///
 /// Wraps the transaction in `Arc` so the same tx can be referenced from the
-/// peer-side and the txid-side maps without copying.
+/// peer-side and the wtxid-side maps without copying.
 #[derive(Debug, Clone)]
 pub struct OrphanEntry {
     /// The orphan transaction.
@@ -77,7 +82,7 @@ pub enum OrphanError {
     TooLarge { size: usize },
     /// Per-peer cap reached (`MAX_ORPHANS_PER_PEER`).
     PeerCap,
-    /// Already present (by txid).
+    /// Already present (by wtxid).
     AlreadyKnown,
 }
 
@@ -86,14 +91,33 @@ pub enum OrphanError {
 /// Tracks unconfirmed transactions whose inputs cannot be resolved against
 /// the chainstate + mempool *yet*, so they may become valid as soon as
 /// their missing parent arrives.
+///
+/// Since BIP-339 (Core PR #18044 + #28196) the primary key is **wtxid**
+/// (witness txid).  This prevents a witness-malleability DoS where an
+/// attacker retransmits the same transaction with a different (invalid)
+/// witness, which under txid-keying would silently overwrite the legitimate
+/// orphan and cause the parent-resolution attempt to validate against the
+/// malleated copy.
+///
+/// A secondary `txid_to_wtxids` index maps each txid to the set of wtxids
+/// that share that txid (normally a singleton, but possibly >1 under
+/// witness malleation).  `find_children()` uses this to resolve orphan
+/// children by the parent's txid as referenced in `TxIn::previous_output`.
 #[derive(Debug, Default)]
 pub struct TxOrphanage {
-    /// Primary index: txid → OrphanEntry.
-    by_txid: HashMap<Hash256, OrphanEntry>,
-    /// Per-peer txid set, used for the per-peer cap and `erase_for_peer`.
+    /// Primary index: wtxid → OrphanEntry.
+    ///
+    /// BIP-339: dedup key is wtxid (full witness txid), not the stripped txid.
+    by_wtxid: HashMap<Hash256, OrphanEntry>,
+    /// Secondary index: txid → set of wtxids stored under that txid.
+    ///
+    /// Required for `find_children()` because `TxIn::previous_output.txid`
+    /// references the parent by its non-witness txid.
+    txid_to_wtxids: HashMap<Hash256, HashSet<Hash256>>,
+    /// Per-peer wtxid set, used for the per-peer cap and `erase_for_peer`.
     by_peer: HashMap<u64, HashSet<Hash256>>,
-    /// FIFO queue of txids in insertion order; used by the eviction policy.
-    /// Stale entries (txids no longer in `by_txid`) are skipped lazily.
+    /// FIFO queue of wtxids in insertion order; used by the eviction policy.
+    /// Stale entries (wtxids no longer in `by_wtxid`) are skipped lazily.
     fifo: VecDeque<Hash256>,
     /// Insertion-order counter; assigned to `OrphanEntry::seq` and
     /// monotonically increases across the orphanage's lifetime.
@@ -108,17 +132,29 @@ impl TxOrphanage {
 
     /// Number of orphans currently stored.
     pub fn len(&self) -> usize {
-        self.by_txid.len()
+        self.by_wtxid.len()
     }
 
     /// `true` if the orphanage holds no transactions.
     pub fn is_empty(&self) -> bool {
-        self.by_txid.is_empty()
+        self.by_wtxid.is_empty()
     }
 
-    /// `true` if a transaction with this txid is currently stored.
-    pub fn contains(&self, txid: &Hash256) -> bool {
-        self.by_txid.contains_key(txid)
+    /// `true` if a transaction with this **wtxid** is currently stored.
+    ///
+    /// Per BIP-339 the primary lookup key is wtxid.  Use `contains_txid()`
+    /// if you only know the stripped txid.
+    pub fn contains(&self, wtxid: &Hash256) -> bool {
+        self.by_wtxid.contains_key(wtxid)
+    }
+
+    /// `true` if any orphan with this **txid** (stripped, non-witness) is
+    /// currently stored.  Under witness malleation there may be more than one.
+    pub fn contains_txid(&self, txid: &Hash256) -> bool {
+        self.txid_to_wtxids
+            .get(txid)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
     }
 
     /// Number of orphans currently stored from a specific peer.
@@ -131,6 +167,10 @@ impl TxOrphanage {
     /// Returns `Ok(())` if the orphan was inserted (which may have triggered
     /// an eviction), or `Err(OrphanError)` if a soft bound was hit.  If the
     /// global cap is exceeded, the oldest entry is evicted to make room.
+    ///
+    /// Deduplication is by **wtxid**: two transactions with the same txid but
+    /// different witnesses are distinct entries; a retransmit of an identical
+    /// (same wtxid) transaction returns `Err(AlreadyKnown)`.
     ///
     /// `serialized_size` is the byte length of the wire encoding; callers
     /// should pass the value from the deserializer rather than re-serialize.
@@ -146,8 +186,9 @@ impl TxOrphanage {
             });
         }
 
-        let txid = tx.txid();
-        if self.by_txid.contains_key(&txid) {
+        // BIP-339: dedup by wtxid, not txid.
+        let wtxid = tx.wtxid();
+        if self.by_wtxid.contains_key(&wtxid) {
             return Err(OrphanError::AlreadyKnown);
         }
 
@@ -159,7 +200,7 @@ impl TxOrphanage {
         }
 
         // Evict oldest entries until we have room for this one.
-        while self.by_txid.len() >= MAX_ORPHAN_TRANSACTIONS {
+        while self.by_wtxid.len() >= MAX_ORPHAN_TRANSACTIONS {
             if !self.evict_oldest() {
                 // FIFO somehow drained without freeing room.  Defensive:
                 // shouldn't happen, but bail rather than spin.
@@ -170,8 +211,15 @@ impl TxOrphanage {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
 
-        self.by_txid.insert(
-            txid,
+        // Populate secondary txid → wtxid index.
+        let txid = tx.txid();
+        self.txid_to_wtxids
+            .entry(txid)
+            .or_default()
+            .insert(wtxid);
+
+        self.by_wtxid.insert(
+            wtxid,
             OrphanEntry {
                 tx,
                 from_peer,
@@ -181,19 +229,27 @@ impl TxOrphanage {
         self.by_peer
             .entry(from_peer)
             .or_default()
-            .insert(txid);
-        self.fifo.push_back(txid);
+            .insert(wtxid);
+        self.fifo.push_back(wtxid);
 
         Ok(())
     }
 
-    /// Remove a single orphan by txid.  Returns the entry if present.
-    pub fn erase(&mut self, txid: &Hash256) -> Option<OrphanEntry> {
-        let entry = self.by_txid.remove(txid)?;
+    /// Remove a single orphan by **wtxid**.  Returns the entry if present.
+    pub fn erase(&mut self, wtxid: &Hash256) -> Option<OrphanEntry> {
+        let entry = self.by_wtxid.remove(wtxid)?;
         if let Some(set) = self.by_peer.get_mut(&entry.from_peer) {
-            set.remove(txid);
+            set.remove(wtxid);
             if set.is_empty() {
                 self.by_peer.remove(&entry.from_peer);
+            }
+        }
+        // Clean up the secondary txid → wtxid index.
+        let txid = entry.tx.txid();
+        if let Some(set) = self.txid_to_wtxids.get_mut(&txid) {
+            set.remove(wtxid);
+            if set.is_empty() {
+                self.txid_to_wtxids.remove(&txid);
             }
         }
         // We don't proactively scan `fifo` — stale entries are skipped on
@@ -203,13 +259,21 @@ impl TxOrphanage {
 
     /// Remove every orphan announced by a given peer.  Called on disconnect.
     pub fn erase_for_peer(&mut self, peer: u64) -> usize {
-        let txids: Vec<Hash256> = match self.by_peer.remove(&peer) {
+        let wtxids: Vec<Hash256> = match self.by_peer.remove(&peer) {
             Some(set) => set.into_iter().collect(),
             None => return 0,
         };
         let mut removed = 0;
-        for txid in &txids {
-            if self.by_txid.remove(txid).is_some() {
+        for wtxid in &wtxids {
+            if let Some(entry) = self.by_wtxid.remove(wtxid) {
+                // Clean up secondary txid → wtxid index.
+                let txid = entry.tx.txid();
+                if let Some(set) = self.txid_to_wtxids.get_mut(&txid) {
+                    set.remove(wtxid);
+                    if set.is_empty() {
+                        self.txid_to_wtxids.remove(&txid);
+                    }
+                }
                 removed += 1;
             }
         }
@@ -222,14 +286,18 @@ impl TxOrphanage {
     /// Mirrors `TxOrphanage::EraseForBlock`.  After a block lands, any
     /// orphan that depended on a (now-spent) UTXO is permanently invalid;
     /// keeping it around just wastes an orphanage slot.
+    ///
+    /// `block_txids` are the **txids** (non-witness) of transactions included
+    /// in the block.
     pub fn erase_for_block(&mut self, block_txids: &[Hash256], spent: &[OutPoint]) -> usize {
-        let included: HashSet<&Hash256> = block_txids.iter().collect();
+        let included_txids: HashSet<&Hash256> = block_txids.iter().collect();
         let spent_set: HashSet<&OutPoint> = spent.iter().collect();
 
         let mut to_remove = Vec::new();
-        for (txid, entry) in &self.by_txid {
-            if included.contains(txid) {
-                to_remove.push(*txid);
+        for (wtxid, entry) in &self.by_wtxid {
+            let txid = entry.tx.txid();
+            if included_txids.contains(&txid) {
+                to_remove.push(*wtxid);
                 continue;
             }
             if entry
@@ -238,12 +306,12 @@ impl TxOrphanage {
                 .iter()
                 .any(|i| spent_set.contains(&i.previous_output))
             {
-                to_remove.push(*txid);
+                to_remove.push(*wtxid);
             }
         }
         let n = to_remove.len();
-        for txid in to_remove {
-            self.erase(&txid);
+        for wtxid in to_remove {
+            self.erase(&wtxid);
         }
         n
     }
@@ -252,13 +320,18 @@ impl TxOrphanage {
     /// transaction arrives in the mempool: any orphan that lists the new tx
     /// as a parent should be re-tried for admission.
     ///
+    /// Resolves via the secondary `txid_to_wtxids` index: all orphans whose
+    /// `TxIn::previous_output.txid` matches `parent_txid` are candidates.
+    /// Under witness malleation, multiple orphans may share the same parent
+    /// txid — all are returned.
+    ///
     /// Returns owned clones of the matching entries.  The caller is
     /// responsible for `erase`-ing successfully admitted ones; rejected
     /// orphans should also be erased to avoid retrying them on every parent
     /// arrival (the caller can record a "tried-and-failed" set if desired).
     pub fn find_children(&self, parent_txid: &Hash256) -> Vec<OrphanEntry> {
         let mut out = Vec::new();
-        for entry in self.by_txid.values() {
+        for entry in self.by_wtxid.values() {
             if entry
                 .tx
                 .inputs
@@ -276,9 +349,9 @@ impl TxOrphanage {
     /// Drop the oldest orphan in FIFO order.  Called when the global cap is
     /// reached.  Returns `true` if something was evicted.
     fn evict_oldest(&mut self) -> bool {
-        while let Some(txid) = self.fifo.pop_front() {
-            if self.by_txid.contains_key(&txid) {
-                self.erase(&txid);
+        while let Some(wtxid) = self.fifo.pop_front() {
+            if self.by_wtxid.contains_key(&wtxid) {
+                self.erase(&wtxid);
                 return true;
             }
             // else: stale FIFO entry from a prior `erase`; keep popping.
@@ -321,16 +394,17 @@ mod tests {
     fn add_lookup_remove_round_trip() {
         let mut o = TxOrphanage::new();
         let tx = make_unique_tx(1);
-        let txid = tx.txid();
+        // For a non-witness tx, wtxid == txid.
+        let wtxid = tx.wtxid();
 
         assert_eq!(o.len(), 0);
-        assert!(!o.contains(&txid));
+        assert!(!o.contains(&wtxid));
         assert!(o.add(tx.clone(), 7, 250).is_ok());
         assert_eq!(o.len(), 1);
-        assert!(o.contains(&txid));
+        assert!(o.contains(&wtxid));
         assert_eq!(o.count_from_peer(7), 1);
 
-        let entry = o.erase(&txid).expect("present");
+        let entry = o.erase(&wtxid).expect("present");
         assert_eq!(entry.from_peer, 7);
         assert_eq!(o.len(), 0);
         assert_eq!(o.count_from_peer(7), 0);
@@ -380,15 +454,16 @@ mod tests {
         }
         assert_eq!(o.len(), MAX_ORPHAN_TRANSACTIONS);
 
-        // First inserted txid (the oldest) must get evicted next.
-        let first_txid = make_unique_tx(0).txid();
-        assert!(o.contains(&first_txid));
+        // First inserted entry (the oldest) must get evicted next.
+        // For non-witness txs, wtxid == txid.
+        let first_wtxid = make_unique_tx(0).wtxid();
+        assert!(o.contains(&first_wtxid));
 
         let new_tx = make_unique_tx(MAX_ORPHAN_TRANSACTIONS as u32);
         o.add(new_tx, 9999, 200).unwrap();
 
         assert_eq!(o.len(), MAX_ORPHAN_TRANSACTIONS);
-        assert!(!o.contains(&first_txid), "oldest should be evicted");
+        assert!(!o.contains(&first_wtxid), "oldest should be evicted");
     }
 
     #[test]
@@ -451,6 +526,8 @@ mod tests {
         o.add(b.clone(), 1, 200).unwrap();
         o.add(c.clone(), 1, 200).unwrap();
 
+        // erase_for_block takes txids (non-witness); for non-witness txs
+        // txid == wtxid, so c.txid() is correct here.
         let block_txids = vec![c.txid()];
         let spent_outpoints = vec![OutPoint {
             txid: parent_txid,
@@ -459,8 +536,9 @@ mod tests {
 
         let n = o.erase_for_block(&block_txids, &spent_outpoints);
         assert_eq!(n, 2); // A (spent) + C (included); B survives.
-        assert!(o.contains(&b.txid()));
-        assert!(!o.contains(&a.txid()));
-        assert!(!o.contains(&c.txid()));
+        // contains() now takes wtxid; for non-witness txs, wtxid == txid.
+        assert!(o.contains(&b.wtxid()));
+        assert!(!o.contains(&a.wtxid()));
+        assert!(!o.contains(&c.wtxid()));
     }
 }
