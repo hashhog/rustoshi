@@ -28,7 +28,7 @@ use ops::{
 
 use rustoshi_consensus::{
     dump_mempool, get_block_proof, load_mempool, ChainParams, ChainState, ChainWork, FeeEstimator,
-    NetworkId,
+    NetworkId, ValidationError,
 };
 use rustoshi_network::{
     BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason, NetworkMessage, PeerEvent,
@@ -2433,10 +2433,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         tracing::warn!("Header sync error from peer {}: {}", peer_id.0, e);
 
                                         // Classify the error: unconnecting-headers vs
-                                        // genuinely-invalid-content (PoW etc).
+                                        // genuinely-invalid-content (PoW, bad version, etc.).
                                         let is_unconnecting =
                                             e.contains("not connected") || e.contains("not in our chain");
-                                        let is_invalid_pow = e.contains("proof of work");
 
                                         if is_unconnecting {
                                             // Core (net_processing.cpp::ProcessHeadersMessage)
@@ -2473,9 +2472,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     }
                                                 }
                                             }
-                                        } else if is_invalid_pow {
-                                            // PoW failure is genuinely-invalid content —
-                                            // ban-score immediately (Core +100 on bad PoW).
+                                        } else {
+                                            // Any other header error (bad PoW, bad version,
+                                            // timestamp in future/past, too many headers, etc.)
+                                            // is genuinely invalid content — ban immediately.
+                                            // Mirrors Bitcoin Core MaybePunishNodeForBlock:
+                                            //   BLOCK_INVALID_HEADER → Misbehaving(peer, "bad-header")
+                                            // W99 G17: previously only PoW errors reached this
+                                            // branch; all other invalid-header errors were
+                                            // silently ignored (no Misbehaving call).
                                             let mut ps = peer_state.write().await;
                                             if let Some(ref mut pm) = ps.peer_manager {
                                                 pm.misbehaving(peer_id, MisbehaviorReason::InvalidBlockHeader).await;
@@ -2542,16 +2547,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     "Block validation failed at height {}: {}",
                                                     height, e
                                                 );
-                                                // DoS: peer sent us an invalid
-                                                // block.  100-pt instant ban
-                                                // (Bitcoin Core: bad-blk-*).
+                                                // DoS: peer sent us an invalid block.
+                                                // Distinguish BLOCK_MUTATED (merkle/witness
+                                                // corruption) from generic invalid-block,
+                                                // matching Bitcoin Core MaybePunishNodeForBlock:
+                                                //   BLOCK_MUTATED → Misbehaving(peer, "mutated-block")
+                                                //   other failures → Misbehaving(peer, "bad-blk-*")
+                                                // Both are 100-pt instant bans.  W99 G16.
+                                                let reason = match e {
+                                                    ValidationError::BadMerkleRoot
+                                                    | ValidationError::BadWitnessCommitment
+                                                    | ValidationError::BadWitnessNonceSize
+                                                    | ValidationError::UnexpectedWitness => {
+                                                        MisbehaviorReason::MutatedBlock
+                                                    }
+                                                    _ => MisbehaviorReason::InvalidBlock,
+                                                };
                                                 let mut ps = peer_state.write().await;
                                                 if let Some(ref mut pm) = ps.peer_manager {
-                                                    pm.misbehaving(
-                                                        peer_id,
-                                                        MisbehaviorReason::InvalidBlock,
-                                                    )
-                                                    .await;
+                                                    pm.misbehaving(peer_id, reason).await;
                                                 }
                                                 false
                                             }
