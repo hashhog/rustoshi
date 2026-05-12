@@ -738,8 +738,9 @@ fn run_import_from_blk_files(
         let prev_block_mtp =
             compute_mtp_via_store(block_store, &chain_state.tip_hash()).unwrap_or(0);
 
-        // Validate and process
-        match chain_state.process_block(&block, utxo_view, prev_block_mtp) {
+        // Validate and process (f_requested=true: import-from-Core-datadir is
+        // a requested/trusted path — no fTooFarAhead guard needed).
+        match chain_state.process_block(&block, utxo_view, prev_block_mtp, true) {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", height, e);
@@ -916,8 +917,9 @@ fn run_import_from_stdin(
         let prev_block_mtp =
             compute_mtp_via_store(block_store, &chain_state.tip_hash()).unwrap_or(0);
 
-        // Validate and process
-        match chain_state.process_block(&block, utxo_view, prev_block_mtp) {
+        // Validate and process (f_requested=true: snapshot-import is a
+        // requested/trusted path — no fTooFarAhead guard needed).
+        match chain_state.process_block(&block, utxo_view, prev_block_mtp, true) {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", frame_height, e);
@@ -2043,7 +2045,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         let prev_block_mtp =
                             compute_mtp_via_store(&block_store, &cs.tip_hash())
                                 .unwrap_or(0);
-                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp) {
+                        // f_requested=true: blocks from the IBD block downloader
+                        // are actively requested via getdata — no fTooFarAhead guard.
+                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true) {
                             Ok(_) => true,
                             Err(e) => {
                                 tracing::warn!(
@@ -2529,7 +2533,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         let prev_block_mtp =
                                             compute_mtp_via_store(&block_store, &cs.tip_hash())
                                                 .unwrap_or(0);
-                                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp) {
+                                        // f_requested=true: blocks from the P2P block downloader
+                                        // are actively requested via getdata — no fTooFarAhead guard.
+                                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true) {
                                             Ok(_) => true,
                                             Err(e) => {
                                                 tracing::warn!(

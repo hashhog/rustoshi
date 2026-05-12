@@ -58,6 +58,17 @@ pub struct AssumeutxoData {
 /// Maximum block weight (BIP-141). 4 million weight units.
 pub const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
 
+/// Minimum number of blocks that must remain in the block store (pruning window).
+///
+/// Used as an anti-DoS gate in AcceptBlock (Core validation.cpp:4325):
+/// a block on an unrequested path is rejected without validation if its
+/// claimed height exceeds `ActiveHeight + MIN_BLOCKS_TO_KEEP`.  This
+/// prevents a peer from forcing download + validation of a block that
+/// is 289+ blocks ahead of our active chain tip.
+///
+/// Mirror of `src/kernel/blockstorage.h:24`: `MIN_BLOCKS_TO_KEEP = 288`.
+pub const MIN_BLOCKS_TO_KEEP: u32 = 288;
+
 /// Maximum legacy block size in bytes (pre-SegWit interpretation).
 pub const MAX_BLOCK_SERIALIZED_SIZE: u64 = 4_000_000;
 
