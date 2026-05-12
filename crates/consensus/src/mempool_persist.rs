@@ -481,6 +481,16 @@ mod tests {
     }
 
     fn build_utxo(prev_txid: Hash256, prev_vout: u32, value: u64) -> HashMap<OutPoint, CoinEntry> {
+        // W96: the prevout scriptPubKey must classify as standard to pass
+        // the new AreInputsStandard (ValidateInputsStandardness) gate.
+        // Construct a real 25-byte P2PKH script.
+        let p2pkh: Vec<u8> = {
+            let mut v = vec![0x76, 0xa9, 0x14];
+            v.extend_from_slice(&[0x33u8; 20]);
+            v.push(0x88);
+            v.push(0xac);
+            v
+        };
         let mut m = HashMap::new();
         m.insert(
             OutPoint {
@@ -491,7 +501,7 @@ mod tests {
                 height: 1,
                 is_coinbase: false,
                 value,
-                script_pubkey: vec![0x76, 0xa9, 0x14, 0x00, 0x88, 0xac],
+                script_pubkey: p2pkh,
             },
         );
         m
