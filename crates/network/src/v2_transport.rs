@@ -20,6 +20,7 @@ use secp256k1::{All, Secp256k1, SecretKey};
 use sha2::Sha256;
 use std::collections::HashMap;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 lazy_static! {
     /// Lazily-initialized full-capability secp256k1 context.
@@ -781,7 +782,7 @@ impl Bip324Cipher {
         let secret_key = self.secret_key.take().expect("already initialized");
 
         // Compute ECDH shared secret
-        let ecdh_secret = compute_bip324_ecdh_secret(
+        let mut ecdh_secret = compute_bip324_ecdh_secret(
             &secret_key,
             &self.our_pubkey,
             their_pubkey,
@@ -831,6 +832,21 @@ impl Bip324Cipher {
             self.recv_garbage_terminator.copy_from_slice(&garbage_terminators[..16]);
             self.send_garbage_terminator.copy_from_slice(&garbage_terminators[16..]);
         }
+
+        // Zeroize all intermediate key material after cipher contexts are
+        // established — mirrors Bitcoin Core memory_cleanse() calls in
+        // bip324.cpp:67-70. Prevents recovery of session keys from a heap/
+        // stack memory dump. (W98 G10)
+        ecdh_secret.zeroize();
+        initiator_l_key.zeroize();
+        initiator_p_key.zeroize();
+        responder_l_key.zeroize();
+        responder_p_key.zeroize();
+        garbage_terminators.zeroize();
+        // `hkdf` holds a reference to ecdh_secret (already zeroed above) and
+        // its internal PRK. Drop it explicitly so the compiler sees its
+        // lifetime end here rather than at the enclosing scope.
+        drop(hkdf);
     }
 
     /// Get the session ID.
@@ -2039,26 +2055,20 @@ mod tests {
         );
     }
 
-    /// G10-BUG: ECDH secret and HKDF key material are NOT zeroized after use
-    /// in initialize_internal().  Bitcoin Core calls memory_cleanse() on all
-    /// sensitive intermediate values (ecdh_secret, hkdf_32_okm, the hkdf
-    /// object itself) before returning.  Rustoshi drops them via normal Rust
-    /// drop (no zeroize) — the bytes remain in stack/heap memory until
-    /// overwritten by subsequent allocations, creating a potential
-    /// memory-dump side-channel.
-    ///
-    /// This test pins the ABSENCE of zeroize by verifying the crate does not
-    /// have a zeroize dependency.  When this test fails it means zeroize was
-    /// added (the bug is being fixed).
+    /// G10 (FIXED): ECDH secret and HKDF key material ARE zeroized after
+    /// initialize_internal() completes.  Bitcoin Core calls memory_cleanse()
+    /// on ecdh_secret, hkdf_32_okm, and the hkdf object (bip324.cpp:67-70).
+    /// Rustoshi now calls .zeroize() on the same buffers immediately after the
+    /// cipher contexts are constructed. (W98 G10)
     #[test]
-    fn test_g10_zeroize_dependency_absent_documents_crypto_bug() {
-        // We can't directly test that stack bytes are cleared, but we can
-        // document that the `zeroize` crate is not used as a compile-time
-        // proxy.  The network crate's Cargo.toml has no `zeroize` entry.
-        //
-        // Positive test: cipher initialisation completes and the cipher is
-        // initialized (the key was consumed).  A correct impl would zeroize
-        // here; we document the gap without crashing production code.
+    fn test_g10_zeroize_intermediate_key_material_after_initialize() {
+        // Verify that initialize() completes successfully and produces working
+        // ciphers.  We cannot observe stack bytes post-return without unsafe,
+        // but we can verify:
+        //   (a) ciphers are live (is_initialized() == true),
+        //   (b) a round-trip encrypt/decrypt succeeds (zeroize runs AFTER
+        //       the ciphers are seeded, so they must still work), and
+        //   (c) both ciphers agree on the session_id (HKDF ran correctly).
         use secp256k1::SecretKey;
         let sk1 = SecretKey::from_slice(&[3u8; 32]).unwrap();
         let sk2 = SecretKey::from_slice(&[4u8; 32]).unwrap();
@@ -2073,11 +2083,38 @@ mod tests {
         c1.initialize(&pub2, true, &magic);
         c2.initialize(&pub1, false, &magic);
 
-        assert!(c1.is_initialized(), "cipher must be initialized after ECDH");
-        assert!(c2.is_initialized(), "cipher must be initialized after ECDH");
-        // secret_key is None after initialize (the take() removes it),
-        // but the raw bytes were never explicitly zeroed.
-        // G10 BUG: no zeroize call on ecdh_secret / hkdf intermediate keys.
+        // (a) Both ciphers are fully initialized.
+        assert!(c1.is_initialized(), "G10: c1 must be initialized after ECDH");
+        assert!(c2.is_initialized(), "G10: c2 must be initialized after ECDH");
+
+        // (b) Round-trip: encrypt with c1, decrypt with c2.
+        // Zeroize calls fire AFTER cipher seeding — if they ran too early the
+        // ciphers would produce garbage and this assertion would fail.
+        let plaintext = b"G10-zeroize-roundtrip";
+        let mut ciphertext = vec![0u8; plaintext.len() + EXPANSION];
+        c1.encrypt(plaintext, &[], false, &mut ciphertext)
+            .expect("G10: encrypt must succeed after initialize");
+
+        let len = c2
+            .decrypt_length(&ciphertext[..LENGTH_LEN].try_into().unwrap())
+            .expect("G10: decrypt_length must succeed");
+        assert_eq!(len as usize, plaintext.len(), "G10: decrypted length must match");
+
+        let mut decrypted = vec![0u8; len as usize];
+        c2.decrypt(&ciphertext[LENGTH_LEN..], &[], &mut decrypted)
+            .expect("G10: decrypt must succeed after initialize");
+        assert_eq!(
+            decrypted.as_slice(),
+            plaintext.as_ref(),
+            "G10: round-trip plaintext must match after zeroize"
+        );
+
+        // (c) Session IDs must agree (HKDF "session_id" expand ran correctly).
+        assert_eq!(
+            c1.session_id(),
+            c2.session_id(),
+            "G10: session_id must match between initiator and responder"
+        );
     }
 
     /// G22-BUG: Long-form message type decoding (first byte == 0) does NOT
