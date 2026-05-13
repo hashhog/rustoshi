@@ -37,6 +37,7 @@
 use rustoshi_primitives::{Hash256, OutPoint, Transaction};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Maximum size of an orphan transaction in bytes (Core constant).
 ///
@@ -58,6 +59,18 @@ pub const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 /// peers contributing.
 pub const MAX_ORPHANS_PER_PEER: usize = 100;
 
+/// How long an orphan is allowed to stay in the pool before it is evicted
+/// by time, regardless of count pressure.
+///
+/// Mirrors the historical Bitcoin Core constant:
+///   `static constexpr int64_t ORPHAN_TX_EXPIRE_TIME = 20 * 60;`
+/// (in `src/node/txorphanage.cpp`, removed during the PR #32941 weight-based
+/// revamp but kept here as the authoritative TTL for rustoshi because rustoshi
+/// uses a simpler count-and-time model).
+///
+/// Value: 20 minutes = 1 200 seconds.
+pub const ORPHAN_TX_EXPIRE_TIME: Duration = Duration::from_secs(20 * 60);
+
 /// A single orphan entry.
 ///
 /// Wraps the transaction in `Arc` so the same tx can be referenced from the
@@ -72,6 +85,12 @@ pub struct OrphanEntry {
     /// Wall-clock insertion order (FIFO eviction key).  Monotonically
     /// increasing across the orphanage's lifetime.
     pub seq: u64,
+    /// Monotonic clock timestamp of when this orphan was inserted.
+    ///
+    /// Used by [`TxOrphanage::expire_orphans`] to implement the
+    /// [`ORPHAN_TX_EXPIRE_TIME`] TTL.  Entries older than
+    /// `ORPHAN_TX_EXPIRE_TIME` are dropped regardless of count pressure.
+    pub inserted_at: Instant,
 }
 
 /// Reasons an `add` call can fail.  None of these are protocol errors —
@@ -224,6 +243,7 @@ impl TxOrphanage {
                 tx,
                 from_peer,
                 seq,
+                inserted_at: Instant::now(),
             },
         );
         self.by_peer
@@ -357,6 +377,37 @@ impl TxOrphanage {
             // else: stale FIFO entry from a prior `erase`; keep popping.
         }
         false
+    }
+
+    /// Evict all orphans that have been resident for longer than
+    /// [`ORPHAN_TX_EXPIRE_TIME`] as measured from `now`.
+    ///
+    /// Mirrors Bitcoin Core's `TxOrphanage::LimitOrphans` time-sweep (the
+    /// historical `ORPHAN_TX_EXPIRE_TIME = 20 * 60 = 1200s` gate removed
+    /// during PR #32941 but preserved here for rustoshi's simpler model).
+    ///
+    /// Callers should invoke this periodically from the main event loop.
+    /// The method is intentionally `pub` so unit tests can supply a
+    /// synthetic `now` without sleeping.
+    ///
+    /// Returns the number of orphans evicted.
+    pub fn expire_orphans(&mut self, now: Instant) -> usize {
+        let expired: Vec<Hash256> = self
+            .by_wtxid
+            .iter()
+            .filter(|(_, entry)| {
+                now.checked_duration_since(entry.inserted_at)
+                    .map(|age| age >= ORPHAN_TX_EXPIRE_TIME)
+                    .unwrap_or(false)
+            })
+            .map(|(wtxid, _)| *wtxid)
+            .collect();
+
+        let count = expired.len();
+        for wtxid in expired {
+            self.erase(&wtxid);
+        }
+        count
     }
 }
 
