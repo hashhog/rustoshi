@@ -575,70 +575,82 @@ fn g21_cscriptcheck_struct_and_cachestore_missing() {
 }
 
 // ============================================================
-// G22 — OK (partial): signature cache lookup short-circuits verify
+// G22 — OK: signature cache lookup short-circuits verify
 //
 // Core: CachingTransactionSignatureChecker::VerifyECDSASignature /
 //       VerifySchnorrSignature check SignatureCache before ECDSA.
 // Rustoshi: validate_scripts_parallel_with_cache checks SigCache
 //           before calling verify_script. Cache hit → skip verify.
-//           CAVEAT: cache key is (txid, input_idx, flags), NOT
-//           SHA256(nonce||type||sighash||pubkey||sig) — see G23.
+//           Key is now SHA256(nonce||script_sig||script_pubkey||witness||flags)
+//           (G23 fixed).
 // ============================================================
 
 #[test]
 fn g22_cache_hit_short_circuits_verify() {
     let cache = SigCache::new(100);
-    let txid = [0xabu8; 32];
+    let script_sig = vec![0xabu8; 72];
+    let script_pubkey = vec![0x76u8; 25];
+    let witness: Vec<Vec<u8>> = vec![];
 
     // Pre-populate — simulates prior mempool validation
-    cache.insert(&txid, 0, 0x0001);
+    cache.insert(&script_sig, &script_pubkey, &witness, 0x0001);
 
-    // Hit: returns true without re-verifying script
-    assert!(cache.contains(&txid, 0, 0x0001));
+    // Hit: same material
+    assert!(cache.lookup(&script_sig, &script_pubkey, &witness, 0x0001));
     // Miss: different flags
-    assert!(!cache.contains(&txid, 0, 0x0002));
+    assert!(!cache.lookup(&script_sig, &script_pubkey, &witness, 0x0002));
 }
 
 // ============================================================
-// G23 — BUG (P1): cache key is (txid, input_idx, flags)
-//       instead of SHA256(nonce||type||sighash||pubkey||sig)
+// G23 — FIXED (P1): cache key now SHA256(nonce||script_sig||script_pubkey||witness||flags)
 //
 // Core: sigcache.h:42 — "Entries are SHA256(nonce || 'E' or 'S' ||
 //       31 zero bytes || signature hash || public key || signature)".
 //       The key covers the SPECIFIC SIGNATURE + PUBKEY, not just
-//       the tx. A tx can have multiple valid sigs per input (e.g.,
-//       multisig with different key orderings) — caching by txid+
-//       input_idx means: if input 0 of tx T was once validated with
-//       sig_A, a different sig_B for the same input hits the cache
-//       and bypasses verification. During reorg or mempool eviction
-//       this creates a cache-poisoning window where an attacker can
-//       make rustoshi accept a malformed signature.
+//       the tx.  Two inputs with the same txid+index but different sig
+//       bytes must NOT share a cache entry; an attacker rebroadcasting a
+//       malformed variant of a previously cached tx input must not hit.
 //
-// Rustoshi: sig_cache.rs CacheKey = {txid:[u8;32], input_index:u32,
-//           flags:u32}. No signature or pubkey bytes in key.
-//           No random nonce to prevent cross-session cache pollution.
-// Severity: P1 (security: forged-signature acceptance if attacker
-//           can arrange cache pollution — e.g., broadcast a valid
-//           tx, evict it from mempool, rebroadcast with invalid sig)
+// Fix: SigCache now carries a 256-bit per-session OsRng nonce.
+//      lookup() / insert() take (script_sig, script_pubkey, witness, flags)
+//      and key on SHA256(nonce||script_sig||script_pubkey||witness||flags).
+//      The old txid+input_index key is gone.
+// Severity was: P1 (cache-poisoning → forged-sig acceptance)
 // ============================================================
 
 #[test]
-#[ignore = "BUG G23 (P1): cache key is (txid,input_idx,flags) not SHA256(nonce||type||sighash||pubkey||sig); no random nonce; allows cache-poisoning attack where a txid-input pair cached with valid sig can be re-used to accept an invalid sig on the same outpoint"]
-fn g23_cache_key_missing_signature_and_pubkey() {
+fn g23_cache_key_covers_signature_and_pubkey_bytes() {
     let cache = SigCache::new(100);
-    let txid = [0xabu8; 32];
+    let script_pubkey = vec![0x76u8, 0xa9, 0x14]; // P2PKH-style prefix
+    let witness: Vec<Vec<u8>> = vec![];
     let flags: u32 = 0x0001;
 
-    // Insert "verified" result for (txid, 0, flags)
-    cache.insert(&txid, 0, flags);
+    // sig_a: "valid" sig material
+    let sig_a = vec![0xaau8; 72];
+    // sig_b: forged / different sig bytes — same outpoint identity
+    let sig_b = vec![0xbbu8; 72];
 
-    // Core's cache would require same sig+pubkey to hit.
-    // rustoshi's cache hits on txid+index+flags alone.
-    // A second lookup with same coords but different sig bytes
-    // would incorrectly return a cache hit.
+    // Cache a hit for sig_a
+    cache.insert(&sig_a, &script_pubkey, &witness, flags);
+
+    // sig_a must hit
     assert!(
-        cache.contains(&txid, 0, flags),
-        "rustoshi cache hits on txid+index+flags regardless of sig/pubkey bytes — cache poisoning risk"
+        cache.lookup(&sig_a, &script_pubkey, &witness, flags),
+        "sig_a should hit the cache after insert"
+    );
+
+    // sig_b (different bytes, same conceptual outpoint) must NOT hit
+    assert!(
+        !cache.lookup(&sig_b, &script_pubkey, &witness, flags),
+        "sig_b must not hit the cache — cache key covers sig bytes, preventing cache-poisoning"
+    );
+
+    // Per-session nonce: a fresh cache instance must also not hit for sig_a
+    // (different nonce → different key space → no cross-session poisoning)
+    let cache2 = SigCache::new(100);
+    assert!(
+        !cache2.lookup(&sig_a, &script_pubkey, &witness, flags),
+        "a fresh cache with different nonce must not inherit entries from the old cache"
     );
 }
 
@@ -690,18 +702,20 @@ fn g24_cache_write_policy_inverted() {
 #[test]
 fn g25_cache_write_only_on_success() {
     let cache = SigCache::new(100);
-    let txid = [0x01u8; 32];
+    let script_sig = vec![0x01u8; 72];
+    let script_pubkey = vec![0x76u8; 25];
+    let witness: Vec<Vec<u8>> = vec![];
 
     // Simulate: validation failed → no insert
     // (rustoshi code path: result = Err(_); no cache.insert())
-    assert!(!cache.contains(&txid, 0, 0x0001));
+    assert!(!cache.lookup(&script_sig, &script_pubkey, &witness, 0x0001));
 
     // Simulate: validation succeeded → insert
-    cache.insert(&txid, 0, 0x0001);
-    assert!(cache.contains(&txid, 0, 0x0001));
+    cache.insert(&script_sig, &script_pubkey, &witness, 0x0001);
+    assert!(cache.lookup(&script_sig, &script_pubkey, &witness, 0x0001));
 
-    // Failed validations do not appear in cache
-    assert!(!cache.contains(&txid, 1, 0x0001)); // different input
+    // Different flags — distinct entry (failed validations not cached)
+    assert!(!cache.lookup(&script_sig, &script_pubkey, &witness, 0x0002));
 }
 
 // ============================================================
@@ -818,35 +832,39 @@ fn g30_reorg_connect_uses_parallel_verify() {
 }
 
 // ============================================================
-// Additional correctness: SigCache key collision / no-nonce test
+// Additional correctness: SigCache key covers cryptographic material
 // ============================================================
 
 #[test]
-fn sig_cache_is_keyed_by_txid_index_flags() {
+fn sig_cache_is_keyed_by_script_material() {
     let cache = SigCache::new(100);
+    let script_pubkey = vec![0x76u8; 25];
+    let witness: Vec<Vec<u8>> = vec![];
+    let flags: u32 = 0x0001;
 
-    let txid_a = [0xaau8; 32];
-    let txid_b = [0xbbu8; 32];
+    let sig_a = vec![0xaau8; 72];
+    let sig_b = vec![0xbbu8; 72];
 
-    cache.insert(&txid_a, 0, 0x0001);
+    cache.insert(&sig_a, &script_pubkey, &witness, flags);
 
-    // Same txid, different input — distinct entry
-    assert!(!cache.contains(&txid_a, 1, 0x0001));
-    // Different txid — distinct entry
-    assert!(!cache.contains(&txid_b, 0, 0x0001));
-    // Same txid, same input, different flags — distinct entry
-    assert!(!cache.contains(&txid_a, 0, 0x0002));
+    // Same sig, same flags — cache hit
+    assert!(cache.lookup(&sig_a, &script_pubkey, &witness, flags));
+    // Different sig bytes — distinct entry (the anti-poisoning property)
+    assert!(!cache.lookup(&sig_b, &script_pubkey, &witness, flags));
+    // Different flags — distinct entry
+    assert!(!cache.lookup(&sig_a, &script_pubkey, &witness, 0x0002));
 }
 
 #[test]
 fn sig_cache_eviction_stays_within_capacity() {
     let cap = 20usize;
     let cache = SigCache::new(cap);
+    let script_pubkey = vec![0x76u8; 25];
+    let witness: Vec<Vec<u8>> = vec![];
 
     for i in 0u8..40 {
-        let mut txid = [0u8; 32];
-        txid[0] = i;
-        cache.insert(&txid, 0, 0);
+        let script_sig = vec![i; 72];
+        cache.insert(&script_sig, &script_pubkey, &witness, 0);
     }
 
     // After inserting 40 entries into a cap-20 cache, size <= cap + slack
@@ -861,10 +879,11 @@ fn sig_cache_eviction_stays_within_capacity() {
 #[test]
 fn sig_cache_clear_removes_all() {
     let cache = SigCache::new(100);
+    let script_pubkey = vec![0x76u8; 25];
+    let witness: Vec<Vec<u8>> = vec![];
     for i in 0u8..10 {
-        let mut txid = [0u8; 32];
-        txid[0] = i;
-        cache.insert(&txid, 0, 0);
+        let script_sig = vec![i; 72];
+        cache.insert(&script_sig, &script_pubkey, &witness, 0);
     }
     assert_eq!(cache.len(), 10);
     cache.clear();
