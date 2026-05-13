@@ -406,26 +406,50 @@ fn g18_source_group_bucketing_missing() {
 
 // ─── G19: SHA256 bucket hash ──────────────────────────────────────────────────
 
-/// G19 BUG (P1) — SHA256(m_addrman_key || source || group) bucket hash absent.
+/// G19 FIX verified — SHA256d(key_bytes || group_bytes) used in keyed().
 ///
-/// The entire bucket-key selection algorithm from Core (double SHA256 /
-/// CheapHash of nKey with various inputs) does not exist because rustoshi
-/// lacks the new/tried bucket structure entirely.  The `keyed()` method in
-/// NetGroup uses Rust's DefaultHasher (not SHA256), which is not
-/// cryptographically secure and thus provides no eclipse protection against
-/// an attacker who can predict hash outputs.
+/// NetGroup::keyed() now mirrors Bitcoin Core's HashWriter::GetCheapHash():
+/// it computes SHA256d(key || group) and returns the first 8 bytes as a
+/// little-endian u64.  DefaultHasher (non-cryptographic, 64-bit output,
+/// leakable via side-channel) is no longer used.
+///
+/// This test pins the exact byte format: independently compute SHA256d of
+/// key.to_le_bytes() || group_bytes and compare against keyed() output.
 ///
 /// Core reference: addrman.cpp:28-45 GetTriedBucket(), GetNewBucket(),
-/// GetBucketPosition(); all use HashWriter (SHA256d).
+/// GetBucketPosition(); all use HashWriter (SHA256d) + GetCheapHash().
 #[test]
-#[ignore = "BUG G19 P1: SHA256-based bucket position hash absent; NetGroup.keyed() uses DefaultHasher (non-cryptographic)"]
-fn g19_sha256_bucket_hash_missing() {
-    // NetGroup::keyed() uses std::collections::hash_map::DefaultHasher, not SHA256.
-    // An attacker who knows the key can predict group assignments.
-    assert!(
-        false,
-        "G19 P1: non-cryptographic DefaultHasher used for netgroup key; SHA256 bucket hash absent"
+fn g19_netgroup_keyed_uses_sha256d() {
+    use crate::netgroup::NetGroup;
+    use rustoshi_crypto::sha256d;
+
+    let key: u64 = 0xdeadbeef_cafebabe;
+    let group_bytes = vec![0u8, 8, 8]; // IPv4 type byte + /16 prefix 8.8.*
+
+    let group = NetGroup::new(group_bytes.clone());
+    let result = group.keyed(key);
+
+    // Independently replicate Core's GetCheapHash(): SHA256d(key_le || group)
+    // then first 8 bytes as LE u64.
+    let mut data = Vec::with_capacity(8 + group_bytes.len());
+    data.extend_from_slice(&key.to_le_bytes());
+    data.extend_from_slice(&group_bytes);
+    let hash = sha256d(&data);
+    let expected = u64::from_le_bytes(hash.0[..8].try_into().unwrap());
+
+    assert_eq!(
+        result, expected,
+        "G19: keyed() must return first 8 bytes of SHA256d(key_le || group) as LE u64"
     );
+
+    // Sanity: different keys produce different outputs (non-trivial hash).
+    let result2 = group.keyed(key ^ 1);
+    assert_ne!(result, result2, "different keys must produce different hashes");
+
+    // Sanity: different group bytes produce different outputs.
+    let group2 = NetGroup::new(vec![0u8, 1, 1]);
+    let result3 = group2.keyed(key);
+    assert_ne!(result, result3, "different groups must produce different hashes");
 }
 
 /// G19 supplemental — verify that keyed() is at least deterministic (not a
