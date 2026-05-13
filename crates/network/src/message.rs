@@ -21,6 +21,17 @@ pub const MAX_MESSAGE_SIZE: usize = 4 * 1000 * 1000; // = 4_000_000
 /// Maximum number of inventory items in a single message.
 pub const MAX_INV_SIZE: usize = 50_000;
 
+/// Maximum number of items served in a single getdata response batch.
+///
+/// Bitcoin Core caps outgoing getdata at 1000 items per event-loop tick to
+/// bound CPU and bandwidth per call (`net_processing.cpp:128` and `:6207`):
+///   `static const unsigned int MAX_GETDATA_SZ = 1000;`
+///   `if (vGetData.size() >= MAX_GETDATA_SZ) break;`
+///
+/// Without this cap, a peer sending inv with MAX_INV_SZ=50_000 items could
+/// force the handler to do 50× the work per turn — a CPU/bandwidth DoS amplifier.
+pub const MAX_GETDATA_SZ: usize = 1_000;
+
 /// Maximum number of headers in a single headers message.
 pub const MAX_HEADERS: usize = 2000;
 

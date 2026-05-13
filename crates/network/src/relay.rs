@@ -22,7 +22,7 @@
 //!
 //! Reference: Bitcoin Core's `net_processing.cpp` `SendMessages()`
 
-use crate::message::{InvType, InvVector};
+use crate::message::{InvType, InvVector, MAX_GETDATA_SZ};
 use crate::peer::PeerId;
 use rustoshi_primitives::Hash256;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -832,6 +832,28 @@ pub fn build_tx_inv_entry(supports_wtxid_relay: bool, txid: Hash256, wtxid: Hash
     } else {
         InvVector { inv_type: InvType::MsgTx, hash: txid }
     }
+}
+
+/// Split an inventory list into getdata batches capped at `MAX_GETDATA_SZ`.
+///
+/// Bitcoin Core's `ProcessGetData` (`net_processing.cpp:6207`) stops serving
+/// after `MAX_GETDATA_SZ = 1000` items per event-loop tick:
+///   `if (vGetData.size() >= MAX_GETDATA_SZ) break;`
+///
+/// This helper enforces the same bound when building outgoing getdata messages
+/// from a received inv: a 50 000-item inv must be split into ≥50 separate
+/// getdata messages rather than being served as a single unbounded response.
+///
+/// Returns a `Vec` of chunks, each of length ≤ `MAX_GETDATA_SZ`.  An empty
+/// input returns an empty outer `Vec`.
+pub fn batch_getdata_items(items: Vec<InvVector>) -> Vec<Vec<InvVector>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    items
+        .chunks(MAX_GETDATA_SZ)
+        .map(|chunk| chunk.to_vec())
+        .collect()
 }
 
 /// Shuffle a slice using Fisher-Yates algorithm.
