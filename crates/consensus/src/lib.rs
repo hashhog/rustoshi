@@ -70,7 +70,7 @@ pub use fee_estimator::{FeeEstimator, RawBucketStats};
 pub use mempool::{AtmpOptions, Mempool, MempoolConfig, MempoolEntry, MempoolError};
 pub use orphanage::{
     OrphanEntry, OrphanError, TxOrphanage, MAX_ORPHANS_PER_PEER, MAX_ORPHAN_TRANSACTIONS,
-    MAX_ORPHAN_TX_SIZE,
+    MAX_ORPHAN_TX_SIZE, ORPHAN_TX_EXPIRE_TIME,
 };
 pub use mempool_persist::{
     dump_mempool, dump_mempool_with_key, header_size, load_mempool, DumpStats, LoadStats,
