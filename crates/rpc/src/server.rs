@@ -33,7 +33,7 @@ use rustoshi_consensus::{
     fee_estimator::FeeEstimator,
     mempool::{Mempool, MempoolConfig},
     orphanage::TxOrphanage,
-    versionbits::{get_deployments, DeploymentId},
+    versionbits::{get_deployments, get_state_for, DeploymentId, ThresholdState},
     ChainParams, ChainState, NetworkId, COIN,
 };
 use rustoshi_network::message::{InvType, InvVector, NetworkMessage};
@@ -4124,10 +4124,79 @@ impl RustoshiRpcServer for RpcServerImpl {
             None
         };
 
+        // Build rules and vbavailable dynamically, mirroring Core mining.cpp:950-991.
+        //
+        // rules: always "csv"; if segwit is active, "!segwit" (mandatory) and
+        //   "taproot" (if active); if signet, "!signet"; plus any active BIP-9
+        //   deployments by name.
+        // vbavailable: name -> bit for every STARTED or LOCKED_IN BIP-9
+        //   deployment (miners should signal these bits).
+        //
+        // A zero-size phantom type satisfying VersionbitsBlockInfo; used
+        // only so that get_state_for can be called with block=None (the
+        // function never dereferences the type when block is None).
+        struct NoBlock;
+        impl rustoshi_consensus::versionbits::VersionbitsBlockInfo for NoBlock {
+            fn height(&self) -> u32 { unreachable!() }
+            fn version(&self) -> i32 { unreachable!() }
+            fn median_time(&self) -> i64 { unreachable!() }
+            fn prev(&self) -> Option<&Self> { unreachable!() }
+            fn ancestor(&self, _: u32) -> Option<&Self> { unreachable!() }
+        }
+
+        let gbt_rules: Vec<String> = {
+            let mut r: Vec<String> = Vec::new();
+            r.push("csv".to_string());
+            if state.params.is_segwit_active(new_height) {
+                r.push("!segwit".to_string());
+                if state.params.is_taproot_active(new_height) {
+                    r.push("taproot".to_string());
+                }
+            }
+            if state.params.network_id == NetworkId::Signet {
+                r.push("!signet".to_string());
+            }
+            // Non-buried BIP-9 deployments that are ACTIVE get added to rules.
+            // (csv/segwit/taproot are treated as buried above.)
+            let vb_deps = get_deployments(&state.params);
+            for (id, dep) in &vb_deps {
+                let name = match id {
+                    DeploymentId::Csv | DeploymentId::Segwit | DeploymentId::Taproot => continue,
+                    DeploymentId::Custom(n) => format!("custom_{}", n),
+                };
+                if get_state_for::<NoBlock>(None, dep, None) == ThresholdState::Active {
+                    r.push(name);
+                }
+            }
+            r
+        };
+
+        // vbavailable: STARTED or LOCKED_IN BIP-9 deployments advertised to miners.
+        // Buried deployments (csv/segwit/taproot) are handled via rules; only
+        // non-buried BIP-9 entries go here.  On most networks this map will be
+        // empty because all known deployments are already active/buried.
+        let gbt_vbavailable: serde_json::Value = {
+            let vb_deps = get_deployments(&state.params);
+            let mut map = serde_json::Map::new();
+            for (id, dep) in &vb_deps {
+                let name = match id {
+                    DeploymentId::Csv | DeploymentId::Segwit | DeploymentId::Taproot => continue,
+                    DeploymentId::Custom(n) => format!("custom_{}", n),
+                };
+                if matches!(
+                    get_state_for::<NoBlock>(None, dep, None),
+                    ThresholdState::Started | ThresholdState::LockedIn
+                ) {
+                    map.insert(name, serde_json::json!(dep.bit));
+                }
+            }
+            serde_json::Value::Object(map)
+        };
+
         let result = BlockTemplateResult {
             version: template.header.version,
-            rules: vec!["csv".to_string(), "segwit".to_string()],
-            vbavailable: serde_json::json!({}),
+            rules: gbt_rules,
+            vbavailable: gbt_vbavailable,
             vbrequired: 0,
             previousblockhash: state.best_hash.to_hex(),
             transactions: txs,
