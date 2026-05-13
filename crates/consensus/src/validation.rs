@@ -1970,11 +1970,15 @@ pub fn validate_scripts_parallel_with_cache(
     let results: Vec<Result<(), TxValidationError>> = script_checks
         .par_iter()
         .map(|(tx, input_idx, coin, tx_coin_idx)| {
-            let txid_bytes: [u8; 32] = tx.txid().0;
+            // Capture script material for cache key derivation.
+            let script_sig = &tx.inputs[*input_idx].script_sig;
+            let witness = &tx.inputs[*input_idx].witness;
+            let script_pubkey = &coin.script_pubkey;
 
-            // Check cache first
+            // Check cache first (keyed on actual cryptographic material,
+            // not txid+index, so a forged sig cannot hit a valid entry).
             if let Some(cache) = sig_cache {
-                if cache.contains(&txid_bytes, *input_idx as u32, flags_bits) {
+                if cache.lookup(script_sig, script_pubkey, witness, flags_bits) {
                     return Ok(());
                 }
             }
@@ -1989,9 +1993,9 @@ pub fn validate_scripts_parallel_with_cache(
                 spent_scripts,
             );
             let result = verify_script(
-                &tx.inputs[*input_idx].script_sig,
-                &coin.script_pubkey,
-                &tx.inputs[*input_idx].witness,
+                script_sig,
+                script_pubkey,
+                witness,
                 flags,
                 &checker,
             )
@@ -2000,7 +2004,7 @@ pub fn validate_scripts_parallel_with_cache(
             // Cache successful verification
             if result.is_ok() {
                 if let Some(cache) = sig_cache {
-                    cache.insert(&txid_bytes, *input_idx as u32, flags_bits);
+                    cache.insert(script_sig, script_pubkey, witness, flags_bits);
                 }
             }
 
