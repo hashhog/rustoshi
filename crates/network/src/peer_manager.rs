@@ -29,7 +29,7 @@ use crate::v2_transport::{
     looks_like_v1_version, Bip324Cipher, EllSwiftPubKey,
 };
 use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
-use crate::netgroup::{NetGroup, NetGroupManager};
+use crate::netgroup::{ip_is_routable, NetGroup, NetGroupManager};
 use crate::peer::{
     run_outbound_peer, DisconnectReason, PeerCommand, PeerEvent, PeerId,
     PeerInfo, PeerState,
@@ -298,6 +298,11 @@ impl AddressManager {
     pub fn add_peer_addresses(&mut self, addrs: &[TimestampedNetAddress], from: SocketAddr) {
         for taddr in addrs {
             if let Some(socket_addr) = net_address_to_socket_addr(&taddr.address) {
+                // Reject non-routable addresses (RFC 1918, loopback, link-local,
+                // multicast, reserved, etc.) — mirrors Core CNetAddr::IsRoutable().
+                if !ip_is_routable(&socket_addr.ip()) {
+                    continue;
+                }
                 if !self.is_banned(&socket_addr) {
                     let entry = self
                         .known_addrs
@@ -515,6 +520,10 @@ impl AddressManager {
 
             // For IPv4/IPv6, also add to legacy storage
             if let Some(socket_addr) = entry.to_socket_addr() {
+                // Reject non-routable addresses — mirrors Core CNetAddr::IsRoutable().
+                if !ip_is_routable(&socket_addr.ip()) {
+                    continue;
+                }
                 if !self.is_banned(&socket_addr) {
                     let addr_entry = self
                         .known_addrs
@@ -3486,11 +3495,12 @@ mod tests {
         let mut mgr = AddressManager::new();
         let netgroup_mgr = NetGroupManager::with_key(12345);
 
-        // Add addresses in different /16 subnets
+        // Add addresses in different /16 subnets (publicly routable — RFC 1918
+        // ranges are now all Unroutable and would share the same netgroup).
         let addrs: Vec<SocketAddr> = vec![
-            "192.168.1.1:8333".parse().unwrap(),
-            "10.0.0.1:8333".parse().unwrap(),
-            "172.16.0.1:8333".parse().unwrap(),
+            "1.2.3.4:8333".parse().unwrap(),    // 1.2.0.0/16
+            "5.6.7.8:8333".parse().unwrap(),    // 5.6.0.0/16
+            "9.10.11.12:8333".parse().unwrap(), // 9.10.0.0/16
         ];
         mgr.add_dns_addresses(addrs.clone());
 
@@ -3708,16 +3718,18 @@ mod tests {
     #[test]
     fn test_address_manager_add_peer_addresses() {
         let mut mgr = AddressManager::new();
-        let from: SocketAddr = "192.168.1.1:8333".parse().unwrap();
+        // Use a routable source address (not RFC 1918 — those are filtered by
+        // the W104 IsRoutable fix).
+        let from: SocketAddr = "8.8.8.8:8333".parse().unwrap();
 
         let addrs = vec![
             TimestampedNetAddress {
                 timestamp: 1700000000,
-                address: NetAddress::from_ipv4([10, 0, 0, 1], 8333, NODE_NETWORK),
+                address: NetAddress::from_ipv4([1, 2, 3, 4], 8333, NODE_NETWORK),
             },
             TimestampedNetAddress {
                 timestamp: 1700000001,
-                address: NetAddress::from_ipv4([10, 0, 0, 2], 8333, NODE_NETWORK | NODE_WITNESS),
+                address: NetAddress::from_ipv4([5, 6, 7, 8], 8333, NODE_NETWORK | NODE_WITNESS),
             },
         ];
 
@@ -3726,7 +3738,7 @@ mod tests {
         assert_eq!(mgr.known_count(), 2);
         let info = mgr
             .known_addrs
-            .get(&"10.0.0.1:8333".parse().unwrap())
+            .get(&"1.2.3.4:8333".parse().unwrap())
             .unwrap();
         assert_eq!(info.source, AddrSource::Peer(from));
     }
@@ -3999,9 +4011,11 @@ mod tests {
         let mut mgr = AddressManager::new();
         let netgroup_mgr = NetGroupManager::with_key(12345);
 
-        let addr1: SocketAddr = "192.168.1.1:8333".parse().unwrap();
-        let addr2: SocketAddr = "192.168.1.2:8333".parse().unwrap(); // Same /16
-        let addr3: SocketAddr = "10.0.0.1:8333".parse().unwrap(); // Different /16
+        // Use publicly routable addresses — RFC 1918 (192.168/16, 10/8) are now
+        // all classified as Unroutable and would share a single netgroup.
+        let addr1: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+        let addr2: SocketAddr = "1.2.4.5:8333".parse().unwrap(); // Same /16 (1.2.0.0/16)
+        let addr3: SocketAddr = "5.6.7.8:8333".parse().unwrap(); // Different /16
 
         // Initially no outbound netgroups
         assert_eq!(mgr.outbound_netgroup_count(), 0);

@@ -108,27 +108,64 @@ impl NetGroupManager {
     fn classify_v4(&self, addr: &Ipv4Addr) -> NetworkType {
         let octets = addr.octets();
 
+        // Unspecified (0.0.0.0/8) — includes 0.0.0.0 itself
+        if octets[0] == 0 {
+            return NetworkType::Unroutable;
+        }
+
         // Loopback (127.0.0.0/8)
         if octets[0] == 127 {
             return NetworkType::Local;
         }
 
-        // Private networks - still routable for our purposes
-        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-        // We treat these as regular IPv4 for grouping
+        // RFC 1918 — private networks
+        // 10.0.0.0/8
+        if octets[0] == 10 {
+            return NetworkType::Unroutable;
+        }
+        // 172.16.0.0/12
+        if octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31 {
+            return NetworkType::Unroutable;
+        }
+        // 192.168.0.0/16
+        if octets[0] == 192 && octets[1] == 168 {
+            return NetworkType::Unroutable;
+        }
 
-        // Link-local (169.254.0.0/16)
+        // RFC 2544 — benchmarking (198.18.0.0/15)
+        if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+            return NetworkType::Unroutable;
+        }
+
+        // RFC 3927 — link-local / auto-config (169.254.0.0/16)
         if octets[0] == 169 && octets[1] == 254 {
             return NetworkType::Unroutable;
         }
 
-        // Unspecified (0.0.0.0)
-        if octets == [0, 0, 0, 0] {
+        // RFC 6598 — shared address space / carrier-grade NAT (100.64.0.0/10)
+        if octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127 {
             return NetworkType::Unroutable;
         }
 
-        // Broadcast (255.255.255.255)
-        if octets == [255, 255, 255, 255] {
+        // RFC 5737 — documentation / test ranges
+        // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
+            return NetworkType::Unroutable;
+        }
+        if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
+            return NetworkType::Unroutable;
+        }
+        if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+            return NetworkType::Unroutable;
+        }
+
+        // Multicast (224.0.0.0/4)
+        if octets[0] >= 224 && octets[0] <= 239 {
+            return NetworkType::Unroutable;
+        }
+
+        // Reserved / "Class E" (240.0.0.0/4) and broadcast (255.255.255.255)
+        if octets[0] >= 240 {
             return NetworkType::Unroutable;
         }
 
@@ -184,8 +221,32 @@ impl NetGroupManager {
             return NetworkType::Cjdns;
         }
 
-        // Link-local (fe80::/10)
+        // Link-local (fe80::/10) — RFC 4862
         if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+            return NetworkType::Unroutable;
+        }
+
+        // Unique-local (fd00::/8) — RFC 4193.
+        // Note: fc00::/8 is CJDNS (already handled above); fd00::/8 is the other
+        // half of fc00::/7 and is not routable on the public internet.
+        if octets[0] == 0xfd {
+            return NetworkType::Unroutable;
+        }
+
+        // ORCHID / ORCHID2 — RFC 4843 (2001:10::/28) and RFC 7343 (2001:20::/28)
+        if octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x00 {
+            let nibble = octets[3] & 0xf0;
+            if nibble == 0x10 || nibble == 0x20 {
+                return NetworkType::Unroutable;
+            }
+        }
+
+        // Documentation (2001:db8::/32) — RFC 3849
+        if octets[0] == 0x20
+            && octets[1] == 0x01
+            && octets[2] == 0x0d
+            && octets[3] == 0xb8
+        {
             return NetworkType::Unroutable;
         }
 
@@ -304,6 +365,20 @@ impl Default for NetGroupManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Return true iff `addr` is publicly routable on the global internet.
+///
+/// Mirrors Bitcoin Core's `CNetAddr::IsRoutable()` from `netaddress.cpp`.
+/// Rejects RFC 1918, RFC 2544, RFC 3927, RFC 4862, RFC 6598, RFC 5737,
+/// RFC 4193 (fd00::/8), RFC 4843/7343 (ORCHID/ORCHID2), RFC 3849
+/// (documentation), multicast, reserved, loopback, and unspecified ranges.
+///
+/// Privacy-network addresses (Tor fd87:d87e:eb43::/48, I2P fd87:d87e:eb44::/48,
+/// CJDNS fc00::/8) are NOT rejected here — they are valid relay targets.
+pub fn ip_is_routable(addr: &IpAddr) -> bool {
+    let mgr = NetGroupManager::with_key(0); // key irrelevant for classification
+    mgr.is_routable(addr)
 }
 
 #[cfg(test)]
@@ -445,14 +520,16 @@ mod tests {
     fn test_netgroup_bytes() {
         let mgr = NetGroupManager::with_key(12345);
 
-        let addr: IpAddr = "192.168.1.1".parse().unwrap();
+        // Use a publicly routable address — 192.168.1.1 is RFC 1918 and now
+        // classified as Unroutable, which would give a 1-byte group.
+        let addr: IpAddr = "8.8.8.8".parse().unwrap();
         let group = mgr.get_group(&addr);
 
-        // Should be network type (Ipv4=0) + two bytes (192, 168)
+        // Should be network type (Ipv4=0) + two bytes (8, 8)
         let bytes = group.as_bytes();
         assert_eq!(bytes[0], NetworkType::Ipv4 as u8);
-        assert_eq!(bytes[1], 192);
-        assert_eq!(bytes[2], 168);
+        assert_eq!(bytes[1], 8);
+        assert_eq!(bytes[2], 8);
     }
 
     #[test]
