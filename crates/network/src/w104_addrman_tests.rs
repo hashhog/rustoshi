@@ -40,9 +40,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use crate::{
     addr::{AddrV2Entry, NetworkAddr, deserialize_addrv2_message, serialize_addrv2_message},
-    message::MAX_ADDR,
-    netgroup::{NetGroupManager, NetworkType},
-    peer_manager::AddressManager,
+    message::{MAX_ADDR, TimestampedNetAddress},
+    netgroup::{ip_is_routable, NetGroupManager, NetworkType},
+    peer_manager::{AddressManager, socket_addr_to_net_address},
 };
 
 // ─── G1: addrv2 message parsing (BIP-155) ───────────────────────────────────
@@ -624,14 +624,20 @@ fn g26_add_rate_limit_per_source_missing() {
     );
 }
 
-/// G26 supplemental — AddressManager accepts unlimited addresses right now.
+/// G26 supplemental — AddressManager accepts unlimited routable addresses right now
+/// (no token-bucket rate-limiter).
 #[test]
 fn g26_address_manager_unbounded_add() {
     let mut mgr = AddressManager::new();
-    // Add 10_000 addresses from the same /16 source — all accepted, no eviction.
-    let source: SocketAddr = "10.0.0.1:8333".parse().unwrap();
+    // Use routable 1.0.x.x addresses (not RFC 1918 — those are now filtered by
+    // the W104 IsRoutable fix).  The G26 bug is about no token-bucket cap, which
+    // still applies to routable addresses.
+    let source: SocketAddr = "8.8.8.8:8333".parse().unwrap();
     for i in 0u32..10_000 {
-        let ip = Ipv4Addr::from(0x0A000002 + i); // 10.0.0.2 onwards
+        // 1.0.0.1 through 1.0.39.16 — all publicly routable
+        let b2 = ((i / 256) & 0xff) as u8;
+        let b3 = (i & 0xff) as u8;
+        let ip = Ipv4Addr::new(1, b2, b3, 1);
         let addr: SocketAddr = SocketAddr::new(IpAddr::V4(ip), 8333);
         let taddr = crate::message::TimestampedNetAddress {
             timestamp: 0,
@@ -639,7 +645,7 @@ fn g26_address_manager_unbounded_add() {
         };
         mgr.add_peer_addresses(&[taddr], source);
     }
-    // All 10 000 were accepted — documents the unbounded behaviour.
+    // All 10 000 were accepted — documents the unbounded behaviour (G26 BUG).
     assert_eq!(mgr.known_count(), 10_000, "address table is unbounded (G26 BUG)");
 }
 
@@ -826,4 +832,211 @@ fn integration_ban_prevents_connection() {
     // next_addr_to_try should skip banned addresses
     let result = mgr.next_addr_to_try(&ng);
     assert!(result.is_none(), "banned address must not be returned from next_addr_to_try");
+}
+
+// ─── IsRoutable filter on AddrMan add (W104 fix) ─────────────────────────────
+//
+// Bitcoin Core's CNetAddr::IsRoutable() (netaddress.cpp:462) rejects RFC 1918,
+// RFC 2544, RFC 3927, RFC 4862, RFC 6598, RFC 5737, loopback, link-local,
+// multicast, reserved, and other non-global ranges before inserting into AddrMan.
+// The following tests verify that rustoshi now applies the same filter.
+
+/// ip_is_routable() returns false for all RFC 1918 private ranges.
+#[test]
+fn w104_rfc1918_not_routable() {
+    // 10.0.0.0/8
+    assert!(!ip_is_routable(&"10.0.0.1".parse::<IpAddr>().unwrap()),       "10/8 must be non-routable (RFC 1918)");
+    assert!(!ip_is_routable(&"10.255.255.255".parse::<IpAddr>().unwrap()),  "10/8 boundary must be non-routable");
+    // 172.16.0.0/12
+    assert!(!ip_is_routable(&"172.16.0.1".parse::<IpAddr>().unwrap()),     "172.16/12 must be non-routable (RFC 1918)");
+    assert!(!ip_is_routable(&"172.31.255.255".parse::<IpAddr>().unwrap()), "172.31/12 boundary must be non-routable");
+    // 192.168.0.0/16
+    assert!(!ip_is_routable(&"192.168.0.1".parse::<IpAddr>().unwrap()),    "192.168/16 must be non-routable (RFC 1918)");
+    assert!(!ip_is_routable(&"192.168.255.255".parse::<IpAddr>().unwrap()),"192.168/16 boundary must be non-routable");
+}
+
+/// ip_is_routable() returns false for loopback, link-local, unspecified, and broadcast.
+#[test]
+fn w104_loopback_linklocal_unspecified_not_routable() {
+    assert!(!ip_is_routable(&"127.0.0.1".parse::<IpAddr>().unwrap()),        "loopback must be non-routable");
+    assert!(!ip_is_routable(&"127.255.255.255".parse::<IpAddr>().unwrap()),  "127/8 boundary must be non-routable");
+    assert!(!ip_is_routable(&"::1".parse::<IpAddr>().unwrap()),              "IPv6 loopback must be non-routable");
+    assert!(!ip_is_routable(&"169.254.1.1".parse::<IpAddr>().unwrap()),      "link-local (RFC 3927) must be non-routable");
+    assert!(!ip_is_routable(&"0.0.0.0".parse::<IpAddr>().unwrap()),          "unspecified must be non-routable");
+    assert!(!ip_is_routable(&"255.255.255.255".parse::<IpAddr>().unwrap()),  "broadcast must be non-routable");
+}
+
+/// ip_is_routable() returns false for multicast and reserved ranges.
+#[test]
+fn w104_multicast_reserved_not_routable() {
+    assert!(!ip_is_routable(&"224.0.0.1".parse::<IpAddr>().unwrap()),   "multicast (224/4) must be non-routable");
+    assert!(!ip_is_routable(&"239.255.255.255".parse::<IpAddr>().unwrap()), "multicast boundary must be non-routable");
+    assert!(!ip_is_routable(&"240.0.0.1".parse::<IpAddr>().unwrap()),   "reserved (240/4) must be non-routable");
+    assert!(!ip_is_routable(&"100.64.0.1".parse::<IpAddr>().unwrap()),  "RFC 6598 CG-NAT must be non-routable");
+}
+
+/// ip_is_routable() returns false for IPv6 unique-local (RFC 4193, fd00::/8).
+#[test]
+fn w104_ipv6_unique_local_not_routable() {
+    assert!(!ip_is_routable(&"fd00::1".parse::<IpAddr>().unwrap()),        "fd00::/8 unique-local must be non-routable (RFC 4193)");
+    assert!(!ip_is_routable(&"fdff:ffff::1".parse::<IpAddr>().unwrap()),   "fd00::/8 boundary must be non-routable");
+    // IPv6 link-local fe80::/10
+    assert!(!ip_is_routable(&"fe80::1".parse::<IpAddr>().unwrap()),        "fe80::/10 link-local must be non-routable (RFC 4862)");
+    // Documentation 2001:db8::/32 (RFC 3849)
+    assert!(!ip_is_routable(&"2001:db8::1".parse::<IpAddr>().unwrap()),    "2001:db8::/32 documentation must be non-routable (RFC 3849)");
+}
+
+/// ip_is_routable() returns true for publicly routable addresses.
+#[test]
+fn w104_routable_addresses_pass() {
+    assert!(ip_is_routable(&"8.8.8.8".parse::<IpAddr>().unwrap()),             "8.8.8.8 must be routable");
+    assert!(ip_is_routable(&"1.1.1.1".parse::<IpAddr>().unwrap()),             "1.1.1.1 must be routable");
+    assert!(ip_is_routable(&"2001:4860:4860::8888".parse::<IpAddr>().unwrap()),"Google IPv6 DNS must be routable");
+    assert!(ip_is_routable(&"2600:1f18::1".parse::<IpAddr>().unwrap()),        "AWS IPv6 must be routable");
+}
+
+/// Privacy-network addresses (Tor, I2P, CJDNS) are passed by ip_is_routable().
+#[test]
+fn w104_privacy_network_addresses_pass_routable_check() {
+    // Tor v3 internal repr: fd87:d87e:eb43::/48
+    let tor: IpAddr = "fd87:d87e:eb43::1".parse().unwrap();
+    assert!(ip_is_routable(&tor), "Tor internal repr must pass routable check (privacy network)");
+
+    // I2P internal repr: fd87:d87e:eb44::/48
+    let i2p: IpAddr = "fd87:d87e:eb44::1".parse().unwrap();
+    assert!(ip_is_routable(&i2p), "I2P internal repr must pass routable check (privacy network)");
+
+    // CJDNS fc00::/8
+    let cjdns: IpAddr = "fc00::1".parse().unwrap();
+    assert!(ip_is_routable(&cjdns), "CJDNS fc00::/8 must pass routable check (privacy network)");
+}
+
+/// add_peer_addresses() silently drops non-routable gossip addresses (W104 fix).
+///
+/// Previously rustoshi accepted any address from gossip — RFC 1918, loopback,
+/// link-local, etc. — into AddrMan.  Core's CNetAddr::IsRoutable() rejects
+/// those before AddrMan insertion.
+#[test]
+fn w104_add_peer_addresses_drops_non_routable() {
+    let mut mgr = AddressManager::new();
+    let source: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+
+    let non_routable_addrs = [
+        "10.0.0.1:8333",        // RFC 1918
+        "172.16.5.5:8333",      // RFC 1918
+        "192.168.1.1:8333",     // RFC 1918
+        "127.0.0.1:8333",       // loopback
+        "169.254.1.1:8333",     // link-local
+        "0.0.0.0:8333",         // unspecified
+        "224.0.0.1:8333",       // multicast
+        "240.0.0.1:8333",       // reserved
+        "100.64.0.1:8333",      // RFC 6598 CG-NAT
+    ];
+
+    for s in &non_routable_addrs {
+        let addr: SocketAddr = s.parse().unwrap();
+        let taddr = TimestampedNetAddress {
+            timestamp: 0,
+            address: socket_addr_to_net_address(addr, 1),
+        };
+        mgr.add_peer_addresses(&[taddr], source);
+    }
+
+    assert_eq!(
+        mgr.known_count(),
+        0,
+        "non-routable gossip addresses must be silently dropped (W104 fix)"
+    );
+}
+
+/// add_peer_addresses() accepts publicly routable gossip addresses.
+#[test]
+fn w104_add_peer_addresses_accepts_routable() {
+    let mut mgr = AddressManager::new();
+    let source: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+
+    let routable_addrs = [
+        "1.2.3.4:8333",
+        "5.6.7.8:8333",
+        "9.10.11.12:8333",
+    ];
+
+    for s in &routable_addrs {
+        let addr: SocketAddr = s.parse().unwrap();
+        let taddr = TimestampedNetAddress {
+            timestamp: 0,
+            address: socket_addr_to_net_address(addr, 1),
+        };
+        mgr.add_peer_addresses(&[taddr], source);
+    }
+
+    assert_eq!(
+        mgr.known_count(),
+        routable_addrs.len(),
+        "routable gossip addresses must be accepted into AddrMan"
+    );
+}
+
+/// add_addrv2_addresses() silently drops non-routable IPv4 in BIP-155 ADDRv2.
+#[test]
+fn w104_add_addrv2_drops_non_routable_ipv4() {
+    let mut mgr = AddressManager::new();
+    let source: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+
+    let non_routable_entries = vec![
+        AddrV2Entry {
+            timestamp: 0,
+            services: 1,
+            addr: NetworkAddr::Ipv4(Ipv4Addr::new(192, 168, 1, 1)),  // RFC 1918
+            port: 8333,
+        },
+        AddrV2Entry {
+            timestamp: 0,
+            services: 1,
+            addr: NetworkAddr::Ipv4(Ipv4Addr::new(10, 0, 0, 1)),    // RFC 1918
+            port: 8333,
+        },
+        AddrV2Entry {
+            timestamp: 0,
+            services: 1,
+            addr: NetworkAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),   // loopback
+            port: 8333,
+        },
+    ];
+
+    mgr.add_addrv2_addresses(&non_routable_entries, source);
+
+    assert_eq!(
+        mgr.known_count(),
+        0,
+        "non-routable IPv4 ADDRv2 gossip must be dropped (W104 fix)"
+    );
+}
+
+/// add_addrv2_addresses() accepts routable IPv4/IPv6 and privacy-network addrs.
+#[test]
+fn w104_add_addrv2_accepts_routable_and_privacy() {
+    let mut mgr = AddressManager::new();
+    let source: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+
+    let entries = vec![
+        AddrV2Entry {
+            timestamp: 0,
+            services: 1,
+            addr: NetworkAddr::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
+            port: 8333,
+        },
+        AddrV2Entry {
+            timestamp: 0,
+            services: 1,
+            addr: NetworkAddr::TorV3([0x42; 32]),
+            port: 9050,
+        },
+    ];
+
+    mgr.add_addrv2_addresses(&entries, source);
+
+    // IPv4 entry adds to known_addrs; Tor adds to known_addrv2 only
+    assert_eq!(mgr.known_count(), 1,        "routable IPv4 ADDRv2 entry must be added");
+    assert_eq!(mgr.known_addrv2_count(), 2, "both IPv4 and Tor entries must be in addrv2 store");
 }

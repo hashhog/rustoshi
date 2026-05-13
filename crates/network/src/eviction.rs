@@ -545,7 +545,9 @@ mod tests {
         let mgr = NetGroupManager::with_key(12345);
         let builder = EvictionCandidateBuilder::new(&mgr);
 
-        let addr: SocketAddr = "192.168.1.1:8333".parse().unwrap();
+        // Use a publicly routable address — 192.168.1.1 is RFC 1918 and now
+        // classified as Unroutable, not Ipv4.
+        let addr: SocketAddr = "8.8.8.8:8333".parse().unwrap();
         let candidate = builder.build(
             PeerId(1),
             addr,
