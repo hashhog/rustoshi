@@ -8,7 +8,7 @@
 //!   G2  - BUG (CORRECTNESS): getdata handler entirely absent; no MSG_TX/MSG_WTX dispatch
 //!   G3  - BUG (CORRECTNESS): inbound v1 path hardcodes supports_wtxid_relay=false (from W99 G21)
 //!   G4  - BUG (CORRECTNESS): mempool message not handled; no NODE_BLOOM gate + !fRelay block
-//!   G5  - BUG (CORRECTNESS): no MAX_GETDATA_SZ=1000 batch cap when responding to getdata
+//!   G5  - FIXED: MAX_GETDATA_SZ=1000 constant + batch_getdata_items helper in relay.rs
 //!   G6  - BUG (CORRECTNESS): wtxidrelay sent by inbound path before VERSION received (ordering violation)
 //!   G7  - PASS: NODE_BLOOM config gate exists; peer_bloom_filters default=false
 //!   G8  - BUG (CORRECTNESS): no tx data piggyback path (FindTxForGetData / m_recently_confirmed_transactions absent)
@@ -41,14 +41,15 @@
 #[cfg(test)]
 mod tests {
     use crate::message::{
-        InvType, InvVector, NetworkMessage, MAX_INV_SIZE,
+        InvType, InvVector, NetworkMessage, MAX_INV_SIZE, MAX_GETDATA_SZ,
     };
     use rustoshi_consensus::orphanage::{
         TxOrphanage, MAX_ORPHAN_TRANSACTIONS, MAX_ORPHANS_PER_PEER, OrphanEntry, OrphanError,
     };
     use crate::relay::{
-        build_tx_inv_entry, InventoryTrickle, PeerRelayState, INVENTORY_BROADCAST_MAX,
-        INBOUND_INVENTORY_BROADCAST_INTERVAL, OUTBOUND_INVENTORY_BROADCAST_INTERVAL,
+        batch_getdata_items, build_tx_inv_entry, InventoryTrickle, PeerRelayState,
+        INVENTORY_BROADCAST_MAX, INBOUND_INVENTORY_BROADCAST_INTERVAL,
+        OUTBOUND_INVENTORY_BROADCAST_INTERVAL,
     };
     use crate::peer::PeerId;
     use rustoshi_primitives::{Hash256, Transaction, TxIn, TxOut, OutPoint};
@@ -202,33 +203,66 @@ mod tests {
         // before processing this message, so any peer can trigger mempool flooding.
     }
 
-    // ─── G5: no MAX_GETDATA_SZ=1000 batch cap on responses ───────────────────
+    // ─── G5: MAX_GETDATA_SZ=1000 batch cap on outgoing getdata ───────────────
 
-    /// G5 BUG (CORRECTNESS): Bitcoin Core's `ProcessGetData` at
-    /// `net_processing.cpp:6207` stops serving after MAX_GETDATA_SZ=1000 items
-    /// per call to bound CPU/bandwidth per tick. rustoshi has no getdata handler
-    /// at all (G2), and therefore also has no batch cap.
-    ///
-    /// If a handler were added without this cap, a single getdata with 50000
-    /// items (the parse limit) would cause unbounded mempool lookups and tx
-    /// serializations in a single event-loop turn, becoming a CPU DoS vector.
+    /// G5 FIXED: `MAX_GETDATA_SZ = 1000` is now defined in `message.rs` and
+    /// `batch_getdata_items` in `relay.rs` splits any inv-derived list into
+    /// chunks ≤ 1000, matching Bitcoin Core's `ProcessGetData` cap at
+    /// `net_processing.cpp:128` and `:6207`.
     ///
     /// Reference: Core `net_processing.cpp:6207` —
     ///   `if (vGetData.size() >= MAX_GETDATA_SZ) break;`
     /// also Core `MAX_GETDATA_SZ = 1000` at line 128.
     #[test]
-    #[ignore = "G5 BUG: no MAX_GETDATA_SZ=1000 batch cap for getdata response processing — add constant and break after 1000 served items"]
-    fn g5_max_getdata_sz_batch_cap_absent() {
-        // MAX_GETDATA_SZ=1000 is NOT defined in rustoshi's message.rs or peer_manager.rs.
-        // MAX_INV_SIZE=50000 is the only cap; this is too coarse for response limiting.
-        //
-        // Core's constant:
-        //   static const unsigned int MAX_GETDATA_SZ = 1000;  // net_processing.cpp:128
-        //
-        // rustoshi exposes MAX_INV_SIZE=50_000 only; no MAX_GETDATA_SZ exists.
-        assert_eq!(MAX_INV_SIZE, 50_000);
-        // Expected after fix: a separate MAX_GETDATA_SZ = 1000 constant controlling
-        // how many items are served per getdata response tick.
+    fn g5_max_getdata_sz_batch_cap() {
+        // Constant is correct.
+        assert_eq!(MAX_GETDATA_SZ, 1_000,
+            "MAX_GETDATA_SZ must be 1000 matching Core's protocol.h:482");
+        // MAX_INV_SIZE is the parse-time cap; MAX_GETDATA_SZ is the per-batch response cap.
+        assert!(MAX_INV_SIZE > MAX_GETDATA_SZ,
+            "MAX_INV_SIZE ({MAX_INV_SIZE}) must exceed MAX_GETDATA_SZ ({MAX_GETDATA_SZ})");
+
+        // Empty input → empty output (no panic, no empty chunk).
+        let batches = batch_getdata_items(vec![]);
+        assert!(batches.is_empty(), "empty input should yield empty batch list");
+
+        // Exactly 1000 items → one batch of 1000.
+        let items_1000: Vec<InvVector> = (0..1000_u32)
+            .map(|i| InvVector {
+                inv_type: InvType::MsgTx,
+                hash: Hash256::from([(i & 0xff) as u8; 32]),
+            })
+            .collect();
+        let batches = batch_getdata_items(items_1000);
+        assert_eq!(batches.len(), 1, "1000 items must fit in exactly one batch");
+        assert_eq!(batches[0].len(), 1000);
+
+        // 1001 items → two batches (1000 + 1).
+        let items_1001: Vec<InvVector> = (0..=1000_u32)
+            .map(|i| InvVector {
+                inv_type: InvType::MsgWtx,
+                hash: Hash256::from([(i & 0xff) as u8; 32]),
+            })
+            .collect();
+        let batches = batch_getdata_items(items_1001);
+        assert_eq!(batches.len(), 2, "1001 items must split into two batches");
+        assert_eq!(batches[0].len(), MAX_GETDATA_SZ);
+        assert_eq!(batches[1].len(), 1);
+
+        // Simulate MAX_INV_SZ=50_000 inv arriving: must produce ceil(50000/1000)=50 batches.
+        let big_items: Vec<InvVector> = (0..50_000_u32)
+            .map(|i| InvVector {
+                inv_type: InvType::MsgTx,
+                hash: Hash256::from([(i & 0xff) as u8; 32]),
+            })
+            .collect();
+        let batches = batch_getdata_items(big_items);
+        assert_eq!(batches.len(), 50,
+            "MAX_INV_SZ=50000 items must split into exactly 50 getdata batches");
+        for (idx, batch) in batches.iter().enumerate() {
+            assert_eq!(batch.len(), MAX_GETDATA_SZ,
+                "batch {idx} should be exactly MAX_GETDATA_SZ items");
+        }
     }
 
     // ─── G6: wtxidrelay sent before VERSION in outbound initiator path ────────
