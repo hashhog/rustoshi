@@ -28,6 +28,9 @@ mod w99_net_processing_tests;
 #[cfg(test)]
 mod w103_tx_relay_tests;
 
+#[cfg(test)]
+mod w104_addrman_tests;
+
 pub use addr::*;
 pub use block_download::*;
 pub use compact_blocks::*;
