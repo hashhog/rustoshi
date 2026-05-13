@@ -11,7 +11,6 @@
 //! - Local addresses: all belong to same group
 //! - Unroutable addresses: all belong to same group
 
-use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Network type classification.
@@ -54,13 +53,21 @@ impl NetGroup {
 
     /// Create a keyed version of this network group for deterministic sorting.
     ///
-    /// This is used by eviction logic to protect diverse netgroups.
+    /// Mirrors Bitcoin Core's `HashWriter::GetCheapHash()`: computes
+    /// SHA256d(key_bytes || group_bytes) and returns the first 8 bytes as a
+    /// little-endian u64.  Using a non-cryptographic hash here (e.g.
+    /// DefaultHasher) would allow an attacker who learns the key to predict
+    /// group assignments and mount a targeted eclipse attack.
+    ///
+    /// Core reference: `addrman.cpp` GetTriedBucket()/GetNewBucket()/
+    /// GetBucketPosition() all use `HashWriter (SHA256d)` + `GetCheapHash()`.
     pub fn keyed(&self, key: u64) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        self.0.hash(&mut hasher);
-        hasher.finish()
+        use rustoshi_crypto::sha256d;
+        let mut data = Vec::with_capacity(8 + self.0.len());
+        data.extend_from_slice(&key.to_le_bytes());
+        data.extend_from_slice(&self.0);
+        let hash = sha256d(&data);
+        u64::from_le_bytes(hash.0[..8].try_into().unwrap())
     }
 }
 
