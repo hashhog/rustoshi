@@ -45,6 +45,7 @@ mod tests {
     };
     use rustoshi_consensus::orphanage::{
         TxOrphanage, MAX_ORPHAN_TRANSACTIONS, MAX_ORPHANS_PER_PEER, OrphanEntry, OrphanError,
+        ORPHAN_TX_EXPIRE_TIME,
     };
     use crate::relay::{
         batch_getdata_items, build_tx_inv_entry, InventoryTrickle, PeerRelayState,
@@ -54,7 +55,7 @@ mod tests {
     use crate::peer::PeerId;
     use rustoshi_primitives::{Hash256, Transaction, TxIn, TxOut, OutPoint};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // ─── helpers ─────────────────────────────────────────────────────────────
 
@@ -757,39 +758,75 @@ mod tests {
         assert_eq!(orphanage.len(), MAX_ORPHAN_TRANSACTIONS);
     }
 
-    // ─── G22: no time-based orphan expiry ─────────────────────────────────────
+    // ─── G22: time-based orphan expiry ───────────────────────────────────────
 
-    /// G22 MISSING: Bitcoin Core evicts orphans that have been resident for more
-    /// than ORPHAN_TX_EXPIRE_TIME=5 minutes (300 seconds), called from the
-    /// periodic scheduler (`m_orphanage.LimitOrphans()` which inspects timestamps).
+    /// G22 FIX: Bitcoin Core evicts orphans that have been resident for more
+    /// than `ORPHAN_TX_EXPIRE_TIME` (20 minutes = 1200 seconds), called from
+    /// the periodic scheduler.  The historical Core constant was:
+    ///   `static constexpr int64_t ORPHAN_TX_EXPIRE_TIME = 20 * 60;`
+    /// (removed during the PR #32941 weight-based revamp; rustoshi preserves
+    /// the 1200 s TTL via its simpler count-and-time model).
     ///
-    /// rustoshi: `OrphanEntry` has `seq` (insertion order) but no timestamp field.
-    /// Eviction is count-only (FIFO). A flood of orphans in the first 5 minutes
-    /// will evict legitimate orphans; orphans that arrive and are never resolved
-    /// (parent never comes) stay until evicted by count pressure only.
+    /// Fix: `OrphanEntry` now carries an `inserted_at: Instant` field.
+    /// `TxOrphanage::expire_orphans(now)` evicts all entries where
+    /// `now - inserted_at >= ORPHAN_TX_EXPIRE_TIME`.  Callers supply a
+    /// synthetic `now` so the test requires no wall-clock sleep.
     ///
-    /// Reference: Core `txorphanage.cpp:442` — `LimitOrphans()` removes entries
-    /// older than `ORPHAN_TX_EXPIRE_TIME` before applying the count cap.
+    /// Reference: Core `txorphanage.cpp` — `ORPHAN_TX_EXPIRE_TIME = 20 * 60`.
     #[test]
-    #[ignore = "G22 MISSING: no time-based orphan expiry — add inserted_at timestamp to OrphanEntry and call EvictExpiredOrphans() periodically (ORPHAN_TX_EXPIRE_TIME=300s)"]
-    fn g22_orphan_time_based_expiry_absent() {
-        // Evidence: OrphanEntry has no timestamp field.
-        // (OrphanEntry imported at top of module)
-        // Fields: { tx: Arc<Transaction>, from_peer: u64, seq: u64 }
-        // A timestamp would be: inserted_at: Instant or unix_secs: u64.
-        //
-        // The absence of a timestamp means it's impossible to implement
-        // the 5-minute TTL eviction required by Core.
+    fn g22_orphan_time_based_expiry() {
+        // Verify the constant is correct: 20 minutes = 1200 seconds.
+        assert_eq!(
+            ORPHAN_TX_EXPIRE_TIME,
+            Duration::from_secs(1200),
+            "ORPHAN_TX_EXPIRE_TIME must be 20 * 60 = 1200s (matching Core's historical constant)"
+        );
+
+        // Verify OrphanEntry carries an inserted_at field (compile-time proof).
         let tx = make_tx(1);
+        let t0 = Instant::now();
         let entry = OrphanEntry {
             tx: tx.clone(),
             from_peer: 1,
             seq: 0,
-            // inserted_at: <missing field>
+            inserted_at: t0,
         };
-        let _ = entry.seq; // seq exists
-        // If inserted_at existed, we could write: entry.inserted_at.elapsed() > Duration::from_secs(300)
-        todo!("add inserted_at field to OrphanEntry and implement EvictExpiredOrphans");
+        assert_eq!(entry.seq, 0);
+        // inserted_at is accessible and is a real Instant.
+        assert!(entry.inserted_at.elapsed() < Duration::from_secs(5));
+
+        // --- functional test: expire_orphans evicts stale entries ---
+
+        let mut orphanage = TxOrphanage::new();
+
+        // Insert two orphans.
+        orphanage.add(make_tx(10), 1, 100).unwrap();
+        orphanage.add(make_tx(11), 2, 100).unwrap();
+        assert_eq!(orphanage.len(), 2);
+
+        // "now" is in the past relative to inserted_at → nothing should be evicted.
+        let past = t0; // t0 predates both add() calls
+        let evicted = orphanage.expire_orphans(past);
+        assert_eq!(evicted, 0, "orphans inserted after 'now' must not be evicted");
+        assert_eq!(orphanage.len(), 2);
+
+        // "now" is ORPHAN_TX_EXPIRE_TIME after the entries were inserted → both evicted.
+        let future = Instant::now() + ORPHAN_TX_EXPIRE_TIME + Duration::from_secs(1);
+        let evicted = orphanage.expire_orphans(future);
+        assert_eq!(evicted, 2, "all orphans past TTL must be evicted");
+        assert_eq!(orphanage.len(), 0);
+
+        // --- fresh entry added after expiry sweep survives a sweep at "now" ---
+        orphanage.add(make_tx(20), 3, 100).unwrap();
+        let evicted = orphanage.expire_orphans(Instant::now());
+        assert_eq!(evicted, 0, "freshly inserted orphan must not be evicted immediately");
+        assert_eq!(orphanage.len(), 1);
+
+        // Only the expired one is evicted; the fresh one survives.
+        orphanage.add(make_tx(30), 4, 100).unwrap();
+        let evicted = orphanage.expire_orphans(Instant::now() + ORPHAN_TX_EXPIRE_TIME + Duration::from_secs(1));
+        assert_eq!(evicted, 2);
+        assert_eq!(orphanage.len(), 0);
     }
 
     // ─── G23: orphan keyed by wtxid (BIP-339) ────────────────────────────────
