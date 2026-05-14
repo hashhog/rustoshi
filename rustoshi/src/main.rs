@@ -1992,6 +1992,23 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // We poll event_rx directly here without holding any locks. When we need to
     // interact with the peer manager (send_to_peer, handle_event), we briefly
     // acquire the peer_state lock.
+    // In-flight partial blocks keyed by (peer_id, block_hash).
+    //
+    // When the cmpctblock handler cannot fully reconstruct a block from the
+    // mempool it sends getblocktxn to the peer and stores the PartiallyDownloadedBlock
+    // here.  The blocktxn handler looks the entry up by (peer_id, block_hash),
+    // calls fill_block() with the provided transactions, and submits the
+    // completed block to the chain via block_downloader.block_received().
+    //
+    // One entry per (peer, block) is sufficient because Bitcoin Core only allows
+    // one compact-block in flight per peer at a time (net_processing.cpp:5028).
+    // We hold at most one entry per peer; the map is keyed by (peer_id_u64,
+    // block_hash) so multiple peers can each have one in-flight block.
+    let mut inflight_partial_blocks: std::collections::HashMap<
+        (u64, rustoshi_primitives::Hash256),
+        rustoshi_network::PartiallyDownloadedBlock,
+    > = std::collections::HashMap::new();
+
     let mut block_retry_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     block_retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -3182,6 +3199,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     } else {
                                                         tracing::info!("Compact block {} missing {} txns (mempool_hits={}), sending getblocktxn", block_hash, missing.len(), from_mempool);
                                                         let req = BlockTxnRequest::new(block_hash, missing);
+                                                        // Store the PartiallyDownloadedBlock so the
+                                                        // blocktxn handler can complete reconstruction.
+                                                        // Key: (peer_id, block_hash) — one in-flight
+                                                        // block per peer (Core net_processing.cpp:5028).
+                                                        inflight_partial_blocks
+                                                            .insert((peer_id.0, block_hash), partial);
                                                         let ps = peer_state.read().await;
                                                         if let Some(ref pm) = ps.peer_manager {
                                                             pm.send_to_peer(peer_id, NetworkMessage::GetBlockTxn(req.serialize())).await;
@@ -3238,6 +3261,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             }
 
                             NetworkMessage::BlockTxn(data) => {
+                                // BIP-152: Complete compact block reconstruction.
+                                //
+                                // Core flow (net_processing.cpp:4276-4326):
+                                //   1. Look up the in-flight PartiallyDownloadedBlock for
+                                //      this (peer, block_hash) pair.
+                                //   2. Call FillBlock(block, resp.txn).
+                                //   3a. READ_STATUS_OK  → ProcessNewBlock (validate + connect).
+                                //   3b. READ_STATUS_FAILED (merkle mismatch / wrong tx count)
+                                //       → Misbehaving(peer, 100) + fall back to full block via
+                                //         getdata MSG_WITNESS_BLOCK.
                                 use rustoshi_network::BlockTxn;
                                 match BlockTxn::deserialize(&data) {
                                     Ok(blocktxn) => {
@@ -3245,6 +3278,93 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             "Received blocktxn for {} from peer {} ({} txns)",
                                             blocktxn.block_hash, peer_id.0, blocktxn.transactions.len()
                                         );
+
+                                        let key = (peer_id.0, blocktxn.block_hash);
+                                        match inflight_partial_blocks.remove(&key) {
+                                            None => {
+                                                // No in-flight partial block for this hash + peer.
+                                                // Could be a duplicate response or arrived after a
+                                                // fallback getdata — ignore silently (Core does the
+                                                // same at net_processing.cpp:4280-4282).
+                                                tracing::debug!(
+                                                    "blocktxn from peer {} for unknown in-flight block {} — ignoring",
+                                                    peer_id.0, blocktxn.block_hash
+                                                );
+                                            }
+                                            Some(mut partial) => {
+                                                let segwit_active = {
+                                                    let rpc = rpc_state.read().await;
+                                                    rpc.params.is_segwit_active(rpc.best_height)
+                                                };
+
+                                                match partial.fill_block(
+                                                    blocktxn.transactions,
+                                                    segwit_active,
+                                                ) {
+                                                    Ok(block) => {
+                                                        tracing::info!(
+                                                            "Compact block {} reconstructed via blocktxn from peer {}",
+                                                            blocktxn.block_hash, peer_id.0
+                                                        );
+                                                        block_downloader
+                                                            .block_received(peer_id, block);
+                                                    }
+                                                    Err(rustoshi_network::compact_blocks::ReadStatus::Failed) => {
+                                                        // Merkle mismatch or wrong tx count —
+                                                        // likely a short-ID collision survivor.
+                                                        // 100-pt Misbehaving (Core net_processing.cpp:4310)
+                                                        // + fall back to requesting the full block.
+                                                        tracing::warn!(
+                                                            "blocktxn from peer {} for {} caused merkle mismatch — misbehaving + requesting full block",
+                                                            peer_id.0, blocktxn.block_hash
+                                                        );
+                                                        {
+                                                            let mut ps = peer_state.write().await;
+                                                            if let Some(ref mut pm) = ps.peer_manager {
+                                                                pm.misbehaving(
+                                                                    peer_id,
+                                                                    MisbehaviorReason::InvalidCompactBlock,
+                                                                )
+                                                                .await;
+                                                            }
+                                                        }
+                                                        let inv = InvVector {
+                                                            inv_type: InvType::MsgWitnessBlock,
+                                                            hash: blocktxn.block_hash,
+                                                        };
+                                                        let ps = peer_state.read().await;
+                                                        if let Some(ref pm) = ps.peer_manager {
+                                                            pm.send_to_peer(
+                                                                peer_id,
+                                                                NetworkMessage::GetData(vec![inv]),
+                                                            )
+                                                            .await;
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        // ReadStatus::Invalid — wrong tx count
+                                                        // supplied (our own bug or DoS).  Log and
+                                                        // fall back to full block without misbehaving.
+                                                        tracing::warn!(
+                                                            "fill_block returned Invalid for {} from peer {} — requesting full block",
+                                                            blocktxn.block_hash, peer_id.0
+                                                        );
+                                                        let inv = InvVector {
+                                                            inv_type: InvType::MsgWitnessBlock,
+                                                            hash: blocktxn.block_hash,
+                                                        };
+                                                        let ps = peer_state.read().await;
+                                                        if let Some(ref pm) = ps.peer_manager {
+                                                            pm.send_to_peer(
+                                                                peer_id,
+                                                                NetworkMessage::GetData(vec![inv]),
+                                                            )
+                                                            .await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::debug!("Failed to decode blocktxn from peer {}: {}", peer_id.0, e);
@@ -3277,6 +3397,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         tracing::info!("Peer {} disconnected: {:?}", peer_id.0, reason);
                         header_sync.remove_peer(peer_id);
                         block_downloader.remove_peer(peer_id);
+                        // Discard any in-flight partial block for this peer —
+                        // the blocktxn response will never arrive.
+                        inflight_partial_blocks.retain(|(pid, _), _| *pid != peer_id.0);
                         // Drop any orphans this peer announced — they're
                         // unverifiable now that the source is gone, so
                         // freeing the slot benefits other peers.
