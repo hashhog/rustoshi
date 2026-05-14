@@ -707,6 +707,12 @@ pub struct PeerInfoRpc {
     pub last_block: i64,
     /// Unix timestamp of last transaction received from this peer.
     pub last_transaction: i64,
+    /// The AS in the BGP sense for the peer's IP address, if an ASMap is loaded.
+    /// None when no asmap is loaded (default).
+    ///
+    /// Core reference: `src/rpc/net.cpp:236` `obj.pushKV("mapped_as", mapped_as)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapped_as: Option<u32>,
 }
 
 /// Response for `getnetworkinfo` RPC.
@@ -1472,6 +1478,7 @@ mod tests {
             session_id: String::new(),
             last_block: 0,
             last_transaction: 0,
+            mapped_as: None,
         };
 
         let json = serde_json::to_string(&peer).unwrap();
@@ -1976,6 +1983,7 @@ mod tests {
             session_id: String::new(),
             last_block: 0,
             last_transaction: 0,
+            mapped_as: None,
         };
 
         let json = serde_json::to_string(&peer).unwrap();
@@ -2042,6 +2050,7 @@ mod tests {
             session_id: String::new(),
             last_block: 0,
             last_transaction: 0,
+            mapped_as: None,
         };
 
         let json = serde_json::to_string(&peer).unwrap();
