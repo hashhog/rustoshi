@@ -4441,6 +4441,21 @@ impl RustoshiRpcServer for RpcServerImpl {
                 state.best_height = new_height;
                 state.best_hash = block_hash;
 
+                // Wire fee estimator: notify it of the confirmed block.
+                // Skip coinbase (index 0) to match Core's processTransaction
+                // filter for coinbase txs.
+                {
+                    let non_cb_txids: Vec<rustoshi_primitives::Hash256> = block
+                        .transactions
+                        .iter()
+                        .skip(1)
+                        .map(|tx| tx.txid())
+                        .collect();
+                    state
+                        .fee_estimator
+                        .process_block(new_height, &non_cb_txids);
+                }
+
                 // NOTE: IBD latch is re-evaluated on every getblockchaininfo
                 // call (see get_blockchain_info). We deliberately do NOT call
                 // should_exit_ibd here; the read-path evaluation handles this
