@@ -614,6 +614,18 @@ impl AddressManager {
             .filter(|info| info.is_privacy_network())
             .count()
     }
+
+    /// Collect all IPv4/IPv6 addresses known to the address manager.
+    ///
+    /// Used by the ASMap health-check to compute per-ASN cardinality across the
+    /// full set of known peers (not just connected peers).  Tor/I2P/CJDNS
+    /// addresses are excluded because the ASMap only covers IPv4/IPv6.
+    pub fn all_known_ips(&self) -> Vec<std::net::IpAddr> {
+        self.known_addrs
+            .keys()
+            .map(|sa| sa.ip())
+            .collect()
+    }
 }
 
 impl Default for AddressManager {
@@ -946,6 +958,19 @@ impl PeerManager {
     /// Get a reference to the network group manager.
     pub fn netgroup_manager(&self) -> &NetGroupManager {
         &self.netgroup_manager
+    }
+
+    /// Run an ASMap health check over all known AddrMan entries.
+    ///
+    /// Collects all IPv4/IPv6 IPs from the AddressManager and calls
+    /// `NetGroupManager::health_check()`.  Returns `None` when no ASMap is
+    /// loaded.  The `top_n` parameter controls how many ASNs appear in the
+    /// top-N list (default: 5 is a reasonable value for log lines).
+    ///
+    /// Called at startup (after asmap load) and every 3600 s by the main loop.
+    pub fn asmap_health_check(&self, top_n: usize) -> Option<crate::netgroup::AsmapHealthStats> {
+        let ips = self.addr_manager.all_known_ips();
+        self.netgroup_manager.health_check(&ips, top_n)
     }
 
     /// Take the event receiver out of the peer manager.

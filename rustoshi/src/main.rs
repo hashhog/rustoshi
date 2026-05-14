@@ -1940,6 +1940,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let mut peer_manager = PeerManager::new_with_netgroup(peer_config, params.clone(), netgroup_manager);
     peer_manager.set_start_height(best_height as i32);
 
+    // ASMap startup health check — log cardinality summary when an asmap is loaded.
+    // AddrMan is empty at this point so mapped/unmapped counts are 0; the useful
+    // numbers appear in the first periodic health check (after peers accumulate).
+    if let Some(stats) = peer_manager.asmap_health_check(5) {
+        tracing::info!("{}", stats.summary_line());
+    }
+
     // Connect to specific peer if --connect is set
     if let Some(connect_addr) = &cli.connect {
         let addr: std::net::SocketAddr = connect_addr.parse().expect("Invalid --connect address");
@@ -2079,6 +2086,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // (observed 2026-05-07: 6+ hour freeze with one zombie peer).
     let mut maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(45));
     maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // ASMap health-check tick — fires every 3600 s (1 hour).
+    // Logs ASN diversity stats (total entries, mapped/unmapped, unique ASNs,
+    // top-N ASNs) to aid operators in detecting stale or low-coverage asmap
+    // files.  No-ops when no asmap is loaded.
+    let mut asmap_health_interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+    // Skip is correct: if the node is behind, we do not need to catch up on
+    // health-check ticks — just fire on the next natural 3600 s boundary.
+    asmap_health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so the first real fire is at t+3600 s
+    // (the startup log above already covers t=0).
+    asmap_health_interval.tick().await;
 
     loop {
         tokio::select! {
@@ -3624,6 +3643,27 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         let ps = peer_state.read().await;
                         if let Some(ref pm) = ps.peer_manager {
                             pm.send_to_peer(target, msg).await;
+                        }
+                    }
+                }
+            }
+
+            // ASMap health-check tick — fires every 3600 s (1 hour).
+            // Logs ASN diversity stats over all known AddrMan entries so operators
+            // can detect stale or low-coverage asmap files.  No-ops (skips the
+            // log entirely) when no asmap is loaded.
+            _ = asmap_health_interval.tick() => {
+                let ps = peer_state.read().await;
+                if let Some(ref pm) = ps.peer_manager {
+                    if let Some(stats) = pm.asmap_health_check(5) {
+                        tracing::info!("{}", stats.summary_line());
+                        if !stats.top_asns.is_empty() {
+                            let top_str: Vec<String> = stats
+                                .top_asns
+                                .iter()
+                                .map(|(asn, cnt)| format!("AS{}:{}", asn, cnt))
+                                .collect();
+                            tracing::info!("ASMap top ASNs: {}", top_str.join(", "));
                         }
                     }
                 }
