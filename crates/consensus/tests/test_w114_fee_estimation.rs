@@ -604,7 +604,6 @@ fn g30_estimaterawfee_response_shape_missing_horizons() {
 /// This is the same "subsystem defined but unwired" pattern observed in W104
 /// (haskoin AddrMan) and W105 (9/10 parallel verify dead-helper).
 #[test]
-#[ignore] // BUG-DEAD-HELPER: fee_estimator.process_block() never called — estimator always empty
 fn g_dead_helper_process_block_never_called() {
     // This test demonstrates the bug: even after calling process_block() manually
     // on the FeeEstimator, the RPC layer's fee_estimator is never updated with
@@ -632,7 +631,6 @@ fn g_dead_helper_process_block_never_called() {
 /// directly via RPC (typically miner/wallet submissions), missing the bulk of
 /// normal mempool traffic.
 #[test]
-#[ignore] // BUG-P2P-WIRING (P1): P2P inbound txs not tracked by fee estimator
 fn g_p2p_inbound_txs_not_tracked() {
     // Only sendrawtransaction wires track_transaction.
     // main.rs handles inbound P2P txs but never calls fee_estimator.track_transaction.
