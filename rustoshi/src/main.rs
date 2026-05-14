@@ -31,8 +31,8 @@ use rustoshi_consensus::{
     NetworkId, ValidationError,
 };
 use rustoshi_network::{
-    BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason, NetworkMessage, PeerEvent,
-    PeerManager, PeerManagerConfig,
+    asmap as asmap_mod, BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason,
+    NetGroupManager, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig,
 };
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
 use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
@@ -183,6 +183,15 @@ struct Cli {
     /// with Core's. Has no effect unless `--rest` is also set.
     #[arg(long = "restbind", value_name = "ADDR")]
     restbind: Option<String>,
+
+    /// Path to an ASMap binary file for AS-based IP bucketing (anti-eclipse).
+    /// If not absolute, the path is resolved relative to the datadir.
+    /// When loaded, peers are grouped by Autonomous System Number (ASN)
+    /// instead of /16 subnet prefix, providing stronger eclipse-attack protection.
+    ///
+    /// Mirrors Bitcoin Core's `-asmap=<file>` from `src/init.cpp`.
+    #[arg(long = "asmap", value_name = "PATH")]
+    asmap: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1117,6 +1126,7 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
     merge_opt_str!(debuglogfile, "debuglogfile");
     merge_bool!(rest, "rest");
     merge_opt_str!(restbind, "restbind");
+    merge_opt_str!(asmap, "asmap");
 }
 
 /// Locate a config file path: explicit `--conf`, then `<datadir>/rustoshi.conf`,
@@ -1875,6 +1885,45 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         peer_state.clone(),
     ));
 
+    // Load ASMap for AS-based IP bucketing (anti-eclipse) — `-asmap=<file>`.
+    //
+    // Mirrors Bitcoin Core's `src/init.cpp:1591-1628` asmap loading + hash log.
+    // If the path is relative, it is resolved relative to the network datadir.
+    // A failed load (bad path, oversized, or sanity-check failure) is non-fatal:
+    // the node continues with /16 subnet-based bucketing (the default).
+    //
+    // MAX_ASMAP_FILESIZE = 8 MiB (enforced inside decode_asmap).
+    let asmap_data: Vec<u8> = if let Some(ref asmap_arg) = cli.asmap {
+        let asmap_path = {
+            let p = PathBuf::from(asmap_arg);
+            if p.is_absolute() {
+                p
+            } else {
+                datadir.join(&p) // relative → prepend network datadir
+            }
+        };
+        let data = asmap_mod::decode_asmap(&asmap_path);
+        if !data.is_empty() {
+            // Log file path + first 8 hex chars of SHA256 — mirrors Core's startup log.
+            let version_hex = asmap_mod::asmap_version_hex(&data);
+            tracing::info!(
+                "Using asmap version {} for IP bucketing ({})",
+                version_hex,
+                asmap_path.display()
+            );
+        }
+        data
+    } else {
+        Vec::new()
+    };
+
+    // Build NetGroupManager: with asmap if loaded, otherwise random-key only.
+    let netgroup_manager = if !asmap_data.is_empty() {
+        NetGroupManager::with_asmap(rand::random(), asmap_data)
+    } else {
+        NetGroupManager::new()
+    };
+
     // Configure peer manager
     let peer_config = PeerManagerConfig {
         max_outbound_full_relay: cli.maxconnections.saturating_sub(2),
@@ -1888,7 +1937,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         data_dir: datadir.clone(),
         ..Default::default()
     };
-    let mut peer_manager = PeerManager::new(peer_config, params.clone());
+    let mut peer_manager = PeerManager::new_with_netgroup(peer_config, params.clone(), netgroup_manager);
     peer_manager.set_start_height(best_height as i32);
 
     // Connect to specific peer if --connect is set

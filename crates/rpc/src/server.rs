@@ -4671,6 +4671,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                         session_id: String::new(),
                         last_block,
                         last_transaction,
+                        mapped_as: None,
                     }
                 })
                 .collect();
