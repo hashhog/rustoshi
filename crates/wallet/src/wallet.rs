@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rand::thread_rng;
 use rustoshi_crypto::{
     address::{Address, Network},
     hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash, sha256,
@@ -20,6 +21,7 @@ use rustoshi_crypto::{
 use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut};
 use secp256k1::{Message, Secp256k1};
 
+use crate::coin_selection::{select_coins, CoinSelectionParams};
 use crate::hd::{ExtendedPrivKey, WalletError, HARDENED_FLAG};
 
 /// BIP-84 purpose for native SegWit (P2WPKH).
@@ -441,46 +443,85 @@ impl Wallet {
     ) -> Result<Transaction, WalletError> {
         let total_output: u64 = recipients.iter().map(|(_, v)| *v).sum();
 
-        // Select UTXOs (largest-first strategy)
-        let mut selected_utxos: Vec<WalletUtxo> = Vec::new();
-        let mut selected_value: u64 = 0;
-
-        // Filter to only spendable UTXOs (confirmed and mature). Skip
-        // outpoints the user has locked via `lockunspent` — Core's
-        // `AvailableCoins` excludes `setLockedCoins` from automatic
-        // selection (`bitcoin-core/src/wallet/spend.cpp`).
-        let mut sorted_utxos: Vec<&WalletUtxo> = self
+        // Collect spendable UTXOs (confirmed, mature, unlocked). Mirror
+        // Core's AvailableCoins which excludes setLockedCoins from automatic
+        // coin selection (bitcoin-core/src/wallet/spend.cpp).
+        let available_utxos: Vec<WalletUtxo> = self
             .utxos
             .values()
             .filter(|u| self.is_spendable(u) && !self.locked_coins.contains(&u.outpoint))
+            .cloned()
             .collect();
-        sorted_utxos.sort_by(|a, b| b.value.cmp(&a.value));
 
-        for utxo in sorted_utxos {
-            selected_utxos.push(utxo.clone());
-            selected_value += utxo.value;
+        // Per-input vsize for the wallet's address type (used by coin_selection
+        // to compute effective-value and fee per UTXO).
+        let input_vsize = input_vsize_for(self.address_type);
 
-            // Estimate size to compute fee
-            let estimated_size = estimate_tx_vsize(
-                selected_utxos.len(),
-                recipients.len() + 1, // +1 for potential change
-                self.address_type,
-            );
-            let estimated_fee = (estimated_size as f64 * fee_rate).ceil() as u64;
+        // Bootstrap fee estimate: assume 1 input + N+1 outputs (N recipients + change)
+        // so the module has a concrete starting target. It will refine this via
+        // effective-value filtering; a slight undercount here is fine because we
+        // recompute the final fee below using the actual selected input count.
+        let bootstrap_fee = {
+            let est_sz = estimate_tx_vsize(1, recipients.len() + 1, self.address_type);
+            (est_sz as f64 * fee_rate).ceil() as u64
+        };
 
-            if selected_value >= total_output + estimated_fee {
-                break;
-            }
-        }
+        // Per-output cost of adding the change output (vsize * feerate).
+        let change_output_vsize = output_vsize_for(self.address_type);
+        let change_cost_weight = change_output_vsize * 4; // stored as weight in CoinSelectionParams
 
-        // Calculate final fee
-        let estimated_size = estimate_tx_vsize(
-            selected_utxos.len(),
-            recipients.len() + 1,
-            self.address_type,
-        );
-        let fee = (estimated_size as f64 * fee_rate).ceil() as u64;
+        let params = CoinSelectionParams {
+            target_value: total_output + bootstrap_fee,
+            fee_rate,
+            change_cost: change_cost_weight as u64,
+            change_spend_cost: input_vsize as u64, // future spend of change at long_term_fee_rate
+            long_term_fee_rate: 10.0 / 1000.0, // 10 sat/kvB = 0.01 sat/vbyte (Core default)
+            min_change: DUST_LIMIT,
+            input_weight: input_vsize * 4,
+        };
 
+        let mut rng = thread_rng();
+        let selection = select_coins(&available_utxos, &params, &mut rng)
+            .ok_or(WalletError::InsufficientFunds {
+                have: available_utxos.iter().map(|u| u.value).sum(),
+                need: total_output + bootstrap_fee,
+            })?;
+
+        let selected_utxos = selection.selected;
+        let selected_value: u64 = selected_utxos.iter().map(|u| u.value).sum();
+
+        // Recompute the final fee with the actual input count selected. We
+        // check for change first to decide whether to include it in the vsize
+        // estimate. cost_of_change from the module gives the creation+spend cost;
+        // absorb change into fee when it wouldn't be economic to create the output.
+        let cost_of_change = params.cost_of_change();
+
+        // Tentative fee without change output
+        let fee_no_change = {
+            let sz = estimate_tx_vsize(selected_utxos.len(), recipients.len(), self.address_type);
+            (sz as f64 * fee_rate).ceil() as u64
+        };
+        // Tentative fee with change output
+        let fee_with_change = {
+            let sz = estimate_tx_vsize(selected_utxos.len(), recipients.len() + 1, self.address_type);
+            (sz as f64 * fee_rate).ceil() as u64
+        };
+
+        // Decide whether to create a change output.
+        // Core: add change when selected_value > total_output + fee + cost_of_change
+        // (i.e., change is large enough to be worth creating).
+        // We also suppress dust regardless (change < DUST_LIMIT).
+        let change_candidate = selected_value.saturating_sub(total_output + fee_with_change);
+        let add_change = change_candidate > DUST_LIMIT && change_candidate > cost_of_change;
+
+        let (fee, change_amount): (u64, u64) = if add_change {
+            (fee_with_change, change_candidate)
+        } else {
+            // Absorb the remainder into fee (no change output)
+            (fee_no_change, 0)
+        };
+
+        // Sanity check: we actually have enough funds after refining the fee.
         if selected_value < total_output + fee {
             return Err(WalletError::InsufficientFunds {
                 have: selected_value,
@@ -510,18 +551,16 @@ impl Wallet {
             });
         }
 
-        // Change output
-        let change = selected_value - total_output - fee;
-        if change > DUST_LIMIT {
+        // Change output (only when economic, per cost_of_change check above)
+        if add_change {
             let change_addr = self.get_change_address()?;
             let change_addr_obj = Address::from_string(&change_addr, Some(self.network))
                 .map_err(|_| WalletError::InvalidAddress(change_addr.clone()))?;
             outputs.push(TxOut {
-                value: change,
+                value: change_amount,
                 script_pubkey: change_addr_obj.to_script_pubkey(),
             });
         }
-
         let mut tx = Transaction {
             version: 2,
             inputs,
@@ -1492,6 +1531,32 @@ fn estimate_tx_vsize(num_inputs: usize, num_outputs: usize, addr_type: AddressTy
             // Simplified: ~57 vbytes per input, ~43 per output, ~11 overhead
             11 + num_inputs * 57 + num_outputs * 43
         }
+    }
+}
+
+/// Return the per-input vsize (in vbytes) for the given address type.
+///
+/// These numbers match the per-input coefficients in `estimate_tx_vsize` and
+/// are used to populate `CoinSelectionParams::input_weight` so the module can
+/// compute effective-value correctly.
+fn input_vsize_for(addr_type: AddressType) -> usize {
+    match addr_type {
+        AddressType::P2WPKH => 68,
+        AddressType::P2PKH => 148,
+        AddressType::P2shP2wpkh => 91,
+        AddressType::P2TR => 57,
+    }
+}
+
+/// Return the per-output vsize (in vbytes) for a change output of the given type.
+///
+/// Used to compute the `change_cost` for `CoinSelectionParams::cost_of_change`.
+fn output_vsize_for(addr_type: AddressType) -> usize {
+    match addr_type {
+        AddressType::P2WPKH => 31,
+        AddressType::P2PKH => 34,
+        AddressType::P2shP2wpkh => 32,
+        AddressType::P2TR => 43,
     }
 }
 
