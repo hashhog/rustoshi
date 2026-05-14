@@ -245,6 +245,14 @@ impl TxConfirmStats {
     ///
     /// Returns `None` if insufficient data.
     fn estimate(&self, conf_target: usize) -> Option<f64> {
+        self.estimate_with_threshold(conf_target, SUCCESS_THRESHOLD)
+    }
+
+    /// Estimate the minimum fee rate achieving a custom success threshold within `conf_target` blocks.
+    ///
+    /// Used by conservative mode (95% threshold) and other callers that need a non-default bar.
+    /// Returns `None` if insufficient data.
+    fn estimate_with_threshold(&self, conf_target: usize, threshold: f64) -> Option<f64> {
         if conf_target == 0 || conf_target > self.periods * self.scale {
             return None;
         }
@@ -271,7 +279,7 @@ impl TxConfirmStats {
             }
 
             let success_rate = total_confirmed / total_tracked;
-            if success_rate >= SUCCESS_THRESHOLD {
+            if success_rate >= threshold {
                 best_rate = Some(FEE_RATE_BUCKETS[i]);
             } else {
                 break;
@@ -452,6 +460,20 @@ impl FeeEstimator {
         self.stats(horizon).estimate(target)
     }
 
+    /// Estimate the fee rate for `target` blocks using a specific horizon and custom threshold.
+    ///
+    /// Used by conservative mode: Core's `estimateConservativeFee` queries the LONG horizon
+    /// at 95% confidence (DOUBLE_SUCCESS_PCT), independent of what horizon `target` would
+    /// normally dispatch to.
+    ///
+    /// Returns `None` if the horizon does not cover `target` or if there is insufficient data.
+    pub fn estimate_fee_at_horizon(&self, target: usize, horizon: Horizon, threshold: f64) -> Option<f64> {
+        if target == 0 {
+            return None;
+        }
+        self.stats(horizon).estimate_with_threshold(target, threshold)
+    }
+
     /// Estimate the fee rate needed to confirm within `target` blocks.
     ///
     /// Dispatches to the appropriate horizon (SHORT/MEDIUM/LONG) based on `target`.
@@ -464,16 +486,19 @@ impl FeeEstimator {
     }
 
     /// Get a conservative estimate (higher fee for higher confidence).
+    ///
+    /// Mirrors Core's `estimateConservativeFee`: uses the LONG horizon at 95% confidence
+    /// (DOUBLE_SUCCESS_PCT). This is a higher bar than the normal 85% threshold, ensuring
+    /// the estimate is robust over long time horizons — appropriate for time-sensitive
+    /// transactions where overpaying is preferable to being stuck.
+    ///
+    /// Previously this used a half-target trick (`estimate_fee(target/2)`) which was the
+    /// *opposite* of Core's conservative semantics — it picked a shorter target to get a
+    /// higher fee, rather than using a long-horizon high-confidence scan. FIX-49 replaces
+    /// this with the correct LONG-horizon @ 95% logic.
     pub fn estimate_conservative(&self, target: usize) -> Option<f64> {
-        let aggressive_target = target / 2;
-        let normal = self.estimate_fee(target);
-        let aggressive = self.estimate_fee(aggressive_target.max(1));
-        match (normal, aggressive) {
-            (Some(n), Some(a)) => Some(n.max(a)),
-            (Some(n), None)    => Some(n),
-            (None, Some(a))    => Some(a),
-            (None, None)       => None,
-        }
+        // Core: conservative mode uses LONG horizon at 95% threshold (DOUBLE_SUCCESS_PCT).
+        self.estimate_fee_at_horizon(target, Horizon::Long, 0.95)
     }
 
     /// Get the number of transactions currently being tracked.
