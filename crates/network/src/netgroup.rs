@@ -473,12 +473,117 @@ impl NetGroupManager {
             NetworkType::Local | NetworkType::Unroutable
         )
     }
+
+    /// Compute ASMap health statistics over a set of IP addresses.
+    ///
+    /// Convenience wrapper around the free function [`asmap_health_check`].
+    /// Returns `None` if no ASMap is loaded.
+    pub fn health_check(&self, addrs: &[IpAddr], top_n: usize) -> Option<AsmapHealthStats> {
+        asmap_health_check(self, addrs, top_n)
+    }
 }
 
 impl Default for NetGroupManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ASMap health-check (observability)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Statistics from a single ASMap health-check run.
+///
+/// Produced by [`asmap_health_check`] and logged at startup and every 3600 s.
+/// The "entries" counted are the caller-supplied IP addresses (typically the
+/// union of all known AddrMan entries).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsmapHealthStats {
+    /// Total number of IP addresses examined.
+    pub total_entries: usize,
+    /// Number of addresses that resolved to a non-zero ASN.
+    pub mapped_count: usize,
+    /// Number of addresses that resolved to ASN 0 (unknown / not in map).
+    pub unmapped_count: usize,
+    /// Number of distinct non-zero ASNs seen.
+    pub unique_asn_count: usize,
+    /// Top ASNs by entry count: `(asn, count)`, descending by count.
+    /// At most `top_n` entries (see [`asmap_health_check`]).
+    pub top_asns: Vec<(u32, usize)>,
+}
+
+impl AsmapHealthStats {
+    /// Format a one-line summary suitable for `tracing::info!`.
+    pub fn summary_line(&self) -> String {
+        format!(
+            "ASMap health: {} entries, {} mapped ({:.1}%), {} unmapped, {} unique ASNs",
+            self.total_entries,
+            self.mapped_count,
+            if self.total_entries > 0 {
+                100.0 * self.mapped_count as f64 / self.total_entries as f64
+            } else {
+                0.0
+            },
+            self.unmapped_count,
+            self.unique_asn_count,
+        )
+    }
+}
+
+/// Compute ASMap health statistics over a set of IP addresses.
+///
+/// Calls `get_mapped_as()` on every address in `addrs`, then produces:
+/// - total entry count
+/// - mapped / unmapped split
+/// - unique ASN count
+/// - top-N ASNs by entry count (sorted descending)
+///
+/// Returns `None` if no ASMap is loaded in `manager` (i.e., `using_asmap()` is
+/// false); the caller should skip logging in that case.
+///
+/// # Parameters
+///
+/// - `manager`  — `NetGroupManager` with (or without) an asmap loaded.
+/// - `addrs`    — IP addresses to evaluate (typically from AddrMan).
+/// - `top_n`    — Maximum number of ASNs to include in the top-N list.
+pub fn asmap_health_check(
+    manager: &NetGroupManager,
+    addrs: &[IpAddr],
+    top_n: usize,
+) -> Option<AsmapHealthStats> {
+    if !manager.using_asmap() {
+        return None;
+    }
+
+    let mut asn_counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut mapped_count: usize = 0;
+    let mut unmapped_count: usize = 0;
+
+    for addr in addrs {
+        let asn = manager.get_mapped_as(addr);
+        if asn != 0 {
+            mapped_count += 1;
+            *asn_counts.entry(asn).or_insert(0) += 1;
+        } else {
+            unmapped_count += 1;
+        }
+    }
+
+    let unique_asn_count = asn_counts.len();
+
+    // Sort by count descending, then by ASN ascending for deterministic output.
+    let mut top_asns: Vec<(u32, usize)> = asn_counts.into_iter().collect();
+    top_asns.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top_asns.truncate(top_n);
+
+    Some(AsmapHealthStats {
+        total_entries: addrs.len(),
+        mapped_count,
+        unmapped_count,
+        unique_asn_count,
+        top_asns,
+    })
 }
 
 /// Return true iff `addr` is publicly routable on the global internet.
