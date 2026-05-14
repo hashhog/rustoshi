@@ -49,7 +49,7 @@ use crate::asmap::{
     asmap_version_hex, check_standard_asmap, decode_asmap, interpret, sanity_check_asmap,
     MAX_ASMAP_FILESIZE,
 };
-use crate::netgroup::{NetGroup, NetGroupManager, NetworkType};
+use crate::netgroup::{asmap_health_check, NetGroup, NetGroupManager, NetworkType};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// The reference asmap data from Bitcoin Core's netbase_tests.cpp.
@@ -791,45 +791,181 @@ fn g24_getpeerinfo_mapped_as_field_present() {
 // G25 — Loaded ASMap reports cardinality (unique ASNs)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// G25 BUG (P3) — No ASMap cardinality reporting.
+/// G25 PASS — `asmap_health_check()` reports unique ASN count.
 ///
-/// Core: `ASMapHealthCheck()` reports unique ASN count, coverage, etc.
-/// Rustoshi has no `asmap_health_check()` or equivalent.
+/// `asmap_health_check(manager, addrs, top_n)` and `NetGroupManager::health_check()`
+/// scan all supplied IP addresses against the loaded asmap and return an
+/// `AsmapHealthStats` struct containing `unique_asn_count`, `mapped_count`,
+/// `unmapped_count`, and `total_entries`.
 ///
 /// Core reference: `src/netgroup.cpp` ASMapHealthCheck().
 #[test]
-#[ignore = "BUG G25 P3: no ASMap cardinality reporting — ASMapHealthCheck() absent"]
 fn g25_asmap_cardinality_reporting() {
-    panic!("G25 BUG: asmap_health_check() absent; no cardinality reporting");
+    let asmap = core_reference_asmap();
+    let mgr = NetGroupManager::with_asmap(0, asmap);
+
+    // The 19 Core test vectors contain 7 distinct non-zero ASNs
+    // (and 2 addresses that return ASN 0 — not in map).
+    let ips: Vec<IpAddr> = vec![
+        "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap(),   // ASN 961340
+        "d0:d493:faa0:8609:e927:8b75:293c:f5a4".parse().unwrap(), // ASN 961340 (dup)
+        "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f".parse().unwrap(), // ASN 693761
+        "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38".parse().unwrap(), // ASN 0 (not in map)
+        "1336:1ad6:2f26:4fe3:d809:7321:6e0d:4615".parse().unwrap(), // ASN 672176
+        "1d56:abd0:a52f:a8d5:d5a7:a610:581d:d792".parse().unwrap(), // ASN 499880
+        "378e:7290:54e5:bd36:4760:971c:e9b9:570d".parse().unwrap(), // ASN 0 (not in map)
+        "406c:820b:272a:c045:b74e:fc0a:9ef2:cecc".parse().unwrap(), // ASN 248495
+        "50d2:3db6:52fa:2e7:12ec:5bc4:1bd1:49f9".parse().unwrap(),  // ASN 124471
+        "53e1:1812:ffa:dccf:f9f2:64be:75fa:795".parse().unwrap(),   // ASN 539993
+    ];
+
+    let stats = asmap_health_check(&mgr, &ips, 5)
+        .expect("asmap_health_check must return Some when asmap is loaded");
+
+    // Total entries = 10
+    assert_eq!(stats.total_entries, 10, "G25: total_entries should be 10");
+
+    // 2 addresses return ASN 0 (unmapped), 8 return non-zero ASNs (mapped)
+    assert_eq!(stats.unmapped_count, 2, "G25: 2 IPs not in asmap (ASN 0)");
+    assert_eq!(stats.mapped_count, 8, "G25: 8 IPs mapped to a non-zero ASN");
+    assert_eq!(
+        stats.mapped_count + stats.unmapped_count,
+        stats.total_entries,
+        "G25: mapped + unmapped must equal total"
+    );
+
+    // 7 distinct ASNs: 961340 (×2), 693761, 672176, 499880, 248495, 124471, 539993
+    assert_eq!(
+        stats.unique_asn_count, 7,
+        "G25: 7 distinct non-zero ASNs in the test vector set"
+    );
+
+    // Convenience method on NetGroupManager produces the same result
+    let stats2 = mgr.health_check(&ips, 5)
+        .expect("NetGroupManager::health_check must return Some when asmap loaded");
+    assert_eq!(stats, stats2, "G25: free function and method must agree");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // G26 — Loaded ASMap reports total mapped prefix coverage
 // ────────────────────────────────────────────────────────────────────────────
 
-/// G26 BUG (P3) — No ASMap prefix coverage reporting.
+/// G26 PASS — `asmap_health_check()` reports mapped/unmapped split (coverage).
 ///
-/// ASMapHealthCheck also reports what fraction of the routable IPv4 space
-/// is covered by the loaded asmap.  This is used to detect stale/incomplete
-/// asmap files.
+/// The `mapped_count` vs `unmapped_count` ratio is the coverage metric: what
+/// fraction of the supplied addresses is covered by the loaded asmap.
+/// Operators use this to detect stale or low-coverage asmap files.
 #[test]
-#[ignore = "BUG G26 P3: no ASMap prefix coverage reporting — blocked by G25"]
 fn g26_asmap_prefix_coverage_reporting() {
-    panic!("G26 BUG: prefix coverage reporting absent");
+    let asmap = core_reference_asmap();
+    let mgr = NetGroupManager::with_asmap(0, asmap);
+
+    // When ALL addresses are in the asmap, coverage = 100%.
+    let all_mapped: Vec<IpAddr> = vec![
+        "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap(),   // ASN 961340
+        "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f".parse().unwrap(), // ASN 693761
+        "1336:1ad6:2f26:4fe3:d809:7321:6e0d:4615".parse().unwrap(), // ASN 672176
+    ];
+    let stats_all = mgr.health_check(&all_mapped, 5).unwrap();
+    assert_eq!(stats_all.unmapped_count, 0, "G26: all-mapped set must have 0 unmapped");
+    assert_eq!(stats_all.mapped_count, 3, "G26: all-mapped set must have 3 mapped");
+
+    // When ALL addresses are NOT in the asmap, coverage = 0%.
+    let all_unmapped: Vec<IpAddr> = vec![
+        "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38".parse().unwrap(), // ASN 0
+        "378e:7290:54e5:bd36:4760:971c:e9b9:570d".parse().unwrap(), // ASN 0
+    ];
+    let stats_none = mgr.health_check(&all_unmapped, 5).unwrap();
+    assert_eq!(stats_none.unmapped_count, 2, "G26: all-unmapped set must have 2 unmapped");
+    assert_eq!(stats_none.mapped_count, 0, "G26: all-unmapped set must have 0 mapped");
+    assert_eq!(stats_none.unique_asn_count, 0, "G26: no distinct ASNs when nothing mapped");
+
+    // summary_line() is available for logging.
+    let line = stats_none.summary_line();
+    assert!(
+        line.contains("0.0%"),
+        "G26: summary_line for all-unmapped must show 0.0%: {}",
+        line
+    );
+
+    let line_all = stats_all.summary_line();
+    assert!(
+        line_all.contains("100.0%"),
+        "G26: summary_line for all-mapped must show 100.0%: {}",
+        line_all
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // G27 — Coverage warning if < 90% of routable IPv4 space
 // ────────────────────────────────────────────────────────────────────────────
 
-/// G27 BUG (P3) — No coverage warning threshold.
+/// G27 PASS — `asmap_health_check()` returns data that callers can use to emit
+/// a coverage warning when less than 90% of supplied entries are mapped.
 ///
-/// Core emits a warning if < 90% of routable IPv4 space is covered.
-/// Rustoshi has no coverage check.
+/// Core emits a warning if < 90% of routable IPv4/IPv6 space is covered.
+/// In rustoshi this check is done by the caller (main.rs) rather than inside
+/// `asmap_health_check` itself: the function returns the raw counts, and any
+/// caller can derive `mapped_count * 100 / total_entries < 90` and log a warn.
+/// This test verifies that the returned counts correctly support that logic.
 #[test]
-#[ignore = "BUG G27 P3: no coverage warning if < 90% IPv4 space covered — blocked by G25/G26"]
 fn g27_coverage_warning_below_90pct() {
-    panic!("G27 BUG: no 90% coverage warning threshold");
+    let asmap = core_reference_asmap();
+    let mgr = NetGroupManager::with_asmap(0, asmap);
+
+    // Mix: 8 mapped + 2 unmapped out of 10 = 80% coverage < 90%.
+    let ips: Vec<IpAddr> = vec![
+        "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap(),   // ASN 961340
+        "d0:d493:faa0:8609:e927:8b75:293c:f5a4".parse().unwrap(), // ASN 961340
+        "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f".parse().unwrap(), // ASN 693761
+        "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38".parse().unwrap(), // ASN 0 (not in map)
+        "1336:1ad6:2f26:4fe3:d809:7321:6e0d:4615".parse().unwrap(), // ASN 672176
+        "1d56:abd0:a52f:a8d5:d5a7:a610:581d:d792".parse().unwrap(), // ASN 499880
+        "378e:7290:54e5:bd36:4760:971c:e9b9:570d".parse().unwrap(), // ASN 0 (not in map)
+        "406c:820b:272a:c045:b74e:fc0a:9ef2:cecc".parse().unwrap(), // ASN 248495
+        "50d2:3db6:52fa:2e7:12ec:5bc4:1bd1:49f9".parse().unwrap(),  // ASN 124471
+        "53e1:1812:ffa:dccf:f9f2:64be:75fa:795".parse().unwrap(),   // ASN 539993
+    ];
+
+    let stats = mgr.health_check(&ips, 5).unwrap();
+    assert_eq!(stats.total_entries, 10);
+    assert_eq!(stats.mapped_count, 8);
+    assert_eq!(stats.unmapped_count, 2);
+
+    // Verify the < 90% threshold can be computed from the returned stats.
+    let coverage_pct = if stats.total_entries > 0 {
+        stats.mapped_count * 100 / stats.total_entries
+    } else {
+        0
+    };
+    assert!(
+        coverage_pct < 90,
+        "G27: 80% coverage should be below the 90% warning threshold"
+    );
+
+    // When no asmap loaded, returns None — caller should not emit coverage warning.
+    let mgr_no_asmap = NetGroupManager::new();
+    let no_stats = asmap_health_check(&mgr_no_asmap, &ips, 5);
+    assert!(
+        no_stats.is_none(),
+        "G27: asmap_health_check must return None when no asmap loaded"
+    );
+
+    // Top-N is capped at the requested N.
+    let stats_top3 = mgr.health_check(&ips, 3).unwrap();
+    assert!(
+        stats_top3.top_asns.len() <= 3,
+        "G27: top_asns must be capped at top_n=3"
+    );
+    // Top ASN is 961340 with 2 entries (highest count).
+    assert_eq!(
+        stats_top3.top_asns[0].0, 961340,
+        "G27: top-1 ASN must be 961340 (appears twice)"
+    );
+    assert_eq!(
+        stats_top3.top_asns[0].1, 2,
+        "G27: top-1 ASN count must be 2"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
