@@ -31,6 +31,9 @@ mod w103_tx_relay_tests;
 #[cfg(test)]
 mod w104_addrman_tests;
 
+#[cfg(test)]
+mod w115_asmap_tests;
+
 pub use addr::*;
 pub use block_download::*;
 pub use compact_blocks::*;
