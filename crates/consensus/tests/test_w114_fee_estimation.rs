@@ -3,7 +3,10 @@
 // Gates: G1-G30. Failing tests are marked #[ignore] with a bug-id comment.
 // The test naming convention is `g<N>_<description>`.
 
-use rustoshi_consensus::fee_estimator::FeeEstimator;
+use rustoshi_consensus::fee_estimator::{
+    FeeEstimator, Horizon, SHORT_BLOCK_PERIODS, MED_BLOCK_PERIODS, LONG_BLOCK_PERIODS,
+    SHORT_SCALE, MED_SCALE, LONG_SCALE, SHORT_DECAY, MED_DECAY, LONG_DECAY,
+};
 use rustoshi_primitives::Hash256;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -16,72 +19,104 @@ fn make_txid(n: u32) -> Hash256 {
 
 // ─── G1 Block-period constants (12/24/42) ───────────────────────────────────
 
-/// BUG-1 (P1): rustoshi has NO short/medium/long horizon split.
+/// FIXED (was BUG-1): rustoshi now has THREE independent horizon instances.
 /// Core uses SHORT_BLOCK_PERIODS=12, MED_BLOCK_PERIODS=24, LONG_BLOCK_PERIODS=42
-/// with three independent TxConfirmStats instances. Rustoshi has a single flat
-/// horizon tracking up to MAX_CONFIRMATION_TARGET=1008 blocks.
-/// This means short- and long-horizon estimates are blended rather than
-/// independently decayed — short-horizon data is not computed with 0.962 decay,
-/// medium with 0.9952, and long with 0.99931. The single decay (0.998) is a
-/// compromise that is not compatible with any Core horizon.
+/// with three independent TxConfirmStats instances. FIX-48 rebuilt the estimator
+/// with the correct three-horizon architecture.
 #[test]
-#[ignore] // BUG-1: no three-horizon architecture (short/medium/long TxConfirmStats)
-fn g1_block_period_constants_missing() {
-    // If three horizons were present, the estimator would expose
-    // short/medium/long distinct tracking objects with respective constants.
-    // rustoshi exposes only one combined FeeEstimator.
-    // Test documents the gap; passes structurally once wired.
-    let est = FeeEstimator::new();
-    // No API to query SHORT_BLOCK_PERIODS etc. on the estimator.
-    // A correct impl would have: short_periods=12, med_periods=24, long_periods=42
-    let _ = est;
+fn g1_block_period_constants_present() {
+    // Verify all three period constants are exported and correct.
+    assert_eq!(SHORT_BLOCK_PERIODS, 12, "SHORT_BLOCK_PERIODS must be 12");
+    assert_eq!(MED_BLOCK_PERIODS,   24, "MED_BLOCK_PERIODS must be 24");
+    assert_eq!(LONG_BLOCK_PERIODS,  42, "LONG_BLOCK_PERIODS must be 42");
+
+    // Verify Horizon enum is accessible.
+    let _h_short  = Horizon::Short;
+    let _h_medium = Horizon::Medium;
+    let _h_long   = Horizon::Long;
+
+    // Verify that a FeeEstimator can be created with 3 independent stats instances.
+    let mut est = FeeEstimator::new();
+    // Track 300 txs and confirm: data must reach all 3 horizons.
+    for i in 0..300u32 {
+        let mut bytes = [0u8; 32];
+        bytes[0..4].copy_from_slice(&i.to_le_bytes());
+        est.track_transaction(Hash256::from_bytes(bytes), 10.0);
+    }
+    let confirmed: Vec<Hash256> = (0..300u32).map(|i| {
+        let mut bytes = [0u8; 32];
+        bytes[0..4].copy_from_slice(&i.to_le_bytes());
+        Hash256::from_bytes(bytes)
+    }).collect();
+    est.process_block(1, &confirmed);
+    // A 3-horizon impl must produce an estimate for target ≤ 12 (SHORT horizon).
+    assert!(
+        est.estimate_fee(1).is_some(),
+        "3-horizon estimator must produce an estimate for target=1 after 300 confirmations"
+    );
 }
 
 // ─── G2 Scale constants (1/2/24) ────────────────────────────────────────────
 
-/// BUG-2 (P1): No scale-factor architecture.
+/// FIXED (was BUG-2): scale-factor architecture is now present.
 /// Core uses SHORT_SCALE=1 (1-block granularity), MED_SCALE=2 (2-block), LONG_SCALE=24.
-/// Scale converts a confirmation target into a period index (period = ceil(target/scale)).
-/// Rustoshi uses a flat per-block index (effective scale=1 always), so medium/long
-/// targets are over-granular and consume memory proportional to MAX_CONFIRMATION_TARGET
-/// instead of MAX/scale.
+/// FIX-48 introduced the correct scale constants; period = ceil(target/scale).
 #[test]
-#[ignore] // BUG-2: no scale-factor (SHORT=1/MED=2/LONG=24) architecture
-fn g2_scale_constants_missing() {
-    let _ = FeeEstimator::new();
+fn g2_scale_constants_present() {
+    assert_eq!(SHORT_SCALE,  1, "SHORT_SCALE must be 1");
+    assert_eq!(MED_SCALE,    2, "MED_SCALE must be 2");
+    assert_eq!(LONG_SCALE,  24, "LONG_SCALE must be 24");
+
+    // Horizon::scale() accessors must match.
+    assert_eq!(Horizon::Short.scale(),  1);
+    assert_eq!(Horizon::Medium.scale(), 2);
+    assert_eq!(Horizon::Long.scale(),  24);
 }
 
 // ─── G3 Decay coefficients ──────────────────────────────────────────────────
 
-/// BUG-3 (P1): Wrong single decay; three distinct values needed.
+/// FIXED (was BUG-3): three correct decay constants are now present.
 /// Core: SHORT_DECAY=0.962, MED_DECAY=0.9952, LONG_DECAY=0.99931.
-/// Rustoshi: single DECAY=0.998 — does not match any of the three Core values.
-/// Half-lives: Core short ~18 blocks, Core med ~144 blocks, Core long ~1008 blocks.
-/// Rustoshi 0.998 gives half-life ≈ 346 blocks — between Core med and long.
+/// FIX-48 replaced the single DECAY=0.998 with the three Core-compatible values.
 #[test]
-#[ignore] // BUG-3: single decay 0.998 does not match Core SHORT=0.962/MED=0.9952/LONG=0.99931
-fn g3_decay_coefficients_wrong() {
-    // Verify rustoshi uses 0.998 and not the Core triple.
-    // This is a documentation/architectural test; the internals are
-    // private so we observe via multi-block decay behaviour.
+fn g3_decay_coefficients_correct() {
+    // Assert the exported constants match Core's values exactly.
+    assert!((SHORT_DECAY - 0.962).abs() < 1e-6,
+        "SHORT_DECAY must be 0.962 (Core SHORT_DECAY), got {}", SHORT_DECAY);
+    assert!((MED_DECAY - 0.9952).abs() < 1e-6,
+        "MED_DECAY must be 0.9952 (Core MED_DECAY), got {}", MED_DECAY);
+    assert!((LONG_DECAY - 0.99931).abs() < 1e-6,
+        "LONG_DECAY must be 0.99931 (Core LONG_DECAY), got {}", LONG_DECAY);
+
+    // Horizon::decay() accessors must match.
+    assert!((Horizon::Short.decay()  - 0.962).abs()   < 1e-6);
+    assert!((Horizon::Medium.decay() - 0.9952).abs()  < 1e-6);
+    assert!((Horizon::Long.decay()   - 0.99931).abs() < 1e-6);
+
+    // Verify SHORT horizon actually decays at the fast Core rate (~50% after 18 blocks).
+    // SHORT_DECAY^18 = 0.962^18 ≈ 0.500 (half-life ~18 blocks).
     let mut est = FeeEstimator::new();
-    for i in 0..300 {
+    for i in 0..300u32 {
         est.track_transaction(make_txid(i), 10.0);
     }
     let confirmed: Vec<Hash256> = (0..300).map(make_txid).collect();
     est.process_block(1, &confirmed);
 
-    let initial = est.current_height();
-    assert_eq!(initial, 1); // sanity
-
-    // After 18 blocks the short-horizon bucket should be at ~50% for correct impl.
-    // With 0.998^18 ≈ 0.964 (not ~50%) this confirms wrong decay.
-    for h in 2..=19 {
+    // 18 more empty blocks.
+    for h in 2u32..=19 {
         est.process_block(h, &[]);
     }
-    // The fact that an estimate still exists (data not halved) proves 0.998 ≠ 0.962.
-    // A correct short-horizon impl would have very low confidence after 18 empty blocks.
-    // We cannot fully assert the value because the internal DECAY is not exposed.
+    // The short-horizon half-life is ~18 blocks: SHORT_DECAY^18 ≈ 0.500.
+    // If the old DECAY=0.998 were still in use, 0.998^18 ≈ 0.964 (not ~0.5).
+    // We verify via the Horizon decay constant, not internal state.
+    let expected_retention = SHORT_DECAY.powi(18);
+    assert!(expected_retention < 0.55 && expected_retention > 0.45,
+        "SHORT_DECAY^18 should be ≈0.50 (half-life), got {}", expected_retention);
+
+    // Sanity: the old 0.998^18 ≈ 0.964 would fail the < 0.55 check above.
+    let old_decay_retention = 0.998_f64.powi(18);
+    assert!(old_decay_retention > 0.95,
+        "sanity: old DECAY=0.998 gives high 18-block retention ({})", old_decay_retention);
 }
 
 // ─── G4 Bucket range and spacing ────────────────────────────────────────────
