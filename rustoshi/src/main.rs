@@ -2148,6 +2148,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 rpc.best_height = height;
                                 rpc.best_hash = block_hash;
                             }
+
+                            // Wire fee estimator: notify it of the newly connected
+                            // block so confirmed_within buckets are populated.
+                            // Skips coinbase (index 0) to match Core's
+                            // processTransaction filter for coinbase txs.
+                            let confirmed_txids: Vec<Hash256> = block
+                                .transactions
+                                .iter()
+                                .skip(1)
+                                .map(|tx| tx.txid())
+                                .collect();
+                            rpc.fee_estimator.process_block(height, &confirmed_txids);
                         }
 
                         // Auto-prune trigger (BIP-159 / Core parity).
@@ -2681,6 +2693,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             rpc.mempool
                                                 .remove_for_block(&block_txids, &block_spent);
 
+                                            // Wire fee estimator: notify it of the confirmed
+                                            // block. Skip coinbase (index 0) to match Core's
+                                            // processTransaction filter.
+                                            let non_cb_txids: Vec<Hash256> = block
+                                                .transactions
+                                                .iter()
+                                                .skip(1)
+                                                .map(|tx| tx.txid())
+                                                .collect();
+                                            rpc.fee_estimator
+                                                .process_block(height, &non_cb_txids);
+
                                             // Same housekeeping for the
                                             // orphan tx pool: drop orphans
                                             // that are now invalid (parent
@@ -2809,6 +2833,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 match result {
                                     Ok(_) => {
                                         tracing::debug!("Added tx {} to mempool", txid);
+
+                                        // Track for fee estimation (P2P inbound path).
+                                        // Mirrors the sendrawtransaction wiring in server.rs.
+                                        // Called while holding the rpc write-lock, same as
+                                        // the RPC path.
+                                        let fee_rate = rpc
+                                            .mempool
+                                            .get(&txid)
+                                            .map(|e| e.fee_rate)
+                                            .unwrap_or(0.0);
+                                        if fee_rate > 0.0 {
+                                            rpc.fee_estimator.track_transaction(txid, fee_rate);
+                                        }
 
                                         // Lookup-and-promote: any orphan
                                         // whose inputs reference this txid
