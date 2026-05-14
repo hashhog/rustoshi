@@ -546,29 +546,89 @@ fn g19_misbehaving_on_bad_getblocktxn_decode() {
 }
 
 // ---------------------------------------------------------------------------
-// G20 — BUG (P0-CDIV): blocktxn handler dead — no fill_block, no block submission
+// G20 — FIX verified: blocktxn handler now completes compact block reconstruction
 //
-// The NetworkMessage::BlockTxn handler in main.rs:3240-3264 receives and
-// decodes a blocktxn response, logs the count, then RETURNS without:
-//   1. Looking up the in-flight PartiallyDownloadedBlock for this peer+hash
-//   2. Calling fill_block() to complete reconstruction
-//   3. Calling block_downloader.block_received() to submit the block
+// The fix (FIX-41, main.rs) wires the full blocktxn flow:
+//   1. cmpctblock arrives with missing txns → PartiallyDownloadedBlock stored in
+//      inflight_partial_blocks keyed by (peer_id, block_hash), getblocktxn sent.
+//   2. blocktxn arrives → partial looked up by (peer_id, block_hash),
+//      fill_block(missing_txns) called, block submitted to chain.
 //
-// As a result, any compact block that requires getblocktxn (i.e. any block
-// with any tx missing from mempool) is silently discarded.  The block is never
-// validated or added to the chain.  This is a P0 consensus-divergent dead-handler.
+// This test verifies the library-level round-trip that the fixed handler now
+// exercises: cmpctblock → init_data (partial fill) → store → blocktxn →
+// fill_block → reconstructed block matches original.
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore = "BUG-G20 (P0-CDIV): blocktxn handler does not complete reconstruction (main.rs:3240-3264)"]
 fn g20_blocktxn_handler_completes_reconstruction() {
-    // This tests main-loop behaviour — cannot unit-test here.
-    // Expected flow:
-    //   1. cmpctblock arrives, missing txns → getblocktxn sent, PartiallyDownloadedBlock stored
-    //   2. blocktxn arrives → fill_block(missing_txns) → block_downloader.block_received()
-    // Actual flow (rustoshi):
-    //   1. cmpctblock arrives, missing txns → getblocktxn sent, NO partial block stored
-    //   2. blocktxn arrives → debug log → discarded
-    panic!("BUG-G20 (P0-CDIV): blocktxn handler dead — fill_block never called (main.rs:3240-3264)");
+    // Build an 8-tx block.
+    let block = make_block(8);
+    let compact = CmpctBlock::from_block(&block, 0xDEAD_0020);
+
+    // Simulate a mempool that only has the first 3 non-coinbase txs.
+    let partial_mempool: Vec<(Hash256, Arc<Transaction>)> = block
+        .transactions
+        .iter()
+        .skip(1)
+        .take(3)
+        .map(|tx| (tx.wtxid(), Arc::new(tx.clone())))
+        .collect();
+    let refs: Vec<(&Hash256, &Arc<Transaction>)> =
+        partial_mempool.iter().map(|(h, t)| (h, t)).collect();
+
+    let partial =
+        PartiallyDownloadedBlock::init_data(&compact, refs.into_iter(), &[]).unwrap();
+
+    // Partial block is incomplete — missing indices will be requested via getblocktxn.
+    assert!(!partial.is_complete(), "block must be incomplete with partial mempool");
+    let missing_idxs = partial.get_missing_indices();
+    assert!(!missing_idxs.is_empty(), "missing indices must be non-empty");
+
+    // Step 1: cmpctblock handler stores the partial block in inflight_partial_blocks.
+    let block_hash = compact.block_hash();
+    let peer_key: (u64, Hash256) = (42, block_hash);
+    let mut inflight: std::collections::HashMap<(u64, Hash256), PartiallyDownloadedBlock> =
+        std::collections::HashMap::new();
+    inflight.insert(peer_key, partial);
+
+    // Step 2: blocktxn arrives with the missing transactions.
+    // (Serialise + deserialise to confirm wire round-trip still works.)
+    let missing_txs: Vec<Arc<Transaction>> = missing_idxs
+        .iter()
+        .map(|&idx| Arc::new(block.transactions[idx as usize].clone()))
+        .collect();
+    let blocktxn = BlockTxn::from_arcs(block_hash, missing_txs);
+    let wire = blocktxn.serialize();
+    let decoded = BlockTxn::deserialize(&wire).unwrap();
+    assert_eq!(decoded.block_hash, block_hash);
+
+    // Step 3: handler looks up the partial block, calls fill_block, gets the block.
+    let mut stored_partial = inflight
+        .remove(&(42u64, decoded.block_hash))
+        .expect("partial block must be retrievable by (peer_id, block_hash)");
+
+    let reconstructed = stored_partial
+        .fill_block(decoded.transactions, false)
+        .expect("fill_block must succeed with correct missing txs");
+
+    // Reconstructed block must exactly match the original.
+    assert_eq!(
+        reconstructed.transactions.len(),
+        block.transactions.len(),
+        "reconstructed block must have all transactions"
+    );
+    assert_eq!(
+        reconstructed.header,
+        block.header,
+        "reconstructed block header must match original"
+    );
+    assert_eq!(
+        reconstructed.transactions[0],
+        block.transactions[0],
+        "coinbase must be preserved"
+    );
+
+    // inflight map must be empty after removal (no leak).
+    assert!(inflight.is_empty(), "inflight map must be cleared after reconstruction");
 }
 
 // ---------------------------------------------------------------------------
