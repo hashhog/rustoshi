@@ -11,6 +11,7 @@
 //! - Local addresses: all belong to same group
 //! - Unroutable addresses: all belong to same group
 
+use crate::asmap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Network type classification.
@@ -77,30 +78,119 @@ impl std::fmt::Debug for NetGroup {
     }
 }
 
+/// NET_IPV6 constant used by Core's GetGroup() when ASN-based grouping is active.
+///
+/// When an ASN is found, Core prefixes the group bytes with `NET_IPV6` (6) so that
+/// both IPv4 and IPv6 addresses with the same ASN land in the same bucket.
+///
+/// Core reference: `netgroup.cpp:26` `vchRet.push_back(NET_IPV6)`.
+const NET_IPV6: u8 = 6;
+
+/// IPv4-in-IPv6 mapping prefix: `::ffff:0:0/96` (RFC 4291).
+///
+/// Used by GetMappedAS to present IPv4 addresses as 128-bit inputs to the
+/// ASMap interpreter — matching Core's `GetLinkedIPv4()` + prefix approach.
+///
+/// Core reference: `netgroup.cpp:89-95` IPv4-mapped handling in GetMappedAS.
+const IPV4_IN_IPV6_PREFIX: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+
 /// Network group manager for computing network groups from addresses.
 #[derive(Debug, Clone)]
 pub struct NetGroupManager {
     /// Random key for keyed netgroup hashing (set once at startup).
     /// This makes netgroup selection unpredictable to attackers.
     key: u64,
+    /// ASMap bit-vector loaded from a file at startup (empty = no asmap).
+    ///
+    /// When non-empty, `get_group()` returns an ASN-derived group instead of
+    /// a subnet prefix group.  `get_mapped_as()` calls the bytecode interpreter.
+    ///
+    /// Core reference: `NetGroupManager::m_asmap` in `netgroup.h`.
+    asmap: Vec<u8>,
 }
 
 impl NetGroupManager {
-    /// Create a new network group manager with a random key.
+    /// Create a new network group manager with a random key and no asmap loaded.
     pub fn new() -> Self {
         Self {
             key: rand::random(),
+            asmap: Vec::new(),
         }
     }
 
     /// Create a network group manager with a specific key (for testing).
     pub fn with_key(key: u64) -> Self {
-        Self { key }
+        Self {
+            key,
+            asmap: Vec::new(),
+        }
+    }
+
+    /// Create a network group manager with an embedded (pre-loaded) ASMap bit-vector.
+    ///
+    /// The caller is responsible for having already called `check_standard_asmap`
+    /// on the data.  This is typically called from `decode_asmap()` which performs
+    /// the sanity check internally.
+    ///
+    /// Core reference: `NetGroupManager::WithEmbeddedAsmap` used in tests.
+    pub fn with_asmap(key: u64, asmap: Vec<u8>) -> Self {
+        Self { key, asmap }
     }
 
     /// Get the random key used for keyed hashing.
     pub fn key(&self) -> u64 {
         self.key
+    }
+
+    /// Returns true if an ASMap is loaded.
+    ///
+    /// Core reference: `NetGroupManager::UsingASMap()` in `netgroup.cpp`.
+    pub fn using_asmap(&self) -> bool {
+        !self.asmap.is_empty()
+    }
+
+    /// Get the SHA256 hash (first 8 hex chars) of the loaded ASMap for logging.
+    pub fn asmap_version_hex(&self) -> Option<String> {
+        if self.asmap.is_empty() {
+            None
+        } else {
+            Some(asmap::asmap_version_hex(&self.asmap))
+        }
+    }
+
+    /// Look up the Autonomous System Number (ASN) for an IP address.
+    ///
+    /// Returns 0 if no asmap is loaded, or if the IP is not IPv4/IPv6, or if
+    /// the address is not in the asmap.  AS0 is reserved per RFC 7607.
+    ///
+    /// For IPv4 addresses the lookup uses the IPv4-mapped-in-IPv6 form
+    /// (`::ffff:a.b.c.d`) to match Core's 128-bit-input convention.
+    ///
+    /// Core reference: `uint32_t NetGroupManager::GetMappedAS(addr)` in `netgroup.cpp`.
+    pub fn get_mapped_as(&self, addr: &IpAddr) -> u32 {
+        if self.asmap.is_empty() {
+            return 0;
+        }
+        match addr {
+            IpAddr::V4(v4) => {
+                // IPv4-mapped to 128-bit input: ::ffff:<v4>
+                let mut ip_bytes = [0u8; 16];
+                ip_bytes[..12].copy_from_slice(&IPV4_IN_IPV6_PREFIX);
+                ip_bytes[12..16].copy_from_slice(&v4.octets());
+                asmap::interpret(&self.asmap, &ip_bytes)
+            }
+            IpAddr::V6(v6) => {
+                // IPv4-mapped IPv6 (::ffff:x.x.x.x) — use the IPv4 part
+                let octets = v6.octets();
+                if octets[..10] == [0u8; 10] && octets[10] == 0xff && octets[11] == 0xff {
+                    // Treat as IPv4-mapped
+                    asmap::interpret(&self.asmap, &octets)
+                } else {
+                    // Pure IPv6
+                    asmap::interpret(&self.asmap, &octets)
+                }
+            }
+        }
     }
 
     /// Classify the network type of an IP address.
@@ -262,13 +352,30 @@ impl NetGroupManager {
 
     /// Get the network group for an IP address.
     ///
-    /// This implements the grouping rules from Bitcoin Core's NetGroupManager::GetGroup():
-    /// - IPv4: /16 prefix
-    /// - IPv6: /32 prefix
-    /// - Tor/I2P: 4-bit prefix
-    /// - CJDNS: 12-bit prefix (skip constant first byte)
-    /// - Local/Unroutable: single group each
+    /// When an ASMap is loaded and the address is IPv4/IPv6, returns an ASN-derived
+    /// group: `[NET_IPV6=6, byte0(asn), byte1(asn), byte2(asn), byte3(asn)]`.
+    /// Both IPv4 and IPv6 addresses with the same ASN land in the same bucket.
+    ///
+    /// Falls back to subnet-prefix grouping (existing /16 / /32 logic) when no
+    /// asmap is loaded or the address is Tor/I2P/CJDNS.
+    ///
+    /// Core reference: `NetGroupManager::GetGroup(addr)` in `netgroup.cpp`.
     pub fn get_group(&self, addr: &IpAddr) -> NetGroup {
+        // ASN-based grouping when asmap is loaded (only for IPv4/IPv6)
+        let asn = self.get_mapped_as(addr);
+        if asn != 0 {
+            // IPv4 and IPv6 with the same ASN share the same bucket.
+            // Core: NET_IPV6 (=6) + 4-byte ASN in little-endian.
+            let mut group = Vec::with_capacity(5);
+            group.push(NET_IPV6);
+            group.push((asn) as u8);
+            group.push((asn >> 8) as u8);
+            group.push((asn >> 16) as u8);
+            group.push((asn >> 24) as u8);
+            return NetGroup::new(group);
+        }
+
+        // Fall back to subnet-prefix grouping.
         let net_type = self.classify_network(addr);
 
         let mut group = Vec::new();

@@ -868,6 +868,49 @@ impl PeerManager {
         }
     }
 
+    /// Create a new peer manager with a pre-built NetGroupManager (e.g., with ASMap loaded).
+    ///
+    /// Use this constructor when an ASMap file has been loaded at startup so that
+    /// AS-based IP bucketing (anti-eclipse) is active from the first connection.
+    ///
+    /// Core reference: `src/init.cpp` loads asmap then builds NetGroupManager and
+    /// passes it into AddrMan; the equivalent here is passing the built manager in.
+    pub fn new_with_netgroup(
+        config: PeerManagerConfig,
+        params: ChainParams,
+        netgroup_manager: NetGroupManager,
+    ) -> Self {
+        let (event_tx, event_rx) = mpsc::channel(1024);
+        let ban_manager = BanManager::with_duration(config.data_dir.clone(), config.ban_duration);
+
+        let anchors = read_anchors(&config.data_dir);
+        if !anchors.is_empty() {
+            tracing::info!(
+                "{} block-relay-only anchors loaded from {}",
+                anchors.len(),
+                config.data_dir.join(ANCHORS_DATABASE_FILENAME).display()
+            );
+        }
+
+        Self {
+            config,
+            params,
+            peers: HashMap::new(),
+            inbound_cmd_txs: None,
+            addr_manager: AddressManager::new(),
+            misbehavior_tracker: MisbehaviorTracker::new(),
+            ban_manager,
+            netgroup_manager,
+            stale_detector: StalePeerDetector::new(),
+            last_stale_check: Instant::now(),
+            next_peer_id: 1,
+            event_tx,
+            event_rx: Some(event_rx),
+            start_height: 0,
+            anchors,
+        }
+    }
+
     /// Create a peer manager for testnet4 with default configuration.
     pub fn testnet4() -> Self {
         Self::new(PeerManagerConfig::testnet4(), ChainParams::testnet4())
