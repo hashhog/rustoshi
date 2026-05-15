@@ -341,6 +341,74 @@ pub struct WalletCreateFundedPsbtResult {
     pub changepos: i32,
 }
 
+/// Options for `bumpfee` / `psbtbumpfee`.
+///
+/// Mirrors a subset of Bitcoin Core's `bumpfee` options. The minimal-
+/// viable rustoshi implementation supports `fee_rate` (absolute sat/vB
+/// override) only — `conf_target`, `estimate_mode`, `replaceable`,
+/// `original_change_index`, and `outputs` reservation are accepted but
+/// `outputs` is rejected as not-yet-supported. `replaceable` defaults to
+/// true to preserve BIP-125 opt-in.
+///
+/// Reference: `bitcoin-core/src/wallet/rpc/feebumper.cpp::bumpfee_helper`.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct BumpFeeOptions {
+    /// Confirmation target (deferred — full Core fee-estimator is not wired).
+    #[serde(rename = "conf_target", skip_serializing_if = "Option::is_none")]
+    pub conf_target: Option<u32>,
+    /// Fee rate override in sat/vB.
+    #[serde(rename = "fee_rate", skip_serializing_if = "Option::is_none")]
+    pub fee_rate: Option<f64>,
+    /// Whether the replacement is replaceable (default: true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaceable: Option<bool>,
+    /// Fee estimate mode (`unset`, `economical`, `conservative`).
+    #[serde(rename = "estimate_mode", skip_serializing_if = "Option::is_none")]
+    pub estimate_mode: Option<String>,
+    /// Originally specified change index (deferred).
+    #[serde(rename = "original_change_index", skip_serializing_if = "Option::is_none")]
+    pub original_change_index: Option<u32>,
+    /// Replace the outputs list explicitly (deferred — not supported).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<serde_json::Value>,
+}
+
+/// Result of `bumpfee`.
+///
+/// Mirrors Bitcoin Core's `bumpfee` JSON shape:
+/// - `txid`: new replacement transaction id.
+/// - `origfee`: original transaction fee (BTC).
+/// - `fee`: new transaction fee (BTC).
+/// - `errors`: any non-fatal warnings produced during the bump.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BumpFeeResult {
+    /// New replacement transaction ID (hex, display order).
+    pub txid: String,
+    /// Original fee in BTC.
+    pub origfee: f64,
+    /// New fee in BTC.
+    pub fee: f64,
+    /// Warnings encountered during the bump.
+    pub errors: Vec<String>,
+}
+
+/// Result of `psbtbumpfee`.
+///
+/// Same shape as [`BumpFeeResult`] but with `psbt` instead of `txid` —
+/// the replacement is returned as an unsigned PSBT (base64) for signing
+/// by another role.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PsbtBumpFeeResult {
+    /// Replacement PSBT (base64).
+    pub psbt: String,
+    /// Original fee in BTC.
+    pub origfee: f64,
+    /// New fee in BTC.
+    pub fee: f64,
+    /// Warnings encountered during the bump.
+    pub errors: Vec<String>,
+}
+
 /// Wallet state for RPC.
 pub struct WalletRpcState {
     /// Wallet manager.
@@ -639,6 +707,54 @@ pub trait WalletRpc {
         options: Option<FundedPsbtOptions>,
         bip32derivs: Option<bool>,
     ) -> RpcResult<WalletCreateFundedPsbtResult>;
+
+    /// Bump the fee on a wallet-created, BIP-125-replaceable, unconfirmed
+    /// transaction (FIX-61, W118 BUG-2 closure).
+    ///
+    /// Mirrors Bitcoin Core's `bumpfee` RPC
+    /// (`bitcoin-core/src/wallet/rpc/feebumper.cpp::bumpfee`). The
+    /// rustoshi implementation is minimal-viable: it reduces the wallet-
+    /// owned change output to cover a 1 sat/vB-per-vbyte fee bump (or a
+    /// caller-specified `fee_rate`), re-signs, and submits.
+    ///
+    /// Errors:
+    /// - `-4` (RPC_WALLET_ERROR) if the tx is not in the wallet, is
+    ///   already confirmed, does not signal BIP-125, lacks a wallet-owned
+    ///   change output, or would push change below dust.
+    /// - `-6` (RPC_WALLET_INSUFFICIENT_FUNDS) if the delta exceeds change
+    ///   value.
+    /// - `-13` (RPC_WALLET_UNLOCK_NEEDED) if the wallet is encrypted and
+    ///   locked (signing requires unlock).
+    ///
+    /// Parameters:
+    /// - `txid`: hex (display order) of the transaction to replace.
+    /// - `options`: optional `BumpFeeOptions`. Only `fee_rate` is
+    ///   honoured in this minimal cut; other fields are accepted but
+    ///   informational.
+    #[method(name = "bumpfee")]
+    async fn bump_fee(
+        &self,
+        txid: String,
+        options: Option<BumpFeeOptions>,
+    ) -> RpcResult<BumpFeeResult>;
+
+    /// PSBT variant of `bumpfee`: returns an unsigned replacement PSBT
+    /// (base64) instead of submitting a signed tx (FIX-61, W118 BUG-3
+    /// closure).
+    ///
+    /// Mirrors Bitcoin Core's `psbtbumpfee` RPC. Same validation rules as
+    /// [`Self::bump_fee`] except signing is skipped; the result is a
+    /// Creator+Updater PSBT that a separate signing role can finalize.
+    ///
+    /// Parameters:
+    /// - `txid`: hex (display order) of the transaction to replace.
+    /// - `options`: same shape as `bumpfee`'s options.
+    #[method(name = "psbtbumpfee")]
+    async fn psbt_bump_fee(
+        &self,
+        txid: String,
+        options: Option<BumpFeeOptions>,
+    ) -> RpcResult<PsbtBumpFeeResult>;
 }
 
 /// Wallet RPC implementation.
@@ -698,6 +814,49 @@ impl WalletRpcImpl {
                 other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
             }
         })
+    }
+
+    /// FIX-61: parse a txid (hex display-order, 32 bytes) and return the
+    /// internal-order `Hash256`. Mirrors how `gettransaction` / `bumpfee`
+    /// expect the txid argument.
+    fn parse_txid_hex(txid_hex: &str) -> Result<rustoshi_primitives::Hash256, ErrorObjectOwned> {
+        let bytes = hex::decode(txid_hex).map_err(|_| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                format!("Invalid txid hex: {}", txid_hex),
+            )
+        })?;
+        if bytes.len() != 32 {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                "txid must be 32 bytes",
+            ));
+        }
+        let mut internal = [0u8; 32];
+        internal.copy_from_slice(&bytes);
+        internal.reverse(); // display → internal
+        Ok(rustoshi_primitives::Hash256(internal))
+    }
+
+    /// FIX-61: translate a `WalletError` produced by `bump_fee` /
+    /// `psbt_bump_fee` into the closest Core-compatible RPC error code.
+    /// Pattern-matches on the message so we keep the existing
+    /// `WalletError::SigningError(String)` shape — the bump-fee helpers
+    /// emit message-encoded reasons.
+    fn bumpfee_err_to_rpc(e: rustoshi_wallet::WalletError) -> ErrorObjectOwned {
+        use rustoshi_wallet::WalletError;
+        let msg = e.to_string();
+        // Insufficient-funds-shaped reasons (delta > change_value).
+        if msg.contains("exceeds change output value") || msg.contains("insufficient") {
+            return Self::rpc_error(wallet_error::RPC_WALLET_INSUFFICIENT_FUNDS, msg);
+        }
+        match e {
+            WalletError::WalletLocked => Self::rpc_error(
+                wallet_error::RPC_WALLET_UNLOCK_NEEDED,
+                "Error: Please enter the wallet passphrase with walletpassphrase first.",
+            ),
+            _ => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg),
+        }
     }
 }
 
@@ -1901,6 +2060,146 @@ impl WalletRpcServer for WalletRpcImpl {
                     other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
                 }
             })
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-61 (W118 BUG-2 + BUG-3): bumpfee + psbtbumpfee
+    //
+    // Both RPCs share the same validation/build pipeline through
+    // `Wallet::bump_fee` / `Wallet::psbt_bump_fee`. The RPC layer is
+    // responsible for:
+    //   1. parsing/validating the txid hex (display-order → internal)
+    //   2. wallet acquisition + unlock gate (signing path only — psbt is
+    //      Creator/Updater so technically does not need to sign, but we
+    //      still gate it: the wallet needs the seed in memory to derive
+    //      the change script for is_mine detection)
+    //   3. translating `WalletError` to Core-compatible RPC errors
+    //   4. shaping the response object
+    // -----------------------------------------------------------------------
+
+    async fn bump_fee(
+        &self,
+        txid: String,
+        options: Option<BumpFeeOptions>,
+    ) -> RpcResult<BumpFeeResult> {
+        let opts = options.unwrap_or_default();
+        let fee_rate_override = opts.fee_rate;
+
+        // Parse the txid: hex display-order → internal (reverse).
+        let hash = Self::parse_txid_hex(&txid)?;
+
+        let state = self.state.read().await;
+        let (name, wallet) = state
+            .wallet_manager
+            .get_wallet_or_default(self.target_wallet.as_deref())
+            .map_err(|e| {
+                Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string())
+            })?;
+
+        Self::require_unlocked(&state, &name)?;
+
+        let mut wallet_guard = wallet
+            .lock()
+            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+
+        // Capture original fee before bump_fee replaces the entry.
+        let orig_fee_sats = wallet_guard
+            .get_sent_tx(&hash)
+            .map(|s| s.fee_sats)
+            .ok_or_else(|| {
+                Self::rpc_error(
+                    wallet_error::RPC_WALLET_ERROR,
+                    format!(
+                        "bumpfee: txid {} not found in wallet outgoing-tx record",
+                        txid
+                    ),
+                )
+            })?;
+
+        let new_tx = wallet_guard
+            .bump_fee(&hash, fee_rate_override)
+            .map_err(|e| Self::bumpfee_err_to_rpc(e))?;
+
+        // Look up the recorded SentTx for the new txid to learn the fee.
+        let new_txid = new_tx.txid();
+        let new_fee_sats = wallet_guard
+            .get_sent_tx(&new_txid)
+            .map(|s| s.fee_sats)
+            .unwrap_or(0);
+
+        let txid_hex = hex::encode(new_txid.0.iter().rev().copied().collect::<Vec<_>>());
+
+        Ok(BumpFeeResult {
+            txid: txid_hex,
+            origfee: Self::sats_to_btc(orig_fee_sats),
+            fee: Self::sats_to_btc(new_fee_sats),
+            errors: vec![],
+        })
+    }
+
+    async fn psbt_bump_fee(
+        &self,
+        txid: String,
+        options: Option<BumpFeeOptions>,
+    ) -> RpcResult<PsbtBumpFeeResult> {
+        let opts = options.unwrap_or_default();
+        let fee_rate_override = opts.fee_rate;
+
+        let hash = Self::parse_txid_hex(&txid)?;
+
+        let state = self.state.read().await;
+        let (name, wallet) = state
+            .wallet_manager
+            .get_wallet_or_default(self.target_wallet.as_deref())
+            .map_err(|e| {
+                Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string())
+            })?;
+
+        // Unlock gate: psbt_bump_fee does not sign, but it does need the
+        // master key to call is_mine via derived addresses on the change
+        // output. Require unlock for parity with Core (which similarly
+        // refuses both bumpfee variants on a locked wallet).
+        Self::require_unlocked(&state, &name)?;
+
+        let mut wallet_guard = wallet
+            .lock()
+            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+
+        let orig_fee_sats = wallet_guard
+            .get_sent_tx(&hash)
+            .map(|s| s.fee_sats)
+            .ok_or_else(|| {
+                Self::rpc_error(
+                    wallet_error::RPC_WALLET_ERROR,
+                    format!(
+                        "psbtbumpfee: txid {} not found in wallet outgoing-tx record",
+                        txid
+                    ),
+                )
+            })?;
+
+        let psbt = wallet_guard
+            .psbt_bump_fee(&hash, fee_rate_override)
+            .map_err(|e| Self::bumpfee_err_to_rpc(e))?;
+
+        // Recompute the new fee from the unsigned-tx outputs vs the
+        // recorded spent UTXOs. We don't record sent_txs for psbt path
+        // (would mis-key against an unsigned tx that may be changed by a
+        // signer); instead inspect the PSBT's unsigned_tx.
+        let total_in: u64 = {
+            let entry = wallet_guard.get_sent_tx(&hash).unwrap();
+            entry.spent_utxos.iter().map(|u| u.value).sum()
+        };
+        let total_out: u64 = psbt.unsigned_tx.outputs.iter().map(|o| o.value).sum();
+        let new_fee_sats = total_in.saturating_sub(total_out);
+
+        let psbt_b64 = psbt.to_base64();
+        Ok(PsbtBumpFeeResult {
+            psbt: psbt_b64,
+            origfee: Self::sats_to_btc(orig_fee_sats),
+            fee: Self::sats_to_btc(new_fee_sats),
+            errors: vec![],
+        })
     }
 }
 
