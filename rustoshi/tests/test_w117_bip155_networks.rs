@@ -228,36 +228,81 @@ fn g7_onion_to_socks5_domain_routing_exists() {
     );
 }
 
-/// BUG-1: torv3_pubkey_to_hostname uses SHA-256, not SHA3-256.
-/// Tor spec (https://spec.torproject.org/rend-spec-v3.html §6) requires:
-///   CHECKSUM = H(".onion checksum" || pubkey || [VERSION])[0:2]
-/// where H is SHA3-256, not SHA-256.
-/// This test documents the bug by showing the checksum diverges from the
-/// reference test vector produced by an independent SHA3-256 implementation.
+/// BUG-1 (FIXED in FIX-57): torv3_pubkey_to_hostname now uses SHA3-256 per Tor
+/// rend-spec-v3 §6: CHECKSUM = SHA3-256(".onion checksum" || pubkey || [VERSION])[0:2].
+///
+/// This test confirms the fix by:
+///   1. Computing the expected SHA3-256 checksum independently.
+///   2. Decoding the hostname's base32 payload.
+///   3. Asserting the checksum bytes in the hostname match SHA3-256, not SHA-256.
 #[test]
-#[ignore = "BUG-1: torv3_pubkey_to_hostname uses SHA-256 instead of SHA3-256 (Tor spec §6)"]
 fn g7_bug1_torv3_pubkey_to_hostname_uses_sha3_256() {
-    // Reference: pubkey = [0x42; 32]
-    // Correct SHA3-256(".onion checksum" || pubkey || [3])[0:2] != SHA-256 of same
-    // In production this means .onion addresses generated here are invalid.
-    // Any Tor relay or BIP-155-compliant node will reject them.
+    use sha2::{Digest as Sha2Digest, Sha256};
+    use sha3::{Digest as Sha3Digest, Sha3_256};
+
     let pubkey = [0x42u8; 32];
     let hostname = torv3_pubkey_to_hostname(&pubkey);
-    // The 56-char base32 blob encodes pubkey(32) + checksum(2) + version(1)
-    // With SHA3-256, the expected checksum bytes are different from SHA-256.
-    // We can't compute the reference without sha3 crate, but we assert the
-    // current implementation does NOT round-trip correctly when parsed by
-    // an external tool — this is the concrete failure mode.
-    assert!(
-        hostname.ends_with(".onion"),
-        "hostname must end with .onion"
-    );
+
+    // Format sanity.
+    assert!(hostname.ends_with(".onion"), "hostname must end with .onion");
     assert_eq!(hostname.len(), 62, "v3 .onion must be 62 chars");
-    // If SHA3 were used, the roundtrip would still work internally — but
-    // crucially, the address would be DIFFERENT, exposing to the actual Tor
-    // network an address that real Tor relays cannot verify.
-    // The bug is that the checksum algorithm is wrong, not that the format is wrong.
-    panic!("This test is intentionally failing to document BUG-1: SHA3-256 must be used");
+
+    // Decode the 56-char base32 portion back to 35 raw bytes:
+    //   pubkey(32) || checksum(2) || version(1)
+    let base32_part = hostname.strip_suffix(".onion").unwrap();
+    let decoded = decode_base32_lowercase(base32_part);
+    assert_eq!(decoded.len(), 35, "decoded onion payload must be 35 bytes");
+    assert_eq!(&decoded[0..32], &pubkey, "pubkey must round-trip");
+    assert_eq!(decoded[34], 3, "version byte must be 0x03");
+
+    let hostname_checksum = &decoded[32..34];
+
+    // Compute the reference SHA3-256 checksum independently.
+    let mut sha3 = Sha3_256::new();
+    Sha3Digest::update(&mut sha3, b".onion checksum");
+    Sha3Digest::update(&mut sha3, &pubkey);
+    Sha3Digest::update(&mut sha3, [3u8]);
+    let sha3_hash = sha3.finalize();
+    let expected_sha3 = &sha3_hash[0..2];
+
+    // Compute the (wrong) SHA-256 checksum for the same input.
+    let mut sha2 = Sha256::new();
+    Sha2Digest::update(&mut sha2, b".onion checksum");
+    Sha2Digest::update(&mut sha2, &pubkey);
+    Sha2Digest::update(&mut sha2, [3u8]);
+    let sha2_hash = sha2.finalize();
+    let sha256_bytes = &sha2_hash[0..2];
+
+    assert_eq!(
+        hostname_checksum, expected_sha3,
+        "checksum bytes must match SHA3-256, not SHA-256"
+    );
+    assert_ne!(
+        expected_sha3, sha256_bytes,
+        "for this input, SHA3-256 and SHA-256 must differ in the first 2 bytes\n\
+         (sanity check: confirms we are actually testing the SHA algo change)"
+    );
+}
+
+/// Helper: decode a lowercase RFC 4648 base32 string (no padding).
+fn decode_base32_lowercase(s: &str) -> Vec<u8> {
+    let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut buffer: u64 = 0;
+    let mut bits: u32 = 0;
+    let mut out = Vec::new();
+    for c in s.chars() {
+        let idx = alphabet
+            .iter()
+            .position(|&a| a as char == c)
+            .unwrap_or_else(|| panic!("invalid base32 char: {c}"));
+        buffer = (buffer << 5) | (idx as u64);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    out
 }
 
 // ============================================================
@@ -706,19 +751,17 @@ fn g30_getnodeaddresses_and_getnetworkinfo_privacy_networks_absent() {
 // Additional regression tests for specific bug coverage
 // ============================================================
 
-/// BUG-1 regression: torv3_pubkey_to_hostname and hostname_to_torv3_pubkey
-/// internally round-trip with SHA-256 (both ends use the same wrong hash).
-/// The internal roundtrip passes, but any external Tor client will reject
-/// these addresses. This test confirms the INTERNAL roundtrip works while
-/// the separate #[ignore] test documents the external incompatibility.
+/// BUG-1 regression (post-FIX-57): roundtrip still works after switching to SHA3-256.
+/// Both encode and decode use the same hash, so a hostname produced locally
+/// must parse back to the original pubkey. The separate g7_bug1 test above
+/// confirms the checksum is now SHA3-256, not SHA-256.
 #[test]
-fn bug1_torv3_internal_roundtrip_passes_with_wrong_hash() {
+fn bug1_torv3_internal_roundtrip_still_works_with_sha3() {
     let pubkey = [0x55u8; 32];
     let hostname = torv3_pubkey_to_hostname(&pubkey);
 
-    // Internal roundtrip works (both sides use SHA-256)
     let parsed = hostname_to_torv3_pubkey(&hostname).unwrap();
-    assert_eq!(parsed, pubkey, "Internal roundtrip must work");
+    assert_eq!(parsed, pubkey, "Internal roundtrip must work after SHA3 switch");
 
     // Sanity: 56 chars before .onion
     let base32_part = hostname.strip_suffix(".onion").unwrap();
