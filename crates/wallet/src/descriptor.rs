@@ -316,6 +316,14 @@ pub enum KeyProvider {
         pubkey: PublicKey,
         /// Whether this is an x-only key (for Taproot).
         xonly: bool,
+        /// Whether the input was compressed (33 bytes, 0x02/0x03 prefix).
+        ///
+        /// `secp256k1::PublicKey::serialize()` always returns 33 bytes
+        /// regardless of input form, so we must remember the original
+        /// compression flag to enforce BIP-141 / BIP-143 (segwit-v0
+        /// forbids uncompressed keys). X-only Taproot keys are treated
+        /// as compressed (they only carry the x-coordinate, 32 bytes).
+        is_compressed: bool,
     },
     /// An extended public key with derivation path.
     Xpub {
@@ -359,6 +367,26 @@ impl KeyProvider {
                 *derive_type != DeriveType::NonRanged
             }
             KeyProvider::WithOrigin { inner, .. } => inner.is_range(),
+        }
+    }
+
+    /// Returns true if the underlying public key was parsed in compressed form.
+    ///
+    /// BIP-141 / BIP-143 forbid uncompressed keys in segwit-v0 contexts
+    /// (`wpkh`, `wsh`, and any segwit script inside `sh()`). The check
+    /// `pubkey.serialize().len() != 33` is dead because
+    /// `secp256k1::PublicKey::serialize()` always returns 33 bytes —
+    /// the input compression flag is lost on construction. We must
+    /// remember it at parse time.
+    ///
+    /// Xpub / Xprv derivation always produces compressed keys (BIP-32),
+    /// so those always return true.
+    pub fn is_compressed(&self) -> bool {
+        match self {
+            KeyProvider::Const { is_compressed, .. } => *is_compressed,
+            // BIP-32 derivation always yields compressed public keys.
+            KeyProvider::Xpub { .. } | KeyProvider::Xprv { .. } => true,
+            KeyProvider::WithOrigin { inner, .. } => inner.is_compressed(),
         }
     }
 
@@ -418,13 +446,21 @@ impl KeyProvider {
     /// Format as string for public representation.
     pub fn to_public_string(&self) -> String {
         match self {
-            KeyProvider::Const { pubkey, xonly } => {
-                let bytes = pubkey.serialize();
+            KeyProvider::Const {
+                pubkey,
+                xonly,
+                is_compressed,
+            } => {
                 if *xonly {
                     // x-only is 32 bytes, skip the prefix byte
+                    let bytes = pubkey.serialize();
                     hex::encode(&bytes[1..])
+                } else if *is_compressed {
+                    hex::encode(pubkey.serialize())
                 } else {
-                    hex::encode(bytes)
+                    // Preserve the original 65-byte uncompressed form for
+                    // legacy descriptors (pkh, sh(pk(...))) that accept it.
+                    hex::encode(pubkey.serialize_uncompressed())
                 }
             }
             KeyProvider::Xpub {
@@ -589,13 +625,22 @@ impl Descriptor {
                 Ok(vec![script])
             }
             Descriptor::Wpkh(key) => {
-                let pubkey = key.get_pubkey(pos)?;
-                // P2WPKH requires compressed pubkey
-                if pubkey.serialize().len() != 33 {
+                // BIP-141 / BIP-143: segwit-v0 requires compressed pubkey.
+                // Primary enforcement happens at parse time
+                // (validate_segwit_v0_compressed); this is defense in depth
+                // for callers that build a Wpkh descriptor programmatically
+                // without going through parse_descriptor().
+                //
+                // NOTE: we deliberately check `key.is_compressed()` rather
+                // than `pubkey.serialize().len() != 33` because
+                // `secp256k1::PublicKey::serialize()` always returns 33
+                // bytes (compressed) — the runtime length check is dead.
+                if !key.is_compressed() {
                     return Err(DescriptorError::InvalidKey(
-                        "P2WPKH requires compressed pubkey".into(),
+                        "P2WPKH requires compressed pubkey (BIP-141)".into(),
                     ));
                 }
+                let pubkey = key.get_pubkey(pos)?;
                 let script = make_p2wpkh_script(&pubkey);
                 Ok(vec![script])
             }
@@ -652,8 +697,14 @@ impl Descriptor {
                 let pubkey = key.get_pubkey(pos)?;
                 let mut scripts = vec![make_p2pk_script(&pubkey), make_p2pkh_script(&pubkey)];
 
-                // If compressed, also add SegWit variants
-                if pubkey.serialize().len() == 33 {
+                // If the input was compressed, also add SegWit variants
+                // (P2WPKH and P2SH-wrapped P2WPKH). Per BIP-380, combo()
+                // with an uncompressed key emits only legacy scripts.
+                //
+                // NOTE: the previous check `pubkey.serialize().len() == 33`
+                // was tautologically true (secp256k1::PublicKey::serialize()
+                // always returns 33 bytes). We track is_compressed at parse.
+                if key.is_compressed() {
                     let p2wpkh = make_p2wpkh_script(&pubkey);
                     let p2sh_p2wpkh = make_p2sh_script(&p2wpkh);
                     scripts.push(p2wpkh);
@@ -863,6 +914,54 @@ fn key_provider_has_private(kp: &KeyProvider) -> bool {
         KeyProvider::Const { .. } => false,
         KeyProvider::Xpub { .. } => false,
         KeyProvider::WithOrigin { inner, .. } => key_provider_has_private(inner),
+    }
+}
+
+/// Validate that every key inside a segwit-v0 context is compressed.
+///
+/// BIP-141 / BIP-143 / BIP-380 forbid uncompressed pubkeys in segwit-v0
+/// outputs (`wpkh`, `wsh`, and segwit scripts nested inside `sh()`).
+/// This walks the descriptor sub-tree rooted at a segwit boundary and
+/// rejects any `KeyProvider` whose underlying key was parsed in
+/// uncompressed (0x04) form.
+///
+/// Matches Bitcoin Core `ParsePubkey()` in
+/// `src/script/descriptor.cpp` — Core threads a `permit_uncompressed`
+/// flag through the parser; we walk the parsed tree post-hoc which is
+/// equivalent for the well-formed descriptor grammar.
+fn validate_segwit_v0_compressed(desc: &Descriptor) -> Result<(), DescriptorError> {
+    match desc {
+        // Single-key segwit-v0 leaves: the key must be compressed.
+        Descriptor::Pk(k)
+        | Descriptor::Pkh(k)
+        | Descriptor::Wpkh(k)
+        | Descriptor::Combo(k) => check_key_compressed(k),
+        // Nested wrappers: keep recursing inside the segwit context.
+        Descriptor::Wsh(inner) => validate_segwit_v0_compressed(inner),
+        Descriptor::Sh(inner) => validate_segwit_v0_compressed(inner),
+        // Multisig inside a segwit context: every signer key must be compressed.
+        Descriptor::Multi { keys, .. } | Descriptor::SortedMulti { keys, .. } => {
+            for k in keys {
+                check_key_compressed(k)?;
+            }
+            Ok(())
+        }
+        // Taproot keys are x-only and always compressed by construction.
+        Descriptor::TrKeyOnly(_)
+        | Descriptor::Rawtr(_)
+        | Descriptor::TrWithTree { .. }
+        | Descriptor::Addr(_)
+        | Descriptor::Raw(_) => Ok(()),
+    }
+}
+
+fn check_key_compressed(k: &KeyProvider) -> Result<(), DescriptorError> {
+    if k.is_compressed() {
+        Ok(())
+    } else {
+        Err(DescriptorError::InvalidKey(
+            "uncompressed pubkey not allowed in segwit v0 (BIP-141/BIP-143)".into(),
+        ))
     }
 }
 
@@ -1292,14 +1391,25 @@ fn parse_descriptor_inner(desc: &str) -> Result<Descriptor, DescriptorError> {
         }
         "wpkh" => {
             let key = parse_key_expression(args)?;
+            // BIP-141 / BIP-143: segwit-v0 forbids uncompressed pubkeys.
+            check_key_compressed(&key)?;
             Ok(Descriptor::Wpkh(key))
         }
         "sh" => {
             let inner = parse_descriptor_inner(args)?;
+            // sh() may wrap a segwit descriptor (sh(wpkh) / sh(wsh)).
+            // Validate the segwit sub-tree only — legacy sh(pk) /
+            // sh(pkh) / sh(multi) still accept uncompressed keys.
+            if matches!(&inner, Descriptor::Wpkh(_) | Descriptor::Wsh(_)) {
+                validate_segwit_v0_compressed(&inner)?;
+            }
             Ok(Descriptor::Sh(Box::new(inner)))
         }
         "wsh" => {
             let inner = parse_descriptor_inner(args)?;
+            // Every key reachable under wsh() lives in a segwit-v0
+            // context — reject uncompressed keys at any depth.
+            validate_segwit_v0_compressed(&inner)?;
             Ok(Descriptor::Wsh(Box::new(inner)))
         }
         "tr" => parse_tr_descriptor(args),
@@ -1597,11 +1707,34 @@ fn split_xpub_and_path(expr: &str) -> Result<(&str, &str, DeriveType, bool), Des
 fn parse_hex_pubkey(hex_str: &str) -> Result<KeyProvider, DescriptorError> {
     let bytes = hex::decode(hex_str)
         .map_err(|e| DescriptorError::InvalidHex(e.to_string()))?;
+    // Determine compression from the prefix byte (the only place where this
+    // information survives — `PublicKey::from_slice` normalizes to compressed
+    // form internally and `serialize()` always returns 33 bytes).
+    //
+    // Per SEC1:
+    //   0x02 / 0x03 → 33-byte compressed (even / odd y)
+    //   0x04        → 65-byte uncompressed
+    //   0x06 / 0x07 → 65-byte hybrid (BIP-380: rejected by Core as invalid;
+    //                 secp256k1::PublicKey::from_slice also rejects hybrid).
+    let is_compressed = match bytes.first() {
+        Some(&0x02) | Some(&0x03) if bytes.len() == 33 => true,
+        Some(&0x04) if bytes.len() == 65 => false,
+        // 0x06 / 0x07 (hybrid) will be rejected by `PublicKey::from_slice`
+        // below; treat as uncompressed for safety in case that ever loosens.
+        Some(&0x06) | Some(&0x07) if bytes.len() == 65 => false,
+        _ => {
+            return Err(DescriptorError::InvalidKey(format!(
+                "invalid pubkey prefix or length: {} bytes",
+                bytes.len()
+            )));
+        }
+    };
     let pubkey = PublicKey::from_slice(&bytes)
         .map_err(|e| DescriptorError::InvalidKey(format!("invalid pubkey: {}", e)))?;
     Ok(KeyProvider::Const {
         pubkey,
         xonly: false,
+        is_compressed,
     })
 }
 
@@ -1617,7 +1750,14 @@ fn parse_xonly_pubkey(hex_str: &str) -> Result<KeyProvider, DescriptorError> {
     let pubkey = PublicKey::from_slice(&full_bytes)
         .map_err(|e| DescriptorError::InvalidKey(format!("invalid x-only pubkey: {}", e)))?;
 
-    Ok(KeyProvider::Const { pubkey, xonly: true })
+    // X-only Taproot keys only encode the x-coordinate (32 bytes); they
+    // are treated as compressed for descriptor purposes (Taproot has no
+    // notion of an uncompressed form).
+    Ok(KeyProvider::Const {
+        pubkey,
+        xonly: true,
+        is_compressed: true,
+    })
 }
 
 // =============================================================================
