@@ -44,6 +44,7 @@ pub mod bip39;
 pub mod coin_selection;
 pub mod db;
 pub mod descriptor;
+pub mod encryption;
 pub mod hd;
 pub mod manager;
 pub mod miniscript;
@@ -69,5 +70,9 @@ pub use miniscript::{
     SatisfactionResult, ScriptContext, StrKey, Type, TypeProperties, Witness,
 };
 pub use psbt::{KeyOrigin, Psbt, PsbtError, PsbtInput, PsbtOutput, PsbtRole};
+pub use encryption::{
+    decrypt_seed, encrypt_seed, parse_seed_file, EncryptedSeedFile, ParsedSeedFile,
+    WalletEncryptError, DEFAULT_KDF_ITERATIONS, ENCRYPTED_FILE_LEN, MIN_KDF_ITERATIONS,
+};
 pub use manager::{CreateWalletOptions, WalletDirEntry, WalletManager, WalletResult};
 pub use wallet::{calculate_vsize, AddressType, Wallet, WalletUtxo};

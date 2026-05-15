@@ -1018,34 +1018,30 @@ fn g23_wallet_persistence_create_load() {
 
 // ============================================================================
 // G24: Wallet encryption (passphrase → KDF → wrap master key)
-// BUG-1: MISSING ENTIRELY — passphrase field is accepted but silently dropped.
-//        The seed is written as plaintext to wallet_seed.bin with no encryption.
+// W118 BUG-1 / P0-SECURITY (FIX-59): wallet_seed.bin is now encrypted with
+// ChaCha20-Poly1305 + PBKDF2-HMAC-SHA512 when a passphrase is supplied.
 // ============================================================================
 
-/// G24 — BUG-1: Wallet encryption is absent; passphrase is silently ignored.
-///
-/// This test documents the BUG (not an assertion of correct behavior).
-/// A correct implementation would store an encrypted seed and fail to load
-/// with a wrong passphrase. Currently both succeed identically because the
-/// passphrase is not used.
+/// G24 — FIX-59: when a passphrase is supplied to createwallet, the
+/// on-disk seed must be encrypted (NOT the previously-shipped raw 64-byte
+/// plaintext blob). Locked-by-default after reload; signing gated on
+/// `walletpassphrase`.
 #[test]
-fn g24_encryption_missing_passphrase_silently_ignored() {
-    use rustoshi_wallet::{CreateWalletOptions, WalletManager};
+fn g24_encryption_passphrase_encrypts_seed_at_rest() {
+    use rustoshi_wallet::{CreateWalletOptions, ENCRYPTED_FILE_LEN, WalletManager};
     use tempfile::TempDir;
 
     let dir = TempDir::new().unwrap();
     let mut mgr = WalletManager::new(dir.path(), Network::Mainnet).unwrap();
 
-    let mut opts_with_passphrase = CreateWalletOptions::default();
-    opts_with_passphrase.passphrase = Some("correct horse battery staple".to_string());
+    let opts_with_passphrase = CreateWalletOptions {
+        passphrase: Some("correct horse battery staple".to_string()),
+        ..Default::default()
+    };
 
-    // BUG-1: this succeeds even though a passphrase is supplied —
-    // a correct impl would encrypt the seed on disk.
     let result = mgr.create_wallet("encrypted_wallet", opts_with_passphrase);
-    assert!(result.is_ok(), "create with passphrase must not panic");
+    assert!(result.is_ok(), "create with passphrase must succeed");
 
-    // Verify the seed file exists (showing it is NOT encrypted — plain bytes).
-    // WalletManager::new creates a "wallets/" subdirectory under data_dir.
     let seed_path = dir
         .path()
         .join("wallets")
@@ -1053,12 +1049,20 @@ fn g24_encryption_missing_passphrase_silently_ignored() {
         .join("wallet_seed.bin");
     assert!(seed_path.exists(), "seed file must exist");
 
-    // The seed is 64 raw bytes with no KDF headers or version markers.
+    // Post-FIX-59 the file is the encrypted layout (148 bytes), not the
+    // 64-byte plaintext that motivated W118 BUG-1.
     let seed_bytes = std::fs::read(&seed_path).unwrap();
     assert_eq!(
         seed_bytes.len(),
-        64,
-        "BUG-1: seed_file is raw 64 bytes (unencrypted) — passphrase was ignored"
+        ENCRYPTED_FILE_LEN,
+        "FIX-59: wallet_seed.bin must be the encrypted layout when a passphrase is set"
+    );
+
+    // The v2 magic must be the first 16 bytes.
+    assert_eq!(
+        &seed_bytes[..16],
+        b"RUSTOSHI_WALLET\0",
+        "FIX-59: encrypted wallet_seed.bin must carry the v2 magic header"
     );
 }
 
