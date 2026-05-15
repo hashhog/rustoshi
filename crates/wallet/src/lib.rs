@@ -40,6 +40,7 @@
 //! println!("Balance: {} sats", wallet.balance());
 //! ```
 
+pub mod bip21;
 pub mod bip39;
 pub mod coin_selection;
 pub mod db;
@@ -51,6 +52,7 @@ pub mod miniscript;
 pub mod psbt;
 pub mod wallet;
 
+pub use bip21::{parse_bip21, Bip21Error, Bip21Uri};
 pub use bip39::{
     entropy_to_mnemonic, mnemonic_to_entropy, mnemonic_to_seed, validate_mnemonic, Bip39Error,
 };
