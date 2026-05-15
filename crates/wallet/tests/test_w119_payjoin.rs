@@ -205,19 +205,22 @@
 //!                  zero are PayJoin.
 //!
 //!   BUG-16 [HIGH]  G28+G29: BIP-21 URI parser MISSING ENTIRELY.
-//!                  The codebase has zero `bitcoin:` URI handling
-//!                  (the only matches for `bitcoin:` in the source
-//!                  tree are doc comments like
-//!                  "Cryptographic primitives for Bitcoin: ..."
-//!                  — pure prose). Without a BIP-21 parser there is
-//!                  no entry point for `pj=` / `pjos=` at all.
-//!                  Fix sketch: add `crates/wallet/src/bip21.rs`
-//!                  with `parse_bip21(s: &str) -> Result<Bip21Uri,
-//!                  Bip21Error>` exposing
-//!                  `address`, `amount`, `label`, `message`,
-//!                  `pj`, `pjos` fields, and recognised vs
-//!                  unrecognised `req-*` query-param semantics per
-//!                  BIP-21.
+//!                  FIX-62 (W119 prereq closure): implemented at
+//!                  `crates/wallet/src/bip21.rs` with
+//!                  `parse_bip21(input: &str, network: Network) ->
+//!                   Result<Bip21Uri, Bip21Error>`. Recognises
+//!                  `amount` (decimal-BTC string → satoshi u64 with
+//!                  no f64 rounding), `label`/`message` (percent-
+//!                  decoded UTF-8), `lightning` (BOLT-11 fallback,
+//!                  pass-through), and BIP-78 `pj` / `pjos`.
+//!                  Unknown `req-` keys reject the URI per spec;
+//!                  unknown unprefixed keys are preserved in
+//!                  `extras` for forward-compat. Address parsing
+//!                  enforces the active network constraint via the
+//!                  existing `Address::from_string` parser.
+//!                  G28+G29 (this file) now exercise the real
+//!                  parser. Remaining BIP-78 sender/receiver flow
+//!                  (BUG-1..15) is still MISSING.
 //!
 //! ## Severity legend
 //!   P0 — security / consensus / interop divergence on the wire
@@ -262,15 +265,16 @@
 //!   G25 Tor onion service support                   — MISSING — BUG-3
 //!   G26 getpayjoinrequest / receiver-side RPC      — MISSING — BUG-15
 //!   G27 sendpayjoinrequest / sender-side RPC       — MISSING — BUG-15
-//!   G28 BIP-21 URI parser supports `pj=`           — MISSING — BUG-16
-//!   G29 BIP-21 URI parser supports `pjos=`         — MISSING — BUG-16
+//!   G28 BIP-21 URI parser supports `pj=`           — PRESENT (FIX-62) — BUG-16 closed
+//!   G29 BIP-21 URI parser supports `pjos=`         — PRESENT (FIX-62) — BUG-16 closed
 //!   G30 Receiver replay protection (PSBT-id unique) — MISSING — BUG-13
 //!
 //! Totals: 30 MISSING ENTIRELY / 0 PARTIAL / 0 PRESENT.
 //!         16 bugs.
 
+use rustoshi_crypto::address::Network;
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
-use rustoshi_wallet::Psbt;
+use rustoshi_wallet::{parse_bip21, Psbt};
 
 /// Local helper mirroring `test_w118_wallet::make_unsigned_tx`. Kept
 /// inline so this audit test compiles standalone without depending on
@@ -306,29 +310,9 @@ fn make_unsigned_tx(num_inputs: usize, num_outputs: usize) -> Transaction {
     }
 }
 
-/// Minimal BIP-21 URI structure that a future PayJoin implementation
-/// will populate. Defined here in the test file so the audit tests
-/// compile and so the future fix-wave has a contract to satisfy.
-///
-/// This struct is **deliberately not exported from
-/// `rustoshi_wallet`** — it lives here purely so the test code
-/// reads the way callers would once a real `Bip21Uri` exists.
-#[allow(dead_code)]
-struct Bip21UriProbe {
-    address: Option<String>,
-    amount_btc: Option<f64>,
-    pj_endpoint: Option<String>,
-    pjos: Option<bool>,
-}
-
-/// Helper: attempt to find `parse_bip21` in the public surface of
-/// `rustoshi_wallet`. Returns `None` so every URI-related gate fails
-/// uniformly. When a real parser lands, swap this for the real call.
-fn parse_bip21_probe(_s: &str) -> Option<Bip21UriProbe> {
-    // No BIP-21 parser exists in rustoshi_wallet (W119 audit confirmed
-    // zero `bitcoin:` URI handling in the source tree).
-    None
-}
+// FIX-62: parse_bip21 now exists in rustoshi_wallet — the
+// `Bip21UriProbe` shim has been removed and G28/G29 below call the
+// real parser. See crates/wallet/src/bip21.rs.
 
 // ============================================================
 // G1 — Receiver POST /payjoin endpoint
@@ -625,17 +609,15 @@ fn g27_sendpayjoinrequest_rpc_bug15() {
 // ============================================================
 #[test]
 fn g28_bip21_parser_supports_pj_bug16() {
-    // Real failing test (not #[ignore]) that documents the gap:
-    // any future BIP-21 parser at `rustoshi_wallet::parse_bip21`
-    // is expected to populate `pj_endpoint`. We probe; expectation
-    // is None today (parser doesn't exist), so the test asserts
-    // the absence and is marked #[ignore] for now — flip to a
-    // positive assert once `parse_bip21` is added.
-    let uri = "bitcoin:bc1qexampleaddressxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?amount=0.01&pj=https://example.com/payjoin&pjos=0";
-    let parsed = parse_bip21_probe(uri);
-    assert!(
-        parsed.is_none(),
-        "BUG-16: BIP-21 parser exists unexpectedly — flip this assertion to is_some() + check pj_endpoint == Some(\"https://example.com/payjoin\")"
+    // FIX-62 closure: parse_bip21 lives in crates/wallet/src/bip21.rs.
+    // We use a valid mainnet bech32 because the parser enforces the
+    // address constraint at parse time.
+    let uri = "bitcoin:bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4?amount=0.01&pj=https://example.com/payjoin&pjos=0";
+    let parsed = parse_bip21(uri, Network::Mainnet).expect("FIX-62 BIP-21 parser must succeed");
+    assert_eq!(
+        parsed.pj.as_deref(),
+        Some("https://example.com/payjoin"),
+        "BUG-16 closed: pj endpoint extracted from BIP-21 URI"
     );
 }
 
@@ -644,13 +626,13 @@ fn g28_bip21_parser_supports_pj_bug16() {
 // ============================================================
 #[test]
 fn g29_bip21_parser_supports_pjos_bug16() {
-    // Same shape as g28. Probe returns None; flip when parser
-    // lands.
-    let uri = "bitcoin:bc1qexampleaddressxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?amount=0.01&pj=https://example.com/payjoin&pjos=0";
-    let parsed = parse_bip21_probe(uri);
-    assert!(
-        parsed.is_none(),
-        "BUG-16: BIP-21 parser exists unexpectedly — flip this assertion to is_some() + check pjos == Some(false)"
+    // FIX-62 closure: pjos=0 → Some(false), pjos=1 → Some(true).
+    let uri = "bitcoin:bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4?amount=0.01&pj=https://example.com/payjoin&pjos=0";
+    let parsed = parse_bip21(uri, Network::Mainnet).expect("FIX-62 BIP-21 parser must succeed");
+    assert_eq!(
+        parsed.pjos,
+        Some(false),
+        "BUG-16 closed: pjos=0 parsed as Some(false)"
     );
 }
 
