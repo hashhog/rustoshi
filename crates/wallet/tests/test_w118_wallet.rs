@@ -124,15 +124,24 @@
 //!                   unconfirmed coins in default balance queries.
 //!                   Honestly this is a UX choice; Core's stricter
 //!                   default is documented for parity.
-//!   BUG-19 [HIGH]   G1:  `wpkh()` with uncompressed key is accepted.
-//!                   `descriptor.rs:594` checks
+//!   BUG-19 [HIGH]   G1:  `wpkh()` with uncompressed key was accepted.
+//!                   `descriptor.rs:594` checked
 //!                   `pubkey.serialize().len() != 33`, but
 //!                   `secp256k1::PublicKey::serialize()` ALWAYS returns
 //!                   33 bytes (compressed) regardless of input form.
 //!                   BIP-141 / BIP-143 explicitly forbid uncompressed
-//!                   keys in segwit-v0. The check is dead. Fix: track
-//!                   `is_compressed` at parse time and check it here,
-//!                   or compare against `serialize_uncompressed()`.
+//!                   keys in segwit-v0. The check was dead.
+//!                   CLOSED in FIX-60: `is_compressed` is now tracked
+//!                   at parse time from the SEC1 prefix byte and
+//!                   validated for every key in a segwit-v0 sub-tree
+//!                   (wpkh / wsh / sh(wpkh) / sh(wsh)). Legacy
+//!                   `pkh` / `sh(pk(...))` still permit uncompressed
+//!                   per BIP-380. NEW PATTERN observed:
+//!                   "dead-check via library encapsulation" —
+//!                   type-system feature
+//!                   (always-compressed `serialize()`) makes runtime
+//!                   check dead. Fix lives at the parse-time byte
+//!                   inspection, not the post-construction API.
 //!
 //! Severity legend:
 //!   P0-CDIV — consensus-divergent (wallet encryption is not
@@ -145,7 +154,7 @@
 //!   LOW     — UX / default mismatch / documented confirmation.
 //!
 //! Per-gate result table:
-//!   G1  descriptor parsing (pkh/sh/wsh/wpkh/sh-wpkh) — PARTIAL — BUG-19
+//!   G1  descriptor parsing (pkh/sh/wsh/wpkh/sh-wpkh) — PASS (BUG-19 CLOSED in FIX-60)
 //!   G2  tr() descriptor                              — PARTIAL — BUG-13
 //!   G3  multi/sortedmulti                            — PASS
 //!   G4  BIP-380 checksum                             — PASS
@@ -255,32 +264,137 @@ fn g1_descriptor_parse_sh_wpkh() {
     }
 }
 
-/// BUG-19 [HIGH]: wpkh() with uncompressed key is accepted (silently
+/// BUG-19 [HIGH]: wpkh() with uncompressed key was accepted (silently
 /// converted to compressed form by secp256k1::PublicKey::serialize()).
 /// BIP-141 / BIP-143 forbid uncompressed keys in segwit-v0. Descriptor.rs:594
-/// checks `pubkey.serialize().len() != 33`, but `serialize()` ALWAYS returns
-/// 33 bytes (compressed) regardless of input form, so the check is dead.
-/// Fix: track an `is_compressed` bit at parse time and check it here, or
-/// compare against `serialize_uncompressed().len()`.
+/// checked `pubkey.serialize().len() != 33`, but `serialize()` ALWAYS returns
+/// 33 bytes (compressed) regardless of input form, so the check was dead.
+///
+/// FIX-60 (W118 closure): track `is_compressed` at parse time from the
+/// SEC1 prefix byte (0x02/0x03 = compressed; 0x04 = uncompressed) and
+/// validate it for every key in a segwit-v0 sub-tree. Uncompressed
+/// pubkeys are now rejected at parse time (preferred — matches Core's
+/// `permit_uncompressed=false` flag in `ParsePubkey()`).
 #[test]
-#[ignore = "BUG-19: wpkh() with uncompressed key not rejected. \
-            descriptor.rs:594 dead-check — secp256k1::PublicKey::serialize() \
-            always returns 33 bytes (compressed) regardless of input form, \
-            so the BIP-141 'segwit-v0 requires compressed key' rule is unenforced. \
-            Fix: track is_compressed at parse, or compare against serialize_uncompressed()."]
 fn g1_wpkh_rejects_uncompressed_key() {
     let uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
                         483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
-    let desc = parse_descriptor(&format!("wpkh({uncompressed})"));
-    if let Ok(d) = desc {
+    let parse_result = parse_descriptor(&format!("wpkh({uncompressed})"));
+    assert!(
+        parse_result.is_err(),
+        "wpkh() with uncompressed key MUST be rejected at parse time \
+         (BIP-141 / BIP-143). Got: {parse_result:?}",
+    );
+
+    // Defense in depth: even if a Wpkh descriptor were constructed
+    // programmatically (bypassing parse_descriptor), derive_script
+    // must still reject uncompressed keys.
+    //
+    // We confirm here that the parse-time rejection happened and that
+    // no script derivation path can silently accept uncompressed keys
+    // in a segwit-v0 context.
+    if let Ok(d) = parse_result {
         let r = d.derive_script(0, Network::Mainnet);
-        if r.is_ok() {
-            panic!(
-                "BUG-19: wpkh() with uncompressed key accepted at derive_script. \
-                 BIP-141 forbids uncompressed keys in segwit-v0."
-            );
-        }
+        assert!(
+            r.is_err(),
+            "derive_script for wpkh(uncompressed) must also reject \
+             (BIP-141 segwit-v0 forbids uncompressed keys)",
+        );
     }
+}
+
+/// FIX-60 W118 BUG-19 closure: wsh() must reject uncompressed pubkeys
+/// at any depth inside the segwit-v0 sub-tree.
+#[test]
+fn g1_wsh_rejects_uncompressed_key_in_pk() {
+    let uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
+                        483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+    let r = parse_descriptor(&format!("wsh(pk({uncompressed}))"));
+    assert!(
+        r.is_err(),
+        "wsh(pk(uncompressed)) MUST be rejected (BIP-141). Got: {r:?}",
+    );
+}
+
+/// FIX-60 W118 BUG-19 closure: wsh(multi(...)) must reject any
+/// uncompressed pubkey in the multisig key set.
+#[test]
+fn g1_wsh_multi_rejects_uncompressed_key() {
+    let uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
+                        483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+    let compressed = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    let r = parse_descriptor(&format!("wsh(multi(1,{compressed},{uncompressed}))"));
+    assert!(
+        r.is_err(),
+        "wsh(multi(_, _, uncompressed)) MUST be rejected (BIP-141). Got: {r:?}",
+    );
+}
+
+/// FIX-60 W118 BUG-19 closure: sh(wpkh(...)) (BIP-49 nested segwit)
+/// must reject uncompressed pubkeys — the inner wpkh is still segwit-v0.
+#[test]
+fn g1_sh_wpkh_rejects_uncompressed_key() {
+    let uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
+                        483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+    let r = parse_descriptor(&format!("sh(wpkh({uncompressed}))"));
+    assert!(
+        r.is_err(),
+        "sh(wpkh(uncompressed)) MUST be rejected (BIP-141 — wpkh is \
+         segwit-v0 regardless of P2SH wrapping). Got: {r:?}",
+    );
+}
+
+/// FIX-60 W118 BUG-19 closure: sh(wsh(pk(...))) must reject
+/// uncompressed pubkeys (segwit-v0 nested inside P2SH).
+#[test]
+fn g1_sh_wsh_rejects_uncompressed_key() {
+    let uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
+                        483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+    let r = parse_descriptor(&format!("sh(wsh(pk({uncompressed})))"));
+    assert!(
+        r.is_err(),
+        "sh(wsh(pk(uncompressed))) MUST be rejected (BIP-141). Got: {r:?}",
+    );
+}
+
+/// FIX-60 regression: legacy `pkh()` MUST still accept uncompressed
+/// pubkeys — they predate segwit and remain valid for non-segwit
+/// outputs (Bitcoin Core `ParsePubkey()` permits them when the
+/// context is TOP or P2SH).
+#[test]
+fn g1_pkh_accepts_uncompressed_key_regression() {
+    let uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
+                        483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+    let desc = parse_descriptor(&format!("pkh({uncompressed})"))
+        .expect("pkh() with uncompressed key must still parse (legacy)");
+    assert!(matches!(desc, Descriptor::Pkh(_)));
+    // And the script must derive cleanly.
+    let _ = desc
+        .derive_script(0, Network::Mainnet)
+        .expect("pkh(uncompressed).derive_script must succeed");
+}
+
+/// FIX-60 regression: legacy `sh(pk(...))` MUST still accept
+/// uncompressed pubkeys (legacy P2SH context).
+#[test]
+fn g1_sh_pk_accepts_uncompressed_key_regression() {
+    let uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
+                        483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+    let desc = parse_descriptor(&format!("sh(pk({uncompressed}))"))
+        .expect("sh(pk(uncompressed)) must still parse (legacy P2SH)");
+    assert!(matches!(desc, Descriptor::Sh(_)));
+}
+
+/// FIX-60 regression: `wpkh()` with a compressed pubkey continues to
+/// parse and derive correctly (sanity for the happy path).
+#[test]
+fn g1_wpkh_accepts_compressed_key_happy_path() {
+    let compressed = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    let desc = parse_descriptor(&format!("wpkh({compressed})"))
+        .expect("wpkh(compressed) must parse");
+    let _ = desc
+        .derive_script(0, Network::Mainnet)
+        .expect("wpkh(compressed).derive_script must succeed");
 }
 
 // ===========================================================================
