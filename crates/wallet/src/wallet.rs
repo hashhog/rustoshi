@@ -18,7 +18,7 @@ use rustoshi_crypto::{
     taproot::{compute_taproot_sighash as crypto_compute_taproot_sighash, TaprootPrevouts,
               SIGHASH_DEFAULT},
 };
-use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut};
+use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
 use secp256k1::{Message, Secp256k1};
 
 use crate::coin_selection::{select_coins, CoinSelectionParams};
@@ -117,6 +117,44 @@ pub struct Wallet {
     /// Core's `persistent=false` default. Persistent (DB-backed) locks can
     /// be added later without breaking the surface.
     locked_coins: HashSet<OutPoint>,
+    /// Outgoing transactions the wallet created but that may still be
+    /// unconfirmed.
+    ///
+    /// FIX-61 (W118 BUG-2 / BUG-3): `bumpfee`/`psbtbumpfee` need to locate
+    /// the original transaction by txid in order to (a) verify it signals
+    /// BIP-125 RBF and (b) re-build a replacement with a higher fee. Core
+    /// keeps every wallet-created tx in `CWallet::mapWallet` with a chain
+    /// position; we keep a much narrower book — just the raw `Transaction`
+    /// plus the spent prevouts (mirrored from `selected_utxos` at
+    /// build-time) — keyed by txid, indexed in send order. Entries are
+    /// removed once a confirmation is recorded for the txid.
+    ///
+    /// Mirrors Core's `mapWallet` for the outgoing-tx-tracking subset.
+    /// Reference: `bitcoin-core/src/wallet/feebumper.cpp::PreconditionChecks`.
+    sent_txs: HashMap<Hash256, SentTx>,
+}
+
+/// A wallet-originated transaction the wallet remembers after `create_transaction`.
+///
+/// Held by [`Wallet::sent_txs`] keyed by txid so [`Wallet::bump_fee`] /
+/// [`Wallet::psbt_bump_fee`] can re-build a replacement.
+#[derive(Clone, Debug)]
+pub struct SentTx {
+    /// The signed transaction as broadcast.
+    pub tx: Transaction,
+    /// The wallet UTXOs that were consumed by this transaction. Indexed in
+    /// the same order as `tx.inputs` so that `bump_fee` can reuse them
+    /// directly (preserving derivation paths + values for re-signing).
+    pub spent_utxos: Vec<WalletUtxo>,
+    /// Fee paid (computed as sum(in) - sum(out) at creation time).
+    pub fee_sats: u64,
+    /// The vsize of the original signed transaction. Used to compute the
+    /// minimum bump per BIP-125 rule 4 + rule 6.
+    pub vsize: usize,
+    /// Whether the transaction is still in mempool (or assumed-mempool).
+    /// We do not track confirmations directly; consumers call
+    /// [`Wallet::mark_sent_tx_confirmed`] when a block confirms it.
+    pub confirmed: bool,
 }
 
 impl Wallet {
@@ -149,6 +187,7 @@ impl Wallet {
             gap_limit: 20,
             chain_height: 0,
             locked_coins: HashSet::new(),
+            sent_txs: HashMap::new(),
         })
     }
 
@@ -589,7 +628,307 @@ impl Wallet {
             }
         }
 
+        // FIX-61 (W118 BUG-2 / BUG-3): record the outgoing tx so a later
+        // `bumpfee` / `psbtbumpfee` can find it by txid. We store the
+        // signed Transaction, the WalletUtxos it consumed (in input order),
+        // the resolved fee, and the vsize for BIP-125-rule-4 bump
+        // calculations. Mirrors Core's `CWallet::AddToWallet` for outgoing
+        // tx entries.
+        let txid = tx.txid();
+        let total_in: u64 = selected_utxos.iter().map(|u| u.value).sum();
+        let total_out: u64 = tx.outputs.iter().map(|o| o.value).sum();
+        let computed_fee = total_in.saturating_sub(total_out);
+        let vsize = tx.vsize();
+        self.sent_txs.insert(
+            txid,
+            SentTx {
+                tx: tx.clone(),
+                spent_utxos: selected_utxos.clone(),
+                fee_sats: computed_fee,
+                vsize,
+                confirmed: false,
+            },
+        );
+
         Ok(tx)
+    }
+
+    /// Look up an outgoing transaction by txid.
+    ///
+    /// Returns the recorded [`SentTx`] (signed transaction + spent UTXOs +
+    /// fee) if [`Wallet::create_transaction`] previously created it.
+    ///
+    /// Used by [`Wallet::bump_fee`] / [`Wallet::psbt_bump_fee`] to locate
+    /// the original tx for fee-bump replacement.
+    pub fn get_sent_tx(&self, txid: &Hash256) -> Option<&SentTx> {
+        self.sent_txs.get(txid)
+    }
+
+    /// Mark an outgoing transaction as confirmed.
+    ///
+    /// After confirmation a tx is no longer eligible for fee bumping (per
+    /// Core's `feebumper.cpp::PreconditionChecks`, which refuses to bump a
+    /// confirmed tx). Callers in the node validation path should invoke
+    /// this when a block containing the txid lands.
+    pub fn mark_sent_tx_confirmed(&mut self, txid: &Hash256) {
+        if let Some(entry) = self.sent_txs.get_mut(txid) {
+            entry.confirmed = true;
+        }
+    }
+
+    /// Forget an outgoing transaction. Used by tests + by long-running
+    /// nodes that prune old entries.
+    pub fn forget_sent_tx(&mut self, txid: &Hash256) {
+        self.sent_txs.remove(txid);
+    }
+
+    /// FIX-61 (W118 BUG-2): bump the fee on a previously-sent outgoing tx
+    /// (BIP-125 replace-by-fee).
+    ///
+    /// Minimal-viable implementation per the W118 audit closure plan:
+    ///
+    /// 1. Locate the original tx by `txid` in [`Wallet::sent_txs`].
+    /// 2. Validate it is **unconfirmed** (per Core's PreconditionChecks).
+    /// 3. Validate at least one input signals BIP-125 RBF (sequence
+    ///    ≤ `0xFFFFFFFD`; per BIP-125 rule "Opt-in").
+    /// 4. Locate the change output owned by the wallet ([`is_mine`]). We
+    ///    pick the largest wallet-owned output as the change candidate so
+    ///    a degenerate recipient-also-mine case does not collapse the
+    ///    transaction.
+    /// 5. Compute `new_fee = orig_fee + bump_delta`, where `bump_delta =
+    ///    ceil(vsize * incremental_fee_rate)` and `incremental_fee_rate`
+    ///    defaults to 1 sat/vB (Core's `DEFAULT_INCREMENTAL_RELAY_FEE`).
+    ///    `fee_rate_override` (sat/vB) lets the caller pin a higher rate
+    ///    explicitly; in that case `new_fee = max(ceil(vsize * fee_rate),
+    ///    orig_fee + bump_delta)` so BIP-125 rule 4 still holds.
+    /// 6. Reduce the change-output value by `(new_fee - orig_fee)`. If
+    ///    the change drops below the dust threshold, refuse with a clear
+    ///    error rather than silently destroying funds.
+    /// 7. Re-build the transaction with the same inputs / outputs /
+    ///    sequences (with the change value reduced) and re-sign.
+    /// 8. Return the replacement [`Transaction`] (still in memory; the
+    ///    RPC layer will broadcast it).
+    ///
+    /// # Limitations (intentional for the minimal viable cut)
+    ///
+    /// - **Requires an existing change output owned by the wallet.** No
+    ///   input-adding path, no change-removal path. If `(orig_fee + delta)
+    ///   ≥ change_value`, the bump fails with a clear error.
+    /// - **Incremental-only bump.** Full Core fee-target inference
+    ///   (`conf_target`/`estimate_mode`) is deferred. The caller may pass
+    ///   an explicit absolute `fee_rate_override` to bump beyond the
+    ///   minimum.
+    /// - **Same-script-type signing.** Re-signs through the same per-
+    ///   AddressType helper as [`create_transaction`]. Mixed-script
+    ///   sends (rare in this wallet) re-use the same path.
+    ///
+    /// Reference: `bitcoin-core/src/wallet/feebumper.cpp` (Core's full
+    /// implementation includes input adding, change removal, and full fee
+    /// estimation — all of which are deferred here).
+    pub fn bump_fee(
+        &mut self,
+        txid: &Hash256,
+        fee_rate_override: Option<f64>,
+    ) -> Result<Transaction, WalletError> {
+        let (new_tx, _new_fee, _orig_fee) = self.build_bumped_tx(txid, fee_rate_override, true)?;
+        Ok(new_tx)
+    }
+
+    /// FIX-61 (W118 BUG-3): same as [`bump_fee`] but returns the
+    /// replacement transaction as an unsigned [`Psbt`] (Creator+Updater
+    /// roles only — signing is left to a separate role).
+    ///
+    /// The PSBT contains the same inputs and outputs as the would-be
+    /// bumped tx; sequences preserve BIP-125 opt-in; no witnesses or
+    /// scriptSigs are set. Mirrors Core's `psbtbumpfee` shape.
+    pub fn psbt_bump_fee(
+        &mut self,
+        txid: &Hash256,
+        fee_rate_override: Option<f64>,
+    ) -> Result<crate::psbt::Psbt, WalletError> {
+        let (new_tx, _new_fee, _orig_fee) =
+            self.build_bumped_tx(txid, fee_rate_override, false)?;
+        crate::psbt::Psbt::from_unsigned_tx(new_tx).map_err(|e| {
+            WalletError::SigningError(format!("PSBT build failed: {}", e))
+        })
+    }
+
+    /// Shared bump-fee core. Returns `(replacement_tx, new_fee, orig_fee)`.
+    ///
+    /// When `sign` is `true`, the returned tx is signed in-place (suitable
+    /// for `bumpfee`). When `false`, witnesses/scriptSigs are left empty
+    /// (suitable for wrapping in a PSBT).
+    fn build_bumped_tx(
+        &mut self,
+        txid: &Hash256,
+        fee_rate_override: Option<f64>,
+        sign: bool,
+    ) -> Result<(Transaction, u64, u64), WalletError> {
+        // ---- locate + validate the original tx --------------------------
+        let entry = self.sent_txs.get(txid).cloned().ok_or_else(|| {
+            WalletError::SigningError(format!(
+                "bumpfee: txid {} not found in wallet outgoing-tx record",
+                hex::encode(txid.0)
+            ))
+        })?;
+        if entry.confirmed {
+            return Err(WalletError::SigningError(
+                "bumpfee: transaction already confirmed; cannot replace".to_string(),
+            ));
+        }
+        let signals_rbf = entry
+            .tx
+            .inputs
+            .iter()
+            .any(|i| i.sequence <= 0xFFFF_FFFD);
+        if !signals_rbf {
+            return Err(WalletError::SigningError(
+                "bumpfee: transaction does not signal BIP-125 RBF \
+                 (no input has sequence <= 0xfffffffd); cannot replace"
+                    .to_string(),
+            ));
+        }
+        // ---- find the change output (largest wallet-owned output) -------
+        let mut change_idx_opt: Option<usize> = None;
+        let mut change_value: u64 = 0;
+        for (idx, out) in entry.tx.outputs.iter().enumerate() {
+            // Decode the scriptPubKey back to an address string so we can
+            // check is_mine against the wallet's known addresses. If the
+            // address fails to decode we just skip — non-recognised
+            // outputs are recipients by definition.
+            let addr_str = match address_from_script(&out.script_pubkey, self.network) {
+                Some(s) => s,
+                None => continue,
+            };
+            if self.is_mine(&addr_str) && out.value > change_value {
+                change_idx_opt = Some(idx);
+                change_value = out.value;
+            }
+        }
+        let change_idx = change_idx_opt.ok_or_else(|| {
+            WalletError::SigningError(
+                "bumpfee: no wallet-owned change output found on transaction; \
+                 cannot reduce a non-change output (would destroy recipient funds)"
+                    .to_string(),
+            )
+        })?;
+
+        // ---- compute the fee bump --------------------------------------
+        const INCREMENTAL_FEE_RATE: f64 = 1.0; // sat/vB; Core DEFAULT_INCREMENTAL_RELAY_FEE
+        let incremental_delta = (entry.vsize as f64 * INCREMENTAL_FEE_RATE).ceil() as u64;
+        // Floor: orig_fee + 1 sat/vB * vsize  (BIP-125 rule 4 + Core rule 6).
+        let min_new_fee = entry.fee_sats.saturating_add(incremental_delta.max(1));
+        // If caller specifies an explicit rate, target that rate but never
+        // dip below the BIP-125 floor.
+        let new_fee = if let Some(rate) = fee_rate_override {
+            if rate <= 0.0 {
+                return Err(WalletError::SigningError(
+                    "bumpfee: fee_rate must be > 0".to_string(),
+                ));
+            }
+            let target_fee = (entry.vsize as f64 * rate).ceil() as u64;
+            target_fee.max(min_new_fee)
+        } else {
+            min_new_fee
+        };
+        let delta = new_fee.checked_sub(entry.fee_sats).ok_or_else(|| {
+            WalletError::SigningError(
+                "bumpfee: new fee not greater than original (no bump needed)".to_string(),
+            )
+        })?;
+        if delta == 0 {
+            return Err(WalletError::SigningError(
+                "bumpfee: new fee equals original fee; no bump needed".to_string(),
+            ));
+        }
+        if delta >= change_value {
+            return Err(WalletError::SigningError(format!(
+                "bumpfee: fee bump delta ({} sats) exceeds change output value ({} sats); \
+                 cannot bump without adding inputs (not yet supported)",
+                delta, change_value
+            )));
+        }
+        let new_change_value = change_value - delta;
+        if new_change_value < DUST_LIMIT {
+            return Err(WalletError::SigningError(format!(
+                "bumpfee: change output would drop below dust threshold ({} < {}); \
+                 cannot bump without removing change (not yet supported)",
+                new_change_value, DUST_LIMIT
+            )));
+        }
+
+        // ---- build the replacement tx -----------------------------------
+        // Same inputs (with original sequences — BIP-125 opt-in preserved).
+        // Same outputs but with reduced change. No script_sig / witness
+        // populated yet — we re-sign below.
+        let inputs: Vec<TxIn> = entry
+            .tx
+            .inputs
+            .iter()
+            .map(|i| TxIn {
+                previous_output: i.previous_output.clone(),
+                script_sig: vec![],
+                sequence: i.sequence,
+                witness: vec![],
+            })
+            .collect();
+        let outputs: Vec<TxOut> = entry
+            .tx
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(idx, o)| TxOut {
+                value: if idx == change_idx { new_change_value } else { o.value },
+                script_pubkey: o.script_pubkey.clone(),
+            })
+            .collect();
+        let mut new_tx = Transaction {
+            version: entry.tx.version,
+            inputs,
+            outputs,
+            lock_time: entry.tx.lock_time,
+        };
+
+        if sign {
+            let secp = Secp256k1::new();
+            for (i, utxo) in entry.spent_utxos.iter().enumerate() {
+                let private_key = self.get_private_key(&utxo.derivation_path)?;
+                match self.address_type {
+                    AddressType::P2WPKH => {
+                        self.sign_p2wpkh_input(&mut new_tx, i, utxo, &private_key, &secp)?
+                    }
+                    AddressType::P2PKH => {
+                        self.sign_p2pkh_input(&mut new_tx, i, utxo, &private_key, &secp)?
+                    }
+                    AddressType::P2shP2wpkh => {
+                        self.sign_p2sh_p2wpkh_input(&mut new_tx, i, utxo, &private_key, &secp)?
+                    }
+                    AddressType::P2TR => self.sign_p2tr_input(
+                        &mut new_tx,
+                        i,
+                        utxo,
+                        &entry.spent_utxos,
+                        &private_key,
+                        &secp,
+                    )?,
+                }
+            }
+            // Record the replacement so a follow-up bump can find it.
+            let new_txid = new_tx.txid();
+            let new_vsize = new_tx.vsize();
+            self.sent_txs.insert(
+                new_txid,
+                SentTx {
+                    tx: new_tx.clone(),
+                    spent_utxos: entry.spent_utxos.clone(),
+                    fee_sats: new_fee,
+                    vsize: new_vsize,
+                    confirmed: false,
+                },
+            );
+        }
+
+        Ok((new_tx, new_fee, entry.fee_sats))
     }
 
     /// Sign a single input of an externally-built transaction with a wallet UTXO.
@@ -1557,6 +1896,84 @@ fn output_vsize_for(addr_type: AddressType) -> usize {
         AddressType::P2PKH => 34,
         AddressType::P2shP2wpkh => 32,
         AddressType::P2TR => 43,
+    }
+}
+
+/// Decode a scriptPubKey back into the corresponding address string.
+///
+/// FIX-61 helper: [`Wallet::bump_fee`] needs to detect which output of a
+/// previously-sent transaction is the wallet's change output. The wallet
+/// tracks addresses (as encoded strings) but not raw `scriptPubKey` bytes,
+/// so we re-decode each output's scriptPubKey into the same string form
+/// that `addresses` uses and dispatch on prefix.
+///
+/// Returns `None` for unrecognised script shapes (bare multisig,
+/// OP_RETURN, non-standard) — these are never wallet-owned and so are
+/// definitionally not change outputs in a wallet-built tx.
+fn address_from_script(script_pubkey: &[u8], network: Network) -> Option<String> {
+    use rustoshi_primitives::Hash160;
+    match script_pubkey {
+        // P2PKH: OP_DUP OP_HASH160 <20> ... OP_EQUALVERIFY OP_CHECKSIG
+        [0x76, 0xa9, 0x14, rest @ ..] if rest.len() == 22 && rest[20] == 0x88 && rest[21] == 0xac => {
+            let mut h = [0u8; 20];
+            h.copy_from_slice(&rest[..20]);
+            Some(
+                Address::P2PKH {
+                    hash: Hash160::from_bytes(h),
+                    network,
+                }
+                .encode(),
+            )
+        }
+        // P2SH: OP_HASH160 <20> OP_EQUAL
+        [0xa9, 0x14, rest @ ..] if rest.len() == 21 && rest[20] == 0x87 => {
+            let mut h = [0u8; 20];
+            h.copy_from_slice(&rest[..20]);
+            Some(
+                Address::P2SH {
+                    hash: Hash160::from_bytes(h),
+                    network,
+                }
+                .encode(),
+            )
+        }
+        // P2WPKH: OP_0 OP_PUSHBYTES_20 <20>
+        [0x00, 0x14, rest @ ..] if rest.len() == 20 => {
+            let mut h = [0u8; 20];
+            h.copy_from_slice(rest);
+            Some(
+                Address::P2WPKH {
+                    hash: Hash160::from_bytes(h),
+                    network,
+                }
+                .encode(),
+            )
+        }
+        // P2WSH: OP_0 OP_PUSHBYTES_32 <32>
+        [0x00, 0x20, rest @ ..] if rest.len() == 32 => {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(rest);
+            Some(
+                Address::P2WSH {
+                    hash: rustoshi_primitives::Hash256(h),
+                    network,
+                }
+                .encode(),
+            )
+        }
+        // P2TR: OP_1 OP_PUSHBYTES_32 <32>
+        [0x51, 0x20, rest @ ..] if rest.len() == 32 => {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(rest);
+            Some(
+                Address::P2TR {
+                    output_key: h,
+                    network,
+                }
+                .encode(),
+            )
+        }
+        _ => None,
     }
 }
 
