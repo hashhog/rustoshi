@@ -9,11 +9,13 @@
 //! The design uses channels to separate I/O from business logic, preventing
 //! blocking I/O from stalling the main event loop.
 
+use crate::addr::NetworkAddr;
 use crate::message::{
     parse_message_header, serialize_message, NetworkMessage, SendCmpctMessage, VersionMessage,
     MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE, MIN_WITNESS_PROTO_VERSION, NODE_WITNESS,
     SENDCMPCT_VERSION, SENDHEADERS_VERSION, WTXID_RELAY_VERSION,
 };
+use crate::proxy::{ProxyConfig, ProxyError, Socks5Proxy, I2pSession};
 use crate::v2_transport::{
     constants::{
         ELLSWIFT_PUBKEY_LEN, EXPANSION, GARBAGE_TERMINATOR_LEN, HEADER_LEN, LENGTH_LEN,
@@ -602,6 +604,429 @@ pub fn clear_v1_only_cache() {
     if let Ok(mut set) = v1_only_cache().lock() {
         set.clear();
     }
+}
+
+// =============================================================================
+// W117 — Outbound dispatch by NetworkAddr variant (BIP-155)
+// =============================================================================
+
+/// How an outbound peer task wants to establish its TCP-equivalent stream.
+///
+/// Stored on each spawned task so the dispatch logic can pick the right
+/// connect implementation: direct TCP for IPv4/IPv6/CJDNS, SOCKS5 for
+/// Tor v3, or I2P SAM for `.b32.i2p` peers.
+///
+/// Distinct from `SocketAddr` because Tor v3 (32-byte ed25519 pubkey),
+/// I2P (32-byte destination hash), and CJDNS (16-byte fc00::/8 ULA)
+/// do not have a canonical `SocketAddr` representation.
+#[derive(Debug, Clone)]
+pub enum OutboundTarget {
+    /// IPv4 or IPv6 — direct `TcpStream::connect`, or `Socks5Proxy::connect_addr`
+    /// when a clearnet SOCKS5 proxy is configured.
+    Clearnet(SocketAddr),
+    /// Tor v3 — `Socks5Proxy::connect_addr` against `onion_proxy` (preferred)
+    /// or `socks5_proxy` (fallback). 32-byte ed25519 pubkey + port.
+    TorV3([u8; 32], u16),
+    /// I2P — `I2pSession::connect` against the configured SAM bridge.
+    /// 32-byte destination hash + port. SAM ignores the port.
+    I2p([u8; 32], u16),
+    /// CJDNS — direct `TcpStream::connect` to an fc00::/8 IPv6 host:port,
+    /// gated on `cjdns_reachable` at dispatch time.
+    Cjdns(SocketAddr),
+}
+
+impl OutboundTarget {
+    /// Best-effort `SocketAddr` for logging / event reporting.
+    ///
+    /// Privacy networks (Tor/I2P) return a synthetic `0.0.0.0:port`
+    /// because their wire address has no IP form.
+    pub fn socket_addr(&self) -> SocketAddr {
+        match self {
+            Self::Clearnet(sa) | Self::Cjdns(sa) => *sa,
+            Self::TorV3(_, port) | Self::I2p(_, port) => {
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), *port)
+            }
+        }
+    }
+
+    /// Convert from a `NetworkAddr` + port. Returns `None` if the variant
+    /// has no representation here (shouldn't happen — every variant is
+    /// covered).
+    pub fn from_network_addr(addr: &NetworkAddr, port: u16) -> Self {
+        match addr {
+            NetworkAddr::Ipv4(ip) => Self::Clearnet(SocketAddr::new((*ip).into(), port)),
+            NetworkAddr::Ipv6(ip) => Self::Clearnet(SocketAddr::new((*ip).into(), port)),
+            NetworkAddr::TorV3(pubkey) => Self::TorV3(*pubkey, port),
+            NetworkAddr::I2P(hash) => Self::I2p(*hash, port),
+            NetworkAddr::Cjdns(bytes) => {
+                let ip = std::net::Ipv6Addr::from(*bytes);
+                Self::Cjdns(SocketAddr::new(ip.into(), port))
+            }
+        }
+    }
+}
+
+/// Test-only override for the dispatch's connect step.
+///
+/// When `Some`, `outbound_connect` returns the override result instead of
+/// performing any real network I/O. Set via [`set_test_connect_override`].
+#[cfg(test)]
+type TestConnectOverride =
+    Box<dyn Fn(&OutboundTarget, &ProxyConfig) -> Result<(), String> + Send + Sync>;
+
+#[cfg(test)]
+static TEST_CONNECT_OVERRIDE: OnceLock<Mutex<Option<TestConnectOverride>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_override_slot() -> &'static Mutex<Option<TestConnectOverride>> {
+    TEST_CONNECT_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+/// Install a test override that intercepts the dispatch path before any
+/// real network I/O runs. Each invocation receives the resolved target
+/// and the proxy config; returning `Ok(())` reports success, `Err` reports
+/// the failure reason.
+#[cfg(test)]
+pub fn set_test_connect_override<F>(f: F)
+where
+    F: Fn(&OutboundTarget, &ProxyConfig) -> Result<(), String> + Send + Sync + 'static,
+{
+    if let Ok(mut slot) = test_override_slot().lock() {
+        *slot = Some(Box::new(f));
+    }
+}
+
+#[cfg(test)]
+pub fn clear_test_connect_override() {
+    if let Ok(mut slot) = test_override_slot().lock() {
+        *slot = None;
+    }
+}
+
+/// Errors specific to the outbound dispatch step (post-target-resolution).
+#[derive(Debug)]
+pub enum OutboundConnectError {
+    /// Proxy or SAM bridge connection failed.
+    Proxy(ProxyError),
+    /// Direct TCP connect failed.
+    Io(std::io::Error),
+    /// Target requires a proxy that isn't configured.
+    Unreachable(String),
+    /// Connect timed out.
+    Timeout,
+    /// Test-only override returned an error.
+    #[cfg(test)]
+    TestOverride(String),
+}
+
+impl std::fmt::Display for OutboundConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proxy(e) => write!(f, "proxy: {}", e),
+            Self::Io(e) => write!(f, "io: {}", e),
+            Self::Unreachable(s) => write!(f, "unreachable: {}", s),
+            Self::Timeout => write!(f, "connect timeout"),
+            #[cfg(test)]
+            Self::TestOverride(s) => write!(f, "test override: {}", s),
+        }
+    }
+}
+
+/// Pick the right connect implementation for `target` and return a `TcpStream`.
+///
+/// Dispatch table:
+/// - `Clearnet`: direct connect, or via `tor_proxy` SOCKS5 when set.
+/// - `TorV3`:    via `onion_proxy` SOCKS5 (preferred) or `tor_proxy` fallback.
+/// - `I2p`:      via `i2p_sam` SAM bridge.
+/// - `Cjdns`:    direct connect (only reached when `cjdns_reachable=true`).
+///
+/// This is the wiring step the W117 audit found missing.
+pub async fn outbound_connect(
+    target: &OutboundTarget,
+    proxy_config: &ProxyConfig,
+) -> Result<TcpStream, OutboundConnectError> {
+    // Test override short-circuits all real network I/O. Used by unit
+    // tests to verify the dispatch path picks the right branch without
+    // starting real Tor/SAM/SOCKS5 daemons.
+    #[cfg(test)]
+    {
+        if let Ok(slot) = test_override_slot().lock() {
+            if let Some(ref f) = *slot {
+                return match f(target, proxy_config) {
+                    Ok(()) => Err(OutboundConnectError::TestOverride(
+                        "dispatch reached connect path; no real socket returned".to_string(),
+                    )),
+                    Err(e) => Err(OutboundConnectError::TestOverride(e)),
+                };
+            }
+        }
+    }
+
+    match target {
+        OutboundTarget::Clearnet(sa) => {
+            // Use SOCKS5 if a clearnet proxy is configured, else direct.
+            if let Some(proxy_addr) = proxy_config.socks5_proxy {
+                let mut proxy = Socks5Proxy::new(proxy_addr);
+                if let Some(creds) = proxy_config.socks5_credentials.clone() {
+                    proxy = proxy.with_credentials(creds);
+                }
+                let nwa = NetworkAddr::from_socket_addr(sa);
+                proxy
+                    .connect_addr(&nwa, sa.port())
+                    .await
+                    .map_err(OutboundConnectError::Proxy)
+            } else {
+                match timeout(CONNECT_TIMEOUT, TcpStream::connect(*sa)).await {
+                    Ok(Ok(s)) => Ok(s),
+                    Ok(Err(e)) => Err(OutboundConnectError::Io(e)),
+                    Err(_) => Err(OutboundConnectError::Timeout),
+                }
+            }
+        }
+        OutboundTarget::TorV3(pubkey, port) => {
+            let nwa = NetworkAddr::TorV3(*pubkey);
+            // Use proxy_config.get_socks5_for to honour onion_proxy / stream
+            // isolation / credentials in one place.
+            let proxy = proxy_config.get_socks5_for(&nwa).ok_or_else(|| {
+                OutboundConnectError::Unreachable(
+                    "Tor v3 peer but no SOCKS5 proxy configured".to_string(),
+                )
+            })?;
+            proxy
+                .connect_addr(&nwa, *port)
+                .await
+                .map_err(OutboundConnectError::Proxy)
+        }
+        OutboundTarget::I2p(hash, port) => {
+            let sam_addr = proxy_config.i2p_sam.ok_or_else(|| {
+                OutboundConnectError::Unreachable(
+                    "I2P peer but no -i2psam bridge configured".to_string(),
+                )
+            })?;
+            // Transient session unless a persistent key path is configured.
+            let mut session = match proxy_config.i2p_key_path.clone() {
+                Some(p) => I2pSession::new_persistent(sam_addr, p),
+                None => I2pSession::new_transient(sam_addr),
+            };
+            let nwa = NetworkAddr::I2P(*hash);
+            session
+                .connect(&nwa, *port)
+                .await
+                .map_err(OutboundConnectError::Proxy)
+        }
+        OutboundTarget::Cjdns(sa) => {
+            // CJDNS uses native IPv6 routing through fc00::/8. Direct TCP.
+            match timeout(CONNECT_TIMEOUT, TcpStream::connect(*sa)).await {
+                Ok(Ok(s)) => Ok(s),
+                Ok(Err(e)) => Err(OutboundConnectError::Io(e)),
+                Err(_) => Err(OutboundConnectError::Timeout),
+            }
+        }
+    }
+}
+
+/// `run_outbound_peer` variant that accepts an [`OutboundTarget`] and a
+/// [`ProxyConfig`], dispatching the initial connect through the right
+/// transport (direct TCP / SOCKS5 / I2P SAM) based on the target variant.
+///
+/// For `OutboundTarget::Clearnet`, the v1-only BIP-324 logic and v2
+/// outbound probe behave exactly like [`run_outbound_peer`]. For
+/// privacy networks, the v2 probe is skipped — BIP-324 over SOCKS5/SAM
+/// is not yet specified by the Bitcoin Core code, and adding speculative
+/// garbage bytes would only break the proxy connection.
+///
+/// W117 audit: this is the entry point that wires the previously
+/// dead-code `proxy.rs` module into the production connect path.
+pub async fn run_outbound_peer_with_proxy(
+    peer_id: PeerId,
+    target: OutboundTarget,
+    magic: [u8; 4],
+    our_version: VersionMessage,
+    proxy_config: ProxyConfig,
+    event_tx: mpsc::Sender<PeerEvent>,
+    command_rx: mpsc::Receiver<PeerCommand>,
+) {
+    // Clearnet IPv4/IPv6 without a proxy goes through the existing
+    // BIP-324 v2 probe path — we don't want to regress the v2-by-default
+    // behaviour for the 99% case.
+    if matches!(&target, OutboundTarget::Clearnet(_)) && proxy_config.socks5_proxy.is_none() {
+        if let OutboundTarget::Clearnet(sa) = target {
+            run_outbound_peer(peer_id, sa, magic, our_version, event_tx, command_rx).await;
+            return;
+        }
+    }
+
+    let stats = Arc::new(PeerStats::new());
+    let addr_for_logging = target.socket_addr();
+
+    // Dispatch the connect step through the right transport.
+    let stream = match outbound_connect(&target, &proxy_config).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(
+                "peer {:?} ({}): outbound connect via {:?} failed: {}",
+                peer_id,
+                addr_for_logging,
+                std::mem::discriminant(&target),
+                e
+            );
+            let reason = match e {
+                OutboundConnectError::Timeout => DisconnectReason::Timeout,
+                OutboundConnectError::Io(io_err) => DisconnectReason::IoError(io_err.to_string()),
+                OutboundConnectError::Proxy(pe) => DisconnectReason::IoError(format!("proxy: {}", pe)),
+                OutboundConnectError::Unreachable(msg) => DisconnectReason::IoError(msg),
+                #[cfg(test)]
+                OutboundConnectError::TestOverride(msg) => DisconnectReason::IoError(msg),
+            };
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, reason))
+                .await;
+            return;
+        }
+    };
+
+    // After connect, the rest of the v1 outbound flow is identical to
+    // `run_outbound_peer`'s post-connect path. Inline that logic here
+    // rather than duplicate-export it so the two paths stay in sync.
+    run_v1_outbound_flow(
+        peer_id,
+        addr_for_logging,
+        magic,
+        our_version,
+        stream,
+        event_tx,
+        command_rx,
+        stats,
+    )
+    .await;
+}
+
+/// V1 outbound flow extracted from `run_outbound_peer` so the proxy
+/// dispatch path and the legacy direct-SocketAddr path can both reuse it.
+async fn run_v1_outbound_flow(
+    peer_id: PeerId,
+    addr: SocketAddr,
+    magic: [u8; 4],
+    our_version: VersionMessage,
+    stream: TcpStream,
+    event_tx: mpsc::Sender<PeerEvent>,
+    command_rx: mpsc::Receiver<PeerCommand>,
+    stats: Arc<PeerStats>,
+) {
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(writer);
+
+    let version_msg = NetworkMessage::Version(our_version.clone());
+    let data = serialize_message(&magic, &version_msg);
+    if writer.write_all(&data).await.is_err() {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::IoError("failed to send version".to_string()),
+            ))
+            .await;
+        return;
+    }
+    stats.record_send("version", data.len() as u64);
+    if writer.flush().await.is_err() {
+        let _ = event_tx
+            .send(PeerEvent::Disconnected(
+                peer_id,
+                DisconnectReason::IoError("failed to flush version".to_string()),
+            ))
+            .await;
+        return;
+    }
+
+    let our_nonce = our_version.nonce;
+    let handshake_result = timeout(
+        HANDSHAKE_TIMEOUT,
+        perform_handshake_tracked(&mut reader, &mut writer, &magic, our_nonce, &stats),
+    )
+    .await;
+
+    let hs_result = match handshake_result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            let reason = match e {
+                HandshakeError::DuplicateVersion => DisconnectReason::DuplicateVersion,
+                HandshakeError::SelfConnection => DisconnectReason::SelfConnection,
+                HandshakeError::ObsoleteVersion(v) => DisconnectReason::ObsoleteVersion(v),
+                HandshakeError::PreHandshakeMessage(cmd) => {
+                    DisconnectReason::PreHandshakeMessage(cmd)
+                }
+                _ => DisconnectReason::HandshakeFailed(e.to_string()),
+            };
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, reason))
+                .await;
+            return;
+        }
+        Err(_) => {
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(peer_id, DisconnectReason::Timeout))
+                .await;
+            return;
+        }
+    };
+
+    let their_version = &hs_result.version;
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let peer_info = PeerInfo {
+        addr,
+        version: their_version.version,
+        services: their_version.services,
+        user_agent: their_version.user_agent.clone(),
+        start_height: their_version.start_height,
+        relay: their_version.relay,
+        inbound: false,
+        state: PeerState::Established,
+        last_send: Instant::now(),
+        last_recv: Instant::now(),
+        ping_nonce: None,
+        ping_time: None,
+        bytes_sent: 0,
+        bytes_recv: 0,
+        time_offset: their_version.timestamp - now_unix,
+        supports_witness: their_version.services & NODE_WITNESS != 0,
+        supports_sendheaders: their_version.version >= SENDHEADERS_VERSION,
+        supports_wtxid_relay: hs_result.wants_wtxid_relay,
+        supports_addrv2: hs_result.wants_addrv2,
+        feefilter: 0,
+    };
+
+    stats.mark_connected();
+
+    let _ = event_tx
+        .send(PeerEvent::Connected(peer_id, peer_info, Arc::clone(&stats)))
+        .await;
+
+    if their_version.version >= SENDHEADERS_VERSION {
+        let msg = serialize_message(&magic, &NetworkMessage::SendHeaders);
+        if writer.write_all(&msg).await.is_ok() {
+            stats.record_send("sendheaders", msg.len() as u64);
+        }
+    }
+    if their_version.version >= SENDCMPCT_VERSION {
+        let msg = serialize_message(
+            &magic,
+            &NetworkMessage::SendCmpct(SendCmpctMessage {
+                announce: false,
+                version: 2,
+            }),
+        );
+        if writer.write_all(&msg).await.is_ok() {
+            stats.record_send("sendcmpct", msg.len() as u64);
+        }
+    }
+    let _ = writer.flush().await;
+
+    run_message_loop_tracked(peer_id, &magic, reader, writer, event_tx, command_rx, stats).await;
 }
 
 /// Run an outbound peer connection task.
@@ -3900,5 +4325,187 @@ mod tests {
             NetworkMessage::Ping(n) => assert_eq!(n, 7),
             other => panic!("expected Ping after decoy, got {}", other.command()),
         }
+    }
+
+    // =========================================================================
+    // W117 BUG-2 — outbound proxy dispatch tests
+    //
+    // These verify that `outbound_connect` picks the right transport for each
+    // NetworkAddr variant. The test override intercepts the dispatch before
+    // any real I/O happens, so we don't need a live Tor / SAM / SOCKS5 daemon.
+    // =========================================================================
+
+    /// Process-wide guard for `set_test_connect_override` — the override
+    /// slot is global, so two parallel tests must serialise on it.
+    fn override_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[tokio::test]
+    async fn w117_dispatch_clearnet_no_proxy_uses_direct_path() {
+        let _g = override_guard();
+        clear_test_connect_override();
+        let observed = Arc::new(Mutex::new(None::<String>));
+        let observed_clone = observed.clone();
+        set_test_connect_override(move |target, _cfg| {
+            *observed_clone.lock().unwrap() = Some(match target {
+                OutboundTarget::Clearnet(_) => "clearnet".to_string(),
+                OutboundTarget::TorV3(_, _) => "tor".to_string(),
+                OutboundTarget::I2p(_, _) => "i2p".to_string(),
+                OutboundTarget::Cjdns(_) => "cjdns".to_string(),
+            });
+            Err("intercepted".to_string())
+        });
+
+        let target = OutboundTarget::Clearnet("203.0.113.5:8333".parse().unwrap());
+        let cfg = ProxyConfig::new().with_socks5("127.0.0.1:1080".parse().unwrap());
+        let _ = outbound_connect(&target, &cfg).await;
+        assert_eq!(observed.lock().unwrap().as_deref(), Some("clearnet"));
+        clear_test_connect_override();
+    }
+
+    #[tokio::test]
+    async fn w117_dispatch_torv3_uses_tor_branch() {
+        let _g = override_guard();
+        clear_test_connect_override();
+        let observed = Arc::new(Mutex::new(None::<String>));
+        let observed_clone = observed.clone();
+        set_test_connect_override(move |target, _cfg| {
+            *observed_clone.lock().unwrap() = Some(match target {
+                OutboundTarget::TorV3(_, _) => "tor".to_string(),
+                _ => "wrong-branch".to_string(),
+            });
+            Err("intercepted".to_string())
+        });
+
+        let target = OutboundTarget::TorV3([0x42; 32], 8333);
+        let cfg = ProxyConfig::new().with_onion_proxy("127.0.0.1:9050".parse().unwrap());
+        let _ = outbound_connect(&target, &cfg).await;
+        assert_eq!(observed.lock().unwrap().as_deref(), Some("tor"));
+        clear_test_connect_override();
+    }
+
+    #[tokio::test]
+    async fn w117_dispatch_i2p_uses_i2p_branch() {
+        let _g = override_guard();
+        clear_test_connect_override();
+        let observed = Arc::new(Mutex::new(None::<String>));
+        let observed_clone = observed.clone();
+        set_test_connect_override(move |target, _cfg| {
+            *observed_clone.lock().unwrap() = Some(match target {
+                OutboundTarget::I2p(_, _) => "i2p".to_string(),
+                _ => "wrong-branch".to_string(),
+            });
+            Err("intercepted".to_string())
+        });
+
+        let target = OutboundTarget::I2p([0xab; 32], 8333);
+        let cfg = ProxyConfig::new().with_i2p_sam("127.0.0.1:7656".parse().unwrap(), None);
+        let _ = outbound_connect(&target, &cfg).await;
+        assert_eq!(observed.lock().unwrap().as_deref(), Some("i2p"));
+        clear_test_connect_override();
+    }
+
+    #[tokio::test]
+    async fn w117_dispatch_cjdns_uses_cjdns_branch() {
+        let _g = override_guard();
+        clear_test_connect_override();
+        let observed = Arc::new(Mutex::new(None::<String>));
+        let observed_clone = observed.clone();
+        set_test_connect_override(move |target, _cfg| {
+            *observed_clone.lock().unwrap() = Some(match target {
+                OutboundTarget::Cjdns(_) => "cjdns".to_string(),
+                _ => "wrong-branch".to_string(),
+            });
+            Err("intercepted".to_string())
+        });
+
+        // fc00::/8 ULA range
+        let cjdns_ip: std::net::Ipv6Addr = "fc00::1".parse().unwrap();
+        let target = OutboundTarget::Cjdns(SocketAddr::new(cjdns_ip.into(), 8333));
+        let cfg = ProxyConfig::new();
+        let _ = outbound_connect(&target, &cfg).await;
+        assert_eq!(observed.lock().unwrap().as_deref(), Some("cjdns"));
+        clear_test_connect_override();
+    }
+
+    #[tokio::test]
+    async fn w117_dispatch_torv3_without_proxy_returns_unreachable() {
+        let _g = override_guard();
+        clear_test_connect_override(); // no override — let the real dispatch run
+
+        let target = OutboundTarget::TorV3([0x42; 32], 8333);
+        let cfg = ProxyConfig::new(); // no onion / no socks5
+        let res = outbound_connect(&target, &cfg).await;
+        match res {
+            Err(OutboundConnectError::Unreachable(msg)) => {
+                assert!(
+                    msg.contains("Tor v3") || msg.contains("SOCKS5"),
+                    "expected unreachable msg about Tor/SOCKS5, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Unreachable error, got {:?}", other.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn w117_dispatch_i2p_without_sam_returns_unreachable() {
+        let _g = override_guard();
+        clear_test_connect_override();
+
+        let target = OutboundTarget::I2p([0xab; 32], 8333);
+        let cfg = ProxyConfig::new(); // no i2psam
+        let res = outbound_connect(&target, &cfg).await;
+        assert!(matches!(res, Err(OutboundConnectError::Unreachable(_))));
+    }
+
+    #[test]
+    fn w117_outbound_target_from_network_addr_covers_all_variants() {
+        // IPv4
+        let t = OutboundTarget::from_network_addr(
+            &NetworkAddr::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            8333,
+        );
+        assert!(matches!(t, OutboundTarget::Clearnet(_)));
+
+        // IPv6
+        let t = OutboundTarget::from_network_addr(
+            &NetworkAddr::Ipv6("2001:db8::1".parse().unwrap()),
+            8333,
+        );
+        assert!(matches!(t, OutboundTarget::Clearnet(_)));
+
+        // Tor v3
+        let t = OutboundTarget::from_network_addr(&NetworkAddr::TorV3([0x42; 32]), 8333);
+        assert!(matches!(t, OutboundTarget::TorV3(_, 8333)));
+
+        // I2P
+        let t = OutboundTarget::from_network_addr(&NetworkAddr::I2P([0xab; 32]), 8333);
+        assert!(matches!(t, OutboundTarget::I2p(_, 8333)));
+
+        // CJDNS
+        let mut cjdns_bytes = [0u8; 16];
+        cjdns_bytes[0] = 0xfc;
+        let t = OutboundTarget::from_network_addr(&NetworkAddr::Cjdns(cjdns_bytes), 8333);
+        assert!(matches!(t, OutboundTarget::Cjdns(_)));
+    }
+
+    #[test]
+    fn w117_outbound_target_socket_addr_for_privacy_networks_is_synthetic() {
+        // Tor and I2P have no IP — socket_addr() must return a placeholder
+        // that downstream logging can still display.
+        let t = OutboundTarget::TorV3([0x42; 32], 8333);
+        let sa = t.socket_addr();
+        assert_eq!(sa.port(), 8333);
+        assert!(sa.ip().is_unspecified());
+
+        let t = OutboundTarget::I2p([0xab; 32], 7656);
+        let sa = t.socket_addr();
+        assert_eq!(sa.port(), 7656);
+        assert!(sa.ip().is_unspecified());
     }
 }

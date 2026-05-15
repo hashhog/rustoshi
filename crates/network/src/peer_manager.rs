@@ -31,9 +31,10 @@ use crate::v2_transport::{
 use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
 use crate::netgroup::{ip_is_routable, NetGroup, NetGroupManager};
 use crate::peer::{
-    run_outbound_peer, DisconnectReason, PeerCommand, PeerEvent, PeerId,
+    run_outbound_peer, run_outbound_peer_with_proxy, DisconnectReason, PeerCommand, PeerEvent, PeerId,
     PeerInfo, PeerState,
 };
+use crate::proxy::ProxyConfig;
 use crate::stale_detection::{
     StalePeerDetector, StalePeerState, EXTRA_PEER_CHECK_INTERVAL, MINIMUM_CONNECT_TIME,
 };
@@ -82,12 +83,76 @@ pub struct PeerManagerConfig {
     pub prune_mode: bool,
     /// Data directory for persistent state (banlist, anchors.dat, etc.).
     pub data_dir: PathBuf,
+    /// SOCKS5 proxy address for clearnet (IPv4/IPv6) outbound connections.
+    ///
+    /// Mirrors Bitcoin Core's `-proxy=<host:port>`. When `Some`, all clearnet
+    /// connections go through this proxy. When `None`, clearnet uses direct
+    /// `TcpStream::connect`. Tor v3 outbound also falls back to this proxy
+    /// when `onion_proxy` is `None`.
+    pub tor_proxy: Option<SocketAddr>,
+    /// SOCKS5 proxy address dedicated to Tor v3 (.onion) outbound.
+    ///
+    /// Mirrors Bitcoin Core's `-onion=<host:port>`. When `Some`, takes
+    /// precedence over `tor_proxy` for `NetworkAddr::TorV3` dispatch.
+    /// When both are `None`, Tor outbound is unreachable.
+    pub onion_proxy: Option<SocketAddr>,
+    /// I2P SAM 3.1 bridge address for I2P outbound connections.
+    ///
+    /// Mirrors Bitcoin Core's `-i2psam=<host:port>`. When `Some`, I2P peers
+    /// in `known_addrv2` become reachable via `I2pSession::connect`. When
+    /// `None`, I2P outbound is unreachable.
+    pub i2p_sam: Option<SocketAddr>,
+    /// Whether CJDNS addresses are considered reachable.
+    ///
+    /// Mirrors Bitcoin Core's `-cjdnsreachable`. CJDNS uses native IPv6
+    /// routing (fc00::/8 ULA range); enable only when the host actually
+    /// has a working CJDNS interface.
+    pub cjdns_reachable: bool,
 }
 
 impl PeerManagerConfig {
     /// Total maximum outbound connections.
     pub fn max_outbound(&self) -> usize {
         self.max_outbound_full_relay + self.max_outbound_block_relay
+    }
+
+    /// Build a `ProxyConfig` from these fields, suitable for passing into
+    /// `run_outbound_peer_with_proxy`.
+    pub fn build_proxy_config(&self) -> ProxyConfig {
+        let mut cfg = ProxyConfig::new();
+        if let Some(p) = self.tor_proxy {
+            cfg = cfg.with_socks5(p);
+        }
+        if let Some(p) = self.onion_proxy {
+            cfg = cfg.with_onion_proxy(p);
+        }
+        if let Some(p) = self.i2p_sam {
+            // No private-key persistence path here yet; sessions are transient.
+            cfg = cfg.with_i2p_sam(p, None);
+        }
+        // Stream isolation is on by default for Tor when an onion proxy is set
+        // (Bitcoin Core default since v0.22 / `proxyrandomize`).
+        if self.onion_proxy.is_some() || self.tor_proxy.is_some() {
+            cfg = cfg.with_stream_isolation();
+        }
+        cfg
+    }
+
+    /// Whether a given `NetworkAddr` is reachable under this configuration.
+    ///
+    /// IPv4/IPv6 are always reachable (direct or via `tor_proxy`).
+    /// TorV3 is reachable iff `onion_proxy` or `tor_proxy` is set.
+    /// I2P is reachable iff `i2p_sam` is set.
+    /// CJDNS is reachable iff `cjdns_reachable` is true.
+    pub fn is_reachable(&self, addr: &crate::addr::NetworkAddr) -> bool {
+        match addr {
+            crate::addr::NetworkAddr::Ipv4(_) | crate::addr::NetworkAddr::Ipv6(_) => true,
+            crate::addr::NetworkAddr::TorV3(_) => {
+                self.onion_proxy.is_some() || self.tor_proxy.is_some()
+            }
+            crate::addr::NetworkAddr::I2P(_) => self.i2p_sam.is_some(),
+            crate::addr::NetworkAddr::Cjdns(_) => self.cjdns_reachable,
+        }
     }
 }
 
@@ -104,6 +169,10 @@ impl Default for PeerManagerConfig {
             peer_bloom_filters: false,
             prune_mode: false,
             data_dir: PathBuf::from("."),
+            tor_proxy: None,
+            onion_proxy: None,
+            i2p_sam: None,
+            cjdns_reachable: false,
         }
     }
 }
@@ -707,6 +776,29 @@ pub fn testnet4_fallback_peers() -> Vec<SocketAddr> {
     ]
 }
 
+/// Build a placeholder `SocketAddr` for a privacy-network peer's handle.
+///
+/// Privacy networks (Tor/I2P) have no IP; CJDNS has a real fc00::/8 IPv6.
+/// Used as the `PeerInfo.addr` field for handle bookkeeping only — the
+/// actual transport target is carried in the spawned task's
+/// `OutboundTarget`.
+fn target_for_handle(addr: &crate::addr::NetworkAddr, port: u16) -> SocketAddr {
+    match addr {
+        crate::addr::NetworkAddr::Ipv4(ip) => SocketAddr::new((*ip).into(), port),
+        crate::addr::NetworkAddr::Ipv6(ip) => SocketAddr::new((*ip).into(), port),
+        crate::addr::NetworkAddr::Cjdns(bytes) => {
+            let ip = std::net::Ipv6Addr::from(*bytes);
+            SocketAddr::new(ip.into(), port)
+        }
+        // Tor / I2P don't have a SocketAddr — use synthetic placeholder so
+        // the existing log/RPC code paths keep functioning. Downstream
+        // displays will show 0.0.0.0:<port>.
+        crate::addr::NetworkAddr::TorV3(_) | crate::addr::NetworkAddr::I2P(_) => {
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+        }
+    }
+}
+
 // ============================================================
 // PEER MANAGER
 // ============================================================
@@ -1288,10 +1380,29 @@ impl PeerManager {
             conn_type
         );
 
-        // Spawn the peer connection task
-        tokio::spawn(async move {
-            run_outbound_peer(peer_id, addr, magic, our_version, event_tx, cmd_rx).await;
-        });
+        // W117 wiring: if any proxy is configured, route the clearnet connect
+        // through the proxy dispatch path. Otherwise keep the legacy direct-
+        // TCP path so the v2-by-default BIP-324 probe behaviour is preserved
+        // bit-for-bit.
+        let needs_proxy_dispatch = self.config.tor_proxy.is_some()
+            || self.config.onion_proxy.is_some()
+            || self.config.i2p_sam.is_some();
+
+        if needs_proxy_dispatch {
+            let proxy_config = self.config.build_proxy_config();
+            let target = crate::peer::OutboundTarget::Clearnet(addr);
+            tokio::spawn(async move {
+                run_outbound_peer_with_proxy(
+                    peer_id, target, magic, our_version, proxy_config, event_tx, cmd_rx,
+                )
+                .await;
+            });
+        } else {
+            // Spawn the peer connection task (legacy direct-TCP path).
+            tokio::spawn(async move {
+                run_outbound_peer(peer_id, addr, magic, our_version, event_tx, cmd_rx).await;
+            });
+        }
 
         self.peers.insert(
             peer_id,
@@ -1327,6 +1438,121 @@ impl PeerManager {
                 last_tx_time: None,
                 stale_state: StalePeerState::new(),
                 // Placeholder; replaced when PeerEvent::Connected fires.
+                stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+            },
+        );
+    }
+
+    /// Initiate an outbound connection to a BIP155 address (any network type).
+    ///
+    /// Unlike [`Self::connect_to_with_type`] this dispatches through the
+    /// proxy/SAM stack based on the `NetworkAddr` variant:
+    /// - IPv4/IPv6 -> direct (or via `tor_proxy` if set)
+    /// - TorV3     -> `onion_proxy` / `tor_proxy`
+    /// - I2P       -> `i2p_sam`
+    /// - Cjdns     -> direct (only when `cjdns_reachable`)
+    ///
+    /// Refuses to dispatch unreachable variants (logs and returns). This is
+    /// the entry point that closes W117 BUG-2: Tor v3 / I2P / CJDNS peers
+    /// learned via ADDRv2 can now actually be dialed.
+    pub async fn connect_to_addrv2(
+        &mut self,
+        addr: crate::addr::NetworkAddr,
+        port: u16,
+        conn_type: ConnectionType,
+    ) {
+        // Reachability gate — analogous to Core's IsReachable() check in
+        // `src/net.cpp::ConnectNode` before initiating an outbound socket.
+        if !self.config.is_reachable(&addr) {
+            tracing::debug!(
+                "Skipping unreachable {:?} peer (no proxy / not enabled): {:?}:{}",
+                addr.network_id(),
+                addr,
+                port
+            );
+            return;
+        }
+
+        // IPv4/IPv6 fall through to the legacy path so we don't regress the
+        // BIP-324 v2 probe behaviour for clearnet.
+        if let Some(sa) = addr.to_socket_addr(port) {
+            self.connect_to_with_type(sa, conn_type).await;
+            return;
+        }
+
+        // Privacy-network branch: build an OutboundTarget and spawn the
+        // proxy-aware variant.
+        let peer_id = PeerId(self.next_peer_id);
+        self.next_peer_id += 1;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let event_tx = self.event_tx.clone();
+        let magic = self.params.network_magic.0;
+
+        let relay = conn_type != ConnectionType::BlockRelayOnly;
+        // Synthetic loopback for version-message addr_recv (we have no IP).
+        let synthetic = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let our_version = self.build_version_message_with_relay(synthetic, relay);
+
+        let target = crate::peer::OutboundTarget::from_network_addr(&addr, port);
+        let proxy_config = self.config.build_proxy_config();
+
+        tracing::info!(
+            "Connecting to {:?} peer (id={}, type={:?})",
+            addr.network_id(),
+            peer_id.0,
+            conn_type
+        );
+
+        tokio::spawn(async move {
+            run_outbound_peer_with_proxy(
+                peer_id,
+                target,
+                magic,
+                our_version,
+                proxy_config,
+                event_tx,
+                cmd_rx,
+            )
+            .await;
+        });
+
+        // Use the synthetic socket addr as the handle key. Privacy-network
+        // peers have no canonical SocketAddr; downstream logic that needs
+        // the BIP-155 address should be extended later (W117 BUG-7/8).
+        self.peers.insert(
+            peer_id,
+            PeerHandle {
+                info: PeerInfo {
+                    addr: target_for_handle(&addr, port),
+                    version: 0,
+                    services: 0,
+                    user_agent: String::new(),
+                    start_height: 0,
+                    relay,
+                    inbound: false,
+                    state: PeerState::Connecting,
+                    last_send: Instant::now(),
+                    last_recv: Instant::now(),
+                    ping_nonce: None,
+                    ping_time: None,
+                    bytes_sent: 0,
+                    bytes_recv: 0,
+                    time_offset: 0,
+                    supports_witness: false,
+                    supports_sendheaders: false,
+                    supports_wtxid_relay: false,
+                    supports_addrv2: false,
+                    feefilter: 0,
+                },
+                command_tx: cmd_tx,
+                conn_type,
+                noban: false,
+                connected_time: Instant::now(),
+                min_ping_time: None,
+                last_block_time: None,
+                last_tx_time: None,
+                stale_state: StalePeerState::new(),
                 stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
             },
         );
@@ -3419,6 +3645,154 @@ mod tests {
         assert_eq!(config.listen_port, 48333);
         assert_eq!(config.max_outbound(), 10); // 8 full-relay + 2 block-relay-only
     }
+
+    // ----- W117 BUG-2 proxy / reachability wiring -----
+
+    #[test]
+    fn w117_default_config_has_no_proxy() {
+        let cfg = PeerManagerConfig::default();
+        assert!(cfg.tor_proxy.is_none());
+        assert!(cfg.onion_proxy.is_none());
+        assert!(cfg.i2p_sam.is_none());
+        assert!(!cfg.cjdns_reachable);
+    }
+
+    #[test]
+    fn w117_is_reachable_clearnet_always_true() {
+        let cfg = PeerManagerConfig::default();
+        assert!(cfg.is_reachable(&crate::addr::NetworkAddr::Ipv4(
+            std::net::Ipv4Addr::new(8, 8, 8, 8)
+        )));
+        assert!(cfg.is_reachable(&crate::addr::NetworkAddr::Ipv6(
+            "2001:db8::1".parse().unwrap()
+        )));
+    }
+
+    #[test]
+    fn w117_is_reachable_tor_requires_proxy() {
+        let mut cfg = PeerManagerConfig::default();
+        let tor = crate::addr::NetworkAddr::TorV3([0x42; 32]);
+        assert!(!cfg.is_reachable(&tor));
+
+        cfg.onion_proxy = Some("127.0.0.1:9050".parse().unwrap());
+        assert!(cfg.is_reachable(&tor));
+
+        cfg.onion_proxy = None;
+        cfg.tor_proxy = Some("127.0.0.1:1080".parse().unwrap());
+        assert!(cfg.is_reachable(&tor));
+    }
+
+    #[test]
+    fn w117_is_reachable_i2p_requires_sam() {
+        let mut cfg = PeerManagerConfig::default();
+        let i2p = crate::addr::NetworkAddr::I2P([0xab; 32]);
+        assert!(!cfg.is_reachable(&i2p));
+
+        cfg.i2p_sam = Some("127.0.0.1:7656".parse().unwrap());
+        assert!(cfg.is_reachable(&i2p));
+    }
+
+    #[test]
+    fn w117_is_reachable_cjdns_requires_flag() {
+        let mut cfg = PeerManagerConfig::default();
+        let mut bytes = [0u8; 16];
+        bytes[0] = 0xfc;
+        let cjdns = crate::addr::NetworkAddr::Cjdns(bytes);
+        assert!(!cfg.is_reachable(&cjdns));
+
+        cfg.cjdns_reachable = true;
+        assert!(cfg.is_reachable(&cjdns));
+    }
+
+    #[test]
+    fn w117_build_proxy_config_propagates_fields() {
+        let cfg = PeerManagerConfig {
+            tor_proxy: Some("127.0.0.1:1080".parse().unwrap()),
+            onion_proxy: Some("127.0.0.1:9050".parse().unwrap()),
+            i2p_sam: Some("127.0.0.1:7656".parse().unwrap()),
+            cjdns_reachable: true,
+            ..Default::default()
+        };
+        let pc = cfg.build_proxy_config();
+        assert_eq!(
+            pc.socks5_proxy,
+            Some("127.0.0.1:1080".parse().unwrap()),
+            "tor_proxy must populate ProxyConfig.socks5_proxy"
+        );
+        assert_eq!(
+            pc.onion_proxy,
+            Some("127.0.0.1:9050".parse().unwrap()),
+            "onion_proxy must propagate"
+        );
+        assert_eq!(
+            pc.i2p_sam,
+            Some("127.0.0.1:7656".parse().unwrap()),
+            "i2p_sam must propagate"
+        );
+        // Stream isolation is on by default whenever a Tor/clearnet proxy is set.
+        assert!(pc.tor_stream_isolation);
+    }
+
+    #[test]
+    fn w117_target_for_handle_resolves_per_variant() {
+        // IPv4 → real socket addr
+        let sa = target_for_handle(
+            &crate::addr::NetworkAddr::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            8333,
+        );
+        assert!(matches!(sa.ip(), IpAddr::V4(_)));
+        assert_eq!(sa.port(), 8333);
+
+        // CJDNS → real IPv6
+        let mut bytes = [0u8; 16];
+        bytes[0] = 0xfc;
+        let sa = target_for_handle(&crate::addr::NetworkAddr::Cjdns(bytes), 8333);
+        assert!(matches!(sa.ip(), IpAddr::V6(_)));
+        assert_eq!(sa.port(), 8333);
+
+        // Tor / I2P → unspecified placeholder
+        let sa = target_for_handle(&crate::addr::NetworkAddr::TorV3([0u8; 32]), 8333);
+        assert!(sa.ip().is_unspecified());
+        let sa = target_for_handle(&crate::addr::NetworkAddr::I2P([0u8; 32]), 8333);
+        assert!(sa.ip().is_unspecified());
+    }
+
+    #[tokio::test]
+    async fn w117_connect_to_addrv2_skips_unreachable_tor() {
+        // Without an onion/tor proxy, calling connect_to_addrv2 on a Tor v3
+        // peer must be a no-op (no peer handle inserted, no panic, no spawn).
+        let config = PeerManagerConfig::testnet4();
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+        let before = mgr.peers.len();
+
+        mgr.connect_to_addrv2(
+            crate::addr::NetworkAddr::TorV3([0x42; 32]),
+            8333,
+            ConnectionType::FullRelay,
+        )
+        .await;
+
+        assert_eq!(mgr.peers.len(), before, "no handle should be inserted");
+    }
+
+    #[tokio::test]
+    async fn w117_connect_to_addrv2_skips_unreachable_i2p() {
+        let config = PeerManagerConfig::testnet4();
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+        let before = mgr.peers.len();
+
+        mgr.connect_to_addrv2(
+            crate::addr::NetworkAddr::I2P([0xab; 32]),
+            8333,
+            ConnectionType::FullRelay,
+        )
+        .await;
+
+        assert_eq!(mgr.peers.len(), before, "no handle should be inserted");
+    }
+
 
     #[test]
     fn test_address_manager_add_dns_addresses() {
