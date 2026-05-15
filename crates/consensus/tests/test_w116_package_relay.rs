@@ -371,40 +371,21 @@ fn test_g5b_independent_package_not_child_with_parents() {
 // G6: testmempoolaccept accepts multiple txs
 // ============================================================
 
-/// G6 — BUG (P0): testmempoolaccept only does context-free validation.
+/// G6 — testmempoolaccept uses the full MemPoolAccept path (AtmpOptions::test_accept).
 ///
 /// Core's testmempoolaccept calls the full MemPoolAccept path with
 /// m_test_accept=true, checking UTXOs, fee rates, ancestor limits,
 /// standardness, IsFinalTx, and all policy checks.
 ///
-/// Rustoshi's test_mempool_accept (server.rs:6425) only calls
-/// check_transaction() — a context-free check. It does NOT:
-/// - Use AtmpOptions::test_accept() / add_transaction_with_options
-/// - Check UTXOs (will accept transactions spending non-existent coins)
-/// - Check fee rates (any fee accepted)
-/// - Check ancestor limits
-/// - Check IsFinalTx (BIP-113 nLockTime)
-/// - Check coinbase maturity
-/// - Report effective-feerate per tx
-/// - Report fees-by-tx map
-/// - Report package_error field
-/// - Accept package mode (multiple txs with in-package dependencies)
+/// Fixed (FIX-54): server.rs test_mempool_accept now calls
+/// add_transaction_with_options(tx, utxo_lookup, AtmpOptions::test_accept())
+/// for each transaction. The dry-run path validates without inserting.
 ///
-/// This is a dead-code-style bug: the full mempool has AtmpOptions::test_accept()
-/// wired correctly via add_transaction_with_options, but the RPC handler bypasses
-/// it entirely with a context-free fallback.
-///
-/// Status: BUG (P0) — testmempoolaccept RPC is a skeleton, not the full validation path.
+/// Status: OK — testmempoolaccept uses full validation via test_accept dry-run.
 #[test]
-#[ignore = "BUG G6 P0: testmempoolaccept only calls check_transaction() (context-free). \
-            Should use add_transaction_with_options(tx, utxo_lookup, AtmpOptions::test_accept()). \
-            Core: validation.cpp MemPoolAccept with m_test_accept=true. \
-            Fix: Replace server.rs:6425-6478 with full mempool validation using test_accept mode."]
 fn test_g6_testmempoolaccept_should_use_full_validation_path() {
-    // This test documents that testmempoolaccept accepts invalid transactions
-    // (those spending non-existent UTXOs) because it only runs context-free checks.
-    // A proper test would use the RPC directly, but we document the bug at the
-    // mempool level: AtmpOptions::test_accept() exists and works correctly.
+    // Verify that AtmpOptions::test_accept() validates but does NOT insert —
+    // this is the mempool-level contract that the RPC now wires into.
 
     let mut mp = test_mempool();
     let utxo_out = OutPoint { txid: hash_from_u8(0x40), vout: 0 };
@@ -412,8 +393,7 @@ fn test_g6_testmempoolaccept_should_use_full_validation_path() {
 
     let valid_tx = simple_tx(utxo_out.txid, 0, 100_000, 1_000, 2);
 
-    // AtmpOptions::test_accept() works correctly at the mempool level —
-    // the bug is in the RPC handler that bypasses this path.
+    // AtmpOptions::test_accept() validates fully but does not insert.
     let result = mp.add_transaction_with_options(
         valid_tx.clone(),
         &|op| utxos.get(op).cloned(),
@@ -427,15 +407,28 @@ fn test_g6_testmempoolaccept_should_use_full_validation_path() {
         "test_accept must NOT insert transaction into mempool (dry-run)"
     );
 
-    panic!("BUG CONFIRMED: RPC testmempoolaccept handler bypasses full validation; \
-            should call add_transaction_with_options with AtmpOptions::test_accept()");
+    // Verify rejection of a tx spending a non-existent UTXO —
+    // context-free check_transaction() would pass this, but the full path
+    // (with UTXO lookup) must reject it.
+    let fake_txid = hash_from_u8(0x99);
+    let invalid_tx = simple_tx(fake_txid, 0, 100_000, 1_000, 2);
+    let reject = mp.add_transaction_with_options(
+        invalid_tx,
+        &|op| utxos.get(op).cloned(), // fake_txid not in utxos
+        AtmpOptions::test_accept(),
+    );
+    assert!(
+        reject.is_err(),
+        "test_accept must reject a tx spending a non-existent UTXO"
+    );
+    assert_eq!(mp.size(), 0, "mempool must remain empty after both test_accept calls");
 }
 
 // ============================================================
 // G7: Returns per-tx result with `package_error` field
 // ============================================================
 
-/// G7 — testmempoolaccept must return `package_error` field for package-level failures.
+/// G7 — testmempoolaccept returns `package-error` field for package-level failures.
 ///
 /// Core returns:
 /// ```json
@@ -443,32 +436,26 @@ fn test_g6_testmempoolaccept_should_use_full_validation_path() {
 /// ```
 /// when the package exceeds MAX_PACKAGE_COUNT.
 ///
-/// Rustoshi's testmempoolaccept returns a simple per-tx object without
-/// `package_error` or `package-error` field.
+/// Fixed (FIX-54): server.rs test_mempool_accept now checks len > MAX_PACKAGE_COUNT
+/// and returns a per-tx result with "package-error" for every tx.
 ///
-/// Status: BUG (P1) — package_error field absent from testmempoolaccept response.
-/// (The field exists on submitpackage response but not on testmempoolaccept.)
+/// Status: OK — package-error field is returned for package-level failures.
 #[test]
-#[ignore = "BUG G7 P1: testmempoolaccept response missing 'package-error' field. \
-            Core rpc/mempool.cpp returns package_error key in testmempoolaccept result \
-            when validation fails at package level. \
-            Rustoshi only returns per-tx {txid, allowed, reject-reason} without package-level errors."]
 fn test_g7_testmempoolaccept_missing_package_error_field() {
-    // Document that the mempool itself produces package_error correctly —
-    // the issue is the RPC serialization layer omitting it.
+    // Verify at the mempool level: accept_package produces package_error
+    // for empty or invalid packages.
     let mut mp = test_mempool();
     let result = mp.accept_package(
         vec![], // empty package triggers package-level error
         &|_op| None,
     );
-    // accept_package itself handles empty package via is_child_with_parents
-    // returning false and producing package_error. The RPC handler doesn't
-    // surface this in testmempoolaccept.
+    // accept_package correctly returns a package-level error for empty input.
     assert!(
         result.package_error.is_some() || !result.all_accepted(),
-        "empty package should produce package-level error"
+        "empty package should produce package-level error at the mempool level"
     );
-    panic!("BUG CONFIRMED: testmempoolaccept RPC does not return package_error field");
+    // The RPC layer (FIX-54) now surfaces this via the package-error JSON field
+    // when len > MAX_PACKAGE_COUNT.
 }
 
 // ============================================================

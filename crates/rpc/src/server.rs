@@ -6427,46 +6427,148 @@ impl RustoshiRpcServer for RpcServerImpl {
         rawtxs: Vec<String>,
         maxfeerate: Option<f64>,
     ) -> RpcResult<serde_json::Value> {
-        let _maxfeerate_btc_kvb = maxfeerate.unwrap_or(0.10);
-        let mut results = Vec::new();
+        use rustoshi_consensus::mempool::{AtmpOptions, MAX_PACKAGE_COUNT};
 
-        for raw in &rawtxs {
+        // Default maxfeerate: 0.10 BTC/kvB (same as sendrawtransaction)
+        let max_fee_rate_btc_kvb = maxfeerate.unwrap_or(0.10);
+        // Convert BTC/kvB → sat/vB for comparisons
+        let max_fee_rate_sat_vb = max_fee_rate_btc_kvb * (COIN as f64) / 1000.0;
+
+        // Decode all transactions up front so we fail fast on malformed hex
+        // before acquiring any lock.
+        let mut txs: Vec<Transaction> = Vec::with_capacity(rawtxs.len());
+        for (i, raw) in rawtxs.iter().enumerate() {
             let bytes = Self::parse_hex(raw)?;
             let tx = Transaction::deserialize(&bytes).map_err(|e| {
                 Self::rpc_error(
                     rpc_error::RPC_DESERIALIZATION_ERROR,
-                    format!("TX decode failed: {}", e),
+                    format!("TX decode failed (tx {}): {}", i, e),
                 )
             })?;
+            txs.push(tx);
+        }
+
+        // Bitcoin Core: testmempoolaccept rejects the whole array when it
+        // exceeds MAX_PACKAGE_COUNT (25) at the package-policy level and
+        // returns a per-tx result with "package-error" for every tx.
+        if txs.len() > MAX_PACKAGE_COUNT {
+            let pkg_err = "package-too-many-transactions";
+            let results: Vec<serde_json::Value> = txs
+                .iter()
+                .map(|tx| {
+                    serde_json::json!({
+                        "txid": tx.txid().to_hex(),
+                        "wtxid": tx.wtxid().to_hex(),
+                        "allowed": false,
+                        "package-error": pkg_err
+                    })
+                })
+                .collect();
+            return Ok(serde_json::json!(results));
+        }
+
+        // Need a write lock: add_transaction_with_options takes &mut self even
+        // in test_accept mode (dry-run; it returns before inserting).
+        let mut state = self.state.write().await;
+        let db = Arc::clone(&state.db);
+
+        // Refresh the mempool's tip snapshot so IsFinalTx (BIP-113) and
+        // coinbase-maturity checks use the current chain tip — mirrors the
+        // same call in sendrawtransaction.
+        {
+            let tip_height = state.best_height;
+            let store = BlockStore::new(&db);
+            let mtp = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+            state.mempool.notify_new_tip(tip_height, mtp);
+        }
+
+        let utxo_lookup = |outpoint: &OutPoint| {
+            let store = BlockStore::new(&db);
+            store
+                .get_utxo(outpoint)
+                .ok()
+                .flatten()
+                .map(|c| rustoshi_consensus::validation::CoinEntry {
+                    height: c.height,
+                    is_coinbase: c.is_coinbase,
+                    value: c.value,
+                    script_pubkey: c.script_pubkey,
+                })
+        };
+
+        let mut results = Vec::with_capacity(txs.len());
+
+        // Bitcoin Core testmempoolaccept tests each tx independently (not as a
+        // package); the package path is only used by submitpackage.  We call
+        // add_transaction_with_options with test_accept=true for each tx.
+        for tx in &txs {
             let txid = tx.txid();
+            let wtxid = tx.wtxid();
+            let vsize = tx.vsize();
 
-            // Check if already in mempool
-            let state = self.state.read().await;
-            if state.mempool.contains(&txid) {
-                results.push(serde_json::json!({
-                    "txid": txid.to_string(),
-                    "allowed": false,
-                    "reject-reason": "txn-already-in-mempool"
-                }));
-                continue;
-            }
+            // Pre-compute fee: Σ(input UTXOs) − Σ(outputs).  Needed for the
+            // successful-result payload and for the maxfeerate check.
+            // Missing inputs yield 0 (the ATMP call will reject them anyway).
+            let input_sum: u64 = tx
+                .inputs
+                .iter()
+                .map(|inp| {
+                    utxo_lookup(&inp.previous_output)
+                        .map(|c| c.value)
+                        .unwrap_or(0)
+                })
+                .sum();
+            let output_sum: u64 = tx.outputs.iter().map(|o| o.value).sum();
+            let fee_sats = input_sum.saturating_sub(output_sum);
 
-            // Basic context-free validation
-            match rustoshi_consensus::validation::check_transaction(&tx) {
-                Ok(()) => {
-                    let vsize = tx.vsize();
-                    results.push(serde_json::json!({
-                        "txid": txid.to_string(),
-                        "allowed": true,
-                        "vsize": vsize,
-                        "fees": {
-                            "base": 0
-                        }
-                    }));
+            match state.mempool.add_transaction_with_options(
+                tx.clone(),
+                &utxo_lookup,
+                AtmpOptions::test_accept(),
+            ) {
+                Ok(_) => {
+                    // Enforce maxfeerate: reject if fee rate exceeds the cap.
+                    let fee_rate_sat_vb = if vsize > 0 {
+                        fee_sats as f64 / vsize as f64
+                    } else {
+                        0.0
+                    };
+                    if max_fee_rate_btc_kvb > 0.0 && fee_rate_sat_vb > max_fee_rate_sat_vb {
+                        let fee_rate_btc_kvb = fee_rate_sat_vb * 1000.0 / COIN as f64;
+                        results.push(serde_json::json!({
+                            "txid": txid.to_hex(),
+                            "wtxid": wtxid.to_hex(),
+                            "allowed": false,
+                            "reject-reason": format!(
+                                "Fee rate too high: {:.8} BTC/kvB > {:.8} BTC/kvB (maxfeerate)",
+                                fee_rate_btc_kvb, max_fee_rate_btc_kvb
+                            )
+                        }));
+                    } else {
+                        // Serialize fee as BTC with 8 decimal places, matching
+                        // Core's ValueFromAmount format ("0.00001000" etc.).
+                        let base_fee_str = {
+                            let whole = fee_sats / 100_000_000;
+                            let frac  = fee_sats % 100_000_000;
+                            format!("{}.{:08}", whole, frac)
+                        };
+                        let base_fee_num: serde_json::Value =
+                            serde_json::from_str(&base_fee_str).unwrap_or(serde_json::json!(0));
+                        results.push(serde_json::json!({
+                            "txid": txid.to_hex(),
+                            "wtxid": wtxid.to_hex(),
+                            "allowed": true,
+                            "vsize": vsize,
+                            "fees": {
+                                "base": base_fee_num
+                            }
+                        }));
+                    }
                 }
                 Err(e) => {
                     results.push(serde_json::json!({
-                        "txid": txid.to_string(),
+                        "txid": txid.to_hex(),
+                        "wtxid": wtxid.to_hex(),
                         "allowed": false,
                         "reject-reason": format!("{}", e)
                     }));
