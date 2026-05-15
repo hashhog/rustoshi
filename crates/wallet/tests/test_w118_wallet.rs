@@ -1458,45 +1458,98 @@ fn g28_importmulti_legacy() {
 // ===========================================================================
 
 #[test]
-fn g29_createwallet_with_passphrase_currently_silently_dropped() {
-    // The passphrase field is accepted but the seed is stored as plaintext.
-    // This test documents the bug: passphrase argument is silently dropped.
+fn g29_createwallet_with_passphrase_encrypts_seed_at_rest() {
+    // FIX-59 / W118 BUG-1 P0-SECURITY: createwallet(passphrase=Some(_)) must
+    // encrypt wallet_seed.bin at rest (ChaCha20-Poly1305 + PBKDF2-HMAC-SHA512,
+    // 210,000 iters). Pre-fix this test asserted the BUG (raw 64 bytes on
+    // disk); post-fix it asserts the fix (148-byte encrypted layout with
+    // the v2 magic header).
+    use rustoshi_wallet::ENCRYPTED_FILE_LEN;
+
     let tmp = tempdir().unwrap();
     let mut mgr = WalletManager::new(tmp.path(), Network::Testnet).unwrap();
-    let mut opts = CreateWalletOptions::default();
-    opts.passphrase = Some("hunter2".to_string());
+    let opts = CreateWalletOptions {
+        passphrase: Some("hunter2".to_string()),
+        ..Default::default()
+    };
     let result = mgr.create_wallet("enc_g29", opts);
-    // Currently this succeeds and produces a plaintext wallet. Test
-    // documents that fact — if encryption is ever wired, this assertion
-    // should be flipped to check that the seed file is actually
-    // encrypted on disk.
     assert!(result.is_ok());
 
-    // Verify the seed file is currently raw 64 bytes (plaintext) — the
-    // hallmark of the missing encryption.
     let seed_path = tmp.path().join("wallets").join("enc_g29").join("wallet_seed.bin");
-    let meta = std::fs::metadata(&seed_path).expect("seed file must exist");
+    let bytes = std::fs::read(&seed_path).expect("seed file must exist");
+
     assert_eq!(
-        meta.len(),
-        64,
-        "BUG-1 confirmation: seed file is raw 64 bytes (plaintext), not AES-wrapped"
+        bytes.len(),
+        ENCRYPTED_FILE_LEN,
+        "FIX-59: seed file must be the 148-byte encrypted layout (was 64-byte plaintext pre-fix)"
+    );
+    assert_eq!(
+        &bytes[..16],
+        b"RUSTOSHI_WALLET\0",
+        "FIX-59: encrypted seed file must carry the v2 magic header"
     );
 }
 
 #[test]
-#[ignore = "BUG-1 (P0): Wallet encryption MISSING ENTIRELY. \
-            CreateWalletOptions::passphrase accepted but silently dropped. \
-            No AES-256-CBC wrap, no scrypt KDF, no master-key derivation, \
-            walletpassphrase/walletlock are no-op RPCs that warn but do nothing. \
-            Reference: bitcoin-core/src/wallet/crypter.cpp (CCrypter, CKeyingMaterial), \
-            bitcoin-core/src/wallet/wallet.cpp (CWallet::EncryptWallet)."]
 fn g29_encryptwallet_actually_encrypts_seed_at_rest() {
-    panic!(
-        "BUG-1: Wallet encryption not implemented. Need: AES-256-CBC + scrypt KDF \
-         (Core uses iterated SHA-512 in CCrypter::SetKeyFromPassphrase, ~25K iters), \
-         master-key-wrap-CKey scheme, walletpassphrase keypool unlocking, \
-         walletlock zeroing of in-memory key material."
-    );
+    // FIX-59 / W118 BUG-1 P0-SECURITY: encryptwallet on an unencrypted
+    // wallet must convert wallet_seed.bin from the 64-byte plaintext layout
+    // (v1) to the 148-byte encrypted layout (v2). After a reload the wallet
+    // is locked-by-default and walletpassphrase is required to sign.
+    //
+    // Implementation choice: ChaCha20-Poly1305 AEAD (RFC 8439) + PBKDF2-
+    // HMAC-SHA512 at 210,000 iterations (OWASP 2023 SHA-512 recommendation,
+    // ~8.4x higher than Core's 25,000-iter SHA-512 round-robin in
+    // CCrypter::SetKeyFromPassphrase). The AEAD tag closes Core's
+    // CMasterKey AES-256-CBC + no-integrity weakness while staying inside
+    // the crate dependency set already used by BIP-324 (network/v2_transport).
+    use rustoshi_wallet::{WalletError, ENCRYPTED_FILE_LEN};
+
+    let tmp = tempdir().unwrap();
+    let mut mgr = WalletManager::new(tmp.path(), Network::Testnet).unwrap();
+    mgr.create_wallet("convert_g29", CreateWalletOptions::default())
+        .unwrap();
+    let seed_path = tmp
+        .path()
+        .join("wallets")
+        .join("convert_g29")
+        .join("wallet_seed.bin");
+
+    // Before: 64-byte plaintext.
+    assert_eq!(std::fs::metadata(&seed_path).unwrap().len(), 64);
+
+    // Convert.
+    mgr.encrypt_wallet("convert_g29", "post-hoc-passphrase")
+        .unwrap();
+
+    // After: 148-byte encrypted layout.
+    let bytes = std::fs::read(&seed_path).unwrap();
+    assert_eq!(bytes.len(), ENCRYPTED_FILE_LEN);
+    assert_eq!(&bytes[..16], b"RUSTOSHI_WALLET\0");
+
+    // Reload → wallet must be encrypted+locked, and signing path refused.
+    mgr.unload_wallet("convert_g29", true).unwrap();
+    mgr.load_wallet("convert_g29").unwrap();
+    let state = mgr.lock_state("convert_g29").unwrap();
+    assert!(state.encrypted);
+    assert!(!state.unlocked);
+    assert!(matches!(
+        mgr.require_unlocked("convert_g29"),
+        Err(WalletError::WalletLocked)
+    ));
+
+    // Wrong passphrase rejected; correct passphrase unlocks.
+    let err = mgr
+        .unlock_wallet("convert_g29", "nope", std::time::Duration::from_secs(60))
+        .unwrap_err();
+    assert!(matches!(err, WalletError::BadPassphrase));
+    mgr.unlock_wallet(
+        "convert_g29",
+        "post-hoc-passphrase",
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+    mgr.require_unlocked("convert_g29").unwrap();
 }
 
 #[test]
