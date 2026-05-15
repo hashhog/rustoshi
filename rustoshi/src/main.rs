@@ -65,6 +65,23 @@ struct Cli {
     #[arg(long)]
     rpcpassword: Option<String>,
 
+    /// Path to a PEM-encoded TLS certificate (chain) for the JSON-RPC server.
+    ///
+    /// When BOTH `--rpc-tls-cert` and `--rpc-tls-key` are set, rustoshi binds
+    /// the RPC endpoint as HTTPS instead of HTTP. When neither is set,
+    /// behaviour is unchanged (HTTP). Setting only one is a startup error.
+    ///
+    /// Mirrors Bitcoin Core's libevent+OpenSSL HTTPS pattern from
+    /// `bitcoin-core/src/httpserver.cpp` (W119 / FIX-64). Required for
+    /// clearnet PayJoin (BIP-78) which mandates HTTPS or .onion.
+    #[arg(long = "rpc-tls-cert", value_name = "PATH")]
+    rpc_tls_cert: Option<String>,
+
+    /// Path to a PEM-encoded private key (PKCS#8, RSA, or SEC1) for the
+    /// JSON-RPC server.  See `--rpc-tls-cert` for activation semantics.
+    #[arg(long = "rpc-tls-key", value_name = "PATH")]
+    rpc_tls_key: Option<String>,
+
     /// Listen for incoming P2P connections
     #[arg(long, default_value = "true")]
     listen: bool,
@@ -1121,6 +1138,8 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
     merge_str!(rpcbind, "rpcbind");
     merge_opt_str!(rpcuser, "rpcuser");
     merge_opt_str!(rpcpassword, "rpcpassword");
+    merge_opt_str!(rpc_tls_cert, "rpc-tls-cert");
+    merge_opt_str!(rpc_tls_key, "rpc-tls-key");
     merge_bool!(listen, "listen");
     merge_bool!(peerbloomfilters, "peerbloomfilters");
     if !was_set(raw_argv, "port") {
@@ -1880,9 +1899,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         auth_user: cli.rpcuser.clone(),
         auth_password: cli.rpcpassword.clone(),
         cookie_secret: Some(cookie_secret),
+        tls_cert: cli.rpc_tls_cert.clone().map(PathBuf::from),
+        tls_key: cli.rpc_tls_key.clone().map(PathBuf::from),
     };
+    let tls_enabled = rpc_config.tls_cert.is_some() && rpc_config.tls_key.is_some();
     let rpc_handle = start_rpc_server(rpc_config, rpc_state.clone(), peer_state.clone()).await?;
-    tracing::info!("RPC server listening on {}", rpc_bind);
+    if tls_enabled {
+        tracing::info!("RPC server listening on https://{} (TLS)", rpc_bind);
+    } else {
+        tracing::info!("RPC server listening on http://{}", rpc_bind);
+    }
 
     // Start unauthenticated REST HTTP server (Bitcoin Core `-rest`).
     // Default off, matching Core's `DEFAULT_REST_ENABLE = false`. When enabled,
