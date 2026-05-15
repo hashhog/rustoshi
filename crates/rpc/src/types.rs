@@ -3,6 +3,8 @@
 //! This module defines all the types used in JSON-RPC responses, matching
 //! the Bitcoin Core RPC format for compatibility with existing tooling.
 
+use std::path::PathBuf;
+
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 // ============================================================
@@ -112,6 +114,20 @@ pub struct RpcConfig {
     /// This is the raw hex string that was written to the .cookie file
     /// (i.e. the password half of `__cookie__:<secret>`).
     pub cookie_secret: Option<String>,
+    /// Optional PEM-encoded TLS certificate (chain) for HTTPS RPC.
+    ///
+    /// When BOTH `tls_cert` and `tls_key` are set, the server binds HTTPS
+    /// instead of HTTP. When neither is set, plain HTTP is used (backward
+    /// compatible with all existing deployments). Setting exactly one is a
+    /// startup error — see `start_rpc_server`.
+    ///
+    /// Mirrors Bitcoin Core's libevent+OpenSSL HTTPS pattern from
+    /// `bitcoin-core/src/httpserver.cpp`. Required for clearnet PayJoin per
+    /// BIP-78 §Protocol ("HTTPS or .onion").
+    pub tls_cert: Option<PathBuf>,
+    /// Optional PEM-encoded PKCS#8 / RSA private key for HTTPS RPC.
+    /// See `tls_cert` for activation semantics.
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for RpcConfig {
@@ -121,6 +137,8 @@ impl Default for RpcConfig {
             auth_user: None,
             auth_password: None,
             cookie_secret: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -133,6 +151,8 @@ impl RpcConfig {
             auth_user: None,
             auth_password: None,
             cookie_secret: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 
@@ -143,6 +163,8 @@ impl RpcConfig {
             auth_user: None,
             auth_password: None,
             cookie_secret: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
