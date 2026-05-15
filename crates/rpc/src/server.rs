@@ -10478,6 +10478,21 @@ pub async fn start_rpc_server(
     state: Arc<RwLock<RpcState>>,
     peer_state: Arc<RwLock<PeerState>>,
 ) -> anyhow::Result<ServerHandle> {
+    // Validate TLS configuration up front — both or neither, never one.
+    // Mirrors Bitcoin Core's libevent SSL setup which refuses an asymmetric
+    // (cert without key / key without cert) config at httpserver init.
+    match (&config.tls_cert, &config.tls_key) {
+        (Some(_), None) => anyhow::bail!(
+            "RPC TLS configuration error: --rpc-tls-cert is set but --rpc-tls-key is missing. \
+             Both flags are required to enable HTTPS; omit both for HTTP."
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "RPC TLS configuration error: --rpc-tls-key is set but --rpc-tls-cert is missing. \
+             Both flags are required to enable HTTPS; omit both for HTTP."
+        ),
+        _ => {}
+    }
+
     // Build auth credentials from config.
     // If neither cookie nor user/pass is set, the middleware still runs and
     // will reject every request with 401 — callers should always provide at
@@ -10491,6 +10506,26 @@ pub async fn start_rpc_server(
     };
 
     let http_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(credentials));
+
+    // TLS branch — wire jsonrpsee through a manual hyper+tokio-rustls acceptor.
+    // This path is opt-in via --rpc-tls-cert + --rpc-tls-key and uses pure-Rust
+    // rustls (no OpenSSL dep). The plaintext path below is bit-for-bit
+    // unchanged to avoid any backward-compat surprise.
+    if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) {
+        let rpc_impl = RpcServerImpl::new(state, peer_state);
+        let methods: jsonrpsee::Methods = rpc_impl.into_rpc().into();
+
+        let tls_config = crate::tls::load_tls_config(cert_path, key_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load RPC TLS materials: {e}"))?;
+
+        return crate::tls::serve_https(
+            &config.bind_address,
+            methods,
+            http_middleware,
+            tls_config,
+        )
+        .await;
+    }
 
     let server = ServerBuilder::default()
         .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_SIZE as u32))
@@ -10660,6 +10695,79 @@ mod tests {
     fn test_rpc_config_testnet4() {
         let config = RpcConfig::testnet4();
         assert_eq!(config.bind_address, "127.0.0.1:48332");
+    }
+
+    /// `start_rpc_server` MUST refuse to launch if `tls_cert` is set without
+    /// `tls_key` — mirrors Bitcoin Core's HTTPS init validation, prevents
+    /// silent plaintext fallback when the operator thinks they enabled TLS.
+    /// (W119 / FIX-64)
+    #[tokio::test]
+    async fn test_rpc_start_rejects_cert_without_key() {
+        use std::path::PathBuf;
+        let cfg = RpcConfig {
+            bind_address: "127.0.0.1:0".to_string(),
+            auth_user: None,
+            auth_password: None,
+            cookie_secret: None,
+            tls_cert: Some(PathBuf::from("/tmp/some-cert.pem")),
+            tls_key: None,
+        };
+        // The validation runs before any chain access — so wire up minimal
+        // shells of state. The validation should bail() before they are read.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = rustoshi_storage::ChainDb::open(tmp.path()).expect("open db");
+        let params = rustoshi_consensus::ChainParams::testnet4();
+        let state = Arc::new(RwLock::new(RpcState::new(Arc::new(db), params)));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let err = start_rpc_server(cfg, state, peer_state)
+            .await
+            .expect_err("cert-without-key must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--rpc-tls-key is missing"),
+            "expected cert-without-key error, got: {msg}"
+        );
+    }
+
+    /// Mirror of the test above for the opposite asymmetric case.
+    #[tokio::test]
+    async fn test_rpc_start_rejects_key_without_cert() {
+        use std::path::PathBuf;
+        let cfg = RpcConfig {
+            bind_address: "127.0.0.1:0".to_string(),
+            auth_user: None,
+            auth_password: None,
+            cookie_secret: None,
+            tls_cert: None,
+            tls_key: Some(PathBuf::from("/tmp/some-key.pem")),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = rustoshi_storage::ChainDb::open(tmp.path()).expect("open db");
+        let params = rustoshi_consensus::ChainParams::testnet4();
+        let state = Arc::new(RwLock::new(RpcState::new(Arc::new(db), params)));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let err = start_rpc_server(cfg, state, peer_state)
+            .await
+            .expect_err("key-without-cert must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--rpc-tls-cert is missing"),
+            "expected key-without-cert error, got: {msg}"
+        );
+    }
+
+    /// Default config has no TLS — backward-compat regression guard.
+    #[test]
+    fn test_rpc_config_default_has_no_tls() {
+        let cfg = RpcConfig::default();
+        assert!(cfg.tls_cert.is_none(), "default config must be HTTP");
+        assert!(cfg.tls_key.is_none(), "default config must be HTTP");
+        let cfg = RpcConfig::testnet4();
+        assert!(cfg.tls_cert.is_none(), "testnet4 default must be HTTP");
+        assert!(cfg.tls_key.is_none(), "testnet4 default must be HTTP");
+        let cfg = RpcConfig::mainnet();
+        assert!(cfg.tls_cert.is_none(), "mainnet default must be HTTP");
+        assert!(cfg.tls_key.is_none(), "mainnet default must be HTTP");
     }
 
     #[test]

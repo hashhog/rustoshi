@@ -34,6 +34,7 @@
 pub mod auth;
 pub mod rest;
 pub mod server;
+pub mod tls;
 pub mod types;
 pub mod wallet;
 pub mod zmq;
