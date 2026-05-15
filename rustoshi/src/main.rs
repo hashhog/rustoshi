@@ -193,6 +193,41 @@ struct Cli {
     #[arg(long = "asmap", value_name = "PATH")]
     asmap: Option<String>,
 
+    /// SOCKS5 proxy for clearnet (IPv4/IPv6) outbound connections.
+    ///
+    /// Mirrors Bitcoin Core's `-proxy=<host:port>`. When set, all clearnet
+    /// outbound connections go through this proxy. Also used as the Tor
+    /// fallback when `--onion` is unset.
+    ///
+    /// Example: `--proxy=127.0.0.1:9050`
+    #[arg(long = "proxy", value_name = "HOST:PORT")]
+    proxy: Option<String>,
+
+    /// Dedicated SOCKS5 proxy for Tor v3 (.onion) outbound connections.
+    ///
+    /// Mirrors Bitcoin Core's `-onion=<host:port>`. Takes precedence over
+    /// `--proxy` for Tor v3 peers learned via ADDRv2.
+    ///
+    /// Example: `--onion=127.0.0.1:9050`
+    #[arg(long = "onion", value_name = "HOST:PORT")]
+    onion: Option<String>,
+
+    /// I2P SAM 3.1 bridge address for I2P outbound connections.
+    ///
+    /// Mirrors Bitcoin Core's `-i2psam=<host:port>`. When set, I2P peers
+    /// learned via ADDRv2 become reachable through the SAM bridge.
+    ///
+    /// Example: `--i2psam=127.0.0.1:7656`
+    #[arg(long = "i2psam", value_name = "HOST:PORT")]
+    i2psam: Option<String>,
+
+    /// Treat CJDNS addresses (fc00::/8 IPv6) as reachable.
+    ///
+    /// Mirrors Bitcoin Core's `-cjdnsreachable`. Enable only when the host
+    /// has a working CJDNS interface and can route fc00::/8 natively.
+    #[arg(long = "cjdnsreachable", default_value = "false")]
+    cjdnsreachable: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1127,6 +1162,11 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
     merge_bool!(rest, "rest");
     merge_opt_str!(restbind, "restbind");
     merge_opt_str!(asmap, "asmap");
+    // W117 BUG-2 proxy wiring — Bitcoin Core compatible flag names.
+    merge_opt_str!(proxy, "proxy");
+    merge_opt_str!(onion, "onion");
+    merge_opt_str!(i2psam, "i2psam");
+    merge_bool!(cjdnsreachable, "cjdnsreachable");
 }
 
 /// Locate a config file path: explicit `--conf`, then `<datadir>/rustoshi.conf`,
@@ -1924,6 +1964,35 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         NetGroupManager::new()
     };
 
+    // W117 BUG-2 proxy wiring: parse -proxy / -onion / -i2psam socket addrs.
+    // Bitcoin Core accepts both `host:port` and `[ipv6]:port` forms; we
+    // delegate to Rust's `SocketAddr::FromStr` which handles both. A bad
+    // value is fatal — better to refuse to start than silently fall back
+    // to direct TCP and leak the operator's clearnet IP.
+    fn parse_proxy_arg(name: &str, val: Option<&String>) -> Option<std::net::SocketAddr> {
+        val.map(|s| {
+            s.parse::<std::net::SocketAddr>().unwrap_or_else(|e| {
+                tracing::error!("Invalid --{} value '{}': {}", name, s, e);
+                std::process::exit(1);
+            })
+        })
+    }
+    let tor_proxy = parse_proxy_arg("proxy", cli.proxy.as_ref());
+    let onion_proxy = parse_proxy_arg("onion", cli.onion.as_ref());
+    let i2p_sam = parse_proxy_arg("i2psam", cli.i2psam.as_ref());
+    if tor_proxy.is_some() {
+        tracing::info!("Clearnet SOCKS5 proxy: {}", tor_proxy.unwrap());
+    }
+    if onion_proxy.is_some() {
+        tracing::info!("Tor onion SOCKS5 proxy: {}", onion_proxy.unwrap());
+    }
+    if i2p_sam.is_some() {
+        tracing::info!("I2P SAM bridge: {}", i2p_sam.unwrap());
+    }
+    if cli.cjdnsreachable {
+        tracing::info!("CJDNS reachability enabled (fc00::/8 native routing)");
+    }
+
     // Configure peer manager
     let peer_config = PeerManagerConfig {
         max_outbound_full_relay: cli.maxconnections.saturating_sub(2),
@@ -1935,6 +2004,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         // know not to request blocks below the recent-288 keep window.
         prune_mode: cli.prune.map(|n| n > 0).unwrap_or(false),
         data_dir: datadir.clone(),
+        // W117: wire BIP-155 proxy infrastructure into the peer manager.
+        tor_proxy,
+        onion_proxy,
+        i2p_sam,
+        cjdns_reachable: cli.cjdnsreachable,
         ..Default::default()
     };
     let mut peer_manager = PeerManager::new_with_netgroup(peer_config, params.clone(), netgroup_manager);
