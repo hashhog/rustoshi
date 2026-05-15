@@ -49,6 +49,9 @@ pub mod wallet_error {
     pub const RPC_WALLET_NOT_SPECIFIED: i32 = -19;
     /// Multiple wallets loaded, wallet must be specified.
     pub const RPC_WALLET_NOT_SELECTED: i32 = -19;
+    /// Wallet encryption state precludes this operation
+    /// (e.g., walletlock on unencrypted or encryptwallet on already-encrypted).
+    pub const RPC_WALLET_WRONG_ENC_STATE: i32 = -15;
 }
 
 /// Result of createwallet RPC.
@@ -559,6 +562,57 @@ pub trait WalletRpc {
     #[method(name = "listlockunspent")]
     async fn list_lock_unspent(&self) -> RpcResult<Vec<LockedOutpoint>>;
 
+    /// Store the wallet decryption key in memory for `timeout` seconds.
+    ///
+    /// Mirrors Bitcoin Core's `walletpassphrase` RPC
+    /// (`bitcoin-core/src/wallet/rpc/encrypt.cpp`). After unlocking, signing
+    /// operations (`sendtoaddress`, `signrawtransactionwithwallet`,
+    /// `walletcreatefundedpsbt` for non-watch-only spends, etc.) can run
+    /// without re-prompting. Once `timeout` seconds elapse the wallet
+    /// re-locks automatically.
+    ///
+    /// Errors with:
+    /// - `-13` (RPC_WALLET_UNLOCK_NEEDED) — wallet is not encrypted.
+    /// - `-14` (RPC_WALLET_PASSPHRASE_INCORRECT) — passphrase rejected.
+    ///
+    /// Parameters:
+    /// - passphrase: wallet passphrase (must not be empty).
+    /// - timeout: timeout in seconds (Core's max is 100,000,000s; we cap
+    ///   identically).
+    #[method(name = "walletpassphrase")]
+    async fn wallet_passphrase(
+        &self,
+        passphrase: String,
+        timeout: u64,
+    ) -> RpcResult<()>;
+
+    /// Re-lock an encrypted wallet, scrubbing the master key from memory.
+    /// Mirrors Bitcoin Core's `walletlock` RPC.
+    ///
+    /// Errors with `-15` (RPC_WALLET_WRONG_ENC_STATE) if the wallet is not
+    /// encrypted.
+    #[method(name = "walletlock")]
+    async fn wallet_lock(&self) -> RpcResult<()>;
+
+    /// Encrypt an unencrypted wallet's seed at rest. Mirrors Bitcoin Core's
+    /// `encryptwallet` RPC. Unlike Core, this implementation does NOT force
+    /// a server shutdown after success — the wallet stays usable for the
+    /// session.
+    ///
+    /// Errors with `-15` (RPC_WALLET_WRONG_ENC_STATE) if the wallet is
+    /// already encrypted or the passphrase is empty.
+    #[method(name = "encryptwallet")]
+    async fn encrypt_wallet(&self, passphrase: String) -> RpcResult<String>;
+
+    /// Change the passphrase on an encrypted wallet. Mirrors Bitcoin Core's
+    /// `walletpassphrasechange` RPC.
+    #[method(name = "walletpassphrasechange")]
+    async fn wallet_passphrase_change(
+        &self,
+        oldpassphrase: String,
+        newpassphrase: String,
+    ) -> RpcResult<()>;
+
     /// Build a funded PSBT (Core's `walletcreatefundedpsbt`).
     ///
     /// Mirrors `bitcoin-core/src/wallet/rpc/spend.cpp::walletcreatefundedpsbt`.
@@ -625,6 +679,25 @@ impl WalletRpcImpl {
     /// BTC to satoshis.
     fn btc_to_sats(btc: f64) -> u64 {
         (btc * 100_000_000.0).round() as u64
+    }
+
+    /// Translate `WalletError::WalletLocked` into Core's
+    /// `RPC_WALLET_UNLOCK_NEEDED` (-13). Every signing RPC funnels through
+    /// here so the error message is uniform.
+    fn require_unlocked(
+        state: &WalletRpcState,
+        name: &str,
+    ) -> Result<(), ErrorObjectOwned> {
+        state.wallet_manager.require_unlocked(name).map_err(|e| {
+            use rustoshi_wallet::WalletError;
+            match e {
+                WalletError::WalletLocked => Self::rpc_error(
+                    wallet_error::RPC_WALLET_UNLOCK_NEEDED,
+                    "Error: Please enter the wallet passphrase with walletpassphrase first.",
+                ),
+                other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
+            }
+        })
     }
 }
 
@@ -862,9 +935,12 @@ impl WalletRpcServer for WalletRpcImpl {
     ) -> RpcResult<String> {
         let state = self.state.read().await;
 
-        let (_, wallet) = state.wallet_manager
+        let (name, wallet) = state.wallet_manager
             .get_wallet_or_default(self.target_wallet.as_deref())
             .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+
+        // P0-SECURITY gate (W118 BUG-1): signing requires an unlocked wallet.
+        Self::require_unlocked(&state, &name)?;
 
         let mut wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
@@ -1005,9 +1081,12 @@ impl WalletRpcServer for WalletRpcImpl {
 
         let state = self.state.read().await;
 
-        let (_, wallet) = state.wallet_manager
+        let (name, wallet) = state.wallet_manager
             .get_wallet_or_default(self.target_wallet.as_deref())
             .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+
+        // P0-SECURITY gate (W118 BUG-1): signing requires an unlocked wallet.
+        Self::require_unlocked(&state, &name)?;
 
         let wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
@@ -1678,6 +1757,150 @@ impl WalletRpcServer for WalletRpcImpl {
             fee: Self::sats_to_btc(fee_sats),
             changepos,
         })
+    }
+
+    async fn wallet_passphrase(
+        &self,
+        passphrase: String,
+        timeout: u64,
+    ) -> RpcResult<()> {
+        // Core caps timeout at 100,000,000 seconds (~3.17 years); mirror that.
+        const MAX_TIMEOUT_SECS: u64 = 100_000_000;
+        if timeout == 0 {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "timeout must be > 0",
+            ));
+        }
+        let capped = timeout.min(MAX_TIMEOUT_SECS);
+
+        // Need write access — unlock swaps the in-memory wallet object.
+        let mut state = self.state.write().await;
+        let name = self.target_wallet.clone().or_else(|| {
+            state.wallet_manager.get_default_wallet().map(|(n, _)| n)
+        });
+        let name = name.ok_or_else(|| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_NOT_SPECIFIED,
+                "No wallet specified",
+            )
+        })?;
+
+        state
+            .wallet_manager
+            .unlock_wallet(&name, &passphrase, std::time::Duration::from_secs(capped))
+            .map_err(|e| {
+                use rustoshi_wallet::WalletError;
+                match e {
+                    WalletError::BadPassphrase => Self::rpc_error(
+                        wallet_error::RPC_WALLET_PASSPHRASE_INCORRECT,
+                        "Error: The wallet passphrase entered was incorrect.",
+                    ),
+                    WalletError::EncryptionState(msg) => Self::rpc_error(
+                        wallet_error::RPC_WALLET_WRONG_ENC_STATE,
+                        format!(
+                            "Error: running with an unencrypted wallet, but walletpassphrase was called ({})",
+                            msg
+                        ),
+                    ),
+                    other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn wallet_lock(&self) -> RpcResult<()> {
+        let mut state = self.state.write().await;
+        let name = self.target_wallet.clone().or_else(|| {
+            state.wallet_manager.get_default_wallet().map(|(n, _)| n)
+        });
+        let name = name.ok_or_else(|| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_NOT_SPECIFIED,
+                "No wallet specified",
+            )
+        })?;
+
+        state.wallet_manager.lock_wallet(&name).map_err(|e| {
+            use rustoshi_wallet::WalletError;
+            match e {
+                WalletError::EncryptionState(_) => Self::rpc_error(
+                    wallet_error::RPC_WALLET_WRONG_ENC_STATE,
+                    "Error: running with an unencrypted wallet, but walletlock was called.",
+                ),
+                other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
+            }
+        })
+    }
+
+    async fn encrypt_wallet(&self, passphrase: String) -> RpcResult<String> {
+        if passphrase.is_empty() {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_WRONG_ENC_STATE,
+                "encryptwallet requires a non-empty passphrase",
+            ));
+        }
+        let mut state = self.state.write().await;
+        let name = self.target_wallet.clone().or_else(|| {
+            state.wallet_manager.get_default_wallet().map(|(n, _)| n)
+        });
+        let name = name.ok_or_else(|| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_NOT_SPECIFIED,
+                "No wallet specified",
+            )
+        })?;
+
+        state
+            .wallet_manager
+            .encrypt_wallet(&name, &passphrase)
+            .map_err(|e| {
+                use rustoshi_wallet::WalletError;
+                match e {
+                    WalletError::EncryptionState(msg) => Self::rpc_error(
+                        wallet_error::RPC_WALLET_WRONG_ENC_STATE,
+                        msg,
+                    ),
+                    other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
+                }
+            })?;
+
+        Ok("wallet encrypted; the master key is now encrypted at rest. You may want to back up your new wallet_seed.bin.".to_string())
+    }
+
+    async fn wallet_passphrase_change(
+        &self,
+        oldpassphrase: String,
+        newpassphrase: String,
+    ) -> RpcResult<()> {
+        let mut state = self.state.write().await;
+        let name = self.target_wallet.clone().or_else(|| {
+            state.wallet_manager.get_default_wallet().map(|(n, _)| n)
+        });
+        let name = name.ok_or_else(|| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_NOT_SPECIFIED,
+                "No wallet specified",
+            )
+        })?;
+
+        state
+            .wallet_manager
+            .change_wallet_passphrase(&name, &oldpassphrase, &newpassphrase)
+            .map_err(|e| {
+                use rustoshi_wallet::WalletError;
+                match e {
+                    WalletError::BadPassphrase => Self::rpc_error(
+                        wallet_error::RPC_WALLET_PASSPHRASE_INCORRECT,
+                        "Error: The wallet passphrase entered was incorrect.",
+                    ),
+                    WalletError::EncryptionState(msg) => Self::rpc_error(
+                        wallet_error::RPC_WALLET_WRONG_ENC_STATE,
+                        msg,
+                    ),
+                    other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
+                }
+            })
     }
 }
 

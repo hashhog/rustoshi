@@ -105,9 +105,39 @@ pub enum WalletError {
     #[error("invalid derivation path: {0}")]
     InvalidPath(String),
 
+    /// Wallet-encryption-layer error (KDF / AEAD).
+    #[error("wallet encryption error: {0}")]
+    Encryption(String),
+
     /// Cryptographic operation failed.
     #[error("crypto error: {0}")]
     Crypto(String),
+
+    /// The wallet is encrypted and locked; signing requires `walletpassphrase`.
+    /// Mirrors Bitcoin Core's RPC error -13 (`RPC_WALLET_UNLOCK_NEEDED`).
+    #[error("wallet is encrypted and locked; please use walletpassphrase first")]
+    WalletLocked,
+
+    /// The passphrase did not match the encrypted master seed.
+    /// Mirrors Bitcoin Core's RPC error -14 (`RPC_WALLET_PASSPHRASE_INCORRECT`).
+    #[error("wallet passphrase is incorrect")]
+    BadPassphrase,
+
+    /// `encryptwallet` was called on an already-encrypted wallet, or
+    /// `walletpassphrase` on an unencrypted one.
+    #[error("wallet encryption state precludes this operation: {0}")]
+    EncryptionState(String),
+}
+
+impl From<crate::encryption::WalletEncryptError> for WalletError {
+    fn from(e: crate::encryption::WalletEncryptError) -> Self {
+        use crate::encryption::WalletEncryptError;
+        match e {
+            WalletEncryptError::BadPassphrase => WalletError::BadPassphrase,
+            WalletEncryptError::Io(io) => WalletError::Io(io),
+            other => WalletError::Encryption(other.to_string()),
+        }
+    }
 }
 
 impl ExtendedPrivKey {
