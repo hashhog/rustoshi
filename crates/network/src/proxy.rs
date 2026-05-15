@@ -709,16 +709,20 @@ impl Socks5Proxy {
 ///
 /// The .onion v3 format is: `<56 chars>.onion`
 /// The 56 chars are base32 encoding of: pubkey (32) + checksum (2) + version (1)
+///
+/// Per Tor rend-spec-v3 §6:
+///   onion_address = base32(pubkey || checksum || version)
+///   checksum = SHA3-256(".onion checksum" || pubkey || version)[0:2]
+///   version = 0x03
 pub fn torv3_pubkey_to_hostname(pubkey: &[u8; 32]) -> String {
-    // Calculate checksum: SHA3-256(".onion checksum" || pubkey || version)
-    use sha2::{Digest, Sha256};
+    use sha3::{Digest, Sha3_256};
 
     let version: u8 = 3;
 
-    // Bitcoin Core uses SHA256 for this, matching Tor spec
-    // Actually Tor uses SHA3-256, but Bitcoin Core's implementation
-    // works because they encode differently. We'll use the same approach.
-    let mut hasher = Sha256::new();
+    // Tor rend-spec-v3 §6: checksum is SHA3-256, not SHA-256.
+    // Using SHA-256 here would produce addresses rejected by real Tor relays
+    // and BIP-155-compliant peers (only the internal roundtrip would work).
+    let mut hasher = Sha3_256::new();
     hasher.update(b".onion checksum");
     hasher.update(pubkey);
     hasher.update([version]);
@@ -756,12 +760,12 @@ pub fn hostname_to_torv3_pubkey(hostname: &str) -> Result<[u8; 32], ProxyError> 
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&decoded[0..32]);
 
-    // Verify checksum
-    use sha2::{Digest, Sha256};
+    // Verify checksum per Tor rend-spec-v3 §6 (SHA3-256, not SHA-256).
+    use sha3::{Digest, Sha3_256};
     let version = decoded[34];
     let checksum = &decoded[32..34];
 
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha3_256::new();
     hasher.update(b".onion checksum");
     hasher.update(pubkey);
     hasher.update([version]);
