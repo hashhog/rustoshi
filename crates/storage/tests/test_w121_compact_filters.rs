@@ -74,11 +74,12 @@
 //!             struct; cannot construct outbound. (P0-CDIV)
 //!   G13 BUG-6: `NetworkMessage::GetCFHeaders` / `CFHeaders` / `GetCFCheckpt`
 //!             / `CFCheckpt` — all opaque Vec<u8>. (P0-CDIV; 4-message gap.)
-//!   G14 BUG-7: NODE_COMPACT_FILTERS service bit (1<<6) is defined in
-//!             message.rs but NEVER OR'd into local_services. (W99 already
-//!             documented as g22.) Light clients filter peers by service bit
-//!             — rustoshi will receive zero light-client connections.
-//!             (P0 — feature unusable end-to-end.)
+//!   G14 BUG-7: FIX-71 NODE_COMPACT_FILTERS gate plumbed in peer_manager.rs::
+//!             local_services via should_advertise_compact_filters. Gate is
+//!             currently FALSE because BIP-157 P2P handlers absent
+//!             (BIP157_P2P_HANDLERS_REGISTERED=false). When a future P2P
+//!             wave registers the dispatch handlers and flips the constant,
+//!             the bit is advertised automatically. (See FIX-71 commit.)
 //!   G15 BUG-8: ProcessGetCFilters handler MISSING. Core has DoS gating
 //!             (NODE_COMPACT_FILTERS, BlockRequestAllowed, max_height_diff
 //!             1000); rustoshi handles the request by silently no-op'ing
@@ -487,21 +488,40 @@ fn g13_remaining_bip157_messages_opaque() {
     );
 }
 
-/// G14 BUG-7 (P0) — NODE_COMPACT_FILTERS service bit (1<<6) defined but never
-/// advertised. Light clients (Neutrino, BDK) gate peer selection on this bit;
-/// rustoshi will receive zero light-client connections.
+/// G14 BUG-7 FIX-71 — NODE_COMPACT_FILTERS service bit (1<<6) gate plumbed in
+/// `crates/network/src/peer_manager.rs::local_services` via
+/// `should_advertise_compact_filters`. Gate currently returns FALSE because
+/// BIP-157 P2P handlers absent (`BIP157_P2P_HANDLERS_REGISTERED = false`).
 ///
-/// Already documented in `w99_net_processing_tests.rs::g22`; we mirror here in
-/// documentary form (no network-crate dependency from storage tests) because
-/// this is the single most user-impactful BIP-157 finding (combined with
-/// G15-G18, the feature is unreachable for clients).
+/// This is the W121 BUG-7 "plumbing without flipping" fix: the bit STAYS
+/// UN-advertised (Light clients still see no NODE_COMPACT_FILTERS), but the
+/// structural wiring is in place so a future P2P fix wave only needs to flip
+/// `BIP157_P2P_HANDLERS_REGISTERED` to `true` and the gate activates.
+///
+/// See `w99_net_processing_tests.rs::g22_node_compact_filters_gate_plumbed_currently_false`
+/// for the network-crate test that asserts the gate is wired (and stays
+/// FALSE) across all PeerManagerConfig permutations.
 #[test]
-#[ignore = "BUG-7 (P0): NODE_COMPACT_FILTERS bit defined (message.rs:141) but never OR'd into local_services"]
-fn g14_node_compact_filters_service_bit_never_advertised() {
-    panic!(
-        "crates/network/src/message.rs:141 defines NODE_COMPACT_FILTERS = 1<<6 \
-         but no call site ORs it into local_services — see \
-         w99_net_processing_tests.rs::g22 for the corresponding network-crate test"
+fn g14_node_compact_filters_gate_plumbed() {
+    // Documentary: the gate function and constant live in
+    // crates/network/src/peer_manager.rs (FIX-71). This file is in the
+    // storage crate which intentionally has no network-crate dep, so we
+    // verify by file-level grep rather than direct symbol reference.
+    use std::fs;
+    let body = fs::read_to_string("../network/src/peer_manager.rs")
+        .expect("crates/network/src/peer_manager.rs must exist");
+    assert!(
+        body.contains("pub fn should_advertise_compact_filters"),
+        "FIX-71: peer_manager.rs must define should_advertise_compact_filters"
+    );
+    assert!(
+        body.contains("pub const BIP157_P2P_HANDLERS_REGISTERED: bool = false"),
+        "FIX-71: BIP157_P2P_HANDLERS_REGISTERED must be `false` until \
+         GetCFilters/Headers/CheckPt dispatch handlers land in peer.rs"
+    );
+    assert!(
+        body.contains("s |= NODE_COMPACT_FILTERS"),
+        "FIX-71: local_services() must OR NODE_COMPACT_FILTERS under the gate"
     );
 }
 

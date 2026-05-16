@@ -18,8 +18,8 @@ use crate::eviction::{select_node_to_evict, EvictionCandidate, EvictionCandidate
 use crate::message::{
     parse_message_header, serialize_message, NetAddress, NetworkMessage,
     TimestampedNetAddress, VersionMessage, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
-    MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_NETWORK, NODE_NETWORK_LIMITED, NODE_WITNESS,
-    PROTOCOL_VERSION, SENDHEADERS_VERSION,
+    MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK, NODE_NETWORK_LIMITED,
+    NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
 };
 use crate::v2_transport::{
     constants::{
@@ -52,6 +52,64 @@ use tokio::time::{Duration, Instant};
 /// Maximum number of block-relay-only anchor connections to persist.
 pub const MAX_BLOCK_RELAY_ONLY_ANCHORS: usize = 2;
 
+/// Whether BIP-157 P2P handlers are registered in the message-dispatch path.
+///
+/// FIX-71 gate flag (W121 BUG-7 / W99 G22): this is the third precondition for
+/// advertising `NODE_COMPACT_FILTERS`. Mirrors Bitcoin Core's implicit
+/// invariant that `ProcessGetCFilters` / `ProcessGetCFHeaders` /
+/// `ProcessGetCFCheckPt` are always linked into `net_processing.cpp` when the
+/// node binary is built (see `bitcoin-core/src/net_processing.cpp` 3315-3460).
+///
+/// rustoshi currently has the BIP-157 wire codec in `message.rs` but NO
+/// dispatch handlers in `peer.rs` / `peer_manager.rs` — incoming
+/// `GetCFilters` / `GetCFHeaders` / `GetCFCheckpt` messages are silently
+/// dropped (they parse as `NetworkMessage::GetCFilters(Vec<u8>)` but there is
+/// no match arm that calls the BlockFilterIndex). Therefore advertising
+/// `NODE_COMPACT_FILTERS` would lie to peers (BIP-157 §"Service Bits").
+///
+/// When a future P2P fix wave registers the handlers, flip this constant to
+/// `true`. The gate function `should_advertise_compact_filters` will then
+/// start OR-ing the bit into `local_services()` automatically. See
+/// `BIP-157` and `bitcoin-core/src/init.cpp:992-999`.
+pub const BIP157_P2P_HANDLERS_REGISTERED: bool = false;
+
+/// Decide whether to advertise `NODE_COMPACT_FILTERS` (bit 6, BIP-157) in the
+/// outbound version handshake.
+///
+/// Mirrors Bitcoin Core's `init.cpp:992-999` gate, with one extra precondition
+/// (handler-presence) made explicit so this can be wired safely before the
+/// dispatch handlers land.
+///
+/// Returns `true` iff ALL of:
+///   (a) `-blockfilterindex` is enabled (`block_filter_index_enabled = true`),
+///       AND
+///   (b) `-peerblockfilters` is enabled (`peer_block_filters = true`),
+///       AND
+///   (c) the BIP-157 P2P dispatch handlers are registered
+///       (`BIP157_P2P_HANDLERS_REGISTERED = true`).
+///
+/// All three are required: a node that runs the index but cannot serve
+/// requests would announce a service it does not fulfil; a node with
+/// handlers but no index would error on every served request. Core enforces
+/// (a)+(b) explicitly (init.cpp 994) and (c) is structurally trivial because
+/// Core always links the handlers in the same binary; rustoshi must check
+/// (c) until the handlers land.
+///
+/// As of FIX-71 this function returns `false` unconditionally because
+/// `BIP157_P2P_HANDLERS_REGISTERED` is `false`. The wiring is structural so
+/// a future P2P fix wave only needs to flip the constant.
+///
+/// References:
+///   - `bitcoin-core/src/protocol.h:323` — `NODE_COMPACT_FILTERS = (1 << 6)`
+///   - `bitcoin-core/src/init.cpp:992-999` — gate computation
+///   - BIP-157 — "Service Bits" section
+pub fn should_advertise_compact_filters(
+    block_filter_index_enabled: bool,
+    peer_block_filters: bool,
+) -> bool {
+    block_filter_index_enabled && peer_block_filters && BIP157_P2P_HANDLERS_REGISTERED
+}
+
 /// Filename for anchor peer persistence.
 pub const ANCHORS_DATABASE_FILENAME: &str = "anchors.dat";
 
@@ -81,6 +139,26 @@ pub struct PeerManagerConfig {
     /// most recent ~288 blocks. Mirrors Core's `init.cpp` behaviour where
     /// `nLocalServices |= NODE_NETWORK_LIMITED` when `IsPruneMode()` is true.
     pub prune_mode: bool,
+    /// Whether the BIP-157/158 BlockFilterIndex is enabled.
+    ///
+    /// Mirrors Bitcoin Core's `-blockfilterindex=basic` (default: disabled, per
+    /// `bitcoin-core/src/index/blockfilterindex.h`). When false the index is
+    /// never built and `NODE_COMPACT_FILTERS` MUST NOT be advertised even if
+    /// `peer_block_filters` is set.
+    ///
+    /// FIX-71: this is one input to `should_advertise_compact_filters()`. Even
+    /// when this is `true`, the gate keeps the bit unset until BIP-157 P2P
+    /// handlers are registered (see `BIP157_P2P_HANDLERS_REGISTERED`).
+    pub block_filter_index_enabled: bool,
+    /// Whether to advertise NODE_COMPACT_FILTERS (BIP-157) and serve filter
+    /// requests from peers.
+    ///
+    /// Mirrors Bitcoin Core's `-peerblockfilters` (default: disabled, per
+    /// `bitcoin-core/src/init.cpp` line 993 `DEFAULT_PEERBLOCKFILTERS`).
+    /// Core enforces that `-peerblockfilters` REQUIRES `-blockfilterindex`
+    /// (init.cpp 994-996); the same precondition is enforced inside
+    /// `should_advertise_compact_filters()`.
+    pub peer_block_filters: bool,
     /// Data directory for persistent state (banlist, anchors.dat, etc.).
     pub data_dir: PathBuf,
     /// SOCKS5 proxy address for clearnet (IPv4/IPv6) outbound connections.
@@ -168,6 +246,8 @@ impl Default for PeerManagerConfig {
             listen: true,
             peer_bloom_filters: false,
             prune_mode: false,
+            block_filter_index_enabled: false,
+            peer_block_filters: false,
             data_dir: PathBuf::from("."),
             tor_proxy: None,
             onion_proxy: None,
@@ -1030,6 +1110,11 @@ impl PeerManager {
     /// `g_local_services` after `init.cpp`'s `-peerbloomfilters` gate).
     /// When prune mode is on, NODE_NETWORK_LIMITED (BIP-159) is advertised so
     /// peers know we serve only the recent-288-block window.
+    ///
+    /// NODE_COMPACT_FILTERS (BIP-157, bit 6) is gated through
+    /// [`should_advertise_compact_filters`]; as of FIX-71 the gate returns
+    /// `false` because BIP-157 P2P handlers are not yet registered — see
+    /// [`BIP157_P2P_HANDLERS_REGISTERED`].
     pub fn local_services(&self) -> u64 {
         let mut s = NODE_NETWORK | NODE_WITNESS;
         if self.config.peer_bloom_filters {
@@ -1037,6 +1122,15 @@ impl PeerManager {
         }
         if self.config.prune_mode {
             s |= NODE_NETWORK_LIMITED;
+        }
+        // FIX-71: BIP-157 compact-filter advertisement gate. Currently false
+        // because `BIP157_P2P_HANDLERS_REGISTERED = false`; future P2P wave
+        // flips the constant and this branch starts advertising automatically.
+        if should_advertise_compact_filters(
+            self.config.block_filter_index_enabled,
+            self.config.peer_block_filters,
+        ) {
+            s |= NODE_COMPACT_FILTERS;
         }
         s
     }
