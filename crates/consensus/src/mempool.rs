@@ -1222,6 +1222,19 @@ pub struct Mempool {
     /// re-admitted from disconnected blocks sort *before* their existing
     /// in-mempool descendants).  W96: previously absent.
     next_sequence: u64,
+
+    /// `prioritisetransaction` fee deltas: txid → cumulative sats delta.
+    /// Mirrors Bitcoin Core `CTxMemPool::mapDeltas` (txmempool.h `mapDeltas`).
+    /// A non-zero delta is the effect of one or more `prioritisetransaction`
+    /// RPC calls; the delta stacks on previous ones (Core txmempool.cpp:630-655).
+    /// Whenever an entry is admitted, its `entry.fee_delta` is initialised
+    /// from this map (Core ApplyDelta, txmempool.cpp:657-665).  The delta is
+    /// removed from the map when it returns to zero.  Not persisted across
+    /// restart: rustoshi clears the map on construction (Core parity:
+    /// mapDeltas itself is in-memory and is repopulated only by the persist
+    /// path; we deliberately do NOT round-trip standalone-delta entries).
+    /// W120 BUG-9 + BUG-10 (FIX-72).
+    map_deltas: HashMap<Hash256, i64>,
 }
 
 impl Mempool {
@@ -1248,6 +1261,7 @@ impl Mempool {
             last_rolling_fee_update: 0,
             // First admitted tx gets sequence 1 (Core uses 1-indexed).
             next_sequence: 1,
+            map_deltas: HashMap::new(),
         }
     }
 
@@ -1727,7 +1741,9 @@ impl Mempool {
             // 2. Pay for bandwidth
             // We do NOT require higher fee rate (unlike standard RBF)
             if let Some(sibling_entry) = self.transactions.get(&sibling_txid) {
-                let sibling_fee = sibling_entry.fee;
+                // FIX-72: use GetModifiedFee for the sibling — a prioritised
+                // sibling must be beaten on its modified fee, mirroring Core.
+                let sibling_fee = Self::get_modified_fee(sibling_entry);
 
                 // Must pay higher absolute fee
                 if fee <= sibling_fee {
@@ -2003,6 +2019,11 @@ impl Mempool {
         // `transactions`.  Required for the txn-already-in-mempool /
         // txn-same-nonwitness-data-in-mempool error-class distinction.
         self.wtxid_index.insert(wtxid, txid);
+
+        // FIX-72: replay any pending prioritisetransaction delta queued
+        // before this admission.  Mirrors Core's CTxMemPool::addUnchecked
+        // → ApplyDelta sequence (txmempool.cpp:1015).
+        self.apply_pending_delta(&txid);
 
         // Add to cluster structure and compute mining score
         self.add_to_clusters(txid, fee, vsize, &mempool_parents);
@@ -2300,13 +2321,30 @@ impl Mempool {
     /// Get transactions sorted by descendant fee rate for block building.
     ///
     /// Returns txids in priority order (highest fee rate first).
+    /// FIX-72 (W120 BUG-9 + BUG-10): single-entry ranks now use modified fee
+    /// (base + prioritisetransaction delta) so an operator-prioritised tx
+    /// surfaces ahead of equally-feed peers.  Mining selection
+    /// (block_template.rs:330+) does the same on its own heap, so this is
+    /// the upstream sort that feeds it.  Note: ancestor_fees aggregation
+    /// still uses raw fees (W106 G8 is a separate follow-up); the modified
+    /// fee is used as a tiebreaker / lone-entry rank.
     pub fn get_sorted_for_mining(&self) -> Vec<Hash256> {
-        // Use ancestor fee rate for CPFP (child-pays-for-parent)
+        // Use ancestor fee rate for CPFP (child-pays-for-parent), folding in
+        // the prioritise delta for entries with no further ancestors.
         let mut entries: Vec<_> = self
             .transactions
             .values()
             .map(|e| {
-                let ancestor_fee_rate = e.ancestor_fees as f64 / e.ancestor_size as f64;
+                let modified_fee = Self::get_modified_fee(e);
+                let ancestor_fee_rate = if e.ancestor_count > 1 {
+                    // Multi-ancestor: aggregate raw ancestor_fees (delta
+                    // propagation across ancestors is W106 G8 follow-up).
+                    e.ancestor_fees as f64 / e.ancestor_size as f64
+                } else if e.vsize > 0 {
+                    modified_fee as f64 / e.vsize as f64
+                } else {
+                    e.fee_rate
+                };
                 (ancestor_fee_rate, e.txid)
             })
             .collect();
@@ -2747,20 +2785,28 @@ impl Mempool {
 
         // Collect all transactions that will be evicted (direct conflicts + descendants).
         // Core policy/rbf.cpp:77-82.
+        //
+        // FIX-72 (W120 BUG-9 + BUG-10): use GetModifiedFee() — Core
+        // policy/rbf.cpp:104 reads `it->GetModifiedFee()`, NOT `it->GetFee()`,
+        // so a `prioritisetransaction`-bumped entry takes its higher modified
+        // fee into the original-fee sum and the replacement must beat that.
+        // Forward regression guard: tests/test_w120_mempool_rbf.rs source
+        // contains a `grep` assertion that this block does NOT read `entry.fee`
+        // directly — see `g11_modified_fee_unused_in_rbf_comparison_bug9`.
         let mut all_to_evict = HashSet::new();
         let mut conflicting_fees: u64 = 0;
 
         for conflict_txid in direct_conflicts {
             all_to_evict.insert(*conflict_txid);
             if let Some(entry) = self.transactions.get(conflict_txid) {
-                conflicting_fees += entry.fee;
+                conflicting_fees = conflicting_fees.saturating_add(Self::get_modified_fee(entry));
             }
 
             // Add all descendants.
             for desc in self.get_all_descendants(conflict_txid) {
                 if all_to_evict.insert(desc) {
                     if let Some(entry) = self.transactions.get(&desc) {
-                        conflicting_fees += entry.fee;
+                        conflicting_fees = conflicting_fees.saturating_add(Self::get_modified_fee(entry));
                     }
                 }
             }
@@ -3184,13 +3230,98 @@ impl Mempool {
 
     /// Override the fee delta on an existing entry.
     /// Used by `mempool_persist::load_mempool` to restore the prioritise
-    /// delta read from `mempool.dat`. Note: rustoshi does not yet
-    /// implement `prioritisetransaction`, so this only round-trips
-    /// data persisted by an external tool (or a future implementation).
+    /// delta read from `mempool.dat`. FIX-72 (W120 BUG-9 + BUG-10): now also
+    /// invoked by `prioritise_transaction` so the delta affects RBF Rule 3,
+    /// mining selection, and getmempoolentry RPC via `get_modified_fee`.
     pub fn set_entry_fee_delta(&mut self, txid: &Hash256, fee_delta: i64) {
         if let Some(entry) = self.transactions.get_mut(txid) {
             entry.fee_delta = fee_delta;
         }
+    }
+
+    /// Stack a `prioritisetransaction` fee delta onto a transaction's
+    /// modified-fee carrier.  Mirrors Bitcoin Core
+    /// `CTxMemPool::PrioritiseTransaction` (txmempool.cpp:630-655).
+    ///
+    /// Semantics:
+    /// - The delta is added to any existing delta for `txid` (stacks).
+    /// - If the txid is in the mempool, the corresponding `MempoolEntry`'s
+    ///   `fee_delta` is updated so `get_modified_fee` returns the new value
+    ///   immediately.  RBF, mining selection, and `getmempoolentry` then
+    ///   reflect the delta on the next call.
+    /// - If the txid is NOT in the mempool, the delta is still recorded in
+    ///   `map_deltas` so a subsequent admission picks it up via
+    ///   `apply_delta` (Core matches this).
+    /// - When the stacked delta returns to exactly zero the entry is
+    ///   removed from `map_deltas` (Core txmempool.cpp:644-646).
+    ///
+    /// Returns the new cumulative delta for the txid (post-stack).
+    /// W120 BUG-10 closure (FIX-72).
+    pub fn prioritise_transaction(&mut self, txid: &Hash256, fee_delta: i64) -> i64 {
+        // Saturating add to match Core's SaturatingAdd (txmempool.cpp:635).
+        let entry_delta = self.map_deltas.entry(*txid).or_insert(0);
+        *entry_delta = entry_delta.saturating_add(fee_delta);
+        let new_delta = *entry_delta;
+
+        if let Some(entry) = self.transactions.get_mut(txid) {
+            // Core: it->UpdateModifiedFee(nFeeDelta) — stack the delta on the
+            // existing entry.fee_delta, NOT replace with new_delta. The two
+            // are kept in sync because every call here updates both.
+            entry.fee_delta = entry.fee_delta.saturating_add(fee_delta);
+        }
+
+        if new_delta == 0 {
+            self.map_deltas.remove(txid);
+        }
+
+        new_delta
+    }
+
+    /// Modified fee for a transaction = base fee + prioritise delta, clamped
+    /// to zero on underflow.  Mirrors Bitcoin Core
+    /// `CTxMemPoolEntry::GetModifiedFee` (kernel/mempool_entry.h).
+    ///
+    /// Every fee comparison gate (RBF Rule 3, package admission,
+    /// mining selection, mempool min-fee, `getmempoolentry`) MUST go
+    /// through this helper rather than reading `entry.fee` directly.
+    /// W120 BUG-9 closure.
+    #[inline]
+    pub fn get_modified_fee(entry: &MempoolEntry) -> u64 {
+        if entry.fee_delta >= 0 {
+            entry.fee.saturating_add(entry.fee_delta as u64)
+        } else {
+            // Negative delta: subtract |delta| from base, clamp at 0.
+            entry.fee.saturating_sub((-entry.fee_delta) as u64)
+        }
+    }
+
+    /// Apply any pending delta for `txid` from `map_deltas` to a newly-admitted
+    /// entry's `fee_delta` field.  Mirrors Bitcoin Core `CTxMemPool::ApplyDelta`
+    /// (txmempool.cpp:657-665) called inside `addUnchecked`
+    /// (txmempool.cpp:1015).  Idempotent: callers may invoke at any time
+    /// (no-op when there is no pending delta).
+    fn apply_pending_delta(&mut self, txid: &Hash256) {
+        if let Some(&delta) = self.map_deltas.get(txid) {
+            if let Some(entry) = self.transactions.get_mut(txid) {
+                entry.fee_delta = delta;
+            }
+        }
+    }
+
+    /// Drop a pending delta for `txid` without affecting any existing entry.
+    /// Mirrors Bitcoin Core `CTxMemPool::ClearPrioritisation` (txmempool.cpp:667-671).
+    /// Called when a block confirms a prioritised tx so the delta does not
+    /// linger and re-apply to a future replacement with the same txid.
+    pub fn clear_prioritisation(&mut self, txid: &Hash256) {
+        self.map_deltas.remove(txid);
+    }
+
+    /// Snapshot of all currently-tracked `prioritisetransaction` deltas.
+    /// Used by `getprioritisedtransactions` RPC and by `mempool_persist`
+    /// when dumping `mempool.dat`.  Mirrors Bitcoin Core
+    /// `CTxMemPool::GetPrioritisedTransactions` (txmempool.cpp:673-688).
+    pub fn prioritised_deltas(&self) -> Vec<(Hash256, i64)> {
+        self.map_deltas.iter().map(|(k, v)| (*k, *v)).collect()
     }
 
     /// Collect all mempool transactions as `(txid, wtxid)` pairs.
@@ -4127,10 +4258,12 @@ impl Mempool {
             }
         }
 
-        // Handle TRUC sibling eviction
+        // Handle TRUC sibling eviction (package path).
         if let Some(sibling_txid) = sibling_to_evict {
             if let Some(sibling_entry) = self.transactions.get(&sibling_txid) {
-                let sibling_fee = sibling_entry.fee;
+                // FIX-72: use GetModifiedFee — same rationale as the
+                // standard add_transaction TRUC sibling path above.
+                let sibling_fee = Self::get_modified_fee(sibling_entry);
 
                 if fee <= sibling_fee {
                     return Err(MempoolError::RbfInsufficientAbsoluteFee(fee, sibling_fee));
@@ -4284,6 +4417,10 @@ impl Mempool {
         self.transactions.insert(txid, entry);
         // W96: maintain wtxid index in the package-admission path too.
         self.wtxid_index.insert(entry_wtxid, txid);
+
+        // FIX-72: replay any pending prioritisetransaction delta for this
+        // entry — package admission path mirrors the single-tx path.
+        self.apply_pending_delta(&txid);
 
         // Add to cluster structure and compute mining score
         self.add_to_clusters(txid, fee, vsize, &mempool_parents);
