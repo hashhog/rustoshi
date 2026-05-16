@@ -238,15 +238,15 @@
 //!
 //! ## Per-gate result table
 //!
-//!   G1  Receiver POST /payjoin endpoint              — MISSING — BUG-1
+//!   G1  Receiver POST /payjoin endpoint              — PRESENT (FIX-65) — BUG-1 closed
 //!   G2  Sender HTTP client POSTs Original PSBT      — MISSING — BUG-2
 //!   G3  TLS / HTTPS or .onion required by sender    — MISSING — BUG-3
-//!   G4  Original PSBT v0 deserialization on receiver — MISSING — BUG-4
-//!   G5  Receiver validates Original PSBT (no key leakage) — MISSING — BUG-4
-//!   G6  Receiver identifies fee output (additionalfeeoutputindex) — MISSING — BUG-5
-//!   G7  Receiver adds own inputs (anti-fingerprinting selection) — MISSING — BUG-6
+//!   G4  Original PSBT v0 deserialization on receiver — PRESENT (FIX-65) — BUG-4 partial closed
+//!   G5  Receiver validates Original PSBT (no key leakage) — PARTIAL (FIX-65 structural only; key-leakage in FIX-67) — BUG-4
+//!   G6  Receiver identifies fee output (additionalfeeoutputindex) — PARTIAL (FIX-65 plumbing; routing in FIX-67) — BUG-5
+//!   G7  Receiver adds own inputs (anti-fingerprinting selection) — PARTIAL (FIX-65 naive selector; UIH in FIX-67) — BUG-6
 //!   G8  Receiver modifies sender's output (substitution within rules) — MISSING — BUG-7
-//!   G9  Receiver adjusts fee (within maxadditionalfeecontribution) — MISSING — BUG-5
+//!   G9  Receiver adjusts fee (within maxadditionalfeecontribution) — PRESENT (FIX-65) — BUG-5 partial closed
 //!   G10 Sender anti-snoop: sender's outputs preserved — MISSING — BUG-8
 //!   G11 Sender anti-snoop: scriptSig types preserved — MISSING — BUG-8
 //!   G12 Sender anti-snoop: no new inputs from sender's wallet — MISSING — BUG-8
@@ -254,9 +254,9 @@
 //!   G14 Sender anti-snoop: disableoutputsubstitution honored — MISSING — BUG-10
 //!   G15 Sender anti-snoop: min-fee-rate respected — MISSING — BUG-9
 //!   G16 BIP-78 query params parsed                  — MISSING — BUG-11
-//!   G17 Receiver error responses (errorCode JSON)  — MISSING — BUG-12
+//!   G17 Receiver error responses (errorCode JSON)  — PRESENT (FIX-65) — BUG-12 closed
 //!   G18 Receiver expiration / TTL on offered payjoin — MISSING — BUG-13
-//!   G19 Receiver no-double-spending guard           — MISSING — BUG-13
+//!   G19 Receiver no-double-spending guard           — PRESENT (FIX-65) — BUG-13 partial
 //!   G20 Receiver UTXO selection anti-fingerprinting (UIH-1 / UIH-2) — MISSING — BUG-6
 //!   G21 Receiver PSBT version constant (BIP-78 v=1) — MISSING — BUG-11
 //!   G22 Sender max retry / fallback to original tx  — MISSING — BUG-14
@@ -269,12 +269,87 @@
 //!   G29 BIP-21 URI parser supports `pjos=`         — PRESENT (FIX-62) — BUG-16 closed
 //!   G30 Receiver replay protection (PSBT-id unique) — MISSING — BUG-13
 //!
-//! Totals: 30 MISSING ENTIRELY / 0 PARTIAL / 0 PRESENT.
-//!         16 bugs.
+//! Totals after FIX-65: 20 MISSING / 3 PARTIAL / 7 PRESENT (was 28/0/2).
+//!         16 bugs (BUG-1, BUG-12, BUG-16 fully closed;
+//!                  BUG-4, BUG-5, BUG-6, BUG-13 partial closure;
+//!                  BUG-2, BUG-3, BUG-7, BUG-8, BUG-9, BUG-10, BUG-11,
+//!                  BUG-14, BUG-15 still open).
+//!
+//! FIX-65 flipped: G1, G4 (receiver-side), G5, G6, G7, G9, G17, G19.
 
-use rustoshi_crypto::address::Network;
+use std::collections::HashMap;
+
+use rustoshi_crypto::address::{Address, Network};
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
-use rustoshi_wallet::{parse_bip21, Psbt};
+use rustoshi_wallet::payjoin::{
+    build_modified_psbt, decode_and_validate_original, find_receiver_output,
+    handle_payjoin_request, pick_receiver_utxo, validate_params, OfferedPayjoin, PayjoinError,
+    PayjoinParams, MAX_ORIGINAL_PSBT_BYTES,
+};
+use rustoshi_wallet::{parse_bip21, AddressType, Psbt, Wallet, WalletUtxo};
+
+/// Build a 1-in/1-out Original PSBT paying `recv_addr` `recv_value`
+/// satoshis. Used by FIX-65 gate flips (G4..G9, G17, G19) — the helper
+/// mirrors the one in `crates/wallet/src/payjoin.rs#tests`.
+fn make_original_psbt_for_addr(recv_addr: &str, recv_value: u64) -> Psbt {
+    let recv_spk = Address::from_string(recv_addr, Some(Network::Regtest))
+        .expect("parse recv addr")
+        .to_script_pubkey();
+    let tx = Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Hash256::from_bytes([0x01; 32]),
+                vout: 0,
+            },
+            script_sig: vec![],
+            sequence: 0xffff_fffd,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: recv_value,
+            script_pubkey: recv_spk,
+        }],
+        lock_time: 0,
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx).expect("psbt build");
+    psbt.inputs[0].witness_utxo = Some(TxOut {
+        value: recv_value + 10_000,
+        script_pubkey: {
+            let mut s = vec![0x00, 0x14];
+            s.extend_from_slice(&[0x77; 20]);
+            s
+        },
+    });
+    psbt
+}
+
+/// Build a Wallet with one P2WPKH UTXO at `value` sats and one fresh
+/// receive address. Returns `(wallet, recv_address)`.
+fn funded_wallet(seed_byte: u8, value: u64) -> (Wallet, String) {
+    let mut w = Wallet::from_seed(&[seed_byte; 64], Network::Regtest, AddressType::P2WPKH)
+        .expect("wallet from seed");
+    w.set_chain_height(200);
+    let addr = w.get_new_address().expect("fresh recv addr");
+    let path = w.get_derivation_path(&addr).unwrap().clone();
+    let spk = Address::from_string(&addr, Some(Network::Regtest))
+        .unwrap()
+        .to_script_pubkey();
+    w.add_utxo(WalletUtxo {
+        outpoint: OutPoint {
+            txid: Hash256::from_bytes([0xab; 32]),
+            vout: 0,
+        },
+        value,
+        script_pubkey: spk,
+        derivation_path: path,
+        confirmations: 10,
+        is_change: false,
+        is_coinbase: false,
+        height: Some(100),
+    });
+    (w, addr)
+}
 
 /// Local helper mirroring `test_w118_wallet::make_unsigned_tx`. Kept
 /// inline so this audit test compiles standalone without depending on
@@ -318,12 +393,34 @@ fn make_unsigned_tx(num_inputs: usize, num_outputs: usize) -> Transaction {
 // G1 — Receiver POST /payjoin endpoint
 // ============================================================
 #[test]
-#[ignore = "BUG-1: no POST /payjoin route registered on the axum REST router"]
-fn g1_receiver_post_payjoin_endpoint_bug1() {
-    // BUG-1: Expected: an HTTP POST handler accepting an Original
-    // PSBT body at a configurable PayJoin endpoint. Reality: no such
-    // route exists in crates/rpc/src/rest.rs.
-    panic!("BUG-1: Receiver HTTP endpoint MISSING ENTIRELY");
+fn g1_receiver_post_payjoin_endpoint_bug1_fix65() {
+    // FIX-65 closure: `POST /payjoin` is registered by
+    // `rustoshi_rpc::rest::rest_router_with_wallet` in
+    // crates/rpc/src/rest.rs. The full HTTP-level round-trip lives in
+    // `crates/rpc/tests/test_fix65_payjoin_receiver.rs`
+    // (`payjoin_round_trip_returns_modified_psbt`).
+    //
+    // Library-side: the receiver pipeline that the route invokes is
+    // importable as `rustoshi_wallet::payjoin::handle_payjoin_request`.
+    // We exercise it here to keep the audit binary self-contained — a
+    // successful end-to-end call proves the receiver foundation is
+    // wired regardless of whether the HTTP layer is being inspected.
+    let (wallet, addr) = funded_wallet(0xa1, 500_000);
+    let psbt = make_original_psbt_for_addr(&addr, 50_000);
+    let body = psbt.to_base64();
+    let params = PayjoinParams {
+        version: 1,
+        max_additional_fee_contribution: Some(1_000),
+        ..Default::default()
+    };
+    let offered = HashMap::new();
+    let res = handle_payjoin_request(body.as_bytes(), &params, &wallet, &offered)
+        .expect("FIX-65 receiver pipeline must accept a valid request");
+    assert_eq!(
+        res.modified_psbt.unsigned_tx.inputs.len(),
+        2,
+        "receiver adds exactly one input"
+    );
 }
 
 // ============================================================
@@ -366,42 +463,129 @@ fn g4_psbt_v0_deserialize_underlying_primitive_works() {
 }
 
 #[test]
-#[ignore = "BUG-4: no receiver path to feed Original PSBT into Psbt::deserialize"]
-fn g4_receiver_deserializes_original_psbt_bug4() {
-    // BUG-4: Underlying Psbt::deserialize exists (see test above),
-    // but no caller passes the HTTP POST body in.
-    panic!("BUG-4: receiver-side Original-PSBT deserialization path MISSING");
+fn g4_receiver_deserializes_original_psbt_bug4_fix65() {
+    // FIX-65 closure: `decode_and_validate_original` parses the base64
+    // body into a `Psbt` and rejects empty / over-sized / unparseable
+    // bodies (returning `PayjoinError::OriginalPsbtRejected`).
+    let (_w, addr) = funded_wallet(0xa2, 1_000_000);
+    let psbt = make_original_psbt_for_addr(&addr, 50_000);
+    let body = psbt.to_base64();
+    let parsed = decode_and_validate_original(body.as_bytes())
+        .expect("FIX-65 receiver must decode a well-formed Original PSBT");
+    assert_eq!(parsed.inputs.len(), 1, "one input on the original");
+    assert_eq!(parsed.outputs.len(), 1, "one output on the original");
+
+    // Oversize body is rejected with the BIP-78 wire code.
+    let oversize = vec![b'a'; MAX_ORIGINAL_PSBT_BYTES + 1];
+    let err = decode_and_validate_original(&oversize)
+        .expect_err("oversize body must reject");
+    assert_eq!(err.code(), "original-psbt-rejected");
 }
 
 // ============================================================
 // G5 — Receiver validates Original PSBT (no key info leakage)
 // ============================================================
 #[test]
-#[ignore = "BUG-4: no receiver-side validation: no caller checks key leakage / finalisation"]
-fn g5_receiver_validates_no_key_leakage_bug4() {
-    // BUG-4 (cont): BIP-78 receiver MUST reject Original PSBTs that
-    // expose unrelated wallet history (non_witness_utxo for segwit
-    // inputs) or sender HD-key origin info. Primitives exist; no
-    // caller.
-    panic!("BUG-4: receiver-side Original-PSBT validation MISSING");
+fn g5_receiver_validates_no_key_leakage_bug4_fix65() {
+    // FIX-65 foundation: the receiver pipeline enforces the
+    // structural validation BIP-78 requires before any receiver action
+    // is taken:
+    //   - every input MUST carry a `witness_utxo` or `non_witness_utxo`
+    //   - at least one output MUST pay a wallet-owned address.
+    //
+    // Full key-leakage policy (rejecting non_witness_utxo for segwit
+    // inputs, blocking key-origin info on sender inputs) lands with the
+    // sender-side anti-snoop work in FIX-66/FIX-67. The structural
+    // checks below are the receiver-foundation contract today.
+    let (wallet, _addr) = funded_wallet(0xa3, 1_000_000);
+
+    // Build a malformed PSBT: 1 input with NEITHER utxo view.
+    let tx = Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Hash256::from_bytes([0xcc; 32]),
+                vout: 0,
+            },
+            script_sig: vec![],
+            sequence: 0xffff_fffd,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: 50_000,
+            script_pubkey: {
+                let mut s = vec![0x00, 0x14];
+                s.extend_from_slice(&[0x44; 20]);
+                s
+            },
+        }],
+        lock_time: 0,
+    };
+    let psbt = Psbt::from_unsigned_tx(tx).expect("psbt");
+    let body = psbt.to_base64();
+    let err = decode_and_validate_original(body.as_bytes())
+        .expect_err("missing utxo view must reject");
+    assert_eq!(err.code(), "original-psbt-rejected");
+
+    // Build a valid-structure PSBT that pays NOBODY of the wallet —
+    // find_receiver_output should reject.
+    let outsider = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    let outsider_psbt = make_original_psbt_for_addr(outsider, 50_000);
+    let err = find_receiver_output(&outsider_psbt, &wallet)
+        .expect_err("PSBT must pay receiver wallet");
+    assert_eq!(err.code(), "original-psbt-rejected");
 }
 
 // ============================================================
 // G6 — Receiver identifies fee output (additionalfeeoutputindex)
 // ============================================================
 #[test]
-#[ignore = "BUG-5: no receiver code parses additionalfeeoutputindex query param"]
-fn g6_receiver_identifies_fee_output_bug5() {
-    panic!("BUG-5: additionalfeeoutputindex parsing + lookup MISSING");
+fn g6_receiver_identifies_fee_output_bug5_fix65() {
+    // FIX-65 closure: `PayjoinParams::additional_fee_output_index` is
+    // parsed off the query string by the REST handler and propagated
+    // into the receiver pipeline. The receiver foundation deducts the
+    // delta-fee from the receiver-output (not the additional-fee
+    // output) — full additional_fee_output_index routing lands with
+    // BUG-9 in FIX-67. Today we just exercise the param plumbing.
+    let p = PayjoinParams {
+        version: 1,
+        additional_fee_output_index: Some(3),
+        max_additional_fee_contribution: Some(1_000),
+        ..Default::default()
+    };
+    validate_params(&p).expect("v=1 with idx must pass");
+    assert_eq!(p.additional_fee_output_index, Some(3));
 }
 
 // ============================================================
 // G7 — Receiver adds own inputs (anti-fingerprinting selection)
 // ============================================================
 #[test]
-#[ignore = "BUG-6: no receiver-side UIH-aware coin selection"]
-fn g7_receiver_adds_own_inputs_bug6() {
-    panic!("BUG-6: receiver-side input addition MISSING");
+fn g7_receiver_adds_own_inputs_bug6_fix65() {
+    // FIX-65 foundation: receiver picks a single wallet UTXO and
+    // appends it to the PSBT. The selector is naive (first eligible)
+    // — UIH-1 / UIH-2 anti-fingerprinting lands in FIX-67 (G20).
+    let (wallet, addr) = funded_wallet(0xa4, 1_500_000);
+    let psbt = make_original_psbt_for_addr(&addr, 50_000);
+    let (recv_idx, _addr) =
+        find_receiver_output(&psbt, &wallet).expect("recv output exists");
+
+    let offered = HashMap::new();
+    let utxo = pick_receiver_utxo(&wallet, &offered).expect("UTXO available");
+    assert_eq!(utxo.value, 1_500_000, "selected the funded UTXO");
+
+    let res = build_modified_psbt(&wallet, psbt, recv_idx, utxo.clone(), 68)
+        .expect("modify PSBT");
+    assert_eq!(
+        res.modified_psbt.unsigned_tx.inputs.len(),
+        2,
+        "one input added"
+    );
+    assert_eq!(
+        res.modified_psbt.unsigned_tx.inputs[1].previous_output,
+        utxo.outpoint,
+        "appended input references the selected UTXO"
+    );
 }
 
 // ============================================================
@@ -417,9 +601,70 @@ fn g8_receiver_output_substitution_bug7() {
 // G9 — Receiver adjusts fee within maxadditionalfeecontribution
 // ============================================================
 #[test]
-#[ignore = "BUG-5: no receiver fee-adjustment path"]
-fn g9_receiver_adjusts_fee_within_cap_bug5() {
-    panic!("BUG-5: receiver-side fee adjustment MISSING");
+fn g9_receiver_adjusts_fee_within_cap_bug5_fix65() {
+    // FIX-65 closure: `handle_payjoin_request` honors the sender's
+    // `maxadditionalfeecontribution` cap. With cap=1000 sat, the
+    // receiver's delta-fee is clamped at 1000 — verified by checking
+    // the resulting `ReceiverContribution::delta_fee_sats`.
+    //
+    // With cap=0, the receiver may not deduct anything: the receiver
+    // output is bumped by the FULL input value, leaving the sender to
+    // pay every extra sat of fee out of its own change.
+    let (wallet, addr) = funded_wallet(0xa5, 2_000_000);
+    let psbt = make_original_psbt_for_addr(&addr, 50_000);
+    let body = psbt.to_base64();
+    let offered = HashMap::new();
+
+    let res_capped = handle_payjoin_request(
+        body.as_bytes(),
+        &PayjoinParams {
+            version: 1,
+            max_additional_fee_contribution: Some(1_000),
+            ..Default::default()
+        },
+        &wallet,
+        &offered,
+    )
+    .expect("cap=1000 must succeed");
+    assert!(
+        res_capped.delta_fee_sats <= 1_000,
+        "delta_fee {} must respect cap=1000",
+        res_capped.delta_fee_sats
+    );
+
+    let res_zero_cap = handle_payjoin_request(
+        body.as_bytes(),
+        &PayjoinParams {
+            version: 1,
+            max_additional_fee_contribution: Some(0),
+            ..Default::default()
+        },
+        &wallet,
+        &offered,
+    )
+    .expect("cap=0 must succeed (receiver deducts nothing)");
+    assert_eq!(
+        res_zero_cap.delta_fee_sats, 0,
+        "zero cap means zero deduction"
+    );
+
+    // Default (no cap) → receiver deducts nothing per the foundation
+    // policy (BIP-78 says receiver MAY add fee; foundation says "only
+    // when explicitly authorised").
+    let res_no_cap = handle_payjoin_request(
+        body.as_bytes(),
+        &PayjoinParams {
+            version: 1,
+            ..Default::default()
+        },
+        &wallet,
+        &offered,
+    )
+    .expect("no cap must still succeed");
+    assert_eq!(
+        res_no_cap.delta_fee_sats, 0,
+        "no cap means no deduction"
+    );
 }
 
 // ============================================================
@@ -491,16 +736,29 @@ fn g16_query_params_parsed_bug11() {
 // G17 — Receiver error responses (errorCode JSON body)
 // ============================================================
 #[test]
-#[ignore = "BUG-12: no errorCode-shaped JSON body anywhere; RPC errors use jsonrpsee envelope"]
-fn g17_receiver_error_envelope_shape_bug12() {
-    // BIP-78 specifies the response body shape:
-    //   `{"errorCode": "unavailable" | "not-enough-money" |
-    //    "version-unsupported" | "original-psbt-rejected",
-    //    "message": "..."}`
-    // The RPC layer uses jsonrpsee's `{"jsonrpc":"2.0","error":
-    //   {"code":N,"message":"..."}}`; the REST layer uses
-    //   `RestError`. Neither matches BIP-78.
-    panic!("BUG-12: BIP-78 errorCode response shape MISSING");
+fn g17_receiver_error_envelope_shape_bug12_fix65() {
+    // FIX-65 closure: BIP-78's `{"errorCode": ..., "message": ...}`
+    // shape is produced by `PayjoinError::code()` (wire string) +
+    // `PayjoinError::http_status()` (HTTP code). The REST handler at
+    // `crates/rpc/src/rest.rs::payjoin_error_response` serialises
+    // these into the response body verbatim. End-to-end JSON
+    // assertions live in `crates/rpc/tests/test_fix65_payjoin_
+    // receiver.rs`. Library-side: every BIP-78 wire variant is
+    // available.
+    assert_eq!(PayjoinError::VersionUnsupported(2).code(), "version-unsupported");
+    assert_eq!(PayjoinError::VersionUnsupported(2).http_status(), 415);
+    assert_eq!(
+        PayjoinError::OriginalPsbtRejected("x".into()).code(),
+        "original-psbt-rejected"
+    );
+    assert_eq!(
+        PayjoinError::OriginalPsbtRejected("x".into()).http_status(),
+        400
+    );
+    assert_eq!(PayjoinError::NotEnoughMoney.code(), "not-enough-money");
+    assert_eq!(PayjoinError::NotEnoughMoney.http_status(), 422);
+    assert_eq!(PayjoinError::Unavailable("x".into()).code(), "unavailable");
+    assert_eq!(PayjoinError::Unavailable("x".into()).http_status(), 503);
 }
 
 // ============================================================
@@ -516,9 +774,30 @@ fn g18_receiver_offered_payjoin_ttl_bug13() {
 // G19 — Receiver no-double-spending guard
 // ============================================================
 #[test]
-#[ignore = "BUG-13: no offered-UTXO reservation"]
-fn g19_receiver_no_double_spending_guard_bug13() {
-    panic!("BUG-13: offered-UTXO reservation MISSING");
+fn g19_receiver_no_double_spending_guard_bug13_fix65() {
+    // FIX-65 closure: `pick_receiver_utxo` skips outpoints that appear
+    // in the caller-supplied `offered_payjoins` map. The REST handler
+    // commits each accepted offer into the map before responding, so a
+    // second concurrent request with a different Original PSBT cannot
+    // be offered the same receiver UTXO. Full TTL eviction lands in
+    // FIX-68 (G18); the conflict guard is in place today.
+    let (wallet, _addr) = funded_wallet(0xa6, 2_000_000);
+
+    // First call: empty offered map → pick succeeds.
+    let mut offered: HashMap<Hash256, OfferedPayjoin> = HashMap::new();
+    let first = pick_receiver_utxo(&wallet, &offered).expect("first pick");
+    offered.insert(
+        Hash256::from_bytes([0x1f; 32]),
+        OfferedPayjoin {
+            receiver_outpoint: first.outpoint.clone(),
+            created_at: 1_700_000_000,
+        },
+    );
+
+    // Second call: only one UTXO exists, and it's already offered →
+    // not-enough-money per the BIP-78 wire code.
+    let err = pick_receiver_utxo(&wallet, &offered).expect_err("conflict");
+    assert_eq!(err.code(), "not-enough-money");
 }
 
 // ============================================================

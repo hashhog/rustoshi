@@ -32,12 +32,13 @@
 
 use crate::server::RpcState;
 use crate::types::*;
+use crate::wallet::WalletRpcState;
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use rustoshi_consensus::COIN;
@@ -46,11 +47,15 @@ use rustoshi_storage::block_store::BlockStore;
 use rustoshi_storage::indexes::blockfilterindex::{
     BlockFilterIndex, BlockFilterType,
 };
-use serde::Serialize;
+use rustoshi_wallet::payjoin::{
+    handle_payjoin_request, OfferedPayjoin, PayjoinError, PayjoinParams,
+    MAX_ORIGINAL_PSBT_BYTES,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 // ============================================================
 // CONSTANTS
@@ -198,6 +203,19 @@ impl IntoResponse for RestError {
 pub struct RestState {
     /// Chain state (shared with RPC).
     pub rpc_state: Arc<RwLock<RpcState>>,
+    /// Wallet state, populated when the binary mounts the wallet RPC.
+    ///
+    /// Currently only consumed by the `POST /payjoin` BIP-78 receiver
+    /// endpoint (FIX-65). Requests arriving when this is `None` are
+    /// answered with HTTP 503 + `{"errorCode":"unavailable", ...}` per
+    /// BIP-78 §"Receiver's well known errors".
+    pub wallet_state: Option<Arc<RwLock<WalletRpcState>>>,
+    /// In-flight PayJoin offers, keyed by Original-PSBT unsigned-tx
+    /// hash. Receiver UTXOs that appear in any value of this map are
+    /// excluded from new-offer coin selection (G19 replay/conflict
+    /// guard). Held outside the wallet to keep FIX-61's `sent_txs`
+    /// single-purpose (outgoing-only).
+    pub offered_payjoins: Mutex<HashMap<Hash256, OfferedPayjoin>>,
 }
 
 // ============================================================
@@ -1566,8 +1584,23 @@ pub async fn start_rest_server(
     config: RestConfig,
     rpc_state: Arc<RwLock<RpcState>>,
 ) -> anyhow::Result<RestServerHandle> {
+    start_rest_server_with_wallet(config, rpc_state, None).await
+}
+
+/// Like [`start_rest_server`], but also mounts the BIP-78 PayJoin
+/// receiver endpoint backed by `wallet_state` when `Some`. The
+/// JSON-RPC wallet endpoints continue to live on the jsonrpsee listener
+/// — only the receiver-side HTTP surface is added here.
+///
+/// Reference: BIP-78 §"Protocol", and the FIX-64 + FIX-65 design notes
+/// in `crates/rpc/src/payjoin.rs` (formerly `crates/wallet/src/payjoin.rs`).
+pub async fn start_rest_server_with_wallet(
+    config: RestConfig,
+    rpc_state: Arc<RwLock<RpcState>>,
+    wallet_state: Option<Arc<RwLock<WalletRpcState>>>,
+) -> anyhow::Result<RestServerHandle> {
     let listener = TcpListener::bind(&config.bind_address).await?;
-    let router = rest_router(rpc_state);
+    let router = rest_router_with_wallet(rpc_state, wallet_state);
     let join = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
             tracing::error!("REST server exited: {}", e);
@@ -1577,12 +1610,224 @@ pub async fn start_rest_server(
 }
 
 // ============================================================
+// BIP-78 PAYJOIN RECEIVER (W119 / FIX-65)
+// ============================================================
+
+/// Query parameters defined by BIP-78 §"Protocol" for the sender's
+/// `POST /payjoin` request.
+///
+/// Optional fields default to `None`; the receiver foundation only
+/// enforces `v=1` today (everything else is captured for future
+/// fee-cap / fee-rate enforcement in FIX-66+).
+#[derive(Debug, Deserialize)]
+struct PayjoinQuery {
+    /// `v=` — BIP-78 protocol version. Required.
+    #[serde(default)]
+    v: Option<u32>,
+    /// `additionalfeeoutputindex=` — sender's hint at which output to
+    /// draw additional fees from.
+    #[serde(default)]
+    additionalfeeoutputindex: Option<usize>,
+    /// `maxadditionalfeecontribution=` — cap on receiver-added fee.
+    #[serde(default)]
+    maxadditionalfeecontribution: Option<u64>,
+    /// `disableoutputsubstitution=` — Boolean serialised as a 0/1 query
+    /// string per BIP-78 §"Optional parameters".
+    #[serde(default)]
+    disableoutputsubstitution: Option<u8>,
+    /// `minfeerate=` — sat/vB.
+    #[serde(default)]
+    minfeerate: Option<f64>,
+}
+
+impl PayjoinQuery {
+    fn into_params(self) -> PayjoinParams {
+        PayjoinParams {
+            // Missing v is treated as version 0 so the validator emits
+            // `version-unsupported` instead of letting an unversioned
+            // request fall through. Matches the BIP-78 wording "v=1".
+            version: self.v.unwrap_or(0),
+            additional_fee_output_index: self.additionalfeeoutputindex,
+            max_additional_fee_contribution: self.maxadditionalfeecontribution,
+            disable_output_substitution: matches!(self.disableoutputsubstitution, Some(1)),
+            min_fee_rate: self.minfeerate,
+        }
+    }
+}
+
+/// Build a BIP-78 JSON error body + the matching HTTP status. The
+/// payload shape is fixed by the spec:
+/// `{"errorCode": "...", "message": "..."}`.
+fn payjoin_error_response(err: &PayjoinError) -> Response {
+    let body = serde_json::json!({
+        "errorCode": err.code(),
+        "message": err.to_string(),
+    });
+    let status = StatusCode::from_u16(err.http_status())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Cap on the request body size before we even try to base64-decode.
+/// BIP-78 specifies that implementations may reject oversize bodies;
+/// we apply the same 8 KiB ceiling as the payjoin module itself uses
+/// for the post-decode shape check, which is overkill for raw bytes
+/// but trivially safe.
+const PAYJOIN_REQUEST_BODY_LIMIT: usize = MAX_ORIGINAL_PSBT_BYTES;
+
+/// POST /payjoin — BIP-78 receiver endpoint.
+///
+/// Flow:
+///  1. Validate query params (only `v=1` is accepted today).
+///  2. Read the request body (text/plain base64 Original PSBT), bounded
+///     by [`PAYJOIN_REQUEST_BODY_LIMIT`].
+///  3. Acquire the wallet handle and require it unlocked; if either
+///     fails, answer with HTTP 503 `unavailable`.
+///  4. Call into [`handle_payjoin_request`] which runs the structural
+///     PSBT checks, picks a receiver UTXO that isn't already in
+///     `offered_payjoins`, augments the PSBT, signs the receiver input,
+///     and returns the modified PSBT.
+///  5. Commit the offer into `offered_payjoins` (key = Original PSBT
+///     unsigned-tx hash) so subsequent concurrent requests don't pick
+///     the same receiver UTXO.
+///  6. Respond `200 text/plain` with the base64 PSBT body. The sender
+///     is responsible for signing its own inputs and broadcasting
+///     (BIP-78 §"Sender's actions").
+async fn payjoin_handler(
+    State(state): State<Arc<RestState>>,
+    Query(query): Query<PayjoinQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    // 1. Body size guard.
+    if body.len() > PAYJOIN_REQUEST_BODY_LIMIT {
+        return payjoin_error_response(&PayjoinError::OriginalPsbtRejected(format!(
+            "request body exceeds {} byte limit",
+            PAYJOIN_REQUEST_BODY_LIMIT
+        )));
+    }
+
+    let params = query.into_params();
+
+    // 2. Validate version FIRST so the wire `version-unsupported` path
+    //    runs even when the receiver wallet is locked / absent.
+    if let Err(e) = rustoshi_wallet::payjoin::validate_params(&params) {
+        return payjoin_error_response(&e);
+    }
+
+    // 3. Resolve the wallet handle. Absent → `unavailable`.
+    let wallet_state = match &state.wallet_state {
+        Some(ws) => ws.clone(),
+        None => {
+            return payjoin_error_response(&PayjoinError::Unavailable(
+                "receiver wallet is not loaded".to_string(),
+            ));
+        }
+    };
+
+    // 4. Take a snapshot of in-flight offers under the dedicated lock
+    //    (held only for the snapshot — the wallet read happens with the
+    //    map lock dropped to avoid two-lock ordering hazards).
+    let offered_snapshot: HashMap<Hash256, OfferedPayjoin> =
+        state.offered_payjoins.lock().await.clone();
+
+    // 5. Acquire wallet read lock + require the active wallet unlocked.
+    let result = {
+        let wallet_state_guard = wallet_state.read().await;
+        let (name, wallet_arc) = match wallet_state_guard
+            .wallet_manager
+            .get_wallet_or_default(None)
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                return payjoin_error_response(&PayjoinError::Unavailable(format!(
+                    "no active wallet: {e}"
+                )));
+            }
+        };
+        if let Err(e) = wallet_state_guard.wallet_manager.require_unlocked(&name) {
+            return payjoin_error_response(&PayjoinError::Unavailable(format!(
+                "wallet '{name}' locked: {e}"
+            )));
+        }
+
+        let wallet_guard = match wallet_arc.lock() {
+            Ok(w) => w,
+            Err(_) => {
+                return payjoin_error_response(&PayjoinError::Unavailable(
+                    "wallet lock poisoned".to_string(),
+                ));
+            }
+        };
+
+        handle_payjoin_request(body.as_ref(), &params, &wallet_guard, &offered_snapshot)
+    };
+
+    let contribution = match result {
+        Ok(c) => c,
+        Err(e) => return payjoin_error_response(&e),
+    };
+
+    // 6. Commit the offer. Key = unsigned-tx hash of the ORIGINAL psbt;
+    //    we reconstruct it from the modified psbt by dropping the
+    //    last (receiver-added) input. Cheaper and equally unique: use
+    //    the modified-tx hash since each PayJoin yields a distinct one.
+    let psbt_id = contribution.modified_psbt.unsigned_tx.txid();
+    {
+        let mut offered = state.offered_payjoins.lock().await;
+        offered.insert(
+            psbt_id,
+            OfferedPayjoin {
+                receiver_outpoint: contribution.added_utxo.outpoint.clone(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            },
+        );
+    }
+
+    let body_b64 = contribution.modified_psbt.to_base64();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from(body_b64))
+        .unwrap()
+}
+
+// ============================================================
 // ROUTER
 // ============================================================
 
-/// Create the REST API router.
+/// Create the REST API router (legacy, no wallet wiring).
+///
+/// Equivalent to `rest_router_with_wallet(rpc_state, None)`. Retained for
+/// callers and existing tests that never need the PayJoin endpoint.
 pub fn rest_router(rpc_state: Arc<RwLock<RpcState>>) -> Router {
-    let state = Arc::new(RestState { rpc_state });
+    rest_router_with_wallet(rpc_state, None)
+}
+
+/// Create the REST API router, optionally mounting the BIP-78 PayJoin
+/// receiver endpoint when `wallet_state` is `Some`.
+///
+/// The PayJoin route is unconditionally registered — when `wallet_state`
+/// is `None` the handler simply answers HTTP 503 +
+/// `{"errorCode":"unavailable", ...}` per BIP-78. This is intentional:
+/// it keeps the route surface deterministic regardless of binary
+/// configuration so a sender that hits the URL gets a structured
+/// answer rather than a 404.
+pub fn rest_router_with_wallet(
+    rpc_state: Arc<RwLock<RpcState>>,
+    wallet_state: Option<Arc<RwLock<WalletRpcState>>>,
+) -> Router {
+    let state = Arc::new(RestState {
+        rpc_state,
+        wallet_state,
+        offered_payjoins: Mutex::new(HashMap::new()),
+    });
 
     // axum 0.7 uses matchit 0.7 syntax: `:name` for single-segment params
     // and `*name` for catch-all. Bitcoin Core's REST URI table is in
@@ -1604,6 +1849,11 @@ pub fn rest_router(rpc_state: Arc<RwLock<RpcState>>) -> Router {
         // `<filtertype>/<...>.<format>` for the handler to parse.
         .route("/rest/blockfilter/*path", get(rest_blockfilter))
         .route("/rest/blockfilterheaders/*path", get(rest_blockfilterheaders))
+        // BIP-78 PayJoin receiver endpoint (W119 / FIX-65). Lives at the
+        // unprefixed `/payjoin` URL so a BIP-21 `bitcoin:?pj=<host>/payjoin`
+        // URI fits the typical receiver-vending pattern without leaking
+        // the REST URI prefix into the spec.
+        .route("/payjoin", post(payjoin_handler))
         .with_state(state)
 }
 
