@@ -5202,6 +5202,21 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Accept the package
         let result = state.mempool.accept_package(txs.clone(), &utxo_lookup);
 
+        // FIX-73 (W120 BUG-5): accumulate the deduped, sorted union of every
+        // per-tx replaced txid. Mirrors Bitcoin Core `rpc/mempool.cpp:1460-1510`
+        // (`std::set<Txid> replaced_txids` populated from
+        // `tx_result.m_replaced_transactions` and emitted as the top-level
+        // `replaced-transactions` array). Previously hardcoded to `None`,
+        // dropping the BIP-125 / package-RBF eviction set entirely.
+        let mut replaced_set: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for tx_result in result.tx_results.iter() {
+            for replaced in &tx_result.replaced_txids {
+                replaced_set.insert(replaced.to_hex());
+            }
+        }
+        let replaced_transactions: Vec<String> = replaced_set.into_iter().collect();
+
         // Build the RPC response
         let mut tx_results_map = HashMap::new();
 
@@ -5301,7 +5316,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             package_feerate,
             package_msg,
             tx_results: tx_results_map,
-            replaced_transactions: None, // TODO: track RBF replacements
+            // FIX-73 (W120 BUG-5): populated above from per-tx
+            // PackageTxResult.replaced_txids — no longer a TODO.
+            replaced_transactions,
         })
     }
 

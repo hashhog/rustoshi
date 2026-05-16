@@ -946,9 +946,14 @@ pub struct SubmitPackageResult {
     /// Per-transaction results, keyed by wtxid.
     #[serde(rename = "tx-results")]
     pub tx_results: std::collections::HashMap<String, PackageTxResultRpc>,
-    /// List of txids that were replaced (RBF).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replaced_transactions: Option<Vec<String>>,
+    /// List of txids that were replaced (RBF + TRUC sibling eviction).
+    ///
+    /// FIX-73 (W120 BUG-5): wire field is `replaced-transactions` (kebab-case)
+    /// to match Bitcoin Core `rpc/mempool.cpp:1510`. Previously emitted as
+    /// snake_case `replaced_transactions` AND always-`None`. Both flaws
+    /// blinded BIP-125 / package-RBF consumers to the eviction set.
+    #[serde(rename = "replaced-transactions")]
+    pub replaced_transactions: Vec<String>,
 }
 
 // ============================================================
@@ -2099,5 +2104,65 @@ mod tests {
         assert!(json.contains("\"reachable\":true"));
         assert!(json.contains("\"proxy\":\"127.0.0.1:9050\""));
         assert!(json.contains("\"proxy_randomize_credentials\":true"));
+    }
+
+    // ============================================================
+    // FIX-73 (W120 BUG-5): SubmitPackageResult.replaced-transactions
+    // ============================================================
+
+    /// FIX-73 — `SubmitPackageResult.replaced_transactions` is emitted as the
+    /// kebab-cased key `replaced-transactions` (matching Bitcoin Core
+    /// `rpc/mempool.cpp:1510`) and is a plain JSON array, never `null`.
+    /// Forward-regression guard: rejects the pre-fix shape where the field was
+    /// `Option<Vec<String>>` with `skip_serializing_if = "Option::is_none"` and
+    /// hardcoded to `None` (so the key was absent entirely).
+    #[test]
+    fn test_submit_package_result_replaced_transactions_shape_fix73() {
+        let result = SubmitPackageResult {
+            package_feerate: None,
+            package_msg: "success".to_string(),
+            tx_results: std::collections::HashMap::new(),
+            replaced_transactions: vec![
+                "aa".repeat(32),
+                "bb".repeat(32),
+            ],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            json.contains("\"replaced-transactions\":["),
+            "FIX-73 (W120 BUG-5): wire key must be kebab-case \
+             'replaced-transactions' matching Core; got {}",
+            json
+        );
+        assert!(
+            !json.contains("\"replaced_transactions\""),
+            "FIX-73: pre-fix snake_case key must not appear (would break \
+             Core-compat clients); got {}",
+            json
+        );
+        assert!(json.contains(&"aa".repeat(32)));
+        assert!(json.contains(&"bb".repeat(32)));
+
+        // Empty case must still emit the key as `[]`, never null nor absent —
+        // BIP-125 / package-RBF consumers rely on key presence to disambiguate
+        // "no replacements" from "field not implemented".
+        let empty = SubmitPackageResult {
+            package_feerate: None,
+            package_msg: "success".to_string(),
+            tx_results: std::collections::HashMap::new(),
+            replaced_transactions: vec![],
+        };
+        let json_empty = serde_json::to_string(&empty).unwrap();
+        assert!(
+            json_empty.contains("\"replaced-transactions\":[]"),
+            "FIX-73: empty replaced-transactions must be `[]`, not null/absent; \
+             got {}",
+            json_empty
+        );
+
+        // Roundtrip: deserialize must accept the Core-shape key and preserve
+        // contents.
+        let parsed: SubmitPackageResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.replaced_transactions.len(), 2);
     }
 }
