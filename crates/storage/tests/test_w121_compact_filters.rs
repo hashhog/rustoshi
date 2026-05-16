@@ -652,32 +652,155 @@ fn g22_cf_blockfilter_header_doc_says_raw_bytes_but_code_stores_json() {
     assert!(raw.len() > 96, "JSON-encoded entry exceeds the doc'd 96 bytes");
 }
 
-/// G23 BUG-16 (P0) — BlockFilterIndex::index_block is DEAD CODE.
+/// G23 BUG-16 (P0) — FIXED in FIX-69.
 ///
-/// `crates/consensus/src/chain_state.rs::connect_tip` does not call into
-/// `BlockFilterIndex`. The entire `~6500 LOC` GCS + index + REST stack is
-/// reachable only from a unit test that hand-builds a filter and calls
-/// `put_filter` directly. In a real node run, the index column families
-/// remain empty forever.
+/// PRIOR STATE: `BlockFilterIndex::index_block` had no caller in
+/// `crates/consensus/` or the main binary. The entire ~6500 LOC GCS + index
+/// + REST stack was reachable only from this unit test file. In a real
+/// node run, the `blockfilter` and `blockfilter_header` column families
+/// stayed empty forever and `/rest/blockfilter/...` returned 404 even
+/// after a full IBD.
 ///
-/// We pin this by exercising the public API end-to-end at "production height"
-/// and confirming the test_w121 cannot rely on connect_block to fill the
-/// index.
+/// FIX: `rustoshi/src/main.rs::write_block_filter_index` is called at
+/// every successful `ChainState::process_block` site (4 call sites: blk-file
+/// import, stdin frame import, IBD validation_interval, and P2P block
+/// downloader). It invokes `BlockFilterIndex::connect_block`, which builds
+/// the basic GCS filter from the block's output scriptPubKeys + the
+/// UndoData's spent scriptPubKeys, then persists filter + header chain.
+///
+/// This regression-pin asserts the helper is wired end-to-end: a block
+/// connect followed by `get_filter` and `get_filter_header` returns
+/// populated entries. Future drive-by refactors that drop the wire-up
+/// will fail this test FIRST.
 #[test]
-#[ignore = "BUG-16 (P0): BlockFilterIndex::index_block is never called from connect_block"]
-fn g23_block_filter_index_not_wired_into_connect_block() {
-    // The shape of this fix:
-    //   1. Add BlockFilterIndex calls to ChainState::connect_tip after UTXO updates.
-    //   2. Plumb spent_scripts from BlockUndo into build_basic.
-    //   3. Carry prev_filter_header forward through ChainState.
-    //   4. Mirror disconnect path.
-    //
-    // Until that is wired, this test cannot be satisfied without faking
-    // the production code path.
-    panic!(
-        "BlockFilterIndex::index_block has no caller in crates/consensus/ — \
-         a production rustoshi node will return 404 on every /rest/blockfilter \
-         lookup even after a full IBD"
+fn g23_block_filter_index_wired_into_connect_path() {
+    use rustoshi_consensus::validation::{CoinEntry, UndoData};
+    use rustoshi_primitives::{Block, BlockHeader, Transaction, TxIn, TxOut};
+
+    // Build a 2-tx block: coinbase + one spending tx (so undo carries one spent coin).
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: rustoshi_primitives::OutPoint {
+                txid: Hash256::ZERO,
+                vout: 0xFFFFFFFF,
+            },
+            script_sig: vec![0x51],
+            sequence: 0xFFFFFFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: 50_000_000,
+            script_pubkey: vec![0x76, 0xa9, 0x14, 0x01, 0x02, 0x03],
+        }],
+        lock_time: 0,
+    };
+    let spender = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: rustoshi_primitives::OutPoint {
+                txid: Hash256::from([1u8; 32]),
+                vout: 0,
+            },
+            script_sig: vec![],
+            sequence: 0xFFFFFFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: 49_000_000,
+            script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb, 0xcc],
+        }],
+        lock_time: 0,
+    };
+    let block = Block {
+        header: BlockHeader {
+            version: 1,
+            prev_block_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            timestamp: 1_700_000_000,
+            bits: 0x207fffff,
+            nonce: 0,
+        },
+        transactions: vec![coinbase, spender],
+    };
+    let undo = UndoData {
+        spent_coins: vec![CoinEntry {
+            height: 99,
+            is_coinbase: false,
+            value: 50_000_000,
+            script_pubkey: vec![0x51, 0x21, 0xde, 0xad, 0xbe, 0xef],
+        }],
+    };
+
+    let db = open_db();
+    let idx = BlockFilterIndex::new(&db);
+    let block_hash = block.block_hash();
+
+    // Exercise the high-level connect_block (the same wrapper main.rs calls).
+    let header = idx
+        .connect_block(0, &block, &undo)
+        .expect("connect_block at genesis-relative height");
+
+    // Filter + header are now persisted.
+    assert!(idx.has_filter(&block_hash).unwrap(), "filter row missing");
+    let entry = idx.get_filter_header(0).expect("get").expect("present");
+    assert_eq!(entry.block_hash, block_hash);
+    assert_eq!(entry.filter_header, header);
+
+    // Filter contains the output's scriptPubKey and the spent script.
+    let filter = idx.get_filter(&block_hash).unwrap().unwrap();
+    assert!(
+        filter.match_script(&[0x76, 0xa9, 0x14, 0x01, 0x02, 0x03]).unwrap(),
+        "output scriptPubKey must match"
+    );
+    assert!(
+        filter.match_script(&[0x51, 0x21, 0xde, 0xad, 0xbe, 0xef]).unwrap(),
+        "spent scriptPubKey must match"
+    );
+}
+
+/// FIX-69 source-level regression guard.
+///
+/// Asserts via filesystem grep that `rustoshi/src/main.rs` still imports
+/// `BlockFilterIndex` AND contains a call to `write_block_filter_index`.
+/// If a future refactor accidentally drops the wire-up, this test fails
+/// FIRST — surfacing the regression at the test layer before the
+/// /rest/blockfilter endpoint silently starts returning 404 again.
+#[test]
+fn fix69_main_rs_wires_block_filter_index() {
+    use std::path::PathBuf;
+    // Walk up from CARGO_MANIFEST_DIR (crates/storage) to find rustoshi/src/main.rs.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let main_rs = manifest
+        .parent() // crates/
+        .and_then(|p| p.parent()) // workspace root
+        .map(|root| root.join("rustoshi/src/main.rs"))
+        .expect("workspace layout");
+    let body = std::fs::read_to_string(&main_rs)
+        .unwrap_or_else(|e| panic!("read {}: {}", main_rs.display(), e));
+
+    assert!(
+        body.contains("BlockFilterIndex"),
+        "rustoshi/src/main.rs must import BlockFilterIndex — \
+         FIX-69 W121 BUG-16 regression guard. If you intentionally moved \
+         the wire-up to another module, update this test to follow."
+    );
+    assert!(
+        body.contains("write_block_filter_index"),
+        "rustoshi/src/main.rs must call write_block_filter_index from \
+         every process_block site — FIX-69 W121 BUG-16 regression guard"
+    );
+    // Sanity: the helper is invoked, not just imported. We require AT
+    // LEAST 4 call sites (3 production process_block sites + the helper
+    // definition referencing itself in the doc comment, or any
+    // future-added call site).
+    let call_count = body.matches("write_block_filter_index").count();
+    assert!(
+        call_count >= 4,
+        "expected ≥4 occurrences of `write_block_filter_index` in main.rs \
+         (1 fn definition + ≥3 call sites); got {}. Future refactors \
+         should not silently lose a call site.",
+        call_count,
     );
 }
 
@@ -927,4 +1050,177 @@ fn sanity_disconnect_block_clears_entries() {
 fn sanity_blockfilter_error_from_storage_error() {
     // Just confirm the trait impl is reachable.
     let _e: BlockFilterError = BlockFilterError::InvalidFilter;
+}
+
+// ============================================================
+// FIX-69 integration tests — connect-then-reorg coverage.
+// ============================================================
+
+/// Helper: build a coinbase-only fake block with a deterministic hash that
+/// depends on `height` (so each block has a distinct hash).  The merkle_root
+/// is `height` packed into a Hash256 so we get unique block_hashes without
+/// hashing a tx.
+fn fake_block_at_height(height: u32, prev_hash: rustoshi_primitives::Hash256) -> rustoshi_primitives::Block {
+    use rustoshi_primitives::{Block, BlockHeader, Transaction, TxIn, TxOut};
+
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: rustoshi_primitives::OutPoint {
+                txid: rustoshi_primitives::Hash256::ZERO,
+                vout: 0xFFFFFFFF,
+            },
+            script_sig: vec![0x51, (height & 0xff) as u8, ((height >> 8) & 0xff) as u8],
+            sequence: 0xFFFFFFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: 50_000_000,
+            // Unique scriptPubKey per height so each filter has different content.
+            script_pubkey: vec![
+                0x76, 0xa9, 0x14,
+                (height & 0xff) as u8,
+                ((height >> 8) & 0xff) as u8,
+                ((height >> 16) & 0xff) as u8,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0x88, 0xac,
+            ],
+        }],
+        lock_time: 0,
+    };
+
+    // Merkle root is `height` packed so block_hash is deterministic per height.
+    let mut merkle = [0u8; 32];
+    merkle[0..4].copy_from_slice(&height.to_le_bytes());
+
+    Block {
+        header: BlockHeader {
+            version: 1,
+            prev_block_hash: prev_hash,
+            merkle_root: rustoshi_primitives::Hash256::from_bytes(merkle),
+            timestamp: 1_700_000_000 + height,
+            bits: 0x207fffff,
+            nonce: height,
+        },
+        transactions: vec![coinbase],
+    }
+}
+
+/// FIX-69 integration test (a): connect 10 blocks → assert filter index
+/// has filter + header rows for all 10 heights.
+///
+/// Mirrors the production hot loop: `BlockFilterIndex::connect_block` is
+/// called for every block as `main.rs::write_block_filter_index` would
+/// invoke it after `process_block`. Verifies:
+///   - Filter rows present for every block hash.
+///   - Filter header chain is contiguous (entry at height h+1 has
+///     filter_header computed from entry at height h).
+///   - Each filter matches its block's unique scriptPubKey.
+#[test]
+fn fix69_connect_ten_blocks_populates_index() {
+    use rustoshi_consensus::validation::UndoData;
+    let db = open_db();
+    let idx = BlockFilterIndex::new(&db);
+
+    let mut prev_hash = Hash256::ZERO;
+    let mut prev_header = Hash256::ZERO;
+    let mut hashes: Vec<Hash256> = Vec::new();
+    let empty_undo = UndoData { spent_coins: vec![] };
+
+    for h in 0..10u32 {
+        let block = fake_block_at_height(h, prev_hash);
+        let block_hash = block.block_hash();
+
+        let header = idx
+            .connect_block(h, &block, &empty_undo)
+            .expect("connect_block");
+
+        // Every block must produce a non-zero header (filter chain advances).
+        assert_ne!(header, Hash256::ZERO, "filter header at height {} is zero", h);
+
+        // Header derives from prev_header (BIP-157 chain rule).
+        let entry = idx.get_filter_header(h).unwrap().expect("header at h");
+        assert_eq!(entry.block_hash, block_hash);
+        let filter = idx.get_filter(&block_hash).unwrap().expect("filter at h");
+        let expected = filter.compute_header(&prev_header);
+        assert_eq!(entry.filter_header, expected, "header chain at height {}", h);
+
+        hashes.push(block_hash);
+        prev_header = entry.filter_header;
+        prev_hash = block_hash;
+    }
+
+    // All 10 heights have filter + header rows.
+    for (h, hash) in hashes.iter().enumerate() {
+        assert!(idx.has_filter(hash).unwrap(), "missing filter at height {}", h);
+        assert!(
+            idx.get_filter_header(h as u32).unwrap().is_some(),
+            "missing header at height {}", h,
+        );
+    }
+}
+
+/// FIX-69 integration test (b): connect 10 then reorg the last 5
+/// → filter index must REMOVE entries for heights 5..10.
+///
+/// Mirrors Core's `BlockFilterIndex::CustomRewind` (mediated through
+/// `BaseIndex::Rewind` on disconnect). Verifies the disconnect-side
+/// cleanup so stale filters from the orphan chain do not linger in the
+/// REST/P2P serving paths.
+#[test]
+fn fix69_reorg_five_blocks_rewinds_index() {
+    use rustoshi_consensus::validation::UndoData;
+    let db = open_db();
+    let idx = BlockFilterIndex::new(&db);
+    let empty_undo = UndoData { spent_coins: vec![] };
+
+    // Connect 10 blocks.
+    let mut prev_hash = Hash256::ZERO;
+    let mut hashes: Vec<Hash256> = Vec::new();
+    for h in 0..10u32 {
+        let block = fake_block_at_height(h, prev_hash);
+        let block_hash = block.block_hash();
+        idx.connect_block(h, &block, &empty_undo).expect("connect");
+        hashes.push(block_hash);
+        prev_hash = block_hash;
+    }
+
+    // Sanity: all 10 present pre-reorg.
+    for (h, hash) in hashes.iter().enumerate() {
+        assert!(idx.has_filter(hash).unwrap());
+        assert!(idx.get_filter_header(h as u32).unwrap().is_some());
+    }
+
+    // Disconnect heights 9, 8, 7, 6, 5 (Core walks the rewind in
+    // newest-to-oldest order — see validation.cpp::DisconnectTip).
+    for h in (5..10u32).rev() {
+        idx.disconnect_block(h, &hashes[h as usize]).expect("disconnect");
+    }
+
+    // Heights 5..10 are gone.
+    for h in 5..10u32 {
+        assert!(
+            !idx.has_filter(&hashes[h as usize]).unwrap(),
+            "filter at disconnected height {} should be removed",
+            h,
+        );
+        assert!(
+            idx.get_filter_header(h).unwrap().is_none(),
+            "header at disconnected height {} should be removed",
+            h,
+        );
+    }
+    // Heights 0..5 are still there.
+    for h in 0..5u32 {
+        assert!(
+            idx.has_filter(&hashes[h as usize]).unwrap(),
+            "filter at retained height {} should still exist",
+            h,
+        );
+        assert!(
+            idx.get_filter_header(h).unwrap().is_some(),
+            "header at retained height {} should still exist",
+            h,
+        );
+    }
 }

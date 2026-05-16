@@ -36,7 +36,11 @@ use rustoshi_network::{
 };
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
 use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
-use rustoshi_storage::{block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry}, BlockStore, ChainDb};
+use rustoshi_storage::{
+    block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry},
+    indexes::BlockFilterIndex,
+    BlockStore, ChainDb,
+};
 
 // ============================================================
 // CLI DEFINITIONS
@@ -343,6 +347,38 @@ fn write_tx_index_entries(
             tracing::warn!(
                 "tx_index write failed for {} in block {}: {}",
                 tx.txid(), block_hash, e
+            );
+        }
+    }
+}
+
+/// Update the BIP-157/158 BlockFilterIndex for a newly connected block.
+///
+/// Mirrors `bitcoin-core/src/index/blockfilterindex.cpp::CustomAppend` (fired
+/// from `BaseIndex::BlockConnected`).  Must be called after a successful
+/// `ChainState::process_block` so that:
+///   - The block's basic GCS filter (BIP-158) is built and persisted.
+///   - The filter header chain (BIP-157) is extended.
+///   - The /rest/blockfilter and /rest/blockfilterheaders REST endpoints can
+///     serve light clients.
+///
+/// W121 BUG-16 P0 (FIX-69): prior to this wiring, the entire ~6500 LOC
+/// GCS + index + REST stack in `rustoshi-storage::indexes` was DEAD CODE
+/// because no production code path ever called `BlockFilterIndex::index_block`.
+/// Light clients querying /rest/blockfilter would get 404 after a full IBD.
+fn write_block_filter_index(
+    block_store: &BlockStore,
+    block: &rustoshi_primitives::Block,
+    height: u32,
+    undo: &rustoshi_consensus::validation::UndoData,
+) {
+    let idx = BlockFilterIndex::new(block_store.db());
+    match idx.connect_block(height, block, undo) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                "BlockFilterIndex update failed for {} at height {}: {}",
+                block.block_hash(), height, e
             );
         }
     }
@@ -801,13 +837,13 @@ fn run_import_from_blk_files(
 
         // Validate and process (f_requested=true: import-from-Core-datadir is
         // a requested/trusted path — no fTooFarAhead guard needed).
-        match chain_state.process_block(&block, utxo_view, prev_block_mtp, true) {
-            Ok(_) => {}
+        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true) {
+            Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", height, e);
                 break;
             }
-        }
+        };
 
         // Store block index entry so getblockheader can return correct height/nTx/chainwork.
         {
@@ -845,6 +881,13 @@ fn run_import_from_blk_files(
         // that getrawtransaction works post-IBD. See write_tx_index_entries
         // for the Core reference + audit-doc citation.
         write_tx_index_entries(block_store, &block, hash);
+
+        // BIP-157/158 block filter index — FIX-69 W121 BUG-16.  Build and
+        // persist the basic GCS filter + filter header for this block so
+        // that /rest/blockfilter, /rest/blockfilterheaders, and (when wired
+        // upstream) BIP-157 P2P serving can respond. Mirrors Core
+        // `BlockFilterIndex::CustomAppend` fired from BaseIndex::BlockConnected.
+        write_block_filter_index(block_store, &block, height, &undo);
 
         // Flush UTXO cache if needed
         if utxo_view.needs_flush() {
@@ -980,13 +1023,13 @@ fn run_import_from_stdin(
 
         // Validate and process (f_requested=true: snapshot-import is a
         // requested/trusted path — no fTooFarAhead guard needed).
-        match chain_state.process_block(&block, utxo_view, prev_block_mtp, true) {
-            Ok(_) => {}
+        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true) {
+            Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", frame_height, e);
                 break;
             }
-        }
+        };
 
         // Store block index entry so getblockheader can return correct height/nTx/chainwork.
         {
@@ -1024,6 +1067,10 @@ fn run_import_from_stdin(
         // this block so getrawtransaction works post-IBD. See
         // `write_tx_index_entries` for the Core reference + audit-doc citation.
         write_tx_index_entries(block_store, &block, hash);
+
+        // BIP-157/158 block filter index — FIX-69 W121 BUG-16.
+        // See `write_block_filter_index` for the Core reference.
+        write_block_filter_index(block_store, &block, frame_height, &undo);
 
         // Flush UTXO cache if needed
         if utxo_view.needs_flush() {
@@ -2231,7 +2278,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     // (first failure h=944601 on 2026-04-11; debug.log
                     // shows zero "Connected block" lines despite tip
                     // hash advancing across every restart).
-                    let validated = {
+                    let connected_undo: Option<rustoshi_consensus::validation::UndoData> = {
                         let mut cs = chain_state.write().await;
                         // BIP-113: compute parent MTP for `is_final_tx`'s
                         // `lock_time_cutoff`.  Without this, every tx with
@@ -2244,18 +2291,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // f_requested=true: blocks from the IBD block downloader
                         // are actively requested via getdata — no fTooFarAhead guard.
                         match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true) {
-                            Ok(_) => true,
+                            Ok((undo, _fees)) => Some(undo),
                             Err(e) => {
                                 tracing::warn!(
                                     "Block validation failed at height {}: {}",
                                     height, e
                                 );
-                                false
+                                None
                             }
                         }
                     };
 
-                    if validated {
+                    if let Some(undo) = connected_undo {
                         // Store block index entry so getblockheader returns height/nTx/chainwork.
                         {
                             let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
@@ -2292,6 +2339,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // every tx in this block so getrawtransaction works
                         // post-IBD. See `write_tx_index_entries`.
                         write_tx_index_entries(&block_store, &block, block_hash);
+
+                        // BIP-157/158 block filter index — FIX-69 W121 BUG-16.
+                        // See `write_block_filter_index` for the Core reference.
+                        write_block_filter_index(&block_store, &block, height, &undo);
 
                         if utxo_view.needs_flush() {
                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
@@ -2737,7 +2788,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     // advance set_best_block, or update RPC state — see
                                     // the matching site in the validation_interval branch
                                     // above for the full rationale.
-                                    let validated = {
+                                    let connected_undo: Option<rustoshi_consensus::validation::UndoData> = {
                                         let mut cs = chain_state.write().await;
                                         // BIP-113: compute parent MTP for
                                         // `is_final_tx`'s `lock_time_cutoff`.
@@ -2749,7 +2800,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // f_requested=true: blocks from the P2P block downloader
                                         // are actively requested via getdata — no fTooFarAhead guard.
                                         match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true) {
-                                            Ok(_) => true,
+                                            Ok((undo, _fees)) => Some(undo),
                                             Err(e) => {
                                                 tracing::warn!(
                                                     "Block validation failed at height {}: {}",
@@ -2775,12 +2826,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 if let Some(ref mut pm) = ps.peer_manager {
                                                     pm.misbehaving(peer_id, reason).await;
                                                 }
-                                                false
+                                                None
                                             }
                                         }
                                     };
 
-                                    if validated {
+                                    if let Some(undo) = connected_undo {
                                         // Store block index entry so getblockheader returns height/nTx/chainwork.
                                         {
                                             let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
@@ -2817,6 +2868,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // every tx in this block so getrawtransaction works
                                         // post-IBD. See `write_tx_index_entries`.
                                         write_tx_index_entries(&block_store, &block, block_hash);
+
+                                        // BIP-157/158 block filter index — FIX-69 W121 BUG-16.
+                                        // See `write_block_filter_index` for the Core reference.
+                                        write_block_filter_index(&block_store, &block, height, &undo);
 
                                         // Flush UTXO cache if it exceeds the 2 GiB limit
                                         if utxo_view.needs_flush() {

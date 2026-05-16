@@ -160,6 +160,15 @@ impl<'a> BlockStore<'a> {
         Self { db }
     }
 
+    /// Borrow the underlying `ChainDb`.
+    ///
+    /// Exposed so that callers can construct additional index wrappers
+    /// (e.g. `BlockFilterIndex::new(block_store.db())`) without having to
+    /// thread the `ChainDb` reference through every helper function.
+    pub fn db(&self) -> &'a ChainDb {
+        self.db
+    }
+
     // ---------------- HEADERS ----------------
 
     /// Store a block header.
