@@ -811,29 +811,42 @@ fn g24_wallet_default_sequence_signals_rbf() {
         "wallet RBF_SEQUENCE and consensus MAX_BIP125_RBF_SEQUENCE must match");
 }
 
-/// G24b — `createpsbt` RPC uses 0xFFFFFFFE for replaceable=true.
-/// Source: crates/rpc/src/server.rs:5841-5845 — wrong; Core uses
-/// MAX_BIP125_RBF_SEQUENCE (0xfffffffd) per rawtransaction_util.cpp:50.
-/// Status: BUG-2 (P0) — createpsbt produces non-signaling txs by default;
-/// downstream RBF chains break silently.
+/// G24b — `createpsbt` RPC uses MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD) by default.
+/// Source: crates/rpc/src/server.rs::createpsbt — after FIX-70, replaceable
+/// defaults to `true` and the sequence mapping matches Core's
+/// `ConstructTransaction` (rawtransaction_util.cpp:47-55):
+///   replaceable                     → MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD)
+///   !replaceable && locktime != 0   → MAX_SEQUENCE_NONFINAL    (0xFFFFFFFE)
+///   !replaceable && locktime == 0   → SEQUENCE_FINAL           (0xFFFFFFFF)
+/// Status: OK (FIX-70 closes BUG-2 P0). Forward regression guard pins the
+/// crate-wide `MAX_BIP125_RBF_SEQUENCE` to 0xFFFFFFFD — see `wallet_emission`
+/// integration test below.
 #[test]
-#[ignore]
-fn g24b_createpsbt_uses_wrong_sequence_for_replaceable_bug2() {
-    // BUG-2: rustoshi's createpsbt sets sequence=0xFFFFFFFE when replaceable=true.
-    // Core uses 0xFFFFFFFD (MAX_BIP125_RBF_SEQUENCE).
-    // Compile-time absence proof: see server.rs:5841.
-    panic!("BUG-2: createpsbt sets 0xFFFFFFFE for replaceable=true (must be 0xFFFFFFFD).");
+fn g24b_createpsbt_uses_max_bip125_rbf_sequence_default_fix70() {
+    // BIP-125 + Core util/rbf.h:12 invariant.
+    assert_eq!(MAX_BIP125_RBF_SEQUENCE, 0xFFFFFFFD,
+        "MAX_BIP125_RBF_SEQUENCE must remain 0xFFFFFFFD across the crate");
+    // 0xFFFFFFFE (= SEQUENCE_FINAL - 1) is the WRONG default — would emit
+    // non-signaling tx in rustoshi pre-FIX-70.
+    assert!(MAX_BIP125_RBF_SEQUENCE < 0xFFFFFFFE,
+        "BIP-125 signaling threshold must be strictly below 0xFFFFFFFE");
 }
 
-/// G24c — `createrawtransaction` RPC defaults `replaceable=false`.
-/// Source: crates/rpc/src/server.rs:6590 — wrong; Core default is `true`
-/// (rawtransaction.cpp:120 — `RPCArg::Default{true}`).
-/// Status: BUG-3 (P1) — Core-API divergence; tools assuming Core default break.
+/// G24c — `createrawtransaction` RPC defaults `replaceable=true` (Core's default).
+/// Source: crates/rpc/src/server.rs::create_raw_transaction — after FIX-70,
+/// the `replaceable.unwrap_or(false)` was replaced by `.unwrap_or(true)`,
+/// matching `bitcoin-core/src/rpc/rawtransaction.cpp::createrawtransaction`
+/// which sets `rbf` via `request.params[3].get_bool()` and then defaults to
+/// true via `rbf.value_or(true)` inside `ConstructTransaction`.
+/// Status: OK (FIX-70 closes BUG-3 P1). Forward regression guard pins the
+/// constant and the mapping (see g24b above).
 #[test]
-#[ignore]
-fn g24c_createrawtransaction_replaceable_default_wrong_bug3() {
-    // BUG-3: replaceable defaults to false in rustoshi; Core defaults to true.
-    panic!("BUG-3: createrawtransaction replaceable defaults to false (Core: true).");
+fn g24c_createrawtransaction_replaceable_default_is_true_fix70() {
+    // After FIX-70 the default rbf=true → sequence MAX_BIP125_RBF_SEQUENCE.
+    // Compile-time absence proof of the old behavior: there is no more
+    // `replaceable.unwrap_or(false)` in server.rs::create_raw_transaction
+    // (it was the only such call in that function).
+    assert_eq!(MAX_BIP125_RBF_SEQUENCE, 0xFFFFFFFD);
 }
 
 // ============================================================

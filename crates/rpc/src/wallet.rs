@@ -1833,6 +1833,17 @@ impl WalletRpcServer for WalletRpcImpl {
                     }
                 })?;
             // Strip script_sig + witness — PSBT requires unsigned creator output.
+            // FIX-70 / W120 BUG-2: mirror Core's `ConstructTransaction`
+            // (bitcoin-core/src/rpc/rawtransaction_util.cpp:47-55) sequence
+            // mapping. Default replaceable=true (Core: m_signal_rbf default).
+            let rbf = opts.replaceable.unwrap_or(true);
+            let default_sequence: u32 = if rbf {
+                0xFFFFFFFD // MAX_BIP125_RBF_SEQUENCE
+            } else if lock_time != 0 {
+                0xFFFFFFFE // MAX_SEQUENCE_NONFINAL — locktime-activates inputs
+            } else {
+                0xFFFFFFFF // SEQUENCE_FINAL
+            };
             let mut tx = Transaction {
                 version: signed.version,
                 inputs: signed
@@ -1841,11 +1852,7 @@ impl WalletRpcServer for WalletRpcImpl {
                     .map(|i| TxIn {
                         previous_output: i.previous_output.clone(),
                         script_sig: vec![],
-                        sequence: if opts.replaceable.unwrap_or(true) {
-                            0xFFFFFFFD
-                        } else {
-                            0xFFFFFFFE
-                        },
+                        sequence: default_sequence,
                         witness: vec![],
                     })
                     .collect(),
@@ -1949,14 +1956,21 @@ impl WalletRpcServer for WalletRpcImpl {
                 // the resulting PSBT will need the signer to provide
                 // witness/non-witness UTXO. Fee will be wrong if values are
                 // missing; that mirrors Core's psbt-funding behaviour.
+                // FIX-70 / W120 BUG-2: mirror Core's `ConstructTransaction`
+                // (bitcoin-core/src/rpc/rawtransaction_util.cpp:47-55) sequence
+                // mapping. Default replaceable=true (Core: m_signal_rbf).
+                let rbf = opts.replaceable.unwrap_or(true);
+                let default_sequence: u32 = if rbf {
+                    0xFFFFFFFD // MAX_BIP125_RBF_SEQUENCE
+                } else if lock_time != 0 {
+                    0xFFFFFFFE // MAX_SEQUENCE_NONFINAL
+                } else {
+                    0xFFFFFFFF // SEQUENCE_FINAL
+                };
                 tx_inputs.push(TxIn {
                     previous_output: outpoint,
                     script_sig: vec![],
-                    sequence: if opts.replaceable.unwrap_or(true) {
-                        0xFFFFFFFD
-                    } else {
-                        0xFFFFFFFE
-                    },
+                    sequence: default_sequence,
                     witness: vec![],
                 });
             }
