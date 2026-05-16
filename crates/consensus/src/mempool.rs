@@ -1087,6 +1087,13 @@ pub struct PackageTxResult {
     pub already_in_mempool: bool,
     /// Error message if validation failed (None if success).
     pub error: Option<String>,
+    /// FIX-73 (W120 BUG-5): txids evicted by this transaction's admission
+    /// (direct RBF conflicts + their descendants + TRUC sibling-eviction).
+    ///
+    /// Mirrors Bitcoin Core `MempoolAcceptResult::m_replaced_transactions`
+    /// (`validation.h:146`). Populated for txs admitted via RBF/TRUC; empty
+    /// for non-replacement admissions and for `already_in_mempool` entries.
+    pub replaced_txids: Vec<Hash256>,
 }
 
 /// Result of package acceptance.
@@ -3955,6 +3962,7 @@ impl Mempool {
                         fee: entry.fee,
                         already_in_mempool: true,
                         error: None,
+                        replaced_txids: Vec::new(),
                     }
                 })
                 .collect();
@@ -4081,6 +4089,7 @@ impl Mempool {
                     fee,
                     already_in_mempool: true,
                     error: None,
+                    replaced_txids: Vec::new(),
                 });
                 continue;
             }
@@ -4088,8 +4097,12 @@ impl Mempool {
             // Try to add the transaction
             // For package validation, we use a special path that allows low fees
             match self.add_transaction_for_package(tx.clone(), utxo_lookup, package_fee_rate) {
-                Ok(_) => {
+                Ok((_, replaced)) => {
                     added_txids.push(txid);
+                    // FIX-73 (W120 BUG-5): thread the per-tx evicted-txid set
+                    // up to the package result so the RPC layer can build
+                    // `submitpackage.replaced-transactions` (Core
+                    // rpc/mempool.cpp:1500).
                     tx_results.push(PackageTxResult {
                         txid,
                         wtxid,
@@ -4097,6 +4110,7 @@ impl Mempool {
                         fee,
                         already_in_mempool: false,
                         error: None,
+                        replaced_txids: replaced,
                     });
                 }
                 Err(e) => {
@@ -4118,12 +4132,18 @@ impl Mempool {
     ///
     /// This is similar to `add_transaction` but uses the package fee rate
     /// for fee validation instead of the individual transaction's fee rate.
+    ///
+    /// FIX-73 (W120 BUG-5): returns `(txid, replaced_txids)` so the RPC layer
+    /// can populate `submitpackage.replaced-transactions`. Replaced txids
+    /// include direct RBF conflicts, their descendants, and any TRUC
+    /// sibling-eviction target. Mirrors Core
+    /// `MempoolAcceptResult::m_replaced_transactions`.
     fn add_transaction_for_package<F>(
         &mut self,
         tx: Transaction,
         utxo_lookup: &F,
         package_fee_rate: f64,
-    ) -> Result<Hash256, MempoolError>
+    ) -> Result<(Hash256, Vec<Hash256>), MempoolError>
     where
         F: Fn(&OutPoint) -> Option<CoinEntry>,
     {
@@ -4131,7 +4151,7 @@ impl Mempool {
 
         // Already in mempool?
         if self.transactions.contains_key(&txid) {
-            return Ok(txid); // Not an error for package validation
+            return Ok((txid, Vec::new())); // Not an error for package validation
         }
 
         // Context-free validation
@@ -4241,6 +4261,12 @@ impl Mempool {
         // Check TRUC policy (v3 transactions)
         let sibling_to_evict = self.check_truc_policy(&tx, txid, vsize, &mempool_parents, &direct_conflicts)?;
 
+        // FIX-73 (W120 BUG-5): collect every txid this admission evicts so the
+        // RPC layer can populate `submitpackage.replaced-transactions`.
+        // Mirrors Core MemPoolAccept's m_subpackage.m_replaced_transactions
+        // accumulation (validation.cpp:1236).
+        let mut replaced_txids: Vec<Hash256> = Vec::new();
+
         // Handle conflicts via RBF (same as normal add_transaction)
         if !direct_conflicts.is_empty() {
             self.check_rbf_rules(&tx, fee, fee_rate, vsize, &direct_conflicts, &mempool_parents)?;
@@ -4254,6 +4280,10 @@ impl Mempool {
             }
 
             for txid_to_remove in &all_to_remove {
+                // Capture for the RPC response BEFORE remove_single drops the
+                // entry — Core does the same via GetSharedTx() in
+                // validation.cpp:1236.
+                replaced_txids.push(*txid_to_remove);
                 self.remove_single(txid_to_remove);
             }
         }
@@ -4279,6 +4309,10 @@ impl Mempool {
                     ));
                 }
 
+                // FIX-73: TRUC sibling counts as a replaced tx per Core
+                // (validation.cpp:639 — m_replaced_transactions includes
+                // sibling-eviction targets in addition to conflict-input txns).
+                replaced_txids.push(sibling_txid);
                 self.remove_single(&sibling_txid);
             }
         }
@@ -4425,7 +4459,7 @@ impl Mempool {
         // Add to cluster structure and compute mining score
         self.add_to_clusters(txid, fee, vsize, &mempool_parents);
 
-        Ok(txid)
+        Ok((txid, replaced_txids))
     }
 }
 
