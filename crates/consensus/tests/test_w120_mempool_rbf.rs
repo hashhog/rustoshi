@@ -513,17 +513,13 @@ fn g10_replaceability_detection_per_input() {
 // ============================================================
 
 /// G11 — Core uses GetModifiedFee() (base + prioritise delta) for RBF comparisons.
-/// Rustoshi's `MempoolEntry.fee_delta` is non-zero only via `set_entry_fee_delta`,
-/// but `check_rbf_rules` reads `entry.fee` (RAW). prioritisetransaction is not
-/// implemented (mempool.rs:3187 comment), so the divergence is unobservable today,
-/// but the API shape is wrong: bumping fee_delta cannot give the entry RBF priority.
-/// Status: BUG (BUG-9) — fee_delta is a dead field that never affects RBF.
+/// FIX-72 wired `Mempool::get_modified_fee()` into RBF Rule 3 (mempool.rs:2750+)
+/// and into the TRUC sibling-eviction fee check. A `prioritisetransaction`-style
+/// delta on the conflicting entry now raises its RBF-comparison fee, matching
+/// Core (policy/rbf.cpp:104).
+/// Status: OK (was BUG-9).
 #[test]
-#[ignore]
-fn g11_modified_fee_unused_in_rbf_comparison_bug9() {
-    // BUG-9: MempoolEntry.fee_delta is unused. To make this pass after fix,
-    // adjusting fee_delta on the conflicting entry MUST raise its effective
-    // RBF-comparison fee.
+fn g11_modified_fee_in_rbf_comparison_fix72() {
     let mut mp = test_mempool();
     let utxo = OutPoint { txid: hash_from_u8(0xB0), vout: 0 };
     let utxos: HashMap<OutPoint, CoinEntry> = [(utxo.clone(), coin(100_000))].into_iter().collect();
@@ -531,11 +527,12 @@ fn g11_modified_fee_unused_in_rbf_comparison_bug9() {
     let orig = tx_seq(utxo.txid, 0, 100_000, 1_000, 0xfffffffd);
     let orig_id = mp_add(&mut mp, orig, &utxos).unwrap();
 
-    // Prioritise the orig +50_000 sats. RBF now needs to beat 51_000 sats fees,
-    // not just the raw 1_000.
-    mp.set_entry_fee_delta(&orig_id, 50_000);
+    // Prioritise the orig +50_000 sats via the canonical RPC entrypoint.
+    // RBF now needs to beat 51_000 sats fees, not just the raw 1_000.
+    let new_delta = mp.prioritise_transaction(&orig_id, 50_000);
+    assert_eq!(new_delta, 50_000, "prioritise_transaction must return cumulative delta");
 
-    // Replacement at 30_000 (more than raw, less than modified). Core would reject.
+    // Replacement at 30_000 (more than raw, less than modified). Core rejects.
     let r = tx_seq(utxo.txid, 0, 100_000, 30_000, 0xfffffffd);
     let res = mp_add(&mut mp, r, &utxos);
     assert!(matches!(res, Err(MempoolError::RbfInsufficientAbsoluteFee(_, _))),
@@ -869,16 +866,40 @@ fn g25_bumpfee_landed_in_fix61() {
 // ============================================================
 
 /// G26 — Core: prioritisetransaction adjusts GetModifiedFee, which feeds every
-/// RBF comparison. Rustoshi: `prioritisetransaction` RPC is not implemented
-/// (mempool.rs:3187 — "rustoshi does not yet implement prioritisetransaction").
-/// `set_entry_fee_delta` is only invoked by mempool persistence round-trip.
-/// Status: BUG-10 (P2) — RPC missing entirely.
+/// RBF comparison. FIX-72 added `Mempool::prioritise_transaction` (stacks on
+/// any existing delta, mirrors Core txmempool.cpp:630-655) and the
+/// `prioritisetransaction` RPC at the server layer. Exercising the mempool
+/// surface here pins (a) deltas are observable via `getmempoolentry`-style
+/// `get_modified_fee`, (b) deltas survive admission ordering by being applied
+/// via `apply_pending_delta` even when posted before the tx itself,
+/// (c) negative-then-positive cancellation returns to zero and removes the
+/// map_deltas entry. Status: OK (was BUG-10).
 #[test]
-#[ignore]
-fn g26_prioritisetransaction_rpc_missing_bug10() {
-    // BUG-10: prioritisetransaction RPC not implemented; RBF cannot honour
-    // operator-provided fee deltas. See also BUG-9 (fee_delta dead field).
-    panic!("BUG-10: prioritisetransaction RPC not implemented (mempool.rs:3187 confession).");
+fn g26_prioritisetransaction_rpc_landed_fix72() {
+    let mut mp = test_mempool();
+    let utxo = OutPoint { txid: hash_from_u8(0xC6), vout: 0 };
+    let utxos: HashMap<OutPoint, CoinEntry> = [(utxo.clone(), coin(200_000))].into_iter().collect();
+
+    let tx = tx_seq(utxo.txid, 0, 200_000, 2_000, 0xfffffffd);
+    let txid = mp_add(&mut mp, tx, &utxos).unwrap();
+
+    // Stack +1000 then +500 — must cumulate to +1500.
+    let after_a = mp.prioritise_transaction(&txid, 1_000);
+    assert_eq!(after_a, 1_000);
+    let after_b = mp.prioritise_transaction(&txid, 500);
+    assert_eq!(after_b, 1_500);
+
+    let entry = mp.get(&txid).expect("entry present");
+    let modified = Mempool::get_modified_fee(entry);
+    assert_eq!(modified, 2_000 + 1_500, "modified fee = base + cumulative delta");
+
+    // Negative delta that drives cumulative to zero must clear the map entry.
+    mp.prioritise_transaction(&txid, -1_500);
+    let deltas = mp.prioritised_deltas();
+    assert!(deltas.iter().find(|(t, _)| *t == txid).is_none(),
+        "zero cumulative delta must be removed from map_deltas (Core txmempool.cpp:644-646)");
+    let entry = mp.get(&txid).expect("entry still present");
+    assert_eq!(Mempool::get_modified_fee(entry), 2_000, "back to base after cancellation");
 }
 
 // ============================================================
@@ -1000,4 +1021,163 @@ fn extra_getmempoolentry_depends_spentby_empty_bug18() {
 #[ignore]
 fn extra_getmempoolinfo_mempoolminfee_hardcoded_bug17() {
     panic!("BUG-17: getmempoolinfo.mempoolminfee hardcoded 1000 sat/kvB; ignores rolling min.");
+}
+
+// ============================================================
+// FIX-72 — prioritise_transaction RPC + modified-fee wiring
+// ============================================================
+//
+// These tests pin BUG-9 + BUG-10 closure beyond the audit-flip surface above.
+// They cover the four behavioural claims in the FIX-72 commit:
+//   - delta application affects RBF gates (positive + negative)
+//   - delta cancellation removes the map_deltas entry
+//   - delta posted before the tx admission is replayed on admission
+//   - source-level regression guard rejecting raw-fee comparison in Rule 3.
+
+/// Positive delta on the conflicting entry must raise its modified fee and
+/// cause a candidate replacement to be rejected on Rule 3 even though it
+/// would beat the raw base fee.  Mirrors `g11_modified_fee_in_rbf_comparison_fix72`
+/// but uses the canonical `prioritise_transaction` entrypoint to guard the
+/// RPC surface, not the persist-internal `set_entry_fee_delta`.
+#[test]
+fn fix72_positive_delta_wins_rule3() {
+    let mut mp = test_mempool();
+    let utxo = OutPoint { txid: hash_from_u8(0xF7), vout: 0 };
+    let utxos: HashMap<OutPoint, CoinEntry> = [(utxo.clone(), coin(500_000))].into_iter().collect();
+
+    let orig = tx_seq(utxo.txid, 0, 500_000, 5_000, 0xfffffffd);
+    let orig_id = mp_add(&mut mp, orig, &utxos).unwrap();
+    mp.prioritise_transaction(&orig_id, 100_000);
+
+    // Raw-fee = 5_000; modified = 105_000. A 50_000-sat replacement BEATS
+    // raw but LOSES to modified.
+    let r = tx_seq(utxo.txid, 0, 500_000, 50_000, 0xfffffffd);
+    let res = mp_add(&mut mp, r, &utxos);
+    assert!(
+        matches!(res, Err(MempoolError::RbfInsufficientAbsoluteFee(_, _))),
+        "Rule 3 must use modified fee; got {:?}",
+        res
+    );
+}
+
+/// Negative delta on the conflicting entry must lower its modified fee so a
+/// previously-rejected replacement is now accepted.  Negative deltas have
+/// no Core-side dust gating in the mempool layer — that lives at the RPC.
+#[test]
+fn fix72_negative_delta_loses_rule3() {
+    let mut mp = test_mempool();
+    let utxo = OutPoint { txid: hash_from_u8(0xF8), vout: 0 };
+    let utxos: HashMap<OutPoint, CoinEntry> = [(utxo.clone(), coin(500_000))].into_iter().collect();
+
+    let orig = tx_seq(utxo.txid, 0, 500_000, 100_000, 0xfffffffd);
+    let orig_id = mp_add(&mut mp, orig, &utxos).unwrap();
+
+    // De-prioritise orig by 80_000 sats → modified fee = 20_000.
+    let new_delta = mp.prioritise_transaction(&orig_id, -80_000);
+    assert_eq!(new_delta, -80_000);
+    let entry = mp.get(&orig_id).expect("orig still present");
+    assert_eq!(Mempool::get_modified_fee(entry), 20_000);
+
+    // Replacement at 50_000 BEATS modified (20_000) and pays bandwidth.
+    let r = tx_seq(utxo.txid, 0, 500_000, 50_000, 0xfffffffd);
+    let res = mp_add(&mut mp, r, &utxos);
+    assert!(res.is_ok(), "negative delta must let lower-fee replacement in; got {:?}", res);
+}
+
+/// Stacking +Δ then –Δ must return the cumulative delta to zero and remove
+/// the txid from `map_deltas`.  Mirrors Core txmempool.cpp:644-646.
+#[test]
+fn fix72_delta_cancellation_removes_map_entry() {
+    let mut mp = test_mempool();
+    let utxo = OutPoint { txid: hash_from_u8(0xF9), vout: 0 };
+    let utxos: HashMap<OutPoint, CoinEntry> = [(utxo.clone(), coin(100_000))].into_iter().collect();
+
+    let tx = tx_seq(utxo.txid, 0, 100_000, 1_000, 0xfffffffd);
+    let txid = mp_add(&mut mp, tx, &utxos).unwrap();
+
+    mp.prioritise_transaction(&txid, 10_000);
+    assert!(
+        mp.prioritised_deltas().iter().any(|(t, _)| *t == txid),
+        "non-zero delta must appear in map_deltas"
+    );
+
+    mp.prioritise_transaction(&txid, -10_000);
+    assert!(
+        mp.prioritised_deltas().iter().find(|(t, _)| *t == txid).is_none(),
+        "zero cumulative delta must be removed from map_deltas"
+    );
+    let entry = mp.get(&txid).expect("entry still present");
+    assert_eq!(entry.fee_delta, 0, "entry.fee_delta must return to zero after cancellation");
+}
+
+/// Delta posted BEFORE the tx is admitted must be applied on admission
+/// (Core CTxMemPool::ApplyDelta in addUnchecked).
+#[test]
+fn fix72_delta_replays_on_admission() {
+    let mut mp = test_mempool();
+    let utxo = OutPoint { txid: hash_from_u8(0xFA), vout: 0 };
+    let utxos: HashMap<OutPoint, CoinEntry> = [(utxo.clone(), coin(100_000))].into_iter().collect();
+
+    let tx = tx_seq(utxo.txid, 0, 100_000, 1_000, 0xfffffffd);
+    let txid = tx.txid();
+
+    // Pre-stage a delta for a txid that is NOT YET in the mempool.
+    mp.prioritise_transaction(&txid, 7_500);
+    assert!(!mp.contains(&txid));
+
+    // Now admit the tx — Core ApplyDelta must populate entry.fee_delta
+    // from the standalone map_deltas record so the next get_modified_fee
+    // reflects the queued delta.
+    let admitted = mp_add(&mut mp, tx, &utxos).unwrap();
+    assert_eq!(admitted, txid);
+    let entry = mp.get(&txid).expect("present after admission");
+    assert_eq!(entry.fee_delta, 7_500);
+    assert_eq!(Mempool::get_modified_fee(entry), 1_000 + 7_500);
+}
+
+/// "Lost on restart" semantics: deltas for txids NOT in the mempool live only
+/// in `map_deltas` and are not persisted by FIX-72.  A fresh mempool has no
+/// deltas.  In-mempool entries' inline `fee_delta` are persisted as before
+/// (see `mempool_persist::dump_mempool`); only the standalone `map_deltas`
+/// HashMap is in-memory only.
+#[test]
+fn fix72_fresh_mempool_has_no_deltas() {
+    let mp = test_mempool();
+    assert!(mp.prioritised_deltas().is_empty(),
+        "freshly-constructed mempool must have no prioritise deltas");
+}
+
+/// Source-level regression guard: the RBF Rule 3 conflicting-fees
+/// accumulator in `mempool.rs` MUST go through `get_modified_fee` —
+/// reading `entry.fee` directly is the BUG-9 signature.  This test is
+/// brittle on purpose: any refactor that re-introduces `entry.fee` in the
+/// Rule 3 accumulator path will trip it before the behaviour-level G11
+/// test would have to do the same job.
+#[test]
+fn fix72_rule3_source_uses_modified_fee() {
+    let src = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/mempool.rs")
+    ).expect("read mempool.rs");
+
+    // Find the function body of check_rbf_rules.
+    let start = src.find("fn check_rbf_rules(")
+        .expect("check_rbf_rules must exist");
+    let end_marker = "// ====================================================================";
+    let end = src[start..].find(end_marker)
+        .map(|i| start + i)
+        .unwrap_or(src.len());
+    let body = &src[start..end];
+
+    // Must call get_modified_fee for conflicting entries' fee aggregation.
+    assert!(
+        body.contains("get_modified_fee"),
+        "check_rbf_rules must aggregate conflicting fees via get_modified_fee (FIX-72)"
+    );
+
+    // The accumulator line in the original BUG-9 shape was
+    // `conflicting_fees += entry.fee;`. Forbid that exact source pattern.
+    assert!(
+        !body.contains("conflicting_fees += entry.fee;"),
+        "raw-fee accumulator must not be re-introduced into check_rbf_rules"
+    );
 }

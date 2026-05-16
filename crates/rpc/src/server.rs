@@ -748,6 +748,21 @@ pub trait RustoshiRpc {
     #[method(name = "getmempoolentry")]
     async fn get_mempool_entry(&self, txid: String) -> RpcResult<Box<serde_json::value::RawValue>>;
 
+    /// Adjust a transaction's effective fee for mining-selection / RBF.
+    /// Mirrors Bitcoin Core `prioritisetransaction` (rpc/mining.cpp:502-545):
+    /// args = (txid, dummy_fee_btc, fee_delta_sats). `dummy` is the legacy
+    /// priority parameter kept for back-compat — Core enforces == 0.
+    /// The delta stacks and is NOT persisted across node restart (Core parity
+    /// for `mapDeltas` in-memory semantics; see txmempool.cpp:630-655).
+    /// FIX-72 / W120 BUG-9 + BUG-10.
+    #[method(name = "prioritisetransaction")]
+    async fn prioritise_transaction(
+        &self,
+        txid: String,
+        dummy: Option<f64>,
+        fee_delta: i64,
+    ) -> RpcResult<bool>;
+
     /// Get all in-mempool ancestors of a transaction.
     #[method(name = "getmempoolancestors")]
     async fn get_mempool_ancestors(
@@ -3758,11 +3773,13 @@ impl RustoshiRpcServer for RpcServerImpl {
         let mut first = true;
         for txid in sorted {
             if let Some(entry) = state.mempool.get(&txid) {
+                // FIX-72 (W120 BUG-9): modifiedfee = base + prioritise delta.
+                let modified_fee_sats = rustoshi_consensus::mempool::Mempool::get_modified_fee(entry);
                 let mem_entry = MempoolEntry {
                     vsize: entry.vsize as u32,
                     weight: entry.weight as u32,
                     fee: BtcAmount::from_sats(entry.fee),
-                    modifiedfee: BtcAmount::from_sats(entry.fee),
+                    modifiedfee: BtcAmount::from_sats(modified_fee_sats),
                     time: entry.time_added.elapsed().as_secs(),
                     height: state.best_height,
                     descendantcount: entry.descendant_count as u32,
@@ -6897,6 +6914,10 @@ impl RustoshiRpcServer for RpcServerImpl {
         match state.mempool.get(&txid_hash) {
             Some(entry) => {
                 let replaceable = state.mempool.is_bip125_replaceable(&txid_hash);
+                // FIX-72 (W120 BUG-9): expose Core-shaped modified fee
+                // (base + prioritise delta) — previously hard-coded to
+                // entry.fee so prioritisetransaction was invisible to clients.
+                let modified_fee_sats = rustoshi_consensus::mempool::Mempool::get_modified_fee(entry);
                 // Serialize via MempoolEntry + to_string so that BtcAmount's
                 // 8-decimal format is preserved.  serde_json::json! with f64 would
                 // emit "fee":1e-05 for small values instead of "fee":0.00001000.
@@ -6904,7 +6925,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     vsize: entry.vsize as u32,
                     weight: entry.weight as u32,
                     fee: BtcAmount::from_sats(entry.fee),
-                    modifiedfee: BtcAmount::from_sats(entry.fee),
+                    modifiedfee: BtcAmount::from_sats(modified_fee_sats),
                     time: entry.time_added.elapsed().as_secs(),
                     height: state.best_height,
                     descendantcount: entry.descendant_count as u32,
@@ -6927,6 +6948,35 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "Transaction not in mempool",
             )),
         }
+    }
+
+    /// FIX-72 (W120 BUG-10): implement `prioritisetransaction` RPC matching
+    /// Bitcoin Core's surface (`rpc/mining.cpp:502-545`).
+    ///
+    /// Three-arg shape: (txid, dummy_fee_btc, fee_delta_sats).
+    ///   * `dummy_fee_btc` is the legacy priority param — Core enforces == 0
+    ///     and we mirror that.
+    ///   * `fee_delta_sats` stacks onto the entry's modified fee via
+    ///     `Mempool::prioritise_transaction`, which feeds RBF Rule 3,
+    ///     mining selection, and `getmempoolentry.modifiedfee`.
+    async fn prioritise_transaction(
+        &self,
+        txid: String,
+        dummy: Option<f64>,
+        fee_delta: i64,
+    ) -> RpcResult<bool> {
+        if let Some(d) = dummy {
+            if d != 0.0 {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.",
+                ));
+            }
+        }
+        let txid_hash = Self::parse_hash(&txid)?;
+        let mut state = self.state.write().await;
+        state.mempool.prioritise_transaction(&txid_hash, fee_delta);
+        Ok(true)
     }
 
     async fn get_mempool_ancestors(
@@ -7050,6 +7100,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getmempoolinfo" => "getmempoolinfo\nReturns details on the active state of the TX memory pool.",
                 "getrawmempool" => "getrawmempool ( verbose )\nReturns all transaction ids in memory pool.",
                 "getmempoolentry" => "getmempoolentry \"txid\"\nReturns mempool data for given transaction.",
+                "prioritisetransaction" => "prioritisetransaction \"txid\" ( dummy ) fee_delta\nAccepts the transaction into mined blocks at a higher (or lower) priority.",
                 "dumpmempool" => "dumpmempool\nWrite the mempool to mempool.dat (Bitcoin Core-format, byte-compatible).",
                 "savemempool" => "savemempool\nDumps the mempool to disk. Returns {\"filename\": \"mempool.dat\"}.",
                 "loadmempool" => "loadmempool\nLoad transactions from mempool.dat back into the mempool.",
@@ -7094,7 +7145,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "savemempool", "testmempoolaccept",
                 "",
                 "== Mining ==",
-                "getblocktemplate", "getmininginfo", "submitblock",
+                "getblocktemplate", "getmininginfo", "prioritisetransaction", "submitblock",
                 "",
                 "== Network ==",
                 "addnode", "clearbanned", "disconnectnode", "getconnectioncount",

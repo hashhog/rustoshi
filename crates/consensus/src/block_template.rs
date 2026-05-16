@@ -334,16 +334,24 @@ pub fn build_block_template(
                 continue;
             }
 
-            // Compute ancestor fee rate
-            let ancestor_fee_rate = if entry.ancestor_size > 0 {
+            // FIX-72 (W120 BUG-10): mining selection ranks by modified fee
+            // (base + prioritisetransaction delta) — Core miner.cpp:142-159
+            // uses `it->GetModifiedFee()` directly. Ancestor-fees aggregation
+            // doesn't yet propagate per-entry deltas (a follow-up tracked in
+            // BUG-9 cleanup), so we use the entry's modified fee in
+            // ancestor_fee_rate only when the entry has no further ancestors.
+            let modified_fee = crate::mempool::Mempool::get_modified_fee(entry);
+            let ancestor_fee_rate = if entry.ancestor_size > 0 && entry.ancestor_count > 1 {
                 entry.ancestor_fees as f64 / entry.ancestor_size as f64
+            } else if entry.vsize > 0 {
+                modified_fee as f64 / entry.vsize as f64
             } else {
                 entry.fee_rate
             };
             heap.push(TxPriority {
                 txid: *txid,
                 ancestor_fee_rate,
-                fee: entry.fee,
+                fee: modified_fee,
                 weight: entry.weight as u64,
             });
         }
@@ -431,6 +439,9 @@ pub fn build_block_template(
             selected_txs.push(entry.tx.clone());
             selected_sigops.push(tx_sigops);
             selected_txids.insert(priority.txid);
+            // FIX-72: total_fees uses the entry's actual base fee — the
+            // delta is a mining-selection knob, not an additional payment.
+            // Core BlockAssembler sums actual fees too (miner.cpp:172-176).
             total_fees += entry.fee;
             total_weight += entry.weight as u64;
             total_sigops += tx_sigops;
