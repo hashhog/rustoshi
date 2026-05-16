@@ -20,7 +20,8 @@
 use crate::columns::{CF_BLOCKFILTER, CF_BLOCKFILTER_HEADER};
 use crate::db::{ChainDb, StorageError};
 use crate::indexes::gcs::{GCSFilter, BASIC_FILTER_M, BASIC_FILTER_P};
-use rustoshi_primitives::Hash256;
+use rustoshi_consensus::validation::UndoData;
+use rustoshi_primitives::{Block, Hash256};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -299,6 +300,82 @@ impl<'a> BlockFilterIndex<'a> {
         self.delete_filter(block_hash)?;
         self.delete_filter_header(height)?;
         Ok(())
+    }
+
+    /// Connect a block to the filter index.
+    ///
+    /// Higher-level wrapper around [`index_block`] that:
+    ///   - Extracts output scriptPubKeys from the block's transactions
+    ///     (skipping OP_RETURN outputs, which `BlockFilter::build_basic`
+    ///     also filters internally).
+    ///   - Extracts spent scriptPubKeys from the `UndoData` returned by
+    ///     `process_block`.
+    ///   - Looks up the previous filter header from the index at `height-1`
+    ///     (or uses `Hash256::ZERO` at genesis, height == 0).
+    ///   - Calls `index_block` to persist the new filter + header.
+    ///
+    /// This is the canonical "BlockConnected" callback that mirrors Core's
+    /// `BlockFilterIndex::CustomAppend` (index/blockfilterindex.cpp:250).
+    /// Production code paths that call `ChainState::process_block` should
+    /// invoke this immediately after a successful block connect.
+    ///
+    /// Returns the filter header for the connected block.
+    pub fn connect_block(
+        &self,
+        height: u32,
+        block: &Block,
+        undo: &UndoData,
+    ) -> Result<Hash256, BlockFilterError> {
+        let block_hash = block.block_hash();
+
+        // Look up the previous filter header. At genesis (height == 0) the
+        // BIP-157 chain head is `Hash256::ZERO`; for any later height we
+        // expect the index to already contain the prev entry (Core's
+        // m_last_header invariant — see blockfilterindex.cpp:255).
+        let prev_filter_header = if height == 0 {
+            Hash256::ZERO
+        } else {
+            match self.get_filter_header(height - 1)? {
+                Some(entry) => entry.filter_header,
+                None => {
+                    // Index lagging the chain (e.g. operator enabled
+                    // -blockfilterindex mid-sync): start a new chain from
+                    // ZERO so the filter still records, even though the
+                    // resulting header chain will not match Core's until a
+                    // backfill walks the gap.
+                    tracing::warn!(
+                        "BlockFilterIndex: missing prev filter header at height {} \
+                         (block {}), starting new header chain from ZERO — full \
+                         reindex required for header-chain Core parity",
+                        height - 1,
+                        block_hash,
+                    );
+                    Hash256::ZERO
+                }
+            }
+        };
+
+        // Output scripts (BlockFilter::build_basic skips OP_RETURN itself,
+        // but we still collect every output here — dedupe happens in the
+        // GCS construction via std::set semantics).
+        let output_scripts = block
+            .transactions
+            .iter()
+            .flat_map(|tx| tx.outputs.iter().map(|o| o.script_pubkey.clone()));
+
+        // Spent scripts (from UndoData; coinbase has no spent inputs).
+        let spent_scripts = undo
+            .spent_coins
+            .iter()
+            .map(|c| c.script_pubkey.clone());
+
+        self.index_block(
+            height,
+            block_hash,
+            output_scripts,
+            spent_scripts,
+            &prev_filter_header,
+        )
     }
 }
 
