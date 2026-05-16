@@ -80,7 +80,8 @@ pub use encryption::{
 pub use manager::{CreateWalletOptions, WalletDirEntry, WalletManager, WalletResult};
 pub use payjoin::{
     build_modified_psbt, decode_and_validate_original, find_receiver_output,
-    handle_payjoin_request, pick_receiver_utxo, validate_params, OfferedPayjoin, PayjoinError,
-    PayjoinParams, ReceiverContribution, MAX_ORIGINAL_PSBT_BYTES,
+    handle_payjoin_request, pick_receiver_utxo, validate_params, validate_proposed_psbt,
+    OfferedPayjoin, PayjoinError, PayjoinParams, ReceiverContribution, SenderError,
+    SenderOptions, MAX_ORIGINAL_PSBT_BYTES,
 };
 pub use wallet::{calculate_vsize, AddressType, Wallet, WalletUtxo};

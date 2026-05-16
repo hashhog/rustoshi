@@ -32,6 +32,7 @@
 //! ```
 
 pub mod auth;
+pub mod payjoin_sender;
 pub mod rest;
 pub mod server;
 pub mod tls;
@@ -39,6 +40,9 @@ pub mod types;
 pub mod wallet;
 pub mod zmq;
 
+pub use payjoin_sender::{
+    post_original_psbt, trim_to_base64 as payjoin_trim_to_base64, SenderHttpError, SenderRequest,
+};
 pub use rest::{
     rest_router, rest_router_with_wallet, start_rest_server, start_rest_server_with_wallet,
     RestConfig, RestServerHandle, RestState,
@@ -47,7 +51,8 @@ pub use server::{start_rpc_server, PeerState, RpcServerImpl, RpcState, RustoshiR
 pub use types::*;
 pub use wallet::{
     BalanceInfo, CreateWalletResult, ListWalletDirResult, LoadWalletResult,
-    UnloadWalletResult, UnspentOutput, WalletRpcImpl, WalletRpcServer, WalletRpcState,
+    PayjoinRequestResult, SendPayjoinOptions, SendPayjoinResult, UnloadWalletResult,
+    UnspentOutput, WalletRpcImpl, WalletRpcServer, WalletRpcState,
 };
 pub use zmq::{
     parse_zmq_args, SharedZmqNotifier, ZmqError, ZmqNotificationInfo, ZmqNotifier,
