@@ -27,7 +27,10 @@
 //!   G19 - PASS: duplicate version → disconnect (DuplicateVersion) in both v1 and v2 paths
 //!   G20 - PASS: pre-handshake non-version messages → PreHandshakeMessage disconnect
 //!   G21 - BUG (CORRECTNESS): inbound v1 path does not track WtxidRelay flag between version/verack
-//!   G22 - BUG (CORRECTNESS): NODE_COMPACT_FILTERS never set in local_services()
+//!   G22 - FIX-71: NODE_COMPACT_FILTERS gate plumbed in local_services() via
+//!         `should_advertise_compact_filters`. Currently false because BIP-157
+//!         P2P handlers absent (`BIP157_P2P_HANDLERS_REGISTERED = false`).
+//!         Future P2P wave only needs to flip the constant.
 //!   G23 - FIXED: MAX_MESSAGE_SIZE=4_000_000 (4MB decimal) per Core net.h:65 (was 32 MiB)
 //!   G24 - PASS: unknown msg → NetworkMessage::Unknown variant, forwarded without Misbehaving
 //!   G25 - FIXED: wtxid-relay peers now get MSG_WTX(5) per BIP-339 (was MSG_WITNESS_TX(0x40000001))
@@ -585,23 +588,154 @@ mod tests {
         assert_eq!(inv.inv_type, InvType::MsgWitnessTx);
     }
 
-    // ─── G22: NODE_COMPACT_FILTERS not advertised ─────────────────────────────
+    // ─── G22: NODE_COMPACT_FILTERS gate plumbed (FIX-71) ──────────────────────
 
-    /// G22 BUG (CORRECTNESS): local_services() only sets NODE_NETWORK |
-    /// NODE_WITNESS (+ optional NODE_BLOOM, NODE_NETWORK_LIMITED).
-    /// NODE_COMPACT_FILTERS (bit 6) is defined in message.rs but never OR'd into
-    /// the advertised service flags — peers that request cfilters will be served
-    /// by a node that hasn't announced it can serve them.
+    /// G22 FIX-71: NODE_COMPACT_FILTERS advertisement is now gated through
+    /// `should_advertise_compact_filters`, which checks (a) `-blockfilterindex`
+    /// enabled, (b) `-peerblockfilters` enabled, AND (c) BIP-157 P2P handlers
+    /// registered. The constant `BIP157_P2P_HANDLERS_REGISTERED` is currently
+    /// `false` because no dispatch handlers exist for `GetCFilters` /
+    /// `GetCFHeaders` / `GetCFCheckpt` in peer.rs/peer_manager.rs — so the
+    /// gate returns FALSE and the bit stays unset.
+    ///
+    /// This is the W121 BUG-7 / W99 G22 "plumbing without flipping" fix: the
+    /// structural wiring is in place so a future P2P fix wave only needs to
+    /// flip `BIP157_P2P_HANDLERS_REGISTERED` to `true` and the gate
+    /// activates automatically.
     #[test]
-    fn g22_node_compact_filters_not_in_local_services() {
+    fn g22_node_compact_filters_gate_plumbed_currently_false() {
         use crate::message::{NODE_COMPACT_FILTERS, NODE_NETWORK, NODE_WITNESS};
-        // local_services() always returns NODE_NETWORK | NODE_WITNESS (base case).
-        let base = NODE_NETWORK | NODE_WITNESS;
-        assert_eq!(base & NODE_COMPACT_FILTERS, 0,
-            "NODE_COMPACT_FILTERS must NOT be set by default (and currently is never set)");
-        // Document: if compact filter serving is enabled, bit 6 should be OR'd in.
+        use crate::peer_manager::{
+            should_advertise_compact_filters, BIP157_P2P_HANDLERS_REGISTERED,
+            PeerManager, PeerManagerConfig,
+        };
+        use rustoshi_consensus::ChainParams;
+
+        // The constant value matches BIP-157.
         assert_eq!(NODE_COMPACT_FILTERS, 1 << 6,
             "constant value must match BIP-157 definition");
+
+        // Gate returns FALSE for all input permutations because P2P handlers
+        // are absent. Future-proofs the test: when handlers land and the
+        // constant flips, the (true, true) branch will start returning true.
+        assert_eq!(BIP157_P2P_HANDLERS_REGISTERED, false,
+            "BIP-157 P2P handlers (ProcessGetCFilters/Headers/CheckPt) are \
+             absent — constant must stay false until they are wired");
+        assert_eq!(should_advertise_compact_filters(false, false), false,
+            "no index, no peerblockfilters → gate false");
+        assert_eq!(should_advertise_compact_filters(true, false), false,
+            "index without peerblockfilters → gate false");
+        assert_eq!(should_advertise_compact_filters(false, true), false,
+            "peerblockfilters without index → gate false (matches Core init.cpp:994 check)");
+        assert_eq!(should_advertise_compact_filters(true, true), false,
+            "both flags set but P2P handlers absent → gate false");
+
+        // local_services() respects the gate: bit 6 stays unset even when
+        // the operator turns on both config flags.
+        let cfg_off = PeerManagerConfig::testnet4();
+        let mgr_off = PeerManager::new(cfg_off, ChainParams::testnet4());
+        assert_eq!(mgr_off.local_services() & NODE_COMPACT_FILTERS, 0,
+            "default config: NODE_COMPACT_FILTERS not advertised");
+
+        let mut cfg_on = PeerManagerConfig::testnet4();
+        cfg_on.block_filter_index_enabled = true;
+        cfg_on.peer_block_filters = true;
+        let mgr_on = PeerManager::new(cfg_on, ChainParams::testnet4());
+        assert_eq!(mgr_on.local_services() & NODE_COMPACT_FILTERS, 0,
+            "even with both flags on: gate is FALSE because BIP-157 P2P \
+             handlers are not registered (BIP157_P2P_HANDLERS_REGISTERED=false)");
+
+        // Sanity: NODE_NETWORK | NODE_WITNESS still advertised in both modes.
+        assert_eq!(mgr_off.local_services() & (NODE_NETWORK | NODE_WITNESS),
+            NODE_NETWORK | NODE_WITNESS,
+            "NODE_NETWORK | NODE_WITNESS must always be advertised");
+        assert_eq!(mgr_on.local_services() & (NODE_NETWORK | NODE_WITNESS),
+            NODE_NETWORK | NODE_WITNESS,
+            "NODE_NETWORK | NODE_WITNESS must always be advertised");
+    }
+
+    /// G22 forward-regression guard: documentation test — confirms the gate
+    /// function signature so that when a future P2P wave wires up the
+    /// handlers, the type-shape of the call site doesn't drift.
+    ///
+    /// Per FIX-71, the gate takes (block_filter_index_enabled, peer_block_filters)
+    /// and a compile-time `BIP157_P2P_HANDLERS_REGISTERED` constant. If a
+    /// future refactor changes the inputs (e.g. takes a `&BlockFilterIndex`
+    /// and calls `is_synced()`), this test will fail to compile and force the
+    /// updater to re-think the audit-test framing.
+    #[test]
+    fn g22_gate_signature_stable_for_future_p2p_wave() {
+        use crate::peer_manager::should_advertise_compact_filters;
+        // The signature is `fn(bool, bool) -> bool`. Future maintainers:
+        // if you change this, update the W121 BUG-7 audit test framing too.
+        let f: fn(bool, bool) -> bool = should_advertise_compact_filters;
+        // Currently returns FALSE for (true, true) because P2P handlers absent.
+        assert_eq!(f(true, true), false,
+            "P2P handlers absent — flip BIP157_P2P_HANDLERS_REGISTERED to \
+             true after ProcessGetCFilters/Headers/CheckPt land, and this \
+             will start returning true");
+    }
+
+    /// G22 source-level regression guard: scan crate sources for any
+    /// unconditional OR of `NODE_COMPACT_FILTERS` into a `services`-shaped
+    /// variable. The only legitimate site is inside `local_services()` under
+    /// the `should_advertise_compact_filters` gate. Bare wiring like
+    /// `s |= NODE_COMPACT_FILTERS` outside that gate would silently lie to
+    /// peers; this test detects it at compile time of the test binary.
+    ///
+    /// Pattern matches drive-by stubs ("just turn it on") that bypass the
+    /// gate. Mirrors the smart-deferral integrity gate pattern used by
+    /// FIX-64 clearbit.
+    #[test]
+    fn g22_no_unconditional_node_compact_filters_or() {
+        use std::fs;
+        use std::path::Path;
+
+        // Files in `crates/network/src/` that could legitimately advertise the
+        // bit. Limit the scan to this crate; test code may use it freely.
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let entries = fs::read_dir(&src_dir)
+            .expect("src dir must exist");
+        let mut bad_lines: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            // Skip tests in this same crate; they may reference the constant.
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if file_name.starts_with("w99_") || file_name.starts_with("w103_")
+                || file_name.starts_with("w104_") || file_name.starts_with("w115_")
+            {
+                continue;
+            }
+            let body = fs::read_to_string(&path).unwrap_or_default();
+            for (idx, line) in body.lines().enumerate() {
+                let trimmed = line.trim();
+                // Match `<lhs> |= NODE_COMPACT_FILTERS` or `... | NODE_COMPACT_FILTERS`
+                // where the prior gate isn't `should_advertise_compact_filters`.
+                if trimmed.contains("NODE_COMPACT_FILTERS")
+                    && (trimmed.contains("|=") || (trimmed.contains("|") && !trimmed.contains("||")))
+                    && !trimmed.starts_with("//")
+                    && !trimmed.starts_with("///")
+                    && !trimmed.contains("should_advertise_compact_filters")
+                    // peer_manager.rs has the legitimate gated `s |= NODE_COMPACT_FILTERS;`
+                    // under the gate. The gate-call line is two lines earlier.
+                    // We allow this exact pattern (s |= NODE_COMPACT_FILTERS;) inside
+                    // peer_manager.rs because it's inside the if-gate block.
+                    && !(file_name == "peer_manager.rs" && trimmed == "s |= NODE_COMPACT_FILTERS;")
+                {
+                    bad_lines.push(format!("{}:{}: {}", file_name, idx + 1, trimmed));
+                }
+            }
+        }
+        assert!(
+            bad_lines.is_empty(),
+            "FIX-71 forward-regression guard: NODE_COMPACT_FILTERS must only \
+             be OR'd into services under the should_advertise_compact_filters \
+             gate. Found violations:\n  {}",
+            bad_lines.join("\n  ")
+        );
     }
 
     // ─── G23: MAX_MESSAGE_SIZE = 4 MB (decimal) ──────────────────────────────
