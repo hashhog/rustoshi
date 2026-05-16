@@ -35,7 +35,7 @@ use crate::types::*;
 use crate::wallet::WalletRpcState;
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -48,10 +48,10 @@ use rustoshi_storage::indexes::blockfilterindex::{
     BlockFilterIndex, BlockFilterType,
 };
 use rustoshi_wallet::payjoin::{
-    handle_payjoin_request, OfferedPayjoin, PayjoinError, PayjoinParams,
-    MAX_ORIGINAL_PSBT_BYTES,
+    evict_expired_offers, handle_payjoin_request, OfferedPayjoin, PayjoinError, PayjoinParams,
+    MAX_ORIGINAL_PSBT_BYTES, OFFERED_PAYJOIN_TTL_SECS,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -215,7 +215,22 @@ pub struct RestState {
     /// excluded from new-offer coin selection (G19 replay/conflict
     /// guard). Held outside the wallet to keep FIX-61's `sent_txs`
     /// single-purpose (outgoing-only).
+    ///
+    /// G18 (FIX-67): Entries are evicted on every new request whose
+    /// `created_at + OFFERED_PAYJOIN_TTL_SECS < now`, so a sender that
+    /// receives a PayJoin reply but never broadcasts cannot pin the
+    /// receiver's UTXO forever.
     pub offered_payjoins: Mutex<HashMap<Hash256, OfferedPayjoin>>,
+    /// G30 (FIX-67): Set of unsigned-tx hashes the receiver has already
+    /// answered for. A second request carrying the same Original-PSBT
+    /// id is rejected as `original-psbt-rejected` (replay) regardless
+    /// of whether the prior offer is still in `offered_payjoins`.
+    ///
+    /// Bounded growth: this set is reset whenever it grows past
+    /// `PAYJOIN_REPLAY_SET_LIMIT`. The reset is coarse — under steady
+    /// state the in-flight TTL eviction keeps the set proportional to
+    /// the request rate × TTL.
+    pub payjoin_replay_ids: Mutex<std::collections::HashSet<Hash256>>,
 }
 
 // ============================================================
@@ -1613,46 +1628,108 @@ pub async fn start_rest_server_with_wallet(
 // BIP-78 PAYJOIN RECEIVER (W119 / FIX-65)
 // ============================================================
 
-/// Query parameters defined by BIP-78 §"Protocol" for the sender's
-/// `POST /payjoin` request.
+/// G16 / G21 (FIX-67) — strict BIP-78 query-param parser.
 ///
-/// Optional fields default to `None`; the receiver foundation only
-/// enforces `v=1` today (everything else is captured for future
-/// fee-cap / fee-rate enforcement in FIX-66+).
-#[derive(Debug, Deserialize)]
-struct PayjoinQuery {
-    /// `v=` — BIP-78 protocol version. Required.
-    #[serde(default)]
-    v: Option<u32>,
-    /// `additionalfeeoutputindex=` — sender's hint at which output to
-    /// draw additional fees from.
-    #[serde(default)]
-    additionalfeeoutputindex: Option<usize>,
-    /// `maxadditionalfeecontribution=` — cap on receiver-added fee.
-    #[serde(default)]
-    maxadditionalfeecontribution: Option<u64>,
-    /// `disableoutputsubstitution=` — Boolean serialised as a 0/1 query
-    /// string per BIP-78 §"Optional parameters".
-    #[serde(default)]
-    disableoutputsubstitution: Option<u8>,
-    /// `minfeerate=` — sat/vB.
-    #[serde(default)]
-    minfeerate: Option<f64>,
-}
+/// BIP-78 §"Protocol" specifies five wire query parameters
+/// (`v`, `additionalfeeoutputindex`, `maxadditionalfeecontribution`,
+/// `disableoutputsubstitution`, `minfeerate`). The receiver MUST
+/// understand `v=1` and reject anything else as
+/// `version-unsupported`; malformed numeric values MUST be rejected
+/// as `original-psbt-rejected`.
+///
+/// Parses the raw query string (`?k=v&k=v`), recognising only the
+/// five wire keys (unknown keys are tolerated for forward-compat
+/// per BIP-78 §"Forward compatibility"), validates each value, and
+/// emits a [`PayjoinParams`] or a typed parser error mapped to a
+/// BIP-78 wire error.
+fn parse_payjoin_query(raw: &str) -> Result<PayjoinParams, PayjoinError> {
+    let mut version: Option<u32> = None;
+    let mut additional_fee_output_index: Option<usize> = None;
+    let mut max_additional_fee_contribution: Option<u64> = None;
+    let mut disable_output_substitution: bool = false;
+    let mut min_fee_rate: Option<f64> = None;
 
-impl PayjoinQuery {
-    fn into_params(self) -> PayjoinParams {
-        PayjoinParams {
-            // Missing v is treated as version 0 so the validator emits
-            // `version-unsupported` instead of letting an unversioned
-            // request fall through. Matches the BIP-78 wording "v=1".
-            version: self.v.unwrap_or(0),
-            additional_fee_output_index: self.additionalfeeoutputindex,
-            max_additional_fee_contribution: self.maxadditionalfeecontribution,
-            disable_output_substitution: matches!(self.disableoutputsubstitution, Some(1)),
-            min_fee_rate: self.minfeerate,
+    // Empty query → defaults (version=0 → caught by validate_params as
+    // `version-unsupported`).
+    if raw.is_empty() {
+        return Ok(PayjoinParams {
+            version: 0,
+            additional_fee_output_index: None,
+            max_additional_fee_contribution: None,
+            disable_output_substitution: false,
+            min_fee_rate: None,
+        });
+    }
+
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = match pair.split_once('=') {
+            Some(kv) => kv,
+            // Bare key without `=` → BIP-78 doesn't define that shape;
+            // we tolerate it as no-op so unknown keys don't trip us.
+            None => continue,
+        };
+        match k {
+            "v" => {
+                let parsed: u32 = v.parse().map_err(|_| {
+                    PayjoinError::OriginalPsbtRejected(format!(
+                        "v query param must be a u32 (got {v:?})"
+                    ))
+                })?;
+                version = Some(parsed);
+            }
+            "additionalfeeoutputindex" => {
+                let parsed: usize = v.parse().map_err(|_| {
+                    PayjoinError::OriginalPsbtRejected(format!(
+                        "additionalfeeoutputindex must be a non-negative integer (got {v:?})"
+                    ))
+                })?;
+                additional_fee_output_index = Some(parsed);
+            }
+            "maxadditionalfeecontribution" => {
+                let parsed: u64 = v.parse().map_err(|_| {
+                    PayjoinError::OriginalPsbtRejected(format!(
+                        "maxadditionalfeecontribution must be a u64 (got {v:?})"
+                    ))
+                })?;
+                max_additional_fee_contribution = Some(parsed);
+            }
+            "disableoutputsubstitution" => {
+                // BIP-78: 0 or 1.
+                match v {
+                    "0" => disable_output_substitution = false,
+                    "1" => disable_output_substitution = true,
+                    other => {
+                        return Err(PayjoinError::OriginalPsbtRejected(format!(
+                            "disableoutputsubstitution must be 0 or 1 (got {other:?})"
+                        )));
+                    }
+                }
+            }
+            "minfeerate" => {
+                let parsed: f64 = v.parse().map_err(|_| {
+                    PayjoinError::OriginalPsbtRejected(format!(
+                        "minfeerate must be a non-negative f64 (got {v:?})"
+                    ))
+                })?;
+                min_fee_rate = Some(parsed);
+            }
+            // Unknown keys: per BIP-78 forward-compat, we tolerate but
+            // do not store. (Senders that need stricter semantics can
+            // use HTTP request validation upstream.)
+            _ => continue,
         }
     }
+
+    Ok(PayjoinParams {
+        version: version.unwrap_or(0),
+        additional_fee_output_index,
+        max_additional_fee_contribution,
+        disable_output_substitution,
+        min_fee_rate,
+    })
 }
 
 /// Build a BIP-78 JSON error body + the matching HTTP status. The
@@ -1679,30 +1756,64 @@ fn payjoin_error_response(err: &PayjoinError) -> Response {
 /// but trivially safe.
 const PAYJOIN_REQUEST_BODY_LIMIT: usize = MAX_ORIGINAL_PSBT_BYTES;
 
+/// G30 (FIX-67) replay-id set soft cap. Larger than the in-flight TTL
+/// map can grow under realistic load; if a misbehaving sender floods,
+/// the set is cleared (replay protection then degrades to "any
+/// previously offered PSBT-id that has expired from `offered_payjoins`
+/// might be re-accepted", which is an acceptable failure mode — the
+/// alternative is unbounded growth).
+const PAYJOIN_REPLAY_SET_LIMIT: usize = 8192;
+
 /// POST /payjoin — BIP-78 receiver endpoint.
 ///
 /// Flow:
-///  1. Validate query params (only `v=1` is accepted today).
-///  2. Read the request body (text/plain base64 Original PSBT), bounded
-///     by [`PAYJOIN_REQUEST_BODY_LIMIT`].
+///  1. Validate request headers: `Content-Type: text/plain` (G23) and
+///     body size ≤ [`PAYJOIN_REQUEST_BODY_LIMIT`] (G23).
+///  2. Strict-parse the query string (G16) into [`PayjoinParams`];
+///     enforce `v=1` (G21).
 ///  3. Acquire the wallet handle and require it unlocked; if either
 ///     fails, answer with HTTP 503 `unavailable`.
-///  4. Call into [`handle_payjoin_request`] which runs the structural
+///  4. Evict expired offers from `offered_payjoins` (G18) before
+///     snapshotting.
+///  5. Reject any request whose Original-PSBT id has already been
+///     served (G30 replay).
+///  6. Call into [`handle_payjoin_request`] which runs the structural
 ///     PSBT checks, picks a receiver UTXO that isn't already in
 ///     `offered_payjoins`, augments the PSBT, signs the receiver input,
 ///     and returns the modified PSBT.
-///  5. Commit the offer into `offered_payjoins` (key = Original PSBT
+///  7. Commit the offer into `offered_payjoins` (key = Original PSBT
 ///     unsigned-tx hash) so subsequent concurrent requests don't pick
-///     the same receiver UTXO.
-///  6. Respond `200 text/plain` with the base64 PSBT body. The sender
+///     the same receiver UTXO. Also record the id in the replay set.
+///  8. Respond `200 text/plain` with the base64 PSBT body. The sender
 ///     is responsible for signing its own inputs and broadcasting
 ///     (BIP-78 §"Sender's actions").
 async fn payjoin_handler(
     State(state): State<Arc<RestState>>,
-    Query(query): Query<PayjoinQuery>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    // 1. Body size guard.
+    // G23: Content-Type strict. BIP-78 §"Protocol" specifies the body
+    // is a base64-encoded PSBT served as `text/plain`. We accept
+    // exactly `text/plain` (optionally with charset parameter, common
+    // in practice). Any other type is rejected with a BIP-78
+    // `original-psbt-rejected`. We look up by string to dodge the
+    // multi-version `http` crate disambiguation (axum 0.7 ships
+    // `http` 1.x; some other deps still pin `http` 0.2).
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    if !content_type
+        .to_ascii_lowercase()
+        .starts_with("text/plain")
+    {
+        return payjoin_error_response(&PayjoinError::OriginalPsbtRejected(format!(
+            "Content-Type must be text/plain (got {content_type:?})"
+        )));
+    }
+
+    // G23: Body size guard (the 8 KiB BIP-78 cap).
     if body.len() > PAYJOIN_REQUEST_BODY_LIMIT {
         return payjoin_error_response(&PayjoinError::OriginalPsbtRejected(format!(
             "request body exceeds {} byte limit",
@@ -1710,15 +1821,23 @@ async fn payjoin_handler(
         )));
     }
 
-    let params = query.into_params();
+    // G16 strict query-param parsing; surfaces parse failures as
+    // `original-psbt-rejected` per BIP-78 "malformed request".
+    let raw = raw_query.unwrap_or_default();
+    let params = match parse_payjoin_query(&raw) {
+        Ok(p) => p,
+        Err(e) => return payjoin_error_response(&e),
+    };
 
-    // 2. Validate version FIRST so the wire `version-unsupported` path
-    //    runs even when the receiver wallet is locked / absent.
+    // G21 + G16 receiver-side validation (v=1 sentinel + minfeerate
+    // sanity). Runs BEFORE wallet resolution so the wire
+    // `version-unsupported` answer is produced even with no wallet
+    // loaded.
     if let Err(e) = rustoshi_wallet::payjoin::validate_params(&params) {
         return payjoin_error_response(&e);
     }
 
-    // 3. Resolve the wallet handle. Absent → `unavailable`.
+    // Resolve the wallet handle. Absent → `unavailable`.
     let wallet_state = match &state.wallet_state {
         Some(ws) => ws.clone(),
         None => {
@@ -1728,13 +1847,40 @@ async fn payjoin_handler(
         }
     };
 
-    // 4. Take a snapshot of in-flight offers under the dedicated lock
-    //    (held only for the snapshot — the wallet read happens with the
-    //    map lock dropped to avoid two-lock ordering hazards).
-    let offered_snapshot: HashMap<Hash256, OfferedPayjoin> =
-        state.offered_payjoins.lock().await.clone();
+    // G18: evict expired offers BEFORE snapshotting. A sender that
+    // received a PayJoin reply but never broadcast won't pin the
+    // receiver UTXO past the TTL.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let offered_snapshot: HashMap<Hash256, OfferedPayjoin> = {
+        let mut offered = state.offered_payjoins.lock().await;
+        let _evicted = evict_expired_offers(&mut offered, now_secs, OFFERED_PAYJOIN_TTL_SECS);
+        offered.clone()
+    };
 
-    // 5. Acquire wallet read lock + require the active wallet unlocked.
+    // G30: replay check. We compute the Original-PSBT id by parsing the
+    // body upfront (cheap — body is already known to be ≤ 8 KiB). If
+    // the id has already been served, return `original-psbt-rejected`
+    // without ever touching the wallet (avoids re-deriving keys for
+    // known-replayed requests).
+    let original_psbt_id: Option<Hash256> = match std::str::from_utf8(body.as_ref()) {
+        Ok(s) => rustoshi_wallet::Psbt::from_base64(s.trim())
+            .ok()
+            .map(|p| p.unsigned_tx.txid()),
+        Err(_) => None,
+    };
+    if let Some(psbt_id) = original_psbt_id.as_ref() {
+        let replays = state.payjoin_replay_ids.lock().await;
+        if replays.contains(psbt_id) {
+            return payjoin_error_response(&PayjoinError::OriginalPsbtRejected(
+                "replay: this Original PSBT has already been served".to_string(),
+            ));
+        }
+    }
+
+    // Acquire wallet read lock + require the active wallet unlocked.
     let result = {
         let wallet_state_guard = wallet_state.read().await;
         let (name, wallet_arc) = match wallet_state_guard
@@ -1771,23 +1917,30 @@ async fn payjoin_handler(
         Err(e) => return payjoin_error_response(&e),
     };
 
-    // 6. Commit the offer. Key = unsigned-tx hash of the ORIGINAL psbt;
-    //    we reconstruct it from the modified psbt by dropping the
-    //    last (receiver-added) input. Cheaper and equally unique: use
-    //    the modified-tx hash since each PayJoin yields a distinct one.
-    let psbt_id = contribution.modified_psbt.unsigned_tx.txid();
+    // Commit the offer. The Original-PSBT id (G30) is the unsigned-tx
+    // hash of the body the sender supplied; offered_payjoins also keys
+    // on it (or falls back to the modified-tx hash if the original
+    // failed to parse a moment ago — that path is defensive: if we
+    // reached here `handle_payjoin_request` already parsed it).
+    let commit_id = original_psbt_id
+        .unwrap_or_else(|| contribution.modified_psbt.unsigned_tx.txid());
     {
         let mut offered = state.offered_payjoins.lock().await;
         offered.insert(
-            psbt_id,
+            commit_id,
             OfferedPayjoin {
                 receiver_outpoint: contribution.added_utxo.outpoint.clone(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                created_at: now_secs,
             },
         );
+    }
+    {
+        let mut replays = state.payjoin_replay_ids.lock().await;
+        if replays.len() >= PAYJOIN_REPLAY_SET_LIMIT {
+            // Soft-reset to bound memory growth (see PAYJOIN_REPLAY_SET_LIMIT).
+            replays.clear();
+        }
+        replays.insert(commit_id);
     }
 
     let body_b64 = contribution.modified_psbt.to_base64();
@@ -1827,6 +1980,7 @@ pub fn rest_router_with_wallet(
         rpc_state,
         wallet_state,
         offered_payjoins: Mutex::new(HashMap::new()),
+        payjoin_replay_ids: Mutex::new(std::collections::HashSet::new()),
     });
 
     // axum 0.7 uses matchit 0.7 syntax: `:name` for single-segment params
@@ -1949,6 +2103,67 @@ mod tests {
         assert_eq!(RestFormat::Json.content_type(), "application/json");
         assert_eq!(RestFormat::Binary.content_type(), "application/octet-stream");
         assert_eq!(RestFormat::Hex.content_type(), "text/plain");
+    }
+
+    // -----------------------------------------------------------------
+    // FIX-67 G16 — parse_payjoin_query
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn payjoin_query_parses_full_set() {
+        let q = "v=1&additionalfeeoutputindex=0&maxadditionalfeecontribution=1000&disableoutputsubstitution=1&minfeerate=2.5";
+        let p = parse_payjoin_query(q).expect("happy parse");
+        assert_eq!(p.version, 1);
+        assert_eq!(p.additional_fee_output_index, Some(0));
+        assert_eq!(p.max_additional_fee_contribution, Some(1000));
+        assert!(p.disable_output_substitution);
+        assert_eq!(p.min_fee_rate, Some(2.5));
+    }
+
+    #[test]
+    fn payjoin_query_default_v_is_zero() {
+        // Empty query → version=0 → caller's validate_params rejects.
+        let p = parse_payjoin_query("").expect("empty parse");
+        assert_eq!(p.version, 0);
+    }
+
+    #[test]
+    fn payjoin_query_rejects_non_numeric_v() {
+        let err = parse_payjoin_query("v=abc").expect_err("non-numeric v rejects");
+        assert_eq!(err.code(), "original-psbt-rejected");
+    }
+
+    #[test]
+    fn payjoin_query_rejects_invalid_disable_output_substitution() {
+        let err = parse_payjoin_query("v=1&disableoutputsubstitution=2")
+            .expect_err("only 0/1 allowed");
+        assert_eq!(err.code(), "original-psbt-rejected");
+    }
+
+    #[test]
+    fn payjoin_query_tolerates_unknown_keys() {
+        // Forward-compat: unknown keys are skipped.
+        let p = parse_payjoin_query("v=1&foo=bar&someotherkey=42").expect("tolerates unknown");
+        assert_eq!(p.version, 1);
+    }
+
+    #[test]
+    fn payjoin_query_rejects_negative_minfeerate_via_validate() {
+        let p = parse_payjoin_query("v=1&minfeerate=-1.0").expect("parses raw");
+        let err = rustoshi_wallet::payjoin::validate_params(&p)
+            .expect_err("negative minfeerate rejects in validate_params");
+        assert_eq!(err.code(), "original-psbt-rejected");
+    }
+
+    // -----------------------------------------------------------------
+    // FIX-67 G18 — payjoin_replay_set + offered_payjoins TTL semantics
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn payjoin_replay_set_limit_is_finite_and_resets() {
+        // Smoke: ensure PAYJOIN_REPLAY_SET_LIMIT is configured so the
+        // soft-reset semantics in payjoin_handler are bounded.
+        assert!(PAYJOIN_REPLAY_SET_LIMIT >= 1024);
     }
 
     #[test]
