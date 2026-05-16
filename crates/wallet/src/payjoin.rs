@@ -501,6 +501,364 @@ fn sign_receiver_input(
 }
 
 // =====================================================================
+// SENDER ANTI-SNOOP VALIDATORS (W119 / FIX-66)
+// =====================================================================
+
+/// Sender-side options the BIP-78 sender sends with the Original PSBT.
+///
+/// Mirrors `PayjoinParams` but from the sender's perspective. The
+/// sender writes these into the URL query string the receiver sees
+/// AND uses the same values to validate the receiver's reply (anti-
+/// snoop checks G10..G15).
+///
+/// Reference: BIP-78 §"Sender's actions" — "After receiving the
+/// modified PSBT, the sender MUST verify that…".
+#[derive(Clone, Debug)]
+pub struct SenderOptions {
+    /// Maximum extra fee the sender will pay over the Original PSBT's
+    /// fee. Drives the BIP-78 `maxadditionalfeecontribution` query
+    /// param AND the G13 bound check on the reply.
+    pub max_additional_fee_contribution: u64,
+    /// Index of the output the receiver may draw additional fees from.
+    /// Drives `additionalfeeoutputindex` (and is the only output the
+    /// sender allows to shrink without rejecting the reply).
+    pub additional_fee_output_index: Option<usize>,
+    /// If `true`, sender refuses any reply where the sender→receiver
+    /// output script type was changed. Drives `disableoutputsubstitution=1`
+    /// AND the G14 enforcement on the reply.
+    pub disable_output_substitution: bool,
+    /// Minimum acceptable fee rate (sat/vB) on the receiver's reply.
+    /// Drives `minfeerate` AND the G15 enforcement on the reply.
+    pub min_fee_rate: f64,
+    /// Sender's own wallet outpoints, used to detect a malicious
+    /// receiver who attempts to add another sender-owned UTXO (G12).
+    /// Empty is acceptable — the sender just won't flag any input
+    /// as "from my own wallet", losing the G12 defence but otherwise
+    /// proceeding.
+    pub own_wallet_outpoints: std::collections::HashSet<OutPoint>,
+}
+
+impl Default for SenderOptions {
+    fn default() -> Self {
+        Self {
+            max_additional_fee_contribution: 0,
+            additional_fee_output_index: None,
+            disable_output_substitution: false,
+            min_fee_rate: 1.0,
+            own_wallet_outpoints: std::collections::HashSet::new(),
+        }
+    }
+}
+
+/// Errors a BIP-78 sender raises while validating the receiver's reply.
+/// Maps to G10..G15 + G22 (fallback).
+#[derive(Debug, thiserror::Error)]
+pub enum SenderError {
+    /// G10: Proposed PSBT is missing an output that was present in the
+    /// Original. Receiver tried to silently drop a sender output.
+    #[error("G10 sender-output preservation: original output {0} missing in proposed")]
+    OutputMissing(usize),
+    /// G10/G14: A non-additional-fee output's value or script changed.
+    /// When `disableoutputsubstitution=1` this is also a hard reject.
+    #[error("G10/G14 output mutated: output {index}: {reason}")]
+    OutputMutated {
+        /// Index of the mutated output in the Original PSBT.
+        index: usize,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// G11: Receiver changed a sender-input's scriptSig type. This
+    /// breaks signing and is forbidden.
+    #[error("G11 scriptSig type changed on input {0}")]
+    ScriptSigTypeChanged(usize),
+    /// G12: Receiver added an input that the sender's wallet owns,
+    /// which would let the receiver indirectly link sender's
+    /// own-wallet UTXOs.
+    #[error("G12 receiver added sender-owned input at index {0}")]
+    NewSenderInput(usize),
+    /// G10: Receiver dropped one of the original inputs.
+    #[error("G10 receiver removed original input {0}")]
+    OriginalInputDropped(usize),
+    /// G13: Proposed PSBT exceeds Original fee + maxadditionalfeecontribution.
+    #[error("G13 fee exceeds bound: original={original}, proposed={proposed}, cap={cap}")]
+    FeeBoundExceeded {
+        /// Fee on the Original PSBT (sats).
+        original: u64,
+        /// Fee on the Proposed PSBT (sats).
+        proposed: u64,
+        /// Sender's `maxadditionalfeecontribution` cap (sats).
+        cap: u64,
+    },
+    /// G15: Resulting fee rate dropped below the sender's `minfeerate`.
+    #[error("G15 fee rate {got:.3} below minimum {min:.3} sat/vB")]
+    FeeRateTooLow {
+        /// Achieved sat/vB.
+        got: f64,
+        /// Configured minimum sat/vB.
+        min: f64,
+    },
+    /// Generic structural rejection of the proposed PSBT (un-parseable,
+    /// missing utxo data, ...). Distinct from G10..G15 because it
+    /// doesn't map to a "receiver tried to cheat" failure — usually a
+    /// receiver bug.
+    #[error("Proposed PSBT structurally invalid: {0}")]
+    InvalidProposed(String),
+}
+
+/// Validate a Proposed PSBT against the Original PSBT and the sender's
+/// own configuration. Runs all six anti-snoop validators (G10..G15) in
+/// one pass — any failure returns Err.
+///
+/// `original` is the PSBT the sender sent on the wire.
+/// `proposed` is the PSBT the receiver returned.
+/// `opts` carries the sender's BIP-78 options.
+///
+/// Sender-output substitution rules (G10): every Original output's
+/// (script, value) MUST appear in Proposed, with two relaxations:
+///   - The output at `additional_fee_output_index` may have its
+///     value decreased by up to `max_additional_fee_contribution`
+///     sats (sender contributes to fee). Its script MUST NOT change.
+///   - When `disable_output_substitution = false`, the receiver-paying
+///     output (the only output in Original whose value can plausibly
+///     increase) may have its value increased *and* its script
+///     substituted, but only to a script of the same type
+///     (same first opcode prefix) and only with `pjos=1` (the
+///     default, captured by `disable_output_substitution=false`).
+///
+/// G11 — scriptSig types: each Original input's spent-script type
+/// (derived from `witness_utxo.script_pubkey` first byte) MUST equal
+/// the type in Proposed (receiver MUST NOT swap a P2WPKH for a P2WSH
+/// etc).
+///
+/// G12 — new inputs from sender's wallet: every input in Proposed
+/// that wasn't in Original MUST NOT match `opts.own_wallet_outpoints`.
+///
+/// G13 — fee bound: `fee(Proposed) ≤ fee(Original) + max_additional_fee_contribution`.
+///
+/// G15 — minimum fee rate: `fee(Proposed) / vsize(Proposed) ≥ min_fee_rate`.
+pub fn validate_proposed_psbt(
+    original: &Psbt,
+    proposed: &Psbt,
+    opts: &SenderOptions,
+) -> Result<(), SenderError> {
+    // --- Compute fees + vsize on both PSBTs first. ---
+    let orig_fee = compute_psbt_fee(original)?;
+    let prop_fee = compute_psbt_fee(proposed)?;
+
+    // G13 fee bound. We compute this before the per-output check so a
+    // grossly-out-of-spec reply fails fast.
+    let cap = opts.max_additional_fee_contribution;
+    if prop_fee > orig_fee.saturating_add(cap) {
+        return Err(SenderError::FeeBoundExceeded {
+            original: orig_fee,
+            proposed: prop_fee,
+            cap,
+        });
+    }
+
+    // G15 minimum fee rate (proposed must clear sender's minfeerate).
+    let prop_vsize = proposed.unsigned_tx.vsize() as f64;
+    if prop_vsize > 0.0 {
+        let achieved = prop_fee as f64 / prop_vsize;
+        if achieved + 1e-9 < opts.min_fee_rate {
+            return Err(SenderError::FeeRateTooLow {
+                got: achieved,
+                min: opts.min_fee_rate,
+            });
+        }
+    }
+
+    // --- G10 + G14: outputs preserved (with allowed relaxations). ---
+    // Build a multiset of (script_pubkey, value) for Proposed.
+    let mut proposed_outputs: Vec<(Vec<u8>, u64)> = proposed
+        .unsigned_tx
+        .outputs
+        .iter()
+        .map(|o| (o.script_pubkey.clone(), o.value))
+        .collect();
+
+    for (i, orig_out) in original.unsigned_tx.outputs.iter().enumerate() {
+        // First, try the exact match: same script, same value.
+        if let Some(pos) = proposed_outputs
+            .iter()
+            .position(|(spk, v)| *spk == orig_out.script_pubkey && *v == orig_out.value)
+        {
+            proposed_outputs.swap_remove(pos);
+            continue;
+        }
+        // No exact match — may we accept a relaxed match?
+        // Relaxation A: same-script output at additionalfeeoutputindex
+        // with decreased value (within cap).
+        if Some(i) == opts.additional_fee_output_index {
+            if let Some(pos) = proposed_outputs
+                .iter()
+                .position(|(spk, v)| *spk == orig_out.script_pubkey && *v <= orig_out.value)
+            {
+                let (_, new_v) = &proposed_outputs[pos];
+                let drop_amount = orig_out.value - *new_v;
+                if drop_amount > cap {
+                    return Err(SenderError::OutputMutated {
+                        index: i,
+                        reason: format!(
+                            "fee-output drop {drop_amount} exceeds maxadditionalfeecontribution {cap}"
+                        ),
+                    });
+                }
+                proposed_outputs.swap_remove(pos);
+                continue;
+            }
+        }
+        // Relaxation B: same-script output whose value INCREASED. The
+        // receiver-paying output legitimately gains the receiver's
+        // contribution. This relaxation respects pjos=1: script MUST
+        // remain byte-equal, only value rises.
+        if let Some(pos) = proposed_outputs
+            .iter()
+            .position(|(spk, v)| *spk == orig_out.script_pubkey && *v >= orig_out.value)
+        {
+            proposed_outputs.swap_remove(pos);
+            continue;
+        }
+        // Relaxation C (G14, pjos=0 only): same-script-TYPE substitution.
+        // BIP-78 permits the receiver to replace its own output script
+        // with one of the same type when pjos=1 is NOT set in the URI
+        // (i.e. `disable_output_substitution=false` on the sender).
+        if !opts.disable_output_substitution {
+            let want_type = script_type_byte(&orig_out.script_pubkey);
+            if let Some(pos) = proposed_outputs.iter().position(|(spk, v)| {
+                script_type_byte(spk) == want_type && *v >= orig_out.value
+            }) {
+                proposed_outputs.swap_remove(pos);
+                continue;
+            }
+        } else {
+            // pjos=1 + no exact-or-value-up match → script was mutated.
+            return Err(SenderError::OutputMutated {
+                index: i,
+                reason: "disableoutputsubstitution=1 but output script changed".to_string(),
+            });
+        }
+        // No relaxation salvaged this output → G10 violation.
+        return Err(SenderError::OutputMissing(i));
+    }
+
+    // --- G11: scriptSig types preserved on Original inputs. ---
+    // BIP-78 says "scriptSig types" but for SegWit inputs (the only
+    // ones the receiver foundation supports) the scriptSig is empty,
+    // and the equivalent invariant is "the script type of the spent
+    // output". We derive it from witness_utxo.script_pubkey's leading
+    // byte (a robust, type-only signature).
+    for (i, orig_in) in original.unsigned_tx.inputs.iter().enumerate() {
+        let prop_in = proposed
+            .unsigned_tx
+            .inputs
+            .iter()
+            .find(|p| p.previous_output == orig_in.previous_output)
+            .ok_or(SenderError::OriginalInputDropped(i))?;
+        // scriptSig field must remain empty/unchanged for SegWit and
+        // for any input the sender will sign post-PayJoin. The
+        // receiver MUST NOT prepopulate it.
+        if orig_in.script_sig != prop_in.script_sig {
+            return Err(SenderError::ScriptSigTypeChanged(i));
+        }
+        // Spent-script type (via PSBT witness_utxo lookup).
+        let orig_spk_type = original
+            .inputs
+            .get(i)
+            .and_then(|p| p.witness_utxo.as_ref().map(|u| script_type_byte(&u.script_pubkey)))
+            .unwrap_or(None);
+        let prop_idx = proposed
+            .unsigned_tx
+            .inputs
+            .iter()
+            .position(|p| p.previous_output == orig_in.previous_output)
+            .ok_or(SenderError::OriginalInputDropped(i))?;
+        let prop_spk_type = proposed
+            .inputs
+            .get(prop_idx)
+            .and_then(|p| p.witness_utxo.as_ref().map(|u| script_type_byte(&u.script_pubkey)))
+            .unwrap_or(None);
+        if orig_spk_type != prop_spk_type {
+            return Err(SenderError::ScriptSigTypeChanged(i));
+        }
+    }
+
+    // --- G12: no new inputs that the sender's wallet owns. ---
+    let orig_outpoints: std::collections::HashSet<OutPoint> = original
+        .unsigned_tx
+        .inputs
+        .iter()
+        .map(|i| i.previous_output.clone())
+        .collect();
+    for (i, prop_in) in proposed.unsigned_tx.inputs.iter().enumerate() {
+        if orig_outpoints.contains(&prop_in.previous_output) {
+            continue; // pre-existing sender input — fine
+        }
+        // New input. Make sure it isn't ours.
+        if opts.own_wallet_outpoints.contains(&prop_in.previous_output) {
+            return Err(SenderError::NewSenderInput(i));
+        }
+    }
+
+    Ok(())
+}
+
+/// Compute the implicit fee on a PSBT: Σ(input values from witness_utxo /
+/// non_witness_utxo) - Σ(unsigned_tx.outputs.value).
+///
+/// Returns [`SenderError::InvalidProposed`] when an input lacks the
+/// utxo metadata required to derive its spent value.
+fn compute_psbt_fee(psbt: &Psbt) -> Result<u64, SenderError> {
+    let mut in_total: u64 = 0;
+    for (i, ti) in psbt.unsigned_tx.inputs.iter().enumerate() {
+        let pin = psbt
+            .inputs
+            .get(i)
+            .ok_or_else(|| SenderError::InvalidProposed(format!("psbt input {i} missing entry")))?;
+        if let Some(wu) = &pin.witness_utxo {
+            in_total = in_total
+                .checked_add(wu.value)
+                .ok_or_else(|| SenderError::InvalidProposed("u64 overflow in fee total".into()))?;
+        } else if let Some(prev) = &pin.non_witness_utxo {
+            let vout = ti.previous_output.vout as usize;
+            let out = prev.outputs.get(vout).ok_or_else(|| {
+                SenderError::InvalidProposed(format!(
+                    "non_witness_utxo vout {vout} oob for input {i}"
+                ))
+            })?;
+            in_total = in_total
+                .checked_add(out.value)
+                .ok_or_else(|| SenderError::InvalidProposed("u64 overflow in fee total".into()))?;
+        } else {
+            return Err(SenderError::InvalidProposed(format!(
+                "input {i} has no utxo data; cannot compute fee"
+            )));
+        }
+    }
+    let out_total: u64 = psbt
+        .unsigned_tx
+        .outputs
+        .iter()
+        .map(|o| o.value)
+        .sum();
+    if in_total < out_total {
+        return Err(SenderError::InvalidProposed(format!(
+            "outputs ({out_total}) exceed inputs ({in_total})"
+        )));
+    }
+    Ok(in_total - out_total)
+}
+
+/// Return the leading "type byte" of a scriptPubKey for G10/G14
+/// same-type substitution checks. This is intentionally coarse: it
+/// only inspects the first opcode, which is enough to tell P2WPKH/
+/// P2WSH (0x00) from P2TR (0x51) from P2PKH/P2SH legacy (0x76/0xa9).
+/// Returns `None` for empty scripts.
+fn script_type_byte(spk: &[u8]) -> Option<u8> {
+    spk.first().copied()
+}
+
+// =====================================================================
 // TESTS
 // =====================================================================
 
