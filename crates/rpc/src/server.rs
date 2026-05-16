@@ -31,10 +31,10 @@ use rustoshi_consensus::{
         is_ancestor_or_descendant, BlockMeta, ChainManagerState,
     },
     fee_estimator::FeeEstimator,
-    mempool::{Mempool, MempoolConfig},
+    mempool::{Mempool, MempoolConfig, MAX_BIP125_RBF_SEQUENCE},
     orphanage::TxOrphanage,
     versionbits::{get_deployments, get_state_for, DeploymentId, ThresholdState},
-    ChainParams, ChainState, NetworkId, COIN,
+    ChainParams, ChainState, NetworkId, COIN, MAX_SEQUENCE_NONFINAL, SEQUENCE_FINAL,
 };
 use rustoshi_network::message::{InvType, InvVector, NetworkMessage};
 use rustoshi_network::peer_manager::PeerManager;
@@ -641,7 +641,11 @@ pub trait RustoshiRpc {
     /// - inputs: Array of inputs `[{"txid": "hex", "vout": n, "sequence": n}]`
     /// - outputs: Array of outputs `[{"address": amount}, ...]` or `[{"data": "hex"}]`
     /// - locktime: Optional locktime (default 0)
-    /// - replaceable: Optional BIP125 replaceability (default false, uses sequence 0xfffffffe if true)
+    /// - replaceable: Optional BIP125 replaceability (default true, matches Core's
+    ///   `ConstructTransaction`/`rbf.value_or(true)`). When true, inputs use
+    ///   `MAX_BIP125_RBF_SEQUENCE` (0xFFFFFFFD). When false and locktime != 0,
+    ///   inputs use `MAX_SEQUENCE_NONFINAL` (0xFFFFFFFE). When false and locktime
+    ///   == 0, inputs use `SEQUENCE_FINAL` (0xFFFFFFFF).
     ///
     /// Returns: Base64-encoded unsigned PSBT
     #[method(name = "createpsbt")]
@@ -5835,13 +5839,25 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Build the unsigned transaction
         let lock_time = locktime.unwrap_or(0);
-        let replaceable = replaceable.unwrap_or(false);
+        // FIX-70 / W120 BUG-2: Core's `createpsbt` defaults `rbf` to TRUE (see
+        // bitcoin-core/src/rpc/rawtransaction.cpp::createpsbt — std::optional<bool>
+        // rbf is unset when param is null and then `rbf.value_or(true)` is applied
+        // inside ConstructTransaction). Was `unwrap_or(false)`.
+        let replaceable = replaceable.unwrap_or(true);
 
-        // Default sequence: 0xfffffffe for RBF-enabled, 0xffffffff otherwise
-        let default_sequence = if replaceable {
-            0xfffffffe
+        // FIX-70 / W120 BUG-2: Core's `ConstructTransaction`
+        // (bitcoin-core/src/rpc/rawtransaction_util.cpp:47-55):
+        //   if (rbf.value_or(true))             → MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD)
+        //   else if (rawTx.nLockTime)           → MAX_SEQUENCE_NONFINAL    (0xFFFFFFFE)
+        //   else                                → SEQUENCE_FINAL           (0xFFFFFFFF)
+        // Was unconditionally 0xFFFFFFFE for replaceable=true → non-signaling tx
+        // (one above the BIP-125 threshold). Now matches Core exactly.
+        let default_sequence: u32 = if replaceable {
+            MAX_BIP125_RBF_SEQUENCE
+        } else if lock_time != 0 {
+            MAX_SEQUENCE_NONFINAL
         } else {
-            0xffffffff
+            SEQUENCE_FINAL
         };
 
         // Parse inputs
@@ -6587,7 +6603,12 @@ impl RustoshiRpcServer for RpcServerImpl {
         replaceable: Option<bool>,
     ) -> RpcResult<String> {
         let locktime = locktime.unwrap_or(0);
-        let replaceable = replaceable.unwrap_or(false);
+        // FIX-70 / W120 BUG-3: Core's `createrawtransaction` defaults `rbf` to
+        // TRUE (see bitcoin-core/src/rpc/rawtransaction.cpp::createrawtransaction
+        // — `std::optional<bool> rbf` is unset when the param is null, then
+        // `rbf.value_or(true)` is applied inside `ConstructTransaction`). Was
+        // `unwrap_or(false)` → API divergence + non-signaling tx by default.
+        let replaceable = replaceable.unwrap_or(true);
 
         // Parse inputs
         let mut tx_inputs = Vec::new();
@@ -6600,12 +6621,22 @@ impl RustoshiRpcServer for RpcServerImpl {
                 .as_u64()
                 .ok_or_else(|| Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Missing vout"))?
                 as u32;
+            // FIX-70 / W120 BUG-2: mirror Core's `ConstructTransaction` mapping
+            // (bitcoin-core/src/rpc/rawtransaction_util.cpp:47-55):
+            //   replaceable → MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD)
+            //   !replaceable && locktime != 0 → MAX_SEQUENCE_NONFINAL (0xFFFFFFFE)
+            //   !replaceable && locktime == 0 → SEQUENCE_FINAL (0xFFFFFFFF)
+            // Explicit per-input `sequence` always wins. Was emitting 0xFFFFFFFE
+            // unconditionally when explicit-replaceable=false; the locktime
+            // case was correct but the !locktime case was wrong.
             let sequence = if let Some(seq) = input.get("sequence") {
-                seq.as_u64().unwrap_or(0xFFFFFFFF) as u32
+                seq.as_u64().unwrap_or(SEQUENCE_FINAL as u64) as u32
             } else if replaceable {
-                0xFFFFFFFD // BIP-125 replaceable
+                MAX_BIP125_RBF_SEQUENCE
+            } else if locktime != 0 {
+                MAX_SEQUENCE_NONFINAL
             } else {
-                0xFFFFFFFE
+                SEQUENCE_FINAL
             };
             tx_inputs.push(TxIn {
                 previous_output: OutPoint { txid, vout },
@@ -14298,5 +14329,252 @@ mod tests {
             "block-relay-only"
         );
         assert_eq!(connection_type_str(ConnectionType::Manual), "manual");
+    }
+
+    // ============================================================
+    // FIX-70 / W120 BUG-2 — createpsbt / createrawtransaction nSequence defaults
+    //
+    // Forward regression guards. Pin the Core-aligned sequence mapping in
+    // `bitcoin-core/src/rpc/rawtransaction_util.cpp:47-55`:
+    //   rbf=true  (or rbf=None)           → MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD)
+    //   rbf=false, locktime != 0          → MAX_SEQUENCE_NONFINAL   (0xFFFFFFFE)
+    //   rbf=false, locktime == 0          → SEQUENCE_FINAL          (0xFFFFFFFF)
+    //
+    // Pre-FIX-70 rustoshi emitted 0xFFFFFFFE for replaceable=true (W120 BUG-2)
+    // and defaulted replaceable=false (W120 BUG-3). bumpfee Rule 1 then fell
+    // over every wallet-created tx through these RPCs.
+    // ============================================================
+
+    fn setup_test_server() -> RpcServerImpl {
+        use rustoshi_storage::ChainDb;
+        use tokio::sync::RwLock;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let state = Arc::new(RwLock::new(RpcState::new(db, ChainParams::regtest())));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        RpcServerImpl::new(state, peer_state)
+    }
+
+    fn decode_psbt_first_input_sequence(psbt_b64: &str) -> u32 {
+        let psbt = rustoshi_wallet::psbt::Psbt::from_base64(psbt_b64)
+            .expect("createpsbt must return valid base64 PSBT");
+        psbt.unsigned_tx.inputs[0].sequence
+    }
+
+    /// FIX-70 G24b: `createpsbt` with `replaceable` unset must default to
+    /// `MAX_BIP125_RBF_SEQUENCE` (0xFFFFFFFD). Core's `rbf.value_or(true)`.
+    #[tokio::test]
+    async fn fix70_createpsbt_default_replaceable_is_rbf_sequence() {
+        let server = setup_test_server();
+        let inputs = vec![CreatePsbtInput {
+            txid: "00".repeat(32),
+            vout: 0,
+            sequence: None,
+        }];
+        let outputs = vec![serde_json::json!({
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
+        })];
+        let psbt_b64 = server
+            .createpsbt(inputs, outputs, None, None)
+            .await
+            .expect("createpsbt must succeed with valid inputs/outputs");
+        let seq = decode_psbt_first_input_sequence(&psbt_b64);
+        assert_eq!(
+            seq, 0xFFFFFFFD,
+            "createpsbt default must emit MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD), got 0x{seq:08x}"
+        );
+        // Belt-and-suspenders: < 0xFFFFFFFE is the BIP-125 signaling threshold.
+        assert!(
+            seq < 0xFFFFFFFE,
+            "createpsbt default must signal BIP-125 RBF (seq < 0xFFFFFFFE)"
+        );
+    }
+
+    /// FIX-70 G24b: `createpsbt` with `replaceable=true` must emit 0xFFFFFFFD.
+    #[tokio::test]
+    async fn fix70_createpsbt_explicit_replaceable_true_is_rbf_sequence() {
+        let server = setup_test_server();
+        let inputs = vec![CreatePsbtInput {
+            txid: "00".repeat(32),
+            vout: 0,
+            sequence: None,
+        }];
+        let outputs = vec![serde_json::json!({
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
+        })];
+        let psbt_b64 = server
+            .createpsbt(inputs, outputs, Some(0), Some(true))
+            .await
+            .expect("createpsbt must succeed");
+        let seq = decode_psbt_first_input_sequence(&psbt_b64);
+        assert_eq!(
+            seq, 0xFFFFFFFD,
+            "createpsbt(replaceable=true) must emit 0xFFFFFFFD (was 0xFFFFFFFE pre-FIX-70), got 0x{seq:08x}"
+        );
+    }
+
+    /// FIX-70: `createpsbt(replaceable=false, locktime=0)` must emit SEQUENCE_FINAL
+    /// (0xFFFFFFFF), matching `ConstructTransaction`'s third branch.
+    #[tokio::test]
+    async fn fix70_createpsbt_no_rbf_no_locktime_is_sequence_final() {
+        let server = setup_test_server();
+        let inputs = vec![CreatePsbtInput {
+            txid: "00".repeat(32),
+            vout: 0,
+            sequence: None,
+        }];
+        let outputs = vec![serde_json::json!({
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
+        })];
+        let psbt_b64 = server
+            .createpsbt(inputs, outputs, Some(0), Some(false))
+            .await
+            .expect("createpsbt must succeed");
+        let seq = decode_psbt_first_input_sequence(&psbt_b64);
+        assert_eq!(
+            seq, 0xFFFFFFFF,
+            "createpsbt(replaceable=false, locktime=0) must emit SEQUENCE_FINAL, got 0x{seq:08x}"
+        );
+    }
+
+    /// FIX-70: `createpsbt(replaceable=false, locktime>0)` must emit
+    /// `MAX_SEQUENCE_NONFINAL` (0xFFFFFFFE) — locktime-activates inputs.
+    #[tokio::test]
+    async fn fix70_createpsbt_no_rbf_with_locktime_is_sequence_nonfinal() {
+        let server = setup_test_server();
+        let inputs = vec![CreatePsbtInput {
+            txid: "00".repeat(32),
+            vout: 0,
+            sequence: None,
+        }];
+        let outputs = vec![serde_json::json!({
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
+        })];
+        let psbt_b64 = server
+            .createpsbt(inputs, outputs, Some(500_000), Some(false))
+            .await
+            .expect("createpsbt must succeed");
+        let seq = decode_psbt_first_input_sequence(&psbt_b64);
+        assert_eq!(
+            seq, 0xFFFFFFFE,
+            "createpsbt(replaceable=false, locktime>0) must emit MAX_SEQUENCE_NONFINAL, got 0x{seq:08x}"
+        );
+    }
+
+    /// FIX-70: explicit per-input `sequence` always wins over the default.
+    #[tokio::test]
+    async fn fix70_createpsbt_explicit_input_sequence_wins() {
+        let server = setup_test_server();
+        let inputs = vec![CreatePsbtInput {
+            txid: "00".repeat(32),
+            vout: 0,
+            sequence: Some(42),
+        }];
+        let outputs = vec![serde_json::json!({
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
+        })];
+        let psbt_b64 = server
+            .createpsbt(inputs, outputs, None, None)
+            .await
+            .expect("createpsbt must succeed");
+        let seq = decode_psbt_first_input_sequence(&psbt_b64);
+        assert_eq!(
+            seq, 42,
+            "explicit per-input sequence must override default, got 0x{seq:08x}"
+        );
+    }
+
+    /// FIX-70 G24c: `createrawtransaction` default replaceable=true → 0xFFFFFFFD.
+    /// Was `unwrap_or(false)` pre-FIX-70 (W120 BUG-3 P1).
+    #[tokio::test]
+    async fn fix70_createrawtransaction_default_replaceable_is_rbf_sequence() {
+        use rustoshi_primitives::{Decodable, Transaction};
+        let server = setup_test_server();
+        let inputs = vec![serde_json::json!({
+            "txid": "00".repeat(32),
+            "vout": 0,
+        })];
+        let outputs = vec![serde_json::json!({
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
+        })];
+        let hex = server
+            .create_raw_transaction(inputs, outputs, None, None)
+            .await
+            .expect("createrawtransaction must succeed");
+        let bytes = hex::decode(&hex).expect("hex");
+        let mut slice = bytes.as_slice();
+        let tx = Transaction::decode(&mut slice).expect("decode tx");
+        assert_eq!(
+            tx.inputs[0].sequence, 0xFFFFFFFD,
+            "createrawtransaction default must emit MAX_BIP125_RBF_SEQUENCE (was 0xFFFFFFFE pre-FIX-70), got 0x{:08x}",
+            tx.inputs[0].sequence
+        );
+    }
+
+    /// FIX-70: `createrawtransaction(replaceable=false, locktime>0)` → 0xFFFFFFFE.
+    #[tokio::test]
+    async fn fix70_createrawtransaction_no_rbf_with_locktime_is_nonfinal() {
+        use rustoshi_primitives::{Decodable, Transaction};
+        let server = setup_test_server();
+        let inputs = vec![serde_json::json!({
+            "txid": "00".repeat(32),
+            "vout": 0,
+        })];
+        let outputs = vec![serde_json::json!({
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
+        })];
+        let hex = server
+            .create_raw_transaction(inputs, outputs, Some(500_000), Some(false))
+            .await
+            .expect("createrawtransaction must succeed");
+        let bytes = hex::decode(&hex).expect("hex");
+        let mut slice = bytes.as_slice();
+        let tx = Transaction::decode(&mut slice).expect("decode tx");
+        assert_eq!(
+            tx.inputs[0].sequence, 0xFFFFFFFE,
+            "createrawtransaction(replaceable=false, locktime>0) must emit MAX_SEQUENCE_NONFINAL"
+        );
+    }
+
+    /// FIX-70: `createrawtransaction(replaceable=false, locktime=0)` → 0xFFFFFFFF.
+    #[tokio::test]
+    async fn fix70_createrawtransaction_no_rbf_no_locktime_is_sequence_final() {
+        use rustoshi_primitives::{Decodable, Transaction};
+        let server = setup_test_server();
+        let inputs = vec![serde_json::json!({
+            "txid": "00".repeat(32),
+            "vout": 0,
+        })];
+        let outputs = vec![serde_json::json!({
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
+        })];
+        let hex = server
+            .create_raw_transaction(inputs, outputs, Some(0), Some(false))
+            .await
+            .expect("createrawtransaction must succeed");
+        let bytes = hex::decode(&hex).expect("hex");
+        let mut slice = bytes.as_slice();
+        let tx = Transaction::decode(&mut slice).expect("decode tx");
+        assert_eq!(
+            tx.inputs[0].sequence, 0xFFFFFFFF,
+            "createrawtransaction(replaceable=false, locktime=0) must emit SEQUENCE_FINAL"
+        );
+    }
+
+    /// FIX-70: pin the named constants against their Core equivalents.
+    #[test]
+    fn fix70_sequence_constants_match_core() {
+        assert_eq!(
+            MAX_BIP125_RBF_SEQUENCE, 0xFFFFFFFD,
+            "MAX_BIP125_RBF_SEQUENCE must equal Core's util/rbf.h:12 constant"
+        );
+        assert_eq!(
+            MAX_SEQUENCE_NONFINAL, 0xFFFFFFFE,
+            "MAX_SEQUENCE_NONFINAL must equal Core's CTxIn::MAX_SEQUENCE_NONFINAL"
+        );
+        assert_eq!(
+            SEQUENCE_FINAL, 0xFFFFFFFF,
+            "SEQUENCE_FINAL must equal Core's CTxIn::SEQUENCE_FINAL"
+        );
     }
 }
