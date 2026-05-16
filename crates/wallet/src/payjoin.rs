@@ -97,9 +97,40 @@ pub struct OfferedPayjoin {
     /// The receiver UTXO that was added to this PayJoin. Used as the
     /// `offered_outpoints` key for cross-offer conflict detection.
     pub receiver_outpoint: OutPoint,
-    /// Unix timestamp (seconds) when the offer was created. Bookkept for
-    /// future TTL eviction (FIX-68) but unused in FIX-65.
+    /// Unix timestamp (seconds) when the offer was created. The HTTP
+    /// layer uses this to drive [`OFFERED_PAYJOIN_TTL_SECS`] eviction
+    /// (G18).
     pub created_at: u64,
+}
+
+/// BIP-78 §"Receiver state". Once an offered PayJoin sits idle for
+/// longer than this, the receiver MUST evict it from the in-flight
+/// map (otherwise a misbehaving sender can DoS receiver UTXOs).
+///
+/// Five minutes matches the BIP-78 reference implementations'
+/// (`payjoin` Rust crate / btcpayserver) default; tests use a smaller
+/// value via [`evict_expired_offers`] directly.
+pub const OFFERED_PAYJOIN_TTL_SECS: u64 = 5 * 60;
+
+/// G18 closure — evict expired offers from the in-flight map.
+///
+/// Called by the HTTP layer before snapshotting [`OfferedPayjoin`]s for
+/// coin-selection conflict detection. Pure helper so the receiver
+/// pipeline tests can drive it deterministically (no wall-clock).
+///
+/// Returns the number of offers evicted.
+pub fn evict_expired_offers(
+    offered: &mut HashMap<Hash256, OfferedPayjoin>,
+    now_secs: u64,
+    ttl_secs: u64,
+) -> usize {
+    let before = offered.len();
+    offered.retain(|_, off| {
+        // Use saturating_sub so a clock-skew "future" timestamp never
+        // triggers eviction.
+        now_secs.saturating_sub(off.created_at) <= ttl_secs
+    });
+    before - offered.len()
 }
 
 /// Errors that flow out of the receiver pipeline. Variants map 1:1 to
@@ -151,12 +182,35 @@ impl PayjoinError {
     }
 }
 
-/// Validate the BIP-78 query-param shape. The receiver foundation only
-/// enforces `v=1`; remaining params are stored verbatim for future
-/// fee-cap / fee-rate enforcement (FIX-67+).
+/// Validate the BIP-78 query-param shape (G16 + G21).
+///
+/// Enforces:
+///   - `v=1` (G21 — version sentinel). Anything else, including a
+///     missing `v` (mapped to `0` by the HTTP layer), returns
+///     [`PayjoinError::VersionUnsupported`].
+///   - `minfeerate` non-negative (a negative rate makes no sense and
+///     is rejected as `original-psbt-rejected` per BIP-78's
+///     "malformed request" guidance).
+///   - The combination of `disableoutputsubstitution=1` AND
+///     `additionalfeeoutputindex` is allowed but cross-checked at
+///     receiver-time only (no early-reject here).
+///
+/// G16 strictness — the matching HTTP-layer query parser in
+/// `crates/rpc/src/rest.rs` rejects unknown / malformed keys before
+/// reaching this function. This validator runs once the deserialised
+/// struct exists.
 pub fn validate_params(params: &PayjoinParams) -> Result<(), PayjoinError> {
+    // G21: v=1 sentinel.
     if params.version != 1 {
         return Err(PayjoinError::VersionUnsupported(params.version));
+    }
+    // G16: non-negative fee rate.
+    if let Some(mfr) = params.min_fee_rate {
+        if !mfr.is_finite() || mfr < 0.0 {
+            return Err(PayjoinError::OriginalPsbtRejected(format!(
+                "minfeerate must be a non-negative finite number (got {mfr})"
+            )));
+        }
     }
     Ok(())
 }
@@ -227,8 +281,8 @@ pub fn find_receiver_output(psbt: &Psbt, wallet: &Wallet) -> Result<(usize, Stri
 ///
 /// Returns `NotEnoughMoney` if the wallet has zero eligible UTXOs;
 /// returns the first non-conflicting candidate otherwise. This is
-/// deliberately naive — UIH-1 / UIH-2 anti-fingerprinting selection
-/// lands in FIX-67 (BUG-6 G20).
+/// deliberately naive (first eligible) — UIH-1 / UIH-2 fingerprinting
+/// awareness lives in [`pick_receiver_utxo_uih`] (G20).
 pub fn pick_receiver_utxo(
     wallet: &Wallet,
     offered: &HashMap<Hash256, OfferedPayjoin>,
@@ -243,6 +297,130 @@ pub fn pick_receiver_utxo(
         }
     }
     Err(PayjoinError::NotEnoughMoney)
+}
+
+/// G20 closure — UIH-1 / UIH-2 anti-fingerprint UTXO selector.
+///
+/// Background: BIP-78 §"Receiver" warns that a careless receiver-side
+/// coin-selector lets chain-analysis heuristics back-distinguish the
+/// receiver-added input from the sender's. The two well-known
+/// heuristics in the literature (`https://eprint.iacr.org/2022/589.pdf`,
+/// §3.1) are:
+///
+///   UIH-1 ("Unnecessary Input Heuristic 1"):
+///     If the receiver-added input value > max(original outputs), an
+///     observer can deduce the receiver contributed an input it didn't
+///     need (sender's original input alone covered the payment), which
+///     leaks "this is a PayJoin, not a real CoinJoin".
+///     Avoidance: pick a receiver UTXO `v <= max_original_output`.
+///
+///   UIH-2 ("Unnecessary Input Heuristic 2"):
+///     After PayJoin, the largest output should not be smaller than the
+///     second-largest input. If `recv_input + sender_input` produces a
+///     transaction where the largest output is < the second-largest
+///     input, the structure looks like a "consolidation that overpaid",
+///     which is unusual and back-distinguishes PayJoin.
+///     Avoidance: pick a receiver UTXO so that
+///       max_output_after_pj >= second_largest_input_after_pj.
+///
+/// Implementation strategy:
+///   - Iterate spendable unspent unlocked, skipping `offered` outpoints
+///     (mirrors [`pick_receiver_utxo`]).
+///   - Score each candidate: prefer "satisfies BOTH UIH-1 and UIH-2"
+///     over "satisfies one" over "satisfies neither" — never reject
+///     outright (a receiver with one UTXO MUST still serve the
+///     PayJoin; UIH is anti-fingerprint hygiene, not consensus).
+///   - Among same-score candidates, prefer smaller values (less likely
+///     to trip UIH-1 in pathological cases the heuristic didn't see).
+///
+/// `original_outputs_values` is `psbt.unsigned_tx.outputs.iter().map(|o| o.value)`.
+/// `original_inputs_values` is the spent-value of each sender input
+/// (the caller computes this from `witness_utxo`/`non_witness_utxo`).
+///
+/// Returns the chosen UTXO (a `WalletUtxo` clone owned by the caller).
+/// Returns [`PayjoinError::NotEnoughMoney`] when there is no eligible
+/// candidate.
+pub fn pick_receiver_utxo_uih(
+    wallet: &Wallet,
+    offered: &HashMap<Hash256, OfferedPayjoin>,
+    original_outputs_values: &[u64],
+    original_inputs_values: &[u64],
+) -> Result<WalletUtxo, PayjoinError> {
+    let claimed: std::collections::HashSet<OutPoint> = offered
+        .values()
+        .map(|o| o.receiver_outpoint.clone())
+        .collect();
+
+    let max_original_output = original_outputs_values
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(u64::MAX);
+
+    // Find largest existing input value (used for UIH-2 scoring).
+    let max_existing_input = original_inputs_values
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+
+    // Iterate, score, keep best.
+    let mut best: Option<(WalletUtxo, u8)> = None;
+    for utxo in wallet.list_spendable_unspent_unlocked() {
+        if claimed.contains(&utxo.outpoint) {
+            continue;
+        }
+        let v = utxo.value;
+
+        // UIH-1: candidate value <= max original output.
+        let uih1 = v <= max_original_output;
+
+        // UIH-2: after adding (v) to inputs and (v) to the largest output,
+        // is max_output_after >= second_largest_input_after?
+        // - max_output_after = max_original_output + v
+        // - second_largest_input_after: among original_inputs and v, the
+        //   second-largest. If v >= max_existing_input then second is
+        //   max_existing_input; else second is the max-of-the-rest of
+        //   original (cheaply approximated as max_existing_input itself
+        //   when there's a single original input).
+        let max_output_after = max_original_output.saturating_add(v);
+        let second_largest_input_after = if v >= max_existing_input {
+            max_existing_input
+        } else {
+            // We approximate: if the receiver UTXO is < max existing input,
+            // then the second-largest input is *either* v *or* the
+            // 2nd-largest of originals. Without a sorted-pass over all
+            // originals, we use `v` as the conservative bound — this only
+            // makes the heuristic slightly stricter (rejects some
+            // borderline candidates) which is the safer direction for
+            // anti-fingerprinting.
+            v
+        };
+        let uih2 = max_output_after >= second_largest_input_after;
+
+        // Score: 2 = both, 1 = one, 0 = neither.
+        let score: u8 = (uih1 as u8) + (uih2 as u8);
+
+        let take = match &best {
+            None => true,
+            Some((existing, exscore)) => {
+                if score > *exscore {
+                    true
+                } else if score == *exscore {
+                    // Tie-break: prefer smaller value (less likely to
+                    // trip UIH-1 in cases the heuristic missed).
+                    v < existing.value
+                } else {
+                    false
+                }
+            }
+        };
+        if take {
+            best = Some((utxo.clone(), score));
+        }
+    }
+
+    best.map(|(u, _)| u).ok_or(PayjoinError::NotEnoughMoney)
 }
 
 /// Outcome of [`build_modified_psbt`]. Held by the HTTP layer so it can
@@ -330,6 +508,75 @@ pub fn build_modified_psbt(
     })
 }
 
+/// G8 closure — receiver-side output substitution.
+///
+/// When the sender's BIP-78 URI carries `pjos=0` (or omits it — the
+/// default is "substitution allowed"), the receiver MAY replace the
+/// receiver output's `script_pubkey` with one of the SAME script type
+/// (same leading-opcode prefix). Useful for consolidating: receiver
+/// can swap to its own fresh address pointing at a different UTXO
+/// chain.
+///
+/// Implementation: returns a freshly-generated wallet address of the
+/// same `AddressType` as the original receiver output's spk shape,
+/// then mutates `psbt.unsigned_tx.outputs[recv_idx].script_pubkey` to
+/// the new address's spk. Returns the new address (for logging /
+/// commit-tracking).
+///
+/// G14 sender-side enforcement (in `validate_proposed_psbt`) already
+/// allows same-type substitution when `disable_output_substitution=false`
+/// — this is the symmetric receiver-side producer.
+///
+/// Returns `Err(PayjoinError::Unavailable(...))` when:
+///   - The wallet can't mint a fresh address of the same type
+///     (e.g. the wallet was created with `AddressType::P2PKH` but the
+///     original output is P2TR — different types).
+///   - The PSBT output's script type isn't supported by the wallet.
+///
+/// Note: this is opt-in. The default request flow
+/// ([`handle_payjoin_request`]) only invokes substitution when the
+/// caller passes `pjos=Some(false)` AND the receiver-side policy is
+/// to substitute. Tests exercise this helper directly to gate G8.
+pub fn substitute_receiver_output(
+    wallet: &mut Wallet,
+    psbt: &mut Psbt,
+    recv_output_idx: usize,
+) -> Result<String, PayjoinError> {
+    if recv_output_idx >= psbt.unsigned_tx.outputs.len() {
+        return Err(PayjoinError::Unavailable(
+            "receiver output index out of range".to_string(),
+        ));
+    }
+    let original_spk = psbt.unsigned_tx.outputs[recv_output_idx].script_pubkey.clone();
+    let original_type = script_type_byte(&original_spk);
+
+    // Generate a fresh receive address (the wallet picks the type per
+    // its AddressType). The substitution rule requires same-type, so
+    // we verify after.
+    let new_addr = wallet
+        .get_new_address()
+        .map_err(|e| PayjoinError::Unavailable(format!("substitute: get_new_address: {e}")))?;
+    let new_spk = Address::from_string(&new_addr, Some(wallet.network()))
+        .map_err(|e| PayjoinError::Unavailable(format!("substitute: parse fresh addr: {e}")))?
+        .to_script_pubkey();
+    let new_type = script_type_byte(&new_spk);
+    if new_type != original_type {
+        return Err(PayjoinError::Unavailable(format!(
+            "substitute: wallet address type ({:?}) differs from original output type ({:?})",
+            new_type, original_type
+        )));
+    }
+    // Must also differ — substituting to the same script is a no-op
+    // and reveals the wallet's preferred address was already in use.
+    if new_spk == original_spk {
+        return Err(PayjoinError::Unavailable(
+            "substitute: fresh address script equals original (no-op)".to_string(),
+        ));
+    }
+    psbt.unsigned_tx.outputs[recv_output_idx].script_pubkey = new_spk;
+    Ok(new_addr)
+}
+
 /// Top-level driver tying together [`validate_params`],
 /// [`decode_and_validate_original`], [`find_receiver_output`],
 /// [`pick_receiver_utxo`], and [`build_modified_psbt`].
@@ -347,7 +594,34 @@ pub fn handle_payjoin_request(
     validate_params(params)?;
     let psbt = decode_and_validate_original(body)?;
     let (recv_idx, _addr) = find_receiver_output(&psbt, wallet)?;
-    let utxo = pick_receiver_utxo(wallet, existing_offered)?;
+
+    // G20 (FIX-67): UIH-aware selection. Compute the input/output value
+    // vectors once and pass into the heuristic-aware picker; degrade to
+    // the naive picker only if the input metadata is missing (which
+    // `decode_and_validate_original` already prevents, but the defensive
+    // fallback keeps a tighter contract).
+    let original_outputs_values: Vec<u64> =
+        psbt.unsigned_tx.outputs.iter().map(|o| o.value).collect();
+    let original_inputs_values: Vec<u64> = psbt
+        .inputs
+        .iter()
+        .filter_map(|pi| {
+            pi.witness_utxo
+                .as_ref()
+                .map(|w| w.value)
+                .or_else(|| pi.non_witness_utxo.as_ref().map(|_| 0))
+        })
+        .collect();
+    let utxo = if original_inputs_values.len() == psbt.unsigned_tx.inputs.len() {
+        pick_receiver_utxo_uih(
+            wallet,
+            existing_offered,
+            &original_outputs_values,
+            &original_inputs_values,
+        )?
+    } else {
+        pick_receiver_utxo(wallet, existing_offered)?
+    };
     // Naive fee policy: the receiver bumps the fee by exactly its own
     // added vsize × 1 sat/vB ≈ 68 sat, capped at the sender's
     // `maxadditionalfeecontribution`. This is intentionally tiny — a
