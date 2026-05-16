@@ -979,15 +979,171 @@ fn g30_zmq_no_replacement_signal_bug13_bug15() {
 // EXTRA — submitpackage replaced_transactions tracking
 // ============================================================
 
-/// EXTRA — `SubmitPackageResult.replaced_transactions` is hardcoded to `None`.
-/// Source: crates/rpc/src/server.rs:5283 — `// TODO: track RBF replacements`.
-/// Status: BUG-5 (P1) — submitpackage path drops replacement context.
+/// EXTRA / FIX-73 (W120 BUG-5 audit flip) — `SubmitPackageResult.replaced_transactions`
+/// must now reflect the eviction set propagated from `PackageTxResult.replaced_txids`.
+///
+/// Pre-fix source: `crates/rpc/src/server.rs:5304` —
+/// `replaced_transactions: None, // TODO: track RBF replacements` AND
+/// `PackageTxResult` carried no `replaced_txids` field at all.
+///
+/// Post-fix invariant: when `accept_package` admits a tx that conflicts with
+/// an existing mempool entry, that entry's txid is returned via
+/// `PackageTxResult.replaced_txids` so the RPC layer can dedupe + emit
+/// `submitpackage.replaced-transactions` (Core `rpc/mempool.cpp:1500-1510`).
 #[test]
-#[ignore]
 fn extra_submitpackage_replaced_transactions_always_none_bug5() {
-    // BUG-5: `accept_package` does not return the eviction set; the RPC layer
-    // therefore cannot fill in `replaced_transactions`.
-    panic!("BUG-5: submitpackage replaced_transactions: None hardcoded; eviction set lost.");
+    let mut mp = test_mempool();
+
+    // Stage 1: admit an original RBF-signaling tx via the standard path.
+    let utxo = OutPoint { txid: hash_from_u8(0xB5), vout: 0 };
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(utxo.clone(), coin(500_000))].into_iter().collect();
+    let orig = tx_seq(utxo.txid, 0, 500_000, 1_000, 0xfffffffd);
+    let orig_txid = mp_add(&mut mp, orig, &utxos).unwrap();
+
+    // Stage 2: replacement tx submitted through accept_package — same input,
+    // higher fee — must RBF-evict the original.  We use a degenerate single-tx
+    // package which accept_package accepts as a 1-tx package (G1b regression).
+    let repl = tx_seq(utxo.txid, 0, 500_000, 50_000, 0xfffffffd);
+    let result = mp.accept_package(vec![repl], &|op| utxos.get(op).cloned());
+
+    assert!(
+        result.all_accepted(),
+        "FIX-73: package-RBF replacement must be accepted; pkg_err={:?}, tx_errs={:?}",
+        result.package_error,
+        result.tx_results.iter().map(|r| r.error.clone()).collect::<Vec<_>>(),
+    );
+    assert_eq!(result.tx_results.len(), 1);
+
+    // FIX-73 BUG-5 flip: the per-tx result must report orig_txid as replaced.
+    let r0 = &result.tx_results[0];
+    assert!(
+        r0.replaced_txids.contains(&orig_txid),
+        "FIX-73 (W120 BUG-5): PackageTxResult.replaced_txids must contain the \
+         RBF-evicted original txid {}; got {:?}.  Pre-fix this field did not \
+         exist; the eviction set was dropped between `add_transaction_for_package` \
+         and the RPC layer.",
+        orig_txid.to_hex(),
+        r0.replaced_txids.iter().map(|t| t.to_hex()).collect::<Vec<_>>(),
+    );
+
+    // Forward-regression guard: ensure exactly one tx was evicted (no spurious
+    // descendants or self-evictions).
+    assert_eq!(
+        r0.replaced_txids.len(),
+        1,
+        "FIX-73: 1 direct conflict, no descendants → replaced_txids.len() == 1"
+    );
+    assert_ne!(
+        r0.replaced_txids[0], r0.txid,
+        "FIX-73 sanity: a tx must not appear in its own replaced_txids set"
+    );
+}
+
+/// FIX-73 forward-regression — `PackageTxResult.replaced_txids` MUST be
+/// empty for non-replacement admissions.  Without this pin, a future change
+/// could leak previously-replaced txids into unrelated entries (e.g. by
+/// re-using a mutable accumulator across calls).
+#[test]
+fn fix73_replaced_txids_empty_when_no_rbf() {
+    let mut mp = test_mempool();
+    let utxo = OutPoint { txid: hash_from_u8(0xB6), vout: 0 };
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(utxo.clone(), coin(200_000))].into_iter().collect();
+
+    // First admission — no conflict — replaced_txids must be empty.
+    let tx = tx_seq(utxo.txid, 0, 200_000, 1_000, 0xfffffffd);
+    let result = mp.accept_package(vec![tx], &|op| utxos.get(op).cloned());
+    assert!(result.all_accepted(), "{:?}", result.package_error);
+    assert_eq!(result.tx_results.len(), 1);
+    assert!(
+        result.tx_results[0].replaced_txids.is_empty(),
+        "FIX-73: non-RBF admission must have empty replaced_txids; got {:?}",
+        result.tx_results[0].replaced_txids,
+    );
+}
+
+/// FIX-73 forward-regression — replaced txid set is captured BEFORE the
+/// in-mempool entry is dropped.  Guards against a future refactor that
+/// inverts the order (`remove_single` first, `push` after) which would
+/// silently lose the txid even though the entry exists in
+/// `direct_conflicts` and `get_all_descendants`.
+///
+/// Two-input package-RBF: original parent has a child; replacement evicts
+/// BOTH (parent direct conflict + child descendant cascade).
+#[test]
+fn fix73_replaced_txids_capture_before_remove_single() {
+    let mut mp = test_mempool();
+    let utxo = OutPoint { txid: hash_from_u8(0xB7), vout: 0 };
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(utxo.clone(), coin(500_000))].into_iter().collect();
+
+    // parent (RBF-signaling), child spends parent:0.  Both pre-admit normally.
+    let parent = tx_seq(utxo.txid, 0, 500_000, 1_000, 0xfffffffd);
+    let parent_id = mp_add(&mut mp, parent, &utxos).unwrap();
+
+    // child spends parent:0 -> we need the parent's UTXO available in lookup.
+    // Mempool tracks created UTXOs internally; lookup only needs confirmed coins.
+    let child = tx_seq(parent_id, 0, 499_000, 500, 0xfffffffd);
+    let child_id = mp_add(&mut mp, child, &utxos).unwrap();
+
+    // Replacement: same input as parent, much higher fee.
+    let repl = tx_seq(utxo.txid, 0, 500_000, 100_000, 0xfffffffd);
+    let result = mp.accept_package(vec![repl], &|op| utxos.get(op).cloned());
+
+    assert!(
+        result.all_accepted(),
+        "FIX-73: package-RBF (with child eviction cascade) must accept; \
+         pkg_err={:?}, tx_errs={:?}",
+        result.package_error,
+        result.tx_results.iter().map(|r| r.error.clone()).collect::<Vec<_>>(),
+    );
+    let r0 = &result.tx_results[0];
+
+    // Both parent_id AND child_id must appear — the latter via descendant cascade.
+    assert!(
+        r0.replaced_txids.contains(&parent_id),
+        "FIX-73: direct-conflict parent {} missing from replaced_txids: {:?}",
+        parent_id.to_hex(),
+        r0.replaced_txids.iter().map(|t| t.to_hex()).collect::<Vec<_>>(),
+    );
+    assert!(
+        r0.replaced_txids.contains(&child_id),
+        "FIX-73: descendant child {} missing from replaced_txids: {:?}",
+        child_id.to_hex(),
+        r0.replaced_txids.iter().map(|t| t.to_hex()).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        r0.replaced_txids.len(),
+        2,
+        "FIX-73: exactly {{parent, child}} should be evicted; got {:?}",
+        r0.replaced_txids.iter().map(|t| t.to_hex()).collect::<Vec<_>>(),
+    );
+}
+
+/// FIX-73 source-shape guard — the per-tx eviction list field exists on
+/// `PackageTxResult` and is a `Vec<Hash256>`, not an `Option<Vec<_>>` and
+/// not hidden behind a feature flag.  This is the cheapest possible
+/// "is the data still there at all" test — it makes a drive-by deletion
+/// of the field fail at compile time on this assertion rather than at
+/// silently-empty wire output in production.
+#[test]
+fn fix73_package_tx_result_replaced_txids_field_shape() {
+    use rustoshi_consensus::mempool::PackageTxResult;
+    // Construct a default-ish PackageTxResult literal — if `replaced_txids`
+    // is removed or its type changes, this test will not compile.
+    let r = PackageTxResult {
+        txid: zero_hash(),
+        wtxid: zero_hash(),
+        vsize: 0,
+        fee: 0,
+        already_in_mempool: false,
+        error: None,
+        replaced_txids: Vec::<rustoshi_primitives::Hash256>::new(),
+    };
+    // Iterator over the canonical Hash256 element type — pins the inner type.
+    let _: Vec<rustoshi_primitives::Hash256> = r.replaced_txids.clone();
+    assert!(r.replaced_txids.is_empty());
 }
 
 /// EXTRA — `MempoolError::Conflict(Hash256)` variant exists but is NEVER
