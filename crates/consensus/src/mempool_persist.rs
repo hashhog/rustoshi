@@ -231,10 +231,22 @@ pub fn dump_mempool_with_key(
             stats.txs += 1;
         }
 
-        // mapDeltas: rustoshi does not implement prioritisetransaction
-        // yet, so this is always empty. We still write the
-        // CompactSize(0) so the format is well-formed.
-        write_compact_size(&mut xor, 0)?;
+        // mapDeltas tail block: standalone `prioritisetransaction` deltas
+        // for txids NOT currently in the mempool. In-mempool deltas are
+        // already round-tripped via the per-entry `fee_delta` slot above.
+        // Mirrors Bitcoin Core `DumpMempool` (node/mempool_persist.cpp:166-201
+        // — copy mapDeltas, then erase each in-mempool txid, then write the
+        // remaining map). FIX-76 closure of the FIX-72 brief-error.
+        let standalone_deltas: Vec<(Hash256, i64)> = mempool
+            .prioritised_deltas()
+            .into_iter()
+            .filter(|(txid, _)| !mempool.contains(txid))
+            .collect();
+        write_compact_size(&mut xor, standalone_deltas.len() as u64)?;
+        for (txid, delta) in &standalone_deltas {
+            xor.write_all(txid.as_ref())?;
+            xor.write_all(&delta.to_le_bytes())?;
+        }
 
         // Unbroadcast set: rustoshi does not track an explicit
         // unbroadcast set yet, so this is always empty too.
@@ -361,7 +373,18 @@ where
         }
     }
 
-    // ---- mapDeltas ----
+    // ---- mapDeltas tail block ----
+    //
+    // Standalone `prioritisetransaction` deltas for txids that were NOT
+    // in the in-mempool entry list at dump time. Mirrors Bitcoin Core
+    // `LoadMempool` (node/mempool_persist.cpp:125-132): for each entry,
+    // call `PrioritiseTransaction(txid, delta)`. This records the delta
+    // in `map_deltas` even when the txid is absent from the mempool, so
+    // a subsequent admission picks it up via `ApplyDelta`.
+    //
+    // FIX-76 closure of the FIX-72 brief-error: previously this branch
+    // only patched an in-mempool entry's `fee_delta`, silently dropping
+    // standalone deltas on load.
     let n_deltas = read_compact_size(&mut xor)?;
     if n_deltas > MAX_DUMP_ENTRIES {
         return Err(io::Error::new(
@@ -377,8 +400,9 @@ where
         xor.read_exact(&mut delta_buf)?;
         let delta = i64::from_le_bytes(delta_buf);
         let txid = Hash256::from_bytes(txid_bytes);
-        // Apply only if the tx is in the mempool (Core does the same).
-        mempool.set_entry_fee_delta(&txid, delta);
+        // Stack delta into mempool.map_deltas (and into any matching
+        // in-mempool entry's `fee_delta`). Matches Core exactly.
+        mempool.prioritise_transaction(&txid, delta);
     }
 
     // ---- unbroadcast txids ----
@@ -683,5 +707,231 @@ mod tests {
         assert_eq!(version, MEMPOOL_DUMP_VERSION);
         assert_eq!(a[8], 0x08);
         assert_eq!(&a[9..17], &key);
+    }
+
+    // ----------------------------------------------------------------
+    // FIX-76: mapDeltas standalone-tail persistence
+    // ----------------------------------------------------------------
+
+    /// Standalone-delta round-trip: prioritise an absent txid, dump,
+    /// load into a fresh mempool, verify the delta is restored in
+    /// `map_deltas` and visible via `prioritised_deltas()`.
+    ///
+    /// Mirrors Bitcoin Core `LoadMempool`'s tail-block path
+    /// (node/mempool_persist.cpp:125-132).
+    #[test]
+    fn standalone_delta_roundtrips_via_tail_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mempool.dat");
+
+        // An absent txid: no UTXO for it, no entry in the mempool.
+        let absent_txid = Hash256::from_bytes([0xABu8; 32]);
+        let mut src = Mempool::new(MempoolConfig::default());
+        let new_delta = src.prioritise_transaction(&absent_txid, 9_876);
+        assert_eq!(new_delta, 9_876);
+        assert!(
+            !src.contains(&absent_txid),
+            "txid is standalone — not in mempool"
+        );
+        assert_eq!(
+            src.prioritised_deltas().len(),
+            1,
+            "source has one standalone delta"
+        );
+
+        let dump = dump_mempool(&src, &path).unwrap();
+        assert_eq!(dump.txs, 0, "no txs were admitted");
+
+        let mut dst = Mempool::new(MempoolConfig::default());
+        let utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+        let load = load_mempool(&mut dst, &path, &lookup_for(&utxos)).unwrap();
+        assert_eq!(load.total, 0);
+        assert_eq!(load.deltas, 1, "tail block carried the one standalone delta");
+
+        let restored = dst.prioritised_deltas();
+        assert_eq!(restored.len(), 1, "fresh mempool got the standalone delta");
+        assert_eq!(restored[0].0, absent_txid, "txid round-tripped intact");
+        assert_eq!(restored[0].1, 9_876, "delta round-tripped intact");
+    }
+
+    /// Empty `map_deltas` survives a round trip: dump writes
+    /// CompactSize(0) for the tail block and the loader sees zero
+    /// standalone deltas. Equivalent to the pre-FIX-76 default — this
+    /// test guards against accidental regression of the existing
+    /// empty-tail behaviour.
+    #[test]
+    fn empty_map_deltas_survives_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mempool.dat");
+
+        let src = Mempool::new(MempoolConfig::default());
+        assert!(src.prioritised_deltas().is_empty());
+        dump_mempool(&src, &path).unwrap();
+
+        let mut dst = Mempool::new(MempoolConfig::default());
+        let utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+        let load = load_mempool(&mut dst, &path, &lookup_for(&utxos)).unwrap();
+        assert_eq!(load.deltas, 0);
+        assert!(dst.prioritised_deltas().is_empty());
+    }
+
+    /// In-mempool delta round-trip via the per-entry inline path
+    /// (regression: this was the only path that worked pre-FIX-76 and
+    /// it MUST continue to work). Mirrors Bitcoin Core's behaviour
+    /// where in-mempool entries' deltas are erased from `mapDeltas`
+    /// before the tail is written (node/mempool_persist.cpp:200).
+    #[test]
+    fn in_mempool_delta_roundtrips_via_per_entry_inline_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mempool.dat");
+
+        let prev = Hash256::from_bytes([11u8; 32]);
+        let utxos = build_utxo(prev, 0, 100_000);
+        let tx = make_dummy_tx(prev, 0, 80_000);
+        let txid = tx.txid();
+
+        let mut src = Mempool::new(MempoolConfig::default());
+        src.add_transaction(tx, &lookup_for(&utxos)).unwrap();
+        // Prioritise on the in-mempool txid: delta lands in both
+        // map_deltas and entry.fee_delta.
+        src.prioritise_transaction(&txid, 4_321);
+        assert!(src.contains(&txid));
+        assert_eq!(src.get(&txid).unwrap().fee_delta, 4_321);
+
+        dump_mempool(&src, &path).unwrap();
+        // The tail block must NOT contain this txid because it is in
+        // the mempool. Reading the file back, the tail count must be
+        // zero — the per-entry inline path carries the delta.
+        let mut dst = Mempool::new(MempoolConfig::default());
+        let load = load_mempool(&mut dst, &path, &lookup_for(&utxos)).unwrap();
+
+        assert_eq!(load.total, 1);
+        assert_eq!(load.accepted, 1);
+        assert_eq!(
+            load.deltas, 0,
+            "in-mempool delta must NOT be in the tail block"
+        );
+        let entry = dst.get(&txid).expect("tx restored to mempool");
+        assert_eq!(entry.fee_delta, 4_321);
+    }
+
+    /// Mixed round-trip: one in-mempool tx with a delta + one
+    /// standalone delta. Both must come back intact through their
+    /// respective on-disk paths.
+    #[test]
+    fn mixed_in_mempool_and_standalone_deltas_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mempool.dat");
+
+        let prev = Hash256::from_bytes([22u8; 32]);
+        let utxos = build_utxo(prev, 0, 100_000);
+        let tx = make_dummy_tx(prev, 0, 70_000);
+        let txid_present = tx.txid();
+        let txid_absent = Hash256::from_bytes([0xCDu8; 32]);
+
+        let mut src = Mempool::new(MempoolConfig::default());
+        src.add_transaction(tx, &lookup_for(&utxos)).unwrap();
+        src.prioritise_transaction(&txid_present, 100);
+        src.prioritise_transaction(&txid_absent, 200);
+
+        dump_mempool(&src, &path).unwrap();
+        let mut dst = Mempool::new(MempoolConfig::default());
+        let load = load_mempool(&mut dst, &path, &lookup_for(&utxos)).unwrap();
+        assert_eq!(load.total, 1);
+        assert_eq!(
+            load.deltas, 1,
+            "only the standalone delta goes into the tail block — \
+             the in-mempool delta rides on the per-entry inline slot"
+        );
+
+        // In-mempool delta arrives via the per-entry inline path:
+        // entry.fee_delta is restored, which is what every fee-comparison
+        // gate (RBF Rule 3, mining score, get_modified_fee) consults.
+        assert_eq!(dst.get(&txid_present).unwrap().fee_delta, 100);
+
+        // Standalone delta arrives via the tail block: prioritise_
+        // transaction puts it into map_deltas so a future admission
+        // picks it up via apply_pending_delta.
+        let restored: HashMap<Hash256, i64> = dst.prioritised_deltas().into_iter().collect();
+        assert_eq!(restored.get(&txid_absent).copied(), Some(200));
+    }
+
+    /// Old-format compat: a hand-built v2 file with an empty tail
+    /// block (the pre-FIX-76 dump shape) loads cleanly with the new
+    /// loader. This is the on-disk-format check the FIX-76 brief
+    /// calls out — historical mempool.dat files must keep loading.
+    #[test]
+    fn old_format_v2_empty_tail_loads_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mempool.dat");
+
+        // Hand-build a v2 file with empty payload (matches a
+        // pre-FIX-76 rustoshi dump of an empty mempool — they wrote
+        // CompactSize(0) for both the deltas tail and the unbroadcast
+        // set).
+        let key = [0u8; 8]; // zero key → no obfuscation
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MEMPOOL_DUMP_VERSION.to_le_bytes());
+        write_compact_size(&mut bytes, OBFUSCATION_KEY_LEN as u64).unwrap();
+        bytes.extend_from_slice(&key);
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tx count
+        write_compact_size(&mut bytes, 0).unwrap(); // mapDeltas tail
+        write_compact_size(&mut bytes, 0).unwrap(); // unbroadcast tail
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+        let stats = load_mempool(&mut mempool, &path, &lookup_for(&utxos)).unwrap();
+        assert_eq!(stats.version, MEMPOOL_DUMP_VERSION);
+        assert_eq!(stats.deltas, 0);
+        assert!(mempool.prioritised_deltas().is_empty());
+    }
+
+    /// Forward-regression source guard: a file containing N standalone
+    /// deltas reports `stats.deltas == N` and every (txid, delta) pair
+    /// survives intact. Catches a future refactor that accidentally
+    /// drops the tail-block read or silently skips entries.
+    #[test]
+    fn forward_regression_many_standalone_deltas_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mempool.dat");
+
+        let mut src = Mempool::new(MempoolConfig::default());
+        // Build N distinct absent txids with distinct deltas.
+        let n: u64 = 32;
+        let mut expected: HashMap<Hash256, i64> = HashMap::new();
+        for i in 0..n {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xff) as u8;
+            bytes[1] = ((i >> 8) & 0xff) as u8;
+            let txid = Hash256::from_bytes(bytes);
+            // Use both positive and negative deltas (stress-test the
+            // sign-preserving i64 LE codec).
+            let delta = if i % 2 == 0 {
+                (i as i64 + 1) * 1_000
+            } else {
+                -(i as i64 + 1) * 1_000
+            };
+            src.prioritise_transaction(&txid, delta);
+            expected.insert(txid, delta);
+        }
+        assert_eq!(src.prioritised_deltas().len() as u64, n);
+
+        dump_mempool(&src, &path).unwrap();
+        let mut dst = Mempool::new(MempoolConfig::default());
+        let utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+        let load = load_mempool(&mut dst, &path, &lookup_for(&utxos)).unwrap();
+        assert_eq!(load.deltas, n);
+
+        let got: HashMap<Hash256, i64> = dst.prioritised_deltas().into_iter().collect();
+        assert_eq!(got.len() as u64, n, "every delta survived");
+        for (txid, want) in &expected {
+            assert_eq!(
+                got.get(txid).copied(),
+                Some(*want),
+                "delta for {:?} survived",
+                txid
+            );
+        }
     }
 }
