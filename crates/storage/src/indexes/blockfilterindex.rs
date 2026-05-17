@@ -25,6 +25,14 @@ use rustoshi_primitives::{Block, Hash256};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// BIP-157 checkpoint interval — see `bitcoin-core/src/index/blockfilterindex.h:31`:
+///   `static constexpr int CFCHECKPT_INTERVAL = 1000;`
+///
+/// Walked by `ProcessGetCFCheckPt`: for every `(i+1) * CFCHECKPT_INTERVAL`
+/// height up to `stop_index.nHeight / CFCHECKPT_INTERVAL`, the handler
+/// returns the filter header at that exact height.  FIX-82 / W121 BUG-18.
+pub const CFCHECKPT_INTERVAL: u32 = 1000;
+
 /// Block filter type (BIP 158).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -289,6 +297,108 @@ impl<'a> BlockFilterIndex<'a> {
         self.put_filter_header(height, &header_entry)?;
 
         Ok(filter_header)
+    }
+
+    // ---------------- RANGE QUERY API (FIX-82) ----------------
+    //
+    // Mirrors Core's `BlockFilterIndex::LookupFilterRange` /
+    // `LookupFilterHashRange` / `LookupFilterHeader` (index/blockfilterindex.cpp).
+    // The P2P handlers in `main.rs` use these to assemble `cfilter`,
+    // `cfheaders`, and `cfcheckpt` responses without doing one full block
+    // load per height.
+
+    /// Look up the filter header entry stored at the given block hash.
+    ///
+    /// Core: `BlockFilterIndex::LookupFilterHeader(const CBlockIndex*, uint256&)`.
+    /// We index headers by *height* (not block hash) on disk for efficient
+    /// range walks, so the caller must supply the height alongside the hash
+    /// — typically resolved via `BlockStore::get_hash_by_height` for the
+    /// active chain or via a stop-hash ancestor walk for non-active hashes.
+    pub fn lookup_filter_header_at_height(
+        &self,
+        height: u32,
+    ) -> Result<Option<Hash256>, BlockFilterError> {
+        Ok(self
+            .get_filter_header(height)?
+            .map(|entry| entry.filter_header))
+    }
+
+    /// Look up the filter hashes for a contiguous height range
+    /// `[start_height ..= stop_height]` on the active chain.
+    ///
+    /// `hash_lookup` is a callback that resolves height → block hash for the
+    /// active chain (typically `BlockStore::get_hash_by_height`).  Returns
+    /// the per-height filter_hash sequence so the caller can build a
+    /// `cfheaders` body.  If any height is missing (e.g. the index is
+    /// lagging), returns `Ok(None)` so the caller can defensively skip
+    /// emitting a partial response — matches Core's
+    /// `LookupFilterHashRange` returning false.
+    pub fn lookup_filter_hash_range<F>(
+        &self,
+        start_height: u32,
+        stop_height: u32,
+        mut hash_lookup: F,
+    ) -> Result<Option<Vec<Hash256>>, BlockFilterError>
+    where
+        F: FnMut(u32) -> Option<Hash256>,
+    {
+        if start_height > stop_height {
+            return Ok(Some(Vec::new()));
+        }
+        let mut out = Vec::with_capacity((stop_height - start_height + 1) as usize);
+        for h in start_height..=stop_height {
+            let entry = match self.get_filter_header(h)? {
+                Some(e) => e,
+                None => return Ok(None),
+            };
+            // Defensively confirm the indexed block hash matches the active
+            // chain's height index. If it doesn't, a reorg happened mid-walk
+            // and we should not serve a stale chain to the peer.
+            if let Some(active) = hash_lookup(h) {
+                if entry.block_hash != active {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
+            out.push(entry.filter_hash);
+        }
+        Ok(Some(out))
+    }
+
+    /// Look up the full filters for a contiguous height range
+    /// `[start_height ..= stop_height]` on the active chain.
+    ///
+    /// Mirrors Core's `BlockFilterIndex::LookupFilterRange`.  Internally
+    /// resolves each height to a block hash via `hash_lookup` (typically
+    /// `BlockStore::get_hash_by_height`) then fetches the per-block filter
+    /// row from CF_BLOCKFILTER. Returns `Ok(None)` if any filter or hash is
+    /// missing (defensive: matches Core's bool return).
+    pub fn lookup_filter_range<F>(
+        &self,
+        start_height: u32,
+        stop_height: u32,
+        mut hash_lookup: F,
+    ) -> Result<Option<Vec<BlockFilter>>, BlockFilterError>
+    where
+        F: FnMut(u32) -> Option<Hash256>,
+    {
+        if start_height > stop_height {
+            return Ok(Some(Vec::new()));
+        }
+        let mut out = Vec::with_capacity((stop_height - start_height + 1) as usize);
+        for h in start_height..=stop_height {
+            let hash = match hash_lookup(h) {
+                Some(h) => h,
+                None => return Ok(None),
+            };
+            let filter = match self.get_filter(&hash)? {
+                Some(f) => f,
+                None => return Ok(None),
+            };
+            out.push(filter);
+        }
+        Ok(Some(out))
     }
 
     /// Remove index data for a block (for reorg handling).

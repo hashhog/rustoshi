@@ -31,8 +31,10 @@ use rustoshi_consensus::{
     NetworkId, ValidationError,
 };
 use rustoshi_network::{
-    asmap as asmap_mod, BlockDownloader, HeaderSync, InvType, InvVector, MisbehaviorReason,
-    NetGroupManager, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig,
+    asmap as asmap_mod, BlockDownloader, CFCheckptMessage, CFHeadersMessage, CFilterMessage,
+    HeaderSync, InvType, InvVector, MisbehaviorReason, NetGroupManager, NetworkMessage, PeerEvent,
+    PeerManager, PeerManagerConfig, CFCHECKPT_INTERVAL, MAX_GETCFHEADERS_SIZE,
+    MAX_GETCFILTERS_SIZE, NODE_COMPACT_FILTERS,
 };
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
 use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
@@ -3310,6 +3312,348 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }
                                         _ => {}
                                     }
+                                }
+                            }
+
+                            // ============================================================
+                            // BIP-157 P2P handlers (FIX-82 / W121 BUG-7..BUG-13 closure)
+                            //
+                            // Mirror Core's net_processing.cpp ProcessGetCFilters /
+                            // ProcessGetCFHeaders / ProcessGetCFCheckPt + the shared
+                            // PrepareBlockFilterRequest DoS gate (lines 3262-3422).
+                            //
+                            // Each handler:
+                            //   1. Validates filter_type == BASIC + NODE_COMPACT_FILTERS
+                            //      advertised; otherwise peer.disconnect (Core
+                            //      fDisconnect=true).
+                            //   2. Resolves stop_hash → height + walks the active chain
+                            //      to confirm the hash is on our best chain (matches
+                            //      Core's BlockRequestAllowed via the height-index
+                            //      mirror).
+                            //   3. Enforces start_height <= stop_height + per-message
+                            //      range cap (MAX_GETCFILTERS_SIZE / MAX_GETCFHEADERS_SIZE
+                            //      / unbounded for getcfcheckpt).
+                            //   4. Reads BlockFilterIndex via lookup_filter_range /
+                            //      lookup_filter_hash_range / per-checkpoint
+                            //      get_filter_header. Defensive return-without-sending
+                            //      if a row is missing (matches Core's bool return).
+                            //   5. Pushes the response back to the peer.
+                            //
+                            // The handler-presence is announced via NODE_COMPACT_FILTERS
+                            // gated by `should_advertise_compact_filters` (FIX-82 flips
+                            // BIP157_P2P_HANDLERS_REGISTERED → true; the bit is
+                            // advertised when both `-blockfilterindex` and
+                            // `-peerblockfilters` are set).
+                            // ============================================================
+                            NetworkMessage::GetCFilters(req) => {
+                                // (1) Service-bit + filter-type gate. Our local services
+                                //     come straight from the PeerManager — if the operator
+                                //     hasn't enabled both -blockfilterindex and
+                                //     -peerblockfilters, the bit is unset and we MUST
+                                //     disconnect any peer that sends getcfilters.
+                                let local_services = {
+                                    let ps = peer_state.read().await;
+                                    ps.peer_manager
+                                        .as_ref()
+                                        .map(|pm| pm.local_services())
+                                        .unwrap_or(0)
+                                };
+                                let serves_cf = local_services & NODE_COMPACT_FILTERS != 0;
+                                if !serves_cf || req.filter_type != 0 {
+                                    tracing::debug!(
+                                        "peer {} sent getcfilters with unsupported filter \
+                                         type {} (serves_cf={}) — disconnect",
+                                        peer_id.0,
+                                        req.filter_type,
+                                        serves_cf
+                                    );
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                // (2) stop_hash lookup + active-chain validation.
+                                let stop_index = match block_store.get_block_index(&req.stop_hash) {
+                                    Ok(Some(e)) => e,
+                                    _ => {
+                                        tracing::debug!(
+                                            "peer {} sent getcfilters with unknown stop_hash {} — disconnect",
+                                            peer_id.0, req.stop_hash
+                                        );
+                                        let ps = peer_state.read().await;
+                                        if let Some(ref pm) = ps.peer_manager {
+                                            pm.try_disconnect_peer(peer_id);
+                                        }
+                                        continue;
+                                    }
+                                };
+                                // The stop_hash must be on the active chain. Mirrors
+                                // Core's BlockRequestAllowed (which checks
+                                // !pindexBestHeader->GetAncestor(h) failure).
+                                if block_store
+                                    .get_hash_by_height(stop_index.height)
+                                    .ok()
+                                    .flatten()
+                                    != Some(req.stop_hash)
+                                {
+                                    tracing::debug!(
+                                        "peer {} sent getcfilters for non-active-chain block — disconnect",
+                                        peer_id.0
+                                    );
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                let stop_height = stop_index.height;
+                                // (3) Range bounds. Core uses "diff >= max" (i.e.
+                                //     stop-start+1 > max) to disconnect.
+                                if req.start_height > stop_height {
+                                    tracing::debug!(
+                                        "peer {} sent getcfilters with start>stop ({} > {}) — disconnect",
+                                        peer_id.0, req.start_height, stop_height
+                                    );
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                if stop_height - req.start_height >= MAX_GETCFILTERS_SIZE {
+                                    tracing::debug!(
+                                        "peer {} requested too many cfilters: {} > {} — disconnect",
+                                        peer_id.0,
+                                        stop_height - req.start_height + 1,
+                                        MAX_GETCFILTERS_SIZE
+                                    );
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                // (4) Read filters via the range API.
+                                let idx = BlockFilterIndex::new(block_store.db());
+                                let filters = match idx.lookup_filter_range(
+                                    req.start_height,
+                                    stop_height,
+                                    |h| block_store.get_hash_by_height(h).ok().flatten(),
+                                ) {
+                                    Ok(Some(f)) => f,
+                                    _ => {
+                                        // Defensive: index lagging or missing row;
+                                        // return without sending. Matches Core
+                                        // ProcessGetCFilters lines 3334-3337.
+                                        tracing::debug!(
+                                            "BlockFilterIndex lookup_filter_range failed for peer {} (start={}, stop={})",
+                                            peer_id.0, req.start_height, stop_height
+                                        );
+                                        continue;
+                                    }
+                                };
+                                // (5) Push each filter as a cfilter response.
+                                let ps = peer_state.read().await;
+                                if let Some(ref pm) = ps.peer_manager {
+                                    for f in filters {
+                                        let msg = NetworkMessage::CFilter(CFilterMessage {
+                                            filter_type: 0,
+                                            block_hash: f.block_hash,
+                                            filter_bytes: f.encoded_filter,
+                                        });
+                                        pm.try_send_to_peer(peer_id, msg);
+                                    }
+                                }
+                            }
+
+                            NetworkMessage::GetCFHeaders(req) => {
+                                let local_services = {
+                                    let ps = peer_state.read().await;
+                                    ps.peer_manager
+                                        .as_ref()
+                                        .map(|pm| pm.local_services())
+                                        .unwrap_or(0)
+                                };
+                                let serves_cf = local_services & NODE_COMPACT_FILTERS != 0;
+                                if !serves_cf || req.filter_type != 0 {
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                let stop_index = match block_store.get_block_index(&req.stop_hash) {
+                                    Ok(Some(e)) => e,
+                                    _ => {
+                                        let ps = peer_state.read().await;
+                                        if let Some(ref pm) = ps.peer_manager {
+                                            pm.try_disconnect_peer(peer_id);
+                                        }
+                                        continue;
+                                    }
+                                };
+                                if block_store
+                                    .get_hash_by_height(stop_index.height)
+                                    .ok()
+                                    .flatten()
+                                    != Some(req.stop_hash)
+                                {
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                let stop_height = stop_index.height;
+                                if req.start_height > stop_height {
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                if stop_height - req.start_height >= MAX_GETCFHEADERS_SIZE {
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                // Resolve prev_filter_header (zero when start_height == 0).
+                                let idx = BlockFilterIndex::new(block_store.db());
+                                let prev_filter_header = if req.start_height == 0 {
+                                    rustoshi_primitives::Hash256::ZERO
+                                } else {
+                                    match idx.lookup_filter_header_at_height(req.start_height - 1) {
+                                        Ok(Some(h)) => h,
+                                        _ => {
+                                            // FIX-79 ouroboros pattern: defensive
+                                            // return-without-sending when the previous
+                                            // header row is missing. Matches Core
+                                            // net_processing.cpp:3361-3370.
+                                            tracing::debug!(
+                                                "peer {} getcfheaders: prev_filter_header at {} missing — defensive return",
+                                                peer_id.0, req.start_height - 1
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                };
+                                // Collect per-height filter hashes.
+                                let filter_hashes = match idx.lookup_filter_hash_range(
+                                    req.start_height,
+                                    stop_height,
+                                    |h| block_store.get_hash_by_height(h).ok().flatten(),
+                                ) {
+                                    Ok(Some(v)) => v,
+                                    _ => {
+                                        tracing::debug!(
+                                            "peer {} getcfheaders: lookup_filter_hash_range failed",
+                                            peer_id.0
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let msg = NetworkMessage::CFHeaders(CFHeadersMessage {
+                                    filter_type: 0,
+                                    stop_hash: req.stop_hash,
+                                    previous_filter_header: prev_filter_header,
+                                    filter_hashes,
+                                });
+                                let ps = peer_state.read().await;
+                                if let Some(ref pm) = ps.peer_manager {
+                                    pm.try_send_to_peer(peer_id, msg);
+                                }
+                            }
+
+                            NetworkMessage::GetCFCheckpt(req) => {
+                                let local_services = {
+                                    let ps = peer_state.read().await;
+                                    ps.peer_manager
+                                        .as_ref()
+                                        .map(|pm| pm.local_services())
+                                        .unwrap_or(0)
+                                };
+                                let serves_cf = local_services & NODE_COMPACT_FILTERS != 0;
+                                if !serves_cf || req.filter_type != 0 {
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                let stop_index = match block_store.get_block_index(&req.stop_hash) {
+                                    Ok(Some(e)) => e,
+                                    _ => {
+                                        let ps = peer_state.read().await;
+                                        if let Some(ref pm) = ps.peer_manager {
+                                            pm.try_disconnect_peer(peer_id);
+                                        }
+                                        continue;
+                                    }
+                                };
+                                if block_store
+                                    .get_hash_by_height(stop_index.height)
+                                    .ok()
+                                    .flatten()
+                                    != Some(req.stop_hash)
+                                {
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_disconnect_peer(peer_id);
+                                    }
+                                    continue;
+                                }
+                                let stop_height = stop_index.height;
+                                // Walk every CFCHECKPT_INTERVAL height up to
+                                // stop_height / CFCHECKPT_INTERVAL. Matches Core
+                                // ProcessGetCFCheckPt (net_processing.cpp:3403-3417).
+                                let idx = BlockFilterIndex::new(block_store.db());
+                                let count = (stop_height / CFCHECKPT_INTERVAL) as usize;
+                                let mut filter_headers: Vec<rustoshi_primitives::Hash256> =
+                                    Vec::with_capacity(count);
+                                let mut ok = true;
+                                for i in 0..count {
+                                    let height = ((i + 1) as u32) * CFCHECKPT_INTERVAL;
+                                    // Active-chain walk: stop_index's ancestor at
+                                    // `height` is the height-index entry only when
+                                    // stop_hash is on the active chain, which we
+                                    // already verified above.
+                                    let _ancestor_hash = match block_store
+                                        .get_hash_by_height(height)
+                                        .ok()
+                                        .flatten()
+                                    {
+                                        Some(h) => h,
+                                        None => {
+                                            ok = false;
+                                            break;
+                                        }
+                                    };
+                                    match idx.lookup_filter_header_at_height(height) {
+                                        Ok(Some(h)) => filter_headers.push(h),
+                                        _ => {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !ok {
+                                    tracing::debug!(
+                                        "peer {} getcfcheckpt: header walk failed at stop_height={}",
+                                        peer_id.0, stop_height
+                                    );
+                                    continue;
+                                }
+                                let msg = NetworkMessage::CFCheckpt(CFCheckptMessage {
+                                    filter_type: 0,
+                                    stop_hash: req.stop_hash,
+                                    filter_headers,
+                                });
+                                let ps = peer_state.read().await;
+                                if let Some(ref pm) = ps.peer_manager {
+                                    pm.try_send_to_peer(peer_id, msg);
                                 }
                             }
 
