@@ -530,6 +530,19 @@ impl<'a> BlockStore<'a> {
         self.db.delete_cf(CF_TX_INDEX, txid.as_bytes())
     }
 
+    /// FIX-88 (W121 G27 `getindexinfo`): whether ANY tx_index row exists.
+    ///
+    /// Used by the `getindexinfo` RPC to detect whether the txindex is
+    /// active for this datadir.  Mirrors Bitcoin Core's
+    /// `g_txindex != nullptr` check (the global is set iff the operator
+    /// enabled `-txindex`).  Since rustoshi has no equivalent global, we
+    /// probe by scanning the column family for a single key — RocksDB's
+    /// `Start` iterator returns the first key cheaply.
+    pub fn has_any_tx_index(&self) -> Result<bool, StorageError> {
+        let mut iter = self.db.iter_cf(CF_TX_INDEX)?;
+        Ok(iter.next().is_some())
+    }
+
     // ---------------- GENESIS INITIALIZATION ----------------
 
     // ---------------- BLOCK VALIDITY ----------------
