@@ -2666,11 +2666,20 @@ async fn core_fallback_gettxout(txid_hex: &str, vout: u32) -> Option<String> {
 /// `getdeploymentinfo` call `DeploymentInfo()`, which reads from
 /// `ChainstateActive()` + `DeploymentPos`.  We mirror that pattern here.
 ///
-/// CSV, SegWit, and Taproot are treated as "buried" deployments: they
-/// activated at a fixed, well-known block height stored in `ChainParams` and
-/// are no longer subject to BIP 9 signalling.  Any additional entries from the
-/// versionbits table that are not yet buried are emitted with a `bip9`
-/// sub-object so callers receive full signalling state.
+/// We emit the same set of buried deployments Core does:
+/// `bip34`, `bip65`, `bip66`, `csv`, `segwit` (see
+/// `bitcoin-core/src/deploymentinfo.cpp::DeploymentName`).  Each activated at
+/// a fixed, well-known block height stored in `ChainParams` and is no longer
+/// subject to BIP 9 signalling.  Rustoshi additionally exposes `taproot` as a
+/// buried deployment so callers can introspect its activation height (Core
+/// dropped this from the registry post-activation; we keep it for parity with
+/// our own historical RPC consumers).
+///
+/// Any additional entries from the versionbits table that are not yet buried
+/// (e.g. `testdummy`, future soft forks) are emitted with a `bip9` sub-object
+/// so callers receive full signalling state.  Deployments whose start_time is
+/// `NEVER_ACTIVE` are omitted entirely, mirroring Core's `DeploymentEnabled`
+/// gate.
 pub fn build_softforks_map(
     params: &ChainParams,
     eval_height: u32,
@@ -2689,17 +2698,31 @@ pub fn build_softforks_map(
 
     let mut map = serde_json::Map::new();
 
+    // BIP 34 — block-height in coinbase
+    map.insert("bip34".to_string(), buried(params.bip34_height, params.bip34_height));
+
+    // BIP 66 — strict DER signatures
+    map.insert("bip66".to_string(), buried(params.bip66_height, params.bip66_height));
+
+    // BIP 65 — CHECKLOCKTIMEVERIFY
+    map.insert("bip65".to_string(), buried(params.bip65_height, params.bip65_height));
+
     // BIP 68/112/113 — CSV (relative lock-times)
     map.insert("csv".to_string(), buried(params.csv_height, params.csv_height));
 
     // BIP 141/143/147 — SegWit
     map.insert("segwit".to_string(), buried(params.segwit_height, params.segwit_height));
 
-    // BIP 341/342 — Taproot
+    // BIP 341/342 — Taproot. Core removed this from `DeploymentName` once
+    // taproot was activated everywhere; we keep it for parity with our own
+    // historical RPC consumers that depend on the field being present.
     map.insert("taproot".to_string(), buried(params.taproot_height, params.taproot_height));
 
     // Any BIP 9 deployments that are NOT covered by the buried entries above
-    // (e.g. testdummy, future soft forks).
+    // (e.g. testdummy, future soft forks). Skip deployments whose start_time
+    // is `NEVER_ACTIVE` — Core gates these behind `DeploymentEnabled` and
+    // omits them from the registry on networks where they cannot ever fire.
+    use rustoshi_consensus::versionbits::{ALWAYS_ACTIVE, NEVER_ACTIVE};
     let vb_deployments = get_deployments(params);
     for (id, dep) in &vb_deployments {
         let name = match id {
@@ -2709,7 +2732,10 @@ pub fn build_softforks_map(
             DeploymentId::Custom(n) => format!("custom_{}", n),
         };
 
-        use rustoshi_consensus::versionbits::ALWAYS_ACTIVE;
+        if dep.start_time == NEVER_ACTIVE {
+            continue;
+        }
+
         let active = dep.start_time == ALWAYS_ACTIVE;
         let status = if active { "active" } else { "defined" };
 
@@ -11829,6 +11855,80 @@ mod tests {
                 assert_eq!(dep["min_activation_height"], serde_json::json!(1u32),
                     "{name}: min_activation_height mismatch");
             }
+        }
+    }
+
+    /// FIX-80 regression guard — every Core-emitted buried deployment must
+    /// appear in `build_softforks_map` so the daily mainnet consensus-diff
+    /// (`tools/consensus-diff.py`) reports zero `deployments.*` keys missing.
+    ///
+    /// Bitcoin Core (`src/deploymentinfo.cpp::DeploymentName`) emits five
+    /// buried deployments: `bip34`, `bip65`, `bip66`, `csv`, `segwit`.
+    /// Rustoshi additionally exposes `taproot` for parity with our own
+    /// historical RPC consumers.  All six MUST be present on mainnet, with
+    /// `type=="buried"`, `active==true` at a post-activation height, and the
+    /// well-known mainnet activation `height`.
+    #[test]
+    fn test_softforks_mainnet_emits_all_core_buried_deployments() {
+        let params = rustoshi_consensus::ChainParams::mainnet();
+
+        // Pick an eval height well past every known activation so every
+        // deployment shows up as active. Block 900000 is the same anchor the
+        // daily consensus-diff uses (`reference_height=900000`).
+        let map = build_softforks_map(&params, 900_000);
+
+        // Every Core-emitted name + our taproot extension.
+        let expected_names = &["bip34", "bip65", "bip66", "csv", "segwit", "taproot"];
+
+        for name in expected_names {
+            let dep = map
+                .get(*name)
+                .unwrap_or_else(|| panic!("FIX-80 regression: missing deployment '{name}' in softforks map"));
+            assert_eq!(
+                dep["type"],
+                serde_json::json!("buried"),
+                "{name}: type must be 'buried'"
+            );
+            assert_eq!(
+                dep["active"],
+                serde_json::json!(true),
+                "{name}: must be active at mainnet height 900000"
+            );
+            assert!(
+                dep["height"].is_number(),
+                "{name}: height must be a number when active"
+            );
+        }
+
+        // Spot-check well-known mainnet activation heights.
+        assert_eq!(map["bip34"]["height"],   serde_json::json!(params.bip34_height));
+        assert_eq!(map["bip65"]["height"],   serde_json::json!(params.bip65_height));
+        assert_eq!(map["bip66"]["height"],   serde_json::json!(params.bip66_height));
+        assert_eq!(map["csv"]["height"],     serde_json::json!(params.csv_height));
+        assert_eq!(map["segwit"]["height"],  serde_json::json!(params.segwit_height));
+        assert_eq!(map["taproot"]["height"], serde_json::json!(params.taproot_height));
+    }
+
+    /// FIX-80 source-level guard — the `build_softforks_map` helper is the
+    /// canonical builder for BOTH `getblockchaininfo.softforks` AND
+    /// `getdeploymentinfo.deployments`.  We must never accidentally drop one
+    /// of the Core-required names while refactoring; assert presence directly
+    /// against the in-memory map rather than only the JSON shape.
+    #[test]
+    fn test_softforks_pre_activation_emits_all_names_inactive() {
+        // Mainnet at height 0: every deployment should still be PRESENT in
+        // the map (so the daily diff doesn't flag missing keys) but with
+        // active=false and height=null.
+        let params = rustoshi_consensus::ChainParams::mainnet();
+        let map = build_softforks_map(&params, 0);
+
+        for name in &["bip34", "bip65", "bip66", "csv", "segwit", "taproot"] {
+            let dep = map
+                .get(*name)
+                .unwrap_or_else(|| panic!("FIX-80 regression: missing deployment '{name}' pre-activation"));
+            assert_eq!(dep["type"], serde_json::json!("buried"), "{name}: type");
+            assert_eq!(dep["active"], serde_json::json!(false), "{name}: should not be active at height 0");
+            assert_eq!(dep["height"], serde_json::json!(null), "{name}: height must be null when inactive");
         }
     }
 
