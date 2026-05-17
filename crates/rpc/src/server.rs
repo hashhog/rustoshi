@@ -1082,35 +1082,52 @@ impl RpcServerImpl {
         serde_json::value::RawValue::from_string(decimal_str).unwrap()
     }
 
-    /// Check if we should exit initial block download.
-    /// Returns true if chain has sufficient work AND tip is recent (< 24h old).
-    /// Once false, it remains false (latch behavior).
+    /// Check whether the IBD latch should flip from `true` to `false`.
+    ///
+    /// Returns `true` ONLY when the caller should mutate
+    /// `state.is_ibd = false`.  Mirrors Bitcoin Core's
+    /// `ChainstateManager::UpdateIBDStatus` (validation.cpp), which
+    /// flips `m_cached_is_ibd` to false iff chainwork >= min_chain_work
+    /// AND tip wallclock age < max_tip_age (24h).
     ///
     /// Takes the tip's chain_work and timestamp as raw values rather than
-    /// looking them up through `&BlockStore`, so callers can fetch the entry
-    /// before mutating `state` and avoid a borrow-checker conflict between
-    /// `let store = BlockStore::new(&state.db)` and `state.best_* = ...`.
+    /// looking them up through `&BlockStore`, so callers can fetch the
+    /// entry before mutating `state` and avoid a borrow-checker conflict
+    /// between `let store = BlockStore::new(&state.db)` and
+    /// `state.best_* = ...`.
     ///
-    /// `tip_chain_work` is `None` when the caller couldn't recover the
-    /// persisted chain work from the block index (which currently happens
-    /// for every P2P-synced block because `rustoshi/src/main.rs`'s
-    /// validation loop never writes a `BlockIndexEntry` — see TODO there).
-    /// When unknown, we trust the tip-age check alone: every block in the
-    /// store has already been validated with real PoW via
-    /// `ChainState::process_block`, so falling through to the age gate does
-    /// not weaken security in practice.
+    /// Sticky-OFF:  callers should gate this call on
+    /// `if state.is_ibd && self.should_exit_ibd(..)` so that once
+    /// `state.is_ibd` has been flipped false it stays false for the
+    /// life of the process — matching Core's `m_cached_is_ibd` latch.
+    ///
+    /// FIX-80 (consensus-diff cosmetic):
+    ///   - Tightened doc comment to spell out the latch+transition rules.
+    ///   - Removed the stale "main.rs never writes BlockIndexEntry" note;
+    ///     both the IBD bootstrap loop (`main.rs` ~line 875) and the
+    ///     live P2P validation loop (~line 2333) call
+    ///     `block_store.put_block_index` with `chain_work` populated.
+    ///   - `tip_chain_work = None` now only happens on a real read miss
+    ///     of the block index (a database fault, not a code-path gap).
+    ///     We continue to trust the tip-age check alone in that case
+    ///     rather than wedging IBD permanently true on a transient
+    ///     read failure — every block in the store has already been
+    ///     validated with full PoW via `ChainState::process_block`.
     fn should_exit_ibd(
         &self,
         state: &RpcState,
         tip_chain_work: Option<&[u8; 32]>,
         tip_timestamp: u32,
     ) -> bool {
-        // Once we've exited IBD, stay exited (latch behavior)
+        // Sticky-OFF guard: once we've exited IBD, stay exited.
         if !state.is_ibd {
             return false;
         }
 
-        // Check if chain work >= minimum chain work when available.
+        // Condition 1: chainwork must meet the minimum chain-work bar.
+        // When the block index lookup fails (transient db read miss), we
+        // skip this gate rather than latching IBD true forever — the
+        // block has already been PoW-validated by `process_block`.
         if let Some(cw) = tip_chain_work {
             if compare_chain_work(cw, &state.params.minimum_chain_work)
                 == std::cmp::Ordering::Less
@@ -1119,8 +1136,10 @@ impl RpcServerImpl {
             }
         }
 
-        // Check if tip is recent (within 24h)
-        let max_tip_age_secs = 24 * 60 * 60; // 24 hours in seconds
+        // Condition 2: tip wallclock age must be < max_tip_age (24h).
+        // Mirrors Core's `IsTipRecent`:
+        //   tip->Time() >= Now<NodeSeconds>() - max_tip_age
+        let max_tip_age_secs: u64 = 24 * 60 * 60;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -14743,6 +14762,147 @@ mod tests {
         assert_eq!(
             SEQUENCE_FINAL, 0xFFFFFFFF,
             "SEQUENCE_FINAL must equal Core's CTxIn::SEQUENCE_FINAL"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // FIX-80 (cosmetic consensus-diff): initialblockdownload latch
+    // -----------------------------------------------------------------
+    // Daily consensus-diff (2026-05-16) flagged that rustoshi's
+    // `blockchaininfo.initialblockdownload` diverged from Bitcoin Core's
+    // `validation.cpp::IsInitialBlockDownload`.  rustoshi already had
+    // the sticky-OFF latch + the chainwork/tip-age checks in
+    // `should_exit_ibd`, but the stale doc-comment claimed
+    // `BlockIndexEntry` was never written (it IS — see main.rs ~875 and
+    // ~2333).  These tests pin the behaviour of `should_exit_ibd`:
+    //   - returns `false` when already latched off (no-op transition).
+    //   - returns `false` when chainwork < min_chain_work.
+    //   - returns `false` when tip wallclock age > max_tip_age (24h).
+    //   - returns `true` when both chainwork meets min AND tip age <
+    //     max_tip_age — flipping the caller's `state.is_ibd` to false.
+    //   - skips chainwork check when `tip_chain_work = None` (transient
+    //     db read miss); falls through to the tip-age gate, matching the
+    //     documented fallback behaviour.
+
+    #[tokio::test]
+    async fn fix_80_should_exit_ibd_already_latched_off_returns_false() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, state, server) = make_test_server(params);
+
+        // Force the latch already-off (post-IBD shape).
+        {
+            let mut st = state.write().await;
+            st.is_ibd = false;
+        }
+
+        let st = state.read().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Pass values that would otherwise satisfy both conditions:
+        // even so the latch must short-circuit to `false`.
+        let result =
+            server.should_exit_ibd(&st, Some(&[0xFFu8; 32]), now as u32);
+        assert!(
+            !result,
+            "should_exit_ibd must return false when state.is_ibd is already false (sticky-OFF guard)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_80_should_exit_ibd_chainwork_below_min_returns_false() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::mainnet();
+        let (_db, state, server) = make_test_server(params);
+
+        let st = state.read().await;
+        // is_ibd is true (default); chainwork = zero < mainnet
+        // min_chain_work; tip timestamp = now (would satisfy age gate).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let result =
+            server.should_exit_ibd(&st, Some(&[0u8; 32]), now as u32);
+        assert!(
+            !result,
+            "should_exit_ibd must return false when chainwork < min_chain_work"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_80_should_exit_ibd_tip_old_returns_false() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, state, server) = make_test_server(params);
+
+        let st = state.read().await;
+        // is_ibd true; regtest min_chain_work = zero, so chainwork
+        // passes trivially; tip timestamp ~30 days ago → fails age gate.
+        let thirty_days_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(30 * 24 * 60 * 60);
+        let result = server.should_exit_ibd(
+            &st,
+            Some(&[0xFFu8; 32]),
+            thirty_days_ago as u32,
+        );
+        assert!(
+            !result,
+            "should_exit_ibd must return false when tip wallclock age > 24h"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_80_should_exit_ibd_fresh_tip_meets_chainwork_returns_true() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, state, server) = make_test_server(params);
+
+        let st = state.read().await;
+        // is_ibd true; chainwork passes (regtest min = 0, supply 0xFF...);
+        // tip timestamp = now → passes age gate → return true.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let result =
+            server.should_exit_ibd(&st, Some(&[0xFFu8; 32]), now as u32);
+        assert!(
+            result,
+            "should_exit_ibd must return true when chainwork >= min AND tip age < max_tip_age (transition)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_80_should_exit_ibd_chainwork_none_falls_through_to_age_gate() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, state, server) = make_test_server(params);
+
+        let st = state.read().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // tip_chain_work=None (transient read miss): we trust the
+        // age gate alone.  Fresh tip → return true.
+        let result = server.should_exit_ibd(&st, None, now as u32);
+        assert!(
+            result,
+            "should_exit_ibd must fall through to tip-age gate when tip_chain_work is None (transient db miss)"
+        );
+
+        // Same call but stale tip → return false.
+        let stale = now.saturating_sub(30 * 24 * 60 * 60);
+        let result_stale = server.should_exit_ibd(&st, None, stale as u32);
+        assert!(
+            !result_stale,
+            "should_exit_ibd must respect age gate even when chainwork is None"
         );
     }
 }
