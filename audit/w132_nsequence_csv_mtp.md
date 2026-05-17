@@ -462,3 +462,15 @@ clean follow-on FIX-NN candidate.
   callers of `script_flags_for_height` and
   `connect_block_with_sequence_locks` already have access to the
   chain state needed to call `is_deployment_active`.
+
+---
+
+## Provenance note (2026-05-17)
+
+The W132 audit files (this document + `crates/consensus/tests/
+test_w132_nsequence_csv_mtp.rs`) were inadvertently included in commit
+`4f3a24c` whose subject reads "audit: W133 Index databases — 17 BUGS /
+30 gates (rustoshi)". The commit message body describes W133 (txindex /
+coinstatsindex); the file contents are the W132 BIP-68/112/113 audit
+plus its 30-gate test suite. This footer-commit confirms the W132
+audit is on master under the documented hash.
