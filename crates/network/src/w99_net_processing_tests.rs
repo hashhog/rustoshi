@@ -27,10 +27,12 @@
 //!   G19 - PASS: duplicate version → disconnect (DuplicateVersion) in both v1 and v2 paths
 //!   G20 - PASS: pre-handshake non-version messages → PreHandshakeMessage disconnect
 //!   G21 - BUG (CORRECTNESS): inbound v1 path does not track WtxidRelay flag between version/verack
-//!   G22 - FIX-71: NODE_COMPACT_FILTERS gate plumbed in local_services() via
-//!         `should_advertise_compact_filters`. Currently false because BIP-157
-//!         P2P handlers absent (`BIP157_P2P_HANDLERS_REGISTERED = false`).
-//!         Future P2P wave only needs to flip the constant.
+//!   G22 - FIX-71 + FIX-82: NODE_COMPACT_FILTERS gate plumbed in local_services()
+//!         via `should_advertise_compact_filters`. As of FIX-82 the dispatch
+//!         handlers (ProcessGetCFilters/CFHeaders/CFCheckPt) are wired in
+//!         rustoshi/src/main.rs, and `BIP157_P2P_HANDLERS_REGISTERED` is
+//!         now `true`. Bit advertised whenever both -blockfilterindex and
+//!         -peerblockfilters are enabled (matches Core init.cpp:992-999).
 //!   G23 - FIXED: MAX_MESSAGE_SIZE=4_000_000 (4MB decimal) per Core net.h:65 (was 32 MiB)
 //!   G24 - PASS: unknown msg → NetworkMessage::Unknown variant, forwarded without Misbehaving
 //!   G25 - FIXED: wtxid-relay peers now get MSG_WTX(5) per BIP-339 (was MSG_WITNESS_TX(0x40000001))
@@ -590,20 +592,17 @@ mod tests {
 
     // ─── G22: NODE_COMPACT_FILTERS gate plumbed (FIX-71) ──────────────────────
 
-    /// G22 FIX-71: NODE_COMPACT_FILTERS advertisement is now gated through
-    /// `should_advertise_compact_filters`, which checks (a) `-blockfilterindex`
-    /// enabled, (b) `-peerblockfilters` enabled, AND (c) BIP-157 P2P handlers
-    /// registered. The constant `BIP157_P2P_HANDLERS_REGISTERED` is currently
-    /// `false` because no dispatch handlers exist for `GetCFilters` /
-    /// `GetCFHeaders` / `GetCFCheckpt` in peer.rs/peer_manager.rs — so the
-    /// gate returns FALSE and the bit stays unset.
+    /// G22 FIX-82: NODE_COMPACT_FILTERS advertisement gate is now ACTIVE.
     ///
-    /// This is the W121 BUG-7 / W99 G22 "plumbing without flipping" fix: the
-    /// structural wiring is in place so a future P2P fix wave only needs to
-    /// flip `BIP157_P2P_HANDLERS_REGISTERED` to `true` and the gate
-    /// activates automatically.
+    /// FIX-71 plumbed the gate with `BIP157_P2P_HANDLERS_REGISTERED = false`.
+    /// FIX-82 wires the `GetCFilters` / `GetCFHeaders` / `GetCFCheckpt`
+    /// dispatch handlers in `rustoshi/src/main.rs` and flips the constant to
+    /// `true`. The gate now returns `true` exactly when both
+    /// `-blockfilterindex` and `-peerblockfilters` are enabled (matching
+    /// Core init.cpp:992-999), and `local_services()` advertises
+    /// NODE_COMPACT_FILTERS in that case.
     #[test]
-    fn g22_node_compact_filters_gate_plumbed_currently_false() {
+    fn g22_node_compact_filters_gate_active() {
         use crate::message::{NODE_COMPACT_FILTERS, NODE_NETWORK, NODE_WITNESS};
         use crate::peer_manager::{
             should_advertise_compact_filters, BIP157_P2P_HANDLERS_REGISTERED,
@@ -615,23 +614,24 @@ mod tests {
         assert_eq!(NODE_COMPACT_FILTERS, 1 << 6,
             "constant value must match BIP-157 definition");
 
-        // Gate returns FALSE for all input permutations because P2P handlers
-        // are absent. Future-proofs the test: when handlers land and the
-        // constant flips, the (true, true) branch will start returning true.
-        assert_eq!(BIP157_P2P_HANDLERS_REGISTERED, false,
-            "BIP-157 P2P handlers (ProcessGetCFilters/Headers/CheckPt) are \
-             absent — constant must stay false until they are wired");
+        // FIX-82: handlers are registered.
+        assert_eq!(BIP157_P2P_HANDLERS_REGISTERED, true,
+            "FIX-82: BIP-157 P2P handlers (ProcessGetCFilters/CFHeaders/\
+             CFCheckPt) are now wired in rustoshi/src/main.rs");
+
+        // The gate still returns FALSE unless BOTH config flags are set
+        // (matches Core's init.cpp 992-999 invariants).
         assert_eq!(should_advertise_compact_filters(false, false), false,
             "no index, no peerblockfilters → gate false");
         assert_eq!(should_advertise_compact_filters(true, false), false,
             "index without peerblockfilters → gate false");
         assert_eq!(should_advertise_compact_filters(false, true), false,
             "peerblockfilters without index → gate false (matches Core init.cpp:994 check)");
-        assert_eq!(should_advertise_compact_filters(true, true), false,
-            "both flags set but P2P handlers absent → gate false");
+        // FIX-82: when BOTH flags are set, the gate now returns TRUE.
+        assert_eq!(should_advertise_compact_filters(true, true), true,
+            "FIX-82: both flags set AND handlers registered → gate TRUE");
 
-        // local_services() respects the gate: bit 6 stays unset even when
-        // the operator turns on both config flags.
+        // local_services() respects the gate.
         let cfg_off = PeerManagerConfig::testnet4();
         let mgr_off = PeerManager::new(cfg_off, ChainParams::testnet4());
         assert_eq!(mgr_off.local_services() & NODE_COMPACT_FILTERS, 0,
@@ -641,9 +641,13 @@ mod tests {
         cfg_on.block_filter_index_enabled = true;
         cfg_on.peer_block_filters = true;
         let mgr_on = PeerManager::new(cfg_on, ChainParams::testnet4());
-        assert_eq!(mgr_on.local_services() & NODE_COMPACT_FILTERS, 0,
-            "even with both flags on: gate is FALSE because BIP-157 P2P \
-             handlers are not registered (BIP157_P2P_HANDLERS_REGISTERED=false)");
+        // FIX-82: bit is now advertised under valid conditions.
+        assert_eq!(
+            mgr_on.local_services() & NODE_COMPACT_FILTERS,
+            NODE_COMPACT_FILTERS,
+            "FIX-82: when both -blockfilterindex and -peerblockfilters are \
+             enabled, NODE_COMPACT_FILTERS is advertised"
+        );
 
         // Sanity: NODE_NETWORK | NODE_WITNESS still advertised in both modes.
         assert_eq!(mgr_off.local_services() & (NODE_NETWORK | NODE_WITNESS),
@@ -658,22 +662,22 @@ mod tests {
     /// function signature so that when a future P2P wave wires up the
     /// handlers, the type-shape of the call site doesn't drift.
     ///
-    /// Per FIX-71, the gate takes (block_filter_index_enabled, peer_block_filters)
-    /// and a compile-time `BIP157_P2P_HANDLERS_REGISTERED` constant. If a
-    /// future refactor changes the inputs (e.g. takes a `&BlockFilterIndex`
-    /// and calls `is_synced()`), this test will fail to compile and force the
-    /// updater to re-think the audit-test framing.
+    /// Per FIX-82, the gate takes (block_filter_index_enabled, peer_block_filters)
+    /// and a compile-time `BIP157_P2P_HANDLERS_REGISTERED` constant (now
+    /// `true`). If a future refactor changes the inputs (e.g. takes a
+    /// `&BlockFilterIndex` and calls `is_synced()`), this test will fail to
+    /// compile and force the updater to re-think the audit-test framing.
     #[test]
-    fn g22_gate_signature_stable_for_future_p2p_wave() {
+    fn g22_gate_signature_stable() {
         use crate::peer_manager::should_advertise_compact_filters;
         // The signature is `fn(bool, bool) -> bool`. Future maintainers:
         // if you change this, update the W121 BUG-7 audit test framing too.
         let f: fn(bool, bool) -> bool = should_advertise_compact_filters;
-        // Currently returns FALSE for (true, true) because P2P handlers absent.
-        assert_eq!(f(true, true), false,
-            "P2P handlers absent — flip BIP157_P2P_HANDLERS_REGISTERED to \
-             true after ProcessGetCFilters/Headers/CheckPt land, and this \
-             will start returning true");
+        // FIX-82: now returns TRUE for (true, true) because P2P handlers
+        // are registered.
+        assert_eq!(f(true, true), true,
+            "FIX-82: P2P handlers wired, gate now returns true under valid \
+             config conditions");
     }
 
     /// G22 source-level regression guard: scan crate sources for any

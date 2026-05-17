@@ -35,6 +35,34 @@ pub const MAX_GETDATA_SZ: usize = 1_000;
 /// Maximum number of headers in a single headers message.
 pub const MAX_HEADERS: usize = 2000;
 
+/// Maximum number of filters requested in a single `getcfilters` message
+/// (BIP-157). Mirrors `bitcoin-core/src/net_processing.cpp:184`:
+///   `static constexpr uint32_t MAX_GETCFILTERS_SIZE = 1000;`
+///
+/// A peer sending a `getcfilters` whose `(stop_height - start_height + 1)`
+/// exceeds this is disconnected per Core's `PrepareBlockFilterRequest`
+/// (FIX-82 / W121 BUG-12 closure).
+pub const MAX_GETCFILTERS_SIZE: u32 = 1000;
+
+/// Maximum number of headers requested in a single `getcfheaders` message
+/// (BIP-157). Mirrors `bitcoin-core/src/net_processing.cpp:186`:
+///   `static constexpr uint32_t MAX_GETCFHEADERS_SIZE = 2000;`
+///
+/// Per Core's `PrepareBlockFilterRequest`, a peer requesting a wider range
+/// than this is disconnected. The response is a single `cfheaders` packing
+/// the previous filter header plus N filter hashes (FIX-82 / W121 BUG-12).
+pub const MAX_GETCFHEADERS_SIZE: u32 = 2000;
+
+/// Interval at which BIP-157 filter checkpoints are emitted.
+///
+/// Mirrors `bitcoin-core/src/index/blockfilterindex.h:31`:
+///   `static constexpr int CFCHECKPT_INTERVAL = 1000;`
+///
+/// `ProcessGetCFCheckPt` walks `stop_index.GetAncestor((i+1) *
+/// CFCHECKPT_INTERVAL)` for every checkpoint up to `stop_height /
+/// CFCHECKPT_INTERVAL`.  (FIX-82 / W121 BUG-18 closure.)
+pub const CFCHECKPT_INTERVAL: u32 = 1000;
+
 /// Maximum number of addresses in a single addr message.
 pub const MAX_ADDR: usize = 1000;
 
@@ -212,17 +240,17 @@ pub enum NetworkMessage {
     /// BIP 37: filtered block (header + merkle match flags).
     MerkleBlock(Vec<u8>),
     /// BIP 157: request compact block filters.
-    GetCFilters(Vec<u8>),
+    GetCFilters(GetCFiltersMessage),
     /// BIP 157: compact block filter.
-    CFilter(Vec<u8>),
+    CFilter(CFilterMessage),
     /// BIP 157: request compact block filter headers.
-    GetCFHeaders(Vec<u8>),
+    GetCFHeaders(GetCFHeadersMessage),
     /// BIP 157: compact block filter headers.
-    CFHeaders(Vec<u8>),
+    CFHeaders(CFHeadersMessage),
     /// BIP 157: request compact block filter checkpoints.
-    GetCFCheckpt(Vec<u8>),
+    GetCFCheckpt(GetCFCheckptMessage),
     /// BIP 157: compact block filter checkpoints.
-    CFCheckpt(Vec<u8>),
+    CFCheckpt(CFCheckptMessage),
     /// Unknown or unsupported message type.
     Unknown { command: String, payload: Vec<u8> },
 }
@@ -308,6 +336,335 @@ pub struct SendCmpctMessage {
     pub announce: bool,
     /// Compact block version.
     pub version: u64,
+}
+
+// ============================================================================
+// BIP-157 typed payloads
+// ============================================================================
+//
+// W121 BUG-4/5/6 closure (FIX-82). Each of the 6 BIP-157 wire messages had
+// been parked behind an opaque `Vec<u8>`; this section adds field-level
+// parsers/serializers so the FIX-82 dispatch handlers (in main.rs) can read
+// inbound requests and emit outbound responses without re-implementing
+// little-endian primitives inline. The exact wire schemas are defined in
+// BIP-157 "Wire types" and mirrored by `bitcoin-core/src/net_processing.cpp`
+// (ProcessGetCFilters/CFHeaders/CFCheckPt) + `src/index/blockfilterindex.h`.
+
+/// `getcfilters` request payload (BIP-157).
+///
+/// Wire format (37 bytes):
+///   `uint8 filter_type | uint32 start_height (LE) | uint256 stop_hash (LE)`
+///
+/// Core reference: `net_processing.cpp:3315 ProcessGetCFilters`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetCFiltersMessage {
+    /// Filter type byte (`BlockFilterType::BASIC = 0` per BIP-158).
+    pub filter_type: u8,
+    /// Height of the first filter the peer wants (inclusive).
+    pub start_height: u32,
+    /// Block hash terminating the (inclusive) requested range.
+    pub stop_hash: Hash256,
+}
+
+impl GetCFiltersMessage {
+    /// Serialize to the BIP-157 wire format.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(37);
+        buf.push(self.filter_type);
+        buf.extend_from_slice(&self.start_height.to_le_bytes());
+        buf.extend_from_slice(self.stop_hash.as_bytes());
+        buf
+    }
+
+    /// Deserialize from the BIP-157 wire format.
+    pub fn deserialize(payload: &[u8]) -> std::io::Result<Self> {
+        if payload.len() < 37 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "getcfilters too short",
+            ));
+        }
+        let filter_type = payload[0];
+        let mut start_buf = [0u8; 4];
+        start_buf.copy_from_slice(&payload[1..5]);
+        let start_height = u32::from_le_bytes(start_buf);
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&payload[5..37]);
+        Ok(Self {
+            filter_type,
+            start_height,
+            stop_hash: Hash256(hash),
+        })
+    }
+}
+
+/// `cfilter` response payload (BIP-157).
+///
+/// Wire format:
+///   `uint8 filter_type | uint256 block_hash (LE) | CompactSize(N) | N bytes`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CFilterMessage {
+    /// Filter type byte (`BlockFilterType::BASIC = 0`).
+    pub filter_type: u8,
+    /// Block hash this filter is for.
+    pub block_hash: Hash256,
+    /// Encoded BIP-158 GCS filter bytes.
+    pub filter_bytes: Vec<u8>,
+}
+
+impl CFilterMessage {
+    /// Serialize to the BIP-157 wire format.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(33 + 9 + self.filter_bytes.len());
+        buf.push(self.filter_type);
+        buf.extend_from_slice(self.block_hash.as_bytes());
+        write_compact_size(&mut buf, self.filter_bytes.len() as u64).unwrap();
+        buf.extend_from_slice(&self.filter_bytes);
+        buf
+    }
+
+    /// Deserialize from the BIP-157 wire format.
+    pub fn deserialize(payload: &[u8]) -> std::io::Result<Self> {
+        if payload.len() < 33 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cfilter too short",
+            ));
+        }
+        let filter_type = payload[0];
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&payload[1..33]);
+        let mut cursor = Cursor::new(&payload[33..]);
+        let len = read_compact_size(&mut cursor)? as usize;
+        let body_start = 33 + cursor.position() as usize;
+        if payload.len() < body_start + len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cfilter body short",
+            ));
+        }
+        let filter_bytes = payload[body_start..body_start + len].to_vec();
+        Ok(Self {
+            filter_type,
+            block_hash: Hash256(hash),
+            filter_bytes,
+        })
+    }
+}
+
+/// `getcfheaders` request payload (BIP-157).
+///
+/// Wire format (37 bytes):
+///   `uint8 filter_type | uint32 start_height (LE) | uint256 stop_hash (LE)`
+///
+/// Core reference: `net_processing.cpp:3344 ProcessGetCFHeaders`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetCFHeadersMessage {
+    /// Filter type byte.
+    pub filter_type: u8,
+    /// Height of the first filter-header the peer wants (inclusive).
+    pub start_height: u32,
+    /// Block hash terminating the inclusive range.
+    pub stop_hash: Hash256,
+}
+
+impl GetCFHeadersMessage {
+    /// Serialize to the BIP-157 wire format.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(37);
+        buf.push(self.filter_type);
+        buf.extend_from_slice(&self.start_height.to_le_bytes());
+        buf.extend_from_slice(self.stop_hash.as_bytes());
+        buf
+    }
+
+    /// Deserialize from the BIP-157 wire format.
+    pub fn deserialize(payload: &[u8]) -> std::io::Result<Self> {
+        // Same shape as getcfilters.
+        let g = GetCFiltersMessage::deserialize(payload)?;
+        Ok(Self {
+            filter_type: g.filter_type,
+            start_height: g.start_height,
+            stop_hash: g.stop_hash,
+        })
+    }
+}
+
+/// `cfheaders` response payload (BIP-157).
+///
+/// Wire format:
+///   `uint8 filter_type | uint256 stop_hash (LE) | uint256 prev_filter_header (LE)
+///    | CompactSize(N) | N * uint256 filter_hashes`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CFHeadersMessage {
+    /// Filter type byte.
+    pub filter_type: u8,
+    /// Stop hash echoed from the request (`stop_index->GetBlockHash()`).
+    pub stop_hash: Hash256,
+    /// Filter header just before `start_height` (or zero when start_height == 0).
+    pub previous_filter_header: Hash256,
+    /// Filter hashes for `[start_height ..= stop_height]`.
+    pub filter_hashes: Vec<Hash256>,
+}
+
+impl CFHeadersMessage {
+    /// Serialize to the BIP-157 wire format.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 64 + 9 + 32 * self.filter_hashes.len());
+        buf.push(self.filter_type);
+        buf.extend_from_slice(self.stop_hash.as_bytes());
+        buf.extend_from_slice(self.previous_filter_header.as_bytes());
+        write_compact_size(&mut buf, self.filter_hashes.len() as u64).unwrap();
+        for h in &self.filter_hashes {
+            buf.extend_from_slice(h.as_bytes());
+        }
+        buf
+    }
+
+    /// Deserialize from the BIP-157 wire format.
+    pub fn deserialize(payload: &[u8]) -> std::io::Result<Self> {
+        if payload.len() < 65 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cfheaders too short",
+            ));
+        }
+        let filter_type = payload[0];
+        let mut stop = [0u8; 32];
+        stop.copy_from_slice(&payload[1..33]);
+        let mut prev = [0u8; 32];
+        prev.copy_from_slice(&payload[33..65]);
+        let mut cursor = Cursor::new(&payload[65..]);
+        let n = read_compact_size(&mut cursor)? as usize;
+        // Cap to MAX_GETCFHEADERS_SIZE to bound allocation on hostile input.
+        if n > MAX_GETCFHEADERS_SIZE as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("cfheaders too many entries: {}", n),
+            ));
+        }
+        let body_start = 65 + cursor.position() as usize;
+        if payload.len() < body_start + 32 * n {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cfheaders body short",
+            ));
+        }
+        let mut filter_hashes = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&payload[body_start + 32 * i..body_start + 32 * (i + 1)]);
+            filter_hashes.push(Hash256(h));
+        }
+        Ok(Self {
+            filter_type,
+            stop_hash: Hash256(stop),
+            previous_filter_header: Hash256(prev),
+            filter_hashes,
+        })
+    }
+}
+
+/// `getcfcheckpt` request payload (BIP-157).
+///
+/// Wire format (33 bytes):
+///   `uint8 filter_type | uint256 stop_hash (LE)`
+///
+/// Core reference: `net_processing.cpp:3386 ProcessGetCFCheckPt`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetCFCheckptMessage {
+    /// Filter type byte.
+    pub filter_type: u8,
+    /// Block hash whose ancestry is walked at every `CFCHECKPT_INTERVAL`.
+    pub stop_hash: Hash256,
+}
+
+impl GetCFCheckptMessage {
+    /// Serialize to the BIP-157 wire format.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(33);
+        buf.push(self.filter_type);
+        buf.extend_from_slice(self.stop_hash.as_bytes());
+        buf
+    }
+
+    /// Deserialize from the BIP-157 wire format.
+    pub fn deserialize(payload: &[u8]) -> std::io::Result<Self> {
+        if payload.len() < 33 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "getcfcheckpt too short",
+            ));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&payload[1..33]);
+        Ok(Self {
+            filter_type: payload[0],
+            stop_hash: Hash256(hash),
+        })
+    }
+}
+
+/// `cfcheckpt` response payload (BIP-157).
+///
+/// Wire format:
+///   `uint8 filter_type | uint256 stop_hash (LE) | CompactSize(N)
+///    | N * uint256 filter_headers`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CFCheckptMessage {
+    /// Filter type byte.
+    pub filter_type: u8,
+    /// Stop hash echoed from the request.
+    pub stop_hash: Hash256,
+    /// Filter headers at every `(i+1) * CFCHECKPT_INTERVAL` height up to stop.
+    pub filter_headers: Vec<Hash256>,
+}
+
+impl CFCheckptMessage {
+    /// Serialize to the BIP-157 wire format.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(33 + 9 + 32 * self.filter_headers.len());
+        buf.push(self.filter_type);
+        buf.extend_from_slice(self.stop_hash.as_bytes());
+        write_compact_size(&mut buf, self.filter_headers.len() as u64).unwrap();
+        for h in &self.filter_headers {
+            buf.extend_from_slice(h.as_bytes());
+        }
+        buf
+    }
+
+    /// Deserialize from the BIP-157 wire format.
+    pub fn deserialize(payload: &[u8]) -> std::io::Result<Self> {
+        if payload.len() < 33 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cfcheckpt too short",
+            ));
+        }
+        let filter_type = payload[0];
+        let mut stop = [0u8; 32];
+        stop.copy_from_slice(&payload[1..33]);
+        let mut cursor = Cursor::new(&payload[33..]);
+        let n = read_compact_size(&mut cursor)? as usize;
+        let body_start = 33 + cursor.position() as usize;
+        if payload.len() < body_start + 32 * n {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cfcheckpt body short",
+            ));
+        }
+        let mut filter_headers = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&payload[body_start + 32 * i..body_start + 32 * (i + 1)]);
+            filter_headers.push(Hash256(h));
+        }
+        Ok(Self {
+            filter_type,
+            stop_hash: Hash256(stop),
+            filter_headers,
+        })
+    }
 }
 
 impl NetworkMessage {
@@ -468,23 +825,23 @@ impl NetworkMessage {
             NetworkMessage::MerkleBlock(data) => {
                 buf.extend_from_slice(data);
             }
-            NetworkMessage::GetCFilters(data) => {
-                buf.extend_from_slice(data);
+            NetworkMessage::GetCFilters(m) => {
+                buf.extend_from_slice(&m.serialize());
             }
-            NetworkMessage::CFilter(data) => {
-                buf.extend_from_slice(data);
+            NetworkMessage::CFilter(m) => {
+                buf.extend_from_slice(&m.serialize());
             }
-            NetworkMessage::GetCFHeaders(data) => {
-                buf.extend_from_slice(data);
+            NetworkMessage::GetCFHeaders(m) => {
+                buf.extend_from_slice(&m.serialize());
             }
-            NetworkMessage::CFHeaders(data) => {
-                buf.extend_from_slice(data);
+            NetworkMessage::CFHeaders(m) => {
+                buf.extend_from_slice(&m.serialize());
             }
-            NetworkMessage::GetCFCheckpt(data) => {
-                buf.extend_from_slice(data);
+            NetworkMessage::GetCFCheckpt(m) => {
+                buf.extend_from_slice(&m.serialize());
             }
-            NetworkMessage::CFCheckpt(data) => {
-                buf.extend_from_slice(data);
+            NetworkMessage::CFCheckpt(m) => {
+                buf.extend_from_slice(&m.serialize());
             }
             NetworkMessage::Reject(r) => {
                 write_compact_size(&mut buf, r.message.len() as u64).unwrap();
@@ -720,13 +1077,25 @@ impl NetworkMessage {
             "filteradd" => Ok(NetworkMessage::FilterAdd(payload.to_vec())),
             "filterclear" => Ok(NetworkMessage::FilterClear),
             "merkleblock" => Ok(NetworkMessage::MerkleBlock(payload.to_vec())),
-            // BIP 157/158 compact block filter messages
-            "getcfilters" => Ok(NetworkMessage::GetCFilters(payload.to_vec())),
-            "cfilter" => Ok(NetworkMessage::CFilter(payload.to_vec())),
-            "getcfheaders" => Ok(NetworkMessage::GetCFHeaders(payload.to_vec())),
-            "cfheaders" => Ok(NetworkMessage::CFHeaders(payload.to_vec())),
-            "getcfcheckpt" => Ok(NetworkMessage::GetCFCheckpt(payload.to_vec())),
-            "cfcheckpt" => Ok(NetworkMessage::CFCheckpt(payload.to_vec())),
+            // BIP 157/158 compact block filter messages (FIX-82: typed payloads)
+            "getcfilters" => Ok(NetworkMessage::GetCFilters(
+                GetCFiltersMessage::deserialize(payload)?,
+            )),
+            "cfilter" => Ok(NetworkMessage::CFilter(CFilterMessage::deserialize(
+                payload,
+            )?)),
+            "getcfheaders" => Ok(NetworkMessage::GetCFHeaders(
+                GetCFHeadersMessage::deserialize(payload)?,
+            )),
+            "cfheaders" => Ok(NetworkMessage::CFHeaders(CFHeadersMessage::deserialize(
+                payload,
+            )?)),
+            "getcfcheckpt" => Ok(NetworkMessage::GetCFCheckpt(
+                GetCFCheckptMessage::deserialize(payload)?,
+            )),
+            "cfcheckpt" => Ok(NetworkMessage::CFCheckpt(CFCheckptMessage::deserialize(
+                payload,
+            )?)),
             "reject" => {
                 let msg_len = read_compact_size(&mut cursor)? as usize;
                 let mut msg_bytes = vec![0u8; msg_len];
@@ -1514,5 +1883,201 @@ mod tests {
         } else {
             panic!("expected AddrV2");
         }
+    }
+
+    // ============================================================
+    // FIX-82: BIP-157 typed payload round-trip tests.
+    // ============================================================
+
+    #[test]
+    fn fix82_bip157_constants_match_core() {
+        assert_eq!(MAX_GETCFILTERS_SIZE, 1000);
+        assert_eq!(MAX_GETCFHEADERS_SIZE, 2000);
+        assert_eq!(CFCHECKPT_INTERVAL, 1000);
+    }
+
+    #[test]
+    fn fix82_getcfilters_roundtrip() {
+        let msg = GetCFiltersMessage {
+            filter_type: 0,
+            start_height: 123,
+            stop_hash: Hash256([7u8; 32]),
+        };
+        let bytes = msg.serialize();
+        assert_eq!(bytes.len(), 37, "BIP-157 getcfilters is 37 bytes");
+        let parsed = GetCFiltersMessage::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        // End-to-end through NetworkMessage.
+        let nm = NetworkMessage::GetCFilters(msg.clone());
+        let payload = nm.serialize_payload();
+        let decoded = NetworkMessage::deserialize("getcfilters", &payload).unwrap();
+        if let NetworkMessage::GetCFilters(p) = decoded {
+            assert_eq!(p, msg);
+        } else {
+            panic!("expected GetCFilters");
+        }
+    }
+
+    #[test]
+    fn fix82_getcfilters_too_short_errors() {
+        // 36 bytes (1 short of 37) must fail to deserialize.
+        let mut buf = vec![0u8; 36];
+        buf[0] = 0; // filter_type
+        assert!(GetCFiltersMessage::deserialize(&buf).is_err());
+    }
+
+    #[test]
+    fn fix82_cfilter_roundtrip() {
+        let msg = CFilterMessage {
+            filter_type: 0,
+            block_hash: Hash256([0xab; 32]),
+            filter_bytes: vec![0x01, 0xde, 0xad, 0xbe, 0xef],
+        };
+        let bytes = msg.serialize();
+        let parsed = CFilterMessage::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let nm = NetworkMessage::CFilter(msg.clone());
+        let payload = nm.serialize_payload();
+        let decoded = NetworkMessage::deserialize("cfilter", &payload).unwrap();
+        if let NetworkMessage::CFilter(p) = decoded {
+            assert_eq!(p, msg);
+        } else {
+            panic!("expected CFilter");
+        }
+    }
+
+    #[test]
+    fn fix82_getcfheaders_roundtrip() {
+        let msg = GetCFHeadersMessage {
+            filter_type: 0,
+            start_height: 0,
+            stop_hash: Hash256([0x44; 32]),
+        };
+        let bytes = msg.serialize();
+        assert_eq!(bytes.len(), 37);
+        let parsed = GetCFHeadersMessage::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let nm = NetworkMessage::GetCFHeaders(msg.clone());
+        let payload = nm.serialize_payload();
+        let decoded = NetworkMessage::deserialize("getcfheaders", &payload).unwrap();
+        if let NetworkMessage::GetCFHeaders(p) = decoded {
+            assert_eq!(p, msg);
+        } else {
+            panic!("expected GetCFHeaders");
+        }
+    }
+
+    #[test]
+    fn fix82_cfheaders_roundtrip() {
+        let msg = CFHeadersMessage {
+            filter_type: 0,
+            stop_hash: Hash256([0x55; 32]),
+            previous_filter_header: Hash256([0x77; 32]),
+            filter_hashes: vec![Hash256([1u8; 32]), Hash256([2u8; 32]), Hash256([3u8; 32])],
+        };
+        let bytes = msg.serialize();
+        let parsed = CFHeadersMessage::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let nm = NetworkMessage::CFHeaders(msg.clone());
+        let payload = nm.serialize_payload();
+        let decoded = NetworkMessage::deserialize("cfheaders", &payload).unwrap();
+        if let NetworkMessage::CFHeaders(p) = decoded {
+            assert_eq!(p, msg);
+        } else {
+            panic!("expected CFHeaders");
+        }
+    }
+
+    #[test]
+    fn fix82_cfheaders_too_many_hashes_errors() {
+        // Construct a payload claiming MAX_GETCFHEADERS_SIZE+1 hashes — must
+        // fail at deserialize without allocating the full vector.
+        let mut payload = Vec::new();
+        payload.push(0u8); // filter_type
+        payload.extend_from_slice(&[0u8; 32]); // stop
+        payload.extend_from_slice(&[0u8; 32]); // prev
+        // CompactSize encoding of 2001 (MAX_GETCFHEADERS_SIZE+1) — uses 0xfd + u16 LE.
+        let n: u64 = (MAX_GETCFHEADERS_SIZE as u64) + 1;
+        write_compact_size(&mut payload, n).unwrap();
+        // (no need to add the actual hashes — the length check should fire)
+        assert!(CFHeadersMessage::deserialize(&payload).is_err());
+    }
+
+    #[test]
+    fn fix82_getcfcheckpt_roundtrip() {
+        let msg = GetCFCheckptMessage {
+            filter_type: 0,
+            stop_hash: Hash256([0xcc; 32]),
+        };
+        let bytes = msg.serialize();
+        assert_eq!(bytes.len(), 33);
+        let parsed = GetCFCheckptMessage::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let nm = NetworkMessage::GetCFCheckpt(msg.clone());
+        let payload = nm.serialize_payload();
+        let decoded = NetworkMessage::deserialize("getcfcheckpt", &payload).unwrap();
+        if let NetworkMessage::GetCFCheckpt(p) = decoded {
+            assert_eq!(p, msg);
+        } else {
+            panic!("expected GetCFCheckpt");
+        }
+    }
+
+    #[test]
+    fn fix82_cfcheckpt_roundtrip() {
+        let msg = CFCheckptMessage {
+            filter_type: 0,
+            stop_hash: Hash256([0xee; 32]),
+            filter_headers: vec![Hash256([0xab; 32]), Hash256([0xcd; 32])],
+        };
+        let bytes = msg.serialize();
+        let parsed = CFCheckptMessage::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+
+        let nm = NetworkMessage::CFCheckpt(msg.clone());
+        let payload = nm.serialize_payload();
+        let decoded = NetworkMessage::deserialize("cfcheckpt", &payload).unwrap();
+        if let NetworkMessage::CFCheckpt(p) = decoded {
+            assert_eq!(p, msg);
+        } else {
+            panic!("expected CFCheckpt");
+        }
+    }
+
+    /// FIX-82: empty filter_hashes encodes to a 66-byte payload (1 + 32 + 32
+    /// + 1-byte CompactSize). Sanity check that 0-hash cfheaders works.
+    #[test]
+    fn fix82_cfheaders_empty_hashes_roundtrip() {
+        let msg = CFHeadersMessage {
+            filter_type: 0,
+            stop_hash: Hash256::ZERO,
+            previous_filter_header: Hash256::ZERO,
+            filter_hashes: vec![],
+        };
+        let bytes = msg.serialize();
+        assert_eq!(bytes.len(), 66, "1 + 32 + 32 + 1 = 66 bytes for empty cfheaders");
+        let parsed = CFHeadersMessage::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, msg);
+    }
+
+    /// FIX-82: cfilter with empty filter_bytes is a valid response (an
+    /// empty BIP-158 GCS filter encodes as CompactSize(0) = 0x00, so the
+    /// per-message body is 33 + 1 + 0 = 34 bytes).
+    #[test]
+    fn fix82_cfilter_empty_filter_bytes_roundtrip() {
+        let msg = CFilterMessage {
+            filter_type: 0,
+            block_hash: Hash256([0u8; 32]),
+            filter_bytes: vec![],
+        };
+        let bytes = msg.serialize();
+        assert_eq!(bytes.len(), 34, "1 + 32 + 1 = 34 bytes for empty cfilter");
+        let parsed = CFilterMessage::deserialize(&bytes).unwrap();
+        assert_eq!(parsed, msg);
     }
 }
