@@ -1236,11 +1236,13 @@ pub struct Mempool {
     /// RPC calls; the delta stacks on previous ones (Core txmempool.cpp:630-655).
     /// Whenever an entry is admitted, its `entry.fee_delta` is initialised
     /// from this map (Core ApplyDelta, txmempool.cpp:657-665).  The delta is
-    /// removed from the map when it returns to zero.  Not persisted across
-    /// restart: rustoshi clears the map on construction (Core parity:
-    /// mapDeltas itself is in-memory and is repopulated only by the persist
-    /// path; we deliberately do NOT round-trip standalone-delta entries).
-    /// W120 BUG-9 + BUG-10 (FIX-72).
+    /// removed from the map when it returns to zero.  Persisted across
+    /// restart via `mempool_persist`: in-mempool deltas round-trip through
+    /// each entry's inline `nFeeDelta`, while standalone deltas (for txids
+    /// not currently in the mempool) round-trip through the `mapDeltas`
+    /// tail block of `mempool.dat` (Core node/mempool_persist.cpp:101
+    /// write + :125-132 load). W120 BUG-9 + BUG-10 (FIX-72); FIX-76
+    /// closure of the standalone-tail persistence gap.
     map_deltas: HashMap<Hash256, i64>,
 }
 
