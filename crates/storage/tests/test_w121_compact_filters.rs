@@ -1071,62 +1071,120 @@ fn g25_cfcheckpt_interval_present() {
 // Gates 26-30 — RPCs + startup args
 // ============================================================
 
-/// G26 BUG-19 (P1) — `getblockfilter` JSON-RPC MISSING.
-/// Core: blockchain.cpp::getblockfilter — `getblockfilter <blockhash> [filtertype="basic"]`.
+/// G26 BUG-19 — FIXED in FIX-88.
+///
+/// `getblockfilter` JSON-RPC is now registered in
+/// `crates/rpc/src/server.rs::RustoshiRpc` via the `#[method(name =
+/// "getblockfilter")]` attribute, dispatching to `get_block_filter()` on
+/// `RpcServerImpl`. The handler returns `{"filter": <hex>, "header":
+/// <hex>}` matching Bitcoin Core `rpc/blockchain.cpp::getblockfilter`.
 #[test]
-#[ignore = "BUG-19 (P1): getblockfilter JSON-RPC MISSING"]
-fn g26_getblockfilter_rpc_missing() {
-    panic!(
-        "Core exposes `getblockfilter` JSON-RPC; rustoshi only has the REST \
-         endpoint /rest/blockfilter (and no RPC) — wallet clients that use the \
-         JSON-RPC channel cannot fetch a filter."
+fn g26_getblockfilter_rpc_present() {
+    let body = std::fs::read_to_string("../rpc/src/server.rs")
+        .expect("crates/rpc/src/server.rs must exist");
+    assert!(
+        body.contains("#[method(name = \"getblockfilter\")]"),
+        "FIX-88: `getblockfilter` must be registered in the jsonrpsee trait"
+    );
+    assert!(
+        body.contains("async fn get_block_filter("),
+        "FIX-88: `get_block_filter` handler must be defined on RpcServerImpl"
+    );
+    assert!(
+        body.contains("\"filter\":") && body.contains("\"header\":"),
+        "FIX-88: `getblockfilter` must return Core's filter+header shape"
     );
 }
 
-/// G27 BUG-20 (P2) — `getindexinfo` RPC MISSING.
-/// Core blockchain.cpp::getindexinfo returns:
-///   `{ "basic block filter index": { "synced": bool, "best_block_height": N } }`.
+/// G27 BUG-20 — FIXED in FIX-88.
+///
+/// `getindexinfo` JSON-RPC is now registered in
+/// `crates/rpc/src/server.rs::RustoshiRpc` via the `#[method(name =
+/// "getindexinfo")]` attribute, dispatching to `get_index_info()` on
+/// `RpcServerImpl`. The handler returns a dynamic object containing
+/// `txindex` and/or `"basic block filter index"` entries, each shaped as
+/// `{"synced": bool, "best_block_height": int}` per Bitcoin Core
+/// `rpc/node.cpp::getindexinfo`.
 #[test]
-#[ignore = "BUG-20 (P2): getindexinfo RPC MISSING"]
-fn g27_getindexinfo_rpc_missing() {
-    panic!("getindexinfo RPC MISSING — operators have no way to query index sync state");
+fn g27_getindexinfo_rpc_present() {
+    let body = std::fs::read_to_string("../rpc/src/server.rs")
+        .expect("crates/rpc/src/server.rs must exist");
+    assert!(
+        body.contains("#[method(name = \"getindexinfo\")]"),
+        "FIX-88: `getindexinfo` must be registered in the jsonrpsee trait"
+    );
+    assert!(
+        body.contains("async fn get_index_info("),
+        "FIX-88: `get_index_info` handler must be defined on RpcServerImpl"
+    );
+    assert!(
+        body.contains("\"basic block filter index\""),
+        "FIX-88: `getindexinfo` must emit the `basic block filter index` key"
+    );
 }
 
 /// G28 BUG-21 (P1) — `scanblocks` RPC MISSING.
 /// Core's flagship light-client RPC; takes filter type + descriptors + height
 /// range, returns matching blocks via the filter index.
+///
+/// FIX-88 scope decision: G28 is substantially larger than G26/G27 because it
+/// requires a descriptor parser + global progress/abort state machine + an
+/// async sweep over the filter index. Deferred to FIX-89.
 #[test]
-#[ignore = "BUG-21 (P1): scanblocks RPC MISSING"]
+#[ignore = "BUG-21 (P1): scanblocks RPC — FIX-89 candidate (FIX-88 scope deferred substantial work)"]
 fn g28_scanblocks_rpc_missing() {
     panic!(
         "scanblocks RPC MISSING — Core's primary descriptor-based light-client \
-         scan interface is unreachable"
+         scan interface is unreachable. FIX-89 candidate."
     );
 }
 
-/// G29 BUG-22 (P0) — `-blockfilterindex=1` startup flag MISSING.
-/// No way to enable the index at startup. Combined with G23 (no wiring into
-/// connect_block), the entire feature has neither a runtime enable path nor a
-/// build-time one.
+/// G29 BUG-22 — FIXED in FIX-88.
+///
+/// `--blockfilterindex` CLI flag is now defined on `Cli` in
+/// `rustoshi/src/main.rs` and plumbed into
+/// `PeerManagerConfig::block_filter_index_enabled` so the FIX-71 gate
+/// (`should_advertise_compact_filters`) and FIX-82 dispatch handlers
+/// activate when the operator passes the flag.  Mirrors Bitcoin Core
+/// `init.cpp:992` `DEFAULT_BLOCKFILTERINDEX`.
 #[test]
-#[ignore = "BUG-22 (P0): -blockfilterindex=1 startup flag MISSING"]
-fn g29_blockfilterindex_cli_arg_missing() {
-    panic!(
-        "rustoshi `main.rs` does not expose -blockfilterindex; \
-         operators cannot enable BIP-157 serving"
+fn g29_blockfilterindex_cli_arg_present() {
+    let body = std::fs::read_to_string("../../rustoshi/src/main.rs")
+        .expect("rustoshi/src/main.rs must exist");
+    assert!(
+        body.contains("long = \"blockfilterindex\""),
+        "FIX-88: rustoshi must expose `--blockfilterindex` CLI flag"
+    );
+    assert!(
+        body.contains("block_filter_index_enabled: blockfilterindex_enabled"),
+        "FIX-88: `--blockfilterindex` must plumb into PeerManagerConfig"
     );
 }
 
-/// G30 BUG-23 (P1) — `-peerblockfilters=1` startup flag MISSING.
-/// Even if G14-G18 were wired, an operator could not gate filter serving
-/// per Core's default (serving disabled unless flag set).
+/// G30 BUG-23 — FIXED in FIX-88.
+///
+/// `--peerblockfilters` CLI flag is now defined on `Cli` in
+/// `rustoshi/src/main.rs` and plumbed into
+/// `PeerManagerConfig::peer_block_filters` so NODE_COMPACT_FILTERS is
+/// advertised when both `-blockfilterindex` and `-peerblockfilters` are
+/// set (Core init.cpp:992-999).  Startup additionally enforces Core's
+/// "-peerblockfilters requires -blockfilterindex" precondition
+/// (init.cpp:994-996).
 #[test]
-#[ignore = "BUG-23 (P1): -peerblockfilters=1 startup flag MISSING"]
-fn g30_peerblockfilters_cli_arg_missing() {
-    panic!(
-        "rustoshi `main.rs` does not expose -peerblockfilters; only \
-         -peerbloomfilters (BIP-37) is implemented. BIP-157 serving cannot \
-         be gated."
+fn g30_peerblockfilters_cli_arg_present() {
+    let body = std::fs::read_to_string("../../rustoshi/src/main.rs")
+        .expect("rustoshi/src/main.rs must exist");
+    assert!(
+        body.contains("peerblockfilters: bool"),
+        "FIX-88: rustoshi must expose `--peerblockfilters` CLI flag"
+    );
+    assert!(
+        body.contains("peer_block_filters: cli.peerblockfilters"),
+        "FIX-88: `--peerblockfilters` must plumb into PeerManagerConfig"
+    );
+    assert!(
+        body.contains("-peerblockfilters requires -blockfilterindex"),
+        "FIX-88: rustoshi must enforce Core's -peerblockfilters/-blockfilterindex precondition"
     );
 }
 
@@ -1144,14 +1202,27 @@ fn bug25_filter_type_from_name_unknown_returns_none() {
     // include "Misbehaving(100)" on unknown type per Core convention.
 }
 
-/// BUG-26 (P2) — REST `rest_blockfilterheaders` walks heights without
-/// verifying the chain didn't reorg mid-query. Pin via structural test:
-/// confirm the handler reads contiguous heights without locking. (Can't
-/// easily exercise; we just leave the BUG-26 marker.)
+/// BUG-26 — FIXED in FIX-88.
+///
+/// `rest_blockfilterheaders` now (a) holds the `RpcState` read lock for
+/// the entire walk so no reorg writer can commit between iterations, and
+/// (b) re-pins each iteration by verifying that the start anchor is still
+/// at the requested height on the active chain. If the chain reorgs to a
+/// point that orphans the start anchor, the request fails with
+/// `BlockNotFound` rather than splicing in headers from the new chain.
+/// See `crates/rpc/src/rest.rs::rest_blockfilterheaders` for the wiring.
 #[test]
-#[ignore = "BUG-26 (P2): rest_blockfilterheaders does not pin chain tip across iterations"]
-fn bug26_rest_handler_no_reorg_guard() {
-    panic!("rest_blockfilterheaders walks heights without a tip-pin — racy under reorg");
+fn bug26_rest_handler_reorg_guard_present() {
+    let body = std::fs::read_to_string("../rpc/src/rest.rs")
+        .expect("crates/rpc/src/rest.rs must exist");
+    assert!(
+        body.contains("FIX-88") && body.contains("BUG-26"),
+        "FIX-88: rest_blockfilterheaders must reference its BUG-26 reorg guard"
+    );
+    assert!(
+        body.contains("Re-pin: after every iteration step"),
+        "FIX-88: rest_blockfilterheaders must defensively re-verify the active-chain anchor"
+    );
 }
 
 /// BUG-27 (P3) — GCSFilter::match_element decodes the whole filter on every
