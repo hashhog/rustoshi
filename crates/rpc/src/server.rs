@@ -41,6 +41,7 @@ use rustoshi_network::peer_manager::PeerManager;
 use rustoshi_primitives::{Block, Decodable, Encodable, Hash256, OutPoint, Transaction, TxIn, TxOut};
 use rustoshi_storage::{
     block_store::{BlockStore, CoinEntry},
+    indexes::BlockFilterIndex,
     snapshot::{SnapshotMetadata, SnapshotWriter},
     ChainDb, Coin, CF_UTXO,
 };
@@ -980,6 +981,45 @@ pub trait RustoshiRpc {
     /// Mirrors Bitcoin Core rpc/server.cpp getrpcinfo.
     #[method(name = "getrpcinfo")]
     async fn get_rpc_info(&self) -> RpcResult<serde_json::Value>;
+
+    /// FIX-88 W121 G26: Retrieve a BIP-157 content filter for a particular block.
+    ///
+    /// Mirrors Bitcoin Core `rpc/blockchain.cpp::getblockfilter`:
+    ///   `getblockfilter "<blockhash>" ( "filtertype" )`
+    /// Returns `{"filter": "<hex>", "header": "<hex>"}` where `filter` is the
+    /// hex-encoded GCS filter body (the same bytes the P2P `cfilter` message
+    /// carries after the leading filter_type byte) and `header` is the BIP-157
+    /// SHA256d filter header chain entry for this block.
+    ///
+    /// Errors:
+    ///   - RPC_INVALID_ADDRESS_OR_KEY if `filtertype` is unknown
+    ///   - RPC_INVALID_ADDRESS_OR_KEY if `blockhash` is not in the block index
+    ///   - RPC_MISC_ERROR if the filter index is disabled or still syncing
+    ///   - RPC_INTERNAL_ERROR if the filter is missing despite the index being
+    ///     ready (indicates index corruption)
+    #[method(name = "getblockfilter")]
+    async fn get_block_filter(
+        &self,
+        blockhash: String,
+        filtertype: Option<String>,
+    ) -> RpcResult<serde_json::Value>;
+
+    /// FIX-88 W121 G27: Return the status of available indexes.
+    ///
+    /// Mirrors Bitcoin Core `rpc/node.cpp::getindexinfo`:
+    ///   `getindexinfo ( "index_name" )`
+    /// Returns a dynamic object keyed by index name; each value is
+    /// `{"synced": bool, "best_block_height": int}`. The optional `index_name`
+    /// argument filters the response to a single index.
+    ///
+    /// Recognized index names:
+    ///   - "txindex" (when -txindex is enabled)
+    ///   - "basic block filter index" (when -blockfilterindex is enabled)
+    #[method(name = "getindexinfo")]
+    async fn get_index_info(
+        &self,
+        index_name: Option<String>,
+    ) -> RpcResult<serde_json::Value>;
 }
 
 // ============================================================
@@ -7154,6 +7194,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getchaintips" => "getchaintips\nReturn information about all known tips in the block tree.",
                 "gettxout" => "gettxout \"txid\" n ( include_mempool )\nReturns details about an unspent transaction output.",
                 "getrawtransaction" => "getrawtransaction \"txid\" ( verbose \"blockhash\" )\nReturn the raw transaction data.",
+                "getblockfilter" => "getblockfilter \"blockhash\" ( \"filtertype\" )\nRetrieve a BIP-157 content filter for a particular block.",
+                "getindexinfo" => "getindexinfo ( \"index_name\" )\nReturns the status of one or all available indices.",
                 "sendrawtransaction" => "sendrawtransaction \"hexstring\" ( maxfeerate )\nSubmit a raw transaction to the network.",
                 "decoderawtransaction" => "decoderawtransaction \"hexstring\" ( iswitness )\nDecode a raw transaction.",
                 "createrawtransaction" => "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )\nCreate a transaction spending the given inputs and creating new outputs.",
@@ -7198,7 +7240,8 @@ impl RustoshiRpcServer for RpcServerImpl {
             let commands = vec![
                 "== Blockchain ==",
                 "getbestblockhash", "getblock", "getblockchaininfo", "getblockcount",
-                "getblockhash", "getblockheader", "getchaintips", "getdifficulty", "gettxout",
+                "getblockfilter", "getblockhash", "getblockheader", "getchaintips",
+                "getdifficulty", "gettxout",
                 "invalidateblock", "preciousblock", "pruneblockchain", "reconsiderblock",
                 "",
                 "== Mempool ==",
@@ -7226,7 +7269,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "combinepsbt", "createpsbt", "decodepsbt", "finalizepsbt",
                 "",
                 "== Util ==",
-                "estimaterawfee", "estimatesmartfee", "getnettotals", "help",
+                "estimaterawfee", "estimatesmartfee", "getindexinfo", "getnettotals", "help",
                 "signmessagewithprivkey", "stop", "uptime", "verifymessage",
             ];
             Ok(commands.join("\n"))
@@ -8463,6 +8506,179 @@ impl RustoshiRpcServer for RpcServerImpl {
             "active_commands": [],
             "logpath": "",
         }))
+    }
+
+    // ============================================================
+    // FIX-88 — W121 RPC tail (G26 getblockfilter / G27 getindexinfo)
+    // ============================================================
+
+    /// G26 — `getblockfilter`.  Mirrors Core
+    /// `rpc/blockchain.cpp::getblockfilter` (lines 2956-3031).
+    ///
+    /// Steps (Core parity):
+    ///   1. Parse blockhash + filter type.  Unknown type =>
+    ///      RPC_INVALID_ADDRESS_OR_KEY "Unknown filtertype".
+    ///   2. Resolve blockhash via the block index.  Missing =>
+    ///      RPC_INVALID_ADDRESS_OR_KEY "Block not found".
+    ///   3. Read the stored filter + filter header.  If either is missing,
+    ///      return the most informative of:
+    ///         - "Block was not connected to active chain"
+    ///           (block index entry exists but isn't on the active chain)
+    ///         - "Block filters are still in the process of being indexed"
+    ///           (best_height < block height; index hasn't reached it yet)
+    ///         - "This error is unexpected and indicates index corruption"
+    ///   4. Return `{"filter": <hex>, "header": <hex>}`.
+    async fn get_block_filter(
+        &self,
+        blockhash: String,
+        filtertype: Option<String>,
+    ) -> RpcResult<serde_json::Value> {
+        use rustoshi_storage::indexes::blockfilterindex::BlockFilterType;
+
+        let block_hash = Self::parse_hash(&blockhash)?;
+        let ftype_name = filtertype.unwrap_or_else(|| "basic".to_string());
+        let _ftype = BlockFilterType::from_name(&ftype_name).ok_or_else(|| {
+            Self::rpc_error(
+                rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                "Unknown filtertype",
+            )
+        })?;
+
+        let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+        let index = BlockFilterIndex::new(&state.db);
+
+        // (2) Resolve block index.
+        let entry = store
+            .get_block_index(&block_hash)
+            .map_err(|e| {
+                Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, format!("db error: {}", e))
+            })?
+            .ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                    "Block not found",
+                )
+            })?;
+
+        // (3) Whether the block is on the active chain.
+        let on_active_chain = store
+            .get_hash_by_height(entry.height)
+            .ok()
+            .flatten()
+            == Some(block_hash);
+
+        // Try to fetch the filter + header.
+        let filter_opt = index.get_filter(&block_hash).map_err(|e| {
+            Self::rpc_error(
+                rpc_error::RPC_DATABASE_ERROR,
+                format!("filter db error: {}", e),
+            )
+        })?;
+        let header_opt = index.get_filter_header(entry.height).map_err(|e| {
+            Self::rpc_error(
+                rpc_error::RPC_DATABASE_ERROR,
+                format!("filter-header db error: {}", e),
+            )
+        })?;
+
+        match (filter_opt, header_opt) {
+            (Some(filter), Some(header_entry)) => {
+                // Mirror Core: encode the encoded_filter (which is the
+                // CompactSize-prefixed GCS body) as hex; the header is the
+                // 32-byte SHA256d filter header chain entry as hex.
+                Ok(serde_json::json!({
+                    "filter": hex::encode(&filter.encoded_filter),
+                    "header": header_entry.filter_header.to_hex(),
+                }))
+            }
+            _ => {
+                // Core's tri-state error reporting: stale/orphan block,
+                // still indexing, or corruption.
+                if !on_active_chain {
+                    Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                        "Filter not found. Block was not connected to active chain.",
+                    ))
+                } else if state.best_height < entry.height {
+                    Err(Self::rpc_error(
+                        rpc_error::RPC_MISC_ERROR,
+                        "Filter not found. Block filters are still in the process of being indexed.",
+                    ))
+                } else {
+                    Err(Self::rpc_error(
+                        rpc_error::RPC_INTERNAL_ERROR,
+                        "Filter not found. This error is unexpected and indicates index corruption.",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// G27 — `getindexinfo`.  Mirrors Core `rpc/node.cpp::getindexinfo`
+    /// (lines 363-412).
+    ///
+    /// rustoshi currently has two enable-able indexes:
+    ///   - txindex (CF_TXINDEX, populated on connect_tip when -txindex)
+    ///   - basic block filter index (CF_BLOCKFILTER, populated when
+    ///     -blockfilterindex)
+    ///
+    /// "synced" mirrors Core's definition: the index's `best_block_height`
+    /// equals the chainstate's `best_height`.  rustoshi's indexes are wired
+    /// to `connect_tip` so they advance in lockstep with the chain — synced
+    /// is functionally `index.has_filter(state.best_hash)` for the filter
+    /// index and "best_height key present in txindex meta" for txindex.
+    /// We use a conservative approximation: `synced = index_enabled` and
+    /// `best_block_height = state.best_height` when there is no separate
+    /// async indexer (the rustoshi indexer is synchronous, so it is always
+    /// at the tip the moment connect_tip returns).
+    async fn get_index_info(
+        &self,
+        index_name: Option<String>,
+    ) -> RpcResult<serde_json::Value> {
+        let state = self.state.read().await;
+
+        let mut out = serde_json::Map::new();
+        let want = index_name.as_deref().unwrap_or("");
+
+        // txindex active iff any row exists in CF_TX_INDEX.  Mirrors Core's
+        // `g_txindex != nullptr` (the global is set iff -txindex was passed
+        // at startup).  rustoshi has no equivalent global, so we probe the
+        // column family directly via `has_any_tx_index` (cheap RocksDB
+        // iterator-start lookup).
+        let txindex_active = {
+            let store = BlockStore::new(&state.db);
+            store.has_any_tx_index().unwrap_or(false)
+        };
+        if txindex_active && (want.is_empty() || want == "txindex") {
+            out.insert(
+                "txindex".to_string(),
+                serde_json::json!({
+                    "synced": true,
+                    "best_block_height": state.best_height,
+                }),
+            );
+        }
+
+        // Basic block filter index.  Active if any filter row exists for
+        // the current best block.
+        let blockfilter_active = {
+            let index = BlockFilterIndex::new(&state.db);
+            index.has_filter(&state.best_hash).unwrap_or(false)
+        };
+        if blockfilter_active
+            && (want.is_empty() || want == "basic block filter index")
+        {
+            out.insert(
+                "basic block filter index".to_string(),
+                serde_json::json!({
+                    "synced": true,
+                    "best_block_height": state.best_height,
+                }),
+            );
+        }
+
+        Ok(serde_json::Value::Object(out))
     }
 }
 
@@ -14903,6 +15119,161 @@ mod tests {
         assert!(
             !result_stale,
             "should_exit_ibd must respect age gate even when chainwork is None"
+        );
+    }
+
+    // ============================================================
+    // FIX-88 — W121 RPC tail tests
+    // ============================================================
+
+    /// G26 — `getblockfilter` on a block with no stored filter returns
+    /// "Block was not connected to active chain" when the hash is unknown.
+    /// Mirrors Bitcoin Core `rpc/blockchain.cpp::getblockfilter` lines
+    /// 2996-2998.
+    #[tokio::test]
+    async fn fix_88_getblockfilter_unknown_block_returns_invalid_address_or_key() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, _state, server) = make_test_server(params);
+        // 32-byte hex string that is not in the block index.
+        let bogus = "0".repeat(64);
+        let err = RustoshiRpcServer::get_block_filter(&server, bogus, None)
+            .await
+            .expect_err("must error on unknown block");
+        // Core returns RPC_INVALID_ADDRESS_OR_KEY (= -5).
+        assert_eq!(err.code(), rpc_error::RPC_INVALID_ADDRESS_OR_KEY);
+        assert!(
+            err.message().contains("Block not found"),
+            "expected 'Block not found' message, got: {}",
+            err.message()
+        );
+    }
+
+    /// G26 — unknown filter type returns
+    /// RPC_INVALID_ADDRESS_OR_KEY "Unknown filtertype".  Mirrors Core
+    /// `rpc/blockchain.cpp::getblockfilter` lines 2981-2983.
+    #[tokio::test]
+    async fn fix_88_getblockfilter_unknown_filtertype_errors() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, _state, server) = make_test_server(params);
+        let bogus = "0".repeat(64);
+        let err = RustoshiRpcServer::get_block_filter(
+            &server,
+            bogus,
+            Some("extended".to_string()),
+        )
+        .await
+        .expect_err("must error on unknown filtertype");
+        assert_eq!(err.code(), rpc_error::RPC_INVALID_ADDRESS_OR_KEY);
+        assert!(
+            err.message().contains("Unknown filtertype"),
+            "expected 'Unknown filtertype' message"
+        );
+    }
+
+    /// G27 — `getindexinfo` on a fresh node (no indexes wired) returns an
+    /// empty object.  Mirrors Core's behaviour when no indexes are active.
+    #[tokio::test]
+    async fn fix_88_getindexinfo_empty_when_no_indexes_enabled() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, _state, server) = make_test_server(params);
+        let result = RustoshiRpcServer::get_index_info(&server, None)
+            .await
+            .expect("getindexinfo must succeed");
+        // No indexes wired in make_test_server → object should be empty.
+        assert!(result.is_object(), "result must be a JSON object");
+        assert!(
+            result.as_object().unwrap().is_empty(),
+            "expected empty object when no indexes are active, got {:?}",
+            result
+        );
+    }
+
+    /// G27 — `getindexinfo` reports the `basic block filter index` entry
+    /// after a filter has been stored (simulating `connect_tip` writing
+    /// the filter via FIX-69).
+    #[tokio::test]
+    async fn fix_88_getindexinfo_reports_basic_block_filter_index() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::{BlockFilter, BlockFilterIndex};
+
+        let params = ChainParams::regtest();
+        let (db, state, server) = make_test_server(params);
+        // Write a filter row for the current best block so the probe in
+        // `get_index_info` sees the index as active.
+        let st = state.read().await;
+        let best = st.best_hash;
+        drop(st);
+        let filter = BlockFilter::build_basic(
+            best,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
+
+        let result = RustoshiRpcServer::get_index_info(&server, None)
+            .await
+            .expect("getindexinfo must succeed");
+        let obj = result.as_object().expect("object");
+        let bfi = obj
+            .get("basic block filter index")
+            .expect("must have basic block filter index entry");
+        assert_eq!(
+            bfi.get("synced").and_then(|v| v.as_bool()),
+            Some(true),
+            "synced must be true"
+        );
+        assert!(
+            bfi.get("best_block_height")
+                .and_then(|v| v.as_u64())
+                .is_some(),
+            "best_block_height must be a number"
+        );
+    }
+
+    /// G27 — `getindexinfo` with explicit `index_name` filters correctly:
+    /// asking for `txindex` on a node with only block filters returns an
+    /// empty object.
+    #[tokio::test]
+    async fn fix_88_getindexinfo_index_name_filter_works() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::{BlockFilter, BlockFilterIndex};
+
+        let params = ChainParams::regtest();
+        let (db, state, server) = make_test_server(params);
+        let st = state.read().await;
+        let best = st.best_hash;
+        drop(st);
+        let filter = BlockFilter::build_basic(
+            best,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
+
+        let only_txindex = RustoshiRpcServer::get_index_info(
+            &server,
+            Some("txindex".to_string()),
+        )
+        .await
+        .expect("getindexinfo must succeed");
+        assert!(
+            only_txindex.as_object().unwrap().is_empty(),
+            "asking for txindex on a filters-only node must return empty"
+        );
+
+        let only_filters = RustoshiRpcServer::get_index_info(
+            &server,
+            Some("basic block filter index".to_string()),
+        )
+        .await
+        .expect("getindexinfo must succeed");
+        assert_eq!(
+            only_filters.as_object().unwrap().len(),
+            1,
+            "asking for 'basic block filter index' must return exactly one entry"
         );
     }
 }

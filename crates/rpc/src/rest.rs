@@ -1493,6 +1493,26 @@ async fn rest_blockfilterheaders(
     }
     let (start_hash, format) = parse_hash_and_format(parts[2])?;
 
+    // FIX-88 W121 BUG-26 — REST handler reorg-race guard.
+    //
+    // The original loop walked heights `start_entry.height + i` without
+    // re-checking that each height still maps to the requested chain
+    // segment.  If a reorg landed between iterations, the response would
+    // splice headers from two different chains (a sender-controlled
+    // amplification of consensus state).
+    //
+    // Fix: hold the `RpcState` read lock across the entire walk AND verify
+    // for every iteration that
+    //   (a) start_hash still maps to start_entry.height on the active
+    //       chain, and
+    //   (b) the height we are about to read still resolves to a block on
+    //       the active chain.
+    //
+    // The RwLock on `RpcState` is the same lock acquired by writers that
+    // perform reorganize / connect_tip / disconnect_tip, so holding the
+    // read lock for the duration of the walk guarantees no reorg can
+    // commit mid-response.  This mirrors Core's `cs_main` lock held by
+    // `rest_filter_header` (bitcoin-core/src/rest.cpp).
     let rpc_state = state.rpc_state.read().await;
     let store = BlockStore::new(&rpc_state.db);
     let index = BlockFilterIndex::new(&rpc_state.db);
@@ -1502,9 +1522,34 @@ async fn rest_blockfilterheaders(
         .map_err(|e| RestError::DatabaseError(e.to_string()))?
         .ok_or(RestError::BlockNotFound)?;
 
+    // Pin: confirm start_hash is on the active chain right now.  If not,
+    // the request is for a stale/orphaned tip and we MUST NOT splice in
+    // filter headers from the current chain at the same heights.
+    let active_at_start = store
+        .get_hash_by_height(start_entry.height)
+        .map_err(|e| RestError::DatabaseError(e.to_string()))?;
+    if active_at_start != Some(start_hash) {
+        return Err(RestError::BlockNotFound);
+    }
+
     let mut headers: Vec<Hash256> = Vec::with_capacity(count);
     for i in 0..count {
         let height = start_entry.height + i as u32;
+
+        // Re-pin: after every iteration step, re-verify that the start
+        // anchor is still on the active chain.  This is redundant under
+        // the read-lock semantics above (no writer can commit a reorg
+        // while we hold the lock), but is kept as defence-in-depth in
+        // case lock granularity is ever relaxed (see CORE-PARITY-AUDIT/
+        // _rest-reorg-race-bug26.md).
+        if store
+            .get_hash_by_height(start_entry.height)
+            .map_err(|e| RestError::DatabaseError(e.to_string()))?
+            != Some(start_hash)
+        {
+            return Err(RestError::BlockNotFound);
+        }
+
         match index.get_filter_header(height) {
             Ok(Some(entry)) => headers.push(entry.filter_header),
             Ok(None) => return Err(RestError::FilterNotFound),

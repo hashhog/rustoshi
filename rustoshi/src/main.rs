@@ -98,6 +98,39 @@ struct Cli {
     #[arg(long, default_value = "false")]
     peerbloomfilters: bool,
 
+    /// FIX-88 W121 G29: enable the BIP-157/158 compact-block-filter index.
+    ///
+    /// Mirrors Bitcoin Core's `-blockfilterindex=basic` (default: disabled,
+    /// per `bitcoin-core/src/index/blockfilterindex.h` and `init.cpp:992`).
+    /// When set, every block connected (and the genesis block at startup)
+    /// is indexed into `CF_BLOCKFILTER` + `CF_BLOCKFILTER_HEADER` so the
+    /// node can serve `getcfilters` / `getcfheaders` / `getcfcheckpt` P2P
+    /// messages and `getblockfilter` / REST `/rest/blockfilter` queries.
+    ///
+    /// Accepts the same values as Core: `0`/`false`/`basic`/`1`/`true`.
+    /// rustoshi only supports the BIP-158 basic filter type; any non-zero
+    /// value enables it.  `--peerblockfilters` REQUIRES this flag, per Core
+    /// `init.cpp:994-996`.
+    #[arg(
+        long = "blockfilterindex",
+        default_value = "false",
+        value_name = "0|1|basic",
+    )]
+    blockfilterindex: String,
+
+    /// FIX-88 W121 G30: advertise `NODE_COMPACT_FILTERS` (BIP-157) and
+    /// serve BIP-157 P2P filter messages.
+    ///
+    /// Mirrors Bitcoin Core's `-peerblockfilters` (default: disabled, per
+    /// `bitcoin-core/src/init.cpp:993 DEFAULT_PEERBLOCKFILTERS`).  Core
+    /// rejects `-peerblockfilters` without `-blockfilterindex` (init.cpp
+    /// 994-996); rustoshi enforces the same precondition at startup.
+    /// The service bit is gated through
+    /// `crates/network/src/peer_manager.rs::should_advertise_compact_filters`,
+    /// which also requires `BIP157_P2P_HANDLERS_REGISTERED` (FIX-82).
+    #[arg(long, default_value = "false")]
+    peerblockfilters: bool,
+
     /// P2P listen port (overrides network default)
     #[arg(long)]
     port: Option<u16>,
@@ -1191,6 +1224,13 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
     merge_opt_str!(rpc_tls_key, "rpc-tls-key");
     merge_bool!(listen, "listen");
     merge_bool!(peerbloomfilters, "peerbloomfilters");
+    // FIX-88 W121 G29/G30: conf-file plumbing for the new compact-filter flags.
+    if !was_set(raw_argv, "blockfilterindex") {
+        if let Some(v) = conf.get("blockfilterindex") {
+            cli.blockfilterindex = v.to_string();
+        }
+    }
+    merge_bool!(peerblockfilters, "peerblockfilters");
     if !was_set(raw_argv, "port") {
         if let Some(v) = conf.get("port") {
             if let Ok(p) = v.parse::<u16>() {
@@ -2068,6 +2108,30 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         tracing::info!("CJDNS reachability enabled (fc00::/8 native routing)");
     }
 
+    // FIX-88 W121 G29/G30: parse the `-blockfilterindex` flag and enforce the
+    // `-peerblockfilters REQUIRES -blockfilterindex` precondition.
+    //
+    // Mirrors Core init.cpp:992-999.  Accepted values for
+    // `--blockfilterindex`: `0`/`false`/`""` => off; everything else
+    // (including `1`, `true`, `basic`) => on.  rustoshi only supports the
+    // BIP-158 basic filter type today.
+    let blockfilterindex_enabled = match cli.blockfilterindex.to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => false,
+        _ => true,
+    };
+    if cli.peerblockfilters && !blockfilterindex_enabled {
+        tracing::error!(
+            "-peerblockfilters requires -blockfilterindex (matches Core init.cpp:994-996)"
+        );
+        std::process::exit(1);
+    }
+    if blockfilterindex_enabled {
+        tracing::info!(
+            "BIP-157/158 block filter index ENABLED (peerblockfilters={})",
+            cli.peerblockfilters
+        );
+    }
+
     // Configure peer manager
     let peer_config = PeerManagerConfig {
         max_outbound_full_relay: cli.maxconnections.saturating_sub(2),
@@ -2075,6 +2139,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         listen_port: cli.port.unwrap_or(params.default_port),
         listen: cli.listen,
         peer_bloom_filters: cli.peerbloomfilters,
+        // FIX-88 W121 G29/G30 plumb: enable filter index + peer-serving gate.
+        // FIX-71 wired `should_advertise_compact_filters` to gate NODE_COMPACT_FILTERS
+        // on both flags being true.  FIX-82 set BIP157_P2P_HANDLERS_REGISTERED=true.
+        // FIX-88 finally exposes the operator-facing knobs so the gate can flip.
+        block_filter_index_enabled: blockfilterindex_enabled,
+        peer_block_filters: cli.peerblockfilters,
         // BIP-159: advertise NODE_NETWORK_LIMITED when prune is enabled so peers
         // know not to request blocks below the recent-288 keep window.
         prune_mode: cli.prune.map(|n| n > 0).unwrap_or(false),
@@ -4411,6 +4481,32 @@ mod tests {
         assert_eq!(cli.port, Some(12345));
         assert_eq!(cli.maxconnections, 16);
         assert_eq!(cli.connect, Some("192.168.1.100:8333".to_string()));
+    }
+
+    /// FIX-88 W121 G29: `--blockfilterindex` parses + defaults off.
+    /// Mirrors Bitcoin Core `init.cpp` default `DEFAULT_BLOCKFILTERINDEX=false`.
+    #[test]
+    fn test_cli_blockfilterindex_flag_fix88() {
+        // Default: off.
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert_eq!(cli.blockfilterindex, "false");
+        // Explicit on (Core-style).
+        let cli = Cli::try_parse_from(["rustoshi", "--blockfilterindex", "1"]).unwrap();
+        assert_eq!(cli.blockfilterindex, "1");
+        // Core also accepts `basic`.
+        let cli = Cli::try_parse_from(["rustoshi", "--blockfilterindex", "basic"]).unwrap();
+        assert_eq!(cli.blockfilterindex, "basic");
+    }
+
+    /// FIX-88 W121 G30: `--peerblockfilters` parses + defaults off.
+    /// Mirrors Bitcoin Core `init.cpp:993 DEFAULT_PEERBLOCKFILTERS=false`.
+    #[test]
+    fn test_cli_peerblockfilters_flag_fix88() {
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert!(!cli.peerblockfilters);
+        // Bare presence enables (matches `--peerbloomfilters` shape).
+        let cli = Cli::try_parse_from(["rustoshi", "--peerblockfilters"]).unwrap();
+        assert!(cli.peerblockfilters);
     }
 
     #[test]
