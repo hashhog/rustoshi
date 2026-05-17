@@ -60,18 +60,20 @@ pub const MAX_BLOCK_RELAY_ONLY_ANCHORS: usize = 2;
 /// `ProcessGetCFCheckPt` are always linked into `net_processing.cpp` when the
 /// node binary is built (see `bitcoin-core/src/net_processing.cpp` 3315-3460).
 ///
-/// rustoshi currently has the BIP-157 wire codec in `message.rs` but NO
-/// dispatch handlers in `peer.rs` / `peer_manager.rs` — incoming
-/// `GetCFilters` / `GetCFHeaders` / `GetCFCheckpt` messages are silently
-/// dropped (they parse as `NetworkMessage::GetCFilters(Vec<u8>)` but there is
-/// no match arm that calls the BlockFilterIndex). Therefore advertising
-/// `NODE_COMPACT_FILTERS` would lie to peers (BIP-157 §"Service Bits").
+/// FIX-82 (W121 BUG-7..BUG-13 closure): flipped to `true`. The dispatch
+/// handlers now live in `rustoshi/src/main.rs` (event-loop match arms for
+/// `NetworkMessage::GetCFilters` / `GetCFHeaders` / `GetCFCheckpt`),
+/// invoking `BlockFilterIndex::lookup_filter_range` /
+/// `lookup_filter_header_range` / per-checkpoint walks (mirrors Core's
+/// `LookupFilterRange` / `LookupFilterHashRange` / `LookupFilterHeader`).
+/// Per-violation `peer.disconnect()` mirrors Core's `node.fDisconnect=true`
+/// inside `PrepareBlockFilterRequest` (net_processing.cpp:3262-3313).
 ///
-/// When a future P2P fix wave registers the handlers, flip this constant to
-/// `true`. The gate function `should_advertise_compact_filters` will then
-/// start OR-ing the bit into `local_services()` automatically. See
-/// `BIP-157` and `bitcoin-core/src/init.cpp:992-999`.
-pub const BIP157_P2P_HANDLERS_REGISTERED: bool = false;
+/// The gate function `should_advertise_compact_filters` now OR-s the bit
+/// into `local_services()` whenever `-blockfilterindex` and
+/// `-peerblockfilters` are both enabled. See `BIP-157` and
+/// `bitcoin-core/src/init.cpp:992-999`.
+pub const BIP157_P2P_HANDLERS_REGISTERED: bool = true;
 
 /// Decide whether to advertise `NODE_COMPACT_FILTERS` (bit 6, BIP-157) in the
 /// outbound version handshake.
@@ -95,9 +97,10 @@ pub const BIP157_P2P_HANDLERS_REGISTERED: bool = false;
 /// Core always links the handlers in the same binary; rustoshi must check
 /// (c) until the handlers land.
 ///
-/// As of FIX-71 this function returns `false` unconditionally because
-/// `BIP157_P2P_HANDLERS_REGISTERED` is `false`. The wiring is structural so
-/// a future P2P fix wave only needs to flip the constant.
+/// As of FIX-82 the dispatch handlers are wired (see
+/// `BIP157_P2P_HANDLERS_REGISTERED`), so this gate now returns `true`
+/// whenever the operator enables both `-blockfilterindex` and
+/// `-peerblockfilters` (matching Core's `init.cpp` behavior).
 ///
 /// References:
 ///   - `bitcoin-core/src/protocol.h:323` — `NODE_COMPACT_FILTERS = (1 << 6)`
@@ -1112,9 +1115,10 @@ impl PeerManager {
     /// peers know we serve only the recent-288-block window.
     ///
     /// NODE_COMPACT_FILTERS (BIP-157, bit 6) is gated through
-    /// [`should_advertise_compact_filters`]; as of FIX-71 the gate returns
-    /// `false` because BIP-157 P2P handlers are not yet registered — see
-    /// [`BIP157_P2P_HANDLERS_REGISTERED`].
+    /// [`should_advertise_compact_filters`]; as of FIX-82 the gate returns
+    /// `true` whenever `-blockfilterindex` and `-peerblockfilters` are both
+    /// enabled, because the BIP-157 P2P handlers are now registered — see
+    /// [`BIP157_P2P_HANDLERS_REGISTERED`] (FIX-82, W121 BUG-7..BUG-13).
     pub fn local_services(&self) -> u64 {
         let mut s = NODE_NETWORK | NODE_WITNESS;
         if self.config.peer_bloom_filters {
@@ -1123,9 +1127,9 @@ impl PeerManager {
         if self.config.prune_mode {
             s |= NODE_NETWORK_LIMITED;
         }
-        // FIX-71: BIP-157 compact-filter advertisement gate. Currently false
-        // because `BIP157_P2P_HANDLERS_REGISTERED = false`; future P2P wave
-        // flips the constant and this branch starts advertising automatically.
+        // FIX-82: BIP-157 compact-filter advertisement gate. Handlers are
+        // registered in `main.rs`; bit advertised when both config flags
+        // are set, matching Core's `init.cpp:992-999`.
         if should_advertise_compact_filters(
             self.config.block_filter_index_enabled,
             self.config.peer_block_filters,
@@ -1759,6 +1763,26 @@ impl PeerManager {
     pub async fn disconnect_peer(&mut self, peer_id: PeerId) {
         if let Some(peer) = self.peers.get(&peer_id) {
             let _ = peer.command_tx.send(PeerCommand::Disconnect).await;
+        }
+    }
+
+    /// Try to disconnect a peer non-blockingly via the peer's command channel.
+    ///
+    /// Mirrors Bitcoin Core's `node.fDisconnect = true` flag, which is checked
+    /// by `SocketHandler` on the next event-loop tick.  Returns `true` if the
+    /// `PeerCommand::Disconnect` was enqueued, `false` if the peer was already
+    /// gone or the channel was full.
+    ///
+    /// Use this from sync code paths (e.g. event-loop match arms that hold
+    /// `&PeerManager` via `peer_state.read()`) when an `await` on
+    /// `disconnect_peer` would require upgrading to `&mut self`.
+    /// (FIX-82 / W121 BIP-157 dispatch handlers use this for the per-violation
+    /// disconnect that matches Core's `PrepareBlockFilterRequest` failure paths.)
+    pub fn try_disconnect_peer(&self, peer_id: PeerId) -> bool {
+        if let Some(peer) = self.peers.get(&peer_id) {
+            peer.command_tx.try_send(PeerCommand::Disconnect).is_ok()
+        } else {
+            false
         }
     }
 
