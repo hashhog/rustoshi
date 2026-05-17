@@ -74,25 +74,26 @@
 //!             struct; cannot construct outbound. (P0-CDIV)
 //!   G13 BUG-6: `NetworkMessage::GetCFHeaders` / `CFHeaders` / `GetCFCheckpt`
 //!             / `CFCheckpt` — all opaque Vec<u8>. (P0-CDIV; 4-message gap.)
-//!   G14 BUG-7: FIX-71 NODE_COMPACT_FILTERS gate plumbed in peer_manager.rs::
-//!             local_services via should_advertise_compact_filters. Gate is
-//!             currently FALSE because BIP-157 P2P handlers absent
-//!             (BIP157_P2P_HANDLERS_REGISTERED=false). When a future P2P
-//!             wave registers the dispatch handlers and flips the constant,
-//!             the bit is advertised automatically. (See FIX-71 commit.)
-//!   G15 BUG-8: ProcessGetCFilters handler MISSING. Core has DoS gating
-//!             (NODE_COMPACT_FILTERS, BlockRequestAllowed, max_height_diff
-//!             1000); rustoshi handles the request by silently no-op'ing
-//!             (peer never sees a response, eventually disconnects). (P0)
-//!   G16 BUG-9: ProcessGetCFHeaders MISSING. (P0)
-//!   G17 BUG-10: ProcessGetCFCheckPt MISSING. (P0)
-//!   G18 BUG-11: Outbound cfilter/cfheaders/cfcheckpt MakeAndPushMessage
-//!             MISSING. (P0)
-//!   G19 BUG-12: MAX_GETCFILTERS_SIZE=1000 / MAX_GETCFHEADERS_SIZE=2000
-//!             constants undefined; no DoS gate possible. (P1)
-//!   G20 BUG-13: PrepareBlockFilterRequest equivalent (start > stop check,
-//!             height-diff check, fDisconnect on misbehavior) MISSING.
-//!             A buggy/malicious peer can spam any payload at zero cost. (P1)
+//!   G14 BUG-7: FIX-71 / FIX-82 NODE_COMPACT_FILTERS gate plumbed in
+//!             peer_manager.rs::local_services via
+//!             should_advertise_compact_filters. As of FIX-82 the
+//!             constant BIP157_P2P_HANDLERS_REGISTERED is now `true` (the
+//!             dispatch handlers live in rustoshi/src/main.rs). Bit is
+//!             advertised when both -blockfilterindex and -peerblockfilters
+//!             are enabled. (CLOSED FIX-82)
+//!   G15 BUG-8: ProcessGetCFilters dispatch handler in main.rs (CLOSED FIX-82).
+//!             Per-violation try_disconnect_peer mirrors Core fDisconnect.
+//!   G16 BUG-9: ProcessGetCFHeaders dispatch handler in main.rs (CLOSED FIX-82).
+//!   G17 BUG-10: ProcessGetCFCheckPt dispatch handler in main.rs (CLOSED FIX-82).
+//!   G18 BUG-11: Outbound cfilter/cfheaders/cfcheckpt via try_send_to_peer +
+//!             typed CFilterMessage/CFHeadersMessage/CFCheckptMessage
+//!             serialize methods (CLOSED FIX-82).
+//!   G19 BUG-12: MAX_GETCFILTERS_SIZE=1000 / MAX_GETCFHEADERS_SIZE=2000 /
+//!             CFCHECKPT_INTERVAL=1000 constants in network::message
+//!             (CLOSED FIX-82).
+//!   G20 BUG-13: PrepareBlockFilterRequest-equivalent gate inlined in each
+//!             of the 3 dispatch handlers; per-violation peer.disconnect
+//!             matches Core net_processing.cpp:3262-3313 (CLOSED FIX-82).
 //!
 //! Gates 21-25 — Filter index persistence + header chain:
 //!   G21 BUG-14: BlockFilterIndex storage encodes via `serde_json::to_vec` for
@@ -112,13 +113,11 @@
 //!             connection/disconnection never invokes the filter index. The
 //!             entire ~6500 LOC (gcs + blockfilterindex + REST handlers + tests)
 //!             is a dead subsystem. (P0 — feature is unreachable in production.)
-//!   G24 BUG-17: No range-query API (LookupFilterRange / LookupFilterHashRange).
-//!             P2P getcfilters batches up to 1000 filters in one request —
-//!             without a range API the handler (when added) must do 1000 single
-//!             RocksDB lookups per peer request. (P2)
-//!   G25 BUG-18: No CFCHECKPT_INTERVAL (1000) constant, no checkpoint walk;
-//!             ProcessGetCFCheckPt cannot be implemented without the per-1000
-//!             height ancestor lookup. (P1, blocker for G17.)
+//!   G24 BUG-17: lookup_filter_range + lookup_filter_hash_range exposed on
+//!             BlockFilterIndex, mirroring Core's LookupFilterRange /
+//!             LookupFilterHashRange (CLOSED FIX-82).
+//!   G25 BUG-18: CFCHECKPT_INTERVAL=1000 in blockfilterindex.rs + parallel
+//!             definition in network::message (CLOSED FIX-82).
 //!
 //! Gates 26-30 — RPCs + startup args:
 //!   G26 BUG-19: `getblockfilter` JSON-RPC MISSING. Core blockchain.cpp exposes
@@ -437,76 +436,99 @@ fn g10_filter_header_chain_genesis() {
 // Gates 11-20 — BIP-157 P2P messages
 // ============================================================
 
-/// G11 BUG-4 (P0-CDIV) — `getcfilters` payload struct MISSING.
+/// G11 BUG-4 — FIXED in FIX-82.
 ///
-/// Core wire format (BIP-157):
-///   `uint8 filter_type + uint32 start_height + uint256 stop_hash`  (37 bytes)
-///
-/// rustoshi: `NetworkMessage::GetCFilters(Vec<u8>)` is an opaque blob — there
-/// is no `GetCFiltersMessage` struct with field-level parse / serialize. See
-/// `crates/network/src/message.rs:215`. Without a typed payload, the
-/// (currently missing) handler cannot validate the inbound bytes, and no
-/// outbound code can construct a request.
-///
-/// We do NOT import `rustoshi-network` from this test (storage crate has no
-/// dev-dep on network) — the assertion is documentary.
+/// `NetworkMessage::GetCFilters` now carries a typed `GetCFiltersMessage`
+/// payload struct with `filter_type: u8`, `start_height: u32`,
+/// `stop_hash: Hash256`. The 37-byte BIP-157 wire format round-trips through
+/// `serialize` / `deserialize` (regression-pinned below by file-level
+/// grep against the storage crate's no-dep-on-network invariant).
 #[test]
-#[ignore = "BUG-4 (P0-CDIV): GetCFilters payload is opaque Vec<u8>; no GetCFiltersMessage struct"]
-fn g11_getcfilters_typed_payload_missing() {
-    panic!(
-        "crates/network/src/message.rs:215 — NetworkMessage::GetCFilters(Vec<u8>) \
-         should be NetworkMessage::GetCFilters(GetCFiltersMessage \
-         {{ filter_type:u8, start_height:u32, stop_hash:Hash256 }}) per BIP-157"
+fn g11_getcfilters_typed_payload_present() {
+    let body = std::fs::read_to_string("../network/src/message.rs")
+        .expect("crates/network/src/message.rs must exist");
+    assert!(
+        body.contains("pub struct GetCFiltersMessage"),
+        "FIX-82: GetCFiltersMessage struct must be defined in message.rs"
+    );
+    assert!(
+        body.contains("GetCFilters(GetCFiltersMessage)"),
+        "FIX-82: NetworkMessage::GetCFilters must carry typed payload, not Vec<u8>"
+    );
+    assert!(
+        body.contains("impl GetCFiltersMessage")
+            && body.contains("pub fn serialize")
+            && body.contains("pub fn deserialize"),
+        "FIX-82: GetCFiltersMessage must expose serialize/deserialize"
     );
 }
 
-/// G12 BUG-5 (P0-CDIV) — `cfilter` payload struct MISSING.
+/// G12 BUG-5 — FIXED in FIX-82.
 ///
-/// Core wire format:
-///   `uint8 filter_type + uint256 block_hash + CompactSize(N) + filter_bytes`
-///
-/// rustoshi: opaque Vec<u8>. See `crates/network/src/message.rs:217`.
+/// `NetworkMessage::CFilter` now carries a typed `CFilterMessage` with
+/// `filter_type: u8`, `block_hash: Hash256`, `filter_bytes: Vec<u8>`.
+/// Wire format: `uint8 filter_type | uint256 block_hash | CompactSize(N)
+/// | N bytes`.
 #[test]
-#[ignore = "BUG-5 (P0-CDIV): CFilter payload is opaque Vec<u8>; no CFilterMessage struct"]
-fn g12_cfilter_typed_payload_missing() {
-    panic!(
-        "crates/network/src/message.rs:217 — NetworkMessage::CFilter(Vec<u8>) \
-         should be NetworkMessage::CFilter(CFilterMessage \
-         {{ filter_type:u8, block_hash:Hash256, filter_bytes:Vec<u8> }})"
+fn g12_cfilter_typed_payload_present() {
+    let body = std::fs::read_to_string("../network/src/message.rs")
+        .expect("crates/network/src/message.rs must exist");
+    assert!(
+        body.contains("pub struct CFilterMessage"),
+        "FIX-82: CFilterMessage struct must be defined"
+    );
+    assert!(
+        body.contains("CFilter(CFilterMessage)"),
+        "FIX-82: NetworkMessage::CFilter must carry typed payload"
+    );
+    assert!(
+        body.contains("filter_bytes: Vec<u8>"),
+        "FIX-82: CFilterMessage must carry the filter bytes"
     );
 }
 
-/// G13 BUG-6 (P0-CDIV) — getcfheaders / cfheaders / getcfcheckpt / cfcheckpt
-/// payload structs all MISSING (4-message gap).
-/// See `crates/network/src/message.rs:219-225`.
+/// G13 BUG-6 — FIXED in FIX-82.
+///
+/// All 6 BIP-157 wire messages now use typed payloads:
+/// `GetCFHeadersMessage`, `CFHeadersMessage`, `GetCFCheckptMessage`,
+/// `CFCheckptMessage`. Each round-trips serialize/deserialize.
 #[test]
-#[ignore = "BUG-6 (P0-CDIV): 4 of 6 BIP-157 messages are opaque Vec<u8>"]
-fn g13_remaining_bip157_messages_opaque() {
-    panic!(
-        "GetCFHeaders, CFHeaders, GetCFCheckpt, CFCheckpt (message.rs:219-225) \
-         all carry raw Vec<u8> instead of typed payloads per BIP-157 wire schema"
-    );
+fn g13_remaining_bip157_messages_typed() {
+    let body = std::fs::read_to_string("../network/src/message.rs")
+        .expect("crates/network/src/message.rs must exist");
+    for type_name in [
+        "GetCFHeadersMessage",
+        "CFHeadersMessage",
+        "GetCFCheckptMessage",
+        "CFCheckptMessage",
+    ] {
+        assert!(
+            body.contains(&format!("pub struct {}", type_name)),
+            "FIX-82: {} struct must exist", type_name
+        );
+    }
+    // Also confirm the variants carry the typed payloads.
+    assert!(body.contains("GetCFHeaders(GetCFHeadersMessage)"));
+    assert!(body.contains("CFHeaders(CFHeadersMessage)"));
+    assert!(body.contains("GetCFCheckpt(GetCFCheckptMessage)"));
+    assert!(body.contains("CFCheckpt(CFCheckptMessage)"));
 }
 
-/// G14 BUG-7 FIX-71 — NODE_COMPACT_FILTERS service bit (1<<6) gate plumbed in
-/// `crates/network/src/peer_manager.rs::local_services` via
-/// `should_advertise_compact_filters`. Gate currently returns FALSE because
-/// BIP-157 P2P handlers absent (`BIP157_P2P_HANDLERS_REGISTERED = false`).
+/// G14 BUG-7 — FIXED in FIX-82.
 ///
-/// This is the W121 BUG-7 "plumbing without flipping" fix: the bit STAYS
-/// UN-advertised (Light clients still see no NODE_COMPACT_FILTERS), but the
-/// structural wiring is in place so a future P2P fix wave only needs to flip
-/// `BIP157_P2P_HANDLERS_REGISTERED` to `true` and the gate activates.
+/// FIX-71 (W121 BUG-7 plumbing-without-flipping) added the gate function
+/// `should_advertise_compact_filters` and the const
+/// `BIP157_P2P_HANDLERS_REGISTERED: bool = false`. FIX-82 wires the
+/// `GetCFilters` / `GetCFHeaders` / `GetCFCheckpt` dispatch handlers in
+/// `rustoshi/src/main.rs` (event-loop match arms) and flips the constant to
+/// `true`. The gate function now returns `true` whenever both
+/// `-blockfilterindex` and `-peerblockfilters` are enabled (matching Core
+/// `init.cpp:992-999`).
 ///
-/// See `w99_net_processing_tests.rs::g22_node_compact_filters_gate_plumbed_currently_false`
-/// for the network-crate test that asserts the gate is wired (and stays
-/// FALSE) across all PeerManagerConfig permutations.
+/// See `w99_net_processing_tests.rs::g22_node_compact_filters_gate_active`
+/// for the network-crate test that exercises the live gate.
 #[test]
 fn g14_node_compact_filters_gate_plumbed() {
-    // Documentary: the gate function and constant live in
-    // crates/network/src/peer_manager.rs (FIX-71). This file is in the
-    // storage crate which intentionally has no network-crate dep, so we
-    // verify by file-level grep rather than direct symbol reference.
     use std::fs;
     let body = fs::read_to_string("../network/src/peer_manager.rs")
         .expect("crates/network/src/peer_manager.rs must exist");
@@ -515,9 +537,9 @@ fn g14_node_compact_filters_gate_plumbed() {
         "FIX-71: peer_manager.rs must define should_advertise_compact_filters"
     );
     assert!(
-        body.contains("pub const BIP157_P2P_HANDLERS_REGISTERED: bool = false"),
-        "FIX-71: BIP157_P2P_HANDLERS_REGISTERED must be `false` until \
-         GetCFilters/Headers/CheckPt dispatch handlers land in peer.rs"
+        body.contains("pub const BIP157_P2P_HANDLERS_REGISTERED: bool = true"),
+        "FIX-82: BIP157_P2P_HANDLERS_REGISTERED must be `true` once the \
+         GetCFilters/Headers/CheckPt dispatch handlers land in main.rs"
     );
     assert!(
         body.contains("s |= NODE_COMPACT_FILTERS"),
@@ -525,77 +547,205 @@ fn g14_node_compact_filters_gate_plumbed() {
     );
 }
 
-/// G15 BUG-8 (P0) — ProcessGetCFilters handler MISSING.
-///
-/// Core `net_processing.cpp::ProcessGetCFilters` (lines 3315-3342):
-///   1. Parse `filter_type:u8 + start_height:u32 + stop_hash:uint256`.
-///   2. Call `PrepareBlockFilterRequest` for DoS gates (NODE_COMPACT_FILTERS
-///      advertised, type supported, stop_index in active chain,
-///      `BlockRequestAllowed`, height diff <= MAX_GETCFILTERS_SIZE=1000).
-///   3. `filter_index->LookupFilterRange(start, stop, filters)`.
-///   4. For each filter: `MakeAndPushMessage(node, NetMsgType::CFILTER, filter)`.
-///
-/// rustoshi has none of this — no parsing, no DoS gate, no dispatch.
+/// FIX-82 source-level regression guard — verify the 3 dispatch handlers
+/// are wired into the rustoshi binary's event loop.
 #[test]
-#[ignore = "BUG-8 (P0): ProcessGetCFilters dispatch handler MISSING (peer.rs no case)"]
-fn g15_process_getcfilters_handler_missing() {
-    panic!(
-        "rustoshi peer.rs / peer_manager.rs has no handler for \
-         NetworkMessage::GetCFilters — inbound requests are silently dropped"
+fn fix82_main_rs_wires_bip157_dispatch_handlers() {
+    use std::path::PathBuf;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let main_rs = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("rustoshi/src/main.rs"))
+        .expect("workspace layout");
+    let body = std::fs::read_to_string(&main_rs)
+        .unwrap_or_else(|e| panic!("read {}: {}", main_rs.display(), e));
+    for sym in [
+        "NetworkMessage::GetCFilters(req)",
+        "NetworkMessage::GetCFHeaders(req)",
+        "NetworkMessage::GetCFCheckpt(req)",
+        "MAX_GETCFILTERS_SIZE",
+        "MAX_GETCFHEADERS_SIZE",
+        "CFCHECKPT_INTERVAL",
+        "lookup_filter_range",
+        "lookup_filter_hash_range",
+        "try_disconnect_peer",
+    ] {
+        assert!(
+            body.contains(sym),
+            "FIX-82: rustoshi/src/main.rs must reference `{}` — \
+             the BIP-157 P2P dispatch handlers / DoS gate / range-API are \
+             expected to be wired into the event loop. If this test fails \
+             after a refactor, verify the handlers are still reachable.",
+            sym,
+        );
+    }
+}
+
+/// G15 BUG-8 — FIXED in FIX-82.
+///
+/// `ProcessGetCFilters` dispatch is wired in `rustoshi/src/main.rs`'s event
+/// loop. The handler validates filter_type + NODE_COMPACT_FILTERS advertise,
+/// resolves stop_hash via the height index (active-chain confirm),
+/// enforces `stop_height - start_height < MAX_GETCFILTERS_SIZE`, then calls
+/// `BlockFilterIndex::lookup_filter_range` and pushes one `cfilter`
+/// per height. Per-violation `try_disconnect_peer` mirrors Core's
+/// `fDisconnect = true`.
+///
+/// Pinned via source-level grep (see `fix82_main_rs_wires_bip157_dispatch_handlers`).
+#[test]
+fn g15_process_getcfilters_handler_present() {
+    use std::path::PathBuf;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let main_rs = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("rustoshi/src/main.rs"))
+        .expect("workspace layout");
+    let body = std::fs::read_to_string(&main_rs).expect("read main.rs");
+    assert!(
+        body.contains("NetworkMessage::GetCFilters(req)"),
+        "FIX-82: main.rs must dispatch on NetworkMessage::GetCFilters"
+    );
+    assert!(
+        body.contains("lookup_filter_range"),
+        "FIX-82: handler must call lookup_filter_range"
+    );
+    assert!(
+        body.contains("MAX_GETCFILTERS_SIZE"),
+        "FIX-82: handler must enforce MAX_GETCFILTERS_SIZE"
     );
 }
 
-/// G16 BUG-9 (P0) — ProcessGetCFHeaders handler MISSING.
-/// Core: net_processing.cpp:3344-3384. Returns 1 cfheaders message with
-/// previous_filter_header + N filter_hashes (up to MAX_GETCFHEADERS_SIZE=2000).
+/// G16 BUG-9 — FIXED in FIX-82.
+///
+/// `ProcessGetCFHeaders` dispatch in main.rs. Resolves `prev_filter_header`
+/// from `lookup_filter_header_at_height(start_height - 1)` (or zero at
+/// start=0), collects filter hashes via `lookup_filter_hash_range`, and
+/// emits a single `cfheaders` response containing `(stop_hash,
+/// previous_filter_header, filter_hashes)`. Defensive return-without-send on
+/// prev-header miss matches Core net_processing.cpp:3361-3370 (FIX-79
+/// pattern).
 #[test]
-#[ignore = "BUG-9 (P0): ProcessGetCFHeaders dispatch handler MISSING"]
-fn g16_process_getcfheaders_handler_missing() {
-    panic!("rustoshi has no GetCFHeaders dispatch — light clients cannot sync filter chain");
+fn g16_process_getcfheaders_handler_present() {
+    use std::path::PathBuf;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let main_rs = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("rustoshi/src/main.rs"))
+        .expect("workspace layout");
+    let body = std::fs::read_to_string(&main_rs).expect("read main.rs");
+    assert!(body.contains("NetworkMessage::GetCFHeaders(req)"));
+    assert!(body.contains("lookup_filter_hash_range"));
+    assert!(body.contains("MAX_GETCFHEADERS_SIZE"));
+    assert!(body.contains("previous_filter_header"));
 }
 
-/// G17 BUG-10 (P0) — ProcessGetCFCheckPt handler MISSING.
-/// Core: net_processing.cpp:3386-3422. Returns checkpoint filter headers at
-/// every CFCHECKPT_INTERVAL=1000 boundary up to stop_hash.
+/// G17 BUG-10 — FIXED in FIX-82.
+///
+/// `ProcessGetCFCheckPt` dispatch in main.rs. Walks every
+/// `(i+1) * CFCHECKPT_INTERVAL` height up to `stop_height /
+/// CFCHECKPT_INTERVAL`, reads each filter header via the index, and emits a
+/// single `cfcheckpt` with the assembled chain. Active-chain validation
+/// ensures the stop_hash is on our best chain before walking.
 #[test]
-#[ignore = "BUG-10 (P0): ProcessGetCFCheckPt dispatch handler MISSING"]
-fn g17_process_getcfcheckpt_handler_missing() {
-    panic!("rustoshi has no GetCFCheckpt dispatch — clients cannot fetch checkpoints");
+fn g17_process_getcfcheckpt_handler_present() {
+    use std::path::PathBuf;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let main_rs = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("rustoshi/src/main.rs"))
+        .expect("workspace layout");
+    let body = std::fs::read_to_string(&main_rs).expect("read main.rs");
+    assert!(body.contains("NetworkMessage::GetCFCheckpt(req)"));
+    assert!(body.contains("CFCHECKPT_INTERVAL"));
 }
 
-/// G18 BUG-11 (P0) — outbound cfilter/cfheaders/cfcheckpt MakeAndPushMessage
-/// MISSING.  Even if a request came in, there is no code path to serialize and
-/// send the response.
+/// G18 BUG-11 — FIXED in FIX-82.
+///
+/// Outbound `cfilter` / `cfheaders` / `cfcheckpt` are emitted via
+/// `try_send_to_peer(peer_id, NetworkMessage::CFilter(...))` (and the
+/// other two variants) inside each handler. The typed payload structs
+/// serialize to BIP-157 wire format on the way out.
 #[test]
-#[ignore = "BUG-11 (P0): outbound CFilter/CFHeaders/CFCheckpt push MISSING"]
-fn g18_outbound_cfilter_responses_missing() {
-    panic!(
-        "no outbound send_message(NetworkMessage::CFilter(...)) call exists in \
-         rustoshi — even with handlers, server cannot reply"
+fn g18_outbound_cfilter_responses_present() {
+    use std::path::PathBuf;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let main_rs = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("rustoshi/src/main.rs"))
+        .expect("workspace layout");
+    let body = std::fs::read_to_string(&main_rs).expect("read main.rs");
+    assert!(body.contains("NetworkMessage::CFilter(CFilterMessage"));
+    assert!(body.contains("NetworkMessage::CFHeaders(CFHeadersMessage"));
+    assert!(body.contains("NetworkMessage::CFCheckpt(CFCheckptMessage"));
+}
+
+/// G19 BUG-12 — FIXED in FIX-82.
+///
+/// `MAX_GETCFILTERS_SIZE = 1000` / `MAX_GETCFHEADERS_SIZE = 2000` /
+/// `CFCHECKPT_INTERVAL = 1000` are now defined in
+/// `crates/network/src/message.rs` (mirrors Core net_processing.cpp:184-186
+/// + blockfilterindex.h:31).
+#[test]
+fn g19_max_getcfilters_constants_present() {
+    let body = std::fs::read_to_string("../network/src/message.rs")
+        .expect("crates/network/src/message.rs must exist");
+    assert!(
+        body.contains("pub const MAX_GETCFILTERS_SIZE: u32 = 1000"),
+        "FIX-82: MAX_GETCFILTERS_SIZE constant must exist with Core value 1000"
+    );
+    assert!(
+        body.contains("pub const MAX_GETCFHEADERS_SIZE: u32 = 2000"),
+        "FIX-82: MAX_GETCFHEADERS_SIZE constant must exist with Core value 2000"
+    );
+    assert!(
+        body.contains("pub const CFCHECKPT_INTERVAL: u32 = 1000"),
+        "FIX-82: CFCHECKPT_INTERVAL constant must exist with Core value 1000"
     );
 }
 
-/// G19 BUG-12 (P1) — MAX_GETCFILTERS_SIZE / MAX_GETCFHEADERS_SIZE constants
-/// MISSING.  Without these, the (future) handler cannot enforce DoS bounds.
+/// G20 BUG-13 — FIXED in FIX-82.
 ///
-/// Core: net_processing.cpp:184-186:
-///   `MAX_GETCFILTERS_SIZE = 1000` / `MAX_GETCFHEADERS_SIZE = 2000`.
+/// `PrepareBlockFilterRequest`-equivalent DoS gate is inlined inside each of
+/// the 3 dispatch handlers (factoring it out into a helper would add no
+/// value at 5 lines per arm). The handler checks:
+///   - filter_type == 0 + NODE_COMPACT_FILTERS advertised
+///   - stop_hash resolves to a known block AND that block is on the active
+///     chain (height index points at it)
+///   - start_height <= stop_height
+///   - stop_height - start_height < MAX_* (per-handler cap)
+/// Any violation triggers `try_disconnect_peer` — matches Core's
+/// `node.fDisconnect = true` in `net_processing.cpp:3262-3313`.
 #[test]
-#[ignore = "BUG-12 (P1): MAX_GETCFILTERS_SIZE=1000 / MAX_GETCFHEADERS_SIZE=2000 MISSING"]
-fn g19_max_getcfilters_constants_missing() {
-    panic!("MAX_GETCFILTERS_SIZE and MAX_GETCFHEADERS_SIZE constants must exist for DoS gating");
-}
-
-/// G20 BUG-13 (P1) — PrepareBlockFilterRequest-equivalent DoS gate MISSING.
-/// Core checks: type supported, stop_index in chain, start <= stop,
-/// height-diff <= max, BlockRequestAllowed (NODE_NETWORK / NODE_NETWORK_LIMITED
-/// + last-288 rule), fDisconnect on misbehavior.
-#[test]
-#[ignore = "BUG-13 (P1): PrepareBlockFilterRequest DoS gate MISSING"]
-fn g20_prepare_block_filter_request_gate_missing() {
-    panic!(
-        "no equivalent of Core's PrepareBlockFilterRequest exists — a malicious \
-         peer can spam start_height=0/stop_hash=tip without disconnect cost"
+fn g20_prepare_block_filter_request_gate_present() {
+    use std::path::PathBuf;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let main_rs = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("rustoshi/src/main.rs"))
+        .expect("workspace layout");
+    let body = std::fs::read_to_string(&main_rs).expect("read main.rs");
+    // Per-violation disconnects are present.
+    assert!(
+        body.contains("try_disconnect_peer"),
+        "FIX-82: DoS gate must call try_disconnect_peer on violation"
+    );
+    // Service-bit gate. The check `local_services & NODE_COMPACT_FILTERS != 0`
+    // is performed before every handler runs.
+    assert!(
+        body.contains("NODE_COMPACT_FILTERS"),
+        "FIX-82: handler must verify NODE_COMPACT_FILTERS is advertised"
+    );
+    // Active-chain stop_hash validation: the height index must echo back
+    // the same stop_hash for the resolved height.
+    assert!(
+        body.contains("get_hash_by_height(stop_index.height)"),
+        "FIX-82: handler must verify stop_hash is on the active chain"
     );
 }
 
@@ -824,27 +974,97 @@ fn fix69_main_rs_wires_block_filter_index() {
     );
 }
 
-/// G24 BUG-17 (P2) — No range-query API. P2P getcfilters batches up to 1000
-/// filters; without `LookupFilterRange`, the handler must issue 1000 single
-/// RocksDB lookups per request.
+/// G24 BUG-17 — FIXED in FIX-82.
+///
+/// `BlockFilterIndex` exposes `lookup_filter_range(start, stop, hash_lookup)`
+/// and `lookup_filter_hash_range(...)`, mirroring Core's
+/// `LookupFilterRange` / `LookupFilterHashRange`. The hash_lookup callback
+/// resolves height → hash on the active chain (typically via
+/// `BlockStore::get_hash_by_height`) and the function returns `Ok(None)` if
+/// any row is missing (defensive, matches Core's bool return).
 #[test]
-#[ignore = "BUG-17 (P2): BlockFilterIndex has no LookupFilterRange/Hashes API"]
-fn g24_block_filter_index_no_range_query() {
-    panic!(
-        "Core BlockFilterIndex exposes LookupFilterRange + LookupFilterHashRange; \
-         rustoshi only exposes get_filter(block_hash) — N round-trips per request"
-    );
+fn g24_block_filter_index_range_query_present() {
+    use rustoshi_consensus::validation::UndoData;
+
+    let db = open_db();
+    let idx = BlockFilterIndex::new(&db);
+    let empty_undo = UndoData { spent_coins: vec![] };
+
+    // Build 5 blocks at heights 0..5 — each with a unique scriptPubKey
+    // (so each filter has different content).
+    let mut prev_hash = Hash256::ZERO;
+    let mut hashes: Vec<Hash256> = Vec::new();
+    for h in 0..5u32 {
+        let block = fake_block_at_height(h, prev_hash);
+        let block_hash = block.block_hash();
+        idx.connect_block(h, &block, &empty_undo).expect("connect");
+        hashes.push(block_hash);
+        prev_hash = block_hash;
+    }
+
+    // Build a hash_lookup that mimics BlockStore::get_hash_by_height.
+    let hashes_ref = hashes.clone();
+    let hash_lookup = |h: u32| -> Option<Hash256> {
+        hashes_ref.get(h as usize).copied()
+    };
+
+    // (a) Filter range: all 5 filters come back in order.
+    let filters = idx
+        .lookup_filter_range(0, 4, hash_lookup)
+        .expect("lookup_filter_range")
+        .expect("present");
+    assert_eq!(filters.len(), 5);
+    for (h, f) in filters.iter().enumerate() {
+        assert_eq!(f.block_hash, hashes[h], "filter at height {} has wrong block_hash", h);
+    }
+
+    // (b) Filter hash range: 5 filter hashes in order.
+    let hash_lookup = |h: u32| -> Option<Hash256> {
+        hashes.get(h as usize).copied()
+    };
+    let filter_hashes = idx
+        .lookup_filter_hash_range(0, 4, hash_lookup)
+        .expect("lookup_filter_hash_range")
+        .expect("present");
+    assert_eq!(filter_hashes.len(), 5);
+
+    // (c) Sub-range works.
+    let hash_lookup2 = |h: u32| -> Option<Hash256> {
+        hashes_ref.get(h as usize).copied()
+    };
+    let sub = idx
+        .lookup_filter_range(2, 3, hash_lookup2)
+        .expect("ok")
+        .expect("present");
+    assert_eq!(sub.len(), 2);
+    assert_eq!(sub[0].block_hash, hashes_ref[2]);
+    assert_eq!(sub[1].block_hash, hashes_ref[3]);
 }
 
-/// G25 BUG-18 (P1) — CFCHECKPT_INTERVAL=1000 constant + checkpoint walk MISSING.
-/// Blocker for G17 (ProcessGetCFCheckPt). Core: blockfilterindex.h:31.
+/// G25 BUG-18 — FIXED in FIX-82.
+///
+/// `CFCHECKPT_INTERVAL = 1000` is now defined in both
+/// `crates/storage/src/indexes/blockfilterindex.rs` (for the index-side
+/// walk helper) and `crates/network/src/message.rs` (for the P2P handler).
+/// The `ProcessGetCFCheckPt` handler in main.rs walks every
+/// `(i+1) * CFCHECKPT_INTERVAL` height up to `stop_height /
+/// CFCHECKPT_INTERVAL`, mirroring Core net_processing.cpp:3403-3417.
 #[test]
-#[ignore = "BUG-18 (P1): CFCHECKPT_INTERVAL=1000 constant + checkpoint walk MISSING"]
-fn g25_cfcheckpt_interval_missing() {
-    // The right shape: a `pub const CFCHECKPT_INTERVAL: u32 = 1000;` in
-    // blockfilterindex.rs + a `lookup_checkpoint_headers(stop_height) ->
-    // Vec<Hash256>` helper that walks ancestors at every (i+1) * 1000.
-    panic!("CFCHECKPT_INTERVAL=1000 + checkpoint walk MISSING");
+fn g25_cfcheckpt_interval_present() {
+    use rustoshi_storage::indexes::blockfilterindex::CFCHECKPT_INTERVAL;
+    assert_eq!(
+        CFCHECKPT_INTERVAL, 1000,
+        "CFCHECKPT_INTERVAL must match Core's blockfilterindex.h:31"
+    );
+
+    // Confirm the parallel constant in the network crate (used by the
+    // dispatch handler) also matches.
+    let body = std::fs::read_to_string("../network/src/message.rs")
+        .expect("crates/network/src/message.rs must exist");
+    assert!(
+        body.contains("pub const CFCHECKPT_INTERVAL: u32 = 1000"),
+        "FIX-82: network crate's CFCHECKPT_INTERVAL must mirror storage crate"
+    );
 }
 
 // ============================================================
