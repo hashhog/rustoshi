@@ -187,9 +187,9 @@ pub fn compute_taproot_output_key(
     let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash)
         .map_err(|_| TaprootError::InvalidTweak)?;
 
-    let secp = secp256k1::Secp256k1::verification_only();
+    let secp = crate::context::secp_ctx();
     let (output_key, parity) = internal_xonly
-        .add_tweak(&secp, &tweak)
+        .add_tweak(secp, &tweak)
         .map_err(|_| TaprootError::TweakFailed)?;
 
     Ok((output_key.serialize(), parity))

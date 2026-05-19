@@ -13,37 +13,30 @@ use chacha20::ChaCha20;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
-use lazy_static::lazy_static;
 use rand::RngCore;
+use rustoshi_crypto::secp_ctx as global_secp_ctx;
 use secp256k1::ellswift::{ElligatorSwift, ElligatorSwiftParty};
-use secp256k1::{All, Secp256k1, SecretKey};
+use secp256k1::SecretKey;
 use sha2::Sha256;
 use std::collections::HashMap;
 use thiserror::Error;
 use zeroize::Zeroize;
 
-lazy_static! {
-    /// Lazily-initialized full-capability secp256k1 context.
-    ///
-    /// `secp256k1` 0.28's `ElligatorSwift::new(seckey, rand)` invokes the C
-    /// function `secp256k1_ellswift_create` with the static
-    /// `context_no_precomp`, whose `ecmult_gen_ctx` is zero-initialized.
-    /// The C implementation calls
-    /// `ARG_CHECK(ecmult_gen_context_is_built(&ctx->ecmult_gen_ctx))` (see
-    /// `secp256k1-sys/.../modules/ellswift/main_impl.h:461`), which fires
-    /// the illegal-argument callback (default: `abort()`) on the static
-    /// context.  This was the panic blocking all 18 rustoshi pairs in the
-    /// BIP324 interop matrix.
-    ///
-    /// The fix is to use `ElligatorSwift::from_seckey(&secp, sk, Some(rand))`
-    /// with a context that actually has its signing-side (`ecmult_gen`)
-    /// precomputation built.  `Secp256k1::new()` returns a `Secp256k1<All>`
-    /// (created with `SECP256K1_START_SIGN | SECP256K1_START_VERIFY`),
-    /// which has `ecmult_gen_ctx` built.  We cache it once and reuse for
-    /// every handshake — building a context is expensive (it allocates and
-    /// precomputes tables); the workspace already enables the `lowmemory`
-    /// feature so the table is the smaller variant.
-    static ref SECP_CTX: Secp256k1<All> = Secp256k1::new();
+/// Process-wide, side-channel-blinded `Secp256k1<All>` context used for
+/// BIP-324 ElligatorSwift handshake.
+///
+/// Previously a `lazy_static! { SECP_CTX: Secp256k1<All> = Secp256k1::new() }`
+/// — which DID solve the original panic (the C
+/// `secp256k1_ellswift_create` asserts `ecmult_gen_context_is_built` and
+/// aborts on `secp256k1_context_no_precomp`) but inherited the
+/// fleet-wide W159 BUG-4 / W161 BUG-7 problem of NEVER calling
+/// `secp256k1_context_randomize`. Routing through
+/// [`rustoshi_crypto::secp_ctx`] keeps the same ABI fix (full-precomp
+/// context for `ellswift_create` + `xdh`) AND inherits the
+/// blinding the global helper applies once at init.
+#[inline]
+fn secp_ctx() -> &'static secp256k1::Secp256k1<secp256k1::All> {
+    global_secp_ctx()
 }
 
 /// Errors that can occur during BIP324 operations.
@@ -242,7 +235,7 @@ impl EllSwiftPubKey {
 /// constructed via `Secp256k1::new()` (which enables `SECP256K1_START_SIGN`)
 /// satisfies that assertion.
 pub fn ellswift_create(secret_key: &SecretKey, entropy: &[u8; 32]) -> EllSwiftPubKey {
-    let es = ElligatorSwift::from_seckey(&*SECP_CTX, *secret_key, Some(*entropy));
+    let es = ElligatorSwift::from_seckey(secp_ctx(), *secret_key, Some(*entropy));
     EllSwiftPubKey::from_ellswift(es)
 }
 
