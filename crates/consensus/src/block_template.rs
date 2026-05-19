@@ -460,6 +460,7 @@ pub fn build_block_template(
         &config.coinbase_script_pubkey,
         &config.coinbase_extra_data,
         &selected_txs,
+        params.is_segwit_active(height),
     );
 
     // Build the full transaction list (coinbase first)
@@ -561,6 +562,7 @@ fn build_coinbase_tx(
     script_pubkey: &[u8],
     extra_data: &[u8],
     selected_txs: &[Transaction],
+    segwit_active: bool,
 ) -> Transaction {
     // BIP-34: encode block height in coinbase scriptSig.
     // Bitcoin Core miner.cpp:186: `coinbaseTx.vin[0].scriptSig = CScript() << nHeight`
@@ -582,8 +584,18 @@ fn build_coinbase_tx(
 
     coinbase_script.extend_from_slice(extra_data);
 
-    // Check if any transaction has witness data
-    let has_witness = selected_txs.iter().any(|tx| tx.has_witness());
+    // BIP-141 / Core validation.cpp:3997-4019: when SegWit is active, the
+    // coinbase MUST include the witness commitment regardless of whether any
+    // selected tx actually carries witness data. A block missing the
+    // commitment on a segwit-active chain is rejected as `bad-witness-merkle-match`.
+    //
+    // Prior behaviour gated on `selected_txs.iter().any(|tx| tx.has_witness())`,
+    // which produced unmineable templates whenever the mempool happened to be
+    // empty or contain only legacy txs (e.g. fresh `generatetoaddress` on
+    // segwit-active networks). Catalogued in W142 BUG-13 / W108 G11 / W123 G3 /
+    // W154 BUG-9 / W155 BUG-11 (5-wave carry-forward; first 5-wave tracking of
+    // a single bug in the fleet's history).
+    let include_witness_commitment = segwit_active;
 
     // Build outputs
     let mut outputs = vec![TxOut {
@@ -594,8 +606,7 @@ fn build_coinbase_tx(
     // Witness commitment nonce (32 zero bytes)
     let witness_nonce = vec![0u8; 32];
 
-    // If we have witness transactions, add the witness commitment
-    if has_witness {
+    if include_witness_commitment {
         let commitment = build_witness_commitment(selected_txs, &witness_nonce);
         outputs.push(TxOut {
             value: 0,
@@ -617,7 +628,10 @@ fn build_coinbase_tx(
             // This value still opts out of BIP-68 relative locktime but enables
             // absolute locktime checking via nLockTime.
             sequence: MAX_SEQUENCE_NONFINAL,
-            witness: if has_witness {
+            // BIP-141 requires the coinbase to carry the witness-reserved-value
+            // (the nonce that hashes with the witness merkle root to produce the
+            // commitment) whenever the commitment itself is present.
+            witness: if include_witness_commitment {
                 vec![witness_nonce]
             } else {
                 vec![]
@@ -884,7 +898,7 @@ mod tests {
     #[test]
     fn test_coinbase_scriptsig_height_1_has_op_dummy_and_correct_prefix() {
         // Height 1 → OP_1 (0x51) + OP_0 dummy (0x00)
-        let coinbase = build_coinbase_tx(1, 5_000_000_000, &[0x51], b"", &[]);
+        let coinbase = build_coinbase_tx(1, 5_000_000_000, &[0x51], b"", &[], false);
         let sig = &coinbase.inputs[0].script_sig;
         assert!(sig.len() >= 2, "bad-cb-length: scriptSig must be ≥ 2 bytes");
         assert_eq!(sig[0], 0x51, "bad-cb-height: prefix must be OP_1 for height 1");
@@ -894,7 +908,7 @@ mod tests {
     #[test]
     fn test_coinbase_scriptsig_height_16_has_op_dummy_and_correct_prefix() {
         // Height 16 → OP_16 (0x60) + OP_0 dummy (0x00)
-        let coinbase = build_coinbase_tx(16, 5_000_000_000, &[0x51], b"", &[]);
+        let coinbase = build_coinbase_tx(16, 5_000_000_000, &[0x51], b"", &[], false);
         let sig = &coinbase.inputs[0].script_sig;
         assert!(sig.len() >= 2, "bad-cb-length: scriptSig must be ≥ 2 bytes");
         assert_eq!(sig[0], 0x60, "bad-cb-height: prefix must be OP_16 for height 16");
@@ -904,7 +918,7 @@ mod tests {
     #[test]
     fn test_coinbase_scriptsig_height_17_no_dummy_needed() {
         // Height 17 → push-encoded [0x01, 0x11] — already 2 bytes; no dummy.
-        let coinbase = build_coinbase_tx(17, 5_000_000_000, &[0x51], b"", &[]);
+        let coinbase = build_coinbase_tx(17, 5_000_000_000, &[0x51], b"", &[], false);
         let sig = &coinbase.inputs[0].script_sig;
         assert!(sig.len() >= 2, "bad-cb-length: scriptSig must be ≥ 2 bytes");
         assert_eq!(sig[0], 0x01, "length byte for height 17");
@@ -914,7 +928,7 @@ mod tests {
     #[test]
     fn test_coinbase_scriptsig_height_100_push_encoded() {
         // Height 100 → push-encoded: [0x01, 0x64] (100 = 0x64)
-        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"", &[]);
+        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"", &[], false);
         let sig = &coinbase.inputs[0].script_sig;
         assert!(sig.len() >= 2, "bad-cb-length: scriptSig must be ≥ 2 bytes");
         assert_eq!(sig[0], 0x01, "length byte 1");
@@ -928,7 +942,8 @@ mod tests {
             5_000_000_000, // 50 BTC
             &[0x51],       // OP_1 (anyone can spend)
             b"test",
-            &[], // no witness txs
+            &[],   // no witness txs
+            false, // segwit inactive
         );
 
         assert!(coinbase.is_coinbase());
@@ -972,6 +987,7 @@ mod tests {
             &[0x51],
             b"test",
             &[witness_tx], // has witness
+            true,          // segwit active
         );
 
         // Should have witness commitment output
@@ -1488,26 +1504,26 @@ mod tests {
     #[test]
     fn test_coinbase_anti_fee_sniping_locktime() {
         // Coinbase at height 100 should have locktime = 99
-        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"test", &[]);
+        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"test", &[], false);
         assert_eq!(coinbase.lock_time, 99);
 
         // Coinbase at height 1 should have locktime = 0
-        let coinbase = build_coinbase_tx(1, 5_000_000_000, &[0x51], b"test", &[]);
+        let coinbase = build_coinbase_tx(1, 5_000_000_000, &[0x51], b"test", &[], false);
         assert_eq!(coinbase.lock_time, 0);
 
         // Coinbase at height 0 (genesis) should have locktime = 0
-        let coinbase = build_coinbase_tx(0, 5_000_000_000, &[0x51], b"test", &[]);
+        let coinbase = build_coinbase_tx(0, 5_000_000_000, &[0x51], b"test", &[], false);
         assert_eq!(coinbase.lock_time, 0);
 
         // Coinbase at height 500000 should have locktime = 499999
-        let coinbase = build_coinbase_tx(500_000, 5_000_000_000, &[0x51], b"test", &[]);
+        let coinbase = build_coinbase_tx(500_000, 5_000_000_000, &[0x51], b"test", &[], false);
         assert_eq!(coinbase.lock_time, 499_999);
     }
 
     #[test]
     fn test_coinbase_sequence_max_nonfinal() {
         // Coinbase should use MAX_SEQUENCE_NONFINAL (0xFFFFFFFE)
-        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"test", &[]);
+        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"test", &[], false);
         assert_eq!(coinbase.inputs[0].sequence, MAX_SEQUENCE_NONFINAL);
         assert_eq!(coinbase.inputs[0].sequence, 0xFFFFFFFE);
     }
@@ -1516,7 +1532,7 @@ mod tests {
     fn test_coinbase_is_final_for_its_block() {
         // Coinbase at height 100 has locktime 99
         // At height 100, it should be final
-        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"test", &[]);
+        let coinbase = build_coinbase_tx(100, 5_000_000_000, &[0x51], b"test", &[], false);
         assert!(is_final_tx(&coinbase, 100, 1000000));
 
         // At height 99 it would NOT be final (locktime not satisfied)
@@ -1874,10 +1890,16 @@ mod tests {
     // BIP-141 witness commitment tests (for getblocktemplate extraction)
     // ================================================================
 
-    /// Empty template (coinbase-only, no segwit txs) should have NO
-    /// witness commitment output — the coinbase only carries one output.
+    /// BIP-141 / Core validation.cpp:3997-4019: when SegWit is active, the
+    /// coinbase MUST include the witness commitment regardless of whether any
+    /// selected tx carries witness data. Regtest activates segwit at height 1,
+    /// so an empty mempool at height 1 still requires the commitment.
+    ///
+    /// Replaces the pre-fix `test_witness_commitment_absent_when_no_segwit_txs`
+    /// assertion, which encoded the W142 BUG-13 buggy contract (commitment
+    /// gated on `has_witness` of selected txs rather than on `segwit_active`).
     #[test]
-    fn test_witness_commitment_absent_when_no_segwit_txs() {
+    fn test_witness_commitment_present_when_segwit_active_empty_mempool() {
         let mempool = Mempool::new(MempoolConfig::default());
         let params = ChainParams::regtest();
         let config = BlockTemplateConfig {
@@ -1896,15 +1918,24 @@ mod tests {
             &config,
         );
 
-        // Coinbase only has the value output when there are no witness txs.
-        assert_eq!(template.coinbase_tx.outputs.len(), 1);
+        // Regtest segwit_height = 1, so segwit is active at h=1. Coinbase must
+        // carry the value output AND the witness commitment output.
+        assert_eq!(template.coinbase_tx.outputs.len(), 2);
+        let commitment = &template.coinbase_tx.outputs[1];
+        assert_eq!(commitment.value, 0);
+        assert_eq!(commitment.script_pubkey.len(), 38);
+        assert_eq!(commitment.script_pubkey[0], 0x6a); // OP_RETURN
+        assert_eq!(commitment.script_pubkey[1], 0x24); // 36-byte push
+        assert_eq!(&commitment.script_pubkey[2..6], &[0xaa, 0x21, 0xa9, 0xed]);
     }
 
-    /// When all non-coinbase txs are legacy (no witness), the coinbase
-    /// should still have NO commitment (BIP-141 §commitment structure: only
-    /// required when any tx has witness data).
+    /// Same contract from the all-legacy-txs angle: even when every selected
+    /// transaction lacks witness data, the segwit-active coinbase still must
+    /// carry the commitment.
+    ///
+    /// Replaces the pre-fix `test_witness_commitment_absent_for_legacy_txs`.
     #[test]
-    fn test_witness_commitment_absent_for_legacy_txs() {
+    fn test_witness_commitment_present_when_segwit_active_legacy_txs_only() {
         let config = MempoolConfig::default();
         let mut mempool = Mempool::new(config);
         let params = ChainParams::regtest();
@@ -1935,8 +1966,15 @@ mod tests {
             &template_config,
         );
 
-        // No witness tx → coinbase has only the value output.
-        assert_eq!(template.coinbase_tx.outputs.len(), 1);
+        // Regtest segwit-active at h=100 → commitment present even though no
+        // selected tx carries witness data. Two outputs: value + commitment.
+        assert_eq!(template.coinbase_tx.outputs.len(), 2);
+        assert_eq!(template.coinbase_tx.outputs[1].value, 0);
+        assert_eq!(template.coinbase_tx.outputs[1].script_pubkey[0], 0x6a);
+        assert_eq!(
+            &template.coinbase_tx.outputs[1].script_pubkey[2..6],
+            &[0xaa, 0x21, 0xa9, 0xed]
+        );
     }
 
     /// When segwit txs are present, the coinbase must carry the BIP-141
@@ -1979,6 +2017,7 @@ mod tests {
             &[0x51],
             b"",
             &[witness_tx.clone()],
+            true, // segwit active
         );
 
         // Commitment output must exist.
@@ -2032,7 +2071,7 @@ mod tests {
         };
 
         let txs: Vec<Transaction> = (1u8..=3).map(make_witness_tx).collect();
-        let coinbase = build_coinbase_tx(700, 5_000_000_000, &[0x51], b"", &txs);
+        let coinbase = build_coinbase_tx(700, 5_000_000_000, &[0x51], b"", &txs, true);
 
         assert_eq!(coinbase.outputs.len(), 2);
         let script = &coinbase.outputs[1].script_pubkey;
