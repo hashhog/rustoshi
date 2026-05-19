@@ -9,24 +9,47 @@
 //! The cache key is derived as:
 //!
 //! ```text
-//! SHA256(nonce[32] || script_sig[..] || script_pubkey[..] || witness_flat[..] || flags_le[4])
+//! SHA256(nonce[32] || wtxid[32] || input_idx_le[4]
+//!        || script_sig[..] || script_pubkey[..] || witness_flat[..] || flags_le[4])
 //! ```
 //!
 //! where `nonce` is a 256-bit random value generated at cache creation time
 //! (per process, per session).  The nonce ensures that cache entries from a
 //! previous process instance cannot poison the current session even if an
-//! attacker can predict or influence the inputs.  Using the actual
-//! cryptographic material (script_sig + script_pubkey + witness) rather than
-//! the logical identity (txid + input_index) means that two inputs with the
-//! same transaction identity but different signatures map to different entries.
+//! attacker can predict or influence the inputs.
+//!
+//! **Why wtxid + input_idx?** (W160 BUG-9 fix.)  Rustoshi caches at the
+//! input/script-execution level, not at the per-signature level as Core
+//! does.  Under SegWit malleability, the same `(script_sig, script_pubkey,
+//! witness, flags)` tuple can legitimately appear in two distinct
+//! transactions whose sighashes (and therefore signature validity) differ
+//! — the sighash depends on the entire spending transaction, not just the
+//! input under inspection.  Without committing to the sighash, a cache hit
+//! on input A in tx X would incorrectly approve input A' in tx Y even
+//! though the underlying signatures verify against a different sighash.
+//!
+//! Committing to the **wtxid + input_idx** binds the cache entry to the
+//! exact witness-bearing transaction that produced the successful verify.
+//! The wtxid is a SHA256d over the full witness serialization, so any
+//! change to the spending transaction (and therefore to any input's
+//! sighash, including non-`ANYONECANPAY` sighashes that hash all
+//! prevouts/sequences/outputs) yields a different wtxid and therefore a
+//! different cache key.  This is functionally equivalent to keying on the
+//! sighash itself but avoids plumbing the sighash through every call site
+//! and supports script flavors (e.g. legacy multisig) that compute
+//! multiple sighashes per script execution.
 //!
 //! This mirrors Bitcoin Core's `CSignatureCache` design in
-//! `bitcoin-core/src/script/sigcache.h`:
+//! `bitcoin-core/src/script/sigcache.cpp:39-50`:
 //!
 //! ```c++
-//! // Entries are SHA256(nonce || 'E' or 'S' || 31 zero bytes
-//! //                    || signature hash || public key || signature)
+//! // ComputeEntryECDSA / ComputeEntrySchnorr:
+//! //   SHA256(nonce_padded[64] || sighash[32] || pubkey[..] || sig[..])
 //! ```
+//!
+//! Core's per-signature granularity is finer-grained than ours, but both
+//! schemes share the load-bearing property that **the cache key commits
+//! to the sighash** (directly in Core, transitively via wtxid here).
 //!
 //! # Thread Safety
 //!
@@ -48,10 +71,10 @@
 //! let cache = Arc::new(SigCache::new(50_000));
 //!
 //! // Check cache before verification
-//! if !cache.lookup(&script_sig, &script_pubkey, &witness, flags) {
+//! if !cache.lookup(&wtxid, input_idx, &script_sig, &script_pubkey, &witness, flags) {
 //!     // Verify script...
 //!     if verification_succeeded {
-//!         cache.insert(&script_sig, &script_pubkey, &witness, flags);
+//!         cache.insert(&wtxid, input_idx, &script_sig, &script_pubkey, &witness, flags);
 //!     }
 //! }
 //!
@@ -153,15 +176,25 @@ impl SigCache {
 
     /// Derive the cache key for the given script material and flags.
     ///
-    /// `SHA256(nonce[32] || script_sig[..] || script_pubkey[..] || witness_flat[..] || flags_le[4])`
+    /// ```text
+    /// SHA256(nonce[32] || wtxid[32] || input_idx_le[4]
+    ///        || script_sig[..] || script_pubkey[..] || witness_flat[..] || flags_le[4])
+    /// ```
     ///
-    /// The first 8 bytes of the SHA256 output are used as a cheap-hash key,
-    /// matching Core's `HashWriter::GetCheapHash()`.  We store the full 32
-    /// bytes to eliminate false-positive collisions at the cost of a slightly
-    /// larger map entry.
+    /// The `wtxid` and `input_idx` bind the cache entry to the exact
+    /// spending transaction that produced the successful verify.  Because
+    /// `wtxid` is a SHA256d over the full witness-bearing serialization,
+    /// any change to the spending transaction (and therefore to any
+    /// input's sighash) yields a different cache key — preventing the
+    /// SegWit-malleability cache-confusion described in W160 BUG-9, where
+    /// the same `(script_sig, script_pubkey, witness, flags)` tuple could
+    /// otherwise be reused across distinct spending transactions whose
+    /// sighashes differ.
     #[inline]
     fn derive_key(
         &self,
+        wtxid: &[u8; 32],
+        input_idx: u32,
         script_sig: &[u8],
         script_pubkey: &[u8],
         witness: &[Vec<u8>],
@@ -169,6 +202,8 @@ impl SigCache {
     ) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update(&self.nonce);
+        h.update(wtxid);
+        h.update(input_idx.to_le_bytes());
         h.update(script_sig);
         h.update(script_pubkey);
         for item in witness {
@@ -181,10 +216,13 @@ impl SigCache {
     /// Check if a verification result is cached.
     ///
     /// Returns `true` if the script verification for the given material
-    /// and flags has already succeeded in this session.
+    /// and flags has already succeeded in this session **for this exact
+    /// spending transaction and input**.
     ///
     /// # Arguments
     ///
+    /// * `wtxid`         - Witness txid of the spending transaction
+    /// * `input_idx`     - Index of the input being verified
     /// * `script_sig`    - Serialized scriptSig bytes from the input
     /// * `script_pubkey` - The locking script (scriptPubKey) from the UTXO
     /// * `witness`       - Witness stack items for the input
@@ -192,12 +230,14 @@ impl SigCache {
     #[inline]
     pub fn lookup(
         &self,
+        wtxid: &[u8; 32],
+        input_idx: u32,
         script_sig: &[u8],
         script_pubkey: &[u8],
         witness: &[Vec<u8>],
         flags: u32,
     ) -> bool {
-        let key = self.derive_key(script_sig, script_pubkey, witness, flags);
+        let key = self.derive_key(wtxid, input_idx, script_sig, script_pubkey, witness, flags);
         self.cache.contains_key(&key)
     }
 
@@ -208,12 +248,16 @@ impl SigCache {
     ///
     /// # Arguments
     ///
+    /// * `wtxid`         - Witness txid of the spending transaction
+    /// * `input_idx`     - Index of the input being verified
     /// * `script_sig`    - Serialized scriptSig bytes from the input
     /// * `script_pubkey` - The locking script (scriptPubKey) from the UTXO
     /// * `witness`       - Witness stack items for the input
     /// * `flags`         - Script verification flags used
     pub fn insert(
         &self,
+        wtxid: &[u8; 32],
+        input_idx: u32,
         script_sig: &[u8],
         script_pubkey: &[u8],
         witness: &[Vec<u8>],
@@ -224,7 +268,7 @@ impl SigCache {
             self.evict_batch();
         }
 
-        let key = self.derive_key(script_sig, script_pubkey, witness, flags);
+        let key = self.derive_key(wtxid, input_idx, script_sig, script_pubkey, witness, flags);
         self.cache.insert(key, ());
     }
 
@@ -292,6 +336,11 @@ mod tests {
         vec![]
     }
 
+    /// Helper: deterministic dummy wtxid built from a single seed byte.
+    fn wtxid(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
     #[test]
     fn new_cache_is_empty() {
         let cache = SigCache::new(100);
@@ -306,12 +355,13 @@ mod tests {
         let script_pubkey = vec![0x76u8; 25]; // P2PKH-like
         let witness = no_witness();
         let flags: u32 = 0x1234;
+        let wt = wtxid(0x01);
 
-        assert!(!cache.lookup(&script_sig, &script_pubkey, &witness, flags));
+        assert!(!cache.lookup(&wt, 0, &script_sig, &script_pubkey, &witness, flags));
 
-        cache.insert(&script_sig, &script_pubkey, &witness, flags);
+        cache.insert(&wt, 0, &script_sig, &script_pubkey, &witness, flags);
 
-        assert!(cache.lookup(&script_sig, &script_pubkey, &witness, flags));
+        assert!(cache.lookup(&wt, 0, &script_sig, &script_pubkey, &witness, flags));
         assert_eq!(cache.len(), 1);
     }
 
@@ -321,14 +371,15 @@ mod tests {
         let script_pubkey = vec![0x76u8; 25];
         let witness = no_witness();
         let flags: u32 = 0x1234;
+        let wt = wtxid(0x02);
 
         let sig_a = vec![0xaau8; 72];
         let sig_b = vec![0xbbu8; 72];
 
-        cache.insert(&sig_a, &script_pubkey, &witness, flags);
+        cache.insert(&wt, 0, &sig_a, &script_pubkey, &witness, flags);
 
-        assert!(cache.lookup(&sig_a, &script_pubkey, &witness, flags));
-        assert!(!cache.lookup(&sig_b, &script_pubkey, &witness, flags));
+        assert!(cache.lookup(&wt, 0, &sig_a, &script_pubkey, &witness, flags));
+        assert!(!cache.lookup(&wt, 0, &sig_b, &script_pubkey, &witness, flags));
     }
 
     #[test]
@@ -337,14 +388,15 @@ mod tests {
         let script_sig = vec![0xabu8; 72];
         let witness = no_witness();
         let flags: u32 = 0x1234;
+        let wt = wtxid(0x03);
 
         let spk_a = vec![0x76u8; 25];
         let spk_b = vec![0x00u8; 22]; // P2WPKH-like
 
-        cache.insert(&script_sig, &spk_a, &witness, flags);
+        cache.insert(&wt, 0, &script_sig, &spk_a, &witness, flags);
 
-        assert!(cache.lookup(&script_sig, &spk_a, &witness, flags));
-        assert!(!cache.lookup(&script_sig, &spk_b, &witness, flags));
+        assert!(cache.lookup(&wt, 0, &script_sig, &spk_a, &witness, flags));
+        assert!(!cache.lookup(&wt, 0, &script_sig, &spk_b, &witness, flags));
     }
 
     #[test]
@@ -353,12 +405,13 @@ mod tests {
         let script_sig = vec![0xabu8; 72];
         let script_pubkey = vec![0x76u8; 25];
         let witness = no_witness();
+        let wt = wtxid(0x04);
 
-        cache.insert(&script_sig, &script_pubkey, &witness, 0x0001);
+        cache.insert(&wt, 0, &script_sig, &script_pubkey, &witness, 0x0001);
 
-        assert!(cache.lookup(&script_sig, &script_pubkey, &witness, 0x0001));
-        assert!(!cache.lookup(&script_sig, &script_pubkey, &witness, 0x0002));
-        assert!(!cache.lookup(&script_sig, &script_pubkey, &witness, 0x0003));
+        assert!(cache.lookup(&wt, 0, &script_sig, &script_pubkey, &witness, 0x0001));
+        assert!(!cache.lookup(&wt, 0, &script_sig, &script_pubkey, &witness, 0x0002));
+        assert!(!cache.lookup(&wt, 0, &script_sig, &script_pubkey, &witness, 0x0003));
     }
 
     #[test]
@@ -367,14 +420,15 @@ mod tests {
         let script_sig = vec![];
         let script_pubkey = vec![0x00u8, 0x14]; // P2WPKH prefix
         let flags: u32 = 0x1234;
+        let wt = wtxid(0x05);
 
         let witness_a = vec![vec![0xaau8; 72], vec![0x02u8; 33]];
         let witness_b = vec![vec![0xbbu8; 72], vec![0x02u8; 33]];
 
-        cache.insert(&script_sig, &script_pubkey, &witness_a, flags);
+        cache.insert(&wt, 0, &script_sig, &script_pubkey, &witness_a, flags);
 
-        assert!(cache.lookup(&script_sig, &script_pubkey, &witness_a, flags));
-        assert!(!cache.lookup(&script_sig, &script_pubkey, &witness_b, flags));
+        assert!(cache.lookup(&wt, 0, &script_sig, &script_pubkey, &witness_a, flags));
+        assert!(!cache.lookup(&wt, 0, &script_sig, &script_pubkey, &witness_b, flags));
     }
 
     #[test]
@@ -385,7 +439,7 @@ mod tests {
         for i in 0u8..10 {
             let script_sig = vec![i; 72];
             let script_pubkey = vec![0x76u8; 25];
-            cache.insert(&script_sig, &script_pubkey, &no_witness(), 0);
+            cache.insert(&wtxid(i), 0, &script_sig, &script_pubkey, &no_witness(), 0);
         }
 
         assert_eq!(cache.len(), 10);
@@ -405,7 +459,7 @@ mod tests {
         for i in 0u8..(max_entries as u8 + 5) {
             let script_sig = vec![i; 72];
             let script_pubkey = vec![0x76u8; 25];
-            cache.insert(&script_sig, &script_pubkey, &no_witness(), 0);
+            cache.insert(&wtxid(i), 0, &script_sig, &script_pubkey, &no_witness(), 0);
         }
 
         // Cache should not exceed max_entries
@@ -441,9 +495,10 @@ mod tests {
         let script_pubkey = vec![0x76u8; 25];
         let witness = no_witness();
         let flags: u32 = 0xdeadbeef;
+        let wt = wtxid(0x99);
 
-        let k1 = cache.derive_key(&script_sig, &script_pubkey, &witness, flags);
-        let k2 = cache.derive_key(&script_sig, &script_pubkey, &witness, flags);
+        let k1 = cache.derive_key(&wt, 0, &script_sig, &script_pubkey, &witness, flags);
+        let k2 = cache.derive_key(&wt, 0, &script_sig, &script_pubkey, &witness, flags);
         assert_eq!(k1, k2);
     }
 
@@ -455,23 +510,70 @@ mod tests {
         let script_pubkey = vec![0x76u8; 25];
         let witness = no_witness();
         let flags: u32 = 0x0001;
+        let wt = wtxid(0x77);
 
         let mut sig_a = vec![0x00u8; 72];
         let mut sig_b = sig_a.clone();
         sig_b[10] = 0xff; // one byte differs
 
-        let k_a = cache.derive_key(&sig_a, &script_pubkey, &witness, flags);
-        let k_b = cache.derive_key(&sig_b, &script_pubkey, &witness, flags);
+        let k_a = cache.derive_key(&wt, 0, &sig_a, &script_pubkey, &witness, flags);
+        let k_b = cache.derive_key(&wt, 0, &sig_b, &script_pubkey, &witness, flags);
         assert_ne!(k_a, k_b);
 
         // Insert with sig_a — must NOT hit for sig_b.
-        cache.insert(&sig_a, &script_pubkey, &witness, flags);
-        assert!(cache.lookup(&sig_a, &script_pubkey, &witness, flags));
-        assert!(!cache.lookup(&sig_b, &script_pubkey, &witness, flags));
+        cache.insert(&wt, 0, &sig_a, &script_pubkey, &witness, flags);
+        assert!(cache.lookup(&wt, 0, &sig_a, &script_pubkey, &witness, flags));
+        assert!(!cache.lookup(&wt, 0, &sig_b, &script_pubkey, &witness, flags));
 
         // Reset last byte on sig_a to satisfy borrow checker cleanly.
         sig_a[10] = 0x00;
-        assert!(cache.lookup(&sig_a, &script_pubkey, &witness, flags));
+        assert!(cache.lookup(&wt, 0, &sig_a, &script_pubkey, &witness, flags));
+    }
+
+    /// W160 BUG-9 regression: two inputs with identical
+    /// (script_sig, script_pubkey, witness, flags) but residing in
+    /// transactions with different wtxids (and therefore different
+    /// sighashes) must NOT share a cache entry.
+    ///
+    /// Without binding the cache key to the spending transaction's
+    /// witness txid (or, equivalently, the sighash), a previously
+    /// successful verification under sighash A would be incorrectly
+    /// reused for sighash B, where the signatures do not actually
+    /// verify.  Under SegWit malleability this is a consensus-divergence
+    /// vector (cache poisoning across transactions).
+    #[test]
+    fn w160_bug9_different_wtxid_does_not_hit() {
+        let cache = SigCache::new(100);
+        let script_sig = vec![0xabu8; 72];
+        let script_pubkey = vec![0x76u8; 25];
+        let witness = no_witness();
+        let flags: u32 = 0x0001;
+
+        let wt_a = wtxid(0xAA); // spending tx A
+        let wt_b = wtxid(0xBB); // spending tx B with a different sighash
+
+        // Verify + cache for tx A, input 0.
+        cache.insert(&wt_a, 0, &script_sig, &script_pubkey, &witness, flags);
+
+        // Same material on tx A still hits — sanity.
+        assert!(
+            cache.lookup(&wt_a, 0, &script_sig, &script_pubkey, &witness, flags),
+            "same wtxid + input must hit after insert"
+        );
+
+        // Same material on tx B (different wtxid → different sighash)
+        // MUST NOT hit — this is the W160 BUG-9 fix.
+        assert!(
+            !cache.lookup(&wt_b, 0, &script_sig, &script_pubkey, &witness, flags),
+            "different wtxid (different sighash) must NOT hit the cache — W160 BUG-9"
+        );
+
+        // Same wtxid but a different input index also must not hit
+        // (because the sighash for a different input differs).
+        assert!(
+            !cache.lookup(&wt_a, 1, &script_sig, &script_pubkey, &witness, flags),
+            "different input_idx must NOT hit the cache"
+        );
     }
 
     #[test]
@@ -490,8 +592,9 @@ mod tests {
                     let script_sig = vec![thread_id, i];
                     let script_pubkey = vec![0x76u8; 25];
                     let witness = no_witness();
-                    cache.insert(&script_sig, &script_pubkey, &witness, 0);
-                    assert!(cache.lookup(&script_sig, &script_pubkey, &witness, 0));
+                    let wt = wtxid(thread_id.wrapping_mul(101).wrapping_add(i));
+                    cache.insert(&wt, 0, &script_sig, &script_pubkey, &witness, 0);
+                    assert!(cache.lookup(&wt, 0, &script_sig, &script_pubkey, &witness, 0));
                 }
             }));
         }
