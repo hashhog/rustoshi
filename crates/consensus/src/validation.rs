@@ -2482,7 +2482,7 @@ impl<'a> SignatureChecker for TransactionSignatureChecker<'a> {
             return false;
         };
 
-        let secp = secp256k1::Secp256k1::verification_only();
+        let secp = rustoshi_crypto::secp_ctx();
         let msg = secp256k1::Message::from_digest(sighash.0);
         secp.verify_ecdsa(&msg, &sig, &pk).is_ok()
     }
@@ -2674,7 +2674,7 @@ impl<'a> TransactionSignatureChecker<'a> {
         };
         let msg = secp256k1::Message::from_digest(sighash);
 
-        let secp = secp256k1::Secp256k1::verification_only();
+        let secp = rustoshi_crypto::secp_ctx();
         secp.verify_schnorr(&sig_obj, &msg, &xonly).is_ok()
     }
 }

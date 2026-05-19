@@ -8,9 +8,10 @@
 use rustoshi_primitives::Hash256;
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId, Signature},
-    Message, PublicKey, Secp256k1, SecretKey,
+    Message, PublicKey, SecretKey,
 };
 
+use crate::context::secp_ctx;
 use crate::hashes::sha256d;
 
 /// Prefix used by Bitcoin Core for `signmessage`/`verifymessage`.
@@ -56,7 +57,7 @@ fn encode_compact_size(n: u64, out: &mut Vec<u8>) {
 ///
 /// `compressed = true` matches Bitcoin Core's default for all derived keys.
 pub fn sign_message_compact(secret: &SecretKey, message: &[u8], compressed: bool) -> [u8; 65] {
-    let secp = Secp256k1::new();
+    let secp = secp_ctx();
     let hash = signed_message_hash(message);
     let msg = Message::from_digest(hash.0);
     let sig = secp.sign_ecdsa_recoverable(&msg, secret);
@@ -99,7 +100,7 @@ pub fn recover_message_pubkey(
     let rec_sig = RecoverableSignature::from_compact(&compact, recid)?;
     let hash = signed_message_hash(message);
     let msg = Message::from_digest(hash.0);
-    let secp = Secp256k1::new();
+    let secp = secp_ctx();
     let pubkey = secp.recover_ecdsa(&msg, &rec_sig)?;
     Ok((pubkey, compressed))
 }
@@ -112,8 +113,8 @@ pub fn generate_private_key() -> SecretKey {
 
 /// Derive the public key from a private key.
 pub fn public_key_from_private(secret: &SecretKey) -> PublicKey {
-    let secp = Secp256k1::new();
-    PublicKey::from_secret_key(&secp, secret)
+    let secp = secp_ctx();
+    PublicKey::from_secret_key(secp, secret)
 }
 
 /// Serialize a public key in compressed form (33 bytes, 0x02 or 0x03 prefix).
@@ -128,14 +129,14 @@ pub fn serialize_pubkey_uncompressed(pubkey: &PublicKey) -> [u8; 65] {
 
 /// Sign a 256-bit message hash using ECDSA.
 pub fn ecdsa_sign(secret: &SecretKey, hash: &Hash256) -> Signature {
-    let secp = Secp256k1::new();
+    let secp = secp_ctx();
     let msg = Message::from_digest(hash.0);
     secp.sign_ecdsa(&msg, secret)
 }
 
 /// Verify an ECDSA signature against a public key and message hash.
 pub fn ecdsa_verify(pubkey: &PublicKey, hash: &Hash256, sig: &Signature) -> bool {
-    let secp = Secp256k1::new();
+    let secp = secp_ctx();
     let msg = Message::from_digest(hash.0);
     secp.verify_ecdsa(&msg, sig, pubkey).is_ok()
 }
