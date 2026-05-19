@@ -591,14 +591,16 @@ fn g22_cache_hit_short_circuits_verify() {
     let script_sig = vec![0xabu8; 72];
     let script_pubkey = vec![0x76u8; 25];
     let witness: Vec<Vec<u8>> = vec![];
+    // Post-W160-BUG-9: cache key also commits to (wtxid, input_idx).
+    let wtxid = [0xCCu8; 32];
 
     // Pre-populate — simulates prior mempool validation
-    cache.insert(&script_sig, &script_pubkey, &witness, 0x0001);
+    cache.insert(&wtxid, 0, &script_sig, &script_pubkey, &witness, 0x0001);
 
     // Hit: same material
-    assert!(cache.lookup(&script_sig, &script_pubkey, &witness, 0x0001));
+    assert!(cache.lookup(&wtxid, 0, &script_sig, &script_pubkey, &witness, 0x0001));
     // Miss: different flags
-    assert!(!cache.lookup(&script_sig, &script_pubkey, &witness, 0x0002));
+    assert!(!cache.lookup(&wtxid, 0, &script_sig, &script_pubkey, &witness, 0x0002));
 }
 
 // ============================================================
@@ -624,6 +626,7 @@ fn g23_cache_key_covers_signature_and_pubkey_bytes() {
     let script_pubkey = vec![0x76u8, 0xa9, 0x14]; // P2PKH-style prefix
     let witness: Vec<Vec<u8>> = vec![];
     let flags: u32 = 0x0001;
+    let wtxid = [0xABu8; 32];
 
     // sig_a: "valid" sig material
     let sig_a = vec![0xaau8; 72];
@@ -631,17 +634,17 @@ fn g23_cache_key_covers_signature_and_pubkey_bytes() {
     let sig_b = vec![0xbbu8; 72];
 
     // Cache a hit for sig_a
-    cache.insert(&sig_a, &script_pubkey, &witness, flags);
+    cache.insert(&wtxid, 0, &sig_a, &script_pubkey, &witness, flags);
 
     // sig_a must hit
     assert!(
-        cache.lookup(&sig_a, &script_pubkey, &witness, flags),
+        cache.lookup(&wtxid, 0, &sig_a, &script_pubkey, &witness, flags),
         "sig_a should hit the cache after insert"
     );
 
     // sig_b (different bytes, same conceptual outpoint) must NOT hit
     assert!(
-        !cache.lookup(&sig_b, &script_pubkey, &witness, flags),
+        !cache.lookup(&wtxid, 0, &sig_b, &script_pubkey, &witness, flags),
         "sig_b must not hit the cache — cache key covers sig bytes, preventing cache-poisoning"
     );
 
@@ -649,7 +652,7 @@ fn g23_cache_key_covers_signature_and_pubkey_bytes() {
     // (different nonce → different key space → no cross-session poisoning)
     let cache2 = SigCache::new(100);
     assert!(
-        !cache2.lookup(&sig_a, &script_pubkey, &witness, flags),
+        !cache2.lookup(&wtxid, 0, &sig_a, &script_pubkey, &witness, flags),
         "a fresh cache with different nonce must not inherit entries from the old cache"
     );
 }
@@ -705,17 +708,18 @@ fn g25_cache_write_only_on_success() {
     let script_sig = vec![0x01u8; 72];
     let script_pubkey = vec![0x76u8; 25];
     let witness: Vec<Vec<u8>> = vec![];
+    let wtxid = [0xDDu8; 32];
 
     // Simulate: validation failed → no insert
     // (rustoshi code path: result = Err(_); no cache.insert())
-    assert!(!cache.lookup(&script_sig, &script_pubkey, &witness, 0x0001));
+    assert!(!cache.lookup(&wtxid, 0, &script_sig, &script_pubkey, &witness, 0x0001));
 
     // Simulate: validation succeeded → insert
-    cache.insert(&script_sig, &script_pubkey, &witness, 0x0001);
-    assert!(cache.lookup(&script_sig, &script_pubkey, &witness, 0x0001));
+    cache.insert(&wtxid, 0, &script_sig, &script_pubkey, &witness, 0x0001);
+    assert!(cache.lookup(&wtxid, 0, &script_sig, &script_pubkey, &witness, 0x0001));
 
     // Different flags — distinct entry (failed validations not cached)
-    assert!(!cache.lookup(&script_sig, &script_pubkey, &witness, 0x0002));
+    assert!(!cache.lookup(&wtxid, 0, &script_sig, &script_pubkey, &witness, 0x0002));
 }
 
 // ============================================================
@@ -841,18 +845,19 @@ fn sig_cache_is_keyed_by_script_material() {
     let script_pubkey = vec![0x76u8; 25];
     let witness: Vec<Vec<u8>> = vec![];
     let flags: u32 = 0x0001;
+    let wtxid = [0xEEu8; 32];
 
     let sig_a = vec![0xaau8; 72];
     let sig_b = vec![0xbbu8; 72];
 
-    cache.insert(&sig_a, &script_pubkey, &witness, flags);
+    cache.insert(&wtxid, 0, &sig_a, &script_pubkey, &witness, flags);
 
     // Same sig, same flags — cache hit
-    assert!(cache.lookup(&sig_a, &script_pubkey, &witness, flags));
+    assert!(cache.lookup(&wtxid, 0, &sig_a, &script_pubkey, &witness, flags));
     // Different sig bytes — distinct entry (the anti-poisoning property)
-    assert!(!cache.lookup(&sig_b, &script_pubkey, &witness, flags));
+    assert!(!cache.lookup(&wtxid, 0, &sig_b, &script_pubkey, &witness, flags));
     // Different flags — distinct entry
-    assert!(!cache.lookup(&sig_a, &script_pubkey, &witness, 0x0002));
+    assert!(!cache.lookup(&wtxid, 0, &sig_a, &script_pubkey, &witness, 0x0002));
 }
 
 #[test]
@@ -864,7 +869,7 @@ fn sig_cache_eviction_stays_within_capacity() {
 
     for i in 0u8..40 {
         let script_sig = vec![i; 72];
-        cache.insert(&script_sig, &script_pubkey, &witness, 0);
+        cache.insert(&[i; 32], 0, &script_sig, &script_pubkey, &witness, 0);
     }
 
     // After inserting 40 entries into a cap-20 cache, size <= cap + slack
@@ -883,7 +888,7 @@ fn sig_cache_clear_removes_all() {
     let witness: Vec<Vec<u8>> = vec![];
     for i in 0u8..10 {
         let script_sig = vec![i; 72];
-        cache.insert(&script_sig, &script_pubkey, &witness, 0);
+        cache.insert(&[i; 32], 0, &script_sig, &script_pubkey, &witness, 0);
     }
     assert_eq!(cache.len(), 10);
     cache.clear();
