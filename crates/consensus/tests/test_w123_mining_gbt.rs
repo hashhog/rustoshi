@@ -188,8 +188,9 @@ fn test_g2_block_sigops_80k_enforced() {
 ///
 /// Carry-forward from W108 G11.
 #[test]
-#[ignore = "BUG G3 (P2-CDIV) — witness commitment omitted when segwit active + no witness txs \
-            (carry-forward of W108 G11; block_template.rs:586,598)"]
+// FIXED 2026-05-19: `build_coinbase_tx` now takes a `segwit_active` parameter
+// (sourced from `params.is_segwit_active(height)` at the call site) and gates
+// the witness commitment on it, per BIP-141 / Core validation.cpp:3997-4019.
 fn test_g3_witness_commitment_when_segwit_active_no_witness_txs() {
     let params = regtest_params(); // segwit always active on regtest
     let mp = empty_mempool();
