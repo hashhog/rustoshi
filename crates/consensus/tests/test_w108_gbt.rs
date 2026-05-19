@@ -500,7 +500,11 @@ fn test_g10_coinbase_value_equals_subsidy_plus_fees() {
 /// would be missing the required witness commitment output and will be rejected
 /// at validation by any other node as `bad-witness-nonce-size`.
 #[test]
-#[ignore = "BUG G11 (P2): witness commitment omitted when segwit active but no witness txs in template"]
+// FIXED 2026-05-19: `build_coinbase_tx` now gates witness commitment on the
+// `segwit_active` parameter rather than `selected_txs.iter().any(|tx|
+// tx.has_witness())`. Per BIP-141 / Core validation.cpp:3997-4019, the
+// commitment must be present whenever segwit is active. Carry-forward
+// from W108 G11 → W123 G3 → W142 BUG-13 → W154 BUG-9 → W155 BUG-11.
 fn test_g11_witness_commitment_always_present_when_segwit_active() {
     let params = regtest_params(); // regtest: segwit always active
     let mempool = empty_mempool(); // no witness txs
