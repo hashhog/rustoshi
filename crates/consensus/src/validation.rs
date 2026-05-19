@@ -1922,13 +1922,16 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
 ///
 /// # Cache Usage
 ///
-/// The cache key includes the txid, input index, and flags. This ensures that:
-/// - Different transactions are cached separately
-/// - Different inputs within a transaction are cached separately
-/// - Different verification flags don't share cache entries
+/// The cache key includes the spending transaction's **wtxid**, the input
+/// index, the script material (script_sig / script_pubkey / witness), and
+/// the verification flags.  Including the wtxid binds the entry to the
+/// exact witness-bearing transaction whose sighash was verified, which
+/// closes the SegWit-malleability cache-confusion described in W160 BUG-9
+/// (without it, two distinct transactions sharing the same input material
+/// but different sighashes could spuriously share a cache hit).
 ///
-/// Only successful verifications are cached. Cache entries should be cleared
-/// during chain reorganizations.
+/// Only successful verifications are cached.  Cache entries should be
+/// cleared during chain reorganizations.
 pub fn validate_scripts_parallel_with_cache(
     block: &Block,
     coins: &[Vec<CoinEntry>],
@@ -1949,6 +1952,19 @@ pub fn validate_scripts_parallel_with_cache(
                 tc.iter().map(|c| c.script_pubkey.clone()).collect(),
             )
         })
+        .collect();
+
+    // Pre-compute wtxids for each non-coinbase tx exactly once.  The wtxid
+    // is part of the SigCache key (W160 BUG-9): it binds a cache entry to
+    // the exact witness-bearing transaction that produced the successful
+    // verify, so two distinct spending transactions with the same
+    // (script_sig, script_pubkey, witness, flags) tuple but different
+    // sighashes cannot share a cache entry.
+    let per_tx_wtxids: Vec<[u8; 32]> = block
+        .transactions
+        .iter()
+        .skip(1)
+        .map(|tx| tx.wtxid().0)
         .collect();
 
     // Collect all (tx, input_index, coin, tx_coin_idx) tuples for
@@ -1974,11 +1990,22 @@ pub fn validate_scripts_parallel_with_cache(
             let script_sig = &tx.inputs[*input_idx].script_sig;
             let witness = &tx.inputs[*input_idx].witness;
             let script_pubkey = &coin.script_pubkey;
+            let wtxid = &per_tx_wtxids[*tx_coin_idx];
+            let input_idx_u32 = *input_idx as u32;
 
-            // Check cache first (keyed on actual cryptographic material,
-            // not txid+index, so a forged sig cannot hit a valid entry).
+            // Check cache first.  Keyed on (wtxid, input_idx, material,
+            // flags) so a hit guarantees that the same spending
+            // transaction (and therefore the same sighash) already passed
+            // verification under the same flags — see W160 BUG-9.
             if let Some(cache) = sig_cache {
-                if cache.lookup(script_sig, script_pubkey, witness, flags_bits) {
+                if cache.lookup(
+                    wtxid,
+                    input_idx_u32,
+                    script_sig,
+                    script_pubkey,
+                    witness,
+                    flags_bits,
+                ) {
                     return Ok(());
                 }
             }
@@ -2004,7 +2031,14 @@ pub fn validate_scripts_parallel_with_cache(
             // Cache successful verification
             if result.is_ok() {
                 if let Some(cache) = sig_cache {
-                    cache.insert(script_sig, script_pubkey, witness, flags_bits);
+                    cache.insert(
+                        wtxid,
+                        input_idx_u32,
+                        script_sig,
+                        script_pubkey,
+                        witness,
+                        flags_bits,
+                    );
                 }
             }
 
