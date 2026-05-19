@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use rand::thread_rng;
 use rustoshi_crypto::{
     address::{Address, Network},
-    hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash, sha256,
+    hash160, p2wpkh_script_code, segwit_v0_sighash, legacy_sighash, secp_ctx, sha256,
     taproot::{compute_taproot_sighash as crypto_compute_taproot_sighash, TaprootPrevouts,
               SIGHASH_DEFAULT},
 };
@@ -307,8 +307,8 @@ impl Wallet {
     /// Derive an address from a derivation path.
     fn derive_address(&self, path: &[u32]) -> Result<String, WalletError> {
         let child_key = self.master_key.derive_path(path)?;
-        let secp = Secp256k1::new();
-        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &child_key.secret_key);
+        let secp = secp_ctx();
+        let pubkey = secp256k1::PublicKey::from_secret_key(secp, &child_key.secret_key);
         let compressed: [u8; 33] = pubkey.serialize();
 
         let addr = match self.address_type {
@@ -608,22 +608,22 @@ impl Wallet {
         };
 
         // Sign inputs
-        let secp = Secp256k1::new();
+        let secp = secp_ctx();
         for (i, utxo) in selected_utxos.iter().enumerate() {
             let private_key = self.get_private_key(&utxo.derivation_path)?;
 
             match self.address_type {
                 AddressType::P2WPKH => {
-                    self.sign_p2wpkh_input(&mut tx, i, utxo, &private_key, &secp)?;
+                    self.sign_p2wpkh_input(&mut tx, i, utxo, &private_key, secp)?;
                 }
                 AddressType::P2PKH => {
-                    self.sign_p2pkh_input(&mut tx, i, utxo, &private_key, &secp)?;
+                    self.sign_p2pkh_input(&mut tx, i, utxo, &private_key, secp)?;
                 }
                 AddressType::P2shP2wpkh => {
-                    self.sign_p2sh_p2wpkh_input(&mut tx, i, utxo, &private_key, &secp)?;
+                    self.sign_p2sh_p2wpkh_input(&mut tx, i, utxo, &private_key, secp)?;
                 }
                 AddressType::P2TR => {
-                    self.sign_p2tr_input(&mut tx, i, utxo, &selected_utxos, &private_key, &secp)?;
+                    self.sign_p2tr_input(&mut tx, i, utxo, &selected_utxos, &private_key, secp)?;
                 }
             }
         }
@@ -890,18 +890,18 @@ impl Wallet {
         };
 
         if sign {
-            let secp = Secp256k1::new();
+            let secp = secp_ctx();
             for (i, utxo) in entry.spent_utxos.iter().enumerate() {
                 let private_key = self.get_private_key(&utxo.derivation_path)?;
                 match self.address_type {
                     AddressType::P2WPKH => {
-                        self.sign_p2wpkh_input(&mut new_tx, i, utxo, &private_key, &secp)?
+                        self.sign_p2wpkh_input(&mut new_tx, i, utxo, &private_key, secp)?
                     }
                     AddressType::P2PKH => {
-                        self.sign_p2pkh_input(&mut new_tx, i, utxo, &private_key, &secp)?
+                        self.sign_p2pkh_input(&mut new_tx, i, utxo, &private_key, secp)?
                     }
                     AddressType::P2shP2wpkh => {
-                        self.sign_p2sh_p2wpkh_input(&mut new_tx, i, utxo, &private_key, &secp)?
+                        self.sign_p2sh_p2wpkh_input(&mut new_tx, i, utxo, &private_key, secp)?
                     }
                     AddressType::P2TR => self.sign_p2tr_input(
                         &mut new_tx,
@@ -909,7 +909,7 @@ impl Wallet {
                         utxo,
                         &entry.spent_utxos,
                         &private_key,
-                        &secp,
+                        secp,
                     )?,
                 }
             }
@@ -978,7 +978,7 @@ impl Wallet {
 
         // Get the private key for this UTXO's derivation path.
         let private_key = self.get_private_key(&utxo.derivation_path)?;
-        let secp = Secp256k1::new();
+        let secp = secp_ctx();
 
         // Detect script type from the actual scriptPubKey bytes, NOT
         // self.address_type — the wallet may have UTXOs of different script
@@ -986,7 +986,7 @@ impl Wallet {
         // honor the prevout's script.
         let spk = &utxo.script_pubkey;
         if is_p2wpkh_spk(spk) {
-            self.sign_p2wpkh_input(tx, input_index, &utxo, &private_key, &secp)?;
+            self.sign_p2wpkh_input(tx, input_index, &utxo, &private_key, secp)?;
         } else if is_p2wsh_spk(spk) {
             // P2WSH cannot be signed from a single-key wallet UTXO — the
             // signer needs the witness_script and (for multisig) multiple
@@ -999,7 +999,7 @@ impl Wallet {
                 input_index
             )));
         } else if is_p2pkh_spk(spk) {
-            self.sign_p2pkh_input(tx, input_index, &utxo, &private_key, &secp)?;
+            self.sign_p2pkh_input(tx, input_index, &utxo, &private_key, secp)?;
         } else if is_p2sh_spk(spk) {
             // We only know how to sign P2SH-P2WPKH (BIP-49 wrapped segwit).
             // The redeem script for a wallet-owned P2SH is reconstructed in
@@ -1007,7 +1007,7 @@ impl Wallet {
             // path, so this is correct provided the wallet stored the UTXO as
             // BIP-49. Wallets that hold P2SH-P2WSH UTXOs must drive signing
             // through PSBT (witness_script lives there).
-            self.sign_p2sh_p2wpkh_input(tx, input_index, &utxo, &private_key, &secp)?;
+            self.sign_p2sh_p2wpkh_input(tx, input_index, &utxo, &private_key, secp)?;
         } else if is_p2tr_spk(spk) {
             // Taproot key-path. all_prev_utxos must cover every input for the
             // BIP-341 sighash; if caller passed an empty slice, fall back to a
@@ -1017,7 +1017,7 @@ impl Wallet {
             } else {
                 all_prev_utxos
             };
-            self.sign_p2tr_input(tx, input_index, &utxo, prevouts, &private_key, &secp)?;
+            self.sign_p2tr_input(tx, input_index, &utxo, prevouts, &private_key, secp)?;
         } else {
             return Err(WalletError::SigningError(format!(
                 "unsupported scriptPubKey type for input {} (len={}, first byte=0x{:02x})",
@@ -1182,7 +1182,7 @@ impl Wallet {
             ));
         }
 
-        let secp = Secp256k1::new();
+        let secp = secp_ctx();
         let sighash = segwit_v0_sighash(
             tx,
             input_index,
@@ -1446,7 +1446,7 @@ impl Wallet {
 
         // Compute the BIP-143 sighash once — same digest signs for all
         // matching keys.
-        let secp = Secp256k1::new();
+        let secp = secp_ctx();
         let sighash = segwit_v0_sighash(
             &psbt.unsigned_tx,
             input_index,
@@ -1458,7 +1458,7 @@ impl Wallet {
 
         let mut added = 0usize;
         for sk in sign_keys {
-            let pk = secp256k1::PublicKey::from_secret_key(&secp, sk);
+            let pk = secp256k1::PublicKey::from_secret_key(secp, sk);
             let pk_bytes: [u8; 33] = pk.serialize();
             if !script_pks.iter().any(|p| p == &pk_bytes) {
                 continue; // key not in this script
@@ -1715,10 +1715,10 @@ impl Wallet {
         &self,
         pkh: &rustoshi_primitives::Hash160,
     ) -> Option<secp256k1::SecretKey> {
-        let secp = Secp256k1::new();
+        let secp = secp_ctx();
         for path in self.addresses.values() {
             let child = self.master_key.derive_path(path).ok()?;
-            let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &child.secret_key);
+            let pubkey = secp256k1::PublicKey::from_secret_key(secp, &child.secret_key);
             let hash = hash160(&pubkey.serialize());
             if &hash == pkh {
                 return Some(child.secret_key);
@@ -3065,7 +3065,7 @@ mod tests {
         // Recompute sighash and walk pubkeys in order, matching against sigs.
         let sighash = segwit_v0_sighash(tx, input_index, witness_script, value, 0x01);
         let msg = Message::from_digest(sighash.0);
-        let secp = Secp256k1::verification_only();
+        let secp = secp_ctx();
 
         let sigs: &[Vec<u8>] = &witness[1..witness.len() - 1];
 

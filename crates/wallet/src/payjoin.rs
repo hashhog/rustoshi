@@ -55,8 +55,9 @@
 use std::collections::HashMap;
 
 use rustoshi_crypto::address::{Address, Network};
+use rustoshi_crypto::secp_ctx;
 use rustoshi_primitives::{Hash256, OutPoint, TxOut};
-use secp256k1::{Message, Secp256k1};
+use secp256k1::Message;
 
 use crate::hd::WalletError;
 use crate::psbt::{Psbt, PsbtError};
@@ -741,8 +742,8 @@ fn sign_receiver_input(
         .ok_or_else(|| WalletError::SigningError(
             "no private key for receiver utxo (wallet locked or unknown path)".into(),
         ))?;
-    let secp = Secp256k1::new();
-    let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+    let secp = secp_ctx();
+    let pk = secp256k1::PublicKey::from_secret_key(secp, &sk);
     let pk_compressed: [u8; 33] = pk.serialize();
     let pubkey_hash = rustoshi_crypto::hash160(&pk_compressed);
     let script_code = {

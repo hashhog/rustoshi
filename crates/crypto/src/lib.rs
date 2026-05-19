@@ -9,6 +9,7 @@
 pub mod address;
 pub mod base58;
 pub mod bech32;
+pub mod context;
 pub mod hashes;
 pub mod hwaccel;
 pub mod keys;
@@ -16,6 +17,8 @@ pub mod p2sh;
 pub mod sha256;
 pub mod sighash;
 pub mod taproot;
+
+pub use context::secp_ctx;
 
 pub use address::{Address, AddressError, Network};
 pub use base58::{base58check_decode, base58check_encode, Base58Error};

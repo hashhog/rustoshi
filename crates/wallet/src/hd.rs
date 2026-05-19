@@ -4,8 +4,8 @@
 //! allowing derivation of an entire tree of key pairs from a single master seed.
 
 use hmac::{Hmac, Mac};
-use rustoshi_crypto::hash160;
-use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
+use rustoshi_crypto::{hash160, secp_ctx};
+use secp256k1::{PublicKey, Scalar, SecretKey};
 use sha2::Sha512;
 
 type HmacSha512 = Hmac<Sha512>;
@@ -186,8 +186,8 @@ impl ExtendedPrivKey {
     /// # Errors
     /// Returns an error if the derivation produces an invalid key (astronomically unlikely).
     pub fn derive_child(&self, child_number: u32) -> Result<Self, WalletError> {
-        let secp = Secp256k1::new();
-        let parent_pub = PublicKey::from_secret_key(&secp, &self.secret_key);
+        let secp = secp_ctx();
+        let parent_pub = PublicKey::from_secret_key(secp, &self.secret_key);
         let fingerprint = key_fingerprint(&parent_pub);
 
         let mut data = Vec::with_capacity(37);
@@ -245,9 +245,9 @@ impl ExtendedPrivKey {
 
     /// Get the extended public key.
     pub fn to_public(&self) -> ExtendedPubKey {
-        let secp = Secp256k1::new();
+        let secp = secp_ctx();
         ExtendedPubKey {
-            public_key: PublicKey::from_secret_key(&secp, &self.secret_key),
+            public_key: PublicKey::from_secret_key(secp, &self.secret_key),
             chain_code: self.chain_code,
             depth: self.depth,
             parent_fingerprint: self.parent_fingerprint,
@@ -257,8 +257,8 @@ impl ExtendedPrivKey {
 
     /// Get the key fingerprint (first 4 bytes of HASH160 of the public key).
     pub fn fingerprint(&self) -> [u8; 4] {
-        let secp = Secp256k1::new();
-        let pubkey = PublicKey::from_secret_key(&secp, &self.secret_key);
+        let secp = secp_ctx();
+        let pubkey = PublicKey::from_secret_key(secp, &self.secret_key);
         key_fingerprint(&pubkey)
     }
 }
@@ -288,10 +288,10 @@ impl ExtendedPubKey {
         tweak_bytes.copy_from_slice(&result[..32]);
 
         // child_pub = parent_pub + tweak * G
-        let secp = Secp256k1::new();
+        let secp = secp_ctx();
         let tweak =
             SecretKey::from_slice(&tweak_bytes).map_err(|_| WalletError::KeyDerivation)?;
-        let tweak_pub = PublicKey::from_secret_key(&secp, &tweak);
+        let tweak_pub = PublicKey::from_secret_key(secp, &tweak);
         let child_pub = self
             .public_key
             .combine(&tweak_pub)
