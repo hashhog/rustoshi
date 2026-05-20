@@ -49,6 +49,33 @@ pub struct AssumeutxoData {
     /// Used to populate m_chain_tx_count for progress estimation.
     /// This is hardcoded because it requires block data to compute.
     pub chain_tx_count: u64,
+
+    /// Median-time-past (MTP) of the snapshot base block.
+    ///
+    /// On a freshly-loaded assumeUTXO node, header sync starts *at* the
+    /// snapshot base and never fetches the base block or its 10 ancestors,
+    /// so the MTP of the base block cannot be computed from the block
+    /// store. Bitcoin Core never has this problem: it validates the full
+    /// header chain (genesis -> tip) before activating a snapshot, so the
+    /// base block's `CBlockIndex` always carries a real `nTime` and a
+    /// `pprev` chain (validation.cpp `ActivateSnapshot` looks up
+    /// `LookupBlockIndex(base_blockhash)` and fails if the header is
+    /// absent).
+    ///
+    /// Without this value the first post-snapshot block's
+    /// `ContextualCheckBlock`/`IsFinalTx` `nLockTimeCutoff` collapses to
+    /// `0` (see `connect_block_with_sequence_locks`), and every
+    /// transaction with a time-based `nLockTime` is rejected as
+    /// `bad-txns-nonfinal` -- wedging the chain at the snapshot base
+    /// (observed live on mainnet 2026-05-20: block 944,184 failed with
+    /// `bad-txns-nonfinal`, tip frozen at the 944,183 snapshot base).
+    ///
+    /// This is a trusted chainparams constant, exactly like `blockhash`
+    /// and `hash_serialized` -- it pins the median of the 11 block
+    /// timestamps ending at the snapshot base height. `None` means the
+    /// connect path falls back to a partial-window MTP computed from
+    /// whatever post-snapshot headers are already stored.
+    pub base_mtp: Option<u32>,
 }
 
 // ============================================================
@@ -668,6 +695,7 @@ impl ChainParams {
                     )
                     .expect("valid hash"),
                     chain_tx_count: 991_032_194,
+                    base_mtp: None,
                 },
                 AssumeutxoData {
                     height: 880_000,
@@ -680,6 +708,7 @@ impl ChainParams {
                     )
                     .expect("valid hash"),
                     chain_tx_count: 1_145_604_538,
+                    base_mtp: None,
                 },
                 AssumeutxoData {
                     height: 910_000,
@@ -692,6 +721,7 @@ impl ChainParams {
                     )
                     .expect("valid hash"),
                     chain_tx_count: 1_226_586_151,
+                    base_mtp: None,
                 },
                 AssumeutxoData {
                     height: 935_000,
@@ -704,6 +734,7 @@ impl ChainParams {
                     )
                     .expect("valid hash"),
                     chain_tx_count: 1_305_397_408,
+                    base_mtp: None,
                 },
                 // hashhog-local snapshot at h=944183 (utxo-snapshot-raw.dat
                 // from /data/nvme1/hashhog-mainnet/), used to recover
@@ -725,6 +756,13 @@ impl ChainParams {
                     )
                     .expect("valid hash"),
                     chain_tx_count: 1_334_000_000,
+                    // MTP of block 944,183 = median of the 11 block
+                    // timestamps for heights 944,173..=944,183. Verified
+                    // against Bitcoin Core `getblockheader` `mediantime`
+                    // (2026-05-20). Required so the first post-snapshot
+                    // block (944,184) gets a correct `IsFinalTx`
+                    // `nLockTimeCutoff` instead of 0.
+                    base_mtp: Some(1_775_650_208),
                 },
             ],
         }
@@ -847,6 +885,7 @@ impl ChainParams {
                     )
                     .expect("valid hash"),
                     chain_tx_count: 11_347_043,
+                    base_mtp: None,
                 },
                 AssumeutxoData {
                     height: 120_000,
@@ -859,6 +898,7 @@ impl ChainParams {
                     )
                     .expect("valid hash"),
                     chain_tx_count: 14_141_057,
+                    base_mtp: None,
                 },
                 AssumeutxoData {
                     height: 290_000,
@@ -871,6 +911,7 @@ impl ChainParams {
                     )
                     .expect("valid hash"),
                     chain_tx_count: 28_547_497,
+                    base_mtp: None,
                 },
             ],
         }
