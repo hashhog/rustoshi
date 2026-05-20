@@ -949,6 +949,50 @@ impl<'a> BlockStoreUtxoView<'a> {
         }
     }
 
+    /// Atomically flush all cached UTXO changes AND advance the persisted
+    /// best-block (tip) pointer to `(hash, height)` in a single RocksDB
+    /// `WriteBatch`.
+    ///
+    /// This is the durability-safe replacement for the broken
+    /// "`set_best_block` eagerly per block + `flush()` lazily at 2 GiB"
+    /// pattern.  The two writes MUST land together: if the persisted tip
+    /// pointer is allowed to advance ahead of the durable UTXO set, a
+    /// process kill (SIGKILL / OOM / crash) between the eager tip write
+    /// and the next lazy flush leaves the node permanently wedged — on
+    /// restart it loads the advanced tip, requests the next block, and
+    /// every connect fails `MissingInput` because the coins created by
+    /// the un-flushed blocks were never written to disk.
+    ///
+    /// This is precisely the bug that froze rustoshi mainnet at height
+    /// 948,304 on 2026-05-07: the node was SIGKILLed after connecting
+    /// block 948,304 (tip pointer persisted) but before any 2 GiB flush,
+    /// so the UTXO created by tx `d57c33d0…29a0` in block 948,293 was
+    /// lost, and block 948,305 could never connect.
+    ///
+    /// Mirrors Bitcoin Core `CCoinsViewDB::BatchWrite`
+    /// (`bitcoin-core/src/txdb.cpp`): the `DB_BEST_BLOCK` key is written
+    /// in the SAME `CDBBatch` as the coin mutations and is never advanced
+    /// independently — Core asserts `!hashBlock.IsNull()` to enforce that
+    /// the best block is only ever set together with coins.
+    ///
+    /// The caller is responsible for ensuring `(hash, height)` is the tip
+    /// AT OR BELOW which every cached coin mutation belongs (i.e. flush
+    /// only on a block boundary after `process_block` succeeded).
+    pub fn flush_with_tip(
+        &mut self,
+        hash: &Hash256,
+        height: u32,
+    ) -> Result<(), StorageError> {
+        let mut batch = self.store.db.new_batch();
+        // Stage all cached UTXO mutations (drains the cache, resets mem).
+        self.flush_into_batch(&mut batch)?;
+        // Stage the tip pointer into the SAME batch so it can never be
+        // durable without its coins.
+        self.store.batch_set_best_block(&mut batch, hash, height)?;
+        self.store.db.write_batch(batch)?;
+        Ok(())
+    }
+
     fn estimate_entry_size(coin: &Option<CoinEntry>) -> usize {
         CACHE_ENTRY_OVERHEAD
             + coin
@@ -1009,5 +1053,161 @@ impl<'a> rustoshi_consensus::validation::UtxoView for BlockStoreUtxoView<'a> {
         } else {
             self.estimated_mem += new_size;
         }
+    }
+}
+
+// ============================================================
+// TESTS
+// ============================================================
+
+#[cfg(test)]
+mod flush_with_tip_tests {
+    use super::*;
+    use crate::db::ChainDb;
+    use rustoshi_consensus::validation::{CoinEntry as ConsCoinEntry, UtxoView};
+    use tempfile::TempDir;
+
+    fn temp_db() -> (TempDir, ChainDb) {
+        let dir = TempDir::new().expect("temp dir");
+        let db = ChainDb::open(dir.path()).expect("open db");
+        (dir, db)
+    }
+
+    fn hash_n(n: u8) -> Hash256 {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        Hash256(b)
+    }
+
+    fn outpoint_n(n: u8) -> OutPoint {
+        OutPoint { txid: hash_n(n), vout: 1 }
+    }
+
+    fn coin(value: u64, height: u32) -> ConsCoinEntry {
+        ConsCoinEntry {
+            height,
+            is_coinbase: false,
+            value,
+            script_pubkey: vec![0x00, 0x14, 0xaa, 0xbb],
+        }
+    }
+
+    /// `flush_with_tip` must persist BOTH the cached UTXO mutations and the
+    /// best-block (tip) pointer, and must drain the cache afterwards.
+    #[test]
+    fn flush_with_tip_persists_utxos_and_tip_together() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let op = outpoint_n(7);
+        let tip = hash_n(42);
+
+        {
+            let mut view = store.utxo_view();
+            view.add_utxo(&op, coin(500_000, 948_293));
+            assert_eq!(view.cache_len(), 1);
+            view.flush_with_tip(&tip, 948_293).expect("flush_with_tip");
+            // Cache drained after flush.
+            assert_eq!(view.cache_len(), 0);
+            assert_eq!(view.estimated_memory(), 0);
+        }
+
+        // UTXO is durable in the DB.
+        let got = store.get_utxo(&op).expect("get_utxo").expect("utxo present");
+        assert_eq!(got.value, 500_000);
+        // Tip pointer is durable in the DB.
+        assert_eq!(store.get_best_block_hash().unwrap(), Some(tip));
+        assert_eq!(store.get_best_height().unwrap(), Some(948_293));
+    }
+
+    /// Regression for the 2026-05-07 mainnet wedge (frozen at height
+    /// 948,304).  Root cause: the connect loop wrote the persisted tip
+    /// pointer eagerly on every block but only flushed the UTXO cache at
+    /// 2 GiB.  A SIGKILL between an eager tip write and the next lazy
+    /// flush left the persisted tip pointing past coins that were never
+    /// written to disk — on restart every block past the tip failed
+    /// `MissingInput`.
+    ///
+    /// This test reproduces the failure mode of the OLD code and proves
+    /// the new `flush_with_tip` path closes it: a coin created at the tip
+    /// height MUST be durable whenever the tip pointer names that height.
+    #[test]
+    fn tip_pointer_never_outruns_durable_utxo_set() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        // Coin created by a tx in "block 948293".
+        let created = outpoint_n(93);
+        let tip_948304 = hash_n(204);
+
+        {
+            let mut view = store.utxo_view();
+            // Connect blocks 948293..948304: add the coin, never hit the
+            // 2 GiB cap, then commit the tip atomically (the fixed path).
+            view.add_utxo(&created, coin(29_220_454, 948_293));
+            view.flush_with_tip(&tip_948304, 948_304).expect("flush");
+        }
+
+        // Simulate a process restart: a fresh view backed by the same DB.
+        let view2 = store.utxo_view();
+
+        // The persisted tip is 948304 ...
+        assert_eq!(store.get_best_height().unwrap(), Some(948_304));
+        assert_eq!(store.get_best_block_hash().unwrap(), Some(tip_948304));
+        // ... and the coin created at 948293 is STILL durably present, so
+        // "block 948305" (which spends it) can connect. Under the old
+        // eager-tip / lazy-flush code this lookup returned None and the
+        // chain wedged forever.
+        let recovered = view2.get_utxo(&created);
+        assert!(
+            recovered.is_some(),
+            "coin created below the persisted tip must survive a restart — \
+             the tip pointer must never be durable without its UTXOs"
+        );
+        assert_eq!(recovered.unwrap().value, 29_220_454);
+    }
+
+    /// `flush_with_tip` must also work (and advance the tip) when the UTXO
+    /// cache happens to be empty — e.g. a shutdown flush right after a
+    /// prior flush already drained the cache. The tip write must NOT be
+    /// silently skipped just because there are no coin mutations.
+    #[test]
+    fn flush_with_tip_advances_tip_even_with_empty_cache() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let tip = hash_n(99);
+        {
+            let mut view = store.utxo_view();
+            assert_eq!(view.cache_len(), 0);
+            view.flush_with_tip(&tip, 950_000).expect("flush empty");
+        }
+        assert_eq!(store.get_best_block_hash().unwrap(), Some(tip));
+        assert_eq!(store.get_best_height().unwrap(), Some(950_000));
+    }
+
+    /// Spending a coin (tombstone `None` in the cache) must be flushed as
+    /// a delete in the same atomic batch as the tip pointer.
+    #[test]
+    fn flush_with_tip_applies_spends_atomically() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let op = outpoint_n(5);
+        // Pre-seed a coin directly into the DB.
+        store
+            .put_utxo(&op, &CoinEntry { height: 1, is_coinbase: false, value: 10, script_pubkey: vec![] })
+            .unwrap();
+        assert!(store.get_utxo(&op).unwrap().is_some());
+
+        {
+            let mut view = store.utxo_view();
+            view.spend_utxo(&op);
+            view.flush_with_tip(&hash_n(1), 2).expect("flush spend");
+        }
+
+        // The spend landed: coin gone, tip advanced.
+        assert!(store.get_utxo(&op).unwrap().is_none());
+        assert_eq!(store.get_best_height().unwrap(), Some(2));
     }
 }
