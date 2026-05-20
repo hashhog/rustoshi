@@ -2259,6 +2259,33 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // UTXO cache for block validation, bounded to 2 GiB
     let mut utxo_view = block_store.utxo_view();
 
+    // Durability bookkeeping for the connect loop.
+    //
+    // The persisted best-block (tip) pointer must NEVER advance ahead of
+    // the durably-flushed UTXO set.  Previously the connect loop wrote the
+    // tip pointer eagerly on every block (`set_best_block`) but only
+    // flushed the UTXO cache when it hit 2 GiB — so a SIGKILL/OOM/crash in
+    // that window left the tip pointing past coins that were never written
+    // to disk, permanently wedging the node on restart (mainnet froze at
+    // height 948,304 on 2026-05-07 — `missing input` on every block past
+    // the un-flushed tip).
+    //
+    // Fix: `utxo_view.flush_with_tip()` writes the coin mutations and the
+    // tip pointer in ONE atomic RocksDB batch (Core's `CCoinsViewDB::
+    // BatchWrite` semantics).  We commit that batch on a block boundary
+    // either when the cache hits its memory cap OR every
+    // `UTXO_FLUSH_INTERVAL_BLOCKS` connected blocks, whichever comes
+    // first.  Between commits the persisted tip simply lags the in-memory
+    // tip; on restart the gap (persisted_tip+1 .. header_tip) is
+    // re-downloaded and re-validated, which is already idempotent.
+    //
+    // 2000 blocks ≈ a few hundred MB of churn at mainnet sizes — small
+    // enough that a crash re-validates only minutes of work, large enough
+    // that the per-batch overhead is negligible during IBD.
+    const UTXO_FLUSH_INTERVAL_BLOCKS: u32 = 2000;
+    // Count of blocks connected since the last durable flush+tip commit.
+    let mut blocks_since_flush: u32 = 0;
+
     // ============================================================
     // MAIN EVENT LOOP
     // ============================================================
@@ -2416,21 +2443,34 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // See `write_block_filter_index` for the Core reference.
                         write_block_filter_index(&block_store, &block, height, &undo);
 
-                        if utxo_view.needs_flush() {
+                        // Durability: advance the persisted tip pointer ONLY
+                        // as part of an atomic UTXO flush, never as a separate
+                        // eager write.  Commit when the cache is full OR every
+                        // UTXO_FLUSH_INTERVAL_BLOCKS blocks. See the
+                        // `flush_with_tip` doc comment and `blocks_since_flush`
+                        // declaration for the wedge this prevents (mainnet
+                        // froze at h=948,304 on 2026-05-07).
+                        blocks_since_flush += 1;
+                        if utxo_view.needs_flush()
+                            || blocks_since_flush >= UTXO_FLUSH_INTERVAL_BLOCKS
+                        {
                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                             let entries = utxo_view.cache_len();
-                            if let Err(e) = utxo_view.flush() {
-                                tracing::error!("UTXO cache flush failed: {}", e);
-                            } else {
-                                tracing::info!(
-                                    "UTXO cache flushed: {} entries, ~{} MiB at height {}",
-                                    entries, cache_mb, height
-                                );
+                            match utxo_view.flush_with_tip(&block_hash, height) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "UTXO+tip flushed atomically: {} entries, ~{} MiB at height {}",
+                                        entries, cache_mb, height
+                                    );
+                                    blocks_since_flush = 0;
+                                }
+                                Err(e) => {
+                                    // Do NOT reset blocks_since_flush — retry
+                                    // on the next block so a transient I/O
+                                    // error cannot strand the tip behind.
+                                    tracing::error!("UTXO+tip atomic flush failed: {}", e);
+                                }
                             }
-                        }
-
-                        if let Err(e) = block_store.set_best_block(&block_hash, height) {
-                            tracing::error!("Failed to update best block: {}", e);
                         }
 
                         {
@@ -2945,23 +2985,35 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // See `write_block_filter_index` for the Core reference.
                                         write_block_filter_index(&block_store, &block, height, &undo);
 
-                                        // Flush UTXO cache if it exceeds the 2 GiB limit
-                                        if utxo_view.needs_flush() {
+                                        // Durability: advance the persisted tip
+                                        // pointer ONLY as part of an atomic UTXO
+                                        // flush, never as a separate eager write.
+                                        // Commit when the cache is full OR every
+                                        // UTXO_FLUSH_INTERVAL_BLOCKS blocks. See
+                                        // the `flush_with_tip` doc comment for the
+                                        // wedge this prevents (mainnet froze at
+                                        // h=948,304 on 2026-05-07 when the eager
+                                        // tip write outran the lazy flush).
+                                        blocks_since_flush += 1;
+                                        if utxo_view.needs_flush()
+                                            || blocks_since_flush >= UTXO_FLUSH_INTERVAL_BLOCKS
+                                        {
                                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                                             let entries = utxo_view.cache_len();
-                                            if let Err(e) = utxo_view.flush() {
-                                                tracing::error!("UTXO cache flush failed: {}", e);
-                                            } else {
-                                                tracing::info!(
-                                                    "UTXO cache flushed: {} entries, ~{} MiB at height {}",
-                                                    entries, cache_mb, height
-                                                );
+                                            match utxo_view.flush_with_tip(&block_hash, height) {
+                                                Ok(()) => {
+                                                    tracing::info!(
+                                                        "UTXO+tip flushed atomically: {} entries, ~{} MiB at height {}",
+                                                        entries, cache_mb, height
+                                                    );
+                                                    blocks_since_flush = 0;
+                                                }
+                                                Err(e) => {
+                                                    // Do NOT reset the counter —
+                                                    // retry on the next block.
+                                                    tracing::error!("UTXO+tip atomic flush failed: {}", e);
+                                                }
                                             }
-                                        }
-
-                                        // Update database tip
-                                        if let Err(e) = block_store.set_best_block(&block_hash, height) {
-                                            tracing::error!("Failed to update best block: {}", e);
                                         }
 
                                         // Update RPC state and clean mempool
@@ -4293,25 +4345,31 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Flush UTXO cache to disk
-    if utxo_view.cache_len() > 0 {
-        let entries = utxo_view.cache_len();
-        let mem_mb = utxo_view.estimated_memory() / (1024 * 1024);
-        match utxo_view.flush() {
-            Ok(()) => tracing::info!("UTXO cache flushed on shutdown: {} entries, ~{} MiB", entries, mem_mb),
-            Err(e) => tracing::error!("Failed to flush UTXO cache on shutdown: {}", e),
-        }
-    }
-
-    // Flush chain state
+    // Flush the UTXO cache AND advance the persisted tip pointer in a
+    // single atomic batch.  This is the same `flush_with_tip` invariant
+    // the connect loop uses: the durable tip must never point past the
+    // durable UTXO set.  Doing the flush and the `set_best_block` as two
+    // separate writes here (the old behaviour) reintroduced the wedge
+    // window if the process died between them.
+    //
+    // NB: a graceful shutdown reaches this code, but a SIGKILL / OOM /
+    // crash does NOT — that is exactly why the connect loop now also
+    // flushes atomically every UTXO_FLUSH_INTERVAL_BLOCKS blocks. This
+    // shutdown flush is the best-effort fast path for clean exits.
     {
         let cs = chain_state.read().await;
-        let _ = block_store.set_best_block(&cs.tip_hash(), cs.tip_height());
-        tracing::debug!(
-            "Chain state flushed: {} at height {}",
-            cs.tip_hash(),
-            cs.tip_height()
-        );
+        let tip_hash = cs.tip_hash();
+        let tip_height = cs.tip_height();
+        drop(cs);
+        let entries = utxo_view.cache_len();
+        let mem_mb = utxo_view.estimated_memory() / (1024 * 1024);
+        match utxo_view.flush_with_tip(&tip_hash, tip_height) {
+            Ok(()) => tracing::info!(
+                "UTXO+tip flushed atomically on shutdown: {} entries, ~{} MiB, tip {} at height {}",
+                entries, mem_mb, tip_hash, tip_height
+            ),
+            Err(e) => tracing::error!("Failed to flush UTXO+tip on shutdown: {}", e),
+        }
     }
 
     // Remove PID file so a subsequent supervisor restart sees a clean state.
