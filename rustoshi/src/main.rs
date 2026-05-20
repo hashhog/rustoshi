@@ -317,11 +317,40 @@ fn resolve_base_datadir(datadir: &str) -> PathBuf {
     PathBuf::from(expanded)
 }
 
+/// Median of a (partial) median-time-past timestamp window.
+///
+/// Mirrors Bitcoin Core `CBlockIndex::GetMedianTimePast` (chain.h):
+/// Core fills a fixed-size buffer by walking `pprev` for up to
+/// `nMedianTimeSpan` (11) steps, **stopping early when `pindex` is null**,
+/// then returns the middle element of the *populated* range. Near genesis
+/// that range is shorter than 11 — Core does not special-case it, it just
+/// medians whatever it has. This helper does the same: it takes the
+/// timestamps already gathered (in any order) and returns the median, or
+/// `None` for an empty slice.
+fn median_time_past(timestamps: &mut [u32]) -> Option<u32> {
+    if timestamps.is_empty() {
+        return None;
+    }
+    timestamps.sort_unstable();
+    Some(timestamps[timestamps.len() / 2])
+}
+
 /// Compute the median-time-past (MTP) of the block at `tip_hash` by walking
-/// 11 ancestors via the block store.  Returns `None` if fewer than 11
-/// ancestors are reachable (genesis-adjacent), in which case callers
-/// should skip the MTP-vs-timestamp check (matches Core's behaviour
-/// when CBlockIndex::GetMedianTimePast walks fewer than the full window).
+/// up to 11 ancestors via the block store.
+///
+/// Returns the median of **whatever ancestor timestamps are reachable** —
+/// the full 11-block window when available, a shorter window when the walk
+/// runs off the front of the chain (genesis-adjacent) or hits a header
+/// that isn't stored. This matches Core's `GetMedianTimePast`, which
+/// likewise medians a partial window rather than refusing to produce a
+/// value.
+///
+/// Returns `None` only when **zero** ancestor headers are reachable, e.g.
+/// when `tip_hash` is the base block of a freshly-loaded assumeUTXO
+/// snapshot whose own header was never downloaded. Callers that connect
+/// blocks past a snapshot base must use [`mtp_for_connect`] instead, which
+/// falls back to the trusted `AssumeutxoData::base_mtp` chainparams
+/// constant in that case.
 fn compute_mtp_via_store(
     block_store: &BlockStore,
     tip_hash: &rustoshi_primitives::Hash256,
@@ -339,17 +368,53 @@ fn compute_mtp_via_store(
                 }
                 current = header.prev_block_hash;
             }
-            _ => return None,
+            // Header not stored (e.g. the parent is below an assumeUTXO
+            // snapshot base): stop the walk here and median what we have,
+            // exactly as Core stops at a null `pprev`.
+            _ => break,
         }
     }
-    if timestamps.len() < MEDIAN_TIME_PAST_WINDOW {
-        // Genesis-adjacent: skip MTP check (Core also has no MTP near
-        // genesis; CBlockIndex::GetMedianTimePast returns at most what's
-        // available, but callers tolerate this near genesis).
-        return None;
+    median_time_past(&mut timestamps)
+}
+
+/// MTP to use as the `IsFinalTx` / `ContextualCheckBlock` `nLockTimeCutoff`
+/// when connecting the block whose parent is `parent_hash`.
+///
+/// This is [`compute_mtp_via_store`] plus the assumeUTXO boundary case.
+/// On a freshly-loaded snapshot node, header sync starts *at* the snapshot
+/// base, so neither the base block nor its 10 ancestors have stored
+/// headers. The first post-snapshot block (e.g. mainnet 944,184) is then
+/// connected with its parent being that header-less base, and
+/// `compute_mtp_via_store` returns `None`.
+///
+/// Before this path existed, the connect loop did `.unwrap_or(0)`, so the
+/// `nLockTimeCutoff` collapsed to `0` and every transaction with a
+/// time-based `nLockTime` in the first post-snapshot block was rejected as
+/// `bad-txns-nonfinal` — wedging the chain at the snapshot base (mainnet
+/// 2026-05-20). Bitcoin Core never hits this because it validates the
+/// whole header chain before activating a snapshot, so the base block's
+/// `CBlockIndex` always has a real `GetMedianTimePast()`.
+///
+/// When the store yields no MTP and `parent_hash` is a configured
+/// assumeUTXO snapshot base, we fall back to the trusted
+/// `AssumeutxoData::base_mtp` chainparams constant (the median of the 11
+/// block timestamps ending at the snapshot base height). Once a few
+/// post-snapshot headers are stored, `compute_mtp_via_store`'s partial
+/// window takes over and converges to the exact 11-block MTP.
+fn mtp_for_connect(
+    block_store: &BlockStore,
+    parent_hash: &rustoshi_primitives::Hash256,
+    params: &rustoshi_consensus::ChainParams,
+) -> Option<u32> {
+    if let Some(mtp) = compute_mtp_via_store(block_store, parent_hash) {
+        return Some(mtp);
     }
-    timestamps.sort_unstable();
-    Some(timestamps[timestamps.len() / 2])
+    // No ancestor headers reachable. If the parent is a trusted assumeUTXO
+    // snapshot base, use its pinned MTP so the first post-snapshot block
+    // validates `IsFinalTx` correctly.
+    params
+        .assumeutxo_for_blockhash(parent_hash)
+        .and_then(|d| d.base_mtp)
 }
 
 /// Pattern C0 (txindex-on-connect): persist a `txid -> block_hash` mapping
@@ -2384,8 +2449,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // a timestamp-based `nLockTime > 0` is rejected
                         // post-CSV (mainnet h>=419,328) — wedged rustoshi's
                         // post-snapshot IBD at h=944,184 on 2026-05-02.
+                        //
+                        // `mtp_for_connect` (not `compute_mtp_via_store`)
+                        // so the FIRST block past an assumeUTXO snapshot
+                        // base — whose parent header was never downloaded
+                        // — uses the trusted `base_mtp` chainparams
+                        // constant instead of collapsing the cutoff to 0
+                        // and rejecting every time-locked tx as
+                        // `bad-txns-nonfinal` (mainnet wedge 2026-05-20:
+                        // block 944,184).
                         let prev_block_mtp =
-                            compute_mtp_via_store(&block_store, &cs.tip_hash())
+                            mtp_for_connect(&block_store, &cs.tip_hash(), &params)
                                 .unwrap_or(0);
                         // f_requested=true: blocks from the IBD block downloader
                         // are actively requested via getdata — no fTooFarAhead guard.
@@ -2905,9 +2979,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // BIP-113: compute parent MTP for
                                         // `is_final_tx`'s `lock_time_cutoff`.
                                         // See validation_interval branch
-                                        // above for full rationale.
+                                        // above for full rationale, including
+                                        // the assumeUTXO snapshot-base case
+                                        // that `mtp_for_connect` handles.
                                         let prev_block_mtp =
-                                            compute_mtp_via_store(&block_store, &cs.tip_hash())
+                                            mtp_for_connect(&block_store, &cs.tip_hash(), &params)
                                                 .unwrap_or(0);
                                         // f_requested=true: blocks from the P2P block downloader
                                         // are actively requested via getdata — no fTooFarAhead guard.
@@ -4674,5 +4750,209 @@ mod tests {
         apply_conf_to_cli(&mut cli, &conf, &raw_argv);
         assert_eq!(cli.rpcuser.as_deref(), Some("carol"));
         assert_eq!(cli.rpcpassword.as_deref(), Some("hunter2"));
+    }
+
+    // =================================================================
+    // Post-assumeUTXO-snapshot connect path: median-time-past (MTP)
+    //
+    // Regression coverage for the mainnet 2026-05-20 wedge: a freshly
+    // loaded assumeUTXO snapshot at height 944,183 froze the chain at the
+    // snapshot base because the first post-snapshot block (944,184) was
+    // rejected `bad-txns-nonfinal`. Root cause: header sync starts *at*
+    // the snapshot base, so neither the base block nor its 10 ancestors
+    // have stored headers; `compute_mtp_via_store` returned `None`, the
+    // connect loop's `.unwrap_or(0)` collapsed the `IsFinalTx`
+    // `nLockTimeCutoff` to 0, and every time-locked tx in 944,184 looked
+    // non-final. The fix: `mtp_for_connect` falls back to the trusted
+    // `AssumeutxoData::base_mtp` chainparams constant.
+    // =================================================================
+
+    use rustoshi_primitives::{BlockHeader, Hash256};
+
+    /// Build a temporary on-disk block store for MTP tests.
+    fn mtp_test_store() -> (tempfile::TempDir, ChainDb) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = ChainDb::open(dir.path()).expect("open db");
+        (dir, db)
+    }
+
+    fn hdr(prev: Hash256, timestamp: u32) -> BlockHeader {
+        BlockHeader {
+            version: 0x2000_0000,
+            prev_block_hash: prev,
+            merkle_root: Hash256::ZERO,
+            timestamp,
+            bits: 0x1702_0684,
+            nonce: 0,
+        }
+    }
+
+    #[test]
+    fn median_time_past_empty_is_none() {
+        assert_eq!(median_time_past(&mut []), None);
+    }
+
+    #[test]
+    fn median_time_past_single_element() {
+        assert_eq!(median_time_past(&mut [1_775_650_208]), Some(1_775_650_208));
+    }
+
+    #[test]
+    fn median_time_past_partial_window_unsorted() {
+        // Core medians whatever it has; input order must not matter.
+        let mut ts = [30u32, 10, 20];
+        assert_eq!(median_time_past(&mut ts), Some(20));
+    }
+
+    #[test]
+    fn median_time_past_full_window_matches_core_944183() {
+        // The 11 block timestamps for heights 944,173..=944,183 (mainnet),
+        // verified against Bitcoin Core `getblockheader`. The median (6th
+        // when sorted) is the MTP of block 944,183 and must equal Core's
+        // reported `mediantime`.
+        let mut ts = [
+            1_775_645_057, // 944173
+            1_775_646_085, // 944174
+            1_775_646_357, // 944175
+            1_775_647_293, // 944176
+            1_775_647_738, // 944177
+            1_775_650_208, // 944178
+            1_775_650_485, // 944179
+            1_775_651_075, // 944180
+            1_775_651_104, // 944181
+            1_775_651_886, // 944182
+            1_775_651_930, // 944183
+        ];
+        assert_eq!(median_time_past(&mut ts), Some(1_775_650_208));
+    }
+
+    #[test]
+    fn compute_mtp_via_store_stops_at_missing_header() {
+        // Two linked headers; the parent of the older one is absent. The
+        // walk must NOT bail out to `None` — it medians the partial window
+        // it could reach, mirroring Core stopping at a null `pprev`.
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+
+        let base_hash = Hash256([7u8; 32]); // header deliberately NOT stored
+        let h1 = hdr(base_hash, 1_775_651_930);
+        let h1_hash = h1.block_hash();
+        let h2 = hdr(h1_hash, 1_775_653_126);
+        let h2_hash = h2.block_hash();
+        store.put_header(&h1_hash, &h1).unwrap();
+        store.put_header(&h2_hash, &h2).unwrap();
+
+        // Walk from h2: reaches h2 + h1, then h1.prev (base) is missing.
+        // Partial median of {1_775_651_930, 1_775_653_126}.
+        assert_eq!(
+            compute_mtp_via_store(&store, &h2_hash),
+            Some(1_775_653_126)
+        );
+    }
+
+    #[test]
+    fn compute_mtp_via_store_zero_headers_is_none() {
+        // The true assumeUTXO boundary: the parent hash has no stored
+        // header at all. `compute_mtp_via_store` must return `None` so
+        // `mtp_for_connect` can fall back to `base_mtp`.
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        assert_eq!(compute_mtp_via_store(&store, &Hash256([9u8; 32])), None);
+    }
+
+    #[test]
+    fn mtp_for_connect_uses_base_mtp_at_snapshot_boundary() {
+        // THE regression test. Parent = the mainnet assumeUTXO snapshot
+        // base (944,183) whose header was never downloaded. The store has
+        // no ancestor headers, so `mtp_for_connect` MUST return the
+        // trusted `base_mtp` chainparams constant instead of `None`.
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::mainnet();
+
+        let snapshot_base = params
+            .assumeutxo_for_height(944_183)
+            .expect("mainnet has a 944183 assumeutxo entry");
+        let base_hash = snapshot_base.blockhash;
+
+        // Pre-fix behaviour: bare `compute_mtp_via_store` -> None -> 0.
+        assert_eq!(compute_mtp_via_store(&store, &base_hash), None);
+
+        // Post-fix behaviour: `mtp_for_connect` recovers the real MTP.
+        let mtp = mtp_for_connect(&store, &base_hash, &params)
+            .expect("snapshot-base MTP must resolve via base_mtp");
+        assert_eq!(mtp, 1_775_650_208);
+        assert_eq!(Some(mtp), snapshot_base.base_mtp);
+    }
+
+    #[test]
+    fn mtp_for_connect_first_post_snapshot_block_is_final_tx() {
+        // End-to-end of the fix: the cutoff that the connect loop hands to
+        // `is_final_tx` for block 944,184. With the bug it was 0 and any
+        // time-locked tx (lock_time >= LOCKTIME_THRESHOLD) was rejected
+        // `bad-txns-nonfinal`; with the fix it is the real MTP and the
+        // same tx is final.
+        use rustoshi_consensus::validation::is_final_tx;
+        use rustoshi_primitives::{OutPoint, Transaction, TxIn, TxOut};
+
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::mainnet();
+        let base_hash = params.assumeutxo_for_height(944_183).unwrap().blockhash;
+
+        // A tx with a time-based nLockTime ~30 min before the base block
+        // and a non-final input sequence (so finality hinges on locktime).
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFE, // not SEQUENCE_FINAL
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1, script_pubkey: vec![] }],
+            lock_time: 1_775_650_000,
+        };
+
+        // Buggy cutoff (compute_mtp_via_store alone -> unwrap_or(0)).
+        let buggy_cutoff = compute_mtp_via_store(&store, &base_hash).unwrap_or(0);
+        assert_eq!(buggy_cutoff, 0);
+        assert!(
+            !is_final_tx(&tx, 944_184, buggy_cutoff),
+            "with the bug, the cutoff is 0 so a real time-locked tx is wrongly non-final"
+        );
+
+        // Fixed cutoff (mtp_for_connect -> base_mtp).
+        let fixed_cutoff = mtp_for_connect(&store, &base_hash, &params).unwrap_or(0);
+        assert_eq!(fixed_cutoff, 1_775_650_208);
+        assert!(
+            is_final_tx(&tx, 944_184, fixed_cutoff),
+            "with the fix, the cutoff is the real MTP so the tx is final \
+             and block 944,184 can connect"
+        );
+    }
+
+    #[test]
+    fn mtp_for_connect_non_snapshot_parent_without_headers_is_none() {
+        // A header-less parent that is NOT a snapshot base must still
+        // yield `None` (no spurious base_mtp). Connect callers then
+        // `.unwrap_or(0)`, which is correct genesis-adjacent behaviour.
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::mainnet();
+        assert_eq!(
+            mtp_for_connect(&store, &Hash256([0x5a; 32]), &params),
+            None
+        );
+    }
+
+    #[test]
+    fn mainnet_944183_assumeutxo_entry_has_base_mtp() {
+        // Guards the chainparams constant the fix depends on.
+        let params = ChainParams::mainnet();
+        let d = params
+            .assumeutxo_for_height(944_183)
+            .expect("mainnet 944183 assumeutxo entry");
+        assert_eq!(d.base_mtp, Some(1_775_650_208));
     }
 }

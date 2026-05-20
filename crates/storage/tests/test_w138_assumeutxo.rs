@@ -295,7 +295,7 @@ fn g10_trailing_data_rejected() {
 // SECTION 3 — AssumeUTXO chainparams + hash check (G11–G15)
 // =====================================================================
 
-/// G11: `AssumeutxoData` struct exposes the 4 mandatory fields.
+/// G11: `AssumeutxoData` struct exposes the mandatory fields.
 #[test]
 fn g11_assumeutxo_data_struct_has_required_fields() {
     let p = ChainParams::mainnet();
@@ -305,6 +305,7 @@ fn g11_assumeutxo_data_struct_has_required_fields() {
     let _hash: Hash256 = d.blockhash;
     let _hs = d.hash_serialized;
     let _ctc: u64 = d.chain_tx_count;
+    let _mtp: Option<u32> = d.base_mtp;
 }
 
 /// G12: mainnet table contains the 4 canonical Core entries.
