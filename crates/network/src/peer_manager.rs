@@ -501,30 +501,29 @@ impl AddressManager {
     /// connections share the same /16 (IPv4) or /32 (IPv6) network group.
     /// Privacy networks (Tor, I2P, CJDNS) are not subject to this restriction.
     ///
-    /// Returns None if no addresses are available.
+    /// Selection has two stages:
+    ///  1. Fast path — drain the `try_queue` hint, which carries freshly
+    ///     learned / preferred-order addresses (DNS seeds, `addr` messages,
+    ///     manual peers).
+    ///  2. Fallback — when the hint queue is empty, re-select from the
+    ///     persistent `known_addrs` store, applying an attempt-count backoff.
+    ///
+    /// The fallback is what makes the AddrMan re-selectable: `try_queue` is a
+    /// one-shot consume queue, so without stage 2 every address would be lost
+    /// forever after one `pop_front()`. Once the queue drained (which happens
+    /// within ~20 min of churn during IBD) `fill_outbound_connections` could
+    /// never open another connection, and with 0 peers no new `addr` messages
+    /// arrive to refill it — a permanent zero-peer deadlock (observed on
+    /// mainnet 2026-05-19: rustoshi wedged 13+ h at h=948304, `peers=0`).
+    /// Bitcoin Core's `AddrMan::Select_` is likewise a non-consuming read of
+    /// the persistent new/tried tables — entries are never dropped on select.
+    ///
+    /// Returns None if no eligible address is available.
     pub fn next_addr_to_try(&mut self, netgroup_manager: &NetGroupManager) -> Option<SocketAddr> {
+        // Stage 1: fast path over the preferred-order hint queue.
         while let Some(addr) = self.try_queue.pop_front() {
-            // Skip banned addresses
-            if self.is_banned(&addr) {
+            if !self.is_addr_eligible(&addr, netgroup_manager) {
                 continue;
-            }
-
-            // Skip already-connected addresses
-            if self.connected.contains(&addr) {
-                continue;
-            }
-
-            // Check network group diversity for IPv4/IPv6 outbound connections
-            // Privacy networks (Tor, I2P, CJDNS) don't need this check as their
-            // addresses are pseudorandom and don't correlate with network topology
-            if !netgroup_manager.is_privacy_network(&addr.ip()) {
-                let netgroup = netgroup_manager.get_group(&addr.ip());
-                let netgroup_bytes = netgroup.as_bytes().to_vec();
-
-                if self.connected_outbound_netgroups.contains(&netgroup_bytes) {
-                    // Already have an outbound in this netgroup, skip
-                    continue;
-                }
             }
 
             // Update attempt metadata
@@ -535,7 +534,87 @@ impl AddressManager {
 
             return Some(addr);
         }
-        None
+
+        // Stage 2: fallback re-selection from the persistent store. Pick the
+        // eligible address whose connect attempt is most overdue (never tried,
+        // or attempted longest ago) so we cycle fairly instead of hammering
+        // one peer. This mirrors Core's AddrMan::Select_ reading the persistent
+        // tables rather than consuming a queue.
+        let now = Instant::now();
+        let mut best: Option<SocketAddr> = None;
+        // Larger key = more overdue. `u64::MAX` for never-attempted addresses.
+        let mut best_key: u64 = 0;
+        for (addr, info) in self.known_addrs.iter() {
+            if !self.is_addr_eligible(addr, netgroup_manager) {
+                continue;
+            }
+            let key = match info.last_attempt {
+                None => u64::MAX,
+                Some(last) => {
+                    // Per-address backoff: an address attempted within the
+                    // backoff window for its current failure streak is not
+                    // yet retryable. Keeps us from spinning on a dead peer
+                    // while still guaranteeing it becomes retryable later.
+                    let since = now.saturating_duration_since(last);
+                    if since < Self::retry_backoff(info.attempt_count) {
+                        continue;
+                    }
+                    since.as_secs()
+                }
+            };
+            if best.is_none() || key > best_key {
+                best = Some(*addr);
+                best_key = key;
+            }
+        }
+
+        if let Some(addr) = best {
+            if let Some(info) = self.known_addrs.get_mut(&addr) {
+                info.last_attempt = Some(now);
+                info.attempt_count += 1;
+            }
+        }
+        best
+    }
+
+    /// Whether `addr` may be dialed right now: not banned, not already
+    /// connected, and (for IPv4/IPv6) not sharing a netgroup with an
+    /// existing outbound connection. Privacy-network addresses skip the
+    /// netgroup check because they don't correlate with network topology.
+    fn is_addr_eligible(&self, addr: &SocketAddr, netgroup_manager: &NetGroupManager) -> bool {
+        if self.is_banned(addr) {
+            return false;
+        }
+        if self.connected.contains(addr) {
+            return false;
+        }
+        if !netgroup_manager.is_privacy_network(&addr.ip()) {
+            let netgroup = netgroup_manager.get_group(&addr.ip());
+            if self
+                .connected_outbound_netgroups
+                .contains(netgroup.as_bytes())
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Backoff window before a previously-attempted address is retryable
+    /// again, growing with the consecutive failure count so dead peers are
+    /// retried progressively less often. Capped at 1 h so even a long-failing
+    /// address eventually re-enters the candidate pool (Core keeps terrible
+    /// entries selectable too — `IsTerrible` only lowers their chance, never
+    /// removes them). A freshly learned address (`attempt_count == 0`) has no
+    /// backoff and is selected immediately.
+    fn retry_backoff(attempt_count: u32) -> Duration {
+        match attempt_count {
+            0 => Duration::from_secs(0),
+            1 => Duration::from_secs(60),
+            2 => Duration::from_secs(5 * 60),
+            3 => Duration::from_secs(15 * 60),
+            _ => Duration::from_secs(60 * 60),
+        }
     }
 
     /// Mark an address as successfully connected (outbound).
@@ -4070,6 +4149,121 @@ mod tests {
             assert_eq!(addr, Some(*expected));
             mgr.mark_outbound_success(expected, &netgroup_mgr);
         }
+    }
+
+    // ── Regression: AddrMan re-selection after try_queue drain ──────────────
+    //
+    // Mainnet incident 2026-05-19: rustoshi wedged 13+ h at h=948304 with
+    // `peers=0`. Root cause: `try_queue` is a one-shot consume queue, so once
+    // it drained (every connect attempt `pop_front`s and never re-queues) the
+    // node could open no further outbound connections, and with 0 peers no
+    // `addr` messages arrived to refill the queue — a permanent deadlock.
+    // `next_addr_to_try` must fall back to re-selecting from the persistent
+    // `known_addrs` store, like Core's non-consuming `AddrMan::Select_`.
+
+    /// After the try_queue is fully drained, a known, non-connected,
+    /// netgroup-free address is still re-selectable from the persistent store.
+    #[test]
+    fn test_addr_reselectable_after_queue_drain() {
+        let mut mgr = AddressManager::new();
+        let ng = NetGroupManager::with_key(12345);
+        // One publicly-routable address (RFC1918 ranges collapse to the same
+        // Unroutable netgroup, which would mask the re-selection behaviour).
+        let addr: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+        mgr.add_dns_addresses(vec![addr]);
+
+        // Stage-1 fast path drains the queue.
+        assert_eq!(mgr.next_addr_to_try(&ng), Some(addr));
+        assert_eq!(mgr.queue_size(), 0, "queue must be drained");
+
+        // The address was attempted but never connected: a fresh attempt is
+        // gated by the failure backoff, so an immediate re-select is None …
+        assert!(
+            mgr.next_addr_to_try(&ng).is_none(),
+            "address within retry backoff must not be re-selected yet"
+        );
+
+        // … but once the backoff has elapsed, stage-2 re-selects it from the
+        // persistent store. Simulate elapsed time by ageing last_attempt.
+        let info = mgr.known_addrs.get_mut(&addr).unwrap();
+        info.last_attempt = Some(Instant::now() - Duration::from_secs(3600));
+        assert_eq!(
+            mgr.next_addr_to_try(&ng),
+            Some(addr),
+            "address must be re-selectable from the persistent store after backoff"
+        );
+    }
+
+    /// The pre-fix failure mode: connect to every known address, disconnect
+    /// them all, and confirm the AddrMan can still hand back a candidate.
+    /// Before the fix this returned None forever (zero-peer deadlock).
+    #[test]
+    fn test_addr_not_starved_after_connect_disconnect_cycle() {
+        let mut mgr = AddressManager::new();
+        let ng = NetGroupManager::with_key(12345);
+        // Distinct /16s so netgroup diversity never blocks the candidates.
+        let addrs: Vec<SocketAddr> = vec![
+            "1.2.3.4:8333".parse().unwrap(),
+            "5.6.7.8:8333".parse().unwrap(),
+            "9.10.11.12:8333".parse().unwrap(),
+        ];
+        mgr.add_dns_addresses(addrs.clone());
+
+        // Connect to all of them (drains the queue), then disconnect all.
+        for _ in &addrs {
+            let picked = mgr.next_addr_to_try(&ng).expect("queue has addresses");
+            mgr.mark_outbound_success(&picked, &ng);
+        }
+        for a in &addrs {
+            mgr.mark_outbound_disconnected(a, &ng);
+        }
+        assert_eq!(mgr.queue_size(), 0, "queue drained by the connect cycle");
+        assert_eq!(mgr.connected_count(), 0, "all peers disconnected");
+
+        // Age last_attempt past the backoff window to model the 45s
+        // maintenance tick firing well after the disconnects.
+        for a in &addrs {
+            mgr.known_addrs.get_mut(a).unwrap().last_attempt =
+                Some(Instant::now() - Duration::from_secs(3600));
+        }
+
+        // The AddrMan must still produce a connectable candidate — this is
+        // exactly what fill_outbound_connections needs to escape peers=0.
+        let recovered = mgr.next_addr_to_try(&ng);
+        assert!(
+            recovered.is_some(),
+            "AddrMan starved: no candidate after connect/disconnect cycle (zero-peer deadlock)"
+        );
+        assert!(addrs.contains(&recovered.unwrap()));
+    }
+
+    /// Banned and currently-connected addresses are still excluded by the
+    /// stage-2 fallback, not just the stage-1 queue path.
+    #[test]
+    fn test_addr_fallback_excludes_banned_and_connected() {
+        let mut mgr = AddressManager::new();
+        let ng = NetGroupManager::with_key(12345);
+        let banned: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+        let connected: SocketAddr = "5.6.7.8:8333".parse().unwrap();
+        mgr.add_dns_addresses(vec![banned, connected]);
+
+        // Drain the queue, then make one banned and one connected.
+        let _ = mgr.next_addr_to_try(&ng);
+        let _ = mgr.next_addr_to_try(&ng);
+        mgr.ban(&banned, Duration::from_secs(3600));
+        mgr.mark_outbound_success(&connected, &ng);
+
+        // Age last_attempt so backoff would otherwise allow re-selection.
+        for a in [banned, connected] {
+            mgr.known_addrs.get_mut(&a).unwrap().last_attempt =
+                Some(Instant::now() - Duration::from_secs(3600));
+        }
+
+        // Neither is eligible: banned is excluded, connected is excluded.
+        assert!(
+            mgr.next_addr_to_try(&ng).is_none(),
+            "stage-2 fallback must exclude banned and connected addresses"
+        );
     }
 
     #[test]
