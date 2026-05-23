@@ -189,6 +189,13 @@ pub struct PeerManagerConfig {
     /// routing (fc00::/8 ULA range); enable only when the host actually
     /// has a working CJDNS interface.
     pub cjdns_reachable: bool,
+    /// Phase B revalidation-harness offline mode. When true the node makes
+    /// NO outbound connections — no anchors, no DNS seeds, no fallback
+    /// peers — and (with `listen` false) accepts none. It advances only via
+    /// the `submitblock` RPC. Set from `--maxconnections=0`. Mirrors Bitcoin
+    /// Core's `-connect=0` + `-dnsseed=0` offline posture; see
+    /// CORE-PARITY-AUDIT/_phase-b-revalidation-harness-plan-2026-05-21.md.
+    pub offline: bool,
 }
 
 impl PeerManagerConfig {
@@ -256,6 +263,7 @@ impl Default for PeerManagerConfig {
             onion_proxy: None,
             i2p_sam: None,
             cjdns_reachable: false,
+            offline: false,
         }
     }
 }
@@ -1253,8 +1261,11 @@ impl PeerManager {
     /// Start the peer manager: resolve DNS seeds, begin connecting, and optionally
     /// start a TCP listener for inbound connections.
     pub async fn start(&mut self) {
-        // Start TCP listener for inbound connections if configured
-        if self.config.listen {
+        // Start TCP listener for inbound connections if configured.
+        // Phase B offline mode also suppresses the inbound listener, so the
+        // shadow node accepts no peers at all (the `offline` early-return
+        // below covers outbound).
+        if self.config.listen && !self.config.offline {
             let listen_addr: SocketAddr =
                 format!("0.0.0.0:{}", self.config.listen_port).parse().unwrap();
             match tokio::net::TcpListener::bind(listen_addr).await {
@@ -1375,6 +1386,19 @@ impl PeerManager {
                     tracing::error!("Failed to bind P2P listener on {}: {}", listen_addr, e);
                 }
             }
+        }
+
+        // Phase B offline mode (`--maxconnections=0`): make no outbound
+        // connections at all — skip anchors, DNS seeds and fallback peers.
+        // The node then advances only when the revalidation harness feeds it
+        // real blocks via `submitblock`. Inbound is separately gated by
+        // `listen` (the harness launches the shadow node without `--listen`).
+        if self.config.offline {
+            tracing::info!(
+                "Offline mode (maxconnections=0): P2P disabled — no DNS \
+                 seeds, no outbound peers. Node advances via submitblock only."
+            );
+            return;
         }
 
         // First, try to connect to anchor peers (block-relay-only)
