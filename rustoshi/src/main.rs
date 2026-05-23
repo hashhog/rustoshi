@@ -2201,6 +2201,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let peer_config = PeerManagerConfig {
         max_outbound_full_relay: cli.maxconnections.saturating_sub(2),
         max_outbound_block_relay: 2, // Block-relay-only anchors for eclipse resistance
+        // Phase B: maxconnections=0 is a fully offline node — no DNS seeds,
+        // no outbound peers — that advances only via submitblock.
+        offline: cli.maxconnections == 0,
         listen_port: cli.port.unwrap_or(params.default_port),
         listen: cli.listen,
         peer_bloom_filters: cli.peerbloomfilters,
