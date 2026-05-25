@@ -4401,7 +4401,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Apply the fTooFarAhead anti-DoS gate.  A block submitted via RPC
         // extends the active tip by definition (height = best_height + 1),
         // so the gate can never fire here in practice (1 ≤ MIN_BLOCKS_TO_KEEP).
-        match chain_state.process_block(&block, &mut utxo_view, prev_block_mtp, false) {
+        match chain_state.process_block(&block, &mut utxo_view, prev_block_mtp, false, rustoshi_consensus::current_time_secs()) {
             Ok((undo_data, _fees)) => {
                 // Store header and block data
                 if let Err(e) = store.put_header(&block_hash, &block.header) {
@@ -9506,7 +9506,7 @@ impl RpcServerImpl {
 
         // f_requested=true: generateblock/generatetoaddress blocks are
         // self-mined (trusted path) — no fTooFarAhead guard needed.
-        match chain_state.process_block(&block, &mut utxo_view, prev_block_mtp, true) {
+        match chain_state.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
             Ok((_undo_data, _fees)) => {
                 // Store the raw block bytes (after validation succeeds, matching
                 // submit_block's ordering to avoid persisting invalid data).

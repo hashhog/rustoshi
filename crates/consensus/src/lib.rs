@@ -65,7 +65,7 @@ pub use validation::{
     SequenceLocks, StubChainContext, TransactionSignatureChecker, TxValidationError,
     UndoData, UtxoView, ValidationError,
 };
-pub use chain_state::{ChainState, CompressedScript, UtxoCache};
+pub use chain_state::{current_time_secs, ChainState, CompressedScript, UtxoCache};
 pub use fee_estimator::{FeeEstimator, RawBucketStats};
 pub use mempool::{AtmpOptions, Mempool, MempoolConfig, MempoolEntry, MempoolError};
 pub use orphanage::{
