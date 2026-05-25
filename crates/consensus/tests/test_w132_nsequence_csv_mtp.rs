@@ -598,19 +598,89 @@ fn w132_g25_contextual_check_block_calls_is_final_tx() {
 // G26: contextual_check_block_header wired in production
 // ============================================================
 
-/// **G26 / BUG-11 (P3)** — `contextual_check_block_header`
-/// (validation.rs:914) is the only production caller of the
-/// `ChainContext::get_median_time_past` trait method. The function
-/// itself is dead code; this gap is documented in
-/// `w97_accept_block_gates.rs:192` as G7 with `#[ignore = "G7:
-/// contextual_check_block_header is dead code"]`. BIP-113 block-
-/// timestamp > MTP gate is enforced via a different path
-/// (chain_state.rs:693).
+/// **G26 / BUG-11 (formerly P3)** — `contextual_check_block_header`
+/// (validation.rs:914) is now wired into the production block-acceptance
+/// path as of rustoshi commit 630166f (2026-05-25). This test asserts
+/// the wiring by exercising gate 4 (outdated-version BIP-34) — a block
+/// with `version < 2` at height >= `bip34_height` must be rejected with
+/// `BadVersion`. Companion test in `w97_accept_block_gates.rs` exercises
+/// gate 3 (7200-future); together the two prove gates 3 + 4 of
+/// `contextual_check_block_header` reach the production path.
+///
+/// Header-sync path (`header_sync::process_headers`) wiring is tracked
+/// separately by task #111; this test only covers block-body acceptance.
 #[test]
-#[ignore = "BUG-11 (P3): contextual_check_block_header is dead code in \
-            production. See w97_accept_block_gates.rs:192 G7 ignore."]
 fn w132_g26_contextual_check_block_header_wired() {
-    panic!("BUG-11 P3: contextual_check_block_header is dead in production");
+    use rustoshi_consensus::chain_state::{ChainState, UtxoCache};
+    use rustoshi_consensus::params::ChainParams;
+    use rustoshi_consensus::validation::ValidationError;
+    use rustoshi_primitives::serialize::Encodable;
+    use rustoshi_primitives::{Block, BlockHeader, Hash256, TxOut};
+
+    // Regtest has bip34/bip65/bip66 height = 1 (verified in params.rs).
+    // A block at height 1 with version=1 (less than BIP-34's required 2) must
+    // be rejected with BadVersion(1).
+    let params = ChainParams::regtest();
+    assert_eq!(params.bip34_height, 1, "test predicate: regtest bip34_height == 1");
+    let genesis_hash = params.genesis_hash;
+    let mut state = ChainState::new(genesis_hash, 0, params.clone());
+    let mut cache = UtxoCache::new(|_: &OutPoint| None, 1000);
+
+    // BIP-34: push block height as CScriptNum in coinbase scriptSig.
+    let coinbase_script: Vec<u8> = {
+        let mut s = vec![0x03u8]; // push 3 bytes
+        s.extend_from_slice(&1u32.to_le_bytes()[..3]);
+        s
+    };
+    let coinbase_tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint { txid: Hash256([0u8; 32]), vout: 0xFFFF_FFFF },
+            script_sig: coinbase_script,
+            sequence: 0xFFFF_FFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut { value: 5_000_000_000, script_pubkey: vec![0x51] }],
+        lock_time: 0,
+    };
+    let merkle_root = rustoshi_crypto::sha256d(&{
+        let mut bytes = Vec::new();
+        coinbase_tx.encode(&mut bytes).unwrap();
+        bytes
+    });
+    let mut block = Block {
+        header: BlockHeader {
+            version: 1, // BAD — must be ≥ 2 at bip34_height=1
+            prev_block_hash: genesis_hash,
+            merkle_root,
+            timestamp: 1_700_000_000,
+            bits: 0x207fffff,
+            nonce: 0,
+        },
+        transactions: vec![coinbase_tx],
+    };
+    // Mine regtest PoW.
+    for nonce in 0u32..1_000_000 {
+        block.header.nonce = nonce;
+        if rustoshi_consensus::pow::check_proof_of_work(
+            &block.block_hash().0,
+            block.header.bits,
+            &params,
+        ) {
+            break;
+        }
+    }
+
+    // current_time=0 skips gate 3 (future-time) so we ensure gate 4 fires,
+    // not gate 3. f_requested=true skips fTooFarAhead.
+    let result = state.process_block(&block, &mut cache, 0, true, 0);
+    assert!(
+        matches!(result, Err(ValidationError::BadVersion(1))),
+        "production process_block must reject a block with version=1 at \
+         height=1 (bip34_height=1) via contextual_check_block_header's \
+         outdated-version gate; got: {:?}",
+        result
+    );
 }
 
 // ============================================================

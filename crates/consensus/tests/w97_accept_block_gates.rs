@@ -24,13 +24,14 @@
 //! - OBSERVABILITY:       wrong error string / log / metric
 
 use rustoshi_consensus::chain_state::{ChainState, UtxoCache};
-use rustoshi_consensus::params::{ChainParams, MIN_BLOCKS_TO_KEEP};
+use rustoshi_consensus::params::{ChainParams, MAX_FUTURE_BLOCK_TIME, MIN_BLOCKS_TO_KEEP};
 use rustoshi_consensus::pow::{get_block_proof, ChainWork};
 use rustoshi_consensus::validation::{
     accept_block_header_chain_work, contextual_check_block_header, BlockIndexEntry, ChainContext,
     CoinEntry, ValidationError,
 };
-use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint};
+use rustoshi_primitives::serialize::Encodable;
+use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint, Transaction, TxIn, TxOut};
 use std::collections::HashMap;
 
 // ----------------------------------------------------------------------
@@ -179,26 +180,115 @@ fn g7_helper_rejects_bip94_timewarp_on_testnet4() {
     assert!(matches!(res, Err(ValidationError::TimeTimewarpAttack)));
 }
 
-/// G7 / production-path gap: `contextual_check_block_header` is the
-/// canonical Core-equivalent helper but is NOT called by rustoshi's
-/// `chain_state::process_block` (production block-acceptance path) nor
-/// by `header_sync::process_headers` (production header-acceptance
-/// path).  Until it is wired, this regression test is documentation-
-/// only and ignored.
+/// G7 / production-path wiring assertion: `contextual_check_block_header`
+/// must be invoked from `chain_state::process_block` so the 7200-future,
+/// BIP-94 timewarp, and outdated-version gates fire on the
+/// production block-acceptance path.
+///
+/// Wiring landed 2026-05-25 in chain_state.rs:497 (see
+/// `CORE-PARITY-AUDIT/_bug-reports/rustoshi-contextual-check-block-
+/// header-dead-code-2026-05-24.md` for the bug report and rustoshi
+/// commit 630166f for the fix). This test exercises gate 3 (7200-future
+/// `time-too-new`) on the production path. If the gate is unwired the
+/// block is accepted; if wired the block is rejected with
+/// `ValidationError::TimeTooNew`.
+///
+/// Header-sync path (`header_sync::process_headers`) is a separate
+/// wiring gap tracked by task #111; this test only asserts the
+/// block-body acceptance path which is the exploitable one.
 ///
 /// Severity: CONSENSUS-DIVERGENT (bad-version / BIP-94 timewarp /
 /// 7200-future are silently skipped on every header rustoshi accepts).
 #[test]
-#[ignore = "G7: contextual_check_block_header is dead code — see validation.rs:883 / lib.rs:61"]
 fn g7_contextual_check_block_header_is_wired_into_production() {
-    // When wired, this test should assert that the production path
-    // rejects a block whose header has version<4 at bip65_height.
-    // We assert false to ensure that flipping #[ignore] fails until
-    // wiring is in place.
+    // Build a coinbase-only block at height 1 with a timestamp
+    // MAX_FUTURE_BLOCK_TIME + 100s past `current_time`. Everything else
+    // (PoW, coinbase shape, merkle root) is valid so `check_block` passes
+    // and execution reaches `contextual_check_block_header`.
+    let params = ChainParams::regtest();
+    let genesis_hash = params.genesis_hash;
+    let mut state = ChainState::new(genesis_hash, 0, params);
+    let mut cache = UtxoCache::new(|_: &OutPoint| None, 1000);
+
+    let current_time: u64 = 1_700_000_000;
+    let future_ts = (current_time + MAX_FUTURE_BLOCK_TIME + 100) as u32;
+    let mut block = make_future_dated_coinbase_block(genesis_hash, 1, future_ts);
+    // Mine regtest PoW (max target — ~50% of nonces pass; usually <8 attempts).
+    let regtest = ChainParams::regtest();
+    for nonce in 0u32..1_000_000 {
+        block.header.nonce = nonce;
+        if rustoshi_consensus::pow::check_proof_of_work(
+            &block.block_hash().0,
+            block.header.bits,
+            &regtest,
+        ) {
+            break;
+        }
+    }
+
+    let result = state.process_block(&block, &mut cache, 0, true, current_time);
     assert!(
-        false,
-        "rustoshi has no production caller of contextual_check_block_header"
+        matches!(result, Err(ValidationError::TimeTooNew)),
+        "production process_block must reject a block timestamped {} \
+         ({}h past current_time {}); got: {:?}",
+        future_ts,
+        (future_ts as u64 - current_time) / 3600,
+        current_time,
+        result
     );
+    // Also confirm process_block with current_time=0 (skip future gate)
+    // does NOT reject for TimeTooNew — proves the gate is gated on
+    // current_time and not always-on. The block may still fail for some
+    // other downstream reason, but it must NOT be TimeTooNew.
+    let result_skip = state.process_block(&block, &mut cache, 0, true, 0);
+    assert!(
+        !matches!(result_skip, Err(ValidationError::TimeTooNew)),
+        "with current_time=0 the 7200-future gate must be skipped; got: {:?}",
+        result_skip
+    );
+}
+
+/// Helper for `g7_contextual_check_block_header_is_wired_into_production`:
+/// build a coinbase-only block at the given height with an arbitrary header
+/// timestamp. Mirrors the `make_coinbase_block` helper in w105_checkqueue.rs.
+fn make_future_dated_coinbase_block(prev_hash: Hash256, height: u32, timestamp: u32) -> Block {
+    // BIP-34: push block height as CScriptNum in coinbase scriptSig.
+    let coinbase_script: Vec<u8> = {
+        let mut s = vec![0x03u8]; // push 3 bytes
+        let h = height.to_le_bytes();
+        s.extend_from_slice(&h[..3]);
+        s
+    };
+    let coinbase_tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint { txid: Hash256([0u8; 32]), vout: 0xFFFF_FFFF },
+            script_sig: coinbase_script,
+            sequence: 0xFFFF_FFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: 5_000_000_000,
+            script_pubkey: vec![0x51], // OP_1
+        }],
+        lock_time: 0,
+    };
+    let merkle_root = rustoshi_crypto::sha256d(&{
+        let mut bytes = Vec::new();
+        coinbase_tx.encode(&mut bytes).unwrap();
+        bytes
+    });
+    Block {
+        header: BlockHeader {
+            version: 0x20000000,
+            prev_block_hash: prev_hash,
+            merkle_root,
+            timestamp,
+            bits: 0x207fffff, // regtest max target — any nonce passes PoW
+            nonce: 0,
+        },
+        transactions: vec![coinbase_tx],
+    }
 }
 
 /// G3 / G6: BLOCK_FAILED_VALID short-circuit.
