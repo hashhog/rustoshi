@@ -937,7 +937,7 @@ fn run_import_from_blk_files(
 
         // Validate and process (f_requested=true: import-from-Core-datadir is
         // a requested/trusted path — no fTooFarAhead guard needed).
-        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true) {
+        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
             Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", height, e);
@@ -1123,7 +1123,7 @@ fn run_import_from_stdin(
 
         // Validate and process (f_requested=true: snapshot-import is a
         // requested/trusted path — no fTooFarAhead guard needed).
-        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true) {
+        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
             Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", frame_height, e);
@@ -2466,7 +2466,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 .unwrap_or(0);
                         // f_requested=true: blocks from the IBD block downloader
                         // are actively requested via getdata — no fTooFarAhead guard.
-                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true) {
+                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
                             Ok((undo, _fees)) => Some(undo),
                             Err(e) => {
                                 tracing::warn!(
@@ -2990,7 +2990,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 .unwrap_or(0);
                                         // f_requested=true: blocks from the P2P block downloader
                                         // are actively requested via getdata — no fTooFarAhead guard.
-                                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true) {
+                                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
                                             Ok((undo, _fees)) => Some(undo),
                                             Err(e) => {
                                                 tracing::warn!(
