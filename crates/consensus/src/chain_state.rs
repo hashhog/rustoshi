@@ -26,12 +26,26 @@
 
 use crate::params::{ChainParams, MEDIAN_TIME_PAST_WINDOW, MIN_BLOCKS_TO_KEEP};
 use crate::validation::{
-    check_block, connect_block_with_sequence_locks, contextual_check_block, disconnect_block,
-    BlockIndexEntry, CoinEntry, DisconnectResult, SequenceLockContext, StubChainContext,
-    UndoData, UtxoView, ValidationError,
+    check_block, connect_block_with_sequence_locks, contextual_check_block,
+    contextual_check_block_header, disconnect_block, BlockIndexEntry, CoinEntry, DisconnectResult,
+    SequenceLockContext, StubChainContext, UndoData, UtxoView, ValidationError,
 };
 use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Wall-clock seconds since UNIX_EPOCH — production callers of
+/// `process_block` / `process_block_at_height` use this for the future-time
+/// (`time-too-new`) consensus gate. Test callers pass `0` to skip the check
+/// (mirrors `contextual_check_block_header`'s convention at
+/// validation.rs:914).
+#[must_use]
+pub fn current_time_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 // ============================================================
 // COMPRESSED SCRIPT
@@ -398,8 +412,9 @@ impl ChainState {
         utxo_cache: &mut U,
         prev_block_mtp: u32,
         f_requested: bool,
+        current_time: u64,
     ) -> Result<(UndoData, u64), ValidationError> {
-        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None)
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None, current_time)
     }
 
     /// Variant of `process_block` that accepts an explicit `claimed_height`.
@@ -417,8 +432,9 @@ impl ChainState {
         prev_block_mtp: u32,
         f_requested: bool,
         claimed_height: u32,
+        current_time: u64,
     ) -> Result<(UndoData, u64), ValidationError> {
-        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, Some(claimed_height))
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, Some(claimed_height), current_time)
     }
 
     fn process_block_inner<U: UtxoView>(
@@ -428,6 +444,7 @@ impl ChainState {
         prev_block_mtp: u32,
         f_requested: bool,
         claimed_height: Option<u32>,
+        current_time: u64,
     ) -> Result<(UndoData, u64), ValidationError> {
         let hash = block.block_hash();
         let new_height = self.tip_height + 1;
@@ -478,6 +495,40 @@ impl ChainState {
 
         // Context-free validation
         check_block(block, &self.params)?;
+
+        // Contextual HEADER checks (BIP-113 MTP / BIP-94 timewarp / 7200-future
+        // time-too-new / outdated-version BIP-34/66/65). Mirrors Core
+        // `validation.cpp::ContextualCheckBlockHeader` (validation.cpp:4092-4118).
+        // Until 2026-05-24 this function existed at validation.rs:914 but had
+        // ZERO production callers — see `g7_contextual_check_block_header_is_
+        // wired_into_production` in tests/w97_accept_block_gates.rs and the
+        // `BUG-11` ignored test in tests/test_w132_nsequence_csv_mtp.rs.
+        // CONSENSUS-DIVERGENT: the 7200-future gap was the practically-
+        // exploitable one — rustoshi would accept blocks dated arbitrarily
+        // far in the future, which Core rejects with `time-too-new`.
+        //
+        // We construct a minimal `prev_entry` here because the production path
+        // doesn't carry full block-index state. The only field
+        // `contextual_check_block_header` reads from `prev_entry` is `timestamp`
+        // (and only at BIP-94 retarget boundaries — mainnet-disabled, so the
+        // zero placeholder is safe). MTP comes from the StubChainContext
+        // (returns 0) — the inline check above already enforces it, so the
+        // double check is harmless.
+        let prev_entry = BlockIndexEntry {
+            height: self.tip_height,
+            timestamp: 0,
+            bits: 0,
+            prev_hash: block.header.prev_block_hash,
+            chain_work: [0u8; 32],
+        };
+        contextual_check_block_header(
+            &block.header,
+            new_height,
+            &prev_entry,
+            &StubChainContext,
+            &self.params,
+            current_time,
+        )?;
 
         // Contextual checks (BIP-34 coinbase-height encoding + SegWit
         // witness commitment).  Mirrors Core
@@ -1147,7 +1198,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache, 0, true);
+        let result = state.process_block(&block, &mut cache, 0, true, 0);
 
         assert!(result.is_err());
         match result {
@@ -1237,7 +1288,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache, 0, true);
+        let result = state.process_block(&block, &mut cache, 0, true, 0);
         if let Err(ValidationError::PrevBlockNotFound(h)) = &result {
             panic!(
                 "ChainState::new(snapshot_hash, snapshot_height) did not bind \
@@ -1311,7 +1362,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache, 0, true);
+        let result = state.process_block(&block, &mut cache, 0, true, 0);
 
         // We may get *some* validation error (e.g. the merkle root may be
         // computed differently, or PoW may fail), but we MUST NOT get
@@ -2068,7 +2119,7 @@ mod tests {
         // Recompute merkle root so we don't fail check_block first.
         block.header.merkle_root = block.compute_merkle_root();
 
-        let result = state.process_block(&block, &mut cache, 0, true);
+        let result = state.process_block(&block, &mut cache, 0, true, 0);
         // Either BadWitnessCommitment surfaces, or pow check fires first
         // (depends on regtest params).  We accept either rejection — the
         // critical thing is that the block is NOT silently accepted.
