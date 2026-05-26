@@ -2674,22 +2674,43 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     peer_id,
                                     headers,
                                     &mut |header, height| {
-                                        // BIP-113 future-drift check: reject headers
-                                        // whose timestamp is more than MAX_FUTURE_BLOCK_TIME
-                                        // (7200 s) ahead of our wall clock.  Mirrors Core
-                                        // CheckBlockHeader (validation.cpp).  Previously
-                                        // not enforced — see audit Bug 0a.
-                                        if (header.timestamp as u64)
-                                            > now_secs
-                                                + rustoshi_consensus::params::MAX_FUTURE_BLOCK_TIME
-                                        {
-                                            return Err(format!(
-                                                "time-too-new: header timestamp {} > now {} + {}",
-                                                header.timestamp,
-                                                now_secs,
-                                                rustoshi_consensus::params::MAX_FUTURE_BLOCK_TIME
-                                            ));
-                                        }
+                                        // Canonical header-validation gates: 7200-future
+                                        // (gate 3), BIP-94 timewarp (gate 2, mainnet no-op),
+                                        // outdated-version BIP-34/65/66 (gate 4). Routes
+                                        // through contextual_check_block_header — the same
+                                        // helper now wired into chain_state::process_block
+                                        // (rustoshi commit 630166f). Closes the header-side
+                                        // half of G7/BUG-11. Until 2026-05-25 the
+                                        // future-time check was inlined here as a workaround
+                                        // for "audit Bug 0a" because the helper was dead
+                                        // code; now it's not.
+                                        //
+                                        // We use StubChainContext (MTP=0) so gate 1 is a
+                                        // no-op here; the REAL MTP enforcement stays inline
+                                        // below where we have block_store access to walk
+                                        // ancestors via compute_mtp_via_store. prev_entry
+                                        // fields are placeholders — only `timestamp` is
+                                        // read by gate 2, and only at BIP-94 retarget
+                                        // boundaries (mainnet-disabled; on testnet4/regtest
+                                        // the 0 placeholder can't spuriously fire since
+                                        // block_time < (0 - MAX_TIMEWARP=600) is always
+                                        // false for any real block).
+                                        let prev_entry = rustoshi_consensus::BlockIndexEntry {
+                                            height: 0,
+                                            timestamp: 0,
+                                            bits: 0,
+                                            prev_hash: rustoshi_primitives::Hash256::ZERO,
+                                            chain_work: [0u8; 32],
+                                        };
+                                        rustoshi_consensus::contextual_check_block_header(
+                                            header,
+                                            height,
+                                            &prev_entry,
+                                            &rustoshi_consensus::StubChainContext,
+                                            &params,
+                                            now_secs,
+                                        )
+                                        .map_err(|e| format!("{:?}", e))?;
                                         // BIP-113 MTP check: reject headers whose timestamp
                                         // is <= the median-time-past of the previous 11
                                         // blocks. Walks ancestors via block_store.
