@@ -41,7 +41,7 @@ use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, R
 use rustoshi_storage::{
     block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry},
     indexes::BlockFilterIndex,
-    BlockStore, ChainDb,
+    BlockStore, ChainDb, UtxoCacheState,
 };
 
 // ============================================================
@@ -2371,6 +2371,61 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let mut blocks_since_flush: u32 = 0;
 
     // ============================================================
+    // CACHE-PRESSURE FLUSH SCHEDULING (Core parity, follow-up to
+    // CORE-PARITY-AUDIT/_rustoshi-ibd-pace-decay-2026-05-27.md)
+    // ============================================================
+    //
+    // The interval-only schedule above had a pathological corner: once
+    // the in-memory UTXO cache crossed the 2 GiB cap (around h=364k on
+    // mainnet), `needs_flush()` returned `true` on every subsequent
+    // block — and each flush then carried the *full* ~11 M-entry batch
+    // (43-87 min wall-clock). We had to wait for `blocks_since_flush`
+    // to reset on every single block until the saw-tooth stabilised,
+    // which it never did.
+    //
+    // Core avoids this by using a three-level cache-state signal
+    // (`bitcoin-core/src/validation.h:509-516` — Ok/Large/Critical)
+    // plus a 50-70 min periodic flush window
+    // (`validation.cpp:96-97`, `DATABASE_WRITE_INTERVAL_MIN/MAX`).
+    // When the cache enters the LARGE band (≥ 90 % of cap) Core
+    // flushes opportunistically on the next periodic tick, draining
+    // the cache while it is still small enough to flush quickly. The
+    // hard CRITICAL gate is only reached after a sustained burst.
+    //
+    // We mirror that here: flush when ANY of the following is true:
+    //   - the cache is CRITICAL (existing `needs_flush()` semantics —
+    //     must drain before the next block to bound RSS),
+    //   - the cache is LARGE AND at least
+    //     `UTXO_FLUSH_INTERVAL_LARGE_BLOCKS` blocks have been
+    //     connected since the last flush (drain early, while the
+    //     batch is still small enough to flush in ≪ 1 min, before
+    //     the cache climbs into CRITICAL),
+    //   - `blocks_since_flush >= UTXO_FLUSH_INTERVAL_BLOCKS` (the
+    //     pre-existing safety floor — bounds crash re-validation),
+    //   - at least `UTXO_FLUSH_INTERVAL_SECS` of wall-clock has
+    //     elapsed since the last flush AND the cache is non-empty
+    //     (the time-based ceiling, mirrors Core's
+    //     `DATABASE_WRITE_INTERVAL_MIN`).
+    //
+    // We pick 60 min for the time interval — the midpoint of Core's
+    // 50-70 min window. We do not need Core's uniform-random jitter
+    // because we are a single node, not a fleet that needs to avoid
+    // synchronised disk writes.
+    const UTXO_FLUSH_INTERVAL_SECS: u64 = 60 * 60;
+    // Cadence when the cache is in the LARGE band (above the 90 % rung
+    // but still below the hard cap). Empirically the 2 GiB cap holds
+    // ~11 M entries, so the 90 % rung sits around ~10 M entries —
+    // ~5x larger than the cache at h=350k where flushes were still
+    // sub-2-minute. Flushing every 200 blocks while LARGE drains the
+    // cache to 0 about every ~5 % of one full IBD-cap-fill cycle,
+    // which keeps the per-flush batch well under 1 M entries even at
+    // h>=400k. Picked to be ≪ UTXO_FLUSH_INTERVAL_BLOCKS (2000) so
+    // LARGE actually shortens the cadence, but ≫ 1 so we never
+    // collapse into per-block flushes.
+    const UTXO_FLUSH_INTERVAL_LARGE_BLOCKS: u32 = 200;
+    let mut last_flush_instant = std::time::Instant::now();
+
+    // ============================================================
     // MAIN EVENT LOOP
     // ============================================================
     //
@@ -2538,24 +2593,44 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                         // Durability: advance the persisted tip pointer ONLY
                         // as part of an atomic UTXO flush, never as a separate
-                        // eager write.  Commit when the cache is full OR every
-                        // UTXO_FLUSH_INTERVAL_BLOCKS blocks. See the
-                        // `flush_with_tip` doc comment and `blocks_since_flush`
-                        // declaration for the wedge this prevents (mainnet
-                        // froze at h=948,304 on 2026-05-07).
+                        // eager write.  Commit when the cache hits the
+                        // Core-parity LARGE/CRITICAL bands OR every
+                        // UTXO_FLUSH_INTERVAL_BLOCKS blocks OR every
+                        // UTXO_FLUSH_INTERVAL_SECS wall-clock seconds. See
+                        // the `flush_with_tip` doc comment and
+                        // `blocks_since_flush` declaration for the wedge
+                        // this prevents (mainnet froze at h=948,304 on
+                        // 2026-05-07), and `UTXO_FLUSH_INTERVAL_SECS` for
+                        // why we added the LARGE+time triggers (the
+                        // 2026-05-27 IBD pace decay).
                         blocks_since_flush += 1;
-                        if utxo_view.needs_flush()
+                        let cache_state = utxo_view.cache_state();
+                        let time_since_flush = last_flush_instant.elapsed();
+                        // CRITICAL: must drain before next block (Core
+                        // `IF_NEEDED`, validation.cpp:2766). LARGE +
+                        // block-count: shortens the flush cadence so we
+                        // empty the cache before it climbs into CRITICAL
+                        // territory and starts per-block-flushing (the
+                        // 2026-05-27 saw-tooth). Time- and block-count
+                        // triggers: pre-existing safety floors.
+                        let should_flush = cache_state == UtxoCacheState::Critical
+                            || (cache_state == UtxoCacheState::Large
+                                && blocks_since_flush >= UTXO_FLUSH_INTERVAL_LARGE_BLOCKS)
                             || blocks_since_flush >= UTXO_FLUSH_INTERVAL_BLOCKS
-                        {
+                            || (time_since_flush.as_secs() >= UTXO_FLUSH_INTERVAL_SECS
+                                && utxo_view.cache_len() > 0);
+                        if should_flush {
                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                             let entries = utxo_view.cache_len();
                             match utxo_view.flush_with_tip(&block_hash, height) {
                                 Ok(()) => {
                                     tracing::info!(
-                                        "UTXO+tip flushed atomically: {} entries, ~{} MiB at height {}",
-                                        entries, cache_mb, height
+                                        "UTXO+tip flushed atomically: {} entries, ~{} MiB at height {} (state={:?}, blocks={}, age={}s)",
+                                        entries, cache_mb, height, cache_state,
+                                        blocks_since_flush, time_since_flush.as_secs(),
                                     );
                                     blocks_since_flush = 0;
+                                    last_flush_instant = std::time::Instant::now();
                                 }
                                 Err(e) => {
                                     // Do NOT reset blocks_since_flush — retry
@@ -3103,26 +3178,35 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                                         // Durability: advance the persisted tip
                                         // pointer ONLY as part of an atomic UTXO
-                                        // flush, never as a separate eager write.
-                                        // Commit when the cache is full OR every
-                                        // UTXO_FLUSH_INTERVAL_BLOCKS blocks. See
-                                        // the `flush_with_tip` doc comment for the
-                                        // wedge this prevents (mainnet froze at
-                                        // h=948,304 on 2026-05-07 when the eager
-                                        // tip write outran the lazy flush).
+                                        // flush. Multi-trigger Core-parity
+                                        // schedule (CRITICAL / LARGE / block-
+                                        // count / wall-clock) — see the
+                                        // `UTXO_FLUSH_INTERVAL_SECS` block
+                                        // declaration above for the full
+                                        // rationale. Earlier (interval-only)
+                                        // scheduler caused the 2026-05-27 IBD
+                                        // pace decay; eager-tip pattern caused
+                                        // the 2026-05-07 wedge at h=948,304.
                                         blocks_since_flush += 1;
-                                        if utxo_view.needs_flush()
+                                        let cache_state = utxo_view.cache_state();
+                                        let time_since_flush = last_flush_instant.elapsed();
+                                        let should_flush = cache_state == UtxoCacheState::Critical
+                                            || (cache_state == UtxoCacheState::Large && blocks_since_flush > 0)
                                             || blocks_since_flush >= UTXO_FLUSH_INTERVAL_BLOCKS
-                                        {
+                                            || (time_since_flush.as_secs() >= UTXO_FLUSH_INTERVAL_SECS
+                                                && utxo_view.cache_len() > 0);
+                                        if should_flush {
                                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                                             let entries = utxo_view.cache_len();
                                             match utxo_view.flush_with_tip(&block_hash, height) {
                                                 Ok(()) => {
                                                     tracing::info!(
-                                                        "UTXO+tip flushed atomically: {} entries, ~{} MiB at height {}",
-                                                        entries, cache_mb, height
+                                                        "UTXO+tip flushed atomically: {} entries, ~{} MiB at height {} (state={:?}, blocks={}, age={}s)",
+                                                        entries, cache_mb, height, cache_state,
+                                                        blocks_since_flush, time_since_flush.as_secs(),
                                                     );
                                                     blocks_since_flush = 0;
+                                                    last_flush_instant = std::time::Instant::now();
                                                 }
                                                 Err(e) => {
                                                     // Do NOT reset the counter —
