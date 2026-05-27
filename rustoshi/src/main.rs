@@ -1521,9 +1521,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // (datadir + base_datadir already resolved above for PID/log setup)
     tracing::info!("Data directory: {}", datadir.display());
 
-    // Open database
+    // Open database with IBD-tuned RocksDB settings:
+    //   - 512 MiB shared block cache (vs the 64 MiB default in `ChainDb::open`)
+    //   - 64 MiB write buffer per CF, 128 MiB for CF_UTXO
+    //   - 4 background jobs (parallel compaction)
+    //   - level_compaction_dynamic_level_bytes for better space-amp on a
+    //     growing UTXO set
+    //
+    // `ChainDb::open_optimized` was added in March 2026 (commit e8c9ec2,
+    // "rocksdb performance tuning for IBD workloads") but never wired in.
+    // The unoptimized defaults (64 MiB block cache vs ~14 GB chainstate at
+    // height 367k, 1 background job for compaction) caused IBD pace to
+    // decay from ~430 blocks/min → ~30 blocks/min between days 1 and 2
+    // of the 2026-05-26 re-IBD: each 2,000-block flush grew from ~2 min
+    // (h=170k) to ~87 min (h=367k) as the cache filled with 11M entries
+    // and every UTXO lookup missed the 64 MiB cache. Mirrors Bitcoin
+    // Core's default of `DEFAULT_KERNEL_CACHE = 450 MiB` in
+    // `bitcoin-core/src/kernel/caches.h`.
     let db_path = datadir.join("chainstate");
-    let db = Arc::new(ChainDb::open(&db_path)?);
+    let db = Arc::new(ChainDb::open_optimized(&db_path)?);
     let block_store = BlockStore::new(&db);
 
     // Note: if the DB contains stale block data from a previous run that stored
