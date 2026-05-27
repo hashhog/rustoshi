@@ -72,6 +72,12 @@ impl BlockStatus {
     pub fn raw(&self) -> u32 {
         self.0
     }
+
+    /// Construct from a raw flags value (used by the binary on-disk
+    /// decoder in `format_v2::decode_block_index_entry`).
+    pub fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
 }
 
 // ============================================================
@@ -225,19 +231,14 @@ impl<'a> BlockStore<'a> {
         hash: &Hash256,
         entry: &BlockIndexEntry,
     ) -> Result<(), StorageError> {
-        let data =
-            serde_json::to_vec(entry).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data = format_v2::encode_block_index_entry(entry);
         self.db.put_cf(CF_BLOCK_INDEX, hash.as_bytes(), &data)
     }
 
     /// Retrieve a block index entry by hash.
     pub fn get_block_index(&self, hash: &Hash256) -> Result<Option<BlockIndexEntry>, StorageError> {
         match self.db.get_cf(CF_BLOCK_INDEX, hash.as_bytes())? {
-            Some(data) => {
-                let entry: BlockIndexEntry = serde_json::from_slice(&data)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok(Some(entry))
-            }
+            Some(data) => Ok(Some(format_v2::decode_block_index_entry(&data)?)),
             None => Ok(None),
         }
     }
@@ -381,8 +382,7 @@ impl<'a> BlockStore<'a> {
         let cf = self.db.cf_handle(CF_TX_INDEX).ok_or_else(|| {
             StorageError::Corruption(format!("missing column family: {}", CF_TX_INDEX))
         })?;
-        let data =
-            serde_json::to_vec(entry).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data = format_v2::encode_tx_index_entry(entry);
         batch.put_cf(cf, txid.as_bytes(), &data);
         Ok(())
     }
@@ -440,8 +440,7 @@ impl<'a> BlockStore<'a> {
     /// Store a UTXO entry.
     pub fn put_utxo(&self, outpoint: &OutPoint, coin: &CoinEntry) -> Result<(), StorageError> {
         let key = outpoint_key(outpoint);
-        let data =
-            serde_json::to_vec(coin).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data = format_v2::encode_coin_entry(coin);
         self.db.put_cf(CF_UTXO, &key, &data)
     }
 
@@ -449,11 +448,7 @@ impl<'a> BlockStore<'a> {
     pub fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<CoinEntry>, StorageError> {
         let key = outpoint_key(outpoint);
         match self.db.get_cf(CF_UTXO, &key)? {
-            Some(data) => {
-                let coin: CoinEntry = serde_json::from_slice(&data)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok(Some(coin))
-            }
+            Some(data) => Ok(Some(format_v2::decode_coin_entry(&data)?)),
             None => Ok(None),
         }
     }
@@ -474,19 +469,14 @@ impl<'a> BlockStore<'a> {
 
     /// Store undo data for a block.
     pub fn put_undo(&self, hash: &Hash256, undo: &UndoData) -> Result<(), StorageError> {
-        let data =
-            serde_json::to_vec(undo).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data = format_v2::encode_undo_data(undo);
         self.db.put_cf(CF_UNDO, hash.as_bytes(), &data)
     }
 
     /// Retrieve undo data for a block.
     pub fn get_undo(&self, hash: &Hash256) -> Result<Option<UndoData>, StorageError> {
         match self.db.get_cf(CF_UNDO, hash.as_bytes())? {
-            Some(data) => {
-                let undo: UndoData = serde_json::from_slice(&data)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok(Some(undo))
-            }
+            Some(data) => Ok(Some(format_v2::decode_undo_data(&data)?)),
             None => Ok(None),
         }
     }
@@ -500,19 +490,14 @@ impl<'a> BlockStore<'a> {
 
     /// Store a transaction index entry.
     pub fn put_tx_index(&self, txid: &Hash256, entry: &TxIndexEntry) -> Result<(), StorageError> {
-        let data =
-            serde_json::to_vec(entry).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data = format_v2::encode_tx_index_entry(entry);
         self.db.put_cf(CF_TX_INDEX, txid.as_bytes(), &data)
     }
 
     /// Retrieve a transaction index entry.
     pub fn get_tx_index(&self, txid: &Hash256) -> Result<Option<TxIndexEntry>, StorageError> {
         match self.db.get_cf(CF_TX_INDEX, txid.as_bytes())? {
-            Some(data) => {
-                let entry: TxIndexEntry = serde_json::from_slice(&data)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok(Some(entry))
-            }
+            Some(data) => Ok(Some(format_v2::decode_tx_index_entry(&data)?)),
             None => Ok(None),
         }
     }
@@ -601,7 +586,7 @@ impl<'a> BlockStore<'a> {
             hash_bytes.copy_from_slice(&key);
             let hash = Hash256(hash_bytes);
 
-            let entry: BlockIndexEntry = serde_json::from_slice(&value).ok()?;
+            let entry = format_v2::decode_block_index_entry(&value).ok()?;
             Some((hash, entry))
         }))
     }
@@ -824,6 +809,295 @@ fn outpoint_key(outpoint: &OutPoint) -> Vec<u8> {
     key
 }
 
+/// Re-export of the v2 binary `CoinEntry` codec for crate-local callers
+/// (`utxo_cache::CoinsViewDB`) that need to read/write coins without
+/// going through `BlockStore::put_utxo` / `get_utxo`. Kept narrow on
+/// purpose — outside the storage crate, callers should use the
+/// `BlockStore` API and stay format-agnostic.
+pub(crate) mod coin_entry_format_v2 {
+    pub use super::format_v2::{decode_coin_entry, encode_coin_entry};
+}
+
+/// Decode a raw `CF_UTXO` value bytes into a `CoinEntry`.
+///
+/// Public escape hatch for downstream crates (`rustoshi-rpc`'s
+/// `dumptxoutset` + `gettxoutsetinfo`) that need to iterate the UTXO
+/// column family directly via `ChainDb::iter_cf(CF_UTXO)` for
+/// streaming reasons rather than going through `BlockStore::get_utxo`
+/// per key. Wraps the private `format_v2::decode_coin_entry` so the
+/// on-disk encoding stays a single source of truth.
+///
+/// Callers that already hold an `OutPoint` should prefer
+/// `BlockStore::get_utxo` — it stays format-agnostic and uses the
+/// same decoder internally.
+pub fn decode_utxo_value(data: &[u8]) -> Result<CoinEntry, StorageError> {
+    format_v2::decode_coin_entry(data)
+}
+
+// ============================================================
+// FORMAT v2 — BINARY ENCODERS FOR CF_UTXO / CF_BLOCK_INDEX /
+// CF_UNDO / CF_TX_INDEX VALUES
+// ============================================================
+//
+// Previously these values were stored via `serde_json::to_vec`, which
+// was a ~5-10× perf cost vs binary AND ~4× larger on disk (RocksDB
+// then had to compact the bloated SSTs). At h=367k that meant a
+// `flush_with_tip` of 11M CoinEntry values cost ~87 min instead of
+// ~10-15 min.
+//
+// The encoding is hand-rolled rather than `bincode` / `borsh` /
+// `postcard` to (a) avoid pulling in a new dependency for what's a
+// handful of types, (b) match the existing wire-format style in
+// `crates/primitives/src/serialize.rs` (CompactSize + LE primitives),
+// and (c) keep the format inspectable for forensic recovery work.
+//
+// Format is gated by `db::CURRENT_DB_VERSION`; bumping that constant
+// invalidates this encoding and forces a re-IBD via the version-check
+// in `ChainDb::check_and_init_version`.
+//
+// The encoders panic on `Vec` writes (which `io::Write` for `Vec` can
+// never fail on); the decoders surface short / malformed input as
+// `StorageError::Serialization`.
+pub(crate) mod format_v2 {
+    use super::{
+        BlockIndexEntry, BlockStatus, CoinEntry, Hash256, StorageError, TxIndexEntry, UndoData,
+    };
+    use rustoshi_primitives::{compact_size_len, read_compact_size, write_compact_size};
+    use std::io::{Cursor, Read};
+
+    // -------- CoinEntry --------
+    //
+    // height       u32 LE        (4 bytes)
+    // flags        u8            (1 byte; bit 0 = is_coinbase)
+    // value        u64 LE        (8 bytes)
+    // script_pk    CompactSize len + bytes
+    //
+    // Fixed prefix is 13 bytes; total for a typical 25-byte P2PKH
+    // scriptPubKey: 13 + 1 + 25 = 39 bytes (vs ~140-180 for JSON).
+
+    const COIN_ENTRY_FIXED_PREFIX: usize = 4 + 1 + 8;
+
+    pub fn coin_entry_size(coin: &CoinEntry) -> usize {
+        COIN_ENTRY_FIXED_PREFIX
+            + compact_size_len(coin.script_pubkey.len() as u64)
+            + coin.script_pubkey.len()
+    }
+
+    pub fn encode_coin_entry(coin: &CoinEntry) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(coin_entry_size(coin));
+        buf.extend_from_slice(&coin.height.to_le_bytes());
+        let flags: u8 = if coin.is_coinbase { 1 } else { 0 };
+        buf.push(flags);
+        buf.extend_from_slice(&coin.value.to_le_bytes());
+        write_compact_size(&mut buf, coin.script_pubkey.len() as u64)
+            .expect("Vec writes never fail");
+        buf.extend_from_slice(&coin.script_pubkey);
+        buf
+    }
+
+    pub fn decode_coin_entry(data: &[u8]) -> Result<CoinEntry, StorageError> {
+        let mut cursor = Cursor::new(data);
+        decode_coin_entry_from(&mut cursor)
+    }
+
+    fn decode_coin_entry_from<R: Read>(reader: &mut R) -> Result<CoinEntry, StorageError> {
+        let mut u32_buf = [0u8; 4];
+        reader.read_exact(&mut u32_buf).map_err(io_err)?;
+        let height = u32::from_le_bytes(u32_buf);
+
+        let mut flag_buf = [0u8; 1];
+        reader.read_exact(&mut flag_buf).map_err(io_err)?;
+        // Reject unknown flag bits so an accidental v1→v2 read of a
+        // JSON byte (which starts with `{` = 0x7B) gets rejected
+        // *immediately* rather than producing a plausible-looking
+        // CoinEntry with garbage values.
+        if flag_buf[0] & !0x01 != 0 {
+            return Err(StorageError::Serialization(format!(
+                "CoinEntry: unknown flag bits 0x{:02x} (only bit 0 is defined)",
+                flag_buf[0]
+            )));
+        }
+        let is_coinbase = flag_buf[0] & 0x01 != 0;
+
+        let mut u64_buf = [0u8; 8];
+        reader.read_exact(&mut u64_buf).map_err(io_err)?;
+        let value = u64::from_le_bytes(u64_buf);
+
+        let script_len = read_compact_size(reader).map_err(io_err)? as usize;
+        // 10 MiB cap on a single scriptPubKey; mainnet maxes out at
+        // ~10 KB so this is hugely generous and just stops a corrupted
+        // varint from triggering a multi-GB allocation.
+        if script_len > 10 * 1024 * 1024 {
+            return Err(StorageError::Serialization(format!(
+                "CoinEntry: scriptPubKey length {} exceeds 10 MiB cap",
+                script_len
+            )));
+        }
+        let mut script_pubkey = vec![0u8; script_len];
+        reader.read_exact(&mut script_pubkey).map_err(io_err)?;
+
+        Ok(CoinEntry {
+            height,
+            is_coinbase,
+            value,
+            script_pubkey,
+        })
+    }
+
+    // -------- BlockIndexEntry --------
+    //
+    // Fixed 92 bytes (no variable-length fields):
+    //   height     u32 LE   (4)
+    //   status     u32 LE   (4)
+    //   n_tx       u32 LE   (4)
+    //   timestamp  u32 LE   (4)
+    //   bits       u32 LE   (4)
+    //   nonce      u32 LE   (4)
+    //   version    i32 LE   (4)
+    //   prev_hash  [u8; 32] (32)
+    //   chain_work [u8; 32] (32)
+
+    pub const BLOCK_INDEX_ENTRY_SIZE: usize = 4 * 7 + 32 + 32;
+
+    pub fn encode_block_index_entry(entry: &BlockIndexEntry) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(BLOCK_INDEX_ENTRY_SIZE);
+        buf.extend_from_slice(&entry.height.to_le_bytes());
+        buf.extend_from_slice(&entry.status.raw().to_le_bytes());
+        buf.extend_from_slice(&entry.n_tx.to_le_bytes());
+        buf.extend_from_slice(&entry.timestamp.to_le_bytes());
+        buf.extend_from_slice(&entry.bits.to_le_bytes());
+        buf.extend_from_slice(&entry.nonce.to_le_bytes());
+        buf.extend_from_slice(&entry.version.to_le_bytes());
+        buf.extend_from_slice(entry.prev_hash.as_bytes());
+        buf.extend_from_slice(&entry.chain_work);
+        debug_assert_eq!(buf.len(), BLOCK_INDEX_ENTRY_SIZE);
+        buf
+    }
+
+    pub fn decode_block_index_entry(data: &[u8]) -> Result<BlockIndexEntry, StorageError> {
+        if data.len() != BLOCK_INDEX_ENTRY_SIZE {
+            return Err(StorageError::Serialization(format!(
+                "BlockIndexEntry: expected {} bytes, got {}",
+                BLOCK_INDEX_ENTRY_SIZE,
+                data.len()
+            )));
+        }
+        // Avoid Cursor / read_exact overhead — every byte offset is fixed.
+        let mut u32_buf = [0u8; 4];
+        let mut i32_buf = [0u8; 4];
+        let mut hash_buf = [0u8; 32];
+
+        u32_buf.copy_from_slice(&data[0..4]);
+        let height = u32::from_le_bytes(u32_buf);
+        u32_buf.copy_from_slice(&data[4..8]);
+        let status_raw = u32::from_le_bytes(u32_buf);
+        u32_buf.copy_from_slice(&data[8..12]);
+        let n_tx = u32::from_le_bytes(u32_buf);
+        u32_buf.copy_from_slice(&data[12..16]);
+        let timestamp = u32::from_le_bytes(u32_buf);
+        u32_buf.copy_from_slice(&data[16..20]);
+        let bits = u32::from_le_bytes(u32_buf);
+        u32_buf.copy_from_slice(&data[20..24]);
+        let nonce = u32::from_le_bytes(u32_buf);
+        i32_buf.copy_from_slice(&data[24..28]);
+        let version = i32::from_le_bytes(i32_buf);
+        hash_buf.copy_from_slice(&data[28..60]);
+        let prev_hash = Hash256(hash_buf);
+        let mut chain_work = [0u8; 32];
+        chain_work.copy_from_slice(&data[60..92]);
+
+        Ok(BlockIndexEntry {
+            height,
+            status: BlockStatus::from_raw(status_raw),
+            n_tx,
+            timestamp,
+            bits,
+            nonce,
+            version,
+            prev_hash,
+            chain_work,
+        })
+    }
+
+    // -------- UndoData --------
+    //
+    // compact_size(spent_coins.len())
+    // [each]: encode_coin_entry(coin)
+
+    pub fn encode_undo_data(undo: &UndoData) -> Vec<u8> {
+        let n = undo.spent_coins.len();
+        let coins_size: usize = undo.spent_coins.iter().map(coin_entry_size).sum();
+        let mut buf = Vec::with_capacity(compact_size_len(n as u64) + coins_size);
+        write_compact_size(&mut buf, n as u64).expect("Vec writes never fail");
+        for coin in &undo.spent_coins {
+            buf.extend_from_slice(&encode_coin_entry(coin));
+        }
+        buf
+    }
+
+    pub fn decode_undo_data(data: &[u8]) -> Result<UndoData, StorageError> {
+        let mut cursor = Cursor::new(data);
+        let n = read_compact_size(&mut cursor).map_err(io_err)? as usize;
+        // 10M coins per block is far above any plausible Bitcoin block
+        // (~4M weight units / 100 wu per input = ~40k inputs hard cap).
+        if n > 10_000_000 {
+            return Err(StorageError::Serialization(format!(
+                "UndoData: implausible spent_coins length {}",
+                n
+            )));
+        }
+        let mut spent_coins = Vec::with_capacity(n);
+        for _ in 0..n {
+            spent_coins.push(decode_coin_entry_from(&mut cursor)?);
+        }
+        Ok(UndoData { spent_coins })
+    }
+
+    // -------- TxIndexEntry --------
+    //
+    // Fixed 40 bytes:
+    //   block_hash [u8; 32]
+    //   tx_offset  u32 LE
+    //   tx_length  u32 LE
+
+    pub const TX_INDEX_ENTRY_SIZE: usize = 32 + 4 + 4;
+
+    pub fn encode_tx_index_entry(entry: &TxIndexEntry) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(TX_INDEX_ENTRY_SIZE);
+        buf.extend_from_slice(entry.block_hash.as_bytes());
+        buf.extend_from_slice(&entry.tx_offset.to_le_bytes());
+        buf.extend_from_slice(&entry.tx_length.to_le_bytes());
+        debug_assert_eq!(buf.len(), TX_INDEX_ENTRY_SIZE);
+        buf
+    }
+
+    pub fn decode_tx_index_entry(data: &[u8]) -> Result<TxIndexEntry, StorageError> {
+        if data.len() != TX_INDEX_ENTRY_SIZE {
+            return Err(StorageError::Serialization(format!(
+                "TxIndexEntry: expected {} bytes, got {}",
+                TX_INDEX_ENTRY_SIZE,
+                data.len()
+            )));
+        }
+        let mut hash_buf = [0u8; 32];
+        hash_buf.copy_from_slice(&data[0..32]);
+        let mut u32_buf = [0u8; 4];
+        u32_buf.copy_from_slice(&data[32..36]);
+        let tx_offset = u32::from_le_bytes(u32_buf);
+        u32_buf.copy_from_slice(&data[36..40]);
+        let tx_length = u32::from_le_bytes(u32_buf);
+        Ok(TxIndexEntry {
+            block_hash: Hash256(hash_buf),
+            tx_offset,
+            tx_length,
+        })
+    }
+
+    fn io_err(e: std::io::Error) -> StorageError {
+        StorageError::Serialization(e.to_string())
+    }
+}
+
 // ============================================================
 // UTXO VIEW FOR BLOCK STORE
 // ============================================================
@@ -924,8 +1198,7 @@ impl<'a> BlockStoreUtxoView<'a> {
             let key = outpoint_key(&outpoint);
             match coin {
                 Some(c) => {
-                    let data = serde_json::to_vec(&c)
-                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                    let data = format_v2::encode_coin_entry(&c);
                     batch.put_cf(cf, &key, &data);
                 }
                 None => {
@@ -1209,5 +1482,253 @@ mod flush_with_tip_tests {
         // The spend landed: coin gone, tip advanced.
         assert!(store.get_utxo(&op).unwrap().is_none());
         assert_eq!(store.get_best_height().unwrap(), Some(2));
+    }
+}
+
+// ============================================================
+// FORMAT v2 ROUNDTRIP TESTS
+// ============================================================
+//
+// Pinning the on-disk encoding so a future refactor that breaks the
+// bytes-on-disk shape (e.g. reorders fields, changes endianness, drops
+// a flag bit) fails the test suite BEFORE it ships and silently
+// corrupts every operator's chainstate.
+
+#[cfg(test)]
+mod format_v2_tests {
+    use super::*;
+
+    fn make_coin(value: u64, script: Vec<u8>, is_coinbase: bool) -> CoinEntry {
+        CoinEntry {
+            height: 12345,
+            is_coinbase,
+            value,
+            script_pubkey: script,
+        }
+    }
+
+    #[test]
+    fn coin_entry_roundtrip_minimal() {
+        let coin = make_coin(0, Vec::new(), false);
+        let bytes = format_v2::encode_coin_entry(&coin);
+        // 4 (height) + 1 (flags) + 8 (value) + 1 (compact_size 0) = 14 bytes
+        assert_eq!(bytes.len(), 14);
+        assert_eq!(bytes.len(), format_v2::coin_entry_size(&coin));
+        let decoded = format_v2::decode_coin_entry(&bytes).expect("roundtrip");
+        assert_eq!(decoded, coin);
+    }
+
+    #[test]
+    fn coin_entry_roundtrip_typical_p2pkh() {
+        // 25-byte P2PKH scriptPubKey: OP_DUP OP_HASH160 <20B push> <20B hash> OP_EQUALVERIFY OP_CHECKSIG
+        let script = vec![
+            0x76, 0xa9, 0x14, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x88, 0xac,
+        ];
+        assert_eq!(script.len(), 25);
+        let coin = make_coin(50_000_000, script, true);
+        let bytes = format_v2::encode_coin_entry(&coin);
+        // 4 + 1 + 8 + 1 (compact_size for 25) + 25 = 39 bytes
+        assert_eq!(bytes.len(), 39);
+        let decoded = format_v2::decode_coin_entry(&bytes).expect("roundtrip");
+        assert_eq!(decoded, coin);
+    }
+
+    #[test]
+    fn coin_entry_roundtrip_large_script() {
+        // 500-byte script (triggers CompactSize 0xFD prefix)
+        let script = vec![0xab; 500];
+        let coin = make_coin(u64::MAX, script, false);
+        let bytes = format_v2::encode_coin_entry(&coin);
+        // 4 + 1 + 8 + 3 (compact_size 0xFD + u16 LE for 500) + 500 = 516 bytes
+        assert_eq!(bytes.len(), 516);
+        let decoded = format_v2::decode_coin_entry(&bytes).expect("roundtrip");
+        assert_eq!(decoded, coin);
+    }
+
+    #[test]
+    fn coin_entry_is_coinbase_flag_preserved() {
+        let coinbase = make_coin(50_0000_0000, vec![0x51], true);
+        let regular = make_coin(50_0000_0000, vec![0x51], false);
+        let cb_bytes = format_v2::encode_coin_entry(&coinbase);
+        let rg_bytes = format_v2::encode_coin_entry(&regular);
+        assert_ne!(cb_bytes, rg_bytes, "coinbase flag must affect bytes");
+        // Flag byte is at offset 4 (after height u32 LE).
+        assert_eq!(cb_bytes[4], 0x01);
+        assert_eq!(rg_bytes[4], 0x00);
+    }
+
+    #[test]
+    fn coin_entry_rejects_v1_json_blob() {
+        // A v1 serde_json blob starts with `{` = 0x7B. The high bits of
+        // 0x7B include bit 1, bit 3, bit 4, bit 5, bit 6 — all undefined
+        // in our flag byte. The decoder MUST refuse rather than misread
+        // a JSON byte as the height field.
+        let v1_blob = br#"{"height":12345,"is_coinbase":false,"value":50000000,"script_pubkey":[81]}"#;
+        // First 4 bytes get interpreted as a u32 height (junk but legal).
+        // Byte 5 is `:` = 0x3A which has unknown flag bits set → rejected.
+        let res = format_v2::decode_coin_entry(v1_blob);
+        assert!(
+            res.is_err(),
+            "decoder must reject v1 JSON blob; got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn coin_entry_rejects_truncated_input() {
+        let coin = make_coin(0, vec![1, 2, 3], false);
+        let bytes = format_v2::encode_coin_entry(&coin);
+        for cut in 0..bytes.len() {
+            let res = format_v2::decode_coin_entry(&bytes[..cut]);
+            assert!(res.is_err(), "must reject {} of {} bytes", cut, bytes.len());
+        }
+        // Full-length decodes.
+        assert!(format_v2::decode_coin_entry(&bytes).is_ok());
+    }
+
+    fn make_block_index_entry() -> BlockIndexEntry {
+        let mut status = BlockStatus::new();
+        status.set(BlockStatus::VALID_SCRIPTS);
+        status.set(BlockStatus::HAVE_DATA);
+        status.set(BlockStatus::HAVE_UNDO);
+        BlockIndexEntry {
+            height: 850_000,
+            status,
+            n_tx: 3210,
+            timestamp: 1_700_000_000,
+            bits: 0x1700_0000,
+            nonce: 0xdead_beef,
+            version: 0x2000_0000,
+            prev_hash: Hash256([0x42; 32]),
+            chain_work: [0xab; 32],
+        }
+    }
+
+    #[test]
+    fn block_index_entry_roundtrip() {
+        let entry = make_block_index_entry();
+        let bytes = format_v2::encode_block_index_entry(&entry);
+        assert_eq!(bytes.len(), format_v2::BLOCK_INDEX_ENTRY_SIZE);
+        assert_eq!(bytes.len(), 92);
+        let decoded = format_v2::decode_block_index_entry(&bytes).expect("roundtrip");
+        assert_eq!(decoded.height, entry.height);
+        assert_eq!(decoded.status.raw(), entry.status.raw());
+        assert_eq!(decoded.n_tx, entry.n_tx);
+        assert_eq!(decoded.timestamp, entry.timestamp);
+        assert_eq!(decoded.bits, entry.bits);
+        assert_eq!(decoded.nonce, entry.nonce);
+        assert_eq!(decoded.version, entry.version);
+        assert_eq!(decoded.prev_hash, entry.prev_hash);
+        assert_eq!(decoded.chain_work, entry.chain_work);
+    }
+
+    #[test]
+    fn block_index_entry_rejects_wrong_length() {
+        let mut bytes = format_v2::encode_block_index_entry(&make_block_index_entry());
+        assert!(format_v2::decode_block_index_entry(&bytes).is_ok());
+        bytes.push(0);
+        assert!(format_v2::decode_block_index_entry(&bytes).is_err());
+        bytes.pop();
+        bytes.pop();
+        assert!(format_v2::decode_block_index_entry(&bytes).is_err());
+    }
+
+    #[test]
+    fn block_index_entry_negative_version_preserved() {
+        let mut entry = make_block_index_entry();
+        entry.version = -1; // Pre-BIP9 sentinel
+        let bytes = format_v2::encode_block_index_entry(&entry);
+        let decoded = format_v2::decode_block_index_entry(&bytes).expect("roundtrip");
+        assert_eq!(decoded.version, -1);
+    }
+
+    #[test]
+    fn undo_data_roundtrip_empty() {
+        let undo = UndoData { spent_coins: Vec::new() };
+        let bytes = format_v2::encode_undo_data(&undo);
+        assert_eq!(bytes, vec![0x00]); // compact_size(0)
+        let decoded = format_v2::decode_undo_data(&bytes).expect("roundtrip");
+        assert_eq!(decoded.spent_coins.len(), 0);
+    }
+
+    #[test]
+    fn undo_data_roundtrip_multiple_coins() {
+        let undo = UndoData {
+            spent_coins: vec![
+                make_coin(100, vec![0x51], true),
+                make_coin(200, vec![0x76, 0xa9, 0x14], false),
+                make_coin(50_0000_0000, vec![], false),
+            ],
+        };
+        let bytes = format_v2::encode_undo_data(&undo);
+        let decoded = format_v2::decode_undo_data(&bytes).expect("roundtrip");
+        assert_eq!(decoded.spent_coins, undo.spent_coins);
+    }
+
+    #[test]
+    fn undo_data_rejects_implausible_length() {
+        // compact_size 0xFE = u32-prefix, with value 20_000_000 (>10M cap)
+        let bytes = [0xFE, 0x00, 0x2D, 0x31, 0x01, /* truncated rest */];
+        let res = format_v2::decode_undo_data(&bytes);
+        assert!(res.is_err(), "implausible length must be rejected");
+    }
+
+    fn make_tx_index_entry() -> TxIndexEntry {
+        TxIndexEntry {
+            block_hash: Hash256([0xde; 32]),
+            tx_offset: 0x1234_5678,
+            tx_length: 0xabcd,
+        }
+    }
+
+    #[test]
+    fn tx_index_entry_roundtrip() {
+        let entry = make_tx_index_entry();
+        let bytes = format_v2::encode_tx_index_entry(&entry);
+        assert_eq!(bytes.len(), format_v2::TX_INDEX_ENTRY_SIZE);
+        assert_eq!(bytes.len(), 40);
+        let decoded = format_v2::decode_tx_index_entry(&bytes).expect("roundtrip");
+        assert_eq!(decoded.block_hash, entry.block_hash);
+        assert_eq!(decoded.tx_offset, entry.tx_offset);
+        assert_eq!(decoded.tx_length, entry.tx_length);
+    }
+
+    #[test]
+    fn tx_index_entry_rejects_wrong_length() {
+        let bytes = format_v2::encode_tx_index_entry(&make_tx_index_entry());
+        assert!(format_v2::decode_tx_index_entry(&bytes[..39]).is_err());
+        let mut grown = bytes.clone();
+        grown.push(0);
+        assert!(format_v2::decode_tx_index_entry(&grown).is_err());
+    }
+
+    /// Size delta vs serde_json — pins the perf-relevant outcome so a
+    /// regression that re-introduces JSON encoding (or a CoinEntry
+    /// field bloat) fails CI immediately.
+    ///
+    /// Typical P2PKH coin: v2 = 39 bytes; serde_json = ~140 bytes
+    /// (~3.6× compression). For 11M UTXO entries on disk that's the
+    /// difference between ~1.4 GiB and ~430 MiB of SST data RocksDB
+    /// has to compact every flush — the diagnosis doc's
+    /// "RocksDB chainstate I/O thrash" was driven by exactly this.
+    #[test]
+    fn coin_entry_v2_is_substantially_smaller_than_json() {
+        let coin = make_coin(
+            50_000_000,
+            vec![
+                0x76, 0xa9, 0x14, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+                0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x88, 0xac,
+            ],
+            false,
+        );
+        let v2 = format_v2::encode_coin_entry(&coin);
+        let json = serde_json::to_vec(&coin).expect("json");
+        assert!(
+            v2.len() * 3 <= json.len(),
+            "expected v2 ({}B) to be at least 3× smaller than json ({}B)",
+            v2.len(),
+            json.len()
+        );
     }
 }
