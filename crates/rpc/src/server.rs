@@ -7976,13 +7976,14 @@ impl RustoshiRpcServer for RpcServerImpl {
             vout_bytes.copy_from_slice(&key[32..]);
             let vout = u32::from_be_bytes(vout_bytes);
 
-            let entry: CoinEntry = serde_json::from_slice(&value).map_err(|e| {
-                cleanup_temp(&temp_path);
-                Self::rpc_error(
-                    rpc_error::RPC_DATABASE_ERROR,
-                    format!("UTXO deserialization failed: {}", e),
-                )
-            })?;
+            let entry: CoinEntry =
+                rustoshi_storage::decode_utxo_value(&value).map_err(|e| {
+                    cleanup_temp(&temp_path);
+                    Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("UTXO deserialization failed: {}", e),
+                    )
+                })?;
             let coin = Coin::from_entry(&entry);
             writer
                 .write_coin(&OutPoint { txid, vout }, &coin)
@@ -8213,7 +8214,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 if k.len() < 36 {
                     continue;
                 }
-                let coin: CoinEntry = match serde_json::from_slice(&v) {
+                let coin: CoinEntry = match rustoshi_storage::decode_utxo_value(&v) {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
@@ -9295,13 +9296,14 @@ impl RpcServerImpl {
             vout_bytes.copy_from_slice(&key[32..]);
             let vout = u32::from_be_bytes(vout_bytes);
 
-            let entry: CoinEntry = serde_json::from_slice(&value).map_err(|e| {
-                cleanup_temp(&temp_path);
-                Self::rpc_error(
-                    rpc_error::RPC_DATABASE_ERROR,
-                    format!("UTXO deserialization failed: {}", e),
-                )
-            })?;
+            let entry: CoinEntry =
+                rustoshi_storage::decode_utxo_value(&value).map_err(|e| {
+                    cleanup_temp(&temp_path);
+                    Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("UTXO deserialization failed: {}", e),
+                    )
+                })?;
             let coin = Coin::from_entry(&entry);
             writer
                 .write_coin(&OutPoint { txid, vout }, &coin)

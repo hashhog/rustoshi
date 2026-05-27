@@ -34,7 +34,21 @@ pub const META_PRUNE_HEIGHT: &[u8] = b"prune_height";
 pub const META_DB_VERSION: &[u8] = b"db_version";
 
 /// Current database schema version.
-pub const CURRENT_DB_VERSION: u32 = 1;
+///
+/// Bumped to 2 on 2026-05-27 (perf(storage): binary encoding for
+/// CoinEntry / BlockIndexEntry / UndoData / TxIndexEntry).
+///
+/// Version history:
+/// - 1: original `serde_json::to_vec` encoding for `CoinEntry`,
+///      `BlockIndexEntry`, `UndoData`, `TxIndexEntry` in
+///      `block_store.rs` and `utxo_cache.rs` (~5-10× slower + ~4×
+///      larger on disk than the binary format below).
+/// - 2: hand-rolled binary encoding for all four types
+///      (`block_store::format_v2`). See the `_rustoshi-ibd-pace-decay`
+///      diagnosis doc 2026-05-27 follow-up note for context. Format
+///      is NOT wire-compatible with v1; a v1 chainstate must be
+///      re-IBDed (`rm -rf <datadir>/chainstate`).
+pub const CURRENT_DB_VERSION: u32 = 2;
 
 // ============================================================
 // ERROR TYPES
@@ -62,6 +76,31 @@ pub enum StorageError {
     /// I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// On-disk chainstate format version does not match the binary.
+    ///
+    /// The on-disk encoding for `CoinEntry`, `BlockIndexEntry`, `UndoData`,
+    /// and `TxIndexEntry` changed in `CURRENT_DB_VERSION = 2`
+    /// (perf(storage): binary encoding, 2026-05-27). The new format is
+    /// NOT backwards-compatible with v1 (`serde_json`) data. An operator
+    /// running a v2 binary against a v1 datadir must delete the
+    /// chainstate and re-IBD (`rm -rf <datadir>/chainstate`).
+    ///
+    /// This error is intentionally loud rather than attempting a silent
+    /// in-place migration: silently reading v1 JSON as v2 binary would
+    /// produce corrupted `CoinEntry` lookups and wedge the node with
+    /// `MissingInput` errors during validation.
+    #[error(
+        "chainstate format version mismatch: on-disk = v{on_disk}, binary expects v{expected}. \
+         The chainstate encoding changed in v{expected} and is not backwards-compatible. \
+         Delete the chainstate directory and re-IBD: `rm -rf <datadir>/chainstate`."
+    )]
+    VersionMismatch {
+        /// Version found on disk.
+        on_disk: u32,
+        /// Version this binary expects.
+        expected: u32,
+    },
 }
 
 // ============================================================
@@ -134,10 +173,12 @@ impl ChainDb {
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
-        Ok(Self {
+        let handle = Self {
             db,
             write_batch_count: AtomicU64::new(0),
-        })
+        };
+        handle.check_and_init_version()?;
+        Ok(handle)
     }
 
     /// Drop all data from the blocks column family to reclaim disk space.
@@ -302,9 +343,150 @@ impl ChainDb {
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
-        Ok(Self {
+        let handle = Self {
             db,
             write_batch_count: AtomicU64::new(0),
-        })
+        };
+        handle.check_and_init_version()?;
+        Ok(handle)
+    }
+
+    /// Check the on-disk chainstate format version and either:
+    ///   - write `CURRENT_DB_VERSION` if the DB is fresh (no version key
+    ///     AND no best-block-hash key), OR
+    ///   - succeed silently if the on-disk version matches, OR
+    ///   - return `StorageError::VersionMismatch` if a different version
+    ///     is on disk (i.e. an incompatible chainstate from an older
+    ///     binary — the operator must re-IBD).
+    ///
+    /// This runs at the end of every `open*` call so that callers see a
+    /// loud, actionable error at startup rather than corrupted reads
+    /// later. It uses raw `META_DB_VERSION` (4 bytes LE u32) so the
+    /// check has no dependency on the higher-level `block_store`
+    /// encoders (which are themselves version-gated).
+    fn check_and_init_version(&self) -> Result<(), StorageError> {
+        // Pull both the version key and the best-block key so we can
+        // tell "fresh DB" (neither present) apart from "v1 DB with no
+        // version key" (best-block-hash present but version absent).
+        let version_bytes = self.get_cf(CF_META, META_DB_VERSION)?;
+        let has_data = self.get_cf(CF_META, META_BEST_BLOCK_HASH)?.is_some();
+
+        match version_bytes {
+            Some(bytes) => {
+                if bytes.len() != 4 {
+                    return Err(StorageError::Corruption(format!(
+                        "META_DB_VERSION has invalid length {}: expected 4",
+                        bytes.len()
+                    )));
+                }
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&bytes);
+                let on_disk = u32::from_le_bytes(buf);
+                if on_disk == CURRENT_DB_VERSION {
+                    Ok(())
+                } else {
+                    Err(StorageError::VersionMismatch {
+                        on_disk,
+                        expected: CURRENT_DB_VERSION,
+                    })
+                }
+            }
+            None if has_data => {
+                // Version key absent but data present → this is a v1
+                // chainstate from a binary that predated the version
+                // bump. The on-disk `serde_json` encoding cannot be
+                // safely re-interpreted as the v2 binary encoding;
+                // direct the operator to re-IBD.
+                Err(StorageError::VersionMismatch {
+                    on_disk: 1,
+                    expected: CURRENT_DB_VERSION,
+                })
+            }
+            None => {
+                // Fresh DB: stamp the current version so subsequent
+                // opens go down the matching-version path above.
+                self.put_cf(
+                    CF_META,
+                    META_DB_VERSION,
+                    &CURRENT_DB_VERSION.to_le_bytes(),
+                )?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_check_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A freshly-created DB must be stamped with `CURRENT_DB_VERSION`
+    /// on open, so the next open succeeds via the matching-version
+    /// path rather than re-stamping.
+    #[test]
+    fn fresh_db_gets_stamped_with_current_version() {
+        let dir = TempDir::new().expect("tempdir");
+        {
+            let db = ChainDb::open(dir.path()).expect("first open");
+            let bytes = db
+                .get_cf(CF_META, META_DB_VERSION)
+                .expect("get version")
+                .expect("version key present");
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(&bytes);
+            assert_eq!(u32::from_le_bytes(buf), CURRENT_DB_VERSION);
+        }
+        // Reopen — must succeed without re-stamping.
+        let _ = ChainDb::open(dir.path()).expect("reopen with matching version");
+    }
+
+    /// If the DB on disk has a different version key, open must fail
+    /// with `VersionMismatch` rather than silently misreading entries.
+    #[test]
+    fn mismatched_version_returns_version_mismatch_error() {
+        let dir = TempDir::new().expect("tempdir");
+        // Create a v=99 chainstate by hand.
+        {
+            let db = ChainDb::open(dir.path()).expect("first open");
+            // Overwrite the version key with a forged value.
+            db.put_cf(CF_META, META_DB_VERSION, &99u32.to_le_bytes())
+                .expect("put forged version");
+        }
+        match ChainDb::open(dir.path()) {
+            Err(StorageError::VersionMismatch { on_disk, expected }) => {
+                assert_eq!(on_disk, 99);
+                assert_eq!(expected, CURRENT_DB_VERSION);
+            }
+            Err(other) => panic!("expected VersionMismatch, got {:?}", other),
+            Ok(_) => panic!("expected error, got success"),
+        }
+    }
+
+    /// A DB with data but no version key must be detected as a v1
+    /// chainstate (the pre-v2 binary never wrote the version key) and
+    /// refused with `VersionMismatch { on_disk: 1, expected: 2 }` —
+    /// this is the path operators will hit when upgrading a pre-fix
+    /// binary across a chainstate format bump.
+    #[test]
+    fn legacy_v1_db_without_version_key_returns_mismatch() {
+        let dir = TempDir::new().expect("tempdir");
+        {
+            let db = ChainDb::open(dir.path()).expect("first open");
+            // Simulate v1: drop the version key but seed the best-block
+            // key so the heuristic identifies the DB as non-empty.
+            db.delete_cf(CF_META, META_DB_VERSION)
+                .expect("delete version");
+            db.put_cf(CF_META, META_BEST_BLOCK_HASH, &[0u8; 32])
+                .expect("seed best-block");
+        }
+        match ChainDb::open(dir.path()) {
+            Err(StorageError::VersionMismatch { on_disk, expected }) => {
+                assert_eq!(on_disk, 1);
+                assert_eq!(expected, CURRENT_DB_VERSION);
+            }
+            Err(other) => panic!("expected VersionMismatch, got {:?}", other),
+            Ok(_) => panic!("expected error, got success"),
+        }
     }
 }

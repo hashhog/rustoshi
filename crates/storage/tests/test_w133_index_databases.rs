@@ -474,11 +474,60 @@ fn g24_coinstats_prune_lock_cooperation() {
 
 /// G25 — `TxIndexEntry` on-disk encoding is binary (e.g., 6-12 bytes
 /// for a VARINT-encoded CDiskTxPos), not serde_json (~80-120 bytes).
-/// Status: BUG-20 (xfail).
+///
+/// FIXED 2026-05-27 (perf(storage): binary encoding for
+/// CoinEntry/BlockIndexEntry/UndoData). `TxIndexEntry` now serializes
+/// to a fixed 40-byte layout (32 B block_hash + 4 B tx_offset LE +
+/// 4 B tx_length LE) via `block_store::format_v2::encode_tx_index_entry`.
+/// Still not byte-compatible with Core's `CDiskTxPos` (Core
+/// VARINT-encodes file_number + offset for ~6-12 B), but the JSON
+/// bloat that this gate originally pinned is gone — rustoshi
+/// `TxIndexEntry` storage is 40 B vs the ~140 B JSON form, a ~3.5×
+/// reduction and within ~3-5× of Core's VARINT scheme.
 #[test]
-#[ignore = "BUG-20 xfail: TxIndexEntry stored as serde_json blob, ~10x size vs Core CDiskTxPos"]
 fn g25_tx_index_entry_binary_encoding() {
-    panic!("BUG-20: TxIndexEntry uses serde_json::to_vec on every write");
+    use rustoshi_storage::{BlockStore, ChainDb, TxIndexEntry};
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().expect("tempdir");
+    let db = ChainDb::open(dir.path()).expect("open db");
+    let store = BlockStore::new(&db);
+
+    let txid = Hash256::from_hex(
+        "0000000000000c00901f2049055e2a437c819d79a3d54fd63e6af796cd7b8a79",
+    )
+    .unwrap();
+    let block_hash = Hash256::from_hex(
+        "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054",
+    )
+    .unwrap();
+    let entry = TxIndexEntry {
+        block_hash,
+        tx_offset: 1234,
+        tx_length: 567,
+    };
+    store.put_tx_index(&txid, &entry).expect("put_tx_index");
+
+    let raw = db
+        .get_cf("tx_index", txid.as_bytes())
+        .expect("get_cf")
+        .expect("present");
+
+    // FIXED state: 40 B fixed layout (32 + 4 + 4). JSON was ~140 B.
+    assert_eq!(
+        raw.len(),
+        40,
+        "BUG-20 FIXED: expected exactly 40 binary bytes; got {} — \
+         either the format regressed back to serde_json (bad) or the \
+         layout changed (update this pin)",
+        raw.len()
+    );
+    // First 32 bytes are the block hash, raw.
+    assert_eq!(&raw[..32], block_hash.as_bytes());
+    // Next 4 bytes: tx_offset LE.
+    assert_eq!(u32::from_le_bytes([raw[32], raw[33], raw[34], raw[35]]), 1234);
+    // Final 4 bytes: tx_length LE.
+    assert_eq!(u32::from_le_bytes([raw[36], raw[37], raw[38], raw[39]]), 567);
 }
 
 /// G26 — `CoinStatsEntry.muhash` is stored as raw bytes, not

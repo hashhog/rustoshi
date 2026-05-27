@@ -31,7 +31,7 @@
 //! The cache tracks its memory usage. When it exceeds the configured limit
 //! (default 450 MiB), it should be flushed to the backing store.
 
-use crate::block_store::CoinEntry;
+use crate::block_store::{coin_entry_format_v2, CoinEntry};
 use crate::columns::CF_UTXO;
 use crate::db::{ChainDb, StorageError};
 use rustoshi_primitives::{Hash256, OutPoint, TxOut};
@@ -247,8 +247,7 @@ impl<'a> CoinsViewDB<'a> {
     pub fn put_coin(&self, outpoint: &OutPoint, coin: &Coin) -> Result<(), StorageError> {
         let key = outpoint_key(outpoint);
         let entry = coin.to_entry();
-        let data =
-            serde_json::to_vec(&entry).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data = coin_entry_format_v2::encode_coin_entry(&entry);
         self.db.put_cf(CF_UTXO, &key, &data)
     }
 
@@ -263,8 +262,7 @@ impl<'a> CoinsViewDB<'a> {
         let key = outpoint_key(outpoint);
         match self.db.get_cf(CF_UTXO, &key)? {
             Some(data) => {
-                let entry: CoinEntry = serde_json::from_slice(&data)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                let entry: CoinEntry = coin_entry_format_v2::decode_coin_entry(&data)?;
                 Ok(Some(Coin::from_entry(&entry)))
             }
             None => Ok(None),
