@@ -52,7 +52,10 @@ pub mod w102_assumeutxo_gates;
 pub mod w109_block_index_gates;
 pub mod utxo_cache;
 
-pub use block_store::{BlockIndexEntry, BlockStatus, BlockStore, BlockStoreUtxoView, CoinEntry, TxIndexEntry, UndoData};
+pub use block_store::{
+    decode_utxo_value, BlockIndexEntry, BlockStatus, BlockStore, BlockStoreUtxoView, CoinEntry,
+    TxIndexEntry, UndoData,
+};
 pub use blockstore::{
     BlockFileInfo, BlockFileLocation, FlatBlockStore, FlatFilePos, FlatFileSeq, PruneConfig,
     BLOCKFILE_CHUNK_SIZE, MAX_BLOCKFILE_SIZE, MIN_BLOCKS_TO_KEEP, MIN_DISK_SPACE_FOR_BLOCK_FILES,
