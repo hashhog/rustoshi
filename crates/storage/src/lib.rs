@@ -54,7 +54,7 @@ pub mod utxo_cache;
 
 pub use block_store::{
     decode_utxo_value, BlockIndexEntry, BlockStatus, BlockStore, BlockStoreUtxoView, CoinEntry,
-    TxIndexEntry, UndoData,
+    TxIndexEntry, UndoData, UtxoCacheState,
 };
 pub use blockstore::{
     BlockFileInfo, BlockFileLocation, FlatBlockStore, FlatFilePos, FlatFileSeq, PruneConfig,

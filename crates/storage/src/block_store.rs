@@ -1111,6 +1111,43 @@ pub const DEFAULT_UTXO_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// + average scriptPubKey (~34 bytes for P2WSH/P2TR)
 const CACHE_ENTRY_OVERHEAD: usize = 180;
 
+/// Coin cache fullness signal, mirrored from Bitcoin Core's
+/// `CoinsCacheSizeState` (`bitcoin-core/src/validation.h:509-516`).
+///
+/// The connect loop uses this to schedule flushes ahead of the hard
+/// memory cap, avoiding the per-block-flush pathology that occurred on
+/// mainnet 2026-05-27 (cache crossed 2 GiB at h=364k and every flush
+/// from then on cost the full ~11 M-entry batch — 43-87 min each).
+/// See `CORE-PARITY-AUDIT/_rustoshi-ibd-pace-decay-2026-05-27.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UtxoCacheState {
+    /// Cache is below the LARGE threshold — no flush needed.
+    Ok = 0,
+    /// Cache is within ~10 % of the cap — flush opportunistically
+    /// on the next PERIODIC tick or block-count boundary so we never
+    /// reach the CRITICAL "must-flush-every-block" state.
+    Large = 1,
+    /// Cache has exceeded the hard memory cap — MUST flush before
+    /// connecting the next block, otherwise heap blows past
+    /// `max_cache_bytes`.
+    Critical = 2,
+}
+
+/// Threshold above which Core considers the coins cache "LARGE" and
+/// starts flushing on PERIODIC ticks (validation.h:518-524 —
+/// `max(total*9/10, total - 10 MiB)`).
+///
+/// Returning a `usize` for direct comparison with `estimated_mem`.
+/// Uses `u128` for the `*9/10` factor to avoid both overflow on the
+/// 2 GiB-default cap on 32-bit targets and the early-truncation
+/// rounding error that `(total / 10) * 9` introduces.
+fn large_coins_cache_threshold(total_space: usize) -> usize {
+    const MAX_BLOCK_COINSDB_USAGE_BYTES: usize = 10 * 1024 * 1024;
+    let nine_tenths = ((total_space as u128) * 9 / 10) as usize;
+    let minus_block = total_space.saturating_sub(MAX_BLOCK_COINSDB_USAGE_BYTES);
+    nine_tenths.max(minus_block)
+}
+
 /// A UTXO view backed by BlockStore with an in-memory cache.
 ///
 /// This implements the `UtxoView` trait from consensus, allowing
@@ -1156,8 +1193,35 @@ impl<'a> BlockStoreUtxoView<'a> {
     }
 
     /// Returns true if the cache has exceeded its memory limit.
+    ///
+    /// At this point the connect loop MUST flush before connecting
+    /// the next block (Core's `CoinsCacheSizeState::CRITICAL`
+    /// gating `FlushStateMode::IF_NEEDED`).
     pub fn needs_flush(&self) -> bool {
         self.estimated_mem >= self.max_cache_bytes
+    }
+
+    /// Returns the cache's fullness state (`Ok` / `Large` / `Critical`).
+    ///
+    /// Mirrors `Chainstate::GetCoinsCacheSizeState` in
+    /// `bitcoin-core/src/validation.cpp:2683-2700`. The connect loop
+    /// uses `Large` as an early-warning signal: it triggers a flush on
+    /// the next block-count or time boundary, well before
+    /// `Critical` forces a per-block flush of the full cache.
+    pub fn cache_state(&self) -> UtxoCacheState {
+        if self.estimated_mem > self.max_cache_bytes {
+            UtxoCacheState::Critical
+        } else if self.estimated_mem > large_coins_cache_threshold(self.max_cache_bytes) {
+            UtxoCacheState::Large
+        } else {
+            UtxoCacheState::Ok
+        }
+    }
+
+    /// The number of bytes above which `cache_state()` returns
+    /// `Large`. Exposed for diagnostics/logging.
+    pub fn large_threshold_bytes(&self) -> usize {
+        large_coins_cache_threshold(self.max_cache_bytes)
     }
 
     /// Flush all cached changes to the database using a WriteBatch.
@@ -1482,6 +1546,87 @@ mod flush_with_tip_tests {
         // The spend landed: coin gone, tip advanced.
         assert!(store.get_utxo(&op).unwrap().is_none());
         assert_eq!(store.get_best_height().unwrap(), Some(2));
+    }
+
+    /// `cache_state()` mirrors Core's `CoinsCacheSizeState`:
+    ///   - `Ok` below `large_threshold_bytes()` (= max(cap*9/10, cap-10MiB))
+    ///   - `Large` between threshold and cap
+    ///   - `Critical` strictly above cap
+    ///
+    /// This test pins the Core-parity boundary so a future refactor that
+    /// drops the LARGE early-warning rung re-introduces the per-block
+    /// flush pathology that triggered the 2026-05-27 IBD pace decay.
+    #[test]
+    fn cache_state_transitions_ok_large_critical() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        // Use a small cap so we can drive the state by hand-adding entries
+        // (one entry ≈ CACHE_ENTRY_OVERHEAD bytes = 180 B + script_pubkey).
+        // 1 MiB cap → LARGE threshold = max(1 MiB * 9 / 10, 1 MiB - 10 MiB sat)
+        // = max(943718, 0) = 943718 B. Critical above 1048576 B.
+        const CAP: usize = 1024 * 1024;
+        let mut view = BlockStoreUtxoView::with_cache_limit(&store, CAP);
+
+        assert_eq!(view.cache_state(), UtxoCacheState::Ok);
+        assert!(view.large_threshold_bytes() < CAP);
+        assert!(view.large_threshold_bytes() >= CAP * 9 / 10);
+
+        // Fill to ~80 % of cap → still Ok.
+        let target_ok = (CAP * 8) / 10;
+        let mut n: u32 = 0;
+        while view.estimated_memory() < target_ok {
+            let op = OutPoint { txid: hash_n((n & 0xff) as u8), vout: n };
+            view.add_utxo(&op, coin(1, 0));
+            n += 1;
+        }
+        assert_eq!(view.cache_state(), UtxoCacheState::Ok);
+
+        // Fill into the 90 %-100 % band → Large.
+        let target_large = view.large_threshold_bytes() + 4096;
+        while view.estimated_memory() < target_large {
+            let op = OutPoint { txid: hash_n((n & 0xff) as u8), vout: n };
+            view.add_utxo(&op, coin(1, 0));
+            n += 1;
+        }
+        assert_eq!(view.cache_state(), UtxoCacheState::Large);
+        // needs_flush() is the CRITICAL gate — must NOT fire in LARGE.
+        assert!(!view.needs_flush());
+
+        // Push past the cap → Critical.
+        while view.estimated_memory() <= CAP {
+            let op = OutPoint { txid: hash_n((n & 0xff) as u8), vout: n };
+            view.add_utxo(&op, coin(1, 0));
+            n += 1;
+        }
+        assert_eq!(view.cache_state(), UtxoCacheState::Critical);
+        assert!(view.needs_flush());
+    }
+
+    /// `large_coins_cache_threshold` matches Core's helper exactly at
+    /// the documented boundaries (validation.h:518-524).
+    /// Core evaluates `(total * 9) / 10` (multiply first), not
+    /// `(total / 10) * 9` — the two differ by up to 9 bytes on
+    /// non-divisible inputs.
+    #[test]
+    fn large_coins_cache_threshold_matches_core() {
+        // Tiny cap: 9/10 dominates (cap - 10MiB underflows → 0).
+        assert_eq!(large_coins_cache_threshold(100), 90);
+        // Small cap below 100 MiB: 9/10 still dominates.
+        assert_eq!(
+            large_coins_cache_threshold(1024 * 1024),
+            (1024 * 1024usize * 9) / 10
+        );
+        // Large cap (≥ 100 MiB): `cap - 10 MiB` dominates over `cap * 9 / 10`.
+        let big = 200 * 1024 * 1024;
+        assert_eq!(large_coins_cache_threshold(big), big - 10 * 1024 * 1024);
+        // Default 2 GiB cap, the production value: well above the
+        // 10 MiB shoulder so `cap - 10 MiB` dominates.
+        let default = DEFAULT_UTXO_CACHE_BYTES;
+        assert_eq!(
+            large_coins_cache_threshold(default),
+            default - 10 * 1024 * 1024
+        );
     }
 }
 
