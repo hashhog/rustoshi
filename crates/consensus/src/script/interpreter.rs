@@ -494,25 +494,35 @@ impl SignatureChecker for DummyChecker {
     }
 }
 
-/// Get the subscript for signature hashing.
+/// Get the subscript (scriptCode) for legacy / SegWit-v0 signature hashing.
 ///
-/// Returns the portion of the script starting after the last OP_CODESEPARATOR.
-/// If no OP_CODESEPARATOR has been encountered (codesep_pos is the sentinel
-/// value 0xFFFFFFFF), returns the full script.
+/// Returns the portion of the script starting at the BYTE OFFSET just after
+/// the last executed OP_CODESEPARATOR.  Mirrors Core's
+/// `CScript scriptCode(pbegincodehash, pend)` (interpreter.cpp:326, 1139),
+/// where `pbegincodehash` is the read cursor positioned immediately after the
+/// most recent OP_CODESEPARATOR byte.  If no OP_CODESEPARATOR has executed
+/// (offset is the sentinel 0xFFFFFFFF), the scriptCode is the whole script
+/// (Core initializes `pbegincodehash = script.begin()`).
+///
+/// IMPORTANT: `codesep_byte_offset` is a BYTE OFFSET (Core's `pbegincodehash`
+/// iterator), NOT the opcode index used for the tapscript sigmsg.  The offset
+/// already points one byte PAST the OP_CODESEPARATOR opcode (the loop advances
+/// `pc` before this opcode's match arm), so no `+1` adjustment is applied.
 ///
 /// # Arguments
 /// * `full_script` - The complete script being executed
-/// * `codesep_pos` - Position of last OP_CODESEPARATOR, or 0xFFFFFFFF if none
-fn get_subscript(full_script: &[u8], codesep_pos: u32) -> &[u8] {
-    if codesep_pos == 0xFFFFFFFF {
-        // No OP_CODESEPARATOR encountered, use full script
+/// * `codesep_byte_offset` - Byte offset after last OP_CODESEPARATOR, or
+///   0xFFFFFFFF if none has executed.
+fn get_subscript(full_script: &[u8], codesep_byte_offset: u32) -> &[u8] {
+    if codesep_byte_offset == 0xFFFFFFFF {
+        // No OP_CODESEPARATOR executed: scriptCode is the full script.
         full_script
     } else {
-        // Start after the OP_CODESEPARATOR
-        let start = (codesep_pos as usize) + 1;
+        let start = codesep_byte_offset as usize;
         if start < full_script.len() {
             &full_script[start..]
         } else {
+            // OP_CODESEPARATOR was the final opcode: empty scriptCode.
             &[]
         }
     }
@@ -784,7 +794,20 @@ struct ExecContext<'a> {
     flags: &'a ScriptFlags,
     checker: &'a dyn SignatureChecker,
     sig_version: SigVersion,
-    codesep_pos: u32, // Position of last OP_CODESEPARATOR
+    /// OPCODE INDEX of the last executed OP_CODESEPARATOR (0xFFFFFFFF if
+    /// none). Mirrors Core's `execdata.m_codeseparator_pos`
+    /// (interpreter.cpp:1055) and is committed to the BIP-341 tapscript
+    /// sigmsg. This is an opcode counter, NOT a byte position.
+    codesep_pos: u32,
+    /// BYTE OFFSET into the executing script of the position JUST AFTER the
+    /// last executed OP_CODESEPARATOR (0xFFFFFFFF if none). Mirrors Core's
+    /// `pbegincodehash` iterator (interpreter.cpp:422, 1054), which is set
+    /// to `pc` — the read cursor positioned right after the OP_CODESEPARATOR
+    /// byte. Used to slice scriptCode = subscript[offset..] for the LEGACY
+    /// (BASE) FindAndDelete sighash and the WITNESS_V0 (P2WSH) sighash.
+    /// Distinct from `codesep_pos`: after a pushdata op the byte offset and
+    /// the opcode index diverge, so the two must be tracked separately.
+    codesep_byte_offset: u32,
     tapscript: Option<TapscriptCtx<'a>>, // Some(_) iff sig_version == Tapscript
     /// BIP-342 tapscript validation-weight budget. Mirrors Core's
     /// `ScriptExecutionData::m_validation_weight_left` (interpreter.cpp:362).
@@ -816,6 +839,7 @@ impl<'a> ExecContext<'a> {
             checker,
             sig_version,
             codesep_pos: 0xFFFFFFFF,
+            codesep_byte_offset: 0xFFFFFFFF,
             tapscript: None,
             validation_weight_left: 0,
             validation_weight_init: false,
@@ -838,6 +862,7 @@ impl<'a> ExecContext<'a> {
             checker,
             sig_version: SigVersion::Tapscript,
             codesep_pos: 0xFFFFFFFF,
+            codesep_byte_offset: 0xFFFFFFFF,
             tapscript: Some(tapscript),
             validation_weight_left,
             validation_weight_init: true,
@@ -1554,14 +1579,22 @@ fn eval_script_internal(
                 // The check that fires here (inside the executing-branch match)
                 // is only a safety belt — the authoritative check must be placed
                 // before the non-executing-branch early-continue at line ~953.
-                // BIP-341: record the OPCODE INDEX (not byte position).
-                // Core stores `opcode_pos` (interpreter.cpp:1055), which is
-                // the 0-based counter of opcodes seen so far in the script.
-                // This value is committed to the tapscript sigmsg at
-                // interpreter.cpp:1565.  Using the byte position (`pc - 1`)
-                // was wrong: after any pushdata opcode, byte position > opcode
-                // index, producing a different sigmsg than Core.
+                // BIP-341: record the OPCODE INDEX (not byte position) for the
+                // tapscript sigmsg.  Core stores `opcode_pos`
+                // (interpreter.cpp:1055), the 0-based counter of opcodes seen
+                // so far; this value is committed to the tapscript sigmsg at
+                // interpreter.cpp:1565.  Using the byte position here would
+                // diverge from Core after any pushdata opcode.
                 ctx.codesep_pos = current_opcode_pos;
+                // LEGACY / WITNESS_V0: record the BYTE OFFSET just after the
+                // OP_CODESEPARATOR for scriptCode slicing.  Core sets
+                // `pbegincodehash = pc` (interpreter.cpp:1054), where `pc` is
+                // the read cursor positioned immediately after the
+                // OP_CODESEPARATOR byte.  At this point in the loop `pc`
+                // already points past the OP_CODESEPARATOR byte (it was
+                // advanced at the top of the iteration), so it equals Core's
+                // `pbegincodehash` exactly.  scriptCode = full_script[pc..].
+                ctx.codesep_byte_offset = pc as u32;
             }
             Opcode::OP_CHECKSIG => {
                 // Pop pubkey first (top), then signature (deeper)
@@ -1643,8 +1676,13 @@ fn eval_script_internal(
                     let success = if sig.is_empty() {
                         false
                     } else {
-                        // Compute the subscript starting after the last OP_CODESEPARATOR
-                        let subscript = get_subscript(full_script, ctx.codesep_pos);
+                        // Compute the scriptCode starting at the BYTE OFFSET just
+                        // after the last executed OP_CODESEPARATOR (Core's
+                        // pbegincodehash). For legacy this subscript is then
+                        // FindAndDelete'd; for WITNESS_V0 it is the witnessScript
+                        // slice. Either way it is a byte slice, NOT an opcode-index
+                        // slice — so pass codesep_byte_offset, not codesep_pos.
+                        let subscript = get_subscript(full_script, ctx.codesep_byte_offset);
                         // CONST_SCRIPTCODE: reject if FindAndDelete would strip
                         // the sig from the scriptCode on the legacy path
                         // (Core interpreter.cpp:330-332).
@@ -1734,8 +1772,13 @@ fn eval_script_internal(
                     let success = if sig.is_empty() {
                         false
                     } else {
-                        // Compute the subscript starting after the last OP_CODESEPARATOR
-                        let subscript = get_subscript(full_script, ctx.codesep_pos);
+                        // Compute the scriptCode starting at the BYTE OFFSET just
+                        // after the last executed OP_CODESEPARATOR (Core's
+                        // pbegincodehash). For legacy this subscript is then
+                        // FindAndDelete'd; for WITNESS_V0 it is the witnessScript
+                        // slice. Either way it is a byte slice, NOT an opcode-index
+                        // slice — so pass codesep_byte_offset, not codesep_pos.
+                        let subscript = get_subscript(full_script, ctx.codesep_byte_offset);
                         // CONST_SCRIPTCODE: reject if FindAndDelete would strip
                         // the sig from the scriptCode on the legacy path
                         // (Core interpreter.cpp:330-332).
@@ -1804,19 +1847,46 @@ fn eval_script_internal(
 
                 // Verify signatures in order
                 // Each signature must match a pubkey, and pubkeys are consumed left-to-right
-                // Compute the subscript starting after the last OP_CODESEPARATOR
-                let subscript = get_subscript(full_script, ctx.codesep_pos);
+                // Compute the scriptCode starting at the BYTE OFFSET just after
+                // the last executed OP_CODESEPARATOR (Core's pbegincodehash).
+                // CHECKMULTISIG is legacy/SegWit-v0 only (tapscript rejects it),
+                // so this is always a byte slice; pass codesep_byte_offset.
+                let subscript = get_subscript(full_script, ctx.codesep_byte_offset);
 
-                // CONST_SCRIPTCODE: Core (interpreter.cpp:1141-1149) runs
-                // FindAndDelete on the scriptCode for EVERY signature on the
-                // legacy path BEFORE the verification loop, and rejects with
-                // SCRIPT_ERR_SIG_FINDANDDELETE if any occurrence was removed
-                // while the flag is set. Mirror that here over all sigs.
-                for sig in &sigs {
-                    check_const_scriptcode_findanddelete(
-                        sig, subscript, ctx.sig_version, ctx.flags,
-                    )?;
-                }
+                // Core (interpreter.cpp:1138-1150) builds ONE scriptCode and
+                // FindAndDelete's EVERY signature out of it BEFORE the
+                // verification loop, so each CheckECDSASignature runs against a
+                // scriptCode with ALL of the multisig's signatures removed (not
+                // just the one currently being checked). A signature embedded
+                // verbatim in the redeemScript/witnessScript therefore changes
+                // the sighash for the OTHER signatures too. Mirror that by
+                // pre-stripping all sigs here (BASE only — BIP-143 WITNESS_V0
+                // does NOT FindAndDelete). Each `check_sig` below re-runs
+                // FindAndDelete for its own sig, which is a no-op on the
+                // already-stripped scriptCode, so the digest matches Core.
+                let multisig_subscript: Vec<u8>;
+                let subscript: &[u8] = if ctx.sig_version == SigVersion::Base {
+                    let mut sc = subscript.to_vec();
+                    for sig in &sigs {
+                        if sig.is_empty() {
+                            continue;
+                        }
+                        // CONST_SCRIPTCODE: reject if FindAndDelete removed any
+                        // occurrence while the flag is set (Core
+                        // interpreter.cpp:1147-1148). Mirror Core's cumulative
+                        // mutation: count + delete against the progressively
+                        // stripped scriptCode.
+                        let found = rustoshi_crypto::find_and_delete_count(&sc, sig);
+                        if found > 0 && ctx.flags.verify_const_scriptcode {
+                            return Err(ScriptError::SigFindAndDelete);
+                        }
+                        sc = rustoshi_crypto::find_and_delete(&sc, sig);
+                    }
+                    multisig_subscript = sc;
+                    &multisig_subscript
+                } else {
+                    subscript
+                };
 
                 let mut key_idx = 0;
                 let mut sig_idx = 0;
@@ -1925,17 +1995,36 @@ fn eval_script_internal(
                     return Err(ScriptError::NullDummy);
                 }
 
-                // Compute the subscript starting after the last OP_CODESEPARATOR
-                let subscript = get_subscript(full_script, ctx.codesep_pos);
+                // Compute the scriptCode starting at the BYTE OFFSET just after
+                // the last executed OP_CODESEPARATOR (Core's pbegincodehash).
+                // CHECKMULTISIG is legacy/SegWit-v0 only (tapscript rejects it),
+                // so this is always a byte slice; pass codesep_byte_offset.
+                let subscript = get_subscript(full_script, ctx.codesep_byte_offset);
 
-                // CONST_SCRIPTCODE: FindAndDelete reject over all sigs on the
-                // legacy path (Core interpreter.cpp:1141-1149), same as
-                // OP_CHECKMULTISIG above.
-                for sig in &sigs {
-                    check_const_scriptcode_findanddelete(
-                        sig, subscript, ctx.sig_version, ctx.flags,
-                    )?;
-                }
+                // Same as OP_CHECKMULTISIG: pre-strip ALL signatures from the
+                // scriptCode up front (BASE only) so each verification runs
+                // against a scriptCode with every multisig signature removed,
+                // matching Core's single-scriptCode FindAndDelete loop
+                // (interpreter.cpp:1138-1150). CONST_SCRIPTCODE rejects if any
+                // occurrence was removed while the flag is set.
+                let multisig_subscript: Vec<u8>;
+                let subscript: &[u8] = if ctx.sig_version == SigVersion::Base {
+                    let mut sc = subscript.to_vec();
+                    for sig in &sigs {
+                        if sig.is_empty() {
+                            continue;
+                        }
+                        let found = rustoshi_crypto::find_and_delete_count(&sc, sig);
+                        if found > 0 && ctx.flags.verify_const_scriptcode {
+                            return Err(ScriptError::SigFindAndDelete);
+                        }
+                        sc = rustoshi_crypto::find_and_delete(&sc, sig);
+                    }
+                    multisig_subscript = sc;
+                    &multisig_subscript
+                } else {
+                    subscript
+                };
 
                 let mut key_idx = 0;
                 let mut sig_idx = 0;
