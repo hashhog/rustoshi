@@ -2577,7 +2577,15 @@ impl<'a> SignatureChecker for TransactionSignatureChecker<'a> {
         // BIP-68 (Bitcoin Core interpreter.cpp:1790): fail if the transaction's
         // version number is not set high enough to trigger BIP-68 rules.
         // A v1 transaction must not be able to satisfy OP_CHECKSEQUENCEVERIFY.
-        if self.tx.version < 2 {
+        //
+        // Core's `CTransaction::version` is `uint32_t`, so `txTo->version < 2`
+        // is an UNSIGNED comparison (interpreter.cpp:1790). rustoshi stores
+        // `version` as `i32`, so a transaction whose version has the high bit
+        // set (e.g. 0xFFFFFFFF) sign-extends to a negative i32 and would
+        // wrongly satisfy `< 2`, falsely rejecting a CSV that Core accepts
+        // (tx_valid "Valid CHECKSEQUENCEVERIFY even with negative tx version").
+        // Cast to u32 to match Core's unsigned comparison exactly.
+        if (self.tx.version as u32) < 2 {
             return false;
         }
 
