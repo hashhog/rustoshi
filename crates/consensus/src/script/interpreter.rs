@@ -376,6 +376,17 @@ pub enum ScriptError {
     /// validation MUST NOT set that flag; it is only for relay/mempool.
     #[error("discouraged upgradable pubkey type")]
     DiscourageUpgradablePubkeyType,
+    /// Mirrors Bitcoin Core `SCRIPT_ERR_SIG_FINDANDDELETE`
+    /// (script/script_error.h, interpreter.cpp:330-332 and 1146-1148).
+    /// Returned when, in a legacy (BASE sigversion) CHECKSIG /
+    /// CHECKSIGVERIFY / CHECKMULTISIG / CHECKMULTISIGVERIFY, applying
+    /// FindAndDelete to the scriptCode removes >=1 occurrence of the
+    /// push-encoded signature AND the policy flag
+    /// `verify_const_scriptcode` (SCRIPT_VERIFY_CONST_SCRIPTCODE) is set.
+    /// This catches a signature being embedded in the scriptSig/scriptCode,
+    /// which BIP-143 era consensus forbids under the CONST_SCRIPTCODE rule.
+    #[error("signature found-and-deleted from scriptCode")]
+    SigFindAndDelete,
 }
 
 /// Signature version for sighash computation.
@@ -705,6 +716,39 @@ fn check_signature_encoding(sig: &[u8], flags: &ScriptFlags) -> Result<(), Scrip
     }
     if flags.verify_strictenc && !is_defined_hashtype(sig) {
         return Err(ScriptError::SigHashType);
+    }
+    Ok(())
+}
+
+/// Enforce Bitcoin Core's SCRIPT_VERIFY_CONST_SCRIPTCODE FindAndDelete rule
+/// for a legacy (BASE sigversion) signature check.
+///
+/// Core's pre-Tapscript CHECKSIG (`EvalChecksigPreTapscript`,
+/// interpreter.cpp:330-332) and CHECKMULTISIG (interpreter.cpp:1146-1148)
+/// both run `int found = FindAndDelete(scriptCode, CScript() << vchSig)` on
+/// the BASE path, and if `found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE)`
+/// they `return set_error(serror, SCRIPT_ERR_SIG_FINDANDDELETE)`. This guards
+/// against a signature being embedded in the scriptCode (e.g. a sig pushed in
+/// the scriptSig of a bare CHECKSIG), which FindAndDelete would otherwise
+/// silently strip while computing the legacy sighash.
+///
+/// This MUST be called BEFORE the actual signature verification at every
+/// legacy CHECKSIG/CHECKSIGVERIFY/CHECKMULTISIG[VERIFY] call site, and ONLY
+/// for `SigVersion::Base` (SegWit v0 and Tapscript do not apply FindAndDelete,
+/// per BIP-143/BIP-341). It does not mutate the subscript — the sighash's own
+/// FindAndDelete inside the signature checker is unchanged.
+#[inline]
+fn check_const_scriptcode_findanddelete(
+    sig: &[u8],
+    subscript: &[u8],
+    sig_version: SigVersion,
+    flags: &ScriptFlags,
+) -> Result<(), ScriptError> {
+    if sig_version == SigVersion::Base
+        && flags.verify_const_scriptcode
+        && rustoshi_crypto::find_and_delete_count(subscript, sig) > 0
+    {
+        return Err(ScriptError::SigFindAndDelete);
     }
     Ok(())
 }
@@ -1601,6 +1645,12 @@ fn eval_script_internal(
                     } else {
                         // Compute the subscript starting after the last OP_CODESEPARATOR
                         let subscript = get_subscript(full_script, ctx.codesep_pos);
+                        // CONST_SCRIPTCODE: reject if FindAndDelete would strip
+                        // the sig from the scriptCode on the legacy path
+                        // (Core interpreter.cpp:330-332).
+                        check_const_scriptcode_findanddelete(
+                            &sig, subscript, ctx.sig_version, ctx.flags,
+                        )?;
                         // Pass full signature including sighash type byte
                         ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
                     };
@@ -1686,6 +1736,12 @@ fn eval_script_internal(
                     } else {
                         // Compute the subscript starting after the last OP_CODESEPARATOR
                         let subscript = get_subscript(full_script, ctx.codesep_pos);
+                        // CONST_SCRIPTCODE: reject if FindAndDelete would strip
+                        // the sig from the scriptCode on the legacy path
+                        // (Core interpreter.cpp:330-332).
+                        check_const_scriptcode_findanddelete(
+                            &sig, subscript, ctx.sig_version, ctx.flags,
+                        )?;
                         // Pass full signature including sighash type byte
                         ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
                     };
@@ -1750,6 +1806,18 @@ fn eval_script_internal(
                 // Each signature must match a pubkey, and pubkeys are consumed left-to-right
                 // Compute the subscript starting after the last OP_CODESEPARATOR
                 let subscript = get_subscript(full_script, ctx.codesep_pos);
+
+                // CONST_SCRIPTCODE: Core (interpreter.cpp:1141-1149) runs
+                // FindAndDelete on the scriptCode for EVERY signature on the
+                // legacy path BEFORE the verification loop, and rejects with
+                // SCRIPT_ERR_SIG_FINDANDDELETE if any occurrence was removed
+                // while the flag is set. Mirror that here over all sigs.
+                for sig in &sigs {
+                    check_const_scriptcode_findanddelete(
+                        sig, subscript, ctx.sig_version, ctx.flags,
+                    )?;
+                }
+
                 let mut key_idx = 0;
                 let mut sig_idx = 0;
                 let mut success = true;
@@ -1859,6 +1927,16 @@ fn eval_script_internal(
 
                 // Compute the subscript starting after the last OP_CODESEPARATOR
                 let subscript = get_subscript(full_script, ctx.codesep_pos);
+
+                // CONST_SCRIPTCODE: FindAndDelete reject over all sigs on the
+                // legacy path (Core interpreter.cpp:1141-1149), same as
+                // OP_CHECKMULTISIG above.
+                for sig in &sigs {
+                    check_const_scriptcode_findanddelete(
+                        sig, subscript, ctx.sig_version, ctx.flags,
+                    )?;
+                }
+
                 let mut key_idx = 0;
                 let mut sig_idx = 0;
                 let mut success = true;

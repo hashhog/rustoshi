@@ -142,6 +142,41 @@ pub fn find_and_delete(script: &[u8], sig: &[u8]) -> Vec<u8> {
     result
 }
 
+/// Count how many push-encoded occurrences of `sig` `find_and_delete` would
+/// remove from `script`, WITHOUT mutating the script.
+///
+/// Mirrors the `int` return value of Bitcoin Core's
+/// `FindAndDelete(CScript& script, const CScript& b)`
+/// (script/interpreter.cpp:229). Core's legacy CHECKSIG / CHECKMULTISIG
+/// paths use that count: if `found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE)`
+/// the script fails with `SCRIPT_ERR_SIG_FINDANDDELETE`
+/// (interpreter.cpp:330-332 and 1146-1148). The interpreter needs the count
+/// (not the rewritten script) to enforce that consensus rule, so this is a
+/// dedicated helper that scans with the SAME non-overlapping forward-match
+/// semantics as `find_and_delete` above.
+pub fn find_and_delete_count(script: &[u8], sig: &[u8]) -> usize {
+    if sig.is_empty() {
+        return 0;
+    }
+
+    let pattern = push_encode(sig);
+    if pattern.is_empty() || pattern.len() > script.len() {
+        return 0;
+    }
+
+    let mut count = 0;
+    let mut i = 0;
+    while i < script.len() {
+        if i + pattern.len() <= script.len() && script[i..i + pattern.len()] == pattern[..] {
+            count += 1;
+            i += pattern.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
 /// Remove all OP_CODESEPARATOR opcodes from the script.
 ///
 /// In legacy sighash, OP_CODESEPARATOR is removed from the scriptCode before

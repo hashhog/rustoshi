@@ -38,8 +38,8 @@ pub use keys::{
     BITCOIN_SIGNED_MESSAGE_MAGIC,
 };
 pub use sighash::{
-    find_and_delete, legacy_sighash, p2wpkh_script_code, remove_codeseparators, segwit_v0_sighash,
-    SigHashType, OP_CODESEPARATOR,
+    find_and_delete, find_and_delete_count, legacy_sighash, p2wpkh_script_code,
+    remove_codeseparators, segwit_v0_sighash, SigHashType, OP_CODESEPARATOR,
 };
 
 // Re-export secp256k1 types that are used in the public API
