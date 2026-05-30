@@ -190,8 +190,30 @@ impl Block {
     /// Algorithm: double-SHA256 each txid, then pairwise hash up the tree.
     /// If odd number of elements at any level, duplicate the last element.
     pub fn compute_merkle_root(&self) -> Hash256 {
+        self.compute_merkle_root_mutated().0
+    }
+
+    /// Compute the transaction Merkle root AND detect the CVE-2012-2459
+    /// duplicate-txid malleation, mirroring Bitcoin Core's
+    /// `ComputeMerkleRoot(std::vector<uint256>, bool* mutated)`
+    /// (bitcoin-core/src/consensus/merkle.cpp:46-63).
+    ///
+    /// Returns `(root, mutated)`. `mutated == true` means two *identical*
+    /// hashes would be combined as a COMPLETE adjacent pair at some level —
+    /// the signature of a duplicate-tx malleation that collides on the same
+    /// root as an honest list. Core's `CheckBlock`/`CheckMerkleRoot`
+    /// (validation.cpp:3850-3858) rejects such a block with
+    /// `bad-txns-duplicate`.
+    ///
+    /// CRITICAL parity (merkle.cpp:48-59): the adjacent-pair scan runs at the
+    /// TOP of each level-collapse iteration, BEFORE the odd-tail duplication,
+    /// and only over COMPLETE pairs (`pos + 1 < len`). The lone trailing
+    /// element on an odd level is excluded from THIS level's scan; once
+    /// duplicated it becomes an identical pair caught on the NEXT level. This
+    /// is exactly what prevents honest odd-N blocks from false-rejecting.
+    pub fn compute_merkle_root_mutated(&self) -> (Hash256, bool) {
         if self.transactions.is_empty() {
-            return Hash256::ZERO;
+            return (Hash256::ZERO, false);
         }
 
         // Start with the txids
@@ -201,10 +223,27 @@ impl Block {
             .map(|tx| tx.txid().0)
             .collect();
 
+        let mut mutated = false;
+
         // Build the tree
         while hashes.len() > 1 {
+            // Core merkle.cpp:50-52 — scan COMPLETE adjacent pairs at the TOP
+            // of the level, BEFORE the odd-tail duplication. `pos + 1 < len`
+            // (step 2) excludes the lone trailing element on an odd level.
+            let len = hashes.len();
+            let mut pos = 0;
+            while pos + 1 < len {
+                if hashes[pos] == hashes[pos + 1] {
+                    mutated = true;
+                }
+                pos += 2;
+            }
+
             if hashes.len() % 2 == 1 {
-                // Duplicate the last hash
+                // Duplicate the last hash (Core merkle.cpp:54-56). The
+                // resulting pair is the legitimate odd-level rule and is NOT
+                // flagged above — only a genuine duplicate appearing as a
+                // complete pair sets `mutated`.
                 hashes.push(*hashes.last().unwrap());
             }
 
@@ -219,7 +258,7 @@ impl Block {
             hashes = next_level;
         }
 
-        Hash256(hashes[0])
+        (Hash256(hashes[0]), mutated)
     }
 
     /// Compute the witness commitment Merkle root using wtxids.

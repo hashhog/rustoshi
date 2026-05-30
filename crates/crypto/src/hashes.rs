@@ -57,13 +57,59 @@ pub fn tagged_hash(tag: &str, data: &[u8]) -> [u8; 32] {
 /// If the list is empty, return the zero hash.
 /// Uses optimized sha256d_64 for merkle tree internal nodes.
 pub fn merkle_root(hashes: &[Hash256]) -> Hash256 {
+    merkle_root_mutated(hashes).0
+}
+
+/// Compute the SHA-256d Merkle root AND detect the CVE-2012-2459
+/// duplicate-txid malleation, mirroring Bitcoin Core's
+/// `ComputeMerkleRoot(std::vector<uint256>, bool* mutated)`
+/// (bitcoin-core/src/consensus/merkle.cpp:46-63).
+///
+/// Returns `(root, mutated)` where `mutated == true` means two *identical*
+/// hashes would be hashed together as a complete adjacent pair at some level
+/// of the tree. Core treats this exactly like an invalid merkle root
+/// (CheckMerkleRoot in validation.cpp rejects with `bad-txns-duplicate`),
+/// because such a transaction list collides on the same root as an honest,
+/// non-duplicated list — allowing a block to be malleated without changing
+/// its hash (CVE-2012-2459).
+///
+/// CRITICAL parity points with Core (merkle.cpp:48-59):
+///   1. The adjacent-pair scan happens at the TOP of each level-collapse
+///      iteration, BEFORE the odd-tail duplication.
+///   2. Only COMPLETE pairs are compared: `pos + 1 < len` (step 2). The lone
+///      trailing element at an odd level is NOT compared at THIS level — but
+///      once it is duplicated (step below) it becomes an identical adjacent
+///      pair that IS caught on the NEXT level's scan. This is why honest
+///      odd-N blocks must NOT false-reject: their trailing duplicate is the
+///      ONLY identical pair and it is the legitimate Bitcoin odd-level rule,
+///      whereas a CVE block carries the duplicate already inside a complete
+///      pair at some level.
+pub fn merkle_root_mutated(hashes: &[Hash256]) -> (Hash256, bool) {
     if hashes.is_empty() {
-        return Hash256::ZERO;
+        return (Hash256::ZERO, false);
     }
 
     let mut current_level: Vec<Hash256> = hashes.to_vec();
+    let mut mutated = false;
 
     while current_level.len() > 1 {
+        // Core merkle.cpp:50-52 — scan COMPLETE adjacent pairs at the TOP of
+        // the level, BEFORE the odd-tail duplication below. `pos + 1 < len`
+        // (step 2) excludes the lone trailing element on an odd level.
+        let len = current_level.len();
+        let mut pos = 0;
+        while pos + 1 < len {
+            if current_level[pos] == current_level[pos + 1] {
+                mutated = true;
+            }
+            pos += 2;
+        }
+
+        // Core merkle.cpp:54-56 — odd level duplicates its last element. The
+        // resulting identical pair is intentionally NOT flagged here; it is
+        // the legitimate odd-level rule and (if it is the only duplicate) it
+        // collapses away without ever appearing as a complete pair at a lower
+        // level scan. A genuine CVE duplicate appears as a complete pair.
         if !current_level.len().is_multiple_of(2) {
             let last = *current_level.last().unwrap();
             current_level.push(last);
@@ -80,7 +126,7 @@ pub fn merkle_root(hashes: &[Hash256]) -> Hash256 {
         current_level = next_level;
     }
 
-    current_level[0]
+    (current_level[0], mutated)
 }
 
 #[cfg(test)]
@@ -219,6 +265,68 @@ mod tests {
     fn merkle_root_empty() {
         let result = merkle_root(&[]);
         assert_eq!(result, Hash256::ZERO);
+    }
+
+    /// CVE-2012-2459: honest lists (including odd-N ones) must NOT be flagged
+    /// as mutated — a false-reject here is a worse consensus bug than the
+    /// original false-accept. Core's scan runs BEFORE the odd-tail dup over
+    /// complete pairs only, so the legitimate odd-level duplication is never
+    /// flagged. The computed root must be identical to `merkle_root`.
+    #[test]
+    fn merkle_root_mutated_honest_not_flagged() {
+        let a = sha256d(b"a");
+        let b = sha256d(b"b");
+        let c = sha256d(b"c");
+        let d = sha256d(b"d");
+        let e = sha256d(b"e");
+
+        // 1 leaf, 2 leaves, 3 leaves (odd), 4 leaves, 5 leaves (odd→odd).
+        for leaves in [
+            vec![a],
+            vec![a, b],
+            vec![a, b, c],
+            vec![a, b, c, d],
+            vec![a, b, c, d, e],
+        ] {
+            let (root, mutated) = merkle_root_mutated(&leaves);
+            assert!(!mutated, "honest {}-leaf list falsely flagged", leaves.len());
+            assert_eq!(root, merkle_root(&leaves), "root drift in mutated variant");
+        }
+    }
+
+    /// CVE-2012-2459: appending the trailing txid of an odd-N honest list
+    /// reproduces the malleation — the duplicate now sits in a COMPLETE
+    /// adjacent pair at level 0, so `mutated` must be true, and the root is
+    /// IDENTICAL to the honest odd-N list (that identity is the whole CVE).
+    #[test]
+    fn merkle_root_mutated_cve_duplicate_flagged() {
+        let a = sha256d(b"a");
+        let b = sha256d(b"b");
+        let c = sha256d(b"c");
+
+        let honest = vec![a, b, c]; // odd-N: Core duplicates c at level 0
+        let (honest_root, honest_mut) = merkle_root_mutated(&honest);
+        assert!(!honest_mut);
+
+        // Malleated: [a,b,c,c]. The trailing c,c is a complete adjacent pair.
+        let malleated = vec![a, b, c, c];
+        let (mal_root, mal_mut) = merkle_root_mutated(&malleated);
+        assert!(mal_mut, "duplicate trailing pair must be flagged as mutated");
+        assert_eq!(
+            mal_root, honest_root,
+            "malleated list must collide on the honest root (the CVE)"
+        );
+    }
+
+    /// A duplicate adjacent pair NOT at the tail (e.g. [a,a,b,c]) is also a
+    /// complete pair at level 0 → mutated.
+    #[test]
+    fn merkle_root_mutated_interior_duplicate_flagged() {
+        let a = sha256d(b"a");
+        let b = sha256d(b"b");
+        let c = sha256d(b"c");
+        let (_root, mutated) = merkle_root_mutated(&[a, a, b, c]);
+        assert!(mutated);
     }
 
     #[test]
