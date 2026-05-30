@@ -196,6 +196,23 @@ pub struct PeerManagerConfig {
     /// Core's `-connect=0` + `-dnsseed=0` offline posture; see
     /// CORE-PARITY-AUDIT/_phase-b-revalidation-harness-plan-2026-05-21.md.
     pub offline: bool,
+    /// Bitcoin Core `-connect=<ip:port>` (repeatable): pin to ONLY these
+    /// peers. When non-empty the peer manager:
+    ///   * does NOT resolve DNS seeds,
+    ///   * does NOT load/dial anchors,
+    ///   * does NOT auto-fill outbound slots from addrman,
+    /// and instead dials exactly these addresses (re-dialing any that drop).
+    /// Mirrors Core's `-connect` (which implies `-dnsseed=0` and disables
+    /// the addrman auto-outbound loop) and clearbit's `connect_address`
+    /// branch (peer.zig:7009 skips `dnsSeeds()`; peer.zig:7050 gates the
+    /// outbound-fill loop on `connect_address == null`).
+    pub connect_peers: Vec<SocketAddr>,
+    /// Bitcoin Core `-nodnsseed` / `-dnsseed=0`: suppress DNS-seed
+    /// resolution independently of `-connect`. Mirrors clearbit's
+    /// `--nodnsseed` setting `dns_seed = false`. (When `connect_peers` is
+    /// non-empty DNS seeding is already skipped; this flag is the standalone
+    /// knob for the addrman-outbound case.)
+    pub no_dns_seed: bool,
 }
 
 impl PeerManagerConfig {
@@ -264,6 +281,8 @@ impl Default for PeerManagerConfig {
             i2p_sam: None,
             cjdns_reachable: false,
             offline: false,
+            connect_peers: Vec::new(),
+            no_dns_seed: false,
         }
     }
 }
@@ -1105,7 +1124,20 @@ pub struct PeerManager {
     start_height: i32,
     /// Anchor connections loaded from disk.
     anchors: Vec<SocketAddr>,
+    /// `-connect` mode: last time each pinned peer was dialed. Used to
+    /// throttle reconnect attempts so a persistently-dead pin does not
+    /// hot-loop the reactive Disconnected handler (which calls
+    /// `fill_outbound_connections` → `maintain_connect_peers` on every
+    /// drop). Empty / unused when `config.connect_peers` is empty.
+    connect_attempt_at: HashMap<SocketAddr, Instant>,
 }
+
+/// Minimum interval between reconnect attempts to a single pinned `-connect`
+/// peer. Bounds the reactive reconnect loop so a dead pin retries at a steady
+/// cadence rather than spinning. (Core's net.cpp uses an exponential backoff
+/// per address; this fixed floor is the minimal equivalent for the pinned
+/// case.)
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 impl PeerManager {
     /// Create a new peer manager with the given configuration and chain parameters.
@@ -1139,6 +1171,7 @@ impl PeerManager {
             event_rx: Some(event_rx),
             start_height: 0,
             anchors,
+            connect_attempt_at: HashMap::new(),
         }
     }
 
@@ -1182,6 +1215,7 @@ impl PeerManager {
             event_rx: Some(event_rx),
             start_height: 0,
             anchors,
+            connect_attempt_at: HashMap::new(),
         }
     }
 
@@ -1401,12 +1435,37 @@ impl PeerManager {
             return;
         }
 
+        // `-connect=<ip:port>` peer pinning (Bitcoin Core / clearbit semantics).
+        // When the connect list is non-empty we connect to ONLY those peers:
+        // no anchors, no DNS seeds, no fallback peers, and no addrman-driven
+        // outbound fill. We dial exactly the pinned addresses here; dropped
+        // pinned peers are re-dialed by `fill_outbound_connections` (which is
+        // itself gated to the pinned-only path in connect mode), driven by the
+        // reactive Disconnected handler and the periodic maintenance tick.
+        // Mirrors clearbit peer.zig:7009 (connect branch skips dnsSeeds()) and
+        // peer.zig:7050 (outbound-fill loop gated on connect_address == null).
+        if !self.config.connect_peers.is_empty() {
+            tracing::info!(
+                "-connect set ({} peer(s)): pinning to those peers only — \
+                 skipping DNS seeds, anchors, and addrman auto-outbound",
+                self.config.connect_peers.len()
+            );
+            self.fill_outbound_connections().await;
+            return;
+        }
+
         // First, try to connect to anchor peers (block-relay-only)
         // These are persisted from previous sessions for eclipse attack resistance
         self.connect_to_anchors().await;
 
-        // Resolve DNS seeds
-        let addrs = resolve_dns_seeds(&self.params.dns_seeds, self.params.default_port).await;
+        // Resolve DNS seeds — suppressed by `-nodnsseed` / `-dnsseed=0`
+        // (Core: no DNS lookups when dnsseed is disabled).
+        let addrs = if self.config.no_dns_seed {
+            tracing::info!("DNS seeding disabled (-nodnsseed); relying on addrman / fallback peers");
+            Vec::new()
+        } else {
+            resolve_dns_seeds(&self.params.dns_seeds, self.params.default_port).await
+        };
 
         if addrs.is_empty() {
             tracing::warn!("No addresses from DNS seeds, trying fallback peers");
@@ -1480,6 +1539,18 @@ impl PeerManager {
     /// This enforces network group diversity: no two IPv4/IPv6 outbound connections
     /// may share the same /16 (IPv4) or /32 (IPv6) network group.
     pub async fn fill_outbound_connections(&mut self) {
+        // `-connect` mode: dial ONLY the pinned peers, never the addrman.
+        // This is the single chokepoint reached on startup, on the reactive
+        // PeerEvent::Disconnected path, and on the periodic maintenance tick,
+        // so gating it here suppresses all three auto-outbound sources at
+        // once. Re-dials any pinned peer that is not currently connected or
+        // connecting (so a dropped pin reconnects), and never touches DNS,
+        // anchors, or `next_addr_to_try`. Mirrors clearbit peer.zig:7050.
+        if !self.config.connect_peers.is_empty() {
+            self.maintain_connect_peers().await;
+            return;
+        }
+
         // Count full-relay outbound connections
         let full_relay_count = self
             .peers
@@ -1534,6 +1605,49 @@ impl PeerManager {
             } else {
                 break;
             }
+        }
+    }
+
+    /// `-connect` mode: re-dial any pinned peer that is not currently
+    /// connected or connecting. Used in place of the addrman-driven
+    /// `fill_outbound_connections` when `config.connect_peers` is non-empty.
+    ///
+    /// Each pinned peer is dialed as a `FullRelay` outbound (Core treats
+    /// `-connect` peers as manual full-relay connections). A pinned peer is
+    /// considered "already handled" if there is an outbound `PeerHandle` to
+    /// the same `SocketAddr` in `Connecting` or `Established` state; otherwise
+    /// we open a fresh connection. This gives Core/clearbit reconnect
+    /// behaviour without ever consulting DNS seeds, anchors, or addrman.
+    async fn maintain_connect_peers(&mut self) {
+        // Snapshot the pin list so we can mutably borrow `self` while dialing.
+        let pins = self.config.connect_peers.clone();
+        let now = Instant::now();
+        for addr in pins {
+            let already = self.peers.values().any(|p| {
+                !p.info.inbound
+                    && p.info.addr == addr
+                    && matches!(
+                        p.info.state,
+                        PeerState::Connecting | PeerState::Established
+                    )
+            });
+            if already {
+                continue;
+            }
+            // Throttle reconnects to a single pinned peer. The reactive
+            // Disconnected handler calls into here on every drop; without this
+            // floor a permanently-dead pin (e.g. wrong/closed port) would spin
+            // a tight connect→refused→reconnect loop. A live pin is unaffected
+            // (it stays Established and hits the `already` guard above).
+            if let Some(last) = self.connect_attempt_at.get(&addr) {
+                if now.duration_since(*last) < CONNECT_RETRY_INTERVAL {
+                    continue;
+                }
+            }
+            self.connect_attempt_at.insert(addr, now);
+            tracing::info!("Connecting to pinned -connect peer {}", addr);
+            self.connect_to_with_type(addr, ConnectionType::FullRelay)
+                .await;
         }
     }
 
