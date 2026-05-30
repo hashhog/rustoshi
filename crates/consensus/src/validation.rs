@@ -64,6 +64,14 @@ pub enum ValidationError {
     #[error("bad merkle root")]
     BadMerkleRoot,
 
+    /// CVE-2012-2459: the transaction list produces an identical adjacent
+    /// pair of hashes at some level of the Merkle tree (a duplicate-txid
+    /// malleation that collides on the same root as an honest list). Bitcoin
+    /// Core's `CheckMerkleRoot` (validation.cpp:3850-3858) rejects this with
+    /// `bad-txns-duplicate` even though the computed root equals the header.
+    #[error("duplicate transactions (CVE-2012-2459 merkle mutation)")]
+    BadTxnsDuplicate,
+
     #[error("bad proof of work")]
     BadProofOfWork,
 
@@ -231,6 +239,9 @@ impl ValidationError {
             ValidationError::BadProofOfWork => "high-hash".to_string(),
             // Merkle root
             ValidationError::BadMerkleRoot => "bad-txnmrklroot".to_string(),
+            // CVE-2012-2459 duplicate-txid merkle malleation
+            // Bitcoin Core: validation.cpp:3856 "bad-txns-duplicate"
+            ValidationError::BadTxnsDuplicate => "bad-txns-duplicate".to_string(),
             // Witness commitment (BIP-141)
             ValidationError::BadWitnessCommitment => "bad-witness-merkle-match".to_string(),
             // Coinbase witness stack not exactly [32-byte nonce]
@@ -492,10 +503,20 @@ pub fn check_block(block: &Block, params: &ChainParams) -> Result<(), Validation
         return Err(ValidationError::BadProofOfWork);
     }
 
-    // Validate merkle root
-    let computed = block.compute_merkle_root();
+    // Validate merkle root.
+    //
+    // Core CheckMerkleRoot (validation.cpp:3850-3858) computes the root with
+    // a `mutated` out-param and rejects on EITHER a root mismatch
+    // (bad-txnmrklroot) OR `mutated == true` (bad-txns-duplicate, the
+    // CVE-2012-2459 duplicate-txid malleation). The malleated block has the
+    // SAME root as the honest one, so checking root equality alone is a
+    // false-accept — we must also reject when the mutation flag is set.
+    let (computed, mutated) = block.compute_merkle_root_mutated();
     if computed != block.header.merkle_root {
         return Err(ValidationError::BadMerkleRoot);
+    }
+    if mutated {
+        return Err(ValidationError::BadTxnsDuplicate);
     }
 
     // Check block weight
@@ -3073,6 +3094,48 @@ mod tests {
         let _params = ChainParams::regtest();
         // First it will fail PoW, so let's just test the merkle root check
         // by using a block that passes PoW
+    }
+
+    /// CVE-2012-2459: `check_block` must reject a block whose transaction
+    /// list trips the merkle mutation flag (duplicate-txid malleation that
+    /// collides on the same root). This is the `bad-txns-duplicate` path that
+    /// `compute_merkle_root_mutated` feeds into `check_block`
+    /// (validation.rs:514-519). The block-level primitive is the one CheckBlock
+    /// uses, so we assert directly on it here (avoiding the unrelated PoW gate),
+    /// then confirm the BIP-22 string + the check_block wiring shape.
+    #[test]
+    fn check_block_flags_cve2459_merkle_mutation() {
+        // Honest 3-tx block: coinbase + 2 distinct txs (odd-N at level 0).
+        let cb = make_coinbase_tx(1, 5_000_000_000);
+        let t1 = make_simple_tx(Hash256::from_bytes([1u8; 32]), 0, 10);
+        let t2 = make_simple_tx(Hash256::from_bytes([2u8; 32]), 0, 20);
+
+        let honest = Block {
+            header: BlockHeader::default(),
+            transactions: vec![cb.clone(), t1.clone(), t2.clone()],
+        };
+        let (honest_root, honest_mut) = honest.compute_merkle_root_mutated();
+        assert!(!honest_mut, "honest odd-N block must NOT be flagged (false-reject)");
+
+        // Malleated: append a duplicate of the last tx so level 0 is
+        // [cb, t1, t2, t2] — t2,t2 is a COMPLETE adjacent pair → mutated, and
+        // the root is IDENTICAL to the honest list (the CVE).
+        let malleated = Block {
+            header: BlockHeader::default(),
+            transactions: vec![cb, t1, t2.clone(), t2],
+        };
+        let (mal_root, mal_mut) = malleated.compute_merkle_root_mutated();
+        assert!(mal_mut, "duplicate-tail block must be flagged as mutated");
+        assert_eq!(
+            mal_root, honest_root,
+            "malleated block collides on honest root (CVE-2012-2459)"
+        );
+
+        // The wired ValidationError maps to Core's canonical reject string.
+        assert_eq!(
+            ValidationError::BadTxnsDuplicate.bip22_string(),
+            "bad-txns-duplicate"
+        );
     }
 
     // =========================
