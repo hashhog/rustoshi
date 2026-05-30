@@ -26,7 +26,7 @@ pub use bech32::{
     bech32_decode, bech32_encode, convert_bits, decode_segwit_address, encode_segwit_address,
     Bech32Error, Bech32Variant,
 };
-pub use hashes::{hash160, merkle_root, sha256, sha256d, tagged_hash};
+pub use hashes::{hash160, merkle_root, merkle_root_mutated, sha256, sha256d, tagged_hash};
 pub use p2sh::{is_p2sh, is_p2wsh, verify_p2sh_commitment, verify_p2wsh_commitment, CommitmentError};
 pub use hwaccel::{sha256_capabilities, Sha256Capabilities};
 pub use sha256::sha256_implementation;
