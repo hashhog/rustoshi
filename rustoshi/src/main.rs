@@ -139,9 +139,21 @@ struct Cli {
     #[arg(long, default_value = "8")]
     maxconnections: usize,
 
-    /// Connect only to this peer (for testing)
+    /// Connect ONLY to the specified peer(s) (`<ip:port>`), repeatable.
+    /// Mirrors Bitcoin Core's `-connect=<ip:port>`: when set, rustoshi pins
+    /// to exactly these peers and disables DNS-seed resolution, anchors, and
+    /// addrman-driven auto-outbound dialing (Core's `-connect` implies
+    /// `-dnsseed=0`). Use to run isolated against a trusted/local node, e.g.
+    /// `--connect=127.0.0.1:8333`.
     #[arg(long)]
-    connect: Option<String>,
+    connect: Vec<String>,
+
+    /// Disable DNS-seed resolution (Bitcoin Core `-nodnsseed` / `-dnsseed=0`).
+    /// Independent of `--connect`; suppresses only DNS lookups while still
+    /// allowing addrman/anchor-driven outbound. When `--connect` is set, DNS
+    /// seeding is already skipped regardless of this flag.
+    #[arg(long = "nodnsseed", default_value = "false")]
+    nodnsseed: bool,
 
     /// Enable transaction indexing
     #[arg(long)]
@@ -1310,7 +1322,19 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
             }
         }
     }
-    merge_opt_str!(connect, "connect");
+    // `-connect` is repeatable on the CLI (Vec). From a conf file we accept a
+    // single `connect=` line, optionally comma-separated, applied only when no
+    // CLI `--connect` was given.
+    if !was_set(raw_argv, "connect") {
+        if let Some(v) = conf.get("connect") {
+            cli.connect = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
+    merge_bool!(nodnsseed, "nodnsseed");
     merge_bool!(txindex, "txindex");
     merge_str!(loglevel, "loglevel");
     if !was_set(raw_argv, "metrics-port") && !was_set(raw_argv, "metrics_port") {
@@ -2238,6 +2262,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         onion_proxy,
         i2p_sam,
         cjdns_reachable: cli.cjdnsreachable,
+        // Bitcoin Core `-connect=<ip:port>` peer pinning: parse each address
+        // now so a bad value fails fast at startup. A non-empty list makes the
+        // peer manager pin to ONLY these peers (no DNS seeds, no anchors, no
+        // addrman auto-outbound) — see PeerManagerConfig::connect_peers.
+        connect_peers: cli
+            .connect
+            .iter()
+            .map(|s| {
+                s.parse::<std::net::SocketAddr>()
+                    .unwrap_or_else(|e| panic!("Invalid --connect address {s:?}: {e}"))
+            })
+            .collect(),
+        // Bitcoin Core `-nodnsseed`: suppress DNS-seed resolution. `-connect`
+        // already implies this, so OR the two so a connect list also reports
+        // DNS as disabled.
+        no_dns_seed: cli.nodnsseed || !cli.connect.is_empty(),
         ..Default::default()
     };
     let mut peer_manager = PeerManager::new_with_netgroup(peer_config, params.clone(), netgroup_manager);
@@ -2250,11 +2290,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         tracing::info!("{}", stats.summary_line());
     }
 
-    // Connect to specific peer if --connect is set
-    if let Some(connect_addr) = &cli.connect {
-        let addr: std::net::SocketAddr = connect_addr.parse().expect("Invalid --connect address");
-        peer_manager.add_peer(addr);
-        tracing::info!("Manual peer added: {}", addr);
+    // `-connect` peer pinning is handled inside the peer manager via
+    // `PeerManagerConfig::connect_peers` (set above): `start()` dials only the
+    // pinned peers and skips DNS seeds / anchors / addrman auto-outbound, and
+    // `fill_outbound_connections` re-dials dropped pins. Nothing to do here.
+    if !cli.connect.is_empty() {
+        tracing::info!(
+            "-connect: pinning to {} peer(s); DNS seeds + auto-outbound disabled",
+            cli.connect.len()
+        );
     }
 
     // Take event receiver out of peer manager so we can poll it independently
