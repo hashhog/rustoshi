@@ -365,7 +365,20 @@ impl ValidationError {
             // Bitcoin Core: BLOCK_HEADER_LOW_WORK → "too-little-chainwork"
             // (validation.cpp:4229-4231).
             ValidationError::TooLittleChainwork => "too-little-chainwork".to_string(),
-            // Catch-all: covers structural/weight/prev-block/chain errors
+            // Block weight / base-size over MAX_BLOCK_WEIGHT (4M weight units).
+            // Bitcoin Core CheckBlock validation.cpp:3938-3942:
+            //   "bad-blk-weight" (and "bad-blk-length" for the raw byte cap).
+            // Token fidelity only — decision-first scoring already counts the
+            // reject; this lets the advisory reason name the real gate.
+            ValidationError::WeightExceeded(_) | ValidationError::BlockTooLarge(_) => {
+                "bad-blk-weight".to_string()
+            }
+            // Coinbase missing / not first: Core CheckBlock validation.cpp:
+            //   vtx empty or !vtx[0]->IsCoinBase() → "bad-cb-missing".
+            ValidationError::NoCoinbase => "bad-cb-missing".to_string(),
+            // More than one coinbase: validation.cpp → "bad-cb-multiple".
+            ValidationError::MultipleCoinbase => "bad-cb-multiple".to_string(),
+            // Catch-all: covers structural/prev-block/chain errors
             _ => "rejected".to_string(),
         }
     }
@@ -462,6 +475,34 @@ pub fn check_transaction(tx: &Transaction) -> Result<(), TxValidationError> {
 /// - Sigops don't exceed limit
 /// - No duplicate transactions
 pub fn check_block(block: &Block, params: &ChainParams) -> Result<(), ValidationError> {
+    // Default: enforce PoW, exactly as every IBD/accept caller requires.
+    // Core's CheckBlock signature is
+    //   CheckBlock(block, state, params, fCheckPOW=true, fCheckMerkleRoot=true)
+    // (bitcoin-core/src/validation.cpp). rustoshi's public `check_block`
+    // historically hard-coded fCheckPOW=true; we now delegate to the
+    // `check_block_with_pow` variant so a pure-function harness (which feeds a
+    // MUTATED real block whose re-serialized header no longer meets the mainnet
+    // target) can disable ONLY the PoW gate and still exercise every body gate
+    // (bad-cb-amount / bad-cb-height / witness-commitment / sigops / weight).
+    // Behavior is byte-identical for all existing callers (check_pow=true).
+    check_block_with_pow(block, params, true)
+}
+
+/// `check_block` with Core's `fCheckPOW` flag exposed.
+///
+/// Mirrors `CheckBlock(..., bool fCheckPOW, ...)` in Bitcoin Core
+/// (src/validation.cpp). When `check_pow == true` this is identical to the
+/// historical `check_block`. When `false`, the unconditional
+/// `check_proof_of_work` short-circuit is skipped so that the remaining
+/// CheckBlock body gates run even on a block whose header hash does not meet
+/// the encoded target — required by the Phase B `checkblock` differential op,
+/// which mutates a real mainnet block (changing its header hash) to probe a
+/// specific body gate. NO other caller passes `false`.
+pub fn check_block_with_pow(
+    block: &Block,
+    params: &ChainParams,
+    check_pow: bool,
+) -> Result<(), ValidationError> {
     // Must have at least one transaction
     if block.transactions.is_empty() {
         return Err(ValidationError::NoTransactions);
@@ -493,14 +534,16 @@ pub fn check_block(block: &Block, params: &ChainParams) -> Result<(), Validation
         check_transaction(tx)?;
     }
 
-    // Validate proof of work.
+    // Validate proof of work (Core fCheckPOW gate).
     // Use check_proof_of_work (not just validate_pow) so we also verify that the
     // encoded target does not exceed pow_limit. Core's DeriveTarget enforces this
     // as part of CheckProofOfWork (pow.cpp:154-155). A block with bits encoding a
     // target above pow_limit must be rejected even if its hash is below that target.
-    let block_hash = block.header.block_hash();
-    if !check_proof_of_work(&block_hash.0, block.header.bits, params) {
-        return Err(ValidationError::BadProofOfWork);
+    if check_pow {
+        let block_hash = block.header.block_hash();
+        if !check_proof_of_work(&block_hash.0, block.header.bits, params) {
+            return Err(ValidationError::BadProofOfWork);
+        }
     }
 
     // Validate merkle root.
