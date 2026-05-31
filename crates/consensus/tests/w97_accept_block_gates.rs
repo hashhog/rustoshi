@@ -122,6 +122,7 @@ fn g7_helper_rejects_time_equals_mtp() {
         &ctx,
         &params,
         0,
+        None, // expected_bits: skip bad-diffbits (testing the other gates)
     );
     assert!(matches!(res, Err(ValidationError::TimeTooOld)));
 }
@@ -145,7 +146,7 @@ fn g7_helper_rejects_v1_at_bip34_height() {
     let mut params = ChainParams::regtest();
     params.bip34_height = 100;
     let res =
-        contextual_check_block_header(&header, 100, &dummy_prev_entry(0), &ctx, &params, 0);
+        contextual_check_block_header(&header, 100, &dummy_prev_entry(0), &ctx, &params, 0, None);
     assert!(matches!(res, Err(ValidationError::BadVersion(1))));
 }
 
@@ -176,6 +177,7 @@ fn g7_helper_rejects_bip94_timewarp_on_testnet4() {
         &ctx,
         &params,
         0,
+        None, // expected_bits: skip bad-diffbits (testing the other gates)
     );
     assert!(matches!(res, Err(ValidationError::TimeTimewarpAttack)));
 }
@@ -743,7 +745,7 @@ fn g7_helper_rejects_v3_at_bip65_height() {
     let mut params = ChainParams::regtest();
     params.bip65_height = 50;
     let res =
-        contextual_check_block_header(&header, 50, &dummy_prev_entry(0), &ctx, &params, 0);
+        contextual_check_block_header(&header, 50, &dummy_prev_entry(0), &ctx, &params, 0, None);
     assert!(matches!(res, Err(ValidationError::BadVersion(3))));
 }
 
@@ -766,7 +768,7 @@ fn g7_helper_rejects_v2_at_bip66_height() {
     let mut params = ChainParams::regtest();
     params.bip66_height = 75;
     let res =
-        contextual_check_block_header(&header, 75, &dummy_prev_entry(0), &ctx, &params, 0);
+        contextual_check_block_header(&header, 75, &dummy_prev_entry(0), &ctx, &params, 0, None);
     assert!(matches!(res, Err(ValidationError::BadVersion(2))));
 }
 
@@ -794,6 +796,7 @@ fn g7_helper_rejects_time_too_new_7201s() {
         &ctx,
         &params,
         now,
+        None, // expected_bits: skip bad-diffbits (testing the other gates)
     );
     assert!(matches!(res, Err(ValidationError::TimeTooNew)));
 }
@@ -822,6 +825,7 @@ fn g7_helper_accepts_time_too_new_exactly_7200s() {
         &ctx,
         &params,
         now,
+        None, // expected_bits: skip bad-diffbits (testing the other gates)
     );
     assert!(res.is_ok(), "exactly 7200s in the future must be accepted: {res:?}");
 }

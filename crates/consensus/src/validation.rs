@@ -75,6 +75,20 @@ pub enum ValidationError {
     #[error("bad proof of work")]
     BadProofOfWork,
 
+    /// The block's claimed `nBits` does not equal the value recomputed by the
+    /// difficulty-retarget algorithm (`GetNextWorkRequired`) for this height.
+    ///
+    /// This is Core's FIRST contextual header gate
+    /// (`validation.cpp::ContextualCheckBlockHeader`, validation.cpp:4088):
+    ///   `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))`
+    ///     -> BLOCK_INVALID_HEADER "bad-diffbits".
+    /// It is the only place the claimed difficulty target is compared to the
+    /// value the network's retarget schedule mandates; without it a block with
+    /// an *easier* `nBits` whose hash meets that easier target is FALSE-ACCEPTED
+    /// (a difficulty-manipulation chain split).
+    #[error("incorrect proof of work (nBits != GetNextWorkRequired)")]
+    BadDifficulty,
+
     #[error("timestamp too old (before median-time-past)")]
     TimeTooOld,
 
@@ -237,6 +251,9 @@ impl ValidationError {
         match self {
             // PoW
             ValidationError::BadProofOfWork => "high-hash".to_string(),
+            // nBits != GetNextWorkRequired (Core's first contextual header gate).
+            // Bitcoin Core: validation.cpp:4088-4089 "bad-diffbits".
+            ValidationError::BadDifficulty => "bad-diffbits".to_string(),
             // Merkle root
             ValidationError::BadMerkleRoot => "bad-txnmrklroot".to_string(),
             // CVE-2012-2459 duplicate-txid merkle malleation
@@ -963,14 +980,27 @@ pub trait ChainContext {
 
 /// Contextual validation of a block header.
 ///
-/// Checks that depend on the previous block / wall clock:
+/// Checks that depend on the previous block / wall clock, in the SAME order as
+/// Core `validation.cpp::ContextualCheckBlockHeader` (validation.cpp:4080-4121):
+/// - **bad-diffbits** (Core's FIRST gate, validation.cpp:4088): `nBits` must
+///   equal the value the difficulty-retarget algorithm mandates for this
+///   height (`GetNextWorkRequired`). Enforced only when `expected_bits` is
+///   supplied (the caller computed it from the real ancestor chain).
 /// - Timestamp must be greater than median-time-past of previous 11 blocks
-///   (Core: `validation.cpp::ContextualCheckBlockHeader`, error
-///   `time-too-old`).
+///   (`time-too-old`, validation.cpp:4092).
+/// - BIP-94 timewarp floor on retarget-boundary blocks
+///   (`time-timewarp-attack`, validation.cpp:4097-4105; testnet4/regtest only).
 /// - Timestamp must NOT be more than `MAX_FUTURE_BLOCK_TIME` (7200 seconds)
-///   ahead of `current_time` (Core: `validation.cpp::CheckBlockHeader`,
-///   error `time-too-new`).
-/// - Block version must be valid for the height (BIP-65/66) — placeholder.
+///   ahead of `current_time` (`time-too-new`, validation.cpp:4108).
+/// - Block version must be valid for the height (BIP-34/66/65 `bad-version`,
+///   validation.cpp:4112).
+///
+/// `expected_bits` is `Some(GetNextWorkRequired(pindexPrev, &block, params))`
+/// when the caller has the ancestor chain to recompute the retarget value;
+/// pass `None` only where that chain is genuinely unavailable (the gate is then
+/// skipped — never a false-reject). Core always has `pindexPrev` so it always
+/// runs this gate; rustoshi callers on top of a header store should always pass
+/// `Some`.
 ///
 /// `current_time` is the node's wall-clock seconds since epoch, used for
 /// the future-drift check.  Pass `0` to skip the future-time check (only
@@ -982,7 +1012,26 @@ pub fn contextual_check_block_header(
     context: &dyn ChainContext,
     params: &ChainParams,
     current_time: u64,
+    expected_bits: Option<u32>,
 ) -> Result<(), ValidationError> {
+    // Gate 0 (Core:4088-4089): the claimed difficulty bits MUST equal the value
+    // recomputed by the difficulty-retarget algorithm for this height.
+    // Reference: bitcoin-core/src/validation.cpp:4088-4089
+    //   `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))`
+    //   `    return state.Invalid(BLOCK_INVALID_HEADER, "bad-diffbits", ...);`
+    // This is Core's FIRST contextual header gate and the ONLY place the
+    // claimed nBits is compared to the network-mandated retarget value. Without
+    // it a block with an easier nBits whose hash meets that easier target would
+    // be FALSE-ACCEPTED (difficulty manipulation / chain split). `expected_bits`
+    // is computed by the caller via `get_next_work_required` over the real
+    // ancestor chain; `None` means the caller could not build that chain and
+    // intentionally skips the gate (never a false-reject).
+    if let Some(expected) = expected_bits {
+        if header.bits != expected {
+            return Err(ValidationError::BadDifficulty);
+        }
+    }
+
     // Gate 1 (Core:4092): Block timestamp must be strictly greater than
     // the median-time-past of the previous 11 blocks (BIP-113).
     // Uses `<=` — block-time must be strictly greater than MTP.
@@ -5104,6 +5153,7 @@ mod tests {
             &ctx,
             &params,
             0, // current_time=0 to skip future-drift check
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(matches!(res, Err(ValidationError::TimeTooOld)),
             "header timestamp == MTP must be rejected: {res:?}");
@@ -5131,6 +5181,7 @@ mod tests {
             &ctx,
             &params,
             1_700_000_500, // current_time well after timestamp
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(), "header > MTP must be accepted: {res:?}");
     }
@@ -5162,6 +5213,7 @@ mod tests {
             &ctx,
             &params,
             now,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(matches!(res, Err(ValidationError::TimeTooNew)),
             "header 4h in future must be rejected: {res:?}");
@@ -5190,6 +5242,7 @@ mod tests {
             &ctx,
             &params,
             now,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(), "header within drift window must be accepted: {res:?}");
     }
@@ -5223,6 +5276,7 @@ mod tests {
             &ctx,
             &params,
             now,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(),
             "timestamp == now+7200 must be accepted (boundary is strict >): {res:?}");
@@ -5252,6 +5306,7 @@ mod tests {
             &ctx,
             &params,
             now,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(),
             "timestamp == now+7199 must be accepted: {res:?}");
@@ -5281,6 +5336,7 @@ mod tests {
             &ctx,
             &params,
             now,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(matches!(res, Err(ValidationError::TimeTooNew)),
             "timestamp == now+7201 must be rejected: {res:?}");
@@ -5314,6 +5370,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(matches!(res, Err(ValidationError::TimeTooOld)),
             "timestamp == MTP must be rejected (strict <=): {res:?}");
@@ -5342,6 +5399,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(), "timestamp == MTP+1 must be accepted: {res:?}");
     }
@@ -5396,6 +5454,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(matches!(res, Err(ValidationError::TimeTimewarpAttack)),
             "timewarp at retarget boundary must be rejected: {res:?}");
@@ -5432,6 +5491,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(),
             "timestamp == prev - MAX_TIMEWARP must be accepted (strict <): {res:?}");
@@ -5465,6 +5525,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(),
             "timewarp must not be enforced on mainnet: {res:?}");
@@ -5496,6 +5557,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(),
             "timewarp must not be enforced at non-retarget heights: {res:?}");
@@ -5539,6 +5601,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(matches!(res, Err(ValidationError::BadVersion(1))),
             "nVersion=1 at bip34_height must be rejected: {res:?}");
@@ -5567,6 +5630,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(), "nVersion=2 at bip34_height must be accepted: {res:?}");
     }
@@ -5594,6 +5658,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(matches!(res, Err(ValidationError::BadVersion(2))),
             "nVersion=2 at bip66_height must be rejected: {res:?}");
@@ -5622,6 +5687,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(matches!(res, Err(ValidationError::BadVersion(3))),
             "nVersion=3 at bip65_height must be rejected: {res:?}");
@@ -5650,6 +5716,7 @@ mod tests {
             &ctx,
             &params,
             0,
+            None, // expected_bits: skip the bad-diffbits gate (this test exercises the OTHER gates)
         );
         assert!(res.is_ok(),
             "nVersion=1 before BIP-34 activation must be accepted: {res:?}");

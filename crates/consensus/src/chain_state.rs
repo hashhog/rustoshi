@@ -521,6 +521,15 @@ impl ChainState {
             prev_hash: block.header.prev_block_hash,
             chain_work: [0u8; 32],
         };
+        // `expected_bits = None`: `ChainState` does not itself hold the header
+        // chain, so it cannot recompute `GetNextWorkRequired` here. The
+        // canonical bad-diffbits enforcement lives on the header-sync path
+        // (rustoshi/src/main.rs), which has `block_store` access to walk the
+        // ancestor chain and passes `Some(expected_bits)` — exactly as the
+        // real MTP enforcement is done inline there rather than via the
+        // StubChainContext (which returns MTP=0). Passing `None` here keeps
+        // this connect-time call a no-op for the diffbits gate (never a
+        // false-reject); the header was already diffbits-checked at acceptance.
         contextual_check_block_header(
             &block.header,
             new_height,
@@ -528,6 +537,7 @@ impl ChainState {
             &StubChainContext,
             &self.params,
             current_time,
+            None,
         )?;
 
         // Contextual checks (BIP-34 coinbase-height encoding + SegWit
