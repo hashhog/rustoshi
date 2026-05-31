@@ -389,6 +389,110 @@ fn compute_mtp_via_store(
     median_time_past(&mut timestamps)
 }
 
+/// Compute the `nBits` the difficulty-retarget algorithm mandates for the block
+/// whose parent (tip) is `parent_hash`, by walking the stored ancestor chain
+/// and running rustoshi's real `get_next_work_required` (the SAME function the
+/// miner/block-template path uses, pow.rs).
+///
+/// This is the input to Core's FIRST contextual header gate
+/// (`validation.cpp::ContextualCheckBlockHeader`, validation.cpp:4088:
+/// `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))`).
+/// `new_block_time` is the timestamp of the block being validated (needed for
+/// the testnet min-difficulty rule). Returns `None` if the parent chain cannot
+/// be walked from the store (e.g. an assumeUTXO snapshot base with no stored
+/// ancestor headers), in which case the caller skips the diffbits gate rather
+/// than false-rejecting.
+fn compute_expected_bits_via_store(
+    block_store: &BlockStore,
+    parent_hash: &rustoshi_primitives::Hash256,
+    new_block_time: u32,
+    params: &rustoshi_consensus::ChainParams,
+) -> Option<u32> {
+    use rustoshi_consensus::params::DIFFICULTY_ADJUSTMENT_INTERVAL;
+    use rustoshi_consensus::pow::{get_next_work_required, BlockIndex as PowBlockIndex};
+
+    // Walk back at most one full retarget interval (+2 buffer) from the parent.
+    // get_next_work_required needs the tip plus, on a retarget boundary, the
+    // ancestor at `h - 2016`; the testnet min-difficulty walk-back also wants
+    // the recent chain.
+    let needed = (DIFFICULTY_ADJUSTMENT_INTERVAL + 2) as usize;
+
+    // First resolve the parent (= tip / pindexPrev) header + its height.
+    let parent_header = match block_store.get_header(parent_hash) {
+        Ok(Some(h)) => h,
+        _ => return None,
+    };
+    let parent_height = match block_store.get_height(parent_hash) {
+        Ok(Some(h)) => h,
+        _ => return None,
+    };
+
+    // Collect parent + ancestors, oldest-last.
+    let mut headers: Vec<rustoshi_primitives::BlockHeader> = Vec::with_capacity(needed);
+    let mut cursor = *parent_hash;
+    for _ in 0..needed {
+        match block_store.get_header(&cursor) {
+            Ok(Some(hdr)) => {
+                let prev = hdr.prev_block_hash;
+                headers.push(hdr);
+                if prev == rustoshi_primitives::Hash256::ZERO {
+                    break;
+                }
+                cursor = prev;
+            }
+            _ => break,
+        }
+    }
+    if headers.is_empty() {
+        return None;
+    }
+
+    // Build a linked BlockIndex chain (headers[0] = parent/tip, oldest last).
+    struct SimpleBlockIndex {
+        height: u32,
+        timestamp: u32,
+        bits: u32,
+        prev: Option<Box<SimpleBlockIndex>>,
+    }
+    impl PowBlockIndex for SimpleBlockIndex {
+        fn height(&self) -> u32 {
+            self.height
+        }
+        fn timestamp(&self) -> u32 {
+            self.timestamp
+        }
+        fn bits(&self) -> u32 {
+            self.bits
+        }
+        fn prev(&self) -> Option<&Self> {
+            self.prev.as_deref()
+        }
+        fn ancestor(&self, target_height: u32) -> Option<&Self> {
+            if target_height > self.height {
+                return None;
+            }
+            let mut cur = self;
+            while cur.height > target_height {
+                cur = cur.prev.as_deref()?;
+            }
+            Some(cur)
+        }
+    }
+
+    let _ = parent_header; // height already taken; header kept only for the get_header guard above
+    let mut node: Option<Box<SimpleBlockIndex>> = None;
+    for (i, hdr) in headers.iter().enumerate().rev() {
+        let h = parent_height.saturating_sub(i as u32);
+        node = Some(Box::new(SimpleBlockIndex {
+            height: h,
+            timestamp: hdr.timestamp,
+            bits: hdr.bits,
+            prev: node,
+        }));
+    }
+    node.map(|tip| get_next_work_required(&*tip, new_block_time, params))
+}
+
 /// MTP to use as the `IsFinalTx` / `ContextualCheckBlock` `nLockTimeCutoff`
 /// when connecting the block whose parent is `parent_hash`.
 ///
@@ -2809,11 +2913,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     peer_id,
                                     headers,
                                     &mut |header, height| {
-                                        // Canonical header-validation gates: 7200-future
-                                        // (gate 3), BIP-94 timewarp (gate 2, mainnet no-op),
-                                        // outdated-version BIP-34/65/66 (gate 4). Routes
-                                        // through contextual_check_block_header — the same
-                                        // helper now wired into chain_state::process_block
+                                        // Canonical header-validation gates: bad-diffbits
+                                        // (gate 0, Core's FIRST gate — now enforced via the
+                                        // expected_bits below), 7200-future (gate 3), BIP-94
+                                        // timewarp (gate 2, mainnet no-op), outdated-version
+                                        // BIP-34/65/66 (gate 4). Routes through
+                                        // contextual_check_block_header — the same helper
+                                        // wired into chain_state::process_block
                                         // (rustoshi commit 630166f). Closes the header-side
                                         // half of G7/BUG-11. Until 2026-05-25 the
                                         // future-time check was inlined here as a workaround
@@ -2837,6 +2943,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             prev_hash: rustoshi_primitives::Hash256::ZERO,
                                             chain_work: [0u8; 32],
                                         };
+                                        // bad-diffbits (Core's FIRST contextual header gate,
+                                        // validation.cpp:4088): recompute GetNextWorkRequired
+                                        // over the stored ancestor chain and require the
+                                        // header's nBits to match. `None` only when the
+                                        // ancestor chain isn't reachable from the store
+                                        // (e.g. an assumeUTXO snapshot base) — then we skip
+                                        // rather than false-reject, same convention as the
+                                        // MTP walk below.
+                                        let expected_bits = compute_expected_bits_via_store(
+                                            &block_store,
+                                            &header.prev_block_hash,
+                                            header.timestamp,
+                                            &params,
+                                        );
                                         rustoshi_consensus::contextual_check_block_header(
                                             header,
                                             height,
@@ -2844,6 +2964,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             &rustoshi_consensus::StubChainContext,
                                             &params,
                                             now_secs,
+                                            expected_bits,
                                         )
                                         .map_err(|e| format!("{:?}", e))?;
                                         // BIP-113 MTP check: reject headers whose timestamp
