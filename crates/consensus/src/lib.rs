@@ -58,7 +58,7 @@ pub use script::{
 };
 pub use validation::{
     accept_block_header_chain_work,
-    calculate_sequence_locks, check_block, check_sequence_locks, check_transaction,
+    calculate_sequence_locks, check_block, check_block_with_pow, check_sequence_locks, check_transaction,
     connect_block_with_sequence_locks, contextual_check_block, contextual_check_block_header,
     disconnect_block, validate_scripts_parallel_with_cache,
     BlockIndexEntry, ChainContext, CoinEntry, DisconnectResult, SequenceLockContext,
