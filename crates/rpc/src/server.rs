@@ -953,6 +953,24 @@ pub trait RustoshiRpc {
         hash_type: Option<String>,
     ) -> RpcResult<serde_json::Value>;
 
+    /// Scan the UTXO set for outputs matching the given scan objects.
+    /// Mirrors Bitcoin Core rpc/blockchain.cpp scantxoutset.
+    ///
+    /// `action` is one of "start" / "abort" / "status". Only "start" does
+    /// real work; "abort"/"status" return a trivial success stub (rustoshi
+    /// performs the scan synchronously, so no background scan can be running).
+    ///
+    /// `scanobjects` (required for "start") is an array of descriptor
+    /// strings. Minimal subset supported: `addr(<address>)`,
+    /// `raw(<scriptPubKey-hex>)`, and the single-key descriptors
+    /// `pkh()/wpkh()/tr()` over a fixed hex pubkey.
+    #[method(name = "scantxoutset")]
+    async fn scan_tx_out_set(
+        &self,
+        action: String,
+        scanobjects: Option<Vec<String>>,
+    ) -> RpcResult<serde_json::Value>;
+
     /// Estimated network hash rate over a window of blocks.
     /// Mirrors Bitcoin Core rpc/mining.cpp GetNetworkHashPS.
     #[method(name = "getnetworkhashps")]
@@ -1078,6 +1096,85 @@ impl RpcServerImpl {
     fn parse_hex(hex: &str) -> Result<Vec<u8>, ErrorObjectOwned> {
         hex::decode(hex)
             .map_err(|_| Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid hex encoding"))
+    }
+
+    /// Convert a `scantxoutset` scan-object descriptor string into the
+    /// scriptPubKey bytes it matches. Minimal subset of Core's descriptor
+    /// language (rpc/blockchain.cpp scantxoutset → EvalDescriptor):
+    ///   - `addr(<address>)`          — the address's output script
+    ///   - `raw(<hex>)`               — the literal scriptPubKey bytes
+    ///   - `pkh(<33-byte-pubkey-hex>)`  — P2PKH for the key
+    ///   - `wpkh(<33-byte-pubkey-hex>)` — P2WPKH for the key
+    ///   - `tr(<32-byte-xonly-hex>)`    — P2TR for the output key
+    ///
+    /// A trailing `#<checksum>` (as printed by Core) is tolerated and
+    /// stripped. xpub-range descriptors are out of scope (a follow-up).
+    fn scanobject_to_script(
+        obj: &str,
+        params: &ChainParams,
+    ) -> Result<Vec<u8>, ErrorObjectOwned> {
+        use rustoshi_crypto::address::Network;
+
+        let invalid = |msg: &str| {
+            Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, msg.to_string())
+        };
+
+        // Strip an optional descriptor checksum suffix ("desc#cccccccc").
+        let body = obj.split('#').next().unwrap_or(obj).trim();
+
+        // Helper: extract the inner argument of "name(...)".
+        let inner = |prefix: &str| -> Option<&str> {
+            let rest = body.strip_prefix(prefix)?;
+            rest.strip_suffix(')')
+        };
+
+        let network = match params.network_id {
+            NetworkId::Mainnet => Network::Mainnet,
+            NetworkId::Regtest => Network::Regtest,
+            _ => Network::Testnet,
+        };
+
+        // Parse a fixed-length hex pubkey argument.
+        let parse_pubkey33 = |arg: &str| -> Result<[u8; 33], ErrorObjectOwned> {
+            let bytes = hex::decode(arg.trim())
+                .map_err(|_| invalid("Invalid pubkey hex in descriptor"))?;
+            let arr: [u8; 33] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid("pkh()/wpkh() require a 33-byte compressed pubkey"))?;
+            Ok(arr)
+        };
+
+        if let Some(arg) = inner("addr(") {
+            // Reuse the same address decoder as sendtoaddress / validateaddress.
+            address_to_script_pubkey(arg.trim(), params)
+        } else if let Some(arg) = inner("raw(") {
+            hex::decode(arg.trim()).map_err(|_| invalid("Invalid hex in raw() descriptor"))
+        } else if let Some(arg) = inner("pkh(") {
+            let pk = parse_pubkey33(arg)?;
+            Ok(rustoshi_crypto::address::Address::p2pkh_from_pubkey(&pk, network)
+                .to_script_pubkey())
+        } else if let Some(arg) = inner("wpkh(") {
+            let pk = parse_pubkey33(arg)?;
+            Ok(rustoshi_crypto::address::Address::p2wpkh_from_pubkey(&pk, network)
+                .to_script_pubkey())
+        } else if let Some(arg) = inner("tr(") {
+            // Single-key P2TR: the argument is the 32-byte x-only output key.
+            // (BIP-341 tweaking with a script tree is out of scope here.)
+            let bytes = hex::decode(arg.trim())
+                .map_err(|_| invalid("Invalid pubkey hex in tr() descriptor"))?;
+            if bytes.len() != 32 {
+                return Err(invalid("tr() requires a 32-byte x-only output key"));
+            }
+            let mut script = vec![0x51, 0x20]; // OP_1 PUSH32
+            script.extend_from_slice(&bytes);
+            Ok(script)
+        } else {
+            Err(invalid(&format!(
+                "Unsupported scan object '{}' (supported: addr(), raw(), pkh(), wpkh(), tr())",
+                obj
+            )))
+        }
     }
 
     /// Calculate difficulty from compact target (bits).
@@ -8265,6 +8362,118 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         Ok(result)
+    }
+
+    async fn scan_tx_out_set(
+        &self,
+        action: String,
+        scanobjects: Option<Vec<String>>,
+    ) -> RpcResult<serde_json::Value> {
+        // Mirrors Bitcoin Core rpc/blockchain.cpp::scantxoutset.
+        //
+        // rustoshi runs the scan synchronously within this RPC call, so
+        // there is never a background scan to abort or report progress on.
+        // "status" therefore returns null (Core: "no scan in progress") and
+        // "abort" returns false (Core: "reserve was possible → nothing
+        // running"). Only "start" does real work.
+        match action.as_str() {
+            "status" => return Ok(serde_json::Value::Null),
+            "abort" => return Ok(serde_json::Value::Bool(false)),
+            "start" => {}
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!("Invalid action '{}'", other),
+                ));
+            }
+        }
+
+        let scanobjects = scanobjects.ok_or_else(|| {
+            Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "scanobjects argument is required for the start action".to_string(),
+            )
+        })?;
+
+        let state = self.state.read().await;
+
+        // Build the set of target scriptPubKeys ("needles") from the scan
+        // objects, remembering the descriptor string for each so the result
+        // can echo it back like Core does.
+        let mut needles: Vec<(Vec<u8>, String)> = Vec::new();
+        for obj in &scanobjects {
+            let script = Self::scanobject_to_script(obj, &state.params)?;
+            needles.push((script, obj.clone()));
+        }
+
+        let height = state.best_height;
+        let best_hash = state.best_hash;
+
+        // Walk the current UTXO set, exactly as gettxoutsetinfo /
+        // dumptxoutset do (CF_UTXO key = txid(32 internal) || vout(4 BE),
+        // value decoded via decode_utxo_value).
+        let mut txouts: u64 = 0;
+        let mut total_amount_sats: u64 = 0;
+        let mut unspents: Vec<serde_json::Value> = Vec::new();
+
+        for (key, value) in state
+            .db
+            .iter_cf(CF_UTXO)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+        {
+            if key.len() != 36 {
+                continue;
+            }
+            let coin: CoinEntry = match rustoshi_storage::decode_utxo_value(&value) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            txouts += 1;
+
+            // Match the output script against every needle. Core dedups
+            // scripts in a std::set; here we just stop at the first match
+            // (an output script matches at most one descriptor's bytes
+            // anyway, and the descriptor string echoed is that needle's).
+            let matched = needles
+                .iter()
+                .find(|(spk, _)| spk.as_slice() == coin.script_pubkey.as_slice());
+            let Some((_, desc)) = matched else {
+                continue;
+            };
+
+            let mut txid_bytes = [0u8; 32];
+            txid_bytes.copy_from_slice(&key[..32]);
+            let txid = Hash256(txid_bytes);
+            let vout = u32::from_be_bytes([key[32], key[33], key[34], key[35]]);
+
+            total_amount_sats = total_amount_sats.saturating_add(coin.value);
+
+            let confirmations = if height >= coin.height {
+                height - coin.height + 1
+            } else {
+                0
+            };
+
+            unspents.push(serde_json::json!({
+                "txid": txid.to_hex(),
+                "vout": vout,
+                "scriptPubKey": hex::encode(&coin.script_pubkey),
+                "desc": desc,
+                "amount": coin.value as f64 / 1e8,
+                "coinbase": coin.is_coinbase,
+                "height": coin.height,
+                "confirmations": confirmations,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "success": true,
+            "txouts": txouts,
+            "height": height,
+            "bestblock": best_hash.to_hex(),
+            "unspents": unspents,
+            "total_amount": total_amount_sats as f64 / 1e8,
+        }))
     }
 
     async fn get_network_hash_ps(
