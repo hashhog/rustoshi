@@ -20,6 +20,9 @@
 
 use crate::auth::{AuthCredentials, AuthLayer};
 use crate::types::*;
+// Brings the `into_rpc()` builder for the wallet RPC surface into scope so it
+// can be merged into the served module in `start_rpc_server`.
+use crate::wallet::WalletRpcServer;
 use jsonrpsee::core::{async_trait, RpcResult};
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::{BatchRequestConfig, ServerBuilder, ServerHandle};
@@ -791,17 +794,13 @@ pub trait RustoshiRpc {
     // WALLET UTILITY RPCs
     // ============================================================
 
-    /// Unlock the wallet for the given duration (seconds).
-    ///
-    /// Parameters:
-    /// - passphrase: The wallet passphrase
-    /// - timeout: Duration in seconds to keep the wallet unlocked
-    #[method(name = "walletpassphrase")]
-    async fn wallet_passphrase(&self, passphrase: String, timeout: u64) -> RpcResult<()>;
-
-    /// Lock the wallet immediately.
-    #[method(name = "walletlock")]
-    async fn wallet_lock(&self) -> RpcResult<()>;
+    // NOTE: `walletpassphrase` and `walletlock` are intentionally NOT declared
+    // here. They are served by the dedicated wallet RPC module
+    // (`crate::wallet::WalletRpc`), which is merged into the served methods in
+    // `start_rpc_server`. That module provides the real WalletManager-backed
+    // implementations (and reproduces Core's `-15` "unencrypted wallet"
+    // behaviour when no encryption is set up), so the former stubs here would
+    // only collide on method-name registration during the merge.
 
     /// Set a label for an address.
     ///
@@ -7276,32 +7275,10 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
-    async fn wallet_passphrase(&self, _passphrase: String, _timeout: u64) -> RpcResult<()> {
-        // Wallet encryption is not implemented in this build. Mirror Bitcoin
-        // Core's `walletpassphrase` behaviour on an unencrypted wallet
-        // (RPC_WALLET_WRONG_ENC_STATE / -15) so callers don't believe their
-        // wallet is now unlocked when nothing actually changed. Returning
-        // Ok(()) here previously was a "lying RPC" — caller would then try
-        // to sign and silently fail. See cross-impl audit
-        // CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md.
-        Err(Self::rpc_error(
-            -15, // RPC_WALLET_WRONG_ENC_STATE
-            "running with an unencrypted wallet, but walletpassphrase was called \
-             (wallet encryption not implemented in this build)",
-        ))
-    }
-
-    async fn wallet_lock(&self) -> RpcResult<()> {
-        // Wallet encryption is not implemented; mirror Core's
-        // RPC_WALLET_WRONG_ENC_STATE response on an unencrypted wallet.
-        // See cross-impl audit
-        // CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md.
-        Err(Self::rpc_error(
-            -15, // RPC_WALLET_WRONG_ENC_STATE
-            "running with an unencrypted wallet, but walletlock was called \
-             (wallet encryption not implemented in this build)",
-        ))
-    }
+    // `wallet_passphrase` / `wallet_lock` removed from this impl: the
+    // walletpassphrase / walletlock RPCs are now served by the merged wallet
+    // module (`crate::wallet`), backed by the real WalletManager. See the note
+    // on the trait declaration above and the merge in `start_rpc_server`.
 
     async fn set_label(&self, _address: String, _label: String) -> RpcResult<()> {
         // Label storage is not implemented in this build. Returning Ok(())
@@ -10869,13 +10846,73 @@ pub async fn start_rpc_server(
 
     let http_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(credentials));
 
+    // Resolve the wallet root + network from RpcState BEFORE `state` is moved
+    // into `RpcServerImpl::new`. The wallet RPC surface (createwallet,
+    // getnewaddress, …) lives in `crate::wallet` but historically was never
+    // merged into the served jsonrpsee module, so every wallet method 404'd
+    // with -32601. We instantiate a `WalletRpcState` here, pointed at the
+    // node's network-resolved datadir (Core lays wallets out under
+    // `<datadir>/wallets`, which `WalletManager::new` creates), then merge its
+    // `into_rpc()` module into the core methods on BOTH transports below.
+    let (wallet_data_dir, wallet_network) = {
+        let st = state.read().await;
+        let net = match st.params.network_id {
+            NetworkId::Mainnet => rustoshi_crypto::address::Network::Mainnet,
+            NetworkId::Testnet3 | NetworkId::Testnet4 | NetworkId::Signet => {
+                rustoshi_crypto::address::Network::Testnet
+            }
+            NetworkId::Regtest => rustoshi_crypto::address::Network::Regtest,
+        };
+        // Fall back to the current working directory if no datadir was wired
+        // (matches the `data_dir` doc-comment fallback used elsewhere).
+        let dir = st
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        (dir, net)
+    };
+
+    // Build the wallet RPC module once. Failure to create the wallet manager
+    // (e.g. unwritable datadir) is non-fatal: we log and skip the merge so the
+    // node still serves its non-wallet RPCs, mirroring Core continuing to run
+    // with `-disablewallet`.
+    let wallet_rpc_module = match rustoshi_wallet::WalletManager::new(
+        &wallet_data_dir,
+        wallet_network,
+    ) {
+        Ok(mut manager) => {
+            // Load any wallets flagged load_on_startup (best-effort).
+            if let Err(e) = manager.load_startup_wallets() {
+                tracing::warn!("Failed to load startup wallets: {e}");
+            }
+            let wallet_state = Arc::new(RwLock::new(crate::wallet::WalletRpcState::new(
+                manager,
+                wallet_data_dir.clone(),
+            )));
+            Some(crate::wallet::WalletRpcImpl::new(wallet_state).into_rpc())
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Wallet RPC disabled: failed to initialize wallet manager at {}: {e}",
+                wallet_data_dir.display()
+            );
+            None
+        }
+    };
+
     // TLS branch — wire jsonrpsee through a manual hyper+tokio-rustls acceptor.
     // This path is opt-in via --rpc-tls-cert + --rpc-tls-key and uses pure-Rust
     // rustls (no OpenSSL dep). The plaintext path below is bit-for-bit
     // unchanged to avoid any backward-compat surprise.
     if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) {
         let rpc_impl = RpcServerImpl::new(state, peer_state);
-        let methods: jsonrpsee::Methods = rpc_impl.into_rpc().into();
+        let mut rpc_module = rpc_impl.into_rpc();
+        if let Some(wallet_module) = wallet_rpc_module {
+            rpc_module
+                .merge(wallet_module)
+                .map_err(|e| anyhow::anyhow!("Failed to merge wallet RPC module: {e}"))?;
+        }
+        let methods: jsonrpsee::Methods = rpc_module.into();
 
         let tls_config = crate::tls::load_tls_config(cert_path, key_path)
             .map_err(|e| anyhow::anyhow!("Failed to load RPC TLS materials: {e}"))?;
@@ -10900,7 +10937,13 @@ pub async fn start_rpc_server(
         .await?;
 
     let rpc_impl = RpcServerImpl::new(state, peer_state);
-    let handle = server.start(rpc_impl.into_rpc());
+    let mut rpc_module = rpc_impl.into_rpc();
+    if let Some(wallet_module) = wallet_rpc_module {
+        rpc_module
+            .merge(wallet_module)
+            .map_err(|e| anyhow::anyhow!("Failed to merge wallet RPC module: {e}"))?;
+    }
+    let handle = server.start(rpc_module);
 
     tracing::info!("RPC server listening on {}", config.bind_address);
     Ok(handle)
