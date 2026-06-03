@@ -4842,7 +4842,7 @@ mod tests {
         assert!(cli.listen);
         assert!(cli.port.is_none());
         assert_eq!(cli.maxconnections, 8);
-        assert!(cli.connect.is_none());
+        assert!(cli.connect.is_empty());
         assert!(!cli.txindex);
         assert_eq!(cli.loglevel, "info");
         assert!(cli.prune.is_none());
@@ -4903,7 +4903,7 @@ mod tests {
         .unwrap();
         assert_eq!(cli.port, Some(12345));
         assert_eq!(cli.maxconnections, 16);
-        assert_eq!(cli.connect, Some("192.168.1.100:8333".to_string()));
+        assert_eq!(cli.connect, vec!["192.168.1.100:8333".to_string()]);
     }
 
     /// FIX-88 W121 G29: `--blockfilterindex` parses + defaults off.
