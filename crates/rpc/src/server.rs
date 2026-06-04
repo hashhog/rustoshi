@@ -9870,10 +9870,12 @@ impl RpcServerImpl {
                 if let Some(ws) = state.wallet_state.clone() {
                     let txs = block.transactions.clone();
                     let h = height;
+                    let bh = block_hash;
+                    let bt = block.header.timestamp as u64;
                     // Drop the wallet read-guard scope quickly.
                     let ws_guard = ws.read().await;
                     let (credits, debits) =
-                        ws_guard.wallet_manager.scan_block_all_wallets(&txs, h);
+                        ws_guard.wallet_manager.scan_block_all_wallets(&txs, h, bh, bt);
                     if credits > 0 || debits > 0 {
                         tracing::debug!(
                             "wallet block-scan @ height {h}: +{credits} credits, -{debits} debits"
