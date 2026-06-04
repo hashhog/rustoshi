@@ -489,6 +489,12 @@ pub struct WalletRpcState {
     /// `POST /payjoin` endpoint (https:// or http://*.onion). When
     /// `None` the RPC refuses with `-4` (no endpoint configured).
     pub payjoin_endpoint: Option<String>,
+    /// Shared core node state, wired in `start_rpc_server` so wallet-native
+    /// spends (`sendtoaddress`) can broadcast the signed transaction into the
+    /// node's mempool — the same path `sendrawtransaction` uses. `None` when
+    /// the wallet RPC is constructed standalone (unit tests): `sendtoaddress`
+    /// then builds + signs but cannot broadcast.
+    pub node: Option<Arc<RwLock<crate::server::RpcState>>>,
 }
 
 impl WalletRpcState {
@@ -498,6 +504,7 @@ impl WalletRpcState {
             wallet_manager,
             data_dir,
             payjoin_endpoint: None,
+            node: None,
         }
     }
 
@@ -1141,11 +1148,25 @@ impl WalletRpcServer for WalletRpcImpl {
         let wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
 
+        // Core's getbalance reports the TRUSTED, SPENDABLE balance: confirmed
+        // and (for coinbase) mature. Immature coinbase and unconfirmed coins
+        // are excluded — they show up under getbalances.mine.immature /
+        // untrusted_pending instead. `minconf` raises the confirmation floor
+        // above the default. (Reference: bitcoin-core wallet/rpc/coins.cpp
+        // getbalance -> GetBalance().m_mine_trusted.)
         let min_confirmations = minconf.unwrap_or(0);
-        let balance = if min_confirmations == 0 {
-            wallet_guard.balance()
+        let balance = if min_confirmations <= 1 {
+            // Default / minconf<=1: mature, confirmed, spendable coins.
+            wallet_guard.spendable_balance()
         } else {
-            wallet_guard.confirmed_balance()
+            // Higher minconf: still spendable, but require >= minconf
+            // confirmations (and coinbase maturity, enforced by is_spendable).
+            wallet_guard
+                .list_spendable_unspent()
+                .iter()
+                .filter(|u| u.confirmations >= min_confirmations)
+                .map(|u| u.value)
+                .sum()
         };
 
         Ok(Self::sats_to_btc(balance))
@@ -1210,6 +1231,10 @@ impl WalletRpcServer for WalletRpcImpl {
                 })
             })
             .map(|utxo| {
+                // Immature coinbase is listed but flagged non-spendable, the
+                // way Core's listunspent reports `spendable=false` for coins
+                // that fail IsSpendable (incl. coinbase under 100 confs).
+                let spendable = wallet_guard.is_spendable(utxo);
                 UnspentOutput {
                     txid: hex::encode(utxo.outpoint.txid.0.iter().rev().copied().collect::<Vec<_>>()),
                     vout: utxo.outpoint.vout,
@@ -1217,7 +1242,7 @@ impl WalletRpcServer for WalletRpcImpl {
                     script_pubkey: hex::encode(&utxo.script_pubkey),
                     amount: Self::sats_to_btc(utxo.value),
                     confirmations: utxo.confirmations,
-                    spendable: true,
+                    spendable,
                     solvable: true,
                     safe: utxo.confirmations >= 1,
                 }
@@ -1267,26 +1292,59 @@ impl WalletRpcServer for WalletRpcImpl {
         // P0-SECURITY gate (W118 BUG-1): signing requires an unlocked wallet.
         Self::require_unlocked(&state, &name)?;
 
-        let mut wallet_guard = wallet.lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
-
         let amount_sats = Self::btc_to_sats(amount);
-        let fee_rate = 2.0; // Default fee rate in sat/vbyte
+        // Default fee rate in sat/vByte. Padded above the 1 sat/vB relay floor
+        // so the wallet's vsize estimate (which can undershoot the final
+        // witness-stack size by a byte or two) never lands the tx below the
+        // mempool's minimum-relay-fee and gets rejected — the same fee-floor
+        // fix the beamchain reference cell needed.
+        let fee_rate = 5.0;
 
-        let tx = wallet_guard.create_transaction(vec![(address, amount_sats)], fee_rate)
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("insufficient") {
-                    Self::rpc_error(wallet_error::RPC_WALLET_INSUFFICIENT_FUNDS, msg)
-                } else if msg.contains("address") {
-                    Self::rpc_error(wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY, msg)
-                } else {
-                    Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
-                }
+        // Build + sign the transaction under the wallet lock, then DROP the
+        // wallet guard before touching the node mempool. The mining /
+        // block-connect path takes node-write THEN wallet-lock; doing the
+        // reverse here while holding the wallet lock would invert lock order.
+        let tx = {
+            let mut wallet_guard = wallet.lock().map_err(|_| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
             })?;
+            wallet_guard
+                .create_transaction(vec![(address, amount_sats)], fee_rate)
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("nsufficient") {
+                        Self::rpc_error(wallet_error::RPC_WALLET_INSUFFICIENT_FUNDS, msg)
+                    } else if msg.contains("address") {
+                        Self::rpc_error(wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY, msg)
+                    } else {
+                        Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
+                    }
+                })?
+        };
 
-        // Return the transaction ID (reversed for display)
         let txid = tx.txid();
+
+        // Broadcast into the node mempool via the shared node handle (same
+        // admission path as sendrawtransaction). Without this the signed tx
+        // would never enter the mempool and never confirm. The node handle is
+        // taken from WalletRpcState; release the WalletRpcState read-guard
+        // first so we hold only the node write-lock during admission.
+        let node = state.node.clone();
+        drop(state);
+        let node = node.ok_or_else(|| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "wallet not wired to node mempool (sendtoaddress cannot broadcast)",
+            )
+        })?;
+        {
+            let mut node_state = node.write().await;
+            crate::server::broadcast_signed_tx(&mut node_state, tx).map_err(|msg| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
+            })?;
+        }
+
+        // Return the Core-style display txid (reversed).
         let txid_hex = hex::encode(txid.0.iter().rev().copied().collect::<Vec<_>>());
         Ok(txid_hex)
     }
