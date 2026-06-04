@@ -351,6 +351,51 @@ impl Address {
             }
         }
     }
+
+    /// Decode a standard scriptPubKey back into an [`Address`].
+    ///
+    /// Inverse of [`Self::to_script_pubkey`] for the five standard output types
+    /// (P2PKH / P2SH / P2WPKH / P2WSH / P2TR). Returns `None` for non-standard
+    /// scripts (bare multisig, OP_RETURN, custom). This is used by wallet
+    /// transaction-history bookkeeping to label the address a send paid out to
+    /// — mirroring Bitcoin Core's `ExtractDestination` /
+    /// `MaybePushAddress(EncodeDestination(dest))` in
+    /// `wallet/rpc/transactions.cpp`.
+    pub fn from_script_pubkey(script: &[u8], network: Network) -> Option<Self> {
+        match script {
+            // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+            [0x76, 0xa9, 0x14, h @ .., 0x88, 0xac] if h.len() == 20 => {
+                let mut hb = [0u8; 20];
+                hb.copy_from_slice(h);
+                Some(Address::P2PKH { hash: Hash160::from_bytes(hb), network })
+            }
+            // P2SH: OP_HASH160 <20> OP_EQUAL
+            [0xa9, 0x14, h @ .., 0x87] if h.len() == 20 => {
+                let mut hb = [0u8; 20];
+                hb.copy_from_slice(h);
+                Some(Address::P2SH { hash: Hash160::from_bytes(hb), network })
+            }
+            // P2WPKH: OP_0 <20>
+            [0x00, 0x14, h @ ..] if h.len() == 20 => {
+                let mut hb = [0u8; 20];
+                hb.copy_from_slice(h);
+                Some(Address::P2WPKH { hash: Hash160::from_bytes(hb), network })
+            }
+            // P2WSH: OP_0 <32>
+            [0x00, 0x20, h @ ..] if h.len() == 32 => {
+                let mut hb = [0u8; 32];
+                hb.copy_from_slice(h);
+                Some(Address::P2WSH { hash: Hash256::from_bytes(hb), network })
+            }
+            // P2TR: OP_1 <32>
+            [0x51, 0x20, h @ ..] if h.len() == 32 => {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(h);
+                Some(Address::P2TR { output_key: k, network })
+            }
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Address {

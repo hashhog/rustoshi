@@ -18,7 +18,7 @@ use rustoshi_crypto::{
     taproot::{compute_taproot_sighash as crypto_compute_taproot_sighash, TaprootPrevouts,
               SIGHASH_DEFAULT},
 };
-use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
+use rustoshi_primitives::{Encodable, Hash256, OutPoint, Transaction, TxIn, TxOut};
 use secp256k1::{Message, Secp256k1};
 
 use crate::coin_selection::{select_coins, CoinSelectionParams};
@@ -132,6 +132,70 @@ pub struct Wallet {
     /// Mirrors Core's `mapWallet` for the outgoing-tx-tracking subset.
     /// Reference: `bitcoin-core/src/wallet/feebumper.cpp::PreconditionChecks`.
     sent_txs: HashMap<Hash256, SentTx>,
+    /// Wallet transaction history, in block-connect order (oldest first).
+    ///
+    /// One [`TxHistoryEntry`] per wallet-relevant transaction observed by
+    /// [`Self::scan_block`] (a tx that credits a wallet-owned output and/or
+    /// debits a wallet-owned coin). This is the backing store for
+    /// `listtransactions` / `gettransaction`, mirroring the subset of Core's
+    /// `CWallet::mapWallet` those RPCs read (see
+    /// `bitcoin-core/src/wallet/rpc/transactions.cpp`). Confirmations and the
+    /// coinbase `generate`/`immature` distinction are NOT frozen here — they
+    /// are recomputed against the live `chain_height` at read time so a
+    /// maturing coinbase or a deepening confirmation count is always current.
+    history: Vec<TxHistoryEntry>,
+}
+
+/// A per-output or per-input line item in a wallet transaction's `details[]`.
+///
+/// Mirrors one element of Core's `COutputEntry`/`details` array
+/// (`wallet/rpc/transactions.cpp` `ListTransactions`).
+#[derive(Clone, Debug)]
+pub struct TxDetail {
+    /// The address this credit/debit involves (the wallet's own address for a
+    /// receive/generate, the recipient address for a send). `None` for
+    /// non-standard scripts that don't decode to an address.
+    pub address: Option<String>,
+    /// "send" | "receive" | "generate" | "immature".
+    pub category: String,
+    /// Amount in satoshis. NEGATIVE for the `send` category, positive otherwise.
+    pub amount_sats: i64,
+    /// The output index this line item refers to.
+    pub vout: u32,
+    /// Fee in satoshis (NEGATIVE), present only on `send` line items.
+    pub fee_sats: Option<i64>,
+}
+
+/// A wallet-relevant transaction recorded at block-connect time.
+///
+/// Records the immutable facts of the transaction (its identity, the block it
+/// confirmed in, the net effect on the wallet, the per-output/input details,
+/// and the raw bytes) so `listtransactions` / `gettransaction` can reproduce
+/// Core's response shape without re-scanning the chain.
+#[derive(Clone, Debug)]
+pub struct TxHistoryEntry {
+    /// The transaction id (internal byte order; reverse for the RPC `txid`).
+    pub txid: Hash256,
+    /// Whether this transaction is a coinbase (drives generate/immature).
+    pub is_coinbase: bool,
+    /// Total satoshis this tx credited to wallet-owned outputs.
+    pub credit_sats: u64,
+    /// Total satoshis this tx debited from wallet-owned coins (value of the
+    /// wallet UTXOs it spent).
+    pub debit_sats: u64,
+    /// Fee in satoshis, present only when the wallet spent into this tx
+    /// (`debit_sats > 0`): sum(wallet inputs) - sum(all outputs).
+    pub fee_sats: Option<u64>,
+    /// Block height the tx confirmed at.
+    pub block_height: u32,
+    /// Block hash the tx confirmed in (internal byte order).
+    pub block_hash: Hash256,
+    /// Block timestamp (Unix seconds).
+    pub block_time: u64,
+    /// Per-output (receive/generate) + per-spend (send) line items.
+    pub details: Vec<TxDetail>,
+    /// Raw transaction bytes (full witness serialization) for the `hex` field.
+    pub raw_tx: Vec<u8>,
 }
 
 /// A wallet-originated transaction the wallet remembers after `create_transaction`.
@@ -188,6 +252,7 @@ impl Wallet {
             chain_height: 0,
             locked_coins: HashSet::new(),
             sent_txs: HashMap::new(),
+            history: Vec::new(),
         })
     }
 
@@ -1614,7 +1679,33 @@ impl Wallet {
     /// over-counts.
     ///
     /// Returns the number of (credits, debits) applied.
+    ///
+    /// Back-compat shim: equivalent to [`Self::scan_block_at`] with a zero
+    /// block hash + zero block time. Callers that have the connecting block's
+    /// hash and timestamp should prefer `scan_block_at` so transaction-history
+    /// entries carry the real `blockhash` / `blocktime`.
     pub fn scan_block(&mut self, txs: &[Transaction], height: u32) -> (usize, usize) {
+        self.scan_block_at(txs, height, Hash256::ZERO, 0)
+    }
+
+    /// Scan a connected block, recording wallet UTXO + transaction-history
+    /// changes (Core's `CWallet::blockConnected`).
+    ///
+    /// In addition to crediting wallet-owned outputs (flagging coinbase) and
+    /// debiting consumed wallet coins, this records one [`TxHistoryEntry`] per
+    /// wallet-relevant transaction so `listtransactions` / `gettransaction` can
+    /// report the wallet's own receive/send/coinbase activity. `block_hash` and
+    /// `block_time` are the connecting block's identity + timestamp (used only
+    /// for the history `blockhash` / `blocktime` fields).
+    ///
+    /// Returns the number of (credits, debits) applied.
+    pub fn scan_block_at(
+        &mut self,
+        txs: &[Transaction],
+        height: u32,
+        block_hash: Hash256,
+        block_time: u64,
+    ) -> (usize, usize) {
         let index = self.build_script_index();
         let mut credits = 0usize;
         let mut debits = 0usize;
@@ -1623,7 +1714,11 @@ impl Wallet {
             let is_cb = tx.is_coinbase();
             let txid = tx.txid();
 
-            // Credit wallet-owned outputs.
+            // --- Credit wallet-owned outputs (build the receive/generate
+            //     details as we go). ----------------------------------------
+            let mut credit_sats: u64 = 0;
+            // Per-output: (vout, value, is_change, owned-address).
+            let mut credit_outs: Vec<(u32, u64, bool, Option<String>)> = Vec::new();
             for (vout, out) in tx.outputs.iter().enumerate() {
                 if let Some((path, is_change)) = index.get(&out.script_pubkey) {
                     let outpoint = OutPoint { txid, vout: vout as u32 };
@@ -1640,16 +1735,101 @@ impl Wallet {
                             height: Some(height),
                         },
                     );
+                    credit_sats = credit_sats.saturating_add(out.value);
+                    let addr = self.derive_address(path).ok();
+                    credit_outs.push((vout as u32, out.value, *is_change, addr));
                     credits += 1;
                 }
             }
 
-            // Debit wallet UTXOs spent by this tx's inputs (coinbase has none).
+            // --- Debit wallet UTXOs spent by this tx's inputs. The spent
+            //     value drives the fee + the `send` detail set. Capture value
+            //     BEFORE removing the coin. (Coinbase has no real inputs.) ---
+            let mut debit_sats: u64 = 0;
             if !is_cb {
                 for input in &tx.inputs {
-                    if self.utxos.remove(&input.previous_output).is_some() {
+                    if let Some(spent) = self.utxos.remove(&input.previous_output) {
+                        debit_sats = debit_sats.saturating_add(spent.value);
                         debits += 1;
                     }
+                }
+            }
+
+            // --- Record transaction history if the tx touched the wallet. ---
+            if credit_sats > 0 || debit_sats > 0 {
+                let mut details: Vec<TxDetail> = Vec::new();
+
+                // When the wallet funded this tx (debit > 0) it is a SEND: per
+                // Core's CachedTxGetAmounts, EVERY non-change output becomes a
+                // "send" line item (amount NEGATIVE), with the fee attached.
+                // fee = sum(wallet inputs) - sum(all outputs).
+                let fee_sats: Option<u64> = if debit_sats > 0 {
+                    let value_out: u64 =
+                        tx.outputs.iter().map(|o| o.value).sum();
+                    Some(debit_sats.saturating_sub(value_out))
+                } else {
+                    None
+                };
+
+                if debit_sats > 0 {
+                    let neg_fee = fee_sats.map(|f| -(f as i64));
+                    for (vout, out) in tx.outputs.iter().enumerate() {
+                        // Skip wallet change outputs (Core excludes change from
+                        // listSent unless include_change).
+                        let is_change = index
+                            .get(&out.script_pubkey)
+                            .map(|(_, c)| *c)
+                            .unwrap_or(false);
+                        if is_change {
+                            continue;
+                        }
+                        let addr = Address::from_script_pubkey(
+                            &out.script_pubkey,
+                            self.network,
+                        )
+                        .map(|a| a.encode());
+                        details.push(TxDetail {
+                            address: addr,
+                            category: "send".to_string(),
+                            amount_sats: -(out.value as i64),
+                            vout: vout as u32,
+                            fee_sats: neg_fee,
+                        });
+                    }
+                }
+
+                // Receive / generate line items for wallet-owned outputs.
+                for (vout, value, _is_change, addr) in &credit_outs {
+                    let category = if is_cb { "generate" } else { "receive" };
+                    details.push(TxDetail {
+                        address: addr.clone(),
+                        category: category.to_string(),
+                        amount_sats: *value as i64,
+                        vout: *vout,
+                        fee_sats: None,
+                    });
+                }
+
+                let entry = TxHistoryEntry {
+                    txid,
+                    is_coinbase: is_cb,
+                    credit_sats,
+                    debit_sats,
+                    fee_sats,
+                    block_height: height,
+                    block_hash,
+                    block_time,
+                    details,
+                    raw_tx: tx.serialize(),
+                };
+                // De-dup on re-scan of the same block: replace any existing
+                // entry for this txid rather than appending a duplicate.
+                if let Some(slot) =
+                    self.history.iter_mut().find(|e| e.txid == txid)
+                {
+                    *slot = entry;
+                } else {
+                    self.history.push(entry);
                 }
             }
 
@@ -1680,6 +1860,10 @@ impl Wallet {
                 let outpoint = OutPoint { txid, vout: vout as u32 };
                 self.utxos.remove(&outpoint);
             }
+            // Drop any transaction-history entry this disconnected tx created,
+            // mirroring the UTXO un-credit so listtransactions/gettransaction
+            // never report a tx that the reorg orphaned.
+            self.history.retain(|e| e.txid != txid);
         }
         // Restore previously-spent wallet coins recorded by the caller.
         for u in spent {
@@ -1687,6 +1871,39 @@ impl Wallet {
         }
         self.set_chain_height(new_tip_height);
         self.refresh_confirmations(new_tip_height);
+    }
+
+    /// Transaction-history entries in block-connect order (oldest first).
+    ///
+    /// Backing store for `listtransactions` / `gettransaction`. Confirmations
+    /// and the coinbase generate/immature distinction are NOT stored here; the
+    /// RPC layer recomputes them against [`Self::chain_height`] at read time
+    /// via [`Self::history_confirmations`] / [`Self::history_category`].
+    pub fn history(&self) -> &[TxHistoryEntry] {
+        &self.history
+    }
+
+    /// Find a single history entry by txid (internal byte order).
+    pub fn history_entry(&self, txid: &Hash256) -> Option<&TxHistoryEntry> {
+        self.history.iter().find(|e| &e.txid == txid)
+    }
+
+    /// Confirmations for a history entry against the current chain tip.
+    ///
+    /// `confirmations = chain_height - block_height + 1` (1 at the block it
+    /// confirmed in), saturating at 0.
+    pub fn history_confirmations(&self, entry: &TxHistoryEntry) -> u32 {
+        self.chain_height
+            .saturating_sub(entry.block_height)
+            .saturating_add(1)
+    }
+
+    /// The effective receive category for a coinbase entry at the current tip:
+    /// "generate" once mature (>= COINBASE_MATURITY confs), else "immature".
+    /// Non-coinbase receives are always "receive". Returns `None` for entries
+    /// that have no receive line item (pure sends).
+    pub fn history_coinbase_is_mature(&self, entry: &TxHistoryEntry) -> bool {
+        self.chain_height >= entry.block_height + COINBASE_MATURITY
     }
 
     /// Recompute every UTXO's confirmation count against the current tip.

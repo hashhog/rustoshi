@@ -740,12 +740,18 @@ impl WalletManager {
     /// one wallet never blocks the others. `height` is the connecting block's
     /// height (drives coinbase maturity). Returns total (credits, debits)
     /// across all wallets.
-    pub fn scan_block_all_wallets(&self, txs: &[rustoshi_primitives::Transaction], height: u32) -> (usize, usize) {
+    pub fn scan_block_all_wallets(
+        &self,
+        txs: &[rustoshi_primitives::Transaction],
+        height: u32,
+        block_hash: rustoshi_primitives::Hash256,
+        block_time: u64,
+    ) -> (usize, usize) {
         let mut credits = 0usize;
         let mut debits = 0usize;
         for wallet in self.wallets.values() {
             if let Ok(mut w) = wallet.lock() {
-                let (c, d) = w.scan_block(txs, height);
+                let (c, d) = w.scan_block_at(txs, height, block_hash, block_time);
                 credits += c;
                 debits += d;
             }
