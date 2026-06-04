@@ -980,6 +980,40 @@ pub trait RustoshiRpc {
         scanobjects: Option<Vec<String>>,
     ) -> RpcResult<serde_json::Value>;
 
+    /// Rescan the local block chain for transactions relevant to the loaded
+    /// wallet(s). Mirrors Bitcoin Core's `rescanblockchain`
+    /// (`wallet/rpc/transactions.cpp`): walk the active chain over
+    /// `[start_height, stop_height]` and feed each block through the same
+    /// wallet scan the block-connect path uses, crediting wallet-owned outputs
+    /// (incl. imported keys) and debiting spent coins. This is the BACKWARD
+    /// counterpart of the forward block-connect scan — it lets a freshly
+    /// restored wallet rediscover its on-chain funds without a chain-level
+    /// `scantxoutset` (which bypasses the wallet ledger entirely).
+    ///
+    /// `start_height` defaults to 0; `stop_height` defaults to the current tip.
+    /// Returns `{start_height, stop_height}` (Core shape).
+    #[method(name = "rescanblockchain")]
+    async fn rescan_blockchain(
+        &self,
+        start_height: Option<u32>,
+        stop_height: Option<u32>,
+    ) -> RpcResult<serde_json::Value>;
+
+    /// Import a private key (WIF) into the loaded wallet and, when `rescan` is
+    /// true (the default), rescan the chain to credit that key's funds. Mirrors
+    /// the intent of Bitcoin Core's `importprivkey`
+    /// (`wallet/rpc/backup.cpp`): decode the WIF, add the key + its standard
+    /// single-key scripts (P2WPKH / P2PKH / P2SH-P2WPKH) to the wallet, then
+    /// rescan so funds already paid to those scripts become spendable. Returns
+    /// null on success (Core shape).
+    #[method(name = "importprivkey")]
+    async fn import_priv_key(
+        &self,
+        privkey: String,
+        label: Option<String>,
+        rescan: Option<bool>,
+    ) -> RpcResult<serde_json::Value>;
+
     /// Estimated network hash rate over a window of blocks.
     /// Mirrors Bitcoin Core rpc/mining.cpp GetNetworkHashPS.
     #[method(name = "getnetworkhashps")]
@@ -8551,6 +8585,144 @@ impl RustoshiRpcServer for RpcServerImpl {
             "unspents": unspents,
             "total_amount": total_amount_sats as f64 / 1e8,
         }))
+    }
+
+    async fn rescan_blockchain(
+        &self,
+        start_height: Option<u32>,
+        stop_height: Option<u32>,
+    ) -> RpcResult<serde_json::Value> {
+        let state = self.state.read().await;
+        let tip = state.best_height;
+        let start = start_height.unwrap_or(0);
+        let stop = stop_height.unwrap_or(tip);
+
+        // Core's parameter validation (transactions.cpp:859-882).
+        if start > tip {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                "Invalid start_height",
+            ));
+        }
+        if stop > tip {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                "Invalid stop_height",
+            ));
+        }
+        if stop < start {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMS,
+                "stop_height must be greater than start_height",
+            ));
+        }
+
+        let Some(ws) = state.wallet_state.clone() else {
+            return Err(Self::rpc_error(
+                crate::wallet::wallet_error::RPC_WALLET_NOT_FOUND,
+                "Method not found (wallet method is disabled because no wallet is loaded)",
+            ));
+        };
+
+        let store = BlockStore::new(&state.db);
+        let ws_guard = ws.read().await;
+
+        // Walk the active chain over [start, stop] in height order, feeding
+        // each block through the SAME wallet scan the block-connect path uses
+        // (Wallet::scan_block_at via scan_block_all_wallets). Reuse means the
+        // rescan credits / debits identically to live block connection.
+        let mut last_scanned: Option<u32> = None;
+        for h in start..=stop {
+            let hash = match store.get_hash_by_height(h) {
+                Ok(Some(hash)) => hash,
+                Ok(None) => break, // gap in the height index — stop here.
+                Err(e) => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("rescan: height index read failed at {}: {}", h, e),
+                    ));
+                }
+            };
+            let block = match store.get_block(&hash) {
+                Ok(Some(b)) => b,
+                Ok(None) => break, // block body absent (pruned) — stop here.
+                Err(e) => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("rescan: block read failed at {}: {}", h, e),
+                    ));
+                }
+            };
+            let block_time = block.header.timestamp as u64;
+            ws_guard
+                .wallet_manager
+                .scan_block_all_wallets(&block.transactions, h, hash, block_time);
+            last_scanned = Some(h);
+        }
+
+        Ok(serde_json::json!({
+            "start_height": start,
+            "stop_height": last_scanned,
+        }))
+    }
+
+    async fn import_priv_key(
+        &self,
+        privkey: String,
+        label: Option<String>,
+        rescan: Option<bool>,
+    ) -> RpcResult<serde_json::Value> {
+        let do_rescan = rescan.unwrap_or(true);
+        let label = label.unwrap_or_default();
+
+        // Decode + register the key into every loaded wallet. Hold the wallet
+        // read-guard only for the registration; the rescan re-acquires below.
+        {
+            use rustoshi_crypto::address::Network;
+            let state = self.state.read().await;
+            let network = match state.params.network_id {
+                NetworkId::Mainnet => Network::Mainnet,
+                NetworkId::Regtest => Network::Regtest,
+                _ => Network::Testnet,
+            };
+
+            let Some(ws) = state.wallet_state.clone() else {
+                return Err(Self::rpc_error(
+                    crate::wallet::wallet_error::RPC_WALLET_NOT_FOUND,
+                    "Method not found (wallet method is disabled because no wallet is loaded)",
+                ));
+            };
+
+            let (secret, _compressed) =
+                rustoshi_wallet::decode_wif(&privkey, network).map_err(|e| {
+                    Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, e.to_string())
+                })?;
+
+            let ws_guard = ws.read().await;
+            // Add the key to whichever wallet is the resolution target (the
+            // single loaded default; importprivkey predates multiwallet URL
+            // routing in this build).
+            let (_name, wallet) = ws_guard
+                .wallet_manager
+                .get_wallet_or_default(None)
+                .map_err(|e| {
+                    Self::rpc_error(crate::wallet::wallet_error::RPC_WALLET_NOT_FOUND, e.to_string())
+                })?;
+            let mut w = wallet.lock().map_err(|_| {
+                Self::rpc_error(crate::wallet::wallet_error::RPC_WALLET_ERROR, "failed to lock wallet")
+            })?;
+            w.import_private_key(secret, label).map_err(|e| {
+                Self::rpc_error(crate::wallet::wallet_error::RPC_WALLET_ERROR, e.to_string())
+            })?;
+        }
+
+        // Rescan the chain so funds already paid to the imported scripts are
+        // credited (Core rescans from genesis by default on importprivkey).
+        if do_rescan {
+            self.rescan_blockchain(Some(0), None).await?;
+        }
+
+        Ok(serde_json::Value::Null)
     }
 
     async fn get_network_hash_ps(
