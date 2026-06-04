@@ -165,6 +165,13 @@ pub struct RpcState {
     /// resolvable against the chainstate or mempool, so they can be
     /// re-tried when a parent arrives.  Capped per Core (`MAX_ORPHAN_*`).
     pub orphanage: TxOrphanage,
+    /// Shared wallet RPC state, wired in `start_rpc_server` so the
+    /// block-connect path (mining + block submission) can fan a connected
+    /// block into every loaded wallet's UTXO ledger — Core's
+    /// `CWallet::blockConnected` notification. `None` when the wallet
+    /// subsystem failed to initialise (`-disablewallet`-equivalent), in which
+    /// case block-connect simply skips the wallet scan.
+    pub wallet_state: Option<Arc<RwLock<crate::wallet::WalletRpcState>>>,
 }
 
 impl RpcState {
@@ -192,6 +199,7 @@ impl RpcState {
             data_dir: None,
             block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orphanage: TxOrphanage::new(),
+            wallet_state: None,
         }
     }
 
@@ -219,6 +227,7 @@ impl RpcState {
             data_dir: None,
             block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orphanage: TxOrphanage::new(),
+            wallet_state: None,
         }
     }
 
@@ -1319,6 +1328,74 @@ fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> u32 {
     }
     timestamps.sort_unstable();
     timestamps[timestamps.len() / 2]
+}
+
+/// Admit an already-signed transaction into the node mempool.
+///
+/// The wallet-native `sendtoaddress` path builds + signs a transaction inside
+/// the wallet, then calls this to broadcast it the same way
+/// `sendrawtransaction` does: refresh the mempool tip snapshot (so BIP-113 /
+/// coinbase-maturity checks use the live tip), resolve prevouts against the
+/// chainstate UTXO set, and hand the tx to `Mempool::add_transaction`. Returns
+/// the internal-order txid on success, or a human-readable rejection string.
+///
+/// Peer relay is intentionally NOT done here (the wallet RPC has no peer-
+/// manager handle); on regtest the local mempool admission + the next
+/// `generatetoaddress` is all that's needed to confirm. Mirrors the admission
+/// core of `RpcServerImpl::send_raw_transaction`.
+pub fn broadcast_signed_tx(
+    state: &mut RpcState,
+    tx: Transaction,
+) -> Result<Hash256, String> {
+    let txid = tx.txid();
+
+    if state.mempool.contains(&txid) {
+        return Ok(txid);
+    }
+
+    let db = Arc::clone(&state.db);
+    let store = BlockStore::new(&db);
+    if let Ok(Some(_)) = store.get_tx_index(&txid) {
+        return Err("Transaction already in block chain".to_string());
+    }
+
+    // Refresh tip snapshot for IsFinalTx / coinbase-maturity checks.
+    {
+        let tip_height = state.best_height;
+        let mtp = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+        state.mempool.notify_new_tip(tip_height, mtp);
+    }
+
+    let utxo_lookup = |outpoint: &OutPoint| {
+        let store = BlockStore::new(&db);
+        store
+            .get_utxo(outpoint)
+            .ok()
+            .flatten()
+            .map(|c| rustoshi_consensus::validation::CoinEntry {
+                height: c.height,
+                is_coinbase: c.is_coinbase,
+                value: c.value,
+                script_pubkey: c.script_pubkey,
+            })
+    };
+
+    match state.mempool.add_transaction(tx, &utxo_lookup) {
+        Ok(_) => {
+            if let Some(entry) = state.mempool.get(&txid) {
+                let fee_rate = entry.fee_rate;
+                state.fee_estimator.track_transaction(txid, fee_rate);
+            }
+            Ok(txid)
+        }
+        Err(e) => {
+            use rustoshi_consensus::mempool::MempoolError;
+            match &e {
+                MempoolError::AlreadyExists => Ok(txid),
+                other => Err(format!("Transaction rejected: {}", other)),
+            }
+        }
+    }
 }
 
 /// Transcribe `validation::UndoData` into the on-disk `storage::UndoData`
@@ -9783,6 +9860,27 @@ impl RpcServerImpl {
                 state.best_hash = block_hash;
                 state.best_height = height;
 
+                // Wallet UTXO ledger: scan the connected block into every
+                // loaded wallet (credit wallet-owned outputs incl. coinbase,
+                // debit spent wallet coins), advancing per-wallet chain height
+                // for coinbase-maturity accounting. Mirrors Core's
+                // CWallet::blockConnected. Best-effort — a wallet failure must
+                // never roll back a fully-validated, already-persisted block;
+                // the ledger is reconstructible via rescan / scantxoutset.
+                if let Some(ws) = state.wallet_state.clone() {
+                    let txs = block.transactions.clone();
+                    let h = height;
+                    // Drop the wallet read-guard scope quickly.
+                    let ws_guard = ws.read().await;
+                    let (credits, debits) =
+                        ws_guard.wallet_manager.scan_block_all_wallets(&txs, h);
+                    if credits > 0 || debits > 0 {
+                        tracing::debug!(
+                            "wallet block-scan @ height {h}: +{credits} credits, -{debits} debits"
+                        );
+                    }
+                }
+
                 // NOTE: IBD latch is re-evaluated on every getblockchaininfo
                 // call (see get_blockchain_info). We deliberately do NOT call
                 // should_exit_ibd here because mine_single_block writes a
@@ -11098,6 +11196,21 @@ pub async fn start_rpc_server(
                 manager,
                 wallet_data_dir.clone(),
             )));
+            // Share the SAME wallet state with the core RpcState so the
+            // block-connect path (mining / block submission) can fan a
+            // connected block into the loaded wallets' UTXO ledgers (Core's
+            // CWallet::blockConnected). Without this, getbalance/listunspent
+            // stay empty and sendtoaddress fails "insufficient funds".
+            {
+                let mut st = state.write().await;
+                st.wallet_state = Some(wallet_state.clone());
+            }
+            // Reverse handle: let the wallet RPC reach the node so
+            // sendtoaddress can broadcast its signed tx into the mempool.
+            {
+                let mut ws = wallet_state.write().await;
+                ws.node = Some(state.clone());
+            }
             Some(crate::wallet::WalletRpcImpl::new(wallet_state).into_rpc())
         }
         Err(e) => {

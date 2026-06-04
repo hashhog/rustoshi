@@ -732,6 +732,27 @@ impl WalletManager {
         self.wallets.keys().cloned().collect()
     }
 
+    /// Scan a connected block into every loaded wallet's UTXO ledger.
+    ///
+    /// Mirrors Core's `CWallet::blockConnected` fan-out: each loaded wallet
+    /// credits its own outputs and debits its own spent coins. Pure per-wallet
+    /// mutation behind the existing `Arc<Mutex<Wallet>>`; a poisoned lock for
+    /// one wallet never blocks the others. `height` is the connecting block's
+    /// height (drives coinbase maturity). Returns total (credits, debits)
+    /// across all wallets.
+    pub fn scan_block_all_wallets(&self, txs: &[rustoshi_primitives::Transaction], height: u32) -> (usize, usize) {
+        let mut credits = 0usize;
+        let mut debits = 0usize;
+        for wallet in self.wallets.values() {
+            if let Ok(mut w) = wallet.lock() {
+                let (c, d) = w.scan_block(txs, height);
+                credits += c;
+                debits += d;
+            }
+        }
+        (credits, debits)
+    }
+
     /// List wallet directories (both loaded and unloaded).
     pub fn list_wallet_dir(&self) -> Result<Vec<WalletDirEntry>, WalletError> {
         let mut entries = Vec::new();
