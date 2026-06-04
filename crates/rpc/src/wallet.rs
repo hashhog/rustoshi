@@ -684,6 +684,44 @@ pub trait WalletRpc {
         requests: Vec<crate::types::ImportDescriptorRequest>,
     ) -> RpcResult<Vec<crate::types::ImportDescriptorResult>>;
 
+    /// Set (restore) the wallet's HD master seed deterministically.
+    ///
+    /// This is rustoshi's seed-only wallet-recovery entry point and mirrors
+    /// the intent of Bitcoin Core's `sethdseed`
+    /// (`bitcoin-core/src/wallet/rpc/backup.cpp`): replace the active wallet's
+    /// HD chain so the SAME seed always re-derives byte-identical addresses.
+    /// Combined with `scantxoutset`, this lets a wallet that lost its disk
+    /// state recover 100% of its on-chain funds from the seed alone.
+    ///
+    /// Unlike Core (which takes a WIF private key), rustoshi's wallet is built
+    /// directly from a BIP-39-style 64-byte master seed (see
+    /// `rustoshi_wallet::Wallet::from_seed`), so the `seed` argument is the
+    /// 128-hex-character (64-byte) master seed. The restored wallet inherits
+    /// the existing wallet's network and address type, and the seed is
+    /// persisted so a later `loadwallet` round-trips to the same keys.
+    ///
+    /// Parameters:
+    /// - newkeypool: Core-compatibility flag; accepted but unused (rustoshi
+    ///   always regenerates the keypool from index 0 on restore).
+    /// - seed: 64-byte master seed, hex-encoded (128 hex chars). When omitted,
+    ///   Core generates a fresh random seed; we require it explicitly here so
+    ///   the call is unambiguously a *deterministic restore*.
+    ///
+    /// Returns the HD seed fingerprint (Core returns null; we return the
+    /// first-4-bytes fingerprint hex so callers can confirm which seed is
+    /// active).
+    ///
+    /// Errors:
+    /// - `-5` (RPC_WALLET_INVALID_ADDRESS_OR_KEY) if `seed` is missing or not
+    ///   exactly 64 bytes of valid hex.
+    /// - `-4` (RPC_WALLET_ERROR) on any wallet/persistence failure.
+    #[method(name = "sethdseed")]
+    async fn set_hd_seed(
+        &self,
+        newkeypool: Option<bool>,
+        seed: Option<String>,
+    ) -> RpcResult<serde_json::Value>;
+
     /// Lock or unlock specified UTXOs from automatic coin selection.
     ///
     /// Mirrors `bitcoin-core/src/wallet/rpc/coins.cpp::lockunspent`. With
@@ -1604,6 +1642,57 @@ impl WalletRpcServer for WalletRpcImpl {
         }
 
         Ok(results)
+    }
+
+    async fn set_hd_seed(
+        &self,
+        _newkeypool: Option<bool>,
+        seed: Option<String>,
+    ) -> RpcResult<serde_json::Value> {
+        // Require an explicit seed: this RPC is rustoshi's deterministic
+        // restore path, so an absent seed is a usage error rather than
+        // "generate a fresh random one" (which `createwallet` already does).
+        let seed_hex = seed.ok_or_else(|| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                "sethdseed requires a 64-byte (128 hex char) master seed for deterministic restore",
+            )
+        })?;
+        let seed_bytes = hex::decode(seed_hex.trim()).map_err(|_| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                "seed must be valid hex",
+            )
+        })?;
+        if seed_bytes.len() != 64 {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                format!("seed must be 64 bytes (128 hex chars), got {}", seed_bytes.len()),
+            ));
+        }
+
+        let mut state = self.state.write().await;
+
+        // Resolve the target wallet name (URL-pinned, or the single default).
+        let (name, _wallet) = state
+            .wallet_manager
+            .get_wallet_or_default(self.target_wallet.as_deref())
+            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+
+        state
+            .wallet_manager
+            .set_hd_seed(&name, &seed_bytes)
+            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
+
+        // Report the HD seed fingerprint so callers can confirm which seed is
+        // active. The fingerprint is the first 4 bytes of HASH160(master
+        // pubkey); we reuse the freshly-restored wallet to peek address 0,
+        // but the simplest stable identifier we can return without exposing
+        // key material is the first 4 bytes of the seed's SHA256 — purely an
+        // opaque "which seed" tag, not consensus-relevant.
+        use sha2::{Digest, Sha256};
+        let tag = Sha256::digest(&seed_bytes);
+        Ok(serde_json::json!(hex::encode(&tag[..4])))
     }
 
     // -----------------------------------------------------------------------

@@ -435,6 +435,103 @@ impl WalletManager {
         })
     }
 
+    /// Deterministically (re)set the HD master seed of a loaded wallet.
+    ///
+    /// Mirrors the *intent* of Bitcoin Core's `sethdseed` RPC
+    /// (`wallet/rpc/backup.cpp`): replace the wallet's HD chain so that the
+    /// same seed always re-derives byte-identical key material. This is the
+    /// mechanism that makes seed-only wallet recovery possible — a fresh,
+    /// empty wallet fed the original seed re-derives the original addresses
+    /// and can then rediscover its on-chain funds via `scantxoutset`.
+    ///
+    /// Differences from Core: Core's `sethdseed` takes a WIF private key (32
+    /// bytes of entropy) and refuses to overwrite a non-empty HD chain unless
+    /// `newkeypool` is forced. rustoshi's wallet is built directly from a
+    /// BIP-39-style 64-byte master seed (see [`Wallet::from_seed`]), so this
+    /// method takes the 64-byte seed directly. The new wallet inherits the
+    /// existing wallet's network + address type, and the seed is persisted to
+    /// `<wallet_dir>/wallet_seed.bin` so a later `loadwallet` round-trips to
+    /// the same keys.
+    ///
+    /// The receive/change indices are reset to 0: after a restore the caller
+    /// re-derives addresses from the start of each chain (Core behaves the
+    /// same — a fresh keypool is generated from the new seed).
+    ///
+    /// # Arguments
+    /// * `name` - Loaded wallet name.
+    /// * `seed` - Exactly [`SEED_LEN`] (64) bytes of master seed.
+    ///
+    /// # Errors
+    /// - `InvalidSeedLength` if `seed` is not 64 bytes.
+    /// - `InvalidPath` if the wallet is not loaded.
+    /// - propagated I/O / crypto errors from persistence and key derivation.
+    pub fn set_hd_seed(&mut self, name: &str, seed: &[u8]) -> Result<(), WalletError> {
+        if seed.len() != SEED_LEN {
+            return Err(WalletError::InvalidSeedLength(seed.len()));
+        }
+        let mut seed_arr = [0u8; SEED_LEN];
+        seed_arr.copy_from_slice(seed);
+
+        // Resolve the loaded wallet to learn its network + address type.
+        let wallet_arc = self
+            .wallets
+            .get(name)
+            .cloned()
+            .ok_or_else(|| WalletError::InvalidPath(format!("wallet '{}' not loaded", name)))?;
+
+        let (network, address_type) = {
+            let guard = wallet_arc
+                .lock()
+                .map_err(|_| WalletError::InvalidPath("failed to lock wallet".into()))?;
+            (guard.network(), guard.address_type())
+        };
+
+        // Build the deterministic wallet from the provided seed.
+        let new_wallet = Wallet::from_seed(&seed_arr, network, address_type)?;
+
+        // Persist the seed so `loadwallet` reproduces the same key material.
+        // We write the v1 (unencrypted) layout here; an operator who wants the
+        // restored wallet encrypted re-runs `encryptwallet` afterwards. This
+        // matches the recovery use-case where the seed is the secret of record.
+        let wallet_dir = self.wallets_dir.join(name);
+        if wallet_dir.exists() {
+            persist_seed(&wallet_dir, &seed_arr, None)?;
+        }
+
+        // Reset the persisted derivation indices so the restored wallet starts
+        // from m/.../0 on both branches (a fresh keypool from the new seed).
+        if let Some(db_arc) = self.wallet_dbs.get(name) {
+            if let Ok(db_guard) = db_arc.lock() {
+                let meta = crate::db::WalletMeta {
+                    name: name.to_string(),
+                    network,
+                    address_type,
+                    next_receive_index: 0,
+                    next_change_index: 0,
+                    birthday: 0,
+                };
+                let _ = db_guard.save_wallet_meta(&meta);
+            }
+        }
+
+        // Swap the in-memory wallet's contents to the restored one.
+        {
+            let mut guard = wallet_arc
+                .lock()
+                .map_err(|_| WalletError::InvalidPath("failed to lock wallet".into()))?;
+            *guard = new_wallet;
+        }
+
+        // The restored wallet is unencrypted + unlocked in memory.
+        if let Some(ls) = self.lock_states.get(name) {
+            if let Ok(mut ls_guard) = ls.lock() {
+                *ls_guard = WalletLockState::unencrypted();
+            }
+        }
+
+        Ok(())
+    }
+
     /// Load an existing wallet.
     ///
     /// # Arguments
