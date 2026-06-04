@@ -157,6 +157,10 @@ pub struct WalletTransaction {
     pub fee: Option<f64>,
     /// Number of confirmations.
     pub confirmations: i32,
+    /// Only present (and `true`) when the transaction's only input is a
+    /// coinbase one. Mirrors Core's `generated` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated: Option<bool>,
     /// Whether the transaction has been abandoned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abandoned: Option<bool>,
@@ -184,6 +188,72 @@ pub struct WalletTransaction {
     pub time: u64,
     /// Unix timestamp when the transaction was received (same as time).
     pub timereceived: u64,
+}
+
+/// A single line item in a `gettransaction` `details[]` array.
+///
+/// Mirrors one element of Core's `gettransaction` details (see
+/// `wallet/rpc/transactions.cpp`): a per-output receive/generate or a
+/// per-recipient send.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransactionDetail {
+    /// The address involved (recipient for a send, own address for a receive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// "send" | "receive" | "generate" | "immature".
+    pub category: String,
+    /// Amount in BTC. NEGATIVE for the `send` category.
+    pub amount: f64,
+    /// Output index.
+    pub vout: u32,
+    /// Fee in BTC (NEGATIVE), present only for `send` line items.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee: Option<f64>,
+}
+
+/// Result of the `gettransaction` RPC.
+///
+/// Mirrors Bitcoin Core's `gettransaction` response shape
+/// (`wallet/rpc/transactions.cpp`): the net wallet `amount`, the `fee` (sends
+/// only, negative), confirmation + block context, the `details[]` breakdown,
+/// and the raw `hex`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GetTransactionResult {
+    /// Net amount to the wallet in BTC (`nNet - nFee` in Core terms).
+    pub amount: f64,
+    /// Fee in BTC (NEGATIVE), present only when the wallet sent this tx.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee: Option<f64>,
+    /// Number of confirmations.
+    pub confirmations: i32,
+    /// Only present (`true`) for coinbase transactions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated: Option<bool>,
+    /// Block hash containing the transaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blockhash: Option<String>,
+    /// Block height containing the transaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blockheight: Option<u32>,
+    /// Block timestamp (Unix seconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocktime: Option<u64>,
+    /// Transaction ID (display / reversed byte order).
+    pub txid: String,
+    /// Wallet conflicts.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub walletconflicts: Vec<String>,
+    /// BIP-125 replaceability status.
+    #[serde(rename = "bip125-replaceable")]
+    pub bip125_replaceable: String,
+    /// Unix timestamp when the transaction was received.
+    pub time: u64,
+    /// Unix timestamp when the transaction was received (same as time).
+    pub timereceived: u64,
+    /// Per-output / per-recipient line items.
+    pub details: Vec<TransactionDetail>,
+    /// The raw transaction, hex-encoded (full witness serialization).
+    pub hex: String,
 }
 
 /// Result of getwalletinfo RPC.
@@ -663,6 +733,21 @@ pub trait WalletRpc {
         include_watchonly: Option<bool>,
     ) -> RpcResult<Vec<WalletTransaction>>;
 
+    /// Get detailed information about an in-wallet transaction.
+    ///
+    /// Parameters:
+    /// - txid: The transaction id (display / reversed byte order)
+    /// - include_watchonly: Include watch-only addresses (default: true for
+    ///   watch-only wallets)
+    /// - verbose: Include the decoded transaction (currently ignored)
+    #[method(name = "gettransaction")]
+    async fn get_transaction(
+        &self,
+        txid: String,
+        include_watchonly: Option<bool>,
+        verbose: Option<bool>,
+    ) -> RpcResult<GetTransactionResult>;
+
     /// Get wallet information.
     #[method(name = "getwalletinfo")]
     async fn get_wallet_info(&self) -> RpcResult<WalletInfo>;
@@ -962,6 +1047,11 @@ impl WalletRpcImpl {
 
     /// Satoshis to BTC.
     fn sats_to_btc(sats: u64) -> f64 {
+        sats as f64 / 100_000_000.0
+    }
+
+    /// Signed satoshis to BTC (preserves a negative sign for send amounts/fees).
+    fn sats_to_btc_signed(sats: i64) -> f64 {
         sats as f64 / 100_000_000.0
     }
 
@@ -1368,53 +1458,180 @@ impl WalletRpcServer for WalletRpcImpl {
         let count = count.unwrap_or(10);
         let skip = skip.unwrap_or(0);
 
-        // Get transactions from UTXOs (both spent and unspent represent wallet activity)
-        // For a full implementation, we'd track sends and receives separately
+        // Build one WalletTransaction per details[] line item across the
+        // wallet's transaction history, mirroring Core's ListTransactions
+        // (one entry per send recipient + one per received output). History is
+        // recorded at block-connect time (Wallet::scan_block_at) so a SEND —
+        // whose wallet UTXO was debited and removed from the live UTXO set —
+        // is still reported. Confirmations + the coinbase generate/immature
+        // split are recomputed against the current chain tip at read time.
         let mut transactions: Vec<WalletTransaction> = Vec::new();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // Core orders listtransactions oldest-first then returns the LAST
+        // `count` after skipping `skip` from the end (most-recent window). The
+        // history Vec is already in block-connect (oldest-first) order; we emit
+        // line items in that order, then apply the from-the-end pagination.
+        for entry in wallet_guard.history() {
+            let txid_hex =
+                hex::encode(entry.txid.0.iter().rev().copied().collect::<Vec<_>>());
+            let confirmations = wallet_guard.history_confirmations(entry) as i32;
+            let generated = if entry.is_coinbase { Some(true) } else { None };
+            let blockhash = if entry.block_hash == rustoshi_primitives::Hash256::ZERO {
+                None
+            } else {
+                Some(hex::encode(
+                    entry.block_hash.0.iter().rev().copied().collect::<Vec<_>>(),
+                ))
+            };
+            let blocktime = if entry.block_time == 0 { None } else { Some(entry.block_time) };
 
-        // Get all UTXOs (these represent received transactions)
-        for utxo in wallet_guard.list_unspent() {
-            let txid_hex = hex::encode(utxo.outpoint.txid.0.iter().rev().copied().collect::<Vec<_>>());
-            let category = if utxo.is_coinbase { "generate" } else { "receive" };
+            for d in &entry.details {
+                // For a coinbase receive, refine generate -> immature when the
+                // coinbase has not yet reached maturity at the current tip.
+                let category = if entry.is_coinbase
+                    && (d.category == "generate" || d.category == "receive")
+                {
+                    if wallet_guard.history_coinbase_is_mature(entry) {
+                        "generate".to_string()
+                    } else {
+                        "immature".to_string()
+                    }
+                } else {
+                    d.category.clone()
+                };
 
-            transactions.push(WalletTransaction {
-                address: None, // Would derive from script
-                category: category.to_string(),
-                amount: Self::sats_to_btc(utxo.value),
-                label: None,
-                vout: Some(utxo.outpoint.vout),
-                fee: None,
-                confirmations: utxo.confirmations as i32,
-                abandoned: None,
-                blockhash: None,
-                blockheight: utxo.height,
-                blockindex: None,
-                blocktime: None,
-                txid: txid_hex,
-                walletconflicts: vec![],
-                bip125_replaceable: "no".to_string(),
-                time: now,
-                timereceived: now,
-            });
+                transactions.push(WalletTransaction {
+                    address: d.address.clone(),
+                    category,
+                    amount: Self::sats_to_btc_signed(d.amount_sats),
+                    label: None,
+                    vout: Some(d.vout),
+                    fee: d.fee_sats.map(Self::sats_to_btc_signed),
+                    confirmations,
+                    generated,
+                    abandoned: Some(false),
+                    blockhash: blockhash.clone(),
+                    blockheight: Some(entry.block_height),
+                    blockindex: None,
+                    blocktime,
+                    txid: txid_hex.clone(),
+                    walletconflicts: vec![],
+                    bip125_replaceable: "no".to_string(),
+                    time: entry.block_time,
+                    timereceived: entry.block_time,
+                });
+            }
         }
 
-        // Sort by time descending
-        transactions.sort_by(|a, b| b.time.cmp(&a.time));
+        // Most-recent window: skip `skip` from the END, then take `count`
+        // (still oldest-first within the window), matching Core's
+        // `nFrom`/`nCount` slicing over the oldest-first list.
+        let total = transactions.len();
+        let end = total.saturating_sub(skip);
+        let start = end.saturating_sub(count);
+        let transactions: Vec<WalletTransaction> =
+            transactions[start..end].to_vec();
 
-        // Apply pagination
-        let transactions: Vec<WalletTransaction> = transactions
-            .into_iter()
-            .skip(skip)
-            .take(count)
+        tracing::debug!(
+            "listtransactions for wallet {}: {} results",
+            wallet_name,
+            transactions.len()
+        );
+        Ok(transactions)
+    }
+
+    async fn get_transaction(
+        &self,
+        txid: String,
+        _include_watchonly: Option<bool>,
+        _verbose: Option<bool>,
+    ) -> RpcResult<GetTransactionResult> {
+        let state = self.state.read().await;
+
+        let (_wallet_name, wallet) = state
+            .wallet_manager
+            .get_wallet_or_default(self.target_wallet.as_deref())
+            .map_err(|e| {
+                Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string())
+            })?;
+
+        let wallet_guard = wallet
+            .lock()
+            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+
+        let txid_internal = Self::parse_txid_hex(&txid)?;
+        let entry = wallet_guard.history_entry(&txid_internal).ok_or_else(|| {
+            // Core: "Invalid or non-wallet transaction id"
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                "Invalid or non-wallet transaction id",
+            )
+        })?;
+
+        // Net amount to the wallet = (credit - debit) - fee, mirroring Core's
+        // `nNet - nFee` where nNet = nCredit - nDebit and the fee is only
+        // counted when the wallet funded the tx.
+        let net: i64 = entry.credit_sats as i64 - entry.debit_sats as i64;
+        let fee_sats_signed: Option<i64> = entry.fee_sats.map(|f| -(f as i64));
+        // Core: amount = nNet - nFee; nFee here is the positive fee, so
+        // subtracting it from net (with fee>0 for a send) yields net - fee.
+        let amount_sats = net - entry.fee_sats.map(|f| f as i64).unwrap_or(0);
+
+        let confirmations = wallet_guard.history_confirmations(entry) as i32;
+        let generated = if entry.is_coinbase { Some(true) } else { None };
+        let blockhash = if entry.block_hash == rustoshi_primitives::Hash256::ZERO {
+            None
+        } else {
+            Some(hex::encode(
+                entry.block_hash.0.iter().rev().copied().collect::<Vec<_>>(),
+            ))
+        };
+        let blocktime = if entry.block_time == 0 { None } else { Some(entry.block_time) };
+
+        let details: Vec<TransactionDetail> = entry
+            .details
+            .iter()
+            .map(|d| {
+                let category = if entry.is_coinbase
+                    && (d.category == "generate" || d.category == "receive")
+                {
+                    if wallet_guard.history_coinbase_is_mature(entry) {
+                        "generate".to_string()
+                    } else {
+                        "immature".to_string()
+                    }
+                } else {
+                    d.category.clone()
+                };
+                TransactionDetail {
+                    address: d.address.clone(),
+                    category,
+                    amount: Self::sats_to_btc_signed(d.amount_sats),
+                    vout: d.vout,
+                    fee: d.fee_sats.map(Self::sats_to_btc_signed),
+                }
+            })
             .collect();
 
-        tracing::debug!("listtransactions for wallet {}: {} results", wallet_name, transactions.len());
-        Ok(transactions)
+        let txid_hex =
+            hex::encode(entry.txid.0.iter().rev().copied().collect::<Vec<_>>());
+
+        Ok(GetTransactionResult {
+            amount: Self::sats_to_btc_signed(amount_sats),
+            fee: fee_sats_signed.map(Self::sats_to_btc_signed),
+            confirmations,
+            generated,
+            blockhash,
+            blockheight: Some(entry.block_height),
+            blocktime,
+            txid: txid_hex,
+            walletconflicts: vec![],
+            bip125_replaceable: "no".to_string(),
+            time: entry.block_time,
+            timereceived: entry.block_time,
+            details,
+            hex: hex::encode(&entry.raw_tx),
+        })
     }
 
     async fn get_wallet_info(&self) -> RpcResult<WalletInfo> {
