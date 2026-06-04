@@ -86,4 +86,7 @@ pub use payjoin::{
     ReceiverContribution, SenderError, SenderOptions, MAX_ORIGINAL_PSBT_BYTES,
     OFFERED_PAYJOIN_TTL_SECS,
 };
-pub use wallet::{calculate_vsize, AddressType, TxDetail, TxHistoryEntry, Wallet, WalletUtxo};
+pub use wallet::{
+    calculate_vsize, decode_wif, encode_wif, AddressType, ImportedKey, TxDetail, TxHistoryEntry,
+    Wallet, WalletUtxo,
+};

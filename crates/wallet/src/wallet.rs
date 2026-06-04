@@ -65,6 +65,28 @@ pub enum AddressType {
 /// Coinbase maturity: coinbase outputs cannot be spent for 100 blocks.
 pub const COINBASE_MATURITY: u32 = 100;
 
+/// Sentinel derivation path stored on UTXOs / index entries that belong to an
+/// *imported* (non-HD) key rather than a seed-derived path. It is never a valid
+/// BIP-32 path (`u32::MAX` as the single element), so `scan_block_at` can route
+/// the address lookup through [`Wallet::imported_keys`] instead of attempting an
+/// HD derivation. Mirrors the way Core distinguishes imported scripts in the
+/// legacy keychain (`mapKeys` vs. HD `mapHdPubKeys`).
+const IMPORTED_PATH: &[u32] = &[u32::MAX];
+
+/// A private key imported into the wallet out-of-band (via `importprivkey`),
+/// outside the HD seed derivation. Mirrors the subset of Core's legacy
+/// `CKey` + `mapAddressBook` bookkeeping that `importprivkey` populates.
+#[derive(Clone, Debug)]
+pub struct ImportedKey {
+    /// The secp256k1 secret key controlling the imported scriptPubKeys.
+    pub secret_key: secp256k1::SecretKey,
+    /// The primary address (the wallet's configured address type) the key
+    /// controls, used to label credits in transaction history.
+    pub address: String,
+    /// Optional user label supplied at import time (Core's `strLabel`).
+    pub label: String,
+}
+
 /// A UTXO owned by the wallet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalletUtxo {
@@ -144,6 +166,12 @@ pub struct Wallet {
     /// are recomputed against the live `chain_height` at read time so a
     /// maturing coinbase or a deepening confirmation count is always current.
     history: Vec<TxHistoryEntry>,
+    /// Private keys imported out-of-band via `importprivkey`, keyed by every
+    /// standard single-key scriptPubKey the imported key controls (P2WPKH,
+    /// P2PKH, P2SH-P2WPKH) so a block / rescan scan credits funds paid to ANY
+    /// of those scripts. The seed-derived keychain is unaffected. Mirrors the
+    /// imported subset of Core's legacy keychain that `importprivkey` writes.
+    imported_keys: HashMap<Vec<u8>, ImportedKey>,
 }
 
 /// A per-output or per-input line item in a wallet transaction's `details[]`.
@@ -253,6 +281,7 @@ impl Wallet {
             locked_coins: HashSet::new(),
             sent_txs: HashMap::new(),
             history: Vec::new(),
+            imported_keys: HashMap::new(),
         })
     }
 
@@ -1615,6 +1644,88 @@ impl Wallet {
     /// Check if an address belongs to this wallet.
     pub fn is_mine(&self, address: &str) -> bool {
         self.addresses.contains_key(address)
+            || self
+                .imported_keys
+                .values()
+                .any(|k| k.address == address)
+    }
+
+    /// Import a raw secp256k1 private key into the wallet (Core's
+    /// `importprivkey`). Registers every standard single-key scriptPubKey the
+    /// key controls — P2WPKH (the wallet's default + most-common), P2PKH, and
+    /// P2SH-P2WPKH — so a subsequent block / rescan scan credits funds paid to
+    /// ANY of those scripts, matching Core's behaviour of adding the key to the
+    /// keychain and watching all its `IsMine` scripts.
+    ///
+    /// The "primary" returned address uses the wallet's configured
+    /// `address_type` (so it round-trips with `getnewaddress`-shaped output).
+    /// The imported key is independent of the HD seed; `sethdseed` /
+    /// recovery never re-derives it. Idempotent: re-importing the same key
+    /// just refreshes the label.
+    ///
+    /// Returns the primary address controlled by the imported key.
+    pub fn import_private_key(
+        &mut self,
+        secret_key: secp256k1::SecretKey,
+        label: String,
+    ) -> Result<String, WalletError> {
+        let secp = secp_ctx();
+        let pubkey = secp256k1::PublicKey::from_secret_key(secp, &secret_key);
+        let compressed: [u8; 33] = pubkey.serialize();
+        let pubkey_hash = hash160(&compressed);
+
+        // The three standard single-key scriptPubKeys the key controls.
+        let p2wpkh = Address::P2WPKH { hash: pubkey_hash, network: self.network };
+        let p2pkh = Address::P2PKH { hash: pubkey_hash, network: self.network };
+        // P2SH-P2WPKH: scriptPubKey = P2SH(redeem = OP_0 <20-byte pubkey hash>).
+        let mut redeem = vec![0x00, 0x14];
+        redeem.extend_from_slice(&pubkey_hash.0);
+        let p2sh_p2wpkh = Address::P2SH { hash: hash160(&redeem), network: self.network };
+
+        // The primary address mirrors the wallet's configured address type.
+        let primary = match self.address_type {
+            AddressType::P2WPKH => p2wpkh.encode(),
+            AddressType::P2PKH => p2pkh.encode(),
+            AddressType::P2shP2wpkh => p2sh_p2wpkh.encode(),
+            // Taproot is a tweaked key, not a hash160 script; for an imported
+            // raw key we expose the key-path P2TR address as primary.
+            AddressType::P2TR => {
+                let xonly = secp256k1::XOnlyPublicKey::from(pubkey);
+                let output_key = self.compute_taproot_output_key(&xonly);
+                Address::P2TR { output_key, network: self.network }.encode()
+            }
+        };
+
+        let entry = ImportedKey {
+            secret_key,
+            address: primary.clone(),
+            label,
+        };
+
+        // Register all standard single-key scripts so funds to any are found.
+        for addr in [&p2wpkh, &p2pkh, &p2sh_p2wpkh] {
+            self.imported_keys
+                .insert(addr.to_script_pubkey(), entry.clone());
+        }
+        if self.address_type == AddressType::P2TR {
+            let xonly = secp256k1::XOnlyPublicKey::from(pubkey);
+            let output_key = self.compute_taproot_output_key(&xonly);
+            self.imported_keys.insert(
+                Address::P2TR { output_key, network: self.network }.to_script_pubkey(),
+                entry.clone(),
+            );
+        }
+
+        Ok(primary)
+    }
+
+    /// Number of distinct imported keys (counted by primary address).
+    pub fn imported_key_count(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for k in self.imported_keys.values() {
+            seen.insert(k.address.clone());
+        }
+        seen.len()
     }
 
     /// Derive the scriptPubKey controlled by a derivation path.
@@ -1665,7 +1776,30 @@ impl Wallet {
             }
         }
 
+        // (c) every imported (non-HD) key's scriptPubKeys. They carry the
+        // sentinel IMPORTED_PATH so the credit-address lookup routes through
+        // `imported_keys` rather than HD derivation. Imported funds are never
+        // "change". A seed-derived script always wins (it was inserted first),
+        // so an overlap never relabels a wallet's own HD output as imported.
+        for spk in self.imported_keys.keys() {
+            index
+                .entry(spk.clone())
+                .or_insert((IMPORTED_PATH.to_vec(), false));
+        }
+
         index
+    }
+
+    /// Resolve the human-readable address that *owns* a wallet scriptPubKey,
+    /// given the `(path, _)` recorded in the ownership index. For HD paths this
+    /// re-derives the address; for the [`IMPORTED_PATH`] sentinel it looks the
+    /// address up in [`Self::imported_keys`]. Used to label credits in history.
+    fn owned_script_address(&self, spk: &[u8], path: &[u32]) -> Option<String> {
+        if path == IMPORTED_PATH {
+            self.imported_keys.get(spk).map(|k| k.address.clone())
+        } else {
+            self.derive_address(path).ok()
+        }
     }
 
     /// Scan a connected block for wallet activity (Core's `CWallet::blockConnected`).
@@ -1736,7 +1870,7 @@ impl Wallet {
                         },
                     );
                     credit_sats = credit_sats.saturating_add(out.value);
-                    let addr = self.derive_address(path).ok();
+                    let addr = self.owned_script_address(&out.script_pubkey, path);
                     credit_outs.push((vout as u32, out.value, *is_change, addr));
                     credits += 1;
                 }
@@ -2108,6 +2242,60 @@ impl Wallet {
         }
         None
     }
+}
+
+/// The WIF (Wallet Import Format) version byte for the secret key on a given
+/// network. Mirrors Core's `base58Prefixes[SECRET_KEY]`
+/// (`kernel/chainparams.cpp`): 0x80 on mainnet, 0xEF on testnet/regtest.
+fn wif_secret_prefix(network: Network) -> u8 {
+    match network {
+        Network::Mainnet => 0x80,
+        Network::Testnet | Network::Regtest => 0xEF,
+    }
+}
+
+/// Decode a Bitcoin WIF private key (base58check). Returns the secp256k1
+/// secret key and whether it encodes a compressed public key. Mirrors Core's
+/// `DecodeSecret` (`key_io.cpp`): the payload is `[version] + 32-byte key`,
+/// optionally followed by a `0x01` compression flag. The version byte is
+/// validated against the active network so a mainnet WIF can't be imported
+/// into a regtest wallet (Core's `pubKeyPrefix`/`secretKeyPrefix` check).
+pub fn decode_wif(
+    wif: &str,
+    network: Network,
+) -> Result<(secp256k1::SecretKey, bool), WalletError> {
+    let data = rustoshi_crypto::base58check_decode(wif.trim())
+        .map_err(|_| WalletError::InvalidAddress(format!("invalid WIF base58check: {}", wif)))?;
+    if data.is_empty() || data[0] != wif_secret_prefix(network) {
+        return Err(WalletError::InvalidAddress(
+            "WIF version byte does not match the active network".to_string(),
+        ));
+    }
+    let (key_bytes, compressed) = match data.len() {
+        // version(1) + key(32)
+        33 => (&data[1..33], false),
+        // version(1) + key(32) + compression flag(1 == 0x01)
+        34 if data[33] == 0x01 => (&data[1..33], true),
+        _ => {
+            return Err(WalletError::InvalidAddress(
+                "invalid WIF length / compression flag".to_string(),
+            ))
+        }
+    };
+    let secret = secp256k1::SecretKey::from_slice(key_bytes)
+        .map_err(|_| WalletError::InvalidAddress("WIF encodes an out-of-range key".to_string()))?;
+    Ok((secret, compressed))
+}
+
+/// Encode a secp256k1 secret key as a (compressed-pubkey) WIF for the given
+/// network — the inverse of [`decode_wif`]. Provided so callers / tests can
+/// round-trip imported keys; not used by the wallet itself.
+pub fn encode_wif(secret_key: &secp256k1::SecretKey, network: Network) -> String {
+    let mut payload = Vec::with_capacity(34);
+    payload.push(wif_secret_prefix(network));
+    payload.extend_from_slice(&secret_key[..]);
+    payload.push(0x01); // compressed-pubkey flag
+    rustoshi_crypto::base58check_encode(&payload)
 }
 
 // ----------------------------------------------------------------------------
@@ -3854,6 +4042,73 @@ mod tests {
         assert!(
             psbt.inputs[0].partial_sigs.is_empty(),
             "no signature should leak when the commitment check rejects"
+        );
+    }
+
+    #[test]
+    fn wif_round_trips_and_network_guards() {
+        let sk = secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
+        // encode -> decode round-trips the key + compressed flag.
+        let wif = encode_wif(&sk, Network::Regtest);
+        let (decoded, compressed) = decode_wif(&wif, Network::Regtest).unwrap();
+        assert_eq!(decoded[..], sk[..]);
+        assert!(compressed, "encode_wif emits the compressed flag");
+        // The regtest WIF must NOT decode under mainnet (version-byte guard).
+        assert!(
+            decode_wif(&wif, Network::Mainnet).is_err(),
+            "regtest WIF must be rejected on mainnet (Core's secretKeyPrefix check)"
+        );
+        // Garbage is rejected.
+        assert!(decode_wif("not-a-wif", Network::Regtest).is_err());
+    }
+
+    #[test]
+    fn import_private_key_registers_scripts_and_scan_credits() {
+        let mut wallet =
+            Wallet::from_seed(&test_seed(), Network::Regtest, AddressType::P2WPKH).unwrap();
+
+        // A foreign key NOT derived from the seed.
+        let sk = secp256k1::SecretKey::from_slice(&[0x7e; 32]).unwrap();
+        let addr = wallet
+            .import_private_key(sk, "ext".to_string())
+            .expect("import should succeed");
+        assert!(wallet.is_mine(&addr), "imported address must be is_mine");
+        assert_eq!(wallet.imported_key_count(), 1);
+
+        // The P2WPKH scriptPubKey for the imported key (default address type).
+        let secp = secp_ctx();
+        let pk = secp256k1::PublicKey::from_secret_key(secp, &sk);
+        let spk = Address::P2WPKH {
+            hash: hash160(&pk.serialize()),
+            network: Network::Regtest,
+        }
+        .to_script_pubkey();
+
+        // A block paying that script must credit the wallet via the SAME scan
+        // path rescanblockchain uses (Wallet::scan_block_at).
+        let funding = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([0x11; 32]), vout: 0 },
+                script_sig: vec![],
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 12_345_000, script_pubkey: spk }],
+            lock_time: 0,
+        };
+        let (credits, _debits) =
+            wallet.scan_block_at(&[funding], 5, Hash256([0x22; 32]), 1_700_000_000);
+        assert_eq!(credits, 1, "scan must credit the imported-key output");
+        assert_eq!(wallet.balance(), 12_345_000);
+
+        // The credited output is labelled with the imported address (history).
+        assert!(
+            wallet.history().iter().any(|e| e
+                .details
+                .iter()
+                .any(|d| d.address.as_deref() == Some(addr.as_str()))),
+            "imported credit must be labelled with the imported address"
         );
     }
 }

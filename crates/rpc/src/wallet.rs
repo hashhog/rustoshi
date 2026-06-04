@@ -1306,36 +1306,54 @@ impl WalletRpcServer for WalletRpcImpl {
         let min_confirmations = minconf.unwrap_or(1);
         let max_confirmations = maxconf.unwrap_or(9999999);
 
+        // Decode each UTXO's scriptPubKey back to its address so listunspent can
+        // label + filter by address (Core's `out.pushKV("address", ...)`). The
+        // wallet only holds wallet-owned coins, so this is `ExtractDestination`
+        // over a known-standard script.
+        let network = state.wallet_manager.network();
+        let want_addrs: Option<std::collections::HashSet<String>> = addresses
+            .as_ref()
+            .filter(|a| !a.is_empty())
+            .map(|a| a.iter().cloned().collect());
+
         let utxos: Vec<UnspentOutput> = wallet_guard
             .list_unspent()
             .iter()
             .filter(|utxo| {
                 utxo.confirmations >= min_confirmations && utxo.confirmations <= max_confirmations
             })
-            .filter(|_utxo| {
-                // Filter by addresses if specified
-                addresses.as_ref().is_none_or(|addrs| {
-                    // We'd need to derive the address from the UTXO to filter
-                    // For now, accept all if addresses are specified
-                    !addrs.is_empty()
-                })
-            })
-            .map(|utxo| {
+            .filter_map(|utxo| {
+                let addr = rustoshi_crypto::address::Address::from_script_pubkey(
+                    &utxo.script_pubkey,
+                    network,
+                )
+                .map(|a| a.encode());
+
+                // Address filter: if the caller passed a non-empty address list,
+                // only keep UTXOs whose decoded address is in it (Core's
+                // `destinations` set check).
+                if let Some(want) = &want_addrs {
+                    match &addr {
+                        Some(a) if want.contains(a) => {}
+                        _ => return None,
+                    }
+                }
+
                 // Immature coinbase is listed but flagged non-spendable, the
                 // way Core's listunspent reports `spendable=false` for coins
                 // that fail IsSpendable (incl. coinbase under 100 confs).
                 let spendable = wallet_guard.is_spendable(utxo);
-                UnspentOutput {
+                Some(UnspentOutput {
                     txid: hex::encode(utxo.outpoint.txid.0.iter().rev().copied().collect::<Vec<_>>()),
                     vout: utxo.outpoint.vout,
-                    address: None, // Would need to derive from script
+                    address: addr,
                     script_pubkey: hex::encode(&utxo.script_pubkey),
                     amount: Self::sats_to_btc(utxo.value),
                     confirmations: utxo.confirmations,
                     spendable,
                     solvable: true,
                     safe: utxo.confirmations >= 1,
-                }
+                })
             })
             .collect();
 
