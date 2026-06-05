@@ -1921,15 +1921,21 @@ fn try_attach_and_reorg(
         ));
     }
 
-    chain_state
-        .reorganize(
-            *block_hash,
-            &get_block,
-            &get_undo,
-            &get_block_index,
-            &mut utxo_view,
-        )
-        .map_err(|e| format!("reorganize: {}", e))?;
+    // `reorganize` surfaces the per-block undo data for every block it
+    // connects on the new branch (ascending height order). We persist that
+    // undo (so a later reorg back across these blocks can disconnect them)
+    // and feed its spent-prevout scriptPubKeys into the block filter index
+    // below.
+    let (_disconnected_count, connected_blocks): (usize, Vec<(Hash256, u32, validation::UndoData)>) =
+        chain_state
+            .reorganize(
+                *block_hash,
+                &get_block,
+                &get_undo,
+                &get_block_index,
+                &mut utxo_view,
+            )
+            .map_err(|e| format!("reorganize: {}", e))?;
 
     // Pattern D (post-reorg-consistency, 2026-05-05):
     // The reorg commit must be ALL-OR-NOTHING on disk. Build a single
@@ -2094,8 +2100,28 @@ fn try_attach_and_reorg(
         }
     }
 
+    // Stage block-undo for every block connected on the new branch, into
+    // the SAME atomic batch. Bitcoin Core writes block undo on every
+    // `ConnectBlock` (reorg connects included); pre-fix the reorg path
+    // discarded the undo returned by `reorganize`, so the new-branch blocks
+    // had no undo on disk and a later reorg back across them failed with
+    // "missing undo data". (The undo is also consumed by the block filter
+    // index below.)
+    {
+        for (h, _height, v_undo) in &connected_blocks {
+            let storage_undo = validation_undo_to_storage(v_undo);
+            if let Err(e) = store.batch_put_undo(&mut batch, h, &storage_undo) {
+                tracing::error!(
+                    "try_attach_and_reorg: failed to stage undo for {}: {}",
+                    h, e
+                );
+            }
+        }
+    }
+
     // Single atomic commit — UTXO + height index + tip pointer + tx-index
-    // (delete for disconnected branch + put for new branch) flip together.
+    // (delete for disconnected branch + put for new branch) + new-branch
+    // block undo all flip together.
     // Pattern D fleet-wide closure: an N+M block reorg lands in one batch.
     store
         .write_batch(batch)
@@ -2103,6 +2129,53 @@ fn try_attach_and_reorg(
 
     state.best_hash = new_tip_hash;
     state.best_height = new_tip_height;
+
+    // BIP-157/158 block filter index — populate the basic GCS filter +
+    // chained filter header for every block connected on the new branch,
+    // mirroring the linear submitblock connect path (search "block filter
+    // index" above) and Bitcoin Core's `BlockFilterIndex::CustomAppend`,
+    // which fires from `BaseIndex::BlockConnected` on EVERY connect —
+    // reorg included. Pre-fix the reorg path indexed tx-index for the new
+    // branch but never the block filters, so `getblockfilter` on a block
+    // brought onto the active chain by a reorg returned "Filter not found"
+    // (or a stale filter from the orphaned branch).
+    //
+    // Order matters: `connect_block` chains each filter header onto the
+    // prev height's header, so we MUST index ascending by height.
+    // `connected_blocks` is already in ascending height order (the order
+    // `reorganize` connected them). The filter index is keyed by block
+    // hash (filter) / height (header), so reconnecting a height that a
+    // disconnected block previously occupied overwrites the stale entry —
+    // matching Core, whose index is likewise keyed by block hash and
+    // overwrites on reconnect. The undo data (spent-prevout scriptPubKeys)
+    // feeds BIP-158's spent-script set exactly as Core requires.
+    {
+        let filter_index = BlockFilterIndex::new(&state.db);
+        for (h, height, v_undo) in &connected_blocks {
+            let block = match store.get_block(h).ok().flatten() {
+                Some(b) => b,
+                None => {
+                    tracing::warn!(
+                        "try_attach_and_reorg: missing block body for {} at height {} — \
+                         cannot index block filter",
+                        h, height
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = filter_index.connect_block(*height, &block, v_undo) {
+                // Non-fatal: a filter-index write failure must not unwind an
+                // already-committed reorg. Mirrors the linear path's warn +
+                // continue. getblockfilter for this height will report
+                // "index corruption" until a reindex.
+                tracing::warn!(
+                    "try_attach_and_reorg: block filter index update failed for {} \
+                     at height {}: {}",
+                    h, height, e
+                );
+            }
+        }
+    }
 
     // Pattern B (mempool-refill-on-reorg): re-admit non-coinbase transactions
     // from the disconnected blocks now that the UTXO + tip state reflect the

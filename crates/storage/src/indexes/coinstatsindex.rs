@@ -218,11 +218,21 @@ pub fn get_bogo_size(script_pubkey_len: usize) -> u64 {
 
 /// Serialize a coin for MuHash.
 ///
-/// The serialization format matches Bitcoin Core:
-/// - outpoint (txid + vout)
-/// - code (height * 2 + coinbase flag)
-/// - value (compressed)
-/// - scriptPubKey
+/// This produces Bitcoin Core's `TxOutSer` byte layout
+/// (`bitcoin-core/src/kernel/coinstats.cpp::TxOutSer`), which is the
+/// SAME serialization used for both the MUHASH and HASH_SERIALIZED
+/// coin-stats hash types — Core feeds identical per-coin bytes into
+/// either `MuHash3072::Insert` or the SHA256d `HashWriter`:
+///
+/// - outpoint: txid (32 bytes, internal order) + vout (u32 LE)
+/// - code: `(height << 1) | coinbase` as a u32 LE
+/// - value: `coin.out.nValue` as an i64 LE (UNcompressed)
+/// - scriptPubKey: CompactSize(len) prefix + raw bytes
+///
+/// Note: this is intentionally NOT the on-disk UTXO encoding (which uses
+/// `compress_amount` + a varint code). The coin-stats commitment is over
+/// the canonical `TxOutSer` form so that rustoshi's `gettxoutsetinfo`
+/// `muhash` / `hash_serialized_3` are byte-compatible with Bitcoin Core.
 pub fn serialize_coin_for_muhash(
     txid: &Hash256,
     vout: u32,
@@ -231,61 +241,40 @@ pub fn serialize_coin_for_muhash(
     value: u64,
     script_pubkey: &[u8],
 ) -> Vec<u8> {
-    let mut data = Vec::with_capacity(36 + 10 + 10 + script_pubkey.len());
+    let mut data = Vec::with_capacity(32 + 4 + 4 + 8 + 9 + script_pubkey.len());
 
-    // Outpoint
+    // Outpoint: txid (internal little-endian, no reversal) + vout u32 LE.
     data.extend_from_slice(txid.as_bytes());
     data.extend_from_slice(&vout.to_le_bytes());
 
-    // Code: height * 2 + coinbase
-    let code = (height as u64) * 2 + (is_coinbase as u64);
-    write_varint(&mut data, code);
+    // Code: (height << 1) | coinbase, serialized as a u32 LE.
+    let code: u32 = (height << 1) | (is_coinbase as u32);
+    data.extend_from_slice(&code.to_le_bytes());
 
-    // Value (compressed using varint)
-    write_varint(&mut data, compress_amount(value));
+    // CTxOut: int64_t nValue (LE, uncompressed).
+    data.extend_from_slice(&(value as i64).to_le_bytes());
 
-    // ScriptPubKey
+    // scriptPubKey: CompactSize(len) prefix + raw bytes.
+    write_compact_size(&mut data, script_pubkey.len() as u64);
     data.extend_from_slice(script_pubkey);
 
     data
 }
 
-/// Compress a satoshi amount for serialization.
-///
-/// This uses Bitcoin Core's amount compression scheme.
-fn compress_amount(n: u64) -> u64 {
-    if n == 0 {
-        return 0;
-    }
-
-    let mut e = 0;
-    let mut n = n;
-
-    while n.is_multiple_of(10) && e < 9 {
-        n /= 10;
-        e += 1;
-    }
-
-    if e < 9 {
-        let d = n % 10;
-        n /= 10;
-        1 + (n * 9 + d - 1) * 10 + e
+/// CompactSize-encode `n` and append to `buf`.  Wire-format equivalent
+/// of `WriteCompactSize` in `bitcoin-core/src/serialize.h`.
+fn write_compact_size(buf: &mut Vec<u8>, n: u64) {
+    if n < 0xFD {
+        buf.push(n as u8);
+    } else if n <= 0xFFFF {
+        buf.push(0xFD);
+        buf.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= 0xFFFF_FFFF {
+        buf.push(0xFE);
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
     } else {
-        1 + (n - 1) * 10 + 9
-    }
-}
-
-/// Write a varint to a buffer.
-fn write_varint(buf: &mut Vec<u8>, mut n: u64) {
-    loop {
-        let byte = (n & 0x7F) as u8;
-        n >>= 7;
-        if n == 0 {
-            buf.push(byte);
-            break;
-        } else {
-            buf.push(byte | 0x80);
-        }
+        buf.push(0xFF);
+        buf.extend_from_slice(&n.to_le_bytes());
     }
 }
 
@@ -362,30 +351,29 @@ mod tests {
     }
 
     #[test]
-    fn test_compress_amount() {
-        // 0 -> 0
-        assert_eq!(compress_amount(0), 0);
-
-        // 1 satoshi
-        assert_ne!(compress_amount(1), 0);
-
-        // 1 BTC = 100_000_000 satoshis
-        assert_ne!(compress_amount(100_000_000), 0);
-    }
-
-    #[test]
     fn test_serialize_coin_for_muhash() {
         let txid = Hash256::ZERO;
-        let vout = 0;
-        let height = 100;
+        let vout: u32 = 0;
+        let height: u32 = 100;
         let is_coinbase = false;
-        let value = 50_000_000;
-        let script = vec![0x76, 0xa9, 0x14]; // P2PKH prefix
+        let value: u64 = 50_000_000;
+        let script = vec![0x76, 0xa9, 0x14]; // P2PKH prefix (3 bytes)
 
         let serialized = serialize_coin_for_muhash(&txid, vout, height, is_coinbase, value, &script);
 
-        // Should contain txid (32) + vout (4) + varint + varint + script
-        assert!(serialized.len() >= 36 + 2 + script.len());
+        // Core TxOutSer layout: txid(32) + vout(4) + code(4) + value i64(8)
+        // + CompactSize(len)(1, since len < 0xFD) + script bytes.
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(txid.as_bytes());
+        expected.extend_from_slice(&vout.to_le_bytes());
+        let code: u32 = (height << 1) | (is_coinbase as u32);
+        expected.extend_from_slice(&code.to_le_bytes());
+        expected.extend_from_slice(&(value as i64).to_le_bytes());
+        expected.push(script.len() as u8); // CompactSize for len < 0xFD
+        expected.extend_from_slice(&script);
+
+        assert_eq!(serialized, expected, "TxOutSer byte layout must match Core");
+        assert_eq!(serialized.len(), 32 + 4 + 4 + 8 + 1 + script.len());
     }
 
     #[test]
@@ -425,13 +413,31 @@ mod tests {
     }
 
     #[test]
-    fn test_varint_encoding() {
-        let test_cases = [0u64, 1, 127, 128, 255, 256, 16383, 16384, u32::MAX as u64];
+    fn test_write_compact_size() {
+        // CompactSize edge cases per bitcoin-core/src/serialize.h.
+        let mut buf = Vec::new();
+        write_compact_size(&mut buf, 0);
+        assert_eq!(buf, vec![0x00]);
 
-        for &value in &test_cases {
-            let mut buf = Vec::new();
-            write_varint(&mut buf, value);
-            assert!(!buf.is_empty());
-        }
+        buf.clear();
+        write_compact_size(&mut buf, 0xFC);
+        assert_eq!(buf, vec![0xFC]);
+
+        buf.clear();
+        write_compact_size(&mut buf, 0xFD);
+        assert_eq!(buf, vec![0xFD, 0xFD, 0x00]); // 0xFD marker + u16 LE
+
+        buf.clear();
+        write_compact_size(&mut buf, 0xFFFF);
+        assert_eq!(buf, vec![0xFD, 0xFF, 0xFF]);
+
+        buf.clear();
+        write_compact_size(&mut buf, 0x1_0000);
+        assert_eq!(buf, vec![0xFE, 0x00, 0x00, 0x01, 0x00]); // 0xFE marker + u32 LE
+
+        buf.clear();
+        write_compact_size(&mut buf, 0x1_0000_0000);
+        // 0xFF marker + u64 LE
+        assert_eq!(buf, vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]);
     }
 }
