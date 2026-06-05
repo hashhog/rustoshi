@@ -341,8 +341,18 @@ pub struct BlockHeaderInfo {
     #[serde(rename = "nTx")]
     pub n_tx: u32,
     /// Previous block hash.
+    ///
+    /// Core (`blockheaderToJSON`, blockchain.cpp:177-178) emits this key ONLY
+    /// when the block has a parent — so genesis must OMIT it entirely, not emit
+    /// `null`. `skip_serializing_if` drops the key when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub previousblockhash: Option<String>,
     /// Next block hash (if available).
+    ///
+    /// Core (`blockheaderToJSON`, blockchain.cpp:179-180) emits this key ONLY
+    /// when a next block exists — so the chain tip (and any block not in the
+    /// active chain) must OMIT it entirely, not emit `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nextblockhash: Option<String>,
 }
 
