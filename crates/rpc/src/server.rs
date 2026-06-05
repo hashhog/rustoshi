@@ -77,6 +77,10 @@ pub mod rpc_error {
     pub const RPC_TYPE_ERROR: i32 = -3;
     /// Invalid address or key.
     pub const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
+    /// Invalid, missing or duplicate parameter. Bitcoin Core uses this for
+    /// `getchaintxstats` "Block is not in main chain" / "Invalid block count"
+    /// (`bitcoin-core/src/rpc/protocol.h::RPC_INVALID_PARAMETER`).
+    pub const RPC_INVALID_PARAMETER: i32 = -8;
     /// Database error.
     pub const RPC_DATABASE_ERROR: i32 = -20;
     /// Deserialization error.
@@ -360,6 +364,20 @@ pub trait RustoshiRpc {
     /// Get the current network difficulty.
     #[method(name = "getdifficulty")]
     async fn get_difficulty(&self) -> RpcResult<f64>;
+
+    /// Compute statistics about the total number and rate of transactions
+    /// in the chain. Mirrors `bitcoin-core/src/rpc/blockchain.cpp::getchaintxstats`.
+    ///
+    /// `nblocks` (optional): size of the window in blocks. Default = one month
+    /// of blocks (`30*24*60*60 / pow_target_spacing`), clamped to `height - 1`.
+    /// `blockhash` (optional): the hash of the block that ends the window.
+    /// Default = active chain tip.
+    #[method(name = "getchaintxstats")]
+    async fn get_chain_tx_stats(
+        &self,
+        nblocks: Option<i64>,
+        blockhash: Option<String>,
+    ) -> RpcResult<serde_json::Value>;
 
     /// Get raw transaction by txid.
     ///
@@ -3625,6 +3643,195 @@ impl RustoshiRpcServer for RpcServerImpl {
         } else {
             Ok(1.0)
         }
+    }
+
+    async fn get_chain_tx_stats(
+        &self,
+        nblocks: Option<i64>,
+        blockhash: Option<String>,
+    ) -> RpcResult<serde_json::Value> {
+        use rustoshi_consensus::params::TARGET_BLOCK_TIME;
+        // Median-time-past window, per Core chain.h::nMedianTimeSpan.
+        const MEDIAN_TIME_SPAN: usize = 11;
+
+        let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+
+        // ── 1. Resolve `pindex` ────────────────────────────────────────────
+        // Default = active chain tip. Else lookup the supplied hash and
+        // require it to be on the active chain (Core: LookupBlockIndex +
+        // ActiveChain().Contains).
+        let (pindex_hash, pindex_height) = match &blockhash {
+            None => (state.best_hash, state.best_height),
+            Some(h) => {
+                let hash = Self::parse_hash(h)?;
+                let entry = store.get_block_index(&hash).map_err(|e| {
+                    Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+                })?;
+                let entry = entry.ok_or_else(|| {
+                    Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
+                })?;
+                // Active-chain membership: the height index must map this
+                // block's height back to this exact hash.
+                let on_active = store
+                    .get_hash_by_height(entry.height)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .map(|h| h == hash)
+                    .unwrap_or(false);
+                if !on_active {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Block is not in main chain",
+                    ));
+                }
+                (hash, entry.height)
+            }
+        };
+
+        // ── 2. Resolve `blockcount` (the window size) ──────────────────────
+        // Default: one month of blocks, clamped to [0, height - 1].
+        // Core: 30*24*60*60 / nPowTargetSpacing; pow target spacing is 600s
+        // on every network rustoshi targets (incl. regtest).
+        let default_blockcount: i64 =
+            (30i64 * 24 * 60 * 60) / (TARGET_BLOCK_TIME as i64);
+        let height_i = pindex_height as i64;
+        let blockcount: i64 = match nblocks {
+            None => default_blockcount.min(height_i - 1).max(0),
+            Some(n) => {
+                if n < 0 || (n > 0 && n >= height_i) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Invalid block count: should be between 0 and the block's height - 1",
+                    ));
+                }
+                n
+            }
+        };
+
+        // ── helpers over the active chain (by height) ──────────────────────
+        // Cumulative tx count genesis..=h  (Core's m_chain_tx_count). Walks
+        // the height index summing per-block n_tx. rustoshi has no persisted
+        // running counter (W109/G10 gap), so we sum on demand; this read-only
+        // diagnostic RPC tolerates the O(height) walk.
+        let chain_tx_count = |h: i64| -> Result<u64, ErrorObjectOwned> {
+            if h < 0 {
+                return Ok(0);
+            }
+            let mut total: u64 = 0;
+            for height in 0..=(h as u32) {
+                let hash = store
+                    .get_hash_by_height(height)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INTERNAL_ERROR,
+                            format!("missing height index at {height}"),
+                        )
+                    })?;
+                let entry = store
+                    .get_block_index(&hash)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INTERNAL_ERROR,
+                            format!("missing block index for {hash}"),
+                        )
+                    })?;
+                total += entry.n_tx as u64;
+            }
+            Ok(total)
+        };
+
+        // Median-time-past of the active-chain block at height `h`: median of
+        // up to 11 timestamps walking back from `h` (Core GetMedianTimePast).
+        let median_time_past = |h: i64| -> Result<i64, ErrorObjectOwned> {
+            let mut ts: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_SPAN);
+            let mut height = h;
+            for _ in 0..MEDIAN_TIME_SPAN {
+                if height < 0 {
+                    break;
+                }
+                let hash = store
+                    .get_hash_by_height(height as u32)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INTERNAL_ERROR,
+                            format!("missing height index at {height}"),
+                        )
+                    })?;
+                let entry = store
+                    .get_block_index(&hash)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INTERNAL_ERROR,
+                            format!("missing block index for {hash}"),
+                        )
+                    })?;
+                ts.push(entry.timestamp);
+                height -= 1;
+            }
+            ts.sort_unstable();
+            Ok(ts[ts.len() / 2] as i64)
+        };
+
+        // The final block's RAW header nTime (NOT mediantime).
+        let final_time: u32 = store
+            .get_block_index(&pindex_hash)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+            .map(|e| e.timestamp)
+            .ok_or_else(|| {
+                Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, "missing tip block index")
+            })?;
+
+        // past_block = ancestor at (height - blockcount).
+        let past_height: i64 = height_i - blockcount;
+        let time_diff: i64 = median_time_past(height_i)? - median_time_past(past_height)?;
+
+        // ── 4. Build the output object (field order mirrors Core) ──────────
+        let mut ret = serde_json::Map::new();
+        ret.insert("time".to_string(), serde_json::json!(final_time));
+
+        // txcount = cumulative tx count genesis..pindex (only emitted when
+        // non-zero, matching Core's `if (pindex->m_chain_tx_count)`).
+        let final_chain_tx = chain_tx_count(height_i)?;
+        if final_chain_tx != 0 {
+            ret.insert("txcount".to_string(), serde_json::json!(final_chain_tx));
+        }
+
+        ret.insert(
+            "window_final_block_hash".to_string(),
+            serde_json::json!(pindex_hash.to_hex()),
+        );
+        ret.insert(
+            "window_final_block_height".to_string(),
+            serde_json::json!(pindex_height),
+        );
+        ret.insert(
+            "window_block_count".to_string(),
+            serde_json::json!(blockcount),
+        );
+
+        if blockcount > 0 {
+            ret.insert("window_interval".to_string(), serde_json::json!(time_diff));
+            let past_chain_tx = chain_tx_count(past_height)?;
+            if final_chain_tx != 0 && past_chain_tx != 0 {
+                let window_tx_count = final_chain_tx - past_chain_tx;
+                ret.insert(
+                    "window_tx_count".to_string(),
+                    serde_json::json!(window_tx_count),
+                );
+                if time_diff > 0 {
+                    ret.insert(
+                        "txrate".to_string(),
+                        serde_json::json!(window_tx_count as f64 / time_diff as f64),
+                    );
+                }
+            }
+        }
+
+        Ok(serde_json::Value::Object(ret))
     }
 
     async fn get_raw_transaction(
@@ -7399,6 +7606,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getbestblockhash" => "getbestblockhash\nReturns the hash of the best (tip) block.",
                 "getdifficulty" => "getdifficulty\nReturns the proof-of-work difficulty.",
                 "getchaintips" => "getchaintips\nReturn information about all known tips in the block tree.",
+                "getchaintxstats" => "getchaintxstats ( nblocks \"blockhash\" )\nCompute statistics about the total number and rate of transactions in the chain.",
                 "gettxout" => "gettxout \"txid\" n ( include_mempool )\nReturns details about an unspent transaction output.",
                 "getrawtransaction" => "getrawtransaction \"txid\" ( verbose \"blockhash\" )\nReturn the raw transaction data.",
                 "getblockfilter" => "getblockfilter \"blockhash\" ( \"filtertype\" )\nRetrieve a BIP-157 content filter for a particular block.",
@@ -7448,7 +7656,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "== Blockchain ==",
                 "getbestblockhash", "getblock", "getblockchaininfo", "getblockcount",
                 "getblockfilter", "getblockhash", "getblockheader", "getchaintips",
-                "getdifficulty", "gettxout",
+                "getchaintxstats", "getdifficulty", "gettxout",
                 "invalidateblock", "preciousblock", "pruneblockchain", "reconsiderblock",
                 "",
                 "== Mempool ==",
