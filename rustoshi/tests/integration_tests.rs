@@ -779,7 +779,11 @@ fn test_chainwork_accumulates_correctly() {
     store.init_genesis(&params).unwrap();
 
     let mut prev_hash = params.genesis_hash;
-    let mut prev_work = ChainWork::ZERO; // genesis starts at zero in init_genesis
+    // This test threads its own chain starting from ZERO and overwrites the
+    // height-1..3 entries directly; it does not read genesis's stored chain_work,
+    // so it is independent of the genesis-proof seeding in init_genesis. It only
+    // asserts monotonic increase, which holds either way.
+    let mut prev_work = ChainWork::ZERO;
 
     for height in 1u32..=3 {
         let block = make_test_block(prev_hash, 0x207f_ffff, height, height);

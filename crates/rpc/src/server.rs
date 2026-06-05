@@ -3489,6 +3489,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             header_nonce: u32,
             height: u32,
             best_height: u32,
+            in_active_chain: bool,
             next_hash: Option<String>,
             chainwork_hex: Option<String>, // None means fallback needed
             n_tx: Option<u32>,             // None means fallback needed
@@ -3530,7 +3531,20 @@ impl RustoshiRpcServer for RpcServerImpl {
                 found.unwrap_or(0)
             };
 
-            let next_hash = if height < state.best_height {
+            // Determine whether this block is on the ACTIVE chain. Core's
+            // ComputeNextBlockAndDepth uses confirmations = tipHeight - height + 1
+            // for an in-chain block and -1 otherwise; nextblockhash is emitted
+            // only for in-chain blocks that are not the tip. A header can be in
+            // the index but NOT on the active chain (a stale/fork header), in
+            // which case the active-chain hash at `height` differs from ours.
+            let in_active_chain = store
+                .get_hash_by_height(height)
+                .ok()
+                .flatten()
+                .map(|h| h == block_hash)
+                .unwrap_or(false);
+
+            let next_hash = if in_active_chain && height < state.best_height {
                 store
                     .get_hash_by_height(height + 1)
                     .ok()
@@ -3576,6 +3590,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 header_nonce: header.nonce,
                 height,
                 best_height: state.best_height,
+                in_active_chain,
                 next_hash,
                 chainwork_hex,
                 n_tx,
@@ -3614,13 +3629,14 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         };
 
-        let confirmations = if snap.height > 0 && snap.best_height >= snap.height {
+        // Confirmations: Core (ComputeNextBlockAndDepth) returns
+        // tipHeight - height + 1 for a block on the active chain, and -1 for a
+        // block that is not on the active chain. This holds for genesis too
+        // (height 0 on the active chain -> best_height + 1).
+        let confirmations = if snap.in_active_chain && snap.best_height >= snap.height {
             (snap.best_height - snap.height + 1) as i32
-        } else if snap.height == 0 {
-            // Could be genesis (genuinely height 0) or an unresolved lookup.
-            (snap.best_height + 1) as i32
         } else {
-            0
+            -1
         };
 
         let prev_hash = if snap.header_prev_hash != Hash256::ZERO {
@@ -14846,7 +14862,8 @@ mod tests {
             .expect("block_index entry must exist for accepted block");
         assert_eq!(entry.height, 1, "block_index entry height matches");
         assert_eq!(entry.prev_hash, genesis_hash, "prev_hash threaded through");
-        // chain_work strictly greater than genesis (which has [0;32]).
+        // chain_work strictly greater than genesis (= genesis proof + block-1
+        // proof). Must be nonzero.
         let cw = ChainWork::from_be_bytes(entry.chain_work);
         assert_ne!(cw.0, [0u8; 32], "chain_work must be nonzero");
 
