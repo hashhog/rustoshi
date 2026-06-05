@@ -1678,6 +1678,39 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // Initialize with genesis block
     block_store.init_genesis(&params)?;
 
+    // BIP-157/158: index the GENESIS block's basic filter + filter header at
+    // startup. Bitcoin Core's `BlockFilterIndex` indexes every connected block
+    // INCLUDING genesis (`BaseIndex` walks from height 0), so the genesis
+    // filter header is the FIRST link of the BIP-157 header chain — height 1's
+    // header is `SHA256d(SHA256d(filter_1) || genesis_filter_header)`, NOT
+    // `... || 0x00..00`. Without indexing genesis, `connect_block` for height 1
+    // would fall back to a ZERO prev-header and the ENTIRE header chain would
+    // diverge from Core by exactly one (genesis) link, even though every
+    // per-block `filter` body still matched byte-for-byte. The genesis block
+    // has only a coinbase (no spent inputs), so its undo is empty. Idempotent:
+    // `connect_block` overwrites the same key, and `init_genesis` itself is a
+    // no-op on restart, so re-running this is harmless.
+    {
+        let genesis_filter_index = BlockFilterIndex::new(block_store.db());
+        if !genesis_filter_index
+            .has_filter(&params.genesis_hash)
+            .unwrap_or(false)
+        {
+            let empty_undo = rustoshi_consensus::validation::UndoData {
+                spent_coins: Vec::new(),
+            };
+            if let Err(e) =
+                genesis_filter_index.connect_block(0, &params.genesis_block, &empty_undo)
+            {
+                tracing::warn!(
+                    "BlockFilterIndex: failed to index genesis filter for {}: {} \
+                     (BIP-157 header chain will be off by the genesis link until reindex)",
+                    params.genesis_hash, e
+                );
+            }
+        }
+    }
+
     // Load chain state.
     // The stored best_height may be a stale cumulative counter from a bug in
     // earlier versions. Derive the actual height from the block index instead.

@@ -5029,6 +5029,37 @@ impl RustoshiRpcServer for RpcServerImpl {
                     }
                 }
 
+                // BIP-157/158 block filter index — populate the basic GCS
+                // filter + chained filter header for this block on connect,
+                // mirroring the P2P/IBD path in `main.rs::write_block_filter_index`
+                // (which fires `BlockFilterIndex::connect_block` from the
+                // block-connect callback). Without this, blocks accepted via the
+                // `submitblock` RPC never had their filters indexed, so
+                // `getblockfilter <hash>` returned "Filter not found" for any
+                // chain built by replaying blocks over RPC. Counterpart to
+                // Bitcoin Core's `BlockFilterIndex::CustomAppend`, fired from
+                // `BaseIndex::BlockConnected` regardless of how the block
+                // arrived (P2P, RPC submitblock, or generate). Uses the
+                // `undo_data` returned by `process_block` for the spent-prevout
+                // scriptPubKeys, exactly as BIP-158 requires.
+                {
+                    let filter_index = BlockFilterIndex::new(&state.db);
+                    if let Err(e) =
+                        filter_index.connect_block(new_height, &block, &undo_data)
+                    {
+                        // Non-fatal: a filter-index write failure should not
+                        // unwind an otherwise-valid block connect (the chain
+                        // state + UTXO set are already committed). Mirrors
+                        // `main.rs::write_block_filter_index`, which logs and
+                        // continues. getblockfilter for this height will then
+                        // report "index corruption" until a reindex.
+                        tracing::warn!(
+                            "submitblock: block filter index update failed for {} at height {}: {}",
+                            block_hash, new_height, e
+                        );
+                    }
+                }
+
                 // Flush UTXO changes to disk
                 if let Err(e) = utxo_view.flush() {
                     tracing::error!("submitblock: UTXO flush failed: {}", e);
