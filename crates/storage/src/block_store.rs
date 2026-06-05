@@ -663,7 +663,14 @@ impl<'a> BlockStore<'a> {
             nonce: genesis.header.nonce,
             version: genesis.header.version,
             prev_hash: genesis.header.prev_block_hash,
-            chain_work: [0u8; 32], // Genesis has minimal work
+            // Bitcoin Core (chain.cpp, CBlockIndex::nChainWork =
+            // (pprev ? pprev->nChainWork : 0) + GetBlockProof(*this)) counts the
+            // genesis block's OWN proof-of-work in its nChainWork, even though it
+            // has no parent. Storing 0 here left every descendant's accumulated
+            // chainwork short by exactly one block-proof (e.g. getblockheader at
+            // height N returned N block-proofs instead of N+1), diverging from
+            // Core's `chainwork` field. Seed genesis with GetBlockProof(genesis).
+            chain_work: rustoshi_consensus::pow::get_block_proof(genesis.header.bits).0,
         };
         self.put_block_index(&hash, &entry)?;
 
