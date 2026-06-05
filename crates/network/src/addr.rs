@@ -119,6 +119,25 @@ impl NetworkAddr {
         }
     }
 
+    /// Render the address as its bare literal string, no port, mirroring
+    /// Bitcoin Core's `CNetAddr::ToStringAddr()`:
+    ///   - IPv4/IPv6: the IP literal.
+    ///   - Tor v3: the `.onion` address (requires SHA3-256 for the checksum;
+    ///     falls back to the base32 of the raw pubkey + `.onion` if the full
+    ///     encoder is unavailable).
+    ///   - I2P: the `<base32>.b32.i2p` destination.
+    ///   - CJDNS: the IPv6 literal in `fc00::/8`.
+    pub fn to_address_string(&self) -> String {
+        match self {
+            Self::Ipv4(ip) => ip.to_string(),
+            Self::Ipv6(ip) => ip.to_string(),
+            Self::TorV3(pubkey) => torv3::encode_onion_address(pubkey)
+                .unwrap_or_else(|| format!("{}.onion", i2p::encode_base32(pubkey))),
+            Self::I2P(hash) => i2p::format_address(hash),
+            Self::Cjdns(addr) => Ipv6Addr::from(*addr).to_string(),
+        }
+    }
+
     /// Try to convert this address to a SocketAddr (for IPv4/IPv6 only).
     pub fn to_socket_addr(&self, port: u16) -> Option<SocketAddr> {
         match self {
