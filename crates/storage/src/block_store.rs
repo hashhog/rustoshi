@@ -387,6 +387,29 @@ impl<'a> BlockStore<'a> {
         Ok(())
     }
 
+    /// Stage a block-undo put into `batch`.
+    ///
+    /// Mirrors [`BlockStore::put_undo`] but writes into a caller-owned
+    /// `WriteBatch`. Used by the reorg path (`try_attach_and_reorg`) so the
+    /// per-block undo data for the newly-connected branch flips atomically
+    /// with the UTXO + tip + height-index + tx-index writes. Bitcoin Core
+    /// writes block undo on every `ConnectBlock` (reorg connects included);
+    /// without this the new-branch blocks had no undo on disk, so a later
+    /// reorg back across them would fail with "missing undo data".
+    pub fn batch_put_undo(
+        &self,
+        batch: &mut WriteBatch,
+        hash: &Hash256,
+        undo: &UndoData,
+    ) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_UNDO).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_UNDO))
+        })?;
+        let data = format_v2::encode_undo_data(undo);
+        batch.put_cf(cf, hash.as_bytes(), &data);
+        Ok(())
+    }
+
     /// Apply a previously-built RocksDB write batch.
     ///
     /// Convenience passthrough so callers don't have to reach through to

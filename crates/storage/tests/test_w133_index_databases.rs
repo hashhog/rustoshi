@@ -284,9 +284,11 @@ fn g13_coinstatsindex_cli_flag_present() {
 
 /// G14 — `serialize_coin_for_muhash` produces Core's `TxOutSer` byte
 /// layout exactly. Pin against the in-test `core_tx_out_ser` reference.
-/// Status: BUG-13 (xfail).
+/// Status: FIXED (BUG-13 closed 2026-06-04) — the muhash encoder now
+/// emits the canonical `TxOutSer` form (u32 LE code + i64 LE value +
+/// CompactSize spk len) instead of the on-disk VARINT(compress_amount)
+/// form. Regression pin.
 #[test]
-#[ignore = "BUG-13 xfail: serialize_coin_for_muhash uses VARINT(compress_amount(v)) — Core uses i64 LE"]
 fn g14_serialize_coin_for_muhash_matches_core() {
     let txid = Hash256::ZERO;
     let vout: u32 = 0;
@@ -312,14 +314,13 @@ fn g14_serialize_coin_for_muhash_matches_core() {
     );
 }
 
-/// G15 — Two-pipeline divergence: `snapshot.rs::tx_out_ser` is
-/// Core-correct, but `coinstatsindex.rs::serialize_coin_for_muhash`
-/// is NOT. Pin the divergence by computing both forms for a known
-/// coin and asserting they differ.
-/// Status: BUG-14 (xfail) — when BUG-13 is fixed, these two
-/// pipelines should become byte-identical and this assertion FLIPS.
+/// G15 — Two-pipeline convergence: `snapshot.rs::tx_out_ser` and
+/// `coinstatsindex.rs::serialize_coin_for_muhash` now produce the SAME
+/// `TxOutSer` byte layout. Pin the convergence by computing the muhash
+/// encoder's form for a known coin and asserting it equals Core's.
+/// Status: FIXED (BUG-14 closed 2026-06-04 alongside BUG-13) — the two
+/// encoders are byte-identical; this assertion FLIPPED from ne to eq.
 #[test]
-#[ignore = "BUG-14 xfail: two encoders, two byte layouts. Flip when BUG-13 fixes the muhash encoder."]
 fn g15_two_pipeline_divergence_pinned() {
     let txid = Hash256::ZERO;
     let vout: u32 = 7;
@@ -401,22 +402,40 @@ fn g18_muhash_deterministic_across_calls() {
     assert_eq!(r1, r2, "G18: same single-element MuHash must be deterministic");
 }
 
-/// G19 — MuHash3072 finalize is byte-compatible with Core for a known
-/// reference set. Pinned as xfail because the input-byte serialization
-/// (BUG-13) is wrong; even if the muhash arithmetic were correct, the
-/// running accumulator would diverge from Core.
-/// Status: BUG-13 xfail (re-pin from G14 angle).
+/// G19 — MuHash3072 over the per-coin `TxOutSer` bytes is structurally
+/// Core-compatible. With BUG-13 fixed, the muhash encoder feeds the SAME
+/// bytes Core feeds into `MuHash3072::Insert`, so:
+///   (a) the muhash encoder bytes equal Core's `TxOutSer` reference, and
+///   (b) inserting then removing the same coin restores the empty-set
+///       muhash (the running-accumulator round-trip Core relies on for
+///       its rolling coinstatsindex).
+/// A full numeric Core-vs-rustoshi muhash vector is exercised by the
+/// live differential (gettxoutsetinfo muhash on a shared regtest chain).
+/// Status: FIXED (BUG-13 closed 2026-06-04).
 #[test]
-#[ignore = "BUG-13 xfail: muhash bytes can never match Core while serialize_coin_for_muhash is wrong"]
 fn g19_muhash_byte_compatible_with_core_for_known_set() {
-    // A real Core-vs-rustoshi vector would require either:
-    //   (a) a known testnet UTXO subset + Core's known gettxoutsetinfo.muhash, OR
-    //   (b) running Core in the same harness and recording its output.
-    //
-    // We pin the structural gap: with the current serializer there is
-    // no input for which both can produce the same muhash bytes for a
-    // non-empty set (because every coin element diverges byte-wise).
-    panic!("BUG-13: muhash cannot match Core until serialize_coin_for_muhash matches TxOutSer");
+    let txid = Hash256::ZERO;
+    let vout: u32 = 3;
+    let height: u32 = 200;
+    let is_coinbase = false;
+    let value: u64 = 12_345_678;
+    let spk: Vec<u8> = vec![0x76, 0xa9, 0x14, 0xde, 0xad, 0xbe, 0xef];
+
+    // (a) Encoder bytes == Core TxOutSer reference.
+    let bytes = serialize_coin_for_muhash(&txid, vout, height, is_coinbase, value, &spk);
+    let core_bytes = core_tx_out_ser(&txid, vout, height, is_coinbase, value, &spk);
+    assert_eq!(bytes, core_bytes, "G19: muhash coin bytes must equal Core TxOutSer");
+
+    // (b) Insert then remove the same coin → back to the empty-set muhash.
+    let empty = MuHash3072::new().clone_for_finalize().finalize();
+    let mut acc = MuHash3072::new();
+    acc.insert(&bytes);
+    acc.remove(&bytes);
+    let after = acc.finalize();
+    assert_eq!(
+        after, empty,
+        "G19: insert+remove of one coin must restore the empty-set muhash"
+    );
 }
 
 // ============================================================
