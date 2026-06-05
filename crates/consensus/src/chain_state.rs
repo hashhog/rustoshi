@@ -608,9 +608,19 @@ impl ChainState {
     /// * `utxo_cache` - UTXO view to update
     ///
     /// # Returns
-    /// - On success: `Ok((disconnected_blocks, connected_blocks))` — the number of
-    ///   blocks disconnected and connected.
-    /// - On error: `ValidationError` if reorganization fails.
+    /// On success returns `(disconnected_count, connected)` where
+    /// `connected` is the list of blocks newly attached on the way to the
+    /// new tip, in ascending height order, each paired with its height and
+    /// the `UndoData` produced when it was connected. On error returns a
+    /// `ValidationError` and the chain is left unchanged by the caller
+    /// (the reorg batch is never committed).
+    ///
+    /// Surfacing the per-block undo data lets the storage-layer caller (a)
+    /// persist undo for the new-branch blocks — Core writes block undo on
+    /// every `ConnectBlock`, including reorg connects, so a subsequent
+    /// reorg back across these blocks has the data it needs — and (b) feed
+    /// the spent-prevout scriptPubKeys into the block filter index, exactly
+    /// as `BlockFilterIndex::CustomAppend` requires (BIP-158).
     pub fn reorganize<U, FB, FU, FI>(
         &mut self,
         new_tip_hash: Hash256,
@@ -618,7 +628,7 @@ impl ChainState {
         get_undo: &FU,
         get_block_index: &FI,
         utxo_cache: &mut U,
-    ) -> Result<(usize, usize), ValidationError>
+    ) -> Result<(usize, Vec<(Hash256, u32, UndoData)>), ValidationError>
     where
         U: UtxoView,
         FB: Fn(&Hash256) -> Option<Block>,
@@ -720,6 +730,7 @@ impl ChainState {
 
         // Connect new blocks (fork point to new tip)
         new_chain.reverse(); // Connect in ascending order
+        let mut connected: Vec<(Hash256, u32, UndoData)> = Vec::with_capacity(new_chain.len());
         for hash in &new_chain {
             let block = get_block(hash).ok_or_else(|| {
                 ValidationError::PrevBlockNotFound(format!("missing block for connect: {}", hash))
@@ -755,7 +766,7 @@ impl ChainState {
                 return Err(ValidationError::TimeTooOld);
             }
             let null_seq_context = ChainStateNullSeqContext;
-            let (_undo, _fees) = connect_block_with_sequence_locks(
+            let (undo, _fees) = connect_block_with_sequence_locks(
                 &block,
                 new_height,
                 utxo_cache,
@@ -765,12 +776,13 @@ impl ChainState {
             )?;
             self.tip_hash = *hash;
             self.tip_height = new_height;
+            connected.push((*hash, new_height, undo));
         }
 
         // Clear MTP cache after reorg
         self.mtp_cache.clear();
 
-        Ok((old_chain.len(), new_chain.len()))
+        Ok((old_chain.len(), connected))
     }
 
     /// Disconnect a single block from the chain tip.
