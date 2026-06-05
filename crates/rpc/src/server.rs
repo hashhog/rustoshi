@@ -1005,6 +1005,8 @@ pub trait RustoshiRpc {
     async fn get_tx_out_set_info(
         &self,
         hash_type: Option<String>,
+        hash_or_height: Option<serde_json::Value>,
+        use_index: Option<bool>,
     ) -> RpcResult<serde_json::Value>;
 
     /// Scan the UTXO set for outputs matching the given scan objects.
@@ -8770,6 +8772,8 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_tx_out_set_info(
         &self,
         hash_type: Option<String>,
+        hash_or_height: Option<serde_json::Value>,
+        use_index: Option<bool>,
     ) -> RpcResult<serde_json::Value> {
         use rustoshi_storage::CoinStatsIndex;
         let state = self.state.read().await;
@@ -8779,6 +8783,41 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Default per Core: hash_serialized_3 (set in rpc/blockchain.cpp:1017
         // RPCArg::Default{"hash_serialized_3"}).
         let ht = hash_type.as_deref().unwrap_or("hash_serialized_3");
+
+        // `use_index` is accepted for Core-signature compatibility but does
+        // not change behaviour here (we always compute base chainstate stats
+        // at the tip). Bind it so callers can pass the third positional arg.
+        let _ = use_index;
+
+        // hash_or_height (params[1]) selects a non-tip block — only
+        // queryable with coinstatsindex in Core. rustoshi exposes coin stats
+        // only at the current tip, so any specific-block request errors,
+        // mirroring Core's two -8 cases in rpc/blockchain.cpp
+        // gettxoutsetinfo:
+        //   1. hash_serialized_3 can NEVER be queried for a specific block
+        //      (checked even when the index exists).
+        //   2. otherwise: specific heights require coinstatsindex.
+        let specific_block_requested = match &hash_or_height {
+            None => false,
+            Some(serde_json::Value::Null) => false,
+            Some(_) => true,
+        };
+        if specific_block_requested {
+            if matches!(
+                ht,
+                "hash_serialized_3" | "hash_serialized_2" | "hash_serialized"
+            ) {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    "hash_serialized_3 hash type cannot be queried for a specific block"
+                        .to_string(),
+                ));
+            }
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Querying specific block heights requires coinstatsindex".to_string(),
+            ));
+        }
 
         // Fast path via the per-tip CoinStats index, but only for muhash /
         // none — hash_serialized_3 is NOT pre-indexed (Core throws when
@@ -8854,6 +8893,13 @@ impl RustoshiRpcServer for RpcServerImpl {
         let mut txouts: u64 = 0;
         let mut bogosize: u64 = 0;
         let mut total_amount_sats: u64 = 0;
+        // Count of distinct transactions with at least one unspent output —
+        // Core's `stats.nTransactions`, emitted as the `transactions` field
+        // (kernel/coinstats.cpp::ApplyStats increments once per txid group).
+        // The CF_UTXO iterator is keyed by `txid(32) || vout(4 BE)`, so it is
+        // txid-grouped; we count each txid the first time it appears.
+        let mut transactions: u64 = 0;
+        let mut prev_txid: Option<[u8; 32]> = None;
 
         if let Ok(iter) = state.db.iter_cf(CF_UTXO) {
             for (k, v) in iter {
@@ -8864,6 +8910,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
+
+                let this_txid: [u8; 32] = k[..32].try_into().unwrap_or([0u8; 32]);
+                if prev_txid != Some(this_txid) {
+                    transactions += 1;
+                    prev_txid = Some(this_txid);
+                }
 
                 txouts += 1;
                 total_amount_sats = total_amount_sats.saturating_add(coin.value);
@@ -8910,6 +8962,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             "bestblock": best_hash.to_hex(),
             "txouts": txouts,
             "bogosize": bogosize,
+            "transactions": transactions,
             "total_amount": total_amount_sats as f64 / 1e8,
             "disk_size": 0u64,
         });
