@@ -3887,6 +3887,25 @@ impl RustoshiRpcServer for RpcServerImpl {
                 .unwrap_or_else(|_| serde_json::value::RawValue::from_string("null".to_owned()).unwrap())
         };
 
+        // ── Genesis-coinbase special case ────────────────────────────────────
+        // The genesis block's coinbase is not a normal transaction: it is not in
+        // any block file's tx index and cannot be spent.  Bitcoin Core rejects a
+        // lookup of it with RPC_INVALID_ADDRESS_OR_KEY when the requested txid
+        // equals the genesis block's merkle root (== the genesis coinbase txid).
+        // (bitcoin-core/src/rpc/rawtransaction.cpp:290-293.)  Checked before any
+        // lookup/proxy so every verbosity returns the same error.
+        {
+            let state = self.state.read().await;
+            if let Some(genesis_cb) = state.params.genesis_block.transactions.first() {
+                if genesis_cb.txid() == tx_hash {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                        "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved",
+                    ));
+                }
+            }
+        }
+
         // ── verbosity=2: always proxy to Bitcoin Core ────────────────────────
         // verbosity=2 requires per-vin prevout enrichment (spent coin height,
         // value, scriptPubKey) and a top-level fee field.  rustoshi's undo data
@@ -3962,6 +3981,19 @@ impl RustoshiRpcServer for RpcServerImpl {
 
             let block = block.unwrap();
 
+            // Whether the supplied block is on the active chain — Core emits
+            // `in_active_chain` whenever a blockhash arg was given
+            // (rpc/rawtransaction.cpp:337-340). A block is in the active chain
+            // iff the canonical hash at its height equals the supplied hash.
+            let in_active_chain = block_index.as_ref().map(|e| {
+                store
+                    .get_hash_by_height(e.height)
+                    .ok()
+                    .flatten()
+                    .map(|h| h == target_block_hash)
+                    .unwrap_or(false)
+            });
+
             // Find the transaction in the block
             for tx in &block.transactions {
                 if tx.txid() == tx_hash {
@@ -3970,16 +4002,24 @@ impl RustoshiRpcServer for RpcServerImpl {
                     }
 
                     let block_index = block_index.as_ref();
-                    let confirmations = block_index.map(|e| {
-                        if state.best_height >= e.height {
-                            state.best_height - e.height + 1
-                        } else {
-                            0
-                        }
-                    });
-                    let blocktime = block_index.map(|e| e.timestamp);
+                    // Confirmations / time are only meaningful when the block is
+                    // in the active chain (Core's TxToJSON pushes confirmations
+                    // only when active_chainstate.m_chain.Contains(pindex)).
+                    let active = in_active_chain.unwrap_or(false);
+                    let confirmations = if active {
+                        block_index.map(|e| {
+                            if state.best_height >= e.height {
+                                state.best_height - e.height + 1
+                            } else {
+                                0
+                            }
+                        })
+                    } else {
+                        block_index.map(|_| 0)
+                    };
+                    let blocktime = if active { block_index.map(|e| e.timestamp) } else { None };
 
-                    let info = build_tx_info_verbose(
+                    let mut info = build_tx_info_verbose(
                         tx,
                         Some(&target_block_hash),
                         confirmations,
@@ -3987,6 +4027,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                         &state,
                         &store,
                     );
+                    info.in_active_chain = in_active_chain;
                     return Ok(raw(serde_json::to_string(&info).unwrap()));
                 }
             }
@@ -4987,6 +5028,25 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Update RPC state
                 state.best_height = new_height;
                 state.best_hash = block_hash;
+
+                // Remove confirmed (and conflicting) transactions from the
+                // mempool — mirrors Bitcoin Core's `CTxMemPool::removeForBlock`
+                // on ConnectTip, and the P2P block-connect path in
+                // `main.rs` (rpc.mempool.remove_for_block). Without this, a tx
+                // confirmed via submitblock lingered in the mempool, so
+                // `getrawtransaction <txid>` (no blockhash) returned the
+                // mempool view (no blockhash/confirmations) instead of the
+                // confirmed view resolved through the txindex.
+                {
+                    let block_txids: Vec<Hash256> =
+                        block.transactions.iter().map(|tx| tx.txid()).collect();
+                    let block_spent: Vec<OutPoint> = block
+                        .transactions
+                        .iter()
+                        .flat_map(|tx| tx.inputs.iter().map(|i| i.previous_output.clone()))
+                        .collect();
+                    state.mempool.remove_for_block(&block_txids, &block_spent);
+                }
 
                 // Wire fee estimator: notify it of the confirmed block.
                 // Skip coinbase (index 0) to match Core's processTransaction
@@ -10643,6 +10703,7 @@ fn build_tx_info(
     confirmations: Option<u32>,
 ) -> TransactionInfo {
     TransactionInfo {
+        in_active_chain: None,
         txid: tx.txid().to_hex(),
         wtxid: tx.wtxid().to_hex(),
         hash: tx.wtxid().to_hex(),
@@ -10718,16 +10779,27 @@ fn build_tx_info(
 
 /// Build verbose transaction info with all details.
 ///
-/// This is used by getrawtransaction verbose mode.
+/// This is used by getrawtransaction verbose mode (verbosity=1).  The decoded
+/// body mirrors Bitcoin Core's `TxToUniv` (core_io.cpp:430-533) field-for-field:
+///   * `scriptSig.asm` uses the sighash-decode disassembler (Core passes
+///     `fAttemptSighashDecode=true` for scriptSig at core_io.cpp:460);
+///   * `scriptPubKey.{asm,desc,hex,address?,type}` are produced exactly as in
+///     `ScriptToUniv` — `address` is present only when the script decodes to a
+///     standard address, `desc` is the BIP-380 `InferDescriptor` string, and
+///     `type` comes from the Solver-style classifier.
+/// The confirmation envelope (`blockhash`, `confirmations`, `time`, `blocktime`)
+/// is added by `TxToJSON` only when the tx is confirmed in the active chain.
 fn build_tx_info_verbose(
     tx: &Transaction,
     block_hash: Option<&Hash256>,
     confirmations: Option<u32>,
     blocktime: Option<u32>,
-    _state: &RpcState,
+    state: &RpcState,
     _store: &BlockStore,
 ) -> TransactionInfo {
+    let params = &state.params;
     TransactionInfo {
+        in_active_chain: None,
         txid: tx.txid().to_hex(),
         wtxid: tx.wtxid().to_hex(),
         hash: tx.wtxid().to_hex(),
@@ -10757,8 +10829,9 @@ fn build_tx_info_verbose(
                     TxInputInfo {
                         txid: Some(input.previous_output.txid.to_hex()),
                         vout: Some(input.previous_output.vout),
+                        // Core uses ScriptToAsmStr(scriptSig, /*fAttemptSighashDecode=*/true).
                         script_sig: Some(ScriptSigInfo {
-                            asm: disassemble_script(&input.script_sig),
+                            asm: disassemble_script_sig_asm(&input.script_sig),
                             hex: hex::encode(&input.script_sig),
                         }),
                         coinbase: None,
@@ -10777,10 +10850,9 @@ fn build_tx_info_verbose(
             .iter()
             .enumerate()
             .map(|(n, output)| {
-                use rustoshi_wallet::descriptor::add_checksum;
-                let script_type = detect_script_type(&output.script_pubkey);
-                let raw_desc = format!("raw({})", hex::encode(&output.script_pubkey));
-                let desc = add_checksum(&raw_desc).unwrap_or(raw_desc);
+                let script_type = classify_script(&output.script_pubkey);
+                let address = script_to_address(&output.script_pubkey, params);
+                let desc = infer_descriptor(&output.script_pubkey, params);
                 TxOutputInfo {
                     value: BtcAmount::from_sats(output.value),
                     n: n as u32,
@@ -10788,7 +10860,7 @@ fn build_tx_info_verbose(
                         asm: disassemble_script(&output.script_pubkey),
                         desc,
                         hex: hex::encode(&output.script_pubkey),
-                        address: None,
+                        address,
                         script_type,
                     },
                 }

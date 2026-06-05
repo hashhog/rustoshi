@@ -351,13 +351,28 @@ pub struct BlockHeaderInfo {
 // ============================================================
 
 /// Response for `getrawtransaction` RPC (verbose mode).
+///
+/// Field shape mirrors Bitcoin Core's `TxToUniv` (core_io.cpp:430-533) plus the
+/// `TxToJSON` confirmation envelope (rpc/rawtransaction.cpp:58-85). The envelope
+/// fields (`blockhash`, `confirmations`, `time`, `blocktime`) and
+/// `in_active_chain` are OPTIONAL — Core OMITS them entirely for an unconfirmed
+/// (mempool) transaction, so they use `skip_serializing_if = Option::is_none`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TransactionInfo {
+    /// `in_active_chain` — present only when an explicit `blockhash` argument was
+    /// supplied (rpc/rawtransaction.cpp:337-340). Whether that block is in the
+    /// active chain.
+    #[serde(rename = "in_active_chain", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_active_chain: Option<bool>,
     /// Transaction ID.
     pub txid: String,
-    /// Witness transaction ID.
+    /// Witness transaction ID. Core's `getrawtransaction` does NOT emit a
+    /// `wtxid` field (only `txid` + `hash`); kept internal for callers but never
+    /// serialized so the JSON matches Core exactly.
+    #[serde(skip_serializing)]
     pub wtxid: String,
-    /// Transaction hash (same as txid for non-witness).
+    /// Transaction hash (the wtxid).
     pub hash: String,
     /// Transaction size in bytes.
     pub size: u32,
@@ -375,13 +390,17 @@ pub struct TransactionInfo {
     pub vout: Vec<TxOutputInfo>,
     /// Raw hex of the transaction.
     pub hex: String,
-    /// Block hash containing this transaction.
+    /// Block hash containing this transaction (omitted when unconfirmed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blockhash: Option<String>,
-    /// Number of confirmations.
+    /// Number of confirmations (omitted when unconfirmed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmations: Option<u32>,
-    /// Block time.
+    /// Block time (omitted when unconfirmed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocktime: Option<u32>,
-    /// Time transaction was received.
+    /// Same as blocktime (omitted when unconfirmed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<u32>,
 }
 
