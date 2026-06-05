@@ -318,6 +318,35 @@ pub enum AddrSource {
     Manual,
 }
 
+/// Current wall-clock time as unix seconds. Used to stamp the `time` of
+/// addresses learned without an explicit timestamp (DNS seeds, manual peers).
+pub(crate) fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One row of the addrman dump returned by the `getnodeaddresses` RPC.
+///
+/// Mirrors the per-address object Bitcoin Core emits (rpc/net.cpp:958-965):
+/// the raw `time`/`services`/`port` integers, the bare `address` literal
+/// (no port), and the Core network-class string (`GetNetworkName`).
+#[derive(Debug, Clone)]
+pub struct NodeAddressEntry {
+    /// Last-seen unix timestamp in seconds.
+    pub time: u64,
+    /// Raw services bitfield (emitted as an integer, not hex).
+    pub services: u64,
+    /// The address literal without the port (ip / `.onion` / `.b32.i2p`).
+    pub address: String,
+    /// The port number.
+    pub port: u16,
+    /// Core network-class string: ipv4 / ipv6 / onion / i2p / cjdns /
+    /// not_publicly_routable / internal.
+    pub network: String,
+}
+
 /// Metadata about a known peer address.
 #[derive(Debug, Clone)]
 pub struct AddrInfo {
@@ -325,6 +354,13 @@ pub struct AddrInfo {
     pub addr: SocketAddr,
     /// Services advertised by this peer.
     pub services: u64,
+    /// When this address was last seen (from addr message or connection),
+    /// as an absolute unix timestamp in seconds. This is what
+    /// `getnodeaddresses` reports as the `time` field (Core:
+    /// `TicksSinceEpoch<seconds>(addr.nTime)`). Kept alongside `last_seen`
+    /// (a monotonic `Instant`) because `Instant` cannot be converted to
+    /// wall-clock time after the fact.
+    pub time_unix: u64,
     /// When this address was last seen (from addr message or connection).
     pub last_seen: Instant,
     /// When we last attempted to connect.
@@ -461,6 +497,7 @@ impl AddressManager {
                     AddrInfo {
                         addr,
                         services: NODE_NETWORK | NODE_WITNESS,
+                        time_unix: now_unix_secs(),
                         last_seen: Instant::now(),
                         last_attempt: None,
                         last_success: None,
@@ -489,6 +526,7 @@ impl AddressManager {
                         .or_insert_with(|| AddrInfo {
                             addr: socket_addr,
                             services: taddr.address.services,
+                            time_unix: taddr.timestamp as u64,
                             last_seen: Instant::now(),
                             last_attempt: None,
                             last_success: None,
@@ -496,6 +534,7 @@ impl AddressManager {
                             source: AddrSource::Peer(from),
                         });
                     entry.last_seen = Instant::now();
+                    entry.time_unix = taddr.timestamp as u64;
                     entry.services = taddr.address.services;
 
                     // Add to try queue if not already connected
@@ -512,6 +551,7 @@ impl AddressManager {
         self.known_addrs.entry(addr).or_insert_with(|| AddrInfo {
             addr,
             services: NODE_NETWORK | NODE_WITNESS,
+            time_unix: now_unix_secs(),
             last_seen: Instant::now(),
             last_attempt: None,
             last_success: None,
@@ -789,6 +829,7 @@ impl AddressManager {
                         .or_insert_with(|| AddrInfo {
                             addr: socket_addr,
                             services: entry.services,
+                            time_unix: entry.timestamp as u64,
                             last_seen: now,
                             last_attempt: None,
                             last_success: None,
@@ -796,6 +837,7 @@ impl AddressManager {
                             source: AddrSource::Peer(from),
                         });
                     addr_entry.last_seen = now;
+                    addr_entry.time_unix = entry.timestamp as u64;
                     addr_entry.services = entry.services;
 
                     // Add to try queue if not already connected
@@ -883,6 +925,108 @@ impl AddressManager {
             .keys()
             .map(|sa| sa.ip())
             .collect()
+    }
+
+    // ============================================================
+    // getnodeaddresses / addpeeraddress support
+    // ============================================================
+
+    /// Inject an IPv4/IPv6 address into the address manager (companion of the
+    /// `addpeeraddress` RPC — Core net.cpp:972). Stamps the supplied unix
+    /// `time` and `services`. Returns `false` if the address was already
+    /// known (Core's `AddrMan::Add` returns false when nothing new was
+    /// inserted), `true` if a fresh entry was created.
+    ///
+    /// Banned addresses are not added (return `false`). Privacy-network
+    /// (Tor/I2P/CJDNS) injection is not supported through this path because
+    /// it operates on the legacy `SocketAddr` store, matching what the
+    /// testing-only RPC needs.
+    pub fn add_address_entry(&mut self, addr: SocketAddr, services: u64, time: u64) -> bool {
+        if self.is_banned(&addr) {
+            return false;
+        }
+        if self.known_addrs.contains_key(&addr) {
+            return false;
+        }
+        self.known_addrs.insert(
+            addr,
+            AddrInfo {
+                addr,
+                services,
+                time_unix: time,
+                last_seen: Instant::now(),
+                last_attempt: None,
+                last_success: None,
+                attempt_count: 0,
+                source: AddrSource::Manual,
+            },
+        );
+        true
+    }
+
+    /// Map a routable / non-routable IP to the Core network-class string,
+    /// mirroring `CNetAddr::GetNetClass()` + `GetNetworkName()`
+    /// (netaddress.cpp:674, netbase.cpp:114). Non-routable IPs (loopback,
+    /// RFC1918, link-local, …) map to `not_publicly_routable`.
+    fn ipv4_ipv6_network_name(ip: &std::net::IpAddr) -> &'static str {
+        if !crate::netgroup::ip_is_routable(ip) {
+            return "not_publicly_routable";
+        }
+        match ip {
+            std::net::IpAddr::V4(_) => "ipv4",
+            std::net::IpAddr::V6(_) => "ipv6",
+        }
+    }
+
+    /// Dump known addresses for the `getnodeaddresses` RPC.
+    ///
+    /// Walks both the legacy IPv4/IPv6 store (`known_addrs`) and the BIP155
+    /// store (`known_addrv2`, which carries Tor/I2P/CJDNS), maps each entry's
+    /// network to the Core network-class string, and returns the combined
+    /// list. The caller is responsible for shuffling, the `count` cap, and
+    /// the optional network filter (matching Core's
+    /// `GetAddressesUnsafe(count, max_pct, network)` contract; here we expose
+    /// the raw rows and let the RPC layer apply count/filter/shuffle so the
+    /// semantics live in one place).
+    ///
+    /// IPv4/IPv6 entries duplicated into both stores (BIP155 mirrors IPv4/IPv6
+    /// into `known_addrs` too) are de-duplicated by preferring the legacy
+    /// entry and only adding addrv2 entries for privacy networks.
+    pub fn dump_addresses(&self) -> Vec<NodeAddressEntry> {
+        let mut out: Vec<NodeAddressEntry> = Vec::new();
+
+        // Legacy IPv4/IPv6 store.
+        for info in self.known_addrs.values() {
+            let ip = info.addr.ip();
+            out.push(NodeAddressEntry {
+                time: info.time_unix,
+                services: info.services,
+                address: ip.to_string(),
+                port: info.addr.port(),
+                network: Self::ipv4_ipv6_network_name(&ip).to_string(),
+            });
+        }
+
+        // BIP155 store — only the privacy networks (IPv4/IPv6 are already
+        // covered by the legacy store above to avoid duplicates).
+        for info in self.known_addrv2.values() {
+            let network = match &info.addr {
+                crate::addr::NetworkAddr::TorV3(_) => "onion",
+                crate::addr::NetworkAddr::I2P(_) => "i2p",
+                crate::addr::NetworkAddr::Cjdns(_) => "cjdns",
+                // IPv4/IPv6 already handled by the legacy store.
+                _ => continue,
+            };
+            out.push(NodeAddressEntry {
+                time: info.timestamp as u64,
+                services: info.services,
+                address: info.addr.to_address_string(),
+                port: info.port,
+                network: network.to_string(),
+            });
+        }
+
+        out
     }
 }
 
@@ -1491,6 +1635,18 @@ impl PeerManager {
     /// Add a manual peer address (e.g., from command line).
     pub fn add_peer(&mut self, addr: SocketAddr) {
         self.addr_manager.add_manual_address(addr);
+    }
+
+    /// Inject an address into the address manager (companion of the
+    /// `addpeeraddress` RPC). Returns `true` if a fresh entry was created.
+    pub fn add_address_entry(&mut self, addr: SocketAddr, services: u64, time: u64) -> bool {
+        self.addr_manager.add_address_entry(addr, services, time)
+    }
+
+    /// Dump all known addresses for the `getnodeaddresses` RPC. The RPC layer
+    /// applies the count cap, the optional network filter, and the shuffle.
+    pub fn dump_addresses(&self) -> Vec<NodeAddressEntry> {
+        self.addr_manager.dump_addresses()
     }
 
     /// Immediately initiate an outbound connection to a peer (for addnode "onetry").

@@ -481,6 +481,33 @@ pub trait RustoshiRpc {
     #[method(name = "getpeerinfo")]
     async fn get_peer_info(&self) -> RpcResult<Vec<PeerInfoRpc>>;
 
+    /// Return known addresses from the address manager (a shuffled addrman
+    /// dump), filtered by count + network. Mirrors Bitcoin Core's
+    /// `getnodeaddresses ( count "network" )` (rpc/net.cpp:911).
+    ///
+    /// `count` (positional 0, default 1): max number to return; `0` = all.
+    /// Negative → error -8 "Address count out of range".
+    /// `network` (positional 1, optional): one of ipv4|ipv6|onion|i2p|cjdns.
+    /// Any other string → error -8 "Network not recognized: <arg>".
+    #[method(name = "getnodeaddresses")]
+    async fn get_node_addresses(
+        &self,
+        count: Option<i64>,
+        network: Option<String>,
+    ) -> RpcResult<serde_json::Value>;
+
+    /// Add the address of a potential peer to the address manager. Testing-only
+    /// companion of `getnodeaddresses`, mirroring Bitcoin Core's
+    /// `addpeeraddress "address" port (tried)` (rpc/net.cpp:972). Returns
+    /// `{"success": bool}`.
+    #[method(name = "addpeeraddress")]
+    async fn add_peer_address(
+        &self,
+        address: String,
+        port: u16,
+        tried: Option<bool>,
+    ) -> RpcResult<serde_json::Value>;
+
     /// Get network information.
     #[method(name = "getnetworkinfo")]
     async fn get_network_info(&self) -> RpcResult<NetworkInfo>;
@@ -5202,6 +5229,123 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
+    async fn get_node_addresses(
+        &self,
+        count: Option<i64>,
+        network: Option<String>,
+    ) -> RpcResult<serde_json::Value> {
+        use rand::seq::SliceRandom;
+        use serde_json::json;
+
+        // ── 1. count (positional 0, default 1) ─────────────────────────────
+        // count == 0 → return ALL; count < 0 → error -8.
+        let count: i64 = count.unwrap_or(1);
+        if count < 0 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Address count out of range",
+            ));
+        }
+
+        // ── 2. network filter (positional 1, optional) ─────────────────────
+        // ParseNetwork lowercases and accepts ONLY ipv4|ipv6|onion|i2p|cjdns;
+        // anything else → error -8 with the RAW (un-lowercased) arg in the
+        // message (Core net.cpp:950-952 uses request.params[1].get_str()).
+        let net_filter: Option<String> = match &network {
+            None => None,
+            Some(raw) => {
+                let lc = raw.to_lowercase();
+                match lc.as_str() {
+                    "ipv4" | "ipv6" | "onion" | "i2p" | "cjdns" => Some(lc),
+                    _ => {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_INVALID_PARAMETER,
+                            format!("Network not recognized: {raw}"),
+                        ));
+                    }
+                }
+            }
+        };
+
+        // ── 3. dump + filter + shuffle + cap ───────────────────────────────
+        let peer_state = self.peer_state.read().await;
+        let mut entries = if let Some(ref pm) = peer_state.peer_manager {
+            pm.dump_addresses()
+        } else {
+            Vec::new()
+        };
+        drop(peer_state);
+
+        if let Some(ref want) = net_filter {
+            entries.retain(|e| &e.network == want);
+        }
+
+        // Core returns a SHUFFLED list (GetAddressesUnsafe). Match that so
+        // callers don't rely on ordering.
+        let mut rng = rand::thread_rng();
+        entries.shuffle(&mut rng);
+
+        // count == 0 means "return all"; otherwise cap at `count`.
+        if count > 0 && entries.len() > count as usize {
+            entries.truncate(count as usize);
+        }
+
+        let arr: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "time": e.time,
+                    "services": e.services,
+                    "address": e.address,
+                    "port": e.port,
+                    "network": e.network,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::Value::Array(arr))
+    }
+
+    async fn add_peer_address(
+        &self,
+        address: String,
+        port: u16,
+        tried: Option<bool>,
+    ) -> RpcResult<serde_json::Value> {
+        use serde_json::json;
+
+        // Parse the IP literal. Core uses LookupHost(addr, false) (no DNS) and
+        // throws RPC_CLIENT_INVALID_IP_OR_SUBNET (-5) "Invalid IP address" on
+        // failure (net.cpp:1001-1003).
+        let ip: std::net::IpAddr = address.parse().map_err(|_| {
+            Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "Invalid IP address")
+        })?;
+        let socket_addr = std::net::SocketAddr::new(ip, port);
+
+        // Core stamps the address with NODE_NETWORK | NODE_WITNESS and the
+        // current time (net.cpp:1009-1010).
+        const NODE_NETWORK: u64 = 1;
+        const NODE_WITNESS: u64 = 1 << 3;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let _tried = tried.unwrap_or(false);
+
+        let mut peer_state = self.peer_state.write().await;
+        let success = if let Some(ref mut pm) = peer_state.peer_manager {
+            pm.add_address_entry(socket_addr, NODE_NETWORK | NODE_WITNESS, now)
+        } else {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_CLIENT_P2P_DISABLED,
+                "P2P networking is disabled",
+            ));
+        };
+
+        Ok(json!({ "success": success }))
+    }
+
     async fn get_network_info(&self) -> RpcResult<NetworkInfo> {
         let peer_state = self.peer_state.read().await;
 
@@ -7627,6 +7771,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getmempooldescendants" => "getmempooldescendants \"txid\" ( verbose )\nReturns all in-mempool descendants.",
                 "getnetworkinfo" => "getnetworkinfo\nReturns an object containing various state info regarding P2P networking.",
                 "getpeerinfo" => "getpeerinfo\nReturns data about each connected network node.",
+                "getnodeaddresses" => "getnodeaddresses ( count \"network\" )\nReturn known addresses, after filtering for quality and recency.",
+                "addpeeraddress" => "addpeeraddress \"address\" port ( tried )\nAdd the address of a potential peer to an address manager table. For testing only.",
                 "getconnectioncount" => "getconnectioncount\nReturns the number of connections to other nodes.",
                 "addnode" => "addnode \"node\" \"command\"\nAttempts to add or remove a node from the addnode list.",
                 "disconnectnode" => "disconnectnode ( \"address\" nodeid )\nDisconnects from the specified peer node.",
@@ -7668,8 +7814,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getblocktemplate", "getmininginfo", "prioritisetransaction", "submitblock",
                 "",
                 "== Network ==",
-                "addnode", "clearbanned", "disconnectnode", "getconnectioncount",
-                "getnetworkinfo", "getpeerinfo", "listbanned", "setban",
+                "addnode", "addpeeraddress", "clearbanned", "disconnectnode", "getconnectioncount",
+                "getnetworkinfo", "getnodeaddresses", "getpeerinfo", "listbanned", "setban",
                 "",
                 "== Rawtransactions ==",
                 "createrawtransaction", "decoderawtransaction", "decodescript",
