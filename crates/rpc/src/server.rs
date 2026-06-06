@@ -11972,6 +11972,17 @@ pub async fn start_rpc_server(
         (dir, net)
     };
 
+    // Handle to the shared wallet RPC state, captured so the startup history
+    // reconcile (Core's CWallet::AttachChain rescan) can be kicked off in the
+    // BACKGROUND *after* the RPC server binds — see `spawn_wallet_reconcile`
+    // below and its call sites at the end of each transport branch. `None` when
+    // the wallet manager failed to initialize (RPC runs `-disablewallet`-style).
+    let mut bg_reconcile_wallet_state: Option<Arc<RwLock<crate::wallet::WalletRpcState>>> = None;
+    // Clone the core node state for the background reconcile *before* `state` is
+    // moved into `RpcServerImpl::new` below. Cheap Arc clone; shareable across
+    // the worker thread.
+    let state_for_reconcile = state.clone();
+
     // Build the wallet RPC module once. Failure to create the wallet manager
     // (e.g. unwritable datadir) is non-fatal: we log and skip the merge so the
     // node still serves its non-wallet RPCs, mirroring Core continuing to run
@@ -11986,43 +11997,24 @@ pub async fn start_rpc_server(
                 tracing::warn!("Failed to load startup wallets: {e}");
             }
 
-            // Startup reconciliation (Core's CWallet::AttachChain rescan):
-            // every loaded wallet persisted its UTXO/ledger only in memory, so
-            // a restart starts with an EMPTY in-memory ledger, and any chain
-            // activity that arrived via normal P2P sync while the wallet was
-            // offline was never credited. Walk each wallet from its persisted
-            // `last_synced_height` watermark to the current tip, feeding every
-            // block through the same `scan_block_at` path live block-connect
-            // uses, then persist the advanced watermark. Best-effort: a failure
-            // here must never block the node from serving RPC.
-            {
-                let (tip_height, db) = {
-                    let st = state.read().await;
-                    (st.best_height, st.db.clone())
-                };
-                if tip_height > 0 {
-                    let store = BlockStore::new(&db);
-                    let summary = manager.reconcile_to_tip(tip_height, |h| {
-                        let hash = match store.get_hash_by_height(h)? {
-                            Some(hash) => hash,
-                            None => return Ok::<_, rustoshi_storage::StorageError>(None),
-                        };
-                        let block = match store.get_block(&hash)? {
-                            Some(b) => b,
-                            None => return Ok(None),
-                        };
-                        let block_time = block.header.timestamp as u64;
-                        Ok(Some((hash, block.transactions, block_time)))
-                    });
-                    for (name, from, to, credits, debits) in summary {
-                        if credits > 0 || debits > 0 || to >= from {
-                            tracing::info!(
-                                "wallet '{name}' reconciled to tip: scanned [{from}, {to}] of {tip_height}, +{credits} credits, -{debits} debits"
-                            );
-                        }
-                    }
-                }
-            }
+            // NOTE: the startup reconciliation that rebuilds each wallet's
+            // in-memory ledger from the chain (Core's CWallet::AttachChain
+            // rescan) used to run SYNCHRONOUSLY right here — before the RPC
+            // server binds further down and before P2P sync starts. That walks
+            // every block from the wallet's persisted `last_synced_height`
+            // watermark to the tip; the watermark defaults to 0 ("never
+            // synced") on a first deploy of the wallet-persistence fix or on a
+            // wallet restored from seed, so it scanned the ENTIRE chain
+            // (~950k blocks on mainnet) before the node could answer a single
+            // RPC — the node looked DOWN for many minutes (a restart-wedge).
+            //
+            // Core keeps RPC responsive while a wallet rescans
+            // (getwalletinfo.scanning). Mirror that: the heavy scan is now
+            // deferred to a non-blocking background worker thread started AFTER
+            // the RPC server binds (`spawn_wallet_reconcile`). The recovery
+            // behaviour is unchanged — the rescan still runs and still rebuilds
+            // history through the same `scan_block_at` path — it just no longer
+            // blocks node boot or RPC bind.
 
             let wallet_state = Arc::new(RwLock::new(crate::wallet::WalletRpcState::new(
                 manager,
@@ -12043,6 +12035,9 @@ pub async fn start_rpc_server(
                 let mut ws = wallet_state.write().await;
                 ws.node = Some(state.clone());
             }
+            // Capture the shared wallet state for the deferred background
+            // reconcile (fired once the RPC server is up, below).
+            bg_reconcile_wallet_state = Some(wallet_state.clone());
             Some(crate::wallet::WalletRpcImpl::new(wallet_state).into_rpc())
         }
         Err(e) => {
@@ -12070,6 +12065,11 @@ pub async fn start_rpc_server(
 
         let tls_config = crate::tls::load_tls_config(cert_path, key_path)
             .map_err(|e| anyhow::anyhow!("Failed to load RPC TLS materials: {e}"))?;
+
+        // Kick the wallet history reconcile in the BACKGROUND before we hand off
+        // to the (awaited) HTTPS serve loop, so a full-chain rescan never blocks
+        // serving. Same deferral as the plaintext branch below.
+        spawn_wallet_reconcile(bg_reconcile_wallet_state, state_for_reconcile);
 
         return crate::tls::serve_https(
             &config.bind_address,
@@ -12100,7 +12100,86 @@ pub async fn start_rpc_server(
     let handle = server.start(rpc_module);
 
     tracing::info!("RPC server listening on {}", config.bind_address);
+
+    // Now that the RPC server is bound, kick the wallet history reconcile
+    // (Core's CWallet::AttachChain rescan) in the BACKGROUND. It walks the gap
+    // from each wallet's persisted watermark to the current tip through the same
+    // `scan_block_at` path the live block-connect loop uses; deferring it here
+    // means even a full-chain scan (first deploy / seed-restore, watermark 0)
+    // never blocks node boot or RPC bind.
+    spawn_wallet_reconcile(bg_reconcile_wallet_state, state_for_reconcile);
+
     Ok(handle)
+}
+
+/// Run the startup wallet history reconcile (Core's `CWallet::AttachChain`
+/// rescan) on a detached background worker thread, so a potentially full-chain
+/// scan never blocks node boot or RPC bind.
+///
+/// This walks each loaded wallet from its persisted `last_synced_height`
+/// watermark to the current chain tip, feeding every block through the same
+/// `scan_block_at` path the live block-connect loop uses, then persists the
+/// advanced watermark. It is best-effort: any fault is logged and dropped.
+///
+/// # Concurrency / lifetime
+///
+/// Both arguments are cheap `Arc` clones (`Send + Sync + 'static`), so the
+/// spawned thread captures no stack-local or non-shareable state. A
+/// `std::thread` (not a tokio task) is used deliberately: the scan is a
+/// synchronous, CPU/IO-bound `for h in start..=tip` loop, so it must not run on
+/// a tokio worker. Because the thread is *not* inside a tokio runtime context,
+/// the `blocking_read`/`blocking_write` async-lock helpers are safe to call
+/// there (they panic only when called from within a runtime). We hold only a
+/// brief `read` guard on the core node state to snapshot the tip + db, then a
+/// `write` guard on the wallet RPC state for the scan — `reconcile_to_tip` takes
+/// `&self` and mutates through the wallet manager's interior `Arc<Mutex<…>>`
+/// locks, so even a read guard would suffice; we take the write guard to keep
+/// the wallet's in-memory ledger consistent against any concurrent
+/// block-connect fan-in for the duration of the rebuild. The thread is detached:
+/// it owns its captured Arcs and outlives this function; if the process is shut
+/// down the worker simply stops scanning (the watermark is persisted only after
+/// each wallet's walk completes, so a half-done scan re-resumes next restart).
+fn spawn_wallet_reconcile(
+    wallet_state: Option<Arc<RwLock<crate::wallet::WalletRpcState>>>,
+    node_state: Arc<RwLock<RpcState>>,
+) {
+    let Some(wallet_state) = wallet_state else {
+        return;
+    };
+    std::thread::spawn(move || {
+        // Snapshot the current tip + db handle under a brief read guard, then
+        // drop it before the heavy scan.
+        let (tip_height, db) = {
+            let st = node_state.blocking_read();
+            (st.best_height, st.db.clone())
+        };
+        if tip_height == 0 {
+            return;
+        }
+        let store = BlockStore::new(&db);
+        let summary = {
+            let ws = wallet_state.blocking_write();
+            ws.wallet_manager.reconcile_to_tip(tip_height, |h| {
+                let hash = match store.get_hash_by_height(h)? {
+                    Some(hash) => hash,
+                    None => return Ok::<_, rustoshi_storage::StorageError>(None),
+                };
+                let block = match store.get_block(&hash)? {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+                let block_time = block.header.timestamp as u64;
+                Ok(Some((hash, block.transactions, block_time)))
+            })
+        };
+        for (name, from, to, credits, debits) in summary {
+            if credits > 0 || debits > 0 || to >= from {
+                tracing::info!(
+                    "wallet '{name}' reconciled to tip: scanned [{from}, {to}] of {tip_height}, +{credits} credits, -{debits} debits"
+                );
+            }
+        }
+    });
 }
 
 // ============================================================
