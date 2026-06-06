@@ -876,6 +876,16 @@ pub enum MempoolError {
     #[error("fee rate too low: {0:.2} sat/vB (minimum: {1})")]
     InsufficientFee(f64, u64),
 
+    /// Dynamic mempool-min-fee floor not met. Distinct from `InsufficientFee`
+    /// (the static `min_relay_feerate` floor): this is the rolling minimum that
+    /// rises when the mempool evicts low-fee txs under memory pressure and
+    /// decays after each connected block. Mirrors Core's "mempool min fee not
+    /// met" rejection in `validation.cpp::CheckFeeRate` (the
+    /// `GetMinFee().GetFee(size)` branch). Values are sat/kvB: (tx feerate,
+    /// required floor).
+    #[error("mempool min fee not met: {0} sat/kvB (minimum: {1} sat/kvB)")]
+    MempoolMinFeeNotMet(u64, u64),
+
     #[error("mempool full")]
     MempoolFull,
 
@@ -1704,12 +1714,41 @@ impl Mempool {
         ) as usize;
         let fee_rate = fee as f64 / vsize as f64;
 
-        // W96 (gate 19): CheckFeeRate vs minRelayFee.  Mirrors Core
-        // validation.cpp:948 — skipped when `bypass_limits` (reorg path) or
-        // `package_feerates` (package-relay sweep where the package as a
-        // whole pays).  Pre-W96 was always enforced; that prevented
-        // disconnected-block re-admission of low-fee txs that *should*
-        // re-enter on reorg.
+        // W96 (gate 19): CheckFeeRate.  Mirrors Core validation.cpp:948 →
+        // `MemPoolAccept::CheckFeeRate` (validation.cpp:699-713) — skipped when
+        // `bypass_limits` (reorg path) or `package_feerates` (package-relay
+        // sweep where the package as a whole pays).  Pre-W96 was always
+        // enforced; that prevented disconnected-block re-admission of low-fee
+        // txs that *should* re-enter on reorg.
+        //
+        // Core enforces TWO floors here, in this order:
+        //   1. the DYNAMIC mempool-min-fee floor — `GetMinFee().GetFee(size)`.
+        //      This is the rolling minimum that rises when the mempool sheds
+        //      low-fee txs under memory pressure (`trackPackageRemoved` /
+        //      `trim_to_size`) and decays after each connected block.
+        //   2. the STATIC min-relay floor — `min_relay_feerate.GetFee(size)`.
+        //
+        // DoS-vector parity (audit w14z8m3zc, finding 2): pre-fix the live
+        // node enforced ONLY the static floor (`min_fee_rate`) — `get_min_fee()`
+        // had no live caller, so a node under mempool pressure would keep
+        // admitting and relaying the very low-fee txs it had just evicted,
+        // defeating the rolling-minimum DoS backpressure entirely.
+        //
+        // Units: `get_min_fee()` and the comparison are in sat/kvB; `fee_rate`
+        // is sat/vB, so we scale by 1000 (mirrors Core comparing absolute
+        // `package_fee` against `GetMinFee().GetFee(package_size)`).
+        if !bypass_limits {
+            let mempool_min_fee_kvb = self.get_min_fee();
+            if mempool_min_fee_kvb > 0 {
+                let tx_fee_rate_kvb = (fee_rate * 1000.0).floor() as u64;
+                if tx_fee_rate_kvb < mempool_min_fee_kvb {
+                    return Err(MempoolError::MempoolMinFeeNotMet(
+                        tx_fee_rate_kvb,
+                        mempool_min_fee_kvb,
+                    ));
+                }
+            }
+        }
         if !bypass_limits && (fee_rate as u64) < self.config.min_fee_rate {
             return Err(MempoolError::InsufficientFee(
                 fee_rate,
@@ -3123,6 +3162,33 @@ impl Mempool {
         self.block_since_last_rolling_fee_bump = true;
     }
 
+    /// Run the per-block mempool housekeeping that Core does on every connected
+    /// block. Call this from the live block-connect path AFTER
+    /// `remove_for_block` has dropped the txs that the block confirmed.
+    ///
+    /// DoS-vector parity (audit w14z8m3zc, findings 2 + 3):
+    ///   1. Arms the rolling-minimum-fee decay (`notify_block_connected`).
+    ///      Without this, `block_since_last_rolling_fee_bump` is never set, so
+    ///      `get_min_fee()` short-circuits and the rolling floor never decays —
+    ///      the dynamic floor would stay pinned at whatever the last eviction
+    ///      raised it to, forever. Mirrors Core's
+    ///      `blockSinceLastRollingFeeBump = true` on the connected-block path.
+    ///   2. Expires entries older than `expiry_seconds` (default 336h / 2 weeks,
+    ///      `DEFAULT_MEMPOOL_EXPIRY_SECONDS`). Mirrors Core's
+    ///      `CTxMemPool::Expire(GetTime<std::chrono::seconds>() - m_expiry)`
+    ///      driven from `CChainState::ConnectTip` →
+    ///      `LimitMempoolSize`/expiry sweep. Without it, stuck low-fee txs
+    ///      accumulate in the live mempool indefinitely (memory DoS).
+    ///
+    /// `now_secs` is the current wall-clock time in seconds since the Unix
+    /// epoch (use `current_time_secs()`); the cutoff is `now_secs -
+    /// expiry_seconds`. Returns the number of transactions expired.
+    pub fn on_block_connected(&mut self, now_secs: i64) -> usize {
+        self.notify_block_connected();
+        let cutoff = now_secs.saturating_sub(self.config.expiry_seconds as i64);
+        self.expire(cutoff)
+    }
+
     /// Evict the lowest fee rate transaction (and its descendants).
     /// Uses mining score (cluster-aware fee rate) for eviction.
     fn evict_lowest_fee_rate(&mut self) -> bool {
@@ -3199,6 +3265,14 @@ impl Mempool {
     /// Get the number of transactions in the mempool.
     pub fn size(&self) -> usize {
         self.transactions.len()
+    }
+
+    /// Whether this mempool verifies scripts on admission
+    /// (`MempoolConfig::verify_scripts`). Exposed so the live node and its
+    /// tests can confirm the production (script-verifying) config is wired on
+    /// real networks — DoS-vector parity (audit w14z8m3zc, finding 1).
+    pub fn verify_scripts(&self) -> bool {
+        self.config.verify_scripts
     }
 
     /// Get the total virtual size of all transactions.
