@@ -568,6 +568,56 @@ fn write_tx_index_entries(
     }
 }
 
+/// Fan a freshly connected block into every loaded wallet's UTXO ledger and
+/// advance each wallet's persisted rescan watermark.
+///
+/// This is the P2P/IBD-path equivalent of Bitcoin Core's
+/// `CWallet::blockConnected` notification, mirroring the mining/RPC-path scan
+/// in `rustoshi-rpc` (`scan_block_all_wallets`). Before this hook existed the
+/// node's block-connect loop had ZERO wallet hooks, so funds received via
+/// normal sync were never credited until a manual rescan. We clone the shared
+/// `WalletRpcState` handle under the RPC read-guard, drop the guard, then scan
+/// + persist the watermark without holding the node's RPC lock across the
+/// wallet mutation. Best-effort: any wallet error is logged and swallowed so it
+/// can never roll back an already-persisted, fully-validated block.
+async fn connect_block_into_wallets(
+    rpc_state: &Arc<RwLock<RpcState>>,
+    txs: &[rustoshi_primitives::Transaction],
+    height: u32,
+    block_hash: Hash256,
+    block_time: u64,
+) {
+    let ws = {
+        let rpc = rpc_state.read().await;
+        rpc.wallet_state.clone()
+    };
+    let Some(ws) = ws else { return };
+    let ws_guard = ws.read().await;
+    let (credits, debits) =
+        ws_guard
+            .wallet_manager
+            .scan_block_all_wallets(txs, height, block_hash, block_time);
+    // Advance every loaded wallet's persisted watermark to this height so a
+    // restart resumes reconciliation from here instead of re-scanning. Only
+    // advance (never regress) in case a reorg replayed an earlier height.
+    for name in ws_guard.wallet_manager.list_wallets() {
+        let prior = ws_guard
+            .wallet_manager
+            .get_wallet_last_synced(&name)
+            .unwrap_or(0);
+        if height > prior {
+            let _ = ws_guard
+                .wallet_manager
+                .set_wallet_last_synced(&name, height);
+        }
+    }
+    if credits > 0 || debits > 0 {
+        tracing::debug!(
+            "wallet block-scan @ height {height}: +{credits} credits, -{debits} debits"
+        );
+    }
+}
+
 /// Update the BIP-157/158 BlockFilterIndex for a newly connected block.
 ///
 /// Mirrors `bitcoin-core/src/index/blockfilterindex.cpp::CustomAppend` (fired
@@ -2842,6 +2892,26 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             rpc.fee_estimator.process_block(height, &confirmed_txids);
                         }
 
+                        // Wallet UTXO ledger: fan this connected block into
+                        // every loaded wallet (credit wallet-owned outputs incl.
+                        // coinbase, debit spent wallet coins), advancing each
+                        // wallet's persisted rescan watermark. Mirrors Core's
+                        // CWallet::blockConnected and the mining-path scan at
+                        // rpc/server.rs (scan_block_all_wallets). Without this
+                        // hook the wallet only ever saw blocks via the RPC
+                        // mining path, so funds received during normal P2P/IBD
+                        // sync were never credited until a manual rescan.
+                        // Best-effort: a wallet failure must never roll back a
+                        // fully-validated, already-persisted block.
+                        connect_block_into_wallets(
+                            &rpc_state,
+                            &block.transactions,
+                            height,
+                            block_hash,
+                            block.header.timestamp as u64,
+                        )
+                        .await;
+
                         // Auto-prune trigger (BIP-159 / Core parity).
                         // Only fires under `-prune=N` size mode (NOT under
                         // `-prune=1` manual-only); throttled to once per
@@ -3462,6 +3532,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             // may no longer apply after a new block
                                             rpc.recently_rejected.clear();
                                         }
+
+                                        // Wallet UTXO ledger: fan this connected
+                                        // block into every loaded wallet,
+                                        // advancing each wallet's persisted
+                                        // rescan watermark. Mirrors Core's
+                                        // CWallet::blockConnected. See the
+                                        // matching call in the foreground IBD
+                                        // path above for the full rationale.
+                                        connect_block_into_wallets(
+                                            &rpc_state,
+                                            &block.transactions,
+                                            height,
+                                            block_hash,
+                                            block.header.timestamp as u64,
+                                        )
+                                        .await;
 
                                         // Auto-prune trigger (BIP-159 / Core parity).
                                         // Mirrors the trigger in the foreground IBD

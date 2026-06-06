@@ -85,6 +85,16 @@ pub struct WalletMeta {
     pub next_change_index: u32,
     /// Birthday (earliest block height of interest).
     pub birthday: u32,
+    /// Highest chain height this wallet has already scanned (the rescan
+    /// watermark). On startup the node reconciles the wallet by walking the
+    /// active chain from `last_synced_height + 1` to the current tip, feeding
+    /// each block through the same `scan_block_at` path that block-connect
+    /// uses. Mirrors the role of Bitcoin Core's per-wallet
+    /// `m_last_block_processed_height` (see `wallet/wallet.h`), persisted so a
+    /// restart never re-scans the whole chain and never silently misses
+    /// activity that arrived while the node was down. `0` means "never synced"
+    /// → reconcile from `birthday`.
+    pub last_synced_height: u32,
 }
 
 impl WalletDb {
@@ -205,7 +215,30 @@ impl WalletDb {
         self.set_meta("next_receive_index", &meta.next_receive_index.to_string())?;
         self.set_meta("next_change_index", &meta.next_change_index.to_string())?;
         self.set_meta("birthday", &meta.birthday.to_string())?;
+        self.set_meta("last_synced_height", &meta.last_synced_height.to_string())?;
         Ok(())
+    }
+
+    /// Read the persisted rescan watermark (`last_synced_height`).
+    ///
+    /// Returns `None` when the wallet has never recorded a watermark (e.g. a
+    /// wallet created before this field existed); callers then fall back to the
+    /// wallet birthday. Stored as a decimal string in `wallet_meta` so it
+    /// survives restart alongside the address indices.
+    pub fn get_last_synced_height(&self) -> Result<Option<u32>, WalletError> {
+        Ok(self
+            .get_meta("last_synced_height")?
+            .and_then(|s| s.parse().ok()))
+    }
+
+    /// Persist the rescan watermark (`last_synced_height`).
+    ///
+    /// Called after the wallet has scanned the active chain up to `height`
+    /// (startup reconciliation, live block-connect, or `rescanblockchain`), so
+    /// the next restart resumes from exactly where it left off. Monotonic in
+    /// normal operation; a reorg/rescan may legitimately rewind it.
+    pub fn set_last_synced_height(&self, height: u32) -> Result<(), WalletError> {
+        self.set_meta("last_synced_height", &height.to_string())
     }
 
     /// Load wallet metadata.
@@ -235,6 +268,10 @@ impl WalletDb {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        let last_synced_height = self.get_meta("last_synced_height")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
         Ok(Some(WalletMeta {
             name,
             network,
@@ -242,6 +279,7 @@ impl WalletDb {
             next_receive_index,
             next_change_index,
             birthday,
+            last_synced_height,
         }))
     }
 
@@ -417,6 +455,31 @@ impl WalletDb {
             params![txid.0.as_slice(), vout, confirmations],
         ).map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?;
         Ok(())
+    }
+
+    /// Recompute every UTXO's `confirmations` against the current tip.
+    ///
+    /// The persisted `confirmations` column (default at insert time, see the
+    /// schema) is an *absolute* snapshot taken when the UTXO was first saved and
+    /// is never refreshed as the chain advances — so trusting it after a restart
+    /// (or after the chain grew while the node was down) reports a stale, too-low
+    /// count. This rewrites it to the Core-correct
+    /// `confirmations = tip_height - height + 1` (1 confirmation at the block it
+    /// was mined in) for every row with a known `height`, clamped at 0 for rows
+    /// whose `height` somehow exceeds the tip. Mirrors the in-memory
+    /// `Wallet::refresh_confirmations` so the durable table and the live ledger
+    /// agree. Returns the number of rows updated.
+    pub fn recompute_confirmations(&self, tip_height: u32) -> Result<usize, WalletError> {
+        // SQLite arithmetic: tip - height + 1, floored at 0 via MAX(...). Only
+        // rows with a non-NULL height participate (mempool/unconfirmed UTXOs
+        // keep confirmations = 0).
+        let rows = self.conn.execute(
+            r#"UPDATE utxos
+               SET confirmations = MAX(0, ?1 - height + 1)
+               WHERE height IS NOT NULL"#,
+            params![tip_height as i64],
+        ).map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(rows)
     }
 
     /// Get the wallet balance.
@@ -662,12 +725,14 @@ mod tests {
             next_receive_index: 5,
             next_change_index: 2,
             birthday: 100000,
+            last_synced_height: 123456,
         };
         db.save_wallet_meta(&meta).unwrap();
 
         let loaded = db.load_wallet_meta().unwrap().unwrap();
         assert_eq!(loaded.name, "test");
         assert_eq!(loaded.network, Network::Testnet);
+        assert_eq!(loaded.last_synced_height, 123456);
         assert_eq!(loaded.next_receive_index, 5);
     }
 
@@ -714,6 +779,63 @@ mod tests {
 
         let balance = db.get_balance().unwrap();
         assert_eq!(balance, 100_000);
+    }
+
+    #[test]
+    fn test_recompute_confirmations_against_tip() {
+        let db = WalletDb::in_memory().unwrap();
+
+        // A UTXO mined at height 100 is saved with confirmations = 6 (the
+        // absolute snapshot at save time). The chain later advances to 250.
+        let utxo = WalletUtxo {
+            outpoint: OutPoint {
+                txid: Hash256::ZERO,
+                vout: 0,
+            },
+            value: 100_000,
+            script_pubkey: vec![0x00, 0x14],
+            derivation_path: vec![0x80000054, 0x80000001, 0x80000000, 0, 0],
+            confirmations: 6,
+            is_change: false,
+            is_coinbase: false,
+            height: Some(100),
+        };
+        db.save_utxo(&utxo).unwrap();
+
+        // Before recompute, the stored value is the stale snapshot.
+        let stale = db.get_all_utxos().unwrap();
+        assert_eq!(stale[0].confirmations, 6);
+
+        // Recompute against tip 250: 250 - 100 + 1 = 151.
+        let updated = db.recompute_confirmations(250).unwrap();
+        assert_eq!(updated, 1, "one row with a known height was updated");
+
+        let fresh = db.get_all_utxos().unwrap();
+        assert_eq!(
+            fresh[0].confirmations, 151,
+            "confirmations must be tip - height + 1, not the stale absolute snapshot"
+        );
+
+        // A row whose height somehow exceeds the tip is clamped at 0, never
+        // underflows.
+        db.recompute_confirmations(50).unwrap();
+        let clamped = db.get_all_utxos().unwrap();
+        assert_eq!(clamped[0].confirmations, 0);
+    }
+
+    #[test]
+    fn test_last_synced_height_roundtrip() {
+        let db = WalletDb::in_memory().unwrap();
+
+        // Absent until written.
+        assert_eq!(db.get_last_synced_height().unwrap(), None);
+
+        db.set_last_synced_height(987_654).unwrap();
+        assert_eq!(db.get_last_synced_height().unwrap(), Some(987_654));
+
+        // Overwrite (e.g. watermark advance).
+        db.set_last_synced_height(1_000_000).unwrap();
+        assert_eq!(db.get_last_synced_height().unwrap(), Some(1_000_000));
     }
 
     #[test]

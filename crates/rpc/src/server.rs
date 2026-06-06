@@ -9247,6 +9247,26 @@ impl RustoshiRpcServer for RpcServerImpl {
             last_scanned = Some(h);
         }
 
+        // Persist the advanced watermark so a restart does not redo the work,
+        // and refresh durable UTXO confirmations against the tip. Only advance
+        // the watermark (never regress it): a partial rescan of an early range
+        // must not strand the wallet behind a later height it had already
+        // scanned. Mirrors Core recording the rescan progress in the wallet DB.
+        if let Some(scanned_to) = last_scanned {
+            for name in ws_guard.wallet_manager.list_wallets() {
+                let prior = ws_guard
+                    .wallet_manager
+                    .get_wallet_last_synced(&name)
+                    .unwrap_or(0);
+                let _ = ws_guard
+                    .wallet_manager
+                    .set_wallet_last_synced(&name, scanned_to.max(prior));
+            }
+            // Recompute durable confirmations for every loaded wallet against
+            // the current tip.
+            ws_guard.wallet_manager.recompute_all_confirmations(tip);
+        }
+
         Ok(serde_json::json!({
             "start_height": start,
             "stop_height": last_scanned,
@@ -11965,6 +11985,45 @@ pub async fn start_rpc_server(
             if let Err(e) = manager.load_startup_wallets() {
                 tracing::warn!("Failed to load startup wallets: {e}");
             }
+
+            // Startup reconciliation (Core's CWallet::AttachChain rescan):
+            // every loaded wallet persisted its UTXO/ledger only in memory, so
+            // a restart starts with an EMPTY in-memory ledger, and any chain
+            // activity that arrived via normal P2P sync while the wallet was
+            // offline was never credited. Walk each wallet from its persisted
+            // `last_synced_height` watermark to the current tip, feeding every
+            // block through the same `scan_block_at` path live block-connect
+            // uses, then persist the advanced watermark. Best-effort: a failure
+            // here must never block the node from serving RPC.
+            {
+                let (tip_height, db) = {
+                    let st = state.read().await;
+                    (st.best_height, st.db.clone())
+                };
+                if tip_height > 0 {
+                    let store = BlockStore::new(&db);
+                    let summary = manager.reconcile_to_tip(tip_height, |h| {
+                        let hash = match store.get_hash_by_height(h)? {
+                            Some(hash) => hash,
+                            None => return Ok::<_, rustoshi_storage::StorageError>(None),
+                        };
+                        let block = match store.get_block(&hash)? {
+                            Some(b) => b,
+                            None => return Ok(None),
+                        };
+                        let block_time = block.header.timestamp as u64;
+                        Ok(Some((hash, block.transactions, block_time)))
+                    });
+                    for (name, from, to, credits, debits) in summary {
+                        if credits > 0 || debits > 0 || to >= from {
+                            tracing::info!(
+                                "wallet '{name}' reconciled to tip: scanned [{from}, {to}] of {tip_height}, +{credits} credits, -{debits} debits"
+                            );
+                        }
+                    }
+                }
+            }
+
             let wallet_state = Arc::new(RwLock::new(crate::wallet::WalletRpcState::new(
                 manager,
                 wallet_data_dir.clone(),
