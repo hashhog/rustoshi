@@ -83,6 +83,30 @@ impl HeaderSync {
         self.peer_heights.insert(peer_id, height);
     }
 
+    /// Record an observed best height for a peer, raising (never lowering) the
+    /// tracked value.
+    ///
+    /// `register_peer` only ever runs at handshake, seeding `peer_heights` from
+    /// the version message's `start_height`. As the chain grows, that seed goes
+    /// stale: a peer that keeps announcing new blocks (via `headers`/`inv`)
+    /// still shows its handshake height, so once our own `best_header_height`
+    /// climbs past it, `best_sync_peer` filters the peer out
+    /// (`best_sync_peer` keeps only peers with `h > best_header_height`).
+    ///
+    /// This mirrors Bitcoin Core's per-peer `pindexBestKnownBlock`, which is
+    /// advanced by `UpdateBlockAvailability`/`ProcessBlockAvailability`
+    /// (`net_processing.cpp`) as new headers and block invs arrive — and is
+    /// only ever raised ("An actually better block was announced"), never
+    /// lowered. We keep the same monotonic semantics here: a peer's tracked
+    /// height only goes up, so a transient lower observation can't drop a peer
+    /// out of the sync-candidate set.
+    pub fn note_peer_height(&mut self, peer_id: PeerId, height: i32) {
+        let entry = self.peer_heights.entry(peer_id).or_insert(height);
+        if height > *entry {
+            *entry = height;
+        }
+    }
+
     /// Number of registered peers.
     pub fn peer_count(&self) -> usize {
         self.peer_heights.len()
@@ -129,6 +153,12 @@ impl HeaderSync {
     #[cfg(test)]
     pub fn unconnecting_headers_count(&self, peer_id: PeerId) -> u32 {
         self.unconnecting_headers.get(&peer_id).copied().unwrap_or(0)
+    }
+
+    /// Read the currently tracked best height for `peer_id`. Used by tests.
+    #[cfg(test)]
+    pub fn peer_height(&self, peer_id: PeerId) -> Option<i32> {
+        self.peer_heights.get(&peer_id).copied()
     }
 
     /// Choose the best peer to sync headers from.
@@ -344,6 +374,15 @@ impl HeaderSync {
         // Update our best header
         self.best_header_height += headers.len() as u32;
         self.best_header_hash = headers.last().unwrap().block_hash();
+
+        // This peer just delivered headers up to our new tip, so it
+        // demonstrably knows a chain at least this tall. Refresh its tracked
+        // height (monotonic raise) so it stays a valid `best_sync_peer`
+        // candidate as the chain grows past its stale handshake
+        // `start_height`. Core analog: `UpdateBlockAvailability(peer,
+        // headers.back())` after a connecting headers batch
+        // (net_processing.cpp::UpdatePeerStateForReceivedHeaders).
+        self.note_peer_height(peer_id, self.best_header_height as i32);
 
         // Successful chain extension — reset the unconnecting-headers counter
         // for this peer (Core: nUnconnectingHeaders = 0 in the headers
@@ -924,6 +963,109 @@ mod tests {
         assert_eq!(sync.unconnecting_headers_count(peer_b), 1);
         // Peer A's 11th message exceeds the threshold.
         assert!(sync.note_unconnecting_headers(peer_a));
+    }
+
+    /// Core parity: a peer's tracked height must be refreshed (raised) as it
+    /// delivers headers, not frozen at its handshake `start_height`. Mirrors
+    /// `UpdateBlockAvailability` advancing `pindexBestKnownBlock`. Without the
+    /// refresh, once our header tip climbs past the peer's stale handshake
+    /// height, `best_sync_peer` filters the peer out and we stop syncing from
+    /// an otherwise-useful peer.
+    #[test]
+    fn test_peer_height_refreshed_after_delivering_headers() {
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer = PeerId(1);
+
+        // Peer handshakes announcing height 2000 — exactly one full batch.
+        sync.register_peer(peer, MAX_HEADERS_PER_REQUEST as i32);
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: genesis_hash,
+        };
+
+        // Peer delivers a full 2000-header batch (it actually has more chain
+        // than its handshake start_height implied).
+        let headers = make_valid_header_chain(genesis_hash, MAX_HEADERS_PER_REQUEST);
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
+        assert_eq!(result, Ok(true));
+        assert_eq!(sync.best_header_height(), MAX_HEADERS_PER_REQUEST as u32);
+
+        // Pre-fix: peer_heights[peer] is still 2000 (its handshake value),
+        // equal to our header tip, so `best_sync_peer` (which requires
+        // h > best_header_height) returns None and we'd stop syncing from this
+        // peer even though it has more to give.
+        // Post-fix: the peer's tracked height was raised to our new tip, so it
+        // remains a candidate (>= tip, and the next batch can lift it higher).
+        assert_eq!(
+            sync.peer_height(peer),
+            Some(MAX_HEADERS_PER_REQUEST as i32),
+            "peer height should be refreshed to the delivered tip"
+        );
+
+        // Simulate the next batch lifting both our tip and the peer's known
+        // height further; the peer must still be selectable.
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: sync.best_header_hash(),
+        };
+        let next = make_valid_header_chain(sync.best_header_hash(), 1);
+        let result = sync.process_headers(peer, next, &mut |_, _| Ok(()), &|_| None);
+        assert_eq!(result, Ok(false));
+        assert_eq!(
+            sync.peer_height(peer),
+            Some(MAX_HEADERS_PER_REQUEST as i32 + 1)
+        );
+    }
+
+    /// `note_peer_height` is monotonic: it raises the tracked height but never
+    /// lowers it (Core only advances `pindexBestKnownBlock` to higher
+    /// chainwork). A stale/lower observation must not drop a peer.
+    #[test]
+    fn test_note_peer_height_is_monotonic() {
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer = PeerId(7);
+
+        sync.note_peer_height(peer, 500);
+        assert_eq!(sync.peer_height(peer), Some(500));
+
+        // Higher observation raises it.
+        sync.note_peer_height(peer, 900);
+        assert_eq!(sync.peer_height(peer), Some(900));
+
+        // Lower observation is ignored.
+        sync.note_peer_height(peer, 100);
+        assert_eq!(sync.peer_height(peer), Some(900));
+    }
+
+    /// Regression guard for the stale-height symptom directly: a peer whose
+    /// handshake height is below our current header tip becomes selectable
+    /// again once it proves (via a delivered header) that it actually has a
+    /// taller chain.
+    #[test]
+    fn test_stale_handshake_height_recovered_via_headers() {
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer = PeerId(1);
+
+        // We're already at header height 10 (e.g. synced from another peer).
+        // This peer handshaked long ago at height 5 — now stale.
+        let chain = make_valid_header_chain(genesis_hash, 11);
+        sync.set_best_header(10, chain[9].block_hash());
+        sync.register_peer(peer, 5);
+
+        // Stale: best_sync_peer ignores it (5 <= 10).
+        assert_eq!(sync.best_sync_peer(), None);
+
+        // The peer announces a new block extending our tip (unsolicited
+        // headers / BIP 130). After processing, its tracked height is raised
+        // to 11.
+        let new_header = vec![chain[10].clone()];
+        let result = sync.process_headers(peer, new_header, &mut |_, _| Ok(()), &|_| None);
+        assert_eq!(result, Ok(false));
+        assert_eq!(sync.best_header_height(), 11);
+        assert_eq!(sync.peer_height(peer), Some(11));
     }
 
     #[test]
