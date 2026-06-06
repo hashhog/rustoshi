@@ -2879,6 +2879,29 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 rpc.best_hash = block_hash;
                             }
 
+                            // Drop confirmed/conflicting txs from the mempool,
+                            // then run per-block housekeeping. This foreground
+                            // IBD path previously skipped the mempool entirely
+                            // (it is normally empty during IBD), but a tx can
+                            // land via P2P relay while catch-up is still in
+                            // progress, so keep it consistent with the P2P
+                            // sync-loop block-connect path below.
+                            let block_txids: Vec<Hash256> =
+                                block.transactions.iter().map(|tx| tx.txid()).collect();
+                            let block_spent: Vec<OutPoint> = block
+                                .transactions
+                                .iter()
+                                .flat_map(|tx| {
+                                    tx.inputs.iter().map(|i| i.previous_output.clone())
+                                })
+                                .collect();
+                            rpc.mempool.remove_for_block(&block_txids, &block_spent);
+                            // DoS-vector parity (audit w14z8m3zc, findings 2 + 3):
+                            // arm the rolling-min-fee decay + expire stale txs.
+                            rpc.mempool.on_block_connected(
+                                rustoshi_consensus::current_time_secs() as i64,
+                            );
+
                             // Wire fee estimator: notify it of the newly connected
                             // block so confirmed_within buckets are populated.
                             // Skips coinbase (index 0) to match Core's
@@ -3507,6 +3530,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 .collect();
                                             rpc.mempool
                                                 .remove_for_block(&block_txids, &block_spent);
+
+                                            // DoS-vector parity (audit w14z8m3zc,
+                                            // findings 2 + 3): per-block mempool
+                                            // housekeeping — arm the rolling-min-fee
+                                            // decay AND expire entries older than the
+                                            // 2-week TTL. Mirrors Core's
+                                            // ConnectTip → expiry sweep +
+                                            // blockSinceLastRollingFeeBump = true.
+                                            let expired = rpc
+                                                .mempool
+                                                .on_block_connected(
+                                                    rustoshi_consensus::current_time_secs() as i64,
+                                                );
+                                            if expired > 0 {
+                                                tracing::debug!(
+                                                    "Mempool expiry swept {} stale tx(s) at height {}",
+                                                    expired, height
+                                                );
+                                            }
 
                                             // Wire fee estimator: notify it of the confirmed
                                             // block. Skip coinbase (index 0) to match Core's
@@ -4705,6 +4747,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             // sync indefinitely (observed 2026-05-07: rustoshi froze
             // for 6+ hours at h=948271 with one zombie peer).
             _ = maintenance_interval.tick() => {
+                // DoS-vector parity (audit w14z8m3zc, finding 3): periodic
+                // orphan-pool TTL sweep. `TxOrphanage::expire_orphans` had no
+                // live caller, so orphan txs whose missing parent never
+                // arrived sat in the bounded orphan pool until evicted by
+                // capacity pressure — a slow memory/relay DoS. Mirrors Core's
+                // periodic `TxOrphanage::LimitOrphans` time sweep. The 45s
+                // maintenance cadence is well under the 20-min ORPHAN_TX
+                // expiry, satisfying the "~1 min" sweep requested by the audit.
+                {
+                    let mut rpc = rpc_state.write().await;
+                    let evicted = rpc.orphanage.expire_orphans(std::time::Instant::now());
+                    if evicted > 0 {
+                        tracing::debug!("Orphan TTL sweep evicted {} stale orphan(s)", evicted);
+                    }
+                }
+
                 let validated_tip = block_downloader.validated_tip_height();
                 let in_flight = block_downloader.in_flight_count();
 

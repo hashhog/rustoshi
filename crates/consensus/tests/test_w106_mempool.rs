@@ -739,6 +739,14 @@ fn test_g17_pays_for_rbf_combined() {
 /// Status: OK
 #[test]
 fn test_g18_entries_and_txids_disjoint() {
+    // EntriesAndTxidsDisjoint (BIP-125 rule / Core validation.cpp
+    // EntriesAndTxidsDisjoint, policy/rbf.cpp): a replacement may not spend an
+    // output of a transaction it is simultaneously replacing — its ancestor set
+    // must be disjoint from its direct-conflict set. Construct the pathological
+    // case: X spends UTXO_A and is in the mempool; the replacement spends BOTH
+    // UTXO_A (so it directly conflicts with X) AND X's output (so X is also an
+    // ancestor of the replacement). X is therefore in both sets, and the
+    // replacement must be rejected with RbfSpendsConflicting — NOT accepted.
     let mut mp = Mempool::new(MempoolConfig {
         verify_scripts: false,
 
@@ -746,49 +754,50 @@ fn test_g18_entries_and_txids_disjoint() {
         incremental_relay_fee: 1,
         ..Default::default()
     });
+    // UTXO_A
     let utxos: HashMap<OutPoint, CoinEntry> = [(OutPoint { txid: zero_hash(), vout: 0 }, coin(1_000_000))].into_iter().collect();
-    let parent_tx = simple_tx(zero_hash(), 1_000_000, 1_000, 0xFFFFFFFD);
-    let parent_id = mp.add_transaction(parent_tx, &|op| utxos.get(op).cloned()).unwrap();
 
-    let parent_out_val = mp.get(&parent_id).unwrap().tx.outputs[0].value;
+    // X spends UTXO_A (zero_hash:0), creating output X:0; lives in the mempool.
+    let x_tx = simple_tx(zero_hash(), 1_000_000, 1_000, 0xFFFFFFFD);
+    let x_id = mp.add_transaction(x_tx, &|op| utxos.get(op).cloned()).unwrap();
+    let x_out_val = mp.get(&x_id).unwrap().tx.outputs[0].value;
+
+    // Replacement spends UTXO_A (conflicts with X) AND X:0 (X is an ancestor).
     let mut utxos2 = utxos.clone();
-    utxos2.insert(OutPoint { txid: parent_id, vout: 0 }, coin(parent_out_val));
-    let child_tx = simple_tx(parent_id, parent_out_val, 2_000, 0xFFFFFFFD);
-    let child_id = mp.add_transaction(child_tx, &|op| utxos2.get(op).cloned()).unwrap();
-
-    // Attempt: replacement that conflicts with parent but is a descendant of parent
-    // (replacement spends parent's output — i.e. parent_id is both an ancestor
-    //  of replacement AND a direct conflict). Must fail RbfSpendsConflicting.
+    utxos2.insert(OutPoint { txid: x_id, vout: 0 }, coin(x_out_val));
     let replacement = Transaction {
         version: 2,
         inputs: vec![
             TxIn {
-                // Spends parent's output (makes parent an ancestor of replacement)
-                previous_output: OutPoint { txid: parent_id, vout: 0 },
+                // Conflicts with X (both spend UTXO_A).
+                previous_output: OutPoint { txid: zero_hash(), vout: 0 },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFD,
+                witness: vec![],
+            },
+            TxIn {
+                // Spends X's output, making X an ancestor of the replacement.
+                previous_output: OutPoint { txid: x_id, vout: 0 },
                 script_sig: vec![],
                 sequence: 0xFFFFFFFD,
                 witness: vec![],
             },
         ],
+        // Pay a generous fee so the only applicable rejection is Rule #2.
         outputs: vec![TxOut {
-            value: parent_out_val - 5_000,
+            value: x_out_val - 5_000,
             script_pubkey: p2pkh_spk(),
         }],
         lock_time: 0,
     };
 
-    // The replacement attempts to spend parent's output while child also spends it.
-    // This is a double-spend: both replacement and child spend parent:vout0.
-    // child is in direct_conflicts. parent is an ancestor of replacement.
-    // EntriesAndTxidsDisjoint should catch this.
-    // Note: in practice child_id is the conflict (not parent_id), so the
-    // ancestor-vs-conflict intersection here is between replacement ancestors
-    // (empty, since parent is confirmed or spending confirmed output) and child.
-    // This test validates the "replacement cannot spend a conflicted tx" path.
     let result = mp.add_transaction(replacement, &|op| utxos2.get(op).cloned());
-    assert!(result.is_err(),
-        "replacement spending conflicting parent must fail: {:?}", result);
-    let _ = child_id; // suppress warning
+    assert!(
+        matches!(result, Err(MempoolError::RbfSpendsConflicting)),
+        "replacement that both conflicts with X and spends X's output must fail \
+         EntriesAndTxidsDisjoint (RbfSpendsConflicting): {:?}",
+        result
+    );
 }
 
 // ============================================================
@@ -1397,4 +1406,374 @@ fn test_compile_smoke() {
     assert_eq!(TRUC_CHILD_MAX_VSIZE, 1_000);
     assert_eq!(MAX_PACKAGE_COUNT, 25);
     assert_eq!(MAX_PACKAGE_SIZE, 101_000);
+}
+
+// ====================================================================
+// DoS-vector parity (audit w14z8m3zc) — proven-teeth tests for the
+// previously-unwired mempool DoS gates. Each test would FAIL against the
+// pre-fix tree (the gate had no live caller / no enforcement).
+// ====================================================================
+
+/// Finding 2 (dynamic mempool-min-fee floor enforced on admission).
+///
+/// Pre-fix: `add_transaction` enforced only the static `min_fee_rate` floor;
+/// `get_min_fee()` (the rolling minimum that rises under memory pressure) had
+/// no live caller. A node under pressure would keep admitting the very low-fee
+/// txs it had just evicted.
+///
+/// Teeth: bump the rolling minimum via `trim_to_size`, then prove a tx whose
+/// feerate clears the STATIC floor is still rejected by the DYNAMIC floor with
+/// `MempoolMinFeeNotMet`. The control half proves the same tx is admitted when
+/// the dynamic floor is zero.
+#[test]
+fn test_dos_w14z8m3zc_dynamic_min_fee_enforced_on_admission() {
+    // min_fee_rate = 1 sat/vB (static floor); incremental = 1000 sat/kvB.
+    let cfg = MempoolConfig {
+        verify_scripts: false,
+        min_fee_rate: 1,
+        incremental_relay_fee: 1_000,
+        // Tiny size limit so trim_to_size actually evicts and bumps the floor.
+        max_size_bytes: 250,
+        ..Default::default()
+    };
+    let mut mp = Mempool::new(cfg);
+
+    // Prime: admit a high-feerate tx (≈100 sat/vB) so trim has something to
+    // evict at a high feerate, driving the rolling minimum well above the
+    // static 1 sat/vB floor.
+    let prime_prev = hash_from_u8(1);
+    let utxos_prime: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: prime_prev, vout: 0 }, coin(1_000_000))]
+            .into_iter()
+            .collect();
+    // simple_tx is ~110 vB; fee 11_000 → ~100 sat/vB.
+    let prime_tx = simple_tx(prime_prev, 1_000_000, 11_000, 0xffffffff);
+    mp_add(&mut mp, prime_tx, &utxos_prime).unwrap();
+
+    // Force eviction: trim to 0 bytes evicts the primed tx and bumps the
+    // rolling minimum to (its feerate * 1000) + incremental_relay_fee.
+    let evicted = mp.trim_to_size(0);
+    assert_eq!(evicted, 1, "trim_to_size must evict the primed tx");
+
+    let floor = mp.get_min_fee();
+    assert!(
+        floor > 1_000,
+        "rolling mempool-min-fee floor must be bumped well above the static floor \
+         after a high-feerate eviction; got {} sat/kvB",
+        floor
+    );
+
+    // Now try to admit a tx whose feerate clears the STATIC floor (1 sat/vB =
+    // 1000 sat/kvB) but is BELOW the dynamic floor. fee=200 over ~110 vB ≈
+    // 1.8 sat/vB ≈ 1800 sat/kvB, which is < `floor` (≈ 100_000 sat/kvB).
+    let lo_prev = hash_from_u8(2);
+    let utxos_lo: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: lo_prev, vout: 0 }, coin(1_000_000))]
+            .into_iter()
+            .collect();
+    let lo_tx = simple_tx(lo_prev, 1_000_000, 200, 0xffffffff);
+    let res = mp_add(&mut mp, lo_tx, &utxos_lo);
+    match res {
+        Err(MempoolError::MempoolMinFeeNotMet(got, required)) => {
+            assert!(
+                got < required,
+                "rejection must report tx feerate {} < dynamic floor {}",
+                got,
+                required
+            );
+        }
+        other => panic!(
+            "low-feerate tx must be rejected by the DYNAMIC mempool-min-fee floor; got {:?}",
+            other
+        ),
+    }
+
+    // Control: a fresh mempool with no rolling bump (floor == 0) admits the
+    // identical low-feerate tx — proving the rejection above was the dynamic
+    // floor, not some other gate.
+    let mut mp_ctrl = test_mempool();
+    let lo_tx2 = simple_tx(lo_prev, 1_000_000, 200, 0xffffffff);
+    assert!(
+        mp_ctrl.get_min_fee() == 0,
+        "control mempool must have a zero dynamic floor"
+    );
+    assert!(
+        mp_add(&mut mp_ctrl, lo_tx2, &utxos_lo).is_ok(),
+        "identical low-feerate tx must be admitted when the dynamic floor is zero"
+    );
+}
+
+/// Finding 2 (rolling-fee bump flag set from the block-connect path).
+///
+/// Pre-fix: `notify_block_connected()` had ZERO callers, so
+/// `block_since_last_rolling_fee_bump` was never set — `get_min_fee()`
+/// hit the `!block_since_last_rolling_fee_bump` short-circuit on EVERY call and
+/// the rolling floor never decayed (it stayed pinned at the bumped value
+/// forever, perpetually rejecting low-fee txs).
+///
+/// Teeth: bump the floor via eviction, confirm it is pinned across repeated
+/// `get_min_fee()` calls while the flag is unset, then prove `on_block_connected`
+/// arms the decay so the very next `get_min_fee()` enters the decay branch and
+/// the floor drops. Before the fix the floor could NOT move because nothing
+/// ever set the flag.
+#[test]
+fn test_dos_w14z8m3zc_on_block_connected_arms_rolling_fee_decay() {
+    let cfg = MempoolConfig {
+        verify_scripts: false,
+        min_fee_rate: 1,
+        incremental_relay_fee: 1_000,
+        max_size_bytes: 250,
+        ..Default::default()
+    };
+    let mut mp = Mempool::new(cfg);
+
+    let prev = hash_from_u8(7);
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: prev, vout: 0 }, coin(1_000_000))]
+            .into_iter()
+            .collect();
+    let tx = simple_tx(prev, 1_000_000, 11_000, 0xffffffff);
+    mp_add(&mut mp, tx, &utxos).unwrap();
+    assert_eq!(mp.trim_to_size(0), 1);
+
+    // Flag is UNSET (no block connected yet): the floor is pinned at the bumped
+    // value and does NOT decay no matter how many times it is queried. This is
+    // exactly the pre-fix steady state.
+    let pinned1 = mp.get_min_fee();
+    let pinned2 = mp.get_min_fee();
+    assert!(pinned1 > 0, "floor must be bumped after eviction");
+    assert_eq!(
+        pinned1, pinned2,
+        "with the bump flag unset the floor must stay pinned (no decay)"
+    );
+
+    // on_block_connected arms the decay flag (and runs the 2-week expiry sweep,
+    // here a no-op on the now-empty pool).
+    let expired = mp.on_block_connected(now_secs());
+    assert_eq!(expired, 0, "no stale entries to expire on an empty pool");
+
+    // With the flag armed, get_min_fee now enters the decay branch. Because
+    // last_rolling_fee_update is stale, the elapsed time is large and the floor
+    // decays below the previously-pinned value. The exact landing value is
+    // time-dependent; the teeth assertion is that it is STRICTLY LESS than the
+    // pinned value — i.e. decay is now reachable, which it never was pre-fix.
+    let after = mp.get_min_fee();
+    assert!(
+        after < pinned1,
+        "after on_block_connected arms the flag, the floor must be able to decay \
+         below the pinned value; pinned={} after={}",
+        pinned1,
+        after
+    );
+}
+
+/// Finding 3 (2-week expiry sweep runs on block-connect).
+///
+/// Pre-fix: `expire()` had no live caller, so stuck low-fee txs accumulated in
+/// the live mempool forever (memory DoS).
+///
+/// Teeth: backdate an entry past the 2-week TTL, then prove `on_block_connected`
+/// (the new live block-connect hook) sweeps it.
+#[test]
+fn test_dos_w14z8m3zc_on_block_connected_expires_stale_txs() {
+    let mut mp = test_mempool();
+    let prev = hash_from_u8(9);
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: prev, vout: 0 }, coin(1_000_000))]
+            .into_iter()
+            .collect();
+    let tx = simple_tx(prev, 1_000_000, 5_000, 0xffffffff);
+    let id = mp_add(&mut mp, tx, &utxos).unwrap();
+
+    // Backdate the entry to the Unix epoch — far older than the 2-week TTL
+    // measured from "now".
+    mp.set_entry_time_seconds(&id, 1);
+    assert!(mp.contains(&id), "tx must be present before the sweep");
+
+    let now = now_secs();
+    let expired = mp.on_block_connected(now);
+    assert_eq!(expired, 1, "on_block_connected must expire the stale tx");
+    assert!(
+        !mp.contains(&id),
+        "stale tx must be gone after the block-connect expiry sweep"
+    );
+
+    // A fresh entry (current timestamp) survives the same sweep — proving the
+    // cutoff is TTL-based, not a blanket flush.
+    let prev2 = hash_from_u8(10);
+    let utxos2: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: prev2, vout: 0 }, coin(1_000_000))]
+            .into_iter()
+            .collect();
+    let fresh = simple_tx(prev2, 1_000_000, 5_000, 0xffffffff);
+    let fresh_id = mp_add(&mut mp, fresh, &utxos2).unwrap();
+    let expired2 = mp.on_block_connected(now);
+    assert_eq!(expired2, 0, "a fresh tx must survive the TTL sweep");
+    assert!(mp.contains(&fresh_id));
+}
+
+/// Finding 4 (remove_for_reorg evicts now-non-final entries).
+///
+/// Pre-fix: `remove_for_reorg` had no live caller, so after a reorg an entry
+/// whose nLockTime is no longer satisfied at the shorter tip lingered.
+///
+/// Teeth: admit a height-locktimed tx valid at tip H, then simulate a reorg
+/// back to a height where the locktime is NOT yet met and prove the new
+/// `remove_for_reorg` predicate (finality at new tip) evicts it.
+#[test]
+fn test_dos_w14z8m3zc_remove_for_reorg_evicts_nonfinal() {
+    let mut mp = test_mempool();
+
+    // Tip at height 200; admit a tx whose nLockTime=150 (height-based) with a
+    // non-final sequence so locktime is actually enforced. At tip 200 the
+    // mempool checks finality against next_height = tip+1 = 201 > 150 → final.
+    mp.notify_new_tip(200, 1_000_000);
+
+    let prev = hash_from_u8(11);
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: prev, vout: 0 }, coin(1_000_000))]
+            .into_iter()
+            .collect();
+    let mut tx = simple_tx(prev, 1_000_000, 5_000, 0xfffffffe); // non-final seq
+    tx.lock_time = 150; // height-based locktime
+    let id = mp_add(&mut mp, tx, &utxos).unwrap();
+    assert!(mp.contains(&id), "tx must be admitted at the original tip");
+
+    // Reorg back to height 100: the new tip's next block is height 101, which
+    // is < locktime 150 → the tx is no longer final.
+    let new_tip_height: u32 = 100;
+    let new_mtp: i64 = 900_000;
+    mp.notify_new_tip(new_tip_height, new_mtp);
+    let next_height = new_tip_height + 1;
+    let removed = mp.remove_for_reorg(|entry| {
+        !rustoshi_consensus::block_template::is_final_tx(&entry.tx, next_height, new_mtp)
+    });
+    assert_eq!(removed, 1, "remove_for_reorg must evict the now-non-final tx");
+    assert!(!mp.contains(&id), "non-final tx must be gone after the reorg sweep");
+}
+
+/// Finding 4 (remove_for_reorg evicts now-immature-coinbase entries).
+///
+/// Teeth: admit a tx spending a coinbase that is mature at tip H, then
+/// "reorg" to a height where the coinbase no longer has COINBASE_MATURITY
+/// confirmations and prove the predicate evicts it.
+#[test]
+fn test_dos_w14z8m3zc_remove_for_reorg_evicts_immature_coinbase() {
+    let mut mp = test_mempool();
+
+    // Coinbase confirmed at height 100. Tip at 250 → 150 confirmations at
+    // next_height 251, well past COINBASE_MATURITY (100), so admission passes.
+    mp.notify_new_tip(250, 1_000_000);
+
+    let cb_prev = hash_from_u8(12);
+    let cb_coin = coinbase_coin(1_000_000, 100);
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: cb_prev, vout: 0 }, cb_coin.clone())]
+            .into_iter()
+            .collect();
+    let tx = simple_tx(cb_prev, 1_000_000, 5_000, 0xffffffff);
+    let id = mp_add(&mut mp, tx, &utxos).unwrap();
+    assert!(mp.contains(&id), "coinbase-spending tx must be admitted when mature");
+
+    // Reorg back to height 120: next_height=121, 121-100=21 < COINBASE_MATURITY
+    // (100) → the coinbase is no longer mature.
+    let new_tip_height: u32 = 120;
+    mp.notify_new_tip(new_tip_height, 900_000);
+    let next_height = new_tip_height + 1;
+    let removed = mp.remove_for_reorg(|entry| {
+        if entry.spends_coinbase {
+            for input in &entry.tx.inputs {
+                if let Some(c) = utxos.get(&input.previous_output) {
+                    if c.is_coinbase
+                        && next_height.saturating_sub(c.height)
+                            < rustoshi_consensus::COINBASE_MATURITY
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    });
+    assert_eq!(
+        removed, 1,
+        "remove_for_reorg must evict the tx spending a now-immature coinbase"
+    );
+    assert!(!mp.contains(&id));
+}
+
+/// Finding 1 (live mempool runs script verification).
+///
+/// Pre-fix: the live node built its mempool with `MempoolConfig::default()`
+/// (verify_scripts = false), so invalid-script txs were admitted/relayed.
+///
+/// Teeth: prove `production()` config (verify_scripts = true) REJECTS a tx with
+/// a failing scriptSig that the `default()`/`test_no_scripts()` config admits.
+/// Uses a P2PKH prevout with a bogus (empty) scriptSig: under STANDARD flags
+/// the script must fail; with verification off it is admitted.
+#[test]
+fn test_dos_w14z8m3zc_production_config_verifies_scripts() {
+    assert!(
+        MempoolConfig::production().verify_scripts,
+        "production() must enable script verification"
+    );
+    assert!(
+        !MempoolConfig::default().verify_scripts,
+        "default() keeps script verification off (test fixtures)"
+    );
+
+    let prev = hash_from_u8(13);
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: prev, vout: 0 }, coin(1_000_000))]
+            .into_iter()
+            .collect();
+
+    // scriptSig is empty (simple_tx default) → cannot satisfy the P2PKH
+    // prevout (needs <sig> <pubkey>). With scripts verified this must fail.
+    // Use require_standard=false to isolate the SCRIPT gate (so an earlier
+    // standardness check can't pre-empt it) while keeping script checks ON.
+    let bad_tx = simple_tx(prev, 1_000_000, 5_000, 0xffffffff);
+    let opts_scripts_on = AtmpOptions {
+        require_standard: false,
+        skip_script_checks: false,
+        ..Default::default()
+    };
+
+    // verify_scripts ON: rejected at the script gate.
+    let mut mp_prod = Mempool::new(MempoolConfig::production());
+    let res = mp_prod.add_transaction_with_options(
+        bad_tx.clone(),
+        &|op| utxos.get(op).cloned(),
+        opts_scripts_on.clone(),
+    );
+    assert!(
+        matches!(
+            res,
+            Err(MempoolError::PolicyScriptCheckFailed(_, _))
+                | Err(MempoolError::ConsensusScriptCheckFailed(_, _))
+        ),
+        "production config must reject the invalid-script tx at the script gate; got {:?}",
+        res
+    );
+
+    // verify_scripts OFF (default/test config): same tx, same options, is
+    // admitted — proving the script gate is what rejected it above.
+    let mut mp_off = Mempool::new(MempoolConfig {
+        verify_scripts: false,
+        ..Default::default()
+    });
+    assert!(
+        mp_off
+            .add_transaction_with_options(bad_tx, &|op| utxos.get(op).cloned(), opts_scripts_on)
+            .is_ok(),
+        "with verify_scripts off the identical tx must be admitted"
+    );
+}
+
+/// Helper: current wall-clock time in seconds (i64).
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

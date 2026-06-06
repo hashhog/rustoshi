@@ -178,12 +178,39 @@ pub struct RpcState {
     pub wallet_state: Option<Arc<RwLock<crate::wallet::WalletRpcState>>>,
 }
 
+/// Select the mempool configuration appropriate for `network`.
+///
+/// DoS-vector parity (audit w14z8m3zc, finding 1): the live node MUST run the
+/// mempool with `verify_scripts = true` so that invalid-script transactions are
+/// rejected at admission (Core's `PolicyScriptChecks` + `ConsensusScriptChecks`
+/// in `validation.cpp::PreChecks`, mirrored at `mempool.rs:1861`). Pre-W96 the
+/// admission path performed ZERO script verification — running the live node
+/// with `MempoolConfig::default()` (which sets `verify_scripts = false` purely
+/// for the synthetic-tx unit-test fixtures) silently regressed that and let the
+/// node admit and relay consensus-invalid txs.
+///
+/// Regtest keeps the loose default because its RPC/integration fixtures build
+/// `OP_1`-style transactions without real signatures (see `MempoolConfig`'s
+/// `verify_scripts` doc and `MempoolConfig::test_no_scripts`). All "real"
+/// networks — mainnet / testnet3 / testnet4 / signet — get the Core-parity
+/// `production()` config.
+pub fn mempool_config_for_network(network: NetworkId) -> MempoolConfig {
+    match network {
+        NetworkId::Regtest => MempoolConfig::default(),
+        NetworkId::Mainnet
+        | NetworkId::Testnet3
+        | NetworkId::Testnet4
+        | NetworkId::Signet => MempoolConfig::production(),
+    }
+}
+
 impl RpcState {
     /// Create a new RPC state.
     pub fn new(db: Arc<ChainDb>, params: ChainParams) -> Self {
+        let mempool_config = mempool_config_for_network(params.network_id);
         Self {
             db,
-            mempool: Mempool::new(MempoolConfig::default()),
+            mempool: Mempool::new(mempool_config),
             fee_estimator: FeeEstimator::new(),
             params,
             best_height: 0,
@@ -209,9 +236,10 @@ impl RpcState {
 
     /// Create a new RPC state with pruning configuration.
     pub fn with_prune_config(db: Arc<ChainDb>, params: ChainParams, prune_target: u64) -> Self {
+        let mempool_config = mempool_config_for_network(params.network_id);
         Self {
             db,
-            mempool: Mempool::new(MempoolConfig::default()),
+            mempool: Mempool::new(mempool_config),
             fee_estimator: FeeEstimator::new(),
             params,
             best_height: 0,
@@ -1728,6 +1756,54 @@ fn disconnect_to(
             state
                 .mempool
                 .block_disconnected(&block.transactions, &utxo_lookup);
+        }
+
+        // DoS-vector parity (audit w14z8m3zc, finding 4): evict mempool entries
+        // that became invalid at the NEW (shorter) tip. After a reorg, txs that
+        // were valid against the old chain can be:
+        //   - no longer FINAL (nLockTime height/time not yet reached at the new
+        //     tip), or
+        //   - spending a coinbase output that is no longer mature (the
+        //     confirming block was rolled off, so the coinbase has fewer
+        //     confirmations than COINBASE_MATURITY at new-tip+1).
+        // Mirrors Core's `CTxMemPool::removeForReorg` driven from
+        // `Chainstate::MaybeUpdateMempoolForReorg` (validation.cpp:334-385),
+        // which runs AFTER the disconnected-block re-add above.
+        //
+        // Scope: this mirrors the two cases named in `remove_for_reorg`'s own
+        // doc-comment (finality + coinbase maturity). Core additionally
+        // re-checks BIP-68 sequence-locks via cached LockPoints; rustoshi's
+        // `MempoolEntry` does not cache LockPoints, so that nuance is left to
+        // whatever `add_transaction` re-enforces on the next admission (the
+        // re-added disconnected txs already pass `is_final_tx`).
+        let next_height = target_height + 1;
+        let removed = state.mempool.remove_for_reorg(|entry| {
+            // 1) Finality at the new tip (BIP-113 uses MTP for time locks).
+            if !rustoshi_consensus::block_template::is_final_tx(&entry.tx, next_height, mtp) {
+                return true;
+            }
+            // 2) Coinbase maturity at the new tip. Only entries flagged as
+            //    spending a coinbase need the (cheap) per-input re-scan.
+            if entry.spends_coinbase {
+                use rustoshi_consensus::validation::UtxoView;
+                for input in &entry.tx.inputs {
+                    if let Some(coin) = refill_view.get_utxo(&input.previous_output) {
+                        if coin.is_coinbase
+                            && next_height.saturating_sub(coin.height)
+                                < rustoshi_consensus::COINBASE_MATURITY
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        });
+        if removed > 0 {
+            tracing::info!(
+                "Reorg to height {}: evicted {} now-invalid mempool tx(s) (non-final / immature-coinbase)",
+                target_height, removed
+            );
         }
     }
 
@@ -5168,6 +5244,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                         .flat_map(|tx| tx.inputs.iter().map(|i| i.previous_output.clone()))
                         .collect();
                     state.mempool.remove_for_block(&block_txids, &block_spent);
+                    // DoS-vector parity (audit w14z8m3zc, findings 2 + 3):
+                    // arm the rolling-min-fee decay + expire the 2-week TTL,
+                    // same as the P2P / IBD block-connect paths in main.rs.
+                    state
+                        .mempool
+                        .on_block_connected(rustoshi_consensus::current_time_secs() as i64);
                 }
 
                 // Wire fee estimator: notify it of the confirmed block.
@@ -12205,6 +12287,65 @@ fn connection_type_str(ct: rustoshi_network::ConnectionType) -> &'static str {
 mod tests {
     use super::*;
     use rustoshi_consensus::chain_manager::{block_status, get_ancestor, is_ancestor};
+
+    /// DoS-vector parity (audit w14z8m3zc, finding 1): the live mempool must
+    /// run with script verification ON for every real network. Pre-fix the live
+    /// constructors hard-wired `MempoolConfig::default()` (verify_scripts =
+    /// false), so the node admitted/relayed invalid-script txs. Regtest keeps
+    /// the loose default for its synthetic-tx integration fixtures.
+    #[test]
+    fn test_dos_w14z8m3zc_mempool_config_for_network() {
+        assert!(
+            mempool_config_for_network(NetworkId::Mainnet).verify_scripts,
+            "mainnet mempool must verify scripts"
+        );
+        assert!(
+            mempool_config_for_network(NetworkId::Testnet3).verify_scripts,
+            "testnet3 mempool must verify scripts"
+        );
+        assert!(
+            mempool_config_for_network(NetworkId::Testnet4).verify_scripts,
+            "testnet4 mempool must verify scripts"
+        );
+        assert!(
+            mempool_config_for_network(NetworkId::Signet).verify_scripts,
+            "signet mempool must verify scripts"
+        );
+        assert!(
+            !mempool_config_for_network(NetworkId::Regtest).verify_scripts,
+            "regtest mempool keeps the loose default (synthetic-tx fixtures)"
+        );
+    }
+
+    /// End-to-end: the live `RpcState` constructors wire the network-appropriate
+    /// mempool config. Mainnet → script-verifying; regtest → loose default.
+    #[test]
+    fn test_dos_w14z8m3zc_rpcstate_wires_script_verification() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+
+        // RpcState::new on mainnet → verify_scripts ON.
+        let main_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        assert!(
+            main_state.mempool.verify_scripts(),
+            "live mainnet RpcState must build a script-verifying mempool"
+        );
+
+        // with_prune_config on mainnet → still verify_scripts ON.
+        let main_pruned =
+            RpcState::with_prune_config(db.clone(), ChainParams::mainnet(), 550 * 1024 * 1024);
+        assert!(
+            main_pruned.mempool.verify_scripts(),
+            "live pruned mainnet RpcState must build a script-verifying mempool"
+        );
+
+        // Regtest → loose default (no script verification).
+        let regtest_state = RpcState::new(db, ChainParams::regtest());
+        assert!(
+            !regtest_state.mempool.verify_scripts(),
+            "regtest RpcState keeps the loose (non-verifying) default"
+        );
+    }
 
     #[test]
     fn test_compact_to_target_f64() {
