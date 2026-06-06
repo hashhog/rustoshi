@@ -413,6 +413,9 @@ impl WalletManager {
             next_receive_index: 0,
             next_change_index: 0,
             birthday: 0,
+            // A brand-new wallet has never scanned the chain; startup
+            // reconciliation walks from birthday (0) to tip the first time.
+            last_synced_height: 0,
         };
         db.save_wallet_meta(&meta)?;
 
@@ -509,6 +512,9 @@ impl WalletManager {
                     next_receive_index: 0,
                     next_change_index: 0,
                     birthday: 0,
+                    // sethdseed restores a fresh keychain → the chain must be
+                    // re-scanned for it from scratch; reset the watermark.
+                    last_synced_height: 0,
                 };
                 let _ = db_guard.save_wallet_meta(&meta);
             }
@@ -655,15 +661,35 @@ impl WalletManager {
         if save {
             if let (Some(db_arc), Ok(wallet_guard)) = (db, wallet.lock()) {
                 if let Ok(db_guard) = db_arc.lock() {
-                    // Save current state
+                    // Save current state. Preserve any previously-persisted
+                    // birthday + watermark rather than clobbering them: the
+                    // in-memory wallet's `chain_height` IS the highest block it
+                    // has scanned, so persist it as the new watermark (never
+                    // regressing below the stored value). This keeps the next
+                    // restart's reconciliation resuming from where we left off
+                    // instead of re-scanning from genesis.
                     let (recv_idx, change_idx) = wallet_guard.get_indices();
+                    let prior_birthday = db_guard
+                        .load_wallet_meta()
+                        .ok()
+                        .flatten()
+                        .map(|m| m.birthday)
+                        .unwrap_or(0);
+                    let prior_watermark = db_guard
+                        .get_last_synced_height()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    let watermark =
+                        wallet_guard.chain_height().max(prior_watermark);
                     let meta = crate::db::WalletMeta {
                         name: name.to_string(),
                         network: self.network,
                         address_type: wallet_guard.address_type(),
                         next_receive_index: recv_idx,
                         next_change_index: change_idx,
-                        birthday: 0,
+                        birthday: prior_birthday,
+                        last_synced_height: watermark,
                     };
                     let _ = db_guard.save_wallet_meta(&meta);
                 }
@@ -757,6 +783,142 @@ impl WalletManager {
             }
         }
         (credits, debits)
+    }
+
+    /// Recompute every loaded wallet's durable UTXO confirmations against
+    /// `tip_height` (best-effort; a poisoned lock for one wallet does not block
+    /// the others). Keeps the persisted `confirmations` column current with the
+    /// chain tip after a rescan / reconciliation.
+    pub fn recompute_all_confirmations(&self, tip_height: u32) {
+        for db in self.wallet_dbs.values() {
+            if let Ok(g) = db.lock() {
+                let _ = g.recompute_confirmations(tip_height);
+            }
+        }
+    }
+
+    /// Read a loaded wallet's persisted rescan watermark
+    /// (`last_synced_height`). `None` if the wallet (or its DB) is not loaded
+    /// or has never recorded one.
+    pub fn get_wallet_last_synced(&self, name: &str) -> Option<u32> {
+        let db = self.wallet_dbs.get(name)?;
+        let guard = db.lock().ok()?;
+        guard.get_last_synced_height().ok().flatten()
+    }
+
+    /// Persist a loaded wallet's rescan watermark (`last_synced_height`).
+    pub fn set_wallet_last_synced(&self, name: &str, height: u32) -> Result<(), WalletError> {
+        let db = self
+            .wallet_dbs
+            .get(name)
+            .ok_or_else(|| WalletError::InvalidPath(format!("wallet '{}' not loaded", name)))?;
+        let guard = db
+            .lock()
+            .map_err(|_| WalletError::InvalidPath(format!("wallet '{}' db lock poisoned", name)))?;
+        guard.set_last_synced_height(height)
+    }
+
+    /// Bring every loaded wallet current with the active chain (Core's
+    /// startup `CWallet::AttachChain` rescan).
+    ///
+    /// For each loaded wallet, walks the active chain from `watermark + 1` to
+    /// `tip_height` (where `watermark` is the wallet's persisted
+    /// `last_synced_height`, or its birthday if that is higher), feeding each
+    /// block through the SAME `scan_block_at` path that live block-connect and
+    /// `rescanblockchain` use. After scanning, the wallet's advanced watermark
+    /// is persisted so the next restart resumes from there, and the wallet's
+    /// durable UTXO confirmations are recomputed against the tip.
+    ///
+    /// `get_block` resolves a height to its `(block_hash, transactions,
+    /// block_time)` on the active chain; returning `Ok(None)` signals a gap
+    /// (pruned / missing) and stops that wallet's walk there. This is the
+    /// recovery path for the "wallet persisted but the chain advanced while the
+    /// node was down" defect: activity in `[watermark+1, tip]` is credited even
+    /// though it was applied via normal P2P sync with the wallet offline.
+    ///
+    /// Returns a per-wallet `(scanned_from, scanned_to, credits, debits)`
+    /// summary for logging.
+    pub fn reconcile_to_tip<F, E>(
+        &self,
+        tip_height: u32,
+        mut get_block: F,
+    ) -> Vec<(String, u32, u32, usize, usize)>
+    where
+        F: FnMut(
+            u32,
+        ) -> Result<
+            Option<(rustoshi_primitives::Hash256, Vec<rustoshi_primitives::Transaction>, u64)>,
+            E,
+        >,
+        E: std::fmt::Display,
+    {
+        let mut summary = Vec::new();
+
+        for (name, wallet) in self.wallets.iter() {
+            // Resolve the starting point: max(persisted watermark, birthday).
+            // A watermark of 0 ("never synced") starts the walk at height 1
+            // (genesis is height 0 and carries no spendable wallet activity in
+            // practice; scan_block_at still tolerates it if a caller starts
+            // from 0).
+            let watermark = self.get_wallet_last_synced(name).unwrap_or(0);
+            let birthday = self
+                .wallet_dbs
+                .get(name)
+                .and_then(|db| db.lock().ok())
+                .and_then(|g| g.load_wallet_meta().ok().flatten())
+                .map(|m| m.birthday)
+                .unwrap_or(0);
+            let start = watermark.max(birthday).saturating_add(1);
+
+            if start > tip_height {
+                // Already current — nothing to scan, but still recompute the
+                // durable confirmations against the (possibly grown) tip and
+                // make sure the in-memory chain height reflects the tip.
+                if let Ok(mut w) = wallet.lock() {
+                    if w.chain_height() < tip_height {
+                        w.set_chain_height(tip_height);
+                    }
+                }
+                if let Some(db) = self.wallet_dbs.get(name) {
+                    if let Ok(g) = db.lock() {
+                        let _ = g.recompute_confirmations(tip_height);
+                    }
+                }
+                summary.push((name.clone(), start, tip_height, 0, 0));
+                continue;
+            }
+
+            let mut credits_total = 0usize;
+            let mut debits_total = 0usize;
+            let mut last_scanned = watermark.max(birthday);
+
+            for h in start..=tip_height {
+                match get_block(h) {
+                    Ok(Some((hash, txs, block_time))) => {
+                        if let Ok(mut w) = wallet.lock() {
+                            let (c, d) = w.scan_block_at(&txs, h, hash, block_time);
+                            credits_total += c;
+                            debits_total += d;
+                        }
+                        last_scanned = h;
+                    }
+                    Ok(None) => break, // gap (pruned / missing) — stop here.
+                    Err(_e) => break,  // read error — stop; retry next restart.
+                }
+            }
+
+            // Persist the advanced watermark and refresh durable confirmations.
+            if let Some(db) = self.wallet_dbs.get(name) {
+                if let Ok(g) = db.lock() {
+                    let _ = g.set_last_synced_height(last_scanned);
+                    let _ = g.recompute_confirmations(tip_height);
+                }
+            }
+
+            summary.push((name.clone(), start, last_scanned, credits_total, debits_total));
+        }
+
+        summary
     }
 
     /// List wallet directories (both loaded and unloaded).
@@ -1917,5 +2079,195 @@ mod tests {
         manager.load_wallet("atomic").unwrap();
         let after = fs::read(&seed_path).unwrap();
         assert_eq!(after, original);
+    }
+
+    // ====================================================================
+    // Startup reconciliation (rescan watermark) — proven-teeth tests.
+    // ====================================================================
+
+    use rustoshi_crypto::address::Address;
+    use rustoshi_primitives::{Hash256, OutPoint as PoOutPoint, Transaction, TxIn, TxOut};
+
+    /// Build a 1-output transaction paying `value` to `script_pubkey`, with a
+    /// dummy (non-wallet) input so it is not treated as coinbase.
+    fn paying_tx(script_pubkey: Vec<u8>, value: u64, salt: u8) -> Transaction {
+        Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: PoOutPoint {
+                    txid: Hash256([salt; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value,
+                script_pubkey,
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// Resolve a freshly-created wallet's first receiving address into its
+    /// scriptPubKey, so a synthetic block can pay the wallet.
+    fn owned_spk(manager: &WalletManager, name: &str, net: Network) -> Vec<u8> {
+        let wallet = manager.get_wallet(name).unwrap();
+        let addr = {
+            let mut w = wallet.lock().unwrap();
+            w.get_new_address().unwrap()
+        };
+        Address::from_string(&addr, Some(net))
+            .unwrap()
+            .to_script_pubkey()
+    }
+
+    /// THE defect: a wallet that was offline while the chain advanced is brought
+    /// current on startup — the missed credit appears, the watermark advances,
+    /// and confirmations are computed against the tip (not stuck at 1).
+    #[test]
+    fn reconcile_brings_offline_wallet_current_to_tip() {
+        let net = Network::Regtest;
+        let temp_dir = tempdir().unwrap();
+        let mut manager = WalletManager::new(temp_dir.path(), net).unwrap();
+        manager
+            .create_wallet("w", CreateWalletOptions::default())
+            .unwrap();
+
+        let spk = owned_spk(&manager, "w", net);
+
+        // Simulate: the node synced to height 10 while the wallet was "down".
+        // Height 7 paid the wallet; heights 1..=10 are otherwise empty. The
+        // wallet's persisted watermark is still 0 (never scanned).
+        assert_eq!(manager.get_wallet_last_synced("w").unwrap_or(0), 0);
+
+        let tip = 10u32;
+        let pay_height = 7u32;
+        let value = 4_200_000u64;
+        let blocks: std::collections::HashMap<u32, Transaction> =
+            std::iter::once((pay_height, paying_tx(spk.clone(), value, 0x33))).collect();
+
+        let summary = manager.reconcile_to_tip::<_, std::io::Error>(tip, |h| {
+            let txs = blocks
+                .get(&h)
+                .cloned()
+                .map(|t| vec![t])
+                .unwrap_or_default();
+            Ok(Some((Hash256([h as u8; 32]), txs, 1_700_000_000 + h as u64)))
+        });
+
+        // One wallet, scanned [1, 10], exactly one credit, no debits.
+        assert_eq!(summary.len(), 1);
+        let (name, from, to, credits, debits) = &summary[0];
+        assert_eq!(name, "w");
+        assert_eq!(*from, 1);
+        assert_eq!(*to, 10);
+        assert_eq!(*credits, 1, "the missed height-7 credit must be applied");
+        assert_eq!(*debits, 0);
+
+        // Balance reflects the recovered funds.
+        let wallet = manager.get_wallet("w").unwrap();
+        let w = wallet.lock().unwrap();
+        assert_eq!(w.balance(), value);
+
+        // Confirmations are computed against the tip: a UTXO mined at height 7
+        // with tip 10 has 10 - 7 + 1 = 4 confirmations — NOT the bare "1" that
+        // scan_block_at credits at insert time.
+        let utxo = w.list_utxos().into_iter().next().unwrap();
+        assert_eq!(utxo.height, Some(pay_height));
+        assert_eq!(
+            utxo.confirmations, 4,
+            "confirmations must recompute against the tip"
+        );
+        assert_eq!(w.chain_height(), tip);
+        drop(w);
+
+        // The watermark advanced + persisted so a second reconcile is a no-op.
+        assert_eq!(manager.get_wallet_last_synced("w"), Some(tip));
+    }
+
+    /// A wallet already at the tip is a no-op scan, but its durable
+    /// confirmations are still refreshed if the tip grew.
+    #[test]
+    fn reconcile_is_idempotent_and_refreshes_confirmations() {
+        let net = Network::Regtest;
+        let temp_dir = tempdir().unwrap();
+        let mut manager = WalletManager::new(temp_dir.path(), net).unwrap();
+        manager
+            .create_wallet("w", CreateWalletOptions::default())
+            .unwrap();
+        let spk = owned_spk(&manager, "w", net);
+
+        let pay_height = 3u32;
+        let value = 1_000_000u64;
+        let blocks: std::collections::HashMap<u32, Transaction> =
+            std::iter::once((pay_height, paying_tx(spk.clone(), value, 0x44))).collect();
+        let make = |h: u32| -> Result<_, std::io::Error> {
+            let txs = blocks.get(&h).cloned().map(|t| vec![t]).unwrap_or_default();
+            Ok(Some((Hash256([h as u8; 32]), txs, 1_700_000_000 + h as u64)))
+        };
+
+        // First reconcile to height 5: credits the height-3 payment.
+        let s1 = manager.reconcile_to_tip(5, make);
+        assert_eq!(s1[0].3, 1);
+        assert_eq!(manager.get_wallet_last_synced("w"), Some(5));
+
+        // Re-run at the SAME tip: nothing rescanned, no double credit.
+        let s2 = manager.reconcile_to_tip(5, make);
+        assert_eq!(s2[0].3, 0, "no re-credit at the same tip");
+        let wallet = manager.get_wallet("w").unwrap();
+        assert_eq!(wallet.lock().unwrap().balance(), value);
+        assert_eq!(wallet.lock().unwrap().list_utxos()[0].confirmations, 3);
+
+        // Now the chain grew to 20 with no new wallet activity. Reconcile must
+        // be a no-op scan (start > old watermark range is empty of credits) yet
+        // bump confirmations to 20 - 3 + 1 = 18.
+        let empty = |h: u32| -> Result<_, std::io::Error> {
+            Ok(Some((Hash256([h as u8; 32]), Vec::new(), 1_700_000_000 + h as u64)))
+        };
+        let s3 = manager.reconcile_to_tip(20, empty);
+        assert_eq!(s3[0].3, 0);
+        assert_eq!(manager.get_wallet_last_synced("w"), Some(20));
+        assert_eq!(
+            wallet.lock().unwrap().list_utxos()[0].confirmations,
+            18,
+            "confirmations must track the grown tip"
+        );
+    }
+
+    /// The watermark survives an unload/reload round trip (persisted in
+    /// wallet_meta), so a restart resumes reconciliation instead of re-scanning
+    /// from genesis.
+    #[test]
+    fn watermark_persists_across_reload() {
+        let net = Network::Regtest;
+        let temp_dir = tempdir().unwrap();
+        let mut manager = WalletManager::new(temp_dir.path(), net).unwrap();
+        manager
+            .create_wallet("w", CreateWalletOptions::default())
+            .unwrap();
+
+        // Reconcile to height 12, advancing + persisting the watermark.
+        let empty = |h: u32| -> Result<_, std::io::Error> {
+            Ok(Some((Hash256([h as u8; 32]), Vec::new(), 1_700_000_000 + h as u64)))
+        };
+        manager.reconcile_to_tip(12, empty);
+        assert_eq!(manager.get_wallet_last_synced("w"), Some(12));
+
+        // Unload (persists meta) and reload from disk.
+        manager.unload_wallet("w", true).unwrap();
+        manager.load_wallet("w").unwrap();
+
+        // The watermark is restored from wallet_meta.
+        assert_eq!(
+            manager.get_wallet_last_synced("w"),
+            Some(12),
+            "watermark must survive a reload"
+        );
+        // And a fresh meta load sees it too.
+        let db = manager.get_wallet_db("w").unwrap();
+        let meta = db.lock().unwrap().load_wallet_meta().unwrap().unwrap();
+        assert_eq!(meta.last_synced_height, 12);
     }
 }
