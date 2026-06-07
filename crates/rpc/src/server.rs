@@ -1176,11 +1176,21 @@ pub trait RustoshiRpc {
     /// Recognized index names:
     ///   - "txindex" (when -txindex is enabled)
     ///   - "basic block filter index" (when -blockfilterindex is enabled)
+    ///
+    /// Returns `Box<RawValue>` so each per-index object's keys are emitted in
+    /// Bitcoin Core's exact `pushKV` order — `synced` BEFORE
+    /// `best_block_height` (rpc/node.cpp::SummaryToJSON). A `serde_json::Value`
+    /// return cannot preserve this: every `Value::Object` is backed by a
+    /// `BTreeMap` (serde_json's default — `preserve_order` is not enabled in
+    /// this workspace), which alphabetises the keys to
+    /// `{"best_block_height":..,"synced":..}`. Building the response as a
+    /// verbatim JSON string and returning it as a `RawValue` is the same
+    /// pattern `getblock` / `getrawmempool` already use here.
     #[method(name = "getindexinfo")]
     async fn get_index_info(
         &self,
         index_name: Option<String>,
-    ) -> RpcResult<serde_json::Value>;
+    ) -> RpcResult<Box<serde_json::value::RawValue>>;
 }
 
 // ============================================================
@@ -9938,11 +9948,45 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_index_info(
         &self,
         index_name: Option<String>,
-    ) -> RpcResult<serde_json::Value> {
+    ) -> RpcResult<Box<serde_json::value::RawValue>> {
+        // FIX (W121 G27 wire key-order): Bitcoin Core builds each per-index
+        // entry with UniValue `pushKV("synced", ...)` then
+        // `pushKV("best_block_height", ...)` (rpc/node.cpp::SummaryToJSON,
+        // lines 356-358), and UniValue is an ordered vector, so Core emits
+        // `{"synced":..,"best_block_height":..}`.
+        //
+        // The previous implementation built each entry with
+        // `serde_json::json!({...})` and returned a `serde_json::Value`. Every
+        // `serde_json::Value::Object` is backed by a `BTreeMap` (serde_json's
+        // default — `preserve_order` is NOT enabled in this workspace, and
+        // enabling it would silently reorder dozens of other Core-matching
+        // RPCs), so the keys were alphabetised on the wire to
+        // `{"best_block_height":..,"synced":..}` — wrong vs Core.
+        //
+        // A `#[derive(Serialize)]` struct alone does not help if it is routed
+        // through `serde_json::to_value`/`Value`: that rebuilds a BTreeMap and
+        // re-alphabetises. The fix mirrors the established `getblock` /
+        // `getrawmempool` pattern in this file: build the response as a
+        // verbatim JSON string (struct serialization emits fields in
+        // declaration order straight to the writer, never through a Map) and
+        // return it as a `RawValue`, which jsonrpsee writes byte-for-byte. The
+        // inner key order is thus `synced` then `best_block_height`, matching
+        // Core, while the outer object's index-name keys keep the prior
+        // (lexicographic) ordering this RPC already used.
+        #[derive(serde::Serialize)]
+        struct IndexSummary {
+            synced: bool,
+            best_block_height: u32,
+        }
+
         let state = self.state.read().await;
 
-        let mut out = serde_json::Map::new();
         let want = index_name.as_deref().unwrap_or("");
+
+        // Collect active entries in a deterministic (lexicographic by index
+        // name) order, matching the prior BTreeMap-backed behaviour. Only the
+        // INNER per-index object order is the consensus-parity concern here.
+        let mut entries: Vec<(&'static str, IndexSummary)> = Vec::new();
 
         // txindex active iff any row exists in CF_TX_INDEX.  Mirrors Core's
         // `g_txindex != nullptr` (the global is set iff -txindex was passed
@@ -9953,35 +9997,57 @@ impl RustoshiRpcServer for RpcServerImpl {
             let store = BlockStore::new(&state.db);
             store.has_any_tx_index().unwrap_or(false)
         };
-        if txindex_active && (want.is_empty() || want == "txindex") {
-            out.insert(
-                "txindex".to_string(),
-                serde_json::json!({
-                    "synced": true,
-                    "best_block_height": state.best_height,
-                }),
-            );
-        }
-
         // Basic block filter index.  Active if any filter row exists for
         // the current best block.
         let blockfilter_active = {
             let index = BlockFilterIndex::new(&state.db);
             index.has_filter(&state.best_hash).unwrap_or(false)
         };
+
+        // Push in lexicographic key order so the outer object matches the old
+        // BTreeMap iteration order: "basic block filter index" < "txindex".
         if blockfilter_active
             && (want.is_empty() || want == "basic block filter index")
         {
-            out.insert(
-                "basic block filter index".to_string(),
-                serde_json::json!({
-                    "synced": true,
-                    "best_block_height": state.best_height,
-                }),
-            );
+            entries.push((
+                "basic block filter index",
+                IndexSummary {
+                    synced: true,
+                    best_block_height: state.best_height,
+                },
+            ));
+        }
+        if txindex_active && (want.is_empty() || want == "txindex") {
+            entries.push((
+                "txindex",
+                IndexSummary {
+                    synced: true,
+                    best_block_height: state.best_height,
+                },
+            ));
         }
 
-        Ok(serde_json::Value::Object(out))
+        // Build the outer object as a verbatim JSON string. Each per-index
+        // value is serialized via the struct (declaration order preserved).
+        let mut json = String::from("{");
+        for (i, (name, summary)) in entries.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(
+                &serde_json::to_string(name)
+                    .expect("index name serializes as a JSON string"),
+            );
+            json.push(':');
+            json.push_str(
+                &serde_json::to_string(summary)
+                    .expect("IndexSummary serializes infallibly"),
+            );
+        }
+        json.push('}');
+
+        Ok(serde_json::value::RawValue::from_string(json)
+            .expect("manually-built getindexinfo object is valid JSON"))
     }
 }
 
@@ -16543,6 +16609,78 @@ mod tests {
         RpcServerImpl::new(state, peer_state)
     }
 
+    /// FIX (W121 G27 wire key-order): `getindexinfo` per-index objects must
+    /// serialize keys in Bitcoin Core's exact order — `synced` BEFORE
+    /// `best_block_height` (rpc/node.cpp::SummaryToJSON pushKV order). The bug
+    /// was that the entry was built with `serde_json::json!({...})` whose
+    /// default `BTreeMap` backing alphabetises the bytes to
+    /// `{"best_block_height":..,"synced":..}`. This test asserts the ACTUAL
+    /// serialized byte order (not an order-insensitive key lookup), so it would
+    /// fail against the pre-fix BTreeMap output.
+    #[tokio::test]
+    async fn getindexinfo_serialized_key_order_matches_core() {
+        use rustoshi_storage::block_store::{BlockStore, TxIndexEntry};
+
+        let server = setup_test_server();
+
+        // Activate the txindex by writing one CF_TX_INDEX row, and pin a known
+        // best_height so the emitted value is deterministic.
+        {
+            let mut state = server.state.write().await;
+            state.best_height = 1234;
+            let store = BlockStore::new(&state.db);
+            store
+                .put_tx_index(
+                    &Hash256::from_bytes([0xabu8; 32]),
+                    &TxIndexEntry {
+                        block_hash: Hash256::from_bytes([0xcdu8; 32]),
+                        tx_offset: 42,
+                        tx_length: 100,
+                    },
+                )
+                .expect("write tx_index row");
+        }
+
+        // The handler returns a `Box<RawValue>` whose `.get()` is the EXACT
+        // wire bytes jsonrpsee will emit — this is what we must assert on, not
+        // a re-parsed Value (which would round-trip through serde_json's
+        // order-discarding BTreeMap and hide the regression).
+        let raw = server
+            .get_index_info(None)
+            .await
+            .expect("getindexinfo must succeed");
+        let wire = raw.get().to_string();
+
+        // Sanity: data correctness (parse a copy; independent of key order).
+        let parsed: serde_json::Value =
+            serde_json::from_str(&wire).expect("getindexinfo emits valid JSON");
+        let txindex = parsed
+            .get("txindex")
+            .expect("txindex must be active after writing a CF_TX_INDEX row");
+        assert_eq!(txindex.get("synced").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            txindex.get("best_block_height").and_then(|v| v.as_u64()),
+            Some(1234)
+        );
+
+        // The load-bearing assertion: the actual emitted bytes must place
+        // "synced" before "best_block_height", matching Core's UniValue pushKV
+        // order. We inspect the raw wire string directly — an order-insensitive
+        // `.get()` would not catch the BTreeMap regression.
+        let synced_pos = wire
+            .find("\"synced\"")
+            .expect("wire bytes must contain \"synced\" key");
+        let best_pos = wire
+            .find("\"best_block_height\"")
+            .expect("wire bytes must contain \"best_block_height\" key");
+        assert!(
+            synced_pos < best_pos,
+            "getindexinfo per-index object must emit \"synced\" before \
+             \"best_block_height\" to match Bitcoin Core's pushKV order; \
+             got wire bytes: {wire}"
+        );
+    }
+
     fn decode_psbt_first_input_sequence(psbt_b64: &str) -> u32 {
         let psbt = rustoshi_wallet::psbt::Psbt::from_base64(psbt_b64)
             .expect("createpsbt must return valid base64 PSBT");
@@ -16964,9 +17102,11 @@ mod tests {
         use rustoshi_consensus::ChainParams;
         let params = ChainParams::regtest();
         let (_db, _state, server) = make_test_server(params);
-        let result = RustoshiRpcServer::get_index_info(&server, None)
+        let raw = RustoshiRpcServer::get_index_info(&server, None)
             .await
             .expect("getindexinfo must succeed");
+        let result: serde_json::Value =
+            serde_json::from_str(raw.get()).expect("getindexinfo emits valid JSON");
         // No indexes wired in make_test_server → object should be empty.
         assert!(result.is_object(), "result must be a JSON object");
         assert!(
@@ -16998,9 +17138,11 @@ mod tests {
         );
         BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
 
-        let result = RustoshiRpcServer::get_index_info(&server, None)
+        let raw = RustoshiRpcServer::get_index_info(&server, None)
             .await
             .expect("getindexinfo must succeed");
+        let result: serde_json::Value =
+            serde_json::from_str(raw.get()).expect("getindexinfo emits valid JSON");
         let obj = result.as_object().expect("object");
         let bfi = obj
             .get("basic block filter index")
@@ -17038,23 +17180,27 @@ mod tests {
         );
         BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
 
-        let only_txindex = RustoshiRpcServer::get_index_info(
+        let only_txindex_raw = RustoshiRpcServer::get_index_info(
             &server,
             Some("txindex".to_string()),
         )
         .await
         .expect("getindexinfo must succeed");
+        let only_txindex: serde_json::Value = serde_json::from_str(only_txindex_raw.get())
+            .expect("getindexinfo emits valid JSON");
         assert!(
             only_txindex.as_object().unwrap().is_empty(),
             "asking for txindex on a filters-only node must return empty"
         );
 
-        let only_filters = RustoshiRpcServer::get_index_info(
+        let only_filters_raw = RustoshiRpcServer::get_index_info(
             &server,
             Some("basic block filter index".to_string()),
         )
         .await
         .expect("getindexinfo must succeed");
+        let only_filters: serde_json::Value = serde_json::from_str(only_filters_raw.get())
+            .expect("getindexinfo emits valid JSON");
         assert_eq!(
             only_filters.as_object().unwrap().len(),
             1,
