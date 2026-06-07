@@ -2645,246 +2645,6 @@ async fn core_fallback_block_info(block_hash_hex: &str) -> Option<(u32, String)>
     None
 }
 
-/// Call Bitcoin Core's `gettxoutproof [txids] <blockhash>` and return the
-/// hex string of the `result` field, or `None` on any error.
-///
-/// Used as the primary path in `get_tx_out_proof` because rustoshi's
-/// CF_BLOCKS is empty post-assumeUTXO snapshot load — the native partial
-/// merkle tree builder has no block data to work with.  The result is a
-/// plain hex string (not a JSON number), so byte-identity is trivially
-/// preserved: we just strip the surrounding JSON double-quotes.
-///
-/// Tries the mainnet Bitcoin Core cookie first, then testnet4.
-async fn core_fallback_gettxoutproof(
-    txids: &[String],
-    blockhash: Option<&str>,
-) -> Option<String> {
-    struct Endpoint {
-        host: &'static str,
-        port: u16,
-        cookie_path: &'static str,
-    }
-    let endpoints = [
-        Endpoint {
-            host: "127.0.0.1",
-            port: 8332,
-            cookie_path: "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
-        },
-        Endpoint {
-            host: "127.0.0.1",
-            port: 48343,
-            cookie_path: "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie",
-        },
-    ];
-
-    // Build params array: [["txid1","txid2",...]] or [["txid1","txid2",...],"blockhash"]
-    let txids_json: String = {
-        let quoted: Vec<String> = txids.iter().map(|t| format!("{:?}", t)).collect();
-        format!("[{}]", quoted.join(","))
-    };
-    let params_json = match blockhash {
-        Some(bh) => format!("[{},{:?}]", txids_json, bh),
-        None => format!("[{}]", txids_json),
-    };
-
-    for ep in &endpoints {
-        let cookie = match std::fs::read_to_string(ep.cookie_path) {
-            Ok(c) => c.trim().to_string(),
-            Err(_) => continue,
-        };
-        let parts: Vec<&str> = cookie.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let credentials = format!("{}:{}", parts[0], parts[1]);
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &credentials);
-
-        let json_body = format!(
-            r#"{{"jsonrpc":"1.0","method":"gettxoutproof","params":{},"id":1}}"#,
-            params_json
-        );
-
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
-
-        let addr = format!("{}:{}", ep.host, ep.port);
-        let mut stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => continue,
-        };
-
-        let request = format!(
-            "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAuthorization: Basic {b64}\r\nConnection: close\r\n\r\n{body}",
-            host = ep.host,
-            port = ep.port,
-            len = json_body.len(),
-            b64 = b64,
-            body = json_body,
-        );
-
-        if stream.write_all(request.as_bytes()).await.is_err() {
-            continue;
-        }
-
-        let mut response = Vec::new();
-        if tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            stream.read_to_end(&mut response),
-        )
-        .await
-        .is_err()
-        {
-            continue;
-        }
-
-        // Find the JSON body after the HTTP headers (\r\n\r\n separator).
-        let body_start = match response.windows(4).position(|w| w == b"\r\n\r\n") {
-            Some(pos) => pos + 4,
-            None => continue,
-        };
-        let body_bytes = &response[body_start..];
-
-        // The result is a quoted hex string — parse as RawValue and strip quotes.
-        #[derive(serde::Deserialize)]
-        struct CoreResp<'a> {
-            #[serde(borrow)]
-            result: Option<&'a serde_json::value::RawValue>,
-            error: Option<serde_json::Value>,
-        }
-
-        if let Ok(resp) = serde_json::from_slice::<CoreResp<'_>>(body_bytes) {
-            if resp.error.is_none() {
-                if let Some(raw_result) = resp.result {
-                    let s = raw_result.get();
-                    // Result is a JSON string like `"aabbcc..."` — strip quotes.
-                    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-                        return Some(s[1..s.len() - 1].to_owned());
-                    }
-                    // Unexpected shape — return as-is.
-                    return Some(s.to_owned());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Call Bitcoin Core's `verifytxoutproof <proof_hex>` and return the
-/// parsed array of txids, or `None` on any error.
-///
-/// Used as the primary path in `verify_tx_out_proof` because rustoshi's
-/// CF_BLOCKS is empty post-assumeUTXO snapshot load — the native partial
-/// merkle tree verifier cannot confirm that the block is in our chain.
-/// The result is a JSON array of txid strings; we parse it as Vec<String>
-/// so that the caller can return it directly via the trait's RpcResult<Vec<String>>.
-///
-/// Tries the mainnet Bitcoin Core cookie first, then testnet4.
-async fn core_fallback_verifytxoutproof(proof_hex: &str) -> Option<Vec<String>> {
-    struct Endpoint {
-        host: &'static str,
-        port: u16,
-        cookie_path: &'static str,
-    }
-    let endpoints = [
-        Endpoint {
-            host: "127.0.0.1",
-            port: 8332,
-            cookie_path: "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
-        },
-        Endpoint {
-            host: "127.0.0.1",
-            port: 48343,
-            cookie_path: "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie",
-        },
-    ];
-
-    for ep in &endpoints {
-        let cookie = match std::fs::read_to_string(ep.cookie_path) {
-            Ok(c) => c.trim().to_string(),
-            Err(_) => continue,
-        };
-        let parts: Vec<&str> = cookie.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let credentials = format!("{}:{}", parts[0], parts[1]);
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &credentials);
-
-        let json_body = format!(
-            r#"{{"jsonrpc":"1.0","method":"verifytxoutproof","params":[{:?}],"id":1}}"#,
-            proof_hex
-        );
-
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
-
-        let addr = format!("{}:{}", ep.host, ep.port);
-        let mut stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => continue,
-        };
-
-        let request = format!(
-            "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAuthorization: Basic {b64}\r\nConnection: close\r\n\r\n{body}",
-            host = ep.host,
-            port = ep.port,
-            len = json_body.len(),
-            b64 = b64,
-            body = json_body,
-        );
-
-        if stream.write_all(request.as_bytes()).await.is_err() {
-            continue;
-        }
-
-        let mut response = Vec::new();
-        if tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            stream.read_to_end(&mut response),
-        )
-        .await
-        .is_err()
-        {
-            continue;
-        }
-
-        // Find the JSON body after the HTTP headers (\r\n\r\n separator).
-        let body_start = match response.windows(4).position(|w| w == b"\r\n\r\n") {
-            Some(pos) => pos + 4,
-            None => continue,
-        };
-        let body_bytes = &response[body_start..];
-
-        // The result is a JSON array of txid strings.
-        #[derive(serde::Deserialize)]
-        struct CoreResp {
-            result: Option<Vec<String>>,
-            error: Option<serde_json::Value>,
-        }
-
-        if let Ok(resp) = serde_json::from_slice::<CoreResp>(body_bytes) {
-            if resp.error.is_none() {
-                if let Some(txids) = resp.result {
-                    return Some(txids);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Call Bitcoin Core's `getblock <hash> <verbosity>` and return the raw
 /// JSON string of the `result` field, or `None` on any error.
 ///
@@ -9804,17 +9564,10 @@ impl RustoshiRpcServer for RpcServerImpl {
             return Err(Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "txids must not be empty"));
         }
 
-        // rustoshi's CF_BLOCKS is empty post-assumeUTXO snapshot load — the
-        // native partial merkle tree builder has no block data to work with.
-        // Proxy to Bitcoin Core (same pattern as W59 getblock / W61 gettxout)
-        // to achieve byte-identity with Core 31.99.
-        if let Some(hex_proof) = core_fallback_gettxoutproof(
-            &txids,
-            blockhash.as_deref(),
-        ).await {
-            return Ok(hex_proof);
-        }
-
+        // Native-only: build the partial merkle tree from rustoshi's own block
+        // store. No Bitcoin Core proxy — an independent node must not depend on
+        // (or leak credentials to) an external Core instance for a consensus
+        // proof. The native partial-merkle-tree builder below is authoritative.
         let state = self.state.read().await;
         let store = BlockStore::new(&state.db);
 
@@ -9890,14 +9643,10 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn verify_tx_out_proof(&self, proof: String) -> RpcResult<Vec<String>> {
-        // rustoshi's CF_BLOCKS is empty post-assumeUTXO snapshot load — the
-        // native partial merkle tree verifier cannot confirm the block is in
-        // our chain.  Proxy to Bitcoin Core (same pattern as W67 gettxoutproof)
-        // to achieve byte-identity with Core 31.99.
-        if let Some(txids) = core_fallback_verifytxoutproof(&proof).await {
-            return Ok(txids);
-        }
-
+        // Native-only: verify the partial merkle tree against rustoshi's own
+        // block store. No Bitcoin Core proxy — an independent node must not
+        // delegate proof verification to (or leak credentials to) an external
+        // Core instance. The native verifier below is authoritative.
         use sha2::Digest;
         let proof_bytes = hex::decode(&proof).map_err(|_| {
             Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Invalid hex")
