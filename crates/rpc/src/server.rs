@@ -1081,6 +1081,50 @@ pub trait RustoshiRpc {
         scanobjects: Option<Vec<String>>,
     ) -> RpcResult<serde_json::Value>;
 
+    /// Scan the BIP-157 basic block filter index for blocks whose filter
+    /// matches any of the given scan objects. Mirrors Bitcoin Core
+    /// `rpc/blockchain.cpp::scanblocks`:
+    ///   `scanblocks "action" ( [scanobjects] start_height stop_height "filtertype" options )`
+    ///
+    /// `action` is one of "start" / "abort" / "status". rustoshi runs the
+    /// scan synchronously within this RPC call, so there is never a background
+    /// scan: "status" returns null (Core: "no scan in progress") and "abort"
+    /// returns false (Core: "reserve was possible → nothing running"). Only
+    /// "start" does real work.
+    ///
+    /// `scanobjects` (required for "start") is an array of descriptor strings;
+    /// the same minimal subset `scantxoutset` accepts — `addr(<address>)`,
+    /// `raw(<scriptPubKey-hex>)`, `pkh()/wpkh()/tr()`.
+    ///
+    /// `start_height` / `stop_height` default to the genesis (0) and the chain
+    /// tip respectively. They are `i64` so out-of-range / negative inputs are
+    /// detectable in the body and mapped to `RPC_MISC_ERROR`
+    /// "Invalid start_height" / "Invalid stop_height" exactly like Core
+    /// (`rpc/blockchain.cpp:2630,2636`) rather than failing deserialization.
+    ///
+    /// `filtertype` defaults to "basic". `options` may carry
+    /// `{"filter_false_positives": bool}`; when true, every candidate block is
+    /// re-scanned against the raw block body to drop GCS false positives
+    /// (Core's `CheckBlockFilterMatches`).
+    ///
+    /// IMPORTANT: block filters have inherent false positives (rate ~1/M),
+    /// so `relevant_blocks` is a SUPERSET — the contract is that a block
+    /// actually containing a matched script MUST appear, never that the list
+    /// is exact.
+    ///
+    /// Returns `{from_height, to_height, relevant_blocks: [blockhash...],
+    /// completed: bool}` (Core shape).
+    #[method(name = "scanblocks")]
+    async fn scan_blocks(
+        &self,
+        action: String,
+        scanobjects: Option<Vec<String>>,
+        start_height: Option<i64>,
+        stop_height: Option<i64>,
+        filtertype: Option<String>,
+        options: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value>;
+
     /// Rescan the local block chain for transactions relevant to the loaded
     /// wallet(s). Mirrors Bitcoin Core's `rescanblockchain`
     /// (`wallet/rpc/transactions.cpp`): walk the active chain over
@@ -1329,6 +1373,66 @@ impl RpcServerImpl {
                 obj
             )))
         }
+    }
+
+    /// Re-scan a block body to confirm at least one of its filter elements
+    /// byte-equals a needle. Mirrors Bitcoin Core
+    /// `rpc/blockchain.cpp::CheckBlockFilterMatches`: the candidate element set
+    /// is every non-empty, non-OP_RETURN output scriptPubKey PLUS every spent
+    /// prevout scriptPubKey (from the undo data) — the exact element set
+    /// `BlockFilter::build_basic` feeds into the GCS filter. Used by
+    /// `scanblocks` when `options.filter_false_positives` is set, to drop GCS
+    /// false positives. Returns `true` if any element matches a needle.
+    ///
+    /// A missing block/undo body is treated as "no match" (the candidate is
+    /// dropped) rather than an error — mirroring the conservative subset
+    /// semantics: the re-scan can only REMOVE false positives, never a genuine
+    /// match that the index already vouched for.
+    fn block_filter_matches(
+        store: &BlockStore,
+        block_hash: &Hash256,
+        needles: &[Vec<u8>],
+    ) -> Result<bool, ErrorObjectOwned> {
+        let block = match store.get_block(block_hash).map_err(|e| {
+            Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, format!("db error: {}", e))
+        })? {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+
+        let is_needle = |spk: &[u8]| needles.iter().any(|n| n.as_slice() == spk);
+
+        // Output scriptPubKeys (skip empty + OP_RETURN, matching build_basic).
+        for tx in &block.transactions {
+            for out in &tx.outputs {
+                let spk = &out.script_pubkey;
+                if spk.is_empty() || spk[0] == 0x6a {
+                    continue;
+                }
+                if is_needle(spk) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Spent prevout scriptPubKeys (from undo; skip empty, matching
+        // build_basic). Undo may be absent for very old pruned blocks; treat
+        // as no spent-script match.
+        if let Some(undo) = store.get_undo(block_hash).map_err(|e| {
+            Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, format!("undo db error: {}", e))
+        })? {
+            for coin in &undo.spent_coins {
+                let spk = &coin.script_pubkey;
+                if spk.is_empty() {
+                    continue;
+                }
+                if is_needle(spk) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     /// Calculate difficulty from compact target (bits).
@@ -8203,6 +8307,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "gettxout" => "gettxout \"txid\" n ( include_mempool )\nReturns details about an unspent transaction output.",
                 "getrawtransaction" => "getrawtransaction \"txid\" ( verbose \"blockhash\" )\nReturn the raw transaction data.",
                 "getblockfilter" => "getblockfilter \"blockhash\" ( \"filtertype\" )\nRetrieve a BIP-157 content filter for a particular block.",
+                "scanblocks" => "scanblocks \"action\" ( [scanobjects] start_height stop_height \"filtertype\" options )\nReturn relevant blockhashes for given scanobjects, using the BIP-157 block filter index.",
                 "getindexinfo" => "getindexinfo ( \"index_name\" )\nReturns the status of one or all available indices.",
                 "sendrawtransaction" => "sendrawtransaction \"hexstring\" ( maxfeerate )\nSubmit a raw transaction to the network.",
                 "decoderawtransaction" => "decoderawtransaction \"hexstring\" ( iswitness )\nDecode a raw transaction.",
@@ -9952,6 +10057,197 @@ impl RustoshiRpcServer for RpcServerImpl {
                 }
             }
         }
+    }
+
+    /// `scanblocks` — mirrors Bitcoin Core `rpc/blockchain.cpp::scanblocks`
+    /// (lines 2531-2716). Read-only over the existing basic block filter
+    /// index; no consensus surface.
+    async fn scan_blocks(
+        &self,
+        action: String,
+        scanobjects: Option<Vec<String>>,
+        start_height: Option<i64>,
+        stop_height: Option<i64>,
+        filtertype: Option<String>,
+        options: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value> {
+        use rustoshi_storage::indexes::blockfilterindex::BlockFilterType;
+
+        // (1) Action dispatch (Core 2578-2596). rustoshi scans synchronously,
+        // so there is never an in-progress scan: "status" -> null (Core's
+        // reserver-not-held branch returns NullUniValue), "abort" -> false
+        // (reserve was possible -> nothing running). Matches scan_tx_out_set.
+        match action.as_str() {
+            "status" => return Ok(serde_json::Value::Null),
+            "abort" => return Ok(serde_json::Value::Bool(false)),
+            "start" => {}
+            other => {
+                // Core throws RPC_INVALID_PARAMETER (-8) here; rustoshi uses
+                // RPC_INVALID_PARAMS (-32602) for the unknown top-level action,
+                // consistent with scan_tx_out_set. (Differential gates on
+                // "is an error", not the exact code, for the action case.)
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    format!("Invalid action '{}'", other),
+                ));
+            }
+        }
+
+        // (2) filtertype validation (Core 2603-2606). Default "basic".
+        let ftype_name = filtertype.unwrap_or_else(|| "basic".to_string());
+        let _ftype = BlockFilterType::from_name(&ftype_name).ok_or_else(|| {
+            Self::rpc_error(
+                rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                "Unknown filtertype",
+            )
+        })?;
+
+        // (3) options.filter_false_positives (Core 2608-2609). Default false.
+        // Reading it must never error when absent / null / non-object.
+        let filter_false_positives = options
+            .as_ref()
+            .and_then(|o| o.get("filter_false_positives"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // (4) scanobjects required for "start" (Core get_array on params[1]).
+        let scanobjects = scanobjects.ok_or_else(|| {
+            Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "scanobjects argument is required for the start action".to_string(),
+            )
+        })?;
+
+        // (5) Acquire shared state + index/store handles.
+        let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+        let index = BlockFilterIndex::new(&state.db);
+
+        // (6) Index-enabled gate (Core 2611-2614: GetBlockFilterIndex==null ->
+        // RPC_MISC_ERROR "Index is not enabled for filtertype <name>"). Reuse
+        // the same probe getindexinfo uses: a filter row for the best block.
+        // (At genesis-only chains best_height==0; the genesis filter is still
+        // written when -blockfilterindex is on, so the probe holds.)
+        let index_enabled = index.has_filter(&state.best_hash).unwrap_or(false);
+        if !index_enabled {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                format!("Index is not enabled for filtertype {}", ftype_name),
+            ));
+        }
+
+        // (7) Height range (Core 2620-2641). NOTE Core uses RPC_MISC_ERROR (-1)
+        // for bad heights here, NOT -8/-32602 like scantxoutset. Default
+        // start=genesis(0), default stop=tip.
+        let tip = state.best_height as i64;
+        let start = start_height.unwrap_or(0);
+        if start < 0 || start > tip {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "Invalid start_height",
+            ));
+        }
+        let stop = stop_height.unwrap_or(tip);
+        if stop < start || stop > tip {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "Invalid stop_height",
+            ));
+        }
+        let start_u = start as u32;
+        let stop_u = stop as u32;
+
+        // (8) Build the needle set (Core 2643-2651). Reuse the same descriptor
+        // helper scantxoutset uses; addr() parity is already proven by the
+        // scantxoutset differential.
+        let mut needles: Vec<Vec<u8>> = Vec::with_capacity(scanobjects.len());
+        for obj in &scanobjects {
+            needles.push(Self::scanobject_to_script(obj, &state.params)?);
+        }
+
+        // (9) Scan loop (Core 2664-2706). Chunk in 10000-block windows
+        // (Core amount_per_chunk=10000) for memory parity, using the existing
+        // LookupFilterRange primitive. Active-chain height->hash via the same
+        // callback the P2P cfilter handlers pass.
+        const AMOUNT_PER_CHUNK: u32 = 10000;
+        let mut relevant: Vec<String> = Vec::new();
+        let mut chunk_start = start_u;
+        loop {
+            let chunk_stop = if chunk_start.saturating_add(AMOUNT_PER_CHUNK) < stop_u {
+                chunk_start + AMOUNT_PER_CHUNK
+            } else {
+                stop_u
+            };
+
+            let filters = index
+                .lookup_filter_range(chunk_start, chunk_stop, |h| {
+                    store.get_hash_by_height(h).ok().flatten()
+                })
+                .map_err(|e| {
+                    Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("filter range lookup failed: {}", e),
+                    )
+                })?;
+
+            match filters {
+                Some(filters) => {
+                    for filter in &filters {
+                        let matched = filter.match_any_scripts(&needles).map_err(|e| {
+                            Self::rpc_error(
+                                rpc_error::RPC_DATABASE_ERROR,
+                                format!("filter match failed: {}", e),
+                            )
+                        })?;
+                        if !matched {
+                            continue;
+                        }
+                        // (Core 2681-2688 CheckBlockFilterMatches.) Optional
+                        // re-scan to drop GCS false positives. This is a strict
+                        // subset: it can only REMOVE false positives, never a
+                        // genuine match, so the funded-block contract holds with
+                        // or without it.
+                        if filter_false_positives
+                            && !Self::block_filter_matches(&store, &filter.block_hash, &needles)?
+                        {
+                            continue;
+                        }
+                        // Display-order block hash, matching Core's GetHex().
+                        relevant.push(filter.block_hash.to_hex());
+                    }
+                }
+                None => {
+                    // A height in [chunk_start, chunk_stop] lacks a filter:
+                    // the index is lagging the chain. Core's LookupFilterRange
+                    // returning false silently skips, but rustoshi raises a
+                    // clear error (consistent with getblockfilter's tri-state),
+                    // so a partial/lagging index never returns a misleadingly
+                    // incomplete relevant_blocks list.
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_MISC_ERROR,
+                        "Filter not found. Block filters are still in the process of being indexed.",
+                    ));
+                }
+            }
+
+            if chunk_stop >= stop_u {
+                break;
+            }
+            // Do not re-include the previous round's end block (Core 2672).
+            chunk_start = chunk_stop + 1;
+        }
+
+        // (10) Return (Core 2708-2711). The synchronous scan is never aborted,
+        // so `completed` is always true. Key order here is alphabetised by
+        // serde_json's default BTreeMap-backed Value::Object, which is fine:
+        // the scanblocks differential parses JSON, it does not assert raw wire
+        // key order (unlike getindexinfo).
+        Ok(serde_json::json!({
+            "from_height": start,
+            "to_height": stop,
+            "relevant_blocks": relevant,
+            "completed": true,
+        }))
     }
 
     /// G27 — `getindexinfo`.  Mirrors Core `rpc/node.cpp::getindexinfo`
@@ -17118,6 +17414,232 @@ mod tests {
         assert!(
             err.message().contains("Unknown filtertype"),
             "expected 'Unknown filtertype' message"
+        );
+    }
+
+    // ============================================================
+    // scanblocks — mirrors Core rpc/blockchain.cpp::scanblocks
+    // ============================================================
+
+    /// `scanblocks status` returns JSON null (rustoshi scans synchronously, so
+    /// there is never an in-progress scan to report). Mirrors Core's
+    /// reserver-not-held branch returning NullUniValue (blockchain.cpp:2582).
+    #[tokio::test]
+    async fn scanblocks_status_returns_null() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, _state, server) = make_test_server(params);
+        let result = RustoshiRpcServer::scan_blocks(
+            &server,
+            "status".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("status must succeed");
+        assert!(result.is_null(), "status must return JSON null, got {:?}", result);
+    }
+
+    /// `scanblocks abort` returns false (no scan running to abort). Mirrors
+    /// Core blockchain.cpp:2591.
+    #[tokio::test]
+    async fn scanblocks_abort_returns_false() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, _state, server) = make_test_server(params);
+        let result = RustoshiRpcServer::scan_blocks(
+            &server,
+            "abort".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("abort must succeed");
+        assert_eq!(result, serde_json::Value::Bool(false));
+    }
+
+    /// `scanblocks <bogus-action>` returns an invalid-params error.
+    #[tokio::test]
+    async fn scanblocks_bad_action_errors() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, _state, server) = make_test_server(params);
+        let err = RustoshiRpcServer::scan_blocks(
+            &server,
+            "bogus".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("bogus action must error");
+        assert_eq!(err.code(), rpc_error::RPC_INVALID_PARAMS);
+    }
+
+    /// `scanblocks start ... bogustype` returns RPC_INVALID_ADDRESS_OR_KEY (-5)
+    /// "Unknown filtertype" (Core blockchain.cpp:2605). The filtertype check
+    /// fires BEFORE the index-enabled gate, so this holds even with no index.
+    #[tokio::test]
+    async fn scanblocks_unknown_filtertype_errors() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, _state, server) = make_test_server(params);
+        let err = RustoshiRpcServer::scan_blocks(
+            &server,
+            "start".to_string(),
+            Some(vec!["raw(0014000000000000000000000000000000000000dead)".to_string()]),
+            Some(0),
+            None,
+            Some("bogustype".to_string()),
+            None,
+        )
+        .await
+        .expect_err("unknown filtertype must error");
+        assert_eq!(err.code(), rpc_error::RPC_INVALID_ADDRESS_OR_KEY);
+        assert!(
+            err.message().contains("Unknown filtertype"),
+            "expected 'Unknown filtertype', got: {}",
+            err.message()
+        );
+    }
+
+    /// `scanblocks start` on a node with NO filter index returns
+    /// RPC_MISC_ERROR (-1) "Index is not enabled ..." (Core blockchain.cpp:2613).
+    /// make_test_server wires no index, so the gate fires.
+    #[tokio::test]
+    async fn scanblocks_index_disabled_errors() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, _state, server) = make_test_server(params);
+        let err = RustoshiRpcServer::scan_blocks(
+            &server,
+            "start".to_string(),
+            Some(vec!["raw(0014000000000000000000000000000000000000dead)".to_string()]),
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("disabled index must error");
+        assert_eq!(err.code(), rpc_error::RPC_MISC_ERROR);
+        assert!(
+            err.message().contains("not enabled"),
+            "expected 'Index is not enabled', got: {}",
+            err.message()
+        );
+    }
+
+    /// `scanblocks start` with start_height > tip returns RPC_MISC_ERROR (-1)
+    /// "Invalid start_height" (Core blockchain.cpp:2630). Core checks the
+    /// filtertype and index BEFORE heights, so we enable the index first.
+    #[tokio::test]
+    async fn scanblocks_bad_heights_error() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::{BlockFilter, BlockFilterIndex};
+
+        let params = ChainParams::regtest();
+        let (db, state, server) = make_test_server(params);
+        // Enable the index by writing a filter row for the best block.
+        let st = state.read().await;
+        let best = st.best_hash;
+        drop(st);
+        let filter = BlockFilter::build_basic(best, std::iter::empty(), std::iter::empty());
+        BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
+
+        let needle = vec!["raw(0014000000000000000000000000000000000000dead)".to_string()];
+
+        // start_height past the tip -> Invalid start_height.
+        let err = RustoshiRpcServer::scan_blocks(
+            &server,
+            "start".to_string(),
+            Some(needle.clone()),
+            Some(999),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("start_height past tip must error");
+        assert_eq!(err.code(), rpc_error::RPC_MISC_ERROR);
+        assert!(
+            err.message().contains("Invalid start_height"),
+            "expected 'Invalid start_height', got: {}",
+            err.message()
+        );
+
+        // stop_height < start_height -> Invalid stop_height.
+        let err2 = RustoshiRpcServer::scan_blocks(
+            &server,
+            "start".to_string(),
+            Some(needle),
+            Some(0),
+            Some(-1),
+            None,
+            None,
+        )
+        .await
+        .expect_err("stop_height < start must error");
+        assert_eq!(err2.code(), rpc_error::RPC_MISC_ERROR);
+        assert!(
+            err2.message().contains("Invalid stop_height"),
+            "expected 'Invalid stop_height', got: {}",
+            err2.message()
+        );
+    }
+
+    /// `scanblocks start` over a genesis-only chain returns the Core shape
+    /// `{from_height, to_height, relevant_blocks, completed}` with from/to ==
+    /// requested range and completed == true.
+    #[tokio::test]
+    async fn scanblocks_start_returns_core_shape() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::{BlockFilter, BlockFilterIndex};
+
+        let params = ChainParams::regtest();
+        let (db, state, server) = make_test_server(params);
+        // Enable the index by writing a filter row for the genesis/best block.
+        let st = state.read().await;
+        let best = st.best_hash;
+        let tip = st.best_height as i64;
+        drop(st);
+        let filter = BlockFilter::build_basic(best, std::iter::empty(), std::iter::empty());
+        BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
+
+        let result = RustoshiRpcServer::scan_blocks(
+            &server,
+            "start".to_string(),
+            Some(vec!["raw(0014000000000000000000000000000000000000dead)".to_string()]),
+            Some(0),
+            Some(tip),
+            Some("basic".to_string()),
+            None,
+        )
+        .await
+        .expect("start must succeed");
+
+        let obj = result.as_object().expect("result must be an object");
+        assert_eq!(obj.get("from_height").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(obj.get("to_height").and_then(|v| v.as_i64()), Some(tip));
+        assert_eq!(obj.get("completed").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            obj.get("relevant_blocks").map(|v| v.is_array()).unwrap_or(false),
+            "relevant_blocks must be an array"
+        );
+        // An all-zero p2wpkh script is not in the genesis filter, so the
+        // genesis block must NOT appear (negative-needle sanity).
+        let rb = obj.get("relevant_blocks").unwrap().as_array().unwrap();
+        assert!(
+            !rb.iter().any(|h| h.as_str() == Some(best.to_hex().as_str())),
+            "unfunded needle must not match genesis block"
         );
     }
 
