@@ -9377,6 +9377,12 @@ impl RustoshiRpcServer for RpcServerImpl {
         let height = state.best_height;
         let best_hash = state.best_hash;
 
+        // Block-hash-by-height lookup, exactly as the getblockhash RPC does
+        // (CF_HEIGHT_INDEX keyed by height.to_be_bytes()). Used to emit
+        // `blockhash` per unspent, mirroring Core's
+        // coinb_block.GetBlockHash().GetHex().
+        let store = BlockStore::new(&state.db);
+
         // Walk the current UTXO set, exactly as gettxoutsetinfo /
         // dumptxoutset do (CF_UTXO key = txid(32 internal) || vout(4 BE),
         // value decoded via decode_utxo_value).
@@ -9422,6 +9428,25 @@ impl RustoshiRpcServer for RpcServerImpl {
                 0
             };
 
+            // blockhash = hash of the block at the coin's height, big-endian
+            // DISPLAY hex, mirroring Core's coinb_block.GetBlockHash().GetHex()
+            // (blockchain.cpp:2451,2463).
+            let blockhash = match store.get_hash_by_height(coin.height) {
+                Ok(Some(hash)) => hash.to_hex(),
+                Ok(None) => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("Block hash not found for height {}", coin.height),
+                    ))
+                }
+                Err(e) => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("Database error: {}", e),
+                    ))
+                }
+            };
+
             unspents.push(serde_json::json!({
                 "txid": txid.to_hex(),
                 "vout": vout,
@@ -9430,6 +9455,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "amount": coin.value as f64 / 1e8,
                 "coinbase": coin.is_coinbase,
                 "height": coin.height,
+                "blockhash": blockhash,
                 "confirmations": confirmations,
             }));
         }
