@@ -864,6 +864,17 @@ pub trait RustoshiRpc {
         fee_delta: i64,
     ) -> RpcResult<bool>;
 
+    /// Return a map of all user-created (`prioritisetransaction`) fee deltas by
+    /// txid, and whether each tx is currently in the mempool.
+    ///
+    /// Mirrors Bitcoin Core `getprioritisedtransactions`
+    /// (rpc/mining.cpp:547). Keyed by txid hex; each value is an object with
+    /// `fee_delta` (i64 sats), `in_mempool` (bool), and — only when
+    /// `in_mempool` is true — `modified_fee` (base modified fee + delta).
+    /// Takes no parameters.
+    #[method(name = "getprioritisedtransactions")]
+    async fn get_prioritised_transactions(&self) -> RpcResult<Box<serde_json::value::RawValue>>;
+
     /// Get all in-mempool ancestors of a transaction.
     #[method(name = "getmempoolancestors")]
     async fn get_mempool_ancestors(
@@ -8028,6 +8039,45 @@ impl RustoshiRpcServer for RpcServerImpl {
         Ok(true)
     }
 
+    async fn get_prioritised_transactions(
+        &self,
+    ) -> RpcResult<Box<serde_json::value::RawValue>> {
+        let state = self.state.read().await;
+
+        // Build the txid-keyed map manually so that the i64 `fee_delta` /
+        // `modified_fee` values serialise as plain JSON integers (Core emits
+        // satoshi NUMs), and so `modified_fee` can be omitted entirely when the
+        // tx is not in the mempool (Core: optional, only when in_mempool=true).
+        let mut json = String::from("{");
+        let mut first = true;
+        for (txid, fee_delta) in state.mempool.prioritised_deltas() {
+            let in_mempool = state.mempool.contains(&txid);
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            json.push('"');
+            json.push_str(&txid.to_hex());
+            json.push_str("\":{\"fee_delta\":");
+            json.push_str(&fee_delta.to_string());
+            json.push_str(",\"in_mempool\":");
+            json.push_str(if in_mempool { "true" } else { "false" });
+            if in_mempool {
+                if let Some(entry) = state.mempool.get(&txid) {
+                    // modified_fee = base modified fee (base + delta), matching
+                    // Core's `entry.GetModifiedFee()` (rpc/mining.cpp:576).
+                    let modified_fee =
+                        rustoshi_consensus::mempool::Mempool::get_modified_fee(entry) as i64;
+                    json.push_str(",\"modified_fee\":");
+                    json.push_str(&modified_fee.to_string());
+                }
+            }
+            json.push('}');
+        }
+        json.push('}');
+        Ok(serde_json::value::RawValue::from_string(json).unwrap())
+    }
+
     async fn get_mempool_ancestors(
         &self,
         txid: String,
@@ -8154,6 +8204,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getmempoolentry" => "getmempoolentry \"txid\"\nReturns mempool data for given transaction.",
                 "getorphantxs" => "getorphantxs ( verbosity )\nShows transactions in the tx orphanage.",
                 "prioritisetransaction" => "prioritisetransaction \"txid\" ( dummy ) fee_delta\nAccepts the transaction into mined blocks at a higher (or lower) priority.",
+                "getprioritisedtransactions" => "getprioritisedtransactions\nReturns a map of all user-created (see prioritisetransaction) fee deltas by txid, and whether the tx is present in mempool.",
                 "dumpmempool" => "dumpmempool\nWrite the mempool to mempool.dat (Bitcoin Core-format, byte-compatible).",
                 "savemempool" => "savemempool\nDumps the mempool to disk. Returns {\"filename\": \"mempool.dat\"}.",
                 "loadmempool" => "loadmempool\nLoad transactions from mempool.dat back into the mempool.",
@@ -8201,7 +8252,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "savemempool", "testmempoolaccept",
                 "",
                 "== Mining ==",
-                "getblocktemplate", "getmininginfo", "prioritisetransaction", "submitblock",
+                "getblocktemplate", "getmininginfo", "getprioritisedtransactions",
+                "prioritisetransaction", "submitblock",
                 "",
                 "== Network ==",
                 "addnode", "addpeeraddress", "clearbanned", "disconnectnode", "getconnectioncount",
@@ -13933,6 +13985,45 @@ mod tests {
         let peer_state = Arc::new(RwLock::new(PeerState::default()));
         let server = RpcServerImpl::new(state, peer_state);
         assert!(server.save_mempool().await.is_err());
+    }
+
+    /// `getprioritisedtransactions` — Core parity (rpc/mining.cpp:547).
+    /// Empty case returns `{}`. After `prioritisetransaction` records a delta
+    /// for a txid that is NOT in the mempool, the result must key by that txid
+    /// with `fee_delta` set, `in_mempool=false`, and `modified_fee` OMITTED
+    /// (Core marks modified_fee optional / only-when-in_mempool).
+    #[tokio::test]
+    async fn getprioritisedtransactions_shape_and_optionality() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let state = Arc::new(RwLock::new(RpcState::new(db, ChainParams::regtest())));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state, peer_state);
+
+        // Empty mempool / no deltas -> empty JSON object.
+        let empty = server.get_prioritised_transactions().await.expect("rpc ok");
+        assert_eq!(empty.get(), "{}", "no deltas must serialise to an empty map");
+
+        // Record a +25_000 sat delta for a txid not present in the mempool.
+        let txid = "00".repeat(31) + "ab"; // 64 hex chars, deterministic.
+        server
+            .prioritise_transaction(txid.clone(), Some(0.0), 25_000)
+            .await
+            .expect("prioritisetransaction ok");
+
+        let raw = server.get_prioritised_transactions().await.expect("rpc ok");
+        let v: serde_json::Value = serde_json::from_str(raw.get()).expect("valid json");
+        let entry = v.get(&txid).expect("txid key present in map");
+        assert_eq!(entry["fee_delta"], serde_json::json!(25_000));
+        assert_eq!(entry["in_mempool"], serde_json::json!(false));
+        assert!(
+            entry.get("modified_fee").is_none(),
+            "modified_fee must be OMITTED when in_mempool=false, got {:?}",
+            entry.get("modified_fee")
+        );
     }
 
     /// `getorphantxs` — proven-teeth: insert a known orphan into the pool, then
