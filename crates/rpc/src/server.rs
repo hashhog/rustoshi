@@ -834,6 +834,21 @@ pub trait RustoshiRpc {
     #[method(name = "getmempoolentry")]
     async fn get_mempool_entry(&self, txid: String) -> RpcResult<Box<serde_json::value::RawValue>>;
 
+    /// Show transactions currently held in the tx orphanage.
+    ///
+    /// Core parity: `bitcoin-core/src/rpc/mempool.cpp::getorphantxs`.
+    /// `verbosity` is an optional integer in `0..=2`, default `0` (a boolean
+    /// argument is rejected — Core `ParseVerbosity(allow_bool=false)`):
+    ///   * `0` → array of txid strings (may contain duplicates).
+    ///   * `1` → array of objects (txid, wtxid, bytes, vsize, weight, from).
+    ///   * `2` → verbosity-1 objects plus `hex` (serialized raw tx).
+    /// Out-of-range verbosity → RPC_INVALID_PARAMETER (-8).
+    #[method(name = "getorphantxs")]
+    async fn get_orphan_txs(
+        &self,
+        verbosity: Option<serde_json::Value>,
+    ) -> RpcResult<Box<serde_json::value::RawValue>>;
+
     /// Adjust a transaction's effective fee for mining-selection / RBF.
     /// Mirrors Bitcoin Core `prioritisetransaction` (rpc/mining.cpp:502-545):
     /// args = (txid, dummy_fee_btc, fee_delta_sats). `dummy` is the legacy
@@ -7874,6 +7889,116 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
+    /// `getorphantxs` — show transactions in the tx orphanage.
+    ///
+    /// Core parity: `bitcoin-core/src/rpc/mempool.cpp::getorphantxs`
+    /// (`OrphanDescription` / `OrphanToJSON`). Output is an array; `verbosity`
+    /// selects the element shape:
+    ///   * `0` → txid strings (`orphan.tx->GetHash().ToString()`, the
+    ///     NON-witness txid; "0 for an array of txids (may contain
+    ///     duplicates)").
+    ///   * `1` → object {txid, wtxid, bytes, vsize, weight, from}, in that
+    ///     exact order (Core `OrphanToJSON`).
+    ///   * `2` → verbosity-1 fields plus `hex` (serialized raw tx, Core's
+    ///     `EncodeHexTx`).
+    /// Invalid verbosity (outside `0..=2`) → RPC_INVALID_PARAMETER (-8) with
+    /// Core's "Invalid verbosity value N" message.
+    ///
+    /// Verbosity is parsed with Core's `ParseVerbosity(..., allow_bool=false)`
+    /// semantics: integer only, default 0. A boolean argument is REJECTED
+    /// (RPC_TYPE_ERROR) rather than mapped to 0/1.
+    ///
+    /// Field notes vs Core:
+    ///   * `bytes`  = total serialized size (Core `ComputeTotalSize`).
+    ///   * `vsize`  = BIP-141 virtual size.
+    ///   * `weight` = BIP-141 weight.
+    ///   * `from`   = announcing peer ids. rustoshi's orphanage tracks a single
+    ///     announcer per orphan (`OrphanEntry::from_peer`), so this is always a
+    ///     1-element array. Core can list multiple (`OrphanInfo::announcers`).
+    async fn get_orphan_txs(
+        &self,
+        verbosity: Option<serde_json::Value>,
+    ) -> RpcResult<Box<serde_json::value::RawValue>> {
+        // ParseVerbosity semantics (Core, rpc/util.cpp::ParseVerbosity with
+        // allow_bool=false): integer only, default 0. A boolean argument is
+        // REJECTED with RPC_TYPE_ERROR — it is NOT mapped to 0/1.
+        let verbosity_int: i64 = match &verbosity {
+            None => 0,
+            // allow_bool=false: bool throws, matching Core's
+            // "Verbosity was boolean but only integer allowed".
+            Some(serde_json::Value::Bool(_)) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    "Verbosity was boolean but only integer allowed".to_string(),
+                ));
+            }
+            Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(-1),
+            // Non-numeric, non-bool argument → out of range like Core.
+            Some(_) => -1,
+        };
+
+        if !(0..=2).contains(&verbosity_int) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                format!("Invalid verbosity value {}", verbosity_int),
+            ));
+        }
+
+        let state = self.state.read().await;
+        let orphans = state.orphanage.entries();
+
+        // Build the array manually so integer fields stay integers and we keep
+        // a stable, oldest-first order (entries() sorts by insertion seq).
+        let mut out = String::from("[");
+        let mut first = true;
+        for entry in orphans {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+
+            let tx = entry.tx.as_ref();
+
+            if verbosity_int == 0 {
+                // Array of txid strings (Core: orphan.tx->GetHash().ToString(),
+                // the non-witness txid; may contain duplicates).
+                out.push('"');
+                out.push_str(&tx.txid().to_hex());
+                out.push('"');
+                continue;
+            }
+
+            // verbosity 1 / 2 object — Core OrphanToJSON field order:
+            // txid, wtxid, bytes, vsize, weight, from.
+            out.push_str("{\"txid\":\"");
+            out.push_str(&tx.txid().to_hex());
+            out.push_str("\",\"wtxid\":\"");
+            out.push_str(&tx.wtxid().to_hex());
+            out.push_str("\",\"bytes\":");
+            out.push_str(&tx.serialized_size().to_string());
+            out.push_str(",\"vsize\":");
+            out.push_str(&tx.vsize().to_string());
+            out.push_str(",\"weight\":");
+            out.push_str(&tx.weight().to_string());
+            // from: rustoshi tracks a single announcer per orphan.
+            out.push_str(",\"from\":[");
+            out.push_str(&entry.from_peer.to_string());
+            out.push(']');
+
+            if verbosity_int == 2 {
+                out.push_str(",\"hex\":\"");
+                out.push_str(&hex::encode(tx.serialize()));
+                out.push('"');
+            }
+
+            out.push('}');
+        }
+        out.push(']');
+
+        Ok(serde_json::value::RawValue::from_string(out)
+            .unwrap_or_else(|_| serde_json::value::RawValue::from_string("[]".to_owned()).unwrap()))
+    }
+
     /// FIX-72 (W120 BUG-10): implement `prioritisetransaction` RPC matching
     /// Bitcoin Core's surface (`rpc/mining.cpp:502-545`).
     ///
@@ -8027,6 +8152,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getmempoolinfo" => "getmempoolinfo\nReturns details on the active state of the TX memory pool.",
                 "getrawmempool" => "getrawmempool ( verbose )\nReturns all transaction ids in memory pool.",
                 "getmempoolentry" => "getmempoolentry \"txid\"\nReturns mempool data for given transaction.",
+                "getorphantxs" => "getorphantxs ( verbosity )\nShows transactions in the tx orphanage.",
                 "prioritisetransaction" => "prioritisetransaction \"txid\" ( dummy ) fee_delta\nAccepts the transaction into mined blocks at a higher (or lower) priority.",
                 "dumpmempool" => "dumpmempool\nWrite the mempool to mempool.dat (Bitcoin Core-format, byte-compatible).",
                 "savemempool" => "savemempool\nDumps the mempool to disk. Returns {\"filename\": \"mempool.dat\"}.",
@@ -8071,7 +8197,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "",
                 "== Mempool ==",
                 "dumpmempool", "getmempoolancestors", "getmempooldescendants",
-                "getmempoolentry", "getmempoolinfo", "getrawmempool", "loadmempool",
+                "getmempoolentry", "getmempoolinfo", "getorphantxs", "getrawmempool", "loadmempool",
                 "savemempool", "testmempoolaccept",
                 "",
                 "== Mining ==",
@@ -13807,6 +13933,154 @@ mod tests {
         let peer_state = Arc::new(RwLock::new(PeerState::default()));
         let server = RpcServerImpl::new(state, peer_state);
         assert!(server.save_mempool().await.is_err());
+    }
+
+    /// `getorphantxs` — proven-teeth: insert a known orphan into the pool, then
+    /// assert the verbosity-0 (txid string array) and verbosity-1 (object with
+    /// EXACTLY txid/wtxid/bytes/vsize/weight/from — no expiration) shapes match
+    /// Core's `getorphantxs` (`bitcoin-core/src/rpc/mempool.cpp` OrphanToJSON).
+    /// Also assert the bool-rejection, out-of-range error, and empty-pool base
+    /// case.
+    #[tokio::test]
+    async fn getorphantxs_verbosity_shapes_and_errors() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let state = Arc::new(RwLock::new(RpcState::new(db, ChainParams::regtest())));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state.clone(), peer_state);
+
+        // Empty pool → empty array at every supported verbosity.
+        for v in [0i64, 1, 2] {
+            let raw = server
+                .get_orphan_txs(Some(serde_json::json!(v)))
+                .await
+                .expect("getorphantxs empty");
+            let arr: serde_json::Value = serde_json::from_str(raw.get()).unwrap();
+            assert_eq!(arr, serde_json::json!([]), "empty pool, verbosity {v}");
+        }
+
+        // Build a single deterministic orphan and insert it as if from peer 7.
+        let orphan = Arc::new(Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256([0xaa; 32]),
+                    vout: 3,
+                },
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 12_345,
+                script_pubkey: vec![0x6a, 0x00], // OP_RETURN dummy
+            }],
+            lock_time: 0,
+        });
+        let want_txid = orphan.txid().to_hex();
+        let want_wtxid = orphan.wtxid().to_hex();
+        let want_bytes = orphan.serialized_size() as u64;
+        let want_vsize = orphan.vsize() as u64;
+        let want_weight = orphan.weight() as u64;
+
+        {
+            let mut st = state.write().await;
+            st.orphanage
+                .add(orphan.clone(), 7, want_bytes as usize)
+                .expect("insert orphan");
+            assert_eq!(st.orphanage.len(), 1);
+        }
+
+        // verbosity 0: array of txid strings (Core GetHash, the non-witness id).
+        let raw0 = server
+            .get_orphan_txs(Some(serde_json::json!(0)))
+            .await
+            .expect("getorphantxs v0");
+        let arr0: serde_json::Value = serde_json::from_str(raw0.get()).unwrap();
+        assert_eq!(arr0, serde_json::json!([want_txid]), "v0 txid array");
+
+        // verbosity 1: object with the Core/rustoshi orphan fields.
+        let raw1 = server
+            .get_orphan_txs(Some(serde_json::json!(1)))
+            .await
+            .expect("getorphantxs v1");
+        let arr1: serde_json::Value = serde_json::from_str(raw1.get()).unwrap();
+        let obj = &arr1[0];
+        assert_eq!(obj["txid"], serde_json::json!(want_txid));
+        assert_eq!(obj["wtxid"], serde_json::json!(want_wtxid));
+        assert_eq!(obj["bytes"], serde_json::json!(want_bytes));
+        assert_eq!(obj["vsize"], serde_json::json!(want_vsize));
+        assert_eq!(obj["weight"], serde_json::json!(want_weight));
+        // from is a 1-element array of the announcing peer id.
+        assert_eq!(obj["from"], serde_json::json!([7]));
+        // Core OrphanToJSON carries EXACTLY these fields — no `expiration`,
+        // and no `hex` (that's verbosity 2 only).
+        let keys: std::collections::BTreeSet<&str> =
+            obj.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["bytes", "from", "txid", "vsize", "weight", "wtxid"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<&str>>(),
+            "v1 must carry EXACTLY Core's OrphanToJSON fields (no expiration, no hex)"
+        );
+        assert!(obj.get("expiration").is_none(), "v1 must omit expiration");
+        assert!(obj.get("hex").is_none(), "v1 must omit hex");
+
+        // verbosity 2: verbosity-1 fields PLUS hex.
+        let raw2 = server
+            .get_orphan_txs(Some(serde_json::json!(2)))
+            .await
+            .expect("getorphantxs v2");
+        let arr2: serde_json::Value = serde_json::from_str(raw2.get()).unwrap();
+        assert_eq!(
+            arr2[0]["hex"],
+            serde_json::json!(hex::encode(orphan.serialize())),
+            "v2 hex == serialized raw tx"
+        );
+        // v2 = v1 fields + hex, nothing else.
+        let keys2: std::collections::BTreeSet<&str> = arr2[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            keys2,
+            ["bytes", "from", "hex", "txid", "vsize", "weight", "wtxid"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<&str>>(),
+            "v2 = v1 fields + hex (no expiration)"
+        );
+
+        // default (no arg) behaves like verbosity 0 (txid array).
+        let raw_default = server.get_orphan_txs(None).await.expect("getorphantxs default");
+        let arr_default: serde_json::Value = serde_json::from_str(raw_default.get()).unwrap();
+        assert_eq!(arr_default, serde_json::json!([want_txid]), "default == v0");
+
+        // Bool argument → REJECTED (Core ParseVerbosity allow_bool=false), NOT
+        // silently mapped to 0/1.
+        let err_bool_t = server
+            .get_orphan_txs(Some(serde_json::json!(true)))
+            .await
+            .expect_err("bool true must error");
+        assert_eq!(err_bool_t.code(), rpc_error::RPC_TYPE_ERROR);
+        let err_bool_f = server
+            .get_orphan_txs(Some(serde_json::json!(false)))
+            .await
+            .expect_err("bool false must error");
+        assert_eq!(err_bool_f.code(), rpc_error::RPC_TYPE_ERROR);
+
+        // Out-of-range verbosity → RPC_INVALID_PARAMETER (-8).
+        let err = server
+            .get_orphan_txs(Some(serde_json::json!(3)))
+            .await
+            .expect_err("verbosity 3 must error");
+        assert_eq!(err.code(), rpc_error::RPC_INVALID_PARAMETER);
+        assert!(err.message().contains("Invalid verbosity value 3"));
     }
 
     #[tokio::test]

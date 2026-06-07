@@ -181,6 +181,22 @@ impl TxOrphanage {
         self.by_peer.get(&peer).map(|s| s.len()).unwrap_or(0)
     }
 
+    /// Snapshot every orphan entry currently held, oldest-first (by insertion
+    /// sequence) for a stable, reproducible order.
+    ///
+    /// Used by the `getorphantxs` RPC (Core parity:
+    /// `PeerManager::GetOrphanTransactions` →
+    /// `bitcoin-core/src/rpc/mempool.cpp::getorphantxs`).  Returns borrowed
+    /// references — the caller holds the orphanage lock for the duration and
+    /// reads `tx`, `from_peer`, and `inserted_at` off each entry to build the
+    /// RPC response.  rustoshi tracks a single announcer per orphan
+    /// (`OrphanEntry::from_peer`), so the RPC's `from` array is 1-element.
+    pub fn entries(&self) -> Vec<&OrphanEntry> {
+        let mut out: Vec<&OrphanEntry> = self.by_wtxid.values().collect();
+        out.sort_by_key(|e| e.seq);
+        out
+    }
+
     /// Insert a new orphan.
     ///
     /// Returns `Ok(())` if the orphan was inserted (which may have triggered
