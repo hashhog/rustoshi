@@ -14,7 +14,16 @@ thiserror.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true
-serde_json = { workspace = true, features = ["raw_value"] }
+# `preserve_order`: back every `serde_json::Value::Object` with an
+# insertion-ordered `IndexMap` instead of the default `BTreeMap`. Without it
+# `Value::Object` alphabetises keys on the wire, diverging from Bitcoin Core's
+# UniValue `pushKV` insertion order across many RPCs. With it enabled, the key
+# order of `json!({...})` literals (and any `Value` built by insertion) is the
+# SOURCE order, so each `json!` site below is written to match Core's pushKV
+# order. (Cargo feature unification makes this apply workspace-wide — intended:
+# insertion order on the wire is correct for every Core-mirroring RPC.)
+# `raw_value`: pre-serialized numeric/object fields (difficulty, getblock, ...).
+serde_json = { workspace = true, features = ["raw_value", "preserve_order"] }
 axum.workspace = true
 jsonrpsee.workspace = true
 tracing.workspace = true
