@@ -22,7 +22,8 @@
 use crate::columns::CF_COINSTATS;
 use crate::db::{ChainDb, StorageError};
 use crate::indexes::muhash::MuHash3072;
-use rustoshi_primitives::Hash256;
+use rustoshi_consensus::validation::UndoData;
+use rustoshi_primitives::{Block, Hash256, OutPoint};
 use serde::{Deserialize, Serialize};
 
 /// UTXO set statistics at a specific block height.
@@ -198,6 +199,141 @@ impl<'a> CoinStatsIndex<'a> {
         }
         Ok(None)
     }
+}
+
+/// `CScript::IsUnspendable` (`bitcoin-core/src/script/script.h:563`):
+/// starts with `OP_RETURN` (0x6a) OR exceeds `MAX_SCRIPT_SIZE` (10,000).
+/// Outputs matching this predicate are NEVER added to the UTXO set
+/// (`CCoinsViewCache::AddCoin`, coins.cpp:89-91), so the coinstatsindex
+/// must skip them exactly as the chainstate does — otherwise the per-height
+/// MuHash diverges from `gettxoutsetinfo`'s tip value.
+const MAX_SCRIPT_SIZE: usize = 10_000;
+fn is_unspendable_script(script: &[u8]) -> bool {
+    (!script.is_empty() && script[0] == 0x6a) || script.len() > MAX_SCRIPT_SIZE
+}
+
+/// Per-UTXO bogosize, matching the full-scan `gettxoutsetinfo` path in
+/// `crates/rpc/src/server.rs` (`32 + 4 + 4 + 8 + 2 + spk.len()`) and Core's
+/// `kernel/coinstats.cpp::GetBogoSize`.
+fn coin_bogo_size(script_pubkey_len: usize) -> u64 {
+    32 + 4 + 4 + 8 + 2 + script_pubkey_len as u64
+}
+
+/// Build the genesis (height-0) coinstats entry.
+///
+/// Core never adds the genesis coinbase output to the UTXO set, so the
+/// height-0 snapshot is the EMPTY UTXO set: zero txouts, zero amount, and
+/// the MuHash of the empty accumulator (numerator = denominator = 1). This
+/// is the base case the height-1 connect builds on. Mirrors
+/// `bitcoin-core/src/index/coinstatsindex.cpp` whose running MuHash starts
+/// empty and never ingests the genesis coinbase.
+pub fn genesis_entry(genesis_hash: Hash256) -> CoinStatsEntry {
+    let mut entry = CoinStatsEntry {
+        height: 0,
+        block_hash: genesis_hash,
+        ..Default::default()
+    };
+    // The empty MuHash3072 (both num/den = 1) — its serialized 768-byte form.
+    entry.set_muhash(&MuHash3072::new());
+    entry
+}
+
+/// Compute the coinstats entry for `block` at `height`, given the entry at
+/// `height - 1` (or `None` for the genesis-adjacent base case).
+///
+/// This is the incremental, reorg-safe update Core performs in
+/// `bitcoin-core/src/index/coinstatsindex.cpp::CustomAppend`:
+///   * for every NEW output added to the UTXO set (those passing
+///     `IsUnspendable`), MuHash3072::Insert(TxOutSer(coin)) + bump counts;
+///   * for every coin SPENT by this block (the `undo` records),
+///     MuHash3072::Remove(TxOutSer(coin)) + drop counts.
+///
+/// MuHash insert/remove are commutative (multiply numerator / multiply
+/// denominator) so iteration order is irrelevant — what matters is that the
+/// resulting multiset of live coins is byte-identical to the chainstate's
+/// UTXO set. We therefore add exactly the outputs `connect_block` adds and
+/// remove exactly the coins recorded in `undo.spent_coins`, in the same
+/// (block-tx → input) order they were collected.
+///
+/// Because each height's entry is persisted, a reorg needs no arithmetic
+/// rewind: `disconnect_to` simply re-bases the running state on the snapshot
+/// at the new tip height, and the connecting branch overwrites the stale
+/// per-height snapshots above the fork as it re-applies its blocks. This
+/// mirrors Core's per-height index keyed by block (overwrite on reconnect).
+pub fn compute_next_entry(
+    prev: Option<&CoinStatsEntry>,
+    block: &Block,
+    height: u32,
+    undo: &UndoData,
+) -> CoinStatsEntry {
+    let mut entry = match prev {
+        Some(p) => p.clone(),
+        None => CoinStatsEntry::default(),
+    };
+    let mut muhash = entry.get_muhash();
+
+    // ── 1. Add every new spendable output created by this block. ──────────
+    for tx in &block.transactions {
+        let is_coinbase = tx.is_coinbase();
+        let txid = tx.txid();
+        for (vout, output) in tx.outputs.iter().enumerate() {
+            if is_unspendable_script(&output.script_pubkey) {
+                continue;
+            }
+            let bytes = serialize_coin_for_muhash(
+                &txid,
+                vout as u32,
+                height,
+                is_coinbase,
+                output.value,
+                &output.script_pubkey,
+            );
+            muhash.insert(&bytes);
+            entry.utxo_count += 1;
+            entry.total_amount = entry.total_amount.saturating_add(output.value);
+            entry.bogo_size = entry
+                .bogo_size
+                .saturating_add(coin_bogo_size(output.script_pubkey.len()));
+        }
+    }
+
+    // ── 2. Remove every coin spent by this block. ────────────────────────
+    // `undo.spent_coins` is collected in `connect_block` order: each
+    // non-coinbase tx, in input order. Reconstruct the matching outpoints by
+    // walking the block's inputs in the same order and zipping them with the
+    // undo records.
+    let mut undo_iter = undo.spent_coins.iter();
+    for tx in &block.transactions {
+        if tx.is_coinbase() {
+            continue;
+        }
+        for input in &tx.inputs {
+            let coin = match undo_iter.next() {
+                Some(c) => c,
+                None => break,
+            };
+            let op: &OutPoint = &input.previous_output;
+            let bytes = serialize_coin_for_muhash(
+                &op.txid,
+                op.vout,
+                coin.height,
+                coin.is_coinbase,
+                coin.value,
+                &coin.script_pubkey,
+            );
+            muhash.remove(&bytes);
+            entry.utxo_count = entry.utxo_count.saturating_sub(1);
+            entry.total_amount = entry.total_amount.saturating_sub(coin.value);
+            entry.bogo_size = entry
+                .bogo_size
+                .saturating_sub(coin_bogo_size(coin.script_pubkey.len()));
+        }
+    }
+
+    entry.height = height;
+    entry.block_hash = block.block_hash();
+    entry.set_muhash(&muhash);
+    entry
 }
 
 /// Compute the "bogosize" of a UTXO (estimated serialized size).

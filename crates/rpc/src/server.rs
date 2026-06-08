@@ -176,6 +176,13 @@ pub struct RpcState {
     /// subsystem failed to initialise (`-disablewallet`-equivalent), in which
     /// case block-connect simply skips the wallet scan.
     pub wallet_state: Option<Arc<RwLock<crate::wallet::WalletRpcState>>>,
+    /// Whether the per-height coinstatsindex is enabled (`-coinstatsindex=1`).
+    /// When set, every block-connect/disconnect maintains a per-height running
+    /// `MuHash3072` + UTXO-set counts (`CF_COINSTATS`), so `gettxoutsetinfo`
+    /// can answer for a HISTORICAL `hash_or_height`. When unset, a specific
+    /// (non-tip) query returns Core's `-8`. Mirrors Bitcoin Core's
+    /// `-coinstatsindex` global (`src/index/coinstatsindex.cpp`).
+    pub coinstatsindex_enabled: bool,
 }
 
 /// Select the mempool configuration appropriate for `network`.
@@ -231,6 +238,7 @@ impl RpcState {
             block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orphanage: TxOrphanage::new(),
             wallet_state: None,
+            coinstatsindex_enabled: false,
         }
     }
 
@@ -260,6 +268,7 @@ impl RpcState {
             block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orphanage: TxOrphanage::new(),
             wallet_state: None,
+            coinstatsindex_enabled: false,
         }
     }
 
@@ -1705,6 +1714,95 @@ fn storage_undo_to_validation(
 /// prevent.
 pub const MAX_REORG_DEPTH: u32 = 100;
 
+/// Maintain the per-height coinstatsindex on block CONNECT.
+///
+/// Computes the height-`height` snapshot from the persisted height-`height-1`
+/// snapshot (the empty/genesis base when `height == 1`) by inserting the
+/// block's new spendable outputs and removing its spent coins into a running
+/// `MuHash3072`, then persists it keyed by `height`. Mirrors Bitcoin Core's
+/// `BlockFilterIndex`/`CoinStatsIndex` `CustomAppend` fired from
+/// `BaseIndex::BlockConnected` on EVERY connect (linear, submitblock, IBD,
+/// and reorg-reconnect). A reconnect at a height a disconnected block
+/// previously occupied OVERWRITES the stale snapshot, exactly as Core's
+/// per-block index does. No-op unless `-coinstatsindex` is enabled.
+///
+/// Non-fatal on error: a coinstats write failure must not unwind an
+/// already-committed block connect (matches the block-filter-index path).
+fn coinstats_connect_block(
+    db: &Arc<ChainDb>,
+    enabled: bool,
+    genesis_hash: Hash256,
+    block: &Block,
+    height: u32,
+    undo: &rustoshi_consensus::validation::UndoData,
+) {
+    if !enabled {
+        return;
+    }
+    let index = rustoshi_storage::CoinStatsIndex::new(db);
+    // Base = persisted snapshot at height-1. For height 1 the base is the
+    // empty genesis snapshot (Core never ingests the genesis coinbase).
+    let prev = if height == 0 {
+        None
+    } else if height == 1 {
+        Some(rustoshi_storage::coinstats_genesis_entry(genesis_hash))
+    } else {
+        match index.get_stats(height - 1) {
+            Ok(Some(e)) => Some(e),
+            _ => None,
+        }
+    };
+    if prev.is_none() && height > 1 {
+        tracing::warn!(
+            "coinstatsindex: no base snapshot at height {} for connect of height {}; \
+             at-height queries for {} may be unavailable",
+            height - 1,
+            height,
+            height
+        );
+        return;
+    }
+    let entry = rustoshi_storage::coinstats_compute_next_entry(
+        prev.as_ref(),
+        block,
+        height,
+        undo,
+    );
+    if let Err(e) = index.put_stats(&entry) {
+        tracing::warn!(
+            "coinstatsindex: failed to persist snapshot at height {}: {}",
+            height,
+            e
+        );
+    }
+}
+
+/// Maintain the per-height coinstatsindex on block DISCONNECT.
+///
+/// After the active chain has been rewound to `target_height`, every
+/// per-height snapshot strictly above `target_height` is stale (it described
+/// the now-orphaned branch). We delete those rows so a query for a height
+/// that has not yet been reconnected reports "unavailable" rather than a
+/// stale value; the new branch overwrites them as it re-applies its blocks
+/// via `coinstats_connect_block`. The snapshot AT `target_height` is left
+/// intact — it is the correct base for the next connect. Mirrors Core's
+/// `CoinStatsIndex::CustomRemove` (`BaseIndex::BlockDisconnected`), which
+/// rewinds the index in lockstep with the chainstate. No-op unless enabled.
+fn coinstats_disconnect_above(
+    db: &Arc<ChainDb>,
+    enabled: bool,
+    target_height: u32,
+    original_height: u32,
+) {
+    if !enabled || original_height <= target_height {
+        return;
+    }
+    let index = rustoshi_storage::CoinStatsIndex::new(db);
+    for h in target_height + 1..=original_height {
+        let _ = index.delete_stats(h);
+    }
+}
+
 /// Disconnect every block in the active chain from `state.best_hash`
 /// (inclusive) back to `target_hash` (exclusive), updating the UTXO set,
 /// chain-state metadata, persisted tip pointer, and height index. Used by
@@ -1863,6 +1961,18 @@ fn disconnect_to(
     store
         .write_batch(batch)
         .map_err(|e| format!("write_batch (disconnect_to): {}", e))?;
+
+    // Coinstatsindex: drop per-height snapshots for the disconnected range so
+    // a query for a not-yet-reconnected height never returns the orphaned
+    // branch's value. The snapshot AT target_height is the correct base for
+    // the next connect and is left intact. (Counterpart to Core's
+    // CoinStatsIndex::CustomRemove on BlockDisconnected.)
+    coinstats_disconnect_above(
+        &db,
+        state.coinstatsindex_enabled,
+        target_height,
+        original_height,
+    );
 
     state.best_hash = target_hash;
     state.best_height = target_height;
@@ -2386,6 +2496,38 @@ fn try_attach_and_reorg(
                     "try_attach_and_reorg: block filter index update failed for {} \
                      at height {}: {}",
                     h, height, e
+                );
+            }
+        }
+    }
+
+    // Coinstatsindex — rewind + re-append in lockstep with the reorg.
+    // First drop the stale per-height snapshots for every height that was
+    // reorged out (above the fork point), then re-append the new branch's
+    // blocks in ascending height order, each based on the previous height's
+    // (now-correct) snapshot. Mirrors Core's CoinStatsIndex CustomRemove on
+    // every disconnect + CustomAppend on every reconnect (BaseIndex fires
+    // both on a reorg). The reconnect overwrites any snapshot a disconnected
+    // block previously occupied at the same height. No-op unless enabled.
+    if state.coinstatsindex_enabled {
+        // Fork height = (lowest connected height) - 1. Everything strictly
+        // above the fork on the OLD chain is stale.
+        let fork_height = connected_blocks
+            .iter()
+            .map(|(_, h, _)| *h)
+            .min()
+            .map(|min_h| min_h.saturating_sub(1))
+            .unwrap_or(new_tip_height);
+        coinstats_disconnect_above(&db, true, fork_height, original_tip_height);
+        for (h, height, v_undo) in &connected_blocks {
+            if let Some(block) = store.get_block(h).ok().flatten() {
+                coinstats_connect_block(
+                    &state.db,
+                    true,
+                    state.params.genesis_hash,
+                    &block,
+                    *height,
+                    v_undo,
                 );
             }
         }
@@ -5117,6 +5259,20 @@ impl RustoshiRpcServer for RpcServerImpl {
                         );
                     }
                 }
+
+                // Coinstatsindex — maintain the per-height running MuHash +
+                // UTXO-set counts on connect, so `gettxoutsetinfo` can answer
+                // for a historical height. Counterpart to Core's
+                // CoinStatsIndex::CustomAppend on BlockConnected. No-op unless
+                // -coinstatsindex was enabled at startup.
+                coinstats_connect_block(
+                    &state.db,
+                    state.coinstatsindex_enabled,
+                    state.params.genesis_hash,
+                    &block,
+                    new_height,
+                    &undo_data,
+                );
 
                 // Flush UTXO changes to disk
                 if let Err(e) = utxo_view.flush() {
@@ -9017,7 +9173,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             Some(serde_json::Value::Null) => false,
             Some(_) => true,
         };
+        let stats_index = CoinStatsIndex::new(&state.db);
         if specific_block_requested {
+            // hash_serialized_3 can NEVER be queried for a specific block,
+            // even with the index — Core throws -8 unconditionally
+            // (rpc/blockchain.cpp gettxoutsetinfo). Mirror that FIRST so the
+            // error message matches regardless of index state.
             if matches!(
                 ht,
                 "hash_serialized_3" | "hash_serialized_2" | "hash_serialized"
@@ -9028,16 +9189,108 @@ impl RustoshiRpcServer for RpcServerImpl {
                         .to_string(),
                 ));
             }
-            return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMETER,
-                "Querying specific block heights requires coinstatsindex".to_string(),
-            ));
+            // Without the index, specific heights are unanswerable — Core's
+            // -8 "Querying specific block heights requires coinstatsindex".
+            if !state.coinstatsindex_enabled {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    "Querying specific block heights requires coinstatsindex".to_string(),
+                ));
+            }
+
+            // Resolve hash_or_height (an int height OR a block-hash string)
+            // to a concrete height on the active chain, exactly as Core's
+            // ParseHashOrHeight does (rpc/blockchain.cpp).
+            let store = BlockStore::new(&state.db);
+            let target_height: u32 = match hash_or_height.as_ref() {
+                Some(serde_json::Value::Number(n)) => {
+                    let h = n.as_i64().unwrap_or(-1);
+                    if h < 0 || h as u64 > height as u64 {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_INVALID_PARAMETER,
+                            "Block height out of range".to_string(),
+                        ));
+                    }
+                    h as u32
+                }
+                Some(serde_json::Value::String(s)) => {
+                    let hash = Self::parse_hash(s)?;
+                    match store.get_block_index(&hash) {
+                        Ok(Some(e)) => e.height,
+                        _ => {
+                            return Err(Self::rpc_error(
+                                rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                                "Block not found".to_string(),
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "hash_or_height must be a height (int) or block hash (string)"
+                            .to_string(),
+                    ));
+                }
+            };
+
+            // Serve the per-height snapshot from the coinstatsindex.
+            let entry = match stats_index.get_stats(target_height) {
+                Ok(Some(e)) => e,
+                _ => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        format!(
+                            "Can't read the index data at height {} - coinstatsindex \
+                             not yet synced to that height",
+                            target_height
+                        ),
+                    ));
+                }
+            };
+
+            // WIRE KEY ORDER — Bitcoin Core `gettxoutsetinfo` index path:
+            // height, bestblock, txouts, bogosize, [muhash], total_amount,
+            // disk_size. `bestblock` is the block hash AT this height (not the
+            // tip). Prefer the snapshot's recorded block_hash; fall back to the
+            // height index if it is somehow zero.
+            let best_at_h = if entry.block_hash != Hash256::ZERO {
+                entry.block_hash
+            } else {
+                store
+                    .get_hash_by_height(target_height)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(entry.block_hash)
+            };
+            let muhash_hex: Option<String> = if ht == "muhash" {
+                let mut mh = entry.get_muhash();
+                Some(mh.finalize().to_hex())
+            } else {
+                None
+            };
+            let mut result = serde_json::Map::new();
+            result.insert("height".to_string(), serde_json::json!(entry.height));
+            result.insert(
+                "bestblock".to_string(),
+                serde_json::json!(best_at_h.to_hex()),
+            );
+            result.insert("txouts".to_string(), serde_json::json!(entry.utxo_count));
+            result.insert("bogosize".to_string(), serde_json::json!(entry.bogo_size));
+            if let Some(mh) = muhash_hex {
+                result.insert("muhash".to_string(), serde_json::Value::String(mh));
+            }
+            result.insert(
+                "total_amount".to_string(),
+                serde_json::json!(entry.total_amount as f64 / 1e8),
+            );
+            result.insert("disk_size".to_string(), serde_json::json!(0u64));
+            return Ok(serde_json::Value::Object(result));
         }
 
         // Fast path via the per-tip CoinStats index, but only for muhash /
         // none — hash_serialized_3 is NOT pre-indexed (Core throws when
         // queried for a specific block too).
-        let stats_index = CoinStatsIndex::new(&state.db);
         if ht == "muhash" || ht == "none" {
             if let Ok(Some(entry)) = stats_index.get_stats(height) {
                 // WIRE KEY ORDER — Bitcoin Core `gettxoutsetinfo`
@@ -10115,9 +10368,22 @@ impl RustoshiRpcServer for RpcServerImpl {
             let index = BlockFilterIndex::new(&state.db);
             index.has_filter(&state.best_hash).unwrap_or(false)
         };
+        // Coinstatsindex.  Active iff -coinstatsindex was enabled at startup.
+        // "synced" mirrors Core's definition: the per-height snapshot for the
+        // current best block exists (the synchronous indexer advances in
+        // lockstep with connect_tip, so it is synced the moment a snapshot at
+        // best_height is present). Mirrors Core's `g_coin_stats_index` global.
+        let (coinstats_active, coinstats_synced) = if state.coinstatsindex_enabled {
+            let index = rustoshi_storage::CoinStatsIndex::new(&state.db);
+            let synced = matches!(index.get_stats(state.best_height), Ok(Some(_)));
+            (true, synced)
+        } else {
+            (false, false)
+        };
 
         // Push in lexicographic key order so the outer object matches the old
-        // BTreeMap iteration order: "basic block filter index" < "txindex".
+        // BTreeMap iteration order: "basic block filter index" < "coinstatsindex"
+        // < "txindex".
         if blockfilter_active
             && (want.is_empty() || want == "basic block filter index")
         {
@@ -10125,6 +10391,15 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "basic block filter index",
                 IndexSummary {
                     synced: true,
+                    best_block_height: state.best_height,
+                },
+            ));
+        }
+        if coinstats_active && (want.is_empty() || want == "coinstatsindex") {
+            entries.push((
+                "coinstatsindex",
+                IndexSummary {
+                    synced: coinstats_synced,
                     best_block_height: state.best_height,
                 },
             ));

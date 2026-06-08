@@ -66,6 +66,7 @@ pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;
 pub use db::{ChainDb, StorageError, CURRENT_DB_VERSION};
 pub use indexes::{
+    compute_next_entry as coinstats_compute_next_entry, genesis_entry as coinstats_genesis_entry,
     BlockFilter, BlockFilterError, BlockFilterIndex, BlockFilterType, CoinStatsEntry,
     CoinStatsError, CoinStatsIndex, FilterHeaderEntry, GCSError, GCSFilter, MuHash3072, Num3072,
     TxIndex, TxIndexError, TxLocation, BASIC_FILTER_M, BASIC_FILTER_P,
