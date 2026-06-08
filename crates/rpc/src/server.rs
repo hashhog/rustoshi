@@ -1223,13 +1223,11 @@ pub trait RustoshiRpc {
     ///
     /// Returns `Box<RawValue>` so each per-index object's keys are emitted in
     /// Bitcoin Core's exact `pushKV` order — `synced` BEFORE
-    /// `best_block_height` (rpc/node.cpp::SummaryToJSON). A `serde_json::Value`
-    /// return cannot preserve this: every `Value::Object` is backed by a
-    /// `BTreeMap` (serde_json's default — `preserve_order` is not enabled in
-    /// this workspace), which alphabetises the keys to
-    /// `{"best_block_height":..,"synced":..}`. Building the response as a
-    /// verbatim JSON string and returning it as a `RawValue` is the same
-    /// pattern `getblock` / `getrawmempool` already use here.
+    /// `best_block_height` (rpc/node.cpp::SummaryToJSON). The crate now enables
+    /// serde_json's `preserve_order` feature, so a `Value::Object` would ALSO
+    /// preserve insertion order; the `RawValue` path is retained here because
+    /// it additionally avoids re-formatting and matches the `getblock` /
+    /// `getrawmempool` pattern already used in this file.
     #[method(name = "getindexinfo")]
     async fn get_index_info(
         &self,
@@ -3485,20 +3483,25 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Build the full response JSON string without going through serde_json::Value
         // for numeric fields — this preserves BtcAmount's 8-decimal format so that
         // `jq -Sc` normalizes correctly (e.g. 0.00000000 → 0E-8 matching Core).
+        //
+        // WIRE KEY ORDER — matches Bitcoin Core `blockToJSON`
+        // (rpc/blockchain.cpp:202-245), which is `blockheaderToJSON` (header
+        // fields, lines 159-181) FOLLOWED BY strippedsize, size, weight,
+        // coinbase_tx, tx (lines 206-242). The header block is therefore:
+        //   hash, confirmations, height, version, versionHex, merkleroot, time,
+        //   mediantime, nonce, bits, target, difficulty, chainwork, nTx,
+        //   previousblockhash, nextblockhash
+        // then the body: strippedsize, size, weight, coinbase_tx, tx.
         use std::fmt::Write as _;
         let mut out = String::with_capacity(tx_json_str.len() + 512);
         // write! to String infallibly (String::write_fmt never returns Err).
         let _ = write!(out, "{{");
         let _ = write!(out, r#""hash":{}"#, serde_json::to_string(&block_hash.to_hex()).unwrap());
         let _ = write!(out, r#","confirmations":{}"#, confirmations);
-        let _ = write!(out, r#","size":{}"#, size);
-        let _ = write!(out, r#","strippedsize":{}"#, strippedsize);
-        let _ = write!(out, r#","weight":{}"#, weight);
         let _ = write!(out, r#","height":{}"#, height);
         let _ = write!(out, r#","version":{}"#, block.header.version);
         let _ = write!(out, r#","versionHex":{}"#, serde_json::to_string(&format!("{:08x}", block.header.version)).unwrap());
         let _ = write!(out, r#","merkleroot":{}"#, serde_json::to_string(&block.header.merkle_root.to_hex()).unwrap());
-        let _ = write!(out, r#","tx":{}"#, tx_json_str);
         let _ = write!(out, r#","time":{}"#, block.header.timestamp);
         let _ = write!(out, r#","mediantime":{}"#, mediantime);
         let _ = write!(out, r#","nonce":{}"#, block.header.nonce);
@@ -3513,9 +3516,13 @@ impl RustoshiRpcServer for RpcServerImpl {
         if let Some(nh) = next_hash {
             let _ = write!(out, r#","nextblockhash":{}"#, serde_json::to_string(&nh).unwrap());
         }
+        let _ = write!(out, r#","strippedsize":{}"#, strippedsize);
+        let _ = write!(out, r#","size":{}"#, size);
+        let _ = write!(out, r#","weight":{}"#, weight);
         if let Some(cb) = coinbase_tx {
             let _ = write!(out, r#","coinbase_tx":{}"#, serde_json::to_string(&cb).unwrap());
         }
+        let _ = write!(out, r#","tx":{}"#, tx_json_str);
         let _ = write!(out, "}}");
 
         Ok(raw(out))
@@ -9033,20 +9040,37 @@ impl RustoshiRpcServer for RpcServerImpl {
         let stats_index = CoinStatsIndex::new(&state.db);
         if ht == "muhash" || ht == "none" {
             if let Ok(Some(entry)) = stats_index.get_stats(height) {
-                let mut result = serde_json::json!({
-                    "height": entry.height,
-                    "bestblock": entry.block_hash.to_hex(),
-                    "txouts": entry.utxo_count,
-                    "bogosize": entry.bogo_size,
-                    "total_amount": entry.total_amount as f64 / 1e8,
-                    "disk_size": 0u64,
-                });
-                if ht == "muhash" {
+                // WIRE KEY ORDER — Bitcoin Core `gettxoutsetinfo`
+                // (rpc/blockchain.cpp:1115-1129): height, bestblock, txouts,
+                // bogosize, [muhash], total_amount, transactions, disk_size.
+                // The hash field (`muhash`) is pushed right after `bogosize`
+                // and BEFORE `total_amount` — NOT appended at the end. With
+                // `preserve_order` the `json!` insertion order is the wire
+                // order, so the muhash branch is computed up front and the
+                // object is built in Core's exact sequence.
+                let muhash_hex: Option<String> = if ht == "muhash" {
                     let mut mh = entry.get_muhash();
-                    let fin = mh.finalize();
-                    result["muhash"] = serde_json::Value::String(fin.to_hex());
+                    Some(mh.finalize().to_hex())
+                } else {
+                    None
+                };
+                let mut result = serde_json::Map::new();
+                result.insert("height".to_string(), serde_json::json!(entry.height));
+                result.insert(
+                    "bestblock".to_string(),
+                    serde_json::json!(entry.block_hash.to_hex()),
+                );
+                result.insert("txouts".to_string(), serde_json::json!(entry.utxo_count));
+                result.insert("bogosize".to_string(), serde_json::json!(entry.bogo_size));
+                if let Some(mh) = muhash_hex {
+                    result.insert("muhash".to_string(), serde_json::Value::String(mh));
                 }
-                return Ok(result);
+                result.insert(
+                    "total_amount".to_string(),
+                    serde_json::json!(entry.total_amount as f64 / 1e8),
+                );
+                result.insert("disk_size".to_string(), serde_json::json!(0u64));
+                return Ok(serde_json::Value::Object(result));
             }
         }
 
@@ -9165,17 +9189,10 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         }
 
-        let mut result = serde_json::json!({
-            "height": height,
-            "bestblock": best_hash.to_hex(),
-            "txouts": txouts,
-            "bogosize": bogosize,
-            "transactions": transactions,
-            "total_amount": total_amount_sats as f64 / 1e8,
-            "disk_size": 0u64,
-        });
-
-        if let Some(h) = hash_ser_state {
+        // Compute the hash field (if any) BEFORE building the result so it can
+        // be inserted in Core's position — right after `bogosize` and before
+        // `total_amount` — rather than appended at the end.
+        let hash_serialized_hex: Option<String> = hash_ser_state.map(|h| {
             // Double-SHA256: feed the first SHA into a new SHA, take that.
             let first = h.finalize();
             let second = Sha256::digest(first);
@@ -9183,18 +9200,49 @@ impl RustoshiRpcServer for RpcServerImpl {
             // little-endian internal, displayed big-endian). Match that.
             let mut display = second.to_vec();
             display.reverse();
-            let hex_str = hex::encode(display);
-            result["hash_serialized_3"] = serde_json::Value::String(hex_str.clone());
-            // Back-compat alias for older clients / diff-test tolerance.
-            result["hash_serialized_2"] = serde_json::Value::String(hex_str);
-        }
+            hex::encode(display)
+        });
+        let muhash_hex: Option<String> = muhash_state.map(|mut mh| mh.finalize().to_hex());
 
-        if let Some(mut mh) = muhash_state {
-            let fin = mh.finalize();
-            result["muhash"] = serde_json::Value::String(fin.to_hex());
+        // WIRE KEY ORDER — Bitcoin Core `gettxoutsetinfo`
+        // (rpc/blockchain.cpp:1115-1129), non-index path:
+        //   height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
+        //   total_amount, transactions, disk_size.
+        // The hash field is pushed immediately after `bogosize` and BEFORE
+        // `total_amount`; `transactions`/`disk_size` come AFTER `total_amount`.
+        // Previously these were built with one `json!` (which alphabetised
+        // under the BTreeMap-backed Value) followed by appended `result[..]=`
+        // assignments, putting the hash at the very end and `transactions`
+        // ahead of `total_amount`. With `preserve_order` the Map insertion
+        // order is the wire order, so we insert in Core's exact sequence.
+        let mut result = serde_json::Map::new();
+        result.insert("height".to_string(), serde_json::json!(height));
+        result.insert("bestblock".to_string(), serde_json::json!(best_hash.to_hex()));
+        result.insert("txouts".to_string(), serde_json::json!(txouts));
+        result.insert("bogosize".to_string(), serde_json::json!(bogosize));
+        if let Some(hex_str) = hash_serialized_hex {
+            result.insert(
+                "hash_serialized_3".to_string(),
+                serde_json::Value::String(hex_str.clone()),
+            );
+            // Back-compat alias for older clients / diff-test tolerance (not a
+            // Core field; kept adjacent to the canonical key).
+            result.insert(
+                "hash_serialized_2".to_string(),
+                serde_json::Value::String(hex_str),
+            );
         }
+        if let Some(mh) = muhash_hex {
+            result.insert("muhash".to_string(), serde_json::Value::String(mh));
+        }
+        result.insert(
+            "total_amount".to_string(),
+            serde_json::json!(total_amount_sats as f64 / 1e8),
+        );
+        result.insert("transactions".to_string(), serde_json::json!(transactions));
+        result.insert("disk_size".to_string(), serde_json::json!(0u64));
 
-        Ok(result)
+        Ok(serde_json::Value::Object(result))
     }
 
     async fn scan_tx_out_set(
@@ -9987,10 +10035,10 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         // (10) Return (Core 2708-2711). The synchronous scan is never aborted,
-        // so `completed` is always true. Key order here is alphabetised by
-        // serde_json's default BTreeMap-backed Value::Object, which is fine:
-        // the scanblocks differential parses JSON, it does not assert raw wire
-        // key order (unlike getindexinfo).
+        // so `completed` is always true. Key order matches Core's pushKV order
+        // (from_height, to_height, relevant_blocks, completed; blockchain.cpp
+        // scanblocks); with serde_json's `preserve_order` feature enabled the
+        // `json!` source order below is the wire order.
         Ok(serde_json::json!({
             "from_height": start,
             "to_height": stop,
@@ -10026,24 +10074,17 @@ impl RustoshiRpcServer for RpcServerImpl {
         // lines 356-358), and UniValue is an ordered vector, so Core emits
         // `{"synced":..,"best_block_height":..}`.
         //
-        // The previous implementation built each entry with
-        // `serde_json::json!({...})` and returned a `serde_json::Value`. Every
-        // `serde_json::Value::Object` is backed by a `BTreeMap` (serde_json's
-        // default — `preserve_order` is NOT enabled in this workspace, and
-        // enabling it would silently reorder dozens of other Core-matching
-        // RPCs), so the keys were alphabetised on the wire to
-        // `{"best_block_height":..,"synced":..}` — wrong vs Core.
-        //
-        // A `#[derive(Serialize)]` struct alone does not help if it is routed
-        // through `serde_json::to_value`/`Value`: that rebuilds a BTreeMap and
-        // re-alphabetises. The fix mirrors the established `getblock` /
-        // `getrawmempool` pattern in this file: build the response as a
-        // verbatim JSON string (struct serialization emits fields in
-        // declaration order straight to the writer, never through a Map) and
-        // return it as a `RawValue`, which jsonrpsee writes byte-for-byte. The
-        // inner key order is thus `synced` then `best_block_height`, matching
-        // Core, while the outer object's index-name keys keep the prior
-        // (lexicographic) ordering this RPC already used.
+        // This entry shape is built as a verbatim JSON string and returned as
+        // a `RawValue`. The crate now enables serde_json's `preserve_order`
+        // feature (Cargo.toml), so a `serde_json::Value::Object` is backed by
+        // an insertion-ordered `IndexMap` and would also preserve the
+        // `synced`-then-`best_block_height` order. The RawValue path is kept
+        // here because it mirrors the established `getblock` / `getrawmempool`
+        // pattern in this file (struct serialization emits fields in
+        // declaration order straight to the writer) and is robust regardless
+        // of any future serde_json feature changes. The inner key order is
+        // `synced` then `best_block_height`, matching Core; the outer object's
+        // index-name keys keep the prior (lexicographic) ordering.
         #[derive(serde::Serialize)]
         struct IndexSummary {
             synced: bool,
