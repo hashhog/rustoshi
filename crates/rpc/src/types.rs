@@ -384,14 +384,20 @@ pub struct TransactionInfo {
     pub wtxid: String,
     /// Transaction hash (the wtxid).
     pub hash: String,
+    /// Transaction version.
+    ///
+    /// Core's `TxToUniv` (core_io.cpp) pushes `version` immediately after
+    /// `hash` and BEFORE `size`/`vsize`/`weight`/`locktime`. Field order here
+    /// is the wire order (jsonrpsee serializes the struct straight to the
+    /// writer), so `version` must sit here to match Core's pushKV sequence:
+    /// txid, hash, version, size, vsize, weight, locktime.
+    pub version: i32,
     /// Transaction size in bytes.
     pub size: u32,
     /// Transaction size without witness (virtual size base).
     pub vsize: u32,
     /// Transaction weight.
     pub weight: u32,
-    /// Transaction version.
-    pub version: i32,
     /// Transaction locktime.
     pub locktime: u32,
     /// Transaction inputs.
@@ -407,11 +413,15 @@ pub struct TransactionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmations: Option<u32>,
     /// Block time (omitted when unconfirmed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocktime: Option<u32>,
-    /// Same as blocktime (omitted when unconfirmed).
+    ///
+    /// Core's `TxToJSON` envelope (rpc/rawtransaction.cpp:77-79) pushes
+    /// `time` BEFORE `blocktime`, so `time` is declared first here to match
+    /// the wire order: blockhash, confirmations, time, blocktime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<u32>,
+    /// Same as time (omitted when unconfirmed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocktime: Option<u32>,
 }
 
 /// Transaction input information.
@@ -690,6 +700,14 @@ pub struct PeerInfoRpc {
     pub addrlocal: Option<String>,
     /// Network type (ipv4, ipv6, onion).
     pub network: String,
+    /// The AS in the BGP sense for the peer's IP address, if an ASMap is loaded.
+    /// None when no asmap is loaded (default).
+    ///
+    /// Core reference: `src/rpc/net.cpp` pushes `mapped_as` immediately after
+    /// `network` (only when non-zero). Field order here is the wire order, so
+    /// `mapped_as` is declared right after `network` to match Core's sequence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapped_as: Option<u32>,
     /// Services offered.
     pub services: String,
     /// Services offered (hex).
@@ -700,6 +718,15 @@ pub struct PeerInfoRpc {
     pub lastsend: u64,
     /// Time of last receive.
     pub lastrecv: u64,
+    /// Unix timestamp of last transaction received from this peer.
+    ///
+    /// Core pushes `last_transaction` then `last_block` immediately after
+    /// `lastrecv` and BEFORE `bytessent` (rpc/net.cpp). Field order here is the
+    /// wire order, so both are declared here to match Core's sequence:
+    /// lastsend, lastrecv, last_transaction, last_block, bytessent, bytesrecv.
+    pub last_transaction: i64,
+    /// Unix timestamp of last block received from this peer.
+    pub last_block: i64,
     /// Total bytes sent.
     pub bytessent: u64,
     /// Total bytes received.
@@ -754,16 +781,6 @@ pub struct PeerInfoRpc {
     pub transport_protocol_type: String,
     /// BIP-324 session ID (empty for v1 connections).
     pub session_id: String,
-    /// Unix timestamp of last block received from this peer.
-    pub last_block: i64,
-    /// Unix timestamp of last transaction received from this peer.
-    pub last_transaction: i64,
-    /// The AS in the BGP sense for the peer's IP address, if an ASMap is loaded.
-    /// None when no asmap is loaded (default).
-    ///
-    /// Core reference: `src/rpc/net.cpp:236` `obj.pushKV("mapped_as", mapped_as)`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mapped_as: Option<u32>,
 }
 
 /// Response for `getnetworkinfo` RPC.
@@ -783,14 +800,20 @@ pub struct NetworkInfo {
     pub localrelay: bool,
     /// Time offset in seconds.
     pub timeoffset: i64,
+    /// Whether network is active.
+    ///
+    /// Core's `getnetworkinfo` (rpc/net.cpp) pushes `networkactive` BEFORE
+    /// the three `connections*` fields. Field order here is the wire order
+    /// (the struct is serialized straight to the writer by jsonrpsee), so
+    /// `networkactive` must precede `connections` to match Core's sequence:
+    /// timeoffset, networkactive, connections, connections_in, connections_out.
+    pub networkactive: bool,
     /// Total number of connections.
     pub connections: u32,
     /// Number of inbound connections.
     pub connections_in: u32,
     /// Number of outbound connections.
     pub connections_out: u32,
-    /// Whether network is active.
-    pub networkactive: bool,
     /// List of network interfaces.
     pub networks: Vec<NetworkInterface>,
     /// Minimum relay fee (BTC/kvB) — serialized as Core's ValueFromAmount `%d.%08d`.
