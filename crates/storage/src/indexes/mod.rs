@@ -30,7 +30,7 @@ pub mod txindex;
 
 // Re-exports for convenience
 pub use blockfilterindex::{BlockFilter, BlockFilterError, BlockFilterIndex, BlockFilterType, FilterHeaderEntry};
-pub use coinstatsindex::{CoinStatsEntry, CoinStatsError, CoinStatsIndex, get_block_subsidy, get_bogo_size, serialize_coin_for_muhash};
+pub use coinstatsindex::{CoinStatsEntry, CoinStatsError, CoinStatsIndex, compute_next_entry, genesis_entry, get_block_subsidy, get_bogo_size, serialize_coin_for_muhash};
 pub use gcs::{GCSFilter, GCSError, BASIC_FILTER_M, BASIC_FILTER_P};
 pub use muhash::{MuHash3072, Num3072};
 pub use txindex::{TxIndex, TxIndexError, TxLocation};

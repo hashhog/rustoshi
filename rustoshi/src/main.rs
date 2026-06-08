@@ -40,8 +40,9 @@ use rustoshi_primitives::{Encodable, Hash256, OutPoint};
 use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
 use rustoshi_storage::{
     block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry},
+    coinstats_compute_next_entry, coinstats_genesis_entry,
     indexes::BlockFilterIndex,
-    BlockStore, ChainDb, UtxoCacheState,
+    BlockStore, ChainDb, CoinStatsIndex, UtxoCacheState,
 };
 
 // ============================================================
@@ -158,6 +159,15 @@ struct Cli {
     /// Enable transaction indexing
     #[arg(long)]
     txindex: bool,
+
+    /// Enable the coin statistics index (`-coinstatsindex`).
+    ///
+    /// Maintains a per-height running MuHash3072 + UTXO-set counts so that
+    /// `gettxoutsetinfo` can answer for a HISTORICAL `hash_or_height`, not
+    /// just the tip. Mirrors Bitcoin Core's `-coinstatsindex`
+    /// (`src/index/coinstatsindex.cpp`, default off).
+    #[arg(long = "coinstatsindex")]
+    coinstatsindex: bool,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
@@ -650,6 +660,72 @@ fn write_block_filter_index(
     }
 }
 
+/// Maintain the per-height coinstatsindex on the node's PRIMARY block-connect
+/// path (blk-file import, stdin import, the foreground IBD validation loop, and
+/// the P2P sync-loop connect) — the SAME path that maintains txindex and the
+/// block filter index. Prior to this wiring the coinstatsindex was updated ONLY
+/// on the `submitblock` RPC path, so a node syncing the chain over P2P/IBD never
+/// populated the index and `gettxoutsetinfo <height>` could not answer for any
+/// historically-synced height.
+///
+/// Computes the height-`height` snapshot from the persisted height-`height-1`
+/// snapshot (the empty/genesis base when `height == 1`) by inserting the block's
+/// new spendable outputs and removing its spent coins via the running
+/// `MuHash3072`, then persists it keyed by `height`. Mirrors Bitcoin Core's
+/// `CoinStatsIndex::CustomAppend` fired from `BaseIndex::BlockConnected` on every
+/// connect (linear and reorg-reconnect). A reconnect at a height a disconnected
+/// block previously occupied OVERWRITES the stale snapshot, exactly as Core's
+/// per-block index does. No-op unless `-coinstatsindex` was enabled at startup.
+///
+/// Non-fatal on error: a coinstats write failure must not unwind an
+/// already-committed block connect (matches the txindex / block-filter-index
+/// paths). Reorg disconnect/rewind of the index is handled on the RPC
+/// invalidate/reconsider path (`coinstats_disconnect_above` in rustoshi-rpc),
+/// which deletes the stale per-height rows so the reconnect overwrites them.
+fn write_coinstats_index(
+    block_store: &BlockStore,
+    enabled: bool,
+    genesis_hash: Hash256,
+    block: &rustoshi_primitives::Block,
+    height: u32,
+    undo: &rustoshi_consensus::validation::UndoData,
+) {
+    if !enabled {
+        return;
+    }
+    let index = CoinStatsIndex::new(block_store.db());
+    // Base = persisted snapshot at height-1. For height 1 the base is the
+    // empty genesis snapshot (Core never ingests the genesis coinbase).
+    let prev = if height == 0 {
+        None
+    } else if height == 1 {
+        Some(coinstats_genesis_entry(genesis_hash))
+    } else {
+        match index.get_stats(height - 1) {
+            Ok(Some(e)) => Some(e),
+            _ => None,
+        }
+    };
+    if prev.is_none() && height > 1 {
+        tracing::warn!(
+            "coinstatsindex: no base snapshot at height {} for connect of height {}; \
+             at-height queries for {} may be unavailable",
+            height - 1,
+            height,
+            height
+        );
+        return;
+    }
+    let entry = coinstats_compute_next_entry(prev.as_ref(), block, height, undo);
+    if let Err(e) = index.put_stats(&entry) {
+        tracing::warn!(
+            "coinstatsindex: failed to persist snapshot at height {}: {}",
+            height,
+            e
+        );
+    }
+}
+
 fn resolve_datadir(datadir: &str, params: &ChainParams) -> PathBuf {
     let mut path = resolve_base_datadir(datadir);
 
@@ -1052,6 +1128,7 @@ fn run_import_from_blk_files(
     chain_state: &mut ChainState,
     utxo_view: &mut rustoshi_storage::BlockStoreUtxoView<'_>,
     start_height: u32,
+    coinstatsindex_enabled: bool,
 ) -> anyhow::Result<u32> {
     let magic = params.network_magic.0;
     tracing::info!("Scanning blk*.dat files in {} ...", blocks_dir.display());
@@ -1155,6 +1232,19 @@ fn run_import_from_blk_files(
         // `BlockFilterIndex::CustomAppend` fired from BaseIndex::BlockConnected.
         write_block_filter_index(block_store, &block, height, &undo);
 
+        // Coinstatsindex — maintain the per-height running MuHash + UTXO-set
+        // counts on the PRIMARY connect path (same as txindex/blockfilterindex)
+        // so `gettxoutsetinfo <height>` answers after a blk-file import / IBD.
+        // Counterpart to Core's CoinStatsIndex::CustomAppend on BlockConnected.
+        write_coinstats_index(
+            block_store,
+            coinstatsindex_enabled,
+            params.genesis_hash,
+            &block,
+            height,
+            &undo,
+        );
+
         // Flush UTXO cache if needed
         if utxo_view.needs_flush() {
             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
@@ -1212,11 +1302,12 @@ fn run_import_from_blk_files(
 /// Run the block import from stdin in framed format.
 /// Frame: [4 bytes height LE] [4 bytes size LE] [size bytes raw block data]
 fn run_import_from_stdin(
-    _params: &ChainParams,
+    params: &ChainParams,
     block_store: &BlockStore,
     chain_state: &mut ChainState,
     utxo_view: &mut rustoshi_storage::BlockStoreUtxoView<'_>,
     start_height: u32,
+    coinstatsindex_enabled: bool,
 ) -> anyhow::Result<u32> {
     use rustoshi_primitives::{Block, Decodable};
     use std::io::Read;
@@ -1337,6 +1428,17 @@ fn run_import_from_stdin(
         // BIP-157/158 block filter index — FIX-69 W121 BUG-16.
         // See `write_block_filter_index` for the Core reference.
         write_block_filter_index(block_store, &block, frame_height, &undo);
+
+        // Coinstatsindex — PRIMARY connect path (same as txindex/blockfilterindex).
+        // See `write_coinstats_index` for the Core reference.
+        write_coinstats_index(
+            block_store,
+            coinstatsindex_enabled,
+            params.genesis_hash,
+            &block,
+            frame_height,
+            &undo,
+        );
 
         // Flush UTXO cache if needed
         if utxo_view.needs_flush() {
@@ -1490,6 +1592,7 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
     }
     merge_bool!(nodnsseed, "nodnsseed");
     merge_bool!(txindex, "txindex");
+    merge_bool!(coinstatsindex, "coinstatsindex");
     merge_str!(loglevel, "loglevel");
     if !was_set(raw_argv, "metrics-port") && !was_set(raw_argv, "metrics_port") {
         if let Some(v) = conf.get("metrics_port") {
@@ -1866,11 +1969,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let mut utxo_view = block_store.utxo_view();
 
         let imported = if import_path == "-" {
-            run_import_from_stdin(&params, &block_store, &mut chain_state, &mut utxo_view, best_height)?
+            run_import_from_stdin(&params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex)?
         } else {
             let path = std::path::PathBuf::from(import_path);
             if path.is_dir() {
-                run_import_from_blk_files(&path, &params, &block_store, &mut chain_state, &mut utxo_view, best_height)?
+                run_import_from_blk_files(&path, &params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex)?
             } else {
                 anyhow::bail!(
                     "--import-blocks path must be a directory containing blk*.dat files, or \"-\" for stdin"
@@ -1941,6 +2044,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         RpcState::new(db.clone(), params.clone())
     };
     rpc_state_inner.data_dir = Some(datadir.clone());
+    rpc_state_inner.coinstatsindex_enabled = cli.coinstatsindex;
     rpc_state_inner.init_from_db().map_err(|e| anyhow::anyhow!(e))?;
 
     // If `--load-snapshot=<path>` was provided, ingest the Core-format UTXO
@@ -2822,6 +2926,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // See `write_block_filter_index` for the Core reference.
                         write_block_filter_index(&block_store, &block, height, &undo);
 
+                        // Coinstatsindex — PRIMARY P2P/IBD connect path (same as
+                        // txindex/blockfilterindex). See `write_coinstats_index`
+                        // for the Core reference (CoinStatsIndex::CustomAppend).
+                        write_coinstats_index(
+                            &block_store,
+                            cli.coinstatsindex,
+                            params.genesis_hash,
+                            &block,
+                            height,
+                            &undo,
+                        );
+
                         // Durability: advance the persisted tip pointer ONLY
                         // as part of an atomic UTXO flush, never as a separate
                         // eager write.  Commit when the cache hits the
@@ -3466,6 +3582,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // BIP-157/158 block filter index — FIX-69 W121 BUG-16.
                                         // See `write_block_filter_index` for the Core reference.
                                         write_block_filter_index(&block_store, &block, height, &undo);
+
+                                        // Coinstatsindex — PRIMARY P2P sync-loop
+                                        // connect path (same as txindex/
+                                        // blockfilterindex). See
+                                        // `write_coinstats_index` for the Core
+                                        // reference (CoinStatsIndex::CustomAppend).
+                                        write_coinstats_index(
+                                            &block_store,
+                                            cli.coinstatsindex,
+                                            params.genesis_hash,
+                                            &block,
+                                            height,
+                                            &undo,
+                                        );
 
                                         // Durability: advance the persisted tip
                                         // pointer ONLY as part of an atomic UTXO
