@@ -3068,6 +3068,60 @@ impl PeerManager {
         cmd_rx
     }
 
+    /// Test-support seam (cross-crate): insert an ESTABLISHED peer with the
+    /// given id/addr and hand back the receiver of its command channel so a
+    /// caller can observe exactly what `send_to_peer` / `broadcast` would
+    /// deliver to it. Unlike [`insert_test_peer`] this is `pub` (not
+    /// `#[cfg(test)]`) so downstream crates — notably `rustoshi-rpc`'s
+    /// `getblockfrompeer` test — can build a `PeerManager` with a fake peer
+    /// without a live TCP connection. `#[doc(hidden)]`: not part of the public
+    /// API contract, test-support only.
+    #[doc(hidden)]
+    pub fn insert_observable_peer(
+        &mut self,
+        peer_id: PeerId,
+        addr: SocketAddr,
+    ) -> mpsc::Receiver<PeerCommand> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        self.peers.insert(
+            peer_id,
+            PeerHandle {
+                info: PeerInfo {
+                    addr,
+                    version: PROTOCOL_VERSION,
+                    services: 0,
+                    user_agent: String::new(),
+                    start_height: 0,
+                    relay: true,
+                    inbound: false,
+                    state: PeerState::Established,
+                    last_send: Instant::now(),
+                    last_recv: Instant::now(),
+                    ping_nonce: None,
+                    ping_time: None,
+                    bytes_sent: 0,
+                    bytes_recv: 0,
+                    time_offset: 0,
+                    supports_witness: true,
+                    supports_sendheaders: false,
+                    supports_wtxid_relay: false,
+                    supports_addrv2: false,
+                    feefilter: 0,
+                },
+                command_tx: cmd_tx,
+                conn_type: ConnectionType::FullRelay,
+                noban: false,
+                connected_time: Instant::now(),
+                min_ping_time: None,
+                last_block_time: None,
+                last_tx_time: None,
+                stale_state: StalePeerState::new(),
+                stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+            },
+        );
+        cmd_rx
+    }
+
     /// Test-only: insert a peer with specific connection type and noban flag.
     /// Used by W99 G2 unit tests to exercise the ban-exemption logic without
     /// a live async runtime.

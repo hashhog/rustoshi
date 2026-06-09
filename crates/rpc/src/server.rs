@@ -518,6 +518,27 @@ pub trait RustoshiRpc {
     #[method(name = "getpeerinfo")]
     async fn get_peer_info(&self) -> RpcResult<Vec<PeerInfoRpc>>;
 
+    /// Attempt to fetch a block from a given peer.
+    ///
+    /// Mirrors Bitcoin Core's `getblockfrompeer "blockhash" peer_id`
+    /// (`rpc/blockchain.cpp` + `net_processing.cpp::FetchBlock`). We must
+    /// already have the block's *header* (e.g. synced via headers-first or
+    /// `submitheader`); the call sends a `getdata(MSG_BLOCK)` for the hash to
+    /// the identified peer and returns immediately (fire-and-forget). The
+    /// `peer_id` matches the `id` field shown by `getpeerinfo`.
+    ///
+    /// Returns an empty JSON object `{}` if the request was scheduled.
+    /// Errors (all `RPC_MISC_ERROR`, -1):
+    ///   - "Block header missing"   — we don't have the header for `blockhash`.
+    ///   - "Block already downloaded" — we already have the full block data.
+    ///   - "Peer does not exist"    — `peer_id` is not a connected peer.
+    #[method(name = "getblockfrompeer")]
+    async fn get_block_from_peer(
+        &self,
+        blockhash: String,
+        peer_id: i64,
+    ) -> RpcResult<serde_json::Value>;
+
     /// Return known addresses from the address manager (a shuffled addrman
     /// dump), filtered by count + network. Mirrors Bitcoin Core's
     /// `getnodeaddresses ( count "network" )` (rpc/net.cpp:911).
@@ -5554,6 +5575,106 @@ impl RustoshiRpcServer for RpcServerImpl {
         } else {
             Ok(vec![])
         }
+    }
+
+    /// `getblockfrompeer "blockhash" peer_id` — schedule a single-block fetch
+    /// from a specific connected peer. Thin port of Bitcoin Core's
+    /// `rpc/blockchain.cpp::getblockfrompeer` + `PeerManagerImpl::FetchBlock`:
+    ///
+    ///   1. The block's *header* must already be known (we hold the
+    ///      `CBlockIndex`), else `RPC_MISC_ERROR "Block header missing"`.
+    ///   2. If we already have the full block data, `RPC_MISC_ERROR
+    ///      "Block already downloaded"` (cheap short-circuit Core also does).
+    ///   3. The `peer_id` must resolve to a connected (established) peer, else
+    ///      `RPC_MISC_ERROR "Peer does not exist"`. The id matches the value
+    ///      `getpeerinfo` reports (`snap.peer_id.0`).
+    ///   4. On success, send a `getdata(MSG_BLOCK)` for the hash to that peer
+    ///      and return `{}`. Fire-and-forget: we do not wait for the block.
+    async fn get_block_from_peer(
+        &self,
+        blockhash: String,
+        peer_id: i64,
+    ) -> RpcResult<serde_json::Value> {
+        use rustoshi_network::peer::PeerId;
+
+        let block_hash = Self::parse_hash(&blockhash)?;
+
+        // ── 1. Header must be known + 2. block-data short-circuit ──────────
+        // Read everything we need from the chain store while holding the
+        // read-lock, then drop it before touching the peer manager.
+        {
+            let state = self.state.read().await;
+            let store = BlockStore::new(&state.db);
+
+            // The header is "known" iff we can produce it from the store —
+            // this is the CBlockIndex / LookupBlockIndex equivalent.
+            let header_known = store
+                .get_header(&block_hash)
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                .is_some();
+            if !header_known {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "Block header missing",
+                ));
+            }
+
+            // If we already have the full block data, there is nothing to
+            // fetch (Core: `index->nStatus & BLOCK_HAVE_DATA`).
+            let have_block = store
+                .get_block(&block_hash)
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                .is_some();
+            if have_block {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "Block already downloaded",
+                ));
+            }
+        }
+
+        // ── 3. Resolve the peer + 4. send the getdata ─────────────────────
+        let target = PeerId(peer_id as u64);
+
+        // Build the block getdata. Core requests `MSG_BLOCK | MSG_WITNESS_FLAG`
+        // from witness-capable peers; the rustoshi wire equivalent is
+        // `InvType::MsgWitnessBlock`, so the served block carries witness data.
+        let getdata = NetworkMessage::GetData(vec![InvVector {
+            inv_type: InvType::MsgWitnessBlock,
+            hash: block_hash,
+        }]);
+
+        let peer_state = self.peer_state.read().await;
+        let pm = peer_state.peer_manager.as_ref().ok_or_else(|| {
+            Self::rpc_error(rpc_error::RPC_MISC_ERROR, "Peer does not exist")
+        })?;
+
+        // Resolve the peer the same way `getpeerinfo` enumerates ids: only
+        // ESTABLISHED peers are visible, so a disconnected / unknown id is
+        // "Peer does not exist" (Core `FetchBlock`: `GetPeerRef == nullptr`).
+        let is_connected = pm
+            .get_peer_info(target)
+            .map(|info| info.state == rustoshi_network::peer::PeerState::Established)
+            .unwrap_or(false);
+        if !is_connected {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "Peer does not exist",
+            ));
+        }
+
+        // Fire the request. `send_to_peer` enqueues onto the peer's command
+        // channel; if the peer vanished between the check and the send (lost
+        // the race) we surface the same "Peer does not exist".
+        if !pm.send_to_peer(target, getdata).await {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "Peer does not exist",
+            ));
+        }
+
+        // Success: empty JSON object, request scheduled (fire-and-forget).
+        Ok(serde_json::json!({}))
     }
 
     async fn get_node_addresses(
@@ -12918,6 +13039,182 @@ fn connection_type_str(ct: rustoshi_network::ConnectionType) -> &'static str {
 mod tests {
     use super::*;
     use rustoshi_consensus::chain_manager::{block_status, get_ancestor, is_ancestor};
+
+    // ── getblockfrompeer ──────────────────────────────────────────────────
+    //
+    // Thin port of Bitcoin Core's `getblockfrompeer` + `FetchBlock`. These
+    // unit tests run fully in-process (regtest ChainDb in a tempdir + a
+    // PeerManager with a fake peer whose command channel we observe) — no
+    // multi-node regtest, no live TCP, OOM-free.
+
+    /// Build an `RpcServerImpl` over an ephemeral regtest db, plus the shared
+    /// `RpcState` / `PeerState` handles so a test can seed a header and a peer.
+    async fn gbfp_fixture() -> (
+        RpcServerImpl,
+        std::sync::Arc<tokio::sync::RwLock<RpcState>>,
+        std::sync::Arc<tokio::sync::RwLock<PeerState>>,
+        tempfile::TempDir,
+    ) {
+        use rustoshi_storage::ChainDb;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+
+        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state.clone(), peer_state.clone());
+        (rpc, state, peer_state, tmp)
+    }
+
+    /// Construct a distinct regtest header, persist it (header only, NO block
+    /// body), and return its hash. This is the "we have the CBlockIndex but not
+    /// the block data" state `getblockfrompeer` is meant to act on.
+    fn gbfp_put_header(state_db: &rustoshi_storage::ChainDb, nonce: u32) -> Hash256 {
+        let header = rustoshi_primitives::BlockHeader {
+            version: 1,
+            prev_block_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            timestamp: 1_700_000_000 + nonce,
+            bits: 0x207fffff,
+            nonce,
+        };
+        let block = Block {
+            header: header.clone(),
+            transactions: vec![],
+        };
+        let hash = block.block_hash();
+        let store = BlockStore::new(state_db);
+        store.put_header(&hash, &header).unwrap();
+        hash
+    }
+
+    /// (a) Unknown header → `RPC_MISC_ERROR "Block header missing"`.
+    #[tokio::test]
+    async fn test_getblockfrompeer_header_missing() {
+        let (rpc, _state, peer_state, _tmp) = gbfp_fixture().await;
+
+        // Wire up a connected peer so we KNOW the error is the missing-header
+        // path and not the peer-not-found path.
+        {
+            let mut ps = peer_state.write().await;
+            let mut pm = rustoshi_network::peer_manager::PeerManager::new(
+                rustoshi_network::peer_manager::PeerManagerConfig::default(),
+                rustoshi_consensus::ChainParams::regtest(),
+            );
+            let _rx = pm.insert_observable_peer(
+                rustoshi_network::peer::PeerId(7),
+                "127.0.0.1:18444".parse().unwrap(),
+            );
+            ps.peer_manager = Some(pm);
+        }
+
+        // A hash for which we never stored a header.
+        let unknown = Hash256::ZERO;
+        let err = rpc
+            .get_block_from_peer(unknown.to_hex(), 7)
+            .await
+            .expect_err("unknown header must error");
+        assert_eq!(err.code(), rpc_error::RPC_MISC_ERROR);
+        assert_eq!(err.message(), "Block header missing");
+    }
+
+    /// (b) Unknown / disconnected peer_id → `RPC_MISC_ERROR "Peer does not
+    /// exist"` (header is present, so we reach the peer-resolution step).
+    #[tokio::test]
+    async fn test_getblockfrompeer_peer_not_found() {
+        let (rpc, state, peer_state, _tmp) = gbfp_fixture().await;
+
+        // Seed a known header (so we pass the header check).
+        let hash = {
+            let s = state.read().await;
+            gbfp_put_header(&s.db, 11)
+        };
+
+        // Empty peer manager → no peer with id 99.
+        {
+            let mut ps = peer_state.write().await;
+            let pm = rustoshi_network::peer_manager::PeerManager::new(
+                rustoshi_network::peer_manager::PeerManagerConfig::default(),
+                rustoshi_consensus::ChainParams::regtest(),
+            );
+            ps.peer_manager = Some(pm);
+        }
+
+        let err = rpc
+            .get_block_from_peer(hash.to_hex(), 99)
+            .await
+            .expect_err("unknown peer must error");
+        assert_eq!(err.code(), rpc_error::RPC_MISC_ERROR);
+        assert_eq!(err.message(), "Peer does not exist");
+    }
+
+    /// (c) Success: header known + block data absent + peer connected →
+    /// returns `{}` AND a `getdata(MSG_BLOCK)` for the hash is delivered to the
+    /// resolved peer's command channel. The peer id matches `getpeerinfo`'s id.
+    #[tokio::test]
+    async fn test_getblockfrompeer_success_sends_getdata() {
+        use rustoshi_network::peer::{PeerCommand, PeerId};
+
+        let (rpc, state, peer_state, _tmp) = gbfp_fixture().await;
+
+        // Header present, block body absent.
+        let hash = {
+            let s = state.read().await;
+            gbfp_put_header(&s.db, 42)
+        };
+
+        // Connected peer id=5; keep the command receiver to observe the send.
+        let target_id: u64 = 5;
+        let mut rx = {
+            let mut ps = peer_state.write().await;
+            let mut pm = rustoshi_network::peer_manager::PeerManager::new(
+                rustoshi_network::peer_manager::PeerManagerConfig::default(),
+                rustoshi_consensus::ChainParams::regtest(),
+            );
+            let rx = pm.insert_observable_peer(
+                PeerId(target_id),
+                "127.0.0.1:18444".parse().unwrap(),
+            );
+            // Confirm the id we'll pass is exactly what getpeerinfo would show.
+            let shown = pm
+                .connected_peers_with_stats()
+                .into_iter()
+                .map(|snap| snap.peer_id.0)
+                .collect::<Vec<_>>();
+            assert!(
+                shown.contains(&target_id),
+                "peer id must match getpeerinfo's id convention"
+            );
+            ps.peer_manager = Some(pm);
+            rx
+        };
+
+        // Call: expect {} on success.
+        let res = rpc
+            .get_block_from_peer(hash.to_hex(), target_id as i64)
+            .await
+            .expect("success path");
+        assert_eq!(res, serde_json::json!({}), "success returns empty object");
+
+        // The peer's command channel must have received a getdata(MSG_BLOCK)
+        // for exactly this block hash.
+        let cmd = rx.try_recv().expect("a command must be enqueued to the peer");
+        match cmd {
+            PeerCommand::SendMessage(NetworkMessage::GetData(invs)) => {
+                assert_eq!(invs.len(), 1, "exactly one inv vector");
+                assert_eq!(
+                    invs[0].inv_type,
+                    InvType::MsgWitnessBlock,
+                    "block getdata (witness) per Core MSG_BLOCK|MSG_WITNESS_FLAG"
+                );
+                assert_eq!(invs[0].hash, hash, "getdata must target the requested block");
+            }
+            other => panic!("expected getdata(block), got {:?}", other),
+        }
+    }
 
     /// DoS-vector parity (audit w14z8m3zc, finding 1): the live mempool must
     /// run with script verification ON for every real network. Pre-fix the live
