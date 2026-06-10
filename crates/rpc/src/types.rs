@@ -879,12 +879,13 @@ pub struct ValidateAddressResult {
     /// Witness program (hex). Only emitted for witness addresses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness_program: Option<String>,
+    /// Error locations for invalid addresses (Core 27+). Core pushes
+    /// error_locations BEFORE error (output_script.cpp validateaddress).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_locations: Option<Vec<serde_json::Value>>,
     /// Error message for invalid addresses (Core 27+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Error locations for invalid addresses (Core 27+).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_locations: Option<Vec<serde_json::Value>>,
 }
 
 // ============================================================
