@@ -8295,7 +8295,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Reference: bitcoin-core/src/rpc/rawtransaction.cpp `decodescript` handler.
         //
         // Shape mirrors ScriptToUniv(script, /*include_hex=*/false) for top level:
-        //   { asm, desc, type, address? }  — NO top-level `hex` field.
+        //   { asm, desc, address?, type }  — NO top-level `hex` field. Core's
+        //   ScriptPubKeyToUniv pushes `address` (when a single dest exists)
+        //   BEFORE `type` (core_io.cpp).
         //
         // can_wrap types (Core's switch statement + validity checks):
         //   pubkey, pubkeyhash, multisig, nonstandard,
@@ -8344,10 +8346,11 @@ impl RustoshiRpcServer for RpcServerImpl {
         let mut result = serde_json::Map::new();
         result.insert("asm".to_string(), serde_json::Value::String(asm));
         result.insert("desc".to_string(), serde_json::Value::String(desc));
-        result.insert("type".to_string(), serde_json::Value::String(script_type.clone()));
+        // Core order: address (when a single dest exists) BEFORE type.
         if let Some(addr) = address {
             result.insert("address".to_string(), serde_json::Value::String(addr));
         }
+        result.insert("type".to_string(), serde_json::Value::String(script_type.clone()));
 
         // Determine can_wrap.
         let is_unspendable = !bytes.is_empty() && bytes[0] == 0x6a;

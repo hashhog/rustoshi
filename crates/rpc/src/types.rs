@@ -918,14 +918,15 @@ pub struct DecodedRawTransaction {
     pub txid: String,
     /// Witness transaction ID.
     pub hash: String,
+    /// Version. (Core TxToUniv order: txid, hash, version, size, vsize,
+    /// weight, locktime — core_io.cpp:430.)
+    pub version: i32,
     /// Transaction size.
     pub size: u32,
     /// Virtual size.
     pub vsize: u32,
     /// Weight.
     pub weight: u32,
-    /// Version.
-    pub version: i32,
     /// Locktime.
     pub locktime: u32,
     /// Inputs.
