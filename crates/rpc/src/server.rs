@@ -383,12 +383,18 @@ pub trait RustoshiRpc {
     async fn get_block(&self, hash: String, verbosity: Option<u8>) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Get a block header by hash.
+    ///
+    /// Returns a pre-serialized raw JSON token (like `getblock`) so the
+    /// `difficulty` field's `%.16g` `RawValue` survives byte-for-byte.
+    /// `serde_json::to_value` would collapse that RawValue back through
+    /// `Value::Number` (re-formatting via ryu), so the verbose body is built
+    /// with `to_string` + `RawValue::from_string` instead.
     #[method(name = "getblockheader")]
     async fn get_block_header(
         &self,
         hash: String,
         verbose: Option<bool>,
-    ) -> RpcResult<serde_json::Value>;
+    ) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Get the current block count (height of the best chain).
     #[method(name = "getblockcount")]
@@ -399,8 +405,14 @@ pub trait RustoshiRpc {
     async fn get_best_block_hash(&self) -> RpcResult<String>;
 
     /// Get the current network difficulty.
+    ///
+    /// Returned as a raw JSON number pre-formatted with Core's `%.16g`
+    /// (`setprecision(16)`) so jsonrpsee/serde does not re-serialise the `f64`
+    /// through ryu's shortest-round-trip form, which diverges at the 16th
+    /// significant digit (and for sub-1e-4 difficulties picks a different
+    /// fixed/scientific representation entirely).
     #[method(name = "getdifficulty")]
-    async fn get_difficulty(&self) -> RpcResult<f64>;
+    async fn get_difficulty(&self) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Compute statistics about the total number and rate of transactions
     /// in the chain. Mirrors `bitcoin-core/src/rpc/blockchain.cpp::getchaintxstats`.
@@ -1509,16 +1521,10 @@ impl RpcServerImpl {
     /// We pre-format to 16 sig digits and embed as a raw JSON number token.
     fn bits_to_difficulty_raw(bits: u32) -> Box<serde_json::value::RawValue> {
         let d = Self::bits_to_difficulty(bits);
-        // Format with 16 significant digits (matches Core's setprecision(16)).
-        // `{:.15e}` = 1 digit before decimal + 15 after = 16 sig digits total.
-        let formatted = format!("{:.15e}", d);
-        // Parse the scientific notation string into mantissa + exponent.
-        let parts: Vec<&str> = formatted.splitn(2, 'e').collect();
-        let mantissa_str = parts[0];
-        let exp: i32 = parts[1].parse().unwrap_or(0);
-        // Reconstruct as decimal without exponent notation where possible.
-        let decimal_str = scientific_to_decimal(mantissa_str, exp);
-        serde_json::value::RawValue::from_string(decimal_str).unwrap()
+        // Format as Core does: `std::ostringstream << setprecision(16) << d`,
+        // i.e. C printf `%.16g` (16 significant digits, fixed<->scientific by
+        // exponent, C-style signed >=2-digit exponent, trailing-zero stripping).
+        serde_json::value::RawValue::from_string(format_double_g16(d)).unwrap()
     }
 
     /// Check whether the IBD latch should flip from `true` to `false`.
@@ -2648,67 +2654,132 @@ fn compact_to_target_hex(bits: u32) -> String {
 // DIFFICULTY FORMATTING HELPERS
 // ============================================================
 
-/// Convert a scientific-notation mantissa string + exponent to a plain decimal
-/// string with no trailing zeros, matching Bitcoin Core's `std::setprecision(16)`
-/// output for difficulty values.
+/// Format an `f64` exactly as Bitcoin Core serialises every JSON `double`:
+/// `std::ostringstream oss; oss << std::setprecision(16) << v;`
+/// (UniValue::setFloat, univalue.cpp:75-82).  With the default float format
+/// (defaultfloat — no `std::fixed`/`std::scientific`), `operator<<` with
+/// `setprecision(16)` is exactly C printf `%.16g` semantics:
 ///
-/// Input: mantissa_str like `"3.438908960159138"`, exp like `6`
-/// Output: `"3438908.960159138"`
-fn scientific_to_decimal(mantissa_str: &str, exp: i32) -> String {
-    // Remove the leading sign, split on the decimal point.
-    let sign = if mantissa_str.starts_with('-') { "-" } else { "" };
-    let unsigned = mantissa_str.trim_start_matches('-');
-    let (int_part, frac_part) = if let Some(pos) = unsigned.find('.') {
-        (&unsigned[..pos], &unsigned[pos + 1..])
+///   * 16 SIGNIFICANT digits (not 16 fractional),
+///   * fixed vs. scientific chosen by the decimal exponent X of the leading
+///     significant digit: FIXED iff `-4 <= X <= 15`, else SCIENTIFIC,
+///   * trailing fractional zeros and a bare trailing decimal point stripped,
+///   * a C-style exponent with an explicit sign and AT LEAST 2 digits
+///     (`e+NN` / `e-NN`, not capped at 2 — e.g. `e+130`).
+///
+/// This is the formatter difficulty must use so rustoshi's JSON is byte-for-byte
+/// identical to Core (serde/ryu produces the *shortest* round-trip decimal —
+/// e.g. `4.6565423739069247e-10` — which differs from Core's 16-sig-digit
+/// `4.656542373906925e-10`).
+///
+/// NOTE: amounts are NOT formatted this way in Core — `ValueFromAmount`
+/// (core_io.cpp) builds a VNUM string directly via `strprintf("%s%d.%08d")`,
+/// which is rustoshi's `BtcAmount` pattern.  Only fields Core emits through
+/// `setFloat` (difficulty, networkhashps, verificationprogress, …) belong here.
+fn format_double_g16(v: f64) -> String {
+    const P: usize = 16; // significant digits (setprecision(16))
+
+    // Non-finite values are not valid JSON.  Core's `%g` would emit
+    // `inf`/`nan`, which `RawValue::from_string` would reject downstream.
+    // Difficulty is always finite & positive, so this guard is defensive only.
+    if !v.is_finite() {
+        return "0".to_string();
+    }
+    if v == 0.0 {
+        // Matches C++ `setprecision(16)`: +0.0 -> "0", -0.0 -> "-0".
+        return if v.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
+    }
+
+    // Step 1: round to P significant digits and recover the decimal exponent X.
+    // `{:.15e}` = 1 digit before the dot + 15 after = 16 sig digits, already
+    // correctly rounded, formatted as `<d>.<15 digits>e<X>` where X is the
+    // power of 10 of the leading digit (Rust prints X with minimal digits,
+    // no '+', no zero-pad: `e-10`, `e16`, `e0`).
+    let sci = format!("{:.*e}", P - 1, v);
+    let (mant_signed, exp_str) = sci.split_once('e').expect("{:e} always emits 'e'");
+    let x: i32 = exp_str.parse().expect("{:e} exponent is an integer");
+
+    let negative = mant_signed.starts_with('-');
+    let mant = mant_signed.trim_start_matches('-');
+    // mant is "d.ddddddddddddddd" (16 digits, one dot).  Build the 16-digit
+    // significand string D = d0 d1 … d15 with the dot removed.
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    debug_assert_eq!(digits.len(), P, "16 significant digits expected");
+
+    // Step 2: %g representation choice.
+    let magnitude = if (-4..(P as i32)).contains(&x) {
+        // FIXED:  -4 <= X <= 15
+        fixed_from_significand(&digits, x)
     } else {
-        (unsigned, "")
+        // SCIENTIFIC:  X < -4 or X >= 16
+        scientific_from_significand(&digits, x)
     };
 
-    // Combine int + frac digits into one continuous string.
-    let mut digits: Vec<char> = int_part.chars().chain(frac_part.chars()).collect();
-    // The decimal point is currently after `int_part.len()` digits.
-    // After applying the exponent it should be after `int_part.len() + exp` digits.
-    let dot_pos = int_part.len() as i32 + exp;
+    if negative {
+        format!("-{magnitude}")
+    } else {
+        magnitude
+    }
+}
 
-    if dot_pos <= 0 {
-        // All digits are after the decimal point, pad with leading zeros.
-        let zeros = (-dot_pos) as usize;
-        let mut result = format!("{}0.", sign);
-        for _ in 0..zeros {
-            result.push('0');
+/// Place a 16-digit significand `D` with the decimal point after `X+1` digits
+/// from the left, then strip trailing fractional zeros and a bare trailing dot.
+/// Only valid for the `%g` FIXED branch (`-4 <= X <= 15`).
+fn fixed_from_significand(digits: &str, x: i32) -> String {
+    let point = x + 1; // number of digits to the left of the decimal point
+    let s = if point <= 0 {
+        // Leading zeros: "0." + (-point zeros) + all digits.
+        let mut s = String::from("0.");
+        for _ in 0..(-point) {
+            s.push('0');
         }
-        for c in &digits {
-            result.push(*c);
+        s.push_str(digits);
+        s
+    } else if (point as usize) >= digits.len() {
+        // Integer value, pad with trailing zeros (e.g. 1000000000000000).
+        let mut s = String::from(digits);
+        for _ in 0..(point as usize - digits.len()) {
+            s.push('0');
         }
-        // Strip trailing zeros after decimal point.
-        let trimmed = result.trim_end_matches('0');
-        let trimmed = trimmed.trim_end_matches('.');
-        return trimmed.to_string();
-    }
+        s
+    } else {
+        // Dot falls inside the digit run.
+        let (int_part, frac_part) = digits.split_at(point as usize);
+        format!("{int_part}.{frac_part}")
+    };
+    strip_trailing_fraction_zeros(s)
+}
 
-    let dot_pos = dot_pos as usize;
-    // Pad with trailing zeros if exponent extends beyond our digits.
-    while digits.len() < dot_pos {
-        digits.push('0');
-    }
+/// Build the `%g` SCIENTIFIC form: `d0[.d1…d15]` (trailing fractional zeros
+/// stripped) followed by a C-style exponent `e±NN` with an explicit sign and
+/// at least 2 digits (not capped — `e+130` is valid).
+fn scientific_from_significand(digits: &str, x: i32) -> String {
+    let (lead, rest) = digits.split_at(1);
+    let mantissa = if rest.is_empty() {
+        lead.to_string()
+    } else {
+        strip_trailing_fraction_zeros(format!("{lead}.{rest}"))
+    };
+    // C-style exponent: sign always present, abs value zero-padded to >= 2
+    // digits.  `{:02}` pads to 2 but never truncates a 3+-digit exponent.
+    let sign = if x < 0 { '-' } else { '+' };
+    format!("{mantissa}e{sign}{:02}", x.abs())
+}
 
-    let mut result = String::from(sign);
-    for (i, c) in digits.iter().enumerate() {
-        if i == dot_pos {
-            result.push('.');
-        }
-        result.push(*c);
+/// Strip trailing `0`s after a decimal point, then a bare trailing `.`.
+/// No-op for a string with no decimal point.
+fn strip_trailing_fraction_zeros(s: String) -> String {
+    if s.contains('.') {
+        let t = s.trim_end_matches('0');
+        let t = t.trim_end_matches('.');
+        t.to_string()
+    } else {
+        s
     }
-    // If dot_pos == digits.len() there's no decimal part — that's fine.
-
-    // Strip trailing zeros after decimal point.
-    if result.contains('.') {
-        let trimmed = result.trim_end_matches('0');
-        let trimmed = trimmed.trim_end_matches('.');
-        return trimmed.to_string();
-    }
-
-    result
 }
 
 /// Query a locally-running Bitcoin Core node for the `nTx` and `chainwork`
@@ -3417,7 +3488,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             bestblockhash: state.best_hash.to_hex(),
             bits: tip_bits,
             target: tip_target,
-            difficulty,
+            // %.16g (Core setprecision(16)) as a raw JSON number — same value
+            // as `bits_to_difficulty(tip.bits)`, formatted to match Core's wire
+            // bytes (the bare f64 would ryu-format with a different 16th digit
+            // / representation).
+            difficulty: serde_json::value::RawValue::from_string(format_double_g16(difficulty))
+                .unwrap(),
             time: tip_time,
             mediantime,
             verificationprogress: progress,
@@ -3712,7 +3788,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         &self,
         hash: String,
         verbose: Option<bool>,
-    ) -> RpcResult<serde_json::Value> {
+    ) -> RpcResult<Box<serde_json::value::RawValue>> {
         let block_hash = Self::parse_hash(&hash)?;
         let verbose = verbose.unwrap_or(true);
 
@@ -3744,7 +3820,10 @@ impl RustoshiRpcServer for RpcServerImpl {
                 .ok_or_else(|| Self::rpc_error(rpc_error::RPC_BLOCK_NOT_FOUND, "Block not found"))?;
 
             if !verbose {
-                return Ok(serde_json::Value::String(hex::encode(header.serialize())));
+                // Non-verbose: a bare JSON string (the serialized header hex).
+                // Wrap as a RawValue string token to match the new return type.
+                let hex_str = serde_json::to_string(&hex::encode(header.serialize())).unwrap();
+                return Ok(serde_json::value::RawValue::from_string(hex_str).unwrap());
             }
 
             let entry = store
@@ -3902,7 +3981,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             nextblockhash: snap.next_hash,
         };
 
-        Ok(serde_json::to_value(&header_info).unwrap())
+        // `to_string` emits the `difficulty` RawValue token verbatim; going
+        // through `to_value` would collapse it back to an f64 and re-ryu-format
+        // it (the getblockheader difficulty byte-diff).  Wrap the serialized
+        // string in a RawValue so jsonrpsee emits it unchanged.
+        let body = serde_json::to_string(&header_info).unwrap();
+        Ok(serde_json::value::RawValue::from_string(body).unwrap())
     }
 
     async fn get_block_count(&self) -> RpcResult<u32> {
@@ -3915,14 +3999,16 @@ impl RustoshiRpcServer for RpcServerImpl {
         Ok(state.best_hash.to_hex())
     }
 
-    async fn get_difficulty(&self) -> RpcResult<f64> {
+    async fn get_difficulty(&self) -> RpcResult<Box<serde_json::value::RawValue>> {
         let state = self.state.read().await;
         let store = BlockStore::new(&state.db);
 
         if let Ok(Some(header)) = store.get_header(&state.best_hash) {
-            Ok(Self::bits_to_difficulty(header.bits))
+            Ok(Self::bits_to_difficulty_raw(header.bits))
         } else {
-            Ok(1.0)
+            // Genesis-bits fallback (difficulty 1.0) — still routed through the
+            // %.16g formatter so the wire bytes match Core ("1", not "1.0").
+            Ok(Self::bits_to_difficulty_raw(0x1d00ffff))
         }
     }
 
@@ -5894,6 +5980,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             NetworkId::Regtest => "regtest",
         };
 
+        // %.16g (Core setprecision(16)) raw JSON number for both the tip and
+        // the "next" block (same bits → same difficulty here).  Pre-format once
+        // and clone the RawValue into each field so serde does not ryu-format
+        // the bare f64.
+        let difficulty_str = format_double_g16(difficulty);
+        let difficulty_raw = serde_json::value::RawValue::from_string(difficulty_str).unwrap();
+
         // Compute "next" block info: same bits as tip (difficulty adjustment
         // requires knowing next-retarget height, which we approximate as same).
         // This matches the data available in a header-only context.
@@ -5901,14 +5994,14 @@ impl RustoshiRpcServer for RpcServerImpl {
         let next = crate::types::MiningInfoNext {
             height: next_height,
             bits: tip_bits.clone(),
-            difficulty,
+            difficulty: difficulty_raw.clone(),
             target: compact_to_target_hex(tip_bits_val),
         };
 
         Ok(MiningInfo {
             blocks: state.best_height,
             bits: tip_bits,
-            difficulty,
+            difficulty: difficulty_raw,
             target: compact_to_target_hex(tip_bits_val),
             networkhashps: 0.0, // would need to compute from recent blocks
             pooledtx: state.mempool.size(),
@@ -13772,6 +13865,74 @@ mod tests {
         // Harder difficulty
         let harder = RpcServerImpl::bits_to_difficulty(0x1c00ffff);
         assert!(harder > 1.0);
+    }
+
+    /// `format_double_g16` must reproduce Bitcoin Core's
+    /// `std::ostringstream << std::setprecision(16) << v` (== C `%.16g`)
+    /// byte-for-byte.  Every expected string below was confirmed against the
+    /// real C++ oracle (`g++ -O2`, `oss << setprecision(16) << v`) and the
+    /// equivalent Python `"%.16g" % v`.  The byte-diff harness only exercises
+    /// ONE regtest difficulty (the e-10 case); these tests cover the
+    /// fixed<->scientific boundaries, mainnet-magnitude (fixed e+14),
+    /// integer-valued, trailing-zero, and sign/zero paths the harness can't see.
+    #[test]
+    fn test_format_double_g16_matches_core() {
+        // (input, Core %.16g expected)
+        let cases: &[(f64, &str)] = &[
+            // --- THE bug case: regtest difficulty, scientific e-10 (signed, 2-digit exp).
+            (4.656542373906925e-10, "4.656542373906925e-10"),
+            // The f64 nearest the above (ryu shortest = ...247e-10) STILL prints
+            // 16 sig digits, NOT the 17-digit shortest-round-trip form.
+            (4.6565423739069247e-10, "4.656542373906925e-10"),
+            // --- mainnet-magnitude difficulty: exponent 13/14 -> FIXED, not scientific.
+            (55621444139429.57, "55621444139429.57"),
+            (95672703408666.97, "95672703408666.97"),
+            (121507793131898.2, "121507793131898.2"), // e+14-magnitude, stays fixed
+            (123456789012345.6, "123456789012345.6"),
+            // --- fixed/scientific boundary on the high side: X=15 fixed, X=16 sci.
+            (1e15, "1000000000000000"), // X=15, FIXED, integer (trailing-zero padded)
+            (1e16, "1e+16"),            // X=16, SCIENTIFIC, e+16
+            (4.5e17, "4.5e+17"),        // mantissa trailing zeros stripped, e+17
+            // --- fixed/scientific boundary on the low side: X=-4 fixed, X=-5 sci.
+            (0.0001, "0.0001"), // X=-4, FIXED
+            (1e-5, "1e-05"),    // X=-5, SCIENTIFIC, zero-padded e-05
+            // --- 16 sig digits expose the f64 rounding tail (NOT ryu shortest "0.9999999").
+            (0.9999999, "0.9999999000000001"),
+            // --- trailing-zero / integer-valued: bare dot + zeros stripped.
+            (1.0, "1"),
+            (10.0, "10"),
+            (100000.0, "100000"),
+            (2.5, "2.5"),
+            // --- zero / signed zero (matches C++ setprecision(16): +0 -> "0", -0 -> "-0").
+            (0.0, "0"),
+            (-0.0, "-0"),
+            // --- negative magnitude path (difficulty never hits this, but the
+            //     generic formatter must still be Core-correct).
+            (-2.5, "-2.5"),
+            (-1e-5, "-1e-05"),
+        ];
+        for &(v, expected) in cases {
+            let got = format_double_g16(v);
+            assert_eq!(got, expected, "format_double_g16({:?})", v);
+        }
+    }
+
+    /// Cross-check against the live difficulty path: a regtest tip whose bits
+    /// yield the e-10 difficulty must serialise to the exact scientific string,
+    /// and the difficulty-1 bits to "1".
+    #[test]
+    fn test_bits_to_difficulty_raw_g16() {
+        // Difficulty-1 bits -> "1" (not "1.0").
+        let one = RpcServerImpl::bits_to_difficulty_raw(0x1d00ffff);
+        assert_eq!(one.get(), "1");
+
+        // Whatever the formatter returns for an arbitrary tip must be a valid
+        // JSON number token (RawValue::from_string would have panicked otherwise)
+        // and must equal format_double_g16 of the same difficulty f64.
+        let bits = 0x207fffff_u32; // regtest powLimit-ish
+        let d = RpcServerImpl::bits_to_difficulty(bits);
+        let raw = RpcServerImpl::bits_to_difficulty_raw(bits);
+        assert_eq!(raw.get(), format_double_g16(d));
     }
 
     #[test]

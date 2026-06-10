@@ -189,7 +189,12 @@ pub struct BlockchainInfo {
     /// Difficulty target of the tip block as a full-precision hex hash (Core 31.99 field).
     pub target: String,
     /// Current difficulty.
-    pub difficulty: f64,
+    ///
+    /// Serialised as a raw JSON number with 16 significant digits to match
+    /// Bitcoin Core's `std::setprecision(16)` (`%.16g`) in `GetDifficulty()`.
+    /// `Box<serde_json::value::RawValue>` makes serde emit the pre-formatted
+    /// decimal token verbatim instead of re-serialising an `f64` through ryu.
+    pub difficulty: Box<serde_json::value::RawValue>,
     /// Block time of the tip (Unix epoch, Core 31.99 field).
     pub time: u64,
     /// Median time of the last 11 blocks.
@@ -589,7 +594,10 @@ pub struct MiningInfo {
     /// Compact difficulty bits of the current tip (Core 31.99 field).
     pub bits: String,
     /// Current difficulty.
-    pub difficulty: f64,
+    ///
+    /// Raw JSON number, 16 significant digits, matching Core's
+    /// `setprecision(16)` (`%.16g`).  See `BlockHeaderInfo::difficulty`.
+    pub difficulty: Box<serde_json::value::RawValue>,
     /// Difficulty target as full-precision hex hash (Core 31.99 field).
     pub target: String,
     /// Estimated network hash rate.
@@ -614,7 +622,10 @@ pub struct MiningInfoNext {
     /// Compact bits of the next block.
     pub bits: String,
     /// Difficulty of the next block.
-    pub difficulty: f64,
+    ///
+    /// Raw JSON number, 16 significant digits, matching Core's
+    /// `setprecision(16)` (`%.16g`).
+    pub difficulty: Box<serde_json::value::RawValue>,
     /// Target of the next block as full-precision hex hash.
     pub target: String,
 }
@@ -1446,7 +1457,7 @@ mod tests {
             bestblockhash: "000000".to_string(),
             bits: "1d00ffff".to_string(),
             target: "0".repeat(64),
-            difficulty: 1.0,
+            difficulty: serde_json::value::RawValue::from_string("1".to_string()).unwrap(),
             time: 1234567890,
             mediantime: 1234567890,
             verificationprogress: 1.0,
@@ -1632,7 +1643,8 @@ mod tests {
         let info = MiningInfo {
             blocks: 800000,
             bits: "17034219".to_string(),
-            difficulty: 55621444139429.57,
+            difficulty: serde_json::value::RawValue::from_string("55621444139429.57".to_string())
+                .unwrap(),
             target: "0".repeat(64),
             networkhashps: 450000000000000000.0,
             pooledtx: 5000,
@@ -1641,7 +1653,10 @@ mod tests {
             next: MiningInfoNext {
                 height: 800001,
                 bits: "17034219".to_string(),
-                difficulty: 55621444139429.57,
+                difficulty: serde_json::value::RawValue::from_string(
+                    "55621444139429.57".to_string(),
+                )
+                .unwrap(),
                 target: "0".repeat(64),
             },
             warnings: "".to_string(),
@@ -1695,7 +1710,8 @@ mod tests {
             bits: "17034219".to_string(),
             target: "0000000000000000000342190000000000000000000000000000000000000000"
                 .to_string(),
-            difficulty: 95672703408666.97,
+            difficulty: serde_json::value::RawValue::from_string("95672703408666.97".to_string())
+                .unwrap(),
             time: 1710000000,
             mediantime: 1710000000,
             verificationprogress: 0.9999999,
@@ -1733,7 +1749,7 @@ mod tests {
             bestblockhash: "00000000".repeat(8),
             bits: "1d00ffff".to_string(),
             target: "0".repeat(64),
-            difficulty: 1.0,
+            difficulty: serde_json::value::RawValue::from_string("1".to_string()).unwrap(),
             time: 1700000000,
             mediantime: 1700000000,
             verificationprogress: 1.0,

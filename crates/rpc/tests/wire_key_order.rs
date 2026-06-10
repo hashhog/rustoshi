@@ -80,7 +80,7 @@ fn mininginfo_key_order_matches_core() {
     let mi = MiningInfo {
         blocks: 0,
         bits: "1d00ffff".into(),
-        difficulty: 1.0,
+        difficulty: serde_json::value::RawValue::from_string("1".to_string()).unwrap(),
         target: "0".repeat(64),
         networkhashps: 0.0,
         pooledtx: 0,
@@ -89,7 +89,7 @@ fn mininginfo_key_order_matches_core() {
         next: MiningInfoNext {
             height: 1,
             bits: "1d00ffff".into(),
-            difficulty: 1.0,
+            difficulty: serde_json::value::RawValue::from_string("1".to_string()).unwrap(),
             target: "0".repeat(64),
         },
         warnings: String::new(),
@@ -306,7 +306,7 @@ fn getblockchaininfo_order_matches_core() {
         bestblockhash: "h".into(),
         bits: "1d00ffff".into(),
         target: "0".repeat(64),
-        difficulty: 1.0,
+        difficulty: serde_json::value::RawValue::from_string("1".to_string()).unwrap(),
         time: 0,
         mediantime: 0,
         verificationprogress: 1.0,
