@@ -416,6 +416,23 @@ pub trait RustoshiRpc {
         blockhash: Option<String>,
     ) -> RpcResult<serde_json::Value>;
 
+    /// Compute per-block statistics (fees, feerates, sizes, weights, UTXO-set
+    /// deltas) for a single block. Mirrors
+    /// `bitcoin-core/src/rpc/blockchain.cpp::getblockstats`.
+    ///
+    /// `hash_or_height`: a block height (JSON number) OR a block hash (hex
+    /// string), exactly like Core's `ParseHashOrHeight` (accepts both, so the
+    /// param is a raw `serde_json::Value`).
+    /// `stats` (optional): an array of stat names; when present the response is
+    /// restricted to those keys (an unknown name is an error). Omitted/empty =
+    /// every statistic. All amounts are in satoshis; feerates are sat/vbyte.
+    #[method(name = "getblockstats")]
+    async fn get_block_stats(
+        &self,
+        hash_or_height: serde_json::Value,
+        stats: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value>;
+
     /// Get raw transaction by txid.
     ///
     /// Parameters:
@@ -4096,6 +4113,453 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         Ok(serde_json::Value::Object(ret))
+    }
+
+    async fn get_block_stats(
+        &self,
+        hash_or_height: serde_json::Value,
+        stats: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value> {
+        use rustoshi_consensus::params::block_subsidy;
+        use rustoshi_primitives::compact_size_len;
+
+        // Core constants (rpc/blockchain.cpp + consensus/amount.h/consensus.h).
+        const WITNESS_SCALE_FACTOR: i64 = 4;
+        const PER_UTXO_OVERHEAD: i64 = 41; // sizeof COutPoint(36)+uint32(4)+bool(1)
+        const MAX_MONEY: i64 = 2_100_000_000_000_000; // 21e6 * COIN
+        const MAX_BLOCK_SERIALIZED_SIZE: i64 = 4_000_000;
+        const NUM_PERCENTILES: usize = 5;
+
+        // CScript::IsUnspendable: OP_RETURN-prefixed or > MAX_SCRIPT_SIZE.
+        fn is_unspendable(script: &[u8]) -> bool {
+            const OP_RETURN: u8 = 0x6a;
+            const MAX_SCRIPT_SIZE: usize = 10_000;
+            (!script.is_empty() && script[0] == OP_RETURN) || script.len() > MAX_SCRIPT_SIZE
+        }
+
+        // CalculateTruncatedMedian: empty=>0; sorted; even=>floor mean of the
+        // two central elements; odd=>central element.
+        fn truncated_median(scores: &mut [i64]) -> i64 {
+            let n = scores.len();
+            if n == 0 {
+                return 0;
+            }
+            scores.sort_unstable();
+            if n % 2 == 0 {
+                (scores[n / 2 - 1] + scores[n / 2]) / 2
+            } else {
+                scores[n / 2]
+            }
+        }
+
+        // CalculatePercentilesByWeight: sort by (feerate asc, then weight asc);
+        // boundaries at total_weight*{0.1,0.25,0.5,0.75,0.9} (f64); accumulate
+        // weight; trailing percentiles filled with the largest feerate; empty
+        // score set => all zeros.
+        fn percentiles_by_weight(
+            scores: &mut Vec<(i64, i64)>,
+            total_weight: i64,
+        ) -> [i64; NUM_PERCENTILES] {
+            let mut result = [0i64; NUM_PERCENTILES];
+            if scores.is_empty() {
+                return result;
+            }
+            scores.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            let weights: [f64; NUM_PERCENTILES] = [
+                total_weight as f64 / 10.0,
+                total_weight as f64 / 4.0,
+                total_weight as f64 / 2.0,
+                (total_weight as f64 * 3.0) / 4.0,
+                (total_weight as f64 * 9.0) / 10.0,
+            ];
+            let mut next: usize = 0;
+            let mut cumulative: i64 = 0;
+            for &(rate, weight) in scores.iter() {
+                cumulative += weight;
+                while next < NUM_PERCENTILES && cumulative as f64 >= weights[next] {
+                    result[next] = rate;
+                    next += 1;
+                }
+            }
+            let last = scores[scores.len() - 1].0;
+            for r in result.iter_mut().skip(next) {
+                *r = last;
+            }
+            result
+        }
+
+        let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+
+        // ── 1. Resolve hash_or_height (Core ParseHashOrHeight). ─────────────
+        // Number => active-chain height; String => block index hash (any chain).
+        let (block_hash, height, n_tx) = match &hash_or_height {
+            serde_json::Value::Number(n) => {
+                let h = n.as_i64().unwrap_or(-1);
+                if h < 0 {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        format!("Target block height {} is negative", h),
+                    ));
+                }
+                if h > state.best_height as i64 {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        format!(
+                            "Target block height {} after current tip {}",
+                            h, state.best_height
+                        ),
+                    ));
+                }
+                let hash = store
+                    .get_hash_by_height(h as u32)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                            "Block not found",
+                        )
+                    })?;
+                let entry = store
+                    .get_block_index(&hash)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                            "Block not found",
+                        )
+                    })?;
+                (hash, h as u32, entry.n_tx)
+            }
+            serde_json::Value::String(s) => {
+                let hash = Self::parse_hash(s)?;
+                let entry = store
+                    .get_block_index(&hash)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                    .ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                            "Block not found",
+                        )
+                    })?;
+                (hash, entry.height, entry.n_tx)
+            }
+            _ => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    "hash_or_height must be a height (int) or block hash (string)",
+                ));
+            }
+        };
+
+        // ── 2. Parse the optional stats filter. ─────────────────────────────
+        // Absent/null/empty-array => do_all. Otherwise restrict to the named
+        // stats (an unknown name is an error AFTER computing every value, like
+        // Core's non-do_all branch).
+        let selected: Option<std::collections::HashSet<String>> = match &stats {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(arr)) => {
+                if arr.is_empty() {
+                    None
+                } else {
+                    let mut set = std::collections::HashSet::with_capacity(arr.len());
+                    for v in arr {
+                        match v {
+                            serde_json::Value::String(name) => {
+                                set.insert(name.clone());
+                            }
+                            _ => {
+                                return Err(Self::rpc_error(
+                                    rpc_error::RPC_INVALID_PARAMETER,
+                                    "stats entries must be strings",
+                                ));
+                            }
+                        }
+                    }
+                    Some(set)
+                }
+            }
+            Some(_) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    "stats must be an array",
+                ));
+            }
+        };
+
+        // ── 3. Load the block body (LOCAL CF_BLOCKS only — getblockstats needs
+        // local undo, so do NOT use the Core getblock-proxy fallback). ───────
+        let block = store
+            .get_block(&block_hash)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+            .ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "Block not available (pruned data)",
+                )
+            })?;
+
+        // Undo data carries spent-prevout (value + scriptPubKey). Genesis and
+        // coinbase-only blocks legitimately have empty/absent undo.
+        let undo = store
+            .get_undo(&block_hash)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
+
+        // ── 4. Single per-tx loop computing every accumulator. ──────────────
+        let mut maxfee: i64 = 0;
+        let mut maxfeerate: i64 = 0;
+        let mut minfee: i64 = MAX_MONEY;
+        let mut minfeerate: i64 = MAX_MONEY;
+        let mut total_out: i64 = 0;
+        let mut totalfee: i64 = 0;
+        let mut inputs: i64 = 0;
+        let mut maxtxsize: i64 = 0;
+        let mut mintxsize: i64 = MAX_BLOCK_SERIALIZED_SIZE;
+        let mut outputs: i64 = 0;
+        let mut swtotal_size: i64 = 0;
+        let mut swtotal_weight: i64 = 0;
+        let mut swtxs: i64 = 0;
+        let mut total_size: i64 = 0;
+        let mut total_weight: i64 = 0;
+        let mut utxos: i64 = 0;
+        let mut utxo_size_inc: i64 = 0;
+        let mut utxo_size_inc_actual: i64 = 0;
+        let mut fee_array: Vec<i64> = Vec::new();
+        let mut feerate_array: Vec<(i64, i64)> = Vec::new();
+        let mut txsize_array: Vec<i64> = Vec::new();
+
+        let is_genesis = height == 0;
+        // BIP30-repeat blocks (mainnet h=91842 / h=91880) had their coinbase
+        // overwritten by an identical earlier one, so their coinbase outputs
+        // never (re-)entered the UTXO set — exclude them from the *_actual
+        // counts exactly as Core does (blockchain.cpp:2088,
+        // `IsBIP30Repeat(pindex) && tx->IsCoinBase()`). Match on (height, hash),
+        // not height alone (params.rs:530).
+        let is_bip30_repeat = state
+            .params
+            .bip30_exception_blocks
+            .iter()
+            .any(|(h, hsh)| *h == height && *hsh == block_hash);
+        let spent_coins: &[CoinEntry] = undo.as_ref().map(|u| u.spent_coins.as_slice()).unwrap_or(&[]);
+        let mut cursor: usize = 0; // flat-undo cursor (advances per non-coinbase tx)
+
+        for tx in block.transactions.iter() {
+            let is_coinbase = tx.is_coinbase();
+            outputs += tx.outputs.len() as i64;
+
+            let mut tx_total_out: i64 = 0;
+            for out in tx.outputs.iter() {
+                tx_total_out += out.value as i64;
+
+                let out_size: i64 = out.serialized_size() as i64 + PER_UTXO_OVERHEAD;
+                utxo_size_inc += out_size;
+
+                // The genesis block and BIP30-repeat coinbases do not change
+                // the UTXO-set counts (Core blockchain.cpp:2088).
+                if is_genesis || (is_bip30_repeat && is_coinbase) {
+                    continue;
+                }
+                // Skip unspendable outputs — never enter the UTXO set.
+                if is_unspendable(&out.script_pubkey) {
+                    continue;
+                }
+                utxos += 1;
+                utxo_size_inc_actual += out_size;
+            }
+
+            if is_coinbase {
+                continue;
+            }
+
+            inputs += tx.inputs.len() as i64; // coinbase's fake input excluded
+            total_out += tx_total_out; // coinbase reward excluded
+
+            let tx_size = tx.serialized_size() as i64; // ComputeTotalSize (with witness)
+            txsize_array.push(tx_size);
+            maxtxsize = maxtxsize.max(tx_size);
+            mintxsize = mintxsize.min(tx_size);
+            total_size += tx_size;
+
+            let weight = tx.weight() as i64; // GetTransactionWeight
+            total_weight += weight;
+
+            if tx.has_witness() {
+                swtxs += 1;
+                swtotal_size += tx_size;
+                swtotal_weight += weight;
+            }
+
+            // Fee math from flat undo: slice this tx's spent coins.
+            let start = cursor;
+            let end = start + tx.inputs.len();
+            if undo.is_none() || end > spent_coins.len() {
+                // Non-coinbase tx without matching undo: prevout values are
+                // unavailable, so a correct fee cannot be computed. Refuse
+                // rather than emit wrong fees (Core GetUndoChecked throws).
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "Undo data unavailable for block (cannot compute fees)",
+                ));
+            }
+            cursor = end;
+
+            let mut tx_total_in: i64 = 0;
+            for coin in &spent_coins[start..end] {
+                tx_total_in += coin.value as i64;
+                let prevout_size: i64 = 8
+                    + compact_size_len(coin.script_pubkey.len() as u64) as i64
+                    + coin.script_pubkey.len() as i64
+                    + PER_UTXO_OVERHEAD;
+                utxo_size_inc -= prevout_size;
+                utxo_size_inc_actual -= prevout_size;
+            }
+
+            let txfee = tx_total_in - tx_total_out;
+            fee_array.push(txfee);
+            maxfee = maxfee.max(txfee);
+            minfee = minfee.min(txfee);
+            totalfee += txfee;
+
+            // Feerate: satoshis per virtual byte = fee * 4 / weight.
+            let feerate = if weight != 0 {
+                (txfee * WITNESS_SCALE_FACTOR) / weight
+            } else {
+                0
+            };
+            feerate_array.push((feerate, weight));
+            maxfeerate = maxfeerate.max(feerate);
+            minfeerate = minfeerate.min(feerate);
+        }
+
+        // Alignment gate: every undo coin must have been consumed.
+        if cursor != spent_coins.len() {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "Undo data does not align with block transactions",
+            ));
+        }
+
+        let feerate_percentiles = percentiles_by_weight(&mut feerate_array, total_weight);
+
+        // n_tx == block.vtx.size(); prefer the loaded body's count.
+        let txs: i64 = block.transactions.len() as i64;
+        let _ = n_tx; // index n_tx used only for resolution sanity
+        let non_coinbase: i64 = if txs > 1 { txs - 1 } else { 0 };
+
+        let avgfee = if txs > 1 { totalfee / non_coinbase } else { 0 };
+        let avgtxsize = if txs > 1 { total_size / non_coinbase } else { 0 };
+        let avgfeerate = if total_weight != 0 {
+            (totalfee * WITNESS_SCALE_FACTOR) / total_weight
+        } else {
+            0
+        };
+
+        if minfee == MAX_MONEY {
+            minfee = 0;
+        }
+        if minfeerate == MAX_MONEY {
+            minfeerate = 0;
+        }
+        if mintxsize == MAX_BLOCK_SERIALIZED_SIZE {
+            mintxsize = 0;
+        }
+
+        let subsidy = block_subsidy(height, state.params.subsidy_halving_interval) as i64;
+
+        // mediantime = GetMedianTimePast: median of up to 11 timestamps over
+        // the window [height-10..=height] of the active chain.
+        let window_start = height.saturating_sub(10);
+        let mut mtp_ts: Vec<u32> = Vec::with_capacity(11);
+        for wh in window_start..=height {
+            if let Ok(Some(bh)) = store.get_hash_by_height(wh) {
+                if let Ok(Some(e)) = store.get_block_index(&bh) {
+                    mtp_ts.push(e.timestamp);
+                }
+            }
+        }
+        let mediantime: i64 = if mtp_ts.is_empty() {
+            block.header.timestamp as i64
+        } else {
+            mtp_ts.sort_unstable();
+            mtp_ts[mtp_ts.len() / 2] as i64
+        };
+
+        let medianfee = truncated_median(&mut fee_array);
+        let mediantxsize = truncated_median(&mut txsize_array);
+        let utxo_increase = outputs - inputs;
+        let utxo_increase_actual = utxos - inputs;
+
+        // ── 5. Build the result map in Core's exact alphabetical pushKV order.
+        let mut ret = serde_json::Map::new();
+        ret.insert("avgfee".to_string(), serde_json::json!(avgfee));
+        ret.insert("avgfeerate".to_string(), serde_json::json!(avgfeerate));
+        ret.insert("avgtxsize".to_string(), serde_json::json!(avgtxsize));
+        ret.insert("blockhash".to_string(), serde_json::json!(block_hash.to_hex()));
+        ret.insert(
+            "feerate_percentiles".to_string(),
+            serde_json::json!(feerate_percentiles.to_vec()),
+        );
+        ret.insert("height".to_string(), serde_json::json!(height as i32));
+        ret.insert("ins".to_string(), serde_json::json!(inputs));
+        ret.insert("maxfee".to_string(), serde_json::json!(maxfee));
+        ret.insert("maxfeerate".to_string(), serde_json::json!(maxfeerate));
+        ret.insert("maxtxsize".to_string(), serde_json::json!(maxtxsize));
+        ret.insert("medianfee".to_string(), serde_json::json!(medianfee));
+        ret.insert("mediantime".to_string(), serde_json::json!(mediantime));
+        ret.insert("mediantxsize".to_string(), serde_json::json!(mediantxsize));
+        ret.insert("minfee".to_string(), serde_json::json!(minfee));
+        ret.insert("minfeerate".to_string(), serde_json::json!(minfeerate));
+        ret.insert("mintxsize".to_string(), serde_json::json!(mintxsize));
+        ret.insert("outs".to_string(), serde_json::json!(outputs));
+        ret.insert("subsidy".to_string(), serde_json::json!(subsidy));
+        ret.insert("swtotal_size".to_string(), serde_json::json!(swtotal_size));
+        ret.insert("swtotal_weight".to_string(), serde_json::json!(swtotal_weight));
+        ret.insert("swtxs".to_string(), serde_json::json!(swtxs));
+        ret.insert("time".to_string(), serde_json::json!(block.header.timestamp as i64));
+        ret.insert("total_out".to_string(), serde_json::json!(total_out));
+        ret.insert("total_size".to_string(), serde_json::json!(total_size));
+        ret.insert("total_weight".to_string(), serde_json::json!(total_weight));
+        ret.insert("totalfee".to_string(), serde_json::json!(totalfee));
+        ret.insert("txs".to_string(), serde_json::json!(txs));
+        ret.insert("utxo_increase".to_string(), serde_json::json!(utxo_increase));
+        ret.insert("utxo_size_inc".to_string(), serde_json::json!(utxo_size_inc));
+        ret.insert(
+            "utxo_increase_actual".to_string(),
+            serde_json::json!(utxo_increase_actual),
+        );
+        ret.insert(
+            "utxo_size_inc_actual".to_string(),
+            serde_json::json!(utxo_size_inc_actual),
+        );
+
+        // ── 6. Project to the requested subset (Core non-do_all branch). ────
+        match selected {
+            None => Ok(serde_json::Value::Object(ret)),
+            Some(names) => {
+                let mut out = serde_json::Map::new();
+                // Core's non-do_all branch iterates a std::set<std::string>
+                // (lexicographically sorted) and pushKV's in that order — NOT
+                // the full-output pushKV order (which is non-alphabetical for the
+                // utxo_* tail). Emit the requested keys alphabetically to match,
+                // erroring on the first unknown name as Core does mid-iteration.
+                let mut sorted_names: Vec<&String> = names.iter().collect();
+                sorted_names.sort();
+                for name in sorted_names {
+                    match ret.get(name) {
+                        Some(v) => {
+                            out.insert(name.clone(), v.clone());
+                        }
+                        None => {
+                            return Err(Self::rpc_error(
+                                rpc_error::RPC_INVALID_PARAMETER,
+                                format!("Invalid selected statistic '{}'", name),
+                            ));
+                        }
+                    }
+                }
+                Ok(serde_json::Value::Object(out))
+            }
+        }
     }
 
     async fn get_raw_transaction(
@@ -8341,6 +8805,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             let help_text = match cmd.as_str() {
                 "getblockchaininfo" => "getblockchaininfo\nReturns an object containing various state info regarding blockchain processing.",
                 "getblock" => "getblock \"blockhash\" ( verbosity )\nReturns block data.",
+                "getblockstats" => "getblockstats hash_or_height ( stats )\nCompute per-block statistics for a given window. All amounts are in satoshis.",
                 "getblockhash" => "getblockhash height\nReturns hash of block at given height.",
                 "getblockheader" => "getblockheader \"blockhash\" ( verbose )\nReturns block header data.",
                 "getblockcount" => "getblockcount\nReturns the height of the most-work fully-validated chain.",
@@ -8401,7 +8866,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             let commands = vec![
                 "== Blockchain ==",
                 "getbestblockhash", "getblock", "getblockchaininfo", "getblockcount",
-                "getblockfilter", "getblockhash", "getblockheader", "getchaintips",
+                "getblockfilter", "getblockhash", "getblockheader", "getblockstats", "getchaintips",
                 "getchaintxstats", "getdifficulty", "gettxout",
                 "invalidateblock", "preciousblock", "pruneblockchain", "reconsiderblock",
                 "",
