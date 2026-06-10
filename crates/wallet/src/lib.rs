@@ -63,9 +63,9 @@ pub use coin_selection::{
 };
 pub use db::{SavedAddress, SavedUtxo, WalletDb, WalletMeta};
 pub use descriptor::{
-    add_checksum, decode_xprv, decode_xpub, descriptor_checksum, encode_xprv, encode_xpub,
-    parse_descriptor, verify_checksum, DeriveType, Descriptor, DescriptorError, DescriptorInfo,
-    KeyOrigin as DescriptorKeyOrigin, KeyProvider, OutputType,
+    add_checksum, decode_xprv, decode_xpub, descriptor_checksum, descriptor_wif_secrets,
+    encode_xprv, encode_xpub, parse_descriptor, verify_checksum, DeriveType, Descriptor,
+    DescriptorError, DescriptorInfo, KeyOrigin as DescriptorKeyOrigin, KeyProvider, OutputType,
 };
 pub use hd::{parse_derivation_path, ExtendedPrivKey, ExtendedPubKey, WalletError, HARDENED_FLAG};
 pub use miniscript::{
@@ -88,5 +88,5 @@ pub use payjoin::{
 };
 pub use wallet::{
     calculate_vsize, decode_wif, encode_wif, AddressType, ImportedKey, TxDetail, TxHistoryEntry,
-    Wallet, WalletUtxo,
+    Wallet, WalletUtxo, WatchedScript,
 };

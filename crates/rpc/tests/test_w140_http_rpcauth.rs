@@ -669,21 +669,27 @@ fn g29_tls_opt_in_requires_both_cert_and_key() {
 // ============================================================
 
 /// G30 — Core registers `/wallet/` as a path prefix and routes wallet-
-/// specific RPCs through it (httprpc.cpp:339-341).  rustoshi has no
-/// equivalent.  P3: only matters once multiwallet support lands.
-/// Status: MISSING.
+/// specific RPCs through it (httprpc.cpp:339-341).  rustoshi's equivalent is
+/// `crates/rpc/src/wallet_route.rs` (`WalletRouteLayer`, stacked in
+/// `start_rpc_server` on both transports), which scopes the URL-pinned
+/// wallet name in a task-local consumed by `WalletRpcImpl::effective_wallet`.
+/// Status: IMPLEMENTED (un-ignored when the routing layer landed).
 #[test]
-#[ignore]
 fn g30_wallet_path_prefix_dispatcher() {
     let server_rs = read_source("crates/rpc/src/server.rs");
-    let rest_rs = read_source("crates/rpc/src/rest.rs");
-    let has_wallet_path = server_rs.contains("/wallet/") || rest_rs.contains("/wallet/");
+    let route_rs = read_source("crates/rpc/src/wallet_route.rs");
     assert!(
-        has_wallet_path,
-        "G30 (P3): no `/wallet/<name>/` URL path-prefix routing.  rustoshi \
-         supports multiwallet via the `wallet` JSON-RPC param; Core also \
-         supports the URL-path form which some clients use exclusively."
+        route_rs.contains("/wallet/") && server_rs.contains("WalletRouteLayer"),
+        "G30: `/wallet/<name>` URL path-prefix routing must exist \
+         (wallet_route.rs) AND be stacked into the served middleware \
+         (server.rs).  Core also supports the URL-path form which some \
+         clients use exclusively."
     );
+    // Behavioral pin on the extractor itself (the live end-to-end probe is
+    // rustoshi/tools/multiwallet_routing_test.sh against a regtest node).
+    use rustoshi_rpc::wallet_route::wallet_name_from_path;
+    assert_eq!(wallet_name_from_path("/wallet/w1"), Some("w1".to_string()));
+    assert_eq!(wallet_name_from_path("/"), None);
 }
 
 // ============================================================

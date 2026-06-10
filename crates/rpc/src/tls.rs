@@ -45,6 +45,7 @@ use tower::ServiceBuilder;
 
 use crate::auth::AuthLayer;
 use crate::server::MAX_BATCH_SIZE;
+use crate::wallet_route::WalletRouteLayer;
 
 /// Load a PEM-encoded certificate chain + private key from disk and build a
 /// `rustls::ServerConfig` configured for HTTP/1.1 (ALPN `http/1.1`).
@@ -142,15 +143,19 @@ pub fn load_tls_config(
 /// surface jsonrpsee uses for its plaintext path
 /// (`jsonrpsee-server/src/server.rs:1222`).
 ///
-/// The `http_middleware` shape is hard-coded to the [`AuthLayer`] stack that
-/// matches `start_rpc_server`'s plaintext branch: jsonrpsee 0.22's tower
-/// service has internal types that make a fully-generic helper impractical,
-/// and the production wiring only ever uses this one shape.
+/// The `http_middleware` shape is hard-coded to the [`AuthLayer`] +
+/// [`WalletRouteLayer`] stack that matches `start_rpc_server`'s plaintext
+/// branch: jsonrpsee 0.22's tower service has internal types that make a
+/// fully-generic helper impractical, and the production wiring only ever uses
+/// this one shape.
 pub async fn serve_https(
     bind_address: &str,
     methods: Methods,
     http_middleware: ServiceBuilder<
-        tower::layer::util::Stack<AuthLayer, tower::layer::util::Identity>,
+        tower::layer::util::Stack<
+            WalletRouteLayer,
+            tower::layer::util::Stack<AuthLayer, tower::layer::util::Identity>,
+        >,
     >,
     tls_config: Arc<ServerConfig>,
 ) -> anyhow::Result<ServerHandle> {
@@ -392,12 +397,12 @@ mod tests {
         // — but for this test we want methods to dispatch, so install a
         // matching `user:pass` credential pair).
         use crate::auth::AuthCredentials;
-        let http_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(
-            AuthCredentials {
+        let http_middleware = tower::ServiceBuilder::new()
+            .layer(AuthLayer::new(AuthCredentials {
                 cookie_secret: None,
                 user_pass: Some(("u".to_string(), "p".to_string())),
-            },
-        ));
+            }))
+            .layer(WalletRouteLayer::new());
 
         // 4. Bind on an OS-assigned port.
         let bind = "127.0.0.1:0";

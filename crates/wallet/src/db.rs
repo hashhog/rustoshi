@@ -95,6 +95,11 @@ pub struct WalletMeta {
     /// activity that arrived while the node was down. `0` means "never synced"
     /// → reconcile from `birthday`.
     pub last_synced_height: u32,
+    /// Whether this wallet holds private keys (the inverse of Core's
+    /// `WALLET_FLAG_DISABLE_PRIVATE_KEYS`, persisted so a watch-only wallet
+    /// stays watch-only across `loadwallet`). Defaults to `true` for wallets
+    /// created before this column existed.
+    pub private_keys_enabled: bool,
 }
 
 impl WalletDb {
@@ -171,6 +176,17 @@ impl WalletDb {
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );
 
+            -- Imported output descriptors (importdescriptors), persisted so
+            -- watch-only imports survive loadwallet (Core stores these in
+            -- the walletdb under DESCRIPTOR records).
+            CREATE TABLE IF NOT EXISTS descriptors (
+                descriptor TEXT PRIMARY KEY,
+                label TEXT NOT NULL DEFAULT '',
+                timestamp INTEGER NOT NULL DEFAULT 0,
+                range_end INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+
             -- Indices for performance
             CREATE INDEX IF NOT EXISTS idx_utxos_spent ON utxos(spent);
             CREATE INDEX IF NOT EXISTS idx_utxos_height ON utxos(height);
@@ -216,6 +232,10 @@ impl WalletDb {
         self.set_meta("next_change_index", &meta.next_change_index.to_string())?;
         self.set_meta("birthday", &meta.birthday.to_string())?;
         self.set_meta("last_synced_height", &meta.last_synced_height.to_string())?;
+        self.set_meta(
+            "private_keys_enabled",
+            if meta.private_keys_enabled { "1" } else { "0" },
+        )?;
         Ok(())
     }
 
@@ -272,6 +292,13 @@ impl WalletDb {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        // Default TRUE for wallets created before the flag existed (they were
+        // all built with signing keys).
+        let private_keys_enabled = self
+            .get_meta("private_keys_enabled")?
+            .map(|s| s != "0")
+            .unwrap_or(true);
+
         Ok(Some(WalletMeta {
             name,
             network,
@@ -280,7 +307,51 @@ impl WalletDb {
             next_change_index,
             birthday,
             last_synced_height,
+            private_keys_enabled,
         }))
+    }
+
+    /// Persist an imported output descriptor (importdescriptors), so the
+    /// watch set survives `loadwallet`. Idempotent on the descriptor string.
+    pub fn save_descriptor(
+        &self,
+        descriptor: &str,
+        label: &str,
+        timestamp: u64,
+        range_end: u32,
+    ) -> Result<(), WalletError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO descriptors (descriptor, label, timestamp, range_end) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![descriptor, label, timestamp as i64, range_end],
+            )
+            .map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(())
+    }
+
+    /// Load all persisted imported descriptors as
+    /// `(descriptor, label, timestamp, range_end)` rows.
+    pub fn load_descriptors(&self) -> Result<Vec<(String, String, u64, u32)>, WalletError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT descriptor, label, timestamp, range_end FROM descriptors")
+            .map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, u32>(3)?,
+                ))
+            })
+            .map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?);
+        }
+        Ok(out)
     }
 
     /// Save an address.
@@ -726,6 +797,7 @@ mod tests {
             next_change_index: 2,
             birthday: 100000,
             last_synced_height: 123456,
+            private_keys_enabled: true,
         };
         db.save_wallet_meta(&meta).unwrap();
 
@@ -734,6 +806,38 @@ mod tests {
         assert_eq!(loaded.network, Network::Testnet);
         assert_eq!(loaded.last_synced_height, 123456);
         assert_eq!(loaded.next_receive_index, 5);
+        assert!(loaded.private_keys_enabled);
+    }
+
+    #[test]
+    fn test_descriptor_round_trip_and_dpk_flag() {
+        let db = WalletDb::in_memory().unwrap();
+
+        // Descriptor persistence round-trips.
+        db.save_descriptor("addr(tb1qtest)#abcd1234", "wo", 1, 0).unwrap();
+        db.save_descriptor("wpkh(02ff)#deadbeef", "", 0, 5).unwrap();
+        let mut rows = db.load_descriptors().unwrap();
+        rows.sort();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ("addr(tb1qtest)#abcd1234".to_string(), "wo".to_string(), 1, 0)
+        );
+
+        // disable_private_keys persists as 0 and round-trips false.
+        let meta = WalletMeta {
+            name: "wo".to_string(),
+            network: Network::Regtest,
+            address_type: AddressType::P2WPKH,
+            next_receive_index: 0,
+            next_change_index: 0,
+            birthday: 0,
+            last_synced_height: 0,
+            private_keys_enabled: false,
+        };
+        db.save_wallet_meta(&meta).unwrap();
+        let loaded = db.load_wallet_meta().unwrap().unwrap();
+        assert!(!loaded.private_keys_enabled);
     }
 
     #[test]
