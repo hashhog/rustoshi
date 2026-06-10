@@ -325,6 +325,21 @@ pub enum KeyProvider {
         /// as compressed (they only carry the x-coordinate, 32 bytes).
         is_compressed: bool,
     },
+    /// A WIF-encoded private key (constant).
+    ///
+    /// BIP-380 key expressions accept WIF alongside hex pubkeys; Core's
+    /// `importdescriptors` uses this form to import raw private keys
+    /// (bitcoin-core/src/script/descriptor.cpp `ParsePubkeyInner` →
+    /// `DecodeSecret`). The public key is derived once at parse time so
+    /// downstream script derivation needs no secp context.
+    Wif {
+        /// The secret key decoded from the WIF payload.
+        secret_key: secp256k1::SecretKey,
+        /// The public key derived from `secret_key`.
+        pubkey: PublicKey,
+        /// Whether the WIF carried the trailing 0x01 compressed-pubkey flag.
+        is_compressed: bool,
+    },
     /// An extended public key with derivation path.
     Xpub {
         /// The extended public key.
@@ -362,7 +377,7 @@ impl KeyProvider {
     /// Returns true if this is a ranged key expression.
     pub fn is_range(&self) -> bool {
         match self {
-            KeyProvider::Const { .. } => false,
+            KeyProvider::Const { .. } | KeyProvider::Wif { .. } => false,
             KeyProvider::Xpub { derive_type, .. } | KeyProvider::Xprv { derive_type, .. } => {
                 *derive_type != DeriveType::NonRanged
             }
@@ -383,7 +398,8 @@ impl KeyProvider {
     /// so those always return true.
     pub fn is_compressed(&self) -> bool {
         match self {
-            KeyProvider::Const { is_compressed, .. } => *is_compressed,
+            KeyProvider::Const { is_compressed, .. }
+            | KeyProvider::Wif { is_compressed, .. } => *is_compressed,
             // BIP-32 derivation always yields compressed public keys.
             KeyProvider::Xpub { .. } | KeyProvider::Xprv { .. } => true,
             KeyProvider::WithOrigin { inner, .. } => inner.is_compressed(),
@@ -393,7 +409,7 @@ impl KeyProvider {
     /// Get the public key at the given position (for ranged descriptors).
     pub fn get_pubkey(&self, pos: u32) -> Result<PublicKey, DescriptorError> {
         match self {
-            KeyProvider::Const { pubkey, .. } => Ok(*pubkey),
+            KeyProvider::Const { pubkey, .. } | KeyProvider::Wif { pubkey, .. } => Ok(*pubkey),
             KeyProvider::Xpub {
                 xpub,
                 path,
@@ -460,6 +476,18 @@ impl KeyProvider {
                 } else {
                     // Preserve the original 65-byte uncompressed form for
                     // legacy descriptors (pkh, sh(pk(...))) that accept it.
+                    hex::encode(pubkey.serialize_uncompressed())
+                }
+            }
+            KeyProvider::Wif {
+                pubkey,
+                is_compressed,
+                ..
+            } => {
+                // Public representation: the derived pubkey, never the secret.
+                if *is_compressed {
+                    hex::encode(pubkey.serialize())
+                } else {
                     hex::encode(pubkey.serialize_uncompressed())
                 }
             }
@@ -907,14 +935,56 @@ fn descriptor_has_private_keys(desc: &Descriptor) -> bool {
 fn key_provider_has_private(kp: &KeyProvider) -> bool {
     match kp {
         KeyProvider::Xprv { .. } => true,
-        // Const is always a public key after parsing; WIF is converted to pubkey on parse
-        // so we can never recover "was this originally WIF?" without extra tracking.
-        // For now, Const is always public — match Bitcoin Core which checks for actual
-        // secret material, not reconstructed pubkeys.
+        // WIF keys are parsed into their own variant so the secret material
+        // is tracked — Core counts them as private keys
+        // (bitcoin-core/src/wallet/rpc/backup.cpp:224-226 importdescriptors
+        // privkey gate fires for WIF-bearing descriptors).
+        KeyProvider::Wif { .. } => true,
+        // Const is always a public key after parsing.
         KeyProvider::Const { .. } => false,
         KeyProvider::Xpub { .. } => false,
         KeyProvider::WithOrigin { inner, .. } => key_provider_has_private(inner),
     }
+}
+
+/// Collect the WIF-embedded secret keys in a descriptor (one per
+/// [`KeyProvider::Wif`] leaf). Used by `importdescriptors` to import the
+/// signing key when a WIF-bearing descriptor lands in a wallet with private
+/// keys enabled. Xprv-derived secrets are not collected here.
+pub fn descriptor_wif_secrets(desc: &Descriptor) -> Vec<secp256k1::SecretKey> {
+    fn from_kp(kp: &KeyProvider, out: &mut Vec<secp256k1::SecretKey>) {
+        match kp {
+            KeyProvider::Wif { secret_key, .. } => out.push(*secret_key),
+            KeyProvider::WithOrigin { inner, .. } => from_kp(inner, out),
+            KeyProvider::Const { .. } | KeyProvider::Xpub { .. } | KeyProvider::Xprv { .. } => {}
+        }
+    }
+    fn walk(desc: &Descriptor, out: &mut Vec<secp256k1::SecretKey>) {
+        match desc {
+            Descriptor::Pk(k)
+            | Descriptor::Pkh(k)
+            | Descriptor::Wpkh(k)
+            | Descriptor::TrKeyOnly(k)
+            | Descriptor::Rawtr(k)
+            | Descriptor::Combo(k) => from_kp(k, out),
+            Descriptor::Sh(inner) | Descriptor::Wsh(inner) => walk(inner, out),
+            Descriptor::TrWithTree { internal_key, tree } => {
+                from_kp(internal_key, out);
+                for (d, _) in tree {
+                    walk(d, out);
+                }
+            }
+            Descriptor::Multi { keys, .. } | Descriptor::SortedMulti { keys, .. } => {
+                for k in keys {
+                    from_kp(k, out);
+                }
+            }
+            Descriptor::Addr(_) | Descriptor::Raw(_) => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(desc, &mut out);
+    out
 }
 
 /// Validate that every key inside a segwit-v0 context is compressed.
@@ -1573,10 +1643,43 @@ fn parse_key_expression(expr: &str) -> Result<KeyProvider, DescriptorError> {
         return parse_xonly_pubkey(expr);
     }
 
+    // WIF-encoded private key (Core: descriptor key expressions accept WIF —
+    // script/descriptor.cpp ParsePubkeyInner → DecodeSecret).
+    if let Some(kp) = parse_wif_key(expr) {
+        return Ok(kp);
+    }
+
     Err(DescriptorError::InvalidKey(format!(
         "unrecognized key format: {}",
         expr
     )))
+}
+
+/// Try to parse a WIF-encoded private key.
+///
+/// WIF layout (base58check): version byte (0x80 mainnet, 0xef
+/// testnet/signet/regtest) ++ 32-byte secret ++ optional trailing 0x01
+/// compressed-pubkey flag. Returns `None` when `expr` is not WIF-shaped so
+/// the caller falls through to its generic "unrecognized key format" error.
+fn parse_wif_key(expr: &str) -> Option<KeyProvider> {
+    let data = rustoshi_crypto::base58check_decode(expr).ok()?;
+    let (version, rest) = data.split_first()?;
+    if !matches!(version, 0x80 | 0xef) {
+        return None;
+    }
+    let (secret_bytes, is_compressed) = match rest.len() {
+        32 => (rest, false),
+        33 if rest[32] == 0x01 => (&rest[..32], true),
+        _ => return None,
+    };
+    let secret_key = secp256k1::SecretKey::from_slice(secret_bytes).ok()?;
+    let secp = secp256k1::Secp256k1::new();
+    let pubkey = PublicKey::from_secret_key(&secp, &secret_key);
+    Some(KeyProvider::Wif {
+        secret_key,
+        pubkey,
+        is_compressed,
+    })
 }
 
 /// Parse a key with origin info: [fingerprint/path]key
