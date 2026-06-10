@@ -12778,7 +12778,16 @@ pub async fn start_rpc_server(
         },
     };
 
-    let http_middleware = tower::ServiceBuilder::new().layer(AuthLayer::new(credentials));
+    // Middleware stack (outermost first): Basic-auth enforcement, then the
+    // `/wallet/<name>` URL pin (Core's WALLET_ENDPOINT_BASE dispatch,
+    // httprpc.cpp:339-341 + wallet/rpc/util.cpp:54-86). The wallet-route layer
+    // scopes a task-local around the jsonrpsee dispatch so wallet method
+    // handlers can resolve the URL-pinned wallet; see crate::wallet_route.
+    // NOTE: tls.rs::serve_https hard-codes this stack's TYPE — change both
+    // together.
+    let http_middleware = tower::ServiceBuilder::new()
+        .layer(AuthLayer::new(credentials))
+        .layer(crate::wallet_route::WalletRouteLayer::new());
 
     // Resolve the wallet root + network from RpcState BEFORE `state` is moved
     // into `RpcServerImpl::new`. The wallet RPC surface (createwallet,

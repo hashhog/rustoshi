@@ -359,7 +359,30 @@ impl WalletManager {
         let want_encryption = passphrase.is_some();
 
         // Create wallet
-        let (wallet, lock_state) = if options.blank || options.disable_private_keys {
+        let (wallet, lock_state) = if options.disable_private_keys {
+            // Watch-only wallet (Core's WALLET_FLAG_DISABLE_PRIVATE_KEYS).
+            // No seed is generated OR persisted — there are no private keys
+            // at all (Core sets up no SPKMs for such wallets,
+            // wallet.cpp:3104-3105). The previous behaviour folded this into
+            // the blank branch and built a NORMAL signing wallet from the
+            // publicly-known all-zero seed — a fund-theft hazard. The
+            // in-memory object still needs a master-key struct, so it is
+            // built from the zero seed but flagged private_keys_enabled =
+            // false, which disables HD derivation/indexing, key generation,
+            // and signing (see Wallet::set_private_keys_enabled).
+            if want_encryption {
+                // Core wallet.cpp:409.
+                return Err(WalletError::Encryption(
+                    "Passphrase provided but private keys are disabled. A passphrase is only \
+                     used to encrypt private keys, so cannot be used for wallets with private \
+                     keys disabled."
+                        .into(),
+                ));
+            }
+            let mut wallet = Wallet::from_seed(&[0u8; SEED_LEN], self.network, AddressType::P2WPKH)?;
+            wallet.set_private_keys_enabled(false);
+            (wallet, WalletLockState::unencrypted())
+        } else if options.blank {
             // Create a blank wallet with a dummy seed.
             // In a real implementation, we'd have a different constructor.
             warnings.push("blank wallet created - no keys available".into());
@@ -416,6 +439,7 @@ impl WalletManager {
             // A brand-new wallet has never scanned the chain; startup
             // reconciliation walks from birthday (0) to tip the first time.
             last_synced_height: 0,
+            private_keys_enabled: !options.disable_private_keys,
         };
         db.save_wallet_meta(&meta)?;
 
@@ -515,6 +539,8 @@ impl WalletManager {
                     // sethdseed restores a fresh keychain → the chain must be
                     // re-scanned for it from scratch; reset the watermark.
                     last_synced_height: 0,
+                    // A restored seed IS the wallet's private-key material.
+                    private_keys_enabled: true,
                 };
                 let _ = db_guard.save_wallet_meta(&meta);
             }
@@ -585,7 +611,16 @@ impl WalletManager {
         // locked. The user must subsequently call `walletpassphrase` to
         // decrypt the seed and swap in a real wallet (see `unlock_wallet`).
         let loaded = load_seed(&wallet_dir)?;
-        let (wallet, lock_state, mut warnings_inner) = match loaded {
+        let (mut wallet, lock_state, mut warnings_inner) = match loaded {
+            // A disable_private_keys wallet has NO seed file by design (it
+            // holds no private keys). Reconstruct the watch-only shell; its
+            // watched descriptors are re-registered below.
+            LoadedSeed::Absent if !meta.private_keys_enabled => {
+                let mut w =
+                    Wallet::from_seed(&[0u8; SEED_LEN], meta.network, meta.address_type)?;
+                w.set_private_keys_enabled(false);
+                (w, WalletLockState::unencrypted(), Vec::<String>::new())
+            }
             LoadedSeed::Absent => {
                 return Err(WalletError::InvalidPath(format!(
                     "wallet '{}' is missing its persisted seed ({}); was it created \
@@ -624,6 +659,41 @@ impl WalletManager {
                 )
             }
         };
+
+        // Honor the persisted disable_private_keys flag for seed-bearing
+        // wallets too (defensive: a dpk wallet should not have a seed file,
+        // but the flag is authoritative).
+        if !meta.private_keys_enabled {
+            wallet.set_private_keys_enabled(false);
+        }
+
+        // Re-register persisted imported descriptors (importdescriptors)
+        // so the watch set survives loadwallet. Unparseable rows are
+        // surfaced as warnings, not load failures.
+        match db.load_descriptors() {
+            Ok(rows) => {
+                for (desc_str, label, _timestamp, range_end) in rows {
+                    let body = desc_str.split('#').next().unwrap_or(&desc_str);
+                    match crate::descriptor::parse_descriptor(body) {
+                        Ok(parsed) => {
+                            if let Err(e) =
+                                wallet.register_descriptor(&desc_str, &parsed, &label, range_end)
+                            {
+                                warnings_inner.push(format!(
+                                    "failed to re-register descriptor '{}': {}",
+                                    desc_str, e
+                                ));
+                            }
+                        }
+                        Err(e) => warnings_inner.push(format!(
+                            "failed to parse persisted descriptor '{}': {}",
+                            desc_str, e
+                        )),
+                    }
+                }
+            }
+            Err(e) => warnings_inner.push(format!("failed to load descriptors: {}", e)),
+        }
 
         // Store wallet
         let wallet_arc = Arc::new(Mutex::new(wallet));
@@ -690,6 +760,7 @@ impl WalletManager {
                         next_change_index: change_idx,
                         birthday: prior_birthday,
                         last_synced_height: watermark,
+                        private_keys_enabled: wallet_guard.private_keys_enabled(),
                     };
                     let _ = db_guard.save_wallet_meta(&meta);
                 }

@@ -38,6 +38,7 @@ pub mod server;
 pub mod tls;
 pub mod types;
 pub mod wallet;
+pub mod wallet_route;
 pub mod zmq;
 
 pub use payjoin_sender::{

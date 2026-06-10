@@ -73,6 +73,33 @@ pub const COINBASE_MATURITY: u32 = 100;
 /// legacy keychain (`mapKeys` vs. HD `mapHdPubKeys`).
 const IMPORTED_PATH: &[u32] = &[u32::MAX];
 
+/// Sentinel derivation path for scriptPubKeys watched via an imported output
+/// descriptor (`importdescriptors` on a watch-only wallet). Like
+/// [`IMPORTED_PATH`] it is never a valid BIP-32 path; `scan_block_at` routes
+/// the address lookup through [`Wallet::watched_scripts`] (decoding the
+/// address straight from the script) instead of attempting HD derivation.
+/// Mirrors Core's `DescriptorScriptPubKeyMan` set-of-scripts ownership.
+const WATCHED_PATH: &[u32] = &[u32::MAX - 1];
+
+/// A scriptPubKey registered through `importdescriptors` (watch-only or
+/// pubkey-descriptor import). Mirrors the per-script view of Core's
+/// `DescriptorScriptPubKeyMan::GetScriptPubKeys()`.
+#[derive(Clone, Debug)]
+pub struct WatchedScript {
+    /// The canonical descriptor (with checksum) this script came from —
+    /// reported as `parent_desc` by `getaddressinfo`.
+    pub descriptor: String,
+    /// User label supplied at import time (empty when none).
+    pub label: String,
+    /// Whether the descriptor is solvable (false for `addr()` / `raw()`,
+    /// matching Core's `IsSolvable`).
+    pub solvable: bool,
+    /// The serialized public key controlling this script, when the
+    /// descriptor exposes one (single-key descriptors). Used by
+    /// `getaddressinfo`'s `pubkey` field.
+    pub pubkey: Option<Vec<u8>>,
+}
+
 /// A private key imported into the wallet out-of-band (via `importprivkey`),
 /// outside the HD seed derivation. Mirrors the subset of Core's legacy
 /// `CKey` + `mapAddressBook` bookkeeping that `importprivkey` populates.
@@ -172,6 +199,20 @@ pub struct Wallet {
     /// of those scripts. The seed-derived keychain is unaffected. Mirrors the
     /// imported subset of Core's legacy keychain that `importprivkey` writes.
     imported_keys: HashMap<Vec<u8>, ImportedKey>,
+    /// ScriptPubKeys watched via `importdescriptors`, keyed by raw script.
+    /// These participate in `build_script_index` (so block scans credit
+    /// funds paid to them) but carry no signing capability. Mirrors Core's
+    /// `DescriptorScriptPubKeyMan` script set for watch-only descriptors.
+    watched_scripts: HashMap<Vec<u8>, WatchedScript>,
+    /// Whether this wallet holds private keys (Core's
+    /// `WALLET_FLAG_DISABLE_PRIVATE_KEYS`, inverted). When `false`:
+    /// - no HD scripts are derived or indexed (Core sets up no SPKMs for
+    ///   such wallets — wallet.cpp:3104-3105), so the placeholder zero seed
+    ///   the in-memory object is built from can never mint spendable-looking
+    ///   addresses (the old behaviour was a fund-theft hazard: the all-zero
+    ///   seed is publicly known);
+    /// - key generation and signing refuse with an explicit error.
+    private_keys_enabled: bool,
 }
 
 /// A per-output or per-input line item in a wallet transaction's `details[]`.
@@ -282,7 +323,22 @@ impl Wallet {
             sent_txs: HashMap::new(),
             history: Vec::new(),
             imported_keys: HashMap::new(),
+            watched_scripts: HashMap::new(),
+            private_keys_enabled: true,
         })
+    }
+
+    /// Whether this wallet holds private keys (the inverse of Core's
+    /// `WALLET_FLAG_DISABLE_PRIVATE_KEYS`).
+    pub fn private_keys_enabled(&self) -> bool {
+        self.private_keys_enabled
+    }
+
+    /// Mark this wallet as private-key-less (`createwallet
+    /// disable_private_keys=true`). Disables HD derivation/indexing, key
+    /// generation, and signing.
+    pub fn set_private_keys_enabled(&mut self, enabled: bool) {
+        self.private_keys_enabled = enabled;
     }
 
     /// Create a new wallet from a BIP-39 mnemonic phrase.
@@ -336,6 +392,14 @@ impl Wallet {
     ///
     /// Each call generates a fresh address at the next index in the derivation chain.
     pub fn get_new_address(&mut self) -> Result<String, WalletError> {
+        if !self.private_keys_enabled {
+            // Core: getnewaddress on a disable_private_keys wallet -> -4
+            // "Error: This wallet has no available keys" (addresses.cpp:47).
+            // The placeholder zero seed must never mint addresses.
+            return Err(WalletError::SigningError(
+                "This wallet has no available keys".into(),
+            ));
+        }
         let path = self.derivation_path(false, self.next_receive_index);
         let address = self.derive_address(&path)?;
         self.addresses.insert(address.clone(), path);
@@ -347,6 +411,11 @@ impl Wallet {
     ///
     /// Change addresses use a different derivation path branch than receiving addresses.
     pub fn get_change_address(&mut self) -> Result<String, WalletError> {
+        if !self.private_keys_enabled {
+            return Err(WalletError::SigningError(
+                "This wallet has no available keys".into(),
+            ));
+        }
         let path = self.derivation_path(true, self.next_change_index);
         let address = self.derive_address(&path)?;
         self.addresses.insert(address.clone(), path);
@@ -1049,6 +1118,14 @@ impl Wallet {
         input_index: usize,
         all_prev_utxos: &[WalletUtxo],
     ) -> Result<(), WalletError> {
+        if !self.private_keys_enabled {
+            // Core: SendMoney/signing on a disable_private_keys wallet -> -4
+            // "Error: Private keys are disabled for this wallet"
+            // (spend.cpp:177-178). The zero placeholder seed must never sign.
+            return Err(WalletError::SigningError(
+                "Private keys are disabled for this wallet".into(),
+            ));
+        }
         if input_index >= tx.inputs.len() {
             return Err(WalletError::SigningError(format!(
                 "input_index {} out of range ({} inputs)",
@@ -1643,11 +1720,97 @@ impl Wallet {
 
     /// Check if an address belongs to this wallet.
     pub fn is_mine(&self, address: &str) -> bool {
-        self.addresses.contains_key(address)
+        if self.addresses.contains_key(address)
             || self
                 .imported_keys
                 .values()
                 .any(|k| k.address == address)
+        {
+            return true;
+        }
+        // Watched (descriptor-imported) scripts: decode the address to its
+        // scriptPubKey and probe the watch set.
+        if !self.watched_scripts.is_empty() {
+            if let Ok(addr) = Address::from_string(address, Some(self.network)) {
+                return self.watched_scripts.contains_key(&addr.to_script_pubkey());
+            }
+        }
+        false
+    }
+
+    /// Check if a raw scriptPubKey belongs to this wallet (HD addresses incl.
+    /// gap-limit lookahead, imported keys, and watched descriptor scripts) —
+    /// the script-level `IsMine` used by `getaddressinfo`.
+    pub fn is_mine_script(&self, script_pubkey: &[u8]) -> bool {
+        self.build_script_index().contains_key(script_pubkey)
+    }
+
+    /// Look up the watched-descriptor entry for a scriptPubKey, when the
+    /// script was registered via `importdescriptors`.
+    pub fn watched_script(&self, script_pubkey: &[u8]) -> Option<&WatchedScript> {
+        self.watched_scripts.get(script_pubkey)
+    }
+
+    /// Register a scriptPubKey as watched (descriptor import). Idempotent:
+    /// re-importing refreshes the stored descriptor/label.
+    pub fn register_watched_script(&mut self, script_pubkey: Vec<u8>, entry: WatchedScript) {
+        self.watched_scripts.insert(script_pubkey, entry);
+    }
+
+    /// Number of distinct watched scripts.
+    pub fn watched_script_count(&self) -> usize {
+        self.watched_scripts.len()
+    }
+
+    /// Register every scriptPubKey a parsed descriptor controls (positions
+    /// `0..=range_end` for ranged descriptors, position 0 otherwise) into the
+    /// watched-script set, so block scans / rescans credit funds paid to
+    /// them. `canonical` is the descriptor string with checksum (stored for
+    /// `getaddressinfo.parent_desc`). Returns the number of scripts
+    /// registered. Mirrors the script-registration half of Core's
+    /// `ProcessDescriptorImport` (wallet/rpc/backup.cpp:141-300).
+    pub fn register_descriptor(
+        &mut self,
+        canonical: &str,
+        parsed: &crate::descriptor::Descriptor,
+        label: &str,
+        range_end: u32,
+    ) -> Result<usize, WalletError> {
+        use crate::descriptor::{Descriptor, DescriptorInfo};
+
+        let info = DescriptorInfo::from_descriptor(parsed);
+        let positions: std::ops::RangeInclusive<u32> = if parsed.is_range() {
+            0..=range_end
+        } else {
+            0..=0
+        };
+
+        let mut registered = 0usize;
+        for pos in positions {
+            let scripts = parsed
+                .derive_scripts(pos, self.network)
+                .map_err(|e| WalletError::InvalidPath(e.to_string()))?;
+            // Best-effort pubkey for single-key descriptors (getaddressinfo).
+            let pubkey: Option<Vec<u8>> = match parsed {
+                Descriptor::Pk(k) | Descriptor::Pkh(k) | Descriptor::Wpkh(k) => {
+                    k.get_pubkey(pos).ok().map(|p| p.serialize().to_vec())
+                }
+                _ => None,
+            };
+            for spk in scripts {
+                self.register_watched_script(
+                    spk,
+                    WatchedScript {
+                        descriptor: canonical.to_string(),
+                        label: label.to_string(),
+                        solvable: info.is_solvable,
+                        pubkey: pubkey.clone(),
+                    },
+                );
+                registered += 1;
+            }
+        }
+        Ok(registered)
     }
 
     /// Import a raw secp256k1 private key into the wallet (Core's
@@ -1755,23 +1918,30 @@ impl Wallet {
     fn build_script_index(&self) -> HashMap<Vec<u8>, (Vec<u32>, bool)> {
         let mut index: HashMap<Vec<u8>, (Vec<u32>, bool)> = HashMap::new();
 
-        // (a) every already-generated address (path tells us the chain branch).
-        for (_addr, path) in self.addresses.iter() {
-            if let Ok(spk) = self.script_pubkey_for_path(path) {
-                // change branch is index [3] == 1 in the BIP-44/49/84/86 path.
-                let is_change = path.get(3).copied() == Some(1);
-                index.insert(spk, (path.clone(), is_change));
+        // HD-derived scripts exist ONLY when the wallet holds private keys.
+        // A disable_private_keys wallet has no SPKMs in Core
+        // (wallet.cpp:3104-3105); indexing the placeholder zero seed's
+        // derivations here would credit funds to publicly-derivable keys.
+        if self.private_keys_enabled {
+            // (a) every already-generated address (path tells us the chain
+            //     branch).
+            for (_addr, path) in self.addresses.iter() {
+                if let Ok(spk) = self.script_pubkey_for_path(path) {
+                    // change branch is index [3] == 1 in the BIP-44/49/84/86 path.
+                    let is_change = path.get(3).copied() == Some(1);
+                    index.insert(spk, (path.clone(), is_change));
+                }
             }
-        }
 
-        // (b) forward lookahead on receive + change chains (gap limit).
-        let look = self.gap_limit;
-        for is_change in [false, true] {
-            let start = if is_change { self.next_change_index } else { self.next_receive_index };
-            for i in start..start.saturating_add(look) {
-                let path = self.derivation_path(is_change, i);
-                if let Ok(spk) = self.script_pubkey_for_path(&path) {
-                    index.entry(spk).or_insert((path, is_change));
+            // (b) forward lookahead on receive + change chains (gap limit).
+            let look = self.gap_limit;
+            for is_change in [false, true] {
+                let start = if is_change { self.next_change_index } else { self.next_receive_index };
+                for i in start..start.saturating_add(look) {
+                    let path = self.derivation_path(is_change, i);
+                    if let Ok(spk) = self.script_pubkey_for_path(&path) {
+                        index.entry(spk).or_insert((path, is_change));
+                    }
                 }
             }
         }
@@ -1787,6 +1957,15 @@ impl Wallet {
                 .or_insert((IMPORTED_PATH.to_vec(), false));
         }
 
+        // (d) watched descriptor scripts (importdescriptors). Never "change";
+        // carry the WATCHED_PATH sentinel so address lookups decode straight
+        // from the script.
+        for spk in self.watched_scripts.keys() {
+            index
+                .entry(spk.clone())
+                .or_insert((WATCHED_PATH.to_vec(), false));
+        }
+
         index
     }
 
@@ -1797,6 +1976,10 @@ impl Wallet {
     fn owned_script_address(&self, spk: &[u8], path: &[u32]) -> Option<String> {
         if path == IMPORTED_PATH {
             self.imported_keys.get(spk).map(|k| k.address.clone())
+        } else if path == WATCHED_PATH {
+            // Watched descriptor scripts have no derivation; decode the
+            // address straight from the scriptPubKey.
+            Address::from_script_pubkey(spk, self.network).map(|a| a.encode())
         } else {
             self.derive_address(path).ok()
         }

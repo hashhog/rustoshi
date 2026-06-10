@@ -1963,11 +1963,14 @@ fn g29_encryptwallet_actually_encrypts_seed_at_rest() {
 fn g29_walletpassphrase_rpc_on_unencrypted_wallet_warns() {
     // Core's walletpassphrase on an unencrypted wallet returns an error
     // ("running with an unencrypted wallet, but walletpassphrase was called").
-    // Rustoshi has this error path wired (server.rs:7102) — test that it
-    // remains in place by checking the substring is present in the source.
-    let server_src = include_str!("../../rpc/src/server.rs");
+    // The handler lives in the merged wallet RPC module
+    // (crates/rpc/src/wallet.rs::wallet_passphrase). This pin previously
+    // pointed at server.rs and went stale when walletpassphrase moved to the
+    // merged module — the test failed at HEAD even though the error path was
+    // intact. Pin the module that actually serves the RPC.
+    let wallet_rpc_src = include_str!("../../rpc/src/wallet.rs");
     assert!(
-        server_src.contains("running with an unencrypted wallet"),
+        wallet_rpc_src.contains("running with an unencrypted wallet"),
         "walletpassphrase must error on unencrypted wallet (Core parity)"
     );
 }

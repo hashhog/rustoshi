@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use jsonrpsee::core::{async_trait, RpcResult};
+use rustoshi_storage::block_store::BlockStore;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use rustoshi_wallet::{CreateWalletOptions, WalletManager, WalletDirEntry};
@@ -52,6 +53,9 @@ pub mod wallet_error {
     /// Wallet encryption state precludes this operation
     /// (e.g., walletlock on unencrypted or encryptwallet on already-encrypted).
     pub const RPC_WALLET_WRONG_ENC_STATE: i32 = -15;
+    /// Failed to encrypt the wallet (Core's RPC_WALLET_ENCRYPTION_FAILED,
+    /// e.g. encryptwallet on a wallet with private keys disabled).
+    pub const RPC_WALLET_ENCRYPTION_FAILED: i32 = -16;
 }
 
 /// Result of createwallet RPC.
@@ -776,6 +780,23 @@ pub trait WalletRpc {
         requests: Vec<crate::types::ImportDescriptorRequest>,
     ) -> RpcResult<Vec<crate::types::ImportDescriptorResult>>;
 
+    /// Return information about the given bitcoin address that the wallet
+    /// knows (Core's `getaddressinfo`,
+    /// `bitcoin-core/src/wallet/rpc/addresses.cpp:368-513`).
+    ///
+    /// Emits Core's field order: address, scriptPubKey, ismine, solvable,
+    /// desc (only when solvable), parent_desc (when a wallet descriptor
+    /// matches), iswatchonly (DEPRECATED — always false, addresses.cpp:478),
+    /// script-class detail (isscript/iswitness/witness_version/
+    /// witness_program), pubkey (when known), ischange, labels. `ismine` is
+    /// TRUE for watch-only descriptor matches — descriptor wallets have no
+    /// ismine/iswatchonly split.
+    ///
+    /// Errors: -5 with "Invalid address" when the address fails to decode
+    /// (addresses.cpp:434-439).
+    #[method(name = "getaddressinfo")]
+    async fn get_address_info(&self, address: String) -> RpcResult<serde_json::Value>;
+
     /// Set (restore) the wallet's HD master seed deterministically.
     ///
     /// This is rustoshi's seed-only wallet-recovery entry point and mirrors
@@ -1045,6 +1066,63 @@ impl WalletRpcImpl {
         ErrorObjectOwned::owned(code, message.into(), None::<()>)
     }
 
+    /// The wallet this request is pinned to: an explicitly-constructed target
+    /// (tests / `with_target_wallet`) first, then the `/wallet/<name>` URL pin
+    /// scoped by [`crate::wallet_route::WalletRouteLayer`]. `None` for
+    /// bare-endpoint requests.
+    fn effective_wallet(&self) -> Option<String> {
+        self.target_wallet
+            .clone()
+            .or_else(crate::wallet_route::current_wallet_route)
+    }
+
+    /// Resolve the wallet this request operates on, mirroring Core's
+    /// `GetWalletForJSONRPCRequest` (wallet/rpc/util.cpp:54-86) error
+    /// contract exactly:
+    /// - `/wallet/<name>` pinned but not loaded → `-18`
+    ///   "Requested wallet does not exist or is not loaded" (util.cpp:71-72);
+    /// - bare endpoint, no wallets loaded → `-18` long message
+    ///   (util.cpp:80-83);
+    /// - bare endpoint, exactly one wallet → that wallet (util.cpp:76-78);
+    /// - bare endpoint, several wallets → `-19` (util.cpp:84-85). This is the
+    ///   ONLY case that may return -19.
+    fn resolve_wallet(
+        &self,
+        state: &WalletRpcState,
+    ) -> Result<(String, Arc<std::sync::Mutex<rustoshi_wallet::Wallet>>), ErrorObjectOwned> {
+        match self.effective_wallet() {
+            Some(name) => state
+                .wallet_manager
+                .get_wallet(&name)
+                .map(|w| (name, w))
+                .ok_or_else(|| {
+                    Self::rpc_error(
+                        wallet_error::RPC_WALLET_NOT_FOUND,
+                        "Requested wallet does not exist or is not loaded",
+                    )
+                }),
+            None => match state.wallet_manager.wallet_count() {
+                0 => Err(Self::rpc_error(
+                    wallet_error::RPC_WALLET_NOT_FOUND,
+                    "No wallet is loaded. Load a wallet using loadwallet or create a new one \
+                     with createwallet. (Note: A default wallet is no longer automatically \
+                     created)",
+                )),
+                1 => state.wallet_manager.get_default_wallet().ok_or_else(|| {
+                    Self::rpc_error(
+                        wallet_error::RPC_WALLET_NOT_FOUND,
+                        "Requested wallet does not exist or is not loaded",
+                    )
+                }),
+                _ => Err(Self::rpc_error(
+                    wallet_error::RPC_WALLET_NOT_SPECIFIED,
+                    "Multiple wallets are loaded. Please select which wallet to use by \
+                     requesting the RPC through the /wallet/<walletname> URI path.",
+                )),
+            },
+        }
+    }
+
     /// Satoshis to BTC.
     fn sats_to_btc(sats: u64) -> f64 {
         sats as f64 / 100_000_000.0
@@ -1121,6 +1199,249 @@ impl WalletRpcImpl {
             _ => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg),
         }
     }
+
+    /// Core's `GetImportTimestamp` (wallet/rpc/backup.cpp:127-139): the
+    /// `timestamp` field is REQUIRED per element and a missing or mistyped
+    /// value is a TOP-LEVEL RPC_TYPE_ERROR (-3) throw — probe-confirmed
+    /// against Core v31.99. Returns `Ok(None)` for `"now"`, `Ok(Some(ts))`
+    /// for a numeric timestamp.
+    fn parse_import_timestamp(
+        value: &serde_json::Value,
+    ) -> Result<Option<u64>, ErrorObjectOwned> {
+        const RPC_TYPE_ERROR: i32 = -3;
+        match value {
+            serde_json::Value::Null => Err(Self::rpc_error(
+                RPC_TYPE_ERROR,
+                "Missing required timestamp field for key",
+            )),
+            serde_json::Value::String(s) if s == "now" => Ok(None),
+            serde_json::Value::Number(n) => {
+                // Negative timestamps clamp to 0 (then to the minimum of 1 by
+                // the caller, matching Core's minimum_timestamp).
+                Ok(Some(n.as_u64().unwrap_or(0)))
+            }
+            other => {
+                let type_name = match other {
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    _ => "null",
+                };
+                Err(Self::rpc_error(
+                    RPC_TYPE_ERROR,
+                    format!(
+                        "Expected number or \"now\" timestamp value for key. got type {}",
+                        type_name
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Core's `CheckChecksum` in REQUIRE mode
+    /// (bitcoin-core/src/script/descriptor.cpp:2838-2869, reached via
+    /// `Parse(..., require_checksum=true)` from backup.cpp:158): every
+    /// importdescriptors descriptor MUST carry a valid checksum. Returns the
+    /// payload (descriptor without checksum) or Core's exact error string.
+    fn check_descriptor_checksum(desc: &str) -> Result<&str, String> {
+        use rustoshi_wallet::descriptor::descriptor_checksum;
+
+        let mut split = desc.split('#');
+        let payload = split.next().unwrap_or(desc);
+        let provided = match split.next() {
+            // No '#' at all -> require mode fails (descriptor.cpp:2845-2848).
+            None => return Err("Missing checksum".to_string()),
+            Some(c) => c,
+        };
+        if split.next().is_some() {
+            // descriptor.cpp:2841-2844.
+            return Err("Multiple '#' symbols".to_string());
+        }
+        if provided.len() != 8 {
+            // descriptor.cpp:2850-2853.
+            return Err(format!(
+                "Expected 8 character checksum, not {} characters",
+                provided.len()
+            ));
+        }
+        let computed = descriptor_checksum(payload)
+            .ok_or_else(|| "Invalid characters in payload".to_string())?;
+        if computed != provided {
+            // descriptor.cpp:2860-2864.
+            return Err(format!(
+                "Provided checksum '{}' does not match computed checksum '{}'",
+                provided, computed
+            ));
+        }
+        Ok(payload)
+    }
+
+    /// Core's `ParseDescriptorRange` (rpc/util.cpp): a number is the
+    /// inclusive end (begin 0), `[begin, end]` an explicit pair.
+    fn parse_descriptor_range(value: &serde_json::Value) -> Result<(u32, u32), (i32, String)> {
+        const RPC_INVALID_PARAMETER: i32 = -8;
+        if let Some(n) = value.as_i64() {
+            if n < 0 {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    "Range should be greater or equal than 0".into(),
+                ));
+            }
+            if n >= 10_000_000 {
+                return Err((RPC_INVALID_PARAMETER, "Range is too large".into()));
+            }
+            return Ok((0, n as u32));
+        }
+        if let Some(arr) = value.as_array() {
+            if arr.len() == 2 {
+                if let (Some(begin), Some(end)) = (arr[0].as_i64(), arr[1].as_i64()) {
+                    if begin < 0 {
+                        return Err((
+                            RPC_INVALID_PARAMETER,
+                            "Range should be greater or equal than 0".into(),
+                        ));
+                    }
+                    if end < begin {
+                        return Err((
+                            RPC_INVALID_PARAMETER,
+                            "Range specified as [begin,end] must not have begin after end".into(),
+                        ));
+                    }
+                    if end >= 10_000_000 || end - begin >= 1_000_000 {
+                        return Err((RPC_INVALID_PARAMETER, "Range is too large".into()));
+                    }
+                    return Ok((begin as u32, end as u32));
+                }
+            }
+        }
+        Err((
+            RPC_INVALID_PARAMETER,
+            "Range must be specified as end or as [begin,end]".into(),
+        ))
+    }
+
+    /// One element of `importdescriptors`, mirroring Core's
+    /// `ProcessDescriptorImport` (wallet/rpc/backup.cpp:141-300). Any error
+    /// returns `(code, message)` which the caller embeds PER-ELEMENT as
+    /// `{"success":false,"error":{...}}` (backup.cpp:293-297) — never a
+    /// top-level RPC error. On success returns
+    /// `(canonical_descriptor, label, range_end, warnings)`.
+    fn process_descriptor_import(
+        wallet: &mut rustoshi_wallet::Wallet,
+        request: &crate::types::ImportDescriptorRequest,
+    ) -> Result<(String, String, u32, Vec<String>), (i32, String)> {
+        use rustoshi_wallet::descriptor::{
+            descriptor_wif_secrets, parse_descriptor, DescriptorInfo,
+        };
+        const RPC_INVALID_PARAMETER: i32 = -8;
+
+        let mut warnings: Vec<String> = Vec::new();
+        let desc_str = request.desc.trim();
+
+        // 1. Checksum is REQUIRED (Core backup.cpp:158 Parse with
+        //    require_checksum=true; -5 on failure, backup.cpp:159-161).
+        let payload = Self::check_descriptor_checksum(desc_str)
+            .map_err(|msg| (wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY, msg))?;
+
+        // 2. Parse the descriptor body.
+        let parsed = parse_descriptor(payload).map_err(|e| {
+            (
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                format!("{}", e),
+            )
+        })?;
+        let info = DescriptorInfo::from_descriptor(&parsed);
+
+        // 3. Range checks (backup.cpp:173-186).
+        let range_end: u32 = if !parsed.is_range() {
+            if request.range.is_some() {
+                return Err((
+                    RPC_INVALID_PARAMETER,
+                    "Range should not be specified for an un-ranged descriptor".into(),
+                ));
+            }
+            0
+        } else {
+            match &request.range {
+                Some(v) => {
+                    // NOTE: a [begin,end] range registers scripts 0..=end (a
+                    // superset of Core's [begin,end] watch set) — rustoshi's
+                    // watch registry has no begin offset yet.
+                    let (_begin, end) = Self::parse_descriptor_range(v)?;
+                    end
+                }
+                None => {
+                    warnings.push("Range not given, using default keypool range".to_string());
+                    // Core defaults to wallet.m_keypool_size (exclusive end);
+                    // getwalletinfo reports keypoolsize 1000 -> inclusive 999.
+                    999
+                }
+            }
+        };
+        if request.active && !parsed.is_range() {
+            return Err((
+                RPC_INVALID_PARAMETER,
+                "Active descriptors must be ranged".into(),
+            ));
+        }
+        if parsed.is_range() && request.label.is_some() {
+            return Err((
+                RPC_INVALID_PARAMETER,
+                "Ranged descriptors should not have a label".into(),
+            ));
+        }
+
+        // 4. Private-key gates (backup.cpp:224-226 and 259-262) — both -4.
+        let privkeys_enabled = wallet.private_keys_enabled();
+        if !privkeys_enabled && info.has_private_keys {
+            return Err((
+                wallet_error::RPC_WALLET_ERROR,
+                "Cannot import private keys to a wallet with private keys disabled".into(),
+            ));
+        }
+        if privkeys_enabled && !info.has_private_keys {
+            return Err((
+                wallet_error::RPC_WALLET_ERROR,
+                "Cannot import descriptor without private keys to a wallet with private keys \
+                 enabled"
+                    .into(),
+            ));
+        }
+
+        // 5. Register the descriptor's scripts into the watch set, and (for
+        //    privkey-enabled wallets) import any WIF secrets so the funds are
+        //    spendable, mirroring AddWalletDescriptor's key import.
+        let label = request.label.clone().unwrap_or_default();
+        let canonical = desc_str.to_string();
+        wallet
+            .register_descriptor(&canonical, &parsed, &label, range_end)
+            .map_err(|e| {
+                (
+                    wallet_error::RPC_WALLET_ERROR,
+                    format!("Could not add descriptor '{}': {}", desc_str, e),
+                )
+            })?;
+        if privkeys_enabled && info.has_private_keys {
+            let wifs = descriptor_wif_secrets(&parsed);
+            if wifs.is_empty() {
+                // xprv-bearing descriptor: scripts are watched, but extended
+                // private key material is not yet stored for signing.
+                warnings.push(
+                    "Not all private keys provided. Some wallet functionality may return \
+                     unexpected errors"
+                        .to_string(),
+                );
+            }
+            for secret in wifs {
+                if let Err(e) = wallet.import_private_key(secret, label.clone()) {
+                    warnings.push(format!("failed to import descriptor private key: {}", e));
+                }
+            }
+        }
+
+        Ok((canonical, label, range_end, warnings))
+    }
 }
 
 #[async_trait]
@@ -1187,9 +1508,10 @@ impl WalletRpcServer for WalletRpcImpl {
     ) -> RpcResult<UnloadWalletResult> {
         let mut state = self.state.write().await;
 
-        // Determine which wallet to unload
+        // Determine which wallet to unload (explicit param, then the
+        // /wallet/<name> URL pin)
         let name = wallet_name
-            .or_else(|| self.target_wallet.clone())
+            .or_else(|| self.effective_wallet())
             .ok_or_else(|| {
                 if state.wallet_manager.wallet_count() > 1 {
                     Self::rpc_error(
@@ -1231,9 +1553,7 @@ impl WalletRpcServer for WalletRpcImpl {
     ) -> RpcResult<f64> {
         let state = self.state.read().await;
 
-        let (_, wallet) = state.wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (_, wallet) = self.resolve_wallet(&state)?;
 
         let wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
@@ -1265,9 +1585,7 @@ impl WalletRpcServer for WalletRpcImpl {
     async fn get_balances(&self) -> RpcResult<BalanceInfo> {
         let state = self.state.read().await;
 
-        let (_, wallet) = state.wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (_, wallet) = self.resolve_wallet(&state)?;
 
         let wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
@@ -1296,9 +1614,7 @@ impl WalletRpcServer for WalletRpcImpl {
     ) -> RpcResult<Vec<UnspentOutput>> {
         let state = self.state.read().await;
 
-        let (_, wallet) = state.wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (_, wallet) = self.resolve_wallet(&state)?;
 
         let wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
@@ -1343,6 +1659,14 @@ impl WalletRpcServer for WalletRpcImpl {
                 // way Core's listunspent reports `spendable=false` for coins
                 // that fail IsSpendable (incl. coinbase under 100 confs).
                 let spendable = wallet_guard.is_spendable(utxo);
+                // Watched (descriptor-imported) coins report their
+                // descriptor's solvability — false for addr()/raw(), matching
+                // Core's listunspent on a watch-only descriptor wallet
+                // (spendable stays true: descriptor ISMINE).
+                let solvable = wallet_guard
+                    .watched_script(&utxo.script_pubkey)
+                    .map(|w| w.solvable)
+                    .unwrap_or(true);
                 Some(UnspentOutput {
                     txid: hex::encode(utxo.outpoint.txid.0.iter().rev().copied().collect::<Vec<_>>()),
                     vout: utxo.outpoint.vout,
@@ -1351,7 +1675,7 @@ impl WalletRpcServer for WalletRpcImpl {
                     amount: Self::sats_to_btc(utxo.value),
                     confirmations: utxo.confirmations,
                     spendable,
-                    solvable: true,
+                    solvable,
                     safe: utxo.confirmations >= 1,
                 })
             })
@@ -1367,12 +1691,20 @@ impl WalletRpcServer for WalletRpcImpl {
     ) -> RpcResult<String> {
         let state = self.state.read().await;
 
-        let (_, wallet) = state.wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (_, wallet) = self.resolve_wallet(&state)?;
 
         let mut wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+
+        // Core: getnewaddress on a disable_private_keys wallet -> -4
+        // "Error: This wallet has no available keys" (addresses.cpp:47 via
+        // CanGetAddresses; probe-confirmed exact text).
+        if !wallet_guard.private_keys_enabled() {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "Error: This wallet has no available keys",
+            ));
+        }
 
         let address = wallet_guard.get_new_address()
             .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
@@ -1393,9 +1725,21 @@ impl WalletRpcServer for WalletRpcImpl {
     ) -> RpcResult<String> {
         let state = self.state.read().await;
 
-        let (name, wallet) = state.wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (name, wallet) = self.resolve_wallet(&state)?;
+
+        // Core SendMoney: -4 "Error: Private keys are disabled for this
+        // wallet" (spend.cpp:177-178; probe-confirmed exact text).
+        {
+            let wallet_guard = wallet.lock().map_err(|_| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+            })?;
+            if !wallet_guard.private_keys_enabled() {
+                return Err(Self::rpc_error(
+                    wallet_error::RPC_WALLET_ERROR,
+                    "Error: Private keys are disabled for this wallet",
+                ));
+            }
+        }
 
         // P0-SECURITY gate (W118 BUG-1): signing requires an unlocked wallet.
         Self::require_unlocked(&state, &name)?;
@@ -1466,9 +1810,7 @@ impl WalletRpcServer for WalletRpcImpl {
     ) -> RpcResult<Vec<WalletTransaction>> {
         let state = self.state.read().await;
 
-        let (wallet_name, wallet) = state.wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (wallet_name, wallet) = self.resolve_wallet(&state)?;
 
         let wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
@@ -1566,12 +1908,7 @@ impl WalletRpcServer for WalletRpcImpl {
     ) -> RpcResult<GetTransactionResult> {
         let state = self.state.read().await;
 
-        let (_wallet_name, wallet) = state
-            .wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| {
-                Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string())
-            })?;
+        let (_wallet_name, wallet) = self.resolve_wallet(&state)?;
 
         let wallet_guard = wallet
             .lock()
@@ -1655,9 +1992,7 @@ impl WalletRpcServer for WalletRpcImpl {
     async fn get_wallet_info(&self) -> RpcResult<WalletInfo> {
         let state = self.state.read().await;
 
-        let (wallet_name, wallet) = state.wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (wallet_name, wallet) = self.resolve_wallet(&state)?;
 
         let wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
@@ -1666,6 +2001,9 @@ impl WalletRpcServer for WalletRpcImpl {
         let unconfirmed_balance = Self::sats_to_btc(wallet_guard.unconfirmed_balance());
         let immature_balance = Self::sats_to_btc(wallet_guard.immature_balance());
         let tx_count = wallet_guard.list_unspent().len(); // Approximation
+        // Core: private_keys_enabled = !IsWalletFlagSet(
+        // WALLET_FLAG_DISABLE_PRIVATE_KEYS) (wallet/rpc/wallet.cpp:50,98).
+        let private_keys_enabled = wallet_guard.private_keys_enabled();
 
         Ok(WalletInfo {
             walletname: wallet_name,
@@ -1676,11 +2014,15 @@ impl WalletRpcServer for WalletRpcImpl {
             immature_balance,
             txcount: tx_count,
             keypoololdest: 0,
-            keypoolsize: 1000,
-            keypoolsize_hd_internal: Some(1000),
+            keypoolsize: if private_keys_enabled { 1000 } else { 0 },
+            keypoolsize_hd_internal: if private_keys_enabled {
+                Some(1000)
+            } else {
+                Some(0)
+            },
             paytxfee: 0.0,
             hdseedid: None,
-            private_keys_enabled: true,
+            private_keys_enabled,
             avoid_reuse: false,
             scanning: serde_json::Value::Bool(false),
             descriptors: true,
@@ -1699,15 +2041,21 @@ impl WalletRpcServer for WalletRpcImpl {
 
         let state = self.state.read().await;
 
-        let (name, wallet) = state.wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (name, wallet) = self.resolve_wallet(&state)?;
 
         // P0-SECURITY gate (W118 BUG-1): signing requires an unlocked wallet.
         Self::require_unlocked(&state, &name)?;
 
         let wallet_guard = wallet.lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+
+        // Watch-only wallets cannot sign (Core: private keys disabled -> -4).
+        if !wallet_guard.private_keys_enabled() {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "Error: Private keys are disabled for this wallet",
+            ));
+        }
 
         // Decode the transaction
         let tx_bytes = hex::decode(&hexstring)
@@ -1872,69 +2220,278 @@ impl WalletRpcServer for WalletRpcImpl {
         &self,
         requests: Vec<crate::types::ImportDescriptorRequest>,
     ) -> RpcResult<Vec<crate::types::ImportDescriptorResult>> {
-        use rustoshi_wallet::descriptor::{parse_descriptor, verify_checksum};
-
         let state = self.state.read().await;
+        let (wallet_name, wallet) = self.resolve_wallet(&state)?;
 
-        let (_wallet_name, wallet) = state.wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
-
-        let mut _wallet_guard = wallet.lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        // Core validates the timestamp per request via GetImportTimestamp
+        // (backup.cpp:127-139) and a missing/mistyped timestamp is a
+        // TOP-LEVEL throw (-3), unlike every other per-element failure.
+        let mut timestamps: Vec<Option<u64>> = Vec::with_capacity(requests.len());
+        for request in &requests {
+            timestamps.push(Self::parse_import_timestamp(&request.timestamp)?);
+        }
 
         let mut results: Vec<crate::types::ImportDescriptorResult> = Vec::new();
+        // Persisted rows for successful imports: (canonical, label, ts, range_end).
+        let mut persisted: Vec<(String, String, u64, u32)> = Vec::new();
+        // Lowest NUMERIC timestamp across requests (clamped to min 1, Core
+        // backup.cpp:376,390). u64::MAX = "every request said now" → no scan.
+        let mut lowest_timestamp: u64 = u64::MAX;
+        let mut any_success = false;
 
-        for request in requests {
-            let desc_str = &request.desc;
+        {
+            let mut wallet_guard = wallet.lock().map_err(|_| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+            })?;
 
-            // Validate checksum if present
-            if desc_str.contains('#') {
-                if let Err(e) = verify_checksum(desc_str) {
-                    results.push(crate::types::ImportDescriptorResult {
-                        success: false,
-                        warnings: None,
-                        error: Some(crate::types::ImportDescriptorError {
-                            code: -5,
-                            message: format!("Invalid checksum: {}", e),
-                        }),
-                    });
-                    continue;
+            for (request, ts) in requests.iter().zip(timestamps.iter()) {
+                match Self::process_descriptor_import(&mut wallet_guard, request) {
+                    Ok((canonical, label, range_end, warnings)) => {
+                        results.push(crate::types::ImportDescriptorResult {
+                            success: true,
+                            warnings: if warnings.is_empty() { None } else { Some(warnings) },
+                            error: None,
+                        });
+                        any_success = true;
+                        // Clamp numeric timestamps to minimum 1 (Core's
+                        // minimum_timestamp, backup.cpp:376); 0/1 both mean
+                        // "scan from genesis".
+                        if let Some(t) = ts {
+                            lowest_timestamp = lowest_timestamp.min((*t).max(1));
+                        }
+                        persisted.push((canonical, label, ts.unwrap_or(0), range_end));
+                    }
+                    Err((code, message)) => {
+                        // Per-element embedded error (Core catches the throw
+                        // and pushes {"success":false,"error":{...}} —
+                        // backup.cpp:293-297).
+                        results.push(crate::types::ImportDescriptorResult {
+                            success: false,
+                            warnings: None,
+                            error: Some(crate::types::ImportDescriptorError { code, message }),
+                        });
+                    }
                 }
             }
+        }
 
-            // Parse the descriptor
-            let desc_without_checksum = desc_str.split('#').next().unwrap_or(desc_str);
-            match parse_descriptor(desc_without_checksum) {
-                Ok(descriptor) => {
-                    // TODO: Actually import the descriptor into the wallet
-                    // For now, just validate it and return success
-                    let mut warnings = Vec::new();
+        // Capture the handles the rescan needs, then RELEASE the wallet-state
+        // guard before touching the node state: the block-connect path takes
+        // node-write THEN wallet-state, so holding wallet-state while waiting
+        // on a node lock would invert the order (same discipline as
+        // send_to_address).
+        let db_arc = state.wallet_manager.get_wallet_db(&wallet_name);
+        let node = state.node.clone();
+        drop(state);
 
-                    if !rustoshi_wallet::descriptor::DescriptorInfo::from_descriptor(&descriptor).is_solvable {
-                        warnings.push("Descriptor is not solvable".to_string());
+        // Persist the imported descriptors so the watch set survives
+        // loadwallet (re-registered by WalletManager::load_wallet).
+        if let Some(db) = &db_arc {
+            if let Ok(db_guard) = db.lock() {
+                for (canonical, label, ts, range_end) in &persisted {
+                    if let Err(e) = db_guard.save_descriptor(canonical, label, *ts, *range_end) {
+                        tracing::warn!("importdescriptors: failed to persist '{canonical}': {e}");
                     }
-
-                    results.push(crate::types::ImportDescriptorResult {
-                        success: true,
-                        warnings: if warnings.is_empty() { None } else { Some(warnings) },
-                        error: None,
-                    });
                 }
-                Err(e) => {
-                    results.push(crate::types::ImportDescriptorResult {
-                        success: false,
-                        warnings: None,
-                        error: Some(crate::types::ImportDescriptorError {
-                            code: -5,
-                            message: format!("Invalid descriptor: {}", e),
-                        }),
-                    });
+            }
+        }
+
+        // Synchronous rescan from the lowest timestamp (Core RescanFromTime,
+        // backup.cpp:408-414 + wallet.cpp:1827-1848): runs whenever at least
+        // one element succeeded, scanning from the first block whose time is
+        // >= lowest_timestamp - TIMESTAMP_WINDOW (7200s, chain.h:37) — which
+        // is genesis for timestamp <= 1. Blocking the RPC until the scan
+        // finishes matches Core's behaviour (importdescriptors returns only
+        // after its rescan). On a large chain with timestamp 0 this walks
+        // every block — same cost Core pays.
+        if any_success && lowest_timestamp != u64::MAX {
+            let Some(node) = node else {
+                tracing::warn!(
+                    "importdescriptors: wallet not wired to a node; imported descriptors \
+                     are registered but NOT rescanned (pre-existing funds will not be \
+                     credited until a restart reconcile)"
+                );
+                return Ok(results);
+            };
+            let (tip_height, chain_db) = {
+                let st = node.read().await;
+                (st.best_height, st.db.clone())
+            };
+            if tip_height > 0 || lowest_timestamp <= 1 {
+                // First block to scan: time >= lowest - TIMESTAMP_WINDOW.
+                let threshold = lowest_timestamp.saturating_sub(7200);
+                let wallet_arc = wallet.clone();
+                let scan = tokio::task::spawn_blocking(move || -> Result<u32, String> {
+                    let store = BlockStore::new(&chain_db);
+                    let mut started = threshold == 0;
+                    let mut last_scanned = 0u32;
+                    for h in 0..=tip_height {
+                        let hash = match store.get_hash_by_height(h) {
+                            Ok(Some(hash)) => hash,
+                            Ok(None) => break,
+                            Err(e) => return Err(e.to_string()),
+                        };
+                        let block = match store.get_block(&hash) {
+                            Ok(Some(b)) => b,
+                            Ok(None) => break,
+                            Err(e) => return Err(e.to_string()),
+                        };
+                        let block_time = block.header.timestamp as u64;
+                        if !started && block_time >= threshold {
+                            // Core CChain::FindEarliestAtLeast: scan starts at
+                            // the FIRST block at/after the window and never
+                            // stops again on later (non-monotonic) dips.
+                            started = true;
+                        }
+                        if started {
+                            if let Ok(mut w) = wallet_arc.lock() {
+                                w.scan_block_at(&block.transactions, h, hash, block_time);
+                            }
+                            last_scanned = h;
+                        }
+                    }
+                    Ok(last_scanned)
+                })
+                .await;
+                match scan {
+                    Ok(Ok(last_scanned)) => {
+                        // Persist the advanced watermark + refresh durable
+                        // confirmations against the tip.
+                        if let Some(db) = &db_arc {
+                            if let Ok(db_guard) = db.lock() {
+                                // Never regress a previously-higher watermark
+                                // (a gap-truncated rescan must not force a
+                                // future full re-walk of already-synced range).
+                                let prior = db_guard
+                                    .get_last_synced_height()
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(0);
+                                let _ = db_guard.set_last_synced_height(last_scanned.max(prior));
+                                let _ = db_guard.recompute_confirmations(tip_height);
+                            }
+                        }
+                        // Make sure the in-memory maturity view reaches tip
+                        // even if the walk stopped early.
+                        if let Ok(mut w) = wallet.lock() {
+                            if w.chain_height() < tip_height {
+                                w.set_chain_height(tip_height);
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("importdescriptors rescan failed: {e}");
+                    }
+                    Err(e) => {
+                        tracing::warn!("importdescriptors rescan task panicked: {e}");
+                    }
                 }
             }
         }
 
         Ok(results)
+    }
+
+    async fn get_address_info(&self, address: String) -> RpcResult<serde_json::Value> {
+        use rustoshi_crypto::address::Address;
+        use serde_json::json;
+
+        let state = self.state.read().await;
+        let (_wallet_name, wallet) = self.resolve_wallet(&state)?;
+        let network = state.wallet_manager.network();
+
+        // Core: invalid address -> -5 with DecodeDestination's reason or
+        // "Invalid address" (addresses.cpp:434-439).
+        let addr = Address::from_string(&address, Some(network)).map_err(|_| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                "Invalid address",
+            )
+        })?;
+        let spk = addr.to_script_pubkey();
+
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
+
+        let watched = wallet_guard.watched_script(&spk).cloned();
+        // ismine covers HD addresses (incl. lookahead), imported keys, and
+        // watched descriptor scripts — TRUE for watch-only descriptor
+        // matches (descriptor wallets have no ismine/iswatchonly split;
+        // probe-confirmed shape A3 of the parity study).
+        let ismine = wallet_guard.is_mine_script(&spk);
+        let hd_path: Option<Vec<u32>> = wallet_guard.get_derivation_path(&address).cloned();
+        // Watched scripts carry their descriptor's solvability (false for
+        // addr()/raw()); HD-owned addresses are solvable.
+        let solvable = match &watched {
+            Some(w) => w.solvable,
+            None => ismine,
+        };
+
+        // Field emission order mirrors Core addresses.cpp:441-510
+        // (serde_json preserve_order keeps insertion order on the wire).
+        let mut obj = serde_json::Map::new();
+        obj.insert("address".into(), json!(address));
+        obj.insert("scriptPubKey".into(), json!(hex::encode(&spk)));
+        obj.insert("ismine".into(), json!(ismine));
+        obj.insert("solvable".into(), json!(solvable));
+        // desc — ONLY when solvable (addresses.cpp:454-463). Best-effort:
+        // emitted for single-key descriptors whose pubkey is recorded.
+        if solvable {
+            if let Some(pk) = watched.as_ref().and_then(|w| w.pubkey.as_ref()) {
+                let body = match &addr {
+                    Address::P2WPKH { .. } => Some(format!("wpkh({})", hex::encode(pk))),
+                    Address::P2PKH { .. } => Some(format!("pkh({})", hex::encode(pk))),
+                    _ => None,
+                };
+                if let Some(desc) =
+                    body.and_then(|b| rustoshi_wallet::descriptor::add_checksum(&b))
+                {
+                    obj.insert("desc".into(), json!(desc));
+                }
+            }
+        }
+        if let Some(w) = &watched {
+            // The wallet descriptor this address belongs to
+            // (addresses.cpp:465-476).
+            obj.insert("parent_desc".into(), json!(w.descriptor));
+        }
+        // DEPRECATED, hardcoded false (addresses.cpp:383,478).
+        obj.insert("iswatchonly".into(), json!(false));
+        let isscript = matches!(addr, Address::P2SH { .. } | Address::P2WSH { .. });
+        obj.insert("isscript".into(), json!(isscript));
+        let witness: Option<(u8, Vec<u8>)> = match &addr {
+            Address::P2WPKH { hash, .. } => Some((0, hash.0.to_vec())),
+            Address::P2WSH { hash, .. } => Some((0, hash.0.to_vec())),
+            Address::P2TR { output_key, .. } => Some((1, output_key.to_vec())),
+            _ => None,
+        };
+        obj.insert("iswitness".into(), json!(witness.is_some()));
+        if let Some((ver, prog)) = &witness {
+            obj.insert("witness_version".into(), json!(ver));
+            obj.insert("witness_program".into(), json!(hex::encode(prog)));
+        }
+        if let Some(pk) = watched.as_ref().and_then(|w| w.pubkey.as_ref()) {
+            obj.insert("pubkey".into(), json!(hex::encode(pk)));
+        }
+        let ischange = hd_path
+            .as_ref()
+            .map(|p| p.get(3).copied() == Some(1))
+            .unwrap_or(false);
+        obj.insert("ischange".into(), json!(ischange));
+        // labels: mine -> [label-or-empty], not-mine -> []
+        // (addresses.cpp:503-508).
+        let labels: Vec<String> = if ismine {
+            vec![watched
+                .as_ref()
+                .map(|w| w.label.clone())
+                .unwrap_or_default()]
+        } else {
+            Vec::new()
+        };
+        obj.insert("labels".into(), json!(labels));
+
+        Ok(serde_json::Value::Object(obj))
     }
 
     async fn set_hd_seed(
@@ -1967,10 +2524,7 @@ impl WalletRpcServer for WalletRpcImpl {
         let mut state = self.state.write().await;
 
         // Resolve the target wallet name (URL-pinned, or the single default).
-        let (name, _wallet) = state
-            .wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (name, _wallet) = self.resolve_wallet(&state)?;
 
         state
             .wallet_manager
@@ -2002,10 +2556,7 @@ impl WalletRpcServer for WalletRpcImpl {
         use rustoshi_primitives::{Hash256, OutPoint};
 
         let state = self.state.read().await;
-        let (_, wallet) = state
-            .wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (_, wallet) = self.resolve_wallet(&state)?;
 
         let mut wallet_guard = wallet
             .lock()
@@ -2078,10 +2629,7 @@ impl WalletRpcServer for WalletRpcImpl {
 
     async fn list_lock_unspent(&self) -> RpcResult<Vec<LockedOutpoint>> {
         let state = self.state.read().await;
-        let (_, wallet) = state
-            .wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (_, wallet) = self.resolve_wallet(&state)?;
 
         let wallet_guard = wallet
             .lock()
@@ -2184,10 +2732,7 @@ impl WalletRpcServer for WalletRpcImpl {
         }
 
         let state = self.state.read().await;
-        let (_, wallet) = state
-            .wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string()))?;
+        let (_, wallet) = self.resolve_wallet(&state)?;
         let net = state.wallet_manager.network();
 
         let total_output_sats: u64 = parsed_outputs.iter().map(|(_, v)| *v).sum();
@@ -2459,7 +3004,7 @@ impl WalletRpcServer for WalletRpcImpl {
 
         // Need write access — unlock swaps the in-memory wallet object.
         let mut state = self.state.write().await;
-        let name = self.target_wallet.clone().or_else(|| {
+        let name = self.effective_wallet().or_else(|| {
             state.wallet_manager.get_default_wallet().map(|(n, _)| n)
         });
         let name = name.ok_or_else(|| {
@@ -2494,7 +3039,7 @@ impl WalletRpcServer for WalletRpcImpl {
 
     async fn wallet_lock(&self) -> RpcResult<()> {
         let mut state = self.state.write().await;
-        let name = self.target_wallet.clone().or_else(|| {
+        let name = self.effective_wallet().or_else(|| {
             state.wallet_manager.get_default_wallet().map(|(n, _)| n)
         });
         let name = name.ok_or_else(|| {
@@ -2524,7 +3069,7 @@ impl WalletRpcServer for WalletRpcImpl {
             ));
         }
         let mut state = self.state.write().await;
-        let name = self.target_wallet.clone().or_else(|| {
+        let name = self.effective_wallet().or_else(|| {
             state.wallet_manager.get_default_wallet().map(|(n, _)| n)
         });
         let name = name.ok_or_else(|| {
@@ -2533,6 +3078,19 @@ impl WalletRpcServer for WalletRpcImpl {
                 "No wallet specified",
             )
         })?;
+
+        // Core encrypt.cpp:256: encrypting a wallet without private keys is
+        // RPC_WALLET_ENCRYPTION_FAILED (-16).
+        if let Some(w) = state.wallet_manager.get_wallet(&name) {
+            if let Ok(guard) = w.lock() {
+                if !guard.private_keys_enabled() {
+                    return Err(Self::rpc_error(
+                        wallet_error::RPC_WALLET_ENCRYPTION_FAILED,
+                        "Error: wallet does not contain private keys, nothing to encrypt.",
+                    ));
+                }
+            }
+        }
 
         state
             .wallet_manager
@@ -2557,7 +3115,7 @@ impl WalletRpcServer for WalletRpcImpl {
         newpassphrase: String,
     ) -> RpcResult<()> {
         let mut state = self.state.write().await;
-        let name = self.target_wallet.clone().or_else(|| {
+        let name = self.effective_wallet().or_else(|| {
             state.wallet_manager.get_default_wallet().map(|(n, _)| n)
         });
         let name = name.ok_or_else(|| {
@@ -2613,18 +3171,21 @@ impl WalletRpcServer for WalletRpcImpl {
         let hash = Self::parse_txid_hex(&txid)?;
 
         let state = self.state.read().await;
-        let (name, wallet) = state
-            .wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| {
-                Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string())
-            })?;
+        let (name, wallet) = self.resolve_wallet(&state)?;
 
         Self::require_unlocked(&state, &name)?;
 
         let mut wallet_guard = wallet
             .lock()
             .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+
+        // Core spend.cpp:1036 (bumpfee signs; psbtbumpfee remains available).
+        if !wallet_guard.private_keys_enabled() {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "bumpfee is not available with wallets that have private keys disabled. Use psbtbumpfee instead.",
+            ));
+        }
 
         // Capture original fee before bump_fee replaces the entry.
         let orig_fee_sats = wallet_guard
@@ -2672,12 +3233,7 @@ impl WalletRpcServer for WalletRpcImpl {
         let hash = Self::parse_txid_hex(&txid)?;
 
         let state = self.state.read().await;
-        let (name, wallet) = state
-            .wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| {
-                Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string())
-            })?;
+        let (name, wallet) = self.resolve_wallet(&state)?;
 
         // Unlock gate: psbt_bump_fee does not sign, but it does need the
         // master key to call is_mine via derived addresses on the change
@@ -2753,12 +3309,7 @@ impl WalletRpcServer for WalletRpcImpl {
                 )
             })?;
 
-        let (name, wallet) = state
-            .wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| {
-                Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string())
-            })?;
+        let (name, wallet) = self.resolve_wallet(&state)?;
         Self::require_unlocked(&state, &name)?;
         let mut w = wallet.lock().map_err(|_| {
             Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "wallet lock poisoned")
@@ -2830,12 +3381,7 @@ impl WalletRpcServer for WalletRpcImpl {
         //    the per-input final witnesses on the receiver-added
         //    inputs (none yet) and wrap as a PSBT.
         let state = self.state.read().await;
-        let (name, wallet) = state
-            .wallet_manager
-            .get_wallet_or_default(self.target_wallet.as_deref())
-            .map_err(|e| {
-                Self::rpc_error(wallet_error::RPC_WALLET_NOT_SPECIFIED, e.to_string())
-            })?;
+        let (name, wallet) = self.resolve_wallet(&state)?;
         Self::require_unlocked(&state, &name)?;
 
         let (original_tx, original_psbt, sender_outpoints) = {
