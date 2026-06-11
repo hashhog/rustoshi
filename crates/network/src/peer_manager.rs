@@ -19,7 +19,7 @@ use crate::message::{
     parse_message_header, serialize_message, NetAddress, NetworkMessage,
     TimestampedNetAddress, VersionMessage, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
     MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK, NODE_NETWORK_LIMITED,
-    NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
+    NODE_P2P_V2, NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
 };
 use crate::v2_transport::{
     constants::{
@@ -31,8 +31,8 @@ use crate::v2_transport::{
 use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
 use crate::netgroup::{ip_is_routable, NetGroup, NetGroupManager};
 use crate::peer::{
-    run_outbound_peer, run_outbound_peer_with_proxy, DisconnectReason, PeerCommand, PeerEvent, PeerId,
-    PeerInfo, PeerState,
+    bip324_v2_outbound_enabled, run_outbound_peer, run_outbound_peer_with_proxy, DisconnectReason,
+    PeerCommand, PeerEvent, PeerId, PeerInfo, PeerState,
 };
 use crate::proxy::ProxyConfig;
 use crate::stale_detection::{
@@ -1400,6 +1400,15 @@ impl PeerManager {
             self.config.peer_block_filters,
         ) {
             s |= NODE_COMPACT_FILTERS;
+        }
+        // NODE_P2P_V2 (BIP-324 v2 encrypted transport, bit 11). rustoshi runs
+        // default-on v2 transport on the wire (see `peer::bip324_v2_outbound_enabled`,
+        // wired into `run_outbound_peer`/inbound v2 detection), so advertising the
+        // capability is honest. Gated on the same toggle so
+        // `RUSTOSHI_BIP324_V2_OUTBOUND=0` drops the bit, mirroring Core's
+        // `-v2transport` gate at `bitcoin-core/src/init.cpp:987-989`.
+        if bip324_v2_outbound_enabled() {
+            s |= NODE_P2P_V2;
         }
         s
     }
