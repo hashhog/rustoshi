@@ -169,6 +169,10 @@ pub const NODE_WITNESS: u64 = 1 << 3;
 pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
 /// This node supports limited blockchain serving (last 288 blocks).
 pub const NODE_NETWORK_LIMITED: u64 = 1 << 10;
+/// This node supports the BIP-324 v2 encrypted transport protocol.
+/// Bitcoin Core advertises this (NODE_P2P_V2, bit 11) whenever `-v2transport`
+/// is enabled (default since v26 — see `bitcoin-core/src/init.cpp:987-989`).
+pub const NODE_P2P_V2: u64 = 1 << 11;
 
 /// All P2P network messages.
 #[derive(Clone, Debug)]
