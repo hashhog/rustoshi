@@ -222,7 +222,7 @@ pub struct BlockchainInfo {
     #[serde(default)]
     pub softforks: serde_json::Value,
     /// Any network and blockchain warnings.
-    pub warnings: String,
+    pub warnings: Vec<String>,
 }
 
 // ============================================================
@@ -611,7 +611,7 @@ pub struct MiningInfo {
     /// Information about the next block (Core 31.99 field).
     pub next: MiningInfoNext,
     /// Any warnings.
-    pub warnings: String,
+    pub warnings: Vec<String>,
 }
 
 /// The `next` sub-object in `getmininginfo` (Core 31.99).
@@ -834,7 +834,7 @@ pub struct NetworkInfo {
     /// Local addresses.
     pub localaddresses: Vec<LocalAddress>,
     /// Any warnings.
-    pub warnings: String,
+    pub warnings: Vec<String>,
 }
 
 /// Network interface information.
@@ -1468,7 +1468,7 @@ mod tests {
             pruneheight: None,
             prune_target_size: None,
             softforks: serde_json::Value::Object(serde_json::Map::new()),
-            warnings: "".to_string(),
+            warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -1659,7 +1659,7 @@ mod tests {
                 .unwrap(),
                 target: "0".repeat(64),
             },
-            warnings: "".to_string(),
+            warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -1685,7 +1685,7 @@ mod tests {
             relayfee: BtcAmount::from_btc(0.00001),
             incrementalfee: BtcAmount::from_btc(0.00001),
             localaddresses: vec![],
-            warnings: "".to_string(),
+            warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -1722,7 +1722,7 @@ mod tests {
             pruneheight: None,
             prune_target_size: None,
             softforks: serde_json::Value::Object(serde_json::Map::new()),
-            warnings: String::new(),
+            warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -1760,7 +1760,7 @@ mod tests {
             pruneheight: None,
             prune_target_size: None,
             softforks: serde_json::Value::Object(serde_json::Map::new()),
-            warnings: String::new(),
+            warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
