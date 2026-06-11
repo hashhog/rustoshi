@@ -3700,28 +3700,96 @@ impl RustoshiRpcServer for RpcServerImpl {
         let difficulty_raw = Self::bits_to_difficulty_raw(block.header.bits);
 
         // tx field: verbosity=1 → txids (strings); verbosity=2 → full TxToUniv objects.
-        // For verbosity=2 we use the Core fallback for fee data; the local path
-        // builds the decoded tx without fee (undo data not available locally).
+        // For verbosity=2 the local path now computes each non-coinbase tx fee
+        // from the block's undo data (the same flat-cursor pattern getblockstats
+        // uses), matching Core's TxToUniv(SHOW_DETAILS) which appends a "fee"
+        // field after "vout" and before "hex" whenever undo data is available.
         let tx_json_str: String = if verbosity >= 2 {
             // Build per-tx objects mirroring TxToUniv(include_hex=true) from
             // bitcoin-core/src/core_io.cpp.  Chain-context fields
             // (blockhash, confirmations, time, blocktime) are NOT included —
             // Core's blockToJSON passes block_hash=uint256() to TxToUniv which
             // causes those fields to be omitted.
-            let (params_clone,) = {
+            //
+            // Undo data carries the spent prevouts (value + scriptPubKey) for
+            // every NON-coinbase input, flattened across the block's txs in
+            // order. The coinbase has no undo entry (Core: `txundo == nullptr`
+            // for coinbase). We walk a cursor over `spent_coins` exactly like
+            // getblockstats, slicing each non-coinbase tx's inputs to sum the
+            // prevout values, and emit `fee = sum(prevout values) - sum(output
+            // values)` as a BTC RawValue (ValueFromAmount parity).
+            let (params_clone, undo) = {
                 let state = self.state.read().await;
-                (state.params.clone(),)
+                let store = BlockStore::new(&state.db);
+                let undo = store
+                    .get_undo(&block_hash)
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
+                (state.params.clone(), undo)
             };
+
+            // Fee emission requires the full undo to align with the block's
+            // non-coinbase inputs. Genesis blocks legitimately have no undo.
+            // If undo is absent OR does not align, degrade like Core for a
+            // pruned/undo-less block: omit the fee field entirely rather than
+            // emit a wrong value. We probe alignment up front so the per-tx
+            // closure can either trust the cursor or skip fees uniformly.
+            let spent_coins: &[CoinEntry] =
+                undo.as_ref().map(|u| u.spent_coins.as_slice()).unwrap_or(&[]);
+            let total_non_coinbase_inputs: usize = block
+                .transactions
+                .iter()
+                .filter(|tx| !tx.is_coinbase())
+                .map(|tx| tx.inputs.len())
+                .sum();
+            let have_fees = undo.is_some() && spent_coins.len() == total_non_coinbase_inputs;
+
+            let mut cursor: usize = 0; // flat-undo cursor (advances per non-coinbase tx)
             let tx_parts: Vec<String> = block.transactions.iter().map(|tx| {
                 let decoded = build_decoded_raw_transaction(tx, Some(&params_clone));
                 // Serialize via to_string to preserve BtcAmount's 8-decimal precision.
                 let mut json_str = serde_json::to_string(&decoded).unwrap();
-                // Strip trailing `}` and inject hex field (Core TxToUniv include_hex=true).
-                // The hex is the full witness-serialized tx (matches Core's GetTxHex).
+
+                // Compute the fee field for non-coinbase txs when undo aligns.
+                // Core appends "fee" after "vout" and before "hex"; coinbase
+                // txs have no undo and therefore no fee field.
+                let fee_field: Option<String> = if have_fees && !tx.is_coinbase() {
+                    let start = cursor;
+                    let end = start + tx.inputs.len();
+                    // `have_fees` guarantees end <= spent_coins.len() across the
+                    // whole block, but clamp defensively.
+                    if end <= spent_coins.len() {
+                        cursor = end;
+                        let total_in: i64 = spent_coins[start..end]
+                            .iter()
+                            .map(|c| c.value as i64)
+                            .sum();
+                        let total_out: i64 =
+                            tx.outputs.iter().map(|o| o.value as i64).sum();
+                        let fee = total_in - total_out;
+                        // ValueFromAmount(fee) — BtcAmount renders the BTC
+                        // decimal string (matches Core's "fee" amount).
+                        Some(format!(
+                            r#","fee":{}"#,
+                            serde_json::to_string(&BtcAmount(fee)).unwrap()
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Strip trailing `}` and inject `fee` (if any) then the hex
+                // field (Core TxToUniv include_hex=true). The hex is the full
+                // witness-serialized tx (matches Core's GetTxHex). Order:
+                // ...,"vout":[...],"fee":<btc>,"hex":"...".
                 let hex_field = format!(r#","hex":"{}""#, hex::encode(tx.serialize()));
                 // Insert before the closing brace.
                 if json_str.ends_with('}') {
                     json_str.truncate(json_str.len() - 1);
+                    if let Some(ref f) = fee_field {
+                        json_str.push_str(f);
+                    }
                     json_str.push_str(&hex_field);
                     json_str.push('}');
                 }
