@@ -156,6 +156,13 @@ struct Cli {
     #[arg(long = "nodnsseed", default_value = "false")]
     nodnsseed: bool,
 
+    /// Disable the hardcoded fixed-seed bootstrap fallback (Bitcoin Core
+    /// `-fixedseeds=0`). Default off, i.e. the fallback is ENABLED (Core
+    /// `DEFAULT_FIXEDSEEDS=true`). When set, the node never injects the
+    /// mainnet fixed seeds even with an empty address book.
+    #[arg(long = "nofixedseeds", default_value = "false")]
+    nofixedseeds: bool,
+
     /// Enable transaction indexing
     #[arg(long)]
     txindex: bool,
@@ -1591,6 +1598,7 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
         }
     }
     merge_bool!(nodnsseed, "nodnsseed");
+    merge_bool!(nofixedseeds, "nofixedseeds");
     merge_bool!(txindex, "txindex");
     merge_bool!(coinstatsindex, "coinstatsindex");
     merge_str!(loglevel, "loglevel");
@@ -2569,6 +2577,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         // already implies this, so OR the two so a connect list also reports
         // DNS as disabled.
         no_dns_seed: cli.nodnsseed || !cli.connect.is_empty(),
+        // Bitcoin Core `-fixedseeds=0`: disable the fixed-seed bootstrap
+        // fallback. Default false = enabled (Core DEFAULT_FIXEDSEEDS=true).
+        no_fixed_seeds: cli.nofixedseeds,
         ..Default::default()
     };
     let mut peer_manager = PeerManager::new_with_netgroup(peer_config, params.clone(), netgroup_manager);
