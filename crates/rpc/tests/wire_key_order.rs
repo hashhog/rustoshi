@@ -323,17 +323,18 @@ fn getblockchaininfo_order_matches_core() {
         pruned: false,
         pruneheight: None,
         prune_target_size: None,
-        softforks: serde_json::json!({}),
         warnings: Vec::new(),
     };
     let got = keys_of_serialize(&bi);
-    // Core through `pruned`; softforks is a rustoshi-retained legacy field placed
-    // just before warnings (Core dropped softforks from getblockchaininfo in v25).
+    // Core v31.99 key order (blockchain.cpp:1420-1466). Core dropped the
+    // softforks field from getblockchaininfo (the builder is now consumed only
+    // by getdeploymentinfo), so rustoshi no longer emits it either. The
+    // optional pruneheight/prune_target_size are skipped when not pruning.
     let want = [
         "chain", "blocks", "headers", "bestblockhash", "bits", "target",
         "difficulty", "time", "mediantime", "verificationprogress",
         "initialblockdownload", "chainwork", "size_on_disk", "pruned",
-        "softforks", "warnings",
+        "warnings",
     ];
     assert_eq!(got, want, "getblockchaininfo key order");
 }

@@ -1591,17 +1591,49 @@ impl RpcServerImpl {
             .as_secs();
         let tip_age = now.saturating_sub(tip_timestamp as u64);
 
-        tip_age < max_tip_age_secs
+        if tip_age < max_tip_age_secs {
+            return true;
+        }
+
+        // Regtest parity: Core's `IsTipRecent` reads `Now<NodeSeconds>()`,
+        // which honors `-mocktime`. Regtest chains are mined under a pinned
+        // mocktime (e.g. 1700000000), so Core sees the freshly-mined tip as
+        // "recent" and latches IBD=false — even though the block timestamp is
+        // years behind real wall-clock. rustoshi has no mock clock, so the
+        // wall-clock gate above would never fire on a mocktime regtest chain.
+        //
+        // We match Core's effective regtest outcome WITHOUT a mock clock: a
+        // regtest node that has connected the most-work chain it knows about
+        // (block tip == best header tip, so there are no further headers to
+        // download) and that has met the chainwork bar (checked above; regtest
+        // min_chain_work == 0) is fully synced — nothing left to fetch — so it
+        // is not in IBD. This is scoped to regtest ONLY; mainnet/testnet keep
+        // the exact Core wall-clock tip-age gate (and their large
+        // min_chain_work keeps a genuinely-behind node in IBD via Condition 1).
+        if state.params.network_id == NetworkId::Regtest
+            && state.best_height == state.header_height
+        {
+            return true;
+        }
+
+        false
     }
 }
 
 /// Compute the median-time-past (MTP) of the block at `tip_hash` by
-/// walking 11 ancestors via the block store.
+/// walking up to `MEDIAN_TIME_PAST_WINDOW` (11) ancestors via the block
+/// store and returning the median of the timestamps gathered.
 ///
-/// Used by `submitblock` to populate `process_block`'s `prev_block_mtp`
-/// argument (BIP-113 `lock_time_cutoff` for `is_final_tx`).  Returns 0
-/// if fewer than `MEDIAN_TIME_PAST_WINDOW` ancestors are reachable
-/// (genesis-adjacent), matching Core's behaviour for short chains.
+/// Used by `submitblock`/`generateblock` to populate `process_block`'s
+/// `prev_block_mtp` argument (BIP-113 `lock_time_cutoff` for `is_final_tx`)
+/// and by `getblockchaininfo` for the `mediantime` field.
+///
+/// Matches Core's `CBlockIndex::GetMedianTimePast` (chain.h:233-245): the
+/// walk loop runs `min(11, available)` times and the median is taken over
+/// however many timestamps were gathered — so a genesis-adjacent / short
+/// chain returns the median of the blocks that DO exist rather than 0.
+/// Only returns 0 when the `tip_hash` header itself is unreadable (no
+/// blocks at all), which callers treat as "unavailable".
 ///
 /// Mirrors `rustoshi/src/main.rs::compute_mtp_via_store` — kept as a
 /// crate-local helper here to avoid pulling the binary's helper into the
@@ -1620,10 +1652,10 @@ fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> u32 {
                 }
                 current = header.prev_block_hash;
             }
-            _ => return 0,
+            _ => break,
         }
     }
-    if timestamps.len() < MEDIAN_TIME_PAST_WINDOW {
+    if timestamps.is_empty() {
         return 0;
     }
     timestamps.sort_unstable();
@@ -2497,6 +2529,10 @@ fn try_attach_and_reorg(
 
     state.best_hash = new_tip_hash;
     state.best_height = new_tip_height;
+    // Advance the most-work header tip with the block tip (see the submitblock
+    // connect path for rationale) so getblockchaininfo.headers /
+    // verificationprogress / getsyncstate stay correct after a reorg.
+    state.header_height = state.header_height.max(new_tip_height);
 
     // BIP-157/158 block filter index — populate the basic GCS filter +
     // chained filter header for every block connected on the new branch,
@@ -3397,12 +3433,26 @@ impl RustoshiRpcServer for RpcServerImpl {
                 (1.0, "1d00ffff".to_string(), compact_to_target_hex(0x1d00ffff), 0u64)
             };
 
-            // Get median time past, chainwork, and tip timestamp for IBD check
+            // `mediantime` = the tip's median-time-past (median of the last
+            // up-to-11 block times, inclusive of the tip) — NOT the tip's own
+            // nTime. Mirrors Core (blockchain.cpp:1429,
+            // `tip.GetMedianTimePast()`). Passing the TIP hash to the
+            // MTP helper yields MTP-of-tip. Falls back to the tip's own time
+            // if the helper can't reach a full window (returns 0) so we never
+            // surface a zero mediantime on genesis-adjacent chains.
+            let mediantime_val = {
+                let mtp = compute_prev_block_mtp(&store, &state.best_hash);
+                if mtp != 0 { mtp as u64 } else { tip_time_val }
+            };
+
+            // Get chainwork and tip timestamp for IBD check. Note `tip_timestamp`
+            // (4th slot) is the tip block's OWN nTime — Core's IsTipRecent uses
+            // `tip->Time()`, not MTP — so it stays the index/header timestamp.
             if let Ok(Some(entry)) = store.get_block_index(&state.best_hash) {
                 let cw_hex = hex::encode(entry.chain_work);
                 (
                     difficulty,
-                    entry.timestamp as u64,
+                    mediantime_val,
                     Some(entry.chain_work),
                     cw_hex,
                     entry.timestamp,
@@ -3421,7 +3471,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     .unwrap_or(0);
                 (
                     difficulty,
-                    0u64,
+                    mediantime_val,
                     None,
                     "0".repeat(64),
                     fallback_ts,
@@ -3459,8 +3509,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             );
         }
 
-        // Build softforks from the same canonical source as getdeploymentinfo.
-        let softforks_map = build_softforks_map(&state.params, state.best_height);
+        // NOTE: Core v31.99's `getblockchaininfo` does NOT emit a `softforks`
+        // field — its body never calls `DeploymentInfo()` (that builder is now
+        // consumed only by `getdeploymentinfo`). rustoshi mirrors this: the
+        // soft-fork deployment state is served by `get_deployment_info`, built
+        // from the same canonical `build_softforks_map` helper, so no data is
+        // lost. See `bitcoin-core/src/rpc/blockchain.cpp` lines 1420-1466.
 
         // BIP-159: report prune watermark + target when in prune mode.
         // Mirrors `bitcoin-core/src/rpc/blockchain.cpp::getblockchaininfo`
@@ -3484,7 +3538,13 @@ impl RustoshiRpcServer for RpcServerImpl {
         Ok(BlockchainInfo {
             chain: chain_name.to_string(),
             blocks: state.best_height,
-            headers: state.header_height,
+            // Core (blockchain.cpp:1423) emits the most-work *header* tip
+            // height (`m_best_header->nHeight`), which is always >= the
+            // connected block tip. `state.header_height` is loaded once at
+            // startup and advanced on connect, but a header tip can never be
+            // behind the block tip — guard with `.max(best_height)` so a
+            // synced node (no headers ahead) reports headers == blocks.
+            headers: state.header_height.max(state.best_height),
             bestblockhash: state.best_hash.to_hex(),
             bits: tip_bits,
             target: tip_target,
@@ -3503,7 +3563,6 @@ impl RustoshiRpcServer for RpcServerImpl {
             pruned: state.prune_mode,
             pruneheight,
             prune_target_size,
-            softforks: serde_json::Value::Object(softforks_map),
             warnings: Vec::new(),
         })
     }
@@ -5935,6 +5994,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Update RPC state
                 state.best_height = new_height;
                 state.best_hash = block_hash;
+                // Advance the most-work header tip alongside the block tip so
+                // getblockchaininfo.headers / verificationprogress / getsyncstate
+                // (all read state.header_height) stay correct over the process
+                // lifetime. `.max` preserves a header tip legitimately ahead of
+                // the block tip from a future headers-first path. Mirrors Core's
+                // m_best_header tracking on connect.
+                state.header_height = state.header_height.max(new_height);
 
                 // Remove confirmed (and conflicting) transactions from the
                 // mempool — mirrors Bitcoin Core's `CTxMemPool::removeForBlock`
@@ -12098,10 +12164,31 @@ impl RpcServerImpl {
 
                 // Store block index entry for metadata lookups
                 {
+                    use rustoshi_consensus::pow::{get_block_proof, ChainWork};
                     use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
                     let mut status = BlockStatus::new();
                     status.set(BlockStatus::VALID_SCRIPTS);
                     status.set(BlockStatus::HAVE_DATA);
+
+                    // Persist real cumulative chain_work (parent_work + this
+                    // block's proof) — same computation as the submitblock
+                    // connect path (server.rs ~5806). Previously this wrote
+                    // [0u8; 32], which left the tip's index entry with zero
+                    // work so the IBD latch in get_blockchain_info could never
+                    // confirm gate 1 and stayed stuck at
+                    // initialblockdownload=true even on a fully-synced node.
+                    let parent_work = if block.header.prev_block_hash != Hash256::ZERO {
+                        store
+                            .get_block_index(&block.header.prev_block_hash)
+                            .ok()
+                            .flatten()
+                            .map(|e| ChainWork::from_be_bytes(e.chain_work))
+                            .unwrap_or(ChainWork::ZERO)
+                    } else {
+                        ChainWork::ZERO
+                    };
+                    let this_work =
+                        parent_work.saturating_add(&get_block_proof(block.header.bits));
 
                     let entry = BlockIndexEntry {
                         height,
@@ -12112,7 +12199,7 @@ impl RpcServerImpl {
                         nonce: block.header.nonce,
                         version: block.header.version,
                         prev_hash: block.header.prev_block_hash,
-                        chain_work: [0u8; 32],
+                        chain_work: this_work.0,
                     };
                     store.put_block_index(&block_hash, &entry).map_err(|e| {
                         Self::rpc_error(
@@ -12150,6 +12237,11 @@ impl RpcServerImpl {
                 // Update state
                 state.best_hash = block_hash;
                 state.best_height = height;
+                // Advance the most-work header tip with the block tip (see the
+                // submitblock connect path for rationale). Keeps
+                // getblockchaininfo.headers / verificationprogress / getsyncstate
+                // correct over the process lifetime.
+                state.header_height = state.header_height.max(height);
 
                 // Wallet UTXO ledger: scan the connected block into every
                 // loaded wallet (credit wallet-owned outputs incl. coinbase,
@@ -12175,11 +12267,10 @@ impl RpcServerImpl {
                 }
 
                 // NOTE: IBD latch is re-evaluated on every getblockchaininfo
-                // call (see get_blockchain_info). We deliberately do NOT call
-                // should_exit_ibd here because mine_single_block writes a
-                // BlockIndexEntry with chain_work=[0u8; 32] (see below), so
-                // the latch check would always fail until chain_work tracking
-                // is implemented.
+                // call (see get_blockchain_info). The BlockIndexEntry written
+                // above now carries real cumulative chain_work, so that read-
+                // path latch can confirm gate 1 and flip is_ibd=false on a
+                // fully-synced node (matching Core's IsInitialBlockDownload).
 
                 // Remove mined transactions from mempool
                 for tx in &block.transactions[1..] {
@@ -15272,15 +15363,17 @@ mod tests {
         }
     }
 
-    /// Regtest round-trip test: both `getblockchaininfo.softforks` and
-    /// `getdeploymentinfo.deployments` must agree on every shared field for
-    /// every named deployment.
+    /// Regtest test: `getblockchaininfo` must NOT emit a `softforks` field
+    /// (Core v31.99 parity — the body never calls `DeploymentInfo()`), while
+    /// `getdeploymentinfo.deployments` still serves the soft-fork state from
+    /// the canonical `build_softforks_map` helper.
     ///
-    /// This test starts an in-process `RpcServerImpl` backed by an ephemeral
-    /// regtest datadir (no mainnet data touched), calls both RPCs, and
-    /// asserts field-level equality for `active`, `type`, `height`, and
-    /// `min_activation_height` across every deployment present in both
-    /// responses.
+    /// This starts an in-process `RpcServerImpl` backed by an ephemeral
+    /// regtest datadir (no mainnet data touched), serialises
+    /// `getblockchaininfo` and asserts the wire object has no `softforks`
+    /// key, then asserts `getdeploymentinfo.deployments` matches
+    /// `build_softforks_map` field-for-field — proving the data moved rather
+    /// than being lost.
     #[tokio::test]
     async fn test_softforks_getblockchaininfo_matches_getdeploymentinfo_regtest() {
         use rustoshi_storage::ChainDb;
@@ -15292,54 +15385,55 @@ mod tests {
         let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
         let params = rustoshi_consensus::ChainParams::regtest();
 
-        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        let state = Arc::new(RwLock::new(RpcState::new(db, params.clone())));
         let peer_state = Arc::new(RwLock::new(PeerState::default()));
         let rpc = RpcServerImpl::new(state, peer_state);
 
-        // --- Call both RPCs ---
+        // --- getblockchaininfo must NOT carry a softforks key (Core v31.99) ---
         let chain_info = rpc.get_blockchain_info().await
             .expect("getblockchaininfo failed");
+        let chain_info_json = serde_json::to_value(&chain_info)
+            .expect("serialize getblockchaininfo");
+        assert!(
+            chain_info_json.get("softforks").is_none(),
+            "getblockchaininfo must NOT emit a softforks field (Core v31.99 parity); keys: {:?}",
+            chain_info_json.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
+
+        // --- getdeploymentinfo still serves the soft-fork state ---
         let deploy_info = rpc.get_deployment_info(None).await
             .expect("getdeploymentinfo failed");
-
-        // Extract the two maps.
-        let softforks = chain_info.softforks.as_object()
-            .expect("getblockchaininfo.softforks must be a JSON object");
         let deployments = deploy_info["deployments"].as_object()
             .expect("getdeploymentinfo.deployments must be a JSON object");
 
-        // Every deployment that appears in getblockchaininfo.softforks must
-        // appear in getdeploymentinfo.deployments with identical fields, and
-        // vice-versa — the two RPCs share the same helper so their key sets
-        // are always identical.
-        let sf_keys: std::collections::BTreeSet<_> = softforks.keys().collect();
+        // The canonical helper is the single source of truth; the RPC must
+        // match it key-for-key and field-for-field. eval_height = best_height
+        // (0 on a fresh regtest datadir), the same value get_deployment_info
+        // passes the helper.
+        let canonical = build_softforks_map(&params, 0);
         let di_keys: std::collections::BTreeSet<_> = deployments.keys().collect();
-        assert_eq!(sf_keys, di_keys,
-            "getblockchaininfo.softforks and getdeploymentinfo.deployments must have the same deployment names");
+        let canon_keys: std::collections::BTreeSet<_> = canonical.keys().collect();
+        assert_eq!(di_keys, canon_keys,
+            "getdeploymentinfo.deployments must have the same deployment names as build_softforks_map");
 
-        for name in sf_keys {
-            let sf = &softforks[name];
+        for name in di_keys {
             let di = &deployments[name];
+            let cn = &canonical[name];
 
-            assert_eq!(sf["active"], di["active"],
-                "deployment '{name}': active mismatch between getblockchaininfo and getdeploymentinfo");
-            assert_eq!(sf["type"], di["type"],
-                "deployment '{name}': type mismatch");
-            assert_eq!(sf["height"], di["height"],
-                "deployment '{name}': height mismatch");
-            assert_eq!(sf["min_activation_height"], di["min_activation_height"],
+            assert_eq!(di["active"], cn["active"], "deployment '{name}': active mismatch");
+            assert_eq!(di["type"], cn["type"], "deployment '{name}': type mismatch");
+            assert_eq!(di["height"], cn["height"], "deployment '{name}': height mismatch");
+            assert_eq!(di["min_activation_height"], cn["min_activation_height"],
                 "deployment '{name}': min_activation_height mismatch");
 
-            // If a bip9 sub-object is present in one, it must be present in
-            // both with identical start_time, timeout, and bit.
-            if sf.get("bip9").is_some() || di.get("bip9").is_some() {
-                let sf_bip9 = sf.get("bip9")
-                    .unwrap_or_else(|| panic!("'{name}': bip9 present in getdeploymentinfo but not in getblockchaininfo"));
+            if di.get("bip9").is_some() || cn.get("bip9").is_some() {
                 let di_bip9 = di.get("bip9")
-                    .unwrap_or_else(|| panic!("'{name}': bip9 present in getblockchaininfo but not in getdeploymentinfo"));
-                assert_eq!(sf_bip9["bit"],        di_bip9["bit"],        "'{name}' bip9.bit mismatch");
-                assert_eq!(sf_bip9["start_time"], di_bip9["start_time"], "'{name}' bip9.start_time mismatch");
-                assert_eq!(sf_bip9["timeout"],    di_bip9["timeout"],    "'{name}' bip9.timeout mismatch");
+                    .unwrap_or_else(|| panic!("'{name}': bip9 present in build_softforks_map but not in getdeploymentinfo"));
+                let cn_bip9 = cn.get("bip9")
+                    .unwrap_or_else(|| panic!("'{name}': bip9 present in getdeploymentinfo but not in build_softforks_map"));
+                assert_eq!(di_bip9["bit"],        cn_bip9["bit"],        "'{name}' bip9.bit mismatch");
+                assert_eq!(di_bip9["start_time"], cn_bip9["start_time"], "'{name}' bip9.start_time mismatch");
+                assert_eq!(di_bip9["timeout"],    cn_bip9["timeout"],    "'{name}' bip9.timeout mismatch");
             }
         }
     }
@@ -18419,6 +18513,15 @@ mod tests {
         let params = ChainParams::regtest();
         let (_db, state, server) = make_test_server(params);
 
+        // Simulate a node still catching up: the block tip is BEHIND the
+        // best known header tip (headers-ahead). This disables the
+        // regtest "caught-up-to-all-known-headers" relaxation so this test
+        // exercises the wall-clock age gate proper.
+        {
+            let mut stw = state.write().await;
+            stw.best_height = 5;
+            stw.header_height = 50; // headers ahead of the block tip
+        }
         let st = state.read().await;
         // is_ibd true; regtest min_chain_work = zero, so chainwork
         // passes trivially; tip timestamp ~30 days ago → fails age gate.
@@ -18434,7 +18537,7 @@ mod tests {
         );
         assert!(
             !result,
-            "should_exit_ibd must return false when tip wallclock age > 24h"
+            "should_exit_ibd must return false when tip wallclock age > 24h and headers are still ahead"
         );
     }
 
@@ -18459,12 +18562,88 @@ mod tests {
         );
     }
 
+    /// Regtest parity: a regtest node whose block tip has caught up to the
+    /// best known header tip (no further headers to download) and that meets
+    /// the chainwork bar must exit IBD even when the tip's wall-clock age is
+    /// far over 24h — mirroring Core's `-mocktime` regtest behaviour where the
+    /// freshly-mined-but-old-timestamp tip is "recent" against the mock clock.
+    /// This is the byte-diff `initialblockdownload` residual fix.
+    #[tokio::test]
+    async fn should_exit_ibd_regtest_caught_up_old_tip_returns_true() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::regtest();
+        let (_db, state, server) = make_test_server(params);
+
+        // Block tip == header tip → fully caught up to all known headers.
+        {
+            let mut stw = state.write().await;
+            stw.best_height = 102;
+            stw.header_height = 102;
+        }
+        let st = state.read().await;
+        // Tip timestamp ~30 days ago (mocktime-old) → wall-clock age gate
+        // would say "not recent", but the caught-up relaxation flips it.
+        let thirty_days_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(30 * 24 * 60 * 60);
+        let result = server.should_exit_ibd(
+            &st,
+            Some(&[0u8; 32]), // regtest min_chain_work == 0 → gate 1 passes
+            thirty_days_ago as u32,
+        );
+        assert!(
+            result,
+            "regtest node caught up to its header tip must exit IBD even with an old tip timestamp"
+        );
+    }
+
+    /// Counterpart: the regtest caught-up relaxation must NOT leak into
+    /// mainnet — a mainnet node with a 30-day-old tip stays in IBD even if
+    /// block tip == header tip, because Core there uses the real wall clock.
+    #[tokio::test]
+    async fn should_exit_ibd_mainnet_caught_up_old_tip_stays_ibd() {
+        use rustoshi_consensus::ChainParams;
+        let params = ChainParams::mainnet();
+        let (_db, state, server) = make_test_server(params);
+
+        {
+            let mut stw = state.write().await;
+            stw.best_height = 800_000;
+            stw.header_height = 800_000;
+        }
+        let st = state.read().await;
+        let thirty_days_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(30 * 24 * 60 * 60);
+        // Supply max chainwork so gate 1 passes; only the age gate decides.
+        let result = server.should_exit_ibd(
+            &st,
+            Some(&[0xFFu8; 32]),
+            thirty_days_ago as u32,
+        );
+        assert!(
+            !result,
+            "mainnet must keep the wall-clock tip-age gate — the regtest caught-up relaxation must not apply"
+        );
+    }
+
     #[tokio::test]
     async fn fix_80_should_exit_ibd_chainwork_none_falls_through_to_age_gate() {
         use rustoshi_consensus::ChainParams;
         let params = ChainParams::regtest();
         let (_db, state, server) = make_test_server(params);
 
+        // Headers-ahead so the regtest caught-up relaxation is disabled and
+        // the wall-clock age gate is the deciding factor for the stale case.
+        {
+            let mut stw = state.write().await;
+            stw.best_height = 5;
+            stw.header_height = 50;
+        }
         let st = state.read().await;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -18478,7 +18657,7 @@ mod tests {
             "should_exit_ibd must fall through to tip-age gate when tip_chain_work is None (transient db miss)"
         );
 
-        // Same call but stale tip → return false.
+        // Same call but stale tip (and headers still ahead) → return false.
         let stale = now.saturating_sub(30 * 24 * 60 * 60);
         let result_stale = server.should_exit_ibd(&st, None, stale as u32);
         assert!(

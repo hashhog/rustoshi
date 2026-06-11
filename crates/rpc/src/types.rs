@@ -217,11 +217,15 @@ pub struct BlockchainInfo {
     /// Mirrors Core's `getblockchaininfo.prune_target_size`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prune_target_size: Option<u64>,
-    /// Soft fork deployment state, keyed by deployment name.
-    /// Populated from the same canonical source as `getdeploymentinfo`.
-    #[serde(default)]
-    pub softforks: serde_json::Value,
     /// Any network and blockchain warnings.
+    ///
+    /// NOTE: Core v31.99's `getblockchaininfo` does NOT emit a `softforks`
+    /// field — the body (`bitcoin-core/src/rpc/blockchain.cpp` lines
+    /// 1420-1466) never calls `DeploymentInfo()`/`SoftForkDescPushBack()`;
+    /// the softforks builder is now consumed only by `getdeploymentinfo`.
+    /// rustoshi mirrors this: the soft-fork deployment state lives in the
+    /// `getdeploymentinfo` RPC, built from the same canonical
+    /// `build_softforks_map` helper.
     pub warnings: Vec<String>,
 }
 
@@ -1477,13 +1481,14 @@ mod tests {
             pruned: false,
             pruneheight: None,
             prune_target_size: None,
-            softforks: serde_json::Value::Object(serde_json::Map::new()),
             warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"blocks\":100"));
         assert!(json.contains("\"chain\":\"test\""));
+        // Core v31.99 parity: getblockchaininfo must NOT emit softforks.
+        assert!(!json.contains("\"softforks\""));
     }
 
     #[test]
@@ -1736,7 +1741,6 @@ mod tests {
             pruned: false,
             pruneheight: None,
             prune_target_size: None,
-            softforks: serde_json::Value::Object(serde_json::Map::new()),
             warnings: Vec::new(),
         };
 
@@ -1753,6 +1757,8 @@ mod tests {
         assert!(json.contains("\"initialblockdownload\":false"));
         assert!(json.contains("\"chainwork\":"));
         assert!(json.contains("\"pruned\":false"));
+        // Core v31.99 parity: getblockchaininfo must NOT emit softforks.
+        assert!(!json.contains("\"softforks\""));
     }
 
     #[test]
@@ -1774,12 +1780,13 @@ mod tests {
             pruned: false,
             pruneheight: None,
             prune_target_size: None,
-            softforks: serde_json::Value::Object(serde_json::Map::new()),
             warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"chain\":\"test4\""));
+        // Core v31.99 parity: getblockchaininfo must NOT emit softforks.
+        assert!(!json.contains("\"softforks\""));
     }
 
     // ============================================================
