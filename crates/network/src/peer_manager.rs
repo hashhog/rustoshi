@@ -17,10 +17,11 @@
 use crate::eviction::{select_node_to_evict, EvictionCandidate, EvictionCandidateBuilder};
 use crate::message::{
     parse_message_header, serialize_message, NetAddress, NetworkMessage,
-    TimestampedNetAddress, VersionMessage, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
-    MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK, NODE_NETWORK_LIMITED,
-    NODE_P2P_V2, NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
+    TimestampedNetAddress, VersionMessage, FEEFILTER_VERSION, MAX_ADDR, MAX_MESSAGE_SIZE,
+    MESSAGE_HEADER_SIZE, MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK,
+    NODE_NETWORK_LIMITED, NODE_P2P_V2, NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
 };
+use crate::relay::FeeFilterManager;
 use crate::v2_transport::{
     constants::{
         ELLSWIFT_PUBKEY_LEN, EXPANSION, GARBAGE_TERMINATOR_LEN, HEADER_LEN, LENGTH_LEN,
@@ -1269,6 +1270,18 @@ pub struct PeerManager {
     netgroup_manager: NetGroupManager,
     /// Stale peer detector for timeout enforcement.
     stale_detector: StalePeerDetector,
+    /// BIP-133 feefilter scheduling state (per-peer next-send timer +
+    /// last-sent value + received filter). Owns the SEND-side cadence that
+    /// `PeerInfo.feefilter` (the received scalar) does not track. Wired into
+    /// the Connected/Disconnected/FeeFilter handlers and driven by
+    /// `maybe_send_feefilters` from the main.rs maintenance tick.
+    feefilter_manager: FeeFilterManager,
+    /// Last-known IBD state, refreshed by main.rs each maintenance tick via
+    /// `set_in_ibd`. Used by the handshake-time initial feefilter send (which
+    /// has no IBD argument of its own) so a peer that connects during IBD is
+    /// told MAX_MONEY ("don't send me txs"), matching Core's IBD branch.
+    /// Defaults to `true`: at startup we are in IBD, the conservative signal.
+    in_ibd: bool,
     /// Last time we ran the stale peer check.
     last_stale_check: Instant,
     /// Next peer ID to assign.
@@ -1336,6 +1349,8 @@ impl PeerManager {
             ban_manager,
             netgroup_manager: NetGroupManager::new(),
             stale_detector: StalePeerDetector::new(),
+            feefilter_manager: FeeFilterManager::default(),
+            in_ibd: true,
             last_stale_check: Instant::now(),
             next_peer_id: 1,
             event_tx,
@@ -1382,6 +1397,8 @@ impl PeerManager {
             ban_manager,
             netgroup_manager,
             stale_detector: StalePeerDetector::new(),
+            feefilter_manager: FeeFilterManager::default(),
+            in_ibd: true,
             last_stale_check: Instant::now(),
             next_peer_id: 1,
             event_tx,
@@ -2552,10 +2569,42 @@ impl PeerManager {
                     peer.stats = std::sync::Arc::clone(stats);
                 }
 
-                // BIP133: Send initial feefilter after handshake
-                // Use high fee rate (100 sat/vbyte) to discourage tx relay during sync
+                // BIP-133: register this peer with the feefilter manager so the
+                // SEND-side cadence (per-peer next-send timer, last-sent value,
+                // periodic re-broadcast) tracks it from now on. Gates mirror
+                // Core's MaybeSendFeefilter short-circuits:
+                //   - supports_feefilter = common version >= FEEFILTER_VERSION
+                //     (70013); pre-70013 peers may treat FEEFILTER as unknown.
+                //   - is_block_only = block-relay-only conn type. Core skips
+                //     these (IsBlockOnlyConn) because they never announce txs to
+                //     us, so we never need to advertise our filter to them.
+                //     NOTE: this is the connection TYPE, distinct from the
+                //     BIP-37 fRelay flag (`info.relay`).
+                let conn_type = self
+                    .peers
+                    .get(id)
+                    .map(|p| p.conn_type)
+                    .unwrap_or(ConnectionType::Inbound);
+                let supports_feefilter = info.version >= FEEFILTER_VERSION;
+                let is_block_only = conn_type == ConnectionType::BlockRelayOnly;
+                self.feefilter_manager
+                    .add_peer(*id, supports_feefilter, is_block_only);
+
+                // Early initial send (preserves the prior handshake-time
+                // feefilter so a peer gets a filter without waiting for the
+                // first maintenance tick), now routed through the manager so it
+                // records the sent value + reschedules — no duplicate re-send.
+                // Eligibility (version/block-only) is enforced inside
+                // force_initial_send; the BIP-37 fRelay flag is an additional
+                // gate (a peer that asked for no tx relay needs no filter).
                 if info.relay {
-                    self.send_initial_feefilter(*id).await;
+                    if let Some(rate) =
+                        self.feefilter_manager.force_initial_send(*id, self.in_ibd)
+                    {
+                        let _ = self
+                            .send_to_peer(*id, NetworkMessage::FeeFilter(rate))
+                            .await;
+                    }
                 }
             }
             PeerEvent::Disconnected(id, reason) => {
@@ -2571,6 +2620,8 @@ impl PeerManager {
                 }
                 // Clean up misbehavior tracking for this peer
                 self.misbehavior_tracker.remove_peer(*id);
+                // Drop the per-peer BIP-133 feefilter scheduling state.
+                self.feefilter_manager.remove_peer(*id);
                 // Try to replace the connection
                 self.fill_outbound_connections().await;
             }
@@ -2645,8 +2696,15 @@ impl PeerManager {
                                 "feefilter out of range".to_string(),
                             ),
                         );
-                    } else if let Some(peer) = self.peers.get_mut(id) {
-                        peer.info.feefilter = *fee_rate;
+                    } else {
+                        if let Some(peer) = self.peers.get_mut(id) {
+                            peer.info.feefilter = *fee_rate;
+                        }
+                        // Mirror the received filter into the manager so the
+                        // outbound tx-INV gate (should_relay_to_peer) consults
+                        // the same value. Both stores stay in sync; the INV gate
+                        // can use either.
+                        self.feefilter_manager.handle_feefilter(*id, *fee_rate);
                     }
                 }
 
@@ -2780,10 +2838,80 @@ impl PeerManager {
     /// Send initial feefilter to a peer (BIP133).
     /// Without mempool, we set a high fee rate (100 sat/vbyte = 100000 sat/kvB)
     /// to discourage transaction relay.
+    ///
+    /// Legacy entry point retained for API compatibility; the live handshake
+    /// path now goes through `FeeFilterManager::force_initial_send` so the
+    /// periodic cadence stays consistent.
     pub async fn send_initial_feefilter(&mut self, peer_id: PeerId) {
         // 100 sat/vbyte = 100,000 sat/kvB (sat per 1000 virtual bytes)
         let fee_rate: u64 = 100_000;
         let _ = self.send_to_peer(peer_id, NetworkMessage::FeeFilter(fee_rate)).await;
+    }
+
+    /// Record the current IBD state for the handshake-time initial feefilter.
+    ///
+    /// Called by the main.rs maintenance tick before `maybe_send_feefilters`.
+    /// Only affects the value chosen by `force_initial_send` for peers that
+    /// connect later; the periodic path always passes the live `is_ibd`.
+    pub fn set_in_ibd(&mut self, in_ibd: bool) {
+        self.in_ibd = in_ibd;
+    }
+
+    /// BIP-133 periodic feefilter re-broadcast (Core `MaybeSendFeefilter`,
+    /// invoked every SendMessages tick — here, every maintenance tick).
+    ///
+    /// Computes the set of peers whose per-peer `next_send_feefilter` timer has
+    /// elapsed (or whose filter changed substantially enough to snap the
+    /// broadcast forward) and pushes the rounded, min-relay-floored current
+    /// filter to each. During IBD the filter is `MAX_MONEY` ("don't send me
+    /// txs"); on the IBD→active transition any peer still holding the
+    /// MAX_MONEY filter is force-updated. Eligibility (version >= 70013,
+    /// not block-relay-only) is enforced per-peer inside the manager.
+    ///
+    /// `mempool_min_fee` is the node's current dynamic mempool minimum fee in
+    /// sat/kvB (Core: `m_mempool.GetMinFee().GetFeePerK()`).
+    pub async fn maybe_send_feefilters(&mut self, mempool_min_fee: u64, is_ibd: bool) {
+        self.in_ibd = is_ibd;
+        let pending = self
+            .feefilter_manager
+            .get_pending_feefilters(mempool_min_fee, is_ibd);
+        for (peer_id, fee_rate) in pending {
+            let _ = self
+                .send_to_peer(peer_id, NetworkMessage::FeeFilter(fee_rate))
+                .await;
+        }
+    }
+
+    /// Announce a transaction INV to peers, gated by each peer's received
+    /// feefilter (BIP-133 outbound tx-INV gate).
+    ///
+    /// Mirrors Core's SendMessages tx-INV loop (net_processing.cpp:6000/6036),
+    /// which skips any tx whose feerate is below the peer's advertised
+    /// `m_fee_filter_received`. A peer that never sent a feefilter (or is
+    /// pre-70013) has a received filter of 0, so every tx passes — only
+    /// genuinely sub-threshold INVs are dropped.
+    ///
+    /// `tx_fee_rate` is the transaction's feerate in sat/kvB, to match the u64
+    /// feefilter units exactly.
+    pub async fn relay_tx_inv(&self, inv: Vec<crate::message::InvVector>, tx_fee_rate: u64) {
+        for (&peer_id, peer) in self.peers.iter() {
+            if peer.info.state != PeerState::Established {
+                continue;
+            }
+            // Consult the per-peer received filter. Use the manager's view
+            // (kept in sync with PeerInfo.feefilter on every received
+            // FEEFILTER); unknown peers default to relay (returns true).
+            if !self
+                .feefilter_manager
+                .should_relay_to_peer(peer_id, tx_fee_rate)
+            {
+                continue;
+            }
+            let _ = peer
+                .command_tx
+                .send(PeerCommand::SendMessage(NetworkMessage::Inv(inv.clone())))
+                .await;
+        }
     }
 
     /// Update our tip height for stale peer detection.

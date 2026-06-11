@@ -4910,12 +4910,34 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 // 1. Run the stale-peer / chain-sync-timeout detector,
                 //    refresh fill-outbound to the configured target,
                 //    and snapshot peer count for sync-recovery logic.
+                // BIP-133 IBD signal: we are in IBD while our validated tip
+                // trails the best header we know about. While in IBD the
+                // feefilter we advertise is MAX_MONEY ("don't send me txs"),
+                // because inbound tx-INVs are discarded during IBD anyway.
+                // best_header == 0 means we have no headers yet → still IBD.
+                let best_header = header_sync.best_header_height();
+                let is_ibd = best_header == 0 || validated_tip < best_header;
+
+                // Node's current dynamic mempool minimum fee (sat/kvB), matching
+                // Core's m_mempool.GetMinFee().GetFeePerK(). get_min_fee takes
+                // &mut self (it decays the rolling minimum), so grab it under the
+                // rpc_state write lock.
+                let mempool_min_fee = {
+                    let mut rpc = rpc_state.write().await;
+                    rpc.mempool.get_min_fee()
+                };
+
                 let (stale_result, peer_count) = {
                     let mut ps = peer_state.write().await;
                     if let Some(ref mut pm) = ps.peer_manager {
                         pm.update_tip_height(validated_tip);
                         let stale = pm.check_for_stale_peers(in_flight).await;
                         pm.fill_outbound_connections().await;
+                        // BIP-133 periodic feefilter re-broadcast (Core
+                        // MaybeSendFeefilter cadence: rand_exp 10-min avg,
+                        // 5-min snap-forward on significant change, per-peer
+                        // timer, skip block-relay-only / pre-70013 peers).
+                        pm.maybe_send_feefilters(mempool_min_fee, is_ibd).await;
                         (stale, pm.peer_count())
                     } else {
                         (Default::default(), 0)
