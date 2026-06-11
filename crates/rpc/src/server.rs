@@ -5157,7 +5157,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             .filter_map(|h| state.mempool.get(h))
             .map(|e| e.fee)
             .sum();
-        let min_fee_rate_sats: u64 = 1000; // 1 sat/vB = 0.00001000 BTC/kvB
+        // DEFAULT_MIN_RELAY_TX_FEE = DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB
+        // (lowered 1000->100 in v31.99); CFeeRate(100).GetFeePerK() = 100 sat = 0.00000100 BTC.
+        let min_fee_rate_sats: u64 = 100;
 
         Ok(MempoolInfo {
             loaded: true,
@@ -5165,12 +5167,17 @@ impl RustoshiRpcServer for RpcServerImpl {
             bytes: state.mempool.total_bytes(),
             usage: state.mempool.total_bytes() * 2, // approximate memory usage
             total_fee: BtcAmount::from_sats(total_fee_sats),
-            maxmempool: 300 * 1024 * 1024, // 300 MB
+            maxmempool: 300 * 1_000_000, // DEFAULT_MAX_MEMPOOL_SIZE_MB(300) * 1'000'000 = 300000000
             mempoolminfee: BtcAmount::from_sats(min_fee_rate_sats),
             minrelaytxfee: BtcAmount::from_sats(min_fee_rate_sats),
             incrementalrelayfee: BtcAmount::from_sats(min_fee_rate_sats),
             unbroadcastcount: 0,
             fullrbf: true,
+            permitbaremultisig: true, // DEFAULT_PERMIT_BAREMULTISIG
+            maxdatacarriersize: 100_000, // MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT(400000)/WITNESS_SCALE_FACTOR(4)
+            limitclustercount: 64, // DEFAULT_CLUSTER_LIMIT
+            limitclustersize: 101_000, // DEFAULT_CLUSTER_SIZE_LIMIT_KVB(101) * 1000
+            optimal: true, // DoWork(0) on default/empty mempool reports known-optimal
         })
     }
 

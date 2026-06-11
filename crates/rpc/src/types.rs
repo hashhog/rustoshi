@@ -523,6 +523,16 @@ pub struct MempoolInfo {
     pub unbroadcastcount: usize,
     /// Whether the mempool accepts RBF without signaling.
     pub fullrbf: bool,
+    /// Whether bare multisig outputs are permitted (DEFAULT_PERMIT_BAREMULTISIG).
+    pub permitbaremultisig: bool,
+    /// Maximum size of OP_RETURN data carrier in bytes (MAX_OP_RETURN_RELAY).
+    pub maxdatacarriersize: u64,
+    /// Maximum number of transactions in a cluster (DEFAULT_CLUSTER_LIMIT).
+    pub limitclustercount: u64,
+    /// Maximum cluster size in vbytes (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000).
+    pub limitclustersize: u64,
+    /// Whether the mempool ordering is known-optimal.
+    pub optimal: bool,
 }
 
 /// Entry in mempool for `getrawmempool` verbose mode.
@@ -1490,6 +1500,11 @@ mod tests {
             incrementalrelayfee: BtcAmount::from_btc(0.00001),
             unbroadcastcount: 0,
             fullrbf: false,
+            permitbaremultisig: true,
+            maxdatacarriersize: 100_000,
+            limitclustercount: 64,
+            limitclustersize: 101_000,
+            optimal: true,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -1860,6 +1875,11 @@ mod tests {
             incrementalrelayfee: BtcAmount::from_btc(0.00001),
             unbroadcastcount: 10,
             fullrbf: false,
+            permitbaremultisig: true,
+            maxdatacarriersize: 100_000,
+            limitclustercount: 64,
+            limitclustersize: 101_000,
+            optimal: true,
         };
 
         let json = serde_json::to_string(&info).unwrap();

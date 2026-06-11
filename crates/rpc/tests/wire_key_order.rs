@@ -65,12 +65,19 @@ fn mempoolinfo_key_order_matches_core() {
         incrementalrelayfee: BtcAmount(0),
         unbroadcastcount: 0,
         fullrbf: true,
+        permitbaremultisig: true,
+        maxdatacarriersize: 100_000,
+        limitclustercount: 64,
+        limitclustersize: 101_000,
+        optimal: true,
     };
     let got = keys_of_serialize(&mi);
     let want = [
         "loaded", "size", "bytes", "usage", "total_fee", "maxmempool",
         "mempoolminfee", "minrelaytxfee", "incrementalrelayfee",
-        "unbroadcastcount", "fullrbf",
+        "unbroadcastcount", "fullrbf", "permitbaremultisig",
+        "maxdatacarriersize", "limitclustercount", "limitclustersize",
+        "optimal",
     ];
     assert_eq!(got, want, "getmempoolinfo key order");
 }
