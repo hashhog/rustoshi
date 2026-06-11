@@ -504,6 +504,16 @@ pub struct ChainParams {
     // DNS seeds
     pub dns_seeds: Vec<&'static str>,
 
+    // Fixed seeds: hardcoded routable IPv4 `ip:port` literals used as a
+    // last-resort bootstrap fallback when the address book ("addrman") is
+    // empty AND DNS/anchors/addnode produced nothing. Populated ONLY on
+    // mainnet (Core-vetted :8333 peers, one per /8 for netgroup diversity);
+    // left empty for testnet3/testnet4/signet/regtest so the fallback is
+    // network-scoped by construction (mirrors Core clearing vFixedSeeds for
+    // regtest, and blockbrew leaving non-mainnet FixedSeeds empty). Injected
+    // by PeerManager::maybe_add_fixed_seeds — see net.cpp:2607-2643 parity.
+    pub fixed_seeds: Vec<&'static str>,
+
     // Subsidy
     pub subsidy_halving_interval: u32,
 
@@ -765,6 +775,55 @@ impl ChainParams {
                     base_mtp: Some(1_775_650_208),
                 },
             ],
+            // Mainnet fixed seeds: 40 Core-vetted routable IPv4 :8333 peers,
+            // one per leading /8 octet for AS/netgroup diversity. Reused
+            // VERBATIM from blockbrew commit 4417bac (MainnetParams.FixedSeeds)
+            // and nimrod commit ab63977 (fallbackPeers) — identical list, no
+            // new IPs invented, no testnet contamination. Last-resort
+            // fallback only; injected by maybe_add_fixed_seeds when the book
+            // is empty (Core net.cpp:2607-2643 / DEFAULT_FIXEDSEEDS=true).
+            fixed_seeds: vec![
+                "2.121.116.198:8333",
+                "3.86.179.235:8333",
+                "4.2.51.251:8333",
+                "5.2.23.226:8333",
+                "12.11.29.34:8333",
+                "14.49.142.41:8333",
+                "18.27.125.103:8333",
+                "23.93.18.82:8333",
+                "24.16.202.74:8333",
+                "27.83.109.113:8333",
+                "31.41.23.249:8333",
+                "34.65.45.157:8333",
+                "35.78.97.86:8333",
+                "37.15.61.236:8333",
+                "38.52.3.192:8333",
+                "40.160.1.232:8333",
+                "44.223.26.178:8333",
+                "45.19.130.200:8333",
+                "46.126.216.3:8333",
+                "47.90.137.13:8333",
+                "50.4.123.66:8333",
+                "51.154.0.142:8333",
+                "52.182.185.242:8333",
+                "60.241.1.72:8333",
+                "62.34.57.141:8333",
+                "63.247.147.166:8333",
+                "64.23.97.128:8333",
+                "65.94.134.253:8333",
+                "66.35.84.14:8333",
+                "67.4.139.122:8333",
+                "68.61.69.53:8333",
+                "69.4.94.226:8333",
+                "70.44.20.24:8333",
+                "71.56.178.136:8333",
+                "72.88.192.74:8333",
+                "73.42.33.255:8333",
+                "74.48.195.218:8333",
+                "75.80.3.4:8333",
+                "76.124.35.108:8333",
+                "77.38.72.37:8333",
+            ],
         }
     }
 
@@ -819,6 +878,8 @@ impl ChainParams {
             ]),
             // Testnet3 has no hardcoded assumeUTXO snapshots
             assumeutxo_data: vec![],
+            // No mainnet fixed seeds on testnet3 (network-scoped fallback).
+            fixed_seeds: Vec::new(),
         }
     }
 
@@ -914,6 +975,8 @@ impl ChainParams {
                     base_mtp: None,
                 },
             ],
+            // No mainnet fixed seeds on testnet4 (network-scoped fallback).
+            fixed_seeds: Vec::new(),
         }
     }
 
@@ -958,6 +1021,8 @@ impl ChainParams {
             ]),
             // Signet has no hardcoded assumeUTXO snapshots
             assumeutxo_data: vec![],
+            // No mainnet fixed seeds on signet (network-scoped fallback).
+            fixed_seeds: Vec::new(),
         }
     }
 
@@ -996,6 +1061,8 @@ impl ChainParams {
             checkpoints: Checkpoints::empty(),
             // Regtest allows any assumeUTXO snapshot (validated at runtime)
             assumeutxo_data: vec![],
+            // No mainnet fixed seeds on regtest (network-scoped fallback).
+            fixed_seeds: Vec::new(),
         }
     }
 

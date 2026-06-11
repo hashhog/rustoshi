@@ -217,6 +217,13 @@ pub struct PeerManagerConfig {
     /// non-empty DNS seeding is already skipped; this flag is the standalone
     /// knob for the addrman-outbound case.)
     pub no_dns_seed: bool,
+    /// Bitcoin Core `-fixedseeds=0`: disable the hardcoded fixed-seed
+    /// bootstrap fallback. Default `false` (Core `DEFAULT_FIXEDSEEDS=true`),
+    /// so the fallback is enabled out of the box. When `true` the node never
+    /// injects `ChainParams::fixed_seeds` even with an empty address book —
+    /// mirrors Core's `add_fixed_seeds = gArgs.GetBoolArg("-fixedseeds", ...)`
+    /// gate (net.cpp:2568). See `maybe_add_fixed_seeds`.
+    pub no_fixed_seeds: bool,
 }
 
 impl PeerManagerConfig {
@@ -287,6 +294,8 @@ impl Default for PeerManagerConfig {
             offline: false,
             connect_peers: Vec::new(),
             no_dns_seed: false,
+            // Core DEFAULT_FIXEDSEEDS = true → fallback enabled by default.
+            no_fixed_seeds: false,
         }
     }
 }
@@ -1278,6 +1287,20 @@ pub struct PeerManager {
     /// `fill_outbound_connections` → `maintain_connect_peers` on every
     /// drop). Empty / unused when `config.connect_peers` is empty.
     connect_attempt_at: HashMap<SocketAddr, Instant>,
+    /// One-shot guard for the fixed-seed bootstrap fallback. Set to `true`
+    /// the first time `maybe_add_fixed_seeds` fires so neither the immediate
+    /// `start()` call nor any later maintenance-tick re-call re-injects the
+    /// seeds (and re-bumps attempt counts) on a still-empty book. Mirrors
+    /// Core's `add_fixed_seeds = false` after firing (net.cpp:2642). A plain
+    /// bool suffices (no lock) because `start()` and the maintenance tick run
+    /// on the same single-threaded manager task — unlike blockbrew's RWMutex.
+    fixed_seeds_added: bool,
+    /// Wall-clock anchor for the fixed-seed 60s grace window, captured once at
+    /// the top of `start()` (mirrors Core's `auto start = GetTime()` at
+    /// net.cpp:2562). `None` until `start()` runs; read by the maintenance-tick
+    /// re-check in `fill_outbound_connections` so the grace clock is shared
+    /// between the immediate call and the periodic call.
+    start_instant: Option<Instant>,
 }
 
 /// Minimum interval between reconnect attempts to a single pinned `-connect`
@@ -1320,6 +1343,8 @@ impl PeerManager {
             start_height: 0,
             anchors,
             connect_attempt_at: HashMap::new(),
+            fixed_seeds_added: false,
+            start_instant: None,
         }
     }
 
@@ -1364,6 +1389,8 @@ impl PeerManager {
             start_height: 0,
             anchors,
             connect_attempt_at: HashMap::new(),
+            fixed_seeds_added: false,
+            start_instant: None,
         }
     }
 
@@ -1464,6 +1491,15 @@ impl PeerManager {
     /// Start the peer manager: resolve DNS seeds, begin connecting, and optionally
     /// start a TCP listener for inbound connections.
     pub async fn start(&mut self) {
+        // Anchor for the fixed-seed 60s grace clock (Core net.cpp:2562
+        // `auto start = GetTime()`). Captured once here and stored on the
+        // manager so the later maintenance-tick re-check in
+        // `fill_outbound_connections` shares the same grace window. Set even
+        // on the offline / `-connect` early-returns below (harmless — the
+        // fallback's enabled/`-connect` gates keep it from firing there).
+        let start_instant = Instant::now();
+        self.start_instant = Some(start_instant);
+
         // Start TCP listener for inbound connections if configured.
         // Phase B offline mode also suppresses the inbound listener, so the
         // shadow node accepts no peers at all (the `offline` early-return
@@ -1653,6 +1689,16 @@ impl PeerManager {
             self.addr_manager.known_count()
         );
 
+        // Last-resort fixed-seed bootstrap fallback (Core net.cpp:2607-2643 /
+        // blockbrew 4417bac). Fires here immediately when the address book is
+        // still empty AND DNS seeding is disabled (nothing to wait for — the
+        // exact DNS-failure hang fix); otherwise it is a cheap no-op now and
+        // the periodic re-check in `fill_outbound_connections` injects the
+        // seeds once the 60s grace elapses with the book still empty. Sits
+        // strictly downstream of anchors and DNS, and is skipped entirely on
+        // the offline / `-connect` early-returns above.
+        self.maybe_add_fixed_seeds(start_instant);
+
         // Fill outbound connections
         self.fill_outbound_connections().await;
     }
@@ -1732,6 +1778,19 @@ impl PeerManager {
             return;
         }
 
+        // Periodic fixed-seed re-check (Core's per-500ms re-check at
+        // net.cpp:2594-2607 / blockbrew's 5s fixedSeedsTicker). This is the
+        // addrman-driven branch reached on the reactive Disconnected path and
+        // the periodic maintenance tick, so an address book that is still
+        // empty after the 60s grace (e.g. DNS was up but returned nothing)
+        // gets the fixed seeds injected on the next tick. The one-shot guard
+        // inside `maybe_add_fixed_seeds` makes this a cheap no-op once fired.
+        // `start_instant` was captured at the top of `start()`; if `start()`
+        // has not run yet it is `None` and we simply skip (no clock yet).
+        if let Some(start) = self.start_instant {
+            self.maybe_add_fixed_seeds(start);
+        }
+
         // Count full-relay outbound connections
         let full_relay_count = self
             .peers
@@ -1787,6 +1846,109 @@ impl PeerManager {
                 break;
             }
         }
+    }
+
+    /// Whether the fixed-seed bootstrap fallback is enabled.
+    ///
+    /// Port of blockbrew 4417bac `fixedSeedsEnabled()` / Core's
+    /// `-fixedseeds` (DEFAULT_FIXEDSEEDS=true) gate: on by default, off when
+    /// `-nofixedseeds` is set OR when `-connect` peer pinning is active (Core
+    /// makes no addrman-driven outbound, and so never adds fixed seeds, when
+    /// `-connect` is given).
+    fn fixed_seeds_enabled(&self) -> bool {
+        !self.config.no_fixed_seeds && self.config.connect_peers.is_empty()
+    }
+
+    /// Whether DNS seeding is disabled for this node.
+    ///
+    /// Port of blockbrew 4417bac `dnsSeedingDisabled()` / Core's `!dnsseed`
+    /// + `-connect` implication. When DNS is disabled there is nothing to
+    /// wait for, so the fixed-seed fallback may fire immediately rather than
+    /// after the 60s grace (Core net.cpp:2620 — fire now when `!dnsseed &&
+    /// !use_seednodes`; we have no `-seednode`, so the DNS predicate suffices).
+    fn dns_seeding_disabled(&self) -> bool {
+        self.config.no_dns_seed || !self.config.connect_peers.is_empty()
+    }
+
+    /// Last-resort fixed-seed bootstrap fallback — faithful port of blockbrew
+    /// 4417bac `maybeAddFixedSeeds` (peermgr.go:1061-1089) + Core
+    /// `ThreadOpenConnections` (net.cpp:2607-2643).
+    ///
+    /// Injects ALL of `ChainParams::fixed_seeds` into the address book exactly
+    /// once, returning `true` only on the firing call. Fires iff every gate
+    /// holds:
+    ///  1. ENABLED — fixed seeds enabled and not in `-connect` mode
+    ///     (`fixed_seeds_enabled()`).
+    ///  2. NETWORK-SCOPED — the active params carry a non-empty `fixed_seeds`
+    ///     list. Only `ChainParams::mainnet()` populates it, so this is
+    ///     mainnet-only by construction; we also assert `network_id == Mainnet`
+    ///     belt-and-suspenders.
+    ///  3. ONE-SHOT — `fixed_seeds_added` is still false (set true on fire so
+    ///     the periodic re-call is a cheap no-op; Core sets `add_fixed_seeds =
+    ///     false` after firing).
+    ///  4. BOOK-EMPTY — `known_count() == 0` (Core's GetReachableEmptyNetworks
+    ///     proxy for an IPv4-only seed set: an empty book == the one reachable
+    ///     network has zero addrman addresses). A populated book blocks firing,
+    ///     so a successful DNS resolve is never bypassed.
+    ///  5. TIMING — 60s grace elapsed since `start` (Core net.cpp:2614) OR DNS
+    ///     seeding disabled (fire immediately — the DNS-failure hang fix).
+    ///
+    /// On fire it injects each literal via the addrman's DNS/manual add path,
+    /// which already dedups against `known_addrs` and rejects banned addresses
+    /// (peer_manager.rs `add_dns_addresses`), so no seed is duplicated or
+    /// un-banned.
+    fn maybe_add_fixed_seeds(&mut self, start: Instant) -> bool {
+        // (3) ONE-SHOT — cheapest check first.
+        if self.fixed_seeds_added {
+            return false;
+        }
+        // (1) ENABLED.
+        if !self.fixed_seeds_enabled() {
+            return false;
+        }
+        // (2) NETWORK-SCOPED — mainnet-only by construction.
+        if self.params.fixed_seeds.is_empty() || self.params.network_id != NetworkId::Mainnet {
+            return false;
+        }
+        // (4) BOOK-EMPTY — a populated book (DNS success / loaded peers.dat)
+        // blocks firing, so the fallback never bypasses normal bootstrap.
+        if self.addr_manager.known_count() != 0 {
+            return false;
+        }
+        // (5) TIMING — 60s grace (Core net.cpp:2614), short-circuited only
+        // when DNS seeding is disabled (nothing to wait for).
+        let grace_elapsed = start.elapsed() > Duration::from_secs(60);
+        if !grace_elapsed && !self.dns_seeding_disabled() {
+            return false;
+        }
+
+        // Fire: set the one-shot guard BEFORE injecting (Core net.cpp:2642
+        // sets `add_fixed_seeds = false`), then inject all reachable seeds.
+        self.fixed_seeds_added = true;
+        let mut added = 0usize;
+        for literal in &self.params.fixed_seeds {
+            match literal.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    // Use the addrman add path that dedups + rejects banned
+                    // (guards `!known_addrs.contains_key && !is_banned`).
+                    self.addr_manager.add_dns_addresses(vec![addr]);
+                    added += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping malformed fixed seed {:?}: {}", literal, e);
+                }
+            }
+        }
+        tracing::info!(
+            "Added {} fixed seeds (book was empty; {}) — last-resort bootstrap fallback",
+            added,
+            if grace_elapsed {
+                "60s grace elapsed"
+            } else {
+                "DNS seeding disabled"
+            }
+        );
+        true
     }
 
     /// `-connect` mode: re-dial any pinned peer that is not currently
@@ -5761,6 +5923,186 @@ mod tests {
         assert!(
             mgr.peers.get(&peer_id).unwrap().info.supports_sendheaders,
             "supports_sendheaders must be set after a SendHeaders message"
+        );
+    }
+
+    // ============================================================
+    // Fixed-seed bootstrap fallback (Core net.cpp:2607-2643 parity)
+    // ============================================================
+
+    /// Build a mainnet PeerManager for the fixed-seed tests, with the address
+    /// book guaranteed empty (fresh `AddressManager`, no DNS, no anchors).
+    fn fixedseed_mainnet_mgr(no_fixed_seeds: bool, no_dns_seed: bool) -> PeerManager {
+        let config = PeerManagerConfig {
+            no_fixed_seeds,
+            no_dns_seed,
+            // No listener bind in these tests (we never call start()).
+            listen: false,
+            ..Default::default()
+        };
+        PeerManager::new(config, ChainParams::mainnet())
+    }
+
+    #[test]
+    fn fixedseed_list_is_40_routable_ipv4_8333() {
+        let params = ChainParams::mainnet();
+        assert_eq!(
+            params.fixed_seeds.len(),
+            40,
+            "mainnet must carry exactly 40 fixed seeds"
+        );
+        for lit in &params.fixed_seeds {
+            let sa: SocketAddr = lit
+                .parse()
+                .unwrap_or_else(|e| panic!("fixed seed {lit:?} must parse: {e}"));
+            assert_eq!(sa.port(), 8333, "fixed seed {lit} must be :8333");
+            match sa.ip() {
+                IpAddr::V4(v4) => assert!(
+                    ip_is_routable(&IpAddr::V4(v4)),
+                    "fixed seed {lit} must be a routable IPv4"
+                ),
+                IpAddr::V6(_) => panic!("fixed seed {lit} must be IPv4, got IPv6"),
+            }
+        }
+        // First and last anchors of the verbatim blockbrew/nimrod list.
+        assert_eq!(params.fixed_seeds.first().copied(), Some("2.121.116.198:8333"));
+        assert_eq!(params.fixed_seeds.last().copied(), Some("77.38.72.37:8333"));
+    }
+
+    #[test]
+    fn fixedseed_non_mainnet_lists_are_empty() {
+        // Network-scoped by construction: only mainnet populates fixed_seeds.
+        assert!(ChainParams::testnet3().fixed_seeds.is_empty());
+        assert!(ChainParams::testnet4().fixed_seeds.is_empty());
+        assert!(ChainParams::signet().fixed_seeds.is_empty());
+        assert!(ChainParams::regtest().fixed_seeds.is_empty());
+    }
+
+    #[test]
+    fn fixedseed_fires_on_empty_book_when_dns_disabled() {
+        // enabled + empty book + DNS disabled → fires immediately (grace not
+        // required). This is the DNS-failure hang fix.
+        let mut mgr = fixedseed_mainnet_mgr(/*no_fixed_seeds=*/ false, /*no_dns_seed=*/ true);
+        assert_eq!(mgr.addr_manager.known_count(), 0, "book starts empty");
+        let now = Instant::now(); // 0s elapsed — grace NOT elapsed
+        let fired = mgr.maybe_add_fixed_seeds(now);
+        assert!(fired, "must fire on empty book with DNS disabled (no grace wait)");
+        assert_eq!(
+            mgr.addr_manager.known_count(),
+            40,
+            "all 40 fixed seeds injected into the book"
+        );
+        assert!(mgr.fixed_seeds_added, "one-shot guard set after firing");
+    }
+
+    #[test]
+    fn fixedseed_fires_on_empty_book_after_60s_grace() {
+        // enabled + empty book + DNS *enabled* → only fires once the 60s grace
+        // has elapsed. Simulate elapsed time via a back-dated start Instant.
+        let mut mgr = fixedseed_mainnet_mgr(false, /*no_dns_seed=*/ false);
+        // Before grace: a fresh `now` => 0s elapsed, DNS enabled => no fire.
+        assert!(
+            !mgr.maybe_add_fixed_seeds(Instant::now()),
+            "must NOT fire before the 60s grace when DNS is enabled"
+        );
+        assert_eq!(mgr.addr_manager.known_count(), 0, "no seeds yet");
+        assert!(!mgr.fixed_seeds_added, "guard not set — did not fire");
+        // After grace: back-date start by 61s so start.elapsed() > 60s.
+        let stale_start = Instant::now() - Duration::from_secs(61);
+        assert!(
+            mgr.maybe_add_fixed_seeds(stale_start),
+            "must fire once 60s grace has elapsed on an empty book"
+        );
+        assert_eq!(mgr.addr_manager.known_count(), 40, "seeds injected after grace");
+    }
+
+    #[test]
+    fn fixedseed_does_not_fire_on_nonempty_book() {
+        // A populated book (e.g. successful DNS / loaded peers.dat) blocks the
+        // fallback so normal bootstrap is never bypassed.
+        let mut mgr = fixedseed_mainnet_mgr(false, /*no_dns_seed=*/ true);
+        mgr.addr_manager
+            .add_dns_addresses(vec!["198.51.100.7:8333".parse().unwrap()]);
+        assert_eq!(mgr.addr_manager.known_count(), 1, "book non-empty");
+        // Even DNS-disabled + a back-dated start must NOT fire on a non-empty book.
+        let stale_start = Instant::now() - Duration::from_secs(120);
+        let fired = mgr.maybe_add_fixed_seeds(stale_start);
+        assert!(!fired, "must NOT fire when the book is non-empty");
+        assert_eq!(
+            mgr.addr_manager.known_count(),
+            1,
+            "no fixed seeds added — book unchanged"
+        );
+        assert!(!mgr.fixed_seeds_added, "guard stays unset — never fired");
+    }
+
+    #[test]
+    fn fixedseed_does_not_fire_when_disabled() {
+        // -nofixedseeds disables the fallback even on an empty book + DNS off.
+        let mut mgr = fixedseed_mainnet_mgr(/*no_fixed_seeds=*/ true, /*no_dns_seed=*/ true);
+        let stale_start = Instant::now() - Duration::from_secs(120);
+        let fired = mgr.maybe_add_fixed_seeds(stale_start);
+        assert!(!fired, "must NOT fire when -nofixedseeds is set");
+        assert_eq!(mgr.addr_manager.known_count(), 0, "no seeds added when disabled");
+    }
+
+    #[test]
+    fn fixedseed_does_not_fire_in_connect_mode() {
+        // -connect pinning disables addrman-driven outbound AND the fallback.
+        let config = PeerManagerConfig {
+            connect_peers: vec!["192.0.2.50:8333".parse().unwrap()],
+            listen: false,
+            ..Default::default()
+        };
+        let mut mgr = PeerManager::new(config, ChainParams::mainnet());
+        let stale_start = Instant::now() - Duration::from_secs(120);
+        assert!(
+            !mgr.maybe_add_fixed_seeds(stale_start),
+            "must NOT fire in -connect mode (fixed_seeds_enabled() is false)"
+        );
+        assert_eq!(mgr.addr_manager.known_count(), 0, "no seeds in -connect mode");
+    }
+
+    #[test]
+    fn fixedseed_does_not_fire_on_non_mainnet() {
+        // Network-scoped: testnet4 has an empty fixed_seeds list, so the
+        // fallback is a no-op even with the book empty + DNS disabled.
+        let config = PeerManagerConfig {
+            no_dns_seed: true,
+            listen: false,
+            ..Default::default()
+        };
+        let mut mgr = PeerManager::new(config, ChainParams::testnet4());
+        let stale_start = Instant::now() - Duration::from_secs(120);
+        assert!(
+            !mgr.maybe_add_fixed_seeds(stale_start),
+            "must NOT fire on testnet4 (empty fixed_seeds, non-Mainnet network_id)"
+        );
+        assert_eq!(mgr.addr_manager.known_count(), 0, "no seeds on testnet4");
+    }
+
+    #[test]
+    fn fixedseed_is_one_shot() {
+        // The first fire injects 40 seeds; a second call is a cheap no-op even
+        // though the book would be re-emptied — guarding against re-injection /
+        // attempt-count re-bumping on every maintenance tick.
+        let mut mgr = fixedseed_mainnet_mgr(false, /*no_dns_seed=*/ true);
+        let now = Instant::now();
+        assert!(mgr.maybe_add_fixed_seeds(now), "first call fires");
+        assert_eq!(mgr.addr_manager.known_count(), 40);
+        // Forcibly empty the book to prove the one-shot guard (not book-empty)
+        // is what blocks the re-fire.
+        mgr.addr_manager = AddressManager::new();
+        assert_eq!(mgr.addr_manager.known_count(), 0, "book re-emptied");
+        let stale_start = Instant::now() - Duration::from_secs(120);
+        assert!(
+            !mgr.maybe_add_fixed_seeds(stale_start),
+            "second call must be a no-op once fixed_seeds_added is set"
+        );
+        assert_eq!(
+            mgr.addr_manager.known_count(),
+            0,
+            "no re-injection after the one-shot guard fired"
         );
     }
 }
