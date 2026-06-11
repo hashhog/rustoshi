@@ -6429,23 +6429,30 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_network_info(&self) -> RpcResult<NetworkInfo> {
         let peer_state = self.peer_state.read().await;
 
-        let (connections, connections_in, connections_out) =
+        let (connections, connections_in, connections_out, local_services) =
             if let Some(ref pm) = peer_state.peer_manager {
                 (
                     pm.peer_count() as u32,
                     pm.inbound_count() as u32,
                     pm.outbound_count() as u32,
+                    pm.local_services(),
                 )
             } else {
-                (0, 0, 0)
+                // No peer manager (e.g. -nonetwork): report the static default
+                // service word so hex and names still agree.
+                // NODE_NETWORK(0x1) | NODE_WITNESS(0x8) | NODE_P2P_V2(0x800) = 0x809.
+                (0, 0, 0, 0x809u64)
             };
 
         Ok(NetworkInfo {
             version: 250000, // 25.0.0
             subversion: "/Rustoshi:0.1.0/".to_string(),
             protocolversion: 70016,
-            localservices: format!("{:016x}", 0x0409),
-            localservicesnames: vec!["NETWORK".to_string(), "WITNESS".to_string()],
+            // Derive both the hex word and the names from the SAME
+            // local_services() value so they can never drift apart (Core
+            // strprintf("%016x", services) + GetServicesNames(services)).
+            localservices: format!("{:016x}", local_services),
+            localservicesnames: decode_services(local_services),
             localrelay: true,
             timeoffset: 0,
             connections,
@@ -6468,10 +6475,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                     proxy_randomize_credentials: false,
                 },
             ],
-            // 1 sat/vB relay fee = 0.00001000 BTC/kvB = 1000 satoshis/kvB.
-            // BtcAmount(1000) serializes as "0.00001000", matching Core's ValueFromAmount.
-            relayfee: BtcAmount::from_sats(1000),
-            incrementalfee: BtcAmount::from_sats(1000),
+            // DEFAULT_MIN_RELAY_TX_FEE = DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB
+            // (lowered 1000->100 in v31.99, policy.h:48,70). CFeeRate(100).GetFeePerK()
+            // = 100 sat = 0.00000100 BTC, matching Core's ValueFromAmount and rustoshi's
+            // own getmempoolinfo (server.rs ~5160).
+            relayfee: BtcAmount::from_sats(100),
+            incrementalfee: BtcAmount::from_sats(100),
             localaddresses: vec![],
             warnings: Vec::new(),
         })
@@ -12309,6 +12318,9 @@ fn decode_services(services: u64) -> Vec<String> {
     }
     if services & 1024 != 0 {
         names.push("NETWORK_LIMITED".to_string());
+    }
+    if services & 2048 != 0 {
+        names.push("P2P_V2".to_string());
     }
     names
 }
