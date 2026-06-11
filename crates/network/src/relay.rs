@@ -184,10 +184,21 @@ pub struct FeeFilterState {
 impl FeeFilterState {
     /// Create a new FeeFilterState for a peer.
     pub fn new(supports_feefilter: bool, is_block_only: bool) -> Self {
+        Self::new_at(Instant::now(), supports_feefilter, is_block_only)
+    }
+
+    /// Create a new FeeFilterState anchored to an explicit clock.
+    ///
+    /// Mirrors Core's per-peer `m_next_send_feefilter` initialization, which
+    /// schedules the first broadcast at `now + rand_exp(AVG_FEEFILTER_BROADCAST_INTERVAL)`.
+    /// Taking `now` as a parameter (rather than calling `Instant::now()`
+    /// internally) lets the cadence be driven deterministically in tests, which
+    /// otherwise cannot observe the initial `next_send_feefilter`.
+    pub fn new_at(now: Instant, supports_feefilter: bool, is_block_only: bool) -> Self {
         Self {
             fee_filter_received: 0,
             fee_filter_sent: 0,
-            next_send_feefilter: Instant::now() + poisson_next_send(AVG_FEEFILTER_BROADCAST_INTERVAL),
+            next_send_feefilter: now + poisson_next_send(AVG_FEEFILTER_BROADCAST_INTERVAL),
             supports_feefilter,
             is_block_only,
         }
@@ -385,6 +396,61 @@ impl FeeFilterManager {
         );
     }
 
+    /// Add a peer anchored to an explicit clock (testability — see
+    /// `FeeFilterState::new_at`).
+    pub fn add_peer_at(
+        &mut self,
+        now: Instant,
+        peer_id: PeerId,
+        supports_feefilter: bool,
+        is_block_only: bool,
+    ) {
+        self.peer_states.insert(
+            peer_id,
+            FeeFilterState::new_at(now, supports_feefilter, is_block_only),
+        );
+    }
+
+    /// Force a peer's next-send deadline (testability). Returns false if the
+    /// peer is unknown. Lets tests assert that the periodic broadcast fires
+    /// exactly when the timer elapses and not before, without sleeping.
+    pub fn set_next_send_for_test(&mut self, peer_id: PeerId, when: Instant) -> bool {
+        match self.peer_states.get_mut(&peer_id) {
+            Some(state) => {
+                state.next_send_feefilter = when;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Compute pending feefilter messages relative to an explicit clock.
+    ///
+    /// Identical to [`get_pending_feefilters`] but with an injected `now`, so
+    /// the due-time branch can be exercised deterministically.
+    ///
+    /// [`get_pending_feefilters`]: FeeFilterManager::get_pending_feefilters
+    pub fn get_pending_feefilters_at(
+        &mut self,
+        now: Instant,
+        current_mempool_min_fee: u64,
+        is_ibd: bool,
+    ) -> Vec<(PeerId, u64)> {
+        let mut updates = Vec::new();
+        for (&peer_id, state) in &mut self.peer_states {
+            if let Some(fee_rate) = state.maybe_send_feefilter(
+                current_mempool_min_fee,
+                self.min_relay_fee,
+                &self.rounder,
+                now,
+                is_ibd,
+            ) {
+                updates.push((peer_id, fee_rate));
+            }
+        }
+        updates
+    }
+
     /// Remove a peer from the manager.
     pub fn remove_peer(&mut self, peer_id: PeerId) {
         self.peer_states.remove(&peer_id);
@@ -395,6 +461,31 @@ impl FeeFilterManager {
         if let Some(state) = self.peer_states.get_mut(&peer_id) {
             state.set_received(fee_rate);
         }
+    }
+
+    /// Force an immediate initial feefilter send for a freshly-connected peer
+    /// and record it as sent (mirrors rustoshi's prior handshake-time
+    /// `send_initial_feefilter`, but now routed through the manager so the
+    /// periodic cadence stays consistent — no duplicate re-send of the same
+    /// value on the next maintenance tick).
+    ///
+    /// Returns `Some(fee_rate)` to push to the peer, or `None` if the peer is
+    /// unknown or not eligible (version < 70013 or block-relay-only). During
+    /// IBD this returns the rounded `MAX_MONEY` ("don't send me txs") signal,
+    /// matching Core's IBD branch.
+    pub fn force_initial_send(&mut self, peer_id: PeerId, is_ibd: bool) -> Option<u64> {
+        let min_relay_fee = self.min_relay_fee;
+        let rounder = &self.rounder;
+        let state = self.peer_states.get_mut(&peer_id)?;
+        if !state.supports_feefilter || state.is_block_only {
+            return None;
+        }
+        let current_filter = if is_ibd { MAX_MONEY } else { min_relay_fee };
+        let filter_to_send = rounder.round(current_filter).max(min_relay_fee);
+        state.fee_filter_sent = filter_to_send;
+        state.next_send_feefilter =
+            Instant::now() + poisson_next_send(AVG_FEEFILTER_BROADCAST_INTERVAL);
+        Some(filter_to_send)
     }
 
     /// Get the feefilter received from a peer.
@@ -423,22 +514,7 @@ impl FeeFilterManager {
         current_mempool_min_fee: u64,
         is_ibd: bool,
     ) -> Vec<(PeerId, u64)> {
-        let now = Instant::now();
-        let mut updates = Vec::new();
-
-        for (&peer_id, state) in &mut self.peer_states {
-            if let Some(fee_rate) = state.maybe_send_feefilter(
-                current_mempool_min_fee,
-                self.min_relay_fee,
-                &self.rounder,
-                now,
-                is_ibd,
-            ) {
-                updates.push((peer_id, fee_rate));
-            }
-        }
-
-        updates
+        self.get_pending_feefilters_at(Instant::now(), current_mempool_min_fee, is_ibd)
     }
 
     /// Check if a replacement transaction pays sufficient fees.

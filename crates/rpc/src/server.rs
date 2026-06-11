@@ -5140,12 +5140,21 @@ impl RustoshiRpcServer for RpcServerImpl {
                     inv_type: InvType::MsgWitnessTx,
                     hash: wtxid,
                 }];
-                let inv_msg = NetworkMessage::Inv(inv);
 
-                // Broadcast to all connected peers
+                // BIP-133 outbound tx-INV gate: feerate in sat/kvB (= fee *
+                // 1000 / vsize) to match the u64 feefilter units. relay_tx_inv
+                // drops the INV only for peers whose advertised feefilter
+                // exceeds this rate; peers with no feefilter (filter 0) pass.
+                let tx_fee_rate_sat_kvb = if vsize > 0 {
+                    fee.saturating_mul(1000) / vsize as u64
+                } else {
+                    0
+                };
+
+                // Relay, consulting each peer's received feefilter.
                 let peer_state = self.peer_state.read().await;
                 if let Some(ref peer_manager) = peer_state.peer_manager {
-                    peer_manager.broadcast(inv_msg).await;
+                    peer_manager.relay_tx_inv(inv, tx_fee_rate_sat_kvb).await;
                     tracing::debug!("Relayed transaction {} to peers", txid.to_hex());
                 }
 
@@ -7131,14 +7140,28 @@ impl RustoshiRpcServer for RpcServerImpl {
             drop(state);
             let peer_state = self.peer_state.read().await;
             if let Some(ref peer_manager) = peer_state.peer_manager {
-                for tx in &txs {
+                for (i, tx) in txs.iter().enumerate() {
                     let wtxid = tx.wtxid();
                     let inv = vec![InvVector {
                         inv_type: InvType::MsgWitnessTx,
                         hash: wtxid,
                     }];
-                    let inv_msg = NetworkMessage::Inv(inv);
-                    peer_manager.broadcast(inv_msg).await;
+                    // BIP-133 outbound tx-INV gate: per-tx feerate in sat/kvB
+                    // (= fee * 1000 / vsize), derived from this tx's package
+                    // result, to match the u64 feefilter units. Drops the INV
+                    // only for peers whose advertised feefilter exceeds it.
+                    let tx_fee_rate_sat_kvb = result
+                        .tx_results
+                        .get(i)
+                        .map(|r| {
+                            if r.vsize > 0 {
+                                r.fee.saturating_mul(1000) / r.vsize as u64
+                            } else {
+                                0
+                            }
+                        })
+                        .unwrap_or(0);
+                    peer_manager.relay_tx_inv(inv, tx_fee_rate_sat_kvb).await;
                 }
             }
         }
