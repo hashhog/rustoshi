@@ -6439,9 +6439,11 @@ impl RustoshiRpcServer for RpcServerImpl {
                 )
             } else {
                 // No peer manager (e.g. -nonetwork): report the static default
-                // service word so hex and names still agree.
-                // NODE_NETWORK(0x1) | NODE_WITNESS(0x8) | NODE_P2P_V2(0x800) = 0x809.
-                (0, 0, 0, 0x809u64)
+                // full-node service word so hex and names still agree with the
+                // value local_services() returns when networking is up.
+                // NODE_NETWORK(0x1) | NODE_WITNESS(0x8) |
+                // NODE_NETWORK_LIMITED(0x400) | NODE_P2P_V2(0x800) = 0xC09.
+                (0, 0, 0, 0xC09u64)
             };
 
         Ok(NetworkInfo {
