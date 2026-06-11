@@ -137,10 +137,14 @@ pub struct PeerManagerConfig {
     /// Bitcoin Core's `-peerbloomfilters` (default: false; see
     /// `bitcoin-core/src/net_processing.h:44 DEFAULT_PEERBLOOMFILTERS`).
     pub peer_bloom_filters: bool,
-    /// Whether prune mode is enabled. When true, advertise NODE_NETWORK_LIMITED
-    /// (BIP-159) in the version handshake to signal that we serve only the
-    /// most recent ~288 blocks. Mirrors Core's `init.cpp` behaviour where
-    /// `nLocalServices |= NODE_NETWORK_LIMITED` when `IsPruneMode()` is true.
+    /// Whether prune mode is enabled. When true the node serves only the most
+    /// recent ~288 blocks, so it advertises NODE_NETWORK_LIMITED (BIP-159)
+    /// *without* NODE_NETWORK. Note that NODE_NETWORK_LIMITED is advertised in
+    /// BOTH prune and non-prune mode — Core seeds `g_local_services` with
+    /// `NODE_NETWORK_LIMITED | NODE_WITNESS` unconditionally at
+    /// `init.cpp:863` and only adds NODE_NETWORK in non-prune mode
+    /// (`init.cpp:1950`). What prune mode actually toggles here is whether
+    /// NODE_NETWORK is also present (full archive vs. limited).
     pub prune_mode: bool,
     /// Whether the BIP-157/158 BlockFilterIndex is enabled.
     ///
@@ -1373,11 +1377,19 @@ impl PeerManager {
         self.start_height = height;
     }
 
-    /// Service flags advertised by this node (NODE_NETWORK | NODE_WITNESS, plus
-    /// NODE_BLOOM when `peer_bloom_filters` is enabled — Bitcoin Core's
-    /// `g_local_services` after `init.cpp`'s `-peerbloomfilters` gate).
-    /// When prune mode is on, NODE_NETWORK_LIMITED (BIP-159) is advertised so
-    /// peers know we serve only the recent-288-block window.
+    /// Service flags advertised by this node (NODE_NETWORK | NODE_WITNESS |
+    /// NODE_NETWORK_LIMITED, plus NODE_BLOOM when `peer_bloom_filters` is
+    /// enabled — Bitcoin Core's `g_local_services` after `init.cpp`'s
+    /// `-peerbloomfilters` gate).
+    ///
+    /// NODE_NETWORK_LIMITED (BIP-159, bit 10) is advertised UNCONDITIONALLY,
+    /// matching Core: `init.cpp:863` seeds `g_local_services` with
+    /// `NODE_NETWORK_LIMITED | NODE_WITNESS` and `init.cpp:1950` adds
+    /// `NODE_NETWORK` in non-prune mode. A full non-pruned node serves the
+    /// whole chain, so it can always serve the recent-288-block window the bit
+    /// promises. (It is NOT prune-gated — a prune node would advertise
+    /// NODE_NETWORK_LIMITED *without* NODE_NETWORK, but the LIMITED bit itself
+    /// is set in both cases.)
     ///
     /// NODE_COMPACT_FILTERS (BIP-157, bit 6) is gated through
     /// [`should_advertise_compact_filters`]; as of FIX-82 the gate returns
@@ -1385,12 +1397,16 @@ impl PeerManager {
     /// enabled, because the BIP-157 P2P handlers are now registered — see
     /// [`BIP157_P2P_HANDLERS_REGISTERED`] (FIX-82, W121 BUG-7..BUG-13).
     pub fn local_services(&self) -> u64 {
-        let mut s = NODE_NETWORK | NODE_WITNESS;
+        // NODE_NETWORK_LIMITED (BIP-159, bit 10) is advertised UNCONDITIONALLY
+        // for this full node. Bitcoin Core seeds `g_local_services` with
+        // `NODE_NETWORK_LIMITED | NODE_WITNESS` at `init.cpp:863` and adds
+        // `NODE_NETWORK` in non-prune mode (`init.cpp:1950`), so a full
+        // non-pruned node always carries NODE_NETWORK_LIMITED — the bit means
+        // "can serve >=288 recent blocks", which is trivially true when the
+        // node serves the entire chain. It is NOT prune-only.
+        let mut s = NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED;
         if self.config.peer_bloom_filters {
             s |= NODE_BLOOM;
-        }
-        if self.config.prune_mode {
-            s |= NODE_NETWORK_LIMITED;
         }
         // FIX-82: BIP-157 compact-filter advertisement gate. Handlers are
         // registered in `main.rs`; bit advertised when both config flags
@@ -4764,27 +4780,87 @@ mod tests {
         assert!(version.addr_from.services & NODE_BLOOM != 0);
     }
 
-    /// BIP-159: NODE_NETWORK_LIMITED (1 << 10) must NOT be advertised when
-    /// prune mode is off. Mirrors Core's `init.cpp` (sets the bit only when
-    /// `IsPruneMode()` is true).
+    /// BIP-159: NODE_NETWORK_LIMITED (1 << 10) MUST be advertised even when
+    /// prune mode is off. Core seeds `g_local_services` with
+    /// `NODE_NETWORK_LIMITED | NODE_WITNESS` unconditionally (`init.cpp:863`)
+    /// and adds NODE_NETWORK in non-prune mode (`init.cpp:1950`), so a full
+    /// non-pruned node advertises NODE_NETWORK | NODE_WITNESS |
+    /// NODE_NETWORK_LIMITED. (Regression test: previously this asserted the
+    /// bit was OMITTED when prune was off, which under-advertised vs. Core.)
     #[test]
-    fn test_node_network_limited_off_by_default() {
+    fn test_node_network_limited_advertised_by_default() {
         let config = PeerManagerConfig::testnet4();
         assert!(!config.prune_mode);
         let params = ChainParams::testnet4();
         let mgr = PeerManager::new(config, params);
 
         let services = mgr.local_services();
-        assert_eq!(
-            services & NODE_NETWORK_LIMITED,
-            0,
-            "NODE_NETWORK_LIMITED must NOT be advertised when prune_mode=false"
+        assert!(
+            services & NODE_NETWORK_LIMITED != 0,
+            "NODE_NETWORK_LIMITED must be advertised unconditionally for a full node (Core init.cpp:863)"
         );
+        // Non-pruned full node also keeps NODE_NETWORK set.
+        assert!(services & NODE_NETWORK != 0);
+        assert!(services & NODE_WITNESS != 0);
 
         let addr: SocketAddr = "192.168.1.1:48333".parse().unwrap();
         let version = mgr.build_version_message(addr);
-        assert_eq!(version.services & NODE_NETWORK_LIMITED, 0);
-        assert_eq!(version.addr_from.services & NODE_NETWORK_LIMITED, 0);
+        assert!(version.services & NODE_NETWORK_LIMITED != 0);
+        assert!(version.addr_from.services & NODE_NETWORK_LIMITED != 0);
+    }
+
+    /// Full-node honest service-flag set: a default (non-pruned, v2-default-on)
+    /// rustoshi node must advertise exactly
+    /// `0xC09 = NODE_NETWORK(0x1) | NODE_WITNESS(0x8) |
+    ///          NODE_NETWORK_LIMITED(0x400) | NODE_P2P_V2(0x800)`.
+    /// NODE_BLOOM and NODE_COMPACT_FILTERS are config-gated off by default, so
+    /// they must be absent. Mirrors Core's `g_local_services` for a full node
+    /// with `-v2transport` on (`init.cpp:863`/`989`/`1950`).
+    #[test]
+    fn test_local_services_full_node_is_0xc09() {
+        // v2 outbound defaults ON; ensure no env override is in effect so the
+        // P2P_V2 bit is present, matching the default production config.
+        let prior = std::env::var("RUSTOSHI_BIP324_V2_OUTBOUND").ok();
+        std::env::remove_var("RUSTOSHI_BIP324_V2_OUTBOUND");
+
+        let config = PeerManagerConfig::testnet4();
+        assert!(!config.prune_mode, "default must be non-pruned");
+        assert!(!config.peer_bloom_filters, "NODE_BLOOM must default off");
+        let params = ChainParams::testnet4();
+        let mgr = PeerManager::new(config, params);
+
+        let services = mgr.local_services();
+        let expected =
+            NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED | NODE_P2P_V2;
+        assert_eq!(
+            services, expected,
+            "full-node local_services() must be exactly 0xC09 \
+             (NETWORK|WITNESS|NETWORK_LIMITED|P2P_V2); got {:#x}",
+            services
+        );
+        // Spell out the individual honest bits for clarity.
+        assert!(services & NODE_NETWORK != 0, "NODE_NETWORK (full node)");
+        assert!(services & NODE_WITNESS != 0, "NODE_WITNESS (witness node)");
+        assert!(
+            services & NODE_NETWORK_LIMITED != 0,
+            "NODE_NETWORK_LIMITED (unconditional, Core init.cpp:863)"
+        );
+        assert!(
+            services & NODE_P2P_V2 != 0,
+            "NODE_P2P_V2 (BIP-324 v2 default-on, genuinely implemented)"
+        );
+        // Honesty: bits we do NOT genuinely support by default stay off.
+        assert_eq!(services & NODE_BLOOM, 0, "NODE_BLOOM off by default");
+        assert_eq!(
+            services & NODE_COMPACT_FILTERS,
+            0,
+            "NODE_COMPACT_FILTERS off by default"
+        );
+
+        // Restore the env var to whatever it was before the test.
+        if let Some(v) = prior {
+            std::env::set_var("RUSTOSHI_BIP324_V2_OUTBOUND", v);
+        }
     }
 
     /// BIP-159: when prune mode is enabled the version handshake must
