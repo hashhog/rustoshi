@@ -39,7 +39,7 @@ fn networkinfo_key_order_matches_core() {
         relayfee: BtcAmount(0),
         incrementalfee: BtcAmount(0),
         localaddresses: vec![],
-        warnings: String::new(),
+        warnings: Vec::new(),
     };
     let got = keys_of_serialize(&ni);
     let want = [
@@ -92,7 +92,7 @@ fn mininginfo_key_order_matches_core() {
             difficulty: serde_json::value::RawValue::from_string("1".to_string()).unwrap(),
             target: "0".repeat(64),
         },
-        warnings: String::new(),
+        warnings: Vec::new(),
     };
     let got = keys_of_serialize(&mi);
     let want = [
@@ -317,7 +317,7 @@ fn getblockchaininfo_order_matches_core() {
         pruneheight: None,
         prune_target_size: None,
         softforks: serde_json::json!({}),
-        warnings: String::new(),
+        warnings: Vec::new(),
     };
     let got = keys_of_serialize(&bi);
     // Core through `pruned`; softforks is a rustoshi-retained legacy field placed

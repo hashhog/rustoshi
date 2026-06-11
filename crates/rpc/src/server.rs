@@ -3504,7 +3504,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             pruneheight,
             prune_target_size,
             softforks: serde_json::Value::Object(softforks_map),
-            warnings: String::new(),
+            warnings: Vec::new(),
         })
     }
 
@@ -6010,7 +6010,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             blockmintxfee: BtcAmount::from_sats(1),
             chain: chain_name.to_string(),
             next,
-            warnings: String::new(),
+            warnings: Vec::new(),
         })
     }
 
@@ -6398,7 +6398,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             relayfee: BtcAmount::from_sats(1000),
             incrementalfee: BtcAmount::from_sats(1000),
             localaddresses: vec![],
-            warnings: String::new(),
+            warnings: Vec::new(),
         })
     }
 
