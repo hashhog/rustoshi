@@ -6461,6 +6461,16 @@ impl RustoshiRpcServer for RpcServerImpl {
             connections_in,
             connections_out,
             networkactive: true,
+            // Core's GetNetworksInfo (rpc/net.cpp) iterates Network 0..NET_MAX,
+            // skipping NET_UNROUTABLE and NET_INTERNAL, emitting one entry per
+            // routable network in enum order: ipv4, ipv6, onion, i2p, cjdns.
+            // Per entry: limited = !g_reachable_nets.Contains(net), reachable =
+            // g_reachable_nets.Contains(net). Although netbase.h DefaultNets()
+            // seeds all networks at static-init, on a node with no proxy/-onlynet
+            // configured Core marks onion/i2p/cjdns NOT reachable during init
+            // (no proxy/binding) — verified against a live regtest bitcoind oracle:
+            // ipv4/ipv6 -> reachable=true,limited=false; onion/i2p/cjdns ->
+            // reachable=false,limited=true. proxy="" and randomize=false for all.
             networks: vec![
                 NetworkInterface {
                     name: "ipv4".to_string(),
@@ -6473,6 +6483,27 @@ impl RustoshiRpcServer for RpcServerImpl {
                     name: "ipv6".to_string(),
                     limited: false,
                     reachable: true,
+                    proxy: String::new(),
+                    proxy_randomize_credentials: false,
+                },
+                NetworkInterface {
+                    name: "onion".to_string(),
+                    limited: true,
+                    reachable: false,
+                    proxy: String::new(),
+                    proxy_randomize_credentials: false,
+                },
+                NetworkInterface {
+                    name: "i2p".to_string(),
+                    limited: true,
+                    reachable: false,
+                    proxy: String::new(),
+                    proxy_randomize_credentials: false,
+                },
+                NetworkInterface {
+                    name: "cjdns".to_string(),
+                    limited: true,
+                    reachable: false,
                     proxy: String::new(),
                     proxy_randomize_credentials: false,
                 },
