@@ -5225,9 +5225,18 @@ impl RustoshiRpcServer for RpcServerImpl {
             .filter_map(|h| state.mempool.get(h))
             .map(|e| e.fee)
             .sum();
-        // DEFAULT_MIN_RELAY_TX_FEE = DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB
-        // (lowered 1000->100 in v31.99); CFeeRate(100).GetFeePerK() = 100 sat = 0.00000100 BTC.
-        let min_fee_rate_sats: u64 = 100;
+        // Couple the displayed fee fields to the REAL admission floor instead
+        // of a hardcoded literal (audit wx12re33x: the prior `let _ = 100;`
+        // understated the policy by 10x). All three are sat/kvB integers read
+        // from the live mempool config; BtcAmount serializes 100 sat/kvB to
+        // 0.00000100 BTC (Core ValueFromAmount(CFeeRate(100).GetFeePerK())).
+        //   minrelaytxfee      = static min-relay floor (config.min_fee_rate)
+        //   incrementalrelayfee = config.incremental_relay_fee
+        //   mempoolminfee      = max(rolling, floor) per Core CTxMemPool::GetMinFee
+        let min_relay_kvb = state.mempool.min_relay_feerate_kvb();
+        let incremental_kvb = state.mempool.incremental_relay_feerate_kvb();
+        let mempool_min_kvb =
+            std::cmp::max(state.mempool.mempool_min_feerate_kvb(), min_relay_kvb);
 
         Ok(MempoolInfo {
             loaded: true,
@@ -5236,9 +5245,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             usage: state.mempool.total_bytes() * 2, // approximate memory usage
             total_fee: BtcAmount::from_sats(total_fee_sats),
             maxmempool: 300 * 1_000_000, // DEFAULT_MAX_MEMPOOL_SIZE_MB(300) * 1'000'000 = 300000000
-            mempoolminfee: BtcAmount::from_sats(min_fee_rate_sats),
-            minrelaytxfee: BtcAmount::from_sats(min_fee_rate_sats),
-            incrementalrelayfee: BtcAmount::from_sats(min_fee_rate_sats),
+            mempoolminfee: BtcAmount::from_sats(mempool_min_kvb),
+            minrelaytxfee: BtcAmount::from_sats(min_relay_kvb),
+            incrementalrelayfee: BtcAmount::from_sats(incremental_kvb),
             unbroadcastcount: 0,
             fullrbf: true,
             permitbaremultisig: true, // DEFAULT_PERMIT_BAREMULTISIG
@@ -6504,6 +6513,19 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_network_info(&self) -> RpcResult<NetworkInfo> {
         let peer_state = self.peer_state.read().await;
 
+        // Couple relayfee/incrementalfee to the REAL admission floor (read from
+        // the live mempool config) instead of a hardcoded literal — audit
+        // wx12re33x (the fee-display lie). Both are sat/kvB; BtcAmount serializes
+        // 100 sat/kvB to 0.00000100 BTC, matching Core getnetworkinfo's
+        // ValueFromAmount(CFeeRate(min_relay).GetFeePerK()).
+        let (relay_fee_kvb, incremental_fee_kvb) = {
+            let state = self.state.read().await;
+            (
+                state.mempool.min_relay_feerate_kvb(),
+                state.mempool.incremental_relay_feerate_kvb(),
+            )
+        };
+
         let (connections, connections_in, connections_out, local_services) =
             if let Some(ref pm) = peer_state.peer_manager {
                 (
@@ -6583,12 +6605,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                     proxy_randomize_credentials: false,
                 },
             ],
-            // DEFAULT_MIN_RELAY_TX_FEE = DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB
-            // (lowered 1000->100 in v31.99, policy.h:48,70). CFeeRate(100).GetFeePerK()
-            // = 100 sat = 0.00000100 BTC, matching Core's ValueFromAmount and rustoshi's
-            // own getmempoolinfo (server.rs ~5160).
-            relayfee: BtcAmount::from_sats(100),
-            incrementalfee: BtcAmount::from_sats(100),
+            relayfee: BtcAmount::from_sats(relay_fee_kvb),
+            incrementalfee: BtcAmount::from_sats(incremental_fee_kvb),
             localaddresses: vec![],
             warnings: Vec::new(),
         })
@@ -14077,6 +14095,48 @@ mod tests {
             !regtest_state.mempool.verify_scripts(),
             "regtest RpcState keeps the loose (non-verifying) default"
         );
+    }
+
+    /// Recurrence guard for the fee-display lie (audit wx12re33x):
+    /// getmempoolinfo / getnetworkinfo MUST report the REAL admission floor,
+    /// not a hardcoded literal. Asserts the served values both (1) serialize to
+    /// the Core-parity 0.00000100 BTC (100 sat/kvB) and (2) equal the value
+    /// derived from the live mempool accessor — so a future hardcode drift
+    /// (display diverging from policy) fails the build.
+    #[tokio::test]
+    async fn test_fee_display_equals_policy_wx12re33x() {
+        let (rpc, state, _peer_state, _tmp) = gbfp_fixture().await;
+
+        // The real floor as the mempool reports it.
+        let (floor_kvb, incremental_kvb) = {
+            let st = state.read().await;
+            (
+                st.mempool.min_relay_feerate_kvb(),
+                st.mempool.incremental_relay_feerate_kvb(),
+            )
+        };
+        // Honest floor is the Core default: 100 sat/kvB.
+        assert_eq!(floor_kvb, 100, "real admission floor must be 100 sat/kvB");
+        assert_eq!(incremental_kvb, 100);
+
+        // getmempoolinfo: every displayed fee field reads the real floor.
+        let mi = rpc.get_mempool_info().await.expect("getmempoolinfo");
+        assert_eq!(mi.minrelaytxfee.0 as u64, floor_kvb, "minrelaytxfee == policy floor");
+        assert_eq!(mi.incrementalrelayfee.0 as u64, incremental_kvb);
+        // mempoolminfee = max(rolling, floor); empty mempool => == floor.
+        assert_eq!(mi.mempoolminfee.0 as u64, floor_kvb, "mempoolminfee == max(rolling, floor)");
+        let mi_json = serde_json::to_string(&mi).unwrap();
+        assert!(mi_json.contains("\"minrelaytxfee\":0.00000100"), "got {}", mi_json);
+        assert!(mi_json.contains("\"incrementalrelayfee\":0.00000100"), "got {}", mi_json);
+        assert!(mi_json.contains("\"mempoolminfee\":0.00000100"), "got {}", mi_json);
+
+        // getnetworkinfo: relayfee/incrementalfee read the same real floor.
+        let ni = rpc.get_network_info().await.expect("getnetworkinfo");
+        assert_eq!(ni.relayfee.0 as u64, floor_kvb, "relayfee == policy floor");
+        assert_eq!(ni.incrementalfee.0 as u64, incremental_kvb);
+        let ni_json = serde_json::to_string(&ni).unwrap();
+        assert!(ni_json.contains("\"relayfee\":0.00000100"), "got {}", ni_json);
+        assert!(ni_json.contains("\"incrementalfee\":0.00000100"), "got {}", ni_json);
     }
 
     #[test]
