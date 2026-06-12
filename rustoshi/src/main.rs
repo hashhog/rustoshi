@@ -2889,6 +2889,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let mut maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(45));
     maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // FEELER timer (Core net.h:61 FEELER_INTERVAL=2min). Every ~120s the
+    // maintenance tick opens ONE short-lived feeler to a NEW-table address,
+    // handshakes, promotes it NEW->TRIED, then disconnects — keeping TRIED
+    // fresh as the primary eclipse-attack mitigation. Driven off the 45s
+    // maintenance cadence (which already holds the peer_manager write lock)
+    // via a wall-clock gate, mirroring blockbrew's feelerTicker + nextFeeler
+    // poisson gate rather than spawning a separate interval. Exponentially
+    // jittered each fire to de-synchronise feelers across the fleet.
+    let mut next_feeler = std::time::Instant::now() + rustoshi_network::FEELER_INTERVAL;
+
     // ASMap health-check tick — fires every 3600 s (1 hour).
     // Logs ASN diversity stats (total entries, mapped/unmapped, unique ASNs,
     // top-N ASNs) to aid operators in detecting stale or low-coverage asmap
@@ -5022,12 +5032,29 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     rpc.mempool.get_min_fee()
                 };
 
+                // FEELER gate: at most one short-lived NEW-table probe per
+                // ~FEELER_INTERVAL, jittered. Computed before taking the lock so
+                // the (cheap) jitter draw doesn't extend lock hold time.
+                let feeler_due = std::time::Instant::now() >= next_feeler;
+                if feeler_due {
+                    // Exponential-ish jitter around FEELER_INTERVAL so feelers
+                    // de-sync (Core rand_exp_duration; we approximate with a
+                    // uniform 0.5x-1.5x spread, cheap and dependency-free).
+                    let jitter = rand::random::<f64>() + 0.5; // [0.5, 1.5)
+                    let secs = (rustoshi_network::FEELER_INTERVAL.as_secs_f64() * jitter).max(1.0);
+                    next_feeler =
+                        std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+                }
+
                 let (stale_result, peer_count) = {
                     let mut ps = peer_state.write().await;
                     if let Some(ref mut pm) = ps.peer_manager {
                         pm.update_tip_height(validated_tip);
                         let stale = pm.check_for_stale_peers(in_flight).await;
                         pm.fill_outbound_connections().await;
+                        if feeler_due {
+                            pm.maybe_open_feeler().await;
+                        }
                         // BIP-133 periodic feefilter re-broadcast (Core
                         // MaybeSendFeefilter cadence: rand_exp 10-min avg,
                         // 5-min snap-forward on significant change, per-peer
