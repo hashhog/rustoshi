@@ -16,18 +16,10 @@
 
 use crate::eviction::{select_node_to_evict, EvictionCandidate, EvictionCandidateBuilder};
 use crate::message::{
-    parse_message_header, serialize_message, NetAddress, NetworkMessage,
-    TimestampedNetAddress, VersionMessage, FEEFILTER_VERSION, MAX_ADDR, MAX_MESSAGE_SIZE,
-    MESSAGE_HEADER_SIZE, MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK,
+    parse_message_header, serialize_message, NetAddress, NetworkMessage, TimestampedNetAddress,
+    VersionMessage, FEEFILTER_VERSION, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
+    MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK,
     NODE_NETWORK_LIMITED, NODE_P2P_V2, NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
-};
-use crate::relay::FeeFilterManager;
-use crate::v2_transport::{
-    constants::{
-        ELLSWIFT_PUBKEY_LEN, EXPANSION, GARBAGE_TERMINATOR_LEN, HEADER_LEN, LENGTH_LEN,
-        MAX_GARBAGE_LEN, V1_PREFIX_LEN,
-    },
-    looks_like_v1_version, Bip324Cipher, EllSwiftPubKey,
 };
 use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
 use crate::netgroup::{ip_is_routable, NetGroup, NetGroupManager};
@@ -36,8 +28,16 @@ use crate::peer::{
     PeerCommand, PeerEvent, PeerId, PeerInfo, PeerState,
 };
 use crate::proxy::ProxyConfig;
+use crate::relay::FeeFilterManager;
 use crate::stale_detection::{
     StalePeerDetector, StalePeerState, EXTRA_PEER_CHECK_INTERVAL, MINIMUM_CONNECT_TIME,
+};
+use crate::v2_transport::{
+    constants::{
+        ELLSWIFT_PUBKEY_LEN, EXPANSION, GARBAGE_TERMINATOR_LEN, HEADER_LEN, LENGTH_LEN,
+        MAX_GARBAGE_LEN, V1_PREFIX_LEN,
+    },
+    looks_like_v1_version, Bip324Cipher, EllSwiftPubKey,
 };
 use rustoshi_consensus::{ChainParams, NetworkId};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -361,6 +361,783 @@ pub struct NodeAddressEntry {
     pub network: String,
 }
 
+// ============================================================
+// CORE-BUCKETED ADDRMAN (vvNew / vvTried)
+//
+// A faithful port of Bitcoin Core's CAddrMan (bitcoin-core/src/addrman.cpp +
+// addrman_impl.h): two id-indexed bucket tables (NEW[1024][64] + TRIED[256][64])
+// keyed off one per-manager 256-bit salt `nkey`, with the deterministic
+// GetNewBucket / GetTriedBucket / GetBucketPosition placement, Add/Good/Select,
+// IsTerrible eviction, and a versioned, corrupt-safe, bounded peers.dat-equiv.
+//
+// This is wired UNDER the existing public AddressManager API (add_*, mark_*,
+// next_addr_to_try, get_addr_for_sharing) so the rest of the node is
+// unaffected. The legacy `known_addrs` flat map is retained for the rich
+// getnodeaddresses / addr-sharing metadata; the bucket table is the placement
+// + anti-Sybil engine + persistence.
+//
+// NOTE: the cheap hash here is impl-internal (single SHA-256 truncated to the
+// low 8 bytes, little-endian). peers.dat is a LOCAL file (never wire/RPC), so
+// byte-identical Core bucket numbers are not required and not claimed; the
+// golden test pins THIS impl's chosen hash.
+// ============================================================
+
+/// Number of new-address buckets (Core ADDRMAN_NEW_BUCKET_COUNT = 1 << 10).
+pub const ADDRMAN_NEW_BUCKET_COUNT: usize = 1024;
+/// Number of tried-address buckets (Core ADDRMAN_TRIED_BUCKET_COUNT = 1 << 8).
+pub const ADDRMAN_TRIED_BUCKET_COUNT: usize = 256;
+/// Positions per bucket (Core ADDRMAN_BUCKET_SIZE = 1 << 6).
+pub const ADDRMAN_BUCKET_SIZE: usize = 64;
+/// New buckets a single source group can reach (Core
+/// ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP). Anti-Sybil cap.
+pub const ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP: u64 = 64;
+/// Tried buckets a single addr group can reach (Core
+/// ADDRMAN_TRIED_BUCKETS_PER_GROUP). Anti-Sybil cap.
+pub const ADDRMAN_TRIED_BUCKETS_PER_GROUP: u64 = 8;
+/// Max new buckets one address may simultaneously occupy (Core
+/// ADDRMAN_NEW_BUCKETS_PER_ADDRESS).
+pub const ADDRMAN_NEW_BUCKETS_PER_ADDRESS: u32 = 8;
+/// Addresses not seen in this long are terrible (Core ADDRMAN_HORIZON = 30 d).
+pub const ADDRMAN_HORIZON_SECS: u64 = 30 * 24 * 60 * 60;
+/// Tries after which a never-successful address is terrible (Core
+/// ADDRMAN_RETRIES).
+pub const ADDRMAN_RETRIES: u32 = 3;
+/// Failed-attempt count after which a long-failing address is terrible (Core
+/// ADDRMAN_MAX_FAILURES).
+pub const ADDRMAN_MAX_FAILURES: u32 = 10;
+/// Minimum time since last success before MAX_FAILURES applies (Core
+/// ADDRMAN_MIN_FAIL = 7 d).
+pub const ADDRMAN_MIN_FAIL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Hard slot ceiling: every id occupies at most one slot per table, and no
+/// table can grow past its fixed bucket geometry. This is the bounded ceiling.
+pub const ADDRMAN_CEILING: usize = ADDRMAN_NEW_BUCKET_COUNT * ADDRMAN_BUCKET_SIZE
+    + ADDRMAN_TRIED_BUCKET_COUNT * ADDRMAN_BUCKET_SIZE;
+
+/// On-disk format version for the peers.dat-equiv. Bumping invalidates older
+/// files (they load as an empty cold start, never a hard-down).
+pub const ADDRMAN_DAT_VERSION: u32 = 1;
+/// Filename for the bucketed addrman persistence (peers.dat-equiv).
+pub const PEERS_DATABASE_FILENAME: &str = "peers.dat";
+
+/// Integer node id (Core nid_type). `-1` is the empty-slot sentinel.
+type NId = i64;
+
+/// One address record held by the bucketed addrman. Mirrors Core AddrInfo's
+/// bookkeeping fields (refcount, in_tried, attempt/success/seen times).
+#[derive(Debug, Clone)]
+pub struct AddrManEntry {
+    /// The socket address (IPv4/IPv6 only in this pilot).
+    pub addr: SocketAddr,
+    /// Services bitfield.
+    pub services: u64,
+    /// Where we first heard about it (the source, for new-bucket grouping).
+    pub source: IpAddr,
+    /// Last-seen unix timestamp (seconds).
+    pub time_unix: u64,
+    /// Last-success unix timestamp (0 = never).
+    pub last_success_unix: u64,
+    /// Last-try unix timestamp (0 = never).
+    pub last_try_unix: u64,
+    /// Consecutive connection attempts.
+    pub attempts: u32,
+    /// How many new buckets reference this id (Core nRefCount). 0 once in tried.
+    pub ref_count: u32,
+    /// Whether this id currently lives in the tried table.
+    pub in_tried: bool,
+}
+
+impl AddrManEntry {
+    /// Core IsTerrible: should this entry be eviction-preferred? Ports the five
+    /// Core conditions (addrman.cpp:49-72) using `now` as unix seconds.
+    fn is_terrible(&self, now: u64) -> bool {
+        // never remove things tried in the last minute
+        if self.last_try_unix != 0 && now.saturating_sub(self.last_try_unix) <= 60 {
+            return false;
+        }
+        // came in a flying DeLorean
+        if self.time_unix > now + 10 * 60 {
+            return true;
+        }
+        // not seen in recent history
+        if now.saturating_sub(self.time_unix) > ADDRMAN_HORIZON_SECS {
+            return true;
+        }
+        // tried N times and never a success
+        if self.last_success_unix == 0 && self.attempts >= ADDRMAN_RETRIES {
+            return true;
+        }
+        // N successive failures in the last week
+        if self.last_success_unix != 0
+            && now.saturating_sub(self.last_success_unix) > ADDRMAN_MIN_FAIL_SECS
+            && self.attempts >= ADDRMAN_MAX_FAILURES
+        {
+            return true;
+        }
+        false
+    }
+}
+
+/// Core-bucketed address manager: the NEW/TRIED tables + id maps + salt.
+///
+/// Heap-allocates the bucket tables (each is ~512 KB of i64) to avoid a
+/// stack-overflow at construct (Core stores them in std::array members behind
+/// the heap-allocated AddrManImpl).
+#[derive(Debug)]
+pub struct AddrManTable {
+    /// 256-bit per-manager salt (Core nKey). Persisted; drives all placement.
+    nkey: [u8; 32],
+    /// NEW table: vv_new[bucket][pos] = id (or -1). Heap-boxed.
+    vv_new: Box<[[NId; ADDRMAN_BUCKET_SIZE]]>,
+    /// TRIED table: vv_tried[bucket][pos] = id (or -1). Heap-boxed.
+    vv_tried: Box<[[NId; ADDRMAN_BUCKET_SIZE]]>,
+    /// id -> entry (Core mapInfo).
+    map_info: HashMap<NId, AddrManEntry>,
+    /// addr -> id (Core mapAddr).
+    map_addr: HashMap<SocketAddr, NId>,
+    /// Next id to allocate (Core nIdCount).
+    id_count: NId,
+    /// Count of ids in the new table (Core nNew).
+    n_new: usize,
+    /// Count of ids in the tried table (Core nTried).
+    n_tried: usize,
+}
+
+impl AddrManTable {
+    /// Create an empty table with a random salt.
+    pub fn new() -> Self {
+        Self::with_nkey(rand::random())
+    }
+
+    /// Create an empty table with a fixed salt (deterministic; for tests +
+    /// persistence restore).
+    pub fn with_nkey(nkey: [u8; 32]) -> Self {
+        Self {
+            nkey,
+            vv_new: vec![[-1; ADDRMAN_BUCKET_SIZE]; ADDRMAN_NEW_BUCKET_COUNT].into_boxed_slice(),
+            vv_tried: vec![[-1; ADDRMAN_BUCKET_SIZE]; ADDRMAN_TRIED_BUCKET_COUNT]
+                .into_boxed_slice(),
+            map_info: HashMap::new(),
+            map_addr: HashMap::new(),
+            id_count: 0,
+            n_new: 0,
+            n_tried: 0,
+        }
+    }
+
+    /// Cheap hash (Core HashWriter::GetCheapHash analogue): single SHA-256 of
+    /// the concatenated parts, low 8 bytes interpreted little-endian.
+    fn cheap_hash(parts: &[&[u8]]) -> u64 {
+        let mut buf: Vec<u8> = Vec::new();
+        for p in parts {
+            buf.extend_from_slice(p);
+        }
+        let h = rustoshi_crypto::sha256(&buf);
+        u64::from_le_bytes(h[0..8].try_into().expect("sha256 yields >= 8 bytes"))
+    }
+
+    /// Stable key bytes for an address (Core CService::GetKey analogue):
+    /// 16-byte IPv6 representation + 2-byte big-endian port.
+    fn addr_key(addr: &SocketAddr) -> Vec<u8> {
+        let mut v = Vec::with_capacity(18);
+        let octets: [u8; 16] = match addr.ip() {
+            IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+            IpAddr::V6(v6) => v6.octets(),
+        };
+        v.extend_from_slice(&octets);
+        v.extend_from_slice(&addr.port().to_be_bytes());
+        v
+    }
+
+    /// Core AddrInfo::GetNewBucket. `src_group` / `addr_group` are the
+    /// NetGroupManager group bytes for the address and its source.
+    fn get_new_bucket(&self, addr_group: &[u8], src_group: &[u8]) -> usize {
+        let hash1 = Self::cheap_hash(&[&self.nkey, addr_group, src_group]);
+        let hash2 = Self::cheap_hash(&[
+            &self.nkey,
+            src_group,
+            &(hash1 % ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP).to_le_bytes(),
+        ]);
+        (hash2 % ADDRMAN_NEW_BUCKET_COUNT as u64) as usize
+    }
+
+    /// Core AddrInfo::GetTriedBucket. `addr_group` is the address's group bytes.
+    fn get_tried_bucket(&self, addr: &SocketAddr, addr_group: &[u8]) -> usize {
+        let hash1 = Self::cheap_hash(&[&self.nkey, &Self::addr_key(addr)]);
+        let hash2 = Self::cheap_hash(&[
+            &self.nkey,
+            addr_group,
+            &(hash1 % ADDRMAN_TRIED_BUCKETS_PER_GROUP).to_le_bytes(),
+        ]);
+        (hash2 % ADDRMAN_TRIED_BUCKET_COUNT as u64) as usize
+    }
+
+    /// Core AddrInfo::GetBucketPosition.
+    fn get_bucket_position(&self, f_new: bool, bucket: usize, addr: &SocketAddr) -> usize {
+        let tag: [u8; 1] = [if f_new { b'N' } else { b'K' }];
+        let hash1 = Self::cheap_hash(&[
+            &self.nkey,
+            &tag,
+            &(bucket as u32).to_le_bytes(),
+            &Self::addr_key(addr),
+        ]);
+        (hash1 % ADDRMAN_BUCKET_SIZE as u64) as usize
+    }
+
+    /// Look up the id for an address (Core Find).
+    fn find(&self, addr: &SocketAddr) -> Option<NId> {
+        self.map_addr.get(addr).copied()
+    }
+
+    /// Allocate a fresh entry (Core Create).
+    fn create(&mut self, addr: SocketAddr, source: IpAddr, services: u64, time_unix: u64) -> NId {
+        let id = self.id_count;
+        self.id_count += 1;
+        self.map_info.insert(
+            id,
+            AddrManEntry {
+                addr,
+                services,
+                source,
+                time_unix,
+                last_success_unix: 0,
+                last_try_unix: 0,
+                attempts: 0,
+                ref_count: 0,
+                in_tried: false,
+            },
+        );
+        self.map_addr.insert(addr, id);
+        id
+    }
+
+    /// Delete a refcount-0, non-tried id entirely (Core Delete).
+    fn delete(&mut self, id: NId) {
+        if let Some(info) = self.map_info.get(&id) {
+            if info.ref_count == 0 && !info.in_tried {
+                let a = info.addr;
+                self.map_addr.remove(&a);
+                self.map_info.remove(&id);
+            }
+        }
+    }
+
+    /// Clear a new-table slot, decrementing the occupant refcount and deleting
+    /// at 0 (Core ClearNew).
+    fn clear_new(&mut self, bucket: usize, pos: usize) {
+        let id = self.vv_new[bucket][pos];
+        if id != -1 {
+            if let Some(info) = self.map_info.get_mut(&id) {
+                if info.ref_count > 0 {
+                    info.ref_count -= 1;
+                }
+                let rc = info.ref_count;
+                self.vv_new[bucket][pos] = -1;
+                if rc == 0 {
+                    self.n_new = self.n_new.saturating_sub(1);
+                    self.delete(id);
+                }
+            } else {
+                self.vv_new[bucket][pos] = -1;
+            }
+        }
+    }
+
+    /// The addr/src group bytes for an id, computed via the netgroup manager.
+    fn groups(info: &AddrManEntry, ng: &NetGroupManager) -> (Vec<u8>, Vec<u8>) {
+        let addr_group = ng.get_group(&info.addr.ip()).as_bytes().to_vec();
+        let src_group = ng.get_group(&info.source).as_bytes().to_vec();
+        (addr_group, src_group)
+    }
+
+    /// Core Add_/AddSingle: place a heard-about address in the NEW table.
+    /// Returns true if a fresh slot insertion occurred. Non-routable addrs and
+    /// the bounded-ceiling guard cause a `false` return.
+    pub fn add(
+        &mut self,
+        addr: SocketAddr,
+        source: IpAddr,
+        services: u64,
+        time_unix: u64,
+        ng: &NetGroupManager,
+    ) -> bool {
+        if !ng.is_routable(&addr.ip()) {
+            return false;
+        }
+        let now = now_unix_secs();
+
+        let existing = self.find(&addr);
+        let id = match existing {
+            Some(id) => {
+                // Refresh existing (Core AddSingle update path).
+                if let Some(info) = self.map_info.get_mut(&id) {
+                    if time_unix > info.time_unix {
+                        info.time_unix = time_unix;
+                    }
+                    info.services |= services;
+                    if info.in_tried {
+                        return false;
+                    }
+                    if info.ref_count >= ADDRMAN_NEW_BUCKETS_PER_ADDRESS {
+                        return false;
+                    }
+                    // stochastic multiplicity gate: 2^refcount harder each time.
+                    if info.ref_count > 0 {
+                        let factor = 1u32 << info.ref_count;
+                        if rand::random::<u32>() % factor != 0 {
+                            return false;
+                        }
+                    }
+                }
+                id
+            }
+            None => {
+                // Bounded-ceiling guard: never allocate past the table capacity.
+                if self.map_info.len() >= ADDRMAN_CEILING {
+                    return false;
+                }
+                self.create(addr, source, services, time_unix)
+            }
+        };
+
+        // Compute the placement.
+        let (addr_group, src_group) = {
+            let info = self.map_info.get(&id).expect("id just created/found");
+            Self::groups(info, ng)
+        };
+        let bucket = self.get_new_bucket(&addr_group, &src_group);
+        let pos = self.get_bucket_position(true, bucket, &addr);
+
+        let occupant = self.vv_new[bucket][pos];
+        let mut insert = occupant == -1;
+        if occupant != id {
+            if !insert {
+                // Collision: overwrite iff occupant terrible, or occupant
+                // multiply-referenced while the newcomer is fresh (Core rule).
+                let occ_terrible_or_evictable = self
+                    .map_info
+                    .get(&occupant)
+                    .map(|o| {
+                        o.is_terrible(now)
+                            || (o.ref_count > 1
+                                && self.map_info.get(&id).map(|n| n.ref_count).unwrap_or(0) == 0)
+                    })
+                    .unwrap_or(true);
+                insert = occ_terrible_or_evictable;
+            }
+            if insert {
+                self.clear_new(bucket, pos);
+                if let Some(info) = self.map_info.get_mut(&id) {
+                    info.ref_count += 1;
+                }
+                self.vv_new[bucket][pos] = id;
+                self.n_new += 1;
+            } else if self.map_info.get(&id).map(|i| i.ref_count).unwrap_or(0) == 0 {
+                // newly-created but not inserted -> drop it.
+                self.delete(id);
+            }
+        }
+        insert
+    }
+
+    /// Core Good_/MakeTried: promote an address from NEW to TRIED, evicting the
+    /// existing tried occupant back to its NEW bucket on collision.
+    pub fn good(&mut self, addr: &SocketAddr, now: u64, ng: &NetGroupManager) -> bool {
+        let id = match self.find(addr) {
+            Some(id) => id,
+            None => return false,
+        };
+        // Update try/success bookkeeping (Core Good_).
+        if let Some(info) = self.map_info.get_mut(&id) {
+            info.last_success_unix = now;
+            info.last_try_unix = now;
+            info.attempts = 0;
+            if info.in_tried {
+                return false;
+            }
+            if info.ref_count == 0 {
+                return false;
+            }
+        }
+
+        // Remove the id from ALL its new buckets (Core MakeTried loop).
+        let positions: Vec<(usize, usize)> = {
+            let info = self.map_info.get(&id).expect("id present");
+            let (addr_group, src_group) = Self::groups(info, ng);
+            let start = self.get_new_bucket(&addr_group, &src_group);
+            (0..ADDRMAN_NEW_BUCKET_COUNT)
+                .map(|n| {
+                    let b = (start + n) % ADDRMAN_NEW_BUCKET_COUNT;
+                    let p = self.get_bucket_position(true, b, addr);
+                    (b, p)
+                })
+                .collect()
+        };
+        for (b, p) in positions {
+            if self.vv_new[b][p] == id {
+                self.vv_new[b][p] = -1;
+                if let Some(info) = self.map_info.get_mut(&id) {
+                    if info.ref_count > 0 {
+                        info.ref_count -= 1;
+                    }
+                    if info.ref_count == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        self.n_new = self.n_new.saturating_sub(1);
+        if let Some(info) = self.map_info.get_mut(&id) {
+            info.ref_count = 0;
+        }
+
+        // Compute the tried slot.
+        let (k_bucket, k_pos) = {
+            let info = self.map_info.get(&id).expect("id present");
+            let (addr_group, _src) = Self::groups(info, ng);
+            let kb = self.get_tried_bucket(addr, &addr_group);
+            let kp = self.get_bucket_position(false, kb, addr);
+            (kb, kp)
+        };
+
+        // On collision evict the existing tried occupant back to NEW.
+        let evict = self.vv_tried[k_bucket][k_pos];
+        if evict != -1 {
+            // Pull it out of tried.
+            self.vv_tried[k_bucket][k_pos] = -1;
+            self.n_tried = self.n_tried.saturating_sub(1);
+            if let Some(old) = self.map_info.get_mut(&evict) {
+                old.in_tried = false;
+            }
+            // Recompute its new slot and place it back.
+            let (ob, op) = {
+                let old = self.map_info.get(&evict).expect("evict present");
+                let (ag, sg) = Self::groups(old, ng);
+                let b = self.get_new_bucket(&ag, &sg);
+                let p = self.get_bucket_position(true, b, &old.addr);
+                (b, p)
+            };
+            self.clear_new(ob, op);
+            if let Some(old) = self.map_info.get_mut(&evict) {
+                old.ref_count = 1;
+            }
+            self.vv_new[ob][op] = evict;
+            self.n_new += 1;
+        }
+
+        // Place the promoted id into tried.
+        self.vv_tried[k_bucket][k_pos] = id;
+        self.n_tried += 1;
+        if let Some(info) = self.map_info.get_mut(&id) {
+            info.in_tried = true;
+        }
+        true
+    }
+
+    /// Core Attempt_: record a (possibly-failed) connection attempt.
+    pub fn attempt(&mut self, addr: &SocketAddr, now: u64) {
+        if let Some(&id) = self.map_addr.get(addr) {
+            if let Some(info) = self.map_info.get_mut(&id) {
+                info.last_try_unix = now;
+                info.attempts += 1;
+            }
+        }
+    }
+
+    /// Core Select_ (simplified): 50/50 new-vs-tried when both are non-empty,
+    /// then scan a random bucket from a random position and return the first
+    /// occupant. Returns the chosen address.
+    ///
+    /// NOTE: the GetChance() * 1.2^miss probability bias is a named follow-up;
+    /// this lands plain random-scan selection, which is bounded, deterministic
+    /// per-RNG-draw, and faithful to the bucket geometry.
+    pub fn select(&self, new_only: bool) -> Option<SocketAddr> {
+        if self.map_info.is_empty() {
+            return None;
+        }
+        if new_only && self.n_new == 0 {
+            return None;
+        }
+        if self.n_new + self.n_tried == 0 {
+            return None;
+        }
+
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+
+        let search_tried = if new_only || self.n_tried == 0 {
+            false
+        } else if self.n_new == 0 {
+            true
+        } else {
+            rng.gen_bool(0.5)
+        };
+
+        let (table, bucket_count): (&Box<[[NId; ADDRMAN_BUCKET_SIZE]]>, usize) = if search_tried {
+            (&self.vv_tried, ADDRMAN_TRIED_BUCKET_COUNT)
+        } else {
+            (&self.vv_new, ADDRMAN_NEW_BUCKET_COUNT)
+        };
+
+        // Pick a random starting bucket + position for selection bias, then
+        // walk deterministically (wrapping) through every bucket. This is
+        // bounded (at most bucket_count * BUCKET_SIZE slots) AND guaranteed to
+        // return an occupant whenever one exists, unlike a pure rejection-
+        // sample loop which can starve on a sparse table. Core's Select_ loops
+        // forever on random buckets until it hits a non-empty one; this is the
+        // bounded, liveness-safe analogue. (GetChance()*1.2^miss probability
+        // bias is a named follow-up.)
+        let start_bucket = rng.gen_range(0..bucket_count);
+        let initial_pos = rng.gen_range(0..ADDRMAN_BUCKET_SIZE);
+        for nb in 0..bucket_count {
+            let bucket = (start_bucket + nb) % bucket_count;
+            for i in 0..ADDRMAN_BUCKET_SIZE {
+                let pos = (initial_pos + i) % ADDRMAN_BUCKET_SIZE;
+                let id = table[bucket][pos];
+                if id != -1 {
+                    if let Some(info) = self.map_info.get(&id) {
+                        return Some(info.addr);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Number of addresses currently in the NEW table.
+    pub fn new_count(&self) -> usize {
+        self.n_new
+    }
+
+    /// Number of addresses currently in the TRIED table.
+    pub fn tried_count(&self) -> usize {
+        self.n_tried
+    }
+
+    /// Total distinct ids tracked (bounded by ADDRMAN_CEILING).
+    pub fn total_count(&self) -> usize {
+        self.map_info.len()
+    }
+
+    /// Whether `addr` is in the TRIED table (test/inspection helper).
+    pub fn is_in_tried(&self, addr: &SocketAddr) -> bool {
+        self.map_addr
+            .get(addr)
+            .and_then(|id| self.map_info.get(id))
+            .map(|i| i.in_tried)
+            .unwrap_or(false)
+    }
+
+    /// Recompute the (bucket, pos) an address currently occupies in NEW (for
+    /// determinism tests). Returns None if not in NEW.
+    pub fn new_slot_of(&self, addr: &SocketAddr, ng: &NetGroupManager) -> Option<(usize, usize)> {
+        let id = *self.map_addr.get(addr)?;
+        let info = self.map_info.get(&id)?;
+        if info.in_tried {
+            return None;
+        }
+        let (ag, sg) = Self::groups(info, ng);
+        let start = self.get_new_bucket(&ag, &sg);
+        for n in 0..ADDRMAN_NEW_BUCKET_COUNT {
+            let b = (start + n) % ADDRMAN_NEW_BUCKET_COUNT;
+            let p = self.get_bucket_position(true, b, addr);
+            if self.vv_new[b][p] == id {
+                return Some((b, p));
+            }
+        }
+        None
+    }
+
+    /// The (bucket, pos) an address occupies in TRIED. None if not in TRIED.
+    pub fn tried_slot_of(&self, addr: &SocketAddr, ng: &NetGroupManager) -> Option<(usize, usize)> {
+        let id = *self.map_addr.get(addr)?;
+        let info = self.map_info.get(&id)?;
+        if !info.in_tried {
+            return None;
+        }
+        let (ag, _sg) = Self::groups(info, ng);
+        let kb = self.get_tried_bucket(addr, &ag);
+        let kp = self.get_bucket_position(false, kb, addr);
+        Some((kb, kp))
+    }
+
+    /// The nkey salt bytes (test/persistence helper).
+    pub fn nkey(&self) -> [u8; 32] {
+        self.nkey
+    }
+
+    // --- Persistence (peers.dat-equiv) -------------------------------------
+
+    /// Serialize to a versioned, line-oriented text format. Atomic-write is
+    /// handled by `save`. Format:
+    ///   line 0: "ADDRMAN <version> <nkey-hex>"
+    ///   then one record per id:
+    ///     "<n|t> <addr> <services> <source-ip> <time> <last_success> <last_try> <attempts> <ref_count>"
+    /// New records carry their explicit (bucket,pos) restored on load via add();
+    /// tried records are re-promoted via good() so placement is recomputed
+    /// deterministically from the same nkey.
+    fn serialize(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "ADDRMAN {} {}\n",
+            ADDRMAN_DAT_VERSION,
+            hex_encode(&self.nkey)
+        ));
+        for info in self.map_info.values() {
+            let tag = if info.in_tried { 't' } else { 'n' };
+            out.push_str(&format!(
+                "{} {} {} {} {} {} {} {} {}\n",
+                tag,
+                info.addr,
+                info.services,
+                info.source,
+                info.time_unix,
+                info.last_success_unix,
+                info.last_try_unix,
+                info.attempts,
+                info.ref_count,
+            ));
+        }
+        out
+    }
+
+    /// Atomic save to `<data_dir>/peers.dat` (temp + rename). Best-effort;
+    /// failures are logged, never fatal.
+    pub fn save(&self, data_dir: &std::path::Path) {
+        let path = data_dir.join(PEERS_DATABASE_FILENAME);
+        let tmp = data_dir.join(format!("{}.tmp", PEERS_DATABASE_FILENAME));
+        let result = (|| -> Result<(), std::io::Error> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            {
+                let mut f = fs::File::create(&tmp)?;
+                f.write_all(self.serialize().as_bytes())?;
+                f.flush()?;
+            }
+            fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!("Failed to write peers.dat to {}: {}", path.display(), e);
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+
+    /// Load from `<data_dir>/peers.dat`, re-bucketing via add()/good() so
+    /// placement is recomputed from the persisted nkey. Corrupt / truncated /
+    /// wrong-version / missing files yield a graceful empty cold start (never a
+    /// panic, never a hard-down). Bounded by ADDRMAN_CEILING.
+    pub fn load(data_dir: &std::path::Path, ng: &NetGroupManager) -> Self {
+        let path = data_dir.join(PEERS_DATABASE_FILENAME);
+        let contents = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return Self::new(),
+        };
+        match Self::parse(&contents, ng) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(
+                    "peers.dat at {} corrupt or unsupported; starting cold",
+                    path.display()
+                );
+                Self::new()
+            }
+        }
+    }
+
+    /// Parse the serialized form. Returns None on any structural problem so the
+    /// caller can cold-start. Separated from `load` for in-process tests.
+    fn parse(contents: &str, ng: &NetGroupManager) -> Option<Self> {
+        let mut lines = contents.lines();
+        let header = lines.next()?;
+        let mut hp = header.split_whitespace();
+        if hp.next()? != "ADDRMAN" {
+            return None;
+        }
+        let version: u32 = hp.next()?.parse().ok()?;
+        if version != ADDRMAN_DAT_VERSION {
+            return None;
+        }
+        let nkey = hex_decode_32(hp.next()?)?;
+
+        let mut table = Self::with_nkey(nkey);
+        // Two passes: place NEW first (via add), then promote TRIED (via good)
+        // so a tried record always finds the id already present.
+        let mut tried_addrs: Vec<SocketAddr> = Vec::new();
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Bounded: stop ingesting past the ceiling.
+            if table.map_info.len() >= ADDRMAN_CEILING {
+                break;
+            }
+            let mut f = line.split_whitespace();
+            let tag = f.next()?;
+            let addr: SocketAddr = f.next()?.parse().ok()?;
+            let services: u64 = f.next()?.parse().ok()?;
+            let source: IpAddr = f.next()?.parse().ok()?;
+            let time_unix: u64 = f.next()?.parse().ok()?;
+            let last_success: u64 = f.next()?.parse().ok()?;
+            let last_try: u64 = f.next()?.parse().ok()?;
+            let attempts: u32 = f.next()?.parse().ok()?;
+            let _ref_count: u32 = f.next().unwrap_or("0").parse().unwrap_or(0);
+
+            // (Re)create via add() so the new-bucket placement is recomputed.
+            table.add(addr, source, services, time_unix, ng);
+            // Restore the attempt/success bookkeeping that add() does not carry.
+            if let Some(&id) = table.map_addr.get(&addr) {
+                if let Some(info) = table.map_info.get_mut(&id) {
+                    info.last_success_unix = last_success;
+                    info.last_try_unix = last_try;
+                    info.attempts = attempts;
+                }
+            }
+            if tag == "t" {
+                tried_addrs.push(addr);
+            }
+        }
+        // Second pass: promote the tried records.
+        let now = now_unix_secs();
+        for addr in tried_addrs {
+            table.good(&addr, now, ng);
+        }
+        Some(table)
+    }
+}
+
+impl Default for AddrManTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lowercase hex encoding (no external dep).
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// Decode a 64-char hex string into a 32-byte array. None on bad input.
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let bytes = s.as_bytes();
+    for i in 0..32 {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        out[i] = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
 /// Metadata about a known peer address.
 #[derive(Debug, Clone)]
 pub struct AddrInfo {
@@ -487,6 +1264,19 @@ pub struct AddressManager {
     connected: HashSet<SocketAddr>,
     /// Network groups of currently connected outbound peers (for diversity).
     connected_outbound_netgroups: HashSet<Vec<u8>>,
+    /// Core-bucketed addrman (NEW[1024][64] + TRIED[256][64]) driving anti-Sybil
+    /// placement, Good/Add/Select, and peers.dat persistence. The legacy
+    /// `known_addrs` map above is kept for rich getnodeaddresses / addr-sharing
+    /// metadata; this table is the placement + bounded persistence engine.
+    addrman: AddrManTable,
+    /// A clone of the netgroup manager, captured lazily the first time a
+    /// netgroup-aware public method runs. Lets the sourceless ingest paths
+    /// (DNS / manual / addpeeraddress) bucket without changing their public
+    /// signatures. None until first capture.
+    bucket_ng: Option<Arc<NetGroupManager>>,
+    /// Adds that arrived before `bucket_ng` was captured. Flushed into the
+    /// bucketed addrman on first capture. Bounded by ADDRMAN_CEILING.
+    pending_bucket_adds: Vec<(SocketAddr, IpAddr, u64, u64)>,
 }
 
 impl AddressManager {
@@ -499,7 +1289,45 @@ impl AddressManager {
             banned: HashMap::new(),
             connected: HashSet::new(),
             connected_outbound_netgroups: HashSet::new(),
+            addrman: AddrManTable::new(),
+            bucket_ng: None,
+            pending_bucket_adds: Vec::new(),
         }
+    }
+
+    /// Capture the netgroup manager (idempotent) and flush any adds that
+    /// arrived before it was available, so the bucketed addrman stays in sync
+    /// with the legacy store. Called from every netgroup-aware public method.
+    fn bind_netgroup(&mut self, ng: &NetGroupManager) {
+        if self.bucket_ng.is_none() {
+            let arc = Arc::new(ng.clone());
+            self.bucket_ng = Some(arc.clone());
+            let pending = std::mem::take(&mut self.pending_bucket_adds);
+            for (addr, source, services, time_unix) in pending {
+                self.addrman.add(addr, source, services, time_unix, &arc);
+            }
+        }
+    }
+
+    /// Create an address manager whose bucketed addrman is loaded from
+    /// `<data_dir>/peers.dat` (or cold-started if absent/corrupt). The salt and
+    /// bucket placement survive the round-trip.
+    pub fn with_persisted(data_dir: &std::path::Path, ng: &NetGroupManager) -> Self {
+        let mut mgr = Self::new();
+        mgr.addrman = AddrManTable::load(data_dir, ng);
+        mgr.bucket_ng = Some(Arc::new(ng.clone()));
+        mgr
+    }
+
+    /// Borrow the underlying bucketed addrman (read-only; for inspection,
+    /// persistence, and tests).
+    pub fn addrman(&self) -> &AddrManTable {
+        &self.addrman
+    }
+
+    /// Atomically persist the bucketed addrman to `<data_dir>/peers.dat`.
+    pub fn save_addrman(&self, data_dir: &std::path::Path) {
+        self.addrman.save(data_dir);
     }
 
     /// Add addresses discovered from DNS seeds.
@@ -520,7 +1348,30 @@ impl AddressManager {
                     },
                 );
                 self.try_queue.push_back(addr);
+                // Mirror into the bucketed addrman. DNS seeds are self-sourced
+                // (no announcing peer), matching Core's CAddress source==addr.
+                self.bucket_add(
+                    addr,
+                    addr.ip(),
+                    NODE_NETWORK | NODE_WITNESS,
+                    now_unix_secs(),
+                );
             }
+        }
+    }
+
+    /// Stage an address into the bucketed addrman (NEW table). Best-effort:
+    /// requires the netgroup manager, so it is only invoked from paths that can
+    /// supply one, or via the self-source convention for sourceless adds. When
+    /// no netgroup manager has been bound yet, the add is deferred until a
+    /// netgroup-aware path runs (the legacy `known_addrs` mirror still tracks
+    /// it). See `bind_netgroup` / the netgroup-aware ingest paths.
+    fn bucket_add(&mut self, addr: SocketAddr, source: IpAddr, services: u64, time_unix: u64) {
+        if let Some(ng) = self.bucket_ng.clone() {
+            self.addrman.add(addr, source, services, time_unix, &ng);
+        } else {
+            self.pending_bucket_adds
+                .push((addr, source, services, time_unix));
         }
     }
 
@@ -550,11 +1401,16 @@ impl AddressManager {
                     entry.last_seen = Instant::now();
                     entry.time_unix = taddr.timestamp as u64;
                     entry.services = taddr.address.services;
+                    let services = taddr.address.services;
+                    let ts = taddr.timestamp as u64;
 
                     // Add to try queue if not already connected
                     if !self.connected.contains(&socket_addr) {
                         self.try_queue.push_back(socket_addr);
                     }
+                    // Mirror into the bucketed addrman, keyed by the announcing
+                    // peer's address as the source group (Core AddSingle source).
+                    self.bucket_add(socket_addr, from.ip(), services, ts);
                 }
             }
         }
@@ -574,6 +1430,13 @@ impl AddressManager {
         });
         // Manual addresses go to the front of the queue
         self.try_queue.push_front(addr);
+        // Manual peers are self-sourced in the bucketed addrman.
+        self.bucket_add(
+            addr,
+            addr.ip(),
+            NODE_NETWORK | NODE_WITNESS,
+            now_unix_secs(),
+        );
     }
 
     /// Get the next address to try connecting to with network group diversity.
@@ -601,6 +1464,8 @@ impl AddressManager {
     ///
     /// Returns None if no eligible address is available.
     pub fn next_addr_to_try(&mut self, netgroup_manager: &NetGroupManager) -> Option<SocketAddr> {
+        // Capture the netgroup manager + flush any deferred bucket adds.
+        self.bind_netgroup(netgroup_manager);
         // Stage 1: fast path over the preferred-order hint queue.
         while let Some(addr) = self.try_queue.pop_front() {
             if !self.is_addr_eligible(&addr, netgroup_manager) {
@@ -713,6 +1578,13 @@ impl AddressManager {
             info.last_success = Some(Instant::now());
             info.attempt_count = 0;
         }
+
+        // Promote in the bucketed addrman (NEW -> TRIED), mirroring Core's
+        // AddrMan::Good on a successful outbound connection.
+        self.bind_netgroup(netgroup_manager);
+        if let Some(ng) = self.bucket_ng.clone() {
+            self.addrman.good(addr, now_unix_secs(), &ng);
+        }
     }
 
     /// Mark an address as successfully connected (inbound - no netgroup tracking).
@@ -736,7 +1608,11 @@ impl AddressManager {
     }
 
     /// Mark an address as disconnected (outbound).
-    pub fn mark_outbound_disconnected(&mut self, addr: &SocketAddr, netgroup_manager: &NetGroupManager) {
+    pub fn mark_outbound_disconnected(
+        &mut self,
+        addr: &SocketAddr,
+        netgroup_manager: &NetGroupManager,
+    ) {
         self.connected.remove(addr);
 
         // Remove netgroup from tracking
@@ -837,19 +1713,19 @@ impl AddressManager {
                     continue;
                 }
                 if !self.is_banned(&socket_addr) {
-                    let addr_entry = self
-                        .known_addrs
-                        .entry(socket_addr)
-                        .or_insert_with(|| AddrInfo {
-                            addr: socket_addr,
-                            services: entry.services,
-                            time_unix: entry.timestamp as u64,
-                            last_seen: now,
-                            last_attempt: None,
-                            last_success: None,
-                            attempt_count: 0,
-                            source: AddrSource::Peer(from),
-                        });
+                    let addr_entry =
+                        self.known_addrs
+                            .entry(socket_addr)
+                            .or_insert_with(|| AddrInfo {
+                                addr: socket_addr,
+                                services: entry.services,
+                                time_unix: entry.timestamp as u64,
+                                last_seen: now,
+                                last_attempt: None,
+                                last_success: None,
+                                attempt_count: 0,
+                                source: AddrSource::Peer(from),
+                            });
                     addr_entry.last_seen = now;
                     addr_entry.time_unix = entry.timestamp as u64;
                     addr_entry.services = entry.services;
@@ -862,20 +1738,17 @@ impl AddressManager {
             }
 
             // Store in addrv2 storage
-            let v2_entry = self
-                .known_addrv2
-                .entry(key)
-                .or_insert_with(|| AddrV2Info {
-                    addr: entry.addr.clone(),
-                    port: entry.port,
-                    services: entry.services,
-                    timestamp: entry.timestamp,
-                    last_seen: now,
-                    last_attempt: None,
-                    last_success: None,
-                    attempt_count: 0,
-                    source: AddrSource::Peer(from),
-                });
+            let v2_entry = self.known_addrv2.entry(key).or_insert_with(|| AddrV2Info {
+                addr: entry.addr.clone(),
+                port: entry.port,
+                services: entry.services,
+                timestamp: entry.timestamp,
+                last_seen: now,
+                last_attempt: None,
+                last_success: None,
+                attempt_count: 0,
+                source: AddrSource::Peer(from),
+            });
             v2_entry.last_seen = now;
             v2_entry.services = entry.services;
             v2_entry.timestamp = entry.timestamp;
@@ -935,10 +1808,7 @@ impl AddressManager {
     /// full set of known peers (not just connected peers).  Tor/I2P/CJDNS
     /// addresses are excluded because the ASMap only covers IPv4/IPv6.
     pub fn all_known_ips(&self) -> Vec<std::net::IpAddr> {
-        self.known_addrs
-            .keys()
-            .map(|sa| sa.ip())
-            .collect()
+        self.known_addrs.keys().map(|sa| sa.ip()).collect()
     }
 
     // ============================================================
@@ -975,6 +1845,8 @@ impl AddressManager {
                 source: AddrSource::Manual,
             },
         );
+        // Mirror into the bucketed addrman (self-sourced injection).
+        self.bucket_add(addr, addr.ip(), services, time);
         true
     }
 
@@ -1190,7 +2062,9 @@ impl StalePeerCheckResult {
 
     /// Get all peers that were disconnected.
     pub fn disconnected_peers(&self) -> impl Iterator<Item = &PeerId> {
-        self.ping_timeouts.iter().chain(self.chain_sync_failures.iter())
+        self.ping_timeouts
+            .iter()
+            .chain(self.chain_sync_failures.iter())
     }
 }
 
@@ -1522,8 +2396,9 @@ impl PeerManager {
         // shadow node accepts no peers at all (the `offline` early-return
         // below covers outbound).
         if self.config.listen && !self.config.offline {
-            let listen_addr: SocketAddr =
-                format!("0.0.0.0:{}", self.config.listen_port).parse().unwrap();
+            let listen_addr: SocketAddr = format!("0.0.0.0:{}", self.config.listen_port)
+                .parse()
+                .unwrap();
             match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(listener) => {
                     tracing::info!("P2P listening on {}", listen_addr);
@@ -1538,8 +2413,9 @@ impl PeerManager {
                     ));
                     // Shared map to keep command senders alive until the peer
                     // manager moves them into PeerHandle on Connected event.
-                    let inbound_senders: Arc<std::sync::Mutex<HashMap<PeerId, mpsc::Sender<PeerCommand>>>> =
-                        Arc::new(std::sync::Mutex::new(HashMap::new()));
+                    let inbound_senders: Arc<
+                        std::sync::Mutex<HashMap<PeerId, mpsc::Sender<PeerCommand>>>,
+                    > = Arc::new(std::sync::Mutex::new(HashMap::new()));
                     self.inbound_cmd_txs = Some(inbound_senders.clone());
                     // Snapshot path of the on-disk banlist for the accept
                     // loop.  The listener task lives outside the manager's
@@ -1564,7 +2440,9 @@ impl PeerManager {
                                     if banlist_file.exists() {
                                         let is_banned = match std::fs::File::open(&banlist_file) {
                                             Ok(f) => {
-                                                match serde_json::from_reader::<_, serde_json::Value>(f) {
+                                                match serde_json::from_reader::<_, serde_json::Value>(
+                                                    f,
+                                                ) {
                                                     Ok(v) => {
                                                         let now = std::time::SystemTime::now()
                                                             .duration_since(std::time::UNIX_EPOCH)
@@ -1573,20 +2451,29 @@ impl PeerManager {
                                                         v.get("entries")
                                                             .and_then(|e| e.as_object())
                                                             .map(|entries| {
-                                                                entries.iter().any(|(ip_str, entry)| {
-                                                                    if ip_str.parse::<IpAddr>()
-                                                                        .map(|ip| ip == addr.ip())
-                                                                        .unwrap_or(false)
-                                                                    {
-                                                                        entry
-                                                                            .get("ban_until")
-                                                                            .and_then(|u| u.as_u64())
-                                                                            .map(|until| until > now)
+                                                                entries.iter().any(
+                                                                    |(ip_str, entry)| {
+                                                                        if ip_str
+                                                                            .parse::<IpAddr>()
+                                                                            .map(|ip| {
+                                                                                ip == addr.ip()
+                                                                            })
                                                                             .unwrap_or(false)
-                                                                    } else {
-                                                                        false
-                                                                    }
-                                                                })
+                                                                        {
+                                                                            entry
+                                                                                .get("ban_until")
+                                                                                .and_then(|u| {
+                                                                                    u.as_u64()
+                                                                                })
+                                                                                .map(|until| {
+                                                                                    until > now
+                                                                                })
+                                                                                .unwrap_or(false)
+                                                                        } else {
+                                                                            false
+                                                                        }
+                                                                    },
+                                                                )
                                                             })
                                                             .unwrap_or(false)
                                                     }
@@ -1683,7 +2570,9 @@ impl PeerManager {
         // Resolve DNS seeds — suppressed by `-nodnsseed` / `-dnsseed=0`
         // (Core: no DNS lookups when dnsseed is disabled).
         let addrs = if self.config.no_dns_seed {
-            tracing::info!("DNS seeding disabled (-nodnsseed); relying on addrman / fallback peers");
+            tracing::info!(
+                "DNS seeding disabled (-nodnsseed); relying on addrman / fallback peers"
+            );
             Vec::new()
         } else {
             resolve_dns_seeds(&self.params.dns_seeds, self.params.default_port).await
@@ -1812,26 +2701,36 @@ impl PeerManager {
         let full_relay_count = self
             .peers
             .values()
-            .filter(|p| p.conn_type == ConnectionType::FullRelay && p.info.state == PeerState::Established)
+            .filter(|p| {
+                p.conn_type == ConnectionType::FullRelay && p.info.state == PeerState::Established
+            })
             .count();
 
         let full_relay_connecting = self
             .peers
             .values()
-            .filter(|p| p.conn_type == ConnectionType::FullRelay && p.info.state == PeerState::Connecting)
+            .filter(|p| {
+                p.conn_type == ConnectionType::FullRelay && p.info.state == PeerState::Connecting
+            })
             .count();
 
         // Count block-relay-only outbound connections
         let block_relay_count = self
             .peers
             .values()
-            .filter(|p| p.conn_type == ConnectionType::BlockRelayOnly && p.info.state == PeerState::Established)
+            .filter(|p| {
+                p.conn_type == ConnectionType::BlockRelayOnly
+                    && p.info.state == PeerState::Established
+            })
             .count();
 
         let block_relay_connecting = self
             .peers
             .values()
-            .filter(|p| p.conn_type == ConnectionType::BlockRelayOnly && p.info.state == PeerState::Connecting)
+            .filter(|p| {
+                p.conn_type == ConnectionType::BlockRelayOnly
+                    && p.info.state == PeerState::Connecting
+            })
             .count();
 
         // Fill full-relay connections first
@@ -1986,10 +2885,7 @@ impl PeerManager {
             let already = self.peers.values().any(|p| {
                 !p.info.inbound
                     && p.info.addr == addr
-                    && matches!(
-                        p.info.state,
-                        PeerState::Connecting | PeerState::Established
-                    )
+                    && matches!(p.info.state, PeerState::Connecting | PeerState::Established)
             });
             if already {
                 continue;
@@ -2068,7 +2964,13 @@ impl PeerManager {
             let target = crate::peer::OutboundTarget::Clearnet(addr);
             tokio::spawn(async move {
                 run_outbound_peer_with_proxy(
-                    peer_id, target, magic, our_version, proxy_config, event_tx, cmd_rx,
+                    peer_id,
+                    target,
+                    magic,
+                    our_version,
+                    proxy_config,
+                    event_tx,
+                    cmd_rx,
                 )
                 .await;
             });
@@ -2250,10 +3152,7 @@ impl PeerManager {
                 .unwrap()
                 .as_secs() as i64,
             addr_recv: socket_addr_to_net_address(addr, 0),
-            addr_from: socket_addr_to_net_address(
-                "0.0.0.0:0".parse().unwrap(),
-                our_services,
-            ),
+            addr_from: socket_addr_to_net_address("0.0.0.0:0".parse().unwrap(), our_services),
             nonce: rand::random(),
             user_agent: "/Rustoshi:0.1.0/".to_string(),
             start_height: self.start_height,
@@ -2280,7 +3179,9 @@ impl PeerManager {
     /// peer's send buffer is full. Use for non-critical bulk responses.
     pub fn try_send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> bool {
         if let Some(peer) = self.peers.get(&peer_id) {
-            peer.command_tx.try_send(PeerCommand::SendMessage(msg)).is_ok()
+            peer.command_tx
+                .try_send(PeerCommand::SendMessage(msg))
+                .is_ok()
         } else {
             false
         }
@@ -2365,7 +3266,8 @@ impl PeerManager {
 
     /// Ban a peer for misbehavior.
     pub async fn ban_peer(&mut self, peer_id: PeerId) {
-        self.ban_peer_with_reason(peer_id, "manual ban".to_string()).await;
+        self.ban_peer_with_reason(peer_id, "manual ban".to_string())
+            .await;
     }
 
     /// Ban a peer with a specific reason.
@@ -2390,7 +3292,8 @@ impl PeerManager {
         if peer.noban {
             tracing::debug!(
                 "Peer {} has NoBan permission, skipping ban (reason: {})",
-                peer_id.0, reason
+                peer_id.0,
+                reason
             );
             return;
         }
@@ -2399,7 +3302,8 @@ impl PeerManager {
         if peer.conn_type == ConnectionType::Manual {
             tracing::debug!(
                 "Peer {} is a manual connection, skipping ban (reason: {})",
-                peer_id.0, reason
+                peer_id.0,
+                reason
             );
             return;
         }
@@ -2415,13 +3319,16 @@ impl PeerManager {
             // list (Core: "don't pollute Discourage list with local addrs").
             tracing::debug!(
                 "Peer {} has local address {}, disconnecting without ban (reason: {})",
-                peer_id.0, addr, reason
+                peer_id.0,
+                addr,
+                reason
             );
             let _ = peer.command_tx.send(PeerCommand::Disconnect).await;
         } else {
             // Regular inbound/outbound: discourage + disconnect.
             self.addr_manager.ban(&addr, self.config.ban_duration);
-            self.ban_manager.ban_addr(addr, self.config.ban_duration, reason);
+            self.ban_manager
+                .ban_addr(addr, self.config.ban_duration, reason);
             let _ = self.peers[&peer_id]
                 .command_tx
                 .send(PeerCommand::Disconnect)
@@ -2434,7 +3341,9 @@ impl PeerManager {
     /// Per Core PR #25974 (2022): any Misbehaving call immediately discourages
     /// the peer — no score accumulation to a threshold required.
     pub async fn misbehaving(&mut self, peer_id: PeerId, reason: MisbehaviorReason) -> bool {
-        let should_ban = self.misbehavior_tracker.misbehaving(peer_id, reason.clone());
+        let should_ban = self
+            .misbehavior_tracker
+            .misbehaving(peer_id, reason.clone());
 
         if should_ban {
             self.ban_peer_with_reason(peer_id, reason.to_string()).await;
@@ -2452,10 +3361,13 @@ impl PeerManager {
         howmuch: u32,
         message: &str,
     ) -> bool {
-        let should_ban = self.misbehavior_tracker.misbehaving_with_score(peer_id, howmuch, message);
+        let should_ban = self
+            .misbehavior_tracker
+            .misbehaving_with_score(peer_id, howmuch, message);
 
         if should_ban {
-            self.ban_peer_with_reason(peer_id, message.to_string()).await;
+            self.ban_peer_with_reason(peer_id, message.to_string())
+                .await;
         }
 
         should_ban
@@ -2529,7 +3441,11 @@ impl PeerManager {
                 // For inbound peers, create a PeerHandle from the shared
                 // command sender stored by the listener task.
                 if !self.peers.contains_key(id) {
-                    tracing::info!("Peer {} not in peers map, checking inbound_cmd_txs (is_some={})", id.0, self.inbound_cmd_txs.is_some());
+                    tracing::info!(
+                        "Peer {} not in peers map, checking inbound_cmd_txs (is_some={})",
+                        id.0,
+                        self.inbound_cmd_txs.is_some()
+                    );
                     if let Some(ref inbound_map) = self.inbound_cmd_txs {
                         if let Some(cmd_tx) = inbound_map.lock().unwrap().remove(id) {
                             self.peers.insert(
@@ -2598,8 +3514,7 @@ impl PeerManager {
                 // force_initial_send; the BIP-37 fRelay flag is an additional
                 // gate (a peer that asked for no tx relay needs no filter).
                 if info.relay {
-                    if let Some(rate) =
-                        self.feefilter_manager.force_initial_send(*id, self.in_ibd)
+                    if let Some(rate) = self.feefilter_manager.force_initial_send(*id, self.in_ibd)
                     {
                         let _ = self
                             .send_to_peer(*id, NetworkMessage::FeeFilter(rate))
@@ -2678,7 +3593,13 @@ impl PeerManager {
                             .misbehavior_tracker
                             .misbehaving(*id, MisbehaviorReason::InvalidAddr);
                     } else {
-                        self.addr_manager.add_addrv2_addresses(entries, self.peers.get(id).map(|p| p.info.addr).unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()));
+                        self.addr_manager.add_addrv2_addresses(
+                            entries,
+                            self.peers
+                                .get(id)
+                                .map(|p| p.info.addr)
+                                .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+                        );
                         // Relay to 2 other peers
                         self.relay_addresses_to_peers(*id).await;
                     }
@@ -2711,11 +3632,17 @@ impl PeerManager {
                 // Handle getaddr messages
                 if let NetworkMessage::GetAddr = msg {
                     // Send addrv2 if peer supports it, otherwise legacy addr
-                    let peer_supports_addrv2 = self.peers.get(id).map(|p| p.info.supports_addrv2).unwrap_or(false);
+                    let peer_supports_addrv2 = self
+                        .peers
+                        .get(id)
+                        .map(|p| p.info.supports_addrv2)
+                        .unwrap_or(false);
                     if peer_supports_addrv2 {
                         let entries = self.addr_manager.get_addrv2_for_sharing(MAX_ADDR);
                         if !entries.is_empty() {
-                            let _ = self.send_to_peer(*id, NetworkMessage::AddrV2(entries)).await;
+                            let _ = self
+                                .send_to_peer(*id, NetworkMessage::AddrV2(entries))
+                                .await;
                         }
                     } else {
                         let addrs = self.addr_manager.get_addresses_for_sharing(MAX_ADDR);
@@ -2817,7 +3744,9 @@ impl PeerManager {
             if target_supports_addrv2 {
                 let entries = self.addr_manager.get_addrv2_for_sharing(10);
                 if !entries.is_empty() {
-                    let _ = self.send_to_peer(target_id, NetworkMessage::AddrV2(entries)).await;
+                    let _ = self
+                        .send_to_peer(target_id, NetworkMessage::AddrV2(entries))
+                        .await;
                 }
             } else {
                 let addrs = self.addr_manager.get_addresses_for_sharing(10);
@@ -2829,7 +3758,9 @@ impl PeerManager {
                     })
                     .collect();
                 if !timestamped.is_empty() {
-                    let _ = self.send_to_peer(target_id, NetworkMessage::Addr(timestamped)).await;
+                    let _ = self
+                        .send_to_peer(target_id, NetworkMessage::Addr(timestamped))
+                        .await;
                 }
             }
         }
@@ -2845,7 +3776,9 @@ impl PeerManager {
     pub async fn send_initial_feefilter(&mut self, peer_id: PeerId) {
         // 100 sat/vbyte = 100,000 sat/kvB (sat per 1000 virtual bytes)
         let fee_rate: u64 = 100_000;
-        let _ = self.send_to_peer(peer_id, NetworkMessage::FeeFilter(fee_rate)).await;
+        let _ = self
+            .send_to_peer(peer_id, NetworkMessage::FeeFilter(fee_rate))
+            .await;
     }
 
     /// Record the current IBD state for the handshake-time initial feefilter.
@@ -2931,10 +3864,7 @@ impl PeerManager {
     /// - Evict stale peers, preferring inbound over outbound
     ///
     /// Returns lists of peers to disconnect.
-    pub async fn check_for_stale_peers(
-        &mut self,
-        blocks_in_flight: usize,
-    ) -> StalePeerCheckResult {
+    pub async fn check_for_stale_peers(&mut self, blocks_in_flight: usize) -> StalePeerCheckResult {
         let now = Instant::now();
 
         // Only check every EXTRA_PEER_CHECK_INTERVAL
@@ -3043,8 +3973,7 @@ impl PeerManager {
             .peers
             .values()
             .filter(|p| {
-                p.conn_type == ConnectionType::FullRelay
-                    && p.info.state == PeerState::Established
+                p.conn_type == ConnectionType::FullRelay && p.info.state == PeerState::Established
             })
             .count();
 
@@ -3101,9 +4030,8 @@ impl PeerManager {
                 })
                 .min_by_key(|(_, p)| {
                     // Prefer to evict peers with oldest last_block_time
-                    p.last_block_time.map_or(0, |t| {
-                        (Instant::now() - t).as_secs()
-                    })
+                    p.last_block_time
+                        .map_or(0, |t| (Instant::now() - t).as_secs())
                 })
                 .map(|(id, _)| *id);
 
@@ -3160,7 +4088,10 @@ impl PeerManager {
             tracing::info!(
                 "Saved {} anchor connections to {}",
                 anchors.len(),
-                self.config.data_dir.join(ANCHORS_DATABASE_FILENAME).display()
+                self.config
+                    .data_dir
+                    .join(ANCHORS_DATABASE_FILENAME)
+                    .display()
             );
         }
     }
@@ -3174,7 +4105,9 @@ impl PeerManager {
         let candidates: Vec<EvictionCandidate> = self
             .peers
             .iter()
-            .filter(|(_, p)| p.conn_type == ConnectionType::Inbound && p.info.state == PeerState::Established)
+            .filter(|(_, p)| {
+                p.conn_type == ConnectionType::Inbound && p.info.state == PeerState::Established
+            })
             .map(|(id, p)| {
                 builder.build(
                     *id,
@@ -3221,9 +4154,7 @@ impl PeerManager {
                 stats: std::sync::Arc::clone(&h.stats),
                 conn_type: h.conn_type,
                 min_ping_time: h.min_ping_time,
-                last_block_time: h
-                    .last_block_time
-                    .map(|t| now.saturating_duration_since(t)),
+                last_block_time: h.last_block_time.map(|t| now.saturating_duration_since(t)),
                 last_tx_time: h.last_tx_time.map(|t| now.saturating_duration_since(t)),
             })
             .collect()
@@ -3626,10 +4557,7 @@ pub async fn run_inbound_peer(
             let _ = event_tx
                 .send(PeerEvent::Disconnected(
                     peer_id,
-                    DisconnectReason::IoError(format!(
-                        "failed to read version header tail: {}",
-                        e
-                    )),
+                    DisconnectReason::IoError(format!("failed to read version header tail: {}", e)),
                 ))
                 .await;
             return;
@@ -3664,10 +4592,7 @@ pub async fn run_inbound_peer(
         let _ = event_tx
             .send(PeerEvent::Misbehaving(
                 peer_id,
-                MisbehaviorReason::ProtocolViolation(format!(
-                    "pre-handshake message: {}",
-                    command
-                )),
+                MisbehaviorReason::ProtocolViolation(format!("pre-handshake message: {}", command)),
             ))
             .await;
         let _ = event_tx
@@ -3742,9 +4667,7 @@ pub async fn run_inbound_peer(
             let _ = event_tx
                 .send(PeerEvent::Misbehaving(
                     peer_id,
-                    MisbehaviorReason::ProtocolViolation(
-                        "invalid version message".to_string(),
-                    ),
+                    MisbehaviorReason::ProtocolViolation("invalid version message".to_string()),
                 ))
                 .await;
             let _ = event_tx
@@ -3909,9 +4832,7 @@ pub async fn run_inbound_peer(
                     let _ = event_tx
                         .send(PeerEvent::Misbehaving(
                             peer_id,
-                            MisbehaviorReason::ProtocolViolation(
-                                "duplicate version".to_string(),
-                            ),
+                            MisbehaviorReason::ProtocolViolation("duplicate version".to_string()),
                         ))
                         .await;
                     let _ = event_tx
@@ -4469,7 +5390,10 @@ pub fn dump_anchors(data_dir: &std::path::Path, anchors: &[SocketAddr]) {
 
         let mut file = fs::File::create(&path)?;
         writeln!(file, "# Anchor connections for eclipse attack resistance")?;
-        writeln!(file, "# These block-relay-only peers will be reconnected on startup")?;
+        writeln!(
+            file,
+            "# These block-relay-only peers will be reconnected on startup"
+        )?;
         writeln!(file, "# This file is automatically deleted after reading")?;
 
         for addr in anchors.iter().take(MAX_BLOCK_RELAY_ONLY_ANCHORS) {
@@ -4520,9 +5444,11 @@ mod tests {
     #[test]
     fn w117_is_reachable_clearnet_always_true() {
         let cfg = PeerManagerConfig::default();
-        assert!(cfg.is_reachable(&crate::addr::NetworkAddr::Ipv4(
-            std::net::Ipv4Addr::new(8, 8, 8, 8)
-        )));
+        assert!(
+            cfg.is_reachable(&crate::addr::NetworkAddr::Ipv4(std::net::Ipv4Addr::new(
+                8, 8, 8, 8
+            )))
+        );
         assert!(cfg.is_reachable(&crate::addr::NetworkAddr::Ipv6(
             "2001:db8::1".parse().unwrap()
         )));
@@ -4652,7 +5578,6 @@ mod tests {
 
         assert_eq!(mgr.peers.len(), before, "no handle should be inserted");
     }
-
 
     #[test]
     fn test_address_manager_add_dns_addresses() {
@@ -5120,8 +6045,7 @@ mod tests {
         let mgr = PeerManager::new(config, params);
 
         let services = mgr.local_services();
-        let expected =
-            NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED | NODE_P2P_V2;
+        let expected = NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED | NODE_P2P_V2;
         assert_eq!(
             services, expected,
             "full-node local_services() must be exactly 0xC09 \
@@ -5185,7 +6109,8 @@ mod tests {
         let addr: SocketAddr = "192.168.1.1:8333".parse().unwrap();
 
         // Ban with zero duration (already expired)
-        mgr.banned.insert(addr, Instant::now() - Duration::from_secs(1));
+        mgr.banned
+            .insert(addr, Instant::now() - Duration::from_secs(1));
         assert_eq!(mgr.banned_count(), 1);
 
         mgr.expire_bans();
@@ -5277,13 +6202,17 @@ mod tests {
         assert_eq!(mgr.get_misbehavior_score(peer_id), 0);
 
         // Single-event (Core PR #25974): first Misbehaving call discourages immediately.
-        let banned = mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction).await;
+        let banned = mgr
+            .misbehaving(peer_id, MisbehaviorReason::InvalidTransaction)
+            .await;
         assert!(banned, "single-event: first call must return true");
         assert_eq!(mgr.get_misbehavior_score(peer_id), 10);
 
         // Subsequent calls accumulate score for log context.
-        mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction).await;
-        mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction).await;
+        mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction)
+            .await;
+        mgr.misbehaving(peer_id, MisbehaviorReason::InvalidTransaction)
+            .await;
         assert_eq!(mgr.get_misbehavior_score(peer_id), 30);
     }
 
@@ -5299,7 +6228,9 @@ mod tests {
         let peer_id = PeerId(1);
 
         // Invalid block header = 100 points = instant ban
-        let banned = mgr.misbehaving(peer_id, MisbehaviorReason::InvalidBlockHeader).await;
+        let banned = mgr
+            .misbehaving(peer_id, MisbehaviorReason::InvalidBlockHeader)
+            .await;
         assert!(banned);
         assert_eq!(mgr.get_misbehavior_score(peer_id), 100);
     }
@@ -5355,12 +6286,19 @@ mod tests {
         let peer_id = PeerId(1);
 
         // Single-event (Core PR #25974): first call discourages immediately.
-        let banned = mgr.misbehaving_with_score(peer_id, 50, "custom violation").await;
-        assert!(banned, "single-event: first misbehaving_with_score must return true");
+        let banned = mgr
+            .misbehaving_with_score(peer_id, 50, "custom violation")
+            .await;
+        assert!(
+            banned,
+            "single-event: first misbehaving_with_score must return true"
+        );
         assert_eq!(mgr.get_misbehavior_score(peer_id), 50);
 
         // Subsequent calls accumulate score for log context.
-        let banned = mgr.misbehaving_with_score(peer_id, 50, "another violation").await;
+        let banned = mgr
+            .misbehaving_with_score(peer_id, 50, "another violation")
+            .await;
         assert!(banned);
         assert_eq!(mgr.get_misbehavior_score(peer_id), 100);
     }
@@ -5385,8 +6323,11 @@ mod tests {
             MisbehaviorReason::UnsolicitedMessage,
         ))
         .await;
-        assert_eq!(mgr.get_misbehavior_score(peer_id), 20,
-            "score accumulated to 20 (for logging)");
+        assert_eq!(
+            mgr.get_misbehavior_score(peer_id),
+            20,
+            "score accumulated to 20 (for logging)"
+        );
 
         // Subsequent calls keep accumulating score for log context.
         for _ in 0..4 {
@@ -5648,10 +6589,7 @@ mod tests {
         mgr.update_tip_height(100);
 
         let peer_id = PeerId(42);
-        let mut rx = mgr.insert_test_outbound_peer_old(
-            peer_id,
-            "192.0.2.42:8333".parse().unwrap(),
-        );
+        let mut rx = mgr.insert_test_outbound_peer_old(peer_id, "192.0.2.42:8333".parse().unwrap());
 
         // Pre-arm the stalled-peer state: peer is behind, timeout has
         // fired, getheaders was already sent (so the next tick should
@@ -5661,8 +6599,7 @@ mod tests {
             state.chain_sync.set_timeout(100, Duration::from_millis(1));
             state.chain_sync.sent_getheaders = true;
             // Backdate the timeout so is_timed_out() returns true now.
-            state.chain_sync.timeout =
-                Some(Instant::now() - Duration::from_secs(1));
+            state.chain_sync.timeout = Some(Instant::now() - Duration::from_secs(1));
         }
 
         // Skip the EXTRA_PEER_CHECK_INTERVAL gate so we run synchronously.
@@ -5756,7 +6693,8 @@ mod tests {
         assert!(!state.is_headers_timed_out());
 
         // Simulate timeout
-        state.last_getheaders_time = Some(Instant::now() - HEADERS_RESPONSE_TIME - Duration::from_secs(1));
+        state.last_getheaders_time =
+            Some(Instant::now() - HEADERS_RESPONSE_TIME - Duration::from_secs(1));
         assert!(state.is_headers_timed_out());
     }
 
@@ -5796,7 +6734,10 @@ mod tests {
             assert!(states[i].chain_sync.protected);
         }
 
-        assert_eq!(detector.protected_count(), MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT);
+        assert_eq!(
+            detector.protected_count(),
+            MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT
+        );
 
         // Can't protect more
         assert!(!detector.try_protect_peer(&mut states[4]));
@@ -5805,7 +6746,10 @@ mod tests {
         // Unprotect one
         detector.unprotect_peer(&mut states[0]);
         assert!(!states[0].chain_sync.protected);
-        assert_eq!(detector.protected_count(), MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT - 1);
+        assert_eq!(
+            detector.protected_count(),
+            MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT - 1
+        );
 
         // Now can protect the last one
         assert!(detector.try_protect_peer(&mut states[4]));
@@ -5969,18 +6913,10 @@ mod tests {
             true,  // supports_sendheaders
             false, // supports_witness
         );
-        let mut rx_b = mgr.insert_test_peer(
-            PeerId(2),
-            "192.0.2.2:8333".parse().unwrap(),
-            false,
-            true,
-        );
-        let mut rx_c = mgr.insert_test_peer(
-            PeerId(3),
-            "192.0.2.3:8333".parse().unwrap(),
-            false,
-            false,
-        );
+        let mut rx_b =
+            mgr.insert_test_peer(PeerId(2), "192.0.2.2:8333".parse().unwrap(), false, true);
+        let mut rx_c =
+            mgr.insert_test_peer(PeerId(3), "192.0.2.3:8333".parse().unwrap(), false, false);
 
         let header = BlockHeader {
             version: 1,
@@ -6093,7 +7029,10 @@ mod tests {
             }
         }
         // First and last anchors of the verbatim blockbrew/nimrod list.
-        assert_eq!(params.fixed_seeds.first().copied(), Some("2.121.116.198:8333"));
+        assert_eq!(
+            params.fixed_seeds.first().copied(),
+            Some("2.121.116.198:8333")
+        );
         assert_eq!(params.fixed_seeds.last().copied(), Some("77.38.72.37:8333"));
     }
 
@@ -6110,11 +7049,15 @@ mod tests {
     fn fixedseed_fires_on_empty_book_when_dns_disabled() {
         // enabled + empty book + DNS disabled → fires immediately (grace not
         // required). This is the DNS-failure hang fix.
-        let mut mgr = fixedseed_mainnet_mgr(/*no_fixed_seeds=*/ false, /*no_dns_seed=*/ true);
+        let mut mgr =
+            fixedseed_mainnet_mgr(/*no_fixed_seeds=*/ false, /*no_dns_seed=*/ true);
         assert_eq!(mgr.addr_manager.known_count(), 0, "book starts empty");
         let now = Instant::now(); // 0s elapsed — grace NOT elapsed
         let fired = mgr.maybe_add_fixed_seeds(now);
-        assert!(fired, "must fire on empty book with DNS disabled (no grace wait)");
+        assert!(
+            fired,
+            "must fire on empty book with DNS disabled (no grace wait)"
+        );
         assert_eq!(
             mgr.addr_manager.known_count(),
             40,
@@ -6141,7 +7084,11 @@ mod tests {
             mgr.maybe_add_fixed_seeds(stale_start),
             "must fire once 60s grace has elapsed on an empty book"
         );
-        assert_eq!(mgr.addr_manager.known_count(), 40, "seeds injected after grace");
+        assert_eq!(
+            mgr.addr_manager.known_count(),
+            40,
+            "seeds injected after grace"
+        );
     }
 
     #[test]
@@ -6167,11 +7114,16 @@ mod tests {
     #[test]
     fn fixedseed_does_not_fire_when_disabled() {
         // -nofixedseeds disables the fallback even on an empty book + DNS off.
-        let mut mgr = fixedseed_mainnet_mgr(/*no_fixed_seeds=*/ true, /*no_dns_seed=*/ true);
+        let mut mgr =
+            fixedseed_mainnet_mgr(/*no_fixed_seeds=*/ true, /*no_dns_seed=*/ true);
         let stale_start = Instant::now() - Duration::from_secs(120);
         let fired = mgr.maybe_add_fixed_seeds(stale_start);
         assert!(!fired, "must NOT fire when -nofixedseeds is set");
-        assert_eq!(mgr.addr_manager.known_count(), 0, "no seeds added when disabled");
+        assert_eq!(
+            mgr.addr_manager.known_count(),
+            0,
+            "no seeds added when disabled"
+        );
     }
 
     #[test]
@@ -6188,7 +7140,11 @@ mod tests {
             !mgr.maybe_add_fixed_seeds(stale_start),
             "must NOT fire in -connect mode (fixed_seeds_enabled() is false)"
         );
-        assert_eq!(mgr.addr_manager.known_count(), 0, "no seeds in -connect mode");
+        assert_eq!(
+            mgr.addr_manager.known_count(),
+            0,
+            "no seeds in -connect mode"
+        );
     }
 
     #[test]

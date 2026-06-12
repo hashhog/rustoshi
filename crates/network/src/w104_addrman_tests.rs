@@ -36,14 +36,14 @@
 //  G29 ADDRMAN_TEST_WINDOW (smaller on testnet/regtest)
 //  G30 m_addrman_key persistence across restarts
 
+use crate::{
+    addr::{deserialize_addrv2_message, serialize_addrv2_message, AddrV2Entry, NetworkAddr},
+    message::{TimestampedNetAddress, MAX_ADDR},
+    netgroup::{ip_is_routable, NetGroupManager, NetworkType},
+    peer_manager::{socket_addr_to_net_address, AddressManager},
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
-use crate::{
-    addr::{AddrV2Entry, NetworkAddr, deserialize_addrv2_message, serialize_addrv2_message},
-    message::{MAX_ADDR, TimestampedNetAddress},
-    netgroup::{ip_is_routable, NetGroupManager, NetworkType},
-    peer_manager::{AddressManager, socket_addr_to_net_address},
-};
 
 // ─── G1: addrv2 message parsing (BIP-155) ───────────────────────────────────
 
@@ -103,7 +103,11 @@ fn g1_addrv2_unknown_network_skipped_gracefully() {
     // Unknown network IDs are silently skipped; result should be empty (not Err).
     let result = deserialize_addrv2_message(&data);
     assert!(result.is_ok(), "must not error on unknown network ID");
-    assert_eq!(result.unwrap().len(), 0, "unknown network entry should be dropped");
+    assert_eq!(
+        result.unwrap().len(),
+        0,
+        "unknown network entry should be dropped"
+    );
 }
 
 // ─── G2: ADDR_RELAY_MAX cap = 1000 ──────────────────────────────────────────
@@ -112,7 +116,10 @@ fn g1_addrv2_unknown_network_skipped_gracefully() {
 /// `MAX_ADDR_TO_SEND = 1000`.
 #[test]
 fn g2_addr_relay_max_is_1000() {
-    assert_eq!(MAX_ADDR, 1000, "MAX_ADDR must be 1000 (Bitcoin Core MAX_ADDR_TO_SEND)");
+    assert_eq!(
+        MAX_ADDR, 1000,
+        "MAX_ADDR must be 1000 (Bitcoin Core MAX_ADDR_TO_SEND)"
+    );
 }
 
 /// G2 PASS — ADDR message with >1000 entries triggers misbehaving path.
@@ -208,7 +215,10 @@ fn g5_getaddr_response_capped_at_max_addr() {
     let mgr = AddressManager::new();
     // AddressManager::get_addresses_for_sharing(MAX_ADDR) returns at most MAX_ADDR items.
     let addrs = mgr.get_addresses_for_sharing(MAX_ADDR);
-    assert!(addrs.len() <= MAX_ADDR, "get_addresses_for_sharing must respect MAX_ADDR cap");
+    assert!(
+        addrs.len() <= MAX_ADDR,
+        "get_addresses_for_sharing must respect MAX_ADDR cap"
+    );
 }
 
 // ─── G6-G14: Bucketing math constants ───────────────────────────────────────
@@ -331,7 +341,7 @@ fn g15_tor_grouping_uses_4bit_prefix() {
     let tor_a: IpAddr = "fd87:d87e:eb43:0000::1".parse().unwrap();
     let tor_b: IpAddr = "fd87:d87e:eb43:0001::1".parse().unwrap(); // same nibble in octet[6]
     let tor_c: IpAddr = "fd87:d87e:eb43:1000::1".parse().unwrap(); // different nibble
-    // Both tor_a and tor_b should be Tor network
+                                                                   // Both tor_a and tor_b should be Tor network
     assert_eq!(mgr.classify_network(&tor_a), NetworkType::Tor);
     assert_eq!(mgr.classify_network(&tor_c), NetworkType::Tor);
     // Grouping: tor_a and tor_b may or may not share depending on exact nibble
@@ -444,12 +454,18 @@ fn g19_netgroup_keyed_uses_sha256d() {
 
     // Sanity: different keys produce different outputs (non-trivial hash).
     let result2 = group.keyed(key ^ 1);
-    assert_ne!(result, result2, "different keys must produce different hashes");
+    assert_ne!(
+        result, result2,
+        "different keys must produce different hashes"
+    );
 
     // Sanity: different group bytes produce different outputs.
     let group2 = NetGroup::new(vec![0u8, 1, 1]);
     let result3 = group2.keyed(key);
-    assert_ne!(result, result3, "different groups must produce different hashes");
+    assert_ne!(
+        result, result3,
+        "different groups must produce different hashes"
+    );
 }
 
 /// G19 supplemental — verify that keyed() is at least deterministic (not a
@@ -472,24 +488,27 @@ fn g19_netgroup_keyed_is_deterministic() {
 #[test]
 fn g20_privacy_network_type_aware_grouping() {
     let mgr = NetGroupManager::with_key(0);
-    let tor:   IpAddr = "fd87:d87e:eb43::1".parse().unwrap();
-    let i2p:   IpAddr = "fd87:d87e:eb44::1".parse().unwrap();
+    let tor: IpAddr = "fd87:d87e:eb43::1".parse().unwrap();
+    let i2p: IpAddr = "fd87:d87e:eb44::1".parse().unwrap();
     let cjdns: IpAddr = "fc00::1".parse().unwrap();
-    let ipv4:  IpAddr = "8.8.8.8".parse().unwrap();
+    let ipv4: IpAddr = "8.8.8.8".parse().unwrap();
 
-    assert_eq!(mgr.classify_network(&tor),   NetworkType::Tor);
-    assert_eq!(mgr.classify_network(&i2p),   NetworkType::I2P);
+    assert_eq!(mgr.classify_network(&tor), NetworkType::Tor);
+    assert_eq!(mgr.classify_network(&i2p), NetworkType::I2P);
     assert_eq!(mgr.classify_network(&cjdns), NetworkType::Cjdns);
 
     // Privacy networks get their own groups, distinct from each other and IPv4
-    let g_tor   = mgr.get_group(&tor);
-    let g_i2p   = mgr.get_group(&i2p);
+    let g_tor = mgr.get_group(&tor);
+    let g_i2p = mgr.get_group(&i2p);
     let g_cjdns = mgr.get_group(&cjdns);
-    let g_ipv4  = mgr.get_group(&ipv4);
+    let g_ipv4 = mgr.get_group(&ipv4);
 
-    assert_ne!(g_tor, g_i2p,   "Tor and I2P must be in different groups");
-    assert_ne!(g_tor, g_ipv4,  "Tor and IPv4 must be in different groups");
-    assert_ne!(g_cjdns, g_ipv4,"CJDNS and IPv4 must be in different groups");
+    assert_ne!(g_tor, g_i2p, "Tor and I2P must be in different groups");
+    assert_ne!(g_tor, g_ipv4, "Tor and IPv4 must be in different groups");
+    assert_ne!(
+        g_cjdns, g_ipv4,
+        "CJDNS and IPv4 must be in different groups"
+    );
 }
 
 /// G20 PASS — Privacy networks are excluded from outbound netgroup diversity
@@ -559,7 +578,11 @@ fn g22_netgroup_manager_has_random_key() {
     let mgr2 = NetGroupManager::new();
     // With overwhelming probability two fresh managers have different keys.
     // (2^-64 chance of collision — acceptable for a test)
-    assert_ne!(mgr1.key(), mgr2.key(), "each manager must have a unique random key");
+    assert_ne!(
+        mgr1.key(),
+        mgr2.key(),
+        "each manager must have a unique random key"
+    );
 }
 
 // ─── G23: Serialize/Deserialize via VARINT ───────────────────────────────────
@@ -670,7 +693,11 @@ fn g26_address_manager_unbounded_add() {
         mgr.add_peer_addresses(&[taddr], source);
     }
     // All 10 000 were accepted — documents the unbounded behaviour (G26 BUG).
-    assert_eq!(mgr.known_count(), 10_000, "address table is unbounded (G26 BUG)");
+    assert_eq!(
+        mgr.known_count(),
+        10_000,
+        "address table is unbounded (G26 BUG)"
+    );
 }
 
 // ─── G27: Source connectivity verification before tried-promote ──────────────
@@ -719,10 +746,18 @@ fn g28_mark_outbound_success_updates_metadata() {
     let addr: SocketAddr = "8.8.8.8:8333".parse().unwrap();
     mgr.add_manual_address(addr);
     // Before success, no entries shared
-    assert_eq!(mgr.get_addresses_for_sharing(100).len(), 0, "no shareable addrs before success");
+    assert_eq!(
+        mgr.get_addresses_for_sharing(100).len(),
+        0,
+        "no shareable addrs before success"
+    );
     mgr.mark_outbound_success(&addr, &netgroup_mgr);
     // After success, the address becomes shareable
-    assert_eq!(mgr.get_addresses_for_sharing(100).len(), 1, "addr should be shareable after outbound success");
+    assert_eq!(
+        mgr.get_addresses_for_sharing(100).len(),
+        1,
+        "addr should be shareable after outbound success"
+    );
 }
 
 // ─── G29: ADDRMAN_TEST_WINDOW ────────────────────────────────────────────────
@@ -839,7 +874,10 @@ fn integration_addrv2_mixed_network_types() {
     let wire = serialize_addrv2_message(&entries);
     let decoded = deserialize_addrv2_message(&wire).unwrap();
     assert_eq!(decoded.len(), 3);
-    assert_eq!(decoded[0].addr, NetworkAddr::Ipv4(Ipv4Addr::new(8, 8, 8, 8)));
+    assert_eq!(
+        decoded[0].addr,
+        NetworkAddr::Ipv4(Ipv4Addr::new(8, 8, 8, 8))
+    );
     assert_eq!(decoded[1].addr, NetworkAddr::TorV3([0x11; 32]));
     assert_eq!(decoded[2].addr, NetworkAddr::I2P([0xAB; 32]));
 }
@@ -855,7 +893,10 @@ fn integration_ban_prevents_connection() {
     assert!(mgr.is_banned(&addr));
     // next_addr_to_try should skip banned addresses
     let result = mgr.next_addr_to_try(&ng);
-    assert!(result.is_none(), "banned address must not be returned from next_addr_to_try");
+    assert!(
+        result.is_none(),
+        "banned address must not be returned from next_addr_to_try"
+    );
 }
 
 // ─── IsRoutable filter on AddrMan add (W104 fix) ─────────────────────────────
@@ -869,54 +910,126 @@ fn integration_ban_prevents_connection() {
 #[test]
 fn w104_rfc1918_not_routable() {
     // 10.0.0.0/8
-    assert!(!ip_is_routable(&"10.0.0.1".parse::<IpAddr>().unwrap()),       "10/8 must be non-routable (RFC 1918)");
-    assert!(!ip_is_routable(&"10.255.255.255".parse::<IpAddr>().unwrap()),  "10/8 boundary must be non-routable");
+    assert!(
+        !ip_is_routable(&"10.0.0.1".parse::<IpAddr>().unwrap()),
+        "10/8 must be non-routable (RFC 1918)"
+    );
+    assert!(
+        !ip_is_routable(&"10.255.255.255".parse::<IpAddr>().unwrap()),
+        "10/8 boundary must be non-routable"
+    );
     // 172.16.0.0/12
-    assert!(!ip_is_routable(&"172.16.0.1".parse::<IpAddr>().unwrap()),     "172.16/12 must be non-routable (RFC 1918)");
-    assert!(!ip_is_routable(&"172.31.255.255".parse::<IpAddr>().unwrap()), "172.31/12 boundary must be non-routable");
+    assert!(
+        !ip_is_routable(&"172.16.0.1".parse::<IpAddr>().unwrap()),
+        "172.16/12 must be non-routable (RFC 1918)"
+    );
+    assert!(
+        !ip_is_routable(&"172.31.255.255".parse::<IpAddr>().unwrap()),
+        "172.31/12 boundary must be non-routable"
+    );
     // 192.168.0.0/16
-    assert!(!ip_is_routable(&"192.168.0.1".parse::<IpAddr>().unwrap()),    "192.168/16 must be non-routable (RFC 1918)");
-    assert!(!ip_is_routable(&"192.168.255.255".parse::<IpAddr>().unwrap()),"192.168/16 boundary must be non-routable");
+    assert!(
+        !ip_is_routable(&"192.168.0.1".parse::<IpAddr>().unwrap()),
+        "192.168/16 must be non-routable (RFC 1918)"
+    );
+    assert!(
+        !ip_is_routable(&"192.168.255.255".parse::<IpAddr>().unwrap()),
+        "192.168/16 boundary must be non-routable"
+    );
 }
 
 /// ip_is_routable() returns false for loopback, link-local, unspecified, and broadcast.
 #[test]
 fn w104_loopback_linklocal_unspecified_not_routable() {
-    assert!(!ip_is_routable(&"127.0.0.1".parse::<IpAddr>().unwrap()),        "loopback must be non-routable");
-    assert!(!ip_is_routable(&"127.255.255.255".parse::<IpAddr>().unwrap()),  "127/8 boundary must be non-routable");
-    assert!(!ip_is_routable(&"::1".parse::<IpAddr>().unwrap()),              "IPv6 loopback must be non-routable");
-    assert!(!ip_is_routable(&"169.254.1.1".parse::<IpAddr>().unwrap()),      "link-local (RFC 3927) must be non-routable");
-    assert!(!ip_is_routable(&"0.0.0.0".parse::<IpAddr>().unwrap()),          "unspecified must be non-routable");
-    assert!(!ip_is_routable(&"255.255.255.255".parse::<IpAddr>().unwrap()),  "broadcast must be non-routable");
+    assert!(
+        !ip_is_routable(&"127.0.0.1".parse::<IpAddr>().unwrap()),
+        "loopback must be non-routable"
+    );
+    assert!(
+        !ip_is_routable(&"127.255.255.255".parse::<IpAddr>().unwrap()),
+        "127/8 boundary must be non-routable"
+    );
+    assert!(
+        !ip_is_routable(&"::1".parse::<IpAddr>().unwrap()),
+        "IPv6 loopback must be non-routable"
+    );
+    assert!(
+        !ip_is_routable(&"169.254.1.1".parse::<IpAddr>().unwrap()),
+        "link-local (RFC 3927) must be non-routable"
+    );
+    assert!(
+        !ip_is_routable(&"0.0.0.0".parse::<IpAddr>().unwrap()),
+        "unspecified must be non-routable"
+    );
+    assert!(
+        !ip_is_routable(&"255.255.255.255".parse::<IpAddr>().unwrap()),
+        "broadcast must be non-routable"
+    );
 }
 
 /// ip_is_routable() returns false for multicast and reserved ranges.
 #[test]
 fn w104_multicast_reserved_not_routable() {
-    assert!(!ip_is_routable(&"224.0.0.1".parse::<IpAddr>().unwrap()),   "multicast (224/4) must be non-routable");
-    assert!(!ip_is_routable(&"239.255.255.255".parse::<IpAddr>().unwrap()), "multicast boundary must be non-routable");
-    assert!(!ip_is_routable(&"240.0.0.1".parse::<IpAddr>().unwrap()),   "reserved (240/4) must be non-routable");
-    assert!(!ip_is_routable(&"100.64.0.1".parse::<IpAddr>().unwrap()),  "RFC 6598 CG-NAT must be non-routable");
+    assert!(
+        !ip_is_routable(&"224.0.0.1".parse::<IpAddr>().unwrap()),
+        "multicast (224/4) must be non-routable"
+    );
+    assert!(
+        !ip_is_routable(&"239.255.255.255".parse::<IpAddr>().unwrap()),
+        "multicast boundary must be non-routable"
+    );
+    assert!(
+        !ip_is_routable(&"240.0.0.1".parse::<IpAddr>().unwrap()),
+        "reserved (240/4) must be non-routable"
+    );
+    assert!(
+        !ip_is_routable(&"100.64.0.1".parse::<IpAddr>().unwrap()),
+        "RFC 6598 CG-NAT must be non-routable"
+    );
 }
 
 /// ip_is_routable() returns false for IPv6 unique-local (RFC 4193, fd00::/8).
 #[test]
 fn w104_ipv6_unique_local_not_routable() {
-    assert!(!ip_is_routable(&"fd00::1".parse::<IpAddr>().unwrap()),        "fd00::/8 unique-local must be non-routable (RFC 4193)");
-    assert!(!ip_is_routable(&"fdff:ffff::1".parse::<IpAddr>().unwrap()),   "fd00::/8 boundary must be non-routable");
+    assert!(
+        !ip_is_routable(&"fd00::1".parse::<IpAddr>().unwrap()),
+        "fd00::/8 unique-local must be non-routable (RFC 4193)"
+    );
+    assert!(
+        !ip_is_routable(&"fdff:ffff::1".parse::<IpAddr>().unwrap()),
+        "fd00::/8 boundary must be non-routable"
+    );
     // IPv6 link-local fe80::/10
-    assert!(!ip_is_routable(&"fe80::1".parse::<IpAddr>().unwrap()),        "fe80::/10 link-local must be non-routable (RFC 4862)");
+    assert!(
+        !ip_is_routable(&"fe80::1".parse::<IpAddr>().unwrap()),
+        "fe80::/10 link-local must be non-routable (RFC 4862)"
+    );
     // Documentation 2001:db8::/32 (RFC 3849)
-    assert!(!ip_is_routable(&"2001:db8::1".parse::<IpAddr>().unwrap()),    "2001:db8::/32 documentation must be non-routable (RFC 3849)");
+    assert!(
+        !ip_is_routable(&"2001:db8::1".parse::<IpAddr>().unwrap()),
+        "2001:db8::/32 documentation must be non-routable (RFC 3849)"
+    );
 }
 
 /// ip_is_routable() returns true for publicly routable addresses.
 #[test]
 fn w104_routable_addresses_pass() {
-    assert!(ip_is_routable(&"8.8.8.8".parse::<IpAddr>().unwrap()),             "8.8.8.8 must be routable");
-    assert!(ip_is_routable(&"1.1.1.1".parse::<IpAddr>().unwrap()),             "1.1.1.1 must be routable");
-    assert!(ip_is_routable(&"2001:4860:4860::8888".parse::<IpAddr>().unwrap()),"Google IPv6 DNS must be routable");
-    assert!(ip_is_routable(&"2600:1f18::1".parse::<IpAddr>().unwrap()),        "AWS IPv6 must be routable");
+    assert!(
+        ip_is_routable(&"8.8.8.8".parse::<IpAddr>().unwrap()),
+        "8.8.8.8 must be routable"
+    );
+    assert!(
+        ip_is_routable(&"1.1.1.1".parse::<IpAddr>().unwrap()),
+        "1.1.1.1 must be routable"
+    );
+    assert!(
+        ip_is_routable(&"2001:4860:4860::8888".parse::<IpAddr>().unwrap()),
+        "Google IPv6 DNS must be routable"
+    );
+    assert!(
+        ip_is_routable(&"2600:1f18::1".parse::<IpAddr>().unwrap()),
+        "AWS IPv6 must be routable"
+    );
 }
 
 /// Privacy-network addresses (Tor, I2P, CJDNS) are passed by ip_is_routable().
@@ -924,15 +1037,24 @@ fn w104_routable_addresses_pass() {
 fn w104_privacy_network_addresses_pass_routable_check() {
     // Tor v3 internal repr: fd87:d87e:eb43::/48
     let tor: IpAddr = "fd87:d87e:eb43::1".parse().unwrap();
-    assert!(ip_is_routable(&tor), "Tor internal repr must pass routable check (privacy network)");
+    assert!(
+        ip_is_routable(&tor),
+        "Tor internal repr must pass routable check (privacy network)"
+    );
 
     // I2P internal repr: fd87:d87e:eb44::/48
     let i2p: IpAddr = "fd87:d87e:eb44::1".parse().unwrap();
-    assert!(ip_is_routable(&i2p), "I2P internal repr must pass routable check (privacy network)");
+    assert!(
+        ip_is_routable(&i2p),
+        "I2P internal repr must pass routable check (privacy network)"
+    );
 
     // CJDNS fc00::/8
     let cjdns: IpAddr = "fc00::1".parse().unwrap();
-    assert!(ip_is_routable(&cjdns), "CJDNS fc00::/8 must pass routable check (privacy network)");
+    assert!(
+        ip_is_routable(&cjdns),
+        "CJDNS fc00::/8 must pass routable check (privacy network)"
+    );
 }
 
 /// add_peer_addresses() silently drops non-routable gossip addresses (W104 fix).
@@ -946,15 +1068,15 @@ fn w104_add_peer_addresses_drops_non_routable() {
     let source: SocketAddr = "8.8.8.8:8333".parse().unwrap();
 
     let non_routable_addrs = [
-        "10.0.0.1:8333",        // RFC 1918
-        "172.16.5.5:8333",      // RFC 1918
-        "192.168.1.1:8333",     // RFC 1918
-        "127.0.0.1:8333",       // loopback
-        "169.254.1.1:8333",     // link-local
-        "0.0.0.0:8333",         // unspecified
-        "224.0.0.1:8333",       // multicast
-        "240.0.0.1:8333",       // reserved
-        "100.64.0.1:8333",      // RFC 6598 CG-NAT
+        "10.0.0.1:8333",    // RFC 1918
+        "172.16.5.5:8333",  // RFC 1918
+        "192.168.1.1:8333", // RFC 1918
+        "127.0.0.1:8333",   // loopback
+        "169.254.1.1:8333", // link-local
+        "0.0.0.0:8333",     // unspecified
+        "224.0.0.1:8333",   // multicast
+        "240.0.0.1:8333",   // reserved
+        "100.64.0.1:8333",  // RFC 6598 CG-NAT
     ];
 
     for s in &non_routable_addrs {
@@ -979,11 +1101,7 @@ fn w104_add_peer_addresses_accepts_routable() {
     let mut mgr = AddressManager::new();
     let source: SocketAddr = "8.8.8.8:8333".parse().unwrap();
 
-    let routable_addrs = [
-        "1.2.3.4:8333",
-        "5.6.7.8:8333",
-        "9.10.11.12:8333",
-    ];
+    let routable_addrs = ["1.2.3.4:8333", "5.6.7.8:8333", "9.10.11.12:8333"];
 
     for s in &routable_addrs {
         let addr: SocketAddr = s.parse().unwrap();
@@ -1011,19 +1129,19 @@ fn w104_add_addrv2_drops_non_routable_ipv4() {
         AddrV2Entry {
             timestamp: 0,
             services: 1,
-            addr: NetworkAddr::Ipv4(Ipv4Addr::new(192, 168, 1, 1)),  // RFC 1918
+            addr: NetworkAddr::Ipv4(Ipv4Addr::new(192, 168, 1, 1)), // RFC 1918
             port: 8333,
         },
         AddrV2Entry {
             timestamp: 0,
             services: 1,
-            addr: NetworkAddr::Ipv4(Ipv4Addr::new(10, 0, 0, 1)),    // RFC 1918
+            addr: NetworkAddr::Ipv4(Ipv4Addr::new(10, 0, 0, 1)), // RFC 1918
             port: 8333,
         },
         AddrV2Entry {
             timestamp: 0,
             services: 1,
-            addr: NetworkAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),   // loopback
+            addr: NetworkAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)), // loopback
             port: 8333,
         },
     ];
@@ -1061,6 +1179,552 @@ fn w104_add_addrv2_accepts_routable_and_privacy() {
     mgr.add_addrv2_addresses(&entries, source);
 
     // IPv4 entry adds to known_addrs; Tor adds to known_addrv2 only
-    assert_eq!(mgr.known_count(), 1,        "routable IPv4 ADDRv2 entry must be added");
-    assert_eq!(mgr.known_addrv2_count(), 2, "both IPv4 and Tor entries must be in addrv2 store");
+    assert_eq!(
+        mgr.known_count(),
+        1,
+        "routable IPv4 ADDRv2 entry must be added"
+    );
+    assert_eq!(
+        mgr.known_addrv2_count(),
+        2,
+        "both IPv4 and Tor entries must be in addrv2 store"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// AXIS-2 FLAT-MAP -> CORE-BUCKETED ADDRMAN  (pilot: rustoshi)
+//
+// These close G6-G10 (bucket constants), G18/G19 (source-group bucketing +
+// keyed bucket hash), and G22/G30 (nKey + persistence) by exercising the real
+// vvNew[1024][64] / vvTried[256][64] tables now wired under AddressManager.
+//
+// Proof obligations: (1) placement determinism + golden + anti-Sybil spread,
+// (2) Add/Good/Select + collision eviction, (3) restart-persistence verbatim,
+// (4) boundedness, plus the falsification (distinct groups land in distinct
+// buckets -- real bucketing, not a relabelled flat map).
+// ════════════════════════════════════════════════════════════════════════════
+
+use crate::peer_manager::{
+    AddrManTable, ADDRMAN_BUCKET_SIZE, ADDRMAN_CEILING, ADDRMAN_NEW_BUCKETS_PER_ADDRESS,
+    ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP, ADDRMAN_NEW_BUCKET_COUNT,
+    ADDRMAN_TRIED_BUCKETS_PER_GROUP, ADDRMAN_TRIED_BUCKET_COUNT,
+};
+
+const TEST_NKEY: [u8; 32] = [
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+    0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0,
+];
+
+fn sa(a: u8, b: u8, c: u8, d: u8) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), 8333)
+}
+
+// ─── G6-G10: bucket geometry constants now exist and equal Core ──────────────
+
+#[test]
+fn axis2_g6_to_g10_bucket_constants_match_core() {
+    assert_eq!(
+        ADDRMAN_NEW_BUCKET_COUNT, 1024,
+        "G7 ADDRMAN_NEW_BUCKET_COUNT"
+    );
+    assert_eq!(
+        ADDRMAN_TRIED_BUCKET_COUNT, 256,
+        "G9 ADDRMAN_TRIED_BUCKET_COUNT"
+    );
+    assert_eq!(ADDRMAN_BUCKET_SIZE, 64, "G10 ADDRMAN_BUCKET_SIZE");
+    assert_eq!(
+        ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP, 64,
+        "G6 per-source-group"
+    );
+    assert_eq!(ADDRMAN_TRIED_BUCKETS_PER_GROUP, 8, "G8 per-tried-group");
+    assert_eq!(
+        ADDRMAN_CEILING,
+        1024 * 64 + 256 * 64,
+        "bounded ceiling 81920"
+    );
+    assert_eq!(ADDRMAN_CEILING, 81920);
+}
+
+// ─── 1. PLACEMENT DETERMINISM + GOLDEN + ANTI-SYBIL SPREAD ────────────────────
+
+/// Same addr + same nKey => identical new (bucket,pos) across recompute.
+#[test]
+fn axis2_new_placement_is_deterministic() {
+    let ng = NetGroupManager::new();
+    let addr = sa(8, 8, 8, 8);
+    let src = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+
+    let mut t1 = AddrManTable::with_nkey(TEST_NKEY);
+    let mut t2 = AddrManTable::with_nkey(TEST_NKEY);
+    assert!(t1.add(addr, src, 1, 1_700_000_000, &ng));
+    assert!(t2.add(addr, src, 1, 1_700_000_000, &ng));
+
+    let s1 = t1.new_slot_of(&addr, &ng).expect("in new");
+    let s2 = t2.new_slot_of(&addr, &ng).expect("in new");
+    assert_eq!(
+        s1, s2,
+        "same addr+nKey => same new bucket/pos (recompute==stored)"
+    );
+}
+
+/// GOLDEN: a fixed nKey + a known addr gives a STABLE bucket/pos. Pins THIS
+/// impl's chosen cheap-hash (single SHA-256 low 8 bytes LE) so a future change
+/// to the hashing is caught. (Not Core-byte-identical -- peers.dat is local.)
+#[test]
+fn axis2_golden_stable_bucket() {
+    let ng = NetGroupManager::new();
+    // Both globally-routable (avoids RFC1918 / TEST-NET / CGNAT which Core +
+    // is_routable reject).
+    let addr = sa(8, 8, 8, 8);
+    let src = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+    assert!(t.add(addr, src, 1, 1_700_000_000, &ng));
+    let (b, p) = t.new_slot_of(&addr, &ng).expect("in new");
+
+    // Recompute on a SECOND table with the same nKey -- must be byte-stable.
+    let mut t2 = AddrManTable::with_nkey(TEST_NKEY);
+    assert!(t2.add(addr, src, 1, 1_700_000_000, &ng));
+    let (b2, p2) = t2.new_slot_of(&addr, &ng).expect("in new");
+    assert_eq!(
+        (b, p),
+        (b2, p2),
+        "golden: stable bucket/pos for fixed nKey+addr"
+    );
+    assert!(
+        b < ADDRMAN_NEW_BUCKET_COUNT && p < ADDRMAN_BUCKET_SIZE,
+        "in-range"
+    );
+}
+
+/// A DIFFERENT nKey moves the SAME addr to a (very likely) different slot --
+/// proves the salt actually keys placement (anti-fingerprinting).
+#[test]
+fn axis2_nkey_changes_placement() {
+    let ng = NetGroupManager::new();
+    let addr = sa(9, 9, 9, 9);
+    let src = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+
+    let mut a = AddrManTable::with_nkey([0x01; 32]);
+    let mut b = AddrManTable::with_nkey([0x02; 32]);
+    a.add(addr, src, 1, 1_700_000_000, &ng);
+    b.add(addr, src, 1, 1_700_000_000, &ng);
+    let sa_ = a.new_slot_of(&addr, &ng).unwrap();
+    let sb_ = b.new_slot_of(&addr, &ng).unwrap();
+    assert_ne!(
+        sa_, sb_,
+        "different nKey should remap the addr (salt keys placement)"
+    );
+}
+
+/// ANTI-SYBIL: one addr announced from MANY distinct source groups spreads
+/// across MANY distinct new buckets (Core: source diversity widens reach), and
+/// a SINGLE source group reaches at most NEW_BUCKETS_PER_SOURCE_GROUP buckets.
+#[test]
+fn axis2_source_groups_spread_buckets() {
+    let ng = NetGroupManager::new();
+    // A globally-routable addr (8.8.x.x).
+    let addr = sa(8, 8, 1, 1);
+
+    // Same addr, many distinct globally-routable /16 source groups -> collect
+    // the new buckets each (addr,src) pair maps to. Different sources must NOT
+    // all collapse to one bucket. Use the 11.x-50.x /8s (all routable).
+    let mut buckets = std::collections::HashSet::new();
+    for i in 0..40u8 {
+        let mut t = AddrManTable::with_nkey(TEST_NKEY);
+        let src = IpAddr::V4(Ipv4Addr::new(11 + i, 200, 0, 1));
+        t.add(addr, src, 1, 1_700_000_000, &ng);
+        if let Some((b, _)) = t.new_slot_of(&addr, &ng) {
+            buckets.insert(b);
+        }
+    }
+    assert!(
+        buckets.len() > 5,
+        "distinct source groups must spread one addr across many new buckets (got {})",
+        buckets.len()
+    );
+}
+
+/// A single source group reaches at most NEW_BUCKETS_PER_SOURCE_GROUP (64)
+/// distinct buckets across many addrs -- the Core anti-Sybil ceiling.
+#[test]
+fn axis2_single_source_group_bucket_ceiling() {
+    let ng = NetGroupManager::new();
+    let src = IpAddr::V4(Ipv4Addr::new(172, 99, 0, 1)); // one /16 source group
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+
+    let mut buckets = std::collections::HashSet::new();
+    // Many distinct addrs in many distinct /16s, all from ONE source group.
+    for a in 1..60u8 {
+        for b in 1..40u8 {
+            let addr = sa(a, b, 7, 7);
+            t.add(addr, src, 1, 1_700_000_000, &ng);
+            // Recompute the would-be new bucket for this addr+src.
+            if let Some((bk, _)) = t.new_slot_of(&addr, &ng) {
+                buckets.insert(bk);
+            }
+        }
+    }
+    assert!(
+        buckets.len() as u64 <= ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP,
+        "one source group must reach <= {} new buckets (got {})",
+        ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP,
+        buckets.len()
+    );
+}
+
+// ─── FALSIFICATION: distinct addrs/groups land in DISTINCT buckets ───────────
+
+/// The PRE-impl was a single flat HashMap (no buckets). This proves the new
+/// store actually buckets: many distinct addrs from distinct groups occupy
+/// MANY distinct new buckets, not one list.
+#[test]
+fn axis2_falsification_real_bucketing_not_flat() {
+    let ng = NetGroupManager::new();
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+    let mut occupied = std::collections::HashSet::new();
+    for a in 1..50u8 {
+        let addr = sa(a, a.wrapping_mul(3).wrapping_add(1), 4, 2);
+        let src = IpAddr::V4(Ipv4Addr::new(a, 50, 0, 1));
+        t.add(addr, src, 1, 1_700_000_000, &ng);
+        if let Some((b, p)) = t.new_slot_of(&addr, &ng) {
+            occupied.insert((b, p));
+        }
+    }
+    assert!(
+        occupied.len() > 20,
+        "distinct addrs must occupy many distinct (bucket,pos) slots -- real bucketing (got {})",
+        occupied.len()
+    );
+}
+
+// ─── 2. ADD / GOOD / SELECT + COLLISION EVICTION ─────────────────────────────
+
+#[test]
+fn axis2_add_lands_in_new() {
+    let ng = NetGroupManager::new();
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+    let addr = sa(11, 22, 33, 44);
+    assert!(t.add(
+        addr,
+        IpAddr::V4(Ipv4Addr::new(5, 5, 5, 5)),
+        1,
+        1_700_000_000,
+        &ng
+    ));
+    assert_eq!(t.new_count(), 1, "Add places one addr in NEW");
+    assert_eq!(t.tried_count(), 0, "Add does not touch TRIED");
+    assert!(
+        t.new_slot_of(&addr, &ng).is_some(),
+        "addr occupies a NEW slot"
+    );
+    assert!(!t.is_in_tried(&addr));
+}
+
+#[test]
+fn axis2_good_promotes_to_tried() {
+    let ng = NetGroupManager::new();
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+    let addr = sa(11, 22, 33, 44);
+    t.add(
+        addr,
+        IpAddr::V4(Ipv4Addr::new(5, 5, 5, 5)),
+        1,
+        1_700_000_000,
+        &ng,
+    );
+    assert!(
+        t.good(&addr, 1_700_000_100, &ng),
+        "Good promotes NEW -> TRIED"
+    );
+    assert!(t.is_in_tried(&addr), "addr now in TRIED");
+    assert_eq!(t.tried_count(), 1);
+    assert_eq!(t.new_count(), 0, "promoted addr removed from NEW");
+    assert!(
+        t.tried_slot_of(&addr, &ng).is_some(),
+        "occupies a TRIED slot"
+    );
+    // Good on an unknown addr is a no-op.
+    assert!(!t.good(&sa(1, 2, 3, 4), 1_700_000_200, &ng));
+}
+
+/// Tried-collision: two addrs that map to the SAME tried slot -- promoting the
+/// second evicts the first back to NEW (Core MakeTried eviction).
+#[test]
+fn axis2_tried_collision_evicts_to_new() {
+    let ng = NetGroupManager::new();
+    // Search for two addrs colliding on the same (tried bucket,pos).
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+    let src = IpAddr::V4(Ipv4Addr::new(5, 5, 5, 5));
+    // First addr -> tried.
+    let a = sa(50, 60, 70, 80);
+    t.add(a, src, 1, 1_700_000_000, &ng);
+    t.good(&a, 1_700_000_100, &ng);
+    let slot_a = t.tried_slot_of(&a, &ng).expect("a in tried");
+
+    // Find a second addr that maps to the same tried slot.
+    let mut collider: Option<SocketAddr> = None;
+    'outer: for x in 1..255u8 {
+        for y in 1..255u8 {
+            let cand = sa(x, y, 200, 201);
+            if cand == a {
+                continue;
+            }
+            // Probe the tried slot the candidate WOULD occupy by promoting it
+            // in a throwaway table seeded identically.
+            let mut probe = AddrManTable::with_nkey(TEST_NKEY);
+            probe.add(cand, src, 1, 1_700_000_000, &ng);
+            probe.good(&cand, 1_700_000_100, &ng);
+            if probe.tried_slot_of(&cand, &ng) == Some(slot_a) {
+                collider = Some(cand);
+                break 'outer;
+            }
+        }
+    }
+    let c = collider.expect("found a tried-slot collider");
+
+    // Now promote the collider in the REAL table -> evicts `a` back to NEW.
+    t.add(c, src, 1, 1_700_000_000, &ng);
+    t.good(&c, 1_700_000_200, &ng);
+    assert!(t.is_in_tried(&c), "collider took the tried slot");
+    assert!(!t.is_in_tried(&a), "original evicted out of tried");
+    assert!(
+        t.new_slot_of(&a, &ng).is_some(),
+        "evicted addr lands back in NEW"
+    );
+}
+
+#[test]
+fn axis2_select_returns_added_addrs() {
+    let ng = NetGroupManager::new();
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+    let mut added = std::collections::HashSet::new();
+    for i in 1..30u8 {
+        let addr = sa(120, i, 3, 3);
+        t.add(
+            addr,
+            IpAddr::V4(Ipv4Addr::new(120, i, 0, 1)),
+            1,
+            1_700_000_000,
+            &ng,
+        );
+        added.insert(addr);
+    }
+    // Empty table returns None.
+    assert!(AddrManTable::with_nkey(TEST_NKEY).select(false).is_none());
+    // Select returns only previously-added addrs.
+    for _ in 0..200 {
+        if let Some(s) = t.select(false) {
+            assert!(added.contains(&s), "select must return an added addr");
+        }
+    }
+    // new_only never returns a tried-only addr.
+    let only = sa(200, 1, 1, 1);
+    let mut t2 = AddrManTable::with_nkey(TEST_NKEY);
+    t2.add(
+        only,
+        IpAddr::V4(Ipv4Addr::new(200, 1, 0, 1)),
+        1,
+        1_700_000_000,
+        &ng,
+    );
+    t2.good(&only, 1_700_000_100, &ng); // now tried-only
+    assert!(
+        t2.select(true).is_none(),
+        "new_only must not return a tried-only addr"
+    );
+    assert_eq!(
+        t2.select(false),
+        Some(only),
+        "select(false) finds the tried addr"
+    );
+}
+
+// ─── 3. RESTART PERSISTENCE (placement verbatim) ─────────────────────────────
+
+#[test]
+fn axis2_persistence_roundtrip_verbatim() {
+    let ng = NetGroupManager::new();
+    let dir = std::env::temp_dir().join(format!("rustoshi-addrman-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+    // A mix of NEW and TRIED addrs.
+    let new_addrs: Vec<SocketAddr> = (1..15u8).map(|i| sa(130, i, 9, 9)).collect();
+    for (i, a) in new_addrs.iter().enumerate() {
+        t.add(
+            *a,
+            IpAddr::V4(Ipv4Addr::new(130, (i as u8) + 1, 0, 1)),
+            1,
+            1_700_000_000,
+            &ng,
+        );
+    }
+    let tried_addrs: Vec<SocketAddr> = (1..6u8).map(|i| sa(140, i, 9, 9)).collect();
+    for a in &tried_addrs {
+        t.add(
+            *a,
+            IpAddr::V4(Ipv4Addr::new(140, 50, 0, 1)),
+            1,
+            1_700_000_000,
+            &ng,
+        );
+        t.good(a, 1_700_000_100, &ng);
+    }
+
+    // Capture pre-save placement.
+    let pre_nkey = t.nkey();
+    let mut pre_new = std::collections::HashMap::new();
+    for a in &new_addrs {
+        if let Some(s) = t.new_slot_of(a, &ng) {
+            pre_new.insert(*a, s);
+        }
+    }
+    let mut pre_tried = std::collections::HashMap::new();
+    for a in &tried_addrs {
+        if let Some(s) = t.tried_slot_of(a, &ng) {
+            pre_tried.insert(*a, s);
+        }
+    }
+
+    t.save(&dir);
+    let loaded = AddrManTable::load(&dir, &ng);
+
+    assert_eq!(loaded.nkey(), pre_nkey, "nKey survives save->load");
+    for (a, s) in &pre_new {
+        assert_eq!(
+            loaded.new_slot_of(a, &ng),
+            Some(*s),
+            "NEW placement verbatim for {}",
+            a
+        );
+    }
+    for (a, s) in &pre_tried {
+        assert!(loaded.is_in_tried(a), "{} still tried after reload", a);
+        assert_eq!(
+            loaded.tried_slot_of(a, &ng),
+            Some(*s),
+            "TRIED placement verbatim for {}",
+            a
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn axis2_persistence_corrupt_cold_starts() {
+    let ng = NetGroupManager::new();
+    let dir = std::env::temp_dir().join(format!("rustoshi-addrman-corrupt-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("peers.dat");
+
+    // Garbage / wrong-version / truncated must all yield an empty cold start.
+    for bad in [
+        "@@@not a header@@@",
+        "ADDRMAN 999 deadbeef\n",
+        "ADDRMAN",
+        "",
+    ] {
+        std::fs::write(&path, bad).unwrap();
+        let t = AddrManTable::load(&dir, &ng);
+        assert_eq!(
+            t.total_count(),
+            0,
+            "corrupt file ({:?}) must cold-start empty",
+            bad
+        );
+    }
+    // Missing file too.
+    let _ = std::fs::remove_file(&path);
+    let t = AddrManTable::load(&dir, &ng);
+    assert_eq!(t.total_count(), 0, "missing file cold-starts empty");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─── 4. BOUNDEDNESS ──────────────────────────────────────────────────────────
+
+/// Thousands of addrs from ONE source group must stay within the per-source
+/// bucket reach and never exceed the global ceiling.
+#[test]
+fn axis2_bounded_one_source_group() {
+    let ng = NetGroupManager::new();
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+    let src = IpAddr::V4(Ipv4Addr::new(203, 113, 0, 1)); // one routable /16 source group
+
+    let mut new_buckets = std::collections::HashSet::new();
+    for a in 1..200u8 {
+        for b in 1..200u8 {
+            let addr = sa(a, b, 1, 9);
+            t.add(addr, src, 1, 1_700_000_000, &ng);
+            if let Some((bk, _)) = t.new_slot_of(&addr, &ng) {
+                new_buckets.insert(bk);
+            }
+        }
+    }
+    assert!(
+        new_buckets.len() as u64 <= ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP,
+        "one source group must occupy <= {} new buckets (got {})",
+        ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP,
+        new_buckets.len()
+    );
+    assert!(
+        t.total_count() <= ADDRMAN_CEILING,
+        "never exceed the global slot ceiling"
+    );
+    // Capped storage: <= 64 buckets * 64 positions of new from this group.
+    assert!(
+        t.total_count() <= (ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP as usize) * ADDRMAN_BUCKET_SIZE,
+        "bounded by per-source bucket reach * bucket size"
+    );
+}
+
+/// Re-adding the same addr many times caps its ref_count at
+/// NEW_BUCKETS_PER_ADDRESS (8) and never grows the id set.
+#[test]
+fn axis2_bounded_refcount_cap() {
+    let ng = NetGroupManager::new();
+    let mut t = AddrManTable::with_nkey(TEST_NKEY);
+    let addr = sa(150, 150, 150, 150);
+    // Add from many distinct sources (raises refcount across distinct buckets).
+    for i in 0..200u8 {
+        let src = IpAddr::V4(Ipv4Addr::new(30 + (i % 200), 1, 0, 1));
+        t.add(addr, src, 1, 1_700_000_000, &ng);
+    }
+    assert_eq!(
+        t.total_count(),
+        1,
+        "only ONE id for one addr regardless of re-adds"
+    );
+    // The ceiling on simultaneous new refs is NEW_BUCKETS_PER_ADDRESS.
+    assert!(
+        t.new_count() as u32 <= ADDRMAN_NEW_BUCKETS_PER_ADDRESS,
+        "an addr occupies at most {} new slots (got {})",
+        ADDRMAN_NEW_BUCKETS_PER_ADDRESS,
+        t.new_count()
+    );
+}
+
+// ─── PUBLIC-API PRESERVATION: AddressManager still drives the table ──────────
+
+#[test]
+fn axis2_public_api_feeds_bucketed_addrman() {
+    let ng = NetGroupManager::new();
+    let mut mgr = AddressManager::new();
+    // add_manual_address is sourceless -> deferred bucket add until netgroup
+    // binds via next_addr_to_try.
+    mgr.add_manual_address(sa(170, 1, 2, 3));
+    mgr.add_manual_address(sa(170, 4, 5, 6));
+    let _ = mgr.next_addr_to_try(&ng); // binds netgroup + flushes pending adds
+    assert!(
+        mgr.addrman().total_count() >= 2,
+        "manual adds reach the bucketed addrman"
+    );
+    assert!(mgr.addrman().new_count() >= 1, "they land in NEW");
+    // mark_outbound_success promotes to TRIED via good().
+    let a = sa(170, 1, 2, 3);
+    mgr.mark_outbound_success(&a, &ng);
+    assert!(
+        mgr.addrman().is_in_tried(&a),
+        "success promotes the addr to TRIED"
+    );
 }
