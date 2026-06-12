@@ -95,8 +95,11 @@ pub mod rpc_error {
     pub const RPC_VERIFY_ALREADY_IN_CHAIN: i32 = -27;
     /// Transaction already in UTXO set (confirmed).
     pub const RPC_TRANSACTION_ALREADY_IN_CHAIN: i32 = -27;
-    /// P2P network disabled.
-    pub const RPC_CLIENT_P2P_DISABLED: i32 = -9;
+    /// P2P network disabled — no valid connection manager instance found
+    /// (`bitcoin-core/src/rpc/protocol.h::RPC_CLIENT_P2P_DISABLED = -31`).
+    /// Distinct from `RPC_CLIENT_NOT_CONNECTED = -9`; the previous -9 here
+    /// collided with that code.
+    pub const RPC_CLIENT_P2P_DISABLED: i32 = -31;
     /// Block not found.
     pub const RPC_BLOCK_NOT_FOUND: i32 = -5;
 }
