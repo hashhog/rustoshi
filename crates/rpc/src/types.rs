@@ -1500,9 +1500,10 @@ mod tests {
             usage: 100000,
             total_fee: BtcAmount::from_btc(0.001),
             maxmempool: 300000000,
-            mempoolminfee: BtcAmount::from_btc(0.00001),
-            minrelaytxfee: BtcAmount::from_btc(0.00001),
-            incrementalrelayfee: BtcAmount::from_btc(0.00001),
+            // 100 sat/kvB floor (Core DEFAULT_MIN_RELAY_TX_FEE) = 0.00000100 BTC.
+            mempoolminfee: BtcAmount::from_sats(100),
+            minrelaytxfee: BtcAmount::from_sats(100),
+            incrementalrelayfee: BtcAmount::from_sats(100),
             unbroadcastcount: 0,
             fullrbf: false,
             permitbaremultisig: true,
@@ -1514,9 +1515,9 @@ mod tests {
 
         let json = serde_json::to_string(&info).unwrap();
         // Verify 8-decimal precision is preserved.
-        assert!(json.contains("\"mempoolminfee\":0.00001000"), "mempoolminfee precision: {}", json);
-        assert!(json.contains("\"minrelaytxfee\":0.00001000"), "minrelaytxfee precision: {}", json);
-        assert!(json.contains("\"incrementalrelayfee\":0.00001000"), "incrementalrelayfee precision: {}", json);
+        assert!(json.contains("\"mempoolminfee\":0.00000100"), "mempoolminfee precision: {}", json);
+        assert!(json.contains("\"minrelaytxfee\":0.00000100"), "minrelaytxfee precision: {}", json);
+        assert!(json.contains("\"incrementalrelayfee\":0.00000100"), "incrementalrelayfee precision: {}", json);
         let parsed: MempoolInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.size, 100);
         assert_eq!(parsed.loaded, true);
@@ -1702,8 +1703,9 @@ mod tests {
             connections_out: 8,
             networkactive: true,
             networks: vec![],
-            relayfee: BtcAmount::from_btc(0.00001),
-            incrementalfee: BtcAmount::from_btc(0.00001),
+            // 100 sat/kvB floor (Core DEFAULT_MIN_RELAY_TX_FEE) = 0.00000100 BTC.
+            relayfee: BtcAmount::from_sats(100),
+            incrementalfee: BtcAmount::from_sats(100),
             localaddresses: vec![],
             warnings: Vec::new(),
         };
@@ -1711,8 +1713,8 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"connections\":10"));
         assert!(json.contains("\"networkactive\":true"));
-        assert!(json.contains("\"relayfee\":0.00001000"), "relayfee precision: {}", json);
-        assert!(json.contains("\"incrementalfee\":0.00001000"), "incrementalfee precision: {}", json);
+        assert!(json.contains("\"relayfee\":0.00000100"), "relayfee precision: {}", json);
+        assert!(json.contains("\"incrementalfee\":0.00000100"), "incrementalfee precision: {}", json);
     }
 
     // ============================================================
