@@ -58,6 +58,15 @@ pub const CF_BLOCKFILTER_HEADER: &str = "blockfilter_header";
 /// Value: serialized CoinStatsEntry (muhash, utxo_count, total_amount, etc.)
 pub const CF_COINSTATS: &str = "coinstats";
 
+/// Transaction-output spender index: spent outpoint -> spending txid.
+/// Key: outpoint txid (32 bytes) + vout (4 bytes, big-endian)
+/// Value: spending txid (32 bytes) + spending block hash (32 bytes)
+/// Mirrors Bitcoin Core's `TxoSpenderIndex` (`src/index/txospenderindex.cpp`),
+/// populated on block CONNECT and re-derived/erased on DISCONNECT. Used by the
+/// `gettxspendingprevout` RPC's confirmed-spend path. Default off
+/// (`-txospenderindex`, `DEFAULT_TXOSPENDERINDEX{false}`).
+pub const CF_TXOSPENDER: &str = "txospender";
+
 /// List of all column families for database initialization.
 pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     CF_HEADERS,
@@ -71,4 +80,5 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     CF_BLOCKFILTER,
     CF_BLOCKFILTER_HEADER,
     CF_COINSTATS,
+    CF_TXOSPENDER,
 ];

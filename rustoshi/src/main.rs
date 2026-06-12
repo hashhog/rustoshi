@@ -176,6 +176,19 @@ struct Cli {
     #[arg(long = "coinstatsindex")]
     coinstatsindex: bool,
 
+    /// Enable the transaction-output spender index (`-txospenderindex`).
+    ///
+    /// Maintains a `spent outpoint -> spending txid` mapping for every
+    /// non-coinbase input of every connected block, so the
+    /// `gettxspendingprevout` RPC can resolve CONFIRMED spends
+    /// (`mempool_only=false`). Reorg-safe: the keys are re-derived from a
+    /// disconnected block's own inputs and erased. Mirrors Bitcoin Core's
+    /// `-txospenderindex` (`src/index/txospenderindex.cpp`,
+    /// `DEFAULT_TXOSPENDERINDEX{false}`, default off). The RPC's mempool form
+    /// works regardless of this flag.
+    #[arg(long = "txospenderindex")]
+    txospenderindex: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     loglevel: String,
@@ -733,6 +746,41 @@ fn write_coinstats_index(
     }
 }
 
+/// Maintain the txospenderindex on the node's PRIMARY block-connect paths
+/// (blk-file import, framed import, IBD/P2P sync) — the SAME paths that
+/// maintain txindex and the coinstatsindex. Records (spent outpoint ->
+/// spending txid || block hash) for every non-coinbase input, so
+/// `gettxspendingprevout` can resolve confirmed spends after a full IBD.
+///
+/// Counterpart to Core's `TxoSpenderIndex::CustomAppend(BuildSpenderPositions)`
+/// fired from `BaseIndex::BlockConnected` (`src/index/txospenderindex.cpp`).
+/// Reorg disconnect/rewind of the index is handled on the RPC
+/// invalidate/reconsider path (`txospender_disconnect_block` in rustoshi-rpc),
+/// matching how the coinstatsindex rewind lives there. No-op unless
+/// `-txospenderindex` was enabled at startup.
+///
+/// Non-fatal on error: a spender-index write failure must not abort an
+/// already-committed block connect (matches the txindex / coinstats paths).
+fn write_txospender_index(
+    block_store: &BlockStore,
+    enabled: bool,
+    block: &rustoshi_primitives::Block,
+    height: u32,
+    block_hash: Hash256,
+) {
+    if !enabled {
+        return;
+    }
+    let index = rustoshi_storage::TxoSpenderIndex::new(block_store.db());
+    if let Err(e) = index.write_block(block, height, block_hash) {
+        tracing::warn!(
+            "txospenderindex: failed to write spends at height {}: {}",
+            height,
+            e
+        );
+    }
+}
+
 fn resolve_datadir(datadir: &str, params: &ChainParams) -> PathBuf {
     let mut path = resolve_base_datadir(datadir);
 
@@ -1136,6 +1184,7 @@ fn run_import_from_blk_files(
     utxo_view: &mut rustoshi_storage::BlockStoreUtxoView<'_>,
     start_height: u32,
     coinstatsindex_enabled: bool,
+    txospenderindex_enabled: bool,
 ) -> anyhow::Result<u32> {
     let magic = params.network_magic.0;
     tracing::info!("Scanning blk*.dat files in {} ...", blocks_dir.display());
@@ -1252,6 +1301,16 @@ fn run_import_from_blk_files(
             &undo,
         );
 
+        // Txospenderindex — record spends on the blk-file import path. See
+        // `write_txospender_index` (TxoSpenderIndex::CustomAppend).
+        write_txospender_index(
+            block_store,
+            txospenderindex_enabled,
+            &block,
+            height,
+            hash,
+        );
+
         // Flush UTXO cache if needed
         if utxo_view.needs_flush() {
             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
@@ -1315,6 +1374,7 @@ fn run_import_from_stdin(
     utxo_view: &mut rustoshi_storage::BlockStoreUtxoView<'_>,
     start_height: u32,
     coinstatsindex_enabled: bool,
+    txospenderindex_enabled: bool,
 ) -> anyhow::Result<u32> {
     use rustoshi_primitives::{Block, Decodable};
     use std::io::Read;
@@ -1445,6 +1505,16 @@ fn run_import_from_stdin(
             &block,
             frame_height,
             &undo,
+        );
+
+        // Txospenderindex — record spends on the framed-import path. See
+        // `write_txospender_index` (TxoSpenderIndex::CustomAppend).
+        write_txospender_index(
+            block_store,
+            txospenderindex_enabled,
+            &block,
+            frame_height,
+            hash,
         );
 
         // Flush UTXO cache if needed
@@ -1977,11 +2047,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let mut utxo_view = block_store.utxo_view();
 
         let imported = if import_path == "-" {
-            run_import_from_stdin(&params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex)?
+            run_import_from_stdin(&params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex, cli.txospenderindex)?
         } else {
             let path = std::path::PathBuf::from(import_path);
             if path.is_dir() {
-                run_import_from_blk_files(&path, &params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex)?
+                run_import_from_blk_files(&path, &params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex, cli.txospenderindex)?
             } else {
                 anyhow::bail!(
                     "--import-blocks path must be a directory containing blk*.dat files, or \"-\" for stdin"
@@ -2053,6 +2123,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     };
     rpc_state_inner.data_dir = Some(datadir.clone());
     rpc_state_inner.coinstatsindex_enabled = cli.coinstatsindex;
+    rpc_state_inner.txospenderindex_enabled = cli.txospenderindex;
     rpc_state_inner.init_from_db().map_err(|e| anyhow::anyhow!(e))?;
 
     // If `--load-snapshot=<path>` was provided, ingest the Core-format UTXO
@@ -2949,6 +3020,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             &undo,
                         );
 
+                        // Txospenderindex — PRIMARY P2P/IBD connect path (same
+                        // as txindex/coinstatsindex). See `write_txospender_index`
+                        // for the Core reference (TxoSpenderIndex::CustomAppend).
+                        write_txospender_index(
+                            &block_store,
+                            cli.txospenderindex,
+                            &block,
+                            height,
+                            block_hash,
+                        );
+
                         // Durability: advance the persisted tip pointer ONLY
                         // as part of an atomic UTXO flush, never as a separate
                         // eager write.  Commit when the cache hits the
@@ -3606,6 +3688,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             &block,
                                             height,
                                             &undo,
+                                        );
+
+                                        // Txospenderindex — PRIMARY P2P
+                                        // sync-loop connect path (same as
+                                        // txindex/coinstatsindex). See
+                                        // `write_txospender_index` for the Core
+                                        // reference (TxoSpenderIndex::CustomAppend).
+                                        write_txospender_index(
+                                            &block_store,
+                                            cli.txospenderindex,
+                                            &block,
+                                            height,
+                                            block_hash,
                                         );
 
                                         // Durability: advance the persisted tip

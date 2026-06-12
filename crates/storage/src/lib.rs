@@ -69,7 +69,8 @@ pub use indexes::{
     compute_next_entry as coinstats_compute_next_entry, genesis_entry as coinstats_genesis_entry,
     BlockFilter, BlockFilterError, BlockFilterIndex, BlockFilterType, CoinStatsEntry,
     CoinStatsError, CoinStatsIndex, FilterHeaderEntry, GCSError, GCSFilter, MuHash3072, Num3072,
-    TxIndex, TxIndexError, TxLocation, BASIC_FILTER_M, BASIC_FILTER_P,
+    TxIndex, TxIndexError, TxLocation, TxoSpender, TxoSpenderError, TxoSpenderIndex,
+    BASIC_FILTER_M, BASIC_FILTER_P,
 };
 pub use utxo_cache::{
     CacheEntryFlags, Coin, CoinsCacheEntry, CoinsView, CoinsViewCache, CoinsViewDB,
