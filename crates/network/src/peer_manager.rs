@@ -332,6 +332,47 @@ pub enum AddrSource {
     Manual,
 }
 
+/// Feeler connection interval (Core net.h:61 FEELER_INTERVAL = 2min). Every
+/// `FEELER_INTERVAL` the connection-open loop opens ONE short-lived feeler to a
+/// NEW-table address, handshakes, promotes it NEW->TRIED, and disconnects.
+pub const FEELER_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Maximum number of simultaneous feeler connections (Core net.h:75
+/// MAX_FEELER_CONNECTIONS = 1).
+pub const MAX_FEELER_CONNECTIONS: usize = 1;
+
+/// Percentage of the addrman shared in a getaddr response (Core
+/// MAX_PCT_ADDR_TO_SEND = 23). The getaddr response is capped at
+/// min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size)) — primary getaddr anti-DoS.
+pub const MAX_PCT_ADDR_TO_SEND: usize = 23;
+
+/// Token-bucket constants for INBOUND addr rate-limiting (Core
+/// net_processing.cpp:193-197). The bucket refills at MAX_ADDR_RATE_PER_SECOND
+/// tokens/sec, capped at MAX_ADDR_PROCESSING_TOKEN_BUCKET; each processed
+/// address costs one token, and addresses are dropped once the bucket runs dry.
+pub const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
+/// Soft cap on the inbound-addr token bucket (Core MAX_ADDR_PROCESSING_TOKEN_BUCKET
+/// = MAX_ADDR_TO_SEND = 1000).
+pub const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1000.0;
+
+/// Compute the getaddr 23%-cap over an addrman of `size` entries: the number of
+/// addresses we are willing to return in a single getaddr response, i.e.
+/// min(MAX_ADDR, ceil(0.23 * size)). Mirrors Core's `GetAddr_` cap
+/// (addrman.cpp:798-803: `nNodes = max_pct * nNodes / 100`, then clamped to
+/// `max_addresses`). We use a ceil so a tiny addrman still shares at least one
+/// address when non-empty, matching the spirit of the resurvey spec
+/// (`min(1000, ceil(0.23*size))`).
+pub fn getaddr_cap(size: usize) -> usize {
+    if size == 0 {
+        return 0;
+    }
+    let pct = size
+        .saturating_mul(MAX_PCT_ADDR_TO_SEND)
+        .div_ceil(100)
+        .max(1);
+    pct.min(MAX_ADDR)
+}
+
 /// Current wall-clock time as unix seconds. Used to stamp the `time` of
 /// addresses learned without an explicit timestamp (DNS seeds, manual peers).
 pub(crate) fn now_unix_secs() -> u64 {
@@ -1587,6 +1628,95 @@ impl AddressManager {
         }
     }
 
+    /// Select an address from the NEW table for a feeler probe (Core
+    /// net.cpp:2809 `addrman.Select(/*newOnly=*/true, ...)`).
+    ///
+    /// Returns a NEW-table address that is not currently connected and not
+    /// banned, or `None` when the NEW table is empty / yields only ineligible
+    /// candidates. Feelers deliberately read from NEW (not TRIED): they probe
+    /// freshly-learned addresses and, on a successful handshake, the caller
+    /// promotes them NEW->TRIED via `mark_outbound_success` -> `addrman.good()`.
+    ///
+    /// NOTE: Core first tries `SelectTriedCollision()` (test-before-evict)
+    /// before falling back to the NEW-table select. rustoshi's `AddrManTable`
+    /// has no tried-collision queue yet, so this lands the NEW-only path (the
+    /// eclipse-mitigation core); tried-collision test-before-evict is a named
+    /// follow-up, exactly as `select()` deferred the GetChance bias.
+    pub fn select_for_feeler(&self) -> Option<SocketAddr> {
+        // A handful of attempts so a transiently-connected/banned pick does not
+        // starve the probe; bounded so an all-ineligible NEW table no-ops.
+        for _ in 0..8 {
+            let addr = self.addrman.select(true)?;
+            if self.connected.contains(&addr) {
+                continue;
+            }
+            if self.is_banned(&addr) {
+                continue;
+            }
+            return Some(addr);
+        }
+        None
+    }
+
+    /// Test-only: seed a routable address straight into the bucketed NEW table
+    /// with the netgroup manager bound, so `select_for_feeler` / the 23%-cap
+    /// have something to draw from without a live peer handshake. Mirrors a
+    /// peer-announced address (source = the address itself).
+    #[cfg(test)]
+    pub(crate) fn test_seed_new(&mut self, addr: SocketAddr, ng: &NetGroupManager) {
+        self.bind_netgroup(ng);
+        self.known_addrs.entry(addr).or_insert_with(|| AddrInfo {
+            addr,
+            services: NODE_NETWORK | NODE_WITNESS,
+            time_unix: now_unix_secs(),
+            last_seen: Instant::now(),
+            last_attempt: None,
+            last_success: None,
+            attempt_count: 0,
+            source: AddrSource::Peer(addr),
+        });
+        self.bucket_add(addr, addr.ip(), NODE_NETWORK | NODE_WITNESS, now_unix_secs());
+    }
+
+    /// Test-only: mark a shareable entry (record a successful connect) so it is
+    /// counted by `shareable_count` and returned by `get_addresses_for_sharing`,
+    /// without a live handshake.
+    #[cfg(test)]
+    pub(crate) fn test_mark_shareable(&mut self, addr: SocketAddr) {
+        if let Some(info) = self.known_addrs.get_mut(&addr) {
+            info.last_success = Some(Instant::now());
+        }
+    }
+
+    /// Record a (feeler) connection attempt against the bucketed addrman
+    /// (Core `AddrMan::Attempt`). Bumps the address's attempt count + last-try
+    /// time so a NEW entry that never answers ages toward "terrible" over time
+    /// without being promoted. Best-effort: no-ops if the netgroup manager is
+    /// not yet bound (the addrman cannot place an entry it never saw).
+    pub fn attempt_addr(&mut self, addr: &SocketAddr) {
+        self.addrman.attempt(addr, now_unix_secs());
+    }
+
+    /// Promote a feeler-probed address NEW->TRIED on a successful handshake
+    /// (Core net.cpp:2816 `addrman.Good()` for feelers).
+    ///
+    /// Unlike `mark_outbound_success` this does NOT insert into `connected` or
+    /// the outbound-netgroup diversity set: a feeler is a short-lived probe that
+    /// disconnects immediately, and Core explicitly excludes feelers from
+    /// netgroup-distinctness accounting (net.cpp:2831). It only refreshes the
+    /// success bookkeeping and promotes the address in the bucketed addrman.
+    /// On a feeler FAILURE this is never called, so TRIED is left unchanged.
+    pub fn mark_feeler_success(&mut self, addr: &SocketAddr, netgroup_manager: &NetGroupManager) {
+        if let Some(info) = self.known_addrs.get_mut(addr) {
+            info.last_success = Some(Instant::now());
+            info.attempt_count = 0;
+        }
+        self.bind_netgroup(netgroup_manager);
+        if let Some(ng) = self.bucket_ng.clone() {
+            self.addrman.good(addr, now_unix_secs(), &ng);
+        }
+    }
+
     /// Mark an address as successfully connected (inbound - no netgroup tracking).
     pub fn mark_inbound_success(&mut self, addr: &SocketAddr) {
         self.connected.insert(*addr);
@@ -1664,6 +1794,26 @@ impl AddressManager {
             .filter(|info| info.last_success.is_some())
             .take(count)
             .collect()
+    }
+
+    /// Number of addresses eligible to be shared in a getaddr response — the
+    /// pool the 23%-cap (`getaddr_cap`) is computed over. Mirrors the filter in
+    /// `get_addresses_for_sharing` / `get_addrv2_for_sharing` (entries with a
+    /// recorded `last_success`). Counts both the legacy IPv4/IPv6 store and the
+    /// BIP155 store so the cap reflects the union a peer could actually receive,
+    /// analogous to Core computing the percentage over the whole addrman.
+    pub fn shareable_count(&self) -> usize {
+        let legacy = self
+            .known_addrs
+            .values()
+            .filter(|i| i.last_success.is_some())
+            .count();
+        let v2 = self
+            .known_addrv2
+            .values()
+            .filter(|i| i.last_success.is_some())
+            .count();
+        legacy + v2
     }
 
     /// Number of known addresses.
@@ -2039,6 +2189,15 @@ pub enum ConnectionType {
     /// Manually configured connection (addnode / -addnode).
     /// Core: ConnectionType::MANUAL — never banned or discouraged.
     Manual,
+    /// Short-lived feeler connection (Core: ConnectionType::FEELER).
+    ///
+    /// A feeler dials an address selected FROM THE NEW TABLE, completes the
+    /// version handshake, promotes the address NEW->TRIED via addrman Good(),
+    /// then disconnects. Feelers keep TRIED fresh (the primary eclipse-attack
+    /// mitigation) and are bounded to MAX_FEELER_CONNECTIONS=1; they are
+    /// excluded from the full-relay/block-relay outbound slot budgets and from
+    /// netgroup-diversity accounting (Core net.cpp:2831).
+    Feeler,
 }
 
 /// Result of checking for stale peers.
@@ -2120,6 +2279,18 @@ struct PeerHandle {
     /// Pre-handshake / Connecting handles get a fresh empty `PeerStats`
     /// so the RPC path always sees a well-formed value.
     stats: std::sync::Arc<crate::peer::PeerStats>,
+    /// GETADDR anti-DoS: whether we have already answered a getaddr from this
+    /// peer. Core net_processing.cpp:4833 (`peer.m_getaddr_recvd`) — only the
+    /// FIRST getaddr per connection is answered; subsequent ones are ignored
+    /// to discourage addr stamping / resource waste.
+    getaddr_recvd: bool,
+    /// INBOUND addr token bucket (Core `peer.m_addr_token_bucket`, init 1.0).
+    /// Refilled by `elapsed * MAX_ADDR_RATE_PER_SECOND` (capped at
+    /// MAX_ADDR_PROCESSING_TOKEN_BUCKET) on each addr message; each processed
+    /// address consumes one token, and addresses are dropped once it runs dry.
+    addr_token_bucket: f64,
+    /// Timestamp of the last addr-bucket refill (Core `m_addr_token_timestamp`).
+    addr_token_timestamp: Instant,
 }
 
 /// The peer manager coordinates all peer connections.
@@ -2918,6 +3089,99 @@ impl PeerManager {
             .count()
     }
 
+    /// Count in-flight feeler connections (connecting OR established) so a new
+    /// feeler is only opened when below MAX_FEELER_CONNECTIONS. A feeler that
+    /// has completed its handshake is disconnected immediately, so this is
+    /// normally 0 between probes.
+    fn feeler_count(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|p| {
+                p.conn_type == ConnectionType::Feeler
+                    && matches!(p.info.state, PeerState::Established | PeerState::Connecting)
+            })
+            .count()
+    }
+
+    /// Open at most one short-lived feeler connection (Core net.cpp
+    /// ThreadOpenConnections FEELER branch). Selects a NEW-table address (the
+    /// addresses a feeler exists to probe), dials it as a `Feeler` connection,
+    /// and returns. On a successful handshake the `PeerEvent::Connected`
+    /// handler promotes the address NEW->TRIED via `mark_feeler_success` and
+    /// disconnects (mirrors blockbrew peermgr.go:1626); on failure nothing is
+    /// promoted, so TRIED stays unchanged.
+    ///
+    /// Bounded to MAX_FEELER_CONNECTIONS=1 in-flight: feelers never consume the
+    /// full-relay/block-relay outbound slot budgets (those counts filter on
+    /// their own conn types in `fill_outbound_connections`). No-ops gracefully
+    /// when `-connect` pinning is active (the addrman is intentionally unused)
+    /// or when the NEW table yields no eligible candidate.
+    pub async fn maybe_open_feeler(&mut self) {
+        // `-connect` mode makes no addrman-driven outbound (Core / blockbrew
+        // peermgr.go:1260) — the feeler probe is addrman-driven, so skip it.
+        if !self.config.connect_peers.is_empty() {
+            return;
+        }
+        if self.feeler_count() >= MAX_FEELER_CONNECTIONS {
+            return;
+        }
+        // Record the attempt in addrman so a never-answering NEW entry ages out
+        // (Core records SelectTriedCollision/Select attempts; blockbrew does
+        // NOT MarkFailed feelers, only MarkSuccess — so we only `attempt()`,
+        // never penalise beyond the normal attempt bookkeeping).
+        let addr = match self.addr_manager.select_for_feeler() {
+            Some(a) => a,
+            None => return,
+        };
+        self.addr_manager.attempt_addr(&addr);
+        tracing::debug!("Making feeler connection to {}", addr);
+        self.connect_to_with_type(addr, ConnectionType::Feeler).await;
+    }
+
+    /// Refill a peer's inbound-addr token bucket and consume up to `requested`
+    /// tokens, returning how many addresses may be admitted (Core ProcessAddrs
+    /// token-bucket, net_processing.cpp:5644-5671).
+    ///
+    /// The bucket refills at `MAX_ADDR_RATE_PER_SECOND` tokens/sec since the
+    /// last addr message, capped at `MAX_ADDR_PROCESSING_TOKEN_BUCKET`. Each
+    /// admitted address costs one token; once the bucket drops below 1.0 the
+    /// remaining addresses are dropped (we hold no Addr-permission peers, so all
+    /// inbound traffic is rate-limited, matching Core's default). A peer with no
+    /// handle (already disconnected) admits 0.
+    fn take_addr_tokens(&mut self, id: PeerId, requested: usize) -> usize {
+        let now = Instant::now();
+        let peer = match self.peers.get_mut(&id) {
+            Some(p) => p,
+            None => return 0,
+        };
+        // Refill (skip when already at/above the soft cap, matching Core's
+        // "don't increment if already full" guard).
+        if peer.addr_token_bucket < MAX_ADDR_PROCESSING_TOKEN_BUCKET {
+            let elapsed = now
+                .saturating_duration_since(peer.addr_token_timestamp)
+                .as_secs_f64();
+            let increment = elapsed.max(0.0) * MAX_ADDR_RATE_PER_SECOND;
+            peer.addr_token_bucket =
+                (peer.addr_token_bucket + increment).min(MAX_ADDR_PROCESSING_TOKEN_BUCKET);
+        }
+        peer.addr_token_timestamp = now;
+
+        // Admit up to floor(bucket) addresses, bounded by the request size.
+        let admit = (peer.addr_token_bucket.floor() as usize).min(requested);
+        peer.addr_token_bucket -= admit as f64;
+        admit
+    }
+
+    /// Grant a peer the post-getaddr token bonus (Core net_processing.cpp:3767:
+    /// `peer.m_addr_token_bucket += MAX_ADDR_TO_SEND`). Called when WE send a
+    /// getaddr to a peer so the (possibly large) addr response we asked for is
+    /// not spuriously rate-limited by the inbound token-bucket.
+    pub fn grant_getaddr_token_bonus(&mut self, id: PeerId) {
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.addr_token_bucket += MAX_ADDR_PROCESSING_TOKEN_BUCKET;
+        }
+    }
+
     /// Initiate an outbound connection to a peer.
     #[allow(dead_code)]
     async fn connect_to(&mut self, addr: SocketAddr) {
@@ -2940,8 +3204,12 @@ impl PeerManager {
         let event_tx = self.event_tx.clone();
         let magic = self.params.network_magic.0;
 
-        // For block-relay-only connections, set relay=false
-        let relay = conn_type != ConnectionType::BlockRelayOnly;
+        // For block-relay-only AND feeler connections, set relay=false.
+        // Feelers are short-lived probes that disconnect right after the
+        // handshake and never participate in tx relay (Core treats FEELER like
+        // BLOCK_RELAY for the version `fRelay=false` flag).
+        let relay =
+            conn_type != ConnectionType::BlockRelayOnly && conn_type != ConnectionType::Feeler;
         let our_version = self.build_version_message_with_relay(addr, relay);
 
         tracing::debug!(
@@ -3016,6 +3284,9 @@ impl PeerManager {
                 stale_state: StalePeerState::new(),
                 // Placeholder; replaced when PeerEvent::Connected fires.
                 stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+                getaddr_recvd: false,
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: Instant::now(),
             },
         );
     }
@@ -3131,6 +3402,9 @@ impl PeerManager {
                 last_tx_time: None,
                 stale_state: StalePeerState::new(),
                 stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+                getaddr_recvd: false,
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: Instant::now(),
             },
         );
     }
@@ -3461,11 +3735,44 @@ impl PeerManager {
                                     last_tx_time: None,
                                     stale_state: StalePeerState::new(),
                                     stats: std::sync::Arc::clone(stats),
+                                    getaddr_recvd: false,
+                                    addr_token_bucket: 1.0,
+                                    addr_token_timestamp: Instant::now(),
                                 },
                             );
                             self.addr_manager.mark_inbound_success(&info.addr);
                         }
                     }
+                }
+
+                // Feeler: a successful handshake promotes the probed address
+                // NEW->TRIED, then we disconnect immediately (Core net.cpp:2816
+                // Good() + blockbrew peermgr.go:1626 MarkSuccess+Disconnect).
+                // A feeler is NOT inserted into `connected`/netgroup diversity
+                // (it is short-lived), so we use `mark_feeler_success` not
+                // `mark_outbound_success`. On a feeler FAILURE this branch never
+                // runs, so TRIED is left unchanged — the falsification guard.
+                let is_feeler = self
+                    .peers
+                    .get(id)
+                    .map(|p| p.conn_type == ConnectionType::Feeler)
+                    .unwrap_or(false);
+                if is_feeler {
+                    self.addr_manager
+                        .mark_feeler_success(&info.addr, &self.netgroup_manager);
+                    tracing::debug!(
+                        "Feeler to {} handshook; promoted NEW->TRIED, disconnecting",
+                        info.addr
+                    );
+                    // Tear the probe down by enqueuing Disconnect on the peer's
+                    // command channel; the peer task then fires
+                    // PeerEvent::Disconnected, which removes the handle and
+                    // frees the single feeler slot for the next probe. We do
+                    // NOT remove the handle here so the standard Disconnected
+                    // cleanup path (feefilter/misbehavior bookkeeping) still
+                    // runs exactly once.
+                    self.disconnect_peer(*id).await;
+                    return Some(event);
                 }
 
                 // Track netgroup for outbound connections
@@ -3577,8 +3884,24 @@ impl PeerManager {
                             .misbehavior_tracker
                             .misbehaving(*id, MisbehaviorReason::InvalidAddr);
                     } else {
+                        // INBOUND addr token-bucket (Core ProcessAddrs,
+                        // net_processing.cpp:5644-5671): refill by elapsed*0.1
+                        // capped at 1000, then admit at most `tokens` addresses,
+                        // dropping the rest. We have no Addr-permission peers, so
+                        // all inbound addr traffic is rate-limited (Core default).
+                        let admit = self.take_addr_tokens(*id, addrs.len());
+                        if admit < addrs.len() {
+                            tracing::debug!(
+                                "addr rate-limit: dropped {} of {} addrs from peer {}",
+                                addrs.len() - admit,
+                                addrs.len(),
+                                id.0
+                            );
+                        }
+                        let admitted = &addrs[..admit];
                         if let Some(peer) = self.peers.get(id) {
-                            self.addr_manager.add_peer_addresses(addrs, peer.info.addr);
+                            self.addr_manager
+                                .add_peer_addresses(admitted, peer.info.addr);
                         }
                         // BIP155: Relay a random subset of new addresses to 2 other peers
                         self.relay_addresses_to_peers(*id).await;
@@ -3593,8 +3916,19 @@ impl PeerManager {
                             .misbehavior_tracker
                             .misbehaving(*id, MisbehaviorReason::InvalidAddr);
                     } else {
+                        // Same inbound token-bucket as legacy addr above.
+                        let admit = self.take_addr_tokens(*id, entries.len());
+                        if admit < entries.len() {
+                            tracing::debug!(
+                                "addrv2 rate-limit: dropped {} of {} addrs from peer {}",
+                                entries.len() - admit,
+                                entries.len(),
+                                id.0
+                            );
+                        }
+                        let admitted = &entries[..admit];
                         self.addr_manager.add_addrv2_addresses(
-                            entries,
+                            admitted,
                             self.peers
                                 .get(id)
                                 .map(|p| p.info.addr)
@@ -3631,37 +3965,60 @@ impl PeerManager {
 
                 // Handle getaddr messages
                 if let NetworkMessage::GetAddr = msg {
-                    // Send addrv2 if peer supports it, otherwise legacy addr
-                    let peer_supports_addrv2 = self
+                    // GETADDR-once anti-DoS (Core net_processing.cpp:4833): only
+                    // the FIRST getaddr per connection is answered; subsequent
+                    // ones are ignored. We set the per-peer flag here and bail
+                    // early on repeats (the flag is reset only when the peer
+                    // reconnects and gets a fresh PeerHandle).
+                    let already = self
                         .peers
                         .get(id)
-                        .map(|p| p.info.supports_addrv2)
-                        .unwrap_or(false);
-                    if peer_supports_addrv2 {
-                        let entries = self.addr_manager.get_addrv2_for_sharing(MAX_ADDR);
-                        if !entries.is_empty() {
-                            let _ = self
-                                .send_to_peer(*id, NetworkMessage::AddrV2(entries))
-                                .await;
-                        }
+                        .map(|p| p.getaddr_recvd)
+                        .unwrap_or(true);
+                    if already {
+                        tracing::debug!("Ignoring repeated getaddr from peer {}", id.0);
                     } else {
-                        let addrs = self.addr_manager.get_addresses_for_sharing(MAX_ADDR);
-                        let timestamped_addrs: Vec<TimestampedNetAddress> = addrs
-                            .into_iter()
-                            .map(|info| TimestampedNetAddress {
-                                timestamp: info
-                                    .last_seen
-                                    .elapsed()
-                                    .as_secs()
-                                    .saturating_sub(info.last_seen.elapsed().as_secs())
-                                    as u32,
-                                address: socket_addr_to_net_address(info.addr, info.services),
-                            })
-                            .collect();
-                        if !timestamped_addrs.is_empty() {
-                            let _ = self
-                                .send_to_peer(*id, NetworkMessage::Addr(timestamped_addrs))
-                                .await;
+                        if let Some(peer) = self.peers.get_mut(id) {
+                            peer.getaddr_recvd = true;
+                        }
+                        // 23%-cap (Core MAX_PCT_ADDR_TO_SEND): cap the response
+                        // to min(MAX_ADDR, ceil(0.23 * addrman_size)). Computed
+                        // over the shareable pool size; gated to THIS getaddr
+                        // call site so the getnodeaddresses RPC dump path stays
+                        // uncapped (byte-exact, a closed northstar axis).
+                        let cap = getaddr_cap(self.addr_manager.shareable_count());
+                        // Send addrv2 if peer supports it, otherwise legacy addr
+                        let peer_supports_addrv2 = self
+                            .peers
+                            .get(id)
+                            .map(|p| p.info.supports_addrv2)
+                            .unwrap_or(false);
+                        if peer_supports_addrv2 {
+                            let entries = self.addr_manager.get_addrv2_for_sharing(cap);
+                            if !entries.is_empty() {
+                                let _ = self
+                                    .send_to_peer(*id, NetworkMessage::AddrV2(entries))
+                                    .await;
+                            }
+                        } else {
+                            let addrs = self.addr_manager.get_addresses_for_sharing(cap);
+                            let timestamped_addrs: Vec<TimestampedNetAddress> = addrs
+                                .into_iter()
+                                .map(|info| TimestampedNetAddress {
+                                    timestamp: info
+                                        .last_seen
+                                        .elapsed()
+                                        .as_secs()
+                                        .saturating_sub(info.last_seen.elapsed().as_secs())
+                                        as u32,
+                                    address: socket_addr_to_net_address(info.addr, info.services),
+                                })
+                                .collect();
+                            if !timestamped_addrs.is_empty() {
+                                let _ = self
+                                    .send_to_peer(*id, NetworkMessage::Addr(timestamped_addrs))
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -4250,6 +4607,9 @@ impl PeerManager {
                 last_tx_time: None,
                 stale_state: StalePeerState::new(),
                 stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+                getaddr_recvd: false,
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: Instant::now(),
             },
         );
         cmd_rx
@@ -4309,6 +4669,9 @@ impl PeerManager {
                 last_tx_time: None,
                 stale_state: StalePeerState::new(),
                 stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+                getaddr_recvd: false,
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: Instant::now(),
             },
         );
         cmd_rx
@@ -4363,9 +4726,67 @@ impl PeerManager {
                 last_tx_time: None,
                 stale_state: StalePeerState::new(),
                 stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+                getaddr_recvd: false,
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: Instant::now(),
             },
         );
         cmd_rx
+    }
+
+    /// Test-only: insert a `Feeler` peer handle in the `Connecting` state and
+    /// hand back a clone of its `PeerInfo` (so a test can build a matching
+    /// `PeerEvent::Connected`) plus the command-channel receiver (so the test
+    /// can observe the post-handshake `Disconnect`). Mirrors what
+    /// `connect_to_with_type(addr, Feeler)` would have inserted.
+    #[cfg(test)]
+    pub(crate) fn insert_test_feeler_peer(
+        &mut self,
+        peer_id: PeerId,
+        addr: SocketAddr,
+    ) -> (PeerInfo, mpsc::Receiver<PeerCommand>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let info = PeerInfo {
+            addr,
+            version: PROTOCOL_VERSION,
+            services: NODE_NETWORK | NODE_WITNESS,
+            user_agent: String::new(),
+            start_height: 0,
+            relay: false,
+            inbound: false,
+            state: PeerState::Connecting,
+            last_send: Instant::now(),
+            last_recv: Instant::now(),
+            ping_nonce: None,
+            ping_time: None,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            time_offset: 0,
+            supports_witness: false,
+            supports_sendheaders: false,
+            supports_wtxid_relay: false,
+            supports_addrv2: false,
+            feefilter: 0,
+        };
+        self.peers.insert(
+            peer_id,
+            PeerHandle {
+                info: info.clone(),
+                command_tx: cmd_tx,
+                conn_type: ConnectionType::Feeler,
+                noban: false,
+                connected_time: Instant::now(),
+                min_ping_time: None,
+                last_block_time: None,
+                last_tx_time: None,
+                stale_state: StalePeerState::new(),
+                stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+                getaddr_recvd: false,
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: Instant::now(),
+            },
+        );
+        (info, cmd_rx)
     }
 
     /// Test-only: insert a peer with specific connection type and noban flag.
@@ -4414,6 +4835,9 @@ impl PeerManager {
                 last_tx_time: None,
                 stale_state: StalePeerState::new(),
                 stats: std::sync::Arc::new(crate::peer::PeerStats::new()),
+                getaddr_recvd: false,
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: Instant::now(),
             },
         );
         cmd_rx
@@ -7187,6 +7611,242 @@ mod tests {
             mgr.addr_manager.known_count(),
             0,
             "no re-injection after the one-shot guard fired"
+        );
+    }
+
+    // ========================================================================
+    // P2P anti-eclipse hardening — FEELER + getaddr anti-DoS proof tests
+    // (Core net.cpp ThreadOpenConnections FEELER + net_processing.cpp getaddr
+    // guards + addr token-bucket). In-process; no daemon/regtest slot needed.
+    // ========================================================================
+
+    /// getaddr_cap honors min(MAX_ADDR, ceil(0.23 * size)).
+    #[test]
+    fn feeler_getaddr_cap_formula() {
+        assert_eq!(getaddr_cap(0), 0, "empty addrman shares nothing");
+        assert_eq!(getaddr_cap(1), 1, "tiny addrman shares at least one");
+        // ceil(0.23 * 100) = 23
+        assert_eq!(getaddr_cap(100), 23);
+        // ceil(0.23 * 1000) = 230
+        assert_eq!(getaddr_cap(1000), 230);
+        // 0.23 * 100000 = 23000 -> clamped to MAX_ADDR (1000)
+        assert_eq!(getaddr_cap(100_000), MAX_ADDR);
+    }
+
+    /// FEELER (AddressManager level): a probed NEW-table address is promoted
+    /// NEW->TRIED on handshake SUCCESS, and NOT promoted on failure.
+    /// Falsification: pre-impl there was no feeler at all, so TRIED was never
+    /// refreshed by probing — this proves the promote path exists and is gated
+    /// on success.
+    #[test]
+    fn feeler_promotes_new_to_tried_on_success_only() {
+        let ng = NetGroupManager::new();
+        let mut mgr = AddressManager::new();
+
+        let probed: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+        let unprobed: SocketAddr = "5.6.7.8:8333".parse().unwrap();
+        mgr.test_seed_new(probed, &ng);
+        mgr.test_seed_new(unprobed, &ng);
+
+        assert_eq!(mgr.addrman().tried_count(), 0, "nothing tried yet");
+        assert!(!mgr.addrman().is_in_tried(&probed));
+        assert!(!mgr.addrman().is_in_tried(&unprobed));
+
+        // select_for_feeler draws from the NEW table.
+        let selected = mgr.select_for_feeler();
+        assert!(selected.is_some(), "NEW table must yield a feeler candidate");
+
+        // SUCCESS: handshake completed -> promote NEW->TRIED.
+        mgr.mark_feeler_success(&probed, &ng);
+        assert!(
+            mgr.addrman().is_in_tried(&probed),
+            "successful feeler must promote NEW->TRIED"
+        );
+        assert_eq!(mgr.addrman().tried_count(), 1, "tried went 0 -> 1");
+
+        // FAILURE (never marked): the unprobed addr stays in NEW.
+        assert!(
+            !mgr.addrman().is_in_tried(&unprobed),
+            "an un-handshook feeler candidate must NOT be promoted"
+        );
+        assert_eq!(mgr.addrman().tried_count(), 1, "no spurious promotion");
+    }
+
+    /// select_for_feeler no-ops gracefully on an empty NEW table (must not dial
+    /// an invalid address — Core breaks out of the select loop).
+    #[test]
+    fn feeler_select_empty_new_table_is_none() {
+        let mut mgr = AddressManager::new();
+        assert!(mgr.select_for_feeler().is_none());
+        // After binding a netgroup but with no NEW entries, still None.
+        let ng = NetGroupManager::new();
+        mgr.bind_netgroup(&ng);
+        assert!(mgr.select_for_feeler().is_none());
+    }
+
+    /// FEELER (end-to-end wiring): the PeerEvent::Connected handler routes a
+    /// Feeler peer through mark_feeler_success (NEW->TRIED promote) and then
+    /// enqueues a Disconnect on the peer's command channel.
+    #[tokio::test]
+    async fn feeler_connected_handler_promotes_and_disconnects() {
+        let config = PeerManagerConfig::testnet4();
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let addr: SocketAddr = "9.9.9.9:8333".parse().unwrap();
+        let ng = mgr.netgroup_manager.clone();
+        mgr.addr_manager.test_seed_new(addr, &ng);
+        assert!(!mgr.addr_manager.addrman().is_in_tried(&addr));
+
+        let pid = PeerId(77);
+        let (info, mut cmd_rx) = mgr.insert_test_feeler_peer(pid, addr);
+
+        let stats = std::sync::Arc::new(crate::peer::PeerStats::new());
+        mgr.handle_event(PeerEvent::Connected(pid, info, stats))
+            .await;
+
+        // Promoted NEW->TRIED on handshake success.
+        assert!(
+            mgr.addr_manager.addrman().is_in_tried(&addr),
+            "feeler Connected must promote the probed addr NEW->TRIED"
+        );
+        // Disconnect enqueued on the feeler's command channel.
+        match cmd_rx.try_recv() {
+            Ok(PeerCommand::Disconnect) => {}
+            other => panic!("expected Disconnect on feeler channel, got {:?}", other),
+        }
+    }
+
+    /// GETADDR-once: a 2nd getaddr from the same peer is ignored (no addr sent),
+    /// while the 1st is answered. Falsification: pre-impl answered EVERY getaddr.
+    #[tokio::test]
+    async fn getaddr_answered_once_per_peer() {
+        let config = PeerManagerConfig::testnet4();
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        // Seed a shareable address so the first getaddr produces a response.
+        let shared: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+        let ng = mgr.netgroup_manager.clone();
+        mgr.addr_manager.test_seed_new(shared, &ng);
+        mgr.addr_manager.test_mark_shareable(shared);
+
+        // Insert an inbound peer (legacy addr path; supports_addrv2=false).
+        let pid = PeerId(11);
+        let mut cmd_rx = mgr.insert_test_peer(pid, "2.2.2.2:8333".parse().unwrap(), false, false);
+
+        // 1st getaddr -> answered (an Addr message is sent).
+        mgr.handle_event(PeerEvent::Message(pid, NetworkMessage::GetAddr))
+            .await;
+        let first = cmd_rx.try_recv();
+        assert!(
+            matches!(first, Ok(PeerCommand::SendMessage(NetworkMessage::Addr(_)))),
+            "first getaddr must be answered with an Addr, got {:?}",
+            first
+        );
+        // getaddr_recvd flag set.
+        assert!(
+            mgr.peers.get(&pid).map(|p| p.getaddr_recvd).unwrap_or(false),
+            "getaddr_recvd must be set after first getaddr"
+        );
+
+        // 2nd getaddr -> ignored (nothing sent).
+        mgr.handle_event(PeerEvent::Message(pid, NetworkMessage::GetAddr))
+            .await;
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "second getaddr from the same peer must be ignored (no message)"
+        );
+    }
+
+    /// 23%-cap: the getaddr response length honors min(MAX_ADDR, ceil(0.23*N)).
+    #[tokio::test]
+    async fn getaddr_response_honors_23pct_cap() {
+        let config = PeerManagerConfig::testnet4();
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        // Seed 100 distinct shareable addresses -> cap = ceil(0.23*100) = 23.
+        let ng = mgr.netgroup_manager.clone();
+        for i in 0..100u32 {
+            let octets = i.to_be_bytes();
+            // Build a routable, distinct public IP (avoid RFC1918 ranges).
+            let addr: SocketAddr =
+                format!("100.{}.{}.{}:8333", octets[1], octets[2], octets[3].max(1))
+                    .parse()
+                    .unwrap();
+            mgr.addr_manager.test_seed_new(addr, &ng);
+            mgr.addr_manager.test_mark_shareable(addr);
+        }
+        let pool = mgr.addr_manager.shareable_count();
+        assert!(pool > 0, "must have a shareable pool");
+        let cap = getaddr_cap(pool);
+
+        let pid = PeerId(22);
+        let mut cmd_rx = mgr.insert_test_peer(pid, "3.3.3.3:8333".parse().unwrap(), false, false);
+        mgr.handle_event(PeerEvent::Message(pid, NetworkMessage::GetAddr))
+            .await;
+
+        match cmd_rx.try_recv() {
+            Ok(PeerCommand::SendMessage(NetworkMessage::Addr(addrs))) => {
+                assert!(
+                    addrs.len() <= cap,
+                    "getaddr response ({}) must honor the 23% cap ({})",
+                    addrs.len(),
+                    cap
+                );
+                assert!(addrs.len() <= MAX_ADDR, "and never exceed MAX_ADDR");
+            }
+            other => panic!("expected an Addr response, got {:?}", other),
+        }
+    }
+
+    /// TOKEN-BUCKET: inbound addrs beyond the per-peer bucket are dropped. A
+    /// fresh peer starts with 1.0 token, so a single addr message carrying many
+    /// addresses admits exactly 1 and drops the rest.
+    #[tokio::test]
+    async fn inbound_addr_token_bucket_drops_excess() {
+        let config = PeerManagerConfig::testnet4();
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        let pid = PeerId(33);
+        let _cmd_rx = mgr.insert_test_peer(pid, "4.4.4.4:8333".parse().unwrap(), false, false);
+
+        // 10 routable addresses in one addr message; fresh bucket = 1.0 token.
+        let mut taddrs = Vec::new();
+        for i in 0..10u32 {
+            let addr: SocketAddr = format!("101.0.0.{}:8333", i + 1).parse().unwrap();
+            taddrs.push(TimestampedNetAddress {
+                timestamp: now_unix_secs() as u32,
+                address: socket_addr_to_net_address(addr, NODE_NETWORK | NODE_WITNESS),
+            });
+        }
+        let before = mgr.addr_manager.known_count();
+        mgr.handle_event(PeerEvent::Message(pid, NetworkMessage::Addr(taddrs)))
+            .await;
+        let admitted = mgr.addr_manager.known_count() - before;
+        assert_eq!(
+            admitted, 1,
+            "fresh 1.0-token bucket must admit exactly 1 of 10 addrs, dropping the excess"
+        );
+
+        // The bucket is now drained; an immediate second message admits 0.
+        let mut more = Vec::new();
+        for i in 0..5u32 {
+            let addr: SocketAddr = format!("102.0.0.{}:8333", i + 1).parse().unwrap();
+            more.push(TimestampedNetAddress {
+                timestamp: now_unix_secs() as u32,
+                address: socket_addr_to_net_address(addr, NODE_NETWORK | NODE_WITNESS),
+            });
+        }
+        let before2 = mgr.addr_manager.known_count();
+        mgr.handle_event(PeerEvent::Message(pid, NetworkMessage::Addr(more)))
+            .await;
+        assert_eq!(
+            mgr.addr_manager.known_count(),
+            before2,
+            "drained bucket must drop all addrs in the immediate next message"
         );
     }
 }
