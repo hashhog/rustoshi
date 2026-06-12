@@ -679,7 +679,11 @@ pub struct MempoolConfig {
     /// How long a transaction may stay in the mempool before being expired (seconds).
     /// Default: 336 hours (2 weeks). Mirrors Bitcoin Core -mempoolexpiry.
     pub expiry_seconds: u64,
-    /// Minimum fee rate to accept a transaction (satoshis per virtual byte).
+    /// Minimum fee rate to accept a transaction, in satoshis per 1000 virtual
+    /// bytes (sat/kvB), mirrors Core DEFAULT_MIN_RELAY_TX_FEE (policy.h:70).
+    /// Stored in sat/kvB (same unit as `incremental_relay_fee` and Core's
+    /// CFeeRate internal GetFeePerK) so the static relay floor can express
+    /// sub-sat/vB feerates such as 100 sat/kvB = 0.1 sat/vB.
     pub min_fee_rate: u64,
     /// Maximum number of transactions.
     pub max_tx_count: usize,
@@ -721,7 +725,7 @@ impl Default for MempoolConfig {
             // (kernel/mempool_options.h:40). Note: SI megabytes (1_000_000), not MiB.
             max_size_bytes: 300 * 1_000_000,
             expiry_seconds: DEFAULT_MEMPOOL_EXPIRY_SECONDS,
-            min_fee_rate: 1, // 1 sat/vbyte
+            min_fee_rate: 100, // 100 sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE, policy.h:70)
             max_tx_count: 1_000_000,
             max_ancestor_count: DEFAULT_ANCESTOR_LIMIT,
             max_ancestor_size: 101_000,
@@ -873,7 +877,7 @@ pub enum MempoolError {
     #[error("transaction conflicts with mempool entry {0}")]
     Conflict(Hash256),
 
-    #[error("fee rate too low: {0:.2} sat/vB (minimum: {1})")]
+    #[error("fee rate too low: {0:.2} sat/vB (minimum: {1} sat/kvB)")]
     InsufficientFee(f64, u64),
 
     /// Dynamic mempool-min-fee floor not met. Distinct from `InsufficientFee`
@@ -970,7 +974,7 @@ pub enum MempoolError {
     #[error("package: transactions conflict with each other")]
     PackageConflict,
 
-    #[error("package: fee rate too low ({0:.2} sat/vB < {1} sat/vB minimum)")]
+    #[error("package: fee rate too low ({0:.2} sat/vB < {1} sat/kvB minimum)")]
     PackageInsufficientFee(f64, u64),
 
     #[error("package: not a child-with-parents topology")]
@@ -1749,11 +1753,18 @@ impl Mempool {
                 }
             }
         }
-        if !bypass_limits && (fee_rate as u64) < self.config.min_fee_rate {
-            return Err(MempoolError::InsufficientFee(
-                fee_rate,
-                self.config.min_fee_rate,
-            ));
+        // Static relay floor (`min_fee_rate`) is sat/kvB; convert the tx feerate
+        // to sat/kvB before comparing so the floor can be a true sub-sat/vB
+        // value (100 sat/kvB = 0.1 sat/vB). Mirrors the dynamic-floor block above
+        // and Core comparing absolute fee against CFeeRate(min_relay).GetFee(vsize).
+        if !bypass_limits {
+            let tx_fee_rate_kvb = (fee_rate * 1000.0).floor() as u64;
+            if tx_fee_rate_kvb < self.config.min_fee_rate {
+                return Err(MempoolError::InsufficientFee(
+                    fee_rate,
+                    self.config.min_fee_rate,
+                ));
+            }
         }
 
         // Check TRUC policy (v3 transactions)
@@ -3275,6 +3286,41 @@ impl Mempool {
         self.config.verify_scripts
     }
 
+    /// The static minimum relay feerate floor in sat/kvB
+    /// (`MempoolConfig::min_fee_rate`). Exposed so the RPC layer
+    /// (getmempoolinfo.minrelaytxfee / getnetworkinfo.relayfee) can READ the
+    /// real admission floor instead of hardcoding a literal — the recurrence
+    /// guard against the fee-display lie (audit wx12re33x). Mirrors Core
+    /// DEFAULT_MIN_RELAY_TX_FEE (policy.h:70) = 100 sat/kvB.
+    pub fn min_relay_feerate_kvb(&self) -> u64 {
+        self.config.min_fee_rate
+    }
+
+    /// The incremental relay feerate in sat/kvB
+    /// (`MempoolConfig::incremental_relay_fee`). Exposed so the RPC layer
+    /// (getmempoolinfo.incrementalrelayfee / getnetworkinfo.incrementalfee) can
+    /// READ the real value. Mirrors Core DEFAULT_INCREMENTAL_RELAY_FEE
+    /// (policy.h:48) = 100 sat/kvB.
+    pub fn incremental_relay_feerate_kvb(&self) -> u64 {
+        self.config.incremental_relay_fee
+    }
+
+    /// Non-mutating snapshot of the rolling minimum feerate in sat/kvB.
+    /// Unlike `get_min_fee()` (which takes `&mut self` because it decays the
+    /// rolling rate on read), this reads the current value WITHOUT advancing
+    /// the decay, so it can be called under a read lock. Returns
+    /// `max(rolling_snapshot, incremental_relay_fee)` — the same floor
+    /// `get_min_fee()` would return absent any decay step — so the RPC
+    /// getmempoolinfo.mempoolminfee can report the live dynamic floor without
+    /// mutating mempool state. Mirrors Core CTxMemPool::GetMinFee's
+    /// `max(rolling, incremental)` clamp (txmempool.cpp:829-851).
+    pub fn mempool_min_feerate_kvb(&self) -> u64 {
+        std::cmp::max(
+            self.rolling_minimum_fee_rate.round() as u64,
+            self.config.incremental_relay_fee,
+        )
+    }
+
     /// Get the total virtual size of all transactions.
     pub fn total_bytes(&self) -> usize {
         self.total_size
@@ -4138,7 +4184,8 @@ impl Mempool {
             0.0
         };
 
-        if (package_fee_rate as u64) < self.config.min_fee_rate {
+        // `min_fee_rate` is sat/kvB; scale the package feerate (sat/vB) by 1000.
+        if ((package_fee_rate * 1000.0).floor() as u64) < self.config.min_fee_rate {
             return PackageAcceptResult::package_failure(
                 MempoolError::PackageInsufficientFee(package_fee_rate, self.config.min_fee_rate)
                     .to_string(),
@@ -4326,8 +4373,9 @@ impl Mempool {
         let fee_rate = fee as f64 / vsize as f64;
 
         // For package validation, use the PACKAGE fee rate for the minimum check
-        // Individual transactions can be below minimum as long as package rate is sufficient
-        if (package_fee_rate as u64) < self.config.min_fee_rate {
+        // Individual transactions can be below minimum as long as package rate is sufficient.
+        // `min_fee_rate` is sat/kvB; scale the package feerate (sat/vB) by 1000.
+        if ((package_fee_rate * 1000.0).floor() as u64) < self.config.min_fee_rate {
             return Err(MempoolError::InsufficientFee(
                 package_fee_rate,
                 self.config.min_fee_rate,
@@ -5491,8 +5539,9 @@ mod tests {
 
     #[test]
     fn test_reject_low_fee_rate() {
+        // 100 sat/kvB floor (sat/kvB units, post wx12re33x — the real default).
         let config = MempoolConfig {
-            min_fee_rate: 10, // 10 sat/vB minimum
+            min_fee_rate: 100,
             ..Default::default()
         };
         let mut mempool = Mempool::new(config);
@@ -5502,11 +5551,107 @@ mod tests {
                 .unwrap();
         let utxos = mock_utxo_set(vec![(OutPoint { txid: prev_txid, vout: 0 }, 100_000)]);
 
-        // Very small fee (1 satoshi)
+        // Very small fee (1 satoshi). On a ~90 vB tx this is ~11 sat/kvB, far
+        // below the 100 sat/kvB floor, so it is rejected.
         let tx = make_tx(vec![(prev_txid, 0)], vec![99_999], 1);
 
         let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
         assert!(matches!(result, Err(MempoolError::InsufficientFee(_, _))));
+    }
+
+    /// Admission boundary at the true 100 sat/kvB floor (audit wx12re33x).
+    ///
+    /// With the floor stored in sat/kvB and the comparison done as
+    /// `(fee_rate * 1000).floor() >= min_fee_rate`, the boundary is a genuine
+    /// 100 sat/kvB = 0.1 sat/vB — a feerate the old whole-sat/vB integer
+    /// comparison literally could not express. This proves the floor change is
+    /// NOT display-only: a 100-sat/kvB tx is admitted and a 99-sat/kvB tx is
+    /// rejected.
+    #[test]
+    fn test_admission_boundary_100_sat_kvb() {
+        // Default config: min_fee_rate == 100 sat/kvB (the new honest floor).
+        assert_eq!(MempoolConfig::default().min_fee_rate, 100);
+
+        let prev_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap();
+        let input_value = 100_000_000u64;
+
+        // Build the tx with MANY outputs so its vsize is large (~1 kvB). At that
+        // size a single satoshi of fee moves the feerate by <1 sat/kvB, giving
+        // the resolution to land precisely on the 100 vs 99 sat/kvB boundary —
+        // a sub-1-sat/vB feerate the pre-fix whole-sat/vB integer comparison
+        // could not express. The admission gate is
+        // `(fee/vsize * 1000).floor() < min_fee_rate` => reject.
+        let n_outputs = 30usize; // ~34 vB each => vsize well above 1000 vB.
+        let make_with_fee = |fee: u64| -> Transaction {
+            // Distribute (input_value - fee) across n_outputs.
+            let total_out = input_value - fee;
+            let per = total_out / n_outputs as u64;
+            let mut outs = vec![per; n_outputs];
+            // Put the remainder on the first output so the sum is exact.
+            outs[0] += total_out - per * n_outputs as u64;
+            make_tx(vec![(prev_txid, 0)], outs, 1)
+        };
+
+        // Use the CONSUMER's vsize (sigop-adjusted) so the calibration matches
+        // the admission math exactly. With P2PKH prevouts + OP_1 scriptSig the
+        // sigop cost is 0, so this equals tx.vsize(); compute it the same way.
+        let probe = make_with_fee(0);
+        let vsize = crate::params::get_virtual_transaction_size(
+            probe.weight() as u64,
+            0,
+            crate::params::DEFAULT_BYTES_PER_SIGOP,
+        ) as u64;
+        assert!(vsize >= 1000, "need a large tx for sub-sat/vB resolution, got {vsize}");
+
+        // Smallest fee whose floored sat/kvB feerate is >= 100 (the admitted
+        // boundary), and the largest fee whose feerate is exactly 99 (rejected).
+        let kvb = |fee: u64| -> u64 { ((fee as f64 / vsize as f64) * 1000.0).floor() as u64 };
+        let mut fee_100 = (vsize * 100).div_ceil(1000);
+        while kvb(fee_100) < 100 { fee_100 += 1; }
+        let mut fee_99 = fee_100;
+        while kvb(fee_99) >= 100 { fee_99 -= 1; }
+        assert!(kvb(fee_100) >= 100, "fee_100 feerate {} must be >= 100", kvb(fee_100));
+        assert_eq!(kvb(fee_99), 99, "fee_99 must floor to exactly 99 sat/kvB");
+
+        // 100 sat/kvB tx is ADMITTED.
+        {
+            let mut mempool = Mempool::new(MempoolConfig::default());
+            let utxos = mock_utxo_set(vec![(
+                OutPoint { txid: prev_txid, vout: 0 },
+                input_value,
+            )]);
+            let res = mempool.add_transaction(make_with_fee(fee_100), &|op| utxos.get(op).cloned());
+            assert!(res.is_ok(), "100 sat/kvB tx must be admitted, got {:?}", res);
+        }
+
+        // 99 sat/kvB tx is REJECTED with InsufficientFee.
+        {
+            let mut mempool = Mempool::new(MempoolConfig::default());
+            let utxos = mock_utxo_set(vec![(
+                OutPoint { txid: prev_txid, vout: 0 },
+                input_value,
+            )]);
+            let res = mempool.add_transaction(make_with_fee(fee_99), &|op| utxos.get(op).cloned());
+            assert!(
+                matches!(res, Err(MempoolError::InsufficientFee(_, _))),
+                "99 sat/kvB tx must be rejected with InsufficientFee, got {:?}",
+                res
+            );
+        }
+    }
+
+    /// The public accessors expose the real sat/kvB floor so the RPC display
+    /// can READ policy instead of hardcoding a literal (the recurrence guard
+    /// for the fee-display lie). Production config must report 100 sat/kvB.
+    #[test]
+    fn test_min_relay_feerate_accessor_is_100_kvb() {
+        let mempool = Mempool::new(MempoolConfig::production());
+        assert_eq!(mempool.min_relay_feerate_kvb(), 100);
+        assert_eq!(mempool.incremental_relay_feerate_kvb(), 100);
+        // Empty mempool: rolling rate is 0, so mempool-min == max(0, 100) == 100.
+        assert_eq!(mempool.mempool_min_feerate_kvb(), 100);
     }
 
     #[test]
