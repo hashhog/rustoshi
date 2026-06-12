@@ -183,6 +183,16 @@ pub struct RpcState {
     /// (non-tip) query returns Core's `-8`. Mirrors Bitcoin Core's
     /// `-coinstatsindex` global (`src/index/coinstatsindex.cpp`).
     pub coinstatsindex_enabled: bool,
+    /// Whether the transaction-output spender index is enabled
+    /// (`-txospenderindex=1`). When set, every block-connect records
+    /// (spent outpoint -> spending txid || block hash) in `CF_TXOSPENDER` and
+    /// every disconnect re-derives + erases those keys, so
+    /// `gettxspendingprevout` can resolve CONFIRMED spends (`mempool_only=false`)
+    /// and `getindexinfo` reports it. Default off, mirroring Bitcoin Core's
+    /// `-txospenderindex` (`DEFAULT_TXOSPENDERINDEX{false}`,
+    /// `src/index/txospenderindex.cpp`). The RPC's mempool form works
+    /// regardless of this flag.
+    pub txospenderindex_enabled: bool,
 }
 
 /// Select the mempool configuration appropriate for `network`.
@@ -239,6 +249,7 @@ impl RpcState {
             orphanage: TxOrphanage::new(),
             wallet_state: None,
             coinstatsindex_enabled: false,
+            txospenderindex_enabled: false,
         }
     }
 
@@ -269,6 +280,7 @@ impl RpcState {
             orphanage: TxOrphanage::new(),
             wallet_state: None,
             coinstatsindex_enabled: false,
+            txospenderindex_enabled: false,
         }
     }
 
@@ -1292,6 +1304,23 @@ pub trait RustoshiRpc {
         &self,
         index_name: Option<String>,
     ) -> RpcResult<Box<serde_json::value::RawValue>>;
+
+    /// Scan the mempool (and the txospenderindex, if available) to find
+    /// transactions spending any of the given outputs.
+    ///
+    /// Mirrors `bitcoin-core/src/rpc/mempool.cpp::gettxspendingprevout`.
+    /// `outputs` is a required array of `{txid, vout}`. `options` is an
+    /// optional strict object `{mempool_only, return_spending_tx}`. Returns an
+    /// array of per-output objects in Core's `pushKV` order: `txid`, `vout`,
+    /// `[spendingtxid]`, `[spendingtx]`, `[blockhash]`. Built as a verbatim
+    /// JSON string and returned as a `RawValue` so the key order is preserved
+    /// exactly.
+    #[method(name = "gettxspendingprevout")]
+    async fn get_tx_spending_prevout(
+        &self,
+        outputs: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> RpcResult<Box<serde_json::value::RawValue>>;
 }
 
 // ============================================================
@@ -1879,6 +1908,68 @@ fn coinstats_disconnect_above(
     }
 }
 
+/// Maintain the txospenderindex on block CONNECT.
+///
+/// For every input of every non-coinbase transaction in `block`, records
+/// (spent outpoint -> spending txid || block hash) and advances the index's
+/// persisted best-block pointer, all in one atomic batch. Mirrors Bitcoin
+/// Core's `TxoSpenderIndex::CustomAppend(BuildSpenderPositions(block))`
+/// (`src/index/txospenderindex.cpp`), fired from `BaseIndex::BlockConnected`
+/// on every connect (submitblock, IBD, and reorg-reconnect). No-op unless
+/// `-txospenderindex` was enabled at startup.
+///
+/// Non-fatal on error: a spender-index write failure must not unwind an
+/// already-committed block connect (matches the coinstats / block-filter
+/// index paths).
+fn txospender_connect_block(
+    db: &Arc<ChainDb>,
+    enabled: bool,
+    block: &Block,
+    height: u32,
+    block_hash: Hash256,
+) {
+    if !enabled {
+        return;
+    }
+    let index = rustoshi_storage::TxoSpenderIndex::new(db);
+    if let Err(e) = index.write_block(block, height, block_hash) {
+        tracing::warn!(
+            "txospenderindex: failed to write spends at height {}: {}",
+            height,
+            e
+        );
+    }
+}
+
+/// Maintain the txospenderindex on block DISCONNECT.
+///
+/// RE-DERIVES the exact same keys from the disconnected `block`'s own inputs
+/// and erases them, then resets the index's best-block pointer to the parent
+/// (`prev_height` / `prev_hash`). Mirrors Bitcoin Core's
+/// `TxoSpenderIndex::CustomRemove(BuildSpenderPositions(block))`
+/// (`src/index/txospenderindex.cpp`), fired from `BaseIndex::BlockDisconnected`.
+/// Needs no separate undo data — the keys are a pure function of the block's
+/// inputs. No-op unless enabled.
+fn txospender_disconnect_block(
+    db: &Arc<ChainDb>,
+    enabled: bool,
+    block: &Block,
+    prev_height: u32,
+    prev_hash: Hash256,
+) {
+    if !enabled {
+        return;
+    }
+    let index = rustoshi_storage::TxoSpenderIndex::new(db);
+    if let Err(e) = index.revert_block(block, prev_height, prev_hash) {
+        tracing::warn!(
+            "txospenderindex: failed to erase spends on disconnect (new tip height {}): {}",
+            prev_height,
+            e
+        );
+    }
+}
+
 /// Disconnect every block in the active chain from `state.best_hash`
 /// (inclusive) back to `target_hash` (exclusive), updating the UTXO set,
 /// chain-state metadata, persisted tip pointer, and height index. Used by
@@ -2049,6 +2140,24 @@ fn disconnect_to(
         target_height,
         original_height,
     );
+
+    // Txospenderindex: erase the spend keys for every disconnected block by
+    // RE-DERIVING them from each block's own inputs, and reset the index's
+    // best-block pointer to the new tip. Mirrors Core's
+    // `TxoSpenderIndex::CustomRemove` fired from `BaseIndex::BlockDisconnected`
+    // for every block as the chainstate rewinds. `plan` is tip-down; order is
+    // irrelevant since each key is independent. No-op unless enabled.
+    if state.txospenderindex_enabled {
+        for (_h, _hash, block, _undo) in plan.iter() {
+            txospender_disconnect_block(
+                &db,
+                true,
+                block,
+                target_height,
+                target_hash,
+            );
+        }
+    }
 
     state.best_hash = target_hash;
     state.best_height = target_height;
@@ -2609,6 +2718,53 @@ fn try_attach_and_reorg(
                     *height,
                     v_undo,
                 );
+            }
+        }
+    }
+
+    // Txospenderindex: rewind the disconnected branch's spends, then record the
+    // new branch's spends on reconnect — mirroring the txindex (server.rs:2528)
+    // and coinstatsindex (server.rs:2710) hooks above, which both rewind the
+    // disconnected branch in this same `try_attach_and_reorg` orchestration.
+    //
+    // This path drives `chain_state.reorganize()`, NOT `disconnect_to`, so the
+    // disconnected branch's keys are NOT erased anywhere else (the earlier
+    // comment claiming `disconnect_to` had already erased them was WRONG for
+    // this path — there is no `disconnect_to` call here). Without this
+    // disconnect loop, after a natural reorg the index would still report an
+    // outpoint as spent-on-chain when its only spender was orphaned (a
+    // confirmed false-positive in `gettxspendingprevout`).
+    //
+    // ORDER MATTERS: disconnect the OLD branch BEFORE connecting the NEW branch.
+    // A reorg can spend the SAME outpoint by different transactions on each
+    // branch; if we connected first then disconnected, the disconnect would
+    // re-derive that shared outpoint's key from the old branch and erase the
+    // NEW branch's freshly-written entry. Disconnecting first leaves the new
+    // branch's CustomAppend authoritative. Mirrors Core's
+    // `BaseIndex::BlockDisconnected` -> `TxoSpenderIndex::CustomRemove`
+    // (re-derived purely from each disconnected block's own inputs, no undo
+    // data) firing for the whole old branch before `BlockConnected` ->
+    // `CustomAppend` fires for the new branch.
+    //
+    // `disconnected_blocks` was collected by walking from the original tip
+    // (`state.best_hash`, height `original_tip_height`) back toward the fork
+    // point, so `disconnected_blocks[i]` sits at height
+    // `original_tip_height - i` and its parent is `header.prev_block_hash` at
+    // height `(original_tip_height - i) - 1`. The per-block parent pointer is
+    // transient — the final best-block pointer is set forward to the new tip by
+    // the connect loop below — but each disconnect must still write the correct
+    // parent (the block's own prev) so the pointer is consistent at every step.
+    // No-op unless enabled.
+    if state.txospenderindex_enabled {
+        for (i, blk) in disconnected_blocks.iter().enumerate() {
+            let disc_height = original_tip_height.saturating_sub(i as u32);
+            let prev_height = disc_height.saturating_sub(1);
+            let prev_hash = blk.header.prev_block_hash;
+            txospender_disconnect_block(&state.db, true, blk, prev_height, prev_hash);
+        }
+        for (h, height, _v_undo) in &connected_blocks {
+            if let Some(block) = store.get_block(h).ok().flatten() {
+                txospender_connect_block(&state.db, true, &block, *height, *h);
             }
         }
     }
@@ -5995,6 +6151,19 @@ impl RustoshiRpcServer for RpcServerImpl {
                     &block,
                     new_height,
                     &undo_data,
+                );
+
+                // Txospenderindex — record (spent outpoint -> spending txid ||
+                // block hash) for every non-coinbase input, so
+                // `gettxspendingprevout` can resolve confirmed spends.
+                // Counterpart to Core's TxoSpenderIndex::CustomAppend on
+                // BlockConnected. No-op unless -txospenderindex was enabled.
+                txospender_connect_block(
+                    &state.db,
+                    state.txospenderindex_enabled,
+                    &block,
+                    new_height,
+                    block_hash,
                 );
 
                 // Flush UTXO changes to disk
@@ -11286,6 +11455,22 @@ impl RustoshiRpcServer for RpcServerImpl {
         } else {
             (false, false)
         };
+        // Txospenderindex.  Active iff -txospenderindex was enabled at startup.
+        // "synced" = the persisted best-block pointer has reached the tip
+        // (the synchronous indexer advances in lockstep with connect). Mirrors
+        // Core's `g_txospenderindex` global.
+        let (txospender_active, txospender_synced) = if state.txospenderindex_enabled {
+            let index = rustoshi_storage::TxoSpenderIndex::new(&state.db);
+            let synced = index
+                .best_height()
+                .ok()
+                .flatten()
+                .map(|h| h >= state.best_height)
+                .unwrap_or(false);
+            (true, synced)
+        } else {
+            (false, false)
+        };
 
         // Push in lexicographic key order so the outer object matches the old
         // BTreeMap iteration order: "basic block filter index" < "coinstatsindex"
@@ -11319,6 +11504,15 @@ impl RustoshiRpcServer for RpcServerImpl {
                 },
             ));
         }
+        if txospender_active && (want.is_empty() || want == "txospenderindex") {
+            entries.push((
+                "txospenderindex",
+                IndexSummary {
+                    synced: txospender_synced,
+                    best_block_height: state.best_height,
+                },
+            ));
+        }
 
         // Build the outer object as a verbatim JSON string. Each per-index
         // value is serialized via the struct (declaration order preserved).
@@ -11341,6 +11535,236 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         Ok(serde_json::value::RawValue::from_string(json)
             .expect("manually-built getindexinfo object is valid JSON"))
+    }
+
+    async fn get_tx_spending_prevout(
+        &self,
+        outputs: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> RpcResult<Box<serde_json::value::RawValue>> {
+        use serde_json::Value;
+
+        // ── params[0]: outputs ARR of {txid, vout}. ──────────────────────────
+        // Core: `request.params[0].get_array()`; empty -> RPC error.
+        let output_params = outputs.as_array().ok_or_else(|| {
+            Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Invalid parameter, outputs must be an array",
+            )
+        })?;
+        if output_params.is_empty() {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Invalid parameter, outputs are missing",
+            ));
+        }
+
+        let state = self.state.read().await;
+
+        // mempool_only default = index unavailable (Core: `!g_txospenderindex`).
+        let index_enabled = state.txospenderindex_enabled;
+        let mut mempool_only = !index_enabled;
+        let mut return_spending_tx = false;
+
+        // ── params[1]: options OBJ, strict {mempool_only, return_spending_tx}. ─
+        if let Some(opts) = options {
+            if !opts.is_null() {
+                let map = opts.as_object().ok_or_else(|| {
+                    Self::rpc_error(rpc_error::RPC_TYPE_ERROR, "Expected object")
+                })?;
+                for k in map.keys() {
+                    if k != "mempool_only" && k != "return_spending_tx" {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_TYPE_ERROR,
+                            format!("Unexpected key {}", k),
+                        ));
+                    }
+                }
+                if let Some(v) = map.get("mempool_only") {
+                    mempool_only = v.as_bool().ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_TYPE_ERROR,
+                            "JSON value of type string is not of expected type bool",
+                        )
+                    })?;
+                }
+                if let Some(v) = map.get("return_spending_tx") {
+                    return_spending_tx = v.as_bool().ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_TYPE_ERROR,
+                            "JSON value of type string is not of expected type bool",
+                        )
+                    })?;
+                }
+            }
+        }
+
+        // Worklist entry: parsed outpoint + the original txid/vout so the result
+        // object copies them verbatim (Core: `UniValue o{*prevout.raw}`).
+        struct Entry {
+            outpoint: OutPoint,
+            txid_str: String,
+            vout: u32,
+        }
+        let mut worklist: Vec<Entry> = Vec::with_capacity(output_params.len());
+        for raw in output_params {
+            let o = raw.as_object().ok_or_else(|| {
+                Self::rpc_error(rpc_error::RPC_TYPE_ERROR, "Expected object")
+            })?;
+            // Strict: exactly txid + vout (Core RPCTypeCheckObj fStrict=true).
+            for k in o.keys() {
+                if k != "txid" && k != "vout" {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_TYPE_ERROR,
+                        format!("Unexpected key {}", k),
+                    ));
+                }
+            }
+            let txid_str = o
+                .get("txid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Self::rpc_error(rpc_error::RPC_TYPE_ERROR, "Missing txid")
+                })?
+                .to_string();
+            let vout_val = o.get("vout").and_then(Value::as_i64).ok_or_else(|| {
+                Self::rpc_error(rpc_error::RPC_TYPE_ERROR, "Missing vout")
+            })?;
+            // Core: `if (nOutput < 0) throw "vout cannot be negative"`.
+            if vout_val < 0 {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    "Invalid parameter, vout cannot be negative",
+                ));
+            }
+            let txid = Self::parse_hash(&txid_str)?;
+            worklist.push(Entry {
+                outpoint: OutPoint {
+                    txid,
+                    vout: vout_val as u32,
+                },
+                txid_str,
+                vout: vout_val as u32,
+            });
+        }
+
+        // make_output: build the per-output object in Core's pushKV order:
+        // txid, vout, [spendingtxid], [spendingtx]. blockhash is appended by the
+        // caller on the confirmed path only.
+        let make_output = |e: &Entry, spending_tx: Option<&Transaction>| -> serde_json::Map<String, Value> {
+            let mut o = serde_json::Map::new();
+            o.insert("txid".to_string(), Value::String(e.txid_str.clone()));
+            o.insert("vout".to_string(), Value::from(e.vout));
+            if let Some(tx) = spending_tx {
+                o.insert(
+                    "spendingtxid".to_string(),
+                    Value::String(tx.txid().to_string()),
+                );
+                if return_spending_tx {
+                    o.insert(
+                        "spendingtx".to_string(),
+                        Value::String(hex::encode(tx.serialize())),
+                    );
+                }
+            }
+            o
+        };
+
+        let mut result: Vec<Value> = Vec::with_capacity(worklist.len());
+
+        // ── Phase 1: scan the mempool first (Core's GetConflictTx). ──────────
+        let mut remaining: Vec<Entry> = Vec::new();
+        for e in worklist {
+            // The mempool reverse-index: which mempool tx spends this outpoint.
+            let spending_tx: Option<Transaction> = state
+                .mempool
+                .get_spending_tx(&e.outpoint)
+                .and_then(|spender_txid| {
+                    state.mempool.get(&spender_txid).map(|entry| entry.tx.clone())
+                });
+
+            // If unspent in mempool and not a mempool-only request, defer.
+            if spending_tx.is_none() && !mempool_only {
+                remaining.push(e);
+                continue;
+            }
+            result.push(Value::Object(make_output(&e, spending_tx.as_ref())));
+        }
+
+        // Return early if the mempool scan handled everything (Core early-return).
+        if remaining.is_empty() {
+            let s = serde_json::to_string(&result)
+                .expect("gettxspendingprevout result serializes infallibly");
+            return Ok(serde_json::value::RawValue::from_string(s)
+                .expect("gettxspendingprevout result is valid JSON"));
+        }
+
+        // ── Phase 2: the request was not mempool-only and some outpoints are
+        // unresolved. Require the index available AND synced to the tip
+        // (Core: `!g_txospenderindex || !BlockUntilSyncedToCurrentChain()`). ──
+        let index = rustoshi_storage::TxoSpenderIndex::new(&state.db);
+        let synced = index_enabled
+            && index
+                .best_height()
+                .ok()
+                .flatten()
+                .map(|h| h >= state.best_height)
+                .unwrap_or(false);
+        if !index_enabled || !synced {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "Mempool lacks a relevant spend, and txospenderindex is unavailable.",
+            ));
+        }
+
+        let store = BlockStore::new(&state.db);
+        for e in &remaining {
+            let spender = index.find_spender(&e.outpoint).map_err(|err| {
+                Self::rpc_error(rpc_error::RPC_MISC_ERROR, err.to_string())
+            })?;
+            match spender {
+                Some(sp) => {
+                    // Resolve the full spending tx only when needed, by reading
+                    // it from the spending block recorded in the index entry.
+                    let spending_tx: Option<Transaction> = if return_spending_tx {
+                        store.get_block(&sp.block_hash).ok().flatten().and_then(|b| {
+                            b.transactions
+                                .into_iter()
+                                .find(|t| t.txid() == sp.spending_txid)
+                        })
+                    } else {
+                        None
+                    };
+                    let mut o = if let Some(tx) = spending_tx.as_ref() {
+                        make_output(e, Some(tx))
+                    } else {
+                        // Need the recorded spending txid even without the full
+                        // tx; emit it verbatim from the index entry.
+                        let mut m = make_output(e, None);
+                        m.insert(
+                            "spendingtxid".to_string(),
+                            Value::String(sp.spending_txid.to_string()),
+                        );
+                        m
+                    };
+                    // blockhash: confirmed/index path ONLY (never mempool).
+                    o.insert(
+                        "blockhash".to_string(),
+                        Value::String(sp.block_hash.to_string()),
+                    );
+                    result.push(Value::Object(o));
+                }
+                None => {
+                    // Unspent on-chain: only txid+vout (Core make_output(prevout)).
+                    result.push(Value::Object(make_output(e, None)));
+                }
+            }
+        }
+
+        let s = serde_json::to_string(&result)
+            .expect("gettxspendingprevout result serializes infallibly");
+        Ok(serde_json::value::RawValue::from_string(s)
+            .expect("gettxspendingprevout result is valid JSON"))
     }
 }
 
@@ -12267,6 +12691,41 @@ impl RpcServerImpl {
                         })?;
                     }
                 }
+
+                // Persist undo data so future reorgs / `invalidateblock` calls
+                // can disconnect this generate*-mined block correctly — the same
+                // reason submit_block persists it (server.rs ~5972). Without
+                // this, `disconnect_to` errors "missing undo data" and a
+                // generate*-mined tip is non-reorgable (and the txospender /
+                // coinstats index disconnect hooks could never fire on it).
+                let storage_undo = validation_undo_to_storage(&_undo_data);
+                if let Err(e) = store.put_undo(&block_hash, &storage_undo) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("Failed to store undo data: {}", e),
+                    ));
+                }
+
+                // Coinstatsindex / Txospenderindex — maintain the per-block
+                // indexes on the generate* connect path too (this path bypasses
+                // the submit_block index hooks). No-op unless the respective
+                // flag was enabled at startup. Counterparts to Core's
+                // CoinStatsIndex / TxoSpenderIndex CustomAppend on BlockConnected.
+                coinstats_connect_block(
+                    &state.db,
+                    state.coinstatsindex_enabled,
+                    state.params.genesis_hash,
+                    &block,
+                    height,
+                    &_undo_data,
+                );
+                txospender_connect_block(
+                    &state.db,
+                    state.txospenderindex_enabled,
+                    &block,
+                    height,
+                    block_hash,
+                );
 
                 store.set_best_block(&block_hash, height).map_err(|e| {
                     Self::rpc_error(
@@ -19136,5 +19595,670 @@ mod tests {
             1,
             "asking for 'basic block filter index' must return exactly one entry"
         );
+    }
+
+    // ============================================================
+    // VERIFIER 1 PROOF — txospenderindex (gettxspendingprevout)
+    //
+    // Proves the four properties the AXIS-#3 charter requires:
+    //   (1) connect records (spent outpoint -> spending txid || blockhash);
+    //   (2) gettxspendingprevout (confirmed path) resolves A's outpoint to B
+    //       + blockhash, in Core's pushKV order;
+    //   (3) reorg-safe undo: disconnect RE-DERIVES the keys from the block's
+    //       OWN inputs and erases them (no separate undo data) — the entry is
+    //       GONE on re-query (returns bare txid/vout = unspent);
+    //   (4) the mempool form returns the mempool spender (never a blockhash);
+    //   (5) FALSIFICATION: with -txospenderindex OFF the confirmed path throws
+    //       the Core "...txospenderindex is unavailable." error (pre-impl
+    //       behavior) — the test is non-vacuous.
+    //
+    // These call the EXACT live-path functions: `txospender_connect_block`
+    // (the connect hook fired from submitblock / IBD / reorg-reconnect) and
+    // `txospender_disconnect_block` (the function `disconnect_to` loops over
+    // for every disconnected block on the invalidateblock / reorg path).
+    // ============================================================
+
+    /// Build a non-coinbase tx spending `prevout` and paying `value` to OP_TRUE.
+    /// `salt` keeps txids distinct.
+    fn spend_tx(prevout: &OutPoint, value: u64, salt: u8) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: prevout.clone(),
+                script_sig: vec![salt],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value,
+                script_pubkey: vec![0x51], // OP_TRUE
+            }],
+            lock_time: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn verifier1_txospenderindex_records_resolves_and_reorg_erases() {
+        use rustoshi_consensus::ChainParams;
+
+        let (db, state, server) = make_test_server(ChainParams::regtest());
+
+        // tx A: a confirmed tx (we synthesize its outpoint as the thing B
+        // spends). A:0 is the output that B will spend.
+        let txid_a = Hash256::from_bytes([0xA1; 32]);
+        let outpoint_a0 = OutPoint { txid: txid_a, vout: 0 };
+
+        // tx B spends A:0. coinbase + B make up block H1.
+        let coinbase = synth_coinbase(1, 0xCC);
+        let tx_b = spend_tx(&outpoint_a0, 49_000_000, 0xB1);
+        let txid_b = tx_b.txid();
+
+        let block_h1 = {
+            use rustoshi_primitives::BlockHeader;
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_block_hash: state.read().await.best_hash,
+                    merkle_root: Hash256::ZERO,
+                    timestamp: 1_700_000_100,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![coinbase, tx_b.clone()],
+            }
+        };
+        let block_h1_hash = block_h1.block_hash();
+
+        // ── (1) CONNECT records the spend (live connect hook). ───────────────
+        {
+            let st = state.read().await;
+            assert!(st.txospenderindex_enabled == false, "index off by default");
+        }
+        // Direct CF check: nothing is indexed before connect.
+        {
+            let idx = rustoshi_storage::TxoSpenderIndex::new(&db);
+            assert!(
+                idx.find_spender(&outpoint_a0).unwrap().is_none(),
+                "no spend recorded before connect"
+            );
+        }
+
+        // Enable the index and fire the live connect hook for block H1.
+        {
+            let mut st = state.write().await;
+            st.txospenderindex_enabled = true;
+        }
+        txospender_connect_block(&db, true, &block_h1, 1, block_h1_hash);
+
+        // Index now maps A:0 -> (B, blockH1).
+        {
+            let idx = rustoshi_storage::TxoSpenderIndex::new(&db);
+            let sp = idx.find_spender(&outpoint_a0).unwrap().expect("A:0 recorded");
+            assert_eq!(sp.spending_txid, txid_b, "spending txid is B");
+            assert_eq!(sp.block_hash, block_h1_hash, "blockhash is H1");
+            // best-block pointer advanced
+            assert_eq!(idx.best_height().unwrap(), Some(1));
+        }
+
+        // ── (2) gettxspendingprevout (confirmed path) resolves + ordering. ───
+        // Set the in-memory tip to H1 so the RPC's synced() check passes.
+        {
+            let mut st = state.write().await;
+            st.best_hash = block_h1_hash;
+            st.best_height = 1;
+        }
+        let outputs = serde_json::json!([{ "txid": txid_a.to_string(), "vout": 0 }]);
+        let raw = server
+            .get_tx_spending_prevout(outputs.clone(), None)
+            .await
+            .expect("gettxspendingprevout confirmed");
+        // Parse and verify VALUES.
+        let arr: serde_json::Value = serde_json::from_str(raw.get()).unwrap();
+        let obj = &arr[0];
+        assert_eq!(obj["txid"].as_str().unwrap(), txid_a.to_string());
+        assert_eq!(obj["vout"].as_u64().unwrap(), 0);
+        assert_eq!(
+            Hash256::from_hex(obj["spendingtxid"].as_str().unwrap()).unwrap(),
+            txid_b,
+            "spendingtxid must be B"
+        );
+        assert_eq!(
+            Hash256::from_hex(obj["blockhash"].as_str().unwrap()).unwrap(),
+            block_h1_hash,
+            "blockhash must be H1 (confirmed/index path only)"
+        );
+        // Core pushKV order on a confirmed-found object: txid, vout,
+        // spendingtxid, (no spendingtx since return_spending_tx=false), blockhash.
+        let raw_keys: Vec<&str> = obj.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            raw_keys,
+            vec!["txid", "vout", "spendingtxid", "blockhash"],
+            "pushKV key order must match Core exactly"
+        );
+
+        // ── (3) REORG-SAFE UNDO: disconnect re-derives keys + erases. ────────
+        // Fire the live disconnect hook (the one disconnect_to loops over).
+        // prev_height/prev_hash = genesis (the new tip after rolling H1 off).
+        let genesis_hash = {
+            let store = BlockStore::new(&db);
+            store.get_hash_by_height(0).unwrap().unwrap()
+        };
+        txospender_disconnect_block(&db, true, &block_h1, 0, genesis_hash);
+
+        // The entry is GONE — re-derived purely from B's own inputs, no undo.
+        {
+            let idx = rustoshi_storage::TxoSpenderIndex::new(&db);
+            assert!(
+                idx.find_spender(&outpoint_a0).unwrap().is_none(),
+                "STALE ENTRY SURVIVED DISCONNECT — index is NOT reorg-safe"
+            );
+            assert_eq!(
+                idx.best_height().unwrap(),
+                Some(0),
+                "index best-block pointer rewound to parent"
+            );
+        }
+
+        // gettxspendingprevout now reports A:0 as UNSPENT (bare txid/vout).
+        // Roll the in-memory tip back too so synced() still holds (tip==0).
+        {
+            let mut st = state.write().await;
+            st.best_hash = genesis_hash;
+            st.best_height = 0;
+        }
+        let raw2 = server
+            .get_tx_spending_prevout(outputs.clone(), None)
+            .await
+            .expect("gettxspendingprevout after disconnect");
+        let arr2: serde_json::Value = serde_json::from_str(raw2.get()).unwrap();
+        let obj2 = &arr2[0];
+        let keys2: Vec<&str> = obj2.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys2,
+            vec!["txid", "vout"],
+            "after disconnect A:0 must be bare txid/vout (unspent) — no spendingtxid/blockhash"
+        );
+    }
+
+    /// REORG-SAFETY on the `try_attach_and_reorg` (P2P / submitblock-extension)
+    /// path. This path drives `chain_state.reorganize()`, NOT `disconnect_to`,
+    /// so it cannot rely on `disconnect_to`'s txospender-erase loop — it must
+    /// erase the disconnected branch's spend keys itself (the same way the
+    /// txindex code at server.rs:2528 and the coinstatsindex code at
+    /// server.rs:2710 already rewind the disconnected branch in this very
+    /// function).
+    ///
+    /// PRE-FIX BUG (proven non-vacuous): `try_attach_and_reorg` only ran
+    /// `txospender_connect_block` for the NEW branch and never erased the
+    /// DISCONNECTED branch's spends, so after a natural reorg
+    /// `gettxspendingprevout` reported an outpoint as spent-on-chain even though
+    /// its only spender lived on the now-orphaned branch — a confirmed
+    /// false-positive. Reverting the disconnect loop makes this test FAIL on the
+    /// final assertion (the stale entry survives).
+    ///
+    /// The test drives the REAL `try_attach_and_reorg` (exactly like
+    /// `try_attach_and_reorg_revert_and_replay_tx_index` above). The
+    /// soon-to-be-disconnected A-branch carries a non-coinbase tx that spends a
+    /// pre-seeded outpoint X; the heavier B-branch never spends X. After the
+    /// reorg fires, X's spender entry must be gone.
+    #[tokio::test]
+    async fn verifier1_txospenderindex_reorg_via_reorganize_erases_stale_entry() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_primitives::{BlockHeader, TxIn, TxOut};
+        use rustoshi_storage::ChainDb;
+
+        // ── Regtest helpers ──────────────────────────────────────────────────
+        // Regtest's pow_limit accepts the trivial 0x207fffff target (mainnet's
+        // does NOT — which is why the older mainnet-based reorg tests cannot
+        // connect synthetic-difficulty blocks through `reorganize`'s check_block
+        // PoW gate). Regtest activates BIP-34 + SegWit at height 1, so every
+        // coinbase here encodes its height (single OP_N byte for h<=16) and
+        // carries no witness data (=> no witness commitment required).
+        //
+        // A BIP-34-compliant regtest coinbase at height `h`: scriptSig starts
+        // with `0x50 + h` (OP_1..OP_16), then a unique marker so distinct
+        // branches get distinct coinbase txids.
+        fn rt_coinbase(h: u32, marker: u8) -> Transaction {
+            let mut script_sig = vec![0x50u8 + h as u8]; // BIP-34 height (OP_N)
+            script_sig.extend_from_slice(&[marker, marker, marker]);
+            Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint { txid: Hash256::ZERO, vout: u32::MAX },
+                    script_sig,
+                    sequence: 0xFFFF_FFFF,
+                    witness: vec![],
+                }],
+                outputs: vec![TxOut { value: 50_000_000, script_pubkey: vec![0x51] }],
+                lock_time: 0,
+            }
+        }
+
+        // Build a regtest block at `prev_hash` with `txs`, fill the real merkle
+        // root, and grind the nonce until PoW is met (trivial target).
+        fn rt_mine(prev_hash: Hash256, ts: u32, txs: Vec<Transaction>) -> Block {
+            let mut block = Block {
+                header: BlockHeader {
+                    version: 4, // >= 2 so the BIP-34 version gate is satisfied
+                    prev_block_hash: prev_hash,
+                    merkle_root: Hash256::ZERO,
+                    timestamp: ts,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: txs,
+            };
+            block.header.merkle_root = block.compute_merkle_root();
+            let mut nonce: u32 = 0;
+            loop {
+                block.header.nonce = nonce;
+                if block.header.validate_pow() {
+                    break;
+                }
+                nonce = nonce.wrapping_add(1);
+                if nonce == 0 {
+                    block.header.timestamp = block.header.timestamp.wrapping_add(1);
+                }
+            }
+            block
+        }
+
+        // Persist a block + header + block-index (HAVE_DATA, real chain_work) so
+        // the reorg path's get_block / get_block_index closures resolve it.
+        fn rt_persist_side(
+            store: &BlockStore,
+            block: &Block,
+            height: u32,
+            prev_hash: Hash256,
+            prev_work: [u8; 32],
+        ) -> [u8; 32] {
+            use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+            use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+            let hash = block.block_hash();
+            let this_work =
+                ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(0x207fffff));
+            store.put_block(&hash, block).unwrap();
+            store.put_header(&hash, &block.header).unwrap();
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::HAVE_DATA);
+            store
+                .put_block_index(
+                    &hash,
+                    &BlockIndexEntry {
+                        height,
+                        status,
+                        n_tx: block.transactions.len() as u32,
+                        timestamp: block.header.timestamp,
+                        bits: block.header.bits,
+                        nonce: block.header.nonce,
+                        version: block.header.version,
+                        prev_hash,
+                        chain_work: this_work.0,
+                    },
+                )
+                .unwrap();
+            this_work.0
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::regtest());
+        rpc_state.txospenderindex_enabled = true;
+
+        let store = BlockStore::new(&db);
+
+        // Synthetic genesis G (fully populated: UTXO + undo + index). The synth
+        // coinbase's scriptSig isn't BIP-34-shaped, but genesis (height 0) is
+        // never re-validated by `reorganize` (it's the fork point / common
+        // ancestor) — only its index entry + work are read.
+        let (genesis_hash, _block_g, work_g) =
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA);
+        rpc_state.best_hash = genesis_hash;
+        rpc_state.best_height = 0;
+
+        // Pre-seed a spendable NON-coinbase UTXO X (no maturity constraint), so
+        // the A-branch tx that spends it validates through process_block, and
+        // its undo can later disconnect cleanly through reorganize().
+        let txid_x = Hash256::from_bytes([0x77; 32]);
+        let outpoint_x = OutPoint { txid: txid_x, vout: 0 };
+        // height: 1 (NON-zero) is deliberate: disconnect_block's apply_tx_in_undo
+        // treats a restored coin with height==0 as pre-0.15 packed metadata and
+        // tries a sibling-txid recovery, returning Failed if none exists. A
+        // genuine non-coinbase coin always has a real (non-zero) creation height,
+        // so we give X one. height==1 is a same-height spend by A1 (no maturity
+        // constraint applies to non-coinbase coins).
+        store
+            .put_utxo(
+                &outpoint_x,
+                &rustoshi_storage::block_store::CoinEntry {
+                    height: 1,
+                    is_coinbase: false,
+                    value: 50_000_000,
+                    script_pubkey: vec![0x51], // OP_TRUE — trivially spendable
+                },
+            )
+            .unwrap();
+
+        // OLD branch A1 (height 1): BIP-34 coinbase + a tx that SPENDS X. This
+        // is the branch the reorg will disconnect. Connect it via the exact
+        // live connect sequence (validate -> persist block/undo/index -> fire
+        // the txospender connect hook), mirroring the generate*/submit_block
+        // path at server.rs:12596+ so the index, UTXO set, and undo all match a
+        // real node before the reorg.
+        // Spend X with an EMPTY scriptSig: the OP_TRUE (0x51) scriptPubKey
+        // succeeds on its own under consensus script verification. (A non-empty
+        // salt scriptSig would be interpreted as opcodes and underflow.)
+        let tx_spend_x = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: outpoint_x.clone(),
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 49_000_000, script_pubkey: vec![0x51] }],
+            lock_time: 0,
+        };
+        let txid_spend_x = tx_spend_x.txid();
+        let block_a1 = rt_mine(
+            genesis_hash,
+            1_700_000_200,
+            vec![rt_coinbase(1, 0xA1), tx_spend_x.clone()],
+        );
+        let hash_a1 = block_a1.block_hash();
+        {
+            use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+            use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+
+            let mut chain_state = ChainState::new(
+                rpc_state.best_hash,
+                rpc_state.best_height,
+                rpc_state.params.clone(),
+            );
+            let mut utxo_view = store.utxo_view();
+            let (undo_data, _fees) = chain_state
+                .process_block(
+                    &block_a1,
+                    &mut utxo_view,
+                    0, // prev_block_mtp: genesis-adjacent
+                    true,
+                    rustoshi_consensus::current_time_secs(),
+                )
+                .expect("A1 (coinbase + spend of X) must validate");
+            utxo_view.flush().expect("flush A1 utxo");
+
+            store.put_block(&hash_a1, &block_a1).unwrap();
+            store.put_header(&hash_a1, &block_a1.header).unwrap();
+            store.put_height_index(1, &hash_a1).unwrap();
+            let this_work =
+                ChainWork::from_be_bytes(work_g).saturating_add(&get_block_proof(0x207fffff));
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_SCRIPTS);
+            status.set(BlockStatus::HAVE_DATA);
+            store
+                .put_block_index(
+                    &hash_a1,
+                    &BlockIndexEntry {
+                        height: 1,
+                        status,
+                        n_tx: block_a1.transactions.len() as u32,
+                        timestamp: block_a1.header.timestamp,
+                        bits: block_a1.header.bits,
+                        nonce: block_a1.header.nonce,
+                        version: block_a1.header.version,
+                        prev_hash: genesis_hash,
+                        chain_work: this_work.0,
+                    },
+                )
+                .unwrap();
+            store
+                .put_undo(&hash_a1, &validation_undo_to_storage(&undo_data))
+                .unwrap();
+            store.set_best_block(&hash_a1, 1).unwrap();
+            // Fire the live connect hook — records X -> A-branch spend tx.
+            txospender_connect_block(&rpc_state.db, true, &block_a1, 1, hash_a1);
+        }
+        rpc_state.best_hash = hash_a1;
+        rpc_state.best_height = 1;
+
+        // Precondition: the index now maps X -> the A-branch spend tx.
+        {
+            let idx = rustoshi_storage::TxoSpenderIndex::new(&db);
+            let sp = idx
+                .find_spender(&outpoint_x)
+                .unwrap()
+                .expect("precondition: X recorded as spent on branch A");
+            assert_eq!(
+                sp.spending_txid, txid_spend_x,
+                "precondition: X's spender is the A-branch tx"
+            );
+            assert_eq!(sp.block_hash, hash_a1);
+        }
+
+        // Heavier NEW branch B: G -> B1 -> B2 (coinbase-only, does NOT spend X).
+        // Persisted as side blocks; reorganize() validates + connects them
+        // (BIP-34 coinbases, no witness => contextual_check_block passes,
+        // regtest pow_limit => check_proof_of_work passes).
+        let block_b1 = rt_mine(genesis_hash, 1_700_000_300, vec![rt_coinbase(1, 0xB1)]);
+        let hash_b1 = block_b1.block_hash();
+        let work_b1 = rt_persist_side(&store, &block_b1, 1, genesis_hash, work_g);
+        let block_b2 = rt_mine(hash_b1, 1_700_000_400, vec![rt_coinbase(2, 0xB2)]);
+        let hash_b2 = block_b2.block_hash();
+        let _work_b2 = rt_persist_side(&store, &block_b2, 2, hash_b1, work_b1);
+
+        // Fire the REAL reorg orchestration. B has more work (2 blocks vs 1).
+        let did_reorg = try_attach_and_reorg(&mut rpc_state, &block_b2, &hash_b2)
+            .expect("try_attach_and_reorg");
+        assert!(did_reorg, "B-branch has more work — reorg must fire");
+        assert_eq!(rpc_state.best_hash, hash_b2);
+        assert_eq!(rpc_state.best_height, 2);
+
+        // POST-FIX ASSERTION (non-vacuous): X's spender entry is ERASED. The
+        // only block that spent X (A1) was disconnected, and the reorg
+        // orchestration's txospender disconnect loop re-derived + erased the key
+        // from A1's own inputs. Reverting that disconnect loop makes this fail
+        // (the stale A-branch entry would survive — the original bug).
+        let idx = rustoshi_storage::TxoSpenderIndex::new(&db);
+        assert!(
+            idx.find_spender(&outpoint_x).unwrap().is_none(),
+            "STALE ENTRY SURVIVED REORG via reorganize() — the \
+             try_attach_and_reorg path is NOT reorg-safe (txospender disconnect \
+             loop missing). gettxspendingprevout would report X spent-on-chain \
+             though its only spender was orphaned."
+        );
+        // The index best-block pointer tracks the new tip (the connect loop set
+        // it forward after the per-block disconnect rewinds).
+        assert_eq!(
+            idx.best_height().unwrap(),
+            Some(2),
+            "index best-block pointer advanced to the new tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn verifier1_txospenderindex_mempool_form_and_falsification() {
+        use rustoshi_consensus::ChainParams;
+
+        let (db, state, server) = make_test_server(ChainParams::regtest());
+        let _ = &db;
+
+        let txid_a = Hash256::from_bytes([0xA2; 32]);
+        let outpoint_a0 = OutPoint { txid: txid_a, vout: 0 };
+        let outputs = serde_json::json!([{ "txid": txid_a.to_string(), "vout": 0 }]);
+
+        // ── (5) FALSIFICATION: index OFF, confirmed path is unavailable. ─────
+        // mempool_only defaults to false here? No: Core default mempool_only =
+        // !index. With index OFF, default mempool_only=TRUE, so an unspent
+        // outpoint returns bare txid/vout. To exercise the confirmed path we
+        // must explicitly pass mempool_only=false, and THEN (index off) Core
+        // throws "...txospenderindex is unavailable." This is exactly the
+        // pre-impl behavior: a node without the index cannot answer.
+        {
+            let st = state.read().await;
+            assert!(!st.txospenderindex_enabled, "index off by default");
+        }
+        let err = server
+            .get_tx_spending_prevout(
+                outputs.clone(),
+                Some(serde_json::json!({ "mempool_only": false })),
+            )
+            .await
+            .expect_err("confirmed path with index OFF must error (pre-impl behavior)");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("txospenderindex is unavailable"),
+            "must throw Core unavailable error, got: {}",
+            msg
+        );
+
+        // Default (no options): index off -> mempool_only defaults true ->
+        // unspent outpoint returns bare txid/vout (does NOT consult the index).
+        let raw_def = server
+            .get_tx_spending_prevout(outputs.clone(), None)
+            .await
+            .expect("default mempool-only path ok with index off");
+        let arr_def: serde_json::Value = serde_json::from_str(raw_def.get()).unwrap();
+        let keys: Vec<&str> = arr_def[0].as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["txid", "vout"], "mempool-only unspent = bare txid/vout");
+
+        // ── (4) MEMPOOL FORM: a mempool tx spending A:0 is returned, with NO
+        // blockhash (mempool spenders are never confirmed). ──────────────────
+        // Insert tx B into the mempool with a UTXO-lookup that supplies A:0 as
+        // a spendable OP_TRUE coin (so admission populates spent_outpoints —
+        // the real GetConflictTx reverse-index).
+        // Pad B's scriptSig so its base size clears MIN_STANDARD_TX_NONWITNESS_SIZE
+        // (65 bytes, CVE-2017-12842). Mempool admission enforces this gate
+        // regardless of require_standard; it is orthogonal to the property
+        // under test (the mempool reverse-index of A:0 -> B).
+        let mut tx_b = spend_tx(&outpoint_a0, 49_000_000, 0xB2);
+        tx_b.inputs[0].script_sig = vec![0x00; 80];
+        let txid_b = tx_b.txid();
+        {
+            let mut st = state.write().await;
+            let coin_lookup = |op: &OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
+                if *op == outpoint_a0 {
+                    Some(rustoshi_consensus::validation::CoinEntry {
+                        height: 1,
+                        is_coinbase: false,
+                        value: 50_000_000,
+                        script_pubkey: vec![0x51], // OP_TRUE
+                    })
+                } else {
+                    None
+                }
+            };
+            // Tip high enough that any maturity checks are satisfied.
+            st.best_height = 200;
+            // require_standard=false mirrors regtest -acceptnonstdtxn so the
+            // tiny OP_TRUE spend is admitted (the standardness gate is
+            // orthogonal to the reverse-index property under test).
+            let opts = rustoshi_consensus::mempool::AtmpOptions {
+                require_standard: false,
+                ..Default::default()
+            };
+            st.mempool
+                .add_transaction_with_options(tx_b.clone(), &coin_lookup, opts)
+                .expect("mempool admits B spending A:0");
+            // Sanity: the reverse-index now knows B spends A:0.
+            assert_eq!(
+                st.mempool.get_spending_tx(&outpoint_a0),
+                Some(txid_b),
+                "mempool reverse-index must record B as the spender of A:0"
+            );
+        }
+
+        // mempool_only=true (default with index off): the mempool spender B is
+        // returned, WITHOUT a blockhash.
+        let raw_mp = server
+            .get_tx_spending_prevout(outputs.clone(), None)
+            .await
+            .expect("mempool form ok");
+        let arr_mp: serde_json::Value = serde_json::from_str(raw_mp.get()).unwrap();
+        let obj_mp = &arr_mp[0];
+        assert_eq!(
+            Hash256::from_hex(obj_mp["spendingtxid"].as_str().unwrap()).unwrap(),
+            txid_b,
+            "mempool form returns the mempool spender B"
+        );
+        assert!(
+            obj_mp.get("blockhash").is_none(),
+            "a mempool spender must NEVER carry a blockhash"
+        );
+        let keys_mp: Vec<&str> = obj_mp.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys_mp,
+            vec!["txid", "vout", "spendingtxid"],
+            "mempool spender pushKV order: txid, vout, spendingtxid"
+        );
+
+        // return_spending_tx=true must add the full hex spendingtx, in order.
+        let raw_full = server
+            .get_tx_spending_prevout(
+                outputs.clone(),
+                Some(serde_json::json!({ "return_spending_tx": true })),
+            )
+            .await
+            .expect("mempool form with return_spending_tx ok");
+        let arr_full: serde_json::Value = serde_json::from_str(raw_full.get()).unwrap();
+        let obj_full = &arr_full[0];
+        let keys_full: Vec<&str> =
+            obj_full.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys_full,
+            vec!["txid", "vout", "spendingtxid", "spendingtx"],
+            "return_spending_tx pushKV order: txid, vout, spendingtxid, spendingtx"
+        );
+        assert_eq!(
+            obj_full["spendingtx"].as_str().unwrap(),
+            hex::encode(tx_b.serialize()),
+            "spendingtx must be B's full serialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn verifier1_txospenderindex_param_errors_match_core() {
+        use rustoshi_consensus::ChainParams;
+        let (_db, _state, server) = make_test_server(ChainParams::regtest());
+
+        // empty outputs -> "Invalid parameter, outputs are missing"
+        let e = server
+            .get_tx_spending_prevout(serde_json::json!([]), None)
+            .await
+            .expect_err("empty outputs must error");
+        assert!(format!("{:?}", e).contains("outputs are missing"), "got {:?}", e);
+
+        // negative vout -> "Invalid parameter, vout cannot be negative"
+        let e = server
+            .get_tx_spending_prevout(
+                serde_json::json!([{ "txid": "00".repeat(32), "vout": -1 }]),
+                None,
+            )
+            .await
+            .expect_err("negative vout must error");
+        assert!(
+            format!("{:?}", e).contains("vout cannot be negative"),
+            "got {:?}",
+            e
+        );
+
+        // unknown key in an output object -> strict reject
+        let e = server
+            .get_tx_spending_prevout(
+                serde_json::json!([{ "txid": "00".repeat(32), "vout": 0, "bogus": 1 }]),
+                None,
+            )
+            .await
+            .expect_err("unknown key must be rejected");
+        assert!(format!("{:?}", e).contains("bogus"), "got {:?}", e);
+
+        // unknown key in options -> strict reject
+        let e = server
+            .get_tx_spending_prevout(
+                serde_json::json!([{ "txid": "00".repeat(32), "vout": 0 }]),
+                Some(serde_json::json!({ "bogus_opt": true })),
+            )
+            .await
+            .expect_err("unknown option key must be rejected");
+        assert!(format!("{:?}", e).contains("bogus_opt"), "got {:?}", e);
     }
 }

@@ -27,6 +27,7 @@ pub mod coinstatsindex;
 pub mod gcs;
 pub mod muhash;
 pub mod txindex;
+pub mod txospenderindex;
 
 // Re-exports for convenience
 pub use blockfilterindex::{BlockFilter, BlockFilterError, BlockFilterIndex, BlockFilterType, FilterHeaderEntry};
@@ -34,3 +35,4 @@ pub use coinstatsindex::{CoinStatsEntry, CoinStatsError, CoinStatsIndex, compute
 pub use gcs::{GCSFilter, GCSError, BASIC_FILTER_M, BASIC_FILTER_P};
 pub use muhash::{MuHash3072, Num3072};
 pub use txindex::{TxIndex, TxIndexError, TxLocation};
+pub use txospenderindex::{TxoSpender, TxoSpenderError, TxoSpenderIndex};
