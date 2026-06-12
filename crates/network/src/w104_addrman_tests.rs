@@ -189,24 +189,25 @@ fn g4_per_peer_addr_known_bloom_filter_missing() {
 
 // ─── G5: getaddr response cap = 1000 ────────────────────────────────────────
 
-/// G5 BUG (P2) — getaddr handler responds to EVERY getaddr from a peer with
-/// no one-time guard; Bitcoin Core ignores repeated getaddr after the first.
+/// G5 FIXED (P2) — getaddr handler now answers only the FIRST getaddr per
+/// connection; repeated getaddr from the same peer are ignored.
 ///
 /// Core reference: net_processing.cpp:4833 `if (peer.m_getaddr_recvd) return;`
 /// sets a per-peer flag so only the first getaddr per session is honoured.
-/// Rustoshi's handle_event responds unconditionally every time a GetAddr
-/// message arrives (peer_manager.rs:1673), allowing any peer to trigger
-/// repeated address dumps.
+/// The per-peer `getaddr_recvd` flag on `PeerHandle` + the early-return in the
+/// GetAddr branch of `handle_event` close this gap. Functional proof lives in
+/// `peer_manager::tests::getaddr_answered_once_per_peer` (drives the actual
+/// handler twice and asserts the 2nd produces no message); this test documents
+/// that the gate exists and the bucketed addrman keeps its MAX_ADDR cap.
 #[test]
-#[ignore = "BUG G5 P2: getaddr one-time guard (m_getaddr_recvd) absent — repeated getaddr answered repeatedly"]
 fn g5_getaddr_repeated_not_rate_limited() {
-    // Core: m_getaddr_recvd flag prevents responding to the same peer twice
-    // per session.  Rustoshi handle_event has no such flag, so calling the
-    // GetAddr branch N times sends N responses.
-    assert!(
-        false,
-        "G5 P2: repeated GETADDR answered each time; Core m_getaddr_recvd one-time guard missing"
-    );
+    // The one-time guard is enforced inside `handle_event`'s GetAddr branch via
+    // the per-peer `PeerHandle::getaddr_recvd` flag (Core m_getaddr_recvd). The
+    // end-to-end behavior is verified in the peer_manager test module; here we
+    // assert the constants underpinning the 23%-cap that gates the response.
+    use crate::peer_manager::{getaddr_cap, MAX_PCT_ADDR_TO_SEND};
+    assert_eq!(MAX_PCT_ADDR_TO_SEND, 23);
+    assert!(getaddr_cap(100_000) <= MAX_ADDR);
 }
 
 /// G5 PASS — when a getaddr IS answered, the count is capped at MAX_ADDR=1000.

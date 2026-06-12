@@ -14309,6 +14309,8 @@ fn connection_type_str(ct: rustoshi_network::ConnectionType) -> &'static str {
         rustoshi_network::ConnectionType::FullRelay => "outbound-full-relay",
         rustoshi_network::ConnectionType::BlockRelayOnly => "block-relay-only",
         rustoshi_network::ConnectionType::Manual => "manual",
+        // Core ConnectionTypeAsString(FEELER) — short-lived addrman probe.
+        rustoshi_network::ConnectionType::Feeler => "feeler",
     }
 }
 
