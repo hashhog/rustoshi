@@ -40,8 +40,11 @@ pub mod wallet_error {
     pub const RPC_WALLET_UNLOCK_NEEDED: i32 = -13;
     /// Passphrase incorrect.
     pub const RPC_WALLET_PASSPHRASE_INCORRECT: i32 = -14;
-    /// Wallet already exists.
-    pub const RPC_WALLET_ALREADY_EXISTS: i32 = -4;
+    /// There is already a wallet with the same name
+    /// (`bitcoin-core/src/rpc/protocol.h::RPC_WALLET_ALREADY_EXISTS = -36`).
+    /// Distinct from `RPC_WALLET_ERROR = -4`; the previous -4 here collided
+    /// with that generic code.
+    pub const RPC_WALLET_ALREADY_EXISTS: i32 = -36;
     /// Wallet already loaded.
     pub const RPC_WALLET_ALREADY_LOADED: i32 = -35;
     /// Wallet not found.
@@ -1468,7 +1471,22 @@ impl WalletRpcServer for WalletRpcImpl {
         };
 
         let result = state.wallet_manager.create_wallet(&wallet_name, options)
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                // Core's HandleWalletError (wallet/rpc/util.cpp:127-156) maps
+                // DatabaseStatus::FAILED_ALREADY_LOADED -> RPC_WALLET_ALREADY_LOADED
+                // (-35) and FAILED_ALREADY_EXISTS -> RPC_WALLET_ALREADY_EXISTS (-36),
+                // both distinct from the generic RPC_WALLET_ERROR (-4). The manager
+                // returns "already loaded" when the name is in memory and
+                // "already exists" when the on-disk wallet dir is present.
+                if msg.contains("already loaded") {
+                    Self::rpc_error(wallet_error::RPC_WALLET_ALREADY_LOADED, msg)
+                } else if msg.contains("already exists") {
+                    Self::rpc_error(wallet_error::RPC_WALLET_ALREADY_EXISTS, msg)
+                } else {
+                    Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
+                }
+            })?;
 
         Ok(CreateWalletResult {
             name: result.name,
@@ -3590,6 +3608,72 @@ mod tests {
         assert!(result.is_ok());
         let wallet_result = result.unwrap();
         assert_eq!(wallet_result.name, "test_wallet");
+    }
+
+    /// createwallet on a wallet whose DB exists on disk (but is not loaded)
+    /// returns the GENUINE Core code `RPC_WALLET_ALREADY_EXISTS = -36`
+    /// (protocol.h:83), NOT the generic `RPC_WALLET_ERROR = -4`. Core maps
+    /// DatabaseStatus::FAILED_ALREADY_EXISTS to this code (wallet/rpc/util.cpp:142).
+    /// Proves the call-site wiring, not just the constant. We unload first so the
+    /// manager's "already loaded" branch is bypassed and the on-disk
+    /// "already exists" branch fires (Core's FAILED_ALREADY_EXISTS).
+    #[tokio::test]
+    async fn test_create_wallet_already_exists_code() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+
+        // Create, then unload so the on-disk wallet dir survives but the name is
+        // no longer in memory (so the "already loaded" path is NOT taken).
+        rpc.create_wallet("dupe".to_string(), None, None, None, None, None, None)
+            .await
+            .expect("first createwallet must succeed");
+        rpc.unload_wallet(Some("dupe".to_string()), None)
+            .await
+            .expect("unload must succeed");
+
+        // Re-create with the same name: the on-disk dir exists -> Core's
+        // FAILED_ALREADY_EXISTS -> RPC_WALLET_ALREADY_EXISTS (-36).
+        let err = rpc
+            .create_wallet("dupe".to_string(), None, None, None, None, None, None)
+            .await
+            .expect_err("re-create of existing on-disk wallet must error");
+        assert_eq!(
+            err.code(),
+            wallet_error::RPC_WALLET_ALREADY_EXISTS,
+            "re-create of existing wallet must emit RPC_WALLET_ALREADY_EXISTS"
+        );
+        assert_eq!(err.code(), -36, "and that code is the genuine Core value -36");
+        assert_ne!(
+            err.code(),
+            wallet_error::RPC_WALLET_ERROR,
+            "must NOT collapse to the generic RPC_WALLET_ERROR (-4)"
+        );
+    }
+
+    /// createwallet on an ALREADY-LOADED wallet maps to Core's
+    /// FAILED_ALREADY_LOADED -> RPC_WALLET_ALREADY_LOADED (-35), distinct from
+    /// both the generic -4 and the on-disk-exists -36. Guards the call-site
+    /// branch order (loaded check before exists check, matching the manager).
+    #[tokio::test]
+    async fn test_create_wallet_already_loaded_code() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+
+        rpc.create_wallet("loaded".to_string(), None, None, None, None, None, None)
+            .await
+            .expect("first createwallet must succeed");
+
+        // Same name while still loaded -> RPC_WALLET_ALREADY_LOADED (-35).
+        let err = rpc
+            .create_wallet("loaded".to_string(), None, None, None, None, None, None)
+            .await
+            .expect_err("re-create of loaded wallet must error");
+        assert_eq!(
+            err.code(),
+            wallet_error::RPC_WALLET_ALREADY_LOADED,
+            "re-create of loaded wallet must emit RPC_WALLET_ALREADY_LOADED (-35)"
+        );
+        assert_eq!(err.code(), -35, "genuine Core value");
     }
 
     #[tokio::test]

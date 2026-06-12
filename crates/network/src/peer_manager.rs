@@ -342,8 +342,9 @@ pub const FEELER_INTERVAL: Duration = Duration::from_secs(120);
 pub const MAX_FEELER_CONNECTIONS: usize = 1;
 
 /// Percentage of the addrman shared in a getaddr response (Core
-/// MAX_PCT_ADDR_TO_SEND = 23). The getaddr response is capped at
-/// min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size)) — primary getaddr anti-DoS.
+/// MAX_PCT_ADDR_TO_SEND = 23, net_processing.cpp:188). The getaddr response is
+/// capped at min(MAX_ADDR_TO_SEND, floor(23 * addrman_size / 100)) — primary
+/// getaddr anti-DoS. Note: integer FLOOR, matching Core's `GetAddr_`.
 pub const MAX_PCT_ADDR_TO_SEND: usize = 23;
 
 /// Token-bucket constants for INBOUND addr rate-limiting (Core
@@ -357,20 +358,19 @@ pub const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1000.0;
 
 /// Compute the getaddr 23%-cap over an addrman of `size` entries: the number of
 /// addresses we are willing to return in a single getaddr response, i.e.
-/// min(MAX_ADDR, ceil(0.23 * size)). Mirrors Core's `GetAddr_` cap
-/// (addrman.cpp:798-803: `nNodes = max_pct * nNodes / 100`, then clamped to
-/// `max_addresses`). We use a ceil so a tiny addrman still shares at least one
-/// address when non-empty, matching the spirit of the resurvey spec
-/// (`min(1000, ceil(0.23*size))`).
+/// min(MAX_ADDR, floor(23 * size / 100)). Mirrors Core's `GetAddr_` cap
+/// EXACTLY (addrman.cpp:799-805: `nNodes = max_pct * nNodes / 100`, integer
+/// division = floor, then `nNodes = std::min(nNodes, max_addresses)`).
+///
+/// Integer FLOOR — NOT ceil, and NO `.max(1)` clamp: Core returns 0 when the
+/// floor is 0 (e.g. size < 5 -> 23*size/100 == 0 -> share nothing). Rounding up
+/// or forcing a minimum of 1 over-shares relative to Core and breaks the
+/// anti-DoS contract on a small addrman.
 pub fn getaddr_cap(size: usize) -> usize {
-    if size == 0 {
-        return 0;
-    }
-    let pct = size
-        .saturating_mul(MAX_PCT_ADDR_TO_SEND)
-        .div_ceil(100)
-        .max(1);
-    pct.min(MAX_ADDR)
+    // nNodes = max_pct * nNodes / 100  (integer floor, addrman.cpp:805)
+    let n_nodes = size.saturating_mul(MAX_PCT_ADDR_TO_SEND) / 100;
+    // nNodes = std::min(nNodes, max_addresses)  (max_addresses = MAX_ADDR)
+    n_nodes.min(MAX_ADDR)
 }
 
 /// Current wall-clock time as unix seconds. Used to stamp the `time` of
@@ -7620,16 +7620,27 @@ mod tests {
     // guards + addr token-bucket). In-process; no daemon/regtest slot needed.
     // ========================================================================
 
-    /// getaddr_cap honors min(MAX_ADDR, ceil(0.23 * size)).
+    /// getaddr_cap honors min(MAX_ADDR, floor(23 * size / 100)) — Core's
+    /// `GetAddr_` cap (addrman.cpp:805 `nNodes = max_pct * nNodes / 100`, integer
+    /// FLOOR). Uses distinguishing sizes where 23*N is NOT a multiple of 100 so
+    /// floor != ceil and the floor-vs-(ceil/max-1) regression cannot pass:
+    ///   - size=10 -> 230/100 = 2 (floor), NOT 3 (ceil)
+    ///   - size=4  -> 92/100  = 0 (floor), NOT 1 (the old `.max(1)` clamp)
+    ///   - size=1  -> 23/100  = 0 (floor), NOT 1
     #[test]
     fn feeler_getaddr_cap_formula() {
         assert_eq!(getaddr_cap(0), 0, "empty addrman shares nothing");
-        assert_eq!(getaddr_cap(1), 1, "tiny addrman shares at least one");
-        // ceil(0.23 * 100) = 23
+        // FLOOR, no min-1 clamp: 23*1/100 = 0 (Core shares nothing on a 1-entry
+        // addrman). The old ceil/max(1) wrongly returned 1.
+        assert_eq!(getaddr_cap(1), 0, "23*1/100 floors to 0 — Core shares nothing");
+        assert_eq!(getaddr_cap(4), 0, "23*4/100 = 92/100 floors to 0, NOT 1");
+        // DISTINGUISHING: 23*10/100 = 230/100 = 2 (floor) vs 3 (ceil).
+        assert_eq!(getaddr_cap(10), 2, "23*10/100 floors to 2, NOT 3 (ceil)");
+        // 23*100/100 = 23 (floor == ceil here).
         assert_eq!(getaddr_cap(100), 23);
-        // ceil(0.23 * 1000) = 230
+        // 23*1000/100 = 230 (floor == ceil here).
         assert_eq!(getaddr_cap(1000), 230);
-        // 0.23 * 100000 = 23000 -> clamped to MAX_ADDR (1000)
+        // 23*100000/100 = 23000 -> clamped to MAX_ADDR (1000).
         assert_eq!(getaddr_cap(100_000), MAX_ADDR);
     }
 
@@ -7725,11 +7736,20 @@ mod tests {
         let params = ChainParams::testnet4();
         let mut mgr = PeerManager::new(config, params);
 
-        // Seed a shareable address so the first getaddr produces a response.
-        let shared: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+        // Seed enough shareable addresses that the 23%-FLOOR cap is non-zero so
+        // the first getaddr produces a non-empty response. Core's getaddr cap is
+        // floor(23 * N / 100) (addrman.cpp:805); a single address floors to 0
+        // (23*1/100 = 0 -> Core shares nothing), so seed 100 (-> cap 23).
         let ng = mgr.netgroup_manager.clone();
-        mgr.addr_manager.test_seed_new(shared, &ng);
-        mgr.addr_manager.test_mark_shareable(shared);
+        for i in 0..100u32 {
+            let octets = i.to_be_bytes();
+            let addr: SocketAddr =
+                format!("8.{}.{}.{}:8333", octets[1], octets[2], octets[3].max(1))
+                    .parse()
+                    .unwrap();
+            mgr.addr_manager.test_seed_new(addr, &ng);
+            mgr.addr_manager.test_mark_shareable(addr);
+        }
 
         // Insert an inbound peer (legacy addr path; supports_addrv2=false).
         let pid = PeerId(11);
@@ -7759,14 +7779,14 @@ mod tests {
         );
     }
 
-    /// 23%-cap: the getaddr response length honors min(MAX_ADDR, ceil(0.23*N)).
+    /// 23%-cap: the getaddr response length honors min(MAX_ADDR, floor(23*N/100)).
     #[tokio::test]
     async fn getaddr_response_honors_23pct_cap() {
         let config = PeerManagerConfig::testnet4();
         let params = ChainParams::testnet4();
         let mut mgr = PeerManager::new(config, params);
 
-        // Seed 100 distinct shareable addresses -> cap = ceil(0.23*100) = 23.
+        // Seed 100 distinct shareable addresses -> cap = floor(23*100/100) = 23.
         let ng = mgr.netgroup_manager.clone();
         for i in 0..100u32 {
             let octets = i.to_be_bytes();
