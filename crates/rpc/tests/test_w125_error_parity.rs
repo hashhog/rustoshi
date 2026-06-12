@@ -301,24 +301,24 @@ fn g15_rpc_method_deprecated_absence() {
 // G16-G20 — P2P / Network error codes
 // ============================================================
 
-/// G16 — `RPC_CLIENT_NOT_CONNECTED` (-9) is Core's "no peers reachable"
-/// surface (mining.cpp:769, 843). RUSTOSHI DEFINES -9 AS `RPC_CLIENT_P2P_DISABLED`,
-/// which is Core's `-31`. SILENT CODE COLLISION.
-/// Status: BUG-1 (P0).
+/// G16 — `RPC_CLIENT_P2P_DISABLED` numeric parity (BUG-1 FIXED).
+/// Core's `RPC_CLIENT_P2P_DISABLED = -31` (protocol.h:64); `RPC_CLIENT_NOT_CONNECTED
+/// = -9` (protocol.h:58). Rustoshi previously defined P2P_DISABLED as -9, a silent
+/// collision with NOT_CONNECTED. Now remapped to the genuine Core value -31.
+/// Status: BUG-1 (P0) — FIXED. Confirm-present: P2P_DISABLED == -31 and does NOT
+/// collide with NOT_CONNECTED (-9).
 #[test]
-#[ignore]
 fn g16_p2p_disabled_collision_with_not_connected() {
-    // Rustoshi's RPC_CLIENT_P2P_DISABLED = -9.
+    // Rustoshi's RPC_CLIENT_P2P_DISABLED, now the genuine Core value.
     let rustoshi_p2p_disabled = rpc_error::RPC_CLIENT_P2P_DISABLED;
     // Core's RPC_CLIENT_NOT_CONNECTED = -9 (protocol.h:58).
     let core_not_connected: i32 = -9;
     // Core's RPC_CLIENT_P2P_DISABLED = -31 (protocol.h:64).
     let core_p2p_disabled: i32 = -31;
-    assert_eq!(rustoshi_p2p_disabled, core_not_connected,
-        "Rustoshi -9 collides with Core's RPC_CLIENT_NOT_CONNECTED");
-    // After fix, expect: rustoshi_p2p_disabled == core_p2p_disabled (i.e. -31).
     assert_eq!(rustoshi_p2p_disabled, core_p2p_disabled,
-        "BUG-1: RPC_CLIENT_P2P_DISABLED should be -31 (Core), is {}", rustoshi_p2p_disabled);
+        "BUG-1 FIXED: RPC_CLIENT_P2P_DISABLED must be -31 (Core), is {}", rustoshi_p2p_disabled);
+    assert_ne!(rustoshi_p2p_disabled, core_not_connected,
+        "RPC_CLIENT_P2P_DISABLED must NOT collide with RPC_CLIENT_NOT_CONNECTED (-9)");
 }
 
 /// G17 — `RPC_CLIENT_NODE_ALREADY_ADDED` (-23). Core net.cpp:362.
@@ -415,22 +415,22 @@ fn g25_wallet_not_found_numerics() {
     assert_eq!(wallet_error::RPC_WALLET_NOT_SELECTED, -19);
 }
 
-/// G26 — `RPC_WALLET_ALREADY_EXISTS` should be -36 per Core protocol.h:83.
-/// RUSTOSHI DEFINES IT AS -4 (== `RPC_WALLET_ERROR`). SILENT COLLISION:
-/// distinct Core codes (-4 vs -36) both map to -4 in rustoshi.
-/// Status: BUG-2 (P0).
+/// G26 — `RPC_WALLET_ALREADY_EXISTS` numeric parity (BUG-2 FIXED).
+/// Core's `RPC_WALLET_ALREADY_EXISTS = -36` (protocol.h:83); `RPC_WALLET_ERROR
+/// = -4` (protocol.h:71). Rustoshi previously defined ALREADY_EXISTS as -4, a
+/// silent collision with the generic wallet error. Now remapped to -36.
+/// Status: BUG-2 (P0) — FIXED. Confirm-present: ALREADY_EXISTS == -36 and does
+/// NOT collide with RPC_WALLET_ERROR (-4).
 #[test]
-#[ignore]
 fn g26_wallet_already_exists_collision() {
-    // Rustoshi's RPC_WALLET_ALREADY_EXISTS = -4.
+    // Rustoshi's RPC_WALLET_ALREADY_EXISTS, now the genuine Core value.
     let rustoshi_exists = wallet_error::RPC_WALLET_ALREADY_EXISTS;
-    // Core's RPC_WALLET_ALREADY_EXISTS = -36.
+    // Core's RPC_WALLET_ALREADY_EXISTS = -36 (protocol.h:83).
     let core_exists: i32 = -36;
-    assert_eq!(rustoshi_exists, -4,
-        "Rustoshi -4 collides with RPC_WALLET_ERROR");
-    // After fix, expect: rustoshi_exists == -36.
     assert_eq!(rustoshi_exists, core_exists,
-        "BUG-2: RPC_WALLET_ALREADY_EXISTS should be -36 (Core), is {}", rustoshi_exists);
+        "BUG-2 FIXED: RPC_WALLET_ALREADY_EXISTS must be -36 (Core), is {}", rustoshi_exists);
+    assert_ne!(rustoshi_exists, wallet_error::RPC_WALLET_ERROR,
+        "RPC_WALLET_ALREADY_EXISTS must NOT collide with RPC_WALLET_ERROR (-4)");
 }
 
 /// G27 — `RPC_WALLET_ALREADY_LOADED` -35 matches Core protocol.h:82.
@@ -505,7 +505,7 @@ fn pin_all_w125_constants() {
     assert_eq!(rpc_error::RPC_TRANSACTION_REJECTED, -26);
     assert_eq!(rpc_error::RPC_VERIFY_ALREADY_IN_CHAIN, -27);
     assert_eq!(rpc_error::RPC_TRANSACTION_ALREADY_IN_CHAIN, -27);
-    assert_eq!(rpc_error::RPC_CLIENT_P2P_DISABLED, -9); // BUG-1: should be -31
+    assert_eq!(rpc_error::RPC_CLIENT_P2P_DISABLED, -31); // BUG-1 FIXED: genuine Core value
     assert_eq!(rpc_error::RPC_BLOCK_NOT_FOUND, -5);
     // wallet_error module.
     assert_eq!(wallet_error::RPC_WALLET_ERROR, -4);
@@ -515,7 +515,7 @@ fn pin_all_w125_constants() {
     assert_eq!(wallet_error::RPC_WALLET_UNLOCK_NEEDED, -13);
     assert_eq!(wallet_error::RPC_WALLET_PASSPHRASE_INCORRECT, -14);
     assert_eq!(wallet_error::RPC_WALLET_WRONG_ENC_STATE, -15);
-    assert_eq!(wallet_error::RPC_WALLET_ALREADY_EXISTS, -4); // BUG-2: should be -36
+    assert_eq!(wallet_error::RPC_WALLET_ALREADY_EXISTS, -36); // BUG-2 FIXED: genuine Core value
     assert_eq!(wallet_error::RPC_WALLET_ALREADY_LOADED, -35);
     assert_eq!(wallet_error::RPC_WALLET_NOT_FOUND, -18);
     assert_eq!(wallet_error::RPC_WALLET_NOT_SPECIFIED, -19);
