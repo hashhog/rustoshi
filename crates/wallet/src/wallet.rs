@@ -1219,6 +1219,105 @@ impl Wallet {
         Ok(())
     }
 
+    /// Sign one input with an EXPLICITLY supplied private key + prevout, instead
+    /// of an HD-derived wallet key.
+    ///
+    /// This is the engine `signrawtransactionwithkey` drives: the temporary
+    /// keystore is the caller's WIF keys (not the wallet HD tree), and the
+    /// prevout comes from the caller's `prevtxs` array, so `sign_input`'s
+    /// `get_private_key(&utxo.derivation_path)` lookup is bypassed. The actual
+    /// sighash + ECDSA/Schnorr signing is delegated to the SAME per-script
+    /// signers `sign_input` uses (`sign_p2wpkh_input` / `sign_p2pkh_input` /
+    /// `sign_p2sh_p2wpkh_input` / `sign_p2tr_input`) — NO sighash or signing is
+    /// reimplemented here; only the key SOURCE differs.
+    ///
+    /// `prevout` is the UTXO being spent (its `script_pubkey` selects the script
+    /// type and its `value` feeds the BIP-143 / BIP-341 sighash). `all_prevouts`
+    /// must cover every input in spend order for the Taproot (BIP-341) sighash;
+    /// for non-Taproot inputs it is unused.
+    ///
+    /// Reference: `bitcoin-core/src/script/sign.cpp::ProduceSignature` driven
+    /// from `rpc/rawtransaction.cpp::SignTransaction` with a `FillableSigningProvider`
+    /// keystore built from the provided keys.
+    pub fn sign_input_with_key(
+        &self,
+        tx: &mut Transaction,
+        input_index: usize,
+        prevout: &WalletUtxo,
+        all_prevouts: &[WalletUtxo],
+        private_key: &secp256k1::SecretKey,
+    ) -> Result<(), WalletError> {
+        if input_index >= tx.inputs.len() {
+            return Err(WalletError::SigningError(format!(
+                "input_index {} out of range ({} inputs)",
+                input_index,
+                tx.inputs.len()
+            )));
+        }
+        let secp = secp_ctx();
+        let spk = &prevout.script_pubkey;
+        if is_p2wpkh_spk(spk) {
+            self.sign_p2wpkh_input(tx, input_index, prevout, private_key, secp)?;
+        } else if is_p2pkh_spk(spk) {
+            self.sign_p2pkh_input(tx, input_index, prevout, private_key, secp)?;
+        } else if is_p2sh_spk(spk) {
+            // Only P2SH-P2WPKH (BIP-49 wrapped segwit) is reconstructible from a
+            // single key; the redeem script is rebuilt inside the signer and the
+            // P2SH commitment is checked there.
+            self.sign_p2sh_p2wpkh_input(tx, input_index, prevout, private_key, secp)?;
+        } else if is_p2tr_spk(spk) {
+            let prevouts: &[WalletUtxo] = if all_prevouts.is_empty() {
+                std::slice::from_ref(prevout)
+            } else {
+                all_prevouts
+            };
+            self.sign_p2tr_input(tx, input_index, prevout, prevouts, private_key, secp)?;
+        } else if is_p2wsh_spk(spk) {
+            return Err(WalletError::SigningError(format!(
+                "input {} is P2WSH; sign via PSBT / signrawtransactionwithwallet \
+                 with the witness script (multisig is not single-key signable)",
+                input_index
+            )));
+        } else {
+            return Err(WalletError::SigningError(format!(
+                "unsupported scriptPubKey type for input {} (len={}, first byte=0x{:02x})",
+                input_index,
+                spk.len(),
+                spk.first().copied().unwrap_or(0)
+            )));
+        }
+        Ok(())
+    }
+
+    /// The standard single-key scriptPubKeys a raw secp256k1 key controls on a
+    /// given network: P2WPKH, P2PKH, P2SH-P2WPKH and key-path P2TR (BIP-86).
+    /// Exactly the set `import_private_key` registers — exposed for the
+    /// temporary keystore `KeySigner` builds without mutating wallet state.
+    fn script_pubkeys_for_key(
+        secret_key: &secp256k1::SecretKey,
+        network: Network,
+    ) -> Vec<Vec<u8>> {
+        let secp = secp_ctx();
+        let pubkey = secp256k1::PublicKey::from_secret_key(secp, secret_key);
+        let pubkey_hash = hash160(&pubkey.serialize());
+
+        let mut out = Vec::with_capacity(4);
+        out.push(Address::P2WPKH { hash: pubkey_hash, network }.to_script_pubkey());
+        out.push(Address::P2PKH { hash: pubkey_hash, network }.to_script_pubkey());
+        // P2SH-P2WPKH: scriptPubKey = P2SH(redeem = OP_0 <20-byte pubkey hash>).
+        let mut redeem = vec![0x00, 0x14];
+        redeem.extend_from_slice(&pubkey_hash.0);
+        out.push(Address::P2SH { hash: hash160(&redeem), network }.to_script_pubkey());
+        // Key-path P2TR (BIP-86): scriptPubKey commits to the tweaked output key.
+        let xonly = secp256k1::XOnlyPublicKey::from(pubkey);
+        if let Ok((output_key, _parity)) =
+            rustoshi_crypto::taproot::compute_taproot_output_key(&xonly, None)
+        {
+            out.push(Address::P2TR { output_key, network }.to_script_pubkey());
+        }
+        out
+    }
+
     /// Sign a P2WPKH input (native SegWit).
     fn sign_p2wpkh_input(
         &self,
@@ -2442,6 +2541,85 @@ impl Wallet {
             return self.master_key.derive_path(path).ok().map(|c| c.secret_key);
         }
         None
+    }
+
+    /// Export the WIF (compressed) for a wallet-owned address — the inverse of
+    /// importing a WIF into the key-based signer. Returns `None` for addresses
+    /// the wallet does not control. Used by callers/tests that need to drive
+    /// `signrawtransactionwithkey` with a key the wallet generated, without
+    /// handling raw `secp256k1` material themselves.
+    pub fn wif_for_address(&self, address: &str) -> Option<String> {
+        self.private_key_for_address(address)
+            .map(|sk| encode_wif(&sk, self.network))
+    }
+}
+
+/// A temporary, walletless keystore that signs raw-transaction inputs from
+/// EXPLICIT WIF private keys — the engine behind the `signrawtransactionwithkey`
+/// RPC. Mirrors Core's `FillableSigningProvider` built inside
+/// `rpc/rawtransaction.cpp::SignTransaction`: every WIF key registers the
+/// standard single-key scriptPubKeys it controls (`scriptPubKey -> SecretKey`),
+/// and each input whose prevout scriptPubKey matches a registered key is signed
+/// through the SAME BIP-143/BIP-341 sighash + ECDSA/Schnorr engine the wallet
+/// signer uses (`Wallet::sign_input_with_key` -> the per-script signers). No
+/// sighash or signature code is duplicated here.
+///
+/// This type lives in the wallet crate so all `secp256k1` handling stays here;
+/// the RPC layer drives it opaquely.
+pub struct KeySigner {
+    /// scriptPubKey (raw bytes) -> secret key that controls it.
+    keystore: HashMap<Vec<u8>, secp256k1::SecretKey>,
+    /// Stateless host for the per-script signers (HD tree never consulted).
+    signer: Wallet,
+}
+
+impl KeySigner {
+    /// Build the temporary keystore from WIF-encoded private keys. Each WIF is
+    /// validated against `network` (Core `DecodeSecret`); an invalid WIF is a
+    /// hard error (Core throws RPC_INVALID_ADDRESS_OR_KEY for a bad key).
+    pub fn from_wifs(wifs: &[String], network: Network) -> Result<Self, WalletError> {
+        let mut keystore: HashMap<Vec<u8>, secp256k1::SecretKey> = HashMap::new();
+        for wif in wifs {
+            let (sk, _compressed) = decode_wif(wif, network)?;
+            for spk in Wallet::script_pubkeys_for_key(&sk, network) {
+                keystore.insert(spk, sk);
+            }
+        }
+        // A throwaway wallet hosts the (stateless) per-script signers; its HD
+        // tree is never used — every signing key comes from `keystore`. The
+        // fixed dummy seed only satisfies `from_seed`'s constructor.
+        let signer = Wallet::from_seed(&[0u8; 32], network, AddressType::P2WPKH)?;
+        Ok(Self { keystore, signer })
+    }
+
+    /// Whether a provided key controls this scriptPubKey (i.e. the input is
+    /// signable by this keystore).
+    pub fn can_sign(&self, script_pubkey: &[u8]) -> bool {
+        self.keystore.contains_key(script_pubkey)
+    }
+
+    /// Sign one input with the keystore's matching key. `prevout` is the UTXO
+    /// being spent; `all_prevouts` covers every input in spend order (required
+    /// for the BIP-341 Taproot sighash). Returns an error if no key matches or
+    /// the script type is not single-key signable.
+    pub fn sign_input(
+        &self,
+        tx: &mut Transaction,
+        input_index: usize,
+        prevout: &WalletUtxo,
+        all_prevouts: &[WalletUtxo],
+    ) -> Result<(), WalletError> {
+        let sk = self
+            .keystore
+            .get(&prevout.script_pubkey)
+            .copied()
+            .ok_or_else(|| {
+                WalletError::SigningError(
+                    "no provided private key controls this input's scriptPubKey".to_string(),
+                )
+            })?;
+        self.signer
+            .sign_input_with_key(tx, input_index, prevout, all_prevouts, &sk)
     }
 }
 

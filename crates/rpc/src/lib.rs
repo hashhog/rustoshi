@@ -52,8 +52,9 @@ pub use server::{start_rpc_server, PeerState, RpcServerImpl, RpcState, RustoshiR
 pub use types::*;
 pub use wallet::{
     BalanceInfo, CreateWalletResult, ListWalletDirResult, LoadWalletResult,
-    PayjoinRequestResult, SendPayjoinOptions, SendPayjoinResult, UnloadWalletResult,
-    UnspentOutput, WalletRpcImpl, WalletRpcServer, WalletRpcState,
+    PayjoinRequestResult, PrevTx, SendPayjoinOptions, SendPayjoinResult,
+    SignRawTransactionResult, SigningError, UnloadWalletResult, UnspentOutput,
+    WalletRpcImpl, WalletRpcServer, WalletRpcState,
 };
 pub use zmq::{
     parse_zmq_args, SharedZmqNotifier, ZmqError, ZmqNotificationInfo, ZmqNotifier,
