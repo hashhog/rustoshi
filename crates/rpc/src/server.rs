@@ -896,6 +896,16 @@ pub trait RustoshiRpc {
     #[method(name = "getchaintips")]
     async fn get_chain_tips(&self) -> RpcResult<serde_json::Value>;
 
+    /// Return information about all chainstates.
+    ///
+    /// Mirrors `bitcoin-core/src/rpc/blockchain.cpp::getchainstates`. Emits
+    /// `{ headers, chainstates }` where `chainstates` is ordered by work with
+    /// the most-work (active) chainstate LAST. rustoshi runs a single
+    /// fully-validated chainstate (no active AssumeUTXO snapshot), so the array
+    /// is a single `validated:true` element with `snapshot_blockhash` omitted.
+    #[method(name = "getchainstates")]
+    async fn get_chain_states(&self) -> RpcResult<ChainStatesResult>;
+
     /// Disconnect a peer node.
     #[method(name = "disconnectnode")]
     async fn disconnect_node(
@@ -2841,6 +2851,39 @@ fn compact_to_target_f64(bits: u32) -> f64 {
     } else {
         mantissa * 2f64.powi(8 * (exponent - 3))
     }
+}
+
+/// Split a total dbcache budget into `(coins_db_cache_bytes,
+/// coins_tip_cache_bytes)` exactly the way Bitcoin Core's
+/// `kernel::CacheSizes(total_cache)` constructor does
+/// (`bitcoin-core/src/kernel/caches.h`):
+///
+/// ```text
+/// block_tree_db = min(total / 8, MAX_BLOCK_DB_CACHE = 2 MiB); total -= block_tree_db
+/// coins_db      = min(total / 2, MAX_COINS_DB_CACHE = 8 MiB);  total -= coins_db
+/// coins         = total                                       // the coinstip cache
+/// ```
+///
+/// `getchainstates` reports `cs.m_coinsdb_cache_size_bytes` (= `coins_db`) and
+/// `cs.m_coinstip_cache_size_bytes` (= `coins`). rustoshi does not maintain a
+/// separate coinsdb-vs-coinstip split internally — it has one configured total
+/// dbcache budget (`rustoshi_storage::DEFAULT_DB_CACHE_BYTES`, the 450 MiB
+/// `-dbcache` default, same constant Core derives the split from) — so we
+/// derive the two reported figures from that genuine configured total using
+/// Core's own split formula rather than fabricating values. For the 450 MiB
+/// default this yields `coins_db = 8 MiB` and `coins_tip = 440 MiB`, matching
+/// Core's defaults.
+fn core_coins_cache_split(total_cache: u64) -> (u64, u64) {
+    const MAX_BLOCK_DB_CACHE: u64 = 2 * 1024 * 1024; // kernel/caches.h
+    const MAX_COINS_DB_CACHE: u64 = 8 * 1024 * 1024; // kernel/caches.h
+
+    let mut remaining = total_cache;
+    let block_tree_db = std::cmp::min(remaining / 8, MAX_BLOCK_DB_CACHE);
+    remaining -= block_tree_db;
+    let coins_db = std::cmp::min(remaining / 2, MAX_COINS_DB_CACHE);
+    remaining -= coins_db;
+    let coins_tip = remaining; // the rest goes to the coins (tip) cache
+    (coins_db, coins_tip)
 }
 
 /// Convert compact nBits to a full 64-character hex target string, matching
@@ -8973,6 +9016,90 @@ impl RustoshiRpcServer for RpcServerImpl {
         })];
 
         Ok(serde_json::json!(tips))
+    }
+
+    async fn get_chain_states(&self) -> RpcResult<ChainStatesResult> {
+        let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+
+        // Tip difficulty / bits / target come from the active chainstate tip
+        // header (Core: `tip->nBits` / `GetTarget(*tip)` / `GetDifficulty(*tip)`
+        // in `make_chain_data`). Fall back to the network's powLimit-equivalent
+        // default bits if the tip header isn't in the store yet (a fresh,
+        // genesis-only node), mirroring `getblockchaininfo`'s same fallback so
+        // the two RPCs agree.
+        let (difficulty, bits_hex, target_hex) =
+            if let Ok(Some(header)) = store.get_header(&state.best_hash) {
+                let diff = Self::bits_to_difficulty(header.bits);
+                (diff, format!("{:08x}", header.bits), compact_to_target_hex(header.bits))
+            } else {
+                (
+                    1.0,
+                    "1d00ffff".to_string(),
+                    compact_to_target_hex(0x1d00ffff),
+                )
+            };
+
+        // verificationprogress: progress towards the network (header) tip,
+        // clamped to [0, 1]. Same derivation `getblockchaininfo` uses
+        // (`best_height / header_height`), so the two RPCs agree. Core computes
+        // `GuessVerificationProgress(tip)`; rustoshi has no tx-count estimator,
+        // so it uses the block/header-height ratio fleet-wide.
+        let header_height = state.header_height.max(state.best_height);
+        let verificationprogress = if header_height > 0 {
+            (state.best_height as f64 / header_height as f64).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        // Coins-cache sizes: derive Core's coinsdb/coinstip split from the
+        // genuine configured total dbcache budget (rustoshi has no separate
+        // split accounting). See `core_coins_cache_split` for the formula.
+        let (coins_db_cache_bytes, coins_tip_cache_bytes) =
+            core_coins_cache_split(rustoshi_storage::DEFAULT_DB_CACHE_BYTES as u64);
+
+        // rustoshi runs a SINGLE fully-validated chainstate (no active
+        // AssumeUTXO snapshot chainstate), so `chainstates` is a one-element
+        // array: validated=true, snapshot_blockhash omitted. With one element
+        // the "most-work (active) chainstate LAST" ordering is trivially
+        // satisfied.
+        let chainstate = ChainStateInfo {
+            blocks: state.best_height,
+            bestblockhash: state.best_hash.to_hex(),
+            bits: bits_hex,
+            target: target_hex,
+            difficulty: serde_json::value::RawValue::from_string(format_double_g16(difficulty))
+                .unwrap(),
+            verificationprogress,
+            coins_db_cache_bytes,
+            coins_tip_cache_bytes,
+            snapshot_blockhash: None,
+            validated: true,
+        };
+
+        // `headers` = best-header height seen so far (Core:
+        // `chainman.m_best_header->nHeight`, or -1 if none). rustoshi tracks the
+        // header tip in `state.header_height`; a header tip can never be behind
+        // the connected block tip, so guard with `.max(best_height)` exactly
+        // like `getblockchaininfo.headers`. A genuinely empty header index
+        // (height 0 AND no genesis connected) reports -1, matching Core.
+        let headers: i64 = if header_height == 0 && state.best_height == 0 {
+            // Distinguish "header index empty" (no genesis yet) from
+            // "synced to genesis (height 0)": the latter has the genesis
+            // best_hash set. Only report -1 when the chainstate is truly empty.
+            if state.best_hash == Hash256::ZERO {
+                -1
+            } else {
+                0
+            }
+        } else {
+            header_height as i64
+        };
+
+        Ok(ChainStatesResult {
+            headers,
+            chainstates: vec![chainstate],
+        })
     }
 
     async fn disconnect_node(
@@ -18791,6 +18918,153 @@ mod tests {
              \"best_block_height\" to match Bitcoin Core's pushKV order; \
              got wire bytes: {wire}"
         );
+    }
+
+    /// `getchainstates` must return `headers` (int) plus a SINGLE-element
+    /// `chainstates` array whose entry carries every Core
+    /// `RPCHelpForChainstate` field with the correct types, `validated == true`,
+    /// and NO `snapshot_blockhash` key (rustoshi runs one fully-validated
+    /// chainstate with no active AssumeUTXO snapshot).
+    ///
+    /// Reference: `bitcoin-core/src/rpc/blockchain.cpp::getchainstates` /
+    /// `make_chain_data`.
+    #[tokio::test]
+    async fn getchainstates_single_validated_chainstate_shape() {
+        use rustoshi_storage::block_store::BlockStore;
+
+        let server = setup_test_server();
+
+        // Seed a deterministic, genuine tip: connect the regtest genesis. We
+        // pin `best_hash`/`best_height`/`header_height` and write the genesis
+        // header so the handler reads a REAL tip header (bits/target/difficulty)
+        // rather than the genesis-only fallback.
+        let (genesis_hash, genesis_bits) = {
+            let mut state = server.state.write().await;
+            let params = ChainParams::regtest();
+            let genesis_hash = params.genesis_hash;
+            let genesis_header = params.genesis_block.header.clone();
+            let genesis_bits = genesis_header.bits;
+
+            let store = BlockStore::new(&state.db);
+            store
+                .put_header(&genesis_hash, &genesis_header)
+                .expect("write genesis header");
+
+            state.best_hash = genesis_hash;
+            state.best_height = 0;
+            state.header_height = 0;
+            (genesis_hash, genesis_bits)
+        };
+
+        let result = server
+            .get_chain_states()
+            .await
+            .expect("getchainstates must succeed");
+
+        // headers is an int (i64); genesis connected (height 0) -> 0, not -1.
+        assert_eq!(result.headers, 0, "headers must be 0 at genesis tip");
+
+        // Exactly one chainstate.
+        assert_eq!(
+            result.chainstates.len(),
+            1,
+            "rustoshi has a single chainstate (no active snapshot)"
+        );
+        let cs = &result.chainstates[0];
+
+        // Field-by-field type + value checks against the genuine tip.
+        assert_eq!(cs.blocks, 0, "blocks == active tip height");
+        assert_eq!(
+            cs.bestblockhash,
+            genesis_hash.to_hex(),
+            "bestblockhash == active tip hash"
+        );
+        assert_eq!(
+            cs.bits,
+            format!("{genesis_bits:08x}"),
+            "bits == tip nBits (8 hex chars)"
+        );
+        assert_eq!(cs.target.len(), 64, "target is a 64-char hex hash");
+        assert_eq!(
+            cs.target,
+            compact_to_target_hex(genesis_bits),
+            "target derived from tip nBits"
+        );
+        // difficulty is a raw JSON number that parses as a finite f64.
+        let diff: f64 = cs
+            .difficulty
+            .get()
+            .parse()
+            .expect("difficulty is a JSON number");
+        assert!(diff.is_finite() && diff > 0.0, "difficulty positive finite");
+        // verificationprogress in [0,1]; at the tip it is 1.0.
+        assert!(
+            (0.0..=1.0).contains(&cs.verificationprogress),
+            "verificationprogress in [0,1]"
+        );
+        assert_eq!(
+            cs.verificationprogress, 1.0,
+            "fully synced -> progress 1.0"
+        );
+        // Coins-cache sizes derived from the configured total via Core's split.
+        let (exp_db, exp_tip) =
+            core_coins_cache_split(rustoshi_storage::DEFAULT_DB_CACHE_BYTES as u64);
+        assert_eq!(cs.coins_db_cache_bytes, exp_db);
+        assert_eq!(cs.coins_tip_cache_bytes, exp_tip);
+        // Core defaults (450 MiB): coins_db = 8 MiB, coins_tip = 440 MiB.
+        assert_eq!(cs.coins_db_cache_bytes, 8 * 1024 * 1024);
+        assert_eq!(cs.coins_tip_cache_bytes, 440 * 1024 * 1024);
+        // Single fully-validated chainstate.
+        assert!(cs.validated, "validated must be true");
+        assert!(
+            cs.snapshot_blockhash.is_none(),
+            "snapshot_blockhash must be None (no active snapshot)"
+        );
+
+        // Wire-shape assertion: the serialized JSON must NOT contain a
+        // "snapshot_blockhash" key (Core omits it for a non-snapshot
+        // chainstate), and headers must serialize as a bare integer.
+        let wire = serde_json::to_string(&result).expect("serialize getchainstates");
+        assert!(
+            !wire.contains("snapshot_blockhash"),
+            "snapshot_blockhash key must be absent from the wire bytes: {wire}"
+        );
+        assert!(
+            wire.contains("\"headers\":0"),
+            "headers must serialize as an integer: {wire}"
+        );
+        assert!(
+            wire.contains("\"validated\":true"),
+            "validated must serialize as true: {wire}"
+        );
+
+        // Key ORDER (serde struct order == Core pushKV order): bestblockhash
+        // before coins_db_cache_bytes before validated.
+        let pos_best = wire.find("\"bestblockhash\"").unwrap();
+        let pos_db = wire.find("\"coins_db_cache_bytes\"").unwrap();
+        let pos_validated = wire.find("\"validated\"").unwrap();
+        assert!(
+            pos_best < pos_db && pos_db < pos_validated,
+            "chainstate fields must follow Core's pushKV order: {wire}"
+        );
+    }
+
+    /// `headers` reports `-1` when the chainstate is genuinely empty (no
+    /// genesis connected), matching Core's `m_best_header ? ... : -1`.
+    #[tokio::test]
+    async fn getchainstates_empty_chain_reports_headers_minus_one() {
+        // Fresh server: best_hash == Hash256::ZERO, no genesis connected.
+        let server = setup_test_server();
+        let result = server
+            .get_chain_states()
+            .await
+            .expect("getchainstates must succeed on an empty chain");
+        assert_eq!(
+            result.headers, -1,
+            "empty header index must report headers == -1"
+        );
+        assert_eq!(result.chainstates.len(), 1);
+        assert!(result.chainstates[0].validated);
     }
 
     fn decode_psbt_first_input_sequence(psbt_b64: &str) -> u32 {
