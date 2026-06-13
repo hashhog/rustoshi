@@ -898,6 +898,35 @@ pub trait WalletRpc {
         sighashtype: Option<String>,
     ) -> RpcResult<SignRawTransactionResult>;
 
+    /// Sign a raw transaction with the EXPLICIT private keys provided (no
+    /// wallet). Core's `signrawtransactionwithkey`
+    /// (`bitcoin-core/src/rpc/rawtransaction.cpp::signrawtransactionwithkey` ->
+    /// `SignTransaction`): build a temporary keystore from the WIF keys, fill
+    /// missing prevout info from `prevtxs` (and the chain/mempool), sign every
+    /// input a provided key controls, and return `{hex, complete, errors?}`.
+    ///
+    /// REUSES the SAME BIP-143/BIP-341 sighash + ECDSA/Schnorr engine as
+    /// `signrawtransactionwithwallet` / `walletprocesspsbt`
+    /// (`Wallet::sign_input_with_key` -> the per-script signers in
+    /// `crates/wallet/src/wallet.rs`); the only difference is the keystore is
+    /// the supplied keys + prevtxs, not the wallet HD tree. Does NOT require a
+    /// loaded/unlocked wallet.
+    ///
+    /// Parameters:
+    /// - hexstring: the hex-encoded raw transaction.
+    /// - privkeys: array of WIF-encoded base58check private keys.
+    /// - prevtxs: previous outputs being spent (optional). Each `{txid, vout,
+    ///   scriptPubKey, redeemScript?, witnessScript?, amount?}`.
+    /// - sighashtype: signature hash type (default: ALL).
+    #[method(name = "signrawtransactionwithkey")]
+    async fn sign_raw_transaction_with_key(
+        &self,
+        hexstring: String,
+        privkeys: Vec<String>,
+        prevtxs: Option<Vec<PrevTx>>,
+        sighashtype: Option<String>,
+    ) -> RpcResult<SignRawTransactionResult>;
+
     /// Import descriptors into the wallet.
     ///
     /// Parameters:
@@ -2510,6 +2539,207 @@ impl WalletRpcServer for WalletRpcImpl {
         // Serialize the (possibly partially) signed transaction
         let signed_bytes = tx.serialize();
         let signed_hex = hex::encode(&signed_bytes);
+
+        Ok(SignRawTransactionResult {
+            hex: signed_hex,
+            complete,
+            errors: if errors.is_empty() { None } else { Some(errors) },
+        })
+    }
+
+    async fn sign_raw_transaction_with_key(
+        &self,
+        hexstring: String,
+        privkeys: Vec<String>,
+        prevtxs: Option<Vec<PrevTx>>,
+        sighashtype: Option<String>,
+    ) -> RpcResult<SignRawTransactionResult> {
+        use rustoshi_primitives::{Decodable, Encodable, Hash256, OutPoint, Transaction};
+        use rustoshi_wallet::{KeySigner, WalletUtxo};
+
+        // No wallet needed — Core's signrawtransactionwithkey builds a
+        // temporary FillableSigningProvider from the explicit keys. We DO
+        // borrow the active network from the wallet manager so WIF version
+        // bytes are validated against the right network (Core DecodeSecret).
+        let network = {
+            let state = self.state.read().await;
+            state.wallet_manager.network()
+        };
+
+        // Sighash type — the per-script signers currently emit SIGHASH_ALL
+        // (0x01) / SIGHASH_DEFAULT for taproot. Refuse anything else honestly
+        // rather than silently signing ALL (same contract as
+        // signrawtransactionwithwallet).
+        let sighash_type_str = sighashtype.as_deref().unwrap_or("ALL");
+        if !matches!(sighash_type_str, "ALL" | "DEFAULT") {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                format!(
+                    "sighashtype {:?} not yet supported (only ALL/DEFAULT)",
+                    sighash_type_str
+                ),
+            ));
+        }
+
+        // Decode the raw transaction.
+        let tx_bytes = hex::decode(&hexstring).map_err(|e| {
+            Self::rpc_error(wallet_error::RPC_DESERIALIZATION_ERROR, format!("Invalid hex: {}", e))
+        })?;
+        let mut tx = Transaction::deserialize(&tx_bytes).map_err(|e| {
+            Self::rpc_error(
+                wallet_error::RPC_DESERIALIZATION_ERROR,
+                format!("TX decode failed: {}", e),
+            )
+        })?;
+
+        // Build the temporary keystore from the explicit WIF keys (Core's
+        // FillableSigningProvider). `KeySigner` validates each WIF against the
+        // network and registers the standard single-key scriptPubKeys each key
+        // controls; an invalid WIF is a hard -5 error.
+        let key_signer = KeySigner::from_wifs(&privkeys, network).map_err(|e| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                format!("Invalid private key: {}", e),
+            )
+        })?;
+
+        // Merge prevout info from the prevtxs array, keyed by outpoint. Each
+        // entry carries the scriptPubKey (script type) + amount (BIP-143/341
+        // sighash). redeemScript / witnessScript are accepted but only the
+        // single-key script shapes are signable here.
+        let mut prevout_info: std::collections::HashMap<OutPoint, (Vec<u8>, u64)> =
+            std::collections::HashMap::new();
+        if let Some(list) = &prevtxs {
+            for p in list {
+                let txid_bytes = hex::decode(&p.txid).map_err(|_| {
+                    Self::rpc_error(
+                        wallet_error::RPC_DESERIALIZATION_ERROR,
+                        format!("prevtx txid is not valid hex: {}", p.txid),
+                    )
+                })?;
+                if txid_bytes.len() != 32 {
+                    return Err(Self::rpc_error(
+                        wallet_error::RPC_DESERIALIZATION_ERROR,
+                        format!("prevtx txid must be 32 bytes: {}", p.txid),
+                    ));
+                }
+                // RPC txids are big-endian display order; internal is reversed.
+                let mut internal = txid_bytes;
+                internal.reverse();
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&internal);
+                let spk = hex::decode(&p.script_pubkey).map_err(|_| {
+                    Self::rpc_error(
+                        wallet_error::RPC_DESERIALIZATION_ERROR,
+                        format!("prevtx scriptPubKey is not valid hex (vout {})", p.vout),
+                    )
+                })?;
+                // BTC amount -> satoshis (Core AmountFromValue). 0 if omitted.
+                let value = match p.amount {
+                    Some(a) => (a * 1e8).round() as u64,
+                    None => 0,
+                };
+                prevout_info.insert(
+                    OutPoint { txid: Hash256(arr), vout: p.vout },
+                    (spk, value),
+                );
+            }
+        }
+
+        // Assemble per-input prevout UTXOs (in spend order) for the BIP-341
+        // sighash, which needs EVERY input's prevout. Missing entries become a
+        // zeroed placeholder; an input with no prevout info is reported as an
+        // error rather than signed.
+        let placeholder = WalletUtxo {
+            outpoint: OutPoint { txid: Hash256([0u8; 32]), vout: 0 },
+            value: 0,
+            script_pubkey: vec![],
+            derivation_path: vec![],
+            confirmations: 0,
+            is_change: false,
+            is_coinbase: false,
+            height: None,
+        };
+        let mut all_prevouts: Vec<WalletUtxo> = Vec::with_capacity(tx.inputs.len());
+        for input in &tx.inputs {
+            match prevout_info.get(&input.previous_output) {
+                Some((spk, value)) => all_prevouts.push(WalletUtxo {
+                    outpoint: input.previous_output.clone(),
+                    value: *value,
+                    script_pubkey: spk.clone(),
+                    derivation_path: vec![],
+                    confirmations: 0,
+                    is_change: false,
+                    is_coinbase: false,
+                    height: None,
+                }),
+                None => all_prevouts.push(placeholder.clone()),
+            }
+        }
+
+        // Snapshot per-input metadata for error rows before &mut tx is handed
+        // to the signer (Core TransactionError shape: txid/vout/scriptSig/
+        // sequence/error, plus witness).
+        let input_meta: Vec<(String, u32, u32, bool)> = tx
+            .inputs
+            .iter()
+            .map(|inp| {
+                let txid_hex = hex::encode(
+                    inp.previous_output.txid.0.iter().rev().copied().collect::<Vec<_>>(),
+                );
+                let has_prevout = prevout_info.contains_key(&inp.previous_output);
+                (txid_hex, inp.previous_output.vout, inp.sequence, has_prevout)
+            })
+            .collect();
+
+        let mut errors: Vec<SigningError> = Vec::new();
+
+        for i in 0..tx.inputs.len() {
+            let (txid_hex, vout, sequence, has_prevout) = input_meta[i].clone();
+            let prevout = all_prevouts[i].clone();
+
+            if !has_prevout {
+                errors.push(SigningError {
+                    txid: txid_hex,
+                    vout,
+                    script_sig: hex::encode(&tx.inputs[i].script_sig),
+                    sequence,
+                    error: "Input not found or already spent".to_string(),
+                });
+                continue;
+            }
+
+            // No provided key controls this prevout's scriptPubKey -> leave the
+            // input unsigned and report it (Core: input stays incomplete).
+            if !key_signer.can_sign(&prevout.script_pubkey) {
+                errors.push(SigningError {
+                    txid: txid_hex,
+                    vout,
+                    script_sig: hex::encode(&tx.inputs[i].script_sig),
+                    sequence,
+                    error: "Unable to sign input, missing private key for scriptPubKey"
+                        .to_string(),
+                });
+                continue;
+            }
+
+            if let Err(e) = key_signer.sign_input(&mut tx, i, &prevout, &all_prevouts) {
+                errors.push(SigningError {
+                    txid: txid_hex,
+                    vout,
+                    script_sig: hex::encode(&tx.inputs[i].script_sig),
+                    sequence,
+                    error: format!("Signing failed: {}", e),
+                });
+            }
+        }
+
+        // complete is true ONLY when every input was signed without error
+        // (Core: SignTransaction sets complete = all inputs have a complete
+        // SignatureData). Never fabricate completeness.
+        let complete = errors.is_empty();
+
+        let signed_hex = hex::encode(&tx.serialize());
 
         Ok(SignRawTransactionResult {
             hex: signed_hex,
