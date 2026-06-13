@@ -937,6 +937,29 @@ pub trait WalletRpc {
         requests: Vec<crate::types::ImportDescriptorRequest>,
     ) -> RpcResult<Vec<crate::types::ImportDescriptorResult>>;
 
+    /// List all descriptors present in the wallet (Core's `listdescriptors`,
+    /// `bitcoin-core/src/wallet/rpc/backup.cpp:464-572`).
+    ///
+    /// Returns `{ wallet_name, descriptors: [...] }`, the array SORTED by the
+    /// descriptor string (backup.cpp:541-543). Each entry carries `desc` (WITH
+    /// the trailing BIP-380 `#checksum`), `timestamp`, `active`, and — only
+    /// when present — `internal` (active descriptors only), `range`
+    /// (`[begin,end]` inclusive, ranged descriptors only) and `next`/
+    /// `next_index` (ranged descriptors only).
+    ///
+    /// rustoshi's descriptor store is the set of watch-only descriptors
+    /// registered via `importdescriptors` (no active HD ScriptPubKeyMan), so
+    /// every entry is `active=false` and `internal` is omitted — Core's shape
+    /// for an inactive imported descriptor (IsInternalScriptPubKeyMan ->
+    /// nullopt, "defined only for active descriptors").
+    ///
+    /// `private=true` (default false) is rejected with `-4`
+    /// "Can't get private descriptor string for watch-only wallets"
+    /// (backup.cpp:500-502): the imported-descriptor store holds only the
+    /// public form, never private key material.
+    #[method(name = "listdescriptors")]
+    async fn list_descriptors(&self, private: Option<bool>) -> RpcResult<serde_json::Value>;
+
     /// Return information about the given bitcoin address that the wallet
     /// knows (Core's `getaddressinfo`,
     /// `bitcoin-core/src/wallet/rpc/addresses.cpp:368-513`).
@@ -2922,6 +2945,124 @@ impl WalletRpcServer for WalletRpcImpl {
         }
 
         Ok(results)
+    }
+
+    async fn list_descriptors(&self, private: Option<bool>) -> RpcResult<serde_json::Value> {
+        use rustoshi_wallet::{descriptor_checksum, parse_descriptor};
+        use serde_json::json;
+
+        let priv_flag = private.unwrap_or(false);
+
+        let state = self.state.read().await;
+        let (wallet_name, wallet) = self.resolve_wallet(&state)?;
+
+        // Core: private descriptors are unavailable for watch-only
+        // (DISABLE_PRIVATE_KEYS) wallets (backup.cpp:500-502). rustoshi's
+        // importdescriptors store holds only the PUBLIC watch-only form (no
+        // key material), so the private form never exists here — surface
+        // Core's exact -4 rather than emit the public string as "private".
+        if priv_flag {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "Can't get private descriptor string for watch-only wallets",
+            ));
+        }
+
+        // One emitted entry per UNIQUE descriptor string. Prefer the persisted
+        // `descriptors` rows when a wallet DB is available — they carry the
+        // authoritative `timestamp` + `range_end`, which the per-script
+        // in-memory `watched_scripts` table does not retain. Fall back to the
+        // in-memory table (timestamp 0, range_end 0; ranged-ness recovered by
+        // re-parsing the descriptor) when there is no DB.
+        struct DescEntry {
+            descriptor: String,
+            timestamp: u64,
+            range_end: u32,
+            is_range: bool,
+        }
+
+        let mut entries: std::collections::BTreeMap<String, DescEntry> =
+            std::collections::BTreeMap::new();
+
+        let db_arc = state.wallet_manager.get_wallet_db(&wallet_name);
+        let mut used_db = false;
+        if let Some(db) = &db_arc {
+            if let Ok(db_guard) = db.lock() {
+                if let Ok(rows) = db_guard.load_descriptors() {
+                    for (descriptor, _label, timestamp, range_end) in rows {
+                        used_db = true;
+                        // Recover ranged-ness from the descriptor body. The
+                        // persisted range_end is the INCLUSIVE last index
+                        // (Core's range_end-1).
+                        let payload = descriptor.split('#').next().unwrap_or(&descriptor);
+                        let is_range = parse_descriptor(payload)
+                            .map(|d| d.is_range())
+                            .unwrap_or(range_end > 0);
+                        entries.insert(
+                            descriptor.clone(),
+                            DescEntry { descriptor, timestamp, range_end, is_range },
+                        );
+                    }
+                }
+            }
+        }
+
+        if !used_db {
+            let wallet_guard = wallet.lock().map_err(|_| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+            })?;
+            for descriptor in wallet_guard.watched_descriptor_strings() {
+                if entries.contains_key(&descriptor) {
+                    continue;
+                }
+                let payload = descriptor.split('#').next().unwrap_or(&descriptor);
+                let is_range = parse_descriptor(payload)
+                    .map(|d| d.is_range())
+                    .unwrap_or(false);
+                entries.insert(
+                    descriptor.clone(),
+                    DescEntry { descriptor, timestamp: 0, range_end: 0, is_range },
+                );
+            }
+        }
+
+        // BTreeMap iteration is already sorted by the descriptor string key,
+        // matching Core's std::sort by descriptor (backup.cpp:541-543).
+        let mut descriptors: Vec<serde_json::Value> = Vec::with_capacity(entries.len());
+        for entry in entries.into_values() {
+            // Guarantee the trailing #checksum is present and canonical: strip
+            // any stored checksum and recompute via the shared BIP-380 routine
+            // (descriptor.rs:92 descriptor_checksum) — never fabricated.
+            let payload = entry.descriptor.split('#').next().unwrap_or(&entry.descriptor);
+            let desc = match descriptor_checksum(payload) {
+                Some(cs) => format!("{}#{}", payload, cs),
+                // Unparseable payload (shouldn't happen for stored descriptors):
+                // fall back to the descriptor as stored.
+                None => entry.descriptor.clone(),
+            };
+
+            let mut obj = serde_json::Map::new();
+            obj.insert("desc".into(), json!(desc));
+            obj.insert("timestamp".into(), json!(entry.timestamp));
+            // Watch-only imports are never active ScriptPubKeyMans here.
+            obj.insert("active".into(), json!(false));
+            // `internal` is emitted only for active descriptors -> omitted.
+            if entry.is_range {
+                // Ranged: [begin,end] inclusive. rustoshi's watch registry
+                // registers positions 0..=range_end with no begin offset, so
+                // begin is 0. next/next_index default to the range start (0)
+                // for an undriven imported descriptor (backup.cpp:185).
+                obj.insert("range".into(), json!([0, entry.range_end]));
+                obj.insert("next".into(), json!(0));
+                obj.insert("next_index".into(), json!(0));
+            }
+            descriptors.push(serde_json::Value::Object(obj));
+        }
+
+        Ok(json!({
+            "wallet_name": wallet_name,
+            "descriptors": descriptors,
+        }))
     }
 
     async fn get_address_info(&self, address: String) -> RpcResult<serde_json::Value> {
