@@ -230,6 +230,76 @@ pub struct BlockchainInfo {
 }
 
 // ============================================================
+// CHAINSTATES (getchainstates)
+// ============================================================
+
+/// One element of `getchainstates.chainstates`.
+///
+/// Field shape + declaration ORDER mirror Bitcoin Core's `make_chain_data`
+/// (`bitcoin-core/src/rpc/blockchain.cpp::getchainstates`, the
+/// `RPCHelpForChainstate` result). serde serialises struct fields in
+/// declaration order, so the wire key order is exactly Core's `pushKV`
+/// sequence: `blocks, bestblockhash, bits, target, difficulty,
+/// verificationprogress, coins_db_cache_bytes, coins_tip_cache_bytes,
+/// [snapshot_blockhash], validated`.
+///
+/// `snapshot_blockhash` is OPTIONAL — Core only `pushKV`s it for a
+/// from-snapshot chainstate. rustoshi has a single fully-validated chainstate
+/// (no active AssumeUTXO snapshot), so it is `None` and `skip_serializing_if`
+/// omits the key entirely, matching Core. `coins_db_cache_bytes` /
+/// `coins_tip_cache_bytes` are ALWAYS emitted (Core pushes them
+/// unconditionally), so they carry no skip attribute.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChainStateInfo {
+    /// Number of blocks (height) in this chainstate (`CChain::Height()`).
+    pub blocks: u32,
+    /// Blockhash of this chainstate's tip.
+    pub bestblockhash: String,
+    /// nBits: compact representation of the tip's difficulty target.
+    pub bits: String,
+    /// The difficulty target of the tip as a full-precision hex hash.
+    pub target: String,
+    /// Difficulty of the tip.
+    ///
+    /// Serialised as a raw JSON number with 16 significant digits to match
+    /// Bitcoin Core's `std::setprecision(16)` (`%.16g`) in `GetDifficulty()`,
+    /// exactly as `getblockchaininfo.difficulty` does.
+    pub difficulty: Box<serde_json::value::RawValue>,
+    /// Progress towards the network tip, in `[0.0, 1.0]`.
+    pub verificationprogress: f64,
+    /// Size of this chainstate's coinsdb cache, in bytes.
+    pub coins_db_cache_bytes: u64,
+    /// Size of this chainstate's coinstip cache, in bytes.
+    pub coins_tip_cache_bytes: u64,
+    /// The base block of the snapshot this chainstate is based on, if any.
+    /// Present ONLY for a from-snapshot chainstate (Core's
+    /// `cs.m_from_snapshot_blockhash`); omitted for the single validated
+    /// chainstate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_blockhash: Option<String>,
+    /// Whether this chainstate is fully validated. `true` for the single
+    /// validated chainstate; `false` for a snapshot chainstate not yet
+    /// validated.
+    pub validated: bool,
+}
+
+/// Response for the `getchainstates` RPC.
+///
+/// Mirrors `bitcoin-core/src/rpc/blockchain.cpp::getchainstates`:
+///   `{ headers: NUM, chainstates: [ChainStateInfo, ...] }`
+/// where `chainstates` is ordered by work with the most-work (active)
+/// chainstate LAST. rustoshi has exactly one chainstate (no active snapshot),
+/// so the array is a single validated element.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChainStatesResult {
+    /// Number of headers seen so far (best-header height; `-1` if none).
+    /// `i64` so the no-header `-1` sentinel is representable.
+    pub headers: i64,
+    /// Chainstates ordered by work, most-work (active) chainstate LAST.
+    pub chainstates: Vec<ChainStateInfo>,
+}
+
+// ============================================================
 // SYNC STATE (hashhog W70 fleet-wide RPC)
 // ============================================================
 
