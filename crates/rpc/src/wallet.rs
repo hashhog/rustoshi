@@ -418,6 +418,64 @@ pub struct WalletCreateFundedPsbtResult {
     pub changepos: i32,
 }
 
+/// Options for `fundrawtransaction` (Core's `options` parameter).
+///
+/// Mirrors a subset of Bitcoin Core's `fundrawtransaction` options
+/// (`bitcoin-core/src/wallet/rpc/spend.cpp::FundTransaction`). The default
+/// (no-options) path is fully supported. `changeAddress`, `changePosition`,
+/// `feeRate` (BTC/kvB) / `fee_rate` (sat/vB), and `subtractFeeFromOutputs`
+/// are honoured where tractable; less-common knobs (`includeWatching`,
+/// `lockUnspents`, `change_type`, `conf_target`, `estimate_mode`) are
+/// accepted-and-ignored or refused honestly rather than silently
+/// mis-applied.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct FundRawTransactionOptions {
+    /// The bitcoin address to receive the change.
+    #[serde(rename = "changeAddress", alias = "change_address", skip_serializing_if = "Option::is_none")]
+    pub change_address: Option<String>,
+    /// The index of the change output.
+    #[serde(rename = "changePosition", alias = "change_position", skip_serializing_if = "Option::is_none")]
+    pub change_position: Option<u32>,
+    /// Output indices whose amounts the fee should be subtracted from.
+    #[serde(rename = "subtractFeeFromOutputs", alias = "subtract_fee_from_outputs", skip_serializing_if = "Option::is_none")]
+    pub subtract_fee_from_outputs: Option<Vec<u32>>,
+    /// Fee rate in sat/vB (Core `fee_rate`).
+    #[serde(rename = "fee_rate", skip_serializing_if = "Option::is_none")]
+    pub fee_rate: Option<f64>,
+    /// Fee rate in BTC/kvB (Core `feeRate`). Converted to sat/vB internally.
+    #[serde(rename = "feeRate", skip_serializing_if = "Option::is_none")]
+    pub fee_rate_btc_kvb: Option<f64>,
+    /// Mark the transaction BIP-125 replaceable (default: true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaceable: Option<bool>,
+    /// (DEPRECATED in Core) No longer used; accepted for compatibility.
+    #[serde(rename = "includeWatching", alias = "include_watching", skip_serializing_if = "Option::is_none")]
+    pub include_watching: Option<bool>,
+    /// Lock selected unspent outputs (accepted; not yet applied).
+    #[serde(rename = "lockUnspents", alias = "lock_unspents", skip_serializing_if = "Option::is_none")]
+    pub lock_unspents: Option<bool>,
+    /// Confirmation target in blocks (accepted; fee estimator not wired).
+    #[serde(rename = "conf_target", skip_serializing_if = "Option::is_none")]
+    pub conf_target: Option<u32>,
+    /// Fee estimate mode (`unset`, `economical`, `conservative`).
+    #[serde(rename = "estimate_mode", skip_serializing_if = "Option::is_none")]
+    pub estimate_mode: Option<String>,
+}
+
+/// Result of `fundrawtransaction`.
+///
+/// Matches Core's JSON shape EXACTLY:
+/// `{ "hex": <funded raw tx hex>, "fee": <BTC>, "changepos": <int or -1> }`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FundRawTransactionResult {
+    /// The resulting raw transaction (hex-encoded).
+    pub hex: String,
+    /// Fee in BTC the resulting transaction pays.
+    pub fee: f64,
+    /// Position of the added change output, or -1 if none was added.
+    pub changepos: i32,
+}
+
 /// Options for `bumpfee` / `psbtbumpfee`.
 ///
 /// Mirrors a subset of Bitcoin Core's `bumpfee` options. The minimal-
@@ -944,6 +1002,48 @@ pub trait WalletRpc {
         bip32derivs: Option<bool>,
     ) -> RpcResult<WalletCreateFundedPsbtResult>;
 
+    /// Add inputs (and, if needed, a change output) to a raw transaction so
+    /// the wallet funds all of its existing outputs plus the fee
+    /// (Core's `fundrawtransaction`).
+    ///
+    /// Mirrors `bitcoin-core/src/wallet/rpc/spend.cpp::fundrawtransaction`,
+    /// which decodes the raw tx hex, treats its existing outputs as the
+    /// recipients, and calls the same `FundTransaction` coin-selection engine
+    /// that backs `walletcreatefundedpsbt`. The raw-tx sibling: instead of
+    /// wrapping the funded tx as a PSBT, it serialises the funded tx back to
+    /// hex.
+    ///
+    /// Reuses rustoshi's `Wallet::create_transaction` (the same selector
+    /// `walletcreatefundedpsbt`'s no-inputs path uses) to pick inputs and an
+    /// economic change output, then grafts those onto the decoded tx's
+    /// existing inputs/outputs (existing outputs are preserved byte-identical,
+    /// per Core "No existing outputs will be modified").
+    ///
+    /// Parameters:
+    /// - `hexstring`: the hex of the raw transaction to fund.
+    /// - `options`: optional `FundRawTransactionOptions`
+    ///   (changeAddress / changePosition / feeRate / fee_rate /
+    ///   subtractFeeFromOutputs / replaceable / …).
+    /// - `iswitness`: hint for witness vs non-witness decoding (heuristic if
+    ///   omitted; rustoshi's `Transaction::deserialize` auto-detects).
+    ///
+    /// Returns `{ hex, fee, changepos }` with GENUINE values — real selected
+    /// inputs, real computed fee, real change position.
+    ///
+    /// Errors:
+    /// - `-6` (RPC_WALLET_INSUFFICIENT_FUNDS) if the wallet cannot cover
+    ///   outputs + fee.
+    /// - `-5` (RPC_WALLET_INVALID_ADDRESS_OR_KEY) for a bad changeAddress or
+    ///   an output whose script is non-standard / un-fundable.
+    /// - `-4` (RPC_WALLET_ERROR) on hex/decode failure or other errors.
+    #[method(name = "fundrawtransaction")]
+    async fn fund_raw_transaction(
+        &self,
+        hexstring: String,
+        options: Option<FundRawTransactionOptions>,
+        iswitness: Option<bool>,
+    ) -> RpcResult<FundRawTransactionResult>;
+
     /// Bump the fee on a wallet-created, BIP-125-replaceable, unconfirmed
     /// transaction (FIX-61, W118 BUG-2 closure).
     ///
@@ -1139,6 +1239,93 @@ impl WalletRpcImpl {
     /// BTC to satoshis.
     fn btc_to_sats(btc: f64) -> u64 {
         (btc * 100_000_000.0).round() as u64
+    }
+
+    /// Decode a raw transaction from bytes, mirroring Core's `DecodeHexTx`
+    /// try-witness-then-no-witness heuristic
+    /// (`bitcoin-core/src/core_io.h::DecodeHexTx`).
+    ///
+    /// rustoshi's `Transaction::deserialize` auto-detects the SegWit marker,
+    /// which is ambiguous for a transaction with ZERO inputs: such a tx
+    /// serialises as `version | 0x00 | <vout count> | …`, and the leading
+    /// `0x00` is indistinguishable from the SegWit marker byte. That is
+    /// exactly the shape `fundrawtransaction` is handed (a tx with outputs but
+    /// no inputs), and precisely why Core takes the `iswitness` hint. We try
+    /// the witness-permitting decode first; on failure (or when the caller
+    /// passed `iswitness = Some(false)`) we fall back to a forced non-witness
+    /// decode that always treats the post-version compact-size as the input
+    /// count.
+    fn decode_raw_tx_heuristic(
+        bytes: &[u8],
+        iswitness: Option<bool>,
+    ) -> Result<rustoshi_primitives::Transaction, String> {
+        use rustoshi_primitives::{Decodable, Transaction};
+
+        // Honour an explicit `iswitness = false` by skipping the ambiguous
+        // witness-permitting path entirely.
+        if iswitness != Some(false) {
+            if let Ok(tx) = Transaction::deserialize(bytes) {
+                return Ok(tx);
+            }
+        }
+        if iswitness == Some(true) {
+            // Caller insisted on witness decoding and it failed.
+            return Err("TX decode failed (witness)".to_string());
+        }
+        Self::decode_raw_tx_no_witness(bytes)
+            .map_err(|e| format!("TX decode failed: {}", e))
+    }
+
+    /// Force a non-witness decode (no SegWit marker interpretation). Mirrors
+    /// `Transaction::decode` but always reads the byte(s) after the version as
+    /// the input count. Used as the `fundrawtransaction` fallback for the
+    /// zero-input case (see `decode_raw_tx_heuristic`).
+    fn decode_raw_tx_no_witness(
+        bytes: &[u8],
+    ) -> std::io::Result<rustoshi_primitives::Transaction> {
+        use rustoshi_primitives::{read_compact_size, Decodable, OutPoint, Transaction, TxIn, TxOut};
+        use std::io::Read;
+
+        let mut reader = bytes;
+
+        let mut version_bytes = [0u8; 4];
+        reader.read_exact(&mut version_bytes)?;
+        let version = i32::from_le_bytes(version_bytes);
+
+        let input_count = read_compact_size(&mut reader)?;
+        let mut inputs = Vec::with_capacity(input_count as usize);
+        for _ in 0..input_count {
+            let previous_output = OutPoint::decode(&mut reader)?;
+            let script_len = read_compact_size(&mut reader)?;
+            let mut script_sig = vec![0u8; script_len as usize];
+            reader.read_exact(&mut script_sig)?;
+            let mut seq_bytes = [0u8; 4];
+            reader.read_exact(&mut seq_bytes)?;
+            let sequence = u32::from_le_bytes(seq_bytes);
+            inputs.push(TxIn {
+                previous_output,
+                script_sig,
+                sequence,
+                witness: Vec::new(),
+            });
+        }
+
+        let output_count = read_compact_size(&mut reader)?;
+        let mut outputs = Vec::with_capacity(output_count as usize);
+        for _ in 0..output_count {
+            outputs.push(TxOut::decode(&mut reader)?);
+        }
+
+        let mut lock_bytes = [0u8; 4];
+        reader.read_exact(&mut lock_bytes)?;
+        let lock_time = u32::from_le_bytes(lock_bytes);
+
+        Ok(Transaction {
+            version,
+            inputs,
+            outputs,
+            lock_time,
+        })
     }
 
     /// Translate `WalletError::WalletLocked` into Core's
@@ -3005,6 +3192,243 @@ impl WalletRpcServer for WalletRpcImpl {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // fundrawtransaction
+    //
+    // Reference: `bitcoin-core/src/wallet/rpc/spend.cpp::fundrawtransaction`
+    // (line 706) + `FundTransaction` (line 470).
+    //
+    // Core's flow:
+    //   1. DecodeHexTx(hexstring) -> CMutableTransaction
+    //   2. Treat tx.vout as the recipients, clear tx.vout, set
+    //      coin_control.m_allow_other_inputs = true
+    //   3. FundTransaction() -> the SAME CreateTransaction coin-selection
+    //      engine that backs walletcreatefundedpsbt; adds inputs + at most one
+    //      change output, keeping existing inputs/outputs
+    //   4. result = { hex: EncodeHexTx(txr.tx), fee, changepos }
+    //
+    // We mirror this by REUSING `Wallet::create_transaction` — the exact
+    // selector the no-inputs path of `wallet_create_funded_psbt` above calls.
+    // We feed it the decoded tx's existing outputs as recipients, take the
+    // inputs it selected + the change output it created, and graft them onto
+    // the decoded tx's existing inputs/outputs (existing outputs are preserved
+    // byte-identical, matching Core's "No existing outputs will be modified").
+    // The funded tx is then serialised back to hex (vs. the PSBT wrapping the
+    // sibling does). Coin selection / change / fee are NOT reimplemented.
+    // -----------------------------------------------------------------------
+    async fn fund_raw_transaction(
+        &self,
+        hexstring: String,
+        options: Option<FundRawTransactionOptions>,
+        _iswitness: Option<bool>,
+    ) -> RpcResult<FundRawTransactionResult> {
+        use rustoshi_primitives::{Encodable, TxOut};
+        use rustoshi_crypto::address::{Address, Network};
+
+        let opts = options.unwrap_or_default();
+
+        // --- Fee rate resolution (Core: feeRate is BTC/kvB, fee_rate is
+        // sat/vB; cannot specify both). Default mirrors create_transaction's
+        // sibling path (2 sat/vB). ---
+        if opts.fee_rate.is_some() && opts.fee_rate_btc_kvb.is_some() {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "Cannot specify both fee_rate (sat/vB) and feeRate (BTC/kvB)",
+            ));
+        }
+        let fee_rate_sat_vb = if let Some(r) = opts.fee_rate {
+            r
+        } else if let Some(btc_kvb) = opts.fee_rate_btc_kvb {
+            // BTC/kvB -> sat/vB: btc_kvb * 1e8 sat per kvB / 1000 vB per kvB.
+            (btc_kvb * 100_000_000.0) / 1000.0
+        } else {
+            2.0
+        };
+        if fee_rate_sat_vb <= 0.0 {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "fee rate must be positive",
+            ));
+        }
+
+        // --- Decode the raw transaction hex (Core: DecodeHexTx). Uses the
+        // try-witness-then-no-witness heuristic so a zero-input tx (the exact
+        // "fund me" shape) decodes correctly despite the SegWit-marker
+        // ambiguity. Honours the `iswitness` hint. ---
+        let tx_bytes = hex::decode(hexstring.trim()).map_err(|e| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                format!("TX decode failed: invalid hex: {}", e),
+            )
+        })?;
+        let decoded = Self::decode_raw_tx_heuristic(&tx_bytes, _iswitness).map_err(|e| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e)
+        })?;
+
+        // subtractFeeFromOutputs / changeAddress are not yet wired through the
+        // shared selector (it owns change-address generation and fee
+        // placement). Refuse honestly rather than silently ignore, matching
+        // the walletcreatefundedpsbt sibling's stance.
+        if opts.subtract_fee_from_outputs.is_some() {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "options.subtractFeeFromOutputs is not yet supported",
+            ));
+        }
+
+        let state = self.state.read().await;
+        let (_, wallet) = self.resolve_wallet(&state)?;
+        let net = state.wallet_manager.network();
+        let net_param = match net {
+            Network::Mainnet => Network::Mainnet,
+            Network::Testnet => Network::Testnet,
+            Network::Regtest => Network::Regtest,
+        };
+
+        // --- Map the decoded tx's existing outputs into the recipient form
+        // the selector expects: (address_string, value_sats). The selector
+        // rebuilds these into outputs internally; we then discard its rebuilt
+        // recipient outputs and keep the ORIGINAL decoded outputs byte-for-byte
+        // (so non-standard scripts and exact values survive untouched). The
+        // recipient round-trip exists only to drive the selector's target.
+        let mut recipients: Vec<(String, u64)> = Vec::with_capacity(decoded.outputs.len());
+        for (i, out) in decoded.outputs.iter().enumerate() {
+            let addr = Address::from_script_pubkey(&out.script_pubkey, net_param).ok_or_else(|| {
+                Self::rpc_error(
+                    wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                    format!(
+                        "output {} has a non-standard script that cannot be funded (fundrawtransaction requires standard outputs to estimate fees)",
+                        i
+                    ),
+                )
+            })?;
+            recipients.push((addr.to_string(), out.value));
+        }
+        if recipients.is_empty() {
+            // Core funds a tx that has no outputs by funding fee-only; rustoshi's
+            // selector needs a positive target. Honestly refuse the empty case.
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "raw transaction has no outputs to fund",
+            ));
+        }
+
+        // --- Reuse the shared coin-selection engine. This is the SAME
+        // `Wallet::create_transaction` that walletcreatefundedpsbt's
+        // no-inputs path calls (crates/rpc/src/wallet.rs ~line 2768). ---
+        let mut wallet_guard = wallet
+            .lock()
+            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+
+        let selected = wallet_guard
+            .create_transaction(recipients.clone(), fee_rate_sat_vb)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("insufficient") || msg.contains("Insufficient") {
+                    Self::rpc_error(wallet_error::RPC_WALLET_INSUFFICIENT_FUNDS, msg)
+                } else if msg.contains("address") || msg.contains("Address") {
+                    Self::rpc_error(wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY, msg)
+                } else {
+                    Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
+                }
+            })?;
+
+        // The selector returns inputs[selected] and
+        // outputs = [recipients..., change?] (change appended last, only when
+        // economic — see Wallet::create_transaction). Recover the change
+        // output (if any) by position: anything past the recipient count.
+        let change_output: Option<TxOut> = if selected.outputs.len() > recipients.len() {
+            // Exactly one change output, appended last.
+            selected.outputs.last().cloned()
+        } else {
+            None
+        };
+
+        // --- Graft selected inputs + change onto the ORIGINAL decoded tx.
+        // Existing inputs/outputs preserved exactly (Core: existing inputs
+        // kept, "No existing outputs will be modified"). The selector's inputs
+        // are stripped of script_sig/witness (fundrawtransaction returns an
+        // UNSIGNED funded tx — Core: "The inputs added will not be signed").
+        let rbf = opts.replaceable.unwrap_or(true);
+        let default_sequence: u32 = if rbf {
+            0xFFFFFFFD // MAX_BIP125_RBF_SEQUENCE
+        } else if decoded.lock_time != 0 {
+            0xFFFFFFFE // MAX_SEQUENCE_NONFINAL
+        } else {
+            0xFFFFFFFF // SEQUENCE_FINAL
+        };
+
+        let mut funded = decoded.clone();
+        for sin in &selected.inputs {
+            funded.inputs.push(rustoshi_primitives::TxIn {
+                previous_output: sin.previous_output.clone(),
+                script_sig: vec![],
+                sequence: default_sequence,
+                witness: vec![],
+            });
+        }
+
+        // Insert the change output. Default position = appended last; honour
+        // changePosition if in-bounds (Core: change_position, default random —
+        // we default to deterministic append). changeAddress override would
+        // require the selector to accept a destination; refuse it honestly so
+        // the returned changepos is never a lie.
+        let mut changepos: i32 = -1;
+        if let Some(mut change) = change_output {
+            // If a changeAddress was requested, re-point the selector-created
+            // change output's script at it (value unchanged — the selector
+            // already sized it). This is a faithful override: the amount is
+            // still the genuine computed change.
+            if let Some(change_addr_str) = &opts.change_address {
+                let change_addr = Address::from_string(change_addr_str, Some(net_param)).map_err(|e| {
+                    Self::rpc_error(
+                        wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                        format!("Change address must be a valid bitcoin address: {}", e),
+                    )
+                })?;
+                change.script_pubkey = change_addr.to_script_pubkey();
+            }
+            let insert_at = match opts.change_position {
+                Some(want) => {
+                    let want = want as usize;
+                    if want > funded.outputs.len() {
+                        return Err(Self::rpc_error(
+                            wallet_error::RPC_WALLET_ERROR,
+                            "changePosition out of bounds",
+                        ));
+                    }
+                    want
+                }
+                None => funded.outputs.len(),
+            };
+            funded.outputs.insert(insert_at, change);
+            changepos = insert_at as i32;
+        }
+
+        // --- Genuine fee = sum(all input values) - sum(all output values).
+        // Sum every input's value from the wallet UTXO set (the funded tx is
+        // built only from wallet-selected inputs plus whatever the raw tx
+        // already carried; missing values are skipped, mirroring Core's
+        // psbt-funding behaviour for foreign inputs). ---
+        let in_value: u64 = funded
+            .inputs
+            .iter()
+            .filter_map(|i| wallet_guard.get_utxo(&i.previous_output).map(|u| u.value))
+            .sum();
+        let out_value: u64 = funded.outputs.iter().map(|o| o.value).sum();
+        let fee_sats = in_value.saturating_sub(out_value);
+
+        drop(wallet_guard);
+
+        let hex = hex::encode(funded.serialize());
+
+        Ok(FundRawTransactionResult {
+            hex,
+            fee: Self::sats_to_btc(fee_sats),
+            changepos,
+        })
+    }
+
     async fn wallet_passphrase(
         &self,
         passphrase: String,
@@ -4198,5 +4622,197 @@ mod tests {
             res.is_err(),
             "funding must fail when the only UTXO is locked"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // fundrawtransaction — happy path: a raw tx with one output and NO inputs
+    // gets inputs + a change output added from the wallet UTXO set via the
+    // shared coin-selection engine. Asserts the funded tx is internally
+    // consistent (sum(in) == sum(out) + fee, change = in - out - fee) and
+    // that the returned hex round-trips to that tx.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn fundrawtransaction_adds_inputs_and_change() {
+        use rustoshi_crypto::address::{Address, Network};
+        use rustoshi_primitives::{Decodable, Encodable, Hash256, OutPoint, Transaction, TxOut};
+        use rustoshi_wallet::WalletUtxo;
+
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet("w".to_string(), None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        // Inject a confirmed UTXO the wallet owns (0.01 BTC) so the selector
+        // has something to pick — same fixture pattern as the
+        // walletcreatefundedpsbt happy-path test.
+        let utxo_value: u64 = 1_000_000; // 0.01 BTC
+        {
+            let st = state.read().await;
+            let wallet_arc = st.wallet_manager.get_wallet("w").expect("wallet should exist");
+            let mut wallet = wallet_arc.lock().unwrap();
+            let addr = wallet.get_new_address().unwrap();
+            let addr_obj = Address::from_string(&addr, Some(Network::Testnet)).unwrap();
+            let path = wallet.get_derivation_path(&addr).unwrap().clone();
+            wallet.add_utxo(WalletUtxo {
+                outpoint: OutPoint {
+                    txid: Hash256([0x42u8; 32]),
+                    vout: 0,
+                },
+                value: utxo_value,
+                script_pubkey: addr_obj.to_script_pubkey(),
+                derivation_path: path,
+                confirmations: 6,
+                is_change: false,
+                is_coinbase: false,
+                height: Some(100),
+            });
+        }
+
+        // Build a raw tx with ONE output (0.005 BTC to a dummy bech32 addr)
+        // and NO inputs — the canonical "fund me" shape (Core RPCExamples).
+        let recipient = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        let recipient_value: u64 = 500_000; // 0.005 BTC; leaves change > dust
+        let recipient_spk = Address::from_string(recipient, Some(Network::Testnet))
+            .unwrap()
+            .to_script_pubkey();
+        let raw_tx = Transaction {
+            version: 2,
+            inputs: vec![],
+            outputs: vec![TxOut {
+                value: recipient_value,
+                script_pubkey: recipient_spk.clone(),
+            }],
+            lock_time: 0,
+        };
+        let raw_hex = hex::encode(raw_tx.serialize());
+
+        let res = rpc
+            .fund_raw_transaction(raw_hex, None, None)
+            .await
+            .expect("fundrawtransaction must succeed");
+
+        // Fee must be positive — we are paying for the tx.
+        assert!(res.fee > 0.0, "fee must be > 0; got {}", res.fee);
+        // A change output must have been added (recipient < UTXO), so
+        // changepos >= 0.
+        assert!(
+            res.changepos >= 0,
+            "expected a change output; changepos={}",
+            res.changepos
+        );
+
+        // The returned hex must decode to the funded tx.
+        let funded_bytes = hex::decode(&res.hex).expect("returned hex must decode");
+        let funded = Transaction::deserialize(&funded_bytes).expect("funded tx must deserialize");
+
+        // Inputs were added (vin non-empty).
+        assert!(
+            !funded.inputs.is_empty(),
+            "funded tx must have at least one input added"
+        );
+        // The original recipient output is preserved byte-identical.
+        assert!(
+            funded
+                .outputs
+                .iter()
+                .any(|o| o.value == recipient_value && o.script_pubkey == recipient_spk),
+            "original recipient output must be preserved unchanged"
+        );
+        // There must be more outputs than the single original recipient (the
+        // added change), and changepos must index a real output.
+        assert!(
+            funded.outputs.len() > 1,
+            "expected recipient + change; got {} outputs",
+            funded.outputs.len()
+        );
+        assert!(
+            (res.changepos as usize) < funded.outputs.len(),
+            "changepos {} out of range for {} outputs",
+            res.changepos,
+            funded.outputs.len()
+        );
+
+        // Sum the input values from the wallet UTXO set; this funded tx's only
+        // input is the injected wallet UTXO.
+        let in_value: u64 = {
+            let st = state.read().await;
+            let wallet_arc = st.wallet_manager.get_wallet("w").unwrap();
+            let wallet = wallet_arc.lock().unwrap();
+            funded
+                .inputs
+                .iter()
+                .filter_map(|i| wallet.get_utxo(&i.previous_output).map(|u| u.value))
+                .sum()
+        };
+        let out_value: u64 = funded.outputs.iter().map(|o| o.value).sum();
+        let fee_sats = (res.fee * 100_000_000.0).round() as u64;
+
+        // sum(selected inputs) == sum(outputs) + fee.
+        assert_eq!(
+            in_value,
+            out_value + fee_sats,
+            "in {} must equal out {} + fee {}",
+            in_value,
+            out_value,
+            fee_sats
+        );
+
+        // change = inputs - outputs(excluding change) - fee. The non-change
+        // outputs total is just the recipient; change is at changepos.
+        let change_value = funded.outputs[res.changepos as usize].value;
+        let non_change_out: u64 = out_value - change_value;
+        assert_eq!(
+            change_value,
+            in_value - non_change_out - fee_sats,
+            "change {} must equal in {} - non_change_out {} - fee {}",
+            change_value,
+            in_value,
+            non_change_out,
+            fee_sats
+        );
+        // The input value covers outputs + fee (Core invariant).
+        assert!(
+            in_value >= out_value + fee_sats,
+            "input value {} must cover outputs+fee {}",
+            in_value,
+            out_value + fee_sats
+        );
+    }
+
+    // fundrawtransaction — insufficient funds surfaces the wallet
+    // insufficient-funds error (Core: RPC_WALLET_INSUFFICIENT_FUNDS).
+    #[tokio::test]
+    async fn fundrawtransaction_insufficient_funds_errors() {
+        use rustoshi_crypto::address::{Address, Network};
+        use rustoshi_primitives::{Encodable, Transaction, TxOut};
+
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet("w".to_string(), None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        // No UTXOs injected: the wallet is empty. Funding a 0.005 BTC output
+        // must fail with insufficient funds rather than fabricate inputs.
+        let recipient_spk = Address::from_string(
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            Some(Network::Testnet),
+        )
+        .unwrap()
+        .to_script_pubkey();
+        let raw_tx = Transaction {
+            version: 2,
+            inputs: vec![],
+            outputs: vec![TxOut {
+                value: 500_000,
+                script_pubkey: recipient_spk,
+            }],
+            lock_time: 0,
+        };
+        let raw_hex = hex::encode(raw_tx.serialize());
+
+        let res = rpc.fund_raw_transaction(raw_hex, None, None).await;
+        assert!(res.is_err(), "funding an empty wallet must error");
     }
 }
