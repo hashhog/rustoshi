@@ -1879,6 +1879,20 @@ impl Wallet {
         self.watched_scripts.len()
     }
 
+    /// The set of UNIQUE descriptor strings (with checksum) registered via
+    /// `importdescriptors`, deduplicated across the per-position scripts a
+    /// single descriptor controls. Used by `listdescriptors` as the in-memory
+    /// fallback when no persisted `descriptors` rows are available (the
+    /// in-memory `watched_scripts` table does not retain per-descriptor
+    /// timestamp / range_end).
+    pub fn watched_descriptor_strings(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for ws in self.watched_scripts.values() {
+            seen.insert(ws.descriptor.clone());
+        }
+        seen.into_iter().collect()
+    }
+
     /// Register every scriptPubKey a parsed descriptor controls (positions
     /// `0..=range_end` for ranged descriptors, position 0 otherwise) into the
     /// watched-script set, so block scans / rescans credit funds paid to
