@@ -1147,6 +1147,44 @@ impl ChainParams {
         heights.sort_unstable();
         heights
     }
+
+    /// Register a *runtime* assumeUTXO whitelist entry on a **regtest** params.
+    ///
+    /// Bitcoin Core ships regtest with a fixed `m_assumeutxo_data` table (one
+    /// entry at height 110 in `kernel/chainparams.cpp`'s `CRegTestParams`).
+    /// Functional tests that mine an arbitrary regtest chain need the
+    /// (height, blockhash, hash_serialized) triple of *their* chain in the
+    /// whitelist before `loadtxoutset` will accept it. Core exposes this via
+    /// the `-loadutxosnapshot`/`SetAssumeutxoHash` test hooks; rustoshi mirrors
+    /// it with this runtime registrar.
+    ///
+    /// HARD GUARD: this is a no-op (returns `false`) on any network other than
+    /// regtest, so the consensus-critical mainnet / testnet4 / signet tables
+    /// can never be mutated at runtime. Returns `true` when the entry was added.
+    pub fn register_regtest_assumeutxo(
+        &mut self,
+        height: u32,
+        blockhash: Hash256,
+        hash_serialized: AssumeutxoHash,
+        chain_tx_count: u64,
+        base_mtp: Option<u32>,
+    ) -> bool {
+        if self.network_id != NetworkId::Regtest {
+            return false;
+        }
+        // Idempotent on (height, blockhash): replace an existing entry rather
+        // than accumulating duplicates across repeated test setups.
+        self.assumeutxo_data
+            .retain(|d| !(d.height == height && d.blockhash == blockhash));
+        self.assumeutxo_data.push(AssumeutxoData {
+            height,
+            blockhash,
+            hash_serialized,
+            chain_tx_count,
+            base_mtp,
+        });
+        true
+    }
 }
 
 // ============================================================
@@ -2294,6 +2332,48 @@ mod tests {
             entry_290k.chain_tx_count, 28_547_497,
             "testnet4 height-290000 chain_tx_count must match Core chainparams.cpp"
         );
+    }
+
+    /// The runtime regtest assumeutxo registrar must add an entry on regtest
+    /// and be a strict no-op on mainnet / testnet4 (consensus tables stay
+    /// hardcoded).
+    #[test]
+    fn test_register_regtest_assumeutxo_regtest_only() {
+        let h = AssumeutxoHash::from_hex(
+            "abababababababababababababababababababababababababababababababcd",
+        )
+        .unwrap();
+        let bh = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000aa",
+        )
+        .unwrap();
+
+        // Regtest: registration succeeds and is queryable.
+        let mut regtest = ChainParams::regtest();
+        assert!(regtest.assumeutxo_data.is_empty());
+        assert!(regtest.register_regtest_assumeutxo(110, bh, h, 110, Some(0)));
+        assert_eq!(regtest.assumeutxo_data.len(), 1);
+        let e = regtest.assumeutxo_for_height(110).expect("entry present");
+        assert_eq!(e.blockhash, bh);
+        assert_eq!(e.hash_serialized, h);
+        // Idempotent on (height, blockhash): re-register replaces, not appends.
+        assert!(regtest.register_regtest_assumeutxo(110, bh, h, 110, Some(0)));
+        assert_eq!(regtest.assumeutxo_data.len(), 1);
+
+        // Mainnet: HARD no-op — the consensus table is untouched.
+        let mut mainnet = ChainParams::mainnet();
+        let before = mainnet.assumeutxo_data.clone();
+        assert!(!mainnet.register_regtest_assumeutxo(110, bh, h, 110, Some(0)));
+        assert_eq!(
+            mainnet.assumeutxo_data, before,
+            "mainnet assumeutxo table must never be mutated at runtime"
+        );
+
+        // Testnet4: HARD no-op.
+        let mut testnet4 = ChainParams::testnet4();
+        let before4 = testnet4.assumeutxo_data.clone();
+        assert!(!testnet4.register_regtest_assumeutxo(110, bh, h, 110, Some(0)));
+        assert_eq!(testnet4.assumeutxo_data, before4);
     }
 
     /// Sanity check: ensure no testnet4 assumeUTXO hex strings are placeholder
