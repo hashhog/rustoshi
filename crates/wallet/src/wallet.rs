@@ -528,6 +528,24 @@ impl Wallet {
         Ok(child.secret_key)
     }
 
+    /// Derive the compressed public key + BIP32 key-origin (master
+    /// fingerprint + path) for a wallet-owned derivation path.
+    ///
+    /// Used by the PSBT Updater role (`walletprocesspsbt`) to attach genuine
+    /// `PSBT_IN_BIP32_DERIVATION` records for inputs the wallet can sign.
+    /// Reuses the same HD engine (`ExtendedPrivKey::derive_path`) the signer
+    /// uses, so the pubkey is the exact one that will sign the input.
+    pub fn pubkey_and_origin(
+        &self,
+        path: &[u32],
+    ) -> Result<([u8; 33], crate::psbt::KeyOrigin), WalletError> {
+        let secp = secp_ctx();
+        let child = self.master_key.derive_path(path)?;
+        let pubkey = secp256k1::PublicKey::from_secret_key(secp, &child.secret_key);
+        let origin = crate::psbt::KeyOrigin::new(self.master_key.fingerprint(), path.to_vec());
+        Ok((pubkey.serialize(), origin))
+    }
+
     /// Add a UTXO owned by the wallet.
     pub fn add_utxo(&mut self, utxo: WalletUtxo) {
         self.utxos.insert(utxo.outpoint.clone(), utxo);

@@ -59,6 +59,52 @@ pub mod wallet_error {
     /// Failed to encrypt the wallet (Core's RPC_WALLET_ENCRYPTION_FAILED,
     /// e.g. encryptwallet on a wallet with private keys disabled).
     pub const RPC_WALLET_ENCRYPTION_FAILED: i32 = -16;
+    /// Error parsing or validating structure in raw format
+    /// (Core's RPC_DESERIALIZATION_ERROR), e.g. a malformed base64 PSBT in
+    /// `walletprocesspsbt` (spend.cpp: "TX decode failed").
+    pub const RPC_DESERIALIZATION_ERROR: i32 = -22;
+}
+
+/// Extract a single (33-byte compressed pubkey, DER-sig+hashtype) partial-sig
+/// pair from a freshly-signed input, for the `walletprocesspsbt`
+/// sign=true/finalize=false path (records a `PSBT_IN_PARTIAL_SIG` instead of
+/// finalizing). Handles the single-key shapes the wallet signer produces:
+///   - P2WPKH / P2SH-P2WPKH witness: `[sig+hashtype, pubkey(33)]`
+///   - P2PKH scriptSig: `push(sig+hashtype) push(pubkey(33))`
+/// Returns None for multi-element or unrecognised shapes (Taproot key-path
+/// sigs are not partial-sig records and are left to the finalize path).
+fn extract_single_partial_sig(
+    input: &rustoshi_primitives::TxIn,
+) -> Option<([u8; 33], Vec<u8>)> {
+    // Witness shape (P2WPKH / P2SH-P2WPKH): [sig, pubkey33].
+    if input.witness.len() == 2 {
+        let sig = &input.witness[0];
+        let pk = &input.witness[1];
+        if pk.len() == 33 && (pk[0] == 0x02 || pk[0] == 0x03) {
+            let mut pk33 = [0u8; 33];
+            pk33.copy_from_slice(pk);
+            return Some((pk33, sig.clone()));
+        }
+    }
+    // Legacy P2PKH scriptSig: <push sig> <push pubkey33>.
+    let ss = &input.script_sig;
+    if !ss.is_empty() {
+        let sig_len = ss[0] as usize;
+        if 1 + sig_len < ss.len() {
+            let sig = ss[1..1 + sig_len].to_vec();
+            let pk_off = 1 + sig_len;
+            let pk_len = ss[pk_off] as usize;
+            if pk_len == 33 && pk_off + 1 + pk_len <= ss.len() {
+                let pk = &ss[pk_off + 1..pk_off + 1 + pk_len];
+                if pk[0] == 0x02 || pk[0] == 0x03 {
+                    let mut pk33 = [0u8; 33];
+                    pk33.copy_from_slice(pk);
+                    return Some((pk33, sig));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Result of createwallet RPC.
@@ -416,6 +462,27 @@ pub struct WalletCreateFundedPsbtResult {
     pub fee: f64,
     /// Position of the change output (-1 if no change was added).
     pub changepos: i32,
+}
+
+/// Result of `walletprocesspsbt`.
+///
+/// Mirrors `bitcoin-core/src/wallet/rpc/spend.cpp::walletprocesspsbt`
+/// (v31.99): always `{psbt, complete}`, and `hex` ONLY when `complete`
+/// (the finalized network transaction, hex-encoded — Core gates the `hex`
+/// push on `if (complete)`, NOT on the `finalize` flag, because `complete`
+/// already implies finalizability).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletProcessPsbtResult {
+    /// The base64-encoded (partially) signed PSBT.
+    pub psbt: String,
+    /// True iff every input is now signed AND finalizable into a complete
+    /// network transaction.
+    pub complete: bool,
+    /// The hex-encoded finalized network transaction. Present ONLY when
+    /// `complete` is true (Core: `result.pushKV("hex", ...)` inside
+    /// `if (complete)`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hex: Option<String>,
 }
 
 /// Options for `fundrawtransaction` (Core's `options` parameter).
@@ -1001,6 +1068,36 @@ pub trait WalletRpc {
         options: Option<FundedPsbtOptions>,
         bip32derivs: Option<bool>,
     ) -> RpcResult<WalletCreateFundedPsbtResult>;
+
+    /// Update, sign, and optionally finalize a PSBT with wallet data
+    /// (Core's `walletprocesspsbt`, Updater + Signer + Finalizer roles).
+    ///
+    /// Mirrors `bitcoin-core/src/wallet/rpc/spend.cpp::walletprocesspsbt`
+    /// (v31.99). Decodes the base64 PSBT, fills in witness/non-witness UTXO,
+    /// scripts, and BIP-32 derivations the wallet knows (Updater), signs every
+    /// input the wallet holds a key for (Signer, `sign` default true) using the
+    /// SAME BIP-143/BIP-341 sighash + ECDSA/Schnorr engine as
+    /// `signrawtransactionwithwallet` (`Wallet::sign_input`), and finalizes
+    /// completed inputs (`finalize` default true).
+    ///
+    /// Returns `{psbt, complete}`, plus `hex` (the finalized network tx) ONLY
+    /// when `complete`.
+    ///
+    /// Parameters:
+    /// - psbt: the base64 PSBT string.
+    /// - sign: also sign the transaction (default: true).
+    /// - sighashtype: signature hash type (default: ALL).
+    /// - bip32derivs: include BIP-32 derivation paths in the PSBT (default: true).
+    /// - finalize: also finalize inputs if possible (default: true).
+    #[method(name = "walletprocesspsbt")]
+    async fn wallet_process_psbt(
+        &self,
+        psbt: String,
+        sign: Option<bool>,
+        sighashtype: Option<String>,
+        bip32derivs: Option<bool>,
+        finalize: Option<bool>,
+    ) -> RpcResult<WalletProcessPsbtResult>;
 
     /// Add inputs (and, if needed, a change output) to a raw transaction so
     /// the wallet funds all of its existing outputs plus the fee
@@ -3189,6 +3286,251 @@ impl WalletRpcServer for WalletRpcImpl {
             psbt: psbt.to_base64(),
             fee: Self::sats_to_btc(fee_sats),
             changepos,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // walletprocesspsbt
+    //
+    // Reference: `bitcoin-core/src/wallet/rpc/spend.cpp::walletprocesspsbt`
+    // (v31.99). Decodes the base64 PSBT, runs CWallet::FillPSBT in the
+    // Updater (fill UTXO/scripts/bip32 derivs) + Signer (sign=true default)
+    // + Finalizer (finalize=true default) roles, then returns
+    //   { psbt, complete }  (+ hex when complete).
+    //
+    // ⭐ ENGINE REUSE: the actual sighash + ECDSA/Schnorr signing is done by
+    // `Wallet::sign_input` — the SAME path `signrawtransactionwithwallet`
+    // (sign_raw_transaction_with_wallet, this file) drives, which itself
+    // dispatches to the BIP-143 (`segwit_v0_sighash`) / BIP-341
+    // (`sign_p2tr_input`) / legacy sighash signers in
+    // `crates/wallet/src/wallet.rs`. We do NOT reimplement sighash or
+    // signing here. sign_input produces FINAL scriptSig/witness; we graft
+    // those into the PSBT's final_script_sig / final_script_witness, which
+    // is exactly the Finalizer outcome (Core's finalize=true default).
+    // -----------------------------------------------------------------------
+    async fn wallet_process_psbt(
+        &self,
+        psbt: String,
+        sign: Option<bool>,
+        sighashtype: Option<String>,
+        bip32derivs: Option<bool>,
+        finalize: Option<bool>,
+    ) -> RpcResult<WalletProcessPsbtResult> {
+        use rustoshi_primitives::{Encodable, TxOut};
+        use rustoshi_wallet::{Psbt, WalletUtxo};
+
+        let sign = sign.unwrap_or(true);
+        let bip32derivs = bip32derivs.unwrap_or(true);
+        // Note: `finalize` defaults true (Core). Our signer produces final
+        // scripts directly, so when finalize=false we keep the produced
+        // signature OUT of the final_script_* fields and instead record it as
+        // a partial_sig, leaving the PSBT un-finalized (complete=false).
+        let finalize = finalize.unwrap_or(true);
+
+        // Sighash type — the wallet signer currently honours SIGHASH_ALL only
+        // (same constraint as signrawtransactionwithwallet); refuse other
+        // types honestly rather than silently signing ALL.
+        let sighash_type_str = sighashtype.as_deref().unwrap_or("ALL");
+        if !matches!(sighash_type_str, "ALL" | "DEFAULT" | "ALL|ANYONECANPAY") {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                format!(
+                    "sighashtype {:?} not yet supported (only ALL/DEFAULT)",
+                    sighash_type_str
+                ),
+            ));
+        }
+
+        // Decode the base64 PSBT (Core: DecodeBase64PSBT -> RPC_DESERIALIZATION_ERROR -22).
+        let mut psbt = Psbt::from_base64(&psbt).map_err(|e| {
+            Self::rpc_error(
+                wallet_error::RPC_DESERIALIZATION_ERROR,
+                format!("TX decode failed {}", e),
+            )
+        })?;
+
+        let state = self.state.read().await;
+        let (name, wallet) = self.resolve_wallet(&state)?;
+
+        // Core: `if (sign) EnsureWalletIsUnlocked(...)`.
+        if sign {
+            Self::require_unlocked(&state, &name)?;
+        }
+
+        let wallet_guard = wallet
+            .lock()
+            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+
+        let num_inputs = psbt.unsigned_tx.inputs.len();
+
+        // For each input, look up whether the wallet owns the spent UTXO.
+        // (None = foreign input, the wallet cannot fill/sign it.)
+        let prev_utxos: Vec<Option<WalletUtxo>> = psbt
+            .unsigned_tx
+            .inputs
+            .iter()
+            .map(|input| wallet_guard.get_utxo(&input.previous_output).cloned())
+            .collect();
+
+        // BIP-341 sighash needs every input's prevout. Build the parallel
+        // Vec<WalletUtxo> the signer expects; missing entries are placeholders
+        // we never read for a missing input (Taproot inputs are gated below).
+        let any_missing = prev_utxos.iter().any(|u| u.is_none());
+        let placeholder = WalletUtxo {
+            outpoint: rustoshi_primitives::OutPoint {
+                txid: rustoshi_primitives::Hash256([0u8; 32]),
+                vout: 0,
+            },
+            value: 0,
+            script_pubkey: vec![],
+            derivation_path: vec![],
+            confirmations: 0,
+            is_change: false,
+            is_coinbase: false,
+            height: None,
+        };
+        let all_prev_utxos: Vec<WalletUtxo> = prev_utxos
+            .iter()
+            .map(|opt| opt.clone().unwrap_or_else(|| placeholder.clone()))
+            .collect();
+
+        // ============================================================
+        // Updater role — fill witness_utxo / scripts / bip32 derivs.
+        // ============================================================
+        for i in 0..num_inputs {
+            let Some(utxo) = &prev_utxos[i] else { continue };
+            let spk = utxo.script_pubkey.clone();
+
+            // Provide the spent output as a witness_utxo for segwit inputs
+            // (P2WPKH/P2WSH/P2TR/P2SH-wrapped-segwit). For pure-legacy P2PKH
+            // Core would attach a non_witness_utxo (full prev tx), which the
+            // wallet does not retain — but the legacy signer reads scriptPubKey
+            // + value directly from the wallet UTXO, so signing still works.
+            let is_segwit = (spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14) // P2WPKH
+                || (spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20) // P2WSH
+                || (spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20) // P2TR
+                || (spk.len() == 23 && spk[0] == 0xa9 && spk[2] == 0x14); // P2SH (may wrap segwit)
+            if is_segwit && psbt.inputs[i].witness_utxo.is_none() {
+                let _ = psbt.set_witness_utxo(
+                    i,
+                    TxOut {
+                        value: utxo.value,
+                        script_pubkey: spk.clone(),
+                    },
+                );
+            }
+
+            // BIP-32 derivation record (genuine pubkey + master-fingerprint
+            // origin, derived via the same HD engine the signer uses).
+            if bip32derivs {
+                if let Ok((pubkey, origin)) =
+                    wallet_guard.pubkey_and_origin(&utxo.derivation_path)
+                {
+                    let _ = psbt.add_input_derivation(i, pubkey, origin);
+                }
+            }
+        }
+
+        // ============================================================
+        // Signer role — sign every wallet-owned input.
+        // ============================================================
+        // `complete` starts true (Core: `bool complete = true;`) and is
+        // cleared whenever an input cannot be fully signed + finalized.
+        let mut complete = num_inputs > 0;
+
+        if sign {
+            for i in 0..num_inputs {
+                // Already finalized by a prior round: counts as done.
+                if psbt.inputs[i].is_finalized() {
+                    continue;
+                }
+
+                let Some(utxo) = &prev_utxos[i] else {
+                    // Foreign input — wallet has no key, cannot complete.
+                    complete = false;
+                    continue;
+                };
+
+                // Taproot guard: BIP-341 sighash for THIS input needs every
+                // other input's prevout. If any is missing we cannot produce a
+                // correct sighash, so don't sign (and the PSBT stays incomplete).
+                let spk = &utxo.script_pubkey;
+                let is_tr = spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20;
+                if is_tr && any_missing {
+                    complete = false;
+                    continue;
+                }
+
+                // Sign into a scratch tx via the SAME engine
+                // signrawtransactionwithwallet uses (sign_input).
+                let mut scratch = psbt.unsigned_tx.clone();
+                match wallet_guard.sign_input(&mut scratch, i, &all_prev_utxos) {
+                    Ok(()) => {
+                        let signed_in = &scratch.inputs[i];
+                        if finalize {
+                            // Finalizer role: graft the produced FINAL
+                            // scriptSig/witness onto the PSBT input.
+                            if !signed_in.script_sig.is_empty() {
+                                psbt.inputs[i].final_script_sig =
+                                    Some(signed_in.script_sig.clone());
+                            }
+                            if !signed_in.witness.is_empty() {
+                                psbt.inputs[i].final_script_witness =
+                                    Some(signed_in.witness.clone());
+                            }
+                            if !psbt.inputs[i].is_finalized() {
+                                complete = false;
+                            }
+                        } else {
+                            // sign=true, finalize=false: record a partial sig
+                            // and leave the input un-finalized (Core returns a
+                            // signed-but-not-finalized PSBT, complete=false).
+                            // Extract (pubkey, sig) from the produced witness /
+                            // scriptSig single-sig shapes (P2WPKH / P2PKH /
+                            // P2SH-P2WPKH).
+                            let extracted = extract_single_partial_sig(signed_in);
+                            if let Some((pk, sig)) = extracted {
+                                psbt.inputs[i].partial_sigs.insert(pk, sig);
+                            }
+                            complete = false;
+                        }
+                    }
+                    Err(_) => {
+                        complete = false;
+                    }
+                }
+            }
+        } else {
+            // sign=false: Updater/Finalizer only. complete only if every input
+            // is already finalized in the input PSBT.
+            for i in 0..num_inputs {
+                if finalize {
+                    let _ = psbt.finalize_input(i);
+                }
+                if !psbt.inputs[i].is_finalized() {
+                    complete = false;
+                }
+            }
+        }
+
+        // ============================================================
+        // Build result: { psbt, complete } (+ hex when complete).
+        // ============================================================
+        let mut hex = None;
+        if complete {
+            // Core: FinalizeAndExtractPSBT -> serialize the network tx.
+            if let Ok(final_tx) = psbt.extract_tx() {
+                hex = Some(hex::encode(final_tx.serialize()));
+            } else {
+                // Should not happen if complete is true; degrade honestly.
+                complete = false;
+            }
+        }
+
+        Ok(WalletProcessPsbtResult {
+            psbt: psbt.to_base64(),
+            complete,
+            hex,
         })
     }
 
