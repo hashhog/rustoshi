@@ -866,6 +866,38 @@ pub trait RustoshiRpc {
     #[method(name = "analyzepsbt")]
     async fn analyzepsbt(&self, psbt: String) -> RpcResult<AnalyzePsbtResult>;
 
+    /// Convert a network-serialized transaction to a blank PSBT.
+    ///
+    /// Parameters:
+    /// - hexstring: Hex of a raw transaction
+    /// - permitsigdata: If true, discard any signatures present; if false
+    ///   (default), error when any input carries a scriptSig or witness
+    /// - iswitness: Force witness (`true`) or non-witness (`false`)
+    ///   deserialization; when omitted, heuristic dual-decode is used
+    ///
+    /// Returns: Base64-encoded blank PSBT
+    ///
+    /// Mirrors `bitcoin-core/src/rpc/rawtransaction.cpp::converttopsbt`.
+    #[method(name = "converttopsbt")]
+    async fn converttopsbt(
+        &self,
+        hexstring: String,
+        permitsigdata: Option<bool>,
+        iswitness: Option<bool>,
+    ) -> RpcResult<String>;
+
+    /// Join multiple distinct PSBTs (disjoint inputs/outputs) into one.
+    ///
+    /// Parameters:
+    /// - txs: Array of base64-encoded PSBTs (at least two)
+    ///
+    /// Returns: Base64-encoded merged PSBT (inputs/outputs shuffled for
+    /// privacy parity with Core).
+    ///
+    /// Mirrors `bitcoin-core/src/rpc/rawtransaction.cpp::joinpsbts`.
+    #[method(name = "joinpsbts")]
+    async fn joinpsbts(&self, txs: Vec<String>) -> RpcResult<String>;
+
     // ============================================================
     // MISSING RPCs (added for full coverage)
     // ============================================================
@@ -8584,6 +8616,238 @@ impl RustoshiRpcServer for RpcServerImpl {
         })
     }
 
+    async fn converttopsbt(
+        &self,
+        hexstring: String,
+        permitsigdata: Option<bool>,
+        iswitness: Option<bool>,
+    ) -> RpcResult<String> {
+        // Mirrors `bitcoin-core/src/rpc/rawtransaction.cpp::converttopsbt`.
+        let permitsigdata = permitsigdata.unwrap_or(false);
+
+        // Decode the raw hex first; same error code Core uses on bad hex.
+        let raw = Self::parse_hex(&hexstring)?;
+
+        // Core `DecodeTx` dual-decode strategy
+        // (`bitcoin-core/src/core_io.cpp::DecodeTx`):
+        //   - `try_witness`    enables the *extended* (segwit-aware) decode
+        //   - `try_no_witness` enables the *legacy* decode
+        // When `iswitness` is unset, both are tried (heuristic); when set, only
+        // one path is enabled. A decode counts ONLY if it consumes the ENTIRE
+        // input — an empty-vin tx whose leading 0x00 input-count byte is
+        // mis-read as a segwit marker would otherwise silently drop its
+        // outputs. We prefer the witness decode when both fully consume (Core's
+        // tie-break for the simplified, no-scripts-sanity case here).
+        let witness_specified = iswitness.is_some();
+        let iswitness = iswitness.unwrap_or(false);
+        let try_witness = if witness_specified { iswitness } else { true };
+        let try_no_witness = if witness_specified { !iswitness } else { true };
+
+        // Extended (witness-aware) decode, accepted only on full consumption.
+        let ext_tx: Option<Transaction> = if try_witness {
+            let mut cur = std::io::Cursor::new(&raw[..]);
+            match Transaction::decode(&mut cur) {
+                Ok(tx) if cur.position() as usize == raw.len() => Some(tx),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Legacy (no-witness) decode, accepted only on full consumption.
+        let legacy_tx: Option<Transaction> = if try_no_witness {
+            let mut cur = std::io::Cursor::new(&raw[..]);
+            match Transaction::decode_no_witness(&mut cur) {
+                Ok(tx) if cur.position() as usize == raw.len() => Some(tx),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Prefer the extended decode when it fully consumed; else the legacy.
+        let mut tx = match (ext_tx, legacy_tx) {
+            (Some(tx), _) => tx,
+            (None, Some(tx)) => tx,
+            (None, None) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DESERIALIZATION_ERROR,
+                    "TX decode failed",
+                ));
+            }
+        };
+
+        // Remove all scriptSigs and scriptWitnesses from inputs. If sigdata is
+        // present and not permitted, error before clearing (Core parity).
+        for input in &mut tx.inputs {
+            if (!input.script_sig.is_empty() || !input.witness.is_empty()) && !permitsigdata {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DESERIALIZATION_ERROR,
+                    "Inputs must not have scriptSigs and scriptWitnesses",
+                ));
+            }
+            input.script_sig.clear();
+            input.witness.clear();
+        }
+
+        // Build a blank PSBT (tx + one empty per-input map + one empty
+        // per-output map) and base64-encode it.
+        let psbt = Psbt::from_unsigned_tx(tx).map_err(|e| {
+            Self::rpc_error(
+                rpc_error::RPC_DESERIALIZATION_ERROR,
+                format!("Failed to create PSBT: {}", e),
+            )
+        })?;
+
+        Ok(psbt.to_base64())
+    }
+
+    async fn joinpsbts(&self, txs: Vec<String>) -> RpcResult<String> {
+        // Mirrors `bitcoin-core/src/rpc/rawtransaction.cpp::joinpsbts`.
+        use rand::seq::SliceRandom;
+
+        if txs.len() <= 1 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "At least two PSBTs are required to join PSBTs.",
+            ));
+        }
+
+        // Decode each base64 PSBT; pick best version (max, start 1) and best
+        // locktime (min, start 0xffffffff, UNSIGNED compare).
+        let mut psbtxs: Vec<Psbt> = Vec::with_capacity(txs.len());
+        let mut best_version: i32 = 1;
+        let mut best_locktime: u32 = 0xffff_ffff;
+        for t in &txs {
+            let psbtx = Psbt::from_base64(t).map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_DESERIALIZATION_ERROR,
+                    format!("TX decode failed {}", e),
+                )
+            })?;
+            // Highest version. rustoshi Transaction.version is i32 but Core's
+            // CTransaction::version is uint32_t, so the max is picked by UNSIGNED
+            // value (matters only for a pathological version >= 2^31; legitimate
+            // PSBT tx versions are small positive integers). Cast both to u32 for
+            // the comparison; the stored value round-trips the same bytes.
+            if (psbtx.unsigned_tx.version as u32) > (best_version as u32) {
+                best_version = psbtx.unsigned_tx.version;
+            }
+            // Lowest lock time (unsigned).
+            if psbtx.unsigned_tx.lock_time < best_locktime {
+                best_locktime = psbtx.unsigned_tx.lock_time;
+            }
+            psbtxs.push(psbtx);
+        }
+
+        // Build the merged PSBT skeleton with the chosen version/locktime.
+        let mut merged_tx = Transaction {
+            version: best_version,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            lock_time: best_locktime,
+        };
+        let mut merged_inputs: Vec<rustoshi_wallet::psbt::PsbtInput> = Vec::new();
+        let mut merged_outputs: Vec<rustoshi_wallet::psbt::PsbtOutput> = Vec::new();
+        // Mirror `Psbt::xpubs` exactly so the field assignment below type-checks.
+        let mut merged_xpubs: std::collections::BTreeMap<
+            rustoshi_wallet::psbt::KeyOrigin,
+            std::collections::BTreeSet<rustoshi_wallet::psbt::ExtPubKey>,
+        > = std::collections::BTreeMap::new();
+        let mut merged_unknown: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            std::collections::BTreeMap::new();
+
+        for psbt in &psbtxs {
+            // Add every input from every psbt. Core's
+            // `PartiallySignedTransaction::AddInput` (psbt.cpp:52-63):
+            //   - rejects on a FULL CTxIn match (prevout AND scriptSig AND
+            //     nSequence — rustoshi's TxIn derives Eq over exactly those,
+            //     plus an always-empty witness on an unsigned-tx input);
+            //   - UNCONDITIONALLY clears partial_sigs / final_script_sig /
+            //     final_script_witness on each added input (so joining SIGNED
+            //     PSBTs matches Core — sig data is dropped, not carried).
+            for (i, txin) in psbt.unsigned_tx.inputs.iter().enumerate() {
+                if merged_tx.inputs.iter().any(|existing| existing == txin) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        format!(
+                            "Input {}:{} exists in multiple PSBTs",
+                            txin.previous_output.txid.to_hex(),
+                            txin.previous_output.vout
+                        ),
+                    ));
+                }
+                merged_tx.inputs.push(txin.clone());
+                let mut psbtin = psbt.inputs[i].clone();
+                psbtin.partial_sigs.clear();
+                psbtin.final_script_sig = None;
+                psbtin.final_script_witness = None;
+                merged_inputs.push(psbtin);
+            }
+
+            // Add every output (no dedup).
+            for (i, txout) in psbt.unsigned_tx.outputs.iter().enumerate() {
+                merged_tx.outputs.push(txout.clone());
+                merged_outputs.push(psbt.outputs[i].clone());
+            }
+
+            // Merge global xpubs (union per origin).
+            for (origin, xpubs) in &psbt.xpubs {
+                merged_xpubs
+                    .entry(origin.clone())
+                    .or_default()
+                    .extend(xpubs.iter().cloned());
+            }
+            // Merge unknown globals (first writer wins, like Core's map insert).
+            for (key, val) in &psbt.unknown {
+                merged_unknown
+                    .entry(key.clone())
+                    .or_insert_with(|| val.clone());
+            }
+        }
+
+        // Shuffle input and output order for privacy parity with Core
+        // (`std::shuffle` over a FastRandomContext). We shuffle index lists so
+        // each tx input/output stays paired with its per-input/per-output map.
+        let mut rng = rand::thread_rng();
+        let mut input_indices: Vec<usize> = (0..merged_tx.inputs.len()).collect();
+        let mut output_indices: Vec<usize> = (0..merged_tx.outputs.len()).collect();
+        input_indices.shuffle(&mut rng);
+        output_indices.shuffle(&mut rng);
+
+        let mut shuffled_tx = Transaction {
+            version: merged_tx.version,
+            inputs: Vec::with_capacity(merged_tx.inputs.len()),
+            outputs: Vec::with_capacity(merged_tx.outputs.len()),
+            lock_time: merged_tx.lock_time,
+        };
+        let mut shuffled_inputs: Vec<rustoshi_wallet::psbt::PsbtInput> =
+            Vec::with_capacity(merged_inputs.len());
+        let mut shuffled_outputs: Vec<rustoshi_wallet::psbt::PsbtOutput> =
+            Vec::with_capacity(merged_outputs.len());
+        for &i in &input_indices {
+            shuffled_tx.inputs.push(merged_tx.inputs[i].clone());
+            shuffled_inputs.push(merged_inputs[i].clone());
+        }
+        for &i in &output_indices {
+            shuffled_tx.outputs.push(merged_tx.outputs[i].clone());
+            shuffled_outputs.push(merged_outputs[i].clone());
+        }
+
+        let mut shuffled_psbt = Psbt::from_unsigned_tx(shuffled_tx).map_err(|e| {
+            Self::rpc_error(
+                rpc_error::RPC_DESERIALIZATION_ERROR,
+                format!("Failed to build merged PSBT: {}", e),
+            )
+        })?;
+        shuffled_psbt.inputs = shuffled_inputs;
+        shuffled_psbt.outputs = shuffled_outputs;
+        shuffled_psbt.xpubs = merged_xpubs;
+        shuffled_psbt.unknown = merged_unknown;
+
+        Ok(shuffled_psbt.to_base64())
+    }
+
     // ============================================================
     // MISSING RPC IMPLEMENTATIONS
     // ============================================================
@@ -9542,7 +9806,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "walletcreatefundedpsbt", "walletlock", "walletpassphrase",
                 "",
                 "== PSBT ==",
-                "combinepsbt", "createpsbt", "decodepsbt", "finalizepsbt", "walletprocesspsbt",
+                "combinepsbt", "converttopsbt", "createpsbt", "decodepsbt", "finalizepsbt",
+                "joinpsbts", "walletprocesspsbt",
                 "",
                 "== Util ==",
                 "estimaterawfee", "estimatesmartfee", "getindexinfo", "getnettotals", "help",

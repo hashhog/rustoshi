@@ -274,6 +274,77 @@ impl Transaction {
         buf
     }
 
+    /// Decode using *legacy* (no-witness) serialization.
+    ///
+    /// Mirrors Bitcoin Core's `TX_NO_WITNESS` deserialization
+    /// (`bitcoin-core/src/core_io.cpp::DecodeTx`). Unlike the witness-aware
+    /// [`Decodable::decode`], this never interprets a leading `0x00` byte as a
+    /// SegWit marker — the byte immediately following the version is always the
+    /// `CompactSize` input count. This is required for the `converttopsbt`
+    /// dual-decode strategy: an empty-vin transaction whose first input-count
+    /// byte is `0x00` would otherwise be mis-read as a 0-input/0-output segwit
+    /// transaction (silently dropping its outputs).
+    pub fn decode_no_witness<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let mut version_bytes = [0u8; 4];
+        reader.read_exact(&mut version_bytes)?;
+        let version = i32::from_le_bytes(version_bytes);
+
+        let input_count = read_compact_size(reader)?;
+        if input_count > MAX_TX_IN_COUNT as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("too many inputs: {}", input_count),
+            ));
+        }
+        let mut inputs = Vec::with_capacity(input_count as usize);
+        for _ in 0..input_count {
+            let previous_output = OutPoint::decode(reader)?;
+            let script_len = read_compact_size(reader)?;
+            if script_len > MAX_SCRIPT_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("scriptSig too large: {}", script_len),
+                ));
+            }
+            let mut script_sig = vec![0u8; script_len as usize];
+            reader.read_exact(&mut script_sig)?;
+
+            let mut seq_bytes = [0u8; 4];
+            reader.read_exact(&mut seq_bytes)?;
+            let sequence = u32::from_le_bytes(seq_bytes);
+
+            inputs.push(TxIn {
+                previous_output,
+                script_sig,
+                sequence,
+                witness: Vec::new(),
+            });
+        }
+
+        let output_count = read_compact_size(reader)?;
+        if output_count > MAX_TX_OUT_COUNT as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("too many outputs: {}", output_count),
+            ));
+        }
+        let mut outputs = Vec::with_capacity(output_count as usize);
+        for _ in 0..output_count {
+            outputs.push(TxOut::decode(reader)?);
+        }
+
+        let mut locktime_bytes = [0u8; 4];
+        reader.read_exact(&mut locktime_bytes)?;
+        let lock_time = u32::from_le_bytes(locktime_bytes);
+
+        Ok(Self {
+            version,
+            inputs,
+            outputs,
+            lock_time,
+        })
+    }
+
     /// Compute the txid (hash of the non-witness serialization, double-SHA256).
     pub fn txid(&self) -> Hash256 {
         let data = self.serialize_no_witness();
