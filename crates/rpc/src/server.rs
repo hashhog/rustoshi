@@ -41,7 +41,7 @@ use rustoshi_consensus::{
 };
 use rustoshi_network::message::{InvType, InvVector, NetworkMessage};
 use rustoshi_network::peer_manager::PeerManager;
-use rustoshi_primitives::{Block, Decodable, Encodable, Hash256, OutPoint, Transaction, TxIn, TxOut};
+use rustoshi_primitives::{Block, Decodable, Encodable, Hash256, HexError, OutPoint, Transaction, TxIn, TxOut};
 use rustoshi_storage::{
     block_store::{BlockStore, CoinEntry},
     indexes::BlockFilterIndex,
@@ -1373,10 +1373,39 @@ impl RpcServerImpl {
         ErrorObjectOwned::owned(code, message.into(), None::<()>)
     }
 
-    /// Helper to parse a hex-encoded block hash.
+    /// Helper to parse a hex-encoded txid/blockhash argument.
+    ///
+    /// Mirrors Bitcoin Core's `ParseHashV` (`bitcoin-core/src/rpc/util.cpp:117`):
+    /// a MALFORMED hash (wrong length or non-hex) is rejected at the parse
+    /// boundary — BEFORE any lookup — with `RPC_INVALID_PARAMETER` (-8) and one
+    /// of Core's two message shapes:
+    ///   * wrong length → "<name> must be of length 64 (not N, for '<hex>')"
+    ///   * right length, bad hex → "<name> must be hexadecimal string (not '<hex>')"
+    ///
+    /// Previously this returned `RPC_INVALID_PARAMS` (-32602, the JSON-RPC
+    /// transport code), which is wrong: Core uses the application-layer -8 here.
+    /// The well-formed-but-absent case is unaffected (each handler still returns
+    /// -5 / null on a 64-hex hash that simply is not found).
+    ///
+    /// `Hash256` is used for both txids and blockhashes; Core uses the
+    /// caller-supplied parameter name. The shared helper does not know the arg
+    /// name, so it uses the neutral "hash" — the code (-8) and the
+    /// length-vs-hex distinction are the consensus-relevant parity points.
     fn parse_hash(hash: &str) -> Result<Hash256, ErrorObjectOwned> {
-        Hash256::from_hex(hash)
-            .map_err(|_| Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid hash"))
+        Hash256::from_hex(hash).map_err(|e| {
+            let msg = match e {
+                HexError::InvalidLength { expected, .. } => format!(
+                    "hash must be of length {} (not {}, for '{}')",
+                    expected,
+                    hash.len(),
+                    hash
+                ),
+                HexError::InvalidChar { .. } => {
+                    format!("hash must be hexadecimal string (not '{}')", hash)
+                }
+            };
+            Self::rpc_error(rpc_error::RPC_INVALID_PARAMETER, msg)
+        })
     }
 
     /// Helper to parse hex-encoded bytes.
@@ -19210,6 +19239,174 @@ mod tests {
         assert!(
             !result_stale,
             "should_exit_ibd must respect age gate even when chainwork is None"
+        );
+    }
+
+    // ============================================================
+    // ParseHashV parity — malformed txid/blockhash → RPC_INVALID_PARAMETER (-8)
+    //
+    // Mirrors Bitcoin Core `rpc/util.cpp::ParseHashV` (line 117): a malformed
+    // hash (wrong length OR non-hex) is rejected at the PARSE boundary, BEFORE
+    // any lookup, with code -8. A well-formed-but-absent 64-hex hash must still
+    // surface the handler's not-found behavior (-5, or null for gettxout).
+    // Pre-fix `parse_hash` returned RPC_INVALID_PARAMS (-32602) for the
+    // malformed case; this pins the Core code + message shapes and guards the
+    // not-found case from regressing.
+    // ============================================================
+
+    /// (a) malformed arg → -8 for every in-scope RPC, both the too-short-hex
+    /// and the 64-char-non-hex variant, with Core's two message shapes.
+    #[tokio::test]
+    async fn parsehashv_malformed_txid_blockhash_emits_invalid_parameter() {
+        use rustoshi_consensus::ChainParams;
+        let (_db, _state, server) = make_test_server(ChainParams::regtest());
+
+        // Too-short hex → "must be of length 64 (not 3, ...)".
+        let short = "abc".to_string();
+        // 64 chars, all 'z' (non-hex) → "must be hexadecimal string ...".
+        let nonhex = "z".repeat(64);
+
+        // getrawtransaction(txid)
+        for bad in [&short, &nonhex] {
+            let err = RustoshiRpcServer::get_raw_transaction(&server, bad.clone(), None, None)
+                .await
+                .expect_err("malformed txid must error");
+            assert_eq!(
+                err.code(),
+                rpc_error::RPC_INVALID_PARAMETER,
+                "getrawtransaction malformed txid '{}' must be -8, got {}: {}",
+                bad,
+                err.code(),
+                err.message()
+            );
+        }
+
+        // gettxout(txid)
+        for bad in [&short, &nonhex] {
+            let err = RustoshiRpcServer::get_tx_out(&server, bad.clone(), 0, None)
+                .await
+                .expect_err("malformed txid must error");
+            assert_eq!(
+                err.code(),
+                rpc_error::RPC_INVALID_PARAMETER,
+                "gettxout malformed txid '{}' must be -8",
+                bad
+            );
+        }
+
+        // getblock(blockhash)
+        for bad in [&short, &nonhex] {
+            let err = RustoshiRpcServer::get_block(&server, bad.clone(), None)
+                .await
+                .expect_err("malformed blockhash must error");
+            assert_eq!(
+                err.code(),
+                rpc_error::RPC_INVALID_PARAMETER,
+                "getblock malformed blockhash '{}' must be -8",
+                bad
+            );
+        }
+
+        // getblockheader(blockhash)
+        for bad in [&short, &nonhex] {
+            let err = RustoshiRpcServer::get_block_header(&server, bad.clone(), None)
+                .await
+                .expect_err("malformed blockhash must error");
+            assert_eq!(
+                err.code(),
+                rpc_error::RPC_INVALID_PARAMETER,
+                "getblockheader malformed blockhash '{}' must be -8",
+                bad
+            );
+        }
+
+        // getmempoolentry(txid)
+        for bad in [&short, &nonhex] {
+            let err = RustoshiRpcServer::get_mempool_entry(&server, bad.clone())
+                .await
+                .expect_err("malformed txid must error");
+            assert_eq!(
+                err.code(),
+                rpc_error::RPC_INVALID_PARAMETER,
+                "getmempoolentry malformed txid '{}' must be -8",
+                bad
+            );
+        }
+
+        // Message-shape parity (Core ParseHashV): wrong-length vs non-hex.
+        let len_err = RustoshiRpcServer::get_block(&server, short.clone(), None)
+            .await
+            .expect_err("short hash");
+        assert!(
+            len_err.message().contains("must be of length 64")
+                && len_err.message().contains("not 3"),
+            "wrong-length message shape mismatch: {}",
+            len_err.message()
+        );
+        let hex_err = RustoshiRpcServer::get_block(&server, nonhex.clone(), None)
+            .await
+            .expect_err("nonhex hash");
+        assert!(
+            hex_err.message().contains("must be hexadecimal string"),
+            "non-hex message shape mismatch: {}",
+            hex_err.message()
+        );
+    }
+
+    /// (b) well-formed-but-absent 64-zero hash → still -5 (or null for
+    /// gettxout). Guards against the malformed-case fix bleeding into the
+    /// not-found case.
+    #[tokio::test]
+    async fn parsehashv_wellformed_absent_hash_stays_invalid_address_or_key() {
+        use rustoshi_consensus::ChainParams;
+        let (_db, _state, server) = make_test_server(ChainParams::regtest());
+
+        let zero = "0".repeat(64);
+
+        // getrawtransaction: absent → -5.
+        let err = RustoshiRpcServer::get_raw_transaction(&server, zero.clone(), None, None)
+            .await
+            .expect_err("absent txid must error");
+        assert_eq!(
+            err.code(),
+            rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+            "getrawtransaction absent txid must stay -5, got {}: {}",
+            err.code(),
+            err.message()
+        );
+
+        // gettxout: absent → Ok(None) (JSON null), NOT an error.
+        let out = RustoshiRpcServer::get_tx_out(&server, zero.clone(), 0, None)
+            .await
+            .expect("gettxout on absent outpoint returns null, not an error");
+        assert!(
+            out.is_none(),
+            "gettxout absent outpoint must be null, got {:?}",
+            out.map(|r| r.get().to_string())
+        );
+
+        // getblock: absent → -5.
+        let err = RustoshiRpcServer::get_block(&server, zero.clone(), None)
+            .await
+            .expect_err("absent block must error");
+        assert_eq!(
+            err.code(),
+            rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+            "getblock absent blockhash must stay -5, got {}: {}",
+            err.code(),
+            err.message()
+        );
+
+        // getmempoolentry: absent → -5.
+        let err = RustoshiRpcServer::get_mempool_entry(&server, zero.clone())
+            .await
+            .expect_err("absent txid must error");
+        assert_eq!(
+            err.code(),
+            rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+            "getmempoolentry absent txid must stay -5, got {}: {}",
+            err.code(),
+            err.message()
         );
     }
 
