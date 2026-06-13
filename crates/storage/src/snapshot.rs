@@ -1289,6 +1289,301 @@ pub fn find_snapshot_chainstate_dir(
 }
 
 // ============================================================
+// BACKGROUND-VALIDATION SECOND CHAINSTATE
+// ============================================================
+//
+// This is the REAL AssumeUTXO background-validation chainstate, mirroring
+// Bitcoin Core's `validation.cpp::AddChainstate` (the genesis-validated
+// chainstate demoted to `BACKGROUND` with its OWN `CoinsDB`) +
+// `MaybeCompleteSnapshotValidation` (at the base height, recompute the
+// background coins `HASH_SERIALIZED` and compare to
+// `au_data.hash_serialized`).
+//
+// The crucial property is that this store is GENUINELY DISTINCT from the
+// active (snapshot-loaded) coins view: a write to the active store is
+// invisible here and vice-versa. The genesis->base re-derivation runs a
+// real ConnectBlock-style state transition (spend inputs / add outputs,
+// skipping provably-unspendable outputs, coinbase outputs flagged
+// `is_coinbase`) — NOT a counter, NOT a stub — so the hash it computes is
+// an INDEPENDENT re-derivation, not a hash-of-self.
+
+/// Error from the background genesis->base re-derivation.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BackgroundValidationError {
+    /// The background store aliases the active store — refusing to run a
+    /// tautological hash-of-self instead of an independent re-derivation.
+    #[error("background store aliases the active store — refusing")]
+    AliasesActiveStore,
+
+    /// A block required by the genesis->base walk was unavailable.
+    #[error("missing block at height {0} during genesis->base re-derivation")]
+    MissingBlock(u32),
+
+    /// A transaction spent an input that does not exist in the background
+    /// store (the snapshot/chain is internally inconsistent).
+    #[error("missing input {txid}:{vout} spending at height {height}")]
+    MissingInput {
+        txid: String,
+        vout: u32,
+        height: u32,
+    },
+}
+
+/// Terminal verdict of `BackgroundChainstate::finalize_validation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotVerdict {
+    /// The re-derived `HASH_SERIALIZED` MATCHED the assumeutxo commitment.
+    Valid,
+    /// The re-derived `HASH_SERIALIZED` MISMATCHED the commitment — the
+    /// snapshot is INVALID and must never be silently accepted.
+    Invalid,
+}
+
+/// The SECOND chainstate used to independently re-derive the snapshot UTXO
+/// set from genesis.
+///
+/// Holds its OWN in-memory coins view (`coins`), seeded EMPTY at genesis —
+/// completely separate from the active chainstate's coins db. The
+/// `active_store_id` field records the identity (allocation address) of the
+/// active coins store so `connect_genesis_to_base` can refuse to run when the
+/// two are the same allocation (the aliasing guard required by the spec).
+#[derive(Debug)]
+pub struct BackgroundChainstate {
+    /// The background store's OWN UTXO set, keyed by outpoint. `finalize`
+    /// sorts the coins into `(txid, vout)` lexicographic order — exactly the
+    /// grouping `compute_hash_serialized` (Core's HASH_SERIALIZED) is anchored
+    /// to. (`OutPoint` is `Hash` but not `Ord`, so a `HashMap` + explicit sort
+    /// is used rather than a `BTreeMap`.)
+    coins: std::collections::HashMap<OutPoint, Coin>,
+
+    /// Height of the last block connected into this store (`-1` sentinel ==
+    /// pre-genesis: the next block to connect is the genesis at height 0).
+    tip_height: i64,
+
+    /// The snapshot base height this background chainstate targets.
+    base_height: u32,
+
+    /// Identity of the ACTIVE coins store (its allocation address as a
+    /// `usize`). Used solely for the aliasing guard — a value of `0` means
+    /// "no active store registered" (unit-test construction).
+    active_store_id: usize,
+}
+
+impl BackgroundChainstate {
+    /// Create a fresh background chainstate seeded EMPTY at pre-genesis.
+    ///
+    /// `active_store_id` is the identity (e.g. `Arc::as_ptr(...) as usize`,
+    /// or a raw-pointer address) of the live/active coins store. Pass `0`
+    /// only in tests that do not have a distinct active store to alias-check
+    /// against.
+    pub fn new(base_height: u32, active_store_id: usize) -> Self {
+        Self {
+            coins: std::collections::HashMap::new(),
+            tip_height: -1,
+            base_height,
+            active_store_id,
+        }
+    }
+
+    /// Identity (allocation address) of THIS background store, for the
+    /// aliasing guard / proving the two stores are distinct.
+    pub fn store_id(&self) -> usize {
+        // The map's heap allocation identity is stable for the lifetime of
+        // `self`. `&self.coins` is the unique in-memory anchor of this store.
+        (&self.coins as *const _) as usize
+    }
+
+    /// Record the active coins-store identity for the aliasing guard.
+    ///
+    /// Lets a caller (or test) pin the active store id AFTER the background
+    /// chainstate is built — used to deterministically exercise the aliasing
+    /// guard by setting the active id to THIS store's own id (which then
+    /// refuses to run a tautological hash-of-self).
+    pub fn set_active_store_id(&mut self, id: usize) {
+        self.active_store_id = id;
+    }
+
+    /// The recorded active-store identity (for the aliasing guard).
+    pub fn active_store_id(&self) -> usize {
+        self.active_store_id
+    }
+
+    /// Number of unspent coins currently in the background store.
+    pub fn len(&self) -> usize {
+        self.coins.len()
+    }
+
+    /// Whether the background store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.coins.is_empty()
+    }
+
+    /// Read-only access to a coin in the background store (for tests proving
+    /// active-store writes are NOT visible here).
+    pub fn get_coin(&self, outpoint: &OutPoint) -> Option<&Coin> {
+        self.coins.get(outpoint)
+    }
+
+    /// Height of the last connected block.
+    pub fn tip_height(&self) -> i64 {
+        self.tip_height
+    }
+
+    /// Apply ONE block's coin updates to the background store, Core
+    /// `ConnectBlock`-style (validation.cpp:1746-1983 mirror):
+    ///
+    ///   * coinbase tx: NO inputs to spend; add its spendable outputs flagged
+    ///     `is_coinbase=true`.
+    ///   * every other tx: SPEND each input's coin (must exist, else the chain
+    ///     is inconsistent), then add its spendable outputs flagged
+    ///     `is_coinbase=false`.
+    ///   * provably-unspendable outputs (OP_RETURN / oversize) are skipped, so
+    ///     they are never inserted — exactly like `CCoinsViewCache::AddCoin`.
+    ///
+    /// `height` is the block's height in the active chain. This is the real
+    /// state transition (spend/add), NOT a counter.
+    fn connect_one_block(
+        &mut self,
+        block: &rustoshi_primitives::Block,
+        height: u32,
+    ) -> Result<(), BackgroundValidationError> {
+        // Genesis (height 0): Core does NOT add the genesis coinbase to the
+        // UTXO set (it is unspendable — `validation.cpp` skips genesis in
+        // `ConnectBlock`; the genesis coin is never in any chainstate's coins
+        // db). So height 0 mutates nothing.
+        if height == 0 {
+            return Ok(());
+        }
+
+        for tx in &block.transactions {
+            let txid = tx.txid();
+            let is_cb = tx.is_coinbase();
+
+            if !is_cb {
+                // Spend each input. The coin MUST exist in the background
+                // store (we replayed all prior blocks). A missing input means
+                // the chain we are replaying is internally inconsistent.
+                for input in &tx.inputs {
+                    let op = &input.previous_output;
+                    if self.coins.remove(op).is_none() {
+                        return Err(BackgroundValidationError::MissingInput {
+                            txid: input.previous_output.txid.to_hex(),
+                            vout: input.previous_output.vout,
+                            height,
+                        });
+                    }
+                }
+            }
+
+            // Add this tx's spendable outputs.
+            for (vout, output) in tx.outputs.iter().enumerate() {
+                if is_provably_unspendable(&output.script_pubkey) {
+                    continue;
+                }
+                let op = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                self.coins.insert(
+                    op,
+                    Coin {
+                        tx_out: TxOut {
+                            value: output.value,
+                            script_pubkey: output.script_pubkey.clone(),
+                        },
+                        height,
+                        is_coinbase: is_cb,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the REAL genesis->base re-derivation into the SEPARATE background
+    /// store, then recompute `HASH_SERIALIZED` over THAT store's coins and
+    /// compare to the snapshot's assumeutxo commitment.
+    ///
+    /// `get_block_by_height(h)` supplies the block at active-chain height `h`
+    /// (genesis is height 0). `assumed_hash` is `au_data.hash_serialized`.
+    ///
+    /// Returns `Ok(SnapshotVerdict::Valid)` when the independently re-derived
+    /// hash MATCHED, `Ok(SnapshotVerdict::Invalid)` when it MISMATCHED (the
+    /// non-circular reject path — the snapshot passed the load-time gate
+    /// because it committed to its own hash, but the genesis->base replay
+    /// computes a DIFFERENT hash). Errors (`Err`) are hard failures (aliasing,
+    /// missing block, inconsistent input) that also mean "not validated" — the
+    /// snapshot is NEVER silently accepted.
+    pub fn connect_genesis_to_base(
+        &mut self,
+        assumed_hash: AssumeutxoHash,
+        mut get_block_by_height: impl FnMut(u32) -> Option<rustoshi_primitives::Block>,
+    ) -> Result<SnapshotVerdict, BackgroundValidationError> {
+        // ALIASING GUARD: refuse to run if the background store IS the active
+        // store. A hash-of-self is not an independent re-derivation.
+        if self.active_store_id != 0 && self.store_id() == self.active_store_id {
+            return Err(BackgroundValidationError::AliasesActiveStore);
+        }
+
+        // Walk genesis (0) .. base inclusive, connecting each block.
+        let start = (self.tip_height + 1) as u32;
+        for height in start..=self.base_height {
+            let block = get_block_by_height(height)
+                .ok_or(BackgroundValidationError::MissingBlock(height))?;
+            self.connect_one_block(&block, height)?;
+            self.tip_height = height as i64;
+        }
+
+        // At the base height: recompute HASH_SERIALIZED over the SEPARATE
+        // store and compare (Core MaybeCompleteSnapshotValidation).
+        Ok(self.finalize_validation(assumed_hash))
+    }
+
+    /// Recompute `HASH_SERIALIZED` over the background store's OWN coins and
+    /// compare to the commitment. MATCH -> Valid, MISMATCH -> Invalid.
+    ///
+    /// Reuses `compute_hash_serialized` (the Core HASH_SERIALIZED routine) —
+    /// it does NOT define a second hasher. Coins are sorted into `(txid, vout)`
+    /// lexicographic order first, which is the grouping Core's HASH_SERIALIZED
+    /// is anchored to (`CCoinsViewCursor` order).
+    pub fn finalize_validation(&self, assumed_hash: AssumeutxoHash) -> SnapshotVerdict {
+        let recomputed = compute_hash_serialized(self.sorted_coins().into_iter());
+        if recomputed == assumed_hash {
+            SnapshotVerdict::Valid
+        } else {
+            SnapshotVerdict::Invalid
+        }
+    }
+
+    /// The background store's coins in `(txid, vout)` lexicographic order.
+    fn sorted_coins(&self) -> Vec<(OutPoint, Coin)> {
+        let mut v: Vec<(OutPoint, Coin)> = self
+            .coins
+            .iter()
+            .map(|(op, coin)| (op.clone(), coin.clone()))
+            .collect();
+        v.sort_by(|a, b| {
+            a.0.txid
+                .as_bytes()
+                .cmp(b.0.txid.as_bytes())
+                .then(a.0.vout.cmp(&b.0.vout))
+        });
+        v
+    }
+}
+
+/// Core `CScript::IsUnspendable` (script.h:563): OP_RETURN-prefixed OR over the
+/// max script size. Matches the predicate `connect_block` uses so the
+/// background store inserts exactly the coins the active validator would.
+fn is_provably_unspendable(script: &[u8]) -> bool {
+    const MAX_SCRIPT_SIZE: usize = 10_000; // bitcoin-core/src/script/script.h
+    if script.is_empty() {
+        return false;
+    }
+    script[0] == 0x6a /* OP_RETURN */ || script.len() > MAX_SCRIPT_SIZE
+}
+
+// ============================================================
 // CHAINSTATE MANAGER
 // ============================================================
 
@@ -1354,6 +1649,22 @@ pub struct ChainstateManager {
 
     /// The snapshot base blockhash (if loaded).
     snapshot_base_blockhash: Option<Hash256>,
+
+    /// The REAL background-validation second chainstate (Core's demoted
+    /// genesis-rooted chainstate with its OWN coins store). Constructed by
+    /// `start_background_validation` once a snapshot is activated; `None`
+    /// before activation (and after the background chainstate is retired on a
+    /// successful validation).
+    background: Option<BackgroundChainstate>,
+
+    /// The assumeutxo `hash_serialized` commitment the background chainstate
+    /// must independently re-derive at the base height. `None` until a
+    /// snapshot is activated.
+    assumed_hash: Option<AssumeutxoHash>,
+
+    /// Whether the background re-derivation determined the snapshot INVALID
+    /// (hash mismatch / inconsistency). Drives `getchainstates` validated=false.
+    snapshot_invalid: bool,
 }
 
 impl ChainstateManager {
@@ -1365,6 +1676,9 @@ impl ChainstateManager {
             snapshot_active: false,
             snapshot_base_height: None,
             snapshot_base_blockhash: None,
+            background: None,
+            assumed_hash: None,
+            snapshot_invalid: false,
         }
     }
 
@@ -1461,6 +1775,144 @@ impl ChainstateManager {
         }
     }
 
+    /// Mark the snapshot INVALID (background re-derivation MISMATCHED, a block
+    /// was missing, or the chain was internally inconsistent).
+    ///
+    /// Core's `MaybeCompleteSnapshotValidation` calls `AbortNode` on a hash
+    /// mismatch — it never silently keeps an unvalidated snapshot. rustoshi
+    /// transitions to a terminal `Invalid` state so the operator-facing RPC
+    /// (`getchainstates`) reports `validated=false` and the snapshot can be
+    /// torn down. The background chainstate is dropped on this path.
+    pub fn invalidate_snapshot(&mut self) {
+        let (bh, hh) = (self.snapshot_base_blockhash, self.snapshot_base_height);
+        if let (Some(base_blockhash), Some(base_height)) = (bh, hh) {
+            // Keep the metadata around (operator can see which snapshot
+            // failed) but flag it via the activation marker as NOT validated
+            // and move out of the `Unvalidated`/`Validated` active state.
+            self.snapshot_state = SnapshotState::Unvalidated {
+                base_blockhash,
+                base_height,
+            };
+        }
+        self.snapshot_invalid = true;
+        self.background = None;
+        if let Some(activation) = &mut self.snapshot_activation {
+            activation.snapshot_validated = false;
+        }
+    }
+
+    /// Whether the loaded snapshot has been determined INVALID by the
+    /// background re-derivation (hash mismatch / inconsistency).
+    pub fn is_snapshot_invalid(&self) -> bool {
+        self.snapshot_invalid
+    }
+
+    /// Activate a snapshot AND record the assumeutxo commitment the background
+    /// chainstate must independently re-derive.
+    ///
+    /// This is the Core `ActivateSnapshot` entry: it transitions to
+    /// `Unvalidated`, records the base + commitment, and (in
+    /// `start_background_validation`) demotes a fresh genesis-rooted
+    /// chainstate to BACKGROUND with its OWN empty coins store.
+    pub fn activate_snapshot_with_commitment(
+        &mut self,
+        base_blockhash: Hash256,
+        base_height: u32,
+        assumed_hash: AssumeutxoHash,
+    ) {
+        self.activate_snapshot(base_blockhash, base_height);
+        self.snapshot_invalid = false;
+        self.assumed_hash = Some(assumed_hash);
+    }
+
+    /// Demote a fresh genesis-rooted chainstate to BACKGROUND (Core
+    /// `AddChainstate`): construct the SECOND chainstate with its OWN empty
+    /// coins store, distinct from the active store identified by
+    /// `active_store_id`.
+    ///
+    /// `active_store_id` is the identity (allocation address as `usize`) of
+    /// the LIVE/active coins store; the background store guards against
+    /// aliasing it. Must be called after `activate_snapshot_with_commitment`.
+    pub fn start_background_validation(&mut self, active_store_id: usize) {
+        if let Some(base_height) = self.snapshot_base_height {
+            self.background = Some(BackgroundChainstate::new(base_height, active_store_id));
+        }
+    }
+
+    /// Identity (allocation address) of the background store, for the
+    /// aliasing-falsification test (proving it is distinct from the active
+    /// store). `None` when no background chainstate exists.
+    pub fn background_store_id(&self) -> Option<usize> {
+        self.background.as_ref().map(|b| b.store_id())
+    }
+
+    /// Read-only access to a coin in the BACKGROUND store (proving an active
+    /// store write is NOT visible there). `None` when no background chainstate
+    /// exists or the coin is absent.
+    pub fn background_get_coin(&self, outpoint: &OutPoint) -> Option<Coin> {
+        self.background
+            .as_ref()
+            .and_then(|b| b.get_coin(outpoint).cloned())
+    }
+
+    /// Number of coins independently re-derived into the background store.
+    pub fn background_coin_count(&self) -> Option<usize> {
+        self.background.as_ref().map(|b| b.len())
+    }
+
+    /// Run the REAL genesis->base background re-derivation to completion and
+    /// apply the verdict to the snapshot state.
+    ///
+    /// This drives Core's `MaybeCompleteSnapshotValidation`: connect every
+    /// block genesis..base into the SEPARATE background store, recompute
+    /// `HASH_SERIALIZED`, and compare to the commitment. On MATCH the snapshot
+    /// is marked `Validated` and the background chainstate is retired; on
+    /// MISMATCH (or any error) the snapshot is marked INVALID — NEVER silently
+    /// accepted.
+    ///
+    /// Returns the verdict (`Ok`) or the hard failure (`Err`) — both leave the
+    /// snapshot un-validated except for the `Valid` case.
+    pub fn run_background_validation(
+        &mut self,
+        get_block_by_height: impl FnMut(u32) -> Option<rustoshi_primitives::Block>,
+    ) -> Result<SnapshotVerdict, BackgroundValidationError> {
+        let assumed = match self.assumed_hash {
+            Some(h) => h,
+            None => {
+                // No commitment recorded — cannot validate; fail closed.
+                self.invalidate_snapshot();
+                return Err(BackgroundValidationError::MissingBlock(0));
+            }
+        };
+        let bg = match self.background.as_mut() {
+            Some(bg) => bg,
+            None => {
+                self.invalidate_snapshot();
+                return Err(BackgroundValidationError::MissingBlock(0));
+            }
+        };
+
+        match bg.connect_genesis_to_base(assumed, get_block_by_height) {
+            Ok(SnapshotVerdict::Valid) => {
+                // MATCH: snapshot validated, background chainstate retired.
+                self.validate_snapshot();
+                self.snapshot_invalid = false;
+                self.background = None;
+                Ok(SnapshotVerdict::Valid)
+            }
+            Ok(SnapshotVerdict::Invalid) => {
+                // MISMATCH: the snapshot is INVALID. Never silently accept.
+                self.invalidate_snapshot();
+                Ok(SnapshotVerdict::Invalid)
+            }
+            Err(e) => {
+                // Hard failure: also "not validated".
+                self.invalidate_snapshot();
+                Err(e)
+            }
+        }
+    }
+
     /// Check if the background chainstate has reached the snapshot height.
     ///
     /// This is called during block connection in the background chainstate
@@ -1479,6 +1931,9 @@ impl ChainstateManager {
         self.snapshot_active = false;
         self.snapshot_base_height = None;
         self.snapshot_base_blockhash = None;
+        self.background = None;
+        self.assumed_hash = None;
+        self.snapshot_invalid = false;
     }
 
     /// Get recommended cache allocation for snapshot chainstate.
