@@ -78,8 +78,9 @@ pub use utxo_cache::{
 };
 pub use snapshot::{
     compute_hash_serialized, compute_utxo_hash, compute_utxo_muhash, find_snapshot_chainstate_dir,
-    read_snapshot_blockhash, write_snapshot_blockhash, ChainstateManager, SnapshotActivation,
-    SnapshotError, SnapshotMetadata, SnapshotReader, SnapshotState, SnapshotWriter,
+    read_snapshot_blockhash, write_snapshot_blockhash, BackgroundChainstate,
+    BackgroundValidationError, ChainstateManager, SnapshotActivation, SnapshotError,
+    SnapshotMetadata, SnapshotReader, SnapshotState, SnapshotVerdict, SnapshotWriter,
     IBD_ACTIVE_CACHE_PERCENT, IBD_CACHE_PERCENT, SNAPSHOT_ACTIVE_CACHE_PERCENT,
     SNAPSHOT_BLOCKHASH_FILENAME, SNAPSHOT_CACHE_PERCENT, SNAPSHOT_CHAINSTATE_SUFFIX,
     SNAPSHOT_MAGIC_BYTES, SNAPSHOT_VERSION,
