@@ -40,7 +40,7 @@ use crate::{
     addr::{deserialize_addrv2_message, serialize_addrv2_message, AddrV2Entry, NetworkAddr},
     message::{TimestampedNetAddress, MAX_ADDR},
     netgroup::{ip_is_routable, NetGroupManager, NetworkType},
-    peer_manager::{socket_addr_to_net_address, AddressManager},
+    peer_manager::{clamp_addr_timestamp, socket_addr_to_net_address, AddressManager},
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -1727,5 +1727,174 @@ fn axis2_public_api_feeds_bucketed_addrman() {
     assert!(
         mgr.addrman().is_in_tried(&a),
         "success promotes the addr to TRIED"
+    );
+}
+
+// ─── 3G: ADDR/ADDRV2 timestamp clamping (Core net_processing.cpp:5678-5680) ──
+//
+// Core clamps nTime to (now - 5 days) when:
+//   nTime <= 100_000_000  (pre-2001, obviously bogus)
+//   nTime >  now + 10 min  (future clock drift / manipulation)
+// Valid timestamps in the range (100_000_000, now + 10 min] are stored as-is.
+
+/// Pre-2001 timestamp (<=100_000_000) must be clamped to now-5days.
+/// Without the fix, clamp_addr_timestamp would just return ts as u64 unchecked
+/// and a peer could poison the addrman with a timestamp from 1970.
+#[test]
+fn g3g_clamp_pre2001_timestamp() {
+    let now: u64 = 1_700_000_000; // 2023-11-14, clearly valid
+    let ancient: u32 = 50_000_000; // 1971 — pre-2001, must be clamped
+
+    let result = clamp_addr_timestamp(ancient, now);
+
+    // Must NOT equal the raw timestamp
+    assert_ne!(
+        result,
+        ancient as u64,
+        "pre-2001 timestamp must not be stored verbatim"
+    );
+    // Must equal now - 5 days
+    let expected = now - 5 * 24 * 60 * 60;
+    assert_eq!(result, expected, "pre-2001 timestamp must clamp to now-5days");
+}
+
+/// Exactly 100_000_000 is still in the "pre-2001" band (<=, not <).
+#[test]
+fn g3g_clamp_exact_boundary_100m() {
+    let now: u64 = 1_700_000_000;
+    let boundary: u32 = 100_000_000;
+
+    let result = clamp_addr_timestamp(boundary, now);
+
+    let expected = now - 5 * 24 * 60 * 60;
+    assert_eq!(
+        result, expected,
+        "timestamp == 100_000_000 must be clamped (Core uses <=)"
+    );
+}
+
+/// A future timestamp more than 10 minutes ahead must be clamped.
+#[test]
+fn g3g_clamp_future_timestamp() {
+    let now: u64 = 1_700_000_000;
+    let far_future: u32 = (now + 3600) as u32; // 1 hour in the future
+
+    let result = clamp_addr_timestamp(far_future, now);
+
+    let expected = now - 5 * 24 * 60 * 60;
+    assert_eq!(result, expected, "future timestamp must clamp to now-5days");
+}
+
+/// A timestamp exactly 10 minutes in the future is within tolerance — not clamped.
+#[test]
+fn g3g_no_clamp_within_tolerance() {
+    let now: u64 = 1_700_000_000;
+    let just_ok: u32 = (now + 10 * 60) as u32; // exactly 10 min ahead
+
+    let result = clamp_addr_timestamp(just_ok, now);
+
+    assert_eq!(
+        result,
+        just_ok as u64,
+        "timestamp <= now+10min must not be clamped"
+    );
+}
+
+/// A normal recent timestamp must pass through unchanged.
+#[test]
+fn g3g_no_clamp_normal_timestamp() {
+    let now: u64 = 1_700_000_000;
+    let recent: u32 = (now - 3600) as u32; // 1 hour ago
+
+    let result = clamp_addr_timestamp(recent, now);
+
+    assert_eq!(result, recent as u64, "recent valid timestamp must not be clamped");
+}
+
+/// Legacy ADDR path: add_peer_addresses stores the clamped timestamp.
+/// A peer advertising a pre-2001 timestamp must not poison addrman with it.
+#[test]
+fn g3g_add_peer_addresses_clamps_timestamp() {
+    use crate::message::NetAddress;
+
+    let mut mgr = AddressManager::new();
+    let from: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+    let peer_addr: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+
+    // Build a TimestampedNetAddress with a pre-2001 timestamp.
+    let ancient_ts: u32 = 42; // way pre-2001, must be clamped
+    let taddr = TimestampedNetAddress {
+        timestamp: ancient_ts,
+        address: NetAddress {
+            services: 1,
+            ip: {
+                // IPv4-mapped IPv6: ::ffff:8.8.8.8
+                let mut buf = [0u8; 16];
+                buf[10] = 0xff;
+                buf[11] = 0xff;
+                buf[12] = 8;
+                buf[13] = 8;
+                buf[14] = 8;
+                buf[15] = 8;
+                buf
+            },
+            port: 8333,
+        },
+    };
+
+    mgr.add_peer_addresses(&[taddr], from);
+
+    // The stored time_unix must NOT be the raw ancient_ts.
+    let stored = mgr
+        .known_addrs()
+        .get(&peer_addr)
+        .expect("address must be stored");
+    assert_ne!(
+        stored.time_unix,
+        ancient_ts as u64,
+        "stored timestamp must not be the raw pre-2001 value"
+    );
+    // Must be in the vicinity of now - 5 days (within 60s for test clock drift).
+    let now = crate::peer_manager::now_unix_secs();
+    let expected = now.saturating_sub(5 * 24 * 60 * 60);
+    let delta = stored.time_unix.abs_diff(expected);
+    assert!(
+        delta <= 60,
+        "stored timestamp should be near now-5days, got delta={delta}s"
+    );
+}
+
+/// ADDRv2 path: add_addrv2_addresses stores the clamped timestamp.
+#[test]
+fn g3g_add_addrv2_addresses_clamps_timestamp() {
+    let mut mgr = AddressManager::new();
+    let from: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+
+    let far_future_ts: u32 = u32::MAX; // year 2106, well beyond tolerance
+    let entry = AddrV2Entry {
+        timestamp: far_future_ts,
+        services: 1,
+        addr: NetworkAddr::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
+        port: 8333,
+    };
+
+    mgr.add_addrv2_addresses(&[entry], from);
+
+    let peer_addr: SocketAddr = "9.9.9.9:8333".parse().unwrap();
+    let stored = mgr
+        .known_addrs()
+        .get(&peer_addr)
+        .expect("address must be stored");
+    assert_ne!(
+        stored.time_unix,
+        far_future_ts as u64,
+        "far-future timestamp must not be stored verbatim"
+    );
+    let now = crate::peer_manager::now_unix_secs();
+    let expected = now.saturating_sub(5 * 24 * 60 * 60);
+    let delta = stored.time_unix.abs_diff(expected);
+    assert!(
+        delta <= 60,
+        "stored timestamp should be near now-5days, got delta={delta}s"
     );
 }
