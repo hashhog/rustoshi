@@ -10,10 +10,18 @@ use crate::serialize::{
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 
-/// Maximum number of inputs/outputs per transaction (consensus: MAX_BLOCK_WEIGHT / MIN_TX_WEIGHT
-/// gives ~25k as a safe upper bound; Bitcoin Core uses similar limits implicitly via block size).
-const MAX_TX_IN_COUNT: usize = 25_000;
-const MAX_TX_OUT_COUNT: usize = 25_000;
+/// Maximum CompactSize input/output count accepted at deserialize. Bitcoin Core imposes NO
+/// per-tx count cap beyond ReadCompactSize's MAX_SIZE (serialize.h, 0x02000000); the real
+/// ceiling is the downstream block-weight check. A tighter cap FALSE-REJECTS a valid tx: a
+/// 4M-weight block fits well over 25k small (9-byte) outputs, so the old 25k output cap
+/// split the chain (bug-hunt 4D — the input cap was safe since min-input weight caps inputs
+/// near 24k, but outputs are far smaller). Match Core's MAX_SIZE bound.
+const MAX_TX_IN_COUNT: usize = 0x0200_0000;
+const MAX_TX_OUT_COUNT: usize = 0x0200_0000;
+/// Cap eager `Vec` pre-allocation so a malicious oversized count cannot OOM the node before
+/// the bytes are actually read (mirrors Core's bounded reserve, serialize.h
+/// MAX_VECTOR_ALLOCATE). The vec still grows if the genuine count is larger.
+const MAX_ALLOC_RESERVE: usize = 16_384;
 /// Maximum script size (consensus limit is 10,000 bytes for scriptSig; scriptPubKey can be
 /// larger in witness but we cap at the block weight limit for safety).
 const MAX_SCRIPT_SIZE: u64 = 10_000;
@@ -296,7 +304,7 @@ impl Transaction {
                 format!("too many inputs: {}", input_count),
             ));
         }
-        let mut inputs = Vec::with_capacity(input_count as usize);
+        let mut inputs = Vec::with_capacity((input_count as usize).min(MAX_ALLOC_RESERVE));
         for _ in 0..input_count {
             let previous_output = OutPoint::decode(reader)?;
             let script_len = read_compact_size(reader)?;
@@ -328,7 +336,7 @@ impl Transaction {
                 format!("too many outputs: {}", output_count),
             ));
         }
-        let mut outputs = Vec::with_capacity(output_count as usize);
+        let mut outputs = Vec::with_capacity((output_count as usize).min(MAX_ALLOC_RESERVE));
         for _ in 0..output_count {
             outputs.push(TxOut::decode(reader)?);
         }
@@ -513,7 +521,7 @@ impl Decodable for Transaction {
                 format!("too many inputs: {}", input_count),
             ));
         }
-        let mut inputs = Vec::with_capacity(input_count as usize);
+        let mut inputs = Vec::with_capacity((input_count as usize).min(MAX_ALLOC_RESERVE));
         for _ in 0..input_count {
             let previous_output = OutPoint::decode(reader)?;
             let script_len = read_compact_size(reader)?;
@@ -546,7 +554,7 @@ impl Decodable for Transaction {
                 format!("too many outputs: {}", output_count),
             ));
         }
-        let mut outputs = Vec::with_capacity(output_count as usize);
+        let mut outputs = Vec::with_capacity((output_count as usize).min(MAX_ALLOC_RESERVE));
         for _ in 0..output_count {
             outputs.push(TxOut::decode(reader)?);
         }
@@ -1107,5 +1115,32 @@ mod tests {
             err.to_string().contains("Superfluous witness record"),
             "error message must mention 'Superfluous witness record', got: {err}"
         );
+    }
+
+    #[test]
+    fn many_outputs_above_old_cap_round_trip_4d() {
+        // Bug-hunt 4D: a consensus-valid tx can carry far more than 25_000 small
+        // (9-byte) outputs within a 4M-weight block. The old MAX_TX_OUT_COUNT=25_000
+        // deserialize cap FALSE-REJECTED such a tx that Bitcoin Core accepts -> chain
+        // split. With the cap raised to Core's MAX_SIZE bound, 30_000 outputs must
+        // round-trip. Pre-fix this deserialize errors with "too many outputs".
+        let n = 30_000usize;
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
+            }],
+            outputs: (0..n)
+                .map(|_| TxOut { value: 0, script_pubkey: Vec::new() })
+                .collect(),
+            lock_time: 0,
+        };
+        let bytes = tx.serialize_no_witness();
+        let decoded = Transaction::deserialize(&bytes)
+            .expect("a tx with 30k outputs must deserialize (Core MAX_SIZE bound)");
+        assert_eq!(decoded.outputs.len(), n, "all 30k outputs must round-trip");
     }
 }

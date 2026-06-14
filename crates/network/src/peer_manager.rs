@@ -382,6 +382,32 @@ pub(crate) fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Clamp a peer-advertised address timestamp before storing it in the address
+/// manager.  Mirrors Bitcoin Core `net_processing.cpp:5678-5680`:
+///
+/// ```cpp
+/// if (addr.nTime <= NodeSeconds{100000000s} || addr.nTime > current_time + 10min)
+///     addr.nTime = current_time - 5 * 24h;
+/// ```
+///
+/// - Timestamps at or before 100 000 000 (pre-2001-03-09) are obviously bogus.
+/// - Timestamps more than 10 minutes in the future are likely clock-drift or
+///   manipulation.
+/// Both cases are clamped to `now - 5 days` so the address stays discoverable
+/// but ranks below freshly-seen peers in addrman selection.
+pub(crate) fn clamp_addr_timestamp(ts: u32, now: u64) -> u64 {
+    const STALE_THRESHOLD: u64 = 100_000_000; // <= this means pre-2001
+    const FUTURE_TOLERANCE_SECS: u64 = 10 * 60; // 10 minutes
+    const PENALTY_SECS: u64 = 5 * 24 * 60 * 60; // 5 days
+
+    let ts64 = ts as u64;
+    if ts64 <= STALE_THRESHOLD || ts64 > now.saturating_add(FUTURE_TOLERANCE_SECS) {
+        now.saturating_sub(PENALTY_SECS)
+    } else {
+        ts64
+    }
+}
+
 /// One row of the addrman dump returned by the `getnodeaddresses` RPC.
 ///
 /// Mirrors the per-address object Bitcoin Core emits (rpc/net.cpp:958-965):
@@ -1366,6 +1392,12 @@ impl AddressManager {
         &self.addrman
     }
 
+    /// Borrow the legacy known_addrs map (for tests).
+    #[cfg(test)]
+    pub fn known_addrs(&self) -> &HashMap<SocketAddr, AddrInfo> {
+        &self.known_addrs
+    }
+
     /// Atomically persist the bucketed addrman to `<data_dir>/peers.dat`.
     pub fn save_addrman(&self, data_dir: &std::path::Path) {
         self.addrman.save(data_dir);
@@ -1426,13 +1458,16 @@ impl AddressManager {
                     continue;
                 }
                 if !self.is_banned(&socket_addr) {
+                    // Clamp timestamp: mirrors Core net_processing.cpp:5678-5680.
+                    // Pre-2001 (<=100_000_000) or >10 min future → 5 days ago.
+                    let clamped_ts = clamp_addr_timestamp(taddr.timestamp, now_unix_secs());
                     let entry = self
                         .known_addrs
                         .entry(socket_addr)
                         .or_insert_with(|| AddrInfo {
                             addr: socket_addr,
                             services: taddr.address.services,
-                            time_unix: taddr.timestamp as u64,
+                            time_unix: clamped_ts,
                             last_seen: Instant::now(),
                             last_attempt: None,
                             last_success: None,
@@ -1440,10 +1475,10 @@ impl AddressManager {
                             source: AddrSource::Peer(from),
                         });
                     entry.last_seen = Instant::now();
-                    entry.time_unix = taddr.timestamp as u64;
+                    entry.time_unix = clamped_ts;
                     entry.services = taddr.address.services;
                     let services = taddr.address.services;
-                    let ts = taddr.timestamp as u64;
+                    let ts = clamped_ts;
 
                     // Add to try queue if not already connected
                     if !self.connected.contains(&socket_addr) {
@@ -1852,9 +1887,17 @@ impl AddressManager {
     /// IPv4/IPv6 addresses are also added to the legacy known_addrs for compatibility.
     pub fn add_addrv2_addresses(&mut self, entries: &[crate::addr::AddrV2Entry], from: SocketAddr) {
         let now = Instant::now();
+        let now_unix = now_unix_secs();
 
         for entry in entries {
             let key = AddrV2Key::new(entry.addr.clone(), entry.port);
+
+            // Clamp timestamp: mirrors Core net_processing.cpp:5678-5680.
+            // Pre-2001 (<=100_000_000) or >10 min future → 5 days ago.
+            let clamped_ts = clamp_addr_timestamp(entry.timestamp, now_unix);
+            // AddrV2Info.timestamp is u32; safe to truncate — clamped_ts is
+            // always >= (now - 5 days) which fits in u32 until year 2106.
+            let clamped_ts_u32 = clamped_ts as u32;
 
             // For IPv4/IPv6, also add to legacy storage
             if let Some(socket_addr) = entry.to_socket_addr() {
@@ -1869,7 +1912,7 @@ impl AddressManager {
                             .or_insert_with(|| AddrInfo {
                                 addr: socket_addr,
                                 services: entry.services,
-                                time_unix: entry.timestamp as u64,
+                                time_unix: clamped_ts,
                                 last_seen: now,
                                 last_attempt: None,
                                 last_success: None,
@@ -1877,7 +1920,7 @@ impl AddressManager {
                                 source: AddrSource::Peer(from),
                             });
                     addr_entry.last_seen = now;
-                    addr_entry.time_unix = entry.timestamp as u64;
+                    addr_entry.time_unix = clamped_ts;
                     addr_entry.services = entry.services;
 
                     // Add to try queue if not already connected
@@ -1892,7 +1935,7 @@ impl AddressManager {
                 addr: entry.addr.clone(),
                 port: entry.port,
                 services: entry.services,
-                timestamp: entry.timestamp,
+                timestamp: clamped_ts_u32,
                 last_seen: now,
                 last_attempt: None,
                 last_success: None,
@@ -1901,7 +1944,7 @@ impl AddressManager {
             });
             v2_entry.last_seen = now;
             v2_entry.services = entry.services;
-            v2_entry.timestamp = entry.timestamp;
+            v2_entry.timestamp = clamped_ts_u32;
         }
     }
 
