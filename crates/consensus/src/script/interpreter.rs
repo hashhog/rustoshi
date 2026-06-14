@@ -306,6 +306,14 @@ pub enum ScriptError {
     WitnessUnexpected,
     #[error("witness malleated")]
     WitnessMalleated,
+    /// Mirrors Bitcoin Core `SCRIPT_ERR_WITNESS_MALLEATED_P2SH`
+    /// (script/script_error.h:69, interpreter.cpp:2085). Returned when a
+    /// P2SH-wrapped witness program has a scriptSig that is not the MINIMAL
+    /// canonical single push of the redeemScript bytes — i.e. the scriptSig
+    /// bytes differ from `canonical_push_script(redeemScript)`. Distinct
+    /// from `WitnessMalleated` (used for native SegWit scriptSig non-empty).
+    #[error("witness malleated P2SH: scriptSig must be the exact minimal push of the redeemScript")]
+    WitnessMalleatedP2SH,
     #[error("invalid stack operation")]
     InvalidStackOperation,
     #[error("bad opcode")]
@@ -2707,6 +2715,58 @@ pub fn is_push_only(script: &[u8]) -> bool {
     true
 }
 
+/// Build the MINIMAL canonical single-push encoding of `data`, mirroring
+/// `CScript() << std::vector<unsigned char>(data.begin(), data.end())` in
+/// Bitcoin Core (script/script.h `AppendDataSize`).
+///
+/// Encoding rules (data-push, NOT integer-push — no OP_1..OP_16 shortcuts):
+///   - empty      → OP_0 (0x00)
+///   - 1–75 bytes → `<len>` `<data>`             (direct push)
+///   - 76–255     → OP_PUSHDATA1 (0x4c) `<u8 len>` `<data>`
+///   - 256–65535  → OP_PUSHDATA2 (0x4d) `<u16le len>` `<data>`
+///   - ≥65536     → OP_PUSHDATA4 (0x4e) `<u32le len>` `<data>`
+///
+/// Used by the P2SH-wrapped-witness malleation check (BIP-141 / Core
+/// interpreter.cpp:2082-2085) to reconstruct the expected scriptSig and
+/// compare it byte-for-byte against the actual scriptSig.
+fn canonical_push_script(data: &[u8]) -> Vec<u8> {
+    let n = data.len();
+    match n {
+        0 => vec![0x00], // OP_0
+        1..=75 => {
+            let mut s = Vec::with_capacity(1 + n);
+            s.push(n as u8);
+            s.extend_from_slice(data);
+            s
+        }
+        76..=255 => {
+            let mut s = Vec::with_capacity(2 + n);
+            s.push(0x4c); // OP_PUSHDATA1
+            s.push(n as u8);
+            s.extend_from_slice(data);
+            s
+        }
+        256..=65535 => {
+            let mut s = Vec::with_capacity(3 + n);
+            s.push(0x4d); // OP_PUSHDATA2
+            s.push(n as u8);
+            s.push((n >> 8) as u8);
+            s.extend_from_slice(data);
+            s
+        }
+        _ => {
+            let mut s = Vec::with_capacity(5 + n);
+            s.push(0x4e); // OP_PUSHDATA4
+            s.push(n as u8);
+            s.push((n >> 8) as u8);
+            s.push((n >> 16) as u8);
+            s.push((n >> 24) as u8);
+            s.extend_from_slice(data);
+            s
+        }
+    }
+}
+
 /// High-level script verification: runs scriptSig, then scriptPubKey,
 /// then P2SH redeem script, then witness program as needed.
 ///
@@ -2767,6 +2827,18 @@ pub fn verify_script(
         // BIP-341 verifier (which would diverge from Core).
         if flags.verify_witness {
             if let Some((version, program)) = parse_witness_program(redeem_script) {
+                // Core interpreter.cpp:2082-2085: scriptSig must be BYTE-EXACTLY
+                // the minimal canonical single-push of the redeemScript bytes.
+                // Checking p2sh_stack.is_empty() is INSUFFICIENT: a non-minimal
+                // push (e.g. OP_PUSHDATA1 for a 22-byte redeemScript) is push-only
+                // and evaluates to [redeemScript] — passing a stack check — but
+                // differs from the minimal 0x16 <bytes> encoding, so Core rejects
+                // it as SCRIPT_ERR_WITNESS_MALLEATED_P2SH. Under block/ConnectBlock
+                // validation MINIMALDATA is not set, making this the only guard.
+                if script_sig != canonical_push_script(redeem_script).as_slice() {
+                    return Err(ScriptError::WitnessMalleatedP2SH);
+                }
+
                 verify_witness_program(
                     witness,
                     version,
@@ -2775,12 +2847,6 @@ pub fn verify_script(
                     checker,
                     /* is_p2sh = */ true,
                 )?;
-
-                // For P2SH-SegWit, the p2sh_stack should be empty after redeem script
-                // The witness provides the actual execution
-                if !p2sh_stack.is_empty() {
-                    return Err(ScriptError::WitnessMalleated);
-                }
 
                 // After successful witness execution, we're done
                 return Ok(());
@@ -6200,6 +6266,93 @@ mod tests {
         assert!(
             matches!(res, Err(ScriptError::DiscourageUpgradablePubkeyType)),
             "DISCOURAGE flag must reject unknown pubkey type on CHECKSIGADD: {res:?}"
+        );
+    }
+
+    /// P2SH-wrapped P2WPKH: non-minimal scriptSig encoding must be rejected.
+    ///
+    /// Bitcoin Core interpreter.cpp:2082-2085 requires that the scriptSig for
+    /// a P2SH-wrapped witness program be BYTE-EXACTLY the minimal canonical
+    /// single-push of the redeemScript.  A scriptSig using OP_PUSHDATA1 to
+    /// push a 22-byte redeemScript (e.g. `0x4c 0x16 <W>`) is push-only and
+    /// evaluates to [W] on the stack — so a check of `p2sh_stack.is_empty()`
+    /// passes — but the bytes differ from the minimal form `0x16 <W>`, so
+    /// Core rejects it as SCRIPT_ERR_WITNESS_MALLEATED_P2SH.  Under block
+    /// validation MINIMALDATA is NOT set, making this the only guard.
+    ///
+    /// Test vectors:
+    ///   redeemScript W = OP_0 <20-byte-hash> (22 bytes, a P2WPKH program)
+    ///   P2SH scriptPubKey = OP_HASH160 <HASH160(W)> OP_EQUAL
+    ///   canonical scriptSig   = 0x16 <W>        (direct push, 22 < 76)
+    ///   non-canonical scriptSig = 0x4c 0x16 <W> (OP_PUSHDATA1, non-minimal)
+    ///
+    ///   non-canonical → WitnessMalleatedP2SH (mirrors SCRIPT_ERR_WITNESS_MALLEATED_P2SH)
+    ///   canonical     → WitnessProgramMismatch (empty witness, but NOT malleation error)
+    #[test]
+    fn witness_malleated_p2sh_noncanonical_pushdata1_rejected() {
+        // redeemScript: OP_0 <20-byte-hash> = 22 bytes (P2WPKH program)
+        let hash20 = [0xabu8; 20];
+        let mut redeem_script = vec![0x00u8, 0x14]; // OP_0, push-20
+        redeem_script.extend_from_slice(&hash20);
+        assert_eq!(redeem_script.len(), 22);
+
+        // P2SH scriptPubKey: OP_HASH160 <HASH160(redeemScript)> OP_EQUAL
+        let redeem_hash = hash160(&redeem_script);
+        let mut script_pubkey = vec![0xa9u8, 0x14]; // OP_HASH160, push-20
+        script_pubkey.extend_from_slice(redeem_hash.as_bytes());
+        script_pubkey.push(0x87); // OP_EQUAL
+
+        // Canonical scriptSig: direct push (0x16 = 22, length byte < 76)
+        let mut canonical_sig = vec![0x16u8]; // direct push of 22 bytes
+        canonical_sig.extend_from_slice(&redeem_script);
+
+        // Non-canonical scriptSig: OP_PUSHDATA1 0x16 <redeemScript>
+        // This is push-only and evaluates to [redeemScript] — but is NOT minimal.
+        let mut noncanonical_sig = vec![0x4cu8, 0x16u8]; // OP_PUSHDATA1, length=22
+        noncanonical_sig.extend_from_slice(&redeem_script);
+
+        // Flags: P2SH + SegWit (block/ConnectBlock flags). MINIMALDATA NOT set.
+        let mut flags = ScriptFlags::default();
+        flags.verify_p2sh = true;
+        flags.verify_witness = true;
+        let checker = DummyChecker;
+
+        // Non-canonical scriptSig must be rejected with WitnessMalleatedP2SH,
+        // mirroring Bitcoin Core SCRIPT_ERR_WITNESS_MALLEATED_P2SH
+        // (interpreter.cpp:2085), regardless of witness content.
+        let res_noncanonical = verify_script(
+            &noncanonical_sig,
+            &script_pubkey,
+            &[],   // witness (empty — irrelevant; check fires before witness eval)
+            &flags,
+            &checker,
+        );
+        assert!(
+            matches!(res_noncanonical, Err(ScriptError::WitnessMalleatedP2SH)),
+            "OP_PUSHDATA1-encoded redeemScript must be rejected as WitnessMalleatedP2SH, got: {:?}",
+            res_noncanonical,
+        );
+
+        // Canonical scriptSig passes the malleation check and proceeds to
+        // witness verification, which fails for an unrelated reason (empty
+        // witness → WitnessProgramMismatch for P2WPKH). This confirms the
+        // malleation check does NOT fire on the minimal encoding.
+        let res_canonical = verify_script(
+            &canonical_sig,
+            &script_pubkey,
+            &[],   // empty witness → WitnessProgramMismatch, not malleation
+            &flags,
+            &checker,
+        );
+        assert!(
+            !matches!(res_canonical, Err(ScriptError::WitnessMalleatedP2SH)),
+            "canonical scriptSig must NOT be rejected as WitnessMalleatedP2SH, got: {:?}",
+            res_canonical,
+        );
+        assert!(
+            matches!(res_canonical, Err(ScriptError::WitnessProgramMismatch)),
+            "canonical scriptSig with empty witness should fail WitnessProgramMismatch, got: {:?}",
+            res_canonical,
         );
     }
 
