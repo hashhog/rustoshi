@@ -1691,7 +1691,9 @@ impl Mempool {
         // the full BIP-68 check will be re-evaluated after conflicts are removed.
         if spent_heights.len() == tx.inputs.len() {
             let seq_ctx = MempoolSeqLockCtx::new(self.median_time_past);
-            let enforce_bip68 = tx.version >= 2;
+            // Core compares version unsigned (uint32_t, tx_verify.cpp:51); a high-bit
+            // version (0x80000002) still enforces BIP68. Shared with validation.rs.
+            let enforce_bip68 = crate::validation::bip68_version_active(tx.version);
             let locks = calculate_sequence_locks(&tx, &spent_heights, &seq_ctx, enforce_bip68);
             if !check_sequence_locks(&locks, next_height, self.median_time_past) {
                 return Err(MempoolError::SequenceLockNotSatisfied);
