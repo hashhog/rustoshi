@@ -1933,7 +1933,19 @@ impl Psbt {
                             got: key.len(),
                         });
                     }
-                    let tx = Transaction::deserialize(&value)?;
+                    // The PSBT global unsigned tx is serialized TX_NO_WITNESS (Core
+                    // psbt.h), symmetric with serialize_no_witness on the write side;
+                    // decode it no-witness so an empty-vin tx is not mis-read as a
+                    // segwit marker (which would silently drop its outputs), and reject
+                    // trailing data.
+                    let mut tx_reader = io::Cursor::new(&value[..]);
+                    let tx = Transaction::decode_no_witness(&mut tx_reader)?;
+                    if (tx_reader.position() as usize) != value.len() {
+                        return Err(PsbtError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "PSBT global unsigned tx has trailing data",
+                        )));
+                    }
                     // Verify empty scriptSigs and witnesses
                     for input in &tx.inputs {
                         if !input.script_sig.is_empty() || !input.witness.is_empty() {
@@ -2668,6 +2680,37 @@ mod tests {
         assert_eq!(psbt.inputs.len(), 1);
         assert_eq!(psbt.outputs.len(), 1);
         assert!(!psbt.is_finalized());
+    }
+
+    #[test]
+    fn test_psbt_empty_vin_roundtrip_preserves_outputs() {
+        // Regression: an empty-vin tx serializes no-witness as 02000000 00 01 ...
+        // The PSBT global unsigned tx must be DECODED no-witness too; otherwise the
+        // leading 0x00 is mis-read as a segwit marker and the OP_RETURN output is
+        // silently dropped on the round-trip.
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![],
+            outputs: vec![TxOut {
+                value: 0,
+                // OP_RETURN OP_PUSH4 00010203
+                script_pubkey: vec![0x6a, 0x04, 0x00, 0x01, 0x02, 0x03],
+            }],
+            lock_time: 0,
+        };
+        let psbt = Psbt::from_unsigned_tx(tx.clone()).unwrap();
+        let decoded = Psbt::from_base64(&psbt.to_base64()).unwrap();
+        assert_eq!(decoded.unsigned_tx.inputs.len(), 0, "empty vin preserved");
+        assert_eq!(
+            decoded.unsigned_tx.outputs.len(),
+            1,
+            "OP_RETURN output must survive the round-trip (not dropped by a witness-misdecode)"
+        );
+        assert_eq!(
+            decoded.unsigned_tx.outputs[0].script_pubkey,
+            vec![0x6a, 0x04, 0x00, 0x01, 0x02, 0x03]
+        );
+        assert_eq!(decoded.unsigned_tx.txid(), tx.txid());
     }
 
     #[test]
