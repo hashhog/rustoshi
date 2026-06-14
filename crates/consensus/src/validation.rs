@@ -1385,6 +1385,16 @@ pub trait SequenceLockContext {
     fn get_mtp_at_height(&self, height: u32) -> u32;
 }
 
+/// BIP-68 applies only when `tx.version >= 2`. Bitcoin Core stores the version as
+/// `uint32_t` and compares it UNSIGNED (`fEnforceBIP68 = tx.version >= 2`,
+/// consensus/tx_verify.cpp:51). rustoshi stores `tx.version` as `i32`, so a signed
+/// `>= 2` would treat a high-bit version (e.g. `0x80000002`) as negative and SKIP
+/// BIP-68 enforcement, false-accepting a tx whose relative timelock is unmet (a
+/// chain split). Cast to `u32` to match Core exactly — same as the OP_CSV path.
+pub fn bip68_version_active(tx_version: i32) -> bool {
+    (tx_version as u32) >= 2
+}
+
 /// Calculate the sequence locks for a transaction (BIP-68).
 ///
 /// This computes the minimum block height and median-time-past required
@@ -1890,7 +1900,7 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
         // Bitcoin Core split: validation.cpp::CheckSequenceLocks
         // (full chain-access path) + script/interpreter.cpp OP_CSV
         // (script-eval path with full per-tx sighash context).
-        let enforce_bip68 = tx.version >= 2 && csv_active;
+        let enforce_bip68 = bip68_version_active(tx.version) && csv_active;
         if enforce_bip68 {
             let locks = calculate_sequence_locks(tx, &spent_heights, seq_context, true);
             // Height-only check: ignore `min_time` because the wired

@@ -367,6 +367,36 @@ fn w132_g15_enforce_bip68_gate_short_circuits() {
 }
 
 // ============================================================
+// BIP-68 unsigned-version gate (differential bug-hunt, 2026-06-14)
+// ============================================================
+
+/// Core stores `tx.version` as `uint32_t` and computes
+/// `fEnforceBIP68 = tx.version >= 2` UNSIGNED (consensus/tx_verify.cpp:51), so a
+/// high-bit version (e.g. `0x80000002`) STILL enforces BIP-68. rustoshi stores the
+/// version as `i32`; a signed `>= 2` would treat `0x80000002` as negative and SKIP
+/// enforcement, false-accepting a tx whose relative timelock is unmet (a chain
+/// split). The connect-block gate (validation.rs:1893) and the mempool gate
+/// (mempool.rs:1694) both route through `bip68_version_active`, which compares
+/// unsigned. This asserts that unsigned semantics — it FAILS on the signed bug.
+#[test]
+fn w132_bip68_version_active_compares_unsigned() {
+    use rustoshi_consensus::validation::bip68_version_active;
+    // The bug: 0x80000002 as i32 is -2147483646; a signed `>= 2` is false.
+    assert!(
+        bip68_version_active(0x8000_0002u32 as i32),
+        "high-bit version 0x80000002 must enable BIP-68 (Core compares unsigned)"
+    );
+    assert!(
+        bip68_version_active(0xFFFF_FFFFu32 as i32),
+        "version 0xFFFFFFFF must enable BIP-68 (unsigned >= 2)"
+    );
+    assert!(bip68_version_active(2), "version 2 enables BIP-68");
+    assert!(bip68_version_active(3), "version 3 enables BIP-68");
+    assert!(!bip68_version_active(1), "version 1 does not enable BIP-68");
+    assert!(!bip68_version_active(0), "version 0 does not enable BIP-68");
+}
+
+// ============================================================
 // G16: BIP-68 block-acceptance must check BOTH min_height AND min_time
 // ============================================================
 
