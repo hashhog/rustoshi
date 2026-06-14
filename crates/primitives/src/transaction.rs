@@ -575,6 +575,15 @@ impl Decodable for Transaction {
                     input.witness.push(item);
                 }
             }
+            // BIP-144: it is illegal to encode a witness section when no input
+            // carries a non-empty witness stack.  Mirrors Bitcoin Core
+            // primitives/transaction.h:228-231 ("Superfluous witness record").
+            if inputs.iter().all(|i| i.witness.is_empty()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Superfluous witness record",
+                ));
+            }
         }
 
         // Read locktime
@@ -1069,5 +1078,34 @@ mod tests {
         let form_b = base * 4 + (total - base); // = base*3 + total algebraically
         assert_eq!(form_a, form_b, "both weight forms must be algebraically identical");
         assert_eq!(tx.weight(), form_a, "Transaction::weight() must match the formula");
+    }
+
+    /// BIP-144 / Core transaction.h:228-231: a tx encoded with the segwit
+    /// marker (0x00) + flag (0x01) byte pair MUST have at least one input
+    /// with a non-empty witness stack.  If all witness stacks are empty the
+    /// encoding is malformed ("Superfluous witness record") and deserialisation
+    /// MUST fail.
+    ///
+    /// The 63-byte hex below is a version=1 tx with 1 input (null outpoint,
+    /// empty scriptSig, sequence=0xffffffff) and 1 output (50 BTC, empty
+    /// scriptPubKey) followed by a single witness section with 0 items (all
+    /// witness stacks empty), locktime=0.  Bitcoin Core rejects it; before
+    /// this fix rustoshi silently accepted it, computing the same txid as the
+    /// equivalent legacy encoding — a consensus split.
+    #[test]
+    fn superfluous_witness_record_is_rejected() {
+        let tx_hex = "0100000000010100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff0100f2052a01000000000000000000";
+        let raw = hex::decode(tx_hex).expect("valid hex");
+        let result = Transaction::deserialize(&raw);
+        assert!(
+            result.is_err(),
+            "segwit-encoded tx with all-empty witness stacks must be rejected \
+             (Superfluous witness record), but deserialize returned Ok"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Superfluous witness record"),
+            "error message must mention 'Superfluous witness record', got: {err}"
+        );
     }
 }
