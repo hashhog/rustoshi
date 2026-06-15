@@ -212,6 +212,44 @@ fn is_unspendable_script(script: &[u8]) -> bool {
     (!script.is_empty() && script[0] == 0x6a) || script.len() > MAX_SCRIPT_SIZE
 }
 
+/// Detect the two historical BIP30 duplicate-coinbase blocks on mainnet.
+///
+/// At heights 91722 and 91812, a miner produced a coinbase transaction whose
+/// txid exactly duplicated an earlier block's coinbase.  The UTXO set treated
+/// the duplicate as an overwrite: the ORIGINAL outputs became unspendable
+/// (the earlier entry was silently clobbered) while the duplicate's outputs
+/// entered the UTXO set normally.  The coinstatsindex must account for this:
+/// the duplicate coinbase's outputs are SKIPPED entirely (they were never
+/// added as net-new UTXOs in the canonical sense), and the block subsidy is
+/// credited to `unspendables_bip30` instead of to `total_amount` or the
+/// MuHash accumulator.
+///
+/// Both HEIGHT and BLOCK HASH must match — the same height on a non-canonical
+/// chain does not trigger the exception.  This mirrors
+/// `IsBIP30Unspendable` in `bitcoin-core/src/validation.cpp:6195-6198`.
+pub(crate) fn is_bip30_unspendable(height: u32, block_hash: &Hash256) -> bool {
+    const BIP30_EXCEPTIONS: &[(u32, &str)] = &[
+        (
+            91722,
+            "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+        ),
+        (
+            91812,
+            "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f",
+        ),
+    ];
+    for &(h, hash_hex) in BIP30_EXCEPTIONS {
+        if height == h {
+            if let Ok(expected) = Hash256::from_hex(hash_hex) {
+                if block_hash == &expected {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Per-UTXO bogosize, matching the full-scan `gettxoutsetinfo` path in
 /// `crates/rpc/src/server.rs` (`32 + 4 + 4 + 8 + 2 + spk.len()`) and Core's
 /// `kernel/coinstats.cpp::GetBogoSize`.
@@ -260,10 +298,24 @@ pub fn genesis_entry(genesis_hash: Hash256) -> CoinStatsEntry {
 /// at the new tip height, and the connecting branch overwrites the stale
 /// per-height snapshots above the fork as it re-applies its blocks. This
 /// mirrors Core's per-height index keyed by block (overwrite on reconnect).
+/// Thin wrapper deriving the block hash from `block`. Production callers use this.
+/// The BIP30 skip is unit-testable via `compute_next_entry_with_hash`, which takes
+/// the block hash explicitly (a synthetic test block cannot reproduce a real mainnet
+/// block hash, which is exactly what `is_bip30_unspendable` matches on).
 pub fn compute_next_entry(
     prev: Option<&CoinStatsEntry>,
     block: &Block,
     height: u32,
+    undo: &UndoData,
+) -> CoinStatsEntry {
+    compute_next_entry_with_hash(prev, block, height, &block.block_hash(), undo)
+}
+
+pub(crate) fn compute_next_entry_with_hash(
+    prev: Option<&CoinStatsEntry>,
+    block: &Block,
+    height: u32,
+    block_hash: &Hash256,
     undo: &UndoData,
 ) -> CoinStatsEntry {
     let mut entry = match prev {
@@ -272,9 +324,34 @@ pub fn compute_next_entry(
     };
     let mut muhash = entry.get_muhash();
 
+    // Block subsidy for this height (mirrors CustomAppend's first line).
+    let block_subsidy = get_block_subsidy(height);
+    entry.total_subsidy = entry.total_subsidy.saturating_add(block_subsidy);
+
+    // Does this block hold a BIP30 duplicate coinbase?
+    // At heights 91722 and 91812 on mainnet, the coinbase txid duplicated an
+    // earlier block's coinbase.  The duplicate outputs were never net-new UTXOs
+    // (the earlier entry was silently overwritten), so the coinstatsindex must
+    // skip them entirely — crediting the block subsidy to `unspendables_bip30`
+    // instead.  Mirrors `IsBIP30Unspendable` + the `continue` in Core's
+    // `CoinStatsIndex::CustomAppend` (bitcoin-core/src/index/coinstatsindex.cpp:128-132).
+    let is_bip30_block = is_bip30_unspendable(height, block_hash);
+
     // ── 1. Add every new spendable output created by this block. ──────────
     for tx in &block.transactions {
         let is_coinbase = tx.is_coinbase();
+
+        // Skip duplicate txid coinbase transactions (BIP30).
+        // Core coinstatsindex.cpp:128-132: if the entire block is a BIP30
+        // exception and this is the coinbase tx, add the subsidy to
+        // unspendables_bip30 and skip ALL of its outputs.
+        if is_coinbase && is_bip30_block {
+            entry.unspendables_bip30 = entry
+                .unspendables_bip30
+                .saturating_add(block_subsidy);
+            continue;
+        }
+
         let txid = tx.txid();
         for (vout, output) in tx.outputs.iter().enumerate() {
             if is_unspendable_script(&output.script_pubkey) {
@@ -331,7 +408,7 @@ pub fn compute_next_entry(
     }
 
     entry.height = height;
-    entry.block_hash = block.block_hash();
+    entry.block_hash = *block_hash;
     entry.set_muhash(&muhash);
     entry
 }
@@ -430,6 +507,216 @@ pub fn get_block_subsidy(height: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustoshi_consensus::validation::UndoData;
+    use rustoshi_primitives::{Block, BlockHeader, Transaction, TxIn, TxOut};
+
+    // ── BIP30 helpers ─────────────────────────────────────────────────────────
+
+    /// Build a minimal spendable coinbase transaction (one P2PKH-style output).
+    fn make_coinbase(value_sat: u64) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x03, 0x01, 0x00, 0x00], // push height 1
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: value_sat,
+                // P2PKH scriptPubKey (25 bytes, spendable)
+                script_pubkey: vec![
+                    0x76, 0xa9, 0x14, // OP_DUP OP_HASH160 PUSH(20)
+                    0x89, 0xab, 0xcd, 0xef, 0xab, 0xba, 0xab, 0xba,
+                    0xab, 0xba, 0xab, 0xba, 0xab, 0xba, 0xab, 0xba,
+                    0xab, 0xba, 0xab, 0xba, // 20-byte hash160
+                    0x88, 0xac, // OP_EQUALVERIFY OP_CHECKSIG
+                ],
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// Build a minimal synthetic block at `height` with just a coinbase tx.
+    fn make_block_at(height: u32, coinbase_value: u64) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_231_006_505 + height,
+                bits: 0x207fffff,
+                nonce: height, // unique-enough nonce per height
+            },
+            transactions: vec![make_coinbase(coinbase_value)],
+        }
+    }
+
+    // ── is_bip30_unspendable ──────────────────────────────────────────────────
+
+    /// The two historical BIP30 duplicate-coinbase blocks must be detected
+    /// by the EXACT (height, hash) pair — neither condition alone is sufficient.
+    ///
+    /// This test FAILS without the fix (the function did not exist before).
+    /// It PASSES with the fix, proving Core's `IsBIP30Unspendable` contract is
+    /// met (bitcoin-core/src/validation.cpp:6195-6198).
+    #[test]
+    fn test_is_bip30_unspendable_exact_pairs() {
+        let hash_91722 = Hash256::from_hex(
+            "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+        )
+        .unwrap();
+        let hash_91812 = Hash256::from_hex(
+            "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f",
+        )
+        .unwrap();
+
+        // Exact pairs → true.
+        assert!(
+            is_bip30_unspendable(91722, &hash_91722),
+            "height 91722 + correct hash must be detected as BIP30 unspendable"
+        );
+        assert!(
+            is_bip30_unspendable(91812, &hash_91812),
+            "height 91812 + correct hash must be detected as BIP30 unspendable"
+        );
+
+        // Right height, wrong hash → false (non-canonical chain at same height).
+        assert!(
+            !is_bip30_unspendable(91722, &hash_91812),
+            "height 91722 with a mismatched hash must NOT be BIP30 unspendable"
+        );
+        assert!(
+            !is_bip30_unspendable(91812, &hash_91722),
+            "height 91812 with a mismatched hash must NOT be BIP30 unspendable"
+        );
+
+        // Right hash, wrong height → false.
+        assert!(
+            !is_bip30_unspendable(91721, &hash_91722),
+            "hash 91722 at the wrong height must NOT be BIP30 unspendable"
+        );
+        assert!(
+            !is_bip30_unspendable(91813, &hash_91812),
+            "hash 91812 at the wrong height must NOT be BIP30 unspendable"
+        );
+
+        // Totally unrelated height + hash → false.
+        assert!(
+            !is_bip30_unspendable(100, &Hash256::ZERO),
+            "arbitrary block must NOT be BIP30 unspendable"
+        );
+    }
+
+    // ── compute_next_entry — total_subsidy tracking ───────────────────────────
+
+    /// Before this fix, `compute_next_entry` never touched `entry.total_subsidy`.
+    /// After the fix it accumulates the block subsidy (mirroring Core's
+    /// `m_total_subsidy += block_subsidy` at the top of CustomAppend).
+    ///
+    /// This test FAILS on the pre-fix code (total_subsidy stays 0) and
+    /// PASSES after the fix (total_subsidy == get_block_subsidy(height)).
+    #[test]
+    fn test_compute_next_entry_total_subsidy_accumulated() {
+        let height: u32 = 100;
+        let expected_subsidy = get_block_subsidy(height); // 50 BTC = 5_000_000_000 sat
+        let block = make_block_at(height, expected_subsidy);
+        let undo = UndoData { spent_coins: vec![] };
+
+        let entry = compute_next_entry(None, &block, height, &undo);
+
+        assert_eq!(
+            entry.total_subsidy, expected_subsidy,
+            "compute_next_entry must accumulate the block subsidy into total_subsidy \
+             (pre-fix: always 0; post-fix: {expected_subsidy})"
+        );
+    }
+
+    /// Verify subsidy accumulates additively across consecutive blocks.
+    #[test]
+    fn test_compute_next_entry_subsidy_cumulative() {
+        let undo = UndoData { spent_coins: vec![] };
+
+        let h1 = 1u32;
+        let block1 = make_block_at(h1, get_block_subsidy(h1));
+        let e1 = compute_next_entry(None, &block1, h1, &undo);
+        assert_eq!(e1.total_subsidy, get_block_subsidy(h1));
+
+        let h2 = 2u32;
+        let block2 = make_block_at(h2, get_block_subsidy(h2));
+        let e2 = compute_next_entry(Some(&e1), &block2, h2, &undo);
+        assert_eq!(
+            e2.total_subsidy,
+            get_block_subsidy(h1) + get_block_subsidy(h2),
+            "total_subsidy must be the running sum across heights"
+        );
+    }
+
+    // ── compute_next_entry — BIP30 block coinbase skipped ────────────────────
+
+    /// For a NORMAL block (same BIP30 height but WRONG hash), the coinbase
+    /// outputs must be added to the UTXO stats as usual — the guard is hash-
+    /// gated, not height-gated.
+    ///
+    /// This establishes the baseline: without the BIP30 exception, coinbase
+    /// outputs ARE counted.  The BIP30-skip test below can then be read as a
+    /// contrast: with the matching hash they are NOT counted.
+    #[test]
+    fn test_compute_next_entry_coinbase_added_for_normal_block() {
+        let coinbase_value: u64 = 5_000_000_000;
+        // Height 91722 but a SYNTHETIC hash (not the real BIP30 block hash) →
+        // the BIP30 gate must NOT fire and the coinbase output must be counted.
+        let block = make_block_at(91722, coinbase_value);
+        let block_hash = block.block_hash();
+        // Confirm this synthetic hash is NOT the real BIP30 exception hash.
+        let real_bip30_hash = Hash256::from_hex(
+            "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+        )
+        .unwrap();
+        assert_ne!(
+            block_hash, real_bip30_hash,
+            "synthetic block must NOT accidentally match the real BIP30 exception hash"
+        );
+
+        let undo = UndoData { spent_coins: vec![] };
+        let entry = compute_next_entry(None, &block, 91722, &undo);
+
+        // The coinbase output is spendable (P2PKH), so it must appear in the stats.
+        assert_eq!(entry.utxo_count, 1, "spendable coinbase output must be counted");
+        assert_eq!(
+            entry.total_amount, coinbase_value,
+            "coinbase value must be counted in total_amount for a normal block"
+        );
+        assert_eq!(
+            entry.unspendables_bip30, 0,
+            "unspendables_bip30 must be zero for a non-BIP30 block"
+        );
+    }
+
+    #[test]
+    fn test_compute_next_entry_coinbase_skipped_for_bip30_block() {
+        // bug-hunt 4F/6H: at a real BIP30 duplicate-coinbase block (height 91722, the
+        // real mainnet hash) the coinbase outputs MUST be skipped (not counted) and the
+        // subsidy charged to unspendables_bip30 -- Core coinstatsindex.cpp:128-132. We
+        // inject the real BIP30 hash because a synthetic test block cannot reproduce it.
+        let coinbase_value: u64 = 5_000_000_000;
+        let block = make_block_at(91722, coinbase_value);
+        let real_bip30_hash = Hash256::from_hex(
+            "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+        )
+        .unwrap();
+        let undo = UndoData { spent_coins: vec![] };
+        let entry =
+            compute_next_entry_with_hash(None, &block, 91722, &real_bip30_hash, &undo);
+        assert_eq!(entry.utxo_count, 0, "BIP30 dup-coinbase outputs must be SKIPPED");
+        assert_eq!(entry.total_amount, 0, "BIP30 dup-coinbase value must NOT be counted");
+        assert_eq!(
+            entry.unspendables_bip30, coinbase_value,
+            "BIP30 subsidy must be charged to unspendables_bip30"
+        );
+    }
+
+    // ── test_block_subsidy ────────────────────────────────────────────────────
 
     #[test]
     fn test_block_subsidy() {
