@@ -231,6 +231,24 @@ pub fn mempool_config_for_network(network: NetworkId) -> MempoolConfig {
     }
 }
 
+/// Whether the active chain is fully validated end-to-end, which is the
+/// precondition for an index to be reported `synced` by `getindexinfo`.
+///
+/// rustoshi maintains txindex/blockfilterindex unconditionally forward from
+/// whatever chainstate is active. Under an AssumeUTXO snapshot that is still
+/// being background-validated, the genesis-side (pre-base) chain is not yet
+/// downloaded/validated, so those indexes have a coverage gap — a lookup for
+/// an uncovered tx fails (`getrawtransaction` returns not-found). Reporting
+/// `synced: true` in that window is a false positive: a monitoring consumer
+/// believes the index is serving when it is not. Bitcoin Core reports
+/// `synced=false` until the index has caught up across the whole active chain.
+///
+/// Fully validated iff there is no active snapshot, or the active snapshot has
+/// completed background validation.
+fn chain_fully_validated(snapshot_active: bool, snapshot_validated: bool) -> bool {
+    !snapshot_active || snapshot_validated
+}
+
 impl RpcState {
     /// Create a new RPC state.
     pub fn new(db: Arc<ChainDb>, params: ChainParams) -> Self {
@@ -12030,6 +12048,17 @@ impl RustoshiRpcServer for RpcServerImpl {
         // INNER per-index object order is the consensus-parity concern here.
         let mut entries: Vec<(&'static str, IndexSummary)> = Vec::new();
 
+        // An index is "synced" only when the active chain is fully validated
+        // end-to-end. Under a still-background-validating AssumeUTXO snapshot the
+        // genesis-side chain is not yet validated, so txindex/blockfilterindex
+        // have a coverage gap and reporting synced=true is a false positive (the
+        // bug: getindexinfo said synced while getrawtransaction failed). See
+        // `chain_fully_validated`.
+        let fully_validated = chain_fully_validated(
+            state.chainstate_manager.is_snapshot_active(),
+            state.chainstate_manager.is_snapshot_validated(),
+        );
+
         // txindex active iff any row exists in CF_TX_INDEX.  Mirrors Core's
         // `g_txindex != nullptr` (the global is set iff -txindex was passed
         // at startup).  rustoshi has no equivalent global, so we probe the
@@ -12083,7 +12112,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             entries.push((
                 "basic block filter index",
                 IndexSummary {
-                    synced: true,
+                    synced: fully_validated,
                     best_block_height: state.best_height,
                 },
             ));
@@ -12101,7 +12130,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             entries.push((
                 "txindex",
                 IndexSummary {
-                    synced: true,
+                    synced: fully_validated,
                     best_block_height: state.best_height,
                 },
             ));
@@ -14924,6 +14953,21 @@ fn connection_type_str(ct: rustoshi_network::ConnectionType) -> &'static str {
 mod tests {
     use super::*;
     use rustoshi_consensus::chain_manager::{block_status, get_ancestor, is_ancestor};
+
+    // getindexinfo `synced` must be FALSE while an AssumeUTXO snapshot is active
+    // but not yet background-validated (the genesis-side coverage gap that makes
+    // getrawtransaction fail). It was hardcoded `true` for txindex/blockfilter,
+    // a false positive. chain_fully_validated drives both call sites now.
+    #[test]
+    fn test_chain_fully_validated_gates_index_synced() {
+        // No snapshot active -> validated from genesis -> synced.
+        assert!(chain_fully_validated(false, false));
+        assert!(chain_fully_validated(false, true));
+        // Snapshot active but NOT yet validated -> coverage gap -> NOT synced.
+        assert!(!chain_fully_validated(true, false));
+        // Snapshot active AND background validation complete -> synced.
+        assert!(chain_fully_validated(true, true));
+    }
 
     // ── getblockfrompeer ──────────────────────────────────────────────────
     //
