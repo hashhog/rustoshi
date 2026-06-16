@@ -40,8 +40,12 @@ use crate::{
     addr::{deserialize_addrv2_message, serialize_addrv2_message, AddrV2Entry, NetworkAddr},
     message::{TimestampedNetAddress, MAX_ADDR},
     netgroup::{ip_is_routable, NetGroupManager, NetworkType},
-    peer_manager::{clamp_addr_timestamp, socket_addr_to_net_address, AddressManager},
+    peer_manager::{
+        clamp_addr_timestamp, socket_addr_to_net_address, AddressManager, PeerManager,
+        PeerManagerConfig,
+    },
 };
+use rustoshi_consensus::ChainParams;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -1897,4 +1901,47 @@ fn g3g_add_addrv2_addresses_clamps_timestamp() {
         delta <= 60,
         "stored timestamp should be near now-5days, got delta={delta}s"
     );
+}
+
+// ─── task #12: addrman persists across a PeerManager restart ─────────────────
+//
+// The daemon constructs its PeerManager via `new_with_netgroup`, which now
+// loads `<data_dir>/peers.dat` (`AddressManager::with_persisted`) instead of
+// starting with an empty `AddressManager::new()`, and the daemon's maintenance
+// tick + graceful shutdown call `save_addrman`. Before this wiring the learned
+// address table was discarded on every restart. This proves the constructor
+// LOADS a persisted addrman: seed a peers.dat independently, then assert a
+// freshly-constructed PeerManager picks it up. Reverting `new_with_netgroup` to
+// `AddressManager::new()` leaves the reloaded addrman empty -> this fails.
+#[test]
+fn g31_addrman_persists_across_peer_manager_restart_task12() {
+    let dir = std::env::temp_dir().join(format!("rustoshi-addrman-task12-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp data_dir");
+    let ng = NetGroupManager::new();
+
+    // Seed a peers.dat with one address, independent of the constructor wiring.
+    {
+        let mut seed = AddressManager::with_persisted(&dir, &ng);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8333);
+        seed.add_address_entry(addr, 1, 1_700_000_000);
+        assert!(
+            seed.addrman().len() >= 1,
+            "address should be in the bucketed addrman after add_address_entry"
+        );
+        seed.save_addrman(&dir);
+    }
+
+    // The daemon constructor MUST load that peers.dat into the addrman.
+    let cfg = PeerManagerConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let pm = PeerManager::new_with_netgroup(cfg, ChainParams::mainnet(), ng);
+    assert!(
+        pm.addr_manager().addrman().len() >= 1,
+        "new_with_netgroup must load peers.dat into the addrman (task #12 wiring)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
