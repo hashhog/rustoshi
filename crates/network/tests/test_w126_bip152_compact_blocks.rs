@@ -585,7 +585,6 @@ fn g24_getdata_cmpctblock_served() {
 /// G25 — `sendcmpct(version=1)` is rejected (Core: any version != 2 ignored).
 /// BUG: rustoshi accepts v1 and stores `version = 1`.
 #[test]
-#[ignore = "BUG-3 (P2): PeerCompactBlockState::handle_sendcmpct accepts version=1 (Core rejects)"]
 fn g25_sendcmpct_v1_rejected() {
     // Document the divergence with a runtime check: handle_sendcmpct(true, 1)
     // does NOT enable v1 once the fix lands.

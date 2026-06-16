@@ -944,29 +944,23 @@ impl PeerCompactBlockState {
 
     /// Update state from sendcmpct message.
     pub fn handle_sendcmpct(&mut self, announce: bool, version: u64) {
-        // We only support version 2 (SegWit)
-        if version == CMPCT_VERSION_2 {
-            self.enabled = true;
-            self.version = version;
-            self.wants_high_bandwidth = announce;
-            self.mode = if announce {
-                CompactBlockMode::HighBandwidth
-            } else {
-                CompactBlockMode::LowBandwidth
-            };
-        } else if version == CMPCT_VERSION_1 {
-            // Accept version 1 but we prefer version 2
-            if self.version == 0 {
-                self.enabled = true;
-                self.version = version;
-                self.wants_high_bandwidth = announce;
-                self.mode = if announce {
-                    CompactBlockMode::HighBandwidth
-                } else {
-                    CompactBlockMode::LowBandwidth
-                };
-            }
+        // Core (net_processing.cpp SENDCMPCT handler): `if (sendcmpct.version !=
+        // CMPCTBLOCKS_VERSION) return;` -- compact-block relay is only supported
+        // at version 2 (SegWit/wtxid), so any other version (v1, v3, ...) is
+        // silently IGNORED with no state change. BUG-3 fix (G25): rustoshi
+        // previously had an explicit v1 branch that accepted version=1 and stored
+        // it, diverging from Core.
+        if version != CMPCT_VERSION_2 {
+            return;
         }
+        self.enabled = true;
+        self.version = version;
+        self.wants_high_bandwidth = announce;
+        self.mode = if announce {
+            CompactBlockMode::HighBandwidth
+        } else {
+            CompactBlockMode::LowBandwidth
+        };
     }
 
     /// Record a successful reconstruction.
