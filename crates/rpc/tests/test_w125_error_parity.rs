@@ -457,14 +457,65 @@ fn g19_rpc_client_node_not_connected_absence() {
             disconnectnode unknown-peer collapses to RPC_INVALID_PARAMS.");
 }
 
-/// G20 — `RPC_CLIENT_INVALID_IP_OR_SUBNET` (-30). Core net.cpp:780, 811.
-/// NOT DEFINED in rustoshi (rustoshi uses -32602).
-/// Status: BUG-14 (P1).
-#[test]
-#[ignore]
-fn g20_rpc_client_invalid_ip_or_subnet_absence() {
-    panic!("BUG-14: rustoshi has no RPC_CLIENT_INVALID_IP_OR_SUBNET (-30); \
-            setban 'Invalid IP' returns -32602 instead of -30.");
+/// G20 — `RPC_CLIENT_INVALID_IP_OR_SUBNET` (-30). Core net.cpp:780.
+/// Status: BUG-14 (P1) — FIXED.
+///
+/// De-staled 2026-06-16: previously an `#[ignore]` `panic!` documenting the
+/// absence. Now a REAL behavioral test — `setban` with an un-parseable IP must
+/// emit Core's -30 with the exact message "Error: Invalid IP/Subnet"
+/// (`bitcoin-core/src/rpc/net.cpp:779-781`), NOT the generic JSON-RPC transport
+/// code RPC_INVALID_PARAMS (-32602) it previously collapsed to. A well-formed
+/// IP must NOT hit that error path (the ban add succeeds).
+#[tokio::test]
+async fn g20_setban_invalid_ip_emits_invalid_ip_or_subnet() {
+    use rustoshi_rpc::RustoshiRpcServer;
+
+    // The numeric constant exists and equals Core's value (protocol.h:63).
+    assert_eq!(
+        rpc_error::RPC_CLIENT_INVALID_IP_OR_SUBNET, -30,
+        "RPC_CLIENT_INVALID_IP_OR_SUBNET must be -30 (Core protocol.h:63)"
+    );
+    // Must not collide with the JSON-RPC transport code it used to share.
+    assert_ne!(
+        rpc_error::RPC_CLIENT_INVALID_IP_OR_SUBNET,
+        rpc_error::RPC_INVALID_PARAMS,
+        "RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) must not collide with RPC_INVALID_PARAMS (-32602)"
+    );
+
+    let server = server_with_peer_manager();
+
+    // An un-parseable subnet/IP must error with Core's -30 (not -32602).
+    let err = RustoshiRpcServer::set_ban(
+        &server,
+        "not-an-ip".to_string(),
+        "add".to_string(),
+        None,
+        None,
+    )
+    .await
+    .expect_err("setban with an invalid IP must error");
+    assert_eq!(
+        err.code(),
+        rpc_error::RPC_CLIENT_INVALID_IP_OR_SUBNET,
+        "invalid setban IP must emit -30 (RPC_CLIENT_INVALID_IP_OR_SUBNET), got {}: {}",
+        err.code(),
+        err.message(),
+    );
+    assert_eq!(
+        err.message(), "Error: Invalid IP/Subnet",
+        "message must match Core net.cpp:780 exactly",
+    );
+
+    // A well-formed IP must NOT hit the invalid-IP path — the ban add succeeds.
+    RustoshiRpcServer::set_ban(
+        &server,
+        "192.0.2.55".to_string(),
+        "add".to_string(),
+        None,
+        None,
+    )
+    .await
+    .expect("setban add with a valid IP must succeed");
 }
 
 // ============================================================
@@ -678,6 +729,7 @@ fn pin_all_w125_constants() {
     assert_eq!(rpc_error::RPC_VERIFY_ALREADY_IN_CHAIN, -27);
     assert_eq!(rpc_error::RPC_TRANSACTION_ALREADY_IN_CHAIN, -27);
     assert_eq!(rpc_error::RPC_CLIENT_P2P_DISABLED, -31); // BUG-1 FIXED: genuine Core value
+    assert_eq!(rpc_error::RPC_CLIENT_INVALID_IP_OR_SUBNET, -30); // BUG-14 FIXED: genuine Core value
     assert_eq!(rpc_error::RPC_BLOCK_NOT_FOUND, -5);
     // wallet_error module.
     assert_eq!(wallet_error::RPC_WALLET_ERROR, -4);

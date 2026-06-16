@@ -109,6 +109,13 @@ pub mod rpc_error {
     /// (`bitcoin-core/src/rpc/protocol.h::RPC_CLIENT_NODE_NOT_ADDED = -24`;
     /// raised at `src/rpc/net.cpp:368`).
     pub const RPC_CLIENT_NODE_NOT_ADDED: i32 = -24;
+    /// `setban` was given a subnet/IP that failed to parse, or `setban remove`
+    /// for an address/subnet that was never manually banned
+    /// (`bitcoin-core/src/rpc/protocol.h::RPC_CLIENT_INVALID_IP_OR_SUBNET = -30`;
+    /// raised at `src/rpc/net.cpp:780,811`). Distinct from the JSON-RPC
+    /// transport code `RPC_INVALID_PARAMS` (-32602) that rustoshi previously
+    /// collapsed it into.
+    pub const RPC_CLIENT_INVALID_IP_OR_SUBNET: i32 = -30;
     /// Block not found.
     pub const RPC_BLOCK_NOT_FOUND: i32 = -5;
 }
@@ -7235,11 +7242,15 @@ impl RustoshiRpcServer for RpcServerImpl {
         bantime: Option<u64>,
         absolute: Option<bool>,
     ) -> RpcResult<()> {
-        // Parse IP address (we don't support subnets yet, just IPs)
+        // Parse IP address (we don't support subnets yet, just IPs).
+        // Core's `setban` raises RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) with the
+        // exact message "Error: Invalid IP/Subnet" when the subnet/IP argument
+        // fails to resolve (`bitcoin-core/src/rpc/net.cpp:779-781`), NOT the
+        // generic JSON-RPC transport code -32602.
         let ip: std::net::IpAddr = subnet.parse().map_err(|_| {
             Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                "Invalid IP address format",
+                rpc_error::RPC_CLIENT_INVALID_IP_OR_SUBNET,
+                "Error: Invalid IP/Subnet",
             )
         })?;
 
