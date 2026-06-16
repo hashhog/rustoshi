@@ -54,10 +54,12 @@
 //!   BUG-8  [P1]      G15: `PsbtOutput::merge` doesn't merge
 //!                    `musig2_participant_pubkeys`. Core at psbt.cpp:317.
 //!
-//!   BUG-9  [P1]      G8:  Missing `key_lookup` duplicate-check on
+//!   BUG-9  [P1]      G8:  FIXED — added duplicate-key guards on
 //!                    `PSBT_IN_TAP_SCRIPT_SIG` / `PSBT_IN_TAP_LEAF_SCRIPT`
-//!                    / `PSBT_IN_TAP_BIP32_DERIVATION`. Core at psbt.h:708,
-//!                    psbt.h:730, psbt.h:750.
+//!                    / `PSBT_IN_TAP_BIP32_DERIVATION`, matching the exact
+//!                    per-field key Core guards (xonly+leaf hash / control
+//!                    block / xonly). Core at psbt.h:708, psbt.h:730,
+//!                    psbt.h:750. G8 is now a live regression test.
 //!
 //!   BUG-10 [P1]      G18: `PSBT_OUT_TAP_TREE` accepts empty value
 //!                    (zero-iteration loop). Core throws "Output Taproot
@@ -632,17 +634,163 @@ fn g7_bug_12_partial_sig_accepts_uncompressed_pubkey() {
 
 /// **G8 — BUG-9: Taproot input fields missing duplicate-key checks.**
 ///
-/// `PSBT_IN_TAP_SCRIPT_SIG` (line 2304-2320), `PSBT_IN_TAP_LEAF_SCRIPT`
-/// (line 2321-2343), `PSBT_IN_TAP_BIP32_DERIVATION` (line 2344-2367)
-/// all lack `key_lookup.insert(key.clone())`. Core enforces all three
-/// at psbt.h:708, psbt.h:730, psbt.h:750.
+/// `PSBT_IN_TAP_SCRIPT_SIG`, `PSBT_IN_TAP_LEAF_SCRIPT`, and
+/// `PSBT_IN_TAP_BIP32_DERIVATION` previously lacked a duplicate-key guard,
+/// so a repeated key silently overwrote (or, for the leaf-script BTreeSet,
+/// silently deduped). Core rejects all three:
+///   - PSBT_IN_TAP_SCRIPT_SIG       psbt.h:708-709 ("Duplicate Key, input
+///     Taproot script signature already provided"), key = <xonly><leaf hash>,
+///     guarded by `m_tap_script_sigs.count({xonly, hash})` semantics.
+///   - PSBT_IN_TAP_LEAF_SCRIPT      psbt.h:730-731 ("Duplicate Key, input
+///     Taproot leaf script already provided"), key = <control block>.
+///   - PSBT_IN_TAP_BIP32_DERIVATION psbt.h:750-751 ("Duplicate Key, input
+///     Taproot BIP32 keypath already provided"), key = <xonly>, guarded by
+///     `m_tap_bip32_paths.count(xonly)` semantics.
 ///
-/// Fix: USE the existing per-input `key_lookup` set (initialized at
-/// line 2070) for these three cases.
+/// Strategy mirrors G4 (BUG-2): for each field, build a PSBT whose input
+/// carries exactly one record of that field, serialize it (control case must
+/// decode `Ok`), then splice a BYTE-IDENTICAL copy of that single record
+/// immediately after the original. A byte-identical copy carries the SAME
+/// key, so Core — and now rustoshi — must reject it with `DuplicateKey`.
 #[test]
-#[ignore = "BUG-9: missing dup-check on PSBT_IN_TAP_{SCRIPT_SIG,LEAF_SCRIPT,BIP32_DERIVATION} (P1); fix in decode_psbt_input"]
 fn g8_bug_9_taproot_input_dup_check_present() {
-    assert!(false, "BUG-9: duplicate Taproot input keys must be rejected");
+    use std::collections::{BTreeMap, BTreeSet};
+    use rustoshi_wallet::psbt::KeyOrigin;
+
+    // Locate the first occurrence of a field record (its key bytes) and return
+    // the byte range [start, end) of the FULL record (key kv-pair + value
+    // kv-pair) in `bytes`. `key_field` is the on-the-wire key field:
+    // compactsize(keylen) || keytype || keydata. We then read the value field
+    // (compactsize(vallen) || value) that immediately follows.
+    fn record_range(bytes: &[u8], key_field: &[u8]) -> (usize, usize) {
+        let key_start = bytes
+            .windows(key_field.len())
+            .position(|w| w == key_field)
+            .expect("field record not found in serialized PSBT");
+        // value field begins right after the key field; its first byte is a
+        // single-byte CompactSize length for all values used in this test
+        // (all < 0xFD), so the value field is 1 + vallen bytes.
+        let val_len_off = key_start + key_field.len();
+        let vallen = bytes[val_len_off] as usize;
+        let record_end = val_len_off + 1 + vallen;
+        (key_start, record_end)
+    }
+
+    // Build `duped` by splicing a byte-identical copy of the record at
+    // [start,end) immediately after itself.
+    fn splice_dup(bytes: &[u8], start: usize, end: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() + (end - start));
+        out.extend_from_slice(&bytes[..end]);
+        out.extend_from_slice(&bytes[start..end]); // the DUPLICATE record
+        out.extend_from_slice(&bytes[end..]);
+        out
+    }
+
+    // ---- PSBT_IN_TAP_SCRIPT_SIG -----------------------------------------
+    // Key = <type 0x14><32-byte xonly><32-byte leaf hash> => keylen 65 (0x41).
+    {
+        let xonly = [0x11u8; 32];
+        let leaf_hash = [0x22u8; 32];
+        let sig = vec![0x33u8; 64]; // 64..=65 bytes required
+
+        let tx = make_test_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0]
+            .tap_script_sigs
+            .insert((xonly, leaf_hash), sig.clone());
+        let single = psbt.serialize();
+        assert!(
+            Psbt::deserialize(&single).is_ok(),
+            "control: single PSBT_IN_TAP_SCRIPT_SIG record must decode Ok"
+        );
+
+        let mut key_field = vec![65u8, PSBT_IN_TAP_SCRIPT_SIG];
+        key_field.extend_from_slice(&xonly);
+        key_field.extend_from_slice(&leaf_hash);
+        let (s, e) = record_range(&single, &key_field);
+        let duped = splice_dup(&single, s, e);
+
+        let res = Psbt::deserialize(&duped);
+        assert!(
+            matches!(res, Err(PsbtError::DuplicateKey(_))),
+            "BUG-9: duplicate PSBT_IN_TAP_SCRIPT_SIG key must be rejected with \
+             DuplicateKey; got {:?}",
+            res
+        );
+    }
+
+    // ---- PSBT_IN_TAP_LEAF_SCRIPT ----------------------------------------
+    // Key = <type 0x15><control block>. Control block must be >= 33 bytes and
+    // (cb_len - 1) % 32 == 0 => 33 bytes (internal key + parity, empty path).
+    // Value = <script bytes><leaf_ver>, must be non-empty.
+    {
+        let control_block = vec![0xC0u8; 33];
+        let script = vec![0x51u8, 0x52u8]; // OP_1 OP_2
+        let leaf_ver = 0xC0u8;
+
+        let tx = make_test_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        let mut cbs = BTreeSet::new();
+        cbs.insert(control_block.clone());
+        psbt.inputs[0]
+            .tap_leaf_scripts
+            .insert((script.clone(), leaf_ver), cbs);
+        let single = psbt.serialize();
+        assert!(
+            Psbt::deserialize(&single).is_ok(),
+            "control: single PSBT_IN_TAP_LEAF_SCRIPT record must decode Ok"
+        );
+
+        // keylen = 1 (type) + 33 (control block) = 34 (0x22).
+        let mut key_field = vec![34u8, PSBT_IN_TAP_LEAF_SCRIPT];
+        key_field.extend_from_slice(&control_block);
+        let (s, e) = record_range(&single, &key_field);
+        let duped = splice_dup(&single, s, e);
+
+        let res = Psbt::deserialize(&duped);
+        assert!(
+            matches!(res, Err(PsbtError::DuplicateKey(_))),
+            "BUG-9: duplicate PSBT_IN_TAP_LEAF_SCRIPT key must be rejected with \
+             DuplicateKey; got {:?}",
+            res
+        );
+    }
+
+    // ---- PSBT_IN_TAP_BIP32_DERIVATION -----------------------------------
+    // Key = <type 0x16><32-byte xonly> => keylen 33 (0x21).
+    {
+        let xonly = [0x44u8; 32];
+        let leaf_hashes: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let origin = KeyOrigin {
+            fingerprint: [0xDE, 0xAD, 0xBE, 0xEF],
+            path: vec![0x80000054, 0x80000000],
+        };
+
+        let tx = make_test_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        let mut paths: BTreeMap<[u8; 32], (BTreeSet<[u8; 32]>, KeyOrigin)> =
+            BTreeMap::new();
+        paths.insert(xonly, (leaf_hashes, origin));
+        psbt.inputs[0].tap_bip32_derivation = paths;
+        let single = psbt.serialize();
+        assert!(
+            Psbt::deserialize(&single).is_ok(),
+            "control: single PSBT_IN_TAP_BIP32_DERIVATION record must decode Ok"
+        );
+
+        let mut key_field = vec![33u8, PSBT_IN_TAP_BIP32_DERIVATION];
+        key_field.extend_from_slice(&xonly);
+        let (s, e) = record_range(&single, &key_field);
+        let duped = splice_dup(&single, s, e);
+
+        let res = Psbt::deserialize(&duped);
+        assert!(
+            matches!(res, Err(PsbtError::DuplicateKey(_))),
+            "BUG-9: duplicate PSBT_IN_TAP_BIP32_DERIVATION key must be rejected \
+             with DuplicateKey; got {:?}",
+            res
+        );
+    }
 }
 
 /// **G14 — BUG-7: PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS not encoded.**
