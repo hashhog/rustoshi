@@ -101,8 +101,9 @@
 //!                    (dead-code defensive; precondition guards make
 //!                    unreachable, but pattern is fragile).
 //!
-//!   BUG-20 [P0-CDIV] n/a: `Psbt::decode` doesn't reject extra bytes
-//!                    after the output maps. Core's DecodeRawPSBT
+//!   BUG-20 [P0-CDIV] n/a: FIXED — `Psbt::deserialize` now rejects extra
+//!                    bytes after the output maps with
+//!                    `PsbtError::TrailingData`. Core's DecodeRawPSBT
 //!                    rejects "extra data after PSBT" at psbt.cpp:622.
 //!
 //!   BUG-21 [P1]      n/a: Hash preimages (RIPEMD160/SHA256/HASH160
@@ -884,11 +885,49 @@ fn bug_19_merge_dropping_excess_inputs() {
 
 /// **BUG-20 — `Psbt::decode` accepts trailing bytes after output map.**
 ///
-/// Core's `DecodeRawPSBT` (`psbt.cpp:622`) rejects "extra data after PSBT".
+/// Core's `DecodeRawPSBT` (`bitcoin-core/src/psbt.cpp:617-631`) rejects
+/// trailing bytes: after `ss_data >> psbt` it does
+/// `if (!ss_data.empty()) { error = "extra data after PSBT"; return false; }`.
+/// `Psbt::deserialize` (the byte-slice boundary, where the total length is
+/// known) must mirror this and reject any unparsed bytes after the final
+/// output map with `PsbtError::TrailingData`.
+///
+/// Mutation check: removing the `cursor.position() != data.len()` guard in
+/// `Psbt::deserialize` makes both the one-byte and many-byte cases below
+/// decode `Ok`, so this test FAILS — i.e. it cannot pass against the buggy
+/// (pre-fix) code path.
 #[test]
-#[ignore = "BUG-20: Psbt::decode accepts trailing bytes (P0-CDIV); fix in Psbt::decode"]
 fn bug_20_decode_rejects_extra_trailing_bytes() {
-    assert!(false, "BUG-20: extra bytes after final output map must be rejected");
+    // A minimal valid PSBT round-trips Ok.
+    let tx = make_test_tx();
+    let psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    let valid = psbt.serialize();
+    assert!(
+        Psbt::deserialize(&valid).is_ok(),
+        "baseline: a freshly serialized PSBT must deserialize Ok"
+    );
+
+    // Appending a single trailing byte must be rejected.
+    let mut one_extra = valid.clone();
+    one_extra.push(0x00);
+    let res = Psbt::deserialize(&one_extra);
+    assert!(
+        matches!(res, Err(PsbtError::TrailingData)),
+        "BUG-20: one trailing byte after the final output map must be rejected \
+         with TrailingData; got {:?}",
+        res
+    );
+
+    // Appending several trailing bytes (incl. non-zero) must also be rejected.
+    let mut many_extra = valid.clone();
+    many_extra.extend_from_slice(&[0x70, 0x73, 0x62, 0x74, 0xFF, 0xAA]);
+    let res = Psbt::deserialize(&many_extra);
+    assert!(
+        matches!(res, Err(PsbtError::TrailingData)),
+        "BUG-20: multiple trailing bytes after the final output map must be \
+         rejected with TrailingData; got {:?}",
+        res
+    );
 }
 
 /// **BUG-21 — Hash preimages not validated and finalizer doesn't use them.**
