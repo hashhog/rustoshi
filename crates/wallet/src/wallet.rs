@@ -65,6 +65,20 @@ pub enum AddressType {
 /// Coinbase maturity: coinbase outputs cannot be spent for 100 blocks.
 pub const COINBASE_MATURITY: u32 = 100;
 
+/// Wallet-side conservative incremental relay fee, in satoshis per 1000 virtual
+/// bytes (sat/kvB). Mirrors Bitcoin Core's `WALLET_INCREMENTAL_RELAY_FEE = 5000`
+/// (`bitcoin-core/src/wallet/wallet.h:124`), i.e. 5 sat/vB.
+///
+/// Core's fee-bumper (`feebumper.cpp` `EstimateFeeRate`) increments the
+/// replacement feerate by `max(node_incremental_relay_fee,
+/// WALLET_INCREMENTAL_RELAY_FEE)` to future-proof against network-wide
+/// incremental-relay-fee policy this node may not yet know about, ensuring the
+/// replacement clears the required relay fee (BIP-125 rule 4) by a conservative
+/// margin. The node default incremental relay fee is `DEFAULT_INCREMENTAL_RELAY_FEE
+/// = 100` sat/kvB (= 1 sat/vB), so `max(100, 5000) = 5000` sat/kvB applies by
+/// default.
+pub const WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 5000;
+
 /// Sentinel derivation path stored on UTXOs / index entries that belong to an
 /// *imported* (non-HD) key rather than a seed-derived path. It is never a valid
 /// BIP-32 path (`u32::MAX` as the single element), so `scan_block_at` can route
@@ -877,8 +891,10 @@ impl Wallet {
     ///    a degenerate recipient-also-mine case does not collapse the
     ///    transaction.
     /// 5. Compute `new_fee = orig_fee + bump_delta`, where `bump_delta =
-    ///    ceil(vsize * incremental_fee_rate)` and `incremental_fee_rate`
-    ///    defaults to 1 sat/vB (Core's `DEFAULT_INCREMENTAL_RELAY_FEE`).
+    ///    ceil(vsize * incremental_fee_rate)` and `incremental_fee_rate` is
+    ///    Core's wallet floor `WALLET_INCREMENTAL_RELAY_FEE` = 5 sat/vB
+    ///    (`max(node_incremental, WALLET_INCREMENTAL_RELAY_FEE)`, feebumper.cpp
+    ///    `EstimateFeeRate`).
     ///    `fee_rate_override` (sat/vB) lets the caller pin a higher rate
     ///    explicitly; in that case `new_fee = max(ceil(vsize * fee_rate),
     ///    orig_fee + bump_delta)` so BIP-125 rule 4 still holds.
@@ -995,8 +1011,17 @@ impl Wallet {
         })?;
 
         // ---- compute the fee bump --------------------------------------
-        const INCREMENTAL_FEE_RATE: f64 = 1.0; // sat/vB; Core DEFAULT_INCREMENTAL_RELAY_FEE
-        let incremental_delta = (entry.vsize as f64 * INCREMENTAL_FEE_RATE).ceil() as u64;
+        // Core's EstimateFeeRate (feebumper.cpp) bumps the replacement feerate
+        // by `max(node_incremental_relay_fee, WALLET_INCREMENTAL_RELAY_FEE)`.
+        // The node default incremental relay fee is DEFAULT_INCREMENTAL_RELAY_FEE
+        // = 100 sat/kvB (1 sat/vB), so `max(100, 5000) = 5000` sat/kvB
+        // (= WALLET_INCREMENTAL_RELAY_FEE = 5 sat/vB) is the conservative
+        // wallet floor. Computed with integer ceiling math
+        // (CFeeRate::GetFee -> CeilDiv parity, matching the mempool Rule-4 path
+        // `(rate_kvb * vsize + 999) / 1000`).
+        let incremental_rate_kvb = WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB;
+        let incremental_delta =
+            (incremental_rate_kvb.saturating_mul(entry.vsize as u64) + 999) / 1000;
         // Floor: orig_fee + 1 sat/vB * vsize  (BIP-125 rule 4 + Core rule 6).
         let min_new_fee = entry.fee_sats.saturating_add(incremental_delta.max(1));
         // If caller specifies an explicit rate, target that rate but never
