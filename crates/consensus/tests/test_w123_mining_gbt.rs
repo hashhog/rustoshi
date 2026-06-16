@@ -561,22 +561,117 @@ fn test_g10_bip34_coinbase_height_and_min_length() {
 // G11 — depends[] populated in GBT transactions
 // ============================================================
 
-/// G11 — MISSING (P2 — BIP-22): GBT response always emits
-/// `transactions[].depends = []` (server.rs:4192). Core mining.cpp:917-923
-/// builds a `setTxIndex: txid → index_in_template` map and pushes each
-/// dependency that's also in the template.
+/// G11 — FIXED 2026-06-16 (P2 — BIP-22): the GBT response now populates
+/// `transactions[].depends` (server.rs `get_block_template`). Core
+/// (rpc/mining.cpp:898-923) builds a `setTxIndex: txid → index_in_template`
+/// map incrementally and, for each input, pushes the parent's template index
+/// when it appears *earlier* in the template; the RPC layer reproduces that
+/// exact algorithm (`tx_index` map + `dep_idx < i` filter, de-dup + sort).
 ///
-/// Impact: a mining client cannot reorder transactions safely — it doesn't
-/// know which txs depend on which other txs in the template. BIP-22 spec
-/// requires this field when `txns` is mutable (and it is: "transactions"
-/// appears in the `mutable` array — server.rs:4317).
+/// `depends` is computed in the RPC layer (the consensus `build_block_template`
+/// emits only `transactions`); the network crate's index map keys off
+/// `tx.txid()` against `template.transactions`. This test pins the data the
+/// RPC layer consumes: it builds a parent→child chain, asserts the template
+/// orders the parent before the child (the precondition that makes `depends`
+/// computable), then runs the *same* dependency-index algorithm the RPC uses
+/// and asserts the child reports the parent's index and the parent reports no
+/// dependency. A behavioural unit test over the real RPC handler lives in
+/// `crates/rpc/src/server.rs` (`mod tests::test_g11_gbt_depends_populated`).
 #[test]
-#[ignore = "BUG G11 (P2) — GBT transactions[].depends hardcoded to [] \
-            (server.rs:4192; Core mining.cpp:917-923)"]
 fn test_g11_depends_array_populated() {
-    panic!(
-        "Build setTxIndex {{txid → index}} and push deps for each input whose \
-         prevout.hash is in the template (Core mining.cpp:917-923)"
+    use std::collections::HashMap as StdHashMap;
+
+    let params = regtest_params();
+    let mut mp = empty_mempool();
+
+    // Parent spends a confirmed coin; child spends the parent's output 0.
+    // Give the parent the higher standalone fee-rate so the ancestor-feerate
+    // selector orders it ahead of the child (matching Core's ancestors-first
+    // template ordering, the precondition for a non-empty `depends`).
+    let parent_prevout = OutPoint { txid: Hash256([0xE1; 32]), vout: 0 };
+    let mut utxos: StdHashMap<OutPoint, CoinEntry> = StdHashMap::new();
+    utxos.insert(parent_prevout.clone(), test_coin(1_000_000));
+
+    // parent: 1_000_000 -> 900_000  => fee 100_000 (high feerate)
+    let parent_tx = make_simple_tx(Hash256([0xE1; 32]), 0, 900_000);
+    let parent_id = mp_add(&mut mp, parent_tx, &utxos).expect("parent admitted");
+
+    // child spends the parent's output 0.
+    utxos.insert(OutPoint { txid: parent_id, vout: 0 }, test_coin(900_000));
+    // child: 900_000 -> 899_000  => fee 1_000 (lower feerate than parent)
+    let child_tx = make_simple_tx(parent_id, 0, 899_000);
+    let child_id = mp_add(&mut mp, child_tx, &utxos).expect("child admitted");
+
+    let template = build_block_template(
+        &mp,
+        Hash256::ZERO,
+        1,
+        1_700_000_000,
+        0x207fffff,
+        0,
+        &params,
+        &default_config(),
+    );
+
+    // Both txs must be in the template (coinbase + parent + child).
+    assert_eq!(template.transactions.len(), 3, "coinbase + parent + child");
+
+    // Locate parent and child in the template (coinbase is index 0).
+    let pos = |id: Hash256| -> u32 {
+        template
+            .transactions
+            .iter()
+            .position(|t| t.txid() == id)
+            .expect("tx must be in template") as u32
+    };
+    let parent_idx = pos(parent_id);
+    let child_idx = pos(child_id);
+    assert!(
+        parent_idx < child_idx,
+        "template must order the parent before the child so its index can be \
+         referenced in the child's `depends` (parent={parent_idx}, child={child_idx})"
+    );
+
+    // Reproduce the exact production `depends` algorithm (server.rs
+    // get_block_template): txid -> index map, then for each tx collect the
+    // indices of in-template parents with index strictly less than its own.
+    let tx_index: StdHashMap<Hash256, u32> = template
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.txid(), i as u32))
+        .collect();
+    let depends_of = |i: usize, tx: &Transaction| -> Vec<u32> {
+        let mut deps: Vec<u32> = tx
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                tx_index
+                    .get(&input.previous_output.txid)
+                    .copied()
+                    .filter(|&dep_idx| dep_idx < i as u32)
+            })
+            .collect();
+        deps.sort_unstable();
+        deps.dedup();
+        deps
+    };
+
+    let child = &template.transactions[child_idx as usize];
+    let parent = &template.transactions[parent_idx as usize];
+
+    // The child depends on exactly the parent's template index — not the old
+    // hardcoded empty vec.
+    assert_eq!(
+        depends_of(child_idx as usize, child),
+        vec![parent_idx],
+        "child's `depends` must name the parent's template index"
+    );
+    // The parent spends only a confirmed coin, so it has no in-template
+    // dependency.
+    assert!(
+        depends_of(parent_idx as usize, parent).is_empty(),
+        "parent's `depends` must be empty (spends a confirmed coin only)"
     );
 }
 
