@@ -4751,19 +4751,24 @@ fn classify_standard_script(script: &[u8]) -> StandardScriptType {
         }
     }
 
-    // Witness unknown: OP_1..OP_16 followed by a 2–40 byte push.
-    // These are standard outputs (mirrors Core Solver() → WITNESS_UNKNOWN → IsStandard=true)
-    // but spending them is non-standard (ValidateInputsStandardness rejects them).
-    // Excludes OP_1 (0x51) because OP_1 <32> is P2TR (handled above) and OP_1 <2> is P2A.
-    if script.len() >= 4 && script.len() <= 42 {
-        let version = script[0];
-        // OP_2 (0x52) through OP_16 (0x60) — v2..=v16 witness programs
-        if (0x52..=0x60).contains(&version) {
-            let push_len = script[1] as usize;
-            if (2..=40).contains(&push_len) && script.len() == 2 + push_len {
-                return StandardScriptType::WitnessUnknown;
-            }
+    // Witness unknown: a valid witness program (OP_1..OP_16 + 2–40 byte push)
+    // whose version is non-zero and which is not one of the recognised types.
+    // Mirrors Bitcoin Core Solver() (script/solver.cpp:154-178): the canonical
+    // witness types are handled above (P2WPKH/P2WSH for v0, P2TR for v1+32, P2A
+    // for the v1 anchor program); any *remaining* witness program with
+    // `version != 0` falls through to WITNESS_UNKNOWN. This includes v1 programs
+    // whose program size is not 32 (and not the P2A anchor) — Core does NOT
+    // exclude OP_1 here, so a v1 16-byte program is WITNESS_UNKNOWN, not
+    // NonStandard. (v0 programs with a non-{20,32} size are NonStandard, matching
+    // Core's `return TxoutType::NONSTANDARD` at solver.cpp:177.)
+    //
+    // WITNESS_UNKNOWN outputs are standard to create but non-standard to spend
+    // (ValidateInputsStandardness rejects them as prevouts).
+    if let Some((version, _program)) = parse_witness_program(script) {
+        if version != 0 {
+            return StandardScriptType::WitnessUnknown;
         }
+        return StandardScriptType::NonStandard;
     }
 
     StandardScriptType::NonStandard
