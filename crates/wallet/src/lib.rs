@@ -87,6 +87,7 @@ pub use payjoin::{
     OFFERED_PAYJOIN_TTL_SECS,
 };
 pub use wallet::{
-    calculate_vsize, decode_wif, encode_wif, AddressType, ImportedKey, KeySigner, TxDetail,
-    TxHistoryEntry, Wallet, WalletUtxo, WatchedScript, WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+    calculate_vsize, decode_wif, encode_wif, fee_for_rate_sat_per_vb, AddressType, ImportedKey,
+    KeySigner, TxDetail, TxHistoryEntry, Wallet, WalletUtxo, WatchedScript,
+    WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
 };
