@@ -5909,7 +5909,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                 txid: tx.txid().to_hex(),
                 hash: tx.wtxid().to_hex(),
                 depends: vec![],
-                fee: 0, // would need to look up from mempool
+                // BIP-22 per-tx base fee, read index-for-index from the
+                // template (coinbase at index 0 is skipped above). Mirrors
+                // Core rpc/mining.cpp:926 `entry.pushKV("fee", tx_fees.at(...))`.
+                // Non-coinbase base fees are always non-negative; the negated
+                // coinbase slot is never reached because the coinbase is
+                // skipped above.
+                fee: template.per_tx_fees.get(i).copied().unwrap_or(0).max(0) as u64,
                 sigops: template
                     .per_tx_sigops
                     .get(i)
