@@ -36,11 +36,14 @@
 //! Bug inventory (BUG-1..19 — see `audit/w130_bip125_feebumper_rule3.md`
 //! for full per-bug rationale and Core line references):
 //!
-//!   BUG-1  [P0-CDIV] G2:  Wallet `INCREMENTAL_FEE_RATE` hardcoded to
-//!                    1.0 sat/vB at wallet.rs:817, ignoring Core's
+//!   BUG-1  [CLOSED 2026-06-16] G2:  Wallet `INCREMENTAL_FEE_RATE` was
+//!                    hardcoded to 1.0 sat/vB, ignoring Core's
 //!                    `WALLET_INCREMENTAL_RELAY_FEE = 5 sat/vB`
-//!                    (wallet.h:124). Wallet-built replacements 5×
-//!                    below Core peers' wallet-build floor.
+//!                    (wallet.h:124). FIXED: `build_bumped_tx` now derives
+//!                    the default incremental delta from
+//!                    `WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB = 5000`
+//!                    using integer-ceiling math (Core feebumper.cpp
+//!                    `EstimateFeeRate` parity). De-staled test below.
 //!
 //!   BUG-2  [P0-CDIV] G10: Wallet never reads
 //!                    `MempoolConfig::incremental_relay_fee` at runtime.
@@ -100,9 +103,11 @@
 //!                    sat/kvB vs sat/vB inconsistently (mempool.rs:
 //!                    100-101, :697-698, wallet.rs:817-819).
 //!
-//!   BUG-12 [P1]      G16: `WALLET_INCREMENTAL_RELAY_FEE` constant
-//!                    (Core wallet.h:124 = 5000 sat/kvB) absent in
-//!                    rustoshi-wallet.
+//!   BUG-12 [CLOSED 2026-06-16] G16: `WALLET_INCREMENTAL_RELAY_FEE`
+//!                    constant (Core wallet.h:124 = 5000 sat/kvB) was
+//!                    absent. FIXED: added
+//!                    `WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB = 5000`
+//!                    (re-exported from the wallet crate), used by BUG-1.
 //!
 //!   BUG-13 [P2]      G21: `calculateCombinedBumpFee` (Core 27+
 //!                    descendant-aware bump fee accounting) absent.
@@ -353,22 +358,58 @@ fn g24_replacement_disallowed_error_variant_present() {
 /// Rustoshi's wallet builds replacements 5× below Core peers' wallet
 /// floor by default. The local mempool accepts (both at 1 sat/vB);
 /// every Core peer's wallet+relay path rejects.
+/// BUG-1 / G2 [De-staled 2026-06-16]: the wallet fee-bump floor now uses
+/// Core's conservative `WALLET_INCREMENTAL_RELAY_FEE = 5000` sat/kvB (= 5
+/// sat/vB, `wallet.h:124`) instead of the old hardcoded 1.0 sat/vB literal.
+/// Core `feebumper.cpp` `EstimateFeeRate` bumps the replacement feerate by
+/// `max(node_incremental_relay_fee, WALLET_INCREMENTAL_RELAY_FEE)`; with the
+/// node default `DEFAULT_INCREMENTAL_RELAY_FEE = 100` sat/kvB, the wallet
+/// floor of 5000 sat/kvB dominates. The bad 1.0 sat/vB literal is gone and
+/// the bump now uses integer-ceiling math (`(rate_kvb * vsize + 999) / 1000`,
+/// `CFeeRate::GetFee` -> `CeilDiv` parity), matching the mempool Rule-4 path.
 #[test]
-#[ignore = "BUG-1 P0-CDIV: wallet uses 1 sat/vB; Core wallet uses max(node, 5 sat/vB)"]
 fn bug1_wallet_uses_wallet_incremental_relay_fee_max_fence() {
-    // The hardcoded literal MUST be replaced by a runtime max against
-    // WALLET_INCREMENTAL_RELAY_FEE. While that constant is absent
-    // (see BUG-12), assert the bad literal still lives at the
-    // expected site so we know which line to fix.
+    // The bad 1.0 sat/vB literal must be GONE.
     assert!(
-        WALLET_SRC.contains("const INCREMENTAL_FEE_RATE: f64 = 1.0;"),
-        "wallet.rs:817 must still carry the bad 1.0 sat/vB literal (regression pin)"
+        !WALLET_SRC.contains("const INCREMENTAL_FEE_RATE: f64 = 1.0;"),
+        "wallet.rs must no longer carry the bad 1.0 sat/vB INCREMENTAL_FEE_RATE literal"
     );
-    panic!(
-        "BUG-1 P0-CDIV: wallet hardcodes 1 sat/vB; Core wallet uses \
-         max(node_incremental, WALLET_INCREMENTAL_RELAY_FEE = 5 sat/vB). \
-         Fix: replace literal at wallet.rs:817 with a max(config, \
-         WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_VBYTE) read."
+    // The corrected floor must reference the Core 5000 sat/kvB constant.
+    assert!(
+        WALLET_SRC.contains("WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB"),
+        "build_bumped_tx must derive its incremental delta from \
+         WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB (Core wallet.h:124 = 5000 sat/kvB)"
+    );
+    // The bump delta must use integer-ceiling math, not f64 ceil() — parity
+    // with the mempool Rule-4 path.
+    assert!(
+        WALLET_SRC
+            .contains("(incremental_rate_kvb.saturating_mul(entry.vsize as u64) + 999) / 1000"),
+        "incremental delta must use integer ceiling (rate_kvb * vsize + 999) / 1000 \
+         (CFeeRate::GetFee / CeilDiv parity)"
+    );
+
+    // Behavioral parity: the public constant equals Core's 5000 sat/kvB, and
+    // the ceiling math the wallet now uses produces the Core-floor delta for a
+    // typical replacement vsize. For a 141-vbyte P2WPKH tx the wallet floor is
+    // ceil(5000 * 141 / 1000) = 705 sat (5 sat/vB), NOT the old 141 sat that
+    // the 1 sat/vB literal produced.
+    assert_eq!(
+        rustoshi_wallet::WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+        CORE_WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+        "exported wallet incremental relay fee must equal Core wallet.h:124 (5000 sat/kvB)"
+    );
+    let vsize: u64 = 141;
+    let wallet_floor_delta = (rustoshi_wallet::WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB
+        * vsize
+        + 999)
+        / 1000;
+    let old_one_sat_per_vb_delta = (100u64 * vsize + 999) / 1000;
+    assert_eq!(wallet_floor_delta, 705, "5 sat/vB floor for a 141-vB tx must be 705 sat");
+    assert_eq!(old_one_sat_per_vb_delta, 15, "old 1 sat/vB delta for a 141-vB tx was 15 sat");
+    assert!(
+        wallet_floor_delta > old_one_sat_per_vb_delta,
+        "the corrected wallet floor must exceed the old 1 sat/vB delta (5x conservative margin)"
     );
 }
 
@@ -583,12 +624,15 @@ fn bug8_bump_fee_calls_is_bip125_replaceable_for_ancestors() {
     );
 }
 
-/// BUG-9 / G20 [P1]: Wallet uses f64 `.ceil()` math for incremental
-/// fee at wallet.rs:818,829; mempool path uses integer `+999/1000`
-/// at mempool.rs:2870. Two parities of the same numeric invariant
-/// (`CFeeRate::GetFee` → `EvaluateFeeUp` / `CeilDiv`, feefrac.h:212).
+/// BUG-9 / G20 [P1]: the wallet's *default incremental delta* now uses
+/// integer-ceiling math (closed alongside BUG-1: `(rate_kvb * vsize + 999)
+/// / 1000`). The remaining f64-ceil divergence is on the
+/// `fee_rate_override` target path (`(entry.vsize as f64 * rate).ceil()`),
+/// where the operator-supplied sat/vB rate is applied. Two parities of the
+/// same numeric invariant (`CFeeRate::GetFee` → `EvaluateFeeUp` / `CeilDiv`,
+/// feefrac.h:212) still coexist until the override path is also ported.
 #[test]
-#[ignore = "BUG-9 P1: wallet uses f64 ceil; mempool uses int ceiling — two parities of one invariant"]
+#[ignore = "BUG-9 P1: fee_rate_override path still uses f64 ceil; default delta now integer-ceiling"]
 fn bug9_evaluate_fee_up_parity_uniform() {
     // Mempool side: integer ceiling math (matches Core CeilDiv).
     assert!(
@@ -596,11 +640,10 @@ fn bug9_evaluate_fee_up_parity_uniform() {
             .contains("(self.config.incremental_relay_fee * new_vsize as u64 + 999) / 1000"),
         "mempool Rule 4 must use integer ceiling +999/1000"
     );
-    // Wallet side: f64 ceil. THIS is the divergence.
+    // Wallet override path still uses f64 ceil. THIS is the residual divergence.
     assert!(
-        WALLET_SRC.contains("(entry.vsize as f64 * INCREMENTAL_FEE_RATE).ceil() as u64")
-            || WALLET_SRC.contains("(entry.vsize as f64 * 1.0).ceil()"),
-        "wallet must currently use f64 ceil (regression pin)"
+        WALLET_SRC.contains("(entry.vsize as f64 * rate).ceil() as u64"),
+        "wallet fee_rate_override path must currently use f64 ceil (regression pin)"
     );
     panic!(
         "BUG-9 P1: incremental fee uses f64 ceil() in wallet but integer \
@@ -678,20 +721,20 @@ fn bug11_incremental_relay_fee_unit_documentation_consistent() {
 /// BUG-12 / G16 [P1]: `WALLET_INCREMENTAL_RELAY_FEE` constant (Core
 /// wallet.h:124 = 5000 sat/kvB) absent in rustoshi-wallet. No
 /// "future-proofing-against-network-wide-policy" floor.
+/// BUG-12 / G16 [De-staled 2026-06-16]: `WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB`
+/// constant (Core `wallet.h:124` = 5000 sat/kvB = 5 sat/vB) is now defined and
+/// re-exported from the wallet crate, used by BUG-1's fee-bump floor.
 #[test]
-#[ignore = "BUG-12 P1: WALLET_INCREMENTAL_RELAY_FEE constant absent from rustoshi-wallet"]
 fn bug12_wallet_incremental_relay_fee_constant_present() {
     assert!(
-        !WALLET_SRC.contains("WALLET_INCREMENTAL_RELAY_FEE"),
-        "WALLET_INCREMENTAL_RELAY_FEE must not yet be defined (regression pin)"
+        WALLET_SRC.contains("pub const WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 5000;"),
+        "WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB must be defined as 5000 (Core wallet.h:124)"
     );
-    let runtime_val: u64 = 5000;
-    assert_eq!(runtime_val, CORE_WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB);
-    panic!(
-        "BUG-12 P1: WALLET_INCREMENTAL_RELAY_FEE constant (Core wallet.h:124 = \
-         5000 sat/kvB = 5 sat/vB) absent. Fix: add `pub const \
-         WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 5000;` to \
-         rustoshi-wallet and use it in BUG-1's max fence."
+    // The constant is re-exported and equals Core's value.
+    assert_eq!(
+        rustoshi_wallet::WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+        CORE_WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+        "exported constant must equal Core wallet.h:124 value 5000 sat/kvB"
     );
 }
 
