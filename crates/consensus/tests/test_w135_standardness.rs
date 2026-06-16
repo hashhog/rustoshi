@@ -369,26 +369,112 @@ fn w135_g9_bug2_max_dust_outputs_per_tx_xfail() {
     panic!("BUG-2: no MAX_DUST_OUTPUTS_PER_TX gate; rustoshi rejects ephemeral-dust txs");
 }
 
-/// G10 — BUG-3 (P0-CDIV): `classify_standard_script` MUST treat v=1
-/// witness programs with non-{2,32}-byte programs as `WITNESS_UNKNOWN`,
-/// not `NonStandard`.
+/// G10 — BUG-3 [De-staled 2026-06-16]: `classify_standard_script` now treats a
+/// v=1 witness program with a non-canonical program size (not 32 = P2TR, not the
+/// 2-byte P2A anchor) as `WITNESS_UNKNOWN` — a *standard* output to create — not
+/// `NonStandard`.
 ///
-/// XFAIL: rustoshi's classifier explicitly excludes v=1 from the
-/// WITNESS_UNKNOWN range (`0x52..=0x60`); Core treats any v=1+ program
-/// of size 2..=40 (excluding the canonical P2TR=32 and P2A=2) as
-/// WITNESS_UNKNOWN per solver.cpp:172-176.
+/// Bug (pre-fix): rustoshi's classifier matched only `OP_2..=OP_16` (`0x52..=0x60`)
+/// for WITNESS_UNKNOWN and excluded `OP_1` (`0x51`) entirely, so a v1 16-byte
+/// witness program fell through to `NonStandard`. Bitcoin Core's `Solver`
+/// (`bitcoin-core/src/script/solver.cpp:172-176`) returns `WITNESS_UNKNOWN` for
+/// *any* valid witness program with `witnessversion != 0` once the canonical
+/// types (WITNESS_V0_*, WITNESS_V1_TAPROOT, ANCHOR) have been ruled out. A node
+/// that mis-rejects these over-rejects forward-compatible outputs that the rest
+/// of the network relays as standard.
+///
+/// Fix: the witness-unknown branch in `classify_standard_script`
+/// (`crates/consensus/src/mempool.rs`) now uses `parse_witness_program` and keys
+/// the decision on `version != 0`, matching Core. P2WPKH/P2WSH (v0), P2TR
+/// (v1+32) and P2A are still recognised earlier and so never reach this branch;
+/// a v0 program with a non-{20,32} size remains `NonStandard` per Core
+/// (`solver.cpp:177`).
+///
+/// Behavioural assertion (output / create side, which is where WITNESS_UNKNOWN
+/// differs observably from NonStandard): a transaction whose sole output is a v1
+/// 16-byte witness program is admitted by `check_standard` (WITNESS_UNKNOWN is
+/// standard to create), whereas a genuinely non-standard output (a bare `OP_1`)
+/// is rejected at the same call site. This pins both the fix and that it did not
+/// turn the classifier into a blanket "accept everything".
 #[test]
-#[ignore]
-fn w135_g10_bug3_v1_witness_unknown_xfail() {
-    let spk = make_v1_unknown_16byte_spk();
-    // Sanity: shape is a valid witness program in Core's sense.
-    assert_eq!(spk[0], 0x51);
-    assert_eq!(spk[1], 0x10); // push 16
-    assert_eq!(spk.len(), 2 + 16);
-    // BUG-3: rustoshi's `classify_standard_script` returns `NonStandard`
-    // here; Core's `Solver` returns `WITNESS_UNKNOWN` (standard output,
-    // non-standard input spend).
-    panic!("BUG-3: v=1 + 16-byte program misclassified as NonStandard");
+fn w135_g10_bug3_v1_witness_unknown_is_standard_output() {
+    use rustoshi_consensus::mempool::{Mempool, MempoolConfig, MempoolError};
+    use rustoshi_consensus::CoinEntry;
+    use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
+    use std::collections::HashMap;
+
+    // Sanity: the v1 16-byte program is a valid witness program in Core's sense
+    // (OP_1, push 16 bytes, total length push_len + 2).
+    let v1_unknown = make_v1_unknown_16byte_spk();
+    assert_eq!(v1_unknown[0], 0x51);
+    assert_eq!(v1_unknown[1], 0x10); // push 16
+    assert_eq!(v1_unknown.len(), 2 + 16);
+
+    // A standard, confirmed P2PKH coin to fund the spend. `require_standard`
+    // (default true) makes `check_standard` + the AreInputsStandard prevout-type
+    // gate run; the P2PKH prevout is standard so the input passes, isolating the
+    // *output* classification under test.
+    let prev = OutPoint { txid: Hash256::from([7u8; 32]), vout: 0 };
+    let funding = CoinEntry {
+        height: 0,
+        is_coinbase: false,
+        value: 100_000,
+        script_pubkey: make_p2pkh_spk(),
+    };
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(prev.clone(), funding)].into_iter().collect();
+
+    // Disable script verification (we are testing standardness classification,
+    // not signature validity); leave `require_standard` at its default (true).
+    let mk_mempool = || {
+        Mempool::new(MempoolConfig { verify_scripts: false, ..Default::default() })
+    };
+
+    let spend_to = |spk: Vec<u8>| Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: prev.clone(),
+            script_sig: vec![],
+            sequence: 0xffffffff,
+            witness: vec![],
+        }],
+        // 90_000 sat is far above any witness-program dust threshold, so the
+        // dust gate cannot be the thing that accepts/rejects here.
+        outputs: vec![TxOut { value: 90_000, script_pubkey: spk }],
+        lock_time: 0,
+    };
+
+    // (a) v1 16-byte witness program output: WITNESS_UNKNOWN ⇒ standard to
+    //     create. `check_standard`'s output loop must NOT reject it with a
+    //     "scriptpubkey at index N" NonStandard error. (Pre-fix it WAS rejected.)
+    let mut mp = mk_mempool();
+    let res = mp.add_transaction(spend_to(v1_unknown), &|op| utxos.get(op).cloned());
+    if let Err(MempoolError::NonStandard(reason)) = &res {
+        assert!(
+            !reason.starts_with("scriptpubkey at index"),
+            "v1 16-byte witness program output must be classified WITNESS_UNKNOWN \
+             (standard to create), not NonStandard; got rejection: {reason}"
+        );
+    }
+    assert!(
+        res.is_ok(),
+        "tx creating a v1 WITNESS_UNKNOWN output must be admitted as standard: {res:?}"
+    );
+
+    // (b) Control: a genuinely non-standard output must still be rejected as
+    //     NonStandard at the same call site. We use a 50-byte all-`OP_1` script:
+    //     50 > 42 so it fails `parse_witness_program` (not a witness program) and
+    //     matches no standard type, yet it is large enough that the tx clears the
+    //     65-byte MIN_STANDARD_TX_NONWITNESS_SIZE floor — so the rejection comes
+    //     from the *output classifier*, not the size guard. This proves the fix
+    //     distinguishes WITNESS_UNKNOWN from NonStandard and did not weaken the
+    //     classifier into accept-everything.
+    let mut mp2 = mk_mempool();
+    let res2 = mp2.add_transaction(spend_to(vec![0x51u8; 50]), &|op| utxos.get(op).cloned());
+    assert!(
+        matches!(&res2, Err(MempoolError::NonStandard(reason)) if reason.starts_with("scriptpubkey at index")),
+        "a 50-byte all-OP_1 output (truly non-standard) must be rejected NonStandard: {res2:?}"
+    );
 }
 
 // ============================================================
