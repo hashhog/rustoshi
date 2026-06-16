@@ -35,7 +35,7 @@
 //!                 G6 ancestor_aware_selection / G14 cmpctblock_construction_only_tests /
 //!                 G16 sendcmpct_high_bandwidth_send / G22 template_refresh_on_new_tip /
 //!                 G29 sigops_per_tx_witness_aware
-//!   MISSING (13): G4 nBlockMaxWeight_clamp / G8 per_tx_fees_in_gbt_response /
+//!   MISSING (12): G4 nBlockMaxWeight_clamp /
 //!                 G11 depends_array_in_gbt_response / G13 capabilities_field /
 //!                 G18 m_last_block_weight_tracked / G20 cluster_improves_diagram /
 //!                 G21 blockmaxweight_cli_arg / G23 truc_topology_at_block_builder /
@@ -399,14 +399,97 @@ fn test_g7_anti_fee_sniping_coinbase_locktime() {
 /// Root cause: `BlockTemplate` carries `total_fees` but no `per_tx_fees`
 /// vector parallel to `per_tx_sigops`.
 #[test]
-#[ignore = "BUG G8 (P1) — GBT transactions[].fee hardcoded to 0 \
-            (server.rs:4193; Core mining.cpp:926 vTxFees)"]
+// FIXED 2026-06-16 (W123 G8): `BlockTemplate` now carries `per_tx_fees`,
+// parallel to `per_tx_sigops` (coinbase at index 0; non-coinbase entries hold
+// each selected tx's base fee). The GBT RPC reads `per_tx_fees[i]` for the
+// `fee` field instead of the old hardcoded `fee: 0`. Mirrors Core
+// `node/miner.cpp:265` (`vTxFees.push_back(entry.GetFee())`) and
+// `rpc/mining.cpp:926` (`entry.pushKV("fee", tx_fees.at(index_in_template))`).
 fn test_g8_per_tx_fees_in_gbt_response() {
-    panic!(
-        "BlockTemplate must carry per_tx_fees in the same order as transactions; \
-         server.rs:4188 must read from it instead of `fee: 0` \
-         (Core mining.cpp:926, pblocktemplate->vTxFees)"
+    let params = regtest_params();
+    let mut mp = empty_mempool();
+
+    // Two independent funded txs with distinct fees so we can assert that the
+    // per-tx fee vector lines up index-for-index with `transactions` rather
+    // than reporting a single aggregate or zero.
+    //
+    // tx_a: input 1_000_000 -> output 988_000  => base fee 12_000
+    // tx_b: input   500_000 -> output 496_500  => base fee  3_500
+    let mut utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+    utxos.insert(
+        OutPoint { txid: Hash256([0xA1; 32]), vout: 0 },
+        test_coin(1_000_000),
     );
+    utxos.insert(
+        OutPoint { txid: Hash256([0xB2; 32]), vout: 0 },
+        test_coin(500_000),
+    );
+
+    let tx_a = make_simple_tx(Hash256([0xA1; 32]), 0, 988_000);
+    let tx_b = make_simple_tx(Hash256([0xB2; 32]), 0, 496_500);
+    let txid_a = mp_add(&mut mp, tx_a, &utxos).expect("tx_a admitted");
+    let txid_b = mp_add(&mut mp, tx_b, &utxos).expect("tx_b admitted");
+
+    let template = build_block_template(
+        &mp,
+        Hash256::ZERO,
+        1,
+        1_700_000_000,
+        0x207fffff,
+        0,
+        &params,
+        &default_config(),
+    );
+
+    // The fee vector must be exactly as long as the transaction list (coinbase
+    // first), parallel to per_tx_sigops.
+    assert_eq!(
+        template.per_tx_fees.len(),
+        template.transactions.len(),
+        "per_tx_fees must be parallel to transactions (coinbase included)"
+    );
+    assert_eq!(
+        template.per_tx_fees.len(),
+        template.per_tx_sigops.len(),
+        "per_tx_fees and per_tx_sigops must have identical layout"
+    );
+
+    // Index 0 is the coinbase: it collects the block fees, so its slot is the
+    // negated total fee (Core sets the coinbase fee entry to -nFees).
+    assert_eq!(
+        template.per_tx_fees[0], -(template.total_fees as i64),
+        "coinbase fee slot must be the negated total block fee"
+    );
+
+    // The two selected txs must each report their own base fee at the same
+    // index they occupy in `transactions` — NOT zero, and NOT swapped.
+    let expected: HashMap<Hash256, i64> =
+        [(txid_a, 12_000i64), (txid_b, 3_500i64)].into_iter().collect();
+
+    let mut sum_non_coinbase: i64 = 0;
+    for (i, tx) in template.transactions.iter().enumerate().skip(1) {
+        let want = *expected
+            .get(&tx.txid())
+            .expect("template tx must be one of the two we inserted");
+        assert_eq!(
+            template.per_tx_fees[i], want,
+            "per_tx_fees[{}] must equal the base fee of transactions[{}]",
+            i, i
+        );
+        assert!(
+            template.per_tx_fees[i] > 0,
+            "non-coinbase fee must be the real fee, not the old hardcoded 0"
+        );
+        sum_non_coinbase += template.per_tx_fees[i];
+    }
+
+    // Both txs were selected and their fees sum to total_fees (15_500).
+    assert_eq!(template.transactions.len(), 3, "coinbase + 2 txs");
+    assert_eq!(
+        sum_non_coinbase, template.total_fees as i64,
+        "sum of per-tx fees must equal total_fees"
+    );
+    assert_eq!(template.total_fees, 15_500, "12_000 + 3_500");
 }
 
 // ============================================================
