@@ -535,15 +535,54 @@ fn w135_g21_truc_inheritance_rules_shape() {
 // G22-G26: P2-P3 BUGs (xfail-pinned)
 // ============================================================
 
-/// G22 — BUG-5 (P2): `is_dust` parameter `_min_fee_rate` is unused;
-/// dust threshold always uses hardcoded `DUST_RELAY_TX_FEE`.
-/// Core: `-dustrelayfee` is configurable per node.
+/// G22 — BUG-5 (P2) [De-staled 2026-06-16]: the dust threshold is now driven
+/// by a configurable dust-relay feerate, matching Core's
+/// `IsDust(txout, dustRelayFeeIn)` / `GetDustThreshold(txout, dustRelayFeeIn)`
+/// (`policy.cpp:27-68`), which takes the node's `m_opts.dust_relay_feerate`
+/// (`-dustrelayfee`, kernel/mempool_options.h:45).
+///
+/// FIX:
+///   * `MempoolConfig::dust_relay_fee` field added, defaulting to
+///     `DUST_RELAY_TX_FEE` (3000 sat/kvB) — the Core default.
+///   * `is_dust(output, dust_relay_fee)` now consumes its feerate argument
+///     (was `_min_fee_rate`, ignored) and forwards it to `dust_threshold`,
+///     instead of hardcoding `DUST_RELAY_TX_FEE`.
+///   * The admission call site passes `self.config.dust_relay_fee` (was
+///     erroneously passing `min_fee_rate`, the min-RELAY floor, which Core
+///     never uses for dust — validation.cpp:808).
+///
+/// This test pins (a) the default-rate threshold, and (b) that the public
+/// `dust_threshold` scales linearly with the dust-relay feerate so an
+/// operator `-dustrelayfee` override changes the dust decision.
 #[test]
-#[ignore]
-fn w135_g22_bug5_dust_fee_unconfigurable_xfail() {
-    // Sanity: rustoshi constant is 3000.
+fn w135_g22_bug5_dust_fee_configurable() {
+    use rustoshi_consensus::mempool::{dust_threshold, MempoolConfig};
+    use rustoshi_primitives::TxOut;
+
+    // Default constant unchanged.
     assert_eq!(DUST_RELAY_TX_FEE, 3_000);
-    panic!("BUG-5: is_dust ignores min_fee_rate; -dustrelayfee not wired");
+
+    // The config now carries a configurable dust-relay feerate, defaulting
+    // to the Core default (mirrors m_opts.dust_relay_feerate).
+    assert_eq!(MempoolConfig::default().dust_relay_fee, DUST_RELAY_TX_FEE);
+
+    let p2pkh = || TxOut { value: 0, script_pubkey: make_p2pkh_spk() };
+
+    // At the default 3000 sat/kvB rate, P2PKH threshold is 546 sat.
+    assert_eq!(dust_threshold(&p2pkh(), DUST_RELAY_TX_FEE), 546);
+
+    // GetDustThreshold scales linearly with dustRelayFeeIn (policy.cpp:63):
+    // doubling the feerate doubles the threshold, halving halves it.
+    assert_eq!(dust_threshold(&p2pkh(), DUST_RELAY_TX_FEE * 2), 1_092);
+    assert_eq!(dust_threshold(&p2pkh(), DUST_RELAY_TX_FEE / 2), 273);
+
+    // Behavioural consequence: a 1000-sat P2PKH output is NOT dust at the
+    // default rate, but IS dust once the operator raises -dustrelayfee high
+    // enough that the threshold exceeds 1000 sat. This is exactly the
+    // decision the previous hardcoded path could never reach.
+    let value = 1_000u64;
+    assert!(value >= dust_threshold(&p2pkh(), DUST_RELAY_TX_FEE)); // not dust at default
+    assert!(value < dust_threshold(&p2pkh(), DUST_RELAY_TX_FEE * 6)); // dust at 6x
 }
 
 /// G23 — BUG-6 (P2): Named constants for IsStandardTx limits MISSING

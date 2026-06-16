@@ -707,6 +707,14 @@ pub struct MempoolConfig {
     /// Whether to relay/accept bare multisig outputs.
     /// Mirrors Bitcoin Core `-permitbaremultisig` (default: true).
     pub permit_bare_multisig: bool,
+    /// Dust relay fee rate in satoshis per 1000 virtual bytes (sat/kvB).
+    /// Outputs whose value is below `GetDustThreshold(output, dust_relay_fee)`
+    /// are rejected as dust. Mirrors Bitcoin Core's configurable
+    /// `m_opts.dust_relay_feerate` (`-dustrelayfee`,
+    /// kernel/mempool_options.h:45), which is a SEPARATE knob from the
+    /// min-relay floor (`min_fee_rate`). Default: `DUST_RELAY_TX_FEE` =
+    /// 3000 sat/kvB (policy.h:68).
+    pub dust_relay_fee: u64,
     /// W96: enable PolicyScriptChecks + ConsensusScriptChecks on the
     /// mempool admission path.  Default: true (matches production Bitcoin
     /// Core behavior).  Set to false for unit-test fixtures that build
@@ -737,6 +745,9 @@ impl Default for MempoolConfig {
             max_datacarrier_bytes: Some(100_000),
             // Mirrors Bitcoin Core DEFAULT_PERMIT_BAREMULTISIG = true.
             permit_bare_multisig: true,
+            // Mirrors Bitcoin Core m_opts.dust_relay_feerate default =
+            // DUST_RELAY_TX_FEE = 3000 sat/kvB (kernel/mempool_options.h:45).
+            dust_relay_fee: DUST_RELAY_TX_FEE,
             // W96: script verification defaults to FALSE for backward
             // compatibility with the pre-W96 test suite (which builds
             // synthetic OP_1 transactions without real signatures).
@@ -2521,7 +2532,10 @@ impl Mempool {
             }
 
             // Dust check (skip for OP_RETURN — handled above with early continue).
-            if is_dust(output, self.config.min_fee_rate) {
+            // Core uses the dust-relay feerate here (`dust_relay_feerate`), NOT
+            // the min-relay floor (`min_fee_rate`); see validation.cpp:808 →
+            // IsStandardTx(..., m_opts.dust_relay_feerate, ...).
+            if is_dust(output, self.config.dust_relay_fee) {
                 return Err(MempoolError::NonStandard(format!(
                     "dust at index {}",
                     i
@@ -5202,13 +5216,20 @@ pub fn dust_threshold(output: &TxOut, dust_relay_fee: u64) -> u64 {
 /// earlier per-shape table (148/91/68/108/58) both omitted the
 /// `GetSerializeSize(txout)` summand and used wrong spending sizes,
 /// under-rejecting dust by 6-267 sat vs Core. Delegates to `dust_threshold`.
-fn is_dust(output: &TxOut, _min_fee_rate: u64) -> bool {
+///
+/// `dust_relay_fee` is the node's configurable dust relay fee rate in
+/// sat/kvB (Core's `dustRelayFeeIn`, `policy.cpp:66`). The operator
+/// `-dustrelayfee` override is plumbed through `MempoolConfig::dust_relay_fee`;
+/// the default is `DUST_RELAY_TX_FEE` (3000 sat/kvB). This is a SEPARATE
+/// knob from the min-relay floor — Core's `IsDust(txout, dustRelayFeeIn)`
+/// never consults the min-relay feerate.
+fn is_dust(output: &TxOut, dust_relay_fee: u64) -> bool {
     // Empty script with zero value is special (sometimes used).
     if output.script_pubkey.is_empty() && output.value == 0 {
         return false;
     }
 
-    output.value < dust_threshold(output, DUST_RELAY_TX_FEE)
+    output.value < dust_threshold(output, dust_relay_fee)
 }
 
 /// Check if an output is ephemeral dust.
@@ -5862,20 +5883,23 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac,
             ],
         };
-        assert!(is_dust(&output, 1));
+        // Use the default dust relay feerate (DUST_RELAY_TX_FEE = 3000 sat/kvB);
+        // the second argument is now the live dust-relay feerate, not an
+        // ignored placeholder.
+        assert!(is_dust(&output, DUST_RELAY_TX_FEE));
 
         let non_dust_output = TxOut {
             value: 1000, // Above dust threshold
             script_pubkey: output.script_pubkey.clone(),
         };
-        assert!(!is_dust(&non_dust_output, 1));
+        assert!(!is_dust(&non_dust_output, DUST_RELAY_TX_FEE));
 
         // OP_RETURN is never dust
         let op_return = TxOut {
             value: 0,
             script_pubkey: vec![0x6a, 0x04, 0x00, 0x00, 0x00, 0x00],
         };
-        assert!(!is_dust(&op_return, 1));
+        assert!(!is_dust(&op_return, DUST_RELAY_TX_FEE));
 
         // P2A (Pay-to-Anchor) is never dust
         // Script: OP_1 PUSHBYTES_2 0x4e 0x73
@@ -5883,14 +5907,23 @@ mod tests {
             value: 0,
             script_pubkey: vec![0x51, 0x02, 0x4e, 0x73],
         };
-        assert!(!is_dust(&p2a, 1));
+        assert!(!is_dust(&p2a, DUST_RELAY_TX_FEE));
 
         // P2A with non-zero value is also not dust
         let p2a_with_value = TxOut {
             value: 1,
             script_pubkey: vec![0x51, 0x02, 0x4e, 0x73],
         };
-        assert!(!is_dust(&p2a_with_value, 1));
+        assert!(!is_dust(&p2a_with_value, DUST_RELAY_TX_FEE));
+
+        // Configurable dust-relay feerate (the BUG-5 fix): a higher
+        // -dustrelayfee raises the threshold, so an output that is NOT dust
+        // at the default rate becomes dust at a higher rate. Core
+        // GetDustThreshold scales linearly with dustRelayFeeIn
+        // (policy.cpp:63). non_dust_output (1000 sat, P2PKH) sits below the
+        // 6x-default threshold.
+        assert!(!is_dust(&non_dust_output, DUST_RELAY_TX_FEE));
+        assert!(is_dust(&non_dust_output, DUST_RELAY_TX_FEE * 6));
     }
 
     #[test]
