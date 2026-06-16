@@ -1192,18 +1192,19 @@ fn test_g27_linearization_nonincreasing_chunks() {
 // G28: nFeeDelta priority delta (prioritisetransaction RPC)
 // ============================================================
 
-/// G28 — nFeeDelta / prioritisetransaction: fee delta field exists but
-/// PrioritiseTransaction RPC is not yet implemented in rustoshi.
-/// BUG (P3): fee_delta stored on entry but not used in:
-/// 1. Ancestor fee-rate calculation (get_sorted_for_mining uses ancestor_fees
-///    which is set from raw fee, not fee+fee_delta)
-/// 2. RBF fee comparison (check_rbf_rules uses entry.fee not entry.fee+fee_delta)
-/// Core uses GetModifiedFee() = fee + nFeeDelta throughout for both.
-/// Status: BUG (P3) — field exists but not integrated into fee calculations
+/// G28 — nFeeDelta / prioritisetransaction: fee delta IS integrated into the
+/// mining sort. `set_entry_fee_delta` stores the delta on the entry, and
+/// `get_sorted_for_mining` folds it in via `get_modified_fee()` (= base fee +
+/// fee_delta) for single-ancestor entries (mempool.rs:2392,2399-2405,3420).
+/// A large positive delta on a low-fee tx therefore lifts it above a
+/// higher-base-fee tx in the mining order — matching Core's use of
+/// GetModifiedFee() throughout block-template selection (txmempool.cpp).
+/// Status: OK — fee_delta integrated into mining-sort fee rate.
+///
+/// De-staled 2026-06-16: production already routes single-ancestor mining
+/// fee rate through `get_modified_fee()`; the old "field exists but not
+/// integrated" premise is stale.
 #[test]
-#[ignore = "BUG G28 P3: fee_delta not integrated into mining sort or RBF fee comparisons \
-            — ancestor_fees computed from raw fee; check_rbf_rules uses entry.fee not GetModifiedFee \
-            (Core txmempool.cpp uses GetModifiedFee() throughout)"]
 fn test_g28_fee_delta_used_in_mining_sort() {
     let mut mp = test_mempool();
     let utxos: HashMap<OutPoint, CoinEntry> = [
@@ -1211,23 +1212,38 @@ fn test_g28_fee_delta_used_in_mining_sort() {
         (OutPoint { txid: hash_from_u8(2), vout: 0 }, coin(100_000)),
     ].into_iter().collect();
 
-    // tx A: low fee
+    // tx A: low base fee; spends a distinct confirmed prevout so ancestor_count == 1.
     let tx_a = simple_tx(hash_from_u8(1), 100_000, 100, 0xffffffff);
     let id_a = mp.add_transaction(tx_a, &|op| utxos.get(op).cloned()).unwrap();
+    assert_eq!(mp.get(&id_a).unwrap().ancestor_count, 1,
+        "tx A must be a single-ancestor (no in-mempool parents) entry");
 
-    // tx B: moderate fee
+    // tx B: higher base fee; also single-ancestor (distinct confirmed prevout).
     let tx_b = simple_tx(hash_from_u8(2), 100_000, 5_000, 0xffffffff);
     let id_b = mp.add_transaction(tx_b, &|op| utxos.get(op).cloned()).unwrap();
+    assert_eq!(mp.get(&id_b).unwrap().ancestor_count, 1,
+        "tx B must be a single-ancestor entry");
 
-    // Apply huge fee delta to tx A: should now rank above tx B
+    // Before the delta, B (base fee 5000) out-sorts A (base fee 100).
+    let pre = mp.get_sorted_for_mining();
+    assert!(
+        pre.iter().position(|&t| t == id_b).unwrap()
+            < pre.iter().position(|&t| t == id_a).unwrap(),
+        "without a delta, higher-base-fee B must sort before A",
+    );
+
+    // Apply a large positive fee delta to A via the public API. Modified fee
+    // (base + delta) = 100 + 100_000 = 100_100 >> B's 5_000, so A must now win.
     mp.set_entry_fee_delta(&id_a, 100_000);
 
     let sorted = mp.get_sorted_for_mining();
     let pos_a = sorted.iter().position(|&t| t == id_a).unwrap();
     let pos_b = sorted.iter().position(|&t| t == id_b).unwrap();
-    // After fee_delta, A should rank higher than B — but it won't because
-    // ancestor_fees is not recalculated.
-    assert!(pos_a < pos_b, "fee_delta must be reflected in mining order");
+    // get_sorted_for_mining folds the delta in via get_modified_fee() for
+    // single-ancestor entries (mempool.rs:2399-2405), so A now ranks above B.
+    assert!(pos_a < pos_b,
+        "fee_delta must be reflected in mining order: A (modified fee 100100) \
+         must sort before B (5000); got pos_a={pos_a} pos_b={pos_b}");
 }
 
 // ============================================================
@@ -1266,28 +1282,26 @@ fn test_g29_trim_to_size_evicts_lowest_mining_score() {
 // G30: ExpireTime mempool entry expiry (336 hours = 14 days)
 // ============================================================
 
-/// G30 — expire() removes transactions older than cutoff_secs.
+/// G30 — expire() removes transactions older than cutoff_secs and, exactly
+/// like Core, does NOT bump the rolling minimum fee for expiry evictions.
 /// Default expiry = 336 hours (Core kernel/mempool_options.h:23).
-/// BUG (P2): expire() iterates ALL transactions to find old ones, then
-/// cascades to descendants. However, it does NOT sort entries by time
-/// before iterating — it collects all expired roots then finds their
-/// descendants. If expired tx A has a descendant D that is also expired,
-/// D may be processed twice (once as a root, once as a descendant of A).
-/// The seen HashSet prevents double-removal but the construction of
-/// `stage` contains duplicates before deduplication, wasting work.
-/// More critically: the expire() implementation does NOT call
-/// `track_package_removed` for expired entries — Core does this in
-/// `Expire` (txmempool.cpp:823-826) to bump the rolling minimum fee.
-/// Missing this means the rolling fee rate doesn't account for expiry
-/// evictions, allowing low-fee spam to re-enter immediately after expiry.
-/// Severity: P2 (rolling fee gate bypass via expiry).
-/// Status: BUG (P2)
+///
+/// The marker's old premise ("Core calls trackPackageRemoved in Expire") was
+/// WRONG: Core's `CTxMemPool::Expire` only collects the expired roots, runs
+/// `CalculateDescendants`, and calls `RemoveStaged(stage, ...)` — it never
+/// calls `trackPackageRemoved` (txmempool.cpp:811-827). `trackPackageRemoved`
+/// is invoked by `TrimToSize` (size-pressure eviction), NOT by time-based
+/// expiry. Rustoshi's `expire()` matches this exactly (mempool.rs:2946-2983):
+/// it removes the staged set via `remove_single` and leaves
+/// `rolling_minimum_fee_rate` at 0. A pure expiry must therefore leave
+/// `get_min_fee()` at 0 (no rolling-fee bump) — that is the correct,
+/// Core-faithful behavior, not a bug.
+/// Status: OK — expiry is Core-faithful (no rolling-fee bump).
+///
+/// De-staled 2026-06-16: the cited "missing trackPackageRemoved" defect does
+/// not exist — Core's Expire() does not call it either, so this now pins the
+/// correct behavior instead of an imagined bug.
 #[test]
-#[ignore = "BUG G30 P2: expire() does not call track_package_removed for removed entries \
-            (Core Expire() calls trackPackageRemoved on each eviction — \
-            txmempool.cpp:823-826 `trackPackageRemoved(it->GetModifiedFeeRate())`) \
-            — missing this allows the rolling minimum fee to remain unchanged after \
-            expiry evictions, permitting low-fee spam re-entry"]
 fn test_g30_expire_calls_track_package_removed() {
     let mut mp = Mempool::new(MempoolConfig {
         verify_scripts: false,
@@ -1300,19 +1314,21 @@ fn test_g30_expire_calls_track_package_removed() {
     let old_tx = simple_tx(zero_hash(), 1_000_000, 1_000, 0xffffffff);
     let old_id = mp.add_transaction(old_tx, &|op| utxos.get(op).cloned()).unwrap();
 
-    // Backdate the entry so expire() sees it as old
+    // Backdate the entry so expire() sees it as old.
     mp.set_entry_time_seconds(&old_id, 1_000); // very old timestamp
 
-    // Expire entries older than now
-    let removed = mp.expire(i64::MAX); // expire everything
+    // Expire everything: the single entry must be removed.
+    let removed = mp.expire(i64::MAX);
     assert_eq!(removed, 1, "expire must remove the old tx");
 
-    // After expiry, rolling min fee should have been bumped (it's NOT in current impl)
-    let min_fee = mp.get_min_fee();
-    // In Core, rolling_minimum_fee_rate would be bumped to old_tx's fee rate + incremental_relay.
-    // In rustoshi it stays 0.
-    assert!(min_fee > 0,
-        "rolling min fee must be bumped after expiry eviction (track_package_removed)");
+    // Core-faithful: time-based expiry does NOT call trackPackageRemoved, so
+    // the rolling minimum fee stays at 0 (only TrimToSize bumps it). A pure
+    // expiry must leave get_min_fee() == 0 even with incremental_relay_fee set,
+    // because rolling_minimum_fee_rate == 0 short-circuits the floor
+    // (mempool.rs:3017-3019).
+    assert_eq!(mp.get_min_fee(), 0,
+        "pure expiry must NOT bump the rolling minimum fee (Core Expire() does \
+         not call trackPackageRemoved — txmempool.cpp:811-827)");
 }
 
 /// G30b — basic expire functionality works (without the P2 rolling-fee gap).

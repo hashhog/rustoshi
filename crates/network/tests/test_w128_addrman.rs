@@ -41,9 +41,12 @@ use rustoshi_network::eviction::{select_node_to_evict, EvictionCandidate, Evicti
 use rustoshi_network::netgroup::{NetGroup, NetGroupManager, NetworkType};
 use rustoshi_network::peer::PeerId;
 use rustoshi_network::peer_manager::{
-    ConnectionType, PeerManagerConfig, MAX_BLOCK_RELAY_ONLY_ANCHORS,
+    AddrManTable, AddressManager, ConnectionType, PeerManagerConfig,
+    ADDRMAN_BUCKET_SIZE, ADDRMAN_HORIZON_SECS, ADDRMAN_MAX_FAILURES, ADDRMAN_MIN_FAIL_SECS,
+    ADDRMAN_NEW_BUCKET_COUNT, ADDRMAN_RETRIES, ADDRMAN_TRIED_BUCKET_COUNT, FEELER_INTERVAL,
+    MAX_BLOCK_RELAY_ONLY_ANCHORS,
 };
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -81,45 +84,100 @@ fn g3_max_outbound_block_relay_default_is_2() {
 
 // ─── G4: Bucket-based AddrMan (vvNew/vvTried) ───────────────────────────────
 
-/// G4 BUG-1 (P0) — Entire bucket-based AddrMan absent; rustoshi uses a flat
-/// `HashMap<SocketAddr, AddrInfo>` instead of vvNew[1024][64] + vvTried[256][64].
-/// Single-source flooding fills the table with sybil entries with no per-bucket cap.
-/// Core: addrman_impl.h:26-33 ADDRMAN_NEW_BUCKET_COUNT=1024,
-/// ADDRMAN_TRIED_BUCKET_COUNT=256, ADDRMAN_BUCKET_SIZE=64.
+/// G4 PASS (BUG-1, De-staled 2026-06-16) — The bucket-based AddrMan IS present.
+/// `AddrManTable` (peer_manager.rs:554) owns the fixed vv_new[1024][64] +
+/// vv_tried[256][64] geometry, with the Core bucket-count constants exported as
+/// `pub const ADDRMAN_NEW_BUCKET_COUNT=1024`, `ADDRMAN_TRIED_BUCKET_COUNT=256`,
+/// `ADDRMAN_BUCKET_SIZE=64` (peer_manager.rs:452-457). `add()` places a heard
+/// address into the NEW table and the `new_count`/`total_count` counters track
+/// it. Core: addrman_impl.h:26-33.
 #[test]
-#[ignore = "BUG-1 P0: flat HashMap, no vvNew[1024][64] / vvTried[256][64] buckets — single-source flood fills table unbounded"]
 fn g4_addrman_buckets_present() {
-    // The constants ADDRMAN_NEW_BUCKET_COUNT, ADDRMAN_TRIED_BUCKET_COUNT,
-    // ADDRMAN_BUCKET_SIZE do not exist anywhere in the rustoshi network crate.
-    // AddressManager.known_addrs is a flat HashMap (peer_manager.rs:402).
-    assert!(false,
-        "BUG-1 P0: no AddrMan buckets — rustoshi uses flat HashMap<SocketAddr, AddrInfo>");
+    // Bucket geometry constants are exported and match Core.
+    assert_eq!(ADDRMAN_NEW_BUCKET_COUNT, 1024,
+        "BUG-1: ADDRMAN_NEW_BUCKET_COUNT must equal Core's 1<<10");
+    assert_eq!(ADDRMAN_TRIED_BUCKET_COUNT, 256,
+        "BUG-1: ADDRMAN_TRIED_BUCKET_COUNT must equal Core's 1<<8");
+    assert_eq!(ADDRMAN_BUCKET_SIZE, 64,
+        "BUG-1: ADDRMAN_BUCKET_SIZE must equal Core's 1<<6");
+
+    // A heard address lands in the NEW table (not a flat undifferentiated map).
+    let ng = NetGroupManager::with_key(0xDEADBEEF);
+    let mut table = AddrManTable::with_nkey([0x11; 32]);
+    let addr: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+    let source: IpAddr = "1.2.3.4".parse().unwrap();
+    assert!(table.add(addr, source, 1, 1_700_000_000, &ng),
+        "BUG-1: add() of a routable addr must insert into a NEW bucket");
+    assert_eq!(table.total_count(), 1, "BUG-1: table holds exactly one addr");
+    assert_eq!(table.new_count(), 1, "BUG-1: the addr lives in the NEW table");
+    assert_eq!(table.tried_count(), 0, "BUG-1: add() must not touch TRIED");
 }
 
 // ─── G5: GetTriedBucket / GetNewBucket / GetBucketPosition ──────────────────
 
-/// G5 BUG-2 (P0) — Cryptographic deterministic-key bucket-selection hashing
-/// absent (addrman.cpp:28-47 GetTriedBucket/GetNewBucket/GetBucketPosition
-/// use HashWriter+nKey). Without these the new/tried bucketing has no
-/// unpredictable placement.
+/// G5 PASS (BUG-2, De-staled 2026-06-16) — Deterministic nkey-salted
+/// bucket-selection hashing IS present. `AddrManTable::get_new_bucket` /
+/// `get_tried_bucket` / `get_bucket_position` (peer_manager.rs:632-663) derive
+/// placement from `cheap_hash(nkey || group || …)`. Public `new_slot_of`
+/// (peer_manager.rs:1011) recomputes the (bucket, pos) an addr occupies, which
+/// exercises that hashing. We assert placement is in-range (bucket<1024,
+/// pos<64) and deterministic across re-query and across an identically-keyed
+/// table. Core: addrman.cpp:28-47 GetNewBucket/GetTriedBucket/GetBucketPosition.
 #[test]
-#[ignore = "BUG-2 P0: no GetTriedBucket / GetNewBucket / GetBucketPosition — bucket selection cryptography absent"]
 fn g5_bucket_selection_hashing_present() {
-    assert!(false,
-        "BUG-2 P0: AddrInfo bucket-selection hash functions (HashWriter+nKey) absent");
+    let ng = NetGroupManager::with_key(0xDEAD);
+    let mut table = AddrManTable::with_nkey([0x11; 32]);
+    let addr: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+    let source: IpAddr = "1.2.3.4".parse().unwrap();
+    assert!(table.add(addr, source, 1, 1_700_000_000, &ng),
+        "BUG-2: routable addr must be admitted");
+
+    let slot = table.new_slot_of(&addr, &ng)
+        .expect("BUG-2: added addr must occupy a computed NEW slot");
+    let (bucket, pos) = slot;
+    assert!(bucket < ADDRMAN_NEW_BUCKET_COUNT,
+        "BUG-2: bucket {bucket} must be < {ADDRMAN_NEW_BUCKET_COUNT}");
+    assert!(pos < ADDRMAN_BUCKET_SIZE,
+        "BUG-2: pos {pos} must be < {ADDRMAN_BUCKET_SIZE}");
+
+    // Deterministic on re-query of the same table.
+    assert_eq!(table.new_slot_of(&addr, &ng), Some(slot),
+        "BUG-2: bucket selection must be deterministic across re-query");
+
+    // Deterministic across a second table with the SAME nkey + same netgroup.
+    let mut table2 = AddrManTable::with_nkey([0x11; 32]);
+    assert!(table2.add(addr, source, 1, 1_700_000_000, &ng));
+    assert_eq!(table2.new_slot_of(&addr, &ng), Some(slot),
+        "BUG-2: same nkey + same addr must hash to the same (bucket,pos)");
 }
 
 // ─── G6: MakeTried new→tried promotion ──────────────────────────────────────
 
-/// G6 BUG-3 (P0) — `MakeTried()` (Core addrman.cpp:471) promotes new-table
-/// entries to tried; rustoshi `mark_outbound_success` only stamps
-/// last_success on a flat-map entry. Without the new→tried split, every
-/// successful peer is "equally good" — no quality stratification.
+/// G6 PASS (BUG-3, De-staled 2026-06-16) — `MakeTried`/Good new→tried promotion
+/// IS present. `AddrManTable::good` (peer_manager.rs:823) promotes a NEW entry
+/// into the TRIED table, and `AddressManager::mark_outbound_success`
+/// (peer_manager.rs:1654) binds the netgroup (flushing the manual address into
+/// the bucketed addrman) and then calls `addrman.good`, mirroring Core's
+/// AddrMan::Good on a successful outbound connection. We drive the full
+/// `AddressManager` path and assert the addr ends up in TRIED.
+/// Core: addrman.cpp:471 MakeTried.
 #[test]
-#[ignore = "BUG-3 P0: no MakeTried / new→tried promotion — mark_outbound_success only updates last_success on flat map"]
 fn g6_make_tried_promotion_present() {
-    assert!(false,
-        "BUG-3 P0: no new→tried promotion (Core addrman.cpp:471 MakeTried)");
+    let ng = NetGroupManager::with_key(1);
+    let mut mgr = AddressManager::new();
+    let addr: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+    mgr.add_manual_address(addr);
+
+    // mark_outbound_success binds the netgroup (flushing the pending manual add
+    // into the NEW table) and then promotes NEW -> TRIED via addrman.good.
+    mgr.mark_outbound_success(&addr, &ng);
+
+    assert!(mgr.addrman().is_in_tried(&addr),
+        "BUG-3: successful outbound peer must be promoted to TRIED");
+    assert_eq!(mgr.addrman().tried_count(), 1,
+        "BUG-3: exactly one addr should live in TRIED after promotion");
+    assert_eq!(mgr.addrman().new_count(), 0,
+        "BUG-3: the promoted addr must leave the NEW table");
 }
 
 // ─── G7: ConnectionType::Manual exempt from ban ─────────────────────────────
@@ -178,40 +236,41 @@ fn g10_select_weighted_rng_present() {
 
 // ─── G11: IsTerrible eviction ───────────────────────────────────────────────
 
-/// G11 BUG-6 (P0) — `IsTerrible()` predicate (Core addrman.cpp:49) absent.
-/// Stale entries (>30d, >3 failed retries, >10 failures in 7d, future
-/// timestamps) live forever in the flat HashMap.
+/// G11 PASS (BUG-6, De-staled 2026-06-16) — The `IsTerrible` eviction predicate
+/// IS present: `AddrManEntry::is_terrible` (peer_manager.rs:520-545) ports the
+/// five Core conditions, gated on the exported tunables. We pin those public
+/// constants to Core's addrman.h values (the predicate's thresholds): horizon
+/// 30 d, retries 3, max-failures 10, min-fail 7 d. Core: addrman.cpp:49-72.
 #[test]
-#[ignore = "BUG-6 P0: no IsTerrible() — ADDRMAN_HORIZON=30d / RETRIES=3 / MAX_FAILURES=10 / future-timestamp eviction absent"]
 fn g11_is_terrible_eviction_present() {
-    assert!(false,
-        "BUG-6 P0: IsTerrible() addrman-eviction predicate not implemented");
+    assert_eq!(ADDRMAN_HORIZON_SECS, 30 * 24 * 60 * 60,
+        "BUG-6: ADDRMAN_HORIZON must be 30 days (Core addrman.h)");
+    assert_eq!(ADDRMAN_RETRIES, 3,
+        "BUG-6: ADDRMAN_RETRIES must be 3 (Core addrman.h)");
+    assert_eq!(ADDRMAN_MAX_FAILURES, 10,
+        "BUG-6: ADDRMAN_MAX_FAILURES must be 10 (Core addrman.h)");
+    assert_eq!(ADDRMAN_MIN_FAIL_SECS, 7 * 24 * 60 * 60,
+        "BUG-6: ADDRMAN_MIN_FAIL must be 7 days (Core addrman.h)");
 }
 
 // ─── G12: ConnectionType::Feeler + FEELER_INTERVAL ──────────────────────────
 
-/// G12 BUG-7 (P1) — `ConnectionType::Feeler` and FEELER_INTERVAL=2min
-/// absent. rustoshi's enum has exactly 4 variants (FullRelay/BlockRelayOnly/
-/// Inbound/Manual). Without a feeler, ResolveCollisions can't issue
-/// test-before-evict probes.
+/// G12 PASS (BUG-7, De-staled 2026-06-16) — `ConnectionType::Feeler`
+/// (peer_manager.rs:2254) and `FEELER_INTERVAL=2min` (peer_manager.rs:338) ARE
+/// present. The enum now carries five variants including Feeler, and the
+/// connection-open loop dials one short-lived feeler every `FEELER_INTERVAL`,
+/// enabling NEW->TRIED test-before-evict probes. Core: net.h:61
+/// FEELER_INTERVAL = 2min, ConnectionType::FEELER.
 #[test]
-#[ignore = "BUG-7 P1: no ConnectionType::Feeler / FEELER_INTERVAL=2min — test-before-evict probes never issued"]
 fn g12_connection_type_feeler_present() {
-    // ConnectionType has only FullRelay, BlockRelayOnly, Inbound, Manual.
-    // Exhaustive match would compile-fail if Feeler existed. We assert the
-    // absence by checking that every legal variant is one of the four known.
-    let variants = [
-        ConnectionType::FullRelay,
-        ConnectionType::BlockRelayOnly,
-        ConnectionType::Inbound,
-        ConnectionType::Manual,
-    ];
-    // The audit BUG is that Feeler is NOT in this list.
-    assert_eq!(variants.len(), 4,
-        "BUG-7 P1: ConnectionType has only 4 variants; Feeler is missing");
-    // Now force a fail to document the BUG.
-    assert!(false,
-        "BUG-7 P1: ConnectionType::Feeler variant + FEELER_INTERVAL=2min constant absent");
+    // The Feeler variant exists and is distinct from the other variants.
+    let feeler = ConnectionType::Feeler;
+    assert_eq!(feeler, ConnectionType::Feeler);
+    assert_ne!(feeler, ConnectionType::FullRelay,
+        "BUG-7: Feeler must be a distinct ConnectionType variant");
+    // The feeler cadence matches Core's 2-minute interval.
+    assert_eq!(FEELER_INTERVAL, Duration::from_secs(120),
+        "BUG-7: FEELER_INTERVAL must equal Core's net.h:61 value (2 min)");
 }
 
 // ─── G13: ConnectionType::AddrFetch ─────────────────────────────────────────
@@ -450,18 +509,42 @@ fn g28_ipv4_slash_16_grouping_correct() {
 
 // ─── G29: ASN used as bucketing key in addrman add path ─────────────────────
 
-/// G29 BUG-21 (P2) — `NetGroupManager::get_group` returns ASN-derived
-/// groups when asmap is loaded (netgroup.rs:363-376), BUT
-/// `AddressManager::add_peer_addresses` (peer_manager.rs:450) never calls
-/// `get_group` on add. The asmap-derived group only enters at
-/// `next_addr_to_try` time as a connection-time filter
-/// (peer_manager.rs:524), not as a bucketing key. Without bucketing
-/// (BUG-1), asmap can't actually constrain table fill.
+/// G29 PASS (BUG-21, De-staled 2026-06-16) — The asmap-derived netgroup IS used
+/// as the bucketing key on add. `AddrManTable::add` buckets via
+/// `Self::groups(info, ng)` (peer_manager.rs:725-728,782-786), which calls
+/// `NetGroupManager::get_group`; when an asmap is loaded that returns the
+/// ASN-group (netgroup.rs:363-376). We load a minimal asmap that maps every IP
+/// to ASN=1 (the RETURN-ASN=1 trie `[0,0,0]`, matching asmap.rs's
+/// `minimal_asmap_asn1`), add two addresses in DIFFERENT /16 prefixes, and
+/// assert they land in the SAME new bucket — proving the ASN, not the /16
+/// prefix, is the bucketing key. Core: addrman.cpp GetNewBucket(... GetGroup).
 #[test]
-#[ignore = "BUG-21 P2: AddressManager.add_peer_addresses does not use asmap-derived NetGroup as bucketing key"]
 fn g29_asn_used_as_bucketing_key_on_add() {
-    assert!(false,
-        "BUG-21 P2: asmap-derived netgroup not used as bucketing key in addrman add path");
+    // Minimal valid asmap: RETURN ASN=1 for ANY IP (asmap.rs minimal_asmap_asn1).
+    let asmap = vec![0x00u8, 0x00, 0x00];
+    let ng = NetGroupManager::with_asmap(0xDEAD, asmap);
+    assert!(ng.using_asmap(), "G29: asmap must be loaded for ASN bucketing");
+
+    // Two addrs in DIFFERENT /16 IPv4 prefixes — under /16 bucketing these would
+    // (almost surely) differ; under ASN bucketing they share ASN=1.
+    let addr1: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+    let addr2: SocketAddr = "200.1.2.3:8333".parse().unwrap();
+    // Sanity: same ASN, distinct /16 groups would-be.
+    assert_eq!(ng.get_group(&addr1.ip()), ng.get_group(&addr2.ip()),
+        "BUG-21: both addrs must share the asmap-derived (ASN) group");
+
+    let src: IpAddr = "1.2.3.4".parse().unwrap();
+    let mut table = AddrManTable::with_nkey([0x11; 32]);
+    assert!(table.add(addr1, src, 1, 1_700_000_000, &ng),
+        "BUG-21: addr1 must be admitted to NEW");
+    assert!(table.add(addr2, src, 1, 1_700_000_000, &ng),
+        "BUG-21: addr2 must be admitted to NEW");
+
+    let (b1, _) = table.new_slot_of(&addr1, &ng).expect("BUG-21: addr1 in NEW");
+    let (b2, _) = table.new_slot_of(&addr2, &ng).expect("BUG-21: addr2 in NEW");
+    assert_eq!(b1, b2,
+        "BUG-21: same-ASN addrs in different /16s must share one NEW bucket — \
+         proving the asmap-derived netgroup is the bucketing key on add");
 }
 
 // ─── G30: peers.dat persistence + uint256 bucket key + anchors is_banned ────
