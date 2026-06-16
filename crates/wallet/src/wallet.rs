@@ -695,7 +695,7 @@ impl Wallet {
             fee_rate,
             change_cost: change_cost_weight as u64,
             change_spend_cost: input_vsize as u64, // future spend of change at long_term_fee_rate
-            long_term_fee_rate: 10.0 / 1000.0, // 10 sat/kvB = 0.01 sat/vbyte (Core default)
+            long_term_fee_rate: 10.0, // Core DEFAULT_CONSOLIDATE_FEERATE = 10000 sat/kvB = 10 sat/vB (wallet.h:112); was 1000x too small at 10.0/1000.0
             min_change: DUST_LIMIT,
             input_weight: input_vsize * 4,
         };
