@@ -2351,12 +2351,37 @@ fn decode_psbt_input<R: Read>(reader: &mut R) -> Result<PsbtInput, PsbtError> {
                 let mut leaf_hash = [0u8; 32];
                 xonly.copy_from_slice(&key[1..33]);
                 leaf_hash.copy_from_slice(&key[33..65]);
+                // BIP-174 / Core psbt.h:708-709: a duplicate Taproot script
+                // signature key (<xonly pubkey><leaf hash>) must be rejected,
+                // not silently overwritten. Core throws "Duplicate Key, input
+                // Taproot script signature already provided". The map is keyed
+                // by (xonly, leaf_hash) parsed from the record key, mirroring
+                // Core's m_tap_script_sigs.count({xonly, hash}).
+                if input.tap_script_sigs.contains_key(&(xonly, leaf_hash)) {
+                    return Err(PsbtError::DuplicateKey(
+                        "tap script signature".to_string(),
+                    ));
+                }
                 if value.len() < 64 || value.len() > 65 {
                     return Err(PsbtError::InvalidSignature);
                 }
                 input.tap_script_sigs.insert((xonly, leaf_hash), value);
             }
             PSBT_IN_TAP_LEAF_SCRIPT => {
+                // BIP-174 / Core psbt.h:730-731: a duplicate Taproot leaf
+                // script key must be rejected, not silently merged. Core's
+                // record key for this field is <type><control block>, and Core
+                // guards it with key_lookup.emplace(key) (the full key bytes),
+                // throwing "Duplicate Key, input Taproot leaf script already
+                // provided". The control block is the unique part of the key, so
+                // tracking the full key bytes in key_lookup is the faithful
+                // equivalent. The (script, leaf_ver)->{control_block} BTreeSet
+                // would otherwise silently dedup a repeated control block.
+                if !key_lookup.insert(key.clone()) {
+                    return Err(PsbtError::DuplicateKey(
+                        "tap leaf script".to_string(),
+                    ));
+                }
                 if key.len() < 34 || !(key.len() - 2).is_multiple_of(32) {
                     return Err(PsbtError::InvalidKeySize {
                         key_type,
@@ -2389,6 +2414,17 @@ fn decode_psbt_input<R: Read>(reader: &mut R) -> Result<PsbtInput, PsbtError> {
                 }
                 let mut xonly = [0u8; 32];
                 xonly.copy_from_slice(&key[1..33]);
+                // BIP-174 / Core psbt.h:750-751: a duplicate Taproot BIP32
+                // derivation key (<xonly pubkey>) must be rejected, not
+                // silently overwritten. Core throws "Duplicate Key, input
+                // Taproot BIP32 keypath already provided". The map is keyed by
+                // the xonly pubkey parsed from the record key, mirroring Core's
+                // m_tap_bip32_paths.count(xonly).
+                if input.tap_bip32_derivation.contains_key(&xonly) {
+                    return Err(PsbtError::DuplicateKey(
+                        "tap bip32 derivation".to_string(),
+                    ));
+                }
 
                 let mut value_cursor = Cursor::new(&value);
                 let num_hashes = read_compact_size(&mut value_cursor)?;
