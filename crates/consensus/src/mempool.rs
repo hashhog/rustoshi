@@ -4807,20 +4807,60 @@ fn try_classify_bare_multisig(script: &[u8]) -> Option<StandardScriptType> {
     }
 
     // Walk the pubkey pushes between OP_m and OP_n.
-    // Each push must be exactly 33 or 65 bytes (compressed / uncompressed public key).
+    //
+    // Core's `MatchMultisig` (script/solver.cpp:85-105) reads each key with
+    // `script.GetOp(it, opcode, data)` and accepts it iff `CPubKey::ValidSize(data)`
+    // — i.e. the *decoded* push payload is 33 or 65 bytes (pubkey.h:77). `GetOp`
+    // (script/script.cpp `GetScriptOp`) decodes direct 1-byte pushes AND the
+    // PUSHDATA1/2/4 forms, so a pubkey pushed as `OP_PUSHDATA1 0x21 <33B>` is just
+    // as standard as the direct `0x21 <33B>` form. Matching only the direct-push
+    // opcodes (the old behaviour) over-rejected PUSHDATA-prefixed bare multisig that
+    // Core relays as standard. The push opcode itself is NOT required to be minimal
+    // here — Core's `MatchMultisig` does not call `CheckMinimalPush` on the keys.
     let mut pos = 1usize;
     let mut found_keys = 0usize;
     while pos < n - 2 {
-        let push_len_byte = script[pos] as usize;
-        // Only direct 1-byte-length pushes (0x21=33, 0x41=65) are valid pubkey pushes.
-        let pk_len = if push_len_byte == 0x21 {
-            33
-        } else if push_len_byte == 0x41 {
-            65
+        // Decode one push (GetScriptOp parity) and capture its payload length.
+        let opcode = script[pos];
+        let (payload_len, header_len) = if (0x01..=0x4b).contains(&opcode) {
+            // Direct push of 1..75 bytes.
+            (opcode as usize, 1usize)
+        } else if opcode == 0x4c {
+            // OP_PUSHDATA1: 1-byte length follows.
+            if pos + 2 > n - 2 {
+                return None;
+            }
+            (script[pos + 1] as usize, 2usize)
+        } else if opcode == 0x4d {
+            // OP_PUSHDATA2: 2-byte LE length follows.
+            if pos + 3 > n - 2 {
+                return None;
+            }
+            (u16::from_le_bytes([script[pos + 1], script[pos + 2]]) as usize, 3usize)
+        } else if opcode == 0x4e {
+            // OP_PUSHDATA4: 4-byte LE length follows.
+            if pos + 5 > n - 2 {
+                return None;
+            }
+            (
+                u32::from_le_bytes([
+                    script[pos + 1],
+                    script[pos + 2],
+                    script[pos + 3],
+                    script[pos + 4],
+                ]) as usize,
+                5usize,
+            )
         } else {
+            // Not a data push → not a pubkey → not a (bare) multisig.
             return None;
         };
-        let end = pos + 1 + pk_len;
+        // CPubKey::ValidSize: only 33-byte (compressed) or 65-byte (uncompressed)
+        // payloads are valid public keys.
+        if payload_len != 33 && payload_len != 65 {
+            return None;
+        }
+        let end = pos + header_len + payload_len;
         if end > n - 2 {
             return None;
         }
