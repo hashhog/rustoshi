@@ -15,9 +15,11 @@
 //! Reference: `audit/w131_descriptors_miniscript.md`.
 
 use rustoshi_crypto::address::Network;
+use rustoshi_crypto::base58check_encode;
 use rustoshi_wallet::descriptor::{
-    add_checksum, decode_xprv, decode_xpub, descriptor_checksum, encode_xprv, encode_xpub,
-    parse_descriptor, verify_checksum, DeriveType, Descriptor, DescriptorInfo, OutputType,
+    add_checksum, decode_xprv, decode_xpub, descriptor_checksum, descriptor_wif_secrets,
+    encode_xprv, encode_xpub, parse_descriptor, verify_checksum, DeriveType, Descriptor,
+    DescriptorInfo, OutputType,
 };
 use rustoshi_wallet::miniscript::{
     BasicType, Fragment, Miniscript, ScriptContext, StrKey, TypeProperties,
@@ -529,19 +531,65 @@ fn bug_11_tr_tree_display_emits_brackets() {
     assert!(false, "BUG-11: tr() Display must use {{...}} tree syntax");
 }
 
-/// **BUG-12 — has_private_keys always false for WIF-loaded Const.**
+/// **BUG-12 — has_private_keys for WIF-loaded key expressions.**
 ///
-/// `parse_hex_pubkey` loses the WIF→Const distinction at parse time.
-/// `descriptor_has_private_keys` returns false for any Const, even
-/// when the original input was a WIF private key.
+/// De-staled 2026-06-16. The original marker claimed `parse_hex_pubkey`
+/// flattened a WIF private key into a public `Const`, so
+/// `descriptor_has_private_keys` could never see it and
+/// `has_private_keys` was always `false` for `pk(WIF)`.
+///
+/// Production no longer does this. WIF key expressions now decode into a
+/// dedicated `KeyProvider::Wif` variant (descriptor.rs) carrying the
+/// `secret_key`; `parse_wif_key` base58check-decodes the WIF payload
+/// (version 0x80 mainnet / 0xef test, optional trailing 0x01 compressed
+/// flag) and `key_provider_has_private` returns `true` for it — matching
+/// Core's `importdescriptors` privkey gate (script/descriptor.cpp
+/// `ParsePubkeyInner` → `DecodeSecret`). A WIF is therefore no longer
+/// flattened into `Const`, so the cited bug cannot occur.
+///
+/// This test builds a real mainnet-compressed WIF, parses `pk(WIF)`, and
+/// asserts both `DescriptorInfo::has_private_keys == true` and that
+/// `descriptor_wif_secrets` recovers exactly one secret. A `pk(<hex
+/// pubkey>)` control must report `has_private_keys == false` and yield no
+/// WIF secrets — exercising the real `Wif`/`Const` discrimination rather
+/// than a tautology.
 #[test]
-#[ignore = "BUG-12: has_private_keys=false for pk(WIF)"]
 fn bug_12_has_private_keys_for_wif() {
-    // Note: rustoshi's parse_hex_pubkey does not currently accept WIF —
-    // this is itself a gap, but documented as BUG-12 because the
-    // comment-as-confession in descriptor.rs:908-917 documents the
-    // deliberate divergence.
-    assert!(false, "BUG-12: WIF→Const mapping not preserved");
+    // Build a mainnet, compressed WIF for a known 32-byte secret:
+    // base58check(0x80 ++ secret ++ 0x01).
+    let secret =
+        hex::decode("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
+    let mut wif_payload = vec![0x80u8];
+    wif_payload.extend_from_slice(&secret);
+    wif_payload.push(0x01); // compressed-pubkey flag
+    let wif = base58check_encode(&wif_payload);
+
+    // pk(WIF) — descriptor embeds a private key.
+    let desc_wif = parse_descriptor(&format!("pk({wif})")).unwrap();
+    let info_wif = DescriptorInfo::from_descriptor(&desc_wif);
+    assert!(
+        info_wif.has_private_keys,
+        "pk(WIF) must report has_private_keys=true"
+    );
+    let secrets = descriptor_wif_secrets(&desc_wif);
+    assert_eq!(
+        secrets.len(),
+        1,
+        "descriptor_wif_secrets must recover exactly one WIF secret"
+    );
+
+    // Control: pk(<33-byte hex pubkey>) — no private material present.
+    let pubkey_hex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    let desc_pub = parse_descriptor(&format!("pk({pubkey_hex})")).unwrap();
+    let info_pub = DescriptorInfo::from_descriptor(&desc_pub);
+    assert!(
+        !info_pub.has_private_keys,
+        "pk(<hex pubkey>) must report has_private_keys=false"
+    );
+    assert!(
+        descriptor_wif_secrets(&desc_pub).is_empty(),
+        "pk(<hex pubkey>) must yield no WIF secrets"
+    );
 }
 
 /// **BUG-13 — Unicode confusable not rejected.**
