@@ -109,6 +109,13 @@ pub mod rpc_error {
     /// (`bitcoin-core/src/rpc/protocol.h::RPC_CLIENT_NODE_NOT_ADDED = -24`;
     /// raised at `src/rpc/net.cpp:368`).
     pub const RPC_CLIENT_NODE_NOT_ADDED: i32 = -24;
+    /// `disconnectnode` was asked to disconnect a peer (by address or nodeid)
+    /// that is not in the connected-nodes table
+    /// (`bitcoin-core/src/rpc/protocol.h::RPC_CLIENT_NODE_NOT_CONNECTED = -29`;
+    /// raised at `src/rpc/net.cpp:478` when `CConnman::DisconnectNode` returns
+    /// false). Distinct from the generic `RPC_INVALID_PARAMS` rustoshi
+    /// previously collapsed the unknown-peer case into.
+    pub const RPC_CLIENT_NODE_NOT_CONNECTED: i32 = -29;
     /// `setban` was given a subnet/IP that failed to parse, or `setban remove`
     /// for an address/subnet that was never manually banned
     /// (`bitcoin-core/src/rpc/protocol.h::RPC_CLIENT_INVALID_IP_OR_SUBNET = -30`;
@@ -9542,15 +9549,57 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
+        // Core treats an empty address string as "no address" so that
+        // `disconnectnode "" <id>` selects the by-id path (net.cpp:464-475).
+        let address = address.filter(|a| !a.is_empty());
+
         let peer_state = self.peer_state.read().await;
-        if peer_state.peer_manager.is_some() {
-            // Node disconnection requested; the peer manager will handle it
-            // on the next connection maintenance cycle.
+        let pm = match peer_state.peer_manager.as_ref() {
+            Some(pm) => pm,
+            None => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_CLIENT_P2P_DISABLED,
+                    "P2P networking disabled",
+                ));
+            }
+        };
+
+        // Mirror Core's `disconnectnode` argument routing
+        // (bitcoin-core/src/rpc/net.cpp:467-479):
+        //   * address-only       → DisconnectNode(strNode)
+        //   * nodeid-only (or "") → DisconnectNode(nodeid)
+        //   * both supplied       → RPC_INVALID_PARAMS
+        //   * !success            → RPC_CLIENT_NODE_NOT_CONNECTED (-29)
+        let success = match (&address, nodeid) {
+            (Some(addr), None) => {
+                // Core matches against the connected node's address name
+                // (m_addr_name). We match on the parsed socket address; an
+                // un-parseable string can never match a connected peer, so it
+                // correctly falls through to the not-connected error.
+                match addr.parse::<std::net::SocketAddr>() {
+                    Ok(socket_addr) => pm.try_disconnect_by_address(&socket_addr),
+                    Err(_) => false,
+                }
+            }
+            (None, Some(id)) => pm.try_disconnect_by_id(id as u64),
+            (Some(_), Some(_)) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    "Only one of address and nodeid should be provided.",
+                ));
+            }
+            // The (None, None) case was handled above.
+            (None, None) => unreachable!(),
+        };
+
+        if success {
             Ok(())
         } else {
+            // Core net.cpp:478 — DisconnectNode returned false (no connected
+            // peer matched the address/id).
             Err(Self::rpc_error(
-                rpc_error::RPC_CLIENT_P2P_DISABLED,
-                "P2P networking disabled",
+                rpc_error::RPC_CLIENT_NODE_NOT_CONNECTED,
+                "Node not found in connected nodes",
             ))
         }
     }

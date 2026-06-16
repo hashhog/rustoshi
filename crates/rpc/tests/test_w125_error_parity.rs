@@ -448,13 +448,113 @@ async fn g18_addnode_remove_unknown_emits_node_not_added() {
 }
 
 /// G19 — `RPC_CLIENT_NODE_NOT_CONNECTED` (-29). Core net.cpp:478 (disconnectnode).
-/// NOT DEFINED in rustoshi.
-/// Status: BUG-13 (P1).
-#[test]
-#[ignore]
-fn g19_rpc_client_node_not_connected_absence() {
-    panic!("BUG-13: rustoshi has no RPC_CLIENT_NODE_NOT_CONNECTED (-29); \
-            disconnectnode unknown-peer collapses to RPC_INVALID_PARAMS.");
+/// Status: BUG-13 (P1) — FIXED.
+///
+/// De-staled 2026-06-16: previously an `#[ignore]` `panic!` documenting the
+/// absence. Now a REAL behavioral test. The numeric constant exists and equals
+/// Core's value (`protocol.h:62`). `disconnectnode` for a peer that is not in
+/// the connected-nodes table — whether selected by address or by nodeid — must
+/// return Core's -29 with the exact message "Node not found in connected nodes"
+/// (`bitcoin-core/src/rpc/net.cpp:478`), NOT the generic `RPC_INVALID_PARAMS`
+/// (-32602) it previously collapsed into. Supplying BOTH address and nodeid must
+/// still yield `RPC_INVALID_PARAMS` per Core's net.cpp:473-475 routing, and
+/// supplying NEITHER must error too.
+///
+/// The `server_with_peer_manager()` helper builds a live-but-unstarted
+/// `PeerManager` with zero connected peers, so every disconnect attempt
+/// correctly matches nothing and exercises the not-connected path.
+#[tokio::test]
+async fn g19_disconnectnode_unknown_peer_emits_node_not_connected() {
+    use rustoshi_rpc::RustoshiRpcServer;
+
+    // The numeric constant exists and equals Core's value (protocol.h:62).
+    assert_eq!(
+        rpc_error::RPC_CLIENT_NODE_NOT_CONNECTED, -29,
+        "RPC_CLIENT_NODE_NOT_CONNECTED must be -29 (Core protocol.h:62)"
+    );
+    // Must not collide with the JSON-RPC transport code it used to collapse into.
+    assert_ne!(
+        rpc_error::RPC_CLIENT_NODE_NOT_CONNECTED,
+        rpc_error::RPC_INVALID_PARAMS,
+        "RPC_CLIENT_NODE_NOT_CONNECTED (-29) must not collide with RPC_INVALID_PARAMS (-32602)"
+    );
+
+    let server = server_with_peer_manager();
+
+    // disconnect-by-address for a peer that is not connected → -29.
+    let err = RustoshiRpcServer::disconnect_node(
+        &server,
+        Some("192.0.2.99:18333".to_string()),
+        None,
+    )
+    .await
+    .expect_err("disconnectnode for an unknown address must error");
+    assert_eq!(
+        err.code(),
+        rpc_error::RPC_CLIENT_NODE_NOT_CONNECTED,
+        "unknown-address disconnectnode must emit -29, got {}: {}",
+        err.code(),
+        err.message(),
+    );
+    assert_eq!(
+        err.message(), "Node not found in connected nodes",
+        "message must match Core net.cpp:478 exactly",
+    );
+
+    // disconnect-by-nodeid for an id that is not connected → -29.
+    let err = RustoshiRpcServer::disconnect_node(&server, None, Some(424242))
+        .await
+        .expect_err("disconnectnode for an unknown nodeid must error");
+    assert_eq!(
+        err.code(),
+        rpc_error::RPC_CLIENT_NODE_NOT_CONNECTED,
+        "unknown-nodeid disconnectnode must emit -29, got {}: {}",
+        err.code(),
+        err.message(),
+    );
+    assert_eq!(err.message(), "Node not found in connected nodes");
+
+    // disconnect-by-nodeid with an EMPTY address string still routes to the
+    // by-id path (Core net.cpp:470) → -29 for an unknown id (not a both-args
+    // INVALID_PARAMS).
+    let err = RustoshiRpcServer::disconnect_node(
+        &server,
+        Some(String::new()),
+        Some(424242),
+    )
+    .await
+    .expect_err("disconnectnode \"\" <unknown-id> must error");
+    assert_eq!(
+        err.code(),
+        rpc_error::RPC_CLIENT_NODE_NOT_CONNECTED,
+        "empty-address + unknown-nodeid must emit -29, got {}: {}",
+        err.code(),
+        err.message(),
+    );
+
+    // Supplying BOTH a non-empty address AND a nodeid is the Core
+    // RPC_INVALID_PARAMS routing case (net.cpp:473-475), NOT -29.
+    let err = RustoshiRpcServer::disconnect_node(
+        &server,
+        Some("192.0.2.99:18333".to_string()),
+        Some(7),
+    )
+    .await
+    .expect_err("disconnectnode with both address and nodeid must error");
+    assert_eq!(
+        err.code(),
+        rpc_error::RPC_INVALID_PARAMS,
+        "both address+nodeid must emit RPC_INVALID_PARAMS, got {}: {}",
+        err.code(),
+        err.message(),
+    );
+    assert_eq!(err.message(), "Only one of address and nodeid should be provided.");
+
+    // Supplying NEITHER must also error (Core requires one of the two).
+    let err = RustoshiRpcServer::disconnect_node(&server, None, None)
+        .await
+        .expect_err("disconnectnode with neither argument must error");
+    assert_eq!(err.code(), rpc_error::RPC_INVALID_PARAMS);
 }
 
 /// G20 — `RPC_CLIENT_INVALID_IP_OR_SUBNET` (-30). Core net.cpp:780.

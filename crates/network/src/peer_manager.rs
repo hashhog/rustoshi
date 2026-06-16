@@ -3648,6 +3648,36 @@ impl PeerManager {
         }
     }
 
+    /// Disconnect a connected peer matched by its remote socket address,
+    /// returning `true` iff a connected peer was found and the disconnect was
+    /// enqueued. Mirrors Bitcoin Core's `CConnman::DisconnectNode(string_view)`
+    /// (`src/net.cpp:3817`): it scans the connected-node table for a match and
+    /// sets `fDisconnect = true`, returning `false` when no connected node
+    /// matches. The RPC `disconnectnode` handler relies on this boolean to
+    /// raise `RPC_CLIENT_NODE_NOT_CONNECTED` (-29) for an unknown peer rather
+    /// than silently succeeding.
+    pub fn try_disconnect_by_address(&self, addr: &SocketAddr) -> bool {
+        for (peer_id, peer) in self.peers.iter() {
+            if &peer.info.addr == addr {
+                return self.try_disconnect_peer(*peer_id);
+            }
+        }
+        false
+    }
+
+    /// Disconnect a connected peer matched by its numeric peer id, returning
+    /// `true` iff a connected peer with that id was found and the disconnect
+    /// was enqueued. Mirrors Bitcoin Core's `CConnman::DisconnectNode(NodeId)`
+    /// (`src/net.cpp:3849`).
+    pub fn try_disconnect_by_id(&self, node_id: u64) -> bool {
+        let pid = PeerId(node_id);
+        if self.peers.contains_key(&pid) {
+            self.try_disconnect_peer(pid)
+        } else {
+            false
+        }
+    }
+
     /// Ban a peer for misbehavior.
     pub async fn ban_peer(&mut self, peer_id: PeerId) {
         self.ban_peer_with_reason(peer_id, "manual ban".to_string())
