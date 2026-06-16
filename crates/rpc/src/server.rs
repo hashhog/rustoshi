@@ -5896,6 +5896,19 @@ impl RustoshiRpcServer for RpcServerImpl {
             &config,
         );
 
+        // Build a {txid -> index-in-template} map so each entry's `depends`
+        // array can name the in-template transactions it spends from. The
+        // index matches `template.transactions` (coinbase at 0, first real tx
+        // at 1, …), i.e. the BIP-22 1-based-into-`transactions` convention.
+        // Mirrors Core rpc/mining.cpp:898-906 `setTxIndex[txHash] = i`.
+        use std::collections::HashMap;
+        let tx_index: HashMap<Hash256, u32> = template
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| (tx.txid(), i as u32))
+            .collect();
+
         // Build BIP-22 format response. The per-tx sigop cost lines up
         // index-for-index with `template.transactions`; we skip the coinbase
         // (index 0) here just like we skip it in the transaction list.
@@ -5908,7 +5921,31 @@ impl RustoshiRpcServer for RpcServerImpl {
                 data: hex::encode(tx.serialize()),
                 txid: tx.txid().to_hex(),
                 hash: tx.wtxid().to_hex(),
-                depends: vec![],
+                // BIP-22 `depends`: indices of in-template transactions this
+                // tx spends from, so a mining client can reorder transactions
+                // safely. Core rpc/mining.cpp:917-923 walks each input and
+                // pushes `setTxIndex[in.prevout.hash]` only when present.
+                // Core builds `setTxIndex` incrementally, so a dependency is
+                // emitted only for a parent that appears *earlier* in the
+                // template (index < this tx's index `i`); we reproduce that by
+                // filtering on `dep_idx < i as u32`. De-duplicated and sorted
+                // so multiple inputs spending the same parent yield one
+                // ascending entry.
+                depends: {
+                    let mut deps: Vec<u32> = tx
+                        .inputs
+                        .iter()
+                        .filter_map(|input| {
+                            tx_index
+                                .get(&input.previous_output.txid)
+                                .copied()
+                                .filter(|&dep_idx| dep_idx < i as u32)
+                        })
+                        .collect();
+                    deps.sort_unstable();
+                    deps.dedup();
+                    deps
+                },
                 // BIP-22 per-tx base fee, read index-for-index from the
                 // template (coinbase at index 0 is skipped above). Mirrors
                 // Core rpc/mining.cpp:926 `entry.pushKV("fee", tx_fees.at(...))`.
@@ -14981,6 +15018,121 @@ mod tests {
         assert!(!chain_fully_validated(true, false));
         // Snapshot active AND background validation complete -> synced.
         assert!(chain_fully_validated(true, true));
+    }
+
+    // ── getblocktemplate `depends` (W123 G11) ─────────────────────────────
+    //
+    // BIP-22 `transactions[].depends` must name the in-template txs each entry
+    // spends from. Before the fix the field was hardcoded `[]`. This drives the
+    // real `get_block_template` handler against a regtest mempool holding a
+    // parent→child chain and asserts the child's `depends` carries the parent's
+    // template index (Core rpc/mining.cpp:917-923).
+    #[tokio::test]
+    async fn test_g11_gbt_depends_populated() {
+        use rustoshi_consensus::{mempool::AtmpOptions, CoinEntry};
+        use std::collections::HashMap as StdHashMap;
+
+        let (rpc, state, _peer_state, _tmp) = gbfp_fixture().await;
+
+        // P2PKH scriptPubKey (regtest mempool has verify_scripts=false, so the
+        // unsigned spends are admitted).
+        let p2pkh = {
+            let mut v = vec![0x76u8, 0xa9, 0x14];
+            v.extend_from_slice(&[0x42u8; 20]);
+            v.push(0x88);
+            v.push(0xac);
+            v
+        };
+        let coin = |value: u64| CoinEntry {
+            value,
+            script_pubkey: p2pkh.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let mk_tx = |prev: Hash256, vout: u32, out_value: u64| Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev, vout },
+                script_sig: vec![],
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: out_value, script_pubkey: p2pkh.clone() }],
+            lock_time: 0,
+        };
+
+        // Parent spends a confirmed coin (high feerate); child spends the
+        // parent's output 0 (lower feerate) so the selector orders parent first.
+        let parent_prevout = OutPoint { txid: Hash256([0xE1; 32]), vout: 0 };
+        let mut utxos: StdHashMap<OutPoint, CoinEntry> = StdHashMap::new();
+        utxos.insert(parent_prevout.clone(), coin(1_000_000));
+
+        let (parent_id, child_id) = {
+            let mut s = state.write().await;
+            let opts = AtmpOptions { skip_script_checks: true, ..Default::default() };
+            let parent_tx = mk_tx(Hash256([0xE1; 32]), 0, 900_000);
+            let parent_id = s
+                .mempool
+                .add_transaction_with_options(parent_tx, &|op| utxos.get(op).cloned(), opts.clone())
+                .expect("parent admitted");
+            utxos.insert(OutPoint { txid: parent_id, vout: 0 }, coin(900_000));
+            let child_tx = mk_tx(parent_id, 0, 899_000);
+            let child_id = s
+                .mempool
+                .add_transaction_with_options(child_tx, &|op| utxos.get(op).cloned(), opts)
+                .expect("child admitted");
+            (parent_id, child_id)
+        };
+
+        let result = rpc
+            .get_block_template(None)
+            .await
+            .expect("getblocktemplate must succeed");
+        let txs = result
+            .get("transactions")
+            .and_then(|v| v.as_array())
+            .expect("transactions array");
+
+        // Locate parent and child by txid. Template index = position in the
+        // `transactions` array + 1 (coinbase is not emitted in this array but
+        // occupies template index 0, the BIP-22 convention the handler uses).
+        let find = |id: Hash256| -> (usize, &serde_json::Value) {
+            txs.iter()
+                .enumerate()
+                .find(|(_, t)| t.get("txid").and_then(|x| x.as_str()) == Some(id.to_hex().as_str()))
+                .map(|(i, t)| (i, t))
+                .expect("tx must be in template")
+        };
+        let (parent_pos, parent_entry) = find(parent_id);
+        let (child_pos, child_entry) = find(child_id);
+        // The parent must be emitted before the child so its index is
+        // referenceable.
+        assert!(parent_pos < child_pos, "parent must precede child in template");
+
+        // Parent template index is its array position + 1 (coinbase = 0).
+        let parent_template_idx = (parent_pos + 1) as u64;
+
+        let child_depends: Vec<u64> = child_entry
+            .get("depends")
+            .and_then(|v| v.as_array())
+            .expect("child depends array")
+            .iter()
+            .map(|v| v.as_u64().expect("depends entry must be a number"))
+            .collect();
+        assert_eq!(
+            child_depends,
+            vec![parent_template_idx],
+            "child's `depends` must name the parent's template index, not be empty"
+        );
+
+        let parent_depends = parent_entry
+            .get("depends")
+            .and_then(|v| v.as_array())
+            .expect("parent depends array");
+        assert!(
+            parent_depends.is_empty(),
+            "parent spends a confirmed coin only — its `depends` must be empty"
+        );
     }
 
     // ── getblockfrompeer ──────────────────────────────────────────────────
