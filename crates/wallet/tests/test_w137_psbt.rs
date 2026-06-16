@@ -513,9 +513,79 @@ fn g3_bug_1_missing_separator_rejected() {
 /// Fix: add `if input.partial_sigs.contains_key(&pubkey) { return Err(...) }`
 /// before the insert.
 #[test]
-#[ignore = "BUG-2: PSBT_IN_PARTIAL_SIG accepts duplicate pubkey (P0-CDIV); fix in decode_psbt_input"]
 fn g4_bug_2_partial_sig_duplicate_pubkey_rejected() {
-    assert!(false, "BUG-2: duplicate PSBT_IN_PARTIAL_SIG pubkey must be rejected");
+    // Build a PSBT input byte stream that contains the SAME
+    // PSBT_IN_PARTIAL_SIG key (0x02 || 33-byte pubkey) TWICE.
+    //
+    // Strategy: serialize a valid PSBT with exactly one partial sig, then
+    // splice a byte-identical copy of that record into the input map right
+    // after the original. Because the bytes are identical the duplicate
+    // carries the SAME pubkey, so Core (psbt.h:535) — and now rustoshi —
+    // must reject it with a duplicate-key error.
+
+    let pubkey = {
+        let mut k = [0u8; 33];
+        k[0] = 0x02;
+        for (i, b) in k.iter_mut().enumerate().skip(1) {
+            *b = i as u8;
+        }
+        k
+    };
+    // A short opaque "signature" value. (BUG-3 encoding check is a separate
+    // gate; the decode path here is the dup-key guard, so any value works.)
+    let sig = vec![0x30u8, 0x44, 0x01];
+
+    // --- single-key PSBT decodes Ok ---------------------------------------
+    let tx = make_test_tx();
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    psbt.add_partial_sig(0, pubkey, sig.clone()).unwrap();
+    let single = psbt.serialize();
+    assert!(
+        Psbt::deserialize(&single).is_ok(),
+        "single PSBT_IN_PARTIAL_SIG record must still decode Ok"
+    );
+
+    // Locate the one PSBT_IN_PARTIAL_SIG record. Key = keylen(34) || type ||
+    // pubkey, i.e. [0x22, 0x02, <33 pubkey bytes>].
+    let mut key_prefix = vec![34u8, PSBT_IN_PARTIAL_SIG];
+    key_prefix.extend_from_slice(&pubkey);
+    let key_start = single
+        .windows(key_prefix.len())
+        .position(|w| w == key_prefix.as_slice())
+        .expect("PSBT_IN_PARTIAL_SIG record not found in serialized PSBT");
+
+    // The record is: key_prefix (35 bytes) || value_len (compactsize) ||
+    // value. Our value is the 3-byte sig, so value encoding is
+    // [0x03, 0x30, 0x44, 0x01] = 4 bytes. Record length = 35 + 4 = 39.
+    let value_field = {
+        let mut v = vec![sig.len() as u8];
+        v.extend_from_slice(&sig);
+        v
+    };
+    let record_len = key_prefix.len() + value_field.len();
+    let record_end = key_start + record_len;
+    // Sanity: the bytes following the key are the expected value field.
+    assert_eq!(
+        &single[key_start + key_prefix.len()..record_end],
+        value_field.as_slice(),
+        "unexpected PSBT_IN_PARTIAL_SIG value layout"
+    );
+    let record = &single[key_start..record_end];
+
+    // Splice a byte-identical duplicate of the record immediately after it.
+    let mut duped = Vec::with_capacity(single.len() + record.len());
+    duped.extend_from_slice(&single[..record_end]);
+    duped.extend_from_slice(record); // the DUPLICATE partial-sig record
+    duped.extend_from_slice(&single[record_end..]);
+
+    // --- duplicate-key PSBT must be rejected ------------------------------
+    let res = Psbt::deserialize(&duped);
+    assert!(
+        matches!(res, Err(PsbtError::DuplicateKey(_))),
+        "BUG-2: duplicate PSBT_IN_PARTIAL_SIG pubkey must be rejected with \
+         DuplicateKey; got {:?}",
+        res
+    );
 }
 
 /// **G5 — BUG-3: PSBT_IN_PARTIAL_SIG skips CheckSignatureEncoding.**
