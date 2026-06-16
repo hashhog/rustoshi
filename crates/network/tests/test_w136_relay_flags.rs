@@ -52,6 +52,7 @@ use rustoshi_network::relay::{
     pays_for_rbf, AVG_FEEFILTER_BROADCAST_INTERVAL, FeeFilterManager, FeeFilterRounder,
     FeeFilterState, InventoryTrickle, MAX_FEEFILTER_CHANGE_DELAY, MAX_MONEY,
 };
+use rustoshi_network::peer::PeerId;
 
 // ============================================================================
 // BIP-130 sendheaders
@@ -377,22 +378,65 @@ fn g19_outbound_tx_inv_filterrate_gate() {
 
 // ─── G20: feefilter sent during IBD = MAX_MONEY ─────────────────────────────
 
-/// G20 BUG-2 (P0) — Core (net_processing.cpp:5552-5556) sends `MAX_MONEY`
-/// as feefilter during IBD to tell peers "do not relay any tx to us."
-/// rustoshi sends a hardcoded `100_000` sat/kvB (peer_manager.rs:2225)
-/// regardless of IBD state.  100 sat/vB is NOT prohibitive — mempool
-/// minfee during congestion routinely exceeds 200 sat/vB.  During a
-/// 2-day mainnet IBD on fresh hardware, rustoshi receives every
-/// tx-INV at fee rates ≥ 100 sat/vB and discards them all (no mempool
-/// yet).  Order-of-magnitude bandwidth waste at the worst possible time.
+/// G20 BUG-2 (FIXED) — Core (net_processing.cpp ~5552-5556) sends `MAX_MONEY`
+/// as the feefilter during IBD to tell peers "do not relay any tx to us."
+/// rustoshi now matches: the initial feefilter send is routed through
+/// `FeeFilterManager::force_initial_send(peer, is_ibd)`, which emits the
+/// rounded `MAX_MONEY` signal while `is_ibd` (relay.rs `force_initial_send`,
+/// `current_filter = if is_ibd { MAX_MONEY } else { min_relay_fee }`) and the
+/// ordinary min-relay floor otherwise. The old hardcoded `100_000` sat/kvB
+/// `send_initial_feefilter` is dead code with no production caller.
+///
+/// De-staled 2026-06-16: this was a vacuous `#[ignore]` / `assert!(false)`
+/// marker; replaced with a live regression test that exercises the production
+/// IBD-gated path and asserts Core-parity behavior in both directions.
 #[test]
-#[ignore = "BUG-2 P0: feefilter during IBD is hardcoded 100_000 sat/kvB instead of MAX_MONEY — order-of-magnitude IBD bandwidth waste"]
 fn g20_feefilter_during_ibd_is_max_money() {
-    // The constant exists.
+    // MAX_MONEY constant sanity (Core consensus/amount.h).
     assert_eq!(MAX_MONEY, 21_000_000 * 100_000_000,
         "G20: MAX_MONEY must equal 21M BTC in sats per Core consensus/amount.h");
-    assert!(false,
-        "BUG-2 P0: send_initial_feefilter at peer_manager.rs:2225 sends 100_000 sat/kvB during IBD instead of MAX_MONEY");
+
+    let min_relay_fee = 1_000u64;
+    let incremental = 1_000u64;
+    let mut manager = FeeFilterManager::new(min_relay_fee, incremental);
+
+    // IBD peer: the initial feefilter must be the prohibitive (rounded)
+    // MAX_MONEY signal — the production formula is
+    // `rounder.round(MAX_MONEY).max(min_relay_fee)`.
+    let ibd_peer = PeerId(1);
+    manager.add_peer(ibd_peer, /* supports_feefilter */ true, /* is_block_only */ false);
+    let expected_ibd = FeeFilterRounder::new(incremental)
+        .round(MAX_MONEY)
+        .max(min_relay_fee);
+    let sent_ibd = manager.force_initial_send(ibd_peer, /* is_ibd */ true);
+    assert_eq!(
+        sent_ibd,
+        Some(expected_ibd),
+        "G20/BUG-2: during IBD the initial feefilter must be the rounded MAX_MONEY signal"
+    );
+    // And it must NOT be the old buggy hardcoded 100_000 sat/kvB.
+    assert!(
+        sent_ibd.unwrap() > 100_000,
+        "G20/BUG-2: IBD feefilter must be prohibitive (>> old 100_000 sat/kvB), got {sent_ibd:?}"
+    );
+
+    // Out-of-IBD peer: the same path must send the ordinary min-relay floor,
+    // NOT MAX_MONEY — proving the `is_ibd` gate actually gates.
+    let normal_peer = PeerId(2);
+    manager.add_peer(normal_peer, true, false);
+    let expected_normal = FeeFilterRounder::new(incremental)
+        .round(min_relay_fee)
+        .max(min_relay_fee);
+    let sent_normal = manager.force_initial_send(normal_peer, /* is_ibd */ false);
+    assert_eq!(
+        sent_normal,
+        Some(expected_normal),
+        "G20: out of IBD, the initial feefilter must be the ordinary min-relay floor"
+    );
+    assert!(
+        sent_normal.unwrap() < expected_ibd,
+        "G20: out-of-IBD filter must be far below the IBD MAX_MONEY signal"
+    );
 }
 
 // ============================================================================
