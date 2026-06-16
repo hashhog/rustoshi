@@ -332,24 +332,119 @@ fn g16_p2p_disabled_collision_with_not_connected() {
         "RPC_CLIENT_P2P_DISABLED must NOT collide with RPC_CLIENT_NOT_CONNECTED (-9)");
 }
 
-/// G17 — `RPC_CLIENT_NODE_ALREADY_ADDED` (-23). Core net.cpp:362.
-/// NOT DEFINED in rustoshi.
-/// Status: BUG-11 (P1).
-#[test]
-#[ignore]
-fn g17_rpc_client_node_already_added_absence() {
-    panic!("BUG-11: rustoshi has no RPC_CLIENT_NODE_ALREADY_ADDED (-23); \
-            addnode 'add' silently no-ops duplicates.");
+/// Build a `PeerServerImpl` whose `PeerState` owns a live (but un-started)
+/// `PeerManager`, so the `addnode` handler exercises the real added-node list
+/// instead of the `RPC_CLIENT_P2P_DISABLED` (no-peer-manager) branch.
+fn server_with_peer_manager() -> rustoshi_rpc::RpcServerImpl {
+    use rustoshi_consensus::ChainParams;
+    use rustoshi_network::peer_manager::{PeerManager, PeerManagerConfig};
+    use rustoshi_rpc::{PeerState, RpcServerImpl, RpcState};
+    use rustoshi_storage::ChainDb;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(ChainDb::open(tmp.path()).expect("open chaindb"));
+    let params = ChainParams::regtest();
+    let rpc_state = RpcState::new(db, params);
+    let state = Arc::new(RwLock::new(rpc_state));
+
+    let pm = PeerManager::new(PeerManagerConfig::testnet4(), ChainParams::testnet4());
+    let peer_state = Arc::new(RwLock::new(PeerState {
+        peer_manager: Some(pm),
+    }));
+    // Keep `tmp` alive for the lifetime of the test by leaking it; the test
+    // process is short-lived and tempdir cleanup is best-effort here.
+    std::mem::forget(tmp);
+    RpcServerImpl::new(state, peer_state)
 }
 
-/// G18 — `RPC_CLIENT_NODE_NOT_ADDED` (-24). Core net.cpp:368, 534.
-/// NOT DEFINED in rustoshi.
-/// Status: BUG-12 (P1).
-#[test]
-#[ignore]
-fn g18_rpc_client_node_not_added_absence() {
-    panic!("BUG-12: rustoshi has no RPC_CLIENT_NODE_NOT_ADDED (-24); \
-            addnode 'remove' returns Ok for unknown peers.");
+/// G17 — `RPC_CLIENT_NODE_ALREADY_ADDED` (-23). Core net.cpp:359-363
+/// (`CConnman::AddNode` returns false → `JSONRPCError(RPC_CLIENT_NODE_ALREADY_ADDED,
+/// "Error: Node already added")`).
+/// Status: BUG-11 (P1) — FIXED.
+///
+/// De-staled 2026-06-16: previously an `#[ignore]` `panic!` documenting the
+/// absence. Now a REAL behavioral test — `addnode "add"` twice for the same
+/// node must succeed once then return Core's -23, not silently no-op.
+#[tokio::test]
+async fn g17_addnode_duplicate_add_emits_node_already_added() {
+    use rustoshi_rpc::RustoshiRpcServer;
+
+    // The numeric constant exists and equals Core's value.
+    assert_eq!(
+        rpc_error::RPC_CLIENT_NODE_ALREADY_ADDED, -23,
+        "RPC_CLIENT_NODE_ALREADY_ADDED must be -23 (Core protocol.h:60)"
+    );
+
+    let server = server_with_peer_manager();
+    let node = "192.0.2.10:18333".to_string();
+
+    // First add succeeds.
+    RustoshiRpcServer::add_node(&server, node.clone(), "add".to_string())
+        .await
+        .expect("first addnode add must succeed");
+
+    // Second add of the SAME node must error with Core's -23 (not a silent Ok).
+    let err = RustoshiRpcServer::add_node(&server, node.clone(), "add".to_string())
+        .await
+        .expect_err("duplicate addnode add must error");
+    assert_eq!(
+        err.code(),
+        rpc_error::RPC_CLIENT_NODE_ALREADY_ADDED,
+        "duplicate add must emit -23 (RPC_CLIENT_NODE_ALREADY_ADDED), got {}: {}",
+        err.code(),
+        err.message(),
+    );
+    assert_eq!(err.message(), "Error: Node already added",
+        "message must match Core net.cpp:362 exactly");
+}
+
+/// G18 — `RPC_CLIENT_NODE_NOT_ADDED` (-24). Core net.cpp:365-369
+/// (`CConnman::RemoveAddedNode` returns false → `JSONRPCError(
+/// RPC_CLIENT_NODE_NOT_ADDED, "Error: Node could not be removed. ...")`).
+/// Status: BUG-12 (P1) — FIXED.
+///
+/// De-staled 2026-06-16: previously an `#[ignore]` `panic!`. Now a REAL test —
+/// `addnode "remove"` for a never-added node must return Core's -24, and a
+/// remove that follows a matching add must succeed.
+#[tokio::test]
+async fn g18_addnode_remove_unknown_emits_node_not_added() {
+    use rustoshi_rpc::RustoshiRpcServer;
+
+    assert_eq!(
+        rpc_error::RPC_CLIENT_NODE_NOT_ADDED, -24,
+        "RPC_CLIENT_NODE_NOT_ADDED must be -24 (Core protocol.h:61)"
+    );
+
+    let server = server_with_peer_manager();
+    let node = "198.51.100.7:18333".to_string();
+
+    // Removing a node that was never added must error with Core's -24,
+    // not return Ok (the pre-fix behaviour).
+    let err = RustoshiRpcServer::add_node(&server, node.clone(), "remove".to_string())
+        .await
+        .expect_err("removing an un-added node must error");
+    assert_eq!(
+        err.code(),
+        rpc_error::RPC_CLIENT_NODE_NOT_ADDED,
+        "remove of un-added node must emit -24 (RPC_CLIENT_NODE_NOT_ADDED), got {}: {}",
+        err.code(),
+        err.message(),
+    );
+    assert_eq!(
+        err.message(),
+        "Error: Node could not be removed. It has not been added previously.",
+        "message must match Core net.cpp:368 exactly",
+    );
+
+    // After a matching add, remove must succeed (round-trips cleanly).
+    RustoshiRpcServer::add_node(&server, node.clone(), "add".to_string())
+        .await
+        .expect("add must succeed");
+    RustoshiRpcServer::add_node(&server, node.clone(), "remove".to_string())
+        .await
+        .expect("remove of a previously-added node must succeed");
 }
 
 /// G19 — `RPC_CLIENT_NODE_NOT_CONNECTED` (-29). Core net.cpp:478 (disconnectnode).

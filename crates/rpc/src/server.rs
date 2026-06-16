@@ -100,6 +100,15 @@ pub mod rpc_error {
     /// Distinct from `RPC_CLIENT_NOT_CONNECTED = -9`; the previous -9 here
     /// collided with that code.
     pub const RPC_CLIENT_P2P_DISABLED: i32 = -31;
+    /// `addnode "add"` for a node already on the added-node list
+    /// (`bitcoin-core/src/rpc/protocol.h::RPC_CLIENT_NODE_ALREADY_ADDED = -23`;
+    /// raised at `src/rpc/net.cpp:362`). Lets operator scripts distinguish a
+    /// duplicate-add no-op from a real failure.
+    pub const RPC_CLIENT_NODE_ALREADY_ADDED: i32 = -23;
+    /// `addnode "remove"` for a node that was never added
+    /// (`bitcoin-core/src/rpc/protocol.h::RPC_CLIENT_NODE_NOT_ADDED = -24`;
+    /// raised at `src/rpc/net.cpp:368`).
+    pub const RPC_CLIENT_NODE_NOT_ADDED: i32 = -24;
     /// Block not found.
     pub const RPC_BLOCK_NOT_FOUND: i32 = -5;
 }
@@ -6977,25 +6986,49 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn add_node(&self, addr: String, command: String) -> RpcResult<()> {
-        let socket_addr: std::net::SocketAddr = addr.parse().map_err(|_| {
-            Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid address format")
-        })?;
-
         let mut peer_state = self.peer_state.write().await;
 
         if let Some(ref mut pm) = peer_state.peer_manager {
             match command.as_str() {
                 "onetry" => {
-                    // Immediately initiate an outbound connection
+                    // Immediately initiate an outbound connection. Core's
+                    // "onetry" does NOT touch the added-node list (net.cpp:356);
+                    // it only opens a one-off MANUAL connection, so it needs a
+                    // resolvable numeric address.
+                    let socket_addr: std::net::SocketAddr = addr.parse().map_err(|_| {
+                        Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid address format")
+                    })?;
                     pm.connect_to_peer(socket_addr).await;
                     Ok(())
                 }
                 "add" => {
-                    pm.add_peer(socket_addr);
+                    // Core's addnode "add" raises RPC_CLIENT_NODE_ALREADY_ADDED
+                    // (-23) when the node is already on the added-node list
+                    // (net.cpp:359-363, CConnman::AddNode returns false). It
+                    // keys by the operator-supplied string, so we record the
+                    // string first and only inject into the addrman on a fresh
+                    // add (and only when it parses as a numeric address).
+                    if !pm.add_added_node(addr.clone()) {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_CLIENT_NODE_ALREADY_ADDED,
+                            "Error: Node already added",
+                        ));
+                    }
+                    if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
+                        pm.add_peer(socket_addr);
+                    }
                     Ok(())
                 }
                 "remove" => {
-                    // Would need to find and disconnect peer
+                    // Core's addnode "remove" raises RPC_CLIENT_NODE_NOT_ADDED
+                    // (-24) when the node was never added (net.cpp:365-369,
+                    // CConnman::RemoveAddedNode returns false).
+                    if !pm.remove_added_node(&addr) {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_CLIENT_NODE_NOT_ADDED,
+                            "Error: Node could not be removed. It has not been added previously.",
+                        ));
+                    }
                     Ok(())
                 }
                 _ => Err(Self::rpc_error(

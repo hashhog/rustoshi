@@ -2413,6 +2413,14 @@ pub struct PeerManager {
     /// re-check in `fill_outbound_connections` so the grace clock is shared
     /// between the immediate call and the periodic call.
     start_instant: Option<Instant>,
+    /// The `addnode`-managed list of persistent peer addresses, keyed by the
+    /// exact node string the operator supplied. Mirrors Core's
+    /// `CConnman::m_added_node_params` (`src/net.cpp`): membership is what
+    /// `addnode "add"`/"remove" toggle, and the list's contents — not the live
+    /// connection state — decide whether a duplicate add or a stale remove is
+    /// an error. Distinct from `addr_manager`'s address book (which also holds
+    /// gossiped/seed addresses); only operator-pinned entries live here.
+    added_nodes: Vec<String>,
 }
 
 /// Minimum interval between reconnect attempts to a single pinned `-connect`
@@ -2459,6 +2467,7 @@ impl PeerManager {
             connect_attempt_at: HashMap::new(),
             fixed_seeds_added: false,
             start_instant: None,
+            added_nodes: Vec::new(),
         }
     }
 
@@ -2514,6 +2523,7 @@ impl PeerManager {
             connect_attempt_at: HashMap::new(),
             fixed_seeds_added: false,
             start_instant: None,
+            added_nodes: Vec::new(),
         }
     }
 
@@ -2844,6 +2854,45 @@ impl PeerManager {
     /// Add a manual peer address (e.g., from command line).
     pub fn add_peer(&mut self, addr: SocketAddr) {
         self.addr_manager.add_manual_address(addr);
+    }
+
+    /// Add a node string to the `addnode`-managed persistent-peer list, the
+    /// rustoshi equivalent of `CConnman::AddNode` (`src/net.cpp:3740`).
+    ///
+    /// Returns `false` — and makes NO change — when the node is already on the
+    /// list, exactly as Core does (`net.cpp:3747` returns false on a string or
+    /// resolved-address collision). The RPC layer turns that `false` into
+    /// `RPC_CLIENT_NODE_ALREADY_ADDED` (-23) (`net.cpp:362`). Returns `true`
+    /// when a fresh entry is recorded.
+    pub fn add_added_node(&mut self, node: String) -> bool {
+        if self.added_nodes.iter().any(|n| n == &node) {
+            return false;
+        }
+        self.added_nodes.push(node);
+        true
+    }
+
+    /// Remove a node string from the `addnode`-managed list, the rustoshi
+    /// equivalent of `CConnman::RemoveAddedNode` (`src/net.cpp:3754`).
+    ///
+    /// Returns `false` when the node was never added (Core's `net.cpp:3763`
+    /// returns false after scanning the whole list), which the RPC layer turns
+    /// into `RPC_CLIENT_NODE_NOT_ADDED` (-24) (`net.cpp:368`). Returns `true`
+    /// when an entry was found and erased.
+    pub fn remove_added_node(&mut self, node: &str) -> bool {
+        if let Some(pos) = self.added_nodes.iter().position(|n| n == node) {
+            self.added_nodes.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Snapshot of the current `addnode`-managed node strings (for
+    /// `getaddednodeinfo` and tests). Mirrors reading
+    /// `CConnman::m_added_node_params`.
+    pub fn added_nodes(&self) -> Vec<String> {
+        self.added_nodes.clone()
     }
 
     /// Inject an address into the address manager (companion of the
