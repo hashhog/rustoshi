@@ -79,6 +79,36 @@ pub const COINBASE_MATURITY: u32 = 100;
 /// default.
 pub const WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 5000;
 
+/// Absolute fee, in satoshis, that an explicit `fee_rate` (sat/vB) target
+/// implies for a transaction of `vsize` virtual bytes, computed with the exact
+/// integer semantics Bitcoin Core uses.
+///
+/// Core parses the RPC `fee_rate` argument (sat/vB) into a `CFeeRate` via
+/// `CFeeRate{AmountFromValue(fee_rate, /*decimals=*/3)}`
+/// (`bitcoin-core/src/wallet/rpc/spend.cpp:224`,
+/// `bitcoin-core/src/rpc/util.cpp:110` `ParseFeeRate`). `AmountFromValue` with
+/// `decimals=3` is a *fixed-point* parse: the sat/vB value is scaled to an
+/// **integer** sat/kvB feerate (3 decimal places), never kept as a float.
+/// `CFeeRate::GetFee(vsize)` then returns `CeilDiv(feerate_kvb * vsize, 1000)`
+/// (`bitcoin-core/src/policy/feerate.cpp:20` →
+/// `bitcoin-core/src/util/feefrac.h:212` `EvaluateFee<RoundDown=false>`), i.e.
+/// integer ceiling division.
+///
+/// Doing the same arithmetic in `f64` (`(vsize * rate).ceil()`) diverges from
+/// this: it carries the operator rate as a float and rounds the *product*, so
+/// it can land a satoshi off from Core for rates that are not exactly
+/// representable in binary floating point (e.g. `1.1`, `0.1`). This helper
+/// reproduces Core exactly: round the sat/vB rate to an integer sat/kvB
+/// feerate, then apply integer ceiling division — the same `(.. + 999) / 1000`
+/// pattern the mempool Rule-4 path and the default bump delta already use.
+pub fn fee_for_rate_sat_per_vb(rate_sat_per_vb: f64, vsize: u64) -> u64 {
+    // sat/vB -> integer sat/kvB, matching Core's ParseFixedPoint(decimals=3)
+    // (round-half-to-even is irrelevant here; 3 decimals of sat/vB is exact).
+    let rate_sat_per_kvb = (rate_sat_per_vb * 1000.0).round() as u64;
+    // CFeeRate::GetFee -> CeilDiv(feerate_kvb * vsize, 1000).
+    (rate_sat_per_kvb.saturating_mul(vsize) + 999) / 1000
+}
+
 /// Sentinel derivation path stored on UTXOs / index entries that belong to an
 /// *imported* (non-HD) key rather than a seed-derived path. It is never a valid
 /// BIP-32 path (`u32::MAX` as the single element), so `scan_block_at` can route
@@ -1032,7 +1062,10 @@ impl Wallet {
                     "bumpfee: fee_rate must be > 0".to_string(),
                 ));
             }
-            let target_fee = (entry.vsize as f64 * rate).ceil() as u64;
+            // Core parity: an explicit fee_rate (sat/vB) implies an integer
+            // fee via CFeeRate::GetFee (CeilDiv on an integer sat/kvB rate),
+            // NOT an f64 ceil() of the product (spend.cpp:224 / feerate.cpp:20).
+            let target_fee = fee_for_rate_sat_per_vb(rate, entry.vsize as u64);
             target_fee.max(min_new_fee)
         } else {
             min_new_fee
