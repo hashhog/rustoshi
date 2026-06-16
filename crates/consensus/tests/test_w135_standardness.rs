@@ -704,21 +704,98 @@ fn w135_g24_bug7_version_type_i32_xfail() {
     panic!("BUG-7: Transaction.version is i32 not u32");
 }
 
-/// G25 — BUG-8 (P2): `try_classify_bare_multisig` only accepts
-/// direct-push (0x21, 0x41) for pubkeys; PUSHDATA1/2/4 prefixes are
-/// rejected.  Core uses `GetOp` + `CPubKey::ValidSize`.
+/// G25 — BUG-8 (P2) [De-staled 2026-06-16]: `try_classify_bare_multisig` now
+/// decodes PUSHDATA1/2/4-prefixed pubkey pushes, not just direct (0x21/0x41)
+/// pushes — matching Core's `MatchMultisig`
+/// (`bitcoin-core/src/script/solver.cpp:85-105`), which reads each key with
+/// `script.GetOp(it, opcode, data)` (PUSHDATA-aware, `script/script.cpp`
+/// `GetScriptOp`) and accepts it iff `CPubKey::ValidSize(data)` — i.e. the
+/// *decoded* payload is 33 or 65 bytes (`pubkey.h:77`).
+///
+/// Bug (pre-fix): the pubkey-walk only matched direct-push opcodes `0x21` (33B)
+/// and `0x41` (65B); a pubkey pushed as `OP_PUSHDATA1 0x21 <33B>` fell through to
+/// `return None`, so the output was classified `NonStandard` and the whole tx
+/// over-rejected at `check_standard` — yet Core relays it as standard `MULTISIG`.
+///
+/// This test admits a bare-multisig output whose pubkeys are PUSHDATA1-prefixed
+/// through the live `check_standard` admission path (so it pins the classifier fix
+/// end-to-end, not just the helper), and keeps a control proving a genuinely
+/// non-standard "multisig" (a non-pubkey-sized push) is still rejected.
 #[test]
-#[ignore]
-fn w135_g25_bug8_multisig_pushdata_xfail() {
-    // A multisig with PUSHDATA1-prefixed pubkey:
-    // OP_1 OP_PUSHDATA1 <0x21> <33B> OP_1 OP_CHECKMULTISIG.
-    let mut spk = vec![0x51, 0x4c, 0x21];
-    spk.extend_from_slice(&[0u8; 33]);
-    spk.push(0x51);
-    spk.push(0xae);
-    // Last byte should still be OP_CHECKMULTISIG.
-    assert_eq!(spk.last(), Some(&0xae));
-    panic!("BUG-8: try_classify_bare_multisig rejects PUSHDATA-prefixed pubkeys");
+fn w135_g25_bug8_multisig_pushdata() {
+    use rustoshi_consensus::mempool::{Mempool, MempoolConfig, MempoolError};
+    use rustoshi_consensus::CoinEntry;
+    use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
+    use std::collections::HashMap;
+
+    // A 1-of-1 bare multisig whose single pubkey is pushed via OP_PUSHDATA1:
+    // OP_1 OP_PUSHDATA1 0x21 <33B> OP_1 OP_CHECKMULTISIG = 38 bytes.
+    let mut pushdata_multisig = vec![0x51u8, 0x4c, 0x21];
+    pushdata_multisig.extend_from_slice(&[0x02u8; 33]); // a 33-byte payload (compressed-pubkey size)
+    pushdata_multisig.push(0x51); // OP_1 (n=1)
+    pushdata_multisig.push(0xae); // OP_CHECKMULTISIG
+    assert_eq!(pushdata_multisig.len(), 38);
+    assert_eq!(pushdata_multisig.last(), Some(&0xae));
+
+    // Fund the spend with a standard confirmed P2PKH coin so the only thing under
+    // test is the OUTPUT classification (require_standard default = true).
+    let prev = OutPoint { txid: Hash256::from([9u8; 32]), vout: 0 };
+    let funding = CoinEntry {
+        height: 0,
+        is_coinbase: false,
+        value: 100_000,
+        script_pubkey: make_p2pkh_spk(),
+    };
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(prev.clone(), funding)].into_iter().collect();
+
+    let mk_mempool = || {
+        Mempool::new(MempoolConfig { verify_scripts: false, ..Default::default() })
+    };
+    let spend_to = |spk: Vec<u8>| Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: prev.clone(),
+            script_sig: vec![],
+            sequence: 0xffffffff,
+            witness: vec![],
+        }],
+        // Well above any dust threshold so dust cannot be the deciding gate.
+        outputs: vec![TxOut { value: 90_000, script_pubkey: spk }],
+        lock_time: 0,
+    };
+
+    // (a) PUSHDATA1-prefixed bare multisig output: classified MULTISIG ⇒ standard.
+    //     `check_standard`'s output loop must NOT reject it as NonStandard.
+    //     (Pre-fix it WAS rejected with "scriptpubkey at index 0".)
+    let mut mp = mk_mempool();
+    let res = mp.add_transaction(spend_to(pushdata_multisig), &|op| utxos.get(op).cloned());
+    if let Err(MempoolError::NonStandard(reason)) = &res {
+        assert!(
+            !reason.starts_with("scriptpubkey at index"),
+            "PUSHDATA-prefixed bare multisig must classify as MULTISIG (standard), \
+             not NonStandard; got rejection: {reason}"
+        );
+    }
+    assert!(
+        res.is_ok(),
+        "tx creating a PUSHDATA-prefixed bare-multisig output must be admitted as standard: {res:?}"
+    );
+
+    // (b) Control: a "multisig-shaped" script whose pushed key is NOT a valid
+    //     pubkey size (32 bytes, not 33/65) must STILL be NonStandard — proving the
+    //     fix keys on CPubKey::ValidSize and did not become accept-everything.
+    //     OP_1 OP_PUSHDATA1 0x20 <32B> OP_1 OP_CHECKMULTISIG.
+    let mut bad = vec![0x51u8, 0x4c, 0x20];
+    bad.extend_from_slice(&[0x02u8; 32]); // 32-byte payload — NOT a valid pubkey size
+    bad.push(0x51);
+    bad.push(0xae);
+    let mut mp2 = mk_mempool();
+    let res2 = mp2.add_transaction(spend_to(bad), &|op| utxos.get(op).cloned());
+    assert!(
+        matches!(&res2, Err(MempoolError::NonStandard(reason)) if reason.starts_with("scriptpubkey at index")),
+        "a multisig with a non-pubkey-sized (32B) push must be rejected NonStandard: {res2:?}"
+    );
 }
 
 /// G26 — BUG-9 (P2) [De-staled 2026-06-16]: `is_dust` P2SH spending size
