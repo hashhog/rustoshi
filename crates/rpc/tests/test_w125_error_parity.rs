@@ -104,8 +104,11 @@
 //!                 (server.rs:7399, signmessage non-PKH). Core uses -3 broadly
 //!                 in AmountFromValue, ParseHashV, GetVerbosity → most rustoshi
 //!                 parameter-type mismatches surface as -32602 / -32700.
-//!   BUG-17 (P2) : `getblockhash` returns -32602 ("Block height out of range")
-//!                 vs Core's -8. server.rs:2961. Cross-ref BUG-3.
+//!   BUG-17 (P2) : `getblockhash` returned -32602 ("Block height out of range")
+//!                 vs Core's -8. FIXED (2026-06-16): the `get_block_hash`
+//!                 handler now emits `RPC_INVALID_PARAMETER` (-8) with Core's
+//!                 exact message text. Pinned by `g29_getblockhash_oor_emits_
+//!                 invalid_parameter`. Cross-ref BUG-3.
 //!   BUG-18 (P2) : `addnode` returns -32602 for "Invalid command" vs Core's
 //!                 sub-codes (validates against {"add","remove","onetry"} with
 //!                 JSON-RPC-shape error). server.rs:4875.
@@ -465,13 +468,79 @@ fn g28_sendrawtransaction_collapses_error_codes_bug10() {
 }
 
 /// G29 — `getblockhash` height-out-of-range must emit -8 per Core
-/// blockchain.cpp:591. Rustoshi emits -32602 at server.rs:2961.
-/// Status: BUG-17 (P2), parent BUG-3.
-#[test]
-#[ignore]
-fn g29_getblockhash_oor_emits_wrong_code() {
-    panic!("BUG-17: getblockhash height-out-of-range emits -32602 (RPC_INVALID_PARAMS); \
-            Core emits -8 (RPC_INVALID_PARAMETER).");
+/// `src/rpc/blockchain.cpp::getblockhash`:
+///   if (nHeight < 0 || nHeight > active_chain.Height())
+///       throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
+/// (`RPC_INVALID_PARAMETER == -8` in `src/rpc/protocol.h`).
+/// Status: BUG-17 (P2), parent BUG-3 — FIXED at server.rs `get_block_hash`.
+///
+/// De-staled 2026-06-16: the prior `#[ignore]` `panic!` stub only documented
+/// the bug. This is now a REAL behavioral test: it builds a server with only
+/// the regtest genesis block (best height 0, so any height > 0 is
+/// out-of-range), calls the `getblockhash` handler with an out-of-range
+/// height, and asserts Core's numeric code (-8) AND exact message text.
+#[tokio::test]
+async fn g29_getblockhash_oor_emits_invalid_parameter() {
+    use rustoshi_consensus::ChainParams;
+    use rustoshi_rpc::{PeerState, RpcServerImpl, RpcState, RustoshiRpcServer};
+    use rustoshi_storage::{block_store::BlockStore, ChainDb};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    // Fresh tempdir-backed chain DB with only the regtest genesis block.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(ChainDb::open(tmp.path()).expect("open chaindb"));
+    let params = ChainParams::regtest();
+    {
+        let store = BlockStore::new(&db);
+        store.init_genesis(&params).expect("init genesis");
+    }
+
+    let mut rpc_state = RpcState::new(db.clone(), params);
+    {
+        let store = BlockStore::new(&db);
+        rpc_state.best_hash = store
+            .get_best_block_hash()
+            .expect("best hash")
+            .expect("genesis present");
+        rpc_state.best_height = store.get_best_height().expect("best height").expect("height 0");
+    }
+    assert_eq!(rpc_state.best_height, 0, "fresh genesis chain must have tip height 0");
+
+    let state = Arc::new(RwLock::new(rpc_state));
+    let peer_state = Arc::new(RwLock::new(PeerState::default()));
+    let server = RpcServerImpl::new(state, peer_state);
+
+    // height 0 (genesis) is valid → returns a 64-hex hash, not an error.
+    let ok = RustoshiRpcServer::get_block_hash(&server, 0)
+        .await
+        .expect("getblockhash(0) must succeed for genesis");
+    assert_eq!(ok.len(), 64, "genesis block hash must be 64 hex chars, got {:?}", ok);
+
+    // Out-of-range height (way past the tip) → Core's RPC_INVALID_PARAMETER (-8)
+    // with the exact Core message, NOT the JSON-RPC transport code -32602.
+    let err = RustoshiRpcServer::get_block_hash(&server, 999_999)
+        .await
+        .expect_err("getblockhash for out-of-range height must error");
+    assert_eq!(
+        err.code(),
+        rpc_error::RPC_INVALID_PARAMETER,
+        "getblockhash out-of-range must emit -8 (RPC_INVALID_PARAMETER), \
+         not -32602 (RPC_INVALID_PARAMS); got {}: {}",
+        err.code(),
+        err.message(),
+    );
+    assert_eq!(err.code(), -8, "RPC_INVALID_PARAMETER numeric value must be -8");
+    assert_ne!(
+        err.code(),
+        rpc_error::RPC_INVALID_PARAMS,
+        "must not collide with the JSON-RPC transport code -32602",
+    );
+    assert_eq!(
+        err.message(),
+        "Block height out of range",
+        "message must match Core exactly (no height interpolation)",
+    );
 }
 
 /// G30 — Error response shape: `{"code": i32, "message": String, "data": null}`

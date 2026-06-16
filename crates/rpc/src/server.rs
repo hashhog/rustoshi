@@ -3863,9 +3863,17 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         match store.get_hash_by_height(height) {
             Ok(Some(hash)) => Ok(hash.to_hex()),
+            // Core parity: `getblockhash` height-out-of-range throws
+            // RPC_INVALID_PARAMETER (-8), not the JSON-RPC transport code
+            // RPC_INVALID_PARAMS (-32602). See bitcoin-core
+            // src/rpc/blockchain.cpp::getblockhash:
+            //   if (nHeight < 0 || nHeight > active_chain.Height())
+            //       throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
+            // Message text matches Core exactly (no height interpolation) so
+            // operator scripts grepping by message also match. (W125 BUG-17 / G29.)
             Ok(None) => Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                format!("Block height {} out of range", height),
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Block height out of range",
             )),
             Err(e) => Err(Self::rpc_error(
                 rpc_error::RPC_DATABASE_ERROR,
