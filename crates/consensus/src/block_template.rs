@@ -120,6 +120,19 @@ pub struct BlockTemplate {
     /// for `transactions[i]` (coinbase first). This is what the RPC layer
     /// reports as the `sigops` field of each entry in `getblocktemplate`.
     pub per_tx_sigops: Vec<u64>,
+    /// Per-transaction base fee in satoshis, in the same order as
+    /// `transactions` (coinbase first).
+    ///
+    /// `per_tx_fees[i]` is the base fee of `transactions[i]`. The values are
+    /// the same per-tx base fees Core stores in `CBlockTemplate::vTxFees`
+    /// (`node/miner.cpp:265`, `vTxFees.push_back(entry.GetFee())`). Core's
+    /// `vTxFees` excludes the coinbase; we keep this vector parallel to
+    /// `per_tx_sigops` instead (coinbase at index 0) so both index off the
+    /// same `transactions` slot. The coinbase slot holds the negated total
+    /// block fee, but the RPC layer skips it. The RPC reports `per_tx_fees[i]`
+    /// as the `fee` field of each non-coinbase `getblocktemplate` entry (Core
+    /// `rpc/mining.cpp:926`, `entry.pushKV("fee", tx_fees.at(...))`).
+    pub per_tx_fees: Vec<i64>,
     /// Block height.
     pub height: u32,
     /// Target threshold (256-bit, big-endian).
@@ -303,6 +316,10 @@ pub fn build_block_template(
     // Per-tx sigop cost in the same order as `selected_txs` (does not include
     // the coinbase; the coinbase entry is prepended after selection).
     let mut selected_sigops: Vec<u64> = Vec::new();
+    // Per-tx base fee in the same order as `selected_txs` (Core
+    // `BlockTemplate::vTxFees` for the non-coinbase entries; the coinbase
+    // entry is prepended after selection).
+    let mut selected_fees: Vec<i64> = Vec::new();
     let mut total_fees: u64 = 0;
     // nBlockWeight starts at block_reserved_weight (not 0) to account for the
     // fixed-size block header, tx-count varint, and coinbase tx — mirroring
@@ -438,6 +455,10 @@ pub fn build_block_template(
 
             selected_txs.push(entry.tx.clone());
             selected_sigops.push(tx_sigops);
+            // Record the base fee for this tx (Core miner.cpp:265
+            // `vTxFees.push_back(entry.GetFee())`). Base fee fits in i64 on
+            // any real chain (max money is < 2^53 sats).
+            selected_fees.push(entry.fee as i64);
             selected_txids.insert(priority.txid);
             // FIX-72: total_fees uses the entry's actual base fee — the
             // delta is a mining-selection knob, not an additional payment.
@@ -477,6 +498,16 @@ pub fn build_block_template(
     // Adjust total_sigops: drop the placeholder reservation and add the real
     // coinbase contribution.
     total_sigops = total_sigops - coinbase_sigop_reserve + coinbase_sigops;
+
+    // Per-tx fees in the same order as `all_txs`, kept parallel to
+    // `per_tx_sigops` (coinbase at index 0). Core's `vTxFees` is each selected
+    // tx's `entry.GetFee()` (miner.cpp:265); we keep the same values for
+    // indices 1..N. The coinbase "collects" the block fees, so its slot holds
+    // the negated total fee; the RPC layer skips the coinbase entry, so the
+    // non-coinbase indices line up with each selected tx's base fee.
+    let mut per_tx_fees: Vec<i64> = Vec::with_capacity(all_txs.len());
+    per_tx_fees.push(-(total_fees as i64));
+    per_tx_fees.extend_from_slice(&selected_fees);
 
     // Compute merkle root
     let txids: Vec<Hash256> = all_txs.iter().map(|tx| tx.txid()).collect();
@@ -529,6 +560,7 @@ pub fn build_block_template(
         total_weight,
         total_sigops,
         per_tx_sigops,
+        per_tx_fees,
         height,
         target,
     }
