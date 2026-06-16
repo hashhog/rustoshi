@@ -284,27 +284,42 @@ fn g24_selection_result_shape_present() {
 // BUG STUBS (BUG-1..26) — #[ignore] regression panics documenting divergence
 // ============================================================================
 
-/// BUG-1 / G29-feat [P0-CDIV]: long-term feerate scale mismatch.
+/// BUG-1 / G29-feat [P0-CDIV] — FIXED: long-term feerate scale.
 ///
-/// `wallet.rs:517` literal is `long_term_fee_rate: 10.0 / 1000.0` (=
-/// 0.01) read as sat/vB in `coin_selection.rs:112`. Core's default is
-/// `DEFAULT_CONSOLIDATE_FEERATE = 10000` sat/kvB = **10 sat/vB**
-/// (1000× larger). The COMMENT on `wallet.rs:517` says "10 sat/kvB =
-/// 0.01 sat/vbyte (Core default)" — the unit conversion is correct,
-/// the documented Core target value is wrong by 1000×. COMMENT-AS-
-/// CONFESSION pattern.
+/// rustoshi's `long_term_fee_rate` is in **sat/vB**: every consumer in
+/// `coin_selection.rs` multiplies it by a vbyte quantity with no /1000
+/// (`:88` change_spend_cost·LTFR, `:112`/`:539` input_weight/4·LTFR).
+/// Core's default long-term feerate is `DEFAULT_CONSOLIDATE_FEERATE =
+/// 10000` sat/kvB (`bitcoin-core/src/wallet/wallet.h:112`), wired in via
+/// `m_long_term_feerate = m_consolidate_feerate` (`spend.cpp:1087`);
+/// 10000 sat/kvB / 1000 = **10 sat/vB**.
+///
+/// The `create_transaction` call site (`wallet.rs`) previously set the
+/// 1000×-too-small `10.0 / 1000.0` (= 0.01), collapsing the waste metric
+/// and over-consolidating at low feerates; it now sets `10.0`, matching
+/// the `CoinSelectionParams` default (`coin_selection.rs:71`, already
+/// correct). De-staled 2026-06-16. (The call-site params are built inline
+/// in `create_transaction` and not unit-inspectable; this pins the
+/// Core-correct value on the public default surface that the call site
+/// now also uses.)
 #[test]
-#[ignore = "BUG-1 P0-CDIV: long-term feerate stored as 0.01 sat/vB vs Core's 10 sat/vB"]
 fn bug1_long_term_feerate_scale() {
-    // Stand-in: until coin selection accepts a `CFeeRate` in
-    // sat/kvB and applies it as `feerate.GetFee(input_bytes)`,
-    // every waste = fee - long_term_fee is wrong by ~1000×.
-    panic!(
-        "BUG-1: long-term feerate scale mismatch. wallet.rs:517 must set \
-         long_term_fee_rate to Core's DEFAULT_CONSOLIDATE_FEERATE (10 sat/vB \
-         = 10000 sat/kvB), and the comment must match. Currently waste \
-         metric is off by ~1000× — wallet over-consolidates at low feerates."
+    // Core DEFAULT_CONSOLIDATE_FEERATE = 10000 sat/kvB, in rustoshi's
+    // sat/vB units: 10000 / 1000 = 10.0 (NOT the old 0.01).
+    const CORE_LTFR_SAT_PER_VB: f64 = 10_000.0 / 1000.0; // = 10.0
+    let params = CoinSelectionParams::default();
+    assert_eq!(
+        params.long_term_fee_rate, CORE_LTFR_SAT_PER_VB,
+        "long_term_fee_rate must equal Core DEFAULT_CONSOLIDATE_FEERATE \
+         (10000 sat/kvB = 10 sat/vB), not the old 0.01 (10.0/1000.0) which \
+         under-counted the waste metric ~1000x and over-consolidated."
     );
+    assert_eq!(params.long_term_fee_rate, 10.0);
+
+    // Arithmetic witness: a 68-vbyte input's long-term spend cost at
+    // 10 sat/vB is ceil(68 * 10.0) = 680 sats (was ~1 under the bug).
+    let ltfr_input_fee = (68.0_f64 * params.long_term_fee_rate).ceil() as i64;
+    assert_eq!(ltfr_input_fee, 680, "68 vB * 10 sat/vB = 680 sats");
 }
 
 /// BUG-2 / G9 [P0-CDIV]: SFFO (`m_subtract_fee_outputs`) MISSING.
