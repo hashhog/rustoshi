@@ -299,39 +299,60 @@ fn w135_g7_txout_type_detection_shapes() {
 // G8-G10: P0-CDIV BUGs (xfail-pinned)
 // ============================================================
 
-/// G8 — BUG-1 (P0-CDIV): `is_dust` MUST include the serialized output
-/// size in `nSize`, matching Core's
-/// `nSize = GetSerializeSize(txout) + spending_cost`.
+/// G8 — BUG-1 (P0-CDIV) [De-staled 2026-06-16]: `is_dust` now includes the
+/// serialized output size in `nSize`, matching Core's
+/// `nSize = GetSerializeSize(txout) + spending_cost` (`policy.cpp:45-62`).
 ///
-/// XFAIL: rustoshi uses only spending_cost; misses GetSerializeSize(txout).
-/// Concrete divergence: P2TR threshold is 174 sat (rustoshi) vs 330 sat
-/// (Core) → rustoshi accepts dust Core rejects.
+/// FIX: `rustoshi_consensus::mempool::dust_threshold` computes
+///   `nSize = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost`
+/// with `spending_cost = 67` for witness programs (`IsWitnessProgram` true)
+/// and `148` otherwise — uniform across witness versions, matching Core. The
+/// previous code used only a per-shape spending-size table (148/91/68/108/58)
+/// and dropped the `GetSerializeSize(txout)` summand entirely, e.g. P2TR
+/// threshold was 174 sat (rustoshi) vs 330 sat (Core) → accepted dust Core
+/// rejects.
+///
+/// This test pins the corrected production threshold for all five canonical
+/// shapes against the independent `core_dust_threshold` reference helper.
 #[test]
-#[ignore]
-fn w135_g8_bug1_dust_threshold_formula_xfail() {
-    let dust_fee = 3_000u64;
-    // Reference Core thresholds.
-    let p2pkh = core_dust_threshold(1, &make_p2pkh_spk(), dust_fee);
-    let p2sh = core_dust_threshold(1, &make_p2sh_spk(), dust_fee);
-    let p2wpkh = core_dust_threshold(1, &make_p2wpkh_spk(), dust_fee);
-    let p2wsh = core_dust_threshold(1, &make_p2wsh_spk(), dust_fee);
-    let p2tr = core_dust_threshold(1, &make_p2tr_spk(), dust_fee);
+fn w135_g8_bug1_dust_threshold_formula() {
+    use rustoshi_consensus::mempool::dust_threshold;
+    use rustoshi_primitives::TxOut;
 
-    // P2PKH: 34 + 148 = 182 → 546 sat
-    assert_eq!(p2pkh, 546);
-    // P2SH: 32 + 148 = 180 → 540 sat
-    assert_eq!(p2sh, 540);
-    // P2WPKH: 31 + 67 = 98 → 294 sat
-    assert_eq!(p2wpkh, 294);
-    // P2WSH: 43 + 67 = 110 → 330 sat
-    assert_eq!(p2wsh, 330);
-    // P2TR: 43 + 67 = 110 → 330 sat
-    assert_eq!(p2tr, 330);
+    let dust_fee = DUST_RELAY_TX_FEE; // 3000 sat/kvB
 
-    // Pin: a rustoshi-correct implementation should reject 545-sat P2PKH
-    // (under Core's 546-sat threshold). Currently it accepts 445+ sat.
-    // This stub fails until BUG-1 is fixed.
-    panic!("BUG-1: rustoshi is_dust misses GetSerializeSize(txout) summand");
+    let mk = |spk: Vec<u8>| TxOut { value: 0, script_pubkey: spk };
+
+    // Production threshold == independent Core reference for each shape.
+    for (name, spk, expected) in [
+        ("p2pkh", make_p2pkh_spk(), 546u64), // (8+1+25=34) + 148 = 182 → 546
+        ("p2sh", make_p2sh_spk(), 540),      // (8+1+23=32) + 148 = 180 → 540
+        ("p2wpkh", make_p2wpkh_spk(), 294),  // (8+1+22=31) +  67 =  98 → 294
+        ("p2wsh", make_p2wsh_spk(), 330),    // (8+1+34=43) +  67 = 110 → 330
+        ("p2tr", make_p2tr_spk(), 330),      // (8+1+34=43) +  67 = 110 → 330
+    ] {
+        let core = core_dust_threshold(1, &spk, dust_fee);
+        assert_eq!(core, expected, "{name}: reference helper");
+        let prod = dust_threshold(&mk(spk), dust_fee);
+        assert_eq!(
+            prod, expected,
+            "{name}: production dust_threshold must match Core ({expected} sat)"
+        );
+    }
+
+    // Behavioural pin: a 545-sat P2PKH output is now correctly dust (below
+    // Core's 546-sat threshold); 546 is exactly at the threshold (not dust).
+    let p2pkh_dust = mk(make_p2pkh_spk());
+    assert_eq!(dust_threshold(&p2pkh_dust, dust_fee), 546);
+    assert!(
+        TxOut { value: 545, script_pubkey: make_p2pkh_spk() }.value
+            < dust_threshold(&mk(make_p2pkh_spk()), dust_fee),
+        "545-sat P2PKH must be below the dust threshold"
+    );
+    assert!(
+        !(546 < dust_threshold(&mk(make_p2pkh_spk()), dust_fee)),
+        "546-sat P2PKH must be exactly at the threshold (not dust)"
+    );
 }
 
 /// G9 — BUG-2 (P0-CDIV): `MAX_DUST_OUTPUTS_PER_TX = 1` ephemeral
@@ -575,16 +596,30 @@ fn w135_g25_bug8_multisig_pushdata_xfail() {
     panic!("BUG-8: try_classify_bare_multisig rejects PUSHDATA-prefixed pubkeys");
 }
 
-/// G26 — BUG-9 (P2): `is_dust` P2SH spending size is 91 (witness-style);
-/// should be 148 (non-witness).  Compounds BUG-1.
+/// G26 — BUG-9 (P2) [De-staled 2026-06-16]: `is_dust` P2SH spending size
+/// was 91 (witness-style); Core uses 148 (non-witness) because P2SH is not
+/// an `IsWitnessProgram`. Same fix as BUG-1: the witness branch is now
+/// gated on `parse_witness_program`, which a 23-byte `OP_HASH160 <20> OP_EQUAL`
+/// P2SH scriptPubKey fails — so P2SH takes the 148-byte non-witness cost.
 #[test]
-#[ignore]
-fn w135_g26_bug9_p2sh_spending_size_wrong_xfail() {
-    let dust_fee = 3_000u64;
+fn w135_g26_bug9_p2sh_spending_size_correct() {
+    use rustoshi_consensus::mempool::dust_threshold;
+    use rustoshi_primitives::TxOut;
+
+    let dust_fee = DUST_RELAY_TX_FEE;
     let p2sh_core = core_dust_threshold(1, &make_p2sh_spk(), dust_fee);
     assert_eq!(p2sh_core, 540); // Core: (32 + 148) * 3000 / 1000 = 540
-    // Rustoshi's `91 * 3000 / 1000 = 273`. Gap = 267 sat.
-    panic!("BUG-9: is_dust P2SH spending_size=91, should be 148 (non-witness)");
+
+    // Production must now also return 540 (not the old 91-based 273).
+    let prod = dust_threshold(
+        &TxOut { value: 0, script_pubkey: make_p2sh_spk() },
+        dust_fee,
+    );
+    assert_eq!(
+        prod, 540,
+        "P2SH dust threshold must use the 148-byte non-witness spending cost"
+    );
+    assert_ne!(prod, 273, "must NOT use the old witness-style 91-byte cost");
 }
 
 // ============================================================

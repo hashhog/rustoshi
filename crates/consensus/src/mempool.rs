@@ -33,7 +33,7 @@ use crate::params::{
     MAX_STANDARD_P2WSH_STACK_ITEMS, MAX_STANDARD_P2WSH_STACK_ITEM_SIZE,
     MAX_STANDARD_SCRIPTSIG_SIZE, MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE,
     MAX_STANDARD_TX_SIGOPS_COST, MAX_STANDARD_TX_WEIGHT, MIN_STANDARD_TX_NONWITNESS_SIZE,
-    TAPROOT_LEAF_MASK, TAPROOT_LEAF_TAPSCRIPT,
+    TAPROOT_LEAF_MASK, TAPROOT_LEAF_TAPSCRIPT, WITNESS_SCALE_FACTOR,
 };
 use crate::params::MAX_MONEY;
 use crate::script::{is_p2a, is_p2sh, parse_witness_program, verify_script, ScriptFlags};
@@ -5146,44 +5146,69 @@ fn is_standard_script(script: &[u8]) -> bool {
     classify_standard_script(script) != StandardScriptType::NonStandard
 }
 
-/// Check if an output is dust.
+/// Compute the dust threshold (in satoshis) for an output at the given
+/// dust relay fee rate (sat/kvB), faithful to Core `GetDustThreshold`
+/// (`policy/policy.cpp:27-63`).
 ///
-/// An output is dust if the cost of spending it exceeds its value.
-fn is_dust(output: &TxOut, _min_fee_rate: u64) -> bool {
-    // OP_RETURN is never dust
+/// An output whose value is below this threshold is "dust": it would cost
+/// more in fees to spend than it is worth. Unspendable outputs (OP_RETURN,
+/// P2A) return 0 — they can never be dust (Core: `IsUnspendable()` ⇒ 0).
+///
+///   nSize = GetSerializeSize(txout) + spending_cost
+///         = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost
+/// where the spending cost is a fixed estimate of the CTxIn needed to spend it:
+///   * witness program: 32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR) + 4 = 67
+///   * non-witness:     32 + 4 + 1 + 107 + 4                          = 148
+///
+/// The witness-vs-non-witness branch is Core's `IsWitnessProgram` test — it is
+/// uniform across all witness versions/sizes (P2WPKH, P2WSH, P2TR, and unknown
+/// witness programs all take the segwit-discounted 67), NOT a per-script-type
+/// table. The threshold is `dustRelayFee.GetFee(nSize)`, i.e.
+/// `CeilDiv(nSize * fee, 1000)` (Core `CFeeRate::GetFee` →
+/// `FeePerVSize::EvaluateFeeUp` → `CeilDiv`, feefrac.h:212).
+pub fn dust_threshold(output: &TxOut, dust_relay_fee: u64) -> u64 {
+    // OP_RETURN and other unspendable scripts can never be dust (Core
+    // `txout.scriptPubKey.IsUnspendable()` ⇒ return 0).
     if !output.script_pubkey.is_empty() && output.script_pubkey[0] == 0x6a {
-        return false;
+        return 0;
+    }
+    // P2A (Pay-to-Anchor) outputs are exempt from the dust threshold.
+    if is_p2a(&output.script_pubkey) {
+        return 0;
     }
 
-    // Empty script with zero value is special (sometimes used)
+    let script_len = output.script_pubkey.len();
+    let script_len_prefix: u64 = if script_len < 0xfd {
+        1
+    } else if script_len <= 0xffff {
+        3
+    } else {
+        5
+    };
+    let txout_ser_size = 8 + script_len_prefix + script_len as u64;
+    let spending_cost: u64 = if parse_witness_program(&output.script_pubkey).is_some() {
+        32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR) + 4
+    } else {
+        32 + 4 + 1 + 107 + 4
+    };
+    let n_size = txout_ser_size + spending_cost;
+
+    (n_size * dust_relay_fee).div_ceil(1000)
+}
+
+/// Check if an output is dust.
+///
+/// An output is dust if the cost of spending it exceeds its value. The
+/// earlier per-shape table (148/91/68/108/58) both omitted the
+/// `GetSerializeSize(txout)` summand and used wrong spending sizes,
+/// under-rejecting dust by 6-267 sat vs Core. Delegates to `dust_threshold`.
+fn is_dust(output: &TxOut, _min_fee_rate: u64) -> bool {
+    // Empty script with zero value is special (sometimes used).
     if output.script_pubkey.is_empty() && output.value == 0 {
         return false;
     }
 
-    // P2A (Pay-to-Anchor) outputs are exempt from dust threshold.
-    // They must have zero value and are used for CPFP fee bumping.
-    if is_p2a(&output.script_pubkey) {
-        return false;
-    }
-
-    // Spending cost depends on output type
-    let spending_size: usize = if output.script_pubkey.len() == 25 {
-        148 // P2PKH input size
-    } else if output.script_pubkey.len() == 23 {
-        91 // P2SH input size (approximate)
-    } else if output.script_pubkey.len() == 22 && output.script_pubkey[0] == 0x00 {
-        68 // P2WPKH input size
-    } else if output.script_pubkey.len() == 34 && output.script_pubkey[0] == 0x00 {
-        108 // P2WSH input size (approximate)
-    } else if output.script_pubkey.len() == 34 && output.script_pubkey[0] == 0x51 {
-        58 // P2TR input size
-    } else {
-        148 // conservative default
-    };
-
-    // Dust threshold calculation: spending_size * DUST_RELAY_TX_FEE / 1000
-    let dust_threshold = (spending_size as u64 * DUST_RELAY_TX_FEE) / 1000;
-    output.value < dust_threshold
+    output.value < dust_threshold(output, DUST_RELAY_TX_FEE)
 }
 
 /// Check if an output is ephemeral dust.
