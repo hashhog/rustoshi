@@ -2145,6 +2145,14 @@ fn decode_psbt_input<R: Read>(reader: &mut R) -> Result<PsbtInput, PsbtError> {
                     // Uncompressed - take first 33 bytes (this is simplified)
                     return Err(PsbtError::InvalidPubkey);
                 }
+                // BIP-174 / Core psbt.h:535: a duplicate partial-sig pubkey
+                // key must be rejected, not silently overwritten. Core throws
+                // "Duplicate Key, input partial signature for pubkey already
+                // provided". The map is keyed by the pubkey bytes from the
+                // record key, so contains_key is the faithful equivalent.
+                if input.partial_sigs.contains_key(&pubkey) {
+                    return Err(PsbtError::DuplicateKey("partial signature".to_string()));
+                }
                 input.partial_sigs.insert(pubkey, value);
             }
             PSBT_IN_SIGHASH => {
