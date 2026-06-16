@@ -624,15 +624,18 @@ fn bug8_bump_fee_calls_is_bip125_replaceable_for_ancestors() {
     );
 }
 
-/// BUG-9 / G20 [P1]: the wallet's *default incremental delta* now uses
-/// integer-ceiling math (closed alongside BUG-1: `(rate_kvb * vsize + 999)
-/// / 1000`). The remaining f64-ceil divergence is on the
-/// `fee_rate_override` target path (`(entry.vsize as f64 * rate).ceil()`),
-/// where the operator-supplied sat/vB rate is applied. Two parities of the
-/// same numeric invariant (`CFeeRate::GetFee` → `EvaluateFeeUp` / `CeilDiv`,
-/// feefrac.h:212) still coexist until the override path is also ported.
+/// BUG-9 / G20 [P1] [CLOSED 2026-06-16]: the wallet's `fee_rate_override`
+/// target path used `(entry.vsize as f64 * rate).ceil() as u64` — an f64
+/// ceiling of the product — whereas Core derives an explicit-`fee_rate`
+/// target fee via `CFeeRate{AmountFromValue(fee_rate, /*decimals=*/3)}.GetFee`
+/// (`spend.cpp:224` → `feerate.cpp:20` → `feefrac.h:212`): the sat/vB rate is
+/// first parsed to an **integer** sat/kvB feerate (3-decimal fixed point), then
+/// `CeilDiv(feerate_kvb * vsize, 1000)` is applied. The f64 path diverges by a
+/// satoshi for rates not exactly representable in binary float (e.g. 1.1).
+/// FIXED: override path now calls the integer-ceiling helper
+/// `fee_for_rate_sat_per_vb`, the same `(.. + 999) / 1000` invariant as the
+/// mempool Rule-4 path. De-staled below.
 #[test]
-#[ignore = "BUG-9 P1: fee_rate_override path still uses f64 ceil; default delta now integer-ceiling"]
 fn bug9_evaluate_fee_up_parity_uniform() {
     // Mempool side: integer ceiling math (matches Core CeilDiv).
     assert!(
@@ -640,17 +643,83 @@ fn bug9_evaluate_fee_up_parity_uniform() {
             .contains("(self.config.incremental_relay_fee * new_vsize as u64 + 999) / 1000"),
         "mempool Rule 4 must use integer ceiling +999/1000"
     );
-    // Wallet override path still uses f64 ceil. THIS is the residual divergence.
+    // The old f64-ceil override literal must be GONE.
     assert!(
-        WALLET_SRC.contains("(entry.vsize as f64 * rate).ceil() as u64"),
-        "wallet fee_rate_override path must currently use f64 ceil (regression pin)"
+        !WALLET_SRC.contains("(entry.vsize as f64 * rate).ceil() as u64"),
+        "wallet fee_rate_override path must no longer use f64 ceil() (regression pin)"
     );
-    panic!(
-        "BUG-9 P1: incremental fee uses f64 ceil() in wallet but integer \
-         +999/1000 in mempool. Two parities of one Core invariant \
-         (`EvaluateFeeUp`/`CeilDiv`, feefrac.h:212). Fix: extract a \
-         shared `incremental_relay_fee_for_vsize(rate_sat_per_kvb, vsize)` \
-         helper using integer ceiling math."
+    // The override path must route through the integer-ceiling helper.
+    assert!(
+        WALLET_SRC.contains("fee_for_rate_sat_per_vb(rate, entry.vsize as u64)"),
+        "build_bumped_tx override path must call fee_for_rate_sat_per_vb (integer CeilDiv parity)"
+    );
+    // The helper itself must use integer ceiling, not f64 ceil().
+    let helper_start = WALLET_SRC
+        .find("pub fn fee_for_rate_sat_per_vb")
+        .expect("fee_for_rate_sat_per_vb helper must exist");
+    let helper_window = &WALLET_SRC[helper_start..helper_start + 600];
+    assert!(
+        helper_window.contains("+ 999) / 1000"),
+        "fee_for_rate_sat_per_vb must apply integer ceiling division (+999)/1000"
+    );
+    assert!(
+        !helper_window.contains(".ceil()"),
+        "fee_for_rate_sat_per_vb must NOT use f64 .ceil()"
+    );
+
+    // --- Behavioral parity vs. Core, independently recomputed ---------------
+    //
+    // Core: fee = CeilDiv(round(rate*1000) * vsize, 1000)  (integer sat/kvB).
+    // Old (buggy): fee = ceil(vsize as f64 * rate).
+    //
+    // Exercise a grid of (rate sat/vB, vsize) pairs. For every pair the helper
+    // must equal the integer Core reference. Include a rate (1.1 sat/vB) that
+    // is NOT exactly representable in binary float, where the old f64-ceil and
+    // the integer path produce DIFFERENT answers for at least one vsize — proof
+    // the fix is observable, not cosmetic.
+    fn core_reference(rate_sat_per_vb: f64, vsize: u64) -> u64 {
+        let rate_kvb = (rate_sat_per_vb * 1000.0).round() as u64; // ParseFixedPoint(3)
+        (rate_kvb.saturating_mul(vsize) + 999) / 1000 // CFeeRate::GetFee / CeilDiv
+    }
+
+    let rates = [1.0_f64, 1.1, 2.0, 2.5, 5.0, 10.0, 0.1];
+    let vsizes = [100_u64, 110, 141, 200, 250, 999, 1000, 1001, 1234];
+    let mut saw_divergence_from_old_f64 = false;
+    for &rate in &rates {
+        for &vsize in &vsizes {
+            let got = rustoshi_wallet::fee_for_rate_sat_per_vb(rate, vsize);
+            let want = core_reference(rate, vsize);
+            assert_eq!(
+                got, want,
+                "fee_for_rate_sat_per_vb({}, {}) = {} must equal Core CeilDiv reference {}",
+                rate, vsize, got, want
+            );
+            let old_f64 = (vsize as f64 * rate).ceil() as u64;
+            if old_f64 != want {
+                saw_divergence_from_old_f64 = true;
+            }
+        }
+    }
+    assert!(
+        saw_divergence_from_old_f64,
+        "the corrected integer path must differ from the old f64-ceil path on at \
+         least one (rate, vsize) — otherwise the fix would be unobservable"
+    );
+
+    // Spot-check the exact off-by-one the float path produced. At 1.1 sat/vB
+    // and vsize=100, the f64 product `100.0 * 1.1` is 110.0000000000000142...,
+    // so `ceil()` rounds it UP to 111, while Core's integer path gives
+    // CeilDiv(round(1.1*1000) * 100, 1000) = CeilDiv(110000, 1000) = 110.
+    // The helper must give Core's 110, not the buggy 111.
+    assert_eq!(
+        rustoshi_wallet::fee_for_rate_sat_per_vb(1.1, 100),
+        110,
+        "1.1 sat/vB * 100 vB must be exactly 110 sat (Core integer path)"
+    );
+    assert_eq!(
+        (100.0_f64 * 1.1).ceil() as u64,
+        111,
+        "sanity: the old f64-ceil path produced 111 here (the off-by-one bug)"
     );
 }
 
