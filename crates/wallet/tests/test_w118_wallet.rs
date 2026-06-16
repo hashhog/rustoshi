@@ -201,7 +201,9 @@ use rustoshi_wallet::{
     Psbt, PsbtInput, PsbtOutput, Wallet, WalletManager, HARDENED_FLAG,
 };
 use rustoshi_crypto::address::{Address, Network};
-use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
+use rustoshi_crypto::hash160;
+use rustoshi_primitives::{Hash160, Hash256, OutPoint, Transaction, TxIn, TxOut};
+use rustoshi_wallet::{decode_wif, encode_wif};
 use std::collections::BTreeMap;
 use tempfile::tempdir;
 
@@ -853,16 +855,51 @@ fn g10_decode_rejects_wrong_length() {
 // G11 — private key signing / WIF format (mainnet 0x80, testnet 0xef)
 // ===========================================================================
 
+/// BUG-10 [De-staled 2026-06-16]: WIF encoding/decoding is IMPLEMENTED.
+/// `rustoshi_wallet::{encode_wif, decode_wif}` (wallet.rs:2656/2686, re-exported
+/// from the crate root via lib.rs:90) provide the inverse of Core's
+/// `EncodeSecret`/`DecodeSecret` (`key_io.cpp`): base58check over
+/// `[version] + 32-byte key [+ 0x01 compression flag]`, with the version byte
+/// 0x80 on mainnet and 0xEF on testnet/regtest. The version byte is validated
+/// against the active network so a mainnet WIF cannot be decoded as testnet.
+///
+/// This test round-trips a known secret through `encode_wif` / `decode_wif` on
+/// mainnet (asserting the canonical compressed-WIF 'K'/'L' prefix and that the
+/// key bytes + compressed flag survive), then confirms a mainnet WIF is
+/// rejected when decoded against the testnet version byte.
 #[test]
-#[ignore = "BUG-10: WIF encoding/decoding MISSING ENTIRELY. \
-            Neither crates/crypto nor crates/wallet exports to_wif / from_wif. \
-            Core's CKey::EncodeBase58 / DecodeBase58Check with 0x80 (mainnet) and \
-            0xef (testnet) version bytes is absent. Descriptor key expressions \
-            cannot accept WIF, only hex pubkeys / xprv / xpub."]
 fn g11_wif_encode_decode_mainnet() {
-    panic!(
-        "BUG-10: WIF format not implemented. Need to_wif/from_wif with 0x80 prefix \
-         for mainnet, 0xef for testnet, with optional 0x01 compressed-pubkey flag."
+    // A deterministic secret key, obtained from a known seed via BIP-32 so the
+    // test needs no out-of-crate key construction.
+    let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+    let master = ExtendedPrivKey::from_seed(&seed).unwrap();
+    let secret = master.secret_key;
+
+    // encode_wif always emits a compressed-pubkey WIF (0x01 flag). On mainnet
+    // (0x80 version byte) the base58check encoding of a compressed key always
+    // starts with 'K' or 'L'.
+    let wif = encode_wif(&secret, Network::Mainnet);
+    assert!(
+        wif.starts_with('K') || wif.starts_with('L'),
+        "mainnet compressed WIF must start with 'K' or 'L', got: {wif}"
+    );
+
+    // Round-trip: decoding the WIF on mainnet must recover the exact key bytes
+    // and report compressed == true (the 0x01 flag encode_wif appends).
+    let (decoded, compressed) =
+        decode_wif(&wif, Network::Mainnet).expect("mainnet WIF must decode on mainnet");
+    assert_eq!(
+        decoded.secret_bytes(),
+        secret.secret_bytes(),
+        "decode_wif must recover the exact secret key bytes"
+    );
+    assert!(compressed, "encode_wif emits a compressed-pubkey WIF (0x01 flag)");
+
+    // Network binding: a mainnet WIF (0x80 prefix) must NOT decode against the
+    // testnet/regtest version byte (0xEF) — Core's secretKeyPrefix check.
+    assert!(
+        decode_wif(&wif, Network::Testnet).is_err(),
+        "a mainnet WIF must be rejected when decoded as testnet (version-byte mismatch)"
     );
 }
 
@@ -1838,14 +1875,58 @@ fn g28_importdescriptors_rpc_trait_method_exists() {
     let _ = CreateWalletOptions::default();
 }
 
+/// BUG-9 [De-staled 2026-06-16]: legacy private-key import is IMPLEMENTED at
+/// the wallet layer. `Wallet::import_private_key(secret, label)`
+/// (wallet.rs:1961, re-exported via lib.rs:89) is Core's `importprivkey`: it
+/// adds the raw key to the keychain and registers every standard single-key
+/// scriptPubKey it controls (P2WPKH + P2PKH + P2SH-P2WPKH) so a later scan
+/// credits funds paid to any of them. It returns the "primary" address using
+/// the wallet's configured `address_type`.
+///
+/// This test imports a known secret into a P2WPKH wallet and asserts the
+/// returned primary address is exactly the native-segwit (`bc1q…`) address for
+/// `hash160(compressed_pubkey)` — i.e. the wallet derived the script from the
+/// imported key correctly, not from the HD seed.
 #[test]
-#[ignore = "BUG-9: importprivkey MISSING ENTIRELY. No `importprivkey` method on \
-            RPC trait. No `import_wif` helper on Wallet. Only `importdescriptors` \
-            is wired."]
 fn g28_importprivkey_wif() {
-    panic!(
-        "BUG-9: importprivkey not implemented. Need import_wif(wif_string, label, rescan) \
-         + RPC wrapper. Depends on G11 (WIF format) being implemented first."
+    // Deterministic secret key via BIP-32 (no out-of-crate key construction).
+    let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+    let master = ExtendedPrivKey::from_seed(&seed).unwrap();
+    let secret = master.secret_key;
+
+    // Independently compute the expected P2WPKH address for this key.
+    let secp = secp256k1::Secp256k1::new();
+    let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+    let compressed: [u8; 33] = pubkey.serialize();
+    let pubkey_hash: Hash160 = hash160(&compressed);
+    let expected_addr = Address::P2WPKH {
+        hash: pubkey_hash,
+        network: Network::Mainnet,
+    }
+    .encode();
+
+    // A P2WPKH wallet returns the imported key's P2WPKH address as primary.
+    let mut wallet =
+        Wallet::from_seed(&[7u8; 64], Network::Mainnet, AddressType::P2WPKH).unwrap();
+    let returned = wallet
+        .import_private_key(secret, "lbl".to_string())
+        .expect("import_private_key must succeed");
+
+    assert_eq!(
+        returned, expected_addr,
+        "importprivkey into a P2WPKH wallet must return the bc1q address for \
+         hash160(pubkey)"
+    );
+    assert!(
+        returned.starts_with("bc1q"),
+        "mainnet P2WPKH primary address must start with 'bc1q', got: {returned}"
+    );
+
+    // The imported key is genuinely registered (independent of the HD seed).
+    assert_eq!(
+        wallet.imported_key_count(),
+        1,
+        "exactly one distinct imported key must be tracked after one import"
     );
 }
 

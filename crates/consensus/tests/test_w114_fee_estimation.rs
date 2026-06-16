@@ -208,16 +208,69 @@ fn g7_bucket_lookup_binary_search() {
 
 // ─── G8 m_confAvg arrays (3 horizons × ~196 buckets × N periods) ─────────────
 
-/// BUG-8 (structural, same as BUG-1/2): rustoshi has one flat confirmed_within
-/// array per bucket (size MAX_CONFIRMATION_TARGET=1008), rather than three separate
-/// confAvg arrays indexed as [horizon][period][bucket]. The flat array wastes
-/// significant memory for medium/long horizons and cannot independently apply
-/// per-horizon decay.
+/// FIXED (was BUG-8): rustoshi now has the three-horizon confAvg architecture.
+/// Core's `TxConfirmStats` keeps per-horizon `confAvg[period][bucket]` arrays; the
+/// old rustoshi had a single flat array that could not apply per-horizon decay.
+/// FIX-48 rebuilt the estimator with three independent `TxConfirmStats` instances
+/// (`short_stats`/`med_stats`/`long_stats`, fee_estimator.rs:381-383), each decayed
+/// separately in `process_block` (fee_estimator.rs:427-429).
+///
+/// We prove the per-horizon arrays are real and independently decayed by feeding
+/// the same confirmation into all three horizons, then decaying 18 empty blocks and
+/// observing that the SHORT bucket has lost ~half its weight (SHORT_DECAY^18 ≈ 0.50)
+/// while the LONG bucket is essentially unchanged (LONG_DECAY^18 ≈ 0.988). A single
+/// flat array could not produce two different decay ratios for the same data.
+///
+/// The decayed per-bucket weight is read via the public
+/// `raw_bucket_stats_horizon(Horizon, target)` accessor (fee_estimator.rs:533), whose
+/// `RawBucketStats::total` field carries the decayed count. Bucket index 8 is the
+/// 10 sat/vB bucket (see fee_estimator.rs unit test `fee_rate_to_bucket(10.0) == 8`).
+///
+/// De-staled 2026-06-16: production already implements the cited three-horizon
+/// architecture; the marker was stale.
 #[test]
-#[ignore] // BUG-8: single flat confirmed_within[1008] vs Core's confAvg[period][bucket] × 3 horizons
 fn g8_confavg_array_architecture_wrong() {
-    // Structural — no direct API; documented as architectural gap.
-    let _ = FeeEstimator::new();
+    let mut est = FeeEstimator::new();
+    // Track 300 txs @ 10 sat/vB and confirm them all in block 1 (blocks_to_confirm=1).
+    for i in 0..300u32 {
+        est.track_transaction(make_txid(i), 10.0);
+    }
+    let confirmed: Vec<Hash256> = (0..300u32).map(make_txid).collect();
+    est.process_block(1, &confirmed);
+
+    // Decayed weight in the 10 sat/vB bucket (index 8), per horizon, right after confirm.
+    // raw_bucket_stats_horizon returns one RawBucketStats per fee-rate bucket; .total is
+    // the decayed total count.
+    let short_after_1 = est.raw_bucket_stats_horizon(Horizon::Short, 1)[8].total;
+    let long_after_1 = est.raw_bucket_stats_horizon(Horizon::Long, 1)[8].total;
+    assert!(short_after_1 > 0.0, "SHORT horizon must record the confirmation");
+    assert!(long_after_1 > 0.0, "LONG horizon must record the same confirmation");
+
+    // Decay 18 more empty blocks.
+    for h in 2u32..=19 {
+        est.process_block(h, &[]);
+    }
+    let short_after_19 = est.raw_bucket_stats_horizon(Horizon::Short, 1)[8].total;
+    let long_after_19 = est.raw_bucket_stats_horizon(Horizon::Long, 1)[8].total;
+
+    // SHORT_DECAY^18 ≈ 0.962^18 ≈ 0.500 → roughly half the weight gone.
+    // LONG_DECAY^18  ≈ 0.99931^18 ≈ 0.988 → almost unchanged.
+    let short_ratio = short_after_19 / short_after_1;
+    let long_ratio = long_after_19 / long_after_1;
+    assert!(
+        short_ratio < 0.55,
+        "SHORT horizon should have decayed >45% after 18 blocks (got ratio {short_ratio})"
+    );
+    assert!(
+        long_ratio > 0.97,
+        "LONG horizon should have decayed <3% after 18 blocks (got ratio {long_ratio})"
+    );
+    // The two horizons must decay independently — a single flat array cannot do this.
+    assert!(
+        short_ratio < long_ratio - 0.3,
+        "SHORT ratio ({short_ratio}) must be much smaller than LONG ratio ({long_ratio}) — \
+         proves three independent confAvg horizons, not one flat array"
+    );
 }
 
 // ─── G9 m_failAvg array ─────────────────────────────────────────────────────
@@ -371,17 +424,66 @@ fn g16_estimate_raw_fee_accumulation_wrong() {
 
 // ─── G17 success_avg > 95% (DOUBLE_SUCCESS_PCT) ──────────────────────────────
 
-/// BUG-17 (P1): Rustoshi uses a single 85% threshold (SUCCESS_THRESHOLD=0.85)
-/// for all targets. Core uses three thresholds:
-///  - HALF_SUCCESS_PCT=0.60  (60%) for half-target in estimateCombinedFee
-///  - SUCCESS_PCT=0.85       (85%) for normal targets
-///  - DOUBLE_SUCCESS_PCT=0.95 (95%) for double-target in estimateConservativeFee
-/// Missing the 95% heuristic for conservative estimates means conservative fees
-/// are not conservative enough compared to Core.
+/// FIXED (was BUG-17): rustoshi now supports per-call success thresholds, including
+/// Core's DOUBLE_SUCCESS_PCT=0.95 used for conservative estimates.
+///
+/// `TxConfirmStats::estimate_with_threshold(conf_target, threshold)` takes the success
+/// bar as a parameter (fee_estimator.rs:255-289), surfaced publicly as
+/// `FeeEstimator::estimate_fee_at_horizon(target, horizon, threshold)`
+/// (fee_estimator.rs:470-475). `estimate_conservative` is exactly the LONG horizon at
+/// 95% confidence: `estimate_fee_at_horizon(target, Horizon::Long, 0.95)`
+/// (fee_estimator.rs:499-502).
+///
+/// We verify three properties against the public API:
+///  1. After populating LONG-horizon data, the 95% estimate is `Some` (the stricter
+///     bar can be met by this single-feerate data).
+///  2. The 95% estimate is ≥ the 85% estimate at the same horizon. A stricter success
+///     bar scans from the highest fee bucket down and stops earlier, so it can only
+///     keep or raise the recommended fee — never lower it.
+///  3. `estimate_conservative(t)` is byte-for-byte the `(Long, 0.95)` estimate, proving
+///     the conservative path uses the 95% heuristic rather than the old single-85%
+///     threshold (or the discredited half-target trick).
+///
+/// De-staled 2026-06-16: production already implements the triple-threshold /
+/// per-call-threshold behavior; the marker was stale.
 #[test]
-#[ignore] // BUG-17: no DOUBLE_SUCCESS_PCT=0.95 heuristic; single 85% threshold used everywhere
 fn g17_success_pct_triple_thresholds_missing() {
-    let _ = FeeEstimator::new();
+    let mut est = FeeEstimator::new();
+
+    // Populate LONG-horizon data: 300 txs @ 5 sat/vB confirming on block 50 (target 50
+    // → LONG horizon, period = ceil(50/24) = 3). Decayed LONG total stays > MIN_TRACKED_TXS.
+    for i in 0..300u32 {
+        est.track_transaction(make_txid(i), 5.0);
+    }
+    for h in 1u32..50 {
+        est.process_block(h, &[]);
+    }
+    let confirmed: Vec<Hash256> = (0..300u32).map(make_txid).collect();
+    est.process_block(50, &confirmed);
+
+    let long_95 = est.estimate_fee_at_horizon(50, Horizon::Long, 0.95);
+    let long_85 = est.estimate_fee_at_horizon(50, Horizon::Long, 0.85);
+
+    // (1) The 95% (DOUBLE_SUCCESS_PCT) bar produces an estimate from this data.
+    assert!(
+        long_95.is_some(),
+        "estimate_fee_at_horizon(50, Long, 0.95) must be Some with 300 confirmed LONG-horizon txs"
+    );
+
+    // (2) Stricter threshold ⇒ fee rate is >= the looser-threshold fee rate.
+    if let (Some(p95), Some(p85)) = (long_95, long_85) {
+        assert!(
+            p95 >= p85,
+            "95% threshold fee ({p95}) must be >= 85% threshold fee ({p85}) at the same horizon"
+        );
+    }
+
+    // (3) Conservative == LONG horizon @ 95% (the DOUBLE_SUCCESS_PCT heuristic), exactly.
+    let conservative = est.estimate_conservative(50);
+    assert_eq!(
+        conservative, long_95,
+        "estimate_conservative(50) must equal estimate_fee_at_horizon(50, Long, 0.95)"
+    );
 }
 
 // ─── G18 estimateCombinedFee: short → medium → long fallback ─────────────────

@@ -227,16 +227,24 @@ fn g7_rpc_invalid_address_or_key_numeric() {
 }
 
 /// G8 — `RPC_INVALID_PARAMETER` (-8) is the canonical Core code for
-/// application-layer parameter validation. NOT DEFINED in rustoshi.
-/// Status: BUG-3 (P1) — see g8_rpc_invalid_parameter_absence.
+/// application-layer parameter validation (Core `protocol.h`
+/// `RPC_INVALID_PARAMETER = -8`). It IS now defined in rustoshi at
+/// `crates/rpc/src/server.rs::rpc_error::RPC_INVALID_PARAMETER`.
+/// Status: BUG-3 (P1) — RESOLVED. The constant exists with the genuine
+/// Core value, distinct from `RPC_INVALID_PARAMS` (-32602).
+/// De-staled 2026-06-16 (prior `#[ignore]` xfail stub was stale — production
+/// already defines the constant; pin it as a regression test instead).
 #[test]
-#[ignore]
 fn g8_rpc_invalid_parameter_absence() {
-    // Compile-time absence proof: there is no `RPC_INVALID_PARAMETER`
-    // constant in `rpc_error` or `wallet_error`. After fix, replace this
-    // with: `assert_eq!(rpc_error::RPC_INVALID_PARAMETER, -8);`
-    panic!("BUG-3: rustoshi has no RPC_INVALID_PARAMETER (-8) constant; \
-            51 call sites use RPC_INVALID_PARAMS (-32602) where Core uses -8.");
+    // Core protocol.h:44 — RPC_INVALID_PARAMETER = -8.
+    assert_eq!(rpc_error::RPC_INVALID_PARAMETER, -8);
+    // Must be the application-layer code, NOT the JSON-RPC transport code
+    // RPC_INVALID_PARAMS (-32602); the two must remain distinct.
+    assert_ne!(
+        rpc_error::RPC_INVALID_PARAMETER,
+        rpc_error::RPC_INVALID_PARAMS,
+        "RPC_INVALID_PARAMETER (-8) must not collide with RPC_INVALID_PARAMS (-32602)"
+    );
 }
 
 /// G9 — `RPC_DATABASE_ERROR` -20 matches Core protocol.h:45.

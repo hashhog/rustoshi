@@ -1170,13 +1170,48 @@ fn extra_getmempoolentry_depends_spentby_empty_bug18() {
     panic!("BUG-18: getmempoolentry returns depends/spentby as empty vec.");
 }
 
-/// EXTRA — getmempoolinfo.mempoolminfee hardcoded `1000 sat/kvB` (server.rs:3719),
-/// ignoring the rolling minimum from `mempool.get_min_fee()`.
-/// Status: BUG-17 (P2) — operators see wrong floor during memory pressure.
+/// EXTRA — getmempoolinfo.mempoolminfee reads the live dynamic floor from the
+/// mempool instead of a hardcoded `1000 sat/kvB`.
+///
+/// De-staled 2026-06-16: BUG-17 is FIXED in production. The mempool now exposes
+/// `mempool_min_feerate_kvb()` = `max(rolling_minimum_fee_rate.round(),
+/// incremental_relay_fee)` (mempool.rs:3319-3324) and `min_relay_feerate_kvb()`
+/// = `config.min_fee_rate` (mempool.rs:3297-3299); getmempoolinfo reads the max
+/// of these (the same `max(rolling, incremental)` clamp Core's
+/// CTxMemPool::GetMinFee applies, txmempool.cpp:829-851). With the production
+/// default config the floor is 100 sat/kvB, NOT the old hardcoded 1000.
+///
+/// This drives the consensus-crate public API directly (the value the RPC layer
+/// surfaces) rather than the RPC server, which lives in another crate.
+/// Status: OK (was BUG-17 P2).
 #[test]
-#[ignore]
 fn extra_getmempoolinfo_mempoolminfee_hardcoded_bug17() {
-    panic!("BUG-17: getmempoolinfo.mempoolminfee hardcoded 1000 sat/kvB; ignores rolling min.");
+    // Empty mempool, default config: rolling rate is 0, so the dynamic floor is
+    // max(0, incremental_relay_fee=100) == 100 sat/kvB.
+    let mp = Mempool::new(MempoolConfig::default());
+
+    assert_eq!(
+        mp.mempool_min_feerate_kvb(),
+        100,
+        "empty-mempool dynamic floor must be max(rolling=0, incremental=100) == 100 sat/kvB"
+    );
+    assert_eq!(
+        mp.min_relay_feerate_kvb(),
+        100,
+        "static relay floor must equal config.min_fee_rate == 100 sat/kvB"
+    );
+
+    // getmempoolinfo.mempoolminfee = max(mempool_min_feerate, min_relay_feerate),
+    // which must be the live 100 sat/kvB floor — NOT the old hardcoded 1000.
+    let mempoolminfee = std::cmp::max(mp.mempool_min_feerate_kvb(), mp.min_relay_feerate_kvb());
+    assert_eq!(
+        mempoolminfee, 100,
+        "getmempoolinfo.mempoolminfee must read the live floor (100), not the hardcoded 1000"
+    );
+    assert_ne!(
+        mempoolminfee, 1000,
+        "BUG-17 regression guard: mempoolminfee must not revert to the hardcoded 1000 sat/kvB"
+    );
 }
 
 // ============================================================
