@@ -171,6 +171,15 @@ pub enum PsbtError {
     #[error("cannot finalize: {0}")]
     CannotFinalize(String),
 
+    /// Trailing (unparsed) bytes remained after a complete PSBT.
+    ///
+    /// Mirrors Bitcoin Core's `DecodeRawPSBT` (src/psbt.cpp): after
+    /// `ss_data >> psbt` it rejects with `if (!ss_data.empty()) { error =
+    /// "extra data after PSBT"; }`. A PSBT that does not consume its entire
+    /// input stream is malformed and must not deserialize as Ok.
+    #[error("extra data after PSBT")]
+    TrailingData,
+
     /// IO error
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -1179,7 +1188,16 @@ impl Psbt {
             )));
         }
         let mut cursor = Cursor::new(data);
-        Self::decode(&mut cursor)
+        let psbt = Self::decode(&mut cursor)?;
+        // Core parity: DecodeRawPSBT (src/psbt.cpp) rejects any bytes left in
+        // the stream after a complete unserialize ("extra data after PSBT").
+        // The byte-slice boundary is where the total length is known, so the
+        // trailing-data check lives here rather than inside the streaming
+        // `decode<R: Read>` (which has no notion of "end of the whole blob").
+        if (cursor.position() as usize) != data.len() {
+            return Err(PsbtError::TrailingData);
+        }
+        Ok(psbt)
     }
 
     /// Encode to base64.
