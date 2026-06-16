@@ -5156,6 +5156,21 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // task #12: persist learned peer state so it survives the restart. The
+    // bucketed addrman (peers.dat) and block-relay anchors had save methods that
+    // were never called by the daemon, so the address table + anchors were lost
+    // on every restart. Mirrors Core's shutdown peers.dat dump + DumpAnchors.
+    // peer_manager was moved into PeerState (line ~2714), so reach it via the
+    // shared lock.
+    {
+        let ps = peer_state.read().await;
+        if let Some(pm) = &ps.peer_manager {
+            pm.save_addrman(&datadir);
+            pm.save_anchors();
+            tracing::info!("Saved peer addrman + anchors under {}", datadir.display());
+        }
+    }
+
     // Dump mempool to `mempool.dat` (Core-format, byte-compatible). Same
     // best-effort posture as fee-estimate persistence: log and continue
     // on any I/O failure.

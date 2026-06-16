@@ -592,6 +592,17 @@ impl AddrManTable {
         }
     }
 
+    /// Number of addresses currently held (NEW + TRIED). Used by the task #12
+    /// persistence test and as a cheap health/inspection counter.
+    pub fn len(&self) -> usize {
+        self.map_info.len()
+    }
+
+    /// True when the table holds no addresses.
+    pub fn is_empty(&self) -> bool {
+        self.map_info.is_empty()
+    }
+
     /// Cheap hash (Core HashWriter::GetCheapHash analogue): single SHA-256 of
     /// the concatenated parts, low 8 bytes interpreted little-endian.
     fn cheap_hash(parts: &[&[u8]]) -> u64 {
@@ -2475,12 +2486,19 @@ impl PeerManager {
             );
         }
 
+        // task #12: load the persisted bucketed addrman from <data_dir>/peers.dat
+        // (graceful cold-start if absent/corrupt) so the learned address table
+        // survives restarts instead of starting empty. Mirrors Core CAddrMan
+        // reading peers.dat at startup. The matching save is wired into the
+        // daemon's periodic maintenance + graceful-shutdown path (main.rs).
+        let addr_manager = AddressManager::with_persisted(&config.data_dir, &netgroup_manager);
+
         Self {
             config,
             params,
             peers: HashMap::new(),
             inbound_cmd_txs: None,
-            addr_manager: AddressManager::new(),
+            addr_manager,
             misbehavior_tracker: MisbehaviorTracker::new(),
             ban_manager,
             netgroup_manager,
@@ -4465,6 +4483,16 @@ impl PeerManager {
     #[cfg(test)]
     pub fn get_peer_stale_state_mut(&mut self, peer_id: PeerId) -> Option<&mut StalePeerState> {
         self.peers.get_mut(&peer_id).map(|p| &mut p.stale_state)
+    }
+
+    /// Persist the bucketed addrman to `<data_dir>/peers.dat` (task #12).
+    ///
+    /// Delegates to the inner `AddressManager`; called from the daemon's
+    /// periodic maintenance tick and graceful-shutdown path so the learned
+    /// address table survives restarts. Mirrors Core's periodic
+    /// `DumpPeerAddresses` + the shutdown dump. Best-effort (never fatal).
+    pub fn save_addrman(&self, data_dir: &std::path::Path) {
+        self.addr_manager.save_addrman(data_dir);
     }
 
     /// Save anchor connections to disk.
