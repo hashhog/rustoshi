@@ -3607,6 +3607,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }
                                         None
                                     },
+                                    // Reorg Unit E (E2): our current header chain's
+                                    // nBits at `height`, for the heavier-fork work
+                                    // compare. None when the height isn't in our
+                                    // index (the work-gate treats it as zero work).
+                                    &|height| {
+                                        block_store
+                                            .get_hash_by_height(height)
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|h| block_store.get_header(&h).ok().flatten())
+                                            .map(|hdr| hdr.bits)
+                                    },
                                 );
 
                                 match need_more {
@@ -3630,6 +3642,41 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }
                                     }
                                     Ok(false) => {
+                                        // Reorg Unit E (E1): if this batch was a peer
+                                        // announcing a chain that does NOT connect to our
+                                        // header tip (a competing fork, which by definition
+                                        // can't connect), send that peer a getheaders with a
+                                        // locator from our active chain and promote it to the
+                                        // active header-sync peer, so its fork reply reaches
+                                        // the rewind path (an unsolicited unconnecting reply
+                                        // would otherwise be ignored). Without this, a
+                                        // competing chain is never requested over passive P2P
+                                        // and the reorg arm (Units A–C) can never fire.
+                                        // Reorg Unit E (review fix 2): only act on the
+                                        // discovery hint when we are NOT mid header-sync, so
+                                        // an unconnecting announcement from another peer can't
+                                        // hijack an in-progress IBD's sync peer (request_..._from
+                                        // would overwrite the active DownloadingHeaders state).
+                                        // The announcing peer re-announces on its next block,
+                                        // so the fork is still discovered once we settle to
+                                        // Idle — matching the inv-discovery Idle gate below.
+                                        let discovery_peer = header_sync.take_getheaders_hint();
+                                        if matches!(header_sync.state(), rustoshi_network::SyncState::Idle) {
+                                            if let Some(hint_peer) = discovery_peer {
+                                                let gh = header_sync.request_headers_from(
+                                                    hint_peer,
+                                                    |h| block_store.get_hash_by_height(h).ok().flatten(),
+                                                );
+                                                tracing::info!(
+                                                    "Reorg Unit E: peer {} announced an unconnecting chain; sending discovery getheaders",
+                                                    hint_peer.0
+                                                );
+                                                let ps = peer_state.read().await;
+                                                if let Some(ref pm) = ps.peer_manager {
+                                                    pm.send_to_peer(hint_peer, gh).await;
+                                                }
+                                            }
+                                        }
                                         let new_best = header_sync.best_header_height();
                                         if header_count > 0 {
                                             tracing::info!(
@@ -3691,7 +3738,28 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             let cs = chain_state.read().await;
                                             cs.tip_height()
                                         };
-                                        let old_best = chainstate_tip;
+                                        // Reorg Unit E (E3): if process_headers rewound the
+                                        // header tip to a heavier fork (header_sync set a
+                                        // pending_rewind), drop the enqueue floor to that
+                                        // fork point so the fork's bodies BELOW our active
+                                        // tip get requested — those are exactly what the
+                                        // reorg arm (Units A–C) needs and what the old
+                                        // chainstate_tip floor skipped (the Unit D finding).
+                                        // No rewind ⇒ floor == chainstate_tip, so the
+                                        // GAP-FILL invariant for normal sync is byte-for-byte
+                                        // unchanged. min() keeps the floor no higher than the
+                                        // normal GAP-FILL floor.
+                                        let old_best = match header_sync.take_pending_rewind() {
+                                            Some(fork_height) => {
+                                                let floor = std::cmp::min(chainstate_tip, fork_height);
+                                                tracing::info!(
+                                                    "Reorg Unit E: heavier-fork rewind to height {}; lowering block-download floor {}->{} to fetch competing-branch bodies",
+                                                    fork_height, chainstate_tip, floor
+                                                );
+                                                floor
+                                            }
+                                            None => chainstate_tip,
+                                        };
                                         block_downloader.set_best_header_height(new_best);
 
                                         // Receiving headers means peers are responsive —
@@ -4310,13 +4378,33 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             NetworkMessage::Inv(inv_items) => {
                                 // Handle new block/transaction announcements
                                 let mut tx_requests = Vec::new();
+                                // Reorg Unit E (E1/Gap-3): set when a peer announces a
+                                // block (via inv) whose header we don't have — a new tip
+                                // or a competing chain. Core replies with getheaders (never
+                                // a direct getdata) to discover it headers-first. Gated on
+                                // SyncState::Idle below so IBD (where unknown-block invs are
+                                // normal noise and the headers pipeline already drives
+                                // download) isn't disrupted.
+                                let mut block_discovery_peer = None;
                                 for item in &inv_items {
                                     match item.inv_type {
                                         InvType::MsgBlock | InvType::MsgWitnessBlock => {
-                                            // New block announced -- request headers
+                                            let have_header = block_store
+                                                .get_header(&item.hash)
+                                                .ok()
+                                                .flatten()
+                                                .is_some();
+                                            if !have_header
+                                                && matches!(
+                                                    header_sync.state(),
+                                                    rustoshi_network::SyncState::Idle
+                                                )
+                                            {
+                                                block_discovery_peer = Some(peer_id);
+                                            }
                                             tracing::debug!(
-                                                "Block announced by peer {}: {}",
-                                                peer_id.0, item.hash
+                                                "Block announced by peer {}: {} (have_header={})",
+                                                peer_id.0, item.hash, have_header
                                             );
                                         }
                                         InvType::MsgTx | InvType::MsgWitnessTx => {
@@ -4340,6 +4428,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             NetworkMessage::GetData(tx_requests),
                                         )
                                         .await;
+                                    }
+                                }
+                                // Reorg Unit E (E1/Gap-3): discover an inv-announced chain
+                                // headers-first by getheaders + promoting the peer to active
+                                // sync (so its reply, which may be a competing fork that
+                                // doesn't connect to our tip, reaches the rewind path).
+                                if let Some(disc_peer) = block_discovery_peer {
+                                    let gh = header_sync.request_headers_from(
+                                        disc_peer,
+                                        |h| block_store.get_hash_by_height(h).ok().flatten(),
+                                    );
+                                    tracing::info!(
+                                        "Reorg Unit E: peer {} inv'd an unknown block; sending discovery getheaders",
+                                        disc_peer.0
+                                    );
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.send_to_peer(disc_peer, gh).await;
                                     }
                                 }
                             }
