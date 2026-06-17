@@ -2379,7 +2379,18 @@ fn disconnect_to(
 /// This is the production wiring for `chain_state.reorganize`. Counterpart
 /// to Bitcoin Core's `ActivateBestChainStep` for side-branch blocks
 /// (`bitcoin-core/src/validation.cpp::ActivateBestChainStep`).
-fn try_attach_and_reorg(
+///
+/// `pub` (reorg cluster Unit C): besides submitblock's `PrevBlockNotFound`
+/// arm, the P2P block-processing loop in `rustoshi/src/main.rs` routes a
+/// dropped competing-branch / fork block (one that does not extend the active
+/// tip) through this same entry under the `RpcState` write lock. Keeping a
+/// single shared implementation guarantees the P2P reorg path drives the
+/// identical `best_hash` / `best_height` / `header_height` / mempool-refill /
+/// txindex / coinstats / txospender / block-filter updates submitblock does —
+/// the two callers can never diverge. The internal `MAX_REORG_DEPTH` cap
+/// (server.rs:2549) applies to both callers, so a P2P-delivered reorg deeper
+/// than `MAX_REORG_DEPTH` is rejected with an `Err`, not attempted.
+pub fn try_attach_and_reorg(
     state: &mut RpcState,
     block: &Block,
     block_hash: &Hash256,
@@ -18870,6 +18881,164 @@ mod tests {
         );
         // Tip is unchanged.
         assert_eq!(rpc_state.best_hash, hash_g);
+    }
+
+    /// Unit C (reorg cluster): a heavier competing branch delivered via the
+    /// P2P block-processing arm must actually trigger `reorganize()` and drive
+    /// the SAME `RpcState` updates submitblock does — proving the P2P reorg
+    /// path and the submitblock reorg path share one implementation and cannot
+    /// diverge.
+    ///
+    /// `try_attach_and_reorg` is the single shared entry both callers invoke
+    /// (submitblock's `PrevBlockNotFound` arm at server.rs:6466, and the P2P
+    /// handler's `reorg_candidate` arm in `rustoshi/src/main.rs`). This test
+    /// exercises that entry under the exact pre-state the P2P arm hands it:
+    /// the active tip's UTXO/undo already flushed to disk (the P2P arm flushes
+    /// `utxo_view` before handing off), then a fork block whose parent is NOT
+    /// the active tip. We assert not just `best_hash`/`best_height` but
+    /// `header_height` (submitblock advances it via `.max`) and the persisted
+    /// tip, so any future change that lets the two callers diverge on the
+    /// RpcState side fails here.
+    #[tokio::test]
+    async fn unit_c_p2p_arm_heavier_branch_triggers_reorg_and_updates_rpcstate() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        // Mainnet params (synthetic heights 0..3 sit far below BIP-34/SegWit
+        // activation, so those contextual checks are no-ops) BUT with the
+        // regtest PoW limit, so `reorganize`'s connect-time `check_proof_of_work`
+        // accepts our `bits=0x207fffff` synthetic blocks. Without the override
+        // the connect re-validation rejects them as `high-hash` (target above
+        // mainnet pow_limit) — the latent rot that broke the older
+        // `try_attach_and_reorg_switches_to_heavier_branch` test when the
+        // pow_limit bound was added to the connect path (validation.rs:555-562).
+        let params = {
+            let mut p = ChainParams::mainnet();
+            let mut regtest_limit = [0xffu8; 32];
+            regtest_limit[0] = 0x7f;
+            p.pow_limit = regtest_limit;
+            p
+        };
+        let mut rpc_state = RpcState::new(db.clone(), params);
+
+        // Active chain G -> A1 -> A2 (height 2), fully populated on disk.
+        let (hash_g, _, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a1, _, work_a1) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xA1)
+        };
+        let (hash_a2, _, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 2, hash_a1, work_a1, 0xA2)
+        };
+        // Drive RpcState to the active tip the way the live node would, INCLUDING
+        // header_height — which the P2P/submitblock connect paths keep in lockstep
+        // with the block tip via `.max`. A correct reorg must not regress it.
+        rpc_state.best_hash = hash_a2;
+        rpc_state.best_height = 2;
+        rpc_state.header_height = 2;
+
+        // Heavier side branch off G: G -> B1 -> B2 pre-committed as side blocks
+        // (header/body/index only — the reorg path computes their UTXO+undo
+        // itself), then B3 is the "newly-arrived" P2P block that overtakes A2.
+        let (hash_b1, _, work_b1) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 1, hash_g, work_g, 0xB1)
+        };
+        let (hash_b2, _, work_b2) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 2, hash_b1, work_b1, 0xB2)
+        };
+        let _ = work_b2;
+        let block_b3 = mine_synth_block(3, hash_b2, 0xB3);
+        let hash_b3 = block_b3.block_hash();
+
+        // --- This is exactly what the P2P `reorg_candidate` arm does: route the
+        //     dropped fork block into the shared attach-and-reorg entry. ---
+        let did_reorg = try_attach_and_reorg(&mut rpc_state, &block_b3, &hash_b3)
+            .expect("attach-and-reorg must not hard-error on a known-parent fork");
+        assert!(did_reorg, "the B-branch is heavier — reorganize() MUST fire");
+
+        // RpcState consistency: the SAME fields submitblock's reorg path drives.
+        assert_eq!(rpc_state.best_hash, hash_b3, "best_hash switched to the new tip");
+        assert_eq!(rpc_state.best_height, 3, "best_height advanced to the new tip");
+        assert_eq!(
+            rpc_state.header_height, 3,
+            "header_height advanced with the block tip (.max), as submitblock does"
+        );
+
+        // Persisted tip must agree — else a restart reloads a corrupt tip. This
+        // is what makes the P2P-delivered reorg durable, not just in-memory.
+        let store = BlockStore::new(&db);
+        assert_eq!(store.get_best_block_hash().unwrap().unwrap(), hash_b3);
+        assert_eq!(store.get_best_height().unwrap().unwrap(), 3);
+
+        // The height index now names the new chain at every contended height —
+        // the in-memory ChainState tip the P2P arm re-points to (via set_tip)
+        // will therefore agree with what get_hash_by_height returns.
+        assert_eq!(store.get_hash_by_height(1).unwrap().unwrap(), hash_b1);
+        assert_eq!(store.get_hash_by_height(2).unwrap().unwrap(), hash_b2);
+        assert_eq!(store.get_hash_by_height(3).unwrap().unwrap(), hash_b3);
+    }
+
+    /// Unit C (reorg cluster): a NON-heavier fork delivered via the P2P arm is
+    /// STORED on its side-branch but does NOT activate — Core keeps side
+    /// branches without reorging onto them. Proves the P2P arm leaves the
+    /// active tip + RpcState untouched on `Ok(false)` (the "stored, not best
+    /// work" outcome the handler logs at debug and otherwise ignores).
+    #[tokio::test]
+    async fn unit_c_p2p_arm_lighter_fork_stores_without_activating() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+
+        // Active chain G -> A1 -> A2 (height 2).
+        let (hash_g, _, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a1, _, work_a1) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xA1)
+        };
+        let (hash_a2, _, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 2, hash_a1, work_a1, 0xA2)
+        };
+        rpc_state.best_hash = hash_a2;
+        rpc_state.best_height = 2;
+        rpc_state.header_height = 2;
+
+        // A lighter competing fork: a single block off G (height 1) — strictly
+        // less work than A2. This is what the P2P arm would route on receiving
+        // a short side-branch block.
+        let block_b1 = mine_synth_block(1, hash_g, 0xB1);
+        let hash_b1 = block_b1.block_hash();
+
+        let did_reorg = try_attach_and_reorg(&mut rpc_state, &block_b1, &hash_b1)
+            .expect("storing a known-parent side block must not hard-error");
+        assert!(!did_reorg, "a lighter fork must NOT trigger a reorg");
+
+        // RpcState fully unchanged — the P2P arm's Ok(false) branch is a no-op
+        // for tip state.
+        assert_eq!(rpc_state.best_hash, hash_a2, "tip unchanged");
+        assert_eq!(rpc_state.best_height, 2, "height unchanged");
+        assert_eq!(rpc_state.header_height, 2, "header tip unchanged");
+
+        // But the block is persisted so a later extension can overtake us.
+        let store = BlockStore::new(&db);
+        assert!(
+            store.get_block(&hash_b1).unwrap().is_some(),
+            "the side-branch block must be stored on disk for a possible later attach"
+        );
     }
 
     // ============================================================
