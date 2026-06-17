@@ -4,7 +4,10 @@
 //! blocks, headers, UTXOs, and chain metadata.
 
 use crate::columns::*;
-use crate::db::{ChainDb, StorageError, META_BEST_BLOCK_HASH, META_BEST_HEIGHT, META_PRUNE_HEIGHT};
+use crate::db::{
+    ChainDb, StorageError, META_BEST_BLOCK_HASH, META_BEST_HEIGHT, META_PRUNE_HEIGHT,
+    META_REORG_PRUNE_HEIGHT,
+};
 use rocksdb::WriteBatch;
 use rustoshi_primitives::{Block, BlockHeader, Decodable, Encodable, Hash256, OutPoint};
 use serde::{Deserialize, Serialize};
@@ -410,6 +413,61 @@ impl<'a> BlockStore<'a> {
         Ok(())
     }
 
+    /// Stage a full-block body put into `batch`.
+    ///
+    /// Mirrors [`BlockStore::put_block`] but writes into a caller-owned
+    /// `WriteBatch`. Used by the linear P2P/IBD connect path (Unit B) to
+    /// persist the block body for the reorg-retention window in the SAME
+    /// atomic batch as the UTXO mutations + tip pointer, so the persisted
+    /// tip can never name a height whose block body is not yet durable.
+    /// Bitcoin Core writes the block to disk (`SaveBlockToDisk`) before it
+    /// advances the chain tip in `ConnectTip`; staging the body in the
+    /// same `WriteBatch` as `DB_BEST_BLOCK` is the rustoshi equivalent.
+    pub fn batch_put_block(
+        &self,
+        batch: &mut WriteBatch,
+        hash: &Hash256,
+        block: &Block,
+    ) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_BLOCKS).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_BLOCKS))
+        })?;
+        let data = block.serialize();
+        batch.put_cf(cf, hash.as_bytes(), &data);
+        Ok(())
+    }
+
+    /// Stage deletes of a block's body + undo into `batch` (retention prune).
+    ///
+    /// Used by the connect path's reorg-retention pruner (Unit B): once a
+    /// block is buried deeper than the reorg window it can never be needed
+    /// to disconnect, so its body + undo are dropped to avoid the
+    /// ~500 GB full-archive footprint. Unlike [`BlockStore::prune_block`]
+    /// this does NOT clear the `HAVE_DATA`/`HAVE_UNDO` index flags or touch
+    /// the prune-height watermark — the reorg-retention prune is an
+    /// internal storage-economy operation distinct from BIP-159 manual /
+    /// auto pruning, and the block stays fully "have data" from the chain
+    /// manager's point of view at the heights where it still matters.
+    /// Staged into the SAME batch as the tip advance so a crash can never
+    /// observe the body deleted while the tip still references it.
+    ///
+    /// Idempotent — RocksDB deletes on a missing key are no-ops.
+    pub fn batch_prune_block_body(
+        &self,
+        batch: &mut WriteBatch,
+        hash: &Hash256,
+    ) -> Result<(), StorageError> {
+        let blocks_cf = self.db.cf_handle(CF_BLOCKS).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_BLOCKS))
+        })?;
+        let undo_cf = self.db.cf_handle(CF_UNDO).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_UNDO))
+        })?;
+        batch.delete_cf(blocks_cf, hash.as_bytes());
+        batch.delete_cf(undo_cf, hash.as_bytes());
+        Ok(())
+    }
+
     /// Apply a previously-built RocksDB write batch.
     ///
     /// Convenience passthrough so callers don't have to reach through to
@@ -780,6 +838,65 @@ impl<'a> BlockStore<'a> {
             }
             None => Ok(0),
         }
+    }
+
+    /// Read the reorg-retention prune watermark (Unit B), or `None` if it
+    /// has never been written (a pre-Unit-B datadir, or a fresh one).
+    ///
+    /// The watermark is the highest active-chain height whose body + undo
+    /// have been dropped by the reorg-retention pruner. `None` (rather than
+    /// `0`) is returned for the missing-key case so the caller can tell
+    /// "never pruned, seed at the current floor" apart from "watermark is
+    /// genuinely at height 0" — a backward-compatibility distinction that a
+    /// `0` sentinel could not express.
+    ///
+    /// Distinct from [`get_prune_height`] (BIP-159 manual/auto prune) — the
+    /// two watermarks live under different `CF_META` keys and never collide.
+    pub fn get_reorg_prune_height(&self) -> Result<Option<u32>, StorageError> {
+        match self.db.get_cf(CF_META, META_REORG_PRUNE_HEIGHT)? {
+            Some(data) => {
+                if data.len() != 4 {
+                    return Err(StorageError::Corruption(
+                        "invalid reorg prune height length".into(),
+                    ));
+                }
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&data);
+                Ok(Some(u32::from_le_bytes(buf)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the reorg-retention prune watermark (Unit B).
+    ///
+    /// Stored as little-endian u32 in `CF_META` under
+    /// `META_REORG_PRUNE_HEIGHT`. Normally staged into the same atomic
+    /// batch as the body/undo deletes via
+    /// [`BlockStore::batch_set_reorg_prune_height`]; this immediate variant
+    /// exists for symmetry / tests.
+    pub fn set_reorg_prune_height(&self, height: u32) -> Result<(), StorageError> {
+        self.db
+            .put_cf(CF_META, META_REORG_PRUNE_HEIGHT, &height.to_le_bytes())
+    }
+
+    /// Stage the reorg-retention prune watermark write into `batch`.
+    ///
+    /// Lets the connect-path flush flip the watermark in the SAME atomic
+    /// `WriteBatch` as the body/undo deletes + coins + tip, so a crash can
+    /// never leave the watermark advanced past bodies that are still on
+    /// disk (or vice-versa — bodies deleted but the watermark not advanced,
+    /// which would simply re-delete them harmlessly on the next flush).
+    pub fn batch_set_reorg_prune_height(
+        &self,
+        batch: &mut WriteBatch,
+        height: u32,
+    ) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_META).ok_or_else(|| {
+            StorageError::Corruption(format!("missing column family: {}", CF_META))
+        })?;
+        batch.put_cf(cf, META_REORG_PRUNE_HEIGHT, height.to_le_bytes());
+        Ok(())
     }
 
     /// Delete the body + undo for every active-chain block in
@@ -1360,6 +1477,87 @@ impl<'a> BlockStoreUtxoView<'a> {
         Ok(())
     }
 
+    /// Atomic UTXO + tip flush that ALSO persists the block bodies + undo
+    /// for the connected blocks accumulated since the last flush, and
+    /// prunes block bodies/undo that have fallen out of the reorg-retention
+    /// window — all in ONE RocksDB `WriteBatch` (Unit B).
+    ///
+    /// This is the linear-connect-path analogue of the atomic reorg commit
+    /// in `try_attach_and_reorg` (`crates/rpc/src/server.rs`): block body +
+    /// undo + UTXO + tip flip together so `chain_state.reorganize()` can
+    /// ALWAYS find the body + undo for any block at or below the persisted
+    /// tip and within the retention window — which is exactly what the live
+    /// P2P/IBD path previously failed to guarantee (it wrote only
+    /// `put_header` + `put_block_index`, never `put_block`/`put_undo`, so a
+    /// reorg arriving over P2P failed at "missing undo data for disconnect").
+    ///
+    /// Atomicity invariant (mirrors Bitcoin Core `CCoinsViewDB::BatchWrite`
+    /// + `ConnectTip`'s "write block before advancing tip"): the tip pointer
+    /// is staged into the SAME batch as the block bodies, undo, and coins,
+    /// so a SIGKILL/OOM/crash mid-commit either leaves EVERYTHING durable or
+    /// NOTHING — the tip never names a block whose body/undo or coins are
+    /// missing.
+    ///
+    /// * `tip_hash` / `tip_height` — the new persisted tip (the highest
+    ///   block in `pending`).
+    /// * `pending` — `(hash, block, undo)` for every block connected since
+    ///   the previous flush, in ascending height order. The body + undo for
+    ///   each is staged. May be empty (e.g. a time-only flush with no new
+    ///   blocks), in which case only coins + tip are committed.
+    /// * `prune_below_height` — bodies/undo for active-chain blocks at
+    ///   heights `< prune_below_height` are dropped (retention prune). Pass
+    ///   `0` to disable pruning for this flush. The caller supplies the
+    ///   list of `(height, hash)` to prune via `prune_targets` so this
+    ///   method performs no chain walk of its own.
+    /// * `prune_targets` — `(height, hash)` pairs whose bodies/undo should
+    ///   be deleted this flush. The caller is responsible for only passing
+    ///   active-chain hashes strictly below the retention floor (and never
+    ///   genesis); this method just stages the deletes.
+    /// * `prune_watermark` — when `Some(h)`, advances the persisted
+    ///   reorg-retention prune watermark (`META_REORG_PRUNE_HEIGHT`) to `h`
+    ///   in the SAME atomic batch as the body/undo deletes. This is what
+    ///   makes the prune O(1)-amortized and cadence-independent: the caller
+    ///   passes `floor - 1` (the highest height it has just guaranteed is
+    ///   pruned-or-genesis), and the next flush resumes the contiguous
+    ///   sweep at `watermark + 1` instead of re-scanning a fixed window.
+    ///   Pass `None` to leave the watermark untouched (e.g. the shutdown
+    ///   flush, which does no retention prune).
+    pub fn flush_with_tip_and_blocks(
+        &mut self,
+        tip_hash: &Hash256,
+        tip_height: u32,
+        pending: &[(Hash256, Block, UndoData)],
+        prune_targets: &[(u32, Hash256)],
+        prune_watermark: Option<u32>,
+    ) -> Result<(), StorageError> {
+        let mut batch = self.store.db.new_batch();
+        // 1. Cached UTXO mutations (drains cache, resets mem).
+        self.flush_into_batch(&mut batch)?;
+        // 2. Block bodies + undo for every block connected since last flush.
+        for (hash, block, undo) in pending {
+            self.store.batch_put_block(&mut batch, hash, block)?;
+            self.store.batch_put_undo(&mut batch, hash, undo)?;
+        }
+        // 3. Retention prune: drop bodies/undo that fell out of the window.
+        for (_height, hash) in prune_targets {
+            self.store.batch_prune_block_body(&mut batch, hash)?;
+        }
+        // 3b. Advance the reorg-retention prune watermark in the SAME batch
+        //     so the contiguous sweep resumes exactly where it left off on
+        //     the next flush — independent of flush cadence, and crash-safe
+        //     (the watermark is never durable without the deletes that earned
+        //     it, and a crash that loses the watermark only re-deletes
+        //     already-gone bodies, an idempotent no-op).
+        if let Some(wm) = prune_watermark {
+            self.store.batch_set_reorg_prune_height(&mut batch, wm)?;
+        }
+        // 4. Tip pointer LAST so it can never be durable without (1)-(2).
+        self.store
+            .batch_set_best_block(&mut batch, tip_hash, tip_height)?;
+        self.store.db.write_batch(batch)?;
+        Ok(())
+    }
+
     fn estimate_entry_size(coin: &Option<CoinEntry>) -> usize {
         CACHE_ENTRY_OVERHEAD
             + coin
@@ -1576,6 +1774,145 @@ mod flush_with_tip_tests {
         // The spend landed: coin gone, tip advanced.
         assert!(store.get_utxo(&op).unwrap().is_none());
         assert_eq!(store.get_best_height().unwrap(), Some(2));
+    }
+
+    // ---- Unit B: block body + undo persistence on the connect path ----
+
+    use rustoshi_primitives::{BlockHeader, OutPoint as PrimOutPoint, Transaction, TxIn, TxOut};
+
+    /// Build a distinct-hash test block at `height` (nonce makes the hash
+    /// unique). One coinbase-ish tx so `serialize`/`deserialize` round-trips.
+    fn test_block(height: u32, prev: Hash256) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: prev,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_700_000_000 + height,
+                bits: 0x1d00ffff,
+                nonce: height,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: PrimOutPoint::null(),
+                    script_sig: vec![height as u8, (height >> 8) as u8],
+                    sequence: 0xFFFF_FFFF,
+                    witness: vec![],
+                }],
+                outputs: vec![TxOut {
+                    value: 50_0000_0000,
+                    script_pubkey: vec![0x51],
+                }],
+                lock_time: 0,
+            }],
+        }
+    }
+
+    fn undo_n(n: u8) -> UndoData {
+        UndoData {
+            spent_coins: vec![CoinEntry {
+                height: n as u32,
+                is_coinbase: false,
+                value: 1000 + n as u64,
+                script_pubkey: vec![0xaa, n],
+            }],
+        }
+    }
+
+    /// `flush_with_tip_and_blocks` must persist the block body + undo for
+    /// every pending block in the SAME atomic batch as the UTXO + tip, so
+    /// that after the flush `get_block` / `get_undo` resolve them — the
+    /// precondition `chain_state.reorganize()` needs to disconnect a block
+    /// that arrived over P2P. (Pre-Unit-B the connect path wrote only
+    /// header + index, so these lookups returned None and a P2P reorg
+    /// failed at "missing undo data for disconnect".)
+    #[test]
+    fn flush_with_tip_and_blocks_persists_body_and_undo() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let b10 = test_block(10, hash_n(9));
+        let b11 = test_block(11, b10.block_hash());
+        let h10 = b10.block_hash();
+        let h11 = b11.block_hash();
+        let u10 = undo_n(10);
+        let u11 = undo_n(11);
+
+        {
+            let mut view = store.utxo_view();
+            // A coin created by these blocks, to prove coins still flip too.
+            view.add_utxo(&outpoint_n(10), coin(5000, 10));
+            let pending = vec![
+                (h10, b10.clone(), u10.clone()),
+                (h11, b11.clone(), u11.clone()),
+            ];
+            view.flush_with_tip_and_blocks(&h11, 11, &pending, &[], None)
+                .expect("flush_with_tip_and_blocks");
+            // Cache drained.
+            assert_eq!(view.cache_len(), 0);
+        }
+
+        // Bodies are durable and round-trip.
+        assert_eq!(store.get_block(&h10).unwrap(), Some(b10));
+        assert_eq!(store.get_block(&h11).unwrap(), Some(b11));
+        // Undo is durable and round-trips.
+        assert_eq!(
+            store.get_undo(&h10).unwrap().unwrap().spent_coins,
+            u10.spent_coins
+        );
+        assert_eq!(
+            store.get_undo(&h11).unwrap().unwrap().spent_coins,
+            u11.spent_coins
+        );
+        // Tip + coin flipped in the same batch.
+        assert_eq!(store.get_best_height().unwrap(), Some(11));
+        assert_eq!(store.get_best_block_hash().unwrap(), Some(h11));
+        assert!(store.get_utxo(&outpoint_n(10)).unwrap().is_some());
+    }
+
+    /// The retention prune staged into the flush batch must delete the body
+    /// + undo of blocks below the floor, while the tip block's body + undo
+    /// stay durable — proving we keep only the bounded reorg window, not the
+    /// full archive, and never strand the tip without its own body/undo.
+    #[test]
+    fn flush_with_tip_and_blocks_prunes_below_floor() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        // Pre-seed an old block's body + undo + height-index (as if it was
+        // connected long ago and is now below the retention floor).
+        let old = test_block(5, hash_n(4));
+        let old_h = old.block_hash();
+        store.put_block(&old_h, &old).unwrap();
+        store.put_undo(&old_h, &undo_n(5)).unwrap();
+        store.put_height_index(5, &old_h).unwrap();
+        assert!(store.has_block(&old_h).unwrap());
+        assert!(store.get_undo(&old_h).unwrap().is_some());
+
+        // New tip block; prune the old one in the same flush.
+        let tip = test_block(300, hash_n(40));
+        let tip_h = tip.block_hash();
+
+        {
+            let mut view = store.utxo_view();
+            let pending = vec![(tip_h, tip.clone(), undo_n(44))];
+            let prune = vec![(5u32, old_h)];
+            // Advance the watermark to the highest pruned height in the same
+            // atomic batch (Unit B contiguous-sweep watermark).
+            view.flush_with_tip_and_blocks(&tip_h, 300, &pending, &prune, Some(5))
+                .expect("flush with prune");
+        }
+
+        // Old block body + undo are gone (pruned out of the window) ...
+        assert!(!store.has_block(&old_h).unwrap());
+        assert!(store.get_undo(&old_h).unwrap().is_none());
+        // ... but the new tip's body + undo are durable.
+        assert!(store.has_block(&tip_h).unwrap());
+        assert!(store.get_undo(&tip_h).unwrap().is_some());
+        assert_eq!(store.get_best_height().unwrap(), Some(300));
+        // The watermark advanced atomically with the prune.
+        assert_eq!(store.get_reorg_prune_height().unwrap(), Some(5));
     }
 
     /// `cache_state()` mirrors Core's `CoinsCacheSizeState`:
