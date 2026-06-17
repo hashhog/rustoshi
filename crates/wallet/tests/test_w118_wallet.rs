@@ -1328,6 +1328,71 @@ fn g19_bumpfee_rejects_confirmed_tx() {
     );
 }
 
+/// BUG-7 / G17 [De-staled 2026-06-16]: the already-bumped guard from Core's
+/// `PreconditionChecks` (`bitcoin-core/src/wallet/feebumper.cpp:42-45`).
+///
+/// Bug (pre-fix): `bump_fee` recorded the replacement under its new txid but
+/// never marked the *original* `SentTx` as replaced, so a second `bump_fee`
+/// on the same original txid succeeded again — producing two independent
+/// replacement transactions for one original (both spending the same inputs,
+/// double-counting the change reduction). Core forbids this: after a bump it
+/// sets `mapValue["replaced_by_txid"]` on the original (`MarkReplaced`,
+/// `wallet/wallet.cpp:985`) and `PreconditionChecks` then rejects any further
+/// bump with "Cannot bump transaction X which was already bumped by Y".
+///
+/// Fix: `SentTx` gained a `replaced_by_txid: Option<Hash256>` field; the
+/// signing/commit path of `build_bumped_tx` sets it on the original, and the
+/// precondition block rejects an entry that already carries it.
+///
+/// Behavioral assertion: bumping once succeeds; bumping the SAME original
+/// txid a second time is rejected with an "already bumped" error — while the
+/// (distinct) replacement txid remains independently bumpable, proving the
+/// guard keys on the per-tx marker, not a blanket lockout.
+#[test]
+fn g19_bumpfee_rejects_already_bumped_tx() {
+    let (mut wallet, original_txid) = setup_wallet_with_sent_tx(0xa9);
+
+    // First bump succeeds and yields a distinct replacement txid.
+    let first = wallet
+        .bump_fee(&original_txid, None)
+        .expect("first bump on a BIP-125 unconfirmed tx must succeed");
+    let first_txid = first.txid();
+    assert_ne!(first_txid, original_txid);
+
+    // The original is now marked as replaced by the first bump.
+    let orig_entry = wallet
+        .get_sent_tx(&original_txid)
+        .expect("original entry must still be recorded");
+    assert_eq!(
+        orig_entry.replaced_by_txid,
+        Some(first_txid),
+        "original SentTx must record the replacement txid (Core MarkReplaced)"
+    );
+
+    // Second bump of the SAME original must be rejected (already-bumped guard).
+    let err = wallet
+        .bump_fee(&original_txid, None)
+        .expect_err("re-bumping an already-bumped tx must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already bumped"),
+        "re-bump must produce an 'already bumped' error (Core feebumper.cpp:42-45), got: {msg}"
+    );
+    // It must name the original and the replacement txid (Core message shape).
+    assert!(
+        msg.contains(&hex::encode(original_txid.0))
+            && msg.contains(&hex::encode(first_txid.0)),
+        "error must name both the original and replacement txids, got: {msg}"
+    );
+
+    // Control: the (distinct) replacement is itself a fresh, unbumped entry,
+    // so it CAN be bumped — the guard is per-tx, not a blanket lockout.
+    let second = wallet
+        .bump_fee(&first_txid, None)
+        .expect("the replacement itself must be bumpable (guard is per-tx)");
+    assert_ne!(second.txid(), first_txid);
+}
+
 #[test]
 fn g19_bumpfee_rejects_dust_after_reduction() {
     // Construct a tx whose change is barely above dust so any bump
