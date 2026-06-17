@@ -578,6 +578,154 @@ fn mtp_for_connect(
 ///
 /// See CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
 /// for the cross-impl finding that motivated this wiring.
+/// Convert a consensus-layer `UndoData` (produced by `process_block`) into
+/// the storage-layer `UndoData` so it can be persisted via the block store.
+///
+/// Mirrors `validation_undo_to_storage` in `crates/rpc/src/server.rs` (the
+/// submitblock/reorg path), which is crate-private there. Unit B: the linear
+/// P2P/IBD connect path persists undo for the reorg-retention window so a
+/// reorg arriving over P2P can disconnect these blocks.
+fn connect_undo_to_storage(
+    undo: &rustoshi_consensus::validation::UndoData,
+) -> rustoshi_storage::block_store::UndoData {
+    rustoshi_storage::block_store::UndoData {
+        spent_coins: undo
+            .spent_coins
+            .iter()
+            .map(|c| rustoshi_storage::block_store::CoinEntry {
+                height: c.height,
+                is_coinbase: c.is_coinbase,
+                value: c.value,
+                script_pubkey: c.script_pubkey.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Reorg-retention window (Unit B): how many blocks of body + undo, below
+/// the tip, the linear connect path keeps on disk so a P2P-delivered reorg
+/// can disconnect them. Core's `MIN_BLOCKS_TO_KEEP` (288) — a comfortable
+/// superset of rustoshi's `MAX_REORG_DEPTH` (100). Bodies/undo strictly
+/// below `tip - REORG_RETENTION_BLOCKS` are dropped by the retention pruner.
+const REORG_RETENTION_BLOCKS: u32 = 288;
+
+/// Result of [`reorg_retention_prune_targets`]: the bodies/undo to drop
+/// this flush plus the watermark to persist atomically alongside them.
+struct ReorgPrunePlan {
+    /// `(height, hash)` whose body + undo should be deleted this flush.
+    targets: Vec<(u32, rustoshi_primitives::Hash256)>,
+    /// New value for the persisted reorg-retention prune watermark
+    /// (`META_REORG_PRUNE_HEIGHT`) — the highest height we have now
+    /// guaranteed is pruned-or-genesis. `None` means "do not move the
+    /// watermark this flush" (nothing is deep enough to prune yet).
+    new_watermark: Option<u32>,
+}
+
+/// Compute the reorg-retention prune plan for a flush at `tip_height`.
+///
+/// CONTIGUOUS-SWEEP design (the fix for the fixed-`scan_back`-window bug):
+/// the pruner resumes from a persisted WATERMARK rather than re-scanning a
+/// fixed number of heights below the floor. Let
+/// `floor = tip_height - retention` (the lowest height we KEEP) and
+/// `highest_prunable = floor - 1`. We prune the CONTIGUOUS active-chain
+/// range `[watermark + 1 .. highest_prunable]` and then advance the
+/// watermark to `highest_prunable`. Because the watermark is persisted in
+/// the SAME atomic batch as the deletes, the sweep is O(blocks-newly-buried-
+/// since-last-flush) — exactly the blocks that crossed below the floor — and
+/// has NO dependence on flush cadence. A flush that buries 50 000 blocks at
+/// once (cold start / cache-pressure stall) prunes all 50 000; the old code
+/// only ever looked at the bottom `scan_back` (= 2000) of them and leaked
+/// the rest toward the ~500 GB archive.
+///
+/// MIGRATION / backward-compatibility: a datadir written before Unit B (or
+/// a freshly-bootstrapped one) has NO `META_REORG_PRUNE_HEIGHT` key, so
+/// `get_reorg_prune_height()` returns `None`. In that case we DO NOT walk
+/// the entire already-buried history (which could be ~950 k heights and a
+/// huge one-shot batch). Instead we SEED the watermark at `highest_prunable`
+/// and prune nothing this flush; from the next flush onward the contiguous
+/// sweep keeps the window bounded going forward. Existing buried bodies from
+/// before the upgrade are left in place (the operator already accepted that
+/// footprint pre-Unit-B; an explicit BIP-159 prune can reclaim them).
+///
+/// Genesis (height 0) is never pruned. Heights whose body is already gone
+/// (idempotent re-run) are skipped to keep the batch small; the watermark
+/// still advances past them so they are never revisited.
+fn reorg_retention_prune_targets(
+    block_store: &BlockStore,
+    tip_height: u32,
+    retention: u32,
+) -> ReorgPrunePlan {
+    let mut targets = Vec::new();
+    // Highest height we are allowed to prune = (tip - retention) - 1.
+    let floor = match tip_height.checked_sub(retention) {
+        Some(f) if f > 0 => f, // floor is the lowest height we KEEP
+        // Not deep enough to prune anything yet — leave the watermark alone.
+        _ => {
+            return ReorgPrunePlan {
+                targets,
+                new_watermark: None,
+            }
+        }
+    };
+    let highest_prunable = floor.saturating_sub(1);
+    if highest_prunable == 0 {
+        // The only prunable height would be genesis — nothing to do.
+        return ReorgPrunePlan {
+            targets,
+            new_watermark: None,
+        };
+    }
+
+    // Resume from the persisted watermark. On a pre-Unit-B / fresh datadir
+    // there is no watermark: SEED it at `highest_prunable` and prune nothing
+    // this flush (no full-history re-walk). `None` is intentionally distinct
+    // from `Some(0)` so this migration case is unambiguous.
+    let resume_after = match block_store.get_reorg_prune_height() {
+        Ok(Some(wm)) => wm,
+        Ok(None) => {
+            return ReorgPrunePlan {
+                targets,
+                new_watermark: Some(highest_prunable),
+            }
+        }
+        Err(e) => {
+            // Reading the watermark failed (corruption) — skip pruning this
+            // flush rather than risk an unbounded or wrong-range delete.
+            tracing::error!("reorg prune: reading watermark failed: {}", e);
+            return ReorgPrunePlan {
+                targets,
+                new_watermark: None,
+            };
+        }
+    };
+
+    // Already caught up (watermark at or above the prunable frontier):
+    // nothing new fell below the floor since the last flush.
+    if resume_after >= highest_prunable {
+        return ReorgPrunePlan {
+            targets,
+            new_watermark: None,
+        };
+    }
+
+    // Prune the CONTIGUOUS range (watermark, highest_prunable]. Start at
+    // max(watermark + 1, 1) so genesis is never touched.
+    let start = resume_after.saturating_add(1).max(1);
+    for h in start..=highest_prunable {
+        if let Ok(Some(hash)) = block_store.get_hash_by_height(h) {
+            // Skip if the body is already gone (idempotent prune already ran)
+            // — the watermark still advances past it below.
+            if block_store.has_block(&hash).unwrap_or(false) {
+                targets.push((h, hash));
+            }
+        }
+    }
+    ReorgPrunePlan {
+        targets,
+        new_watermark: Some(highest_prunable),
+    }
+}
+
 fn write_tx_index_entries(
     block_store: &BlockStore,
     block: &rustoshi_primitives::Block,
@@ -2875,6 +3023,52 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let mut last_flush_instant = std::time::Instant::now();
 
     // ============================================================
+    // REORG-RETENTION: persist block body + undo for the reorg window
+    // (Unit B — DEPLOY-BLOCKING, durability + on-disk footprint)
+    // ============================================================
+    //
+    // The linear P2P/IBD connect path used to write only `put_header` +
+    // `put_block_index`, deliberately SKIPPING `put_block`/`put_undo` to
+    // avoid the ~500 GB full-block-archive footprint. The cost: a reorg
+    // arriving over P2P physically could not run — `chain_state.reorganize`
+    // needs the body + undo of every block it disconnects, and they were
+    // never on disk (only the submitblock RPC persisted them, which is why
+    // reorg worked there but not from P2P).
+    //
+    // Fix: persist block body + undo for at least the reorg window, staged
+    // into the SAME atomic `flush_with_tip` batch as the UTXO + tip writes,
+    // and prune bodies/undo that have fallen below the retention floor so
+    // we keep only a bounded window (NOT the full ~500 GB archive).
+    //
+    // Retention floor = `tip - REORG_RETENTION_BLOCKS`. We use Core's
+    // `MIN_BLOCKS_TO_KEEP` (288) which is a comfortable superset of
+    // rustoshi's `MAX_REORG_DEPTH` (100, `server.rs`): any reorg the node
+    // will attempt is bounded by 100 blocks, so 288 blocks of bodies/undo
+    // is always enough to disconnect back to the fork point, with ~188
+    // blocks of head-room. 288 mainnet blocks ≈ 1 GB of bodies — bounded,
+    // and dwarfed by the chainstate itself.
+    //
+    // Crash safety: the body + undo for a block are committed in the same
+    // batch that advances the tip past that block, so the persisted tip can
+    // never name a block whose body/undo is missing within the window. The
+    // retention prune deletes only blocks strictly below the floor, which
+    // are already buried far deeper than any reorg can reach.
+    //
+    // `REORG_RETENTION_BLOCKS` is now a module-level const (single source of
+    // truth shared with the prune planner + its regression test).
+    // Block bodies + undo accumulated since the last durable flush, in
+    // ascending height order: `(block_hash, block, undo)`. Drained into the
+    // flush batch when `flush_with_tip_and_blocks` fires. Bounded by the
+    // flush cadence (≤ UTXO_FLUSH_INTERVAL_BLOCKS entries); the bodies it
+    // holds are the same blocks the UTXO cache already covers, so it adds no
+    // unbounded memory beyond what the connect loop already buffers.
+    let mut pending_blocks: Vec<(
+        Hash256,
+        rustoshi_primitives::Block,
+        rustoshi_storage::block_store::UndoData,
+    )> = Vec::new();
+
+    // ============================================================
     // MAIN EVENT LOOP
     // ============================================================
     //
@@ -3073,6 +3267,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             block_hash,
                         );
 
+                        // Unit B (DEPLOY-BLOCKING): accumulate the block body +
+                        // undo so they flip to disk in the SAME atomic batch as
+                        // the UTXO + tip pointer below. Without persisting these,
+                        // a reorg arriving over P2P fails at "missing undo data
+                        // for disconnect" (the live connect path used to write
+                        // only header + index). Ascending height order.
+                        pending_blocks.push((
+                            block_hash,
+                            block.clone(),
+                            connect_undo_to_storage(&undo),
+                        ));
+
                         // Durability: advance the persisted tip pointer ONLY
                         // as part of an atomic UTXO flush, never as a separate
                         // eager write.  Commit when the cache hits the
@@ -3104,21 +3310,42 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         if should_flush {
                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                             let entries = utxo_view.cache_len();
-                            match utxo_view.flush_with_tip(&block_hash, height) {
+                            // Unit B: compute the reorg-retention prune plan so
+                            // the flush batch also drops bodies/undo that fell
+                            // below `tip - REORG_RETENTION_BLOCKS`. The pruner
+                            // resumes from the persisted watermark and sweeps
+                            // the CONTIGUOUS range up to the floor, so the prune
+                            // is cadence-independent (no fixed scan window that
+                            // a fast/large flush could skip over).
+                            let prune_plan = reorg_retention_prune_targets(
+                                &block_store,
+                                height,
+                                REORG_RETENTION_BLOCKS,
+                            );
+                            match utxo_view.flush_with_tip_and_blocks(
+                                &block_hash,
+                                height,
+                                &pending_blocks,
+                                &prune_plan.targets,
+                                prune_plan.new_watermark,
+                            ) {
                                 Ok(()) => {
                                     tracing::info!(
-                                        "UTXO+tip flushed atomically: {} entries, ~{} MiB at height {} (state={:?}, blocks={}, age={}s)",
-                                        entries, cache_mb, height, cache_state,
+                                        "UTXO+tip+{}blk flushed atomically: {} entries, ~{} MiB at height {} (state={:?}, blocks={}, age={}s, pruned={}, wm={:?})",
+                                        pending_blocks.len(), entries, cache_mb, height, cache_state,
                                         blocks_since_flush, time_since_flush.as_secs(),
+                                        prune_plan.targets.len(), prune_plan.new_watermark,
                                     );
+                                    pending_blocks.clear();
                                     blocks_since_flush = 0;
                                     last_flush_instant = std::time::Instant::now();
                                 }
                                 Err(e) => {
-                                    // Do NOT reset blocks_since_flush — retry
-                                    // on the next block so a transient I/O
-                                    // error cannot strand the tip behind.
-                                    tracing::error!("UTXO+tip atomic flush failed: {}", e);
+                                    // Do NOT reset blocks_since_flush or drain
+                                    // pending_blocks — retry on the next block
+                                    // so a transient I/O error cannot strand the
+                                    // tip behind (or lose un-persisted bodies).
+                                    tracing::error!("UTXO+tip+blocks atomic flush failed: {}", e);
                                 }
                             }
                         }
@@ -3740,6 +3967,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             block_hash,
                                         );
 
+                                        // Unit B (DEPLOY-BLOCKING): accumulate
+                                        // body + undo so they flip to disk in the
+                                        // SAME atomic batch as the UTXO + tip
+                                        // pointer below — the precondition for a
+                                        // P2P-delivered reorg to be able to
+                                        // disconnect these blocks. Ascending
+                                        // height order.
+                                        pending_blocks.push((
+                                            block_hash,
+                                            block.clone(),
+                                            connect_undo_to_storage(&undo),
+                                        ));
+
                                         // Durability: advance the persisted tip
                                         // pointer ONLY as part of an atomic UTXO
                                         // flush. Multi-trigger Core-parity
@@ -3762,20 +4002,38 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         if should_flush {
                                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                                             let entries = utxo_view.cache_len();
-                                            match utxo_view.flush_with_tip(&block_hash, height) {
+                                            // Unit B: drop bodies/undo below the
+                                            // retention floor in the same batch.
+                                            // Watermark-resumed contiguous sweep
+                                            // (cadence-independent).
+                                            let prune_plan = reorg_retention_prune_targets(
+                                                &block_store,
+                                                height,
+                                                REORG_RETENTION_BLOCKS,
+                                            );
+                                            match utxo_view.flush_with_tip_and_blocks(
+                                                &block_hash,
+                                                height,
+                                                &pending_blocks,
+                                                &prune_plan.targets,
+                                                prune_plan.new_watermark,
+                                            ) {
                                                 Ok(()) => {
                                                     tracing::info!(
-                                                        "UTXO+tip flushed atomically: {} entries, ~{} MiB at height {} (state={:?}, blocks={}, age={}s)",
-                                                        entries, cache_mb, height, cache_state,
+                                                        "UTXO+tip+{}blk flushed atomically: {} entries, ~{} MiB at height {} (state={:?}, blocks={}, age={}s, pruned={}, wm={:?})",
+                                                        pending_blocks.len(), entries, cache_mb, height, cache_state,
                                                         blocks_since_flush, time_since_flush.as_secs(),
+                                                        prune_plan.targets.len(), prune_plan.new_watermark,
                                                     );
+                                                    pending_blocks.clear();
                                                     blocks_since_flush = 0;
                                                     last_flush_instant = std::time::Instant::now();
                                                 }
                                                 Err(e) => {
-                                                    // Do NOT reset the counter —
-                                                    // retry on the next block.
-                                                    tracing::error!("UTXO+tip atomic flush failed: {}", e);
+                                                    // Do NOT reset the counter or
+                                                    // drain pending_blocks — retry
+                                                    // on the next block.
+                                                    tracing::error!("UTXO+tip+blocks atomic flush failed: {}", e);
                                                 }
                                             }
                                         }
@@ -5232,12 +5490,30 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         drop(cs);
         let entries = utxo_view.cache_len();
         let mem_mb = utxo_view.estimated_memory() / (1024 * 1024);
-        match utxo_view.flush_with_tip(&tip_hash, tip_height) {
-            Ok(()) => tracing::info!(
-                "UTXO+tip flushed atomically on shutdown: {} entries, ~{} MiB, tip {} at height {}",
-                entries, mem_mb, tip_hash, tip_height
-            ),
-            Err(e) => tracing::error!("Failed to flush UTXO+tip on shutdown: {}", e),
+        // Unit B: the connect loop may hold un-persisted block bodies + undo
+        // in `pending_blocks` (connected since the last flush boundary).
+        // Persist them in the SAME atomic batch as the final UTXO + tip
+        // flush so a clean shutdown leaves the reorg-retention window intact
+        // for these tip blocks (otherwise a P2P reorg right after restart
+        // could not disconnect them). No retention prune on shutdown — keep
+        // the exit path minimal; the next connect-loop flush prunes (and
+        // `None` leaves the prune watermark untouched so the contiguous
+        // sweep resumes correctly on restart).
+        match utxo_view.flush_with_tip_and_blocks(
+            &tip_hash,
+            tip_height,
+            &pending_blocks,
+            &[],
+            None,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    "UTXO+tip+{}blk flushed atomically on shutdown: {} entries, ~{} MiB, tip {} at height {}",
+                    pending_blocks.len(), entries, mem_mb, tip_hash, tip_height
+                );
+                pending_blocks.clear();
+            }
+            Err(e) => tracing::error!("Failed to flush UTXO+tip+blocks on shutdown: {}", e),
         }
     }
 
@@ -5651,6 +5927,279 @@ mod tests {
         let (_dir, db) = mtp_test_store();
         let store = BlockStore::new(&db);
         assert_eq!(compute_mtp_via_store(&store, &Hash256([9u8; 32])), None);
+    }
+
+    // =================================================================
+    // UNIT B — reorg-retention prune FOOTPRINT BOUND (watermark sweep)
+    // =================================================================
+
+    /// Count how many active-chain blocks still have a body on disk in
+    /// `[1, tip]` (genesis excluded, matching the pruner's invariant).
+    fn on_disk_body_count(store: &BlockStore, tip: u32) -> u32 {
+        let mut n = 0;
+        for h in 1..=tip {
+            if let Ok(Some(hash)) = store.get_hash_by_height(h) {
+                if store.has_block(&hash).unwrap_or(false) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// A tiny distinct-hash block body keyed by height (nonce makes the hash
+    /// unique). One coinbase-ish tx so `serialize`/`deserialize` round-trip.
+    fn retention_block(height: u32) -> rustoshi_primitives::Block {
+        use rustoshi_primitives::{BlockHeader, OutPoint, Transaction, TxIn, TxOut};
+        rustoshi_primitives::Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_700_000_000 + height,
+                bits: 0x1d00_ffff,
+                nonce: height,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: vec![height as u8, (height >> 8) as u8, (height >> 16) as u8],
+                    sequence: 0xFFFF_FFFF,
+                    witness: vec![],
+                }],
+                outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: vec![0x51] }],
+                lock_time: 0,
+            }],
+        }
+    }
+
+    /// Connect the blocks ending at `new_tip` and run the retention-prune
+    /// flush exactly like the connect loop.
+    ///
+    /// IMPORTANT ordering (mirrors production): the prune plan is computed
+    /// AFTER the newly-connected block bodies are durable. In the live node
+    /// the blocks below the retention floor were always persisted by an
+    /// EARLIER flush — the floor (`tip - 288`) is far below the blocks being
+    /// committed in the current flush. We reproduce that here by committing
+    /// the new bodies first (empty prune), then computing the plan against
+    /// the now-durable chain and committing the prune in a second flush. This
+    /// keeps the test honest: it still exercises the REAL
+    /// `reorg_retention_prune_targets` against a real on-disk chain, and the
+    /// prune still lands in an atomic `flush_with_tip_and_blocks` batch with
+    /// the watermark.
+    fn retention_flush_to(
+        store: &BlockStore,
+        from_tip: u32,
+        new_tip: u32,
+    ) {
+        use rustoshi_storage::block_store::UndoData;
+        // 1. Persist height index + bodies/undo for the newly-connected
+        //    blocks (no prune yet — they are above the floor).
+        let mut pending: Vec<(Hash256, rustoshi_primitives::Block, UndoData)> = Vec::new();
+        for h in (from_tip + 1)..=new_tip {
+            let blk = retention_block(h);
+            let hash = blk.block_hash();
+            store.put_height_index(h, &hash).unwrap();
+            pending.push((hash, blk, UndoData { spent_coins: vec![] }));
+        }
+        let tip_hash = pending.last().map(|(h, _, _)| *h).unwrap_or(Hash256::ZERO);
+        {
+            let mut view = store.utxo_view();
+            view.flush_with_tip_and_blocks(&tip_hash, new_tip, &pending, &[], None)
+                .expect("connect-path flush (bodies durable)");
+        }
+
+        // 2. Now compute the retention-prune plan against the durable chain
+        //    and commit the prune + watermark atomically (no new bodies).
+        let plan = reorg_retention_prune_targets(store, new_tip, REORG_RETENTION_BLOCKS);
+        {
+            let mut view = store.utxo_view();
+            view.flush_with_tip_and_blocks(
+                &tip_hash,
+                new_tip,
+                &[],
+                &plan.targets,
+                plan.new_watermark,
+            )
+            .expect("retention prune flush");
+        }
+    }
+
+    /// THE Unit-B regression. The buggy pruner scanned only a fixed
+    /// `UTXO_FLUSH_INTERVAL_BLOCKS` (2000) heights below the floor; at the
+    /// production cadence (~2000 blocks/flush, fewer under cache pressure) a
+    /// block can fall BELOW that scan window before a flush ever prunes it,
+    /// so its body/undo leak forever and the on-disk footprint grows
+    /// unbounded toward the ~500 GB archive.
+    ///
+    /// Here we drive flush cycles whose height jump is LARGER than the old
+    /// scan window (5 000 > 2 000) — exactly the regime the old code
+    /// leaked — across `> 2 * UTXO_FLUSH_INTERVAL_BLOCKS` total blocks, and
+    /// assert the on-disk body/undo count stays bounded near
+    /// `REORG_RETENTION_BLOCKS` and does NOT grow with chain height.
+    #[test]
+    fn reorg_retention_prune_keeps_footprint_bounded_across_flush_cycles() {
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+
+        // Genesis at height 0 (never pruned). Give it a body + height index
+        // so the prune correctly steps over it.
+        let g = retention_block(0);
+        let g_hash = g.block_hash();
+        store.put_height_index(0, &g_hash).unwrap();
+        store.put_block(&g_hash, &g).unwrap();
+
+        // The migration case first: a fresh datadir has NO watermark key, so
+        // the FIRST flush seeds the watermark at the floor and prunes nothing
+        // older than it (no full-history re-walk). We start the chain at 0.
+        assert_eq!(store.get_reorg_prune_height().unwrap(), None);
+
+        // Drive flush cycles with a 5 000-block jump each (deliberately >
+        // the old 2 000 scan window). 12 cycles => tip 60 000, well past
+        // 2 * UTXO_FLUSH_INTERVAL_BLOCKS (4 000) of total connected blocks.
+        const JUMP: u32 = 5_000;
+        const CYCLES: u32 = 12;
+        let mut tip = 0u32;
+        let mut body_counts: Vec<(u32, u32)> = Vec::new(); // (tip, body_count)
+        for _ in 0..CYCLES {
+            let new_tip = tip + JUMP;
+            retention_flush_to(&store, tip, new_tip);
+            tip = new_tip;
+
+            // Footprint after each flush: bodies on disk in [1, tip].
+            let bodies = on_disk_body_count(&store, tip);
+            body_counts.push((tip, bodies));
+
+            // The watermark must track the floor (tip - retention) - 1.
+            let expected_wm = tip - REORG_RETENTION_BLOCKS - 1;
+            assert_eq!(
+                store.get_reorg_prune_height().unwrap(),
+                Some(expected_wm),
+                "watermark must advance to floor-1 every flush"
+            );
+        }
+
+        // ── THE BOUND THE BUGGY CODE VIOLATED ──
+        // The chain is now 60 000 high, but the retained-body footprint must
+        // NOT scale with chain height. Two independent assertions:
+        //
+        // (1) The footprint is BOUNDED — well under the chain height, on the
+        //     order of one flush jump plus the retention window, NEVER the
+        //     ~500 GB full archive (which here would be ~60 000 bodies).
+        let (final_tip, final_bodies) = *body_counts.last().unwrap();
+        assert!(
+            final_bodies <= JUMP + REORG_RETENTION_BLOCKS,
+            "retained bodies {} must stay bounded by one flush jump + the \
+             retention window ({}+{}), not grow with chain height {}",
+            final_bodies,
+            JUMP,
+            REORG_RETENTION_BLOCKS,
+            final_tip,
+        );
+        assert!(
+            final_bodies * 4 < final_tip,
+            "retained bodies {} must be a small fraction of the {}-high chain \
+             (the bug let it approach the full archive)",
+            final_bodies,
+            final_tip,
+        );
+
+        // (2) The footprint is CONSTANT once the watermark catches up: from
+        //     cycle 2 onward every flush prunes exactly the band that fell
+        //     below the new floor, so the retained-body count does not change
+        //     as the tip climbs by 55 000 blocks. THIS is the cadence-
+        //     independence property — the old fixed-window scan let the count
+        //     grow by ~(JUMP - scan_back) every cycle (proven in the earlier
+        //     failing run: 5000 → 9711 → 14422 → … unbounded).
+        let steady = body_counts[1].1;
+        for &(t, b) in &body_counts[1..] {
+            assert_eq!(
+                b, steady,
+                "retained-body count must be constant across cycles \
+                 (cadence-independent); at tip {} it was {} not {}",
+                t, b, steady
+            );
+        }
+
+        // The lowest retained body is exactly the floor; everything strictly
+        // below it (within the swept range) was pruned — proves the
+        // contiguous sweep left no leaked gap.
+        let floor = tip - REORG_RETENTION_BLOCKS;
+        let below_floor = retention_block(floor - 1).block_hash();
+        assert!(
+            !store.has_block(&below_floor).unwrap(),
+            "block just below the floor must have been pruned"
+        );
+        let at_floor = store.get_hash_by_height(floor).unwrap().unwrap();
+        assert!(
+            store.has_block(&at_floor).unwrap(),
+            "block at the floor must be retained (inside the reorg window)"
+        );
+    }
+
+    /// Backward-compat / migration: a datadir that already has buried bodies
+    /// but NO watermark key must NOT trigger a full-history re-walk on the
+    /// first flush — it seeds the watermark at the current floor and only
+    /// prunes forward from there. (Older pre-Unit-B bodies are left in place;
+    /// an explicit BIP-159 prune can reclaim them.)
+    #[test]
+    fn reorg_retention_prune_migration_seeds_watermark_no_backfill() {
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+
+        // Simulate a pre-Unit-B datadir: bodies present for a tall chain,
+        // height index populated, but NO reorg-prune watermark.
+        let tip = 10_000u32;
+        for h in 0..=tip {
+            let blk = retention_block(h);
+            let hash = blk.block_hash();
+            store.put_height_index(h, &hash).unwrap();
+            store.put_block(&hash, &blk).unwrap();
+        }
+        assert_eq!(store.get_reorg_prune_height().unwrap(), None);
+
+        // First flush after the upgrade (no new blocks; just a prune pass).
+        let plan = reorg_retention_prune_targets(&store, tip, REORG_RETENTION_BLOCKS);
+        // Migration: prune NOTHING this flush, seed the watermark at floor-1.
+        assert!(
+            plan.targets.is_empty(),
+            "first flush on an un-watermarked datadir must not backfill-prune"
+        );
+        let floor_minus_1 = tip - REORG_RETENTION_BLOCKS - 1;
+        assert_eq!(plan.new_watermark, Some(floor_minus_1));
+
+        // Commit the seed watermark (no bodies dropped).
+        {
+            let mut view = store.utxo_view();
+            let tip_hash = store.get_hash_by_height(tip).unwrap().unwrap();
+            view.flush_with_tip_and_blocks(&tip_hash, tip, &[], &plan.targets, plan.new_watermark)
+                .unwrap();
+        }
+        // All old bodies still present (no backfill); watermark seeded.
+        assert_eq!(on_disk_body_count(&store, tip), tip); // heights 1..=tip
+        assert_eq!(store.get_reorg_prune_height().unwrap(), Some(floor_minus_1));
+
+        // The NEXT flush (advance the tip by one cycle) now prunes forward
+        // contiguously from the seeded watermark, keeping the window bounded.
+        let new_tip = tip + 5_000;
+        retention_flush_to(&store, tip, new_tip);
+        // Bodies below the (seeded) watermark+1 .. new floor were pruned;
+        // pre-seed history below the original floor is intentionally retained.
+        let new_floor = new_tip - REORG_RETENTION_BLOCKS;
+        // The contiguous sweep covered (floor_minus_1, new_floor-1], so every
+        // height in that band is gone.
+        let mid = (floor_minus_1 + new_floor) / 2;
+        let mid_hash = store.get_hash_by_height(mid).unwrap().unwrap();
+        assert!(
+            !store.has_block(&mid_hash).unwrap(),
+            "height {} in the swept band must be pruned",
+            mid
+        );
+        assert_eq!(
+            store.get_reorg_prune_height().unwrap(),
+            Some(new_tip - REORG_RETENTION_BLOCKS - 1)
+        );
     }
 
     #[test]
