@@ -3858,6 +3858,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     // advance set_best_block, or update RPC state — see
                                     // the matching site in the validation_interval branch
                                     // above for the full rationale.
+                                    // Unit C (reorg cluster): set when `process_block`
+                                    // rejects the block with `PrevBlockNotFound` — i.e. it
+                                    // does NOT extend our active tip. Such a block is a
+                                    // competing-branch / fork candidate; instead of dropping
+                                    // it (the post-Unit-A behaviour) we route it into the
+                                    // shared attach-and-reorg entry below. Captured here, acted
+                                    // on AFTER the `chain_state` / `utxo_view` borrow ends so we
+                                    // can flush + re-borrow cleanly.
+                                    let mut reorg_candidate = false;
                                     let connected_undo: Option<rustoshi_consensus::validation::UndoData> = {
                                         let mut cs = chain_state.write().await;
                                         // BIP-113: compute parent MTP for
@@ -3893,10 +3902,141 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                         pm.misbehaving(peer_id, reason).await;
                                                     }
                                                 }
+                                                // Unit C: a `PrevBlockNotFound` block is a
+                                                // fork/side-branch candidate (chain_state.rs:477-482).
+                                                // Flag it for the attach-and-reorg trigger below.
+                                                if matches!(
+                                                    e,
+                                                    rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)
+                                                ) {
+                                                    reorg_candidate = true;
+                                                }
                                                 None
                                             }
                                         }
                                     };
+
+                                    // Unit C (reorg cluster): TRIGGER. A block that does not
+                                    // extend the active tip was just dropped by the connect path
+                                    // (Unit A stopped banning the peer for it). Route it into the
+                                    // SAME attach-and-reorg machinery `submitblock` uses so a
+                                    // heavier competing branch delivered over P2P actually
+                                    // reorganizes the live node. `try_attach_and_reorg`:
+                                    //   * stores the block on its side-branch (Core keeps side
+                                    //     branches) and returns Ok(false) when the active tip
+                                    //     still has >= work — NO tip change;
+                                    //   * runs `chain_state.reorganize()` inside one atomic
+                                    //     Pattern-D WriteBatch and returns Ok(true) when the new
+                                    //     branch is strictly heavier, driving the identical
+                                    //     best_hash / best_height / header_height / mempool /
+                                    //     txindex / coinstats / txospender / filter updates as
+                                    //     submitblock (single shared impl — they cannot diverge);
+                                    //   * rejects (Err) a reorg deeper than MAX_REORG_DEPTH=100
+                                    //     rather than attempting a non-atomic split.
+                                    //
+                                    // Unit B interaction: Unit B persists block+undo only on the
+                                    // SUCCESSFUL connect path (the `if let Some(undo)` block
+                                    // below). This arm runs ONLY when `connected_undo` is None
+                                    // (process_block returned `PrevBlockNotFound`), so the two
+                                    // paths are mutually exclusive — there is no double-store.
+                                    // `try_attach_and_reorg` performs its OWN persistence
+                                    // (put_header/put_block/put_block_index + the atomic reorg
+                                    // batch). One atomic batch wins; no torn state.
+                                    //
+                                    // Cache coherency: `utxo_view` is a write-back cache over
+                                    // RocksDB. `try_attach_and_reorg` builds a FRESH view from
+                                    // `state.db`, so we MUST flush our cache to disk first (else
+                                    // the reorg reads stale DB state) and recreate our view after
+                                    // (else our stale cache would clobber the reorg on its next
+                                    // flush). We also re-point the in-memory `chain_state` tip so
+                                    // the next block's `prev_block_hash == tip` check is correct.
+                                    if reorg_candidate {
+                                        // Flush any pending connect-path UTXO mutations + bodies
+                                        // so the reorg's fresh view + the on-disk tip are coherent
+                                        // before we hand off. Mirrors the connect loop's atomic
+                                        // flush_with_tip_and_blocks, minus the tip advance (the
+                                        // dropped block did NOT connect).
+                                        if !pending_blocks.is_empty() {
+                                            let (prev_view_tip, prev_view_h) = {
+                                                let cs = chain_state.read().await;
+                                                (cs.tip_hash(), cs.tip_height())
+                                            };
+                                            if let Err(e) = utxo_view.flush_with_tip_and_blocks(
+                                                &prev_view_tip,
+                                                prev_view_h,
+                                                &pending_blocks,
+                                                &[],
+                                                None,
+                                            ) {
+                                                tracing::error!(
+                                                    "Unit C: pre-reorg flush failed: {}", e
+                                                );
+                                            } else {
+                                                pending_blocks.clear();
+                                                blocks_since_flush = 0;
+                                                last_flush_instant = std::time::Instant::now();
+                                            }
+                                        } else if let Err(e) = utxo_view.flush() {
+                                            tracing::error!(
+                                                "Unit C: pre-reorg UTXO flush failed: {}", e
+                                            );
+                                        }
+
+                                        let block_hash_for_reorg = block_hash;
+                                        let reorg_result = {
+                                            let mut rpc = rpc_state.write().await;
+                                            rustoshi_rpc::server::try_attach_and_reorg(
+                                                &mut rpc,
+                                                &block,
+                                                &block_hash_for_reorg,
+                                            )
+                                        };
+                                        match reorg_result {
+                                            Ok(true) => {
+                                                // Reorg fired. Re-sync our in-memory consensus
+                                                // state to the new tip the reorg committed: the
+                                                // ChainState tip (so the next connect extends the
+                                                // right block) and a fresh UTXO view (the old
+                                                // cache is now stale — the reorg wrote the new
+                                                // chain's coins straight to RocksDB).
+                                                let (new_hash, new_height) = {
+                                                    let rpc = rpc_state.read().await;
+                                                    (rpc.best_hash, rpc.best_height)
+                                                };
+                                                {
+                                                    let mut cs = chain_state.write().await;
+                                                    cs.set_tip(new_hash, new_height);
+                                                }
+                                                utxo_view = block_store.utxo_view();
+                                                tracing::info!(
+                                                    "Unit C: P2P-delivered block {} triggered reorg \
+                                                     — new tip {} at height {}",
+                                                    block_hash_for_reorg, new_hash, new_height
+                                                );
+                                            }
+                                            Ok(false) => {
+                                                // Stored on a side-branch but the active tip still
+                                                // has the most work — no tip change. `state.db`
+                                                // holds the block for a later overtake; our
+                                                // in-memory tip + UTXO view are unchanged and stay
+                                                // valid. Mirrors Core's "store but do not activate".
+                                                tracing::debug!(
+                                                    "Unit C: stored side-branch block {} (not best work)",
+                                                    block_hash_for_reorg
+                                                );
+                                            }
+                                            Err(e) => {
+                                                // Unknown parent, MAX_REORG_DEPTH exceeded, or a
+                                                // storage error. Drop the block (same outcome as
+                                                // pre-Unit-C) — do NOT ban the peer (Unit A). Our
+                                                // tip + UTXO view are untouched.
+                                                tracing::warn!(
+                                                    "Unit C: attach-and-reorg declined block {}: {}",
+                                                    block_hash_for_reorg, e
+                                                );
+                                            }
+                                        }
+                                    }
 
                                     if let Some(undo) = connected_undo {
                                         // Store block index entry so getblockheader returns height/nTx/chainwork.
