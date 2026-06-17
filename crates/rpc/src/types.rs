@@ -856,9 +856,14 @@ pub struct PeerInfoRpc {
     /// Whether using BIP152 high bandwidth mode (sending).
     pub bip152_hb_to: bool,
     /// Whether using BIP152 high bandwidth mode (receiving).
+    ///
+    /// Core's `getpeerinfo` (rpc/net.cpp:268-270) pushes `presynced_headers`
+    /// immediately after `bip152_hb_from`; there is NO `startingheight` field
+    /// in Core v31.99's getpeerinfo output (the legacy `m_starting_height` was
+    /// removed from the RPC — it survives only in net_processing's version-message
+    /// handling, never surfaced via entryToJSON). Field order here is the wire
+    /// order, so `presynced_headers` follows `bip152_hb_from` directly.
     pub bip152_hb_from: bool,
-    /// Starting height when connected.
-    pub startingheight: i32,
     /// Presync height (-1 until headers presync phase is done).
     pub presynced_headers: i32,
     /// Current synced headers.
@@ -1657,7 +1662,6 @@ mod tests {
             inbound: false,
             bip152_hb_to: false,
             bip152_hb_from: false,
-            startingheight: 100000,
             presynced_headers: -1,
             synced_headers: 100000,
             synced_blocks: 99999,
@@ -2177,7 +2181,6 @@ mod tests {
             inbound: false,
             bip152_hb_to: true,
             bip152_hb_from: true,
-            startingheight: 850000,
             presynced_headers: -1,
             synced_headers: 850010,
             synced_blocks: 850005,
@@ -2217,6 +2220,21 @@ mod tests {
         assert!(json.contains("\"synced_headers\":850010"));
         assert!(json.contains("\"synced_blocks\":850005"));
         assert!(json.contains("\"connection_type\":\"outbound-full-relay\""));
+
+        // Core-parity (rpc/net.cpp:227-303, RPCResult lines 127-200): Bitcoin
+        // Core v31.99's getpeerinfo NO LONGER emits `startingheight`. The legacy
+        // `m_starting_height` was removed from the RPC output (it survives only
+        // inside net_processing's version-message handling — net_processing.cpp
+        // declares `int starting_height` locally but never surfaces it via
+        // entryToJSON). After `bip152_hb_from`, Core pushes `presynced_headers`
+        // directly. Emitting `startingheight` is an extra-field parity bug, so
+        // it must be absent from the serialized object.
+        assert!(
+            !json.contains("\"startingheight\""),
+            "getpeerinfo must NOT emit `startingheight` — removed from Bitcoin \
+             Core v31.99 getpeerinfo (rpc/net.cpp); presynced_headers follows \
+             bip152_hb_from directly. JSON: {json}"
+        );
     }
 
     #[test]
@@ -2246,7 +2264,6 @@ mod tests {
             inbound: true,
             bip152_hb_to: false,
             bip152_hb_from: false,
-            startingheight: 0,
             presynced_headers: -1,
             synced_headers: 0,
             synced_blocks: 0,

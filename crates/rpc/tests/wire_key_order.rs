@@ -178,7 +178,6 @@ fn peerinfo_key_order_prefix_matches_core() {
         inbound: false,
         bip152_hb_to: false,
         bip152_hb_from: false,
-        startingheight: 0,
         presynced_headers: -1,
         synced_headers: 0,
         synced_blocks: 0,
@@ -224,6 +223,17 @@ fn peerinfo_key_order_prefix_matches_core() {
     assert!(pos("lastrecv") < pos("last_transaction"), "lastrecv < last_transaction");
     assert!(pos("last_transaction") < pos("last_block"), "last_transaction < last_block");
     assert!(pos("last_block") < pos("bytessent"), "last_block < bytessent");
+    // Core's getpeerinfo (rpc/net.cpp:268-270) pushes `presynced_headers`
+    // immediately after `bip152_hb_from`; v31.99 emits NO `startingheight`
+    // (the legacy `m_starting_height` was removed from the RPC output — it
+    // lives only inside net_processing's version handling, never surfaced via
+    // entryToJSON). The field must be absent, and presynced_headers must
+    // directly follow bip152_hb_from with nothing in between.
+    assert!(!has("startingheight"), "getpeerinfo must NOT emit startingheight (removed in Core v31.99)");
+    assert!(
+        pos("bip152_hb_from") + 1 == pos("presynced_headers"),
+        "presynced_headers directly after bip152_hb_from (no startingheight between)"
+    );
     assert!(pos("session_id") == got.len() - 1, "session_id last");
 }
 
