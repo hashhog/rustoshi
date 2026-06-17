@@ -6627,6 +6627,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                         services: format!("{:016x}", info.services),
                         servicesnames: decode_services(info.services),
                         relaytxes: info.relay,
+                        // rustoshi tracks neither the per-peer last-INV mempool
+                        // sequence nor the announce queue depth at the manager
+                        // layer yet, so these default to 0 (like addr_processed /
+                        // addr_rate_limited). Core sources them from
+                        // statestats.m_last_inv_seq / m_inv_to_send.
+                        last_inv_sequence: 0,
+                        inv_to_send: 0,
                         lastsend: last_send_unix as u64,
                         lastrecv: last_recv_unix as u64,
                         bytessent: bytes_sent,
