@@ -4076,6 +4076,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     cs.set_tip(new_hash, new_height);
                                                 }
                                                 utxo_view = block_store.utxo_view();
+                                                // Reorg cluster Unit E follow-up: realign the
+                                                // downloader's validated-tip counter to the reorg
+                                                // tip. next_block_to_validate bumped it past the
+                                                // real tip for every competing-fork block that
+                                                // failed to connect sequentially before this arm
+                                                // fired; left stale, the validation loop derives
+                                                // `best_height` from it and getblockcount
+                                                // over-reports (10 disconnected + N connected
+                                                // instead of N). The fork bodies still pending
+                                                // (heights new_height+1..) then connect with
+                                                // correct heights.
+                                                block_downloader.set_validated_tip_height(new_height);
                                                 tracing::info!(
                                                     "Unit C: P2P-delivered block {} triggered reorg \
                                                      — new tip {} at height {}",
