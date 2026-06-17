@@ -533,12 +533,23 @@ pub fn select_coins_largest_first(
         return None;
     }
 
-    // Calculate waste
-    let waste: i64 = selected.iter().map(|_u| {
-        let fee = (params.input_weight as f64 / 4.0 * params.fee_rate).ceil() as i64;
-        let long_term_fee = (params.input_weight as f64 / 4.0 * params.long_term_fee_rate).ceil() as i64;
-        fee - long_term_fee
-    }).sum();
+    // Calculate waste, mirroring Core's `SelectionResult::RecalculateWaste`
+    // (bitcoin-core/src/wallet/coinselection.cpp:827-852).
+    //
+    // 1. Per-input cost-of-spending-now-vs-later term: sum(fee - long_term_fee).
+    let per_input_fee = (params.input_weight as f64 / 4.0 * params.fee_rate).ceil() as i64;
+    let per_input_ltf = (params.input_weight as f64 / 4.0 * params.long_term_fee_rate).ceil() as i64;
+    let mut waste: i64 = (per_input_fee - per_input_ltf) * selected.len() as i64;
+
+    // 2. Largest-first never creates a change output, so this is always the
+    //    `GetChange(...) == 0` branch of Core's RecalculateWaste: the excess
+    //    above target is thrown away to fees and counts as waste
+    //    (coinselection.cpp:846-849: `waste += selected_effective_value - m_target`).
+    //    selected_effective_value = sum(value - input_fee) per coin (effective
+    //    value), matching Core's `GetSelectedEffectiveValue()`.
+    let selected_effective_value: i64 =
+        total as i64 - per_input_fee * selected.len() as i64;
+    waste += selected_effective_value - target as i64;
 
     Some(SelectionResult {
         selected,
