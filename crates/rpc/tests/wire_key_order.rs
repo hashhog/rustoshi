@@ -160,6 +160,8 @@ fn peerinfo_key_order_prefix_matches_core() {
         services: "0".into(),
         servicesnames: vec![],
         relaytxes: true,
+        last_inv_sequence: 0,
+        inv_to_send: 0,
         lastsend: 0,
         lastrecv: 0,
         last_transaction: 0,
@@ -194,9 +196,31 @@ fn peerinfo_key_order_prefix_matches_core() {
     };
     let got = keys_of_serialize(&p);
     // Verify the Core-critical relative orderings:
-    let pos = |k: &str| got.iter().position(|x| x == k).unwrap();
+    let has = |k: &str| got.iter().any(|x| x == k);
+    let pos = |k: &str| {
+        got.iter()
+            .position(|x| x == k)
+            .unwrap_or_else(|| panic!("getpeerinfo is missing field `{k}` — got {got:?}"))
+    };
     assert!(pos("network") + 1 == pos("mapped_as"), "mapped_as after network");
     assert!(pos("mapped_as") < pos("services"), "mapped_as before services");
+    // Core's getpeerinfo (rpc/net.cpp:242-246) pushes `last_inv_sequence` and
+    // `inv_to_send` immediately after `relaytxes` and BEFORE `lastsend`. Both
+    // MUST be emitted, and in that exact contiguous position.
+    assert!(has("last_inv_sequence"), "getpeerinfo must emit last_inv_sequence");
+    assert!(has("inv_to_send"), "getpeerinfo must emit inv_to_send");
+    assert!(
+        pos("relaytxes") + 1 == pos("last_inv_sequence"),
+        "last_inv_sequence directly after relaytxes"
+    );
+    assert!(
+        pos("last_inv_sequence") + 1 == pos("inv_to_send"),
+        "inv_to_send directly after last_inv_sequence"
+    );
+    assert!(
+        pos("inv_to_send") + 1 == pos("lastsend"),
+        "inv_to_send directly before lastsend"
+    );
     assert!(pos("lastrecv") < pos("last_transaction"), "lastrecv < last_transaction");
     assert!(pos("last_transaction") < pos("last_block"), "last_transaction < last_block");
     assert!(pos("last_block") < pos("bytessent"), "last_block < bytessent");

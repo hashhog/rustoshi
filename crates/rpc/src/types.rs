@@ -809,6 +809,17 @@ pub struct PeerInfoRpc {
     pub servicesnames: Vec<String>,
     /// Whether peer relays transactions.
     pub relaytxes: bool,
+    /// Mempool sequence number of this peer's last INV.
+    ///
+    /// Core's `getpeerinfo` (rpc/net.cpp) pushes `last_inv_sequence` and
+    /// `inv_to_send` immediately after `relaytxes` and BEFORE `lastsend`
+    /// (`statestats.m_last_inv_seq` / `statestats.m_inv_to_send`). Field order
+    /// here is the wire order, so both are declared between `relaytxes` and
+    /// `lastsend` to match Core's sequence:
+    /// relaytxes, last_inv_sequence, inv_to_send, lastsend, lastrecv, ...
+    pub last_inv_sequence: u64,
+    /// How many txs we have queued to announce to this peer.
+    pub inv_to_send: u64,
     /// Time of last send.
     pub lastsend: u64,
     /// Time of last receive.
@@ -1630,6 +1641,8 @@ mod tests {
             services: "0000000000000409".to_string(),
             servicesnames: vec!["NETWORK".to_string(), "WITNESS".to_string()],
             relaytxes: true,
+            last_inv_sequence: 0,
+            inv_to_send: 0,
             lastsend: 1234567890,
             lastrecv: 1234567891,
             bytessent: 10000,
@@ -2148,6 +2161,8 @@ mod tests {
                 "NETWORK_LIMITED".to_string(),
             ],
             relaytxes: true,
+            last_inv_sequence: 0,
+            inv_to_send: 0,
             lastsend: 1710000000,
             lastrecv: 1710000001,
             bytessent: 150000,
@@ -2215,6 +2230,8 @@ mod tests {
             services: "0000000000000001".to_string(),
             servicesnames: vec!["NETWORK".to_string()],
             relaytxes: true,
+            last_inv_sequence: 0,
+            inv_to_send: 0,
             lastsend: 0,
             lastrecv: 0,
             bytessent: 0,
