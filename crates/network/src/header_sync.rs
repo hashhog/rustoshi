@@ -11,6 +11,7 @@
 
 use crate::message::{GetHeadersMessage, NetworkMessage, PROTOCOL_VERSION};
 use crate::peer::PeerId;
+use rustoshi_consensus::{get_block_proof, ChainWork};
 use rustoshi_primitives::{BlockHeader, Hash256};
 use std::collections::HashMap;
 
@@ -59,6 +60,23 @@ pub struct HeaderSync {
     /// the peer is disconnected. Mirrors Core's
     /// `nUnconnectingHeaders` (net_processing.cpp).
     unconnecting_headers: HashMap<PeerId, u32>,
+    /// Reorg Unit E (E3): the fork height the most recent `process_headers`
+    /// rewound the header tip to, if a (heavier-fork) rewind happened. The
+    /// block-download enqueue floors at `min(chainstate_tip, this)` so the
+    /// fork's bodies BELOW the active tip get requested — without this the
+    /// reorg machinery (Units A–C) is unreachable over passive P2P sync
+    /// (see `CORE-PARITY-AUDIT/_reorg-unit-e-fork-aware-download-2026-06-17.md`).
+    /// STICKY across header batches: set (to the min fork height) on a rewind,
+    /// cleared by the caller via `take_pending_rewind` once it has enqueued the
+    /// fork range. This survives a multi-batch fork where the rewinding batch is
+    /// a full (Ok(true)) batch that does not itself enqueue.
+    pending_rewind: Option<u32>,
+    /// Reorg Unit E (E1): a peer that announced headers which do NOT connect to
+    /// our chain (unsolicited, prev_hash unknown). Core responds to an
+    /// unconnecting announcement by sending a getheaders to discover the peer's
+    /// chain; without it a competing fork is never even requested. Set per-call,
+    /// consumed by the caller via `take_getheaders_hint`.
+    getheaders_hint: Option<PeerId>,
 }
 
 impl HeaderSync {
@@ -73,7 +91,24 @@ impl HeaderSync {
             best_header_hash: genesis_hash,
             peer_heights: HashMap::new(),
             unconnecting_headers: HashMap::new(),
+            pending_rewind: None,
+            getheaders_hint: None,
         }
+    }
+
+    /// Reorg Unit E (E3): consume the pending fork-rewind height, if any. The
+    /// block-download enqueue calls this after `process_headers` and floors its
+    /// enqueue at `min(chainstate_tip, fork_height)` so the fork's bodies below
+    /// the active tip are requested. Sticky until consumed (see field doc).
+    pub fn take_pending_rewind(&mut self) -> Option<u32> {
+        self.pending_rewind.take()
+    }
+
+    /// Reorg Unit E (E1): consume the discovery-getheaders hint, if any. When
+    /// `Some(peer)`, the caller should send that peer a getheaders (locator from
+    /// the active chain) to discover the competing chain it just announced.
+    pub fn take_getheaders_hint(&mut self) -> Option<PeerId> {
+        self.getheaders_hint.take()
     }
 
     /// Register a new peer and its announced best height.
@@ -123,6 +158,15 @@ impl HeaderSync {
         if let SyncState::DownloadingHeaders { peer, .. } = &self.state {
             if *peer == peer_id {
                 self.state = SyncState::Idle;
+                // Reorg Unit E (review fix 1): clear a sticky fork-rewind hint
+                // when the sync peer goes away. pending_rewind is only stranded
+                // (set but never consumed) if a fork rewind happened on a full
+                // Ok(true) batch and the continuation was then abandoned — a
+                // peer disconnect is the dominant way that happens. Without
+                // this, a later unrelated Ok(false) Headers message would
+                // consume the stale fork height and spuriously lower its
+                // download floor.
+                self.pending_rewind = None;
             }
         }
     }
@@ -244,7 +288,24 @@ impl HeaderSync {
     where
         F: Fn(u32) -> Option<Hash256>,
     {
-        if let Some(peer_id) = self.best_sync_peer() {
+        // Prefer a peer strictly taller than our header tip (normal IBD). If
+        // none qualifies but we are mid-sync — Reorg Unit E (review fix 3) —
+        // keep requesting from the ACTIVE sync peer. This matters for the
+        // continuation of a multi-batch heavier fork: after the first batch
+        // rewinds, `note_peer_height` credits the fork peer only up to our new
+        // tip, so `best_sync_peer`'s strict `> best_header_height` filter would
+        // exclude it and strand the fork after one 2000-header batch. The
+        // fallback only fires when best_sync_peer is None AND state is
+        // DownloadingHeaders, so it is a no-op for normal IBD (where a taller
+        // peer always exists) and cannot loop at tip (state is Idle there).
+        let target = self.best_sync_peer().or_else(|| {
+            if let SyncState::DownloadingHeaders { peer, .. } = &self.state {
+                Some(*peer)
+            } else {
+                None
+            }
+        });
+        if let Some(peer_id) = target {
             let msg = self.make_getheaders(get_hash_at_height);
             self.state = SyncState::DownloadingHeaders {
                 peer: peer_id,
@@ -254,6 +315,33 @@ impl HeaderSync {
         } else {
             None
         }
+    }
+
+    /// Reorg Unit E (E1): request headers from a SPECIFIC peer (the one that
+    /// announced a chain we couldn't connect), with a locator from our active
+    /// chain, AND mark that peer as the active header-sync peer.
+    ///
+    /// This is the discovery primitive for competing chains. `start_sync` can't
+    /// be used because it only targets `best_sync_peer` (a peer whose tracked
+    /// height exceeds ours) — a fork that forks below our tip never qualifies.
+    /// Marking the peer active is load-bearing: `process_headers` only reaches
+    /// the fork-rewind path for an *active-sync* response; an unsolicited
+    /// response whose first header doesn't connect to our tip is ignored early.
+    /// So we must promote this peer to active sync before its fork reply lands.
+    pub fn request_headers_from<F>(
+        &mut self,
+        peer_id: PeerId,
+        get_hash_at_height: F,
+    ) -> NetworkMessage
+    where
+        F: Fn(u32) -> Option<Hash256>,
+    {
+        let msg = self.make_getheaders(get_hash_at_height);
+        self.state = SyncState::DownloadingHeaders {
+            peer: peer_id,
+            last_hash: self.best_header_hash,
+        };
+        NetworkMessage::GetHeaders(msg)
     }
 
     /// Process received headers.
@@ -283,7 +371,23 @@ impl HeaderSync {
         headers: Vec<BlockHeader>,
         validate_and_store: &mut dyn FnMut(&BlockHeader, u32) -> Result<(), String>,
         find_hash_height: &dyn Fn(&Hash256) -> Option<u32>,
+        // Reorg Unit E (E2): our CURRENT header chain's compact target (nBits) at
+        // a given height, or None if unknown. Used to compare cumulative work
+        // between our chain and a connecting fork, so we only rewind+overwrite
+        // the height index for a STRICTLY heavier fork (Core moves the
+        // best-header candidate on greater nChainWork only). Tests that don't
+        // exercise forks may pass `&|_| None` (treated as zero existing work →
+        // any valid fork is heavier, preserving the pre-Unit-E unconditional
+        // rewind behaviour for those cases).
+        get_existing_header_bits: &dyn Fn(u32) -> Option<u32>,
     ) -> Result<bool, String> {
+        // Reorg Unit E: getheaders_hint is per-call advice — clear it each
+        // entry. pending_rewind is intentionally NOT cleared here: it is sticky
+        // until the caller consumes it via take_pending_rewind (a multi-batch
+        // fork rewinds on its first batch, which may be a full Ok(true) batch
+        // that does not itself enqueue).
+        self.getheaders_hint = None;
+
         // Check if we were actively syncing from this peer
         let is_active_sync = matches!(
             &self.state,
@@ -299,11 +403,18 @@ impl HeaderSync {
 
             // Check if the first header connects to our tip
             if headers[0].prev_block_hash != self.best_header_hash {
-                // Doesn't connect to our tip -- ignore silently.
-                // This is normal: peers may be on a different fork or
-                // we may not have synced to the same point yet.
+                // Doesn't connect to our tip. We don't try to splice it in here
+                // (we lack the intervening headers), but — Reorg Unit E (E1) —
+                // we record the peer so the caller sends it a getheaders with a
+                // full locator from our active chain. That is how a competing
+                // chain (which by definition forks below or beside our tip and
+                // therefore never connects to it) gets DISCOVERED at all; Core
+                // does the same (MaybeSendGetHeaders on an unconnecting
+                // announcement). Without this the fork is never requested and
+                // the reorg machinery (Units A–C) can never fire over P2P.
+                self.getheaders_hint = Some(peer_id);
                 tracing::debug!(
-                    "Ignoring unsolicited headers from peer {}: prev_hash {} doesn't match our tip {}",
+                    "Unsolicited headers from peer {} don't connect (prev_hash {} != tip {}); will getheaders to discover its chain",
                     peer_id.0, headers[0].prev_block_hash, self.best_header_hash
                 );
                 return Ok(false);
@@ -336,14 +447,62 @@ impl HeaderSync {
         if !headers.is_empty() && headers[0].prev_block_hash != prev_hash {
             let fork_prev = &headers[0].prev_block_hash;
             if let Some(fork_height) = find_hash_height(fork_prev) {
+                let old_best = self.best_header_height;
+
+                // Reorg Unit E (E2): only rewind to a STRICTLY heavier fork.
+                // Both chains share everything up to `fork_height`, so we
+                // compare the cumulative work of the two suffixes from that
+                // shared point: the fork's new headers (this batch) vs our
+                // current headers at fork_height+1 ..= old_best. Core moves its
+                // best-header candidate on greater nChainWork only; we mirror
+                // that here so a lighter/equal — or junk — connecting fork never
+                // overwrites the height index (which would diverge our locator
+                // from the still-active heavier chain and waste downloads).
+                let mut fork_work = ChainWork::ZERO;
+                for h in &headers {
+                    fork_work = fork_work.saturating_add(&get_block_proof(h.bits));
+                }
+                let mut our_work = ChainWork::ZERO;
+                for height in (fork_height + 1)..=old_best {
+                    if let Some(bits) = get_existing_header_bits(height) {
+                        our_work = our_work.saturating_add(&get_block_proof(bits));
+                    }
+                }
+                if fork_work <= our_work {
+                    // Not heavier. Don't overwrite our index, and do NOT
+                    // re-request: the discovery getheaders that elicited this
+                    // response carried a full locator from our active chain, so
+                    // the peer already sent its entire fork suffix from the fork
+                    // point in this batch (forks deeper than one 2000-header
+                    // batch are far beyond MAX_REORG_DEPTH). Re-requesting a
+                    // genuinely-lighter fork would just loop. Silent no-op, the
+                    // same outcome a lighter fork had before Unit E.
+                    tracing::info!(
+                        "Ignoring lighter/equal fork from peer {} at height {} (fork_work {} <= our_work {}); not rewinding",
+                        peer_id.0, fork_height, fork_work, our_work
+                    );
+                    return Ok(false);
+                }
+
                 tracing::info!(
-                    "Headers from peer {} fork from height {} (hash {}), rewinding header tip from height {}",
-                    peer_id.0, fork_height, fork_prev, self.best_header_height
+                    "Headers from peer {} fork from height {} (hash {}), HEAVIER (fork_work {} > our_work {}); rewinding header tip from height {}",
+                    peer_id.0, fork_height, fork_prev, fork_work, our_work, self.best_header_height
                 );
                 self.best_header_height = fork_height;
                 self.best_header_hash = *fork_prev;
                 prev_hash = *fork_prev;
                 base_height = fork_height;
+                // Reorg Unit E (E3): record the fork point so the block-download
+                // enqueue floors at min(chainstate_tip, fork_height) and
+                // requests the fork's bodies below the active tip. Sticky and
+                // min-across-batches: a multi-batch fork rewinds on its first
+                // batch (which may be a full Ok(true) batch that does not itself
+                // enqueue); the lowest fork point must survive until the caller
+                // consumes it via take_pending_rewind.
+                self.pending_rewind = Some(match self.pending_rewind {
+                    Some(existing) => existing.min(fork_height),
+                    None => fork_height,
+                });
             } else {
                 return Err(format!(
                     "first header prev_hash {} doesn't match our tip {} and is not in our chain",
@@ -562,7 +721,7 @@ mod tests {
             last_hash: genesis_hash,
         };
 
-        let result = sync.process_headers(peer, vec![], &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, vec![], &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert_eq!(result, Ok(false));
         assert_eq!(sync.state, SyncState::Idle);
     }
@@ -581,7 +740,7 @@ mod tests {
         // Create a header that doesn't connect to genesis
         let bad_header = make_test_header(Hash256([1; 32]), 0);
 
-        let result = sync.process_headers(peer, vec![bad_header], &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, vec![bad_header], &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("prev_hash"));
     }
@@ -599,7 +758,7 @@ mod tests {
 
         let headers = make_valid_header_chain(genesis_hash, MAX_HEADERS_PER_REQUEST);
 
-        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert_eq!(result, Ok(true));
         assert_eq!(sync.best_header_height, MAX_HEADERS_PER_REQUEST as u32);
         assert!(matches!(sync.state, SyncState::DownloadingHeaders { .. }));
@@ -618,7 +777,7 @@ mod tests {
 
         let headers = make_valid_header_chain(genesis_hash, 500);
 
-        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert_eq!(result, Ok(false));
         assert_eq!(sync.best_header_height, 500);
         assert_eq!(sync.state, SyncState::Idle);
@@ -765,7 +924,7 @@ mod tests {
 
         // peer2 sends headers that connect to our tip — should be accepted
         let headers = make_valid_header_chain(genesis_hash, 10);
-        let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), false); // fewer than MAX_HEADERS
@@ -784,7 +943,7 @@ mod tests {
         // Create headers that don't connect to genesis
         let bad_prev = Hash256([99; 32]);
         let headers = make_valid_header_chain(bad_prev, 5);
-        let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer2, headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
 
         // Should return Ok(false) — silently ignored
         assert!(result.is_ok());
@@ -805,7 +964,7 @@ mod tests {
         };
 
         let headers = make_valid_header_chain(genesis_hash, MAX_HEADERS_PER_REQUEST + 1);
-        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("too many"));
@@ -829,7 +988,7 @@ mod tests {
         let result = sync.process_headers(peer, headers, &mut |_, h| {
             heights.push(h);
             Ok(())
-        }, &|_| None);
+        }, &|_| None, &|_| None);
 
         assert!(result.is_ok());
         assert_eq!(heights, vec![1, 2, 3]);
@@ -857,7 +1016,7 @@ mod tests {
             } else {
                 Ok(())
             }
-        }, &|_| None);
+        }, &|_| None, &|_| None);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("validation failed"));
@@ -937,7 +1096,7 @@ mod tests {
             last_hash: genesis_hash,
         };
         let headers = make_valid_header_chain(genesis_hash, 3);
-        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert!(result.is_ok());
         assert_eq!(sync.unconnecting_headers_count(peer), 0);
 
@@ -987,7 +1146,7 @@ mod tests {
         // Peer delivers a full 2000-header batch (it actually has more chain
         // than its handshake start_height implied).
         let headers = make_valid_header_chain(genesis_hash, MAX_HEADERS_PER_REQUEST);
-        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert_eq!(result, Ok(true));
         assert_eq!(sync.best_header_height(), MAX_HEADERS_PER_REQUEST as u32);
 
@@ -1010,7 +1169,7 @@ mod tests {
             last_hash: sync.best_header_hash(),
         };
         let next = make_valid_header_chain(sync.best_header_hash(), 1);
-        let result = sync.process_headers(peer, next, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, next, &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert_eq!(result, Ok(false));
         assert_eq!(
             sync.peer_height(peer),
@@ -1062,7 +1221,7 @@ mod tests {
         // headers / BIP 130). After processing, its tracked height is raised
         // to 11.
         let new_header = vec![chain[10].clone()];
-        let result = sync.process_headers(peer, new_header, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, new_header, &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert_eq!(result, Ok(false));
         assert_eq!(sync.best_header_height(), 11);
         assert_eq!(sync.peer_height(peer), Some(11));
@@ -1081,5 +1240,250 @@ mod tests {
         assert_eq!(sync.unconnecting_headers_count(peer), 3);
         sync.remove_peer(peer);
         assert_eq!(sync.unconnecting_headers_count(peer), 0);
+    }
+
+    // ===================================================================
+    // Reorg Unit E — fork-aware block download (E1 discovery, E2 work-gate,
+    // E3 rewind report). On regtest difficulty is constant, so a heavier
+    // chain is exactly a longer chain — the same scenario the end-to-end
+    // two-node regtest proof exercises.
+    // ===================================================================
+
+    /// Build a HashMap<height,(hash,bits)> for our current chain and seed
+    /// `sync` to its tip by processing it as active sync. Returns the per-height
+    /// maps (for the find_hash_height / get_existing_header_bits closures) and
+    /// the chain's headers.
+    fn seed_chain(
+        sync: &mut HeaderSync,
+        peer: PeerId,
+        genesis: Hash256,
+        len: usize,
+    ) -> (
+        std::collections::HashMap<u32, Hash256>,
+        std::collections::HashMap<u32, u32>,
+        Vec<BlockHeader>,
+    ) {
+        let chain = make_valid_header_chain(genesis, len);
+        let mut h2hash = std::collections::HashMap::new();
+        let mut h2bits = std::collections::HashMap::new();
+        h2hash.insert(0u32, genesis);
+        for (i, h) in chain.iter().enumerate() {
+            let height = (i + 1) as u32;
+            h2hash.insert(height, h.block_hash());
+            h2bits.insert(height, h.bits);
+        }
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: genesis,
+        };
+        let r = sync.process_headers(peer, chain.clone(), &mut |_, _| Ok(()), &|_| None, &|_| None);
+        assert_eq!(r, Ok(false));
+        assert_eq!(sync.best_header_height(), len as u32);
+        // The seeding processed no fork, so nothing should be pending.
+        assert_eq!(sync.pending_rewind, None, "seeding must not set pending_rewind");
+        (h2hash, h2bits, chain)
+    }
+
+    #[test]
+    fn test_e3_e2_heavier_longer_fork_rewinds_and_reports_pending() {
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(1);
+        sync.register_peer(peer, 100);
+
+        // Our chain: genesis -> a1 -> a2 -> a3 (heights 1..=3).
+        let (h2hash, h2bits, our) = seed_chain(&mut sync, peer, genesis, 3);
+
+        // Heavier fork from height 1 (after a1): 3 new headers -> heights 2,3,4.
+        // fork_work = 3w, our_work over heights 2..=3 = 2w  => heavier => rewind.
+        let fork_point_hash = our[0].block_hash(); // height 1
+        let fork = make_valid_header_chain(fork_point_hash, 3);
+
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: sync.best_header_hash(),
+        };
+        let find = |hash: &Hash256| -> Option<u32> {
+            h2hash.iter().find(|(_, v)| *v == hash).map(|(k, _)| *k)
+        };
+        let existing_bits = |height: u32| -> Option<u32> { h2bits.get(&height).copied() };
+
+        let r = sync.process_headers(peer, fork, &mut |_, _| Ok(()), &find, &existing_bits);
+        assert_eq!(r, Ok(false));
+        // Rewound to fork point (height 1) then accepted 3 fork headers -> tip 4.
+        assert_eq!(sync.best_header_height(), 4);
+        // E3: the fork point is reported for the download floor, then consumed.
+        assert_eq!(sync.take_pending_rewind(), Some(1));
+        assert_eq!(sync.take_pending_rewind(), None);
+    }
+
+    #[test]
+    fn test_e2_lighter_shorter_fork_refused_no_rewind() {
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(1);
+        sync.register_peer(peer, 100);
+
+        // Our chain length 5 (heights 1..=5).
+        let (h2hash, h2bits, our) = seed_chain(&mut sync, peer, genesis, 5);
+
+        // Lighter fork from height 1: only 2 headers -> heights 2,3.
+        // fork_work = 2w, our_work over heights 2..=5 = 4w => NOT heavier => refused.
+        let fork_point_hash = our[0].block_hash(); // height 1
+        let fork = make_valid_header_chain(fork_point_hash, 2);
+
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: sync.best_header_hash(),
+        };
+        let find = |hash: &Hash256| -> Option<u32> {
+            h2hash.iter().find(|(_, v)| *v == hash).map(|(k, _)| *k)
+        };
+        let existing_bits = |height: u32| -> Option<u32> { h2bits.get(&height).copied() };
+
+        let r = sync.process_headers(peer, fork, &mut |_, _| Ok(()), &find, &existing_bits);
+        assert_eq!(r, Ok(false));
+        // No rewind: header tip unchanged, nothing pending, index NOT overwritten.
+        assert_eq!(sync.best_header_height(), 5);
+        assert_eq!(sync.take_pending_rewind(), None);
+    }
+
+    #[test]
+    fn test_e1_unsolicited_unconnecting_sets_getheaders_hint() {
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(7);
+        sync.register_peer(peer, 100);
+        // NOT active sync (Idle), tip = genesis.
+
+        // Headers that do not connect to our tip (prev = unknown hash).
+        let unconnected = make_valid_header_chain(Hash256([42u8; 32]), 2);
+        let r = sync.process_headers(peer, unconnected, &mut |_, _| Ok(()), &|_| None, &|_| None);
+        assert_eq!(r, Ok(false));
+        // E1: the peer is recorded so the caller sends a discovery getheaders.
+        assert_eq!(sync.take_getheaders_hint(), Some(peer));
+        assert_eq!(sync.take_getheaders_hint(), None);
+        // The unconnecting batch must not advance our header tip.
+        assert_eq!(sync.best_header_height(), 0);
+    }
+
+    #[test]
+    fn test_e1_unsolicited_connecting_extends_without_hint() {
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(7);
+        sync.register_peer(peer, 100);
+        // Idle, but the announcement connects to our tip (BIP-130 new block).
+        let chain = make_valid_header_chain(genesis, 1);
+        let r = sync.process_headers(peer, chain, &mut |_, _| Ok(()), &|_| None, &|_| None);
+        assert_eq!(r, Ok(false));
+        assert_eq!(sync.best_header_height(), 1);
+        // A connecting announcement is normal sync — no discovery hint.
+        assert_eq!(sync.take_getheaders_hint(), None);
+    }
+
+    #[test]
+    fn test_request_headers_from_sets_active_sync_for_specific_peer() {
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(9);
+        // request_headers_from targets a SPECIFIC peer (not best_sync_peer) and
+        // promotes it to active sync so its fork reply reaches the rewind path.
+        let msg = sync.request_headers_from(peer, |h| if h == 0 { Some(genesis) } else { None });
+        assert!(matches!(msg, NetworkMessage::GetHeaders(_)));
+        match sync.state() {
+            SyncState::DownloadingHeaders { peer: p, .. } => assert_eq!(*p, peer),
+            other => panic!("expected DownloadingHeaders for the targeted peer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_e3_normal_sync_does_not_set_pending_rewind() {
+        // Guard: the no-fork path never sets pending_rewind, so the download
+        // floor stays at chainstate_tip and normal IBD is byte-for-byte
+        // unchanged.
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(3);
+        sync.register_peer(peer, 100);
+        let _ = seed_chain(&mut sync, peer, genesis, 4);
+        assert_eq!(sync.take_pending_rewind(), None);
+    }
+
+    #[test]
+    fn test_remove_active_peer_clears_stranded_pending_rewind() {
+        // Review fix 1: a fork rewind on a full Ok(true) batch leaves a sticky
+        // pending_rewind while state == DownloadingHeaders{peer}. If that peer
+        // then disconnects, the value must be cleared so a later unrelated
+        // Ok(false) Headers message can't consume a stale fork height.
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(5);
+        sync.register_peer(peer, 100);
+        sync.pending_rewind = Some(3);
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: genesis,
+        };
+        sync.remove_peer(peer);
+        assert_eq!(
+            sync.take_pending_rewind(),
+            None,
+            "remove_peer of the active sync peer must clear a stranded pending_rewind"
+        );
+        assert_eq!(sync.state, SyncState::Idle);
+    }
+
+    #[test]
+    fn test_remove_other_peer_keeps_pending_rewind() {
+        // The fork sync is in progress from peer_a; an unrelated peer_b
+        // disconnecting must NOT abort it.
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer_a = PeerId(5);
+        let peer_b = PeerId(6);
+        sync.register_peer(peer_a, 100);
+        sync.register_peer(peer_b, 100);
+        sync.pending_rewind = Some(3);
+        sync.state = SyncState::DownloadingHeaders {
+            peer: peer_a,
+            last_hash: genesis,
+        };
+        sync.remove_peer(peer_b);
+        assert_eq!(sync.take_pending_rewind(), Some(3));
+    }
+
+    #[test]
+    fn test_start_sync_falls_back_to_active_peer_when_none_taller() {
+        // Review fix 3: when no peer is strictly taller than our header tip but
+        // we're mid-sync (a multi-batch fork continuation whose peer's tracked
+        // height was capped at our new tip), start_sync keeps requesting from
+        // the active peer instead of stranding the fork.
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(8);
+        sync.set_best_header(100, Hash256([1u8; 32]));
+        sync.register_peer(peer, 100); // == our tip, not strictly greater
+        assert!(sync.best_sync_peer().is_none());
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: sync.best_header_hash(),
+        };
+        let r = sync.start_sync(|h| if h <= 100 { Some(Hash256([h as u8; 32])) } else { None });
+        let (target, msg) = r.expect("fallback should request from the active peer");
+        assert_eq!(target, peer);
+        assert!(matches!(msg, NetworkMessage::GetHeaders(_)));
+    }
+
+    #[test]
+    fn test_start_sync_no_fallback_when_idle() {
+        // At tip (Idle) with no taller peer, start_sync returns None — the
+        // fallback must not fire (no getheaders loop at the tip).
+        let mut sync = HeaderSync::new(Hash256([0u8; 32]));
+        let peer = PeerId(8);
+        sync.set_best_header(100, Hash256([1u8; 32]));
+        sync.register_peer(peer, 100);
+        assert_eq!(sync.state, SyncState::Idle);
+        assert!(sync.start_sync(|_| None).is_none());
     }
 }

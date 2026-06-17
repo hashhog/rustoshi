@@ -299,7 +299,7 @@ mod tests {
                 nonce: i as u32,
             })
             .collect();
-        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert!(result.is_err(), "2001 headers must be rejected");
     }
 
@@ -341,7 +341,7 @@ mod tests {
         let mut sync = HeaderSync::new(genesis);
         let peer = PeerId(1);
         sync.register_peer(peer, 1000);
-        let result = sync.process_headers(peer, vec![], &mut |_, _| Ok(()), &|_| None);
+        let result = sync.process_headers(peer, vec![], &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert_eq!(result.unwrap(), false, "empty headers = no more, not an error");
     }
 
@@ -930,7 +930,7 @@ mod tests {
                 nonce: i as u32,
             })
             .collect();
-        let r = sync.process_headers(peer, bad_headers, &mut |_, _| Ok(()), &|_| None);
+        let r = sync.process_headers(peer, bad_headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert!(r.is_err(), "must reject {} headers", MAX_HEADERS_PER_REQUEST + 1);
     }
 }
