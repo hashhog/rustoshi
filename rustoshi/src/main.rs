@@ -921,6 +921,38 @@ fn default_rpc_port(network_id: NetworkId) -> u16 {
     }
 }
 
+/// Classify a `process_block` validation error into a peer-misbehavior reason,
+/// or `None` when the failure is NOT misbehavior and the serving peer must NOT
+/// be banned.
+///
+/// Mirrors Bitcoin Core `MaybePunishNodeForBlock` (net_processing.cpp:1906):
+/// `BLOCK_MUTATED` → "mutated-block" (instant discourage), other consensus
+/// failures → "bad-blk-*" (instant discourage).
+///
+/// UNIT A (reorg cluster): `ValidationError::PrevBlockNotFound` is the special
+/// case. `chain_state.process_block` returns it for ANY block whose prev hash is
+/// not our current active tip (chain_state.rs:477-482) — i.e. every honest
+/// competing-branch / fork block. Bitcoin Core never bans the serving peer for
+/// this: a competing-branch block whose header connects is accept-and-stored,
+/// and only a block whose *header* parent is entirely unknown reaches
+/// `BLOCK_MISSING_PREV` (validation.cpp:4217, AcceptBlockHeader), which by
+/// headers-first sync is not the fork blocks we would want to reorg onto. So
+/// `PrevBlockNotFound` returns `None` (no punishment). Routing the dropped fork
+/// block into the attach/reorg path is Units B+C, not done here.
+fn misbehavior_for_block_error(e: &ValidationError) -> Option<MisbehaviorReason> {
+    match e {
+        // Honest competing-branch / unknown-parent block: NOT misbehavior.
+        ValidationError::PrevBlockNotFound(_) => None,
+        // BLOCK_MUTATED: merkle / witness-commitment corruption.
+        ValidationError::BadMerkleRoot
+        | ValidationError::BadWitnessCommitment
+        | ValidationError::BadWitnessNonceSize
+        | ValidationError::UnexpectedWitness => Some(MisbehaviorReason::MutatedBlock),
+        // Any other consensus failure: generic invalid block.
+        _ => Some(MisbehaviorReason::InvalidBlock),
+    }
+}
+
 // ============================================================
 // COOKIE AUTH HELPERS
 // ============================================================
@@ -3620,24 +3652,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     height, e
                                                 );
                                                 // DoS: peer sent us an invalid block.
-                                                // Distinguish BLOCK_MUTATED (merkle/witness
-                                                // corruption) from generic invalid-block,
-                                                // matching Bitcoin Core MaybePunishNodeForBlock:
-                                                //   BLOCK_MUTATED → Misbehaving(peer, "mutated-block")
-                                                //   other failures → Misbehaving(peer, "bad-blk-*")
-                                                // Both are 100-pt instant bans.  W99 G16.
-                                                let reason = match e {
-                                                    ValidationError::BadMerkleRoot
-                                                    | ValidationError::BadWitnessCommitment
-                                                    | ValidationError::BadWitnessNonceSize
-                                                    | ValidationError::UnexpectedWitness => {
-                                                        MisbehaviorReason::MutatedBlock
+                                                // `misbehavior_for_block_error` distinguishes
+                                                // BLOCK_MUTATED (merkle/witness corruption) and
+                                                // generic invalid-block (both 100-pt instant bans,
+                                                // matching Bitcoin Core MaybePunishNodeForBlock),
+                                                // from PrevBlockNotFound — an honest competing-branch
+                                                // / fork block, which Core never bans (Unit A). See
+                                                // that fn for the full Core reference. A None reason
+                                                // means do NOT punish the serving peer.
+                                                if let Some(reason) = misbehavior_for_block_error(&e) {
+                                                    let mut ps = peer_state.write().await;
+                                                    if let Some(ref mut pm) = ps.peer_manager {
+                                                        pm.misbehaving(peer_id, reason).await;
                                                     }
-                                                    _ => MisbehaviorReason::InvalidBlock,
-                                                };
-                                                let mut ps = peer_state.write().await;
-                                                if let Some(ref mut pm) = ps.peer_manager {
-                                                    pm.misbehaving(peer_id, reason).await;
                                                 }
                                                 None
                                             }
@@ -5720,5 +5747,83 @@ mod tests {
             .assumeutxo_for_height(944_183)
             .expect("mainnet 944183 assumeutxo entry");
         assert_eq!(d.base_mtp, Some(1_775_650_208));
+    }
+
+    // ----------------------------------------------------------------
+    // UNIT A (reorg cluster): a competing-branch / unknown-parent block
+    // (`PrevBlockNotFound`) must NOT ban the serving peer, mirroring
+    // Bitcoin Core MaybePunishNodeForBlock. Genuinely-invalid blocks
+    // still incur the 100-pt instant ban.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn prev_block_not_found_is_not_misbehavior() {
+        // The defect this fix closes: `process_block` returns
+        // `PrevBlockNotFound` for every honest competing-branch / fork
+        // block (chain_state.rs:477-482). Before Unit A this fell into the
+        // catch-all `_ => InvalidBlock` (100-pt instant ban), so a peer
+        // serving us a fork we'd want to reorg onto was banned. Core never
+        // bans for an unknown/competing parent, so this MUST be `None`.
+        let e = ValidationError::PrevBlockNotFound(
+            "00000000000000000000000000000000000000000000000000000000deadbeef"
+                .to_string(),
+        );
+        assert_eq!(
+            misbehavior_for_block_error(&e),
+            None,
+            "a competing-branch / unknown-parent block must NOT punish the peer"
+        );
+    }
+
+    #[test]
+    fn genuinely_invalid_block_still_incurs_100pt_ban() {
+        // Regression guard: the carve-out for PrevBlockNotFound must not
+        // weaken punishment for actually-invalid blocks. A generic
+        // consensus failure (e.g. bad PoW, bad subsidy) still maps to the
+        // 100-pt InvalidBlock ban.
+        for e in [
+            ValidationError::BadProofOfWork,
+            ValidationError::BadDifficulty,
+            ValidationError::BadSubsidy(1, 0),
+            ValidationError::NoTransactions,
+            ValidationError::SigopsLimitExceeded(99_999),
+        ] {
+            let reason = misbehavior_for_block_error(&e)
+                .unwrap_or_else(|| panic!("{:?} must still be punished", e));
+            assert_eq!(
+                reason,
+                MisbehaviorReason::InvalidBlock,
+                "{:?} should map to a generic InvalidBlock ban",
+                e
+            );
+            assert_eq!(
+                reason.score(),
+                100,
+                "InvalidBlock is a 100-pt instant ban"
+            );
+        }
+    }
+
+    #[test]
+    fn mutated_block_maps_to_mutated_reason_100pt() {
+        // BLOCK_MUTATED parity: merkle / witness-commitment corruption maps
+        // to the dedicated MutatedBlock reason (also a 100-pt ban), not the
+        // generic InvalidBlock, and certainly not None.
+        for e in [
+            ValidationError::BadMerkleRoot,
+            ValidationError::BadWitnessCommitment,
+            ValidationError::BadWitnessNonceSize,
+            ValidationError::UnexpectedWitness,
+        ] {
+            let reason = misbehavior_for_block_error(&e)
+                .unwrap_or_else(|| panic!("{:?} must still be punished", e));
+            assert_eq!(
+                reason,
+                MisbehaviorReason::MutatedBlock,
+                "{:?} should map to MutatedBlock",
+                e
+            );
+            assert_eq!(reason.score(), 100, "MutatedBlock is a 100-pt instant ban");
+        }
     }
 }
