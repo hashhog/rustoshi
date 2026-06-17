@@ -553,17 +553,19 @@ fn bug6_estimate_fee_rate_helper_present() {
     );
 }
 
-/// BUG-7 / G17 [P1]: `PreconditionChecks` partial. Confirmed-tx
-/// (wallet.rs:774-778) and RBF-signaling (wallet.rs:779-790) are
-/// present. MISSING:
+/// BUG-7 / G17 [P1, PARTIALLY CLOSED 2026-06-16]: `PreconditionChecks`.
+/// Confirmed-tx (wallet.rs) and RBF-signaling (wallet.rs) are present, and
+/// the already-bumped guard (`wtx.mapValue.contains("replaced_by_txid")`,
+/// `feebumper.cpp:42-45`) is now wired — see the behavioral de-stale
+/// `g19_bumpfee_rejects_already_bumped_tx` in `test_w118_wallet.rs`.
+///
+/// STILL MISSING (the residual gap this pin tracks):
 ///   - `HasWalletSpend(wtx.tx)` (descendants in wallet,
 ///     feebumper.cpp:25-28),
 ///   - `hasDescendantsInMempool(wtx.GetHash())` (descendants in
-///     mempool, feebumper.cpp:31-35),
-///   - `wtx.mapValue.contains("replaced_by_txid")` (already-bumped
-///     guard, feebumper.cpp:42-45).
+///     mempool, feebumper.cpp:31-35).
 #[test]
-#[ignore = "BUG-7 P1: PreconditionChecks partial — descendants + replaced_by_txid guards MISSING"]
+#[ignore = "BUG-7 P1: PreconditionChecks partial — descendant-in-wallet/mempool guards MISSING (replaced_by_txid CLOSED 2026-06-16)"]
 fn bug7_precondition_checks_descendants_and_replaced_by_txid() {
     // Confirmed-tx guard is present (this PASSes structurally):
     assert!(
@@ -575,7 +577,13 @@ fn bug7_precondition_checks_descendants_and_replaced_by_txid() {
         WALLET_SRC.contains("\"bumpfee: transaction does not signal BIP-125 RBF"),
         "RBF-signaling guard must remain in place"
     );
-    // MISSING checks (regression pin) — these literals must still NOT
+    // Already-bumped guard is now wired (CLOSED 2026-06-16): the original
+    // SentTx carries a `replaced_by_txid` marker that build_bumped_tx reads.
+    assert!(
+        WALLET_SRC.contains("replaced_by_txid"),
+        "replaced_by_txid already-bumped guard must now exist (CLOSED 2026-06-16)"
+    );
+    // STILL MISSING checks (regression pin) — these literals must still NOT
     // appear:
     assert!(
         !WALLET_SRC.contains("has_descendant")
@@ -583,14 +591,10 @@ fn bug7_precondition_checks_descendants_and_replaced_by_txid() {
             && !WALLET_SRC.contains("hasDescendantsInMempool"),
         "descendant-in-wallet / descendant-in-mempool guards must not yet exist (pin)"
     );
-    assert!(
-        !WALLET_SRC.contains("replaced_by_txid"),
-        "replaced_by_txid mapValue guard must not yet exist (pin)"
-    );
     panic!(
-        "BUG-7 P1: PreconditionChecks missing descendant-in-wallet, \
-         descendant-in-mempool, and replaced_by_txid guards. See \
-         feebumper.cpp:25-45 for Core parity."
+        "BUG-7 P1: PreconditionChecks still missing descendant-in-wallet \
+         and descendant-in-mempool guards. See feebumper.cpp:25-35 for \
+         Core parity. (replaced_by_txid already-bumped guard CLOSED 2026-06-16.)"
     );
 }
 

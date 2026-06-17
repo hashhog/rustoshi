@@ -332,6 +332,13 @@ pub struct SentTx {
     /// We do not track confirmations directly; consumers call
     /// [`Wallet::mark_sent_tx_confirmed`] when a block confirms it.
     pub confirmed: bool,
+    /// Txid of the replacement transaction if this tx has already been
+    /// fee-bumped. Mirrors Core's `mapValue["replaced_by_txid"]`
+    /// (`wallet/feebumper.cpp` CommitTransaction). `bump_fee` refuses to
+    /// bump an entry that already carries this marker (Core
+    /// `PreconditionChecks`, `feebumper.cpp:42-45`) so a transaction is
+    /// never double-bumped into two competing replacements.
+    pub replaced_by_txid: Option<Hash256>,
 }
 
 impl Wallet {
@@ -872,6 +879,7 @@ impl Wallet {
                 fee_sats: computed_fee,
                 vsize,
                 confirmed: false,
+                replaced_by_txid: None,
             },
         );
 
@@ -1002,6 +1010,18 @@ impl Wallet {
             return Err(WalletError::SigningError(
                 "bumpfee: transaction already confirmed; cannot replace".to_string(),
             ));
+        }
+        // Already-bumped guard (Core PreconditionChecks, feebumper.cpp:42-45):
+        // refuse to bump a transaction that was already replaced by a prior
+        // bump, so the wallet never produces two competing replacements for
+        // the same original.
+        if let Some(replacement) = entry.replaced_by_txid {
+            return Err(WalletError::SigningError(format!(
+                "bumpfee: cannot bump transaction {} which was already bumped by \
+                 transaction {}",
+                hex::encode(txid.0),
+                hex::encode(replacement.0)
+            )));
         }
         let signals_rbf = entry
             .tx
@@ -1163,8 +1183,16 @@ impl Wallet {
                     fee_sats: new_fee,
                     vsize: new_vsize,
                     confirmed: false,
+                    replaced_by_txid: None,
                 },
             );
+            // Mark the original as replaced so a second bump of the same
+            // txid is rejected (Core sets `mapValue["replaced_by_txid"]`
+            // on the original wtx; PreconditionChecks then refuses to bump
+            // it again — feebumper.cpp:42-45).
+            if let Some(original) = self.sent_txs.get_mut(txid) {
+                original.replaced_by_txid = Some(new_txid);
+            }
         }
 
         Ok((new_tx, new_fee, entry.fee_sats))
