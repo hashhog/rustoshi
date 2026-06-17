@@ -554,8 +554,13 @@ fn compute_type<Pk: MiniscriptKey>(
         }
 
         Older(n) => {
-            if *n == 0 {
-                return Err(MiniscriptError::InvalidTimelock(0));
+            // BIP-68 / miniscript: the relative-timelock value must satisfy
+            // `1 <= n < 2^31`. n == 0 is meaningless and n with bit 31 set
+            // collides with the BIP-68 disable flag, so Core rejects both.
+            // Mirrors `*num < 1 || *num >= 0x80000000L` in
+            // `bitcoin-core/src/script/miniscript.h:2034`.
+            if *n == 0 || *n >= 0x8000_0000 {
+                return Err(MiniscriptError::InvalidTimelock(*n));
             }
             // Type: Bzfmxk (with timelock properties)
             let is_time = (*n & (1 << 22)) != 0;
@@ -573,8 +578,13 @@ fn compute_type<Pk: MiniscriptKey>(
         }
 
         After(n) => {
-            if *n == 0 {
-                return Err(MiniscriptError::InvalidTimelock(0));
+            // BIP-65 / miniscript: the absolute-locktime value must satisfy
+            // `1 <= n < 2^31`. n == 0 is meaningless and n with bit 31 set is
+            // outside the range an `after()` can express, so Core rejects both.
+            // Mirrors `*num < 1 || *num >= 0x80000000L` in
+            // `bitcoin-core/src/script/miniscript.h:2027`.
+            if *n == 0 || *n >= 0x8000_0000 {
+                return Err(MiniscriptError::InvalidTimelock(*n));
             }
             // Type: Bzfmxk (with timelock properties)
             let is_time = *n >= 500_000_000;
@@ -2685,6 +2695,73 @@ mod tests {
     fn test_parse_after() {
         let ms = Miniscript::parse("after(500000000)", ScriptContext::P2wsh).unwrap();
         assert!(matches!(ms.fragment, Fragment::After(500000000)));
+    }
+
+    /// BIP-65/BIP-68 + miniscript bound: `older(n)` / `after(n)` are only valid
+    /// for `1 <= n < 2^31`. Bitcoin Core's miniscript parser rejects any value
+    /// with bit 31 set (`*num >= 0x80000000L`,
+    /// `bitcoin-core/src/script/miniscript.h:2027,2034`). The largest in-range
+    /// value (2^31 - 1) must still parse, and the first out-of-range value
+    /// (2^31) must be rejected for BOTH fragments.
+    #[test]
+    fn test_older_after_reject_bit31_set() {
+        // 2^31 - 1 is the maximum valid timelock and must parse.
+        let max_valid = 0x7fff_ffffu32;
+        assert!(
+            Miniscript::<StrKey>::parse(
+                &format!("older({})", max_valid),
+                ScriptContext::P2wsh
+            )
+            .is_ok(),
+            "older(2^31 - 1) is in range and must parse",
+        );
+        assert!(
+            Miniscript::<StrKey>::parse(
+                &format!("after({})", max_valid),
+                ScriptContext::P2wsh
+            )
+            .is_ok(),
+            "after(2^31 - 1) is in range and must parse",
+        );
+
+        // 2^31 has bit 31 set — Core rejects it; so must we.
+        let out_of_range = 0x8000_0000u32; // 2147483648
+        match Miniscript::<StrKey>::parse(
+            &format!("older({})", out_of_range),
+            ScriptContext::P2wsh,
+        ) {
+            Err(MiniscriptError::InvalidTimelock(n)) => assert_eq!(n, out_of_range),
+            other => panic!(
+                "older(2^31) must be rejected as InvalidTimelock, got {:?}",
+                other
+            ),
+        }
+        match Miniscript::<StrKey>::parse(
+            &format!("after({})", out_of_range),
+            ScriptContext::P2wsh,
+        ) {
+            Err(MiniscriptError::InvalidTimelock(n)) => assert_eq!(n, out_of_range),
+            other => panic!(
+                "after(2^31) must be rejected as InvalidTimelock, got {:?}",
+                other
+            ),
+        }
+
+        // u32::MAX (bit 31 set) must also be rejected for both.
+        assert!(
+            matches!(
+                Miniscript::<StrKey>::parse("older(4294967295)", ScriptContext::P2wsh),
+                Err(MiniscriptError::InvalidTimelock(_))
+            ),
+            "older(u32::MAX) must be rejected",
+        );
+        assert!(
+            matches!(
+                Miniscript::<StrKey>::parse("after(4294967295)", ScriptContext::P2wsh),
+                Err(MiniscriptError::InvalidTimelock(_))
+            ),
+            "after(u32::MAX) must be rejected",
+        );
     }
 
     #[test]
