@@ -2303,6 +2303,73 @@ impl Mempool {
         }
     }
 
+    /// Add a signed `delta` to a `u64` aggregate fee field, clamping at 0 on
+    /// underflow and at `u64::MAX` on overflow. Mirrors Bitcoin Core's
+    /// `SaturatingAdd` used in `CTxMemPoolEntry::UpdateModifiedFee`
+    /// (kernel/mempool_entry.h:125-128).
+    #[inline]
+    fn apply_signed_to_u64(value: u64, delta: i64) -> u64 {
+        if delta >= 0 {
+            value.saturating_add(delta as u64)
+        } else {
+            value.saturating_sub(delta.unsigned_abs())
+        }
+    }
+
+    /// Propagate a `prioritisetransaction` fee delta into the cached
+    /// ancestor/descendant aggregate fees of related entries.
+    ///
+    /// In Bitcoin Core, `PrioritiseTransaction` adjusts the entry's modified
+    /// fee, and that modified-fee change flows into every ancestor's
+    /// `nModFeesWithDescendants` and every descendant's `nModFeesWithAncestors`
+    /// (kernel/mempool_entry.h:60 — the aggregate "...WithDescendants" /
+    /// "...WithAncestors" fields track *modified* fees, and
+    /// `CTxMemPool::PrioritiseTransaction`, txmempool.cpp:630-655, updates the
+    /// graph so CPFP mining/eviction see the boosted package feerate).
+    ///
+    /// rustoshi mirrors that older explicit model: each entry caches
+    /// `descendant_fees` (= self + descendants, modified) and `ancestor_fees`
+    /// (= self + ancestors, modified). When a delta `d` is applied to `txid`:
+    ///   - `txid` itself and every ancestor gain `d` in `descendant_fees`,
+    ///   - `txid` itself and every descendant gain `d` in `ancestor_fees`.
+    ///
+    /// `delta` is the *change* in the entry's `fee_delta` (the increment for
+    /// `prioritise_transaction`, or `new - old` for `set_entry_fee_delta`), not
+    /// the absolute delta — otherwise stacked calls would double-count. No-op
+    /// when `delta == 0` or `txid` is not in the mempool.
+    ///
+    /// W106 G8 closure: previously the per-entry `fee_delta` was set but never
+    /// folded into the cached aggregates, so a CPFP child's
+    /// `prioritisetransaction` never lifted its parent in
+    /// `get_sorted_for_mining` / `block_template.rs` CPFP ordering.
+    fn propagate_fee_delta(&mut self, txid: &Hash256, delta: i64) {
+        if delta == 0 || !self.transactions.contains_key(txid) {
+            return;
+        }
+
+        // Ancestors' descendant_fees include this tx's modified fee, as does
+        // the tx's own descendant_fees.
+        if let Some(entry) = self.transactions.get_mut(txid) {
+            entry.descendant_fees = Self::apply_signed_to_u64(entry.descendant_fees, delta);
+        }
+        for anc in self.get_ancestors_of(txid) {
+            if let Some(entry) = self.transactions.get_mut(&anc) {
+                entry.descendant_fees = Self::apply_signed_to_u64(entry.descendant_fees, delta);
+            }
+        }
+
+        // Descendants' ancestor_fees include this tx's modified fee, as does
+        // the tx's own ancestor_fees.
+        if let Some(entry) = self.transactions.get_mut(txid) {
+            entry.ancestor_fees = Self::apply_signed_to_u64(entry.ancestor_fees, delta);
+        }
+        for desc in self.get_descendants_of(txid) {
+            if let Some(entry) = self.transactions.get_mut(&desc) {
+                entry.ancestor_fees = Self::apply_signed_to_u64(entry.ancestor_fees, delta);
+            }
+        }
+    }
+
     /// Remove transactions that were confirmed in a block.
     ///
     /// This also removes any conflicting transactions (those spending
@@ -2409,8 +2476,10 @@ impl Mempool {
             .map(|e| {
                 let modified_fee = Self::get_modified_fee(e);
                 let ancestor_fee_rate = if e.ancestor_count > 1 {
-                    // Multi-ancestor: aggregate raw ancestor_fees (delta
-                    // propagation across ancestors is W106 G8 follow-up).
+                    // Multi-ancestor: aggregate ancestor_fees, which now folds
+                    // in prioritisetransaction deltas (W106 G8 closed —
+                    // propagate_fee_delta keeps ancestor_fees/descendant_fees
+                    // in sync with each entry's fee_delta).
                     e.ancestor_fees as f64 / e.ancestor_size as f64
                 } else if e.vsize > 0 {
                     modified_fee as f64 / e.vsize as f64
@@ -3379,9 +3448,18 @@ impl Mempool {
     /// invoked by `prioritise_transaction` so the delta affects RBF Rule 3,
     /// mining selection, and getmempoolentry RPC via `get_modified_fee`.
     pub fn set_entry_fee_delta(&mut self, txid: &Hash256, fee_delta: i64) {
-        if let Some(entry) = self.transactions.get_mut(txid) {
+        // Capture the change in the per-entry delta so the cached aggregate
+        // fees (descendant_fees / ancestor_fees) shift by the same amount,
+        // matching Core (kernel/mempool_entry.h:60). Use the *difference* from
+        // the previous delta so repeated calls don't double-count.
+        let change = if let Some(entry) = self.transactions.get_mut(txid) {
+            let prev = entry.fee_delta;
             entry.fee_delta = fee_delta;
-        }
+            fee_delta.saturating_sub(prev)
+        } else {
+            return;
+        };
+        self.propagate_fee_delta(txid, change);
     }
 
     /// Stack a `prioritisetransaction` fee delta onto a transaction's
@@ -3408,11 +3486,24 @@ impl Mempool {
         *entry_delta = entry_delta.saturating_add(fee_delta);
         let new_delta = *entry_delta;
 
+        let mut entry_delta_change: i64 = 0;
         if let Some(entry) = self.transactions.get_mut(txid) {
             // Core: it->UpdateModifiedFee(nFeeDelta) — stack the delta on the
             // existing entry.fee_delta, NOT replace with new_delta. The two
             // are kept in sync because every call here updates both.
+            let prev = entry.fee_delta;
             entry.fee_delta = entry.fee_delta.saturating_add(fee_delta);
+            // The real applied change (post-saturation) is what must flow into
+            // the cached aggregate fees of ancestors/descendants.
+            entry_delta_change = entry.fee_delta.saturating_sub(prev);
+        }
+
+        // Propagate the modified-fee change into ancestor descendant_fees /
+        // descendant ancestor_fees so CPFP mining/eviction ordering reflects
+        // the bump (Core: txmempool.cpp:630-655, kernel/mempool_entry.h:60).
+        // W106 G8 closure.
+        if entry_delta_change != 0 {
+            self.propagate_fee_delta(txid, entry_delta_change);
         }
 
         if new_delta == 0 {
