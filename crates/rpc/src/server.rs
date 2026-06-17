@@ -19041,6 +19041,196 @@ mod tests {
         );
     }
 
+    /// Unit D (reorg cluster): END-TO-END drive of the *full* `main.rs` P2P
+    /// `reorg_candidate` glue — not just `try_attach_and_reorg`.
+    ///
+    /// The two committed Unit C tests above stop at `try_attach_and_reorg` and
+    /// assert only the `RpcState` side.  The LIVE arm in `rustoshi/src/main.rs`
+    /// (the `if reorg_candidate { … }` block, main.rs:3953-4039) does THREE more
+    /// things after the shared entry returns `Ok(true)`, and NOTHING in the
+    /// committed suite covers them:
+    ///   1. it FLUSHES the connect-path `utxo_view` write-back cache to RocksDB
+    ///      *before* handing off, so the reorg's fresh view reads coherent coins;
+    ///   2. it re-reads `RpcState.best_hash/best_height` and calls
+    ///      `chain_state.set_tip(new_hash, new_height)` so the in-memory consensus
+    ///      tip matches the chain the reorg committed;
+    ///   3. it RECREATES the `utxo_view` (`block_store.utxo_view()`) so the now-stale
+    ///      pre-reorg cache can never clobber the new chain on its next flush.
+    ///
+    /// This test replays that exact sequence against a real `ChainDb` /
+    /// `BlockStore` / `ChainState` / `BlockStoreUtxoView`, then proves the glue
+    /// is CORRECT by the two checks the arm's own doc-comment promises but the
+    /// existing tests never verify:
+    ///   (A) the recreated view returns the NEW chain's coins (B1/B2/B3 coinbases
+    ///       present) and NOT the old chain's (A1/A2 coinbases gone) — i.e. the
+    ///       flush-then-recreate dance actually swapped the UTXO set;
+    ///   (B) a block that extends the NEW tip (B4 on top of B3) connects through
+    ///       `chain_state.process_block` against the post-`set_tip` ChainState +
+    ///       fresh view — i.e. "the next block's prev == tip check is correct"
+    ///       (the arm's stated invariant).  Before `set_tip`, ChainState still
+    ///       names A2 as the tip, so B4 would be misclassified as a fork; this is
+    ///       precisely the glue the arm exists to fix.
+    ///
+    /// A lighter fork (Ok(false)) and a no-parent block (Err) are exercised by
+    /// the two committed Unit C tests; this test focuses on the Ok(true) glue
+    /// that those skip.
+    #[tokio::test]
+    async fn unit_d_p2p_arm_full_glue_set_tip_and_view_recreate_then_extend() {
+        use rustoshi_consensus::validation::UtxoView;
+        use rustoshi_consensus::{ChainParams, ChainState};
+        use rustoshi_primitives::OutPoint;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        // Mainnet params with the regtest PoW limit, identical to the committed
+        // heavier-branch test: synthetic heights 0..4 sit below all activation
+        // forks, and the loosened pow_limit lets `reorganize`'s connect-time
+        // `check_proof_of_work` accept the 0x207fffff synthetic blocks.
+        let params = {
+            let mut p = ChainParams::mainnet();
+            let mut regtest_limit = [0xffu8; 32];
+            regtest_limit[0] = 0x7f;
+            p.pow_limit = regtest_limit;
+            p
+        };
+        let mut rpc_state = RpcState::new(db.clone(), params.clone());
+
+        // Active chain G -> A1 -> A2 (height 2), fully populated on disk.
+        let (hash_g, _, work_g) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA)
+        };
+        let (hash_a1, block_a1, work_a1) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 1, hash_g, work_g, 0xA1)
+        };
+        let (hash_a2, block_a2, _) = {
+            let store = BlockStore::new(&db);
+            synth_append_with_work(&store, 2, hash_a1, work_a1, 0xA2)
+        };
+        rpc_state.best_hash = hash_a2;
+        rpc_state.best_height = 2;
+        rpc_state.header_height = 2;
+
+        // The in-memory consensus state the live node would carry into the arm:
+        // ChainState tip == A2.  This is the object main.rs calls `set_tip` on.
+        let mut chain_state = ChainState::new(hash_a2, 2, params.clone());
+
+        // Heavier side branch off G: G -> B1 -> B2 (staged as side blocks),
+        // then B3 is the "newly-arrived" P2P block that overtakes A2.
+        let (hash_b1, block_b1, work_b1) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 1, hash_g, work_g, 0xB1)
+        };
+        let (hash_b2, block_b2, _work_b2) = {
+            let store = BlockStore::new(&db);
+            synth_persist_side_block(&store, 2, hash_b1, work_b1, 0xB2)
+        };
+        let block_b3 = mine_synth_block(3, hash_b2, 0xB3);
+        let hash_b3 = block_b3.block_hash();
+
+        // ---- Replay the main.rs `reorg_candidate` arm, step by step. ----
+
+        // Step 1 (arm: pre-reorg flush): the live arm flushes the connect-path
+        // `utxo_view` so the reorg's fresh view reads coherent on-disk coins.
+        // Here the connect path left nothing pending, so a plain `flush()` is
+        // the faithful no-pending analogue; the important part is that the view
+        // we hand off to `try_attach_and_reorg` reads the persisted A-chain
+        // coins (which `synth_append_with_work` already wrote).
+        {
+            let block_store = BlockStore::new(&db);
+            let mut utxo_view = block_store.utxo_view();
+            utxo_view.flush().expect("pre-reorg flush");
+        }
+
+        // Step 2 (arm: shared entry): route the dropped fork block into
+        // `try_attach_and_reorg` under the RpcState write lock — the SAME call
+        // submitblock makes.
+        let did_reorg = try_attach_and_reorg(&mut rpc_state, &block_b3, &hash_b3)
+            .expect("attach-and-reorg must not hard-error on a known-parent fork");
+        assert!(did_reorg, "the B-branch is heavier — reorganize() MUST fire");
+
+        // Step 3 (arm: re-sync ChainState): re-read RpcState and `set_tip` —
+        // the glue the committed tests never exercise.
+        let (new_hash, new_height) = (rpc_state.best_hash, rpc_state.best_height);
+        assert_eq!(new_hash, hash_b3, "RpcState best_hash switched to B3");
+        assert_eq!(new_height, 3, "RpcState best_height advanced to 3");
+        chain_state.set_tip(new_hash, new_height);
+        assert_eq!(
+            chain_state.tip_hash(),
+            hash_b3,
+            "set_tip glue: in-memory ChainState tip must be the new B tip"
+        );
+        assert_eq!(chain_state.tip_height(), 3, "set_tip glue: height is 3");
+
+        // Step 4 (arm: recreate view): the old write-back cache is now stale —
+        // recreate it over the same shared Arc<ChainDb>.
+        let block_store = BlockStore::new(&db);
+        let mut utxo_view = block_store.utxo_view();
+
+        // ---- Check (A): the recreated view reflects the NEW chain. ----
+        // B-chain coinbase coins must be present; A-chain coinbase coins gone.
+        let cb_out = |b: &Block| OutPoint { txid: b.transactions[0].txid(), vout: 0 };
+        for (label, b) in [("B1", &block_b1), ("B2", &block_b2), ("B3", &block_b3)] {
+            let coin = utxo_view.get_utxo(&cb_out(b));
+            assert!(
+                coin.is_some(),
+                "recreated view MUST see {} coinbase coin after the reorg (stale-cache clobber bug if missing)",
+                label
+            );
+            assert_eq!(coin.unwrap().value, 50_000_000, "{} coinbase value", label);
+        }
+        for (label, b) in [("A1", &block_a1), ("A2", &block_a2)] {
+            assert!(
+                utxo_view.get_utxo(&cb_out(b)).is_none(),
+                "recreated view MUST NOT see disconnected {} coinbase coin (reorg failed to roll back the old chain)",
+                label
+            );
+        }
+
+        // ---- Check (B): a block extending the NEW tip connects. ----
+        // B4 on top of B3.  Its `prev_block_hash == chain_state.tip_hash()`
+        // ONLY because step 3's set_tip re-pointed the tip from A2 to B3; with
+        // the pre-fix tip (A2) this same block would be a `PrevBlockNotFound`
+        // fork, never a clean extension.  Connecting it through the real
+        // `process_block` against the post-set_tip ChainState + fresh view is
+        // the end-to-end proof the live glue leaves the node ready to extend.
+        let block_b4 = mine_synth_block(4, hash_b3, 0xB4);
+        assert_eq!(
+            block_b4.header.prev_block_hash,
+            chain_state.tip_hash(),
+            "B4 extends the post-reorg tip — the set_tip invariant the arm guarantees"
+        );
+        let (_undo, _fees) = chain_state
+            .process_block(
+                &block_b4,
+                &mut utxo_view,
+                /* prev_block_mtp */ 0,
+                /* f_requested   */ true,
+                /* current_time  */ 1_700_000_100,
+            )
+            .expect(
+                "B4 must connect on top of the post-reorg tip via the recreated view; \
+                 a failure here means the set_tip + view-recreate glue left the node \
+                 in a state that cannot extend the new chain",
+            );
+        assert_eq!(
+            chain_state.tip_hash(),
+            block_b4.block_hash(),
+            "after extending, ChainState tip is B4"
+        );
+        assert_eq!(chain_state.tip_height(), 4, "extended height is 4");
+
+        // The B4 coinbase coin is now spendable in the same view — confirms the
+        // recreated view is a live, writable continuation of the new chain, not
+        // a frozen snapshot.
+        assert!(
+            utxo_view.get_utxo(&cb_out(&block_b4)).is_some(),
+            "B4 coinbase coin present in the recreated view after connect"
+        );
+    }
+
     // ============================================================
     // SIDE-BRANCH ACCEPTANCE TESTS (Pattern Y closure 2026-05-05)
     //
