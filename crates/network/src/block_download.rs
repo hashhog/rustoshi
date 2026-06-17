@@ -444,6 +444,23 @@ impl BlockDownloader {
         self.validated_tip_height
     }
 
+    /// Realign the validated-tip counter to an authoritative chain height.
+    ///
+    /// `validated_tip_height` counts blocks POPPED for validation (incremented
+    /// unconditionally in `next_block_to_validate`, even when the subsequent
+    /// `process_block` fails — see the GAP-FILL rationale in main.rs). After a
+    /// reorg driven by the Unit C P2P arm, the active tip is repointed by a
+    /// DIFFERENT path (`try_attach_and_reorg`), so this counter can be left
+    /// ahead of the real tip by however many competing-fork blocks failed to
+    /// connect sequentially before the reorg fired. The caller resets it to the
+    /// reorg's committed tip height so subsequent connects (and the
+    /// `best_height` the validation loop derives from this counter) track the
+    /// real chain — otherwise getblockcount over-reports (e.g. 10 disconnected +
+    /// 15 connected = 25 instead of 15). Reorg cluster Unit E follow-up.
+    pub fn set_validated_tip_height(&mut self, height: u32) {
+        self.validated_tip_height = height;
+    }
+
     /// Get the best header height.
     pub fn best_header_height(&self) -> u32 {
         self.best_header_height
