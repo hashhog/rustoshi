@@ -6648,7 +6648,6 @@ impl RustoshiRpcServer for RpcServerImpl {
                         inbound: info.inbound,
                         bip152_hb_to: false,
                         bip152_hb_from: false,
-                        startingheight: info.start_height,
                         presynced_headers: -1,
                         synced_headers,
                         synced_blocks,
