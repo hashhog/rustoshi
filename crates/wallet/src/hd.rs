@@ -101,6 +101,13 @@ pub enum WalletError {
     #[error("cannot derive hardened child from public key")]
     HardenedFromPublic,
 
+    /// Cannot derive a child below depth 255 (the BIP-32 depth byte would
+    /// overflow). Mirrors Bitcoin Core's `CExtKey::Derive` /
+    /// `CExtPubKey::Derive` guard (`key.cpp:483` / `pubkey.cpp:416`):
+    /// `if (nDepth == std::numeric_limits<unsigned char>::max()) return false;`.
+    #[error("cannot derive child: depth byte would overflow (parent already at depth 255)")]
+    DepthOverflow,
+
     /// Invalid derivation path format.
     #[error("invalid derivation path: {0}")]
     InvalidPath(String),
@@ -186,6 +193,13 @@ impl ExtendedPrivKey {
     /// # Errors
     /// Returns an error if the derivation produces an invalid key (astronomically unlikely).
     pub fn derive_child(&self, child_number: u32) -> Result<Self, WalletError> {
+        // Core CExtKey::Derive (key.cpp:483): refuse to derive once the parent
+        // is at the maximum depth (the 1-byte depth field would overflow).
+        let depth = self
+            .depth
+            .checked_add(1)
+            .ok_or(WalletError::DepthOverflow)?;
+
         let secp = secp_ctx();
         let parent_pub = PublicKey::from_secret_key(secp, &self.secret_key);
         let fingerprint = key_fingerprint(&parent_pub);
@@ -222,7 +236,7 @@ impl ExtendedPrivKey {
         Ok(Self {
             secret_key: child_secret,
             chain_code,
-            depth: self.depth.saturating_add(1),
+            depth,
             parent_fingerprint: fingerprint,
             child_number,
         })
@@ -273,6 +287,13 @@ impl ExtendedPubKey {
             return Err(WalletError::HardenedFromPublic);
         }
 
+        // Core CExtPubKey::Derive (pubkey.cpp:416): refuse to derive once the
+        // parent is at the maximum depth (the 1-byte depth field would overflow).
+        let depth = self
+            .depth
+            .checked_add(1)
+            .ok_or(WalletError::DepthOverflow)?;
+
         let fingerprint = key_fingerprint(&self.public_key);
 
         let mut data = Vec::with_capacity(37);
@@ -303,7 +324,7 @@ impl ExtendedPubKey {
         Ok(Self {
             public_key: child_pub,
             chain_code,
-            depth: self.depth.saturating_add(1),
+            depth,
             parent_fingerprint: fingerprint,
             child_number,
         })
@@ -719,5 +740,57 @@ mod tests {
         // Using derive_path
         let deep = master.derive_path(&[0, 1, 2, 3, 4]).unwrap();
         assert_eq!(deep.depth, 5);
+    }
+
+    /// Behavioral parity with Core's `CExtKey::Derive` / `CExtPubKey::Derive`
+    /// depth-overflow guard (`key.cpp:483` / `pubkey.cpp:416`):
+    /// `if (nDepth == std::numeric_limits<unsigned char>::max()) return false;`.
+    ///
+    /// Deriving from a parent already at depth 255 must FAIL (the 1-byte depth
+    /// field would overflow). Before the fix `derive_child` used
+    /// `saturating_add(1)`, silently producing a child that ALSO reported
+    /// depth 255 — a wrong-depth extended key that Core would never emit.
+    #[test]
+    fn derive_child_rejects_depth_overflow() {
+        let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let master = ExtendedPrivKey::from_seed(&seed).unwrap();
+
+        // Walk a real derivation chain to depth 255 via the public API. Use a
+        // mix of hardened/normal indices to keep it a genuine derivation.
+        let mut key = master;
+        for i in 0..255u32 {
+            key = key.derive_child(i).expect("derivation up to depth 255 must succeed");
+        }
+        assert_eq!(key.depth, 255, "parent must be at the max depth byte");
+
+        // One more private derivation must be refused — not silently saturated.
+        let priv_res = key.derive_child(0);
+        assert!(
+            matches!(priv_res, Err(WalletError::DepthOverflow)),
+            "private derive at depth 255 must return DepthOverflow, got {:?}",
+            priv_res.map(|k| k.depth)
+        );
+
+        // Same guard on the public-key path (xpub derivation).
+        let pubkey = key.to_public();
+        assert_eq!(pubkey.depth, 255);
+        let pub_res = pubkey.derive_child(0);
+        assert!(
+            matches!(pub_res, Err(WalletError::DepthOverflow)),
+            "public derive at depth 255 must return DepthOverflow, got {:?}",
+            pub_res.map(|k| k.depth)
+        );
+
+        // A parent one level shallower (depth 254) must still derive fine, and
+        // its child lands exactly on 255 (no off-by-one in the guard).
+        let mut parent_254 = ExtendedPrivKey::from_seed(&seed).unwrap();
+        for i in 0..254u32 {
+            parent_254 = parent_254.derive_child(i).unwrap();
+        }
+        assert_eq!(parent_254.depth, 254);
+        let child_255 = parent_254
+            .derive_child(7)
+            .expect("derive at depth 254 must succeed");
+        assert_eq!(child_255.depth, 255);
     }
 }
