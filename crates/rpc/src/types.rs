@@ -370,8 +370,20 @@ pub struct BlockInfo {
     #[serde(rename = "nTx")]
     pub n_tx: u32,
     /// Hash of the previous block.
+    ///
+    /// Core (`blockToJSON` -> `blockheaderToJSON`, blockchain.cpp:177-178)
+    /// emits this key ONLY when the block has a parent (`if (blockindex.pprev)`)
+    /// — so the genesis block must OMIT it entirely, not emit `null`.
+    /// `skip_serializing_if` drops the key when `None`, matching the sibling
+    /// `BlockHeaderInfo` shape and Core's REST `/rest/block/<hash>.json` output.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub previousblockhash: Option<String>,
     /// Hash of the next block (if available).
+    ///
+    /// Core (`blockToJSON` -> `blockheaderToJSON`, blockchain.cpp:179-180)
+    /// emits this key ONLY when a next block exists (`if (pnext)`) — so the
+    /// chain tip must OMIT it entirely, not emit `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nextblockhash: Option<String>,
     /// Coinbase transaction metadata (Core 27+ field).
     /// Present in verbosity=1; omitted when block body unavailable.
