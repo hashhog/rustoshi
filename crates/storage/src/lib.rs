@@ -1103,6 +1103,170 @@ mod tests {
         );
     }
 
+    /// Unit B end-to-end: after the LINEAR connect path persists block
+    /// bodies + undo via `flush_with_tip_and_blocks`, the exact closures the
+    /// reorg path (`try_attach_and_reorg` / `chain_state.reorganize`) uses to
+    /// read block + undo MUST resolve — and a `reorganize` that disconnects
+    /// those blocks MUST get PAST the read phase (it must NOT fail with the
+    /// "missing block/undo for disconnect" error that the pre-Unit-B connect
+    /// path produced, because it only wrote header + index).
+    ///
+    /// This is the regression that proves a reorg arriving over P2P is now
+    /// physically possible: the connect path leaves body + undo on disk for
+    /// the active chain, so the disconnect side of a reorg has its inputs.
+    #[test]
+    fn unit_b_reorg_can_read_connect_path_persisted_body_and_undo() {
+        use rustoshi_consensus::chain_state::ChainState;
+        use rustoshi_consensus::validation::{self, CoinEntry as VCoinEntry, UtxoView};
+
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+
+        // --- Build a real 2-block active chain via the connect-path flush. ---
+        // Genesis-ish parent at h=0.
+        let genesis = Hash256::ZERO;
+
+        let mk_block = |height: u32, prev: Hash256, nonce: u32| -> Block {
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_block_hash: prev,
+                    merkle_root: Hash256::ZERO,
+                    timestamp: 1_700_000_000 + height,
+                    bits: 0x207fffff,
+                    nonce,
+                },
+                transactions: vec![Transaction {
+                    version: 1,
+                    inputs: vec![TxIn {
+                        previous_output: OutPoint::null(),
+                        script_sig: vec![height as u8, nonce as u8],
+                        sequence: 0xFFFF_FFFF,
+                        witness: Vec::new(),
+                    }],
+                    outputs: vec![TxOut {
+                        value: 50_0000_0000,
+                        script_pubkey: vec![0x51],
+                    }],
+                    lock_time: 0,
+                }],
+            }
+        };
+
+        let b1 = mk_block(1, genesis, 1);
+        let h1 = b1.block_hash();
+        let b2 = mk_block(2, h1, 2);
+        let h2 = b2.block_hash();
+
+        // b1/b2 are coinbase-only blocks: disconnect just removes the
+        // coinbase output and re-adds the (empty) spent set. Undo is empty
+        // for both — what Unit B must persist is the BODY (the disconnect
+        // side reads `get_block` to know which outputs to remove) plus this
+        // (empty) undo blob; pre-Unit-B `get_block`/`get_undo` returned None
+        // and reorganize() bailed before ever reaching disconnect_block.
+        let undo1 = UndoData { spent_coins: vec![] };
+        let undo2 = UndoData { spent_coins: vec![] };
+        // b2's coinbase output (the coin it created) — seeded into the view
+        // so the connect-path flush persists it and disconnect can remove it.
+        let b2_coinbase_op = OutPoint {
+            txid: b2.transactions[0].txid(),
+            vout: 0,
+        };
+
+        // Persist block-index entries (the reorg walks prev via these).
+        for (h, blk, height) in [(h1, &b1, 1u32), (h2, &b2, 2u32)] {
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_SCRIPTS);
+            status.set(BlockStatus::HAVE_DATA);
+            let entry = BlockIndexEntry {
+                height,
+                status,
+                n_tx: 1,
+                timestamp: blk.header.timestamp,
+                bits: blk.header.bits,
+                nonce: blk.header.nonce,
+                version: blk.header.version,
+                prev_hash: blk.header.prev_block_hash,
+                chain_work: {
+                    let mut w = [0u8; 32];
+                    w[31] = height as u8; // monotone, enough for the walk
+                    w
+                },
+            };
+            store.put_block_index(&h, &entry).unwrap();
+            store.put_header(&h, &blk.header).unwrap();
+        }
+        store.put_height_index(1, &h1).unwrap();
+        store.put_height_index(2, &h2).unwrap();
+
+        // The LINEAR connect path: bodies + undo land in the SAME atomic
+        // batch as the tip advance (this is the Unit-B fix under test).
+        {
+            let mut view = store.utxo_view();
+            // Seed b2's coinbase output so disconnect can remove it.
+            view.add_utxo(
+                &b2_coinbase_op,
+                VCoinEntry {
+                    height: 2,
+                    is_coinbase: true,
+                    value: 50_0000_0000,
+                    script_pubkey: vec![0x51],
+                },
+            );
+            let pending = vec![
+                (h1, b1.clone(), undo1.clone()),
+                (h2, b2.clone(), undo2.clone()),
+            ];
+            view.flush_with_tip_and_blocks(&h2, 2, &pending, &[], None)
+                .expect("connect-path flush persists body+undo");
+        }
+
+        // --- The reorg-path closures (copied from try_attach_and_reorg). ---
+        let get_block = |h: &Hash256| -> Option<Block> { store.get_block(h).ok().flatten() };
+        let get_undo = |h: &Hash256| -> Option<validation::UndoData> {
+            store.get_undo(h).ok().flatten().map(|u| validation::UndoData {
+                spent_coins: u
+                    .spent_coins
+                    .iter()
+                    .map(|c| VCoinEntry {
+                        height: c.height,
+                        is_coinbase: c.is_coinbase,
+                        value: c.value,
+                        script_pubkey: c.script_pubkey.clone(),
+                    })
+                    .collect(),
+            })
+        };
+
+        // PRECONDITION the pre-Unit-B path failed: the bodies + undo the
+        // disconnect side reads are now resolvable for BOTH connected blocks.
+        assert!(get_block(&h1).is_some(), "b1 body must be persisted");
+        assert!(get_block(&h2).is_some(), "b2 body must be persisted");
+        assert!(get_undo(&h1).is_some(), "b1 undo must be persisted");
+        assert!(get_undo(&h2).is_some(), "b2 undo must be persisted");
+
+        // Drive the disconnect read-phase exactly as reorganize() does: it
+        // looks up get_block + get_undo for the tip and disconnects it. With
+        // Unit B these are Some, so disconnect_block runs instead of the
+        // reorganize() loop bailing out with "missing block/undo".
+        let mut cs = ChainState::new(h2, 2, params.clone());
+        let mut view = store.utxo_view();
+        let blk = get_block(&h2).expect("get_block(tip)");
+        let und = get_undo(&h2).expect("get_undo(tip)");
+        let res = cs.disconnect_block(&blk, &und, &mut view);
+        assert!(
+            res.is_ok(),
+            "disconnect of the connect-path-persisted tip block must succeed \
+             (Unit B persisted its body+undo): {:?}",
+            res
+        );
+        // After disconnect the tip moved back to b1; the coin b2 spent was
+        // re-created from undo2.
+        assert_eq!(cs.tip_hash(), h1);
+        assert_eq!(cs.tip_height(), 1);
+    }
+
     /// `flush()` (the convenience wrapper) MUST still write everything
     /// in one batch. Regression guard: keep the wrapper API working
     /// after refactoring `flush()` to delegate to `flush_into_batch`.

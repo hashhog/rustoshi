@@ -30,6 +30,24 @@ pub const META_CHAIN_WORK: &[u8] = b"chain_work";
 /// Metadata key for the prune height (blocks below this have been pruned).
 pub const META_PRUNE_HEIGHT: &[u8] = b"prune_height";
 
+/// Metadata key for the reorg-retention prune watermark (Unit B).
+///
+/// Records the highest active-chain height whose block body + undo have
+/// been deleted by the reorg-retention pruner (the storage-economy prune
+/// that keeps only a bounded ~288-block reorg window, distinct from the
+/// BIP-159 manual/auto prune tracked by [`META_PRUNE_HEIGHT`]).
+///
+/// ADDITIVE — introduced WITHOUT a `CURRENT_DB_VERSION` bump because it
+/// neither changes any existing on-disk encoding nor invalidates a
+/// chainstate that lacks it. A datadir written before Unit B simply has
+/// no value under this key; `get_reorg_prune_height` then returns `None`
+/// and the connect loop seeds the watermark at the current retention
+/// floor (so it begins pruning forward from there rather than re-walking
+/// the entire buried history). The byte string is distinct from every
+/// other `META_*` key above (notably `prune_height`) so there is no
+/// collision in `CF_META`.
+pub const META_REORG_PRUNE_HEIGHT: &[u8] = b"reorg_prune_height";
+
 /// Metadata key for the database version.
 pub const META_DB_VERSION: &[u8] = b"db_version";
 
