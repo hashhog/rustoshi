@@ -373,45 +373,85 @@ fn getblockchaininfo_order_matches_core() {
     assert_eq!(got, want, "getblockchaininfo key order");
 }
 
+/// Helper: build a `BlockInfo` (the struct serialized by the REST
+/// `/rest/block/<hash>.json` path, rest.rs::build_block_info) with the given
+/// optional prev/next hashes. All non-optional fields use placeholder values —
+/// this test only exercises the serde shape of the optional fields.
+fn sample_block_info(prev: Option<String>, next: Option<String>) -> BlockInfo {
+    BlockInfo {
+        hash: "h".into(),
+        confirmations: 1,
+        size: 1,
+        strippedsize: 1,
+        weight: 1,
+        height: 0,
+        version: 1,
+        version_hex: "00000001".into(),
+        merkleroot: "m".into(),
+        tx: vec![],
+        time: 0,
+        mediantime: 0,
+        nonce: 0,
+        bits: "1d00ffff".into(),
+        target: "0".repeat(64),
+        difficulty: 1.0,
+        chainwork: "0".repeat(64),
+        n_tx: 1,
+        previousblockhash: prev,
+        nextblockhash: next,
+        coinbase_tx: None,
+    }
+}
+
+/// Core `blockToJSON` -> `blockheaderToJSON` (blockchain.cpp:177-180) pushes
+/// `previousblockhash` ONLY when the block has a parent and `nextblockhash`
+/// ONLY when a next block exists. The genesis block and the chain tip must
+/// therefore OMIT the respective key — emitting `"...":null` diverges from
+/// Core's REST output. This serializes the real `BlockInfo` struct (the type
+/// the REST `/rest/block/<hash>.json` handler serializes via serde) so the
+/// test fails if the `skip_serializing_if` attribute regresses.
 #[test]
-fn getblock_verbose_top_level_order_matches_core() {
-    // Replicates the get_block manual string-builder order (verbosity>=1, with
-    // prev/next/coinbase_tx present).
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = write!(out, "{{");
-    let _ = write!(out, r#""hash":"h""#);
-    let _ = write!(out, r#","confirmations":1"#);
-    let _ = write!(out, r#","height":0"#);
-    let _ = write!(out, r#","version":1"#);
-    let _ = write!(out, r#","versionHex":"00000001""#);
-    let _ = write!(out, r#","merkleroot":"m""#);
-    let _ = write!(out, r#","time":0"#);
-    let _ = write!(out, r#","mediantime":0"#);
-    let _ = write!(out, r#","nonce":0"#);
-    let _ = write!(out, r#","bits":"1d00ffff""#);
-    let _ = write!(out, r#","target":"00""#);
-    let _ = write!(out, r#","difficulty":1.0"#);
-    let _ = write!(out, r#","chainwork":"00""#);
-    let _ = write!(out, r#","nTx":1"#);
-    let _ = write!(out, r#","previousblockhash":"p""#);
-    let _ = write!(out, r#","nextblockhash":"n""#);
-    let _ = write!(out, r#","strippedsize":1"#);
-    let _ = write!(out, r#","size":1"#);
-    let _ = write!(out, r#","weight":1"#);
-    let _ = write!(out, r#","coinbase_tx":{{}}"#);
-    let _ = write!(out, r#","tx":[]"#);
-    let _ = write!(out, "}}");
-    let got = top_level_keys(&out);
-    // Core blockToJSON = blockheaderToJSON (header fields) + strippedsize, size,
-    // weight, coinbase_tx, tx.
-    let want = [
-        "hash", "confirmations", "height", "version", "versionHex", "merkleroot",
-        "time", "mediantime", "nonce", "bits", "target", "difficulty",
-        "chainwork", "nTx", "previousblockhash", "nextblockhash",
-        "strippedsize", "size", "weight", "coinbase_tx", "tx",
-    ];
-    assert_eq!(got, want, "getblock verbose top-level key order");
+fn getblock_prev_next_omitted_when_absent() {
+    // Genesis: no parent -> previousblockhash key must be ABSENT (not null).
+    let genesis = serde_json::to_string(&sample_block_info(None, Some("n".into()))).unwrap();
+    let genesis_keys = top_level_keys(&genesis);
+    assert!(
+        !genesis_keys.iter().any(|k| k == "previousblockhash"),
+        "genesis BlockInfo must omit previousblockhash, got: {genesis}"
+    );
+    assert!(
+        genesis_keys.iter().any(|k| k == "nextblockhash"),
+        "genesis BlockInfo must still emit nextblockhash, got: {genesis}"
+    );
+    assert!(
+        !genesis.contains("null"),
+        "genesis BlockInfo must not emit any null field, got: {genesis}"
+    );
+
+    // Chain tip: no next block -> nextblockhash key must be ABSENT (not null).
+    let tip = serde_json::to_string(&sample_block_info(Some("p".into()), None)).unwrap();
+    let tip_keys = top_level_keys(&tip);
+    assert!(
+        !tip_keys.iter().any(|k| k == "nextblockhash"),
+        "tip BlockInfo must omit nextblockhash, got: {tip}"
+    );
+    assert!(
+        tip_keys.iter().any(|k| k == "previousblockhash"),
+        "tip BlockInfo must still emit previousblockhash, got: {tip}"
+    );
+    assert!(
+        !tip.contains("null"),
+        "tip BlockInfo must not emit any null field, got: {tip}"
+    );
+
+    // Mid-chain: both present -> both keys appear.
+    let mid = serde_json::to_string(&sample_block_info(Some("p".into()), Some("n".into()))).unwrap();
+    let mid_keys = top_level_keys(&mid);
+    assert!(
+        mid_keys.iter().any(|k| k == "previousblockhash")
+            && mid_keys.iter().any(|k| k == "nextblockhash"),
+        "mid-chain BlockInfo must emit both prev/next, got: {mid}"
+    );
 }
 
 #[test]
