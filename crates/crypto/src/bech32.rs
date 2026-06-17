@@ -29,6 +29,16 @@ const BECH32_CONST: u32 = 1;
 /// Checksum constant for Bech32m (BIP-350).
 const BECH32M_CONST: u32 = 0x2bc830a3;
 
+/// Maximum length of a Bech32/Bech32m encoded address, in characters.
+///
+/// BIP-173/BIP-350 cap addresses at 90 characters. The underlying BCH code only
+/// guarantees detection of up to 4 errors within an 89-character window, so any
+/// string longer than this limit must be rejected as malformed regardless of
+/// whether its checksum happens to verify. Matches Bitcoin Core's
+/// `bech32::CharLimit::BECH32 = 90` (`src/bech32.h`), enforced in
+/// `bech32::Decode` (`src/bech32.cpp:378`).
+const BECH32_MAX_LENGTH: usize = 90;
+
 /// Bech32 encoding variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bech32Variant {
@@ -56,6 +66,9 @@ pub enum Bech32Error {
     /// Data is too short (need at least 6 characters for checksum).
     #[error("data too short")]
     TooShort,
+    /// String exceeds the BIP-173/BIP-350 90-character limit.
+    #[error("bech32 string too long")]
+    TooLong,
     /// Mixed case in input.
     #[error("mixed case")]
     MixedCase,
@@ -173,6 +186,16 @@ pub fn bech32_decode(s: &str) -> Result<(String, Vec<u8>, Bech32Variant), Bech32
     let has_upper = s.chars().any(|c| c.is_ascii_uppercase());
     if has_lower && has_upper {
         return Err(Bech32Error::MixedCase);
+    }
+
+    // Enforce the BIP-173/BIP-350 90-character limit. Beyond this length the BCH
+    // code's error-detection guarantee no longer holds, so over-long strings are
+    // rejected up front regardless of checksum. Matches Bitcoin Core's
+    // `if (str.size() > limit) return {};` in `bech32::Decode` (src/bech32.cpp:378,
+    // CharLimit::BECH32 = 90). Checked on the original `s` (length is unchanged by
+    // lowercasing).
+    if s.len() > BECH32_MAX_LENGTH {
+        return Err(Bech32Error::TooLong);
     }
 
     // Convert to lowercase for processing
@@ -510,6 +533,44 @@ mod tests {
         // This should fail because v1 requires Bech32m
         let result = decode_segwit_address(&wrong_address);
         assert!(matches!(result, Err(Bech32Error::InvalidChecksum)));
+    }
+
+    #[test]
+    fn reject_overlong_address() {
+        // BIP-173/BIP-350 cap addresses at 90 characters; Bitcoin Core's
+        // bech32::Decode rejects anything longer (CharLimit::BECH32 = 90) before
+        // verifying the checksum. Build a string with a *valid* checksum that is
+        // exactly 91 characters: total = hrp("bc") + sep('1') + data + checksum(6)
+        // = 3 + data.len() + 6, so data.len() = 82 yields 91 chars.
+        let data: Vec<u8> = (0u8..82).map(|i| i % 32).collect();
+        let overlong = bech32_encode("bc", &data, Bech32Variant::Bech32m);
+        assert_eq!(overlong.len(), 91, "test setup: expected a 91-char string");
+
+        // The checksum is valid, so the only reason to reject is length.
+        let result = bech32_decode(&overlong);
+        assert!(
+            matches!(result, Err(Bech32Error::TooLong)),
+            "over-90-char bech32 string must be rejected as TooLong, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn accept_exactly_90_chars() {
+        // A 90-character string is within the limit and must decode (checksum valid).
+        // total = 3 + data.len() + 6 = 90  =>  data.len() = 81.
+        let data: Vec<u8> = (0u8..81).map(|i| i % 32).collect();
+        let at_limit = bech32_encode("bc", &data, Bech32Variant::Bech32m);
+        assert_eq!(at_limit.len(), 90, "test setup: expected a 90-char string");
+
+        let result = bech32_decode(&at_limit);
+        assert!(
+            result.is_ok(),
+            "exactly-90-char bech32 string must decode, got {result:?}"
+        );
+        let (hrp, decoded, variant) = result.unwrap();
+        assert_eq!(hrp, "bc");
+        assert_eq!(decoded, data);
+        assert_eq!(variant, Bech32Variant::Bech32m);
     }
 
     #[test]
