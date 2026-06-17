@@ -808,28 +808,70 @@ fn bug23_one_utxo_per_group() {
     );
 }
 
-/// BUG-24 / G23 [P3]: `select_coins_largest_first` waste excludes
-/// excess-above-target term.
+/// BUG-24 / G23 [P3] — FIXED: `select_coins_largest_first` waste now
+/// includes the excess-above-target term.
 ///
-/// `coin_selection.rs:537-541` sums `fee - long_term_fee` per input
-/// only. Core's `RecalculateWaste` (`coinselection.cpp:846-850`)
-/// adds `selected_effective_value - m_target` (excess thrown to fees)
-/// when there is no change. LargestFirst's no-change case mismatches.
+/// `select_coins_largest_first` is a no-change algorithm, so it always
+/// hits the `GetChange(...) == 0` branch of Core's `RecalculateWaste`
+/// (`bitcoin-core/src/wallet/coinselection.cpp:846-849`), where the
+/// excess thrown to fees counts as waste:
+/// `waste += selected_effective_value - m_target`. Previously the
+/// rustoshi waste summed only the per-input `fee - long_term_fee` term,
+/// dropping the excess. De-staled 2026-06-16.
 #[test]
-#[ignore = "BUG-24 P3: largest_first waste excludes excess-above-target term"]
-fn bug24_largest_first_waste_excludes_excess() {
+fn bug24_largest_first_waste_includes_excess() {
     let utxos = vec![
         make_utxo(100_000, 6),
         make_utxo(50_000, 6),
     ];
     let params = default_params(40_000);
     let result = select_coins_largest_first(&utxos, &params).unwrap();
-    let _ = result.waste; // currently only fee-LTFR contribution
-    panic!(
-        "BUG-24: largest_first waste excludes excess-above-target \
-         term. When selection produces no change (residual absorbed \
-         into fee), waste must include selected_effective_value - \
-         target per Core coinselection.cpp:846-850."
+
+    // Largest-first picks the 100_000 UTXO alone (sorted descending; it
+    // covers target 40_000 + fee 68). One input is selected.
+    assert_eq!(result.selected.len(), 1);
+    assert_eq!(result.total_value, 100_000);
+
+    // Mirror Core's RecalculateWaste (no-change branch):
+    //   per_input_fee = ceil(input_weight/4 * fee_rate)  = ceil(68 * 1.0)  = 68
+    //   per_input_ltf = ceil(input_weight/4 * ltfr)      = ceil(68 * 10.0) = 680
+    //   per-input term            = (68 - 680) * 1                          = -612
+    //   selected_effective_value  = 100_000 - 68 * 1                        = 99_932
+    //   excess (thrown to fees)   = 99_932 - 40_000                         = 59_932
+    //   waste                     = -612 + 59_932                           = 59_320
+    let per_input_fee = (params.input_weight as f64 / 4.0 * params.fee_rate).ceil() as i64;
+    let per_input_ltf =
+        (params.input_weight as f64 / 4.0 * params.long_term_fee_rate).ceil() as i64;
+    let n = result.selected.len() as i64;
+    let per_input_term = (per_input_fee - per_input_ltf) * n;
+    let selected_effective_value = result.total_value as i64 - per_input_fee * n;
+    let excess = selected_effective_value - params.target_value as i64;
+    let expected_waste = per_input_term + excess;
+
+    assert_eq!(
+        expected_waste, 59_320,
+        "test arithmetic sanity check for the pinned scenario"
+    );
+
+    // The fix: waste must include the excess-above-target term. Without
+    // it, waste would be only the negative per-input contribution (-612),
+    // which is < the per-input term alone, so this assertion FAILS on the
+    // unfixed code and PASSES once the excess term is added.
+    assert_eq!(
+        result.waste, expected_waste,
+        "BUG-24: largest_first waste must include selected_effective_value \
+         - target (excess thrown to fees) per Core RecalculateWaste \
+         coinselection.cpp:846-849; got {} expected {}",
+        result.waste, expected_waste
+    );
+
+    // Sharper guard: the excess term is strictly positive here (59_932),
+    // so a correct waste must exceed the per-input-only contribution.
+    assert!(
+        result.waste > per_input_term,
+        "BUG-24: waste {} must exceed the per-input-only term {} once the \
+         excess-to-fees contribution is included",
+        result.waste, per_input_term
     );
 }
 
