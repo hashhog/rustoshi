@@ -321,9 +321,23 @@ fn test_g7_descendant_size_invariant_multi_hop() {
 /// Severity: P3 (only affects block-template CPFP ordering when
 /// prioritisetransaction is used — no consensus impact).
 /// Status: BUG (P3)
+/// G8 — fee_delta (prioritisetransaction) is propagated into the cached
+/// ancestor/descendant aggregate fees, matching Core (kernel/mempool_entry.h:60
+/// — `nModFeesWithDescendants`/`nModFeesWithAncestors` track *modified* fees;
+/// CTxMemPool::PrioritiseTransaction, txmempool.cpp:630-655, flows the modified-
+/// fee change into the related entries so CPFP mining/eviction sees the boost).
+///
+/// De-staled 2026-06-16 (W106 G8 closure): the prior `#[ignore]` stub
+/// documented that rustoshi set the per-entry `fee_delta` but never folded it
+/// into `descendant_fees` / `ancestor_fees`, so a CPFP child's
+/// prioritisetransaction never lifted its parent in `get_sorted_for_mining`
+/// nor in the `block_template.rs` CPFP ordering. `Mempool::propagate_fee_delta`
+/// now keeps the aggregates in sync. This is a behavioral test through the
+/// public `prioritise_transaction` / `set_entry_fee_delta` APIs; it FAILS
+/// without the propagation and PASSES with it.
+///
+/// Status: OK (was BUG P3).
 #[test]
-#[ignore = "BUG G8 P3: fee_delta not propagated to ancestor nModFeesWithDescendants \
-            (txmempool.cpp UpdateAncestorsOf equivalent absent)"]
 fn test_g8_fee_delta_propagated_to_ancestor_desc_fees() {
     let mut mp = test_mempool();
     let utxos: HashMap<OutPoint, CoinEntry> = [(OutPoint { txid: zero_hash(), vout: 0 }, coin(1_000_000))].into_iter().collect();
@@ -336,18 +350,56 @@ fn test_g8_fee_delta_propagated_to_ancestor_desc_fees() {
     utxos2.insert(OutPoint { txid: root_id, vout: 0 }, coin(v));
     let child_id = mp.add_transaction(child_tx, &|op| utxos2.get(op).cloned()).unwrap();
 
-    // Apply a fee delta to the child
-    let delta: i64 = 50_000;
-    mp.set_entry_fee_delta(&child_id, delta);
+    let root_base_fee = mp.get(&root_id).unwrap().fee;
+    let child_base_fee = mp.get(&child_id).unwrap().fee;
 
-    // Core updates all ancestors' descendant_fees when fee_delta changes.
-    // The root's descendant_fees should increase by delta.
+    // Baselines (no delta yet): root.descendant_fees = root + child (raw),
+    // child.ancestor_fees = root + child (raw).
+    assert_eq!(mp.get(&root_id).unwrap().descendant_fees, root_base_fee + child_base_fee);
+    assert_eq!(mp.get(&child_id).unwrap().ancestor_fees, root_base_fee + child_base_fee);
+
+    // Prioritise the CHILD via the public RPC-backed API (CPFP bump path).
+    let delta: i64 = 50_000;
+    mp.prioritise_transaction(&child_id, delta);
+
+    // (1) The ancestor's descendant_fees must include the child's delta — this
+    //     is what feeds CPFP mining/eviction ordering.
     let root_entry = mp.get(&root_id).unwrap();
+    assert_eq!(
+        root_entry.descendant_fees,
+        root_base_fee + child_base_fee + (delta as u64),
+        "root descendant_fees must include child's fee+delta after prioritisetransaction"
+    );
+
+    // (2) The child's own ancestor_fees and descendant_fees absorb its delta.
     let child_entry = mp.get(&child_id).unwrap();
-    let expected = root_entry.fee + child_entry.fee + (delta as u64);
-    // This will fail because rustoshi does not propagate fee_delta to ancestors.
-    assert_eq!(root_entry.descendant_fees, expected,
-        "root descendant_fees must include child's fee+fee_delta after prioritisetransaction");
+    assert_eq!(
+        child_entry.ancestor_fees,
+        root_base_fee + child_base_fee + (delta as u64),
+        "child ancestor_fees must include its own delta"
+    );
+    assert_eq!(
+        child_entry.descendant_fees,
+        child_base_fee + (delta as u64),
+        "child descendant_fees must include its own delta"
+    );
+
+    // (3) Stacking a second positive delta accumulates (not replaces).
+    mp.prioritise_transaction(&child_id, 10_000);
+    assert_eq!(
+        mp.get(&root_id).unwrap().descendant_fees,
+        root_base_fee + child_base_fee + 60_000,
+        "stacked deltas must accumulate in the ancestor's descendant_fees"
+    );
+
+    // (4) set_entry_fee_delta propagates the *difference* from the prior delta
+    //     (mempool.dat restore path). Resetting to 50_000 backs out 10_000.
+    mp.set_entry_fee_delta(&child_id, 50_000);
+    assert_eq!(
+        mp.get(&root_id).unwrap().descendant_fees,
+        root_base_fee + child_base_fee + 50_000,
+        "set_entry_fee_delta must adjust aggregates by the delta difference, not double-count"
+    );
 }
 
 // ============================================================
