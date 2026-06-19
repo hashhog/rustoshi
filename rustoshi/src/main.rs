@@ -2304,6 +2304,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     rpc_state_inner.data_dir = Some(datadir.clone());
     rpc_state_inner.coinstatsindex_enabled = cli.coinstatsindex;
     rpc_state_inner.txospenderindex_enabled = cli.txospenderindex;
+    // getindexinfo must report txindex / the basic block filter index ONLY when
+    // the operator actually enabled them at startup (Core gates on its
+    // `g_txindex` / `g_filter_indexes` globals). rustoshi maintains those CFs
+    // forward unconditionally, so the handler can no longer probe for rows — it
+    // reads these startup flags instead. `--blockfilterindex` accepts
+    // 0/false/off/no/"" => off, anything else (1/true/basic) => on, matching the
+    // canonical parse below (`blockfilterindex_enabled`).
+    rpc_state_inner.txindex_enabled = cli.txindex;
+    rpc_state_inner.blockfilterindex_enabled =
+        !matches!(cli.blockfilterindex.to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no");
     rpc_state_inner.init_from_db().map_err(|e| anyhow::anyhow!(e))?;
 
     // If `--load-snapshot=<path>` was provided, ingest the Core-format UTXO
