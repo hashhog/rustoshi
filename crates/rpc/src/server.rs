@@ -219,6 +219,22 @@ pub struct RpcState {
     /// `src/index/txospenderindex.cpp`). The RPC's mempool form works
     /// regardless of this flag.
     pub txospenderindex_enabled: bool,
+    /// Whether the transaction index is enabled (`-txindex=1`). Mirrors Bitcoin
+    /// Core's `g_txindex` global, which is non-null iff `-txindex` was passed at
+    /// startup (`src/index/txindex.cpp`). rustoshi maintains the `CF_TXINDEX`
+    /// column family forward from whatever chainstate is active regardless of
+    /// this flag, so the presence of a row CANNOT be used to decide whether the
+    /// operator enabled the index. `getindexinfo` reports `txindex` ONLY when
+    /// this flag is set (Core omits a disabled index entirely).
+    pub txindex_enabled: bool,
+    /// Whether the basic block filter index is enabled (`-blockfilterindex`).
+    /// Mirrors Bitcoin Core's `g_filter_indexes` registry, which holds an entry
+    /// iff the operator enabled it at startup (`src/index/blockfilterindex.cpp`).
+    /// As with `txindex_enabled`, rustoshi populates `CF_BLOCKFILTER` forward
+    /// regardless of this flag, so the presence of a filter row is NOT a valid
+    /// enabled signal. `getindexinfo` reports the `basic block filter index`
+    /// entry ONLY when this flag is set.
+    pub blockfilterindex_enabled: bool,
     /// AssumeUTXO dual-chainstate manager. Holds the snapshot state machine and
     /// the REAL background-validation second chainstate (Core's demoted
     /// genesis-rooted chainstate with its OWN coins store). Driven by
@@ -301,6 +317,8 @@ impl RpcState {
             wallet_state: None,
             coinstatsindex_enabled: false,
             txospenderindex_enabled: false,
+            txindex_enabled: false,
+            blockfilterindex_enabled: false,
             chainstate_manager: ChainstateManager::new(),
         }
     }
@@ -333,6 +351,8 @@ impl RpcState {
             wallet_state: None,
             coinstatsindex_enabled: false,
             txospenderindex_enabled: false,
+            txindex_enabled: false,
+            blockfilterindex_enabled: false,
             chainstate_manager: ChainstateManager::new(),
         }
     }
@@ -12220,21 +12240,21 @@ impl RustoshiRpcServer for RpcServerImpl {
             state.chainstate_manager.is_snapshot_validated(),
         );
 
-        // txindex active iff any row exists in CF_TX_INDEX.  Mirrors Core's
-        // `g_txindex != nullptr` (the global is set iff -txindex was passed
-        // at startup).  rustoshi has no equivalent global, so we probe the
-        // column family directly via `has_any_tx_index` (cheap RocksDB
-        // iterator-start lookup).
-        let txindex_active = {
-            let store = BlockStore::new(&state.db);
-            store.has_any_tx_index().unwrap_or(false)
-        };
-        // Basic block filter index.  Active if any filter row exists for
-        // the current best block.
-        let blockfilter_active = {
-            let index = BlockFilterIndex::new(&state.db);
-            index.has_filter(&state.best_hash).unwrap_or(false)
-        };
+        // txindex active iff -txindex was enabled at startup.  Mirrors Core's
+        // `g_txindex != nullptr` (the global is set iff -txindex was passed at
+        // startup, `src/index/txindex.cpp`).  rustoshi maintains CF_TXINDEX
+        // forward from whatever chainstate is active *regardless of the flag*
+        // (see `RpcState` doc / chain_fully_validated), so probing the column
+        // family (`has_any_tx_index`) is a FALSE POSITIVE: it reports txindex as
+        // present + synced even when the operator never passed -txindex.  Gate
+        // on the startup flag, exactly as Core gates on `g_txindex`.
+        let txindex_active = state.txindex_enabled;
+        // Basic block filter index.  Active iff -blockfilterindex was enabled at
+        // startup.  Mirrors Core's `g_filter_indexes` registry, which holds an
+        // entry only when the operator enabled it (`src/index/blockfilterindex.cpp`).
+        // As with txindex, probing for a filter row is a false positive because
+        // rustoshi populates CF_BLOCKFILTER forward regardless of the flag.
+        let blockfilter_active = state.blockfilterindex_enabled;
         // Coinstatsindex.  Active iff -coinstatsindex was enabled at startup.
         // "synced" mirrors Core's definition: the per-height snapshot for the
         // current best block exists (the synchronous indexer advances in
@@ -20249,10 +20269,13 @@ mod tests {
 
         let server = setup_test_server();
 
-        // Activate the txindex by writing one CF_TX_INDEX row, and pin a known
+        // Activate the txindex by setting the startup flag (getindexinfo gates
+        // on `-txindex`, not on a probe for a stored row). Also write one
+        // CF_TX_INDEX row (as the synchronous indexer would) and pin a known
         // best_height so the emitted value is deterministic.
         {
             let mut state = server.state.write().await;
+            state.txindex_enabled = true;
             state.best_height = 1234;
             let store = BlockStore::new(&state.db);
             store
@@ -21368,6 +21391,85 @@ mod tests {
         );
     }
 
+    /// REGRESSION (getindexinfo false-positive): rustoshi maintains the
+    /// `CF_TXINDEX` / `CF_BLOCKFILTER` column families forward from whatever
+    /// chainstate is active *regardless of the operator's flags*. The old
+    /// handler probed those CFs (`has_any_tx_index` / `has_filter`) to decide
+    /// whether to report an index, so a node launched with NO `-txindex` (and no
+    /// `-blockfilterindex`) still reported both indexes as present + synced — a
+    /// false positive. Bitcoin Core omits a disabled index entirely (it gates on
+    /// `g_txindex` / `g_filter_indexes`, set only at startup).
+    ///
+    /// This test writes rows into BOTH CFs (simulating the unconditional
+    /// maintenance) while leaving the startup flags OFF, and asserts
+    /// `getindexinfo` returns an EMPTY object — then flips the flags on and
+    /// asserts both indexes appear. Pre-fix the first assertion FAILED.
+    #[tokio::test]
+    async fn getindexinfo_omits_disabled_index_despite_populated_cf() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::{BlockFilter, BlockFilterIndex, TxIndexEntry};
+
+        let params = ChainParams::regtest();
+        let (db, state, server) = make_test_server(params);
+
+        // Simulate the unconditional CF maintenance: a tx_index row + a filter
+        // row for the best block exist on disk even though the operator passed
+        // no index flags.
+        let best = {
+            let st = state.read().await;
+            st.best_hash
+        };
+        let store = BlockStore::new(&db);
+        store
+            .put_tx_index(
+                &best,
+                &TxIndexEntry { block_hash: best, tx_offset: 0, tx_length: 1 },
+            )
+            .unwrap();
+        let filter =
+            BlockFilter::build_basic(best, std::iter::empty(), std::iter::empty());
+        BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
+
+        // Flags are OFF (default) -> getindexinfo must report NOTHING even
+        // though both CFs are populated. (Pre-fix this returned both indexes
+        // with synced:true.)
+        let raw = RustoshiRpcServer::get_index_info(&server, None)
+            .await
+            .expect("getindexinfo must succeed");
+        let result: serde_json::Value =
+            serde_json::from_str(raw.get()).expect("getindexinfo emits valid JSON");
+        assert!(
+            result.as_object().unwrap().is_empty(),
+            "FALSE-POSITIVE: getindexinfo must omit txindex/blockfilterindex when \
+             the operator did not enable them, even with populated CFs; got {:?}",
+            result
+        );
+
+        // Now flip the startup flags on (as if -txindex -blockfilterindex were
+        // passed) and confirm BOTH indexes are reported.
+        {
+            let mut st = state.write().await;
+            st.txindex_enabled = true;
+            st.blockfilterindex_enabled = true;
+        }
+        let raw = RustoshiRpcServer::get_index_info(&server, None)
+            .await
+            .expect("getindexinfo must succeed");
+        let result: serde_json::Value =
+            serde_json::from_str(raw.get()).expect("getindexinfo emits valid JSON");
+        let obj = result.as_object().expect("object");
+        assert!(
+            obj.contains_key("txindex"),
+            "txindex must be reported once -txindex is enabled; got {:?}",
+            result
+        );
+        assert!(
+            obj.contains_key("basic block filter index"),
+            "filter index must be reported once -blockfilterindex is enabled; got {:?}",
+            result
+        );
+    }
+
     /// G27 — `getindexinfo` reports the `basic block filter index` entry
     /// after a filter has been stored (simulating `connect_tip` writing
     /// the filter via FIX-69).
@@ -21378,9 +21480,12 @@ mod tests {
 
         let params = ChainParams::regtest();
         let (db, state, server) = make_test_server(params);
-        // Write a filter row for the current best block so the probe in
-        // `get_index_info` sees the index as active.
-        let st = state.read().await;
+        // Enable the index at "startup" (the FIX: getindexinfo gates on the
+        // operator's -blockfilterindex flag, not on a probe for a stored row).
+        // Also write a filter row for the current best block (the synchronous
+        // indexer would have done this on connect_tip).
+        let mut st = state.write().await;
+        st.blockfilterindex_enabled = true;
         let best = st.best_hash;
         drop(st);
         let filter = BlockFilter::build_basic(
@@ -21418,19 +21523,15 @@ mod tests {
     #[tokio::test]
     async fn fix_88_getindexinfo_index_name_filter_works() {
         use rustoshi_consensus::ChainParams;
-        use rustoshi_storage::{BlockFilter, BlockFilterIndex};
 
         let params = ChainParams::regtest();
-        let (db, state, server) = make_test_server(params);
-        let st = state.read().await;
-        let best = st.best_hash;
+        let (_db, state, server) = make_test_server(params);
+        // Enable ONLY the block filter index at "startup" (txindex stays off).
+        // The FIX gates getindexinfo on these startup flags, so a node with
+        // only -blockfilterindex must report the filter index and NOT txindex.
+        let mut st = state.write().await;
+        st.blockfilterindex_enabled = true;
         drop(st);
-        let filter = BlockFilter::build_basic(
-            best,
-            std::iter::empty(),
-            std::iter::empty(),
-        );
-        BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
 
         let only_txindex_raw = RustoshiRpcServer::get_index_info(
             &server,
