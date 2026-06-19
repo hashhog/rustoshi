@@ -3137,6 +3137,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // (the startup log above already covers t=0).
     asmap_health_interval.tick().await;
 
+    // Periodic addrman (peers.dat) dump — Core DumpAddresses parity
+    // (scheduler.scheduleEvery(DumpAddresses, DUMP_PEERS_INTERVAL=900s)). The
+    // address table was persisted ONLY in the graceful-shutdown block below, so
+    // a SIGKILL/OOM/power-loss lost every address learned since boot. (The
+    // peer_manager.rs:4570 docstring already CLAIMED this periodic wiring; it was
+    // only ever wired into the shutdown path.) save_addrman is atomic (temp+
+    // rename) + best-effort, so calling it live every 900 s is crash-safe.
+    let mut addrman_dump_interval = tokio::time::interval(std::time::Duration::from_secs(900));
+    addrman_dump_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    addrman_dump_interval.tick().await; // consume the immediate t=0 tick
+
     loop {
         tokio::select! {
             // Fast validation tick — process buffered blocks frequently.
@@ -5657,6 +5668,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             tracing::info!("ASMap top ASNs: {}", top_str.join(", "));
                         }
                     }
+                }
+            }
+
+            _ = addrman_dump_interval.tick() => {
+                // Periodic addrman dump (Core DumpAddresses). Mirrors the
+                // graceful-shutdown save below; save_addrman is atomic
+                // (temp+rename) + best-effort, so it is safe to call live.
+                let ps = peer_state.read().await;
+                if let Some(pm) = &ps.peer_manager {
+                    pm.save_addrman(&datadir);
                 }
             }
 
