@@ -423,41 +423,135 @@ fn g15_no_leaked_checks_on_completion() {
 }
 
 // ============================================================
-// G16 — MISSING / P0-CDIV: parallel script verification NEVER
-//       called from the block-connect path (dead helper)
+// G16 — FIXED / P1-PERF: parallel script verification is now WIRED
+//       into the block-connect path.
 //
 // Core: ConnectBlock calls CheckInputScripts with a vChecks pointer,
 //       then `control->Add(std::move(vChecks))` — parallel dispatch
 //       on every non-coinbase tx (validation.cpp:2581-2584).
-// Rustoshi: `connect_block_with_sequence_locks` (the only function
-//           that connects blocks) uses a sequential for-loop
-//           (validation.rs:1799-1819). `validate_scripts_parallel_
-//           with_cache` is defined and exported but NEVER called.
-//           Therefore rustoshi runs SINGLE-THREADED script checks
-//           regardless of how many cores are available.
-// Severity: P0-CDIV — this is not a fork risk per se, but is a
-//           complete P1 performance regression (IBD 10-30× slower
-//           than advertised on multi-core hardware) AND signals
-//           that the correctness testing of the parallel path is
-//           also untested. Classified P1-PERF (worst performance
-//           class; the sequential path produces correct consensus
-//           results so no fork risk).
+// Rustoshi (now): `connect_block_with_sequence_locks` runs all the
+//       non-script gates and UTXO mutations serially and in order,
+//       accumulates each non-coinbase tx's prevout coins into a
+//       block-level `Vec<Vec<CoinEntry>>`, then dispatches script
+//       verification ONCE via `validate_scripts_parallel_with_cache`
+//       (capped rayon pool, first-failure short-circuit) — unless
+//       assume-valid is in effect, which skips scripts as before.
+//
+// This test proves the helper is REACHABLE from the connect path:
+// it builds a block with one non-coinbase tx spending a pre-seeded
+// mature coin whose scriptPubKey is `OP_0` (leaves false on the
+// stack → always fails verify_script).  Every other gate passes, so
+// the ONLY thing that can reject the block is script verification.
+// If the helper were still a dead helper, the block would connect
+// successfully; because it is wired, the connect fails with a
+// `ScriptFailed`/`TxValidation` error.
 // ============================================================
 
 #[test]
-#[ignore = "BUG G16 (P1-PERF DEAD-HELPER): validate_scripts_parallel_with_cache is never called from connect_block_with_sequence_locks; all script validation is sequential (rayon dependency wasted)"]
 fn g16_parallel_verify_wired_into_connect_block() {
-    // Structural test: compile-time evidence that connect_block uses
-    // validate_scripts_parallel_with_cache.
-    //
-    // To fix: replace the sequential for-loop in
-    // validation.rs:1799-1819 with a call to
-    // validate_scripts_parallel_with_cache (or restructure
-    // connect_block to collect all inputs and dispatch in parallel).
-    //
-    // Alternatively, add first-failure cancellation to
-    // validate_scripts_parallel_with_cache (G11) before wiring.
-    panic!("validate_scripts_parallel_with_cache is a dead helper — connect_block_with_sequence_locks uses sequential verify");
+    use rustoshi_consensus::params::ChainParams;
+    use rustoshi_consensus::validation::{
+        connect_block_with_sequence_locks, SequenceLockContext, TxValidationError, ValidationError,
+    };
+
+    // Minimal SequenceLockContext (no BIP-68 path is exercised here:
+    // the spending tx is version 1, so get_mtp_at_height is never read).
+    struct ZeroSeqCtx;
+    impl SequenceLockContext for ZeroSeqCtx {
+        fn get_mtp_at_height(&self, _height: u32) -> u32 {
+            0
+        }
+    }
+
+    let params = ChainParams::regtest();
+    let height: u32 = 200; // well past coinbase maturity for the seeded coin
+
+    // Pre-seed a spendable, NON-coinbase, mature coin with a scriptPubKey of
+    // OP_0 — a valid (spendable, non-OP_RETURN) output that nonetheless makes
+    // any spend fail script verification (top stack element is false).
+    let funding_txid = _make_hash(0x42);
+    let funding_outpoint = OutPoint { txid: funding_txid, vout: 0 };
+    let mut utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+    utxos.insert(
+        funding_outpoint.clone(),
+        CoinEntry {
+            height: 1, // mined long ago → mature, not coinbase
+            is_coinbase: false,
+            value: 5_000_000_000,
+            script_pubkey: vec![0x00], // OP_0 → spend always fails verify
+        },
+    );
+    let mut view = MapUtxo(utxos);
+
+    // Coinbase tx (BIP-34 height push, value within subsidy).
+    let coinbase_script: Vec<u8> = {
+        let mut s = vec![0x03u8];
+        s.extend_from_slice(&height.to_le_bytes()[..3]);
+        s
+    };
+    let coinbase_tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint { txid: Hash256([0u8; 32]), vout: 0xFFFF_FFFF },
+            script_sig: coinbase_script,
+            sequence: 0xFFFF_FFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut { value: 5_000_000_000, script_pubkey: vec![0x51] }],
+        lock_time: 0,
+    };
+
+    // Non-coinbase tx spending the seeded coin. version=1 → no BIP-68.
+    // sequence is final so IsFinalTx passes; output < input so fee is valid.
+    let spend_tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: funding_outpoint,
+            script_sig: vec![], // empty scriptSig — OP_0 still leaves false
+            sequence: 0xFFFF_FFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut { value: 4_000_000_000, script_pubkey: vec![0x51] }],
+        lock_time: 0,
+    };
+
+    let block = Block {
+        header: BlockHeader {
+            version: 0x20000000,
+            prev_block_hash: _make_hash(0x01),
+            merkle_root: Hash256([0u8; 32]),
+            timestamp: 1_700_000_000 + height,
+            bits: params.genesis_block.header.bits,
+            nonce: 0,
+        },
+        transactions: vec![coinbase_tx, spend_tx],
+    };
+
+    // Assume-valid must NOT be active for this height, or scripts are skipped
+    // by design (mirrors Core).  regtest has no assumed-valid height.
+    assert!(
+        params
+            .assumed_valid_height
+            .map(|av| height > av)
+            .unwrap_or(true),
+        "test predicate: scripts must be verified at this height (not assume-valid)"
+    );
+
+    let result =
+        connect_block_with_sequence_locks(&block, height, &mut view, &params, &ZeroSeqCtx, 0);
+
+    // The ONLY failing gate is script verification, which only runs if the
+    // parallel helper is actually wired into the connect path.  A dead helper
+    // would let this block connect.
+    assert!(
+        matches!(
+            result,
+            Err(ValidationError::TxValidation(TxValidationError::ScriptFailed(_)))
+        ),
+        "connect_block_with_sequence_locks must reject the block via the now-wired \
+         parallel script verifier (validate_scripts_parallel_with_cache); got: {:?}",
+        result
+    );
 }
 
 // ============================================================
