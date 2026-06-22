@@ -40,7 +40,37 @@ use rayon::prelude::*;
 use rustoshi_crypto::sha256d;
 use rustoshi_primitives::{compact_size_len, Block, BlockHeader, Hash256, OutPoint, Transaction};
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use thiserror::Error;
+
+/// Core's `MAX_SCRIPTCHECK_THREADS` (validation.h:90): hard cap on the
+/// number of parallel script-verification worker threads, regardless of
+/// how many cores the machine has.
+const MAX_SCRIPTCHECK_THREADS: usize = 15;
+
+/// Lazily-initialized, process-wide rayon pool dedicated to parallel
+/// script verification in `validate_scripts_parallel_with_cache`.
+///
+/// Sized like Core's script-check queue: `min(available_parallelism()-1,
+/// MAX_SCRIPTCHECK_THREADS)`, leaving one core for block download / I/O and
+/// never exceeding Core's 15-worker cap.  Using a dedicated capped pool
+/// (rather than rayon's unbounded global pool) keeps script verification
+/// from monopolizing every logical core during IBD.  See W105 G1/G4.
+fn script_check_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        // Leave one core for I/O; floor at 1 so the pool never has 0 threads.
+        let workers = cores.saturating_sub(1).clamp(1, MAX_SCRIPTCHECK_THREADS);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|i| format!("script-check-{i}"))
+            .build()
+            .expect("script-check rayon pool must build")
+    })
+}
 
 // ============================================================
 // ERROR TYPES
@@ -1673,6 +1703,15 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     let mut spent_coins = Vec::new();
     let mut block_sigop_cost: u64 = 0;
 
+    // Per-tx prevout coins for every NON-coinbase transaction, in block order
+    // (coinbase contributes nothing).  This is the exact shape
+    // `validate_scripts_parallel_with_cache` expects: `coins[i]` holds the
+    // inputs of the i-th non-coinbase tx, indexed by block tx index minus the
+    // coinbase (helper indexes `coins[tx_idx - 1]`).  Script verification is
+    // deferred out of the serial loop and dispatched once, in parallel, after
+    // all non-script gates and UTXO mutations have run in order.  See W105 G16.
+    let mut all_coins: Vec<Vec<CoinEntry>> = Vec::with_capacity(block.transactions.len());
+
     // Assume-valid: skip script verification for blocks at or below the assume-valid height
     let skip_scripts = match params.assumed_valid_height {
         Some(av_height) => height <= av_height,
@@ -1912,34 +1951,14 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
             }
         }
 
-        // Materialize per-input prevouts once so the Taproot checker can
-        // build BIP-341 sha_amounts / sha_scriptpubkeys without re-walking
-        // `coins` on every call. Cheap: ~Coin::SIZE * inputs bytes per tx.
-        let spent_amounts: Vec<u64> = coins.iter().map(|c| c.value).collect();
-        let spent_scripts: Vec<Vec<u8>> = coins.iter().map(|c| c.script_pubkey.clone()).collect();
-
-        // Second pass: verify scripts and update UTXO set
+        // Second pass: update the UTXO set and collect undo data.
+        //
+        // Script verification is intentionally NOT done here — it is deferred
+        // to a single parallel dispatch after this serial loop (W105 G16).
+        // Everything else (undo collection, UTXO spend) stays in order exactly
+        // as before so the serial UTXO mutation sequence is unchanged.
         for (input_idx, input) in tx.inputs.iter().enumerate() {
             let coin = &coins[input_idx];
-
-            // Verify the script (skip if below assume-valid height)
-            if !skip_scripts {
-                let checker = TransactionSignatureChecker::new(
-                    tx,
-                    input_idx,
-                    coin.value,
-                    &spent_amounts,
-                    &spent_scripts,
-                );
-                verify_script(
-                    &input.script_sig,
-                    &coin.script_pubkey,
-                    &input.witness,
-                    &flags,
-                    &checker,
-                )
-                .map_err(|e| TxValidationError::ScriptFailed(e.to_string()))?;
-            }
 
             // Save spent coin for undo data
             spent_coins.push(coin.clone());
@@ -1991,6 +2010,26 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
                 },
             );
         }
+
+        // Record this non-coinbase tx's prevout coins for the deferred,
+        // parallel script-verification pass.  Pushed in block order, one
+        // entry per non-coinbase tx, so `all_coins[tx_idx - 1]` lines up with
+        // the helper's `coins[tx_idx - 1]` indexing.
+        all_coins.push(coins);
+    }
+
+    // Deferred parallel script verification (W105 G16).
+    //
+    // All non-script consensus gates and UTXO mutations above ran serially and
+    // in order, exactly as before.  Script verification — the embarrassingly
+    // parallel, CPU-bound part — is now dispatched once over the whole block on
+    // a capped rayon pool.  Assume-valid still skips scripts entirely (same as
+    // the old inline `if !skip_scripts`), coinbase is still skipped (the helper
+    // skips tx 0), and any single failed check returns the same
+    // `ScriptFailed` ValidationError (via `#[from] TxValidationError`),
+    // rejecting the block.
+    if !skip_scripts {
+        validate_scripts_parallel_with_cache(block, &all_coins, &flags, None)?;
     }
 
     // Check block sigop cost limit
@@ -2105,74 +2144,79 @@ pub fn validate_scripts_parallel_with_cache(
         })
         .collect();
 
-    // Validate all scripts in parallel
-    let results: Vec<Result<(), TxValidationError>> = script_checks
-        .par_iter()
-        .map(|(tx, input_idx, coin, tx_coin_idx)| {
-            // Capture script material for cache key derivation.
-            let script_sig = &tx.inputs[*input_idx].script_sig;
-            let witness = &tx.inputs[*input_idx].witness;
-            let script_pubkey = &coin.script_pubkey;
-            let wtxid = &per_tx_wtxids[*tx_coin_idx];
-            let input_idx_u32 = *input_idx as u32;
+    // Validate all scripts in parallel on the dedicated, core-capped pool
+    // (W105 G1/G4) with first-failure short-circuit (W105 G11).
+    //
+    // `try_for_each` mirrors Core's `CCheckQueue` `do_work = !m_result`
+    // behaviour: as soon as one check returns `Err`, rayon stops handing out
+    // new work and propagates that first error — so an attacker who places a
+    // bad script before thousands of expensive-but-valid scripts no longer
+    // forces O(N) wasted verification.  Any single failure → `Err` (block
+    // rejected); all pass → `Ok(())`.  Same `ScriptFailed` error type as the
+    // old collect-then-scan path.
+    script_check_pool().install(|| {
+        script_checks
+            .par_iter()
+            .try_for_each(|(tx, input_idx, coin, tx_coin_idx)| {
+                // Capture script material for cache key derivation.
+                let script_sig = &tx.inputs[*input_idx].script_sig;
+                let witness = &tx.inputs[*input_idx].witness;
+                let script_pubkey = &coin.script_pubkey;
+                let wtxid = &per_tx_wtxids[*tx_coin_idx];
+                let input_idx_u32 = *input_idx as u32;
 
-            // Check cache first.  Keyed on (wtxid, input_idx, material,
-            // flags) so a hit guarantees that the same spending
-            // transaction (and therefore the same sighash) already passed
-            // verification under the same flags — see W160 BUG-9.
-            if let Some(cache) = sig_cache {
-                if cache.lookup(
-                    wtxid,
-                    input_idx_u32,
-                    script_sig,
-                    script_pubkey,
-                    witness,
-                    flags_bits,
-                ) {
-                    return Ok(());
-                }
-            }
-
-            // Verify script
-            let (spent_amounts, spent_scripts) = &per_tx_prevouts[*tx_coin_idx];
-            let checker = TransactionSignatureChecker::new(
-                tx,
-                *input_idx,
-                coin.value,
-                spent_amounts,
-                spent_scripts,
-            );
-            let result = verify_script(
-                script_sig,
-                script_pubkey,
-                witness,
-                flags,
-                &checker,
-            )
-            .map_err(|e| TxValidationError::ScriptFailed(e.to_string()));
-
-            // Cache successful verification
-            if result.is_ok() {
+                // Check cache first.  Keyed on (wtxid, input_idx, material,
+                // flags) so a hit guarantees that the same spending
+                // transaction (and therefore the same sighash) already passed
+                // verification under the same flags — see W160 BUG-9.
                 if let Some(cache) = sig_cache {
-                    cache.insert(
+                    if cache.lookup(
                         wtxid,
                         input_idx_u32,
                         script_sig,
                         script_pubkey,
                         witness,
                         flags_bits,
-                    );
+                    ) {
+                        return Ok(());
+                    }
                 }
-            }
 
-            result
-        })
-        .collect();
+                // Verify script
+                let (spent_amounts, spent_scripts) = &per_tx_prevouts[*tx_coin_idx];
+                let checker = TransactionSignatureChecker::new(
+                    tx,
+                    *input_idx,
+                    coin.value,
+                    spent_amounts,
+                    spent_scripts,
+                );
+                let result = verify_script(
+                    script_sig,
+                    script_pubkey,
+                    witness,
+                    flags,
+                    &checker,
+                )
+                .map_err(|e| TxValidationError::ScriptFailed(e.to_string()));
 
-    // Check for any failures
-    for result in results {
-        result?;
-    }
+                // Cache successful verification
+                if result.is_ok() {
+                    if let Some(cache) = sig_cache {
+                        cache.insert(
+                            wtxid,
+                            input_idx_u32,
+                            script_sig,
+                            script_pubkey,
+                            witness,
+                            flags_bits,
+                        );
+                    }
+                }
+
+                result
+            })
+    })?;
 
     Ok(())
 }
