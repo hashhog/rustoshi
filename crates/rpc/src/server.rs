@@ -723,6 +723,55 @@ pub trait RustoshiRpc {
     async fn get_memory_info(&self, mode: Option<serde_json::Value>)
         -> RpcResult<serde_json::Value>;
 
+    /// Get and set the debug-logging category configuration.
+    ///
+    /// Mirrors Bitcoin Core's `logging ( ["include_category",...] ["exclude_category",...] )`
+    /// (`rpc/node.cpp:218-275` + `EnableOrDisableLogCategories` :200-216;
+    /// `logging.cpp` `LogCategoriesList`/`EnableCategory`/`DisableCategory`).
+    ///
+    /// rustoshi has a REAL category-based debug-logging system: its logger is
+    /// `tracing` + `tracing_subscriber::EnvFilter`, and the live analogue of
+    /// Core's per-category bitmask (`BCLog::Logger::m_categories`) is the
+    /// process-global active-category set in `crate::logging`. This RPC reads
+    /// and mutates that set; each toggle rebuilds and HOT-RELOADS the running
+    /// `EnvFilter` (a `tracing_subscriber::reload::Layer`), so enabling a
+    /// category here makes its DEBUG logs actually start flowing with no
+    /// restart — exactly like Core's in-memory `m_categories` mutation, and
+    /// NOT a cosmetic bool flip (the snapshot trap).
+    ///
+    /// The category NAMES are rustoshi's own (it is a from-scratch node with a
+    /// different subsystem decomposition than Core); the SHAPE,
+    /// param-semantics, and the `-8` error match Core exactly:
+    ///
+    /// - Two OPTIONAL positional params, Core order `include` THEN `exclude`.
+    ///   Each is acted on only if it is an ARRAY (Core `isArray()` guard);
+    ///   null/omitted is a no-op for that slot, so `logging` with no args is a
+    ///   pure read-and-report. `include` is applied first, then `exclude`, so a
+    ///   category named in both ends up DISABLED ("exclude wins").
+    /// - Special input-only tokens `"all"`/`"1"`/`""` expand to the full mask
+    ///   (enable → everything on; exclude → everything off, Core's "none"
+    ///   effect). NEVER emitted as output keys.
+    /// - Returns a JSON object mapping every real category name → bool (whether
+    ///   it is currently being debug-logged), in ascending ALPHABETICAL key
+    ///   order (Core iterates a `std::map`).
+    /// - Unknown category in either array → `RPC_INVALID_PARAMETER` (-8),
+    ///   message "unknown logging category <cat>" — thrown as soon as the bad
+    ///   name is hit, after scanning `include` fully then `exclude` in order;
+    ///   categories BEFORE the bad one have ALREADY been applied (partial
+    ///   application, no rollback — Core node.cpp:213 parity).
+    /// - A non-string array element → `RPC_TYPE_ERROR` (-3) (Core `get_str()`).
+    ///
+    /// Both params are taken as raw JSON values so a non-array, non-null param
+    /// is silently ignored (Core's `isArray()` guard makes a scalar a no-op,
+    /// not an error). Scope: mutates the running node only; NOT persisted, resets
+    /// on restart to the `-debug` startup flags.
+    #[method(name = "logging")]
+    async fn logging(
+        &self,
+        include: Option<serde_json::Value>,
+        exclude: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value>;
+
     /// Get network information.
     #[method(name = "getnetworkinfo")]
     async fn get_network_info(&self) -> RpcResult<NetworkInfo>;
@@ -7157,6 +7206,88 @@ impl RustoshiRpcServer for RpcServerImpl {
         ))
     }
 
+    async fn logging(
+        &self,
+        include: Option<serde_json::Value>,
+        exclude: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value> {
+        use crate::logging as logcat;
+
+        // Core's `EnableOrDisableLogCategories` (node.cpp:200): `cats.get_array()`
+        // then per-element `get_str()`. A param that is NOT an array is silently
+        // ignored at the call site — only `isArray()` triggers processing — so a
+        // scalar/null param is a no-op for that slot, NOT an error. This is what
+        // makes `logging` (no args) a pure read-and-report.
+        let apply = |cats: &Option<serde_json::Value>, enable: bool| -> Result<(), ErrorObjectOwned> {
+            let arr = match cats {
+                Some(serde_json::Value::Array(a)) => a,
+                // omitted / null / any non-array scalar -> no-op for this slot
+                _ => return Ok(()),
+            };
+            for item in arr {
+                // Core `get_str()`: a non-string element is a JSON type error
+                // (RPC_TYPE_ERROR, -3) before the category is consulted.
+                let cat = match item {
+                    serde_json::Value::String(s) => s.as_str(),
+                    other => {
+                        let actual = match other {
+                            serde_json::Value::Bool(_) => "bool",
+                            serde_json::Value::Number(_) => "number",
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::Object(_) => "object",
+                            serde_json::Value::Null => "null",
+                            serde_json::Value::String(_) => unreachable!(),
+                        };
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_TYPE_ERROR,
+                            format!(
+                                "JSON value of type {actual} is not of expected type string"
+                            ),
+                        ));
+                    }
+                };
+
+                if logcat::is_all_token(cat) {
+                    // "all"/"1"/"" -> whole mask (enable: everything on;
+                    // disable: everything off — Core's "none" effect).
+                    if enable {
+                        logcat::enable_category(cat);
+                    } else {
+                        logcat::disable_category(cat);
+                    }
+                    continue;
+                }
+                if !logcat::is_known_category(cat) {
+                    // Core node.cpp:213 — EnableCategory/DisableCategory return
+                    // false for an unknown name -> -8 "unknown logging category".
+                    // Thrown AS SOON AS the bad name is hit; categories before it
+                    // in this call have already been applied (no rollback).
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        format!("unknown logging category {cat}"),
+                    ));
+                }
+                if enable {
+                    logcat::enable_category(cat);
+                } else {
+                    logcat::disable_category(cat);
+                }
+            }
+            Ok(())
+        };
+
+        // Core order: include first, then exclude (exclude wins on conflict).
+        // A bad name in `include` throws before `exclude` is even scanned, but
+        // any valid `include` names before it are already applied — partial
+        // application, Core-faithful.
+        apply(&include, true)?;
+        apply(&exclude, false)?;
+
+        // Emit the full {category: active} map, alphabetically sorted, for every
+        // REAL category (special tokens are never keys).
+        Ok(logcat::categories_map())
+    }
+
     async fn set_network_active(&self, state: Option<serde_json::Value>) -> RpcResult<bool> {
         // Required positional bool. Core reads `request.params[0].get_bool()`;
         // a missing arg is RPC_INVALID_PARAMETER (-8) and a non-bool a
@@ -10409,6 +10540,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getnetworkinfo" => "getnetworkinfo\nReturns an object containing various state info regarding P2P networking.",
                 "setnetworkactive" => "setnetworkactive state\nDisable/enable all p2p network activity.",
                 "ping" => "ping\nRequests that a ping be sent to all other nodes, to measure ping time.\nResults are provided in getpeerinfo.\nPing command is handled in queue with all other commands, so it measures processing backlog, not just network ping.",
+                "logging" => "logging ( [\"include_category\",...] [\"exclude_category\",...] )\nGets and sets the logging configuration.\nWhen called without an argument, returns the list of categories with status that are currently being debug logged or not.\nWhen called with arguments, adds or removes categories from debug logging and return the lists above.\nThe arguments are evaluated in order \"include\", \"exclude\".\nIf an item is both included and excluded, it will thus end up being excluded.\nIn addition to the valid logging categories, the following are available as category names with special meanings:\n  - \"all\", \"1\" : represent all logging categories.\n  - \"none\", \"0\", \"\" : even if other logging categories are specified, ignore all of them.",
                 "getpeerinfo" => "getpeerinfo\nReturns data about each connected network node.",
                 "getnodeaddresses" => "getnodeaddresses ( count \"network\" )\nReturn known addresses, after filtering for quality and recency.",
                 "addpeeraddress" => "addpeeraddress \"address\" port ( tried )\nAdd the address of a potential peer to an address manager table. For testing only.",
@@ -10460,6 +10592,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "addnode", "addpeeraddress", "clearbanned", "disconnectnode", "getaddednodeinfo",
                 "getaddrmaninfo", "getconnectioncount", "getnetworkinfo", "getnodeaddresses",
                 "getpeerinfo", "listbanned", "ping", "setban", "setnetworkactive",
+                "",
+                "== Control ==",
+                "getmemoryinfo", "logging", "stop", "uptime",
                 "",
                 "== Rawtransactions ==",
                 "createrawtransaction", "decoderawtransaction", "decodescript",
