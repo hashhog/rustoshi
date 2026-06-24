@@ -242,6 +242,16 @@ pub struct RpcState {
     /// against the assumeutxo whitelist) and reported by `getchainstates`
     /// (`validated` + `snapshot_blockhash`).
     pub chainstate_manager: ChainstateManager,
+    /// Tip-change notifier for the wait-family RPCs (`waitfornewblock` /
+    /// `waitforblock` / `waitforblockheight`). Mirrors Core's
+    /// `KernelNotifications::blockTip` / `WaitTipChanged` condition variable.
+    /// Every connect / reorg chokepoint that advances `best_hash`/`best_height`
+    /// calls [`RpcState::notify_tip_changed`] (which delegates here) under this
+    /// same write lock, so a parked waiter wakes promptly and re-reads the new
+    /// tip. Held behind an `Arc` so a waiter can clone the handle and await on
+    /// it WITHOUT holding the `RpcState` lock (the lock is only taken to read
+    /// the tip each wake). See `crate::tip_notifier`.
+    pub tip_notifier: Arc<crate::tip_notifier::TipNotifier>,
 }
 
 /// Select the mempool configuration appropriate for `network`.
@@ -320,6 +330,7 @@ impl RpcState {
             txindex_enabled: false,
             blockfilterindex_enabled: false,
             chainstate_manager: ChainstateManager::new(),
+            tip_notifier: crate::tip_notifier::TipNotifier::shared(),
         }
     }
 
@@ -354,7 +365,25 @@ impl RpcState {
             txindex_enabled: false,
             blockfilterindex_enabled: false,
             chainstate_manager: ChainstateManager::new(),
+            tip_notifier: crate::tip_notifier::TipNotifier::shared(),
         }
+    }
+
+    /// Wake the wait-family RPCs on a tip advance.
+    ///
+    /// Called from every connect / reorg chokepoint AFTER `best_hash` /
+    /// `best_height` have been updated (and while the caller still holds the
+    /// `RpcState` write lock), mirroring Bitcoin Core firing
+    /// `KernelNotifications::blockTip` / `WaitTipChanged` on each active-chain
+    /// tip update — block-connect during IBD and post-IBD, the submitblock /
+    /// generate accept path, and BOTH halves of a reorg (disconnect-to-fork and
+    /// connect-new-branch). `TipNotifier::notify` is lock-free and never blocks,
+    /// so calling it under the write lock is safe. A parked waiter re-reads the
+    /// authoritative tip from `RpcState` on wake, so a coalesced / missed notify
+    /// can never produce a wrong answer.
+    #[inline]
+    pub fn notify_tip_changed(&self) {
+        self.tip_notifier.notify();
     }
 
     /// Initialize from database state.
@@ -488,6 +517,46 @@ pub trait RustoshiRpc {
     /// Get the hash of the best (tip) block.
     #[method(name = "getbestblockhash")]
     async fn get_best_block_hash(&self) -> RpcResult<String>;
+
+    /// Wait for any new block (tip change) and return the tip.
+    ///
+    /// Core `rpc/blockchain.cpp::waitfornewblock`. Waits until the tip differs
+    /// from `current_tip` (or, if omitted, from the tip observed at call
+    /// entry), then returns `{hash, height}`. `timeout` is in MILLISECONDS;
+    /// 0 = no timeout. On timeout returns the current tip. A malformed
+    /// `current_tip` errors -8 (ParseHashV); a negative timeout errors -1
+    /// "Negative timeout"; a non-integer timeout errors -3.
+    #[method(name = "waitfornewblock")]
+    async fn wait_for_new_block(
+        &self,
+        timeout: Option<serde_json::Value>,
+        current_tip: Option<serde_json::Value>,
+    ) -> RpcResult<WaitTipResult>;
+
+    /// Wait until the tip's hash equals `blockhash`; return the tip.
+    ///
+    /// Core `rpc/blockchain.cpp::waitforblock`. `blockhash` is parsed FIRST
+    /// (before timeout), so a malformed blockhash errors -8 even when a
+    /// negative timeout is also supplied. `timeout` is in MILLISECONDS;
+    /// 0 = no timeout. On timeout returns the current tip.
+    #[method(name = "waitforblock")]
+    async fn wait_for_block(
+        &self,
+        blockhash: Option<serde_json::Value>,
+        timeout: Option<serde_json::Value>,
+    ) -> RpcResult<WaitTipResult>;
+
+    /// Wait until the tip height >= `height`; return the tip.
+    ///
+    /// Core `rpc/blockchain.cpp::waitforblockheight`. `height` is read as an
+    /// int (-3 on non-integral). `timeout` is in MILLISECONDS; 0 = no timeout.
+    /// On timeout returns the current tip.
+    #[method(name = "waitforblockheight")]
+    async fn wait_for_block_height(
+        &self,
+        height: Option<serde_json::Value>,
+        timeout: Option<serde_json::Value>,
+    ) -> RpcResult<WaitTipResult>;
 
     /// Get the current network difficulty.
     ///
@@ -1695,6 +1764,204 @@ impl RpcServerImpl {
         })
     }
 
+    // ── wait-family RPC helpers ─────────────────────────────────────────────
+    //
+    // Shared by `waitfornewblock` / `waitforblock` / `waitforblockheight`.
+    // Mirrors `bitcoin-core/src/rpc/blockchain.cpp` (waitfornewblock @290,
+    // waitforblock @349, waitforblockheight @410) and the proven ouroboros
+    // pilot (`ouroboros/src/ouroboros/rpc.py::_wait_for_tip` + the three
+    // handlers), which byte-matched live Core.
+
+    /// Core's `uvTypeName` (`univalue.cpp:217`) — the JSON type name used in
+    /// the `getInt`/`get_*` type-error message.
+    fn json_uvtype(v: &serde_json::Value) -> &'static str {
+        match v {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
+
+    /// Parse a JSON value as Core's `getInt<int>()` does: it must be an integral
+    /// JSON number. A non-number (bool/string/array/object/null) or a
+    /// fractional number is a type error (`RPC_TYPE_ERROR`, -3) with Core's
+    /// UniValue message "JSON value of type X is not of expected type number".
+    /// Returns the value as `i64` (Core's `int` is 32-bit, but the only callers
+    /// here are timeout — already range-bounded by the negative check — and
+    /// height — clamped to u32 by the caller).
+    fn parse_wait_int(v: &serde_json::Value) -> Result<i64, ErrorObjectOwned> {
+        let type_err = || {
+            Self::rpc_error(
+                rpc_error::RPC_TYPE_ERROR,
+                format!(
+                    "JSON value of type {} is not of expected type number",
+                    Self::json_uvtype(v)
+                ),
+            )
+        };
+        match v {
+            // A JSON bool is NOT a number to Core's getInt (VBOOL != VNUM).
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Ok(i)
+                } else {
+                    // Fractional / out-of-i64-range number: Core's getInt<int>
+                    // rejects a non-integral VNUM (ParseInt on the stored
+                    // string fails). Surface the same -3 type error.
+                    Err(type_err())
+                }
+            }
+            _ => Err(type_err()),
+        }
+    }
+
+    /// Validate the wait-family `timeout` argument (milliseconds).
+    ///
+    /// Core (rpc/blockchain.cpp): `timeout` defaults to 0; if present it is read
+    /// as `getInt<int>()` (-3 on non-integral) and a negative value raises
+    /// `RPC_MISC_ERROR` (-1) "Negative timeout". 0 = no timeout. Returns the
+    /// validated non-negative millisecond count.
+    fn parse_wait_timeout(
+        timeout: Option<&serde_json::Value>,
+    ) -> Result<u64, ErrorObjectOwned> {
+        match timeout {
+            None | Some(serde_json::Value::Null) => Ok(0),
+            Some(v) => {
+                let ms = Self::parse_wait_int(v)?;
+                if ms < 0 {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_MISC_ERROR,
+                        "Negative timeout",
+                    ));
+                }
+                Ok(ms as u64)
+            }
+        }
+    }
+
+    /// Parse a wait-family hash argument (`current_tip` / `blockhash`) exactly
+    /// like Core's `ParseHashV(param, name)` (`rpc/util.cpp`): the value must be
+    /// a 64-hex string; a wrong length or non-hex (incl. a non-string JSON
+    /// value) is `RPC_INVALID_PARAMETER` (-8) with the param NAME in the
+    /// message. Unlike the shared `parse_hash` (which uses the neutral "hash"),
+    /// this carries the caller's parameter name so the wire message byte-matches
+    /// Core for `current_tip` / `blockhash`.
+    fn parse_wait_hash(
+        v: &serde_json::Value,
+        name: &str,
+    ) -> Result<Hash256, ErrorObjectOwned> {
+        // Core's ParseHashV first does `v.get_str()`: a non-string JSON value
+        // is a type error (-3) "JSON value of type X is not of expected type
+        // string". Then it length/hex-checks the string (-8).
+        let s = match v {
+            serde_json::Value::String(s) => s.as_str(),
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type string",
+                        Self::json_uvtype(other)
+                    ),
+                ));
+            }
+        };
+        Hash256::from_hex(s).map_err(|e| {
+            let msg = match e {
+                HexError::InvalidLength { expected, .. } => format!(
+                    "{} must be of length {} (not {}, for '{}')",
+                    name,
+                    expected,
+                    s.len(),
+                    s
+                ),
+                HexError::InvalidChar { .. } => {
+                    format!("{} must be hexadecimal string (not '{}')", name, s)
+                }
+            };
+            Self::rpc_error(rpc_error::RPC_INVALID_PARAMETER, msg)
+        })
+    }
+
+    /// Core's wait-tip-changed loop shared by all three wait-family RPCs
+    /// (`rpc/blockchain.cpp` waitfornewblock/waitforblock/waitforblockheight).
+    ///
+    /// `predicate(tip_hash, tip_height) -> bool` returns true once the desired
+    /// tip condition holds. `timeout_ms` is milliseconds; 0 = wait
+    /// indefinitely. Returns the current tip `{hash, height}` once the
+    /// predicate holds OR the timeout elapses (Core returns the current block
+    /// in both cases).
+    ///
+    /// The loop re-reads the AUTHORITATIVE in-memory tip (`RpcState.best_hash`
+    /// / `best_height`, the same fields every connect/reorg chokepoint writes
+    /// under the write lock and `getbestblockhash`/`getblockcount` read) on
+    /// every wake, so a coalesced or missed notify can never yield a wrong
+    /// answer. The notifier handle is cloned out from under the state lock so
+    /// the await does NOT hold the lock (otherwise the connect path could never
+    /// take the write lock to advance the tip).
+    async fn wait_for_tip<F>(
+        &self,
+        timeout_ms: u64,
+        predicate: F,
+    ) -> RpcResult<WaitTipResult>
+    where
+        F: Fn(Hash256, u32) -> bool,
+    {
+        // Clone the notifier handle once (Arc clone, cheap) so we can await on
+        // it without holding the RpcState lock.
+        let notifier = {
+            let state = self.state.read().await;
+            state.tip_notifier.clone()
+        };
+
+        // Absolute deadline for the bounded-timeout case. Core uses a steady
+        // clock deadline and re-derives the remaining slice after each wake.
+        let deadline = if timeout_ms == 0 {
+            None
+        } else {
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms))
+        };
+
+        loop {
+            // Snapshot the generation BEFORE reading the tip, so a notify that
+            // races in between the predicate check and the await is not lost.
+            let gen = notifier.generation();
+
+            // Re-read the authoritative tip under the state lock, then drop the
+            // lock before awaiting.
+            let (tip_hash, tip_height) = {
+                let state = self.state.read().await;
+                (state.best_hash, state.best_height)
+            };
+
+            if predicate(tip_hash, tip_height) {
+                return Ok(WaitTipResult {
+                    hash: tip_hash.to_hex(),
+                    height: tip_height,
+                });
+            }
+
+            match deadline {
+                Some(dl) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= dl {
+                        // Timed out — return the current tip (Core's behaviour).
+                        return Ok(WaitTipResult {
+                            hash: tip_hash.to_hex(),
+                            height: tip_height,
+                        });
+                    }
+                    notifier.wait(gen, Some(dl - now)).await;
+                }
+                None => {
+                    notifier.wait(gen, None).await;
+                }
+            }
+        }
+    }
+
     /// Helper to parse hex-encoded bytes.
     fn parse_hex(hex: &str) -> Result<Vec<u8>, ErrorObjectOwned> {
         hex::decode(hex)
@@ -2481,6 +2748,12 @@ fn disconnect_to(
     state.best_hash = target_hash;
     state.best_height = target_height;
 
+    // Wake the wait-family RPCs: the disconnect half of a reorg is itself a
+    // tip change (Core fires KernelNotifications::blockTip on DisconnectTip).
+    // The matching connect-new-branch half (`try_attach_and_reorg`) notifies
+    // again once it commits the heavier branch.
+    state.notify_tip_changed();
+
     // Pattern B (mempool-refill-on-reorg): re-admit non-coinbase transactions
     // from the disconnected blocks. The UTXO view has been flushed above, so
     // a fresh `utxo_view()` reads the post-disconnect state.
@@ -2972,6 +3245,10 @@ pub fn try_attach_and_reorg(
     // connect path for rationale) so getblockchaininfo.headers /
     // verificationprogress / getsyncstate stay correct after a reorg.
     state.header_height = state.header_height.max(new_tip_height);
+
+    // Wake the wait-family RPCs: a reorg committed a new active-chain tip
+    // (Core fires KernelNotifications::blockTip on the connect half too).
+    state.notify_tip_changed();
 
     // BIP-157/158 block filter index — populate the basic GCS filter +
     // chained filter header for every block connected on the new branch,
@@ -4651,6 +4928,69 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_best_block_hash(&self) -> RpcResult<String> {
         let state = self.state.read().await;
         Ok(state.best_hash.to_hex())
+    }
+
+    async fn wait_for_new_block(
+        &self,
+        timeout: Option<serde_json::Value>,
+        current_tip: Option<serde_json::Value>,
+    ) -> RpcResult<WaitTipResult> {
+        // Core (waitfornewblock @290): parse timeout FIRST (getInt<int> then
+        // the `< 0` check), THEN resolve the reference tip. A negative timeout
+        // therefore errors before current_tip is even read.
+        let timeout_ms = Self::parse_wait_timeout(timeout.as_ref())?;
+
+        // Reference hash the new tip must differ from. When current_tip is
+        // supplied it is parsed as a 64-hex uint256 (ParseHashV -> -8 on
+        // malformed); when omitted, snapshot the live tip at call entry.
+        let ref_hash = match current_tip {
+            None | Some(serde_json::Value::Null) => {
+                let state = self.state.read().await;
+                state.best_hash
+            }
+            Some(v) => Self::parse_wait_hash(&v, "current_tip")?,
+        };
+
+        self.wait_for_tip(timeout_ms, |tip_hash, _h| tip_hash != ref_hash)
+            .await
+    }
+
+    async fn wait_for_block(
+        &self,
+        blockhash: Option<serde_json::Value>,
+        timeout: Option<serde_json::Value>,
+    ) -> RpcResult<WaitTipResult> {
+        // Core (waitforblock @349): blockhash is parsed FIRST (ParseHashV ->
+        // -8), BEFORE the timeout is read. So a malformed blockhash errors -8
+        // even when a negative timeout is also supplied.
+        let blockhash_val = blockhash.unwrap_or(serde_json::Value::Null);
+        let target = Self::parse_wait_hash(&blockhash_val, "blockhash")?;
+        let timeout_ms = Self::parse_wait_timeout(timeout.as_ref())?;
+
+        self.wait_for_tip(timeout_ms, |tip_hash, _h| tip_hash == target)
+            .await
+    }
+
+    async fn wait_for_block_height(
+        &self,
+        height: Option<serde_json::Value>,
+        timeout: Option<serde_json::Value>,
+    ) -> RpcResult<WaitTipResult> {
+        // Core (waitforblockheight @410): height = params[0].getInt<int>()
+        // FIRST (-3 on non-integral), then timeout (getInt<int> + `< 0`).
+        let height_val = height.unwrap_or(serde_json::Value::Null);
+        let target_height = Self::parse_wait_int(&height_val)?;
+        let timeout_ms = Self::parse_wait_timeout(timeout.as_ref())?;
+
+        // Core compares `current_block.height < height` with signed ints; a
+        // negative target is trivially already satisfied. Clamp at 0 so the
+        // u32 tip height comparison matches (tip height is always >= 0).
+        let target_u32: u32 = if target_height <= 0 { 0 } else { target_height as u32 };
+
+        self.wait_for_tip(timeout_ms, move |_tip_hash, tip_height| {
+            tip_height >= target_u32
+        })
+        .await
     }
 
     async fn get_difficulty(&self) -> RpcResult<Box<serde_json::value::RawValue>> {
@@ -6754,6 +7094,10 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // the block tip from a future headers-first path. Mirrors Core's
                 // m_best_header tracking on connect.
                 state.header_height = state.header_height.max(new_height);
+
+                // Wake the wait-family RPCs on this submitblock-accept tip
+                // advance (Core KernelNotifications::blockTip on ConnectTip).
+                state.notify_tip_changed();
 
                 // Remove confirmed (and conflicting) transactions from the
                 // mempool — mirrors Bitcoin Core's `CTxMemPool::removeForBlock`
@@ -10750,6 +11094,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "verifymessage" => "verifymessage \"address\" \"signature\" \"message\"\nVerify a signed message.",
                 "uptime" => "uptime\nReturns the total uptime of the server in seconds.",
                 "getnettotals" => "getnettotals\nReturns information about network traffic, including bytes in, bytes out, and current time.",
+                "waitfornewblock" => "waitfornewblock ( timeout current_tip )\nWaits for any new block and returns useful info about it.\nReturns the current block on timeout or exit.\n\nArguments:\n1. timeout       (numeric, optional, default=0) Time in milliseconds to wait for a response. 0 indicates no timeout.\n2. current_tip   (string, optional) Method waits for the chain tip to differ from this.",
+                "waitforblock" => "waitforblock \"blockhash\" ( timeout )\nWaits for a specific new block and returns useful info about it.\nReturns the current block on timeout or exit.\n\nArguments:\n1. blockhash   (string, required) Block hash to wait for.\n2. timeout     (numeric, optional, default=0) Time in milliseconds to wait for a response. 0 indicates no timeout.",
+                "waitforblockheight" => "waitforblockheight height ( timeout )\nWaits for (at least) block height and returns the height and hash\nof the current tip.\nReturns the current block on timeout or exit.\n\nArguments:\n1. height    (numeric, required) Block height to wait for.\n2. timeout   (numeric, optional, default=0) Time in milliseconds to wait for a response. 0 indicates no timeout.",
                 _ => "Unknown command. Use \"help\" for a list of all commands.",
             };
             Ok(help_text.to_string())
@@ -10760,6 +11107,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getblockfilter", "getblockhash", "getblockheader", "getblockstats", "getchaintips",
                 "getchaintxstats", "getdifficulty", "gettxout",
                 "invalidateblock", "preciousblock", "pruneblockchain", "reconsiderblock",
+                "waitforblock", "waitforblockheight", "waitfornewblock",
                 "",
                 "== Mempool ==",
                 "dumpmempool", "getmempoolancestors", "getmempooldescendants",
@@ -14286,6 +14634,10 @@ impl RpcServerImpl {
                 // getblockchaininfo.headers / verificationprogress / getsyncstate
                 // correct over the process lifetime.
                 state.header_height = state.header_height.max(height);
+
+                // Wake the wait-family RPCs on this generate*-accept tip advance
+                // (Core KernelNotifications::blockTip on ConnectTip).
+                state.notify_tip_changed();
 
                 // Wallet UTXO ledger: scan the connected block into every
                 // loaded wallet (credit wallet-owned outputs incl. coinbase,

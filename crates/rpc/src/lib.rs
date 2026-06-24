@@ -36,6 +36,7 @@ pub mod logging;
 pub mod payjoin_sender;
 pub mod rest;
 pub mod server;
+pub mod tip_notifier;
 pub mod tls;
 pub mod types;
 pub mod wallet;
@@ -50,6 +51,7 @@ pub use rest::{
     RestConfig, RestServerHandle, RestState,
 };
 pub use server::{start_rpc_server, PeerState, RpcServerImpl, RpcState, RustoshiRpcServer};
+pub use tip_notifier::TipNotifier;
 pub use types::*;
 pub use wallet::{
     BalanceInfo, CreateWalletResult, ListWalletDirResult, LoadWalletResult,
