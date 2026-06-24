@@ -650,6 +650,14 @@ impl<'a> BlockStore<'a> {
         BlockStoreUtxoView::new(self)
     }
 
+    /// Create a UTXO view with an explicit coins-cache budget in bytes
+    /// (Bitcoin Core `-dbcache`). A larger budget keeps more of the hot UTXO
+    /// working set in RAM, cutting the per-input chainstate disk reads that
+    /// dominate the block-connect path during IBD.
+    pub fn utxo_view_with_cache(&self, max_cache_bytes: usize) -> BlockStoreUtxoView<'_> {
+        BlockStoreUtxoView::with_cache_limit(self, max_cache_bytes)
+    }
+
     /// Iterate over all block index entries.
     ///
     /// Returns an iterator of `(Hash256, BlockIndexEntry)` pairs.

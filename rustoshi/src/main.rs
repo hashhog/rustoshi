@@ -201,6 +201,18 @@ struct Cli {
     #[arg(long)]
     prune: Option<u64>,
 
+    /// In-memory UTXO (coins) cache budget in MiB. Mirrors Bitcoin Core's
+    /// `-dbcache`: the size of the in-memory coin cache held in front of the
+    /// on-disk chainstate. A larger cache is the single highest-leverage IBD
+    /// speedup — most coins created and spent within the cache window never
+    /// touch disk, and old-coin spends hit RAM instead of a per-input
+    /// chainstate read. The default (2048 MiB) preserves prior behaviour;
+    /// raise it (e.g. `--dbcache=8192`) on a box with spare RAM to cut the
+    /// disk-read stall that otherwise dominates the block-connect path during
+    /// IBD. See `bitcoin-core/src/kernel/caches.h` (`DEFAULT_KERNEL_CACHE`).
+    #[arg(long = "dbcache", default_value = "2048", value_name = "MiB")]
+    dbcache: usize,
+
     /// Import blocks from blk*.dat files or stdin (use "-" for stdin).
     /// For blk*.dat: pass the directory containing the files.
     /// For stdin: pipe framed data [4B height LE][4B size LE][block bytes].
@@ -2081,6 +2093,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let db = Arc::new(ChainDb::open_optimized(&db_path)?);
     let block_store = BlockStore::new(&db);
 
+    // `-dbcache`: in-memory coins-cache budget for the block-connect path. A
+    // larger budget is the single highest-leverage IBD speedup — it turns the
+    // per-input chainstate disk reads (which otherwise stall the validator in
+    // disk-wait) into RAM hits. Computed once and used at every `utxo_view`
+    // construction below.
+    let dbcache_bytes = (cli.dbcache).saturating_mul(1024 * 1024);
+    tracing::info!("UTXO coins-cache budget: {} MiB (--dbcache)", cli.dbcache);
+
     // Note: if the DB contains stale block data from a previous run that stored
     // full blocks in CF_BLOCKS, stop the node and run with --cleanup-blocks to
     // reclaim space. Don't run compaction during normal operation as it inflates
@@ -2224,7 +2244,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         tracing::info!("Block import mode enabled: {}", import_path);
 
         let mut chain_state = ChainState::new(best_hash, best_height, params.clone());
-        let mut utxo_view = block_store.utxo_view();
+        let mut utxo_view = block_store.utxo_view_with_cache(dbcache_bytes);
 
         let imported = if import_path == "-" {
             run_import_from_stdin(&params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex, cli.txospenderindex)?
@@ -2947,8 +2967,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // UTXO cache for block validation, bounded to 2 GiB
-    let mut utxo_view = block_store.utxo_view();
+    // UTXO cache for block validation, bounded to the --dbcache budget.
+    let mut utxo_view = block_store.utxo_view_with_cache(dbcache_bytes);
 
     // Durability bookkeeping for the connect loop.
     //
@@ -4096,7 +4116,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     let mut cs = chain_state.write().await;
                                                     cs.set_tip(new_hash, new_height);
                                                 }
-                                                utxo_view = block_store.utxo_view();
+                                                utxo_view = block_store.utxo_view_with_cache(dbcache_bytes);
                                                 // Reorg cluster Unit E follow-up: realign the
                                                 // downloader's validated-tip counter to the reorg
                                                 // tip. next_block_to_validate bumped it past the
