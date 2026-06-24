@@ -201,16 +201,18 @@ struct Cli {
     #[arg(long)]
     prune: Option<u64>,
 
-    /// In-memory UTXO (coins) cache budget in MiB. Mirrors Bitcoin Core's
-    /// `-dbcache`: the size of the in-memory coin cache held in front of the
-    /// on-disk chainstate. A larger cache is the single highest-leverage IBD
-    /// speedup — most coins created and spent within the cache window never
-    /// touch disk, and old-coin spends hit RAM instead of a per-input
-    /// chainstate read. The default (2048 MiB) preserves prior behaviour;
-    /// raise it (e.g. `--dbcache=8192`) on a box with spare RAM to cut the
-    /// disk-read stall that otherwise dominates the block-connect path during
-    /// IBD. See `bitcoin-core/src/kernel/caches.h` (`DEFAULT_KERNEL_CACHE`).
-    #[arg(long = "dbcache", default_value = "2048", value_name = "MiB")]
+    /// Total UTXO cache budget in MiB. Mirrors Bitcoin Core's `-dbcache`, but
+    /// split blockbrew-style (`split_dbcache`): 80% to the in-memory coins
+    /// cache held in front of the on-disk chainstate, 20% to the RocksDB shared
+    /// block cache (which, unlike Core's leveldb, serves hot UTXO reads). A
+    /// larger budget is the single highest-leverage IBD speedup — coins created
+    /// and spent within the cache window never touch disk, old-coin spends hit
+    /// RAM, and the bigger block cache cuts SST index/filter/data misses. The
+    /// default (2560 MiB) splits to 2048 coins + 512 block, preserving prior
+    /// runtime behaviour byte-for-byte; raise it (e.g. `--dbcache=8192`) on a
+    /// box with spare RAM. See `bitcoin-core/src/kernel/caches.h`
+    /// (`DEFAULT_KERNEL_CACHE`).
+    #[arg(long = "dbcache", default_value = "2560", value_name = "MiB")]
     dbcache: usize,
 
     /// Import blocks from blk*.dat files or stdin (use "-" for stdin).
@@ -1955,6 +1957,27 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(async_main(cli))
 }
 
+/// Split a single `--dbcache` budget (MiB) into the RocksDB shared block cache
+/// and the in-memory coins cache, mirroring blockbrew's RocksDB-aware 80/20
+/// split (`blockbrew/cmd/blockbrew/main.go:computeCacheSplit`) and the spirit
+/// of Bitcoin Core's `kernel::CacheSizes` ("DB caches get a share, the rest
+/// goes to the coins cache", `bitcoin-core/src/kernel/caches.h`). A RocksDB
+/// backing store (unlike Core's leveldb) serves hot UTXO reads from its block
+/// cache, so the block cache earns a real 20% share rather than Core's tiny
+/// fixed caps.
+///
+/// Returns `(block_cache_bytes, coins_cache_bytes)`, summing to exactly the
+/// (clamped) total. Clamped to [4, 65536] MiB so a fat-fingered `--dbcache=0`
+/// cannot zero a cache. For the default 2560 MiB: 512 MiB block + 2048 MiB
+/// coins — byte-for-byte the prior hardcoded-512-block + 2048-coins behavior.
+fn split_dbcache(dbcache_mib: usize) -> (usize, usize) {
+    let mib = dbcache_mib.clamp(4, 65536);
+    let total = mib * 1024 * 1024;
+    let block = total / 5; // 20% -> RocksDB shared block cache
+    let coins = total - block; // 80% -> in-memory coins cache
+    (block, coins)
+}
+
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // Resolve network early so we can place the debug log under the
     // network-specific data directory.
@@ -2090,16 +2113,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // Core's default of `DEFAULT_KERNEL_CACHE = 450 MiB` in
     // `bitcoin-core/src/kernel/caches.h`.
     let db_path = datadir.join("chainstate");
-    let db = Arc::new(ChainDb::open_optimized(&db_path)?);
+
+    // `--dbcache` is the TOTAL cache budget. Split it (blockbrew-style 80/20,
+    // RocksDB-aware) into the RocksDB shared block cache and the in-memory
+    // coins cache; the block share replaces the formerly-hardcoded 512 MiB
+    // block cache so a single knob trades total RAM for fewer disk reads.
+    // `dbcache_bytes` (the coins share) is computed once and used at every
+    // `utxo_view` construction below; the block share is handed to RocksDB at
+    // open time. The default 2560 MiB splits to 2048 coins + 512 block, exactly
+    // the prior runtime behavior.
+    let (block_cache_bytes, dbcache_bytes) = split_dbcache(cli.dbcache);
+    let db = Arc::new(ChainDb::open_optimized(&db_path, block_cache_bytes)?);
     let block_store = BlockStore::new(&db);
 
-    // `-dbcache`: in-memory coins-cache budget for the block-connect path. A
-    // larger budget is the single highest-leverage IBD speedup — it turns the
-    // per-input chainstate disk reads (which otherwise stall the validator in
-    // disk-wait) into RAM hits. Computed once and used at every `utxo_view`
-    // construction below.
-    let dbcache_bytes = (cli.dbcache).saturating_mul(1024 * 1024);
-    tracing::info!("UTXO coins-cache budget: {} MiB (--dbcache)", cli.dbcache);
+    tracing::info!(
+        "cache split: {} MiB total -> {} MiB coins + {} MiB RocksDB block cache (--dbcache)",
+        cli.dbcache,
+        dbcache_bytes / (1024 * 1024),
+        block_cache_bytes / (1024 * 1024)
+    );
 
     // Note: if the DB contains stale block data from a previous run that stored
     // full blocks in CF_BLOCKS, stop the node and run with --cleanup-blocks to

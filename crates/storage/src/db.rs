@@ -308,11 +308,12 @@ impl ChainDb {
     ///
     /// Key optimizations:
     /// - 64 MB write buffers (reduces compaction frequency during heavy writes)
-    /// - 512 MB shared block cache (keeps hot data in memory)
+    /// - Shared block cache sized from the `--dbcache` split (default 512 MiB);
+    ///   keeps hot SST index/filter/data blocks in memory
     /// - Bloom filters on UTXO column family (reduces disk reads)
     /// - Level compaction with dynamic level sizes
     /// - Background jobs for parallel compaction
-    pub fn open_optimized(path: &Path) -> Result<Self, StorageError> {
+    pub fn open_optimized(path: &Path, block_cache_bytes: usize) -> Result<Self, StorageError> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
@@ -331,8 +332,11 @@ impl ChainDb {
         db_opts.set_max_write_buffer_number(3);
         db_opts.set_min_write_buffer_number_to_merge(2);
 
-        // Block cache: 512 MB shared across all column families
-        let cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024);
+        // Block cache: caller-supplied size (the RocksDB-block-cache share of
+        // the `--dbcache` budget; see `split_dbcache` in main.rs), shared
+        // across all column families. Was hardcoded 512 MiB; now scales with
+        // `--dbcache`.
+        let cache = rocksdb::Cache::new_lru_cache(block_cache_bytes);
 
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_COLUMN_FAMILIES
             .iter()
