@@ -747,6 +747,34 @@ pub trait RustoshiRpc {
     #[method(name = "addnode")]
     async fn add_node(&self, addr: String, command: String) -> RpcResult<()>;
 
+    /// Return information about the persistent added-node list (the
+    /// `addnode "add"`/"remove"-managed set; `onetry` adds excluded), joined
+    /// against the live peer table.
+    ///
+    /// Mirrors Bitcoin Core's `getaddednodeinfo ( "node" )`
+    /// (`rpc/net.cpp:486-558` + `CConnman::GetAddedNodeInfo` `net.cpp:2914`).
+    /// Pure read, no side effects. Output is an ARRAY of objects, each:
+    /// `{ "addednode": <str>, "connected": <bool>,
+    ///    "addresses": [ {"address": <ip:port>, "connected": "inbound"|"outbound"} ] }`
+    /// where `addresses` is ALWAYS present — `[]` when not connected, exactly
+    /// one entry (with the bare `inbound`/`outbound` direction, NOT
+    /// `manual`/`feeler` — net.cpp:548) when connected. With no added nodes
+    /// (and no `node` filter) the result is `[]`.
+    ///
+    /// The optional positional `node` is taken as a raw JSON value (not a typed
+    /// `String`) to reproduce Core's type strictness: a non-string surfaces as
+    /// `RPC_TYPE_ERROR` (-3). When supplied, only the matching added node is
+    /// returned — matching is EXACT STRING EQUALITY against the value originally
+    /// passed to `addnode` (`m_params.m_added_node == node`, net.cpp:527), not a
+    /// resolved-address comparison. A `node` that is not on the added list →
+    /// `RPC_CLIENT_NODE_NOT_ADDED` (-24) "Error: Node has not been added."
+    /// (net.cpp:534).
+    #[method(name = "getaddednodeinfo")]
+    async fn get_added_node_info(
+        &self,
+        node: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value>;
+
     /// Stop the node.
     #[method(name = "stop")]
     async fn stop(&self) -> RpcResult<String>;
@@ -7330,6 +7358,117 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
+    async fn get_added_node_info(
+        &self,
+        node: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value> {
+        use serde_json::json;
+
+        // Optional positional `node` (Core: `MaybeArg<std::string_view>("node")`).
+        // Omitted ⇒ all added nodes. Read it as a raw JSON value (not a typed
+        // `String`) so a NON-string surfaces as RPC_TYPE_ERROR (-3) — Core's
+        // get_str() type check — rather than the jsonrpsee deserializer's
+        // generic -32602. The match against the added list is EXACT STRING
+        // EQUALITY (net.cpp:527 `m_added_node == node`), so we keep the raw
+        // requested string here untouched.
+        let node_filter: Option<String> = match node {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s),
+            Some(other) => {
+                let actual = match other {
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::String(_) | serde_json::Value::Null => "null",
+                };
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!("JSON value of type {actual} is not of expected type string"),
+                ));
+            }
+        };
+
+        // Pure read: snapshot the persistent added-node list (the strings as
+        // typed to `addnode "add"`, `onetry` excluded — net.cpp's
+        // m_added_node_params) plus the live peer table. With no peer manager
+        // there are no added nodes and no peers, so the answer is `[]` (or -24
+        // if a node filter was given) — Core's GetAddedNodeInfo over an empty
+        // connman.
+        let peer_state = self.peer_state.read().await;
+        let pm = peer_state.peer_manager.as_ref();
+
+        // The added-node strings, in insertion order (Core preserves
+        // m_added_node_params order; `added_nodes()` is the backing Vec).
+        let added: Vec<String> = pm.map(|pm| pm.added_nodes()).unwrap_or_default();
+
+        // Build a lookup of currently-connected peers keyed by their resolved
+        // "ip:port" address → inbound? Only ESTABLISHED peers count as
+        // connected (Core's vNodes are post-handshake live connections;
+        // `connected_peers()` filters to PeerState::Established). A given
+        // address maps to at most one live connection here.
+        let mut connected: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        if let Some(pm) = pm {
+            for (_id, info) in pm.connected_peers() {
+                connected.insert(info.addr.to_string(), info.inbound);
+            }
+        }
+        drop(peer_state);
+
+        // Optional `node` filter: exact-string match against the added list.
+        // Miss ⇒ -24 "Error: Node has not been added." (net.cpp:533-535). When
+        // `node` is omitted, no not-found is possible — `[]` is a valid answer.
+        let entries: Vec<String> = if let Some(ref want) = node_filter {
+            if !added.iter().any(|a| a == want) {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_CLIENT_NODE_NOT_ADDED,
+                    "Error: Node has not been added.",
+                ));
+            }
+            vec![want.clone()]
+        } else {
+            added
+        };
+
+        // Per added node, decide connected/address/direction. Core resolves the
+        // added string to a numeric CService (default port appended) and looks
+        // it up in the connected-peer map; rustoshi's `addnode "add"` stores the
+        // operator string verbatim and only injects numeric "ip:port" entries
+        // into the addrman, so we parse the added string as a SocketAddr and
+        // match by resolved address. A non-numeric (hostname) entry simply does
+        // not resolve to a live SocketAddr here and reports connected=false.
+        let mut ret: Vec<serde_json::Value> = Vec::with_capacity(entries.len());
+        for added_node in entries {
+            let resolved = added_node
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|sa| sa.to_string());
+            let direction = resolved
+                .as_ref()
+                .and_then(|key| connected.get(key).copied());
+
+            let addresses: Vec<serde_json::Value> = match (&resolved, direction) {
+                (Some(addr), Some(inbound)) => vec![json!({
+                    "address": addr,
+                    // Bare direction string — "inbound"/"outbound", NOT
+                    // "manual"/"feeler" (net.cpp:548 info.fInbound ? ...).
+                    "connected": if inbound { "inbound" } else { "outbound" },
+                })],
+                // Not connected ⇒ empty array (ALWAYS present — net.cpp).
+                _ => Vec::new(),
+            };
+
+            ret.push(json!({
+                "addednode": added_node,
+                "connected": direction.is_some(),
+                "addresses": addresses,
+            }));
+        }
+
+        Ok(serde_json::Value::Array(ret))
+    }
+
     async fn stop(&self) -> RpcResult<String> {
         let mut state = self.state.write().await;
 
@@ -10239,6 +10378,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getaddrmaninfo" => "getaddrmaninfo\nProvides information about the node's address manager by returning the number of addresses in the `new` and `tried` tables and their sum for all networks.",
                 "getconnectioncount" => "getconnectioncount\nReturns the number of connections to other nodes.",
                 "addnode" => "addnode \"node\" \"command\"\nAttempts to add or remove a node from the addnode list.",
+                "getaddednodeinfo" => "getaddednodeinfo ( \"node\" )\nReturns information about the given added node, or all added nodes (note that onetry addnodes are not listed here).",
                 "disconnectnode" => "disconnectnode ( \"address\" nodeid )\nDisconnects from the specified peer node.",
                 "getblocktemplate" => "getblocktemplate ( \"template_request\" )\nReturns data needed to construct a block.",
                 "submitblock" => "submitblock \"hexdata\" ( \"dummy\" )\nAttempts to submit new block to network.",
@@ -10280,9 +10420,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "prioritisetransaction", "submitblock",
                 "",
                 "== Network ==",
-                "addnode", "addpeeraddress", "clearbanned", "disconnectnode", "getaddrmaninfo",
-                "getconnectioncount", "getnetworkinfo", "getnodeaddresses", "getpeerinfo",
-                "listbanned", "setban", "setnetworkactive",
+                "addnode", "addpeeraddress", "clearbanned", "disconnectnode", "getaddednodeinfo",
+                "getaddrmaninfo", "getconnectioncount", "getnetworkinfo", "getnodeaddresses",
+                "getpeerinfo", "listbanned", "setban", "setnetworkactive",
                 "",
                 "== Rawtransactions ==",
                 "createrawtransaction", "decoderawtransaction", "decodescript",
