@@ -680,6 +680,16 @@ pub trait RustoshiRpc {
         tried: Option<bool>,
     ) -> RpcResult<serde_json::Value>;
 
+    /// Provide information about the node's address manager. Mirrors Bitcoin
+    /// Core's `getaddrmaninfo` (rpc/net.cpp:1080). Pure read, no params, no
+    /// side effects. Returns a JSON object keyed by network name — the FIXED
+    /// set `ipv4, ipv6, onion, i2p, cjdns, all_networks` (always present, even
+    /// at zero) — each value `{new, tried, total}` where `total == new + tried`
+    /// and `all_networks` is the sum across networks
+    /// (`AddrMan::Size(net, in_new)` parity).
+    #[method(name = "getaddrmaninfo")]
+    async fn get_addrman_info(&self) -> RpcResult<serde_json::Value>;
+
     /// Get network information.
     #[method(name = "getnetworkinfo")]
     async fn get_network_info(&self) -> RpcResult<NetworkInfo>;
@@ -6936,6 +6946,63 @@ impl RustoshiRpcServer for RpcServerImpl {
         Ok(json!({ "success": success }))
     }
 
+    async fn get_addrman_info(&self) -> RpcResult<serde_json::Value> {
+        use serde_json::json;
+
+        // Pure read-only snapshot of the addrman (Core net.cpp:1096-1115). No
+        // params, no side effects. Pull the per-network new/tried split from
+        // the peer manager (which forwards to AddrMan::Size parity); with no
+        // peer manager every network is reported at zero (an honest, fixed-
+        // shape answer — Core would surface an "address manager disabled"
+        // error there, but rustoshi always runs an addrman when networking is
+        // up, and reporting zeros keeps the 6-key shape).
+        let peer_state = self.peer_state.read().await;
+        let info = peer_state
+            .peer_manager
+            .as_ref()
+            .map(|pm| pm.addrman_info())
+            .unwrap_or_default();
+        drop(peer_state);
+
+        // Emit the FIXED routable-network key set in Core's enum order
+        // (NET_IPV4..NET_CJDNS, skipping NET_UNROUTABLE / NET_INTERNAL), each
+        // as {new, tried, total} with total == new + tried. Every key is
+        // present even at zero. `all_networks` is the global sum, so
+        // all_networks == {Σ new, Σ tried, Σ total} by construction.
+        let nets = [
+            ("ipv4", info.ipv4),
+            ("ipv6", info.ipv6),
+            ("onion", info.onion),
+            ("i2p", info.i2p),
+            ("cjdns", info.cjdns),
+        ];
+
+        let mut ret = serde_json::Map::new();
+        let (mut sum_new, mut sum_tried) = (0usize, 0usize);
+        for (name, c) in nets {
+            sum_new += c.new;
+            sum_tried += c.tried;
+            ret.insert(
+                name.to_string(),
+                json!({
+                    "new": c.new,
+                    "tried": c.tried,
+                    "total": c.new + c.tried,
+                }),
+            );
+        }
+        ret.insert(
+            "all_networks".to_string(),
+            json!({
+                "new": sum_new,
+                "tried": sum_tried,
+                "total": sum_new + sum_tried,
+            }),
+        );
+
+        Ok(serde_json::Value::Object(ret))
+    }
+
     async fn set_network_active(&self, state: Option<serde_json::Value>) -> RpcResult<bool> {
         // Required positional bool. Core reads `request.params[0].get_bool()`;
         // a missing arg is RPC_INVALID_PARAMETER (-8) and a non-bool a
@@ -10056,6 +10123,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getpeerinfo" => "getpeerinfo\nReturns data about each connected network node.",
                 "getnodeaddresses" => "getnodeaddresses ( count \"network\" )\nReturn known addresses, after filtering for quality and recency.",
                 "addpeeraddress" => "addpeeraddress \"address\" port ( tried )\nAdd the address of a potential peer to an address manager table. For testing only.",
+                "getaddrmaninfo" => "getaddrmaninfo\nProvides information about the node's address manager by returning the number of addresses in the `new` and `tried` tables and their sum for all networks.",
                 "getconnectioncount" => "getconnectioncount\nReturns the number of connections to other nodes.",
                 "addnode" => "addnode \"node\" \"command\"\nAttempts to add or remove a node from the addnode list.",
                 "disconnectnode" => "disconnectnode ( \"address\" nodeid )\nDisconnects from the specified peer node.",
@@ -10099,9 +10167,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "prioritisetransaction", "submitblock",
                 "",
                 "== Network ==",
-                "addnode", "addpeeraddress", "clearbanned", "disconnectnode", "getconnectioncount",
-                "getnetworkinfo", "getnodeaddresses", "getpeerinfo", "listbanned", "setban",
-                "setnetworkactive",
+                "addnode", "addpeeraddress", "clearbanned", "disconnectnode", "getaddrmaninfo",
+                "getconnectioncount", "getnetworkinfo", "getnodeaddresses", "getpeerinfo",
+                "listbanned", "setban", "setnetworkactive",
                 "",
                 "== Rawtransactions ==",
                 "createrawtransaction", "decoderawtransaction", "decodescript",
