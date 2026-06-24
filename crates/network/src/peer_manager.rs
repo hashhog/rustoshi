@@ -428,6 +428,40 @@ pub struct NodeAddressEntry {
     pub network: String,
 }
 
+/// Per-(network, table) address counts for the `getaddrmaninfo` RPC.
+///
+/// Mirrors Bitcoin Core's `AddrMan::Size(net, in_new)` split (addrman.cpp
+/// `Size_` :1006-1026): for each routable network the count of addresses in
+/// the `new` table vs the `tried` table. The RPC layer turns these into the
+/// fixed `{new, tried, total}` objects keyed by network name (ipv4 / ipv6 /
+/// onion / i2p / cjdns) plus the summed `all_networks`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AddrManNetCount {
+    /// Addresses in the NEW table for this network (Core `Size(net, true)`).
+    pub new: usize,
+    /// Addresses in the TRIED table for this network (Core `Size(net, false)`).
+    pub tried: usize,
+}
+
+/// Per-network new/tried counts for `getaddrmaninfo`, in Core's enum order.
+///
+/// Every routable network is always present (even at zero), matching Core's
+/// loop over `NET_IPV4..NET_CJDNS` that emits an entry unconditionally and
+/// skips `NET_UNROUTABLE` / `NET_INTERNAL`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AddrManInfo {
+    /// IPv4 (`GetNetworkName(NET_IPV4)`).
+    pub ipv4: AddrManNetCount,
+    /// IPv6 (`GetNetworkName(NET_IPV6)`).
+    pub ipv6: AddrManNetCount,
+    /// Tor v3 (`GetNetworkName(NET_ONION)`).
+    pub onion: AddrManNetCount,
+    /// I2P (`GetNetworkName(NET_I2P)`).
+    pub i2p: AddrManNetCount,
+    /// CJDNS (`GetNetworkName(NET_CJDNS)`).
+    pub cjdns: AddrManNetCount,
+}
+
 // ============================================================
 // CORE-BUCKETED ADDRMAN (vvNew / vvTried)
 //
@@ -995,6 +1029,15 @@ impl AddrManTable {
     /// Total distinct ids tracked (bounded by ADDRMAN_CEILING).
     pub fn total_count(&self) -> usize {
         self.map_info.len()
+    }
+
+    /// Iterate `(socket_addr, in_tried)` over every address in the table, for
+    /// the per-network new/tried split used by `getaddrmaninfo`. Each id lives
+    /// in exactly one table (NEW while `ref_count > 0`, TRIED once promoted),
+    /// so this exactly partitions the table into the two Core-equivalent
+    /// counters without double-counting (Core `Size(net, in_new)`).
+    pub fn iter_addrs(&self) -> impl Iterator<Item = (SocketAddr, bool)> + '_ {
+        self.map_info.values().map(|info| (info.addr, info.in_tried))
     }
 
     /// Whether `addr` is in the TRIED table (test/inspection helper).
@@ -2118,6 +2161,46 @@ impl AddressManager {
 
         out
     }
+
+    /// Per-network new/tried address counts for the `getaddrmaninfo` RPC.
+    ///
+    /// Mirrors Bitcoin Core's `AddrMan::Size(net, in_new)` (addrman.cpp
+    /// `Size_` :1006-1026), which reads cached per-network counters split by
+    /// the new vs tried table. Rustoshi's split lives in the bucketed
+    /// `AddrManTable` (NEW[1024][64] + TRIED[256][64]); each id sits in exactly
+    /// one table (NEW while referenced, TRIED once promoted via `good()`), so
+    /// iterating `iter_addrs()` and bucketing by `in_tried` reproduces Core's
+    /// per-(network, table) `Size` exactly.
+    ///
+    /// Network classification uses the same `GetNetClass` / `GetNetworkName`
+    /// parity as `getnodeaddresses` (`ipv4_ipv6_network_name`): non-routable
+    /// IPs map to `not_publicly_routable` and are excluded (Core's loop skips
+    /// `NET_UNROUTABLE` / `NET_INTERNAL`).
+    ///
+    /// CAVEAT: the bucketed `AddrManTable` is IPv4/IPv6-only in this impl, so
+    /// onion / i2p / cjdns always report 0/0 here. Those privacy-network
+    /// addresses live in the flat `known_addrv2` store, which has no new/tried
+    /// tier — the RPC still emits their keys at zero to keep Core's fixed
+    /// 6-key shape.
+    pub fn addrman_info(&self) -> AddrManInfo {
+        let mut info = AddrManInfo::default();
+        for (addr, in_tried) in self.addrman.iter_addrs() {
+            let ip = addr.ip();
+            let counter = match Self::ipv4_ipv6_network_name(&ip) {
+                "ipv4" => &mut info.ipv4,
+                "ipv6" => &mut info.ipv6,
+                // not_publicly_routable / internal: skipped (never a key),
+                // matching Core's NET_UNROUTABLE / NET_INTERNAL exclusion.
+                _ => continue,
+            };
+            if in_tried {
+                counter.tried += 1;
+            } else {
+                counter.new += 1;
+            }
+        }
+        info
+    }
 }
 
 impl Default for AddressManager {
@@ -2980,6 +3063,12 @@ impl PeerManager {
     /// applies the count cap, the optional network filter, and the shuffle.
     pub fn dump_addresses(&self) -> Vec<NodeAddressEntry> {
         self.addr_manager.dump_addresses()
+    }
+
+    /// Per-network new/tried address counts for the `getaddrmaninfo` RPC.
+    /// Forwards to the address manager (Core `AddrMan::Size` parity).
+    pub fn addrman_info(&self) -> AddrManInfo {
+        self.addr_manager.addrman_info()
     }
 
     /// Immediately initiate an outbound connection to a peer (for addnode "onetry").
