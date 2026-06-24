@@ -325,6 +325,26 @@ pub struct SyncStateResult {
 }
 
 // ============================================================
+// WAIT-FAMILY RPCs (waitfornewblock / waitforblock / waitforblockheight)
+// ============================================================
+
+/// Response for the wait-family RPCs (`waitfornewblock`, `waitforblock`,
+/// `waitforblockheight`).
+///
+/// Mirrors Bitcoin Core's return object in `rpc/blockchain.cpp` — all three
+/// methods build `{ "hash": <blockhash>, "height": <int> }` and return it on
+/// predicate-match OR on timeout (Core returns the current block in both
+/// cases). `hash` is the big-endian hex form Core's RPCs emit (same order as
+/// `getbestblockhash`); `height` is the active-chain tip height.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WaitTipResult {
+    /// The blockhash of the current active-chain tip (big-endian hex).
+    pub hash: String,
+    /// The height of the current active-chain tip.
+    pub height: u32,
+}
+
+// ============================================================
 // BLOCK INFO
 // ============================================================
 
