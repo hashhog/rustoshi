@@ -739,6 +739,19 @@ pub trait RustoshiRpc {
     #[method(name = "setnetworkactive")]
     async fn set_network_active(&self, state: Option<serde_json::Value>) -> RpcResult<bool>;
 
+    /// Request that a ping be sent to all connected peers, to measure ping time.
+    ///
+    /// Mirrors Bitcoin Core `ping` (rpc/net.cpp:84-107) → `PeerManager::SendPings`.
+    /// NO params; returns JSON `null` (Core `UniValue::VNULL`). Side-effect-only
+    /// control method: it QUEUES a BIP-31 PING (fresh nonce) to every connected
+    /// peer and returns immediately — it does NOT measure latency synchronously
+    /// or wait for the PONGs. The round-trip results surface LATER via
+    /// `getpeerinfo`'s `pingtime` / `minping` fields. With zero peers it is a
+    /// successful no-op (still `null`). A missing peer manager (P2P disabled) is
+    /// `RPC_CLIENT_P2P_DISABLED` (-31), matching Core's `EnsurePeerman`.
+    #[method(name = "ping")]
+    async fn ping(&self) -> RpcResult<serde_json::Value>;
+
     /// Get connection count.
     #[method(name = "getconnectioncount")]
     async fn get_connection_count(&self) -> RpcResult<u32>;
@@ -7182,6 +7195,29 @@ impl RustoshiRpcServer for RpcServerImpl {
         Ok(pm.set_network_active(state))
     }
 
+    async fn ping(&self) -> RpcResult<serde_json::Value> {
+        // EnsurePeerman parity (rpc/net.cpp:100): a missing peer manager is
+        // P2P-disabled, code -31 (RPC_CLIENT_P2P_DISABLED), NOT an empty
+        // success. `send_pings` mutates per-peer state (the outstanding ping
+        // nonce + last_send), so we need the write lock — the same lock the
+        // main event loop takes to process PONGs and populate `ping_time`.
+        let mut peer_state = self.peer_state.write().await;
+        let pm = peer_state.peer_manager.as_mut().ok_or_else(|| {
+            Self::rpc_error(
+                rpc_error::RPC_CLIENT_P2P_DISABLED,
+                "Error: Peer-to-peer functionality missing or disabled",
+            )
+        })?;
+
+        // Request that each peer send a ping during the next message pass
+        // (Core net.cpp:103 `peerman.SendPings()`). Fire-and-forget: no RTT is
+        // measured here. With zero peers this is a successful no-op.
+        pm.send_pings().await;
+
+        // Core returns UniValue::VNULL → JSON `null`.
+        Ok(serde_json::Value::Null)
+    }
+
     async fn get_network_info(&self) -> RpcResult<NetworkInfo> {
         let peer_state = self.peer_state.read().await;
 
@@ -10372,6 +10408,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getmempooldescendants" => "getmempooldescendants \"txid\" ( verbose )\nReturns all in-mempool descendants.",
                 "getnetworkinfo" => "getnetworkinfo\nReturns an object containing various state info regarding P2P networking.",
                 "setnetworkactive" => "setnetworkactive state\nDisable/enable all p2p network activity.",
+                "ping" => "ping\nRequests that a ping be sent to all other nodes, to measure ping time.\nResults are provided in getpeerinfo.\nPing command is handled in queue with all other commands, so it measures processing backlog, not just network ping.",
                 "getpeerinfo" => "getpeerinfo\nReturns data about each connected network node.",
                 "getnodeaddresses" => "getnodeaddresses ( count \"network\" )\nReturn known addresses, after filtering for quality and recency.",
                 "addpeeraddress" => "addpeeraddress \"address\" port ( tried )\nAdd the address of a potential peer to an address manager table. For testing only.",
@@ -10422,7 +10459,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "== Network ==",
                 "addnode", "addpeeraddress", "clearbanned", "disconnectnode", "getaddednodeinfo",
                 "getaddrmaninfo", "getconnectioncount", "getnetworkinfo", "getnodeaddresses",
-                "getpeerinfo", "listbanned", "setban", "setnetworkactive",
+                "getpeerinfo", "listbanned", "ping", "setban", "setnetworkactive",
                 "",
                 "== Rawtransactions ==",
                 "createrawtransaction", "decoderawtransaction", "decodescript",
