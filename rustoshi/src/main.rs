@@ -3483,6 +3483,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             if height > rpc.best_height {
                                 rpc.best_height = height;
                                 rpc.best_hash = block_hash;
+                                // Wake the wait-family RPCs on this IBD/foreground
+                                // block-connect tip advance (Core blockTip).
+                                rpc.notify_tip_changed();
                             }
 
                             // Drop confirmed/conflicting txs from the mempool,
@@ -4392,6 +4395,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             if height > rpc.best_height {
                                                 rpc.best_height = height;
                                                 rpc.best_hash = block_hash;
+                                                // Wake the wait-family RPCs on this
+                                                // post-IBD P2P block-connect tip
+                                                // advance (Core blockTip).
+                                                rpc.notify_tip_changed();
                                             }
 
                                             // Remove confirmed transactions from mempool
