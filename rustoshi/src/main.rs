@@ -2001,6 +2001,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // Build an EnvFilter from `loglevel`, then layer `-debug=<cat>` directives
     // on top.  `RUST_LOG` (if present) wins over both, matching the original
     // behavior.
+    // Track the debug categories enabled at startup (from `-debug=<cat>`), so
+    // we can seed the live `logging` RPC active-category set with them. Honor
+    // Core's `0`/`none` reset: those tokens clear the set even if other
+    // categories appear in the same `-debug` spec.
+    let mut startup_categories: Vec<String> = Vec::new();
     let base_filter = match std::env::var("RUST_LOG") {
         Ok(env) => EnvFilter::try_new(env)
             .unwrap_or_else(|_| EnvFilter::new(&cli.loglevel)),
@@ -2015,6 +2020,30 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 for cat in &unknown {
                     eprintln!("rustoshi: -debug: unknown category '{}'", cat);
                 }
+                // Record the recognized startup categories for the logging RPC.
+                // A `0`/`none`/`false`/`off` token resets to empty (Core idiom),
+                // matching `debug_categories_to_directives` returning no
+                // directives for that case.
+                let mut reset_all = false;
+                for tok in dbg.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let lc = tok.to_ascii_lowercase();
+                    if matches!(lc.as_str(), "0" | "none" | "false" | "off") {
+                        reset_all = true;
+                    } else if rustoshi_rpc::logging::is_all_token(&lc) {
+                        startup_categories =
+                            rustoshi_rpc::logging::LOG_CATEGORIES
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect();
+                    } else if rustoshi_rpc::logging::is_known_category(&lc)
+                        && !startup_categories.contains(&lc)
+                    {
+                        startup_categories.push(lc);
+                    }
+                }
+                if reset_all {
+                    startup_categories.clear();
+                }
             }
             EnvFilter::try_new(&spec).unwrap_or_else(|_| EnvFilter::new(&cli.loglevel))
         }
@@ -2027,6 +2056,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let log_file = ReopenableLogFile::new(log_file_path.clone())
         .map_err(|e| anyhow::anyhow!("open debug log {}: {}", log_file_path.display(), e))?;
 
+    // Wrap the env-filter in a reload layer so the `logging` RPC can toggle
+    // debug categories at runtime (Core parity: mutating
+    // `BCLog::Logger::m_categories` in place — the toggle actually starts/stops
+    // that category's logs, no restart, no snapshot). The reload handle's
+    // subscriber type parameter is unnameable here, so we erase it behind a
+    // closure handed to `EnvFilterReloadControl`.
+    let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(base_filter);
+
     // Compose stdout + file layers.  We use registry+layers so we can add a
     // file writer on top of the optional stdout writer.
     let file_layer = tracing_subscriber::fmt::layer()
@@ -2034,7 +2071,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         .with_ansi(false)
         .with_writer(log_file.clone());
     let registry = tracing_subscriber::registry()
-        .with(base_filter)
+        .with(filter_layer)
         .with(file_layer);
     if cli.printtoconsole && !cli.daemon {
         let stdout_layer = tracing_subscriber::fmt::layer()
@@ -2042,6 +2079,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         registry.with(stdout_layer).init();
     } else {
         registry.init();
+    }
+
+    // Install the live-log-control hook for the `logging` RPC: rebuilds the
+    // EnvFilter from the active-category set and reloads it into the running
+    // subscriber on each toggle. Seed the active set with the `-debug` startup
+    // categories so `logging` (no args) reports them as already-on.
+    {
+        let base_loglevel = cli.loglevel.clone();
+        let reload = move |filter: EnvFilter| {
+            // A reload failure means the subscriber was dropped (shutdown); in
+            // that case the toggle is moot, so swallow the error.
+            let _ = reload_handle.reload(filter);
+        };
+        let control = ops::EnvFilterReloadControl::new(
+            base_loglevel,
+            Box::new(reload),
+        );
+        rustoshi_rpc::logging::install_control(Box::new(control), &startup_categories);
     }
 
     tracing::info!("Rustoshi v{}", env!("CARGO_PKG_VERSION"));

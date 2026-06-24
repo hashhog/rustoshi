@@ -32,6 +32,7 @@
 //! ```
 
 pub mod auth;
+pub mod logging;
 pub mod payjoin_sender;
 pub mod rest;
 pub mod server;
