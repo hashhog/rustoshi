@@ -567,6 +567,36 @@ pub trait RustoshiRpc {
     #[method(name = "decoderawtransaction")]
     async fn decode_raw_transaction(&self, hex: String) -> RpcResult<Box<serde_json::value::RawValue>>;
 
+    /// Combine multiple partially-signed versions of the SAME transaction into
+    /// one carrying the union of their signature data.
+    ///
+    /// Mirrors Bitcoin Core `combinerawtransaction` (rpc/rawtransaction.cpp,
+    /// impl body 605-668). `txs` is taken as a raw JSON value (not a typed
+    /// `Vec<String>`) so we reproduce Core's exact param errors: a non-array is
+    /// `RPC_TYPE_ERROR` (-3) ("JSON value of type X is not of expected type
+    /// array", Core `get_array()`); a non-string element is `RPC_TYPE_ERROR`
+    /// (-3) (Core `get_str()`); an empty array is `RPC_DESERIALIZATION_ERROR`
+    /// (-22) "Missing transactions"; an undecodable element is
+    /// `RPC_DESERIALIZATION_ERROR` (-22) "TX decode failed for tx N. Make sure
+    /// the tx has at least one input." (N is the 0-based index). Returns the
+    /// witness-serialized hex of the merged transaction (bare STRING).
+    ///
+    /// SCOPE — single-sig parity (the dominant case, matching the ouroboros
+    /// reference). The first variant is the structural template (version /
+    /// locktime / vin / vout); for each input we pick, across all variants, the
+    /// variant carrying signature data (non-empty scriptSig or witness),
+    /// tie-broken by total sig-data length. Re-serialize witness-aware: emit the
+    /// segwit marker/flag iff ANY input has a non-empty witness (the codec's
+    /// `Transaction::has_witness`, == Core `CTransaction::HasWitness`). This is
+    /// BYTE-IDENTICAL to Core for single-key inputs (P2PKH/P2WPKH/P2SH-P2WPKH).
+    /// OUT OF SCOPE (documented, NOT faked): merging PARTIAL multisig sigs
+    /// WITHIN one input (two variants each holding one of M sigs) — we keep the
+    /// longer scriptSig, no Solver/sigdata-splice — and the -25 "Input not found
+    /// or already spent" prevout path (combine is a pure function of the
+    /// variants here; no chainstate/UTXO lookup).
+    #[method(name = "combinerawtransaction")]
+    async fn combine_raw_transaction(&self, txs: Option<serde_json::Value>) -> RpcResult<String>;
+
     /// Get mempool information.
     #[method(name = "getmempoolinfo")]
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo>;
@@ -5711,6 +5741,158 @@ impl RustoshiRpcServer for RpcServerImpl {
         // This matches the non_witness_utxo path in decodepsbt (server.rs ~4701).
         let json_str = serde_json::to_string(&decoded).unwrap();
         Ok(serde_json::value::RawValue::from_string(json_str).unwrap())
+    }
+
+    async fn combine_raw_transaction(&self, txs: Option<serde_json::Value>) -> RpcResult<String> {
+        // Core: `UniValue txs = request.params[0].get_array();` — a non-array
+        // (incl. omitted/null) is a JSON type error (RPC_TYPE_ERROR, -3) with
+        // the UniValue message "JSON value of type X is not of expected type
+        // array" (univalue.cpp:212; X from uvTypeName). The jsonrpsee typed
+        // `Vec<String>` deserializer would instead collapse this to -32602, so
+        // we take the raw JSON value and reproduce Core's code + message.
+        let uvtype = |v: &serde_json::Value| -> &'static str {
+            match v {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+            }
+        };
+        // An omitted positional arg surfaces as `None`; Core's required-array
+        // `get_array()` on a missing param sees VNULL -> "type null ... array".
+        let txs_val = txs.unwrap_or(serde_json::Value::Null);
+        let arr = match &txs_val {
+            serde_json::Value::Array(a) => a,
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type array",
+                        uvtype(other)
+                    ),
+                ));
+            }
+        };
+
+        // 1. Decode every variant (witness-aware). Core: `DecodeHexTx` per idx
+        //    over the whole array FIRST; on failure -> -22 "TX decode failed for
+        //    tx N. ..." (0-based). Each element must be a JSON string (Core
+        //    `txs[idx].get_str()` -> RPC_TYPE_ERROR (-3) on a non-string), and
+        //    that string-type check happens inside the same per-idx loop, so it
+        //    fires BEFORE the empty-array check below (matching Core's order:
+        //    the for-loop runs before `txVariants.empty()`).
+        let mut variants: Vec<Transaction> = Vec::with_capacity(arr.len());
+        for (idx, item) in arr.iter().enumerate() {
+            let hexstr = match item {
+                serde_json::Value::String(s) => s.as_str(),
+                other => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_TYPE_ERROR,
+                        format!(
+                            "JSON value of type {} is not of expected type string",
+                            uvtype(other)
+                        ),
+                    ));
+                }
+            };
+            // DecodeHexTx is witness-aware (try_witness=true) and requires at
+            // least one input. `Transaction::deserialize` is the node's
+            // witness-aware codec (interprets the 0x00 segwit marker); a 0-input
+            // tx is rejected to match Core's "Make sure the tx has at least one
+            // input." contract.
+            let decoded = hex::decode(hexstr)
+                .ok()
+                .and_then(|bytes| Transaction::deserialize(&bytes).ok())
+                .filter(|tx| !tx.inputs.is_empty());
+            match decoded {
+                Some(tx) => variants.push(tx),
+                None => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_DESERIALIZATION_ERROR,
+                        format!(
+                            "TX decode failed for tx {}. Make sure the tx has at \
+                             least one input.",
+                            idx
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // 2. Empty `txVariants` -> -22 "Missing transactions".
+        if variants.is_empty() {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_DESERIALIZATION_ERROR,
+                "Missing transactions",
+            ));
+        }
+
+        // 3. mergedTx starts as a clone of the first variant — the template:
+        //    its version / lock_time / vin / vout define the result; only each
+        //    input's scriptSig + witness get rebuilt below.
+        let template = &variants[0];
+        let mut merged_inputs: Vec<TxIn> = Vec::with_capacity(template.inputs.len());
+
+        for i in 0..template.inputs.len() {
+            let base = &template.inputs[i];
+            let mut best_script_sig: Vec<u8> = Vec::new();
+            let mut best_witness: Vec<Vec<u8>> = Vec::new();
+            // Rank candidates: higher score = more complete. An input carrying
+            // ANY signature data (non-empty scriptSig or witness) outranks an
+            // unsigned one; ties broken by total sig-data length (longer = more
+            // sigs — the partial-multisig fallback note); equal length keeps the
+            // earliest variant (Core's per-input merge is order-stable for the
+            // complete single-sig case).
+            let mut best_score: i64 = -1;
+
+            for variant in &variants {
+                if i >= variant.inputs.len() {
+                    continue;
+                }
+                let vin = &variant.inputs[i];
+                let ss = &vin.script_sig;
+                let wit = &vin.witness;
+                let ss_nonempty = !ss.is_empty();
+                let wit_nonempty = wit.iter().any(|x| !x.is_empty());
+
+                let score: i64 = if !ss_nonempty && !wit_nonempty {
+                    0
+                } else {
+                    let sig_len: i64 = ss.len() as i64
+                        + wit.iter().map(|x| x.len() as i64).sum::<i64>();
+                    1_000_000 + sig_len
+                };
+
+                if score > best_score {
+                    best_score = score;
+                    best_script_sig = ss.clone();
+                    best_witness = wit.clone();
+                }
+            }
+
+            merged_inputs.push(TxIn {
+                previous_output: base.previous_output.clone(),
+                script_sig: best_script_sig,
+                sequence: base.sequence,
+                witness: best_witness,
+            });
+        }
+
+        let merged = Transaction {
+            version: template.version,
+            inputs: merged_inputs,
+            outputs: template.outputs.clone(),
+            lock_time: template.lock_time,
+        };
+
+        // 4. Re-encode WITH witness (Core EncodeHexTx -> TX_WITH_WITNESS). The
+        //    codec's `serialize()` (Encodable::encode) emits the segwit
+        //    marker/flag iff `has_witness()` (any input has a non-empty witness
+        //    stack) — exactly Core's `CTransaction::HasWitness` gate. Lowercase
+        //    hex, bare STRING result.
+        Ok(hex::encode(merged.serialize()))
     }
 
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
