@@ -187,6 +187,71 @@ pub fn debug_categories_to_directives(spec: &str) -> (String, Vec<String>) {
 }
 
 // ============================================================
+// LIVE LOG-CATEGORY TOGGLE (the `logging` RPC backend)
+// ============================================================
+
+/// Build a fresh `EnvFilter` directive string from a set of active Core-style
+/// debug categories, layered on top of `base_loglevel` (e.g. "info").
+///
+/// This is the rustoshi analogue of Core rebuilding `m_categories`: given the
+/// live active-category set, produce the `tracing` `EnvFilter` spec that emits
+/// exactly those subsystems at DEBUG (and everything at `base_loglevel`).
+/// Empty set ⇒ just `base_loglevel` (no DEBUG categories — Core's "none").
+pub fn envfilter_spec_for_categories(base_loglevel: &str, active: &[String]) -> String {
+    if active.is_empty() {
+        return base_loglevel.to_string();
+    }
+    let joined = active.join(",");
+    let (directives, _unknown) = debug_categories_to_directives(&joined);
+    if directives.is_empty() {
+        base_loglevel.to_string()
+    } else {
+        format!("{base_loglevel},{directives}")
+    }
+}
+
+/// Implementation of [`rustoshi_rpc::logging::LiveLogControl`] that hot-reloads
+/// the running `tracing` `EnvFilter` whenever the `logging` RPC toggles a
+/// category — the live equivalent of Core mutating `BCLog::Logger::m_categories`
+/// in place.
+///
+/// The complex, unnameable subscriber type parameter on a
+/// `tracing_subscriber::reload::Handle<EnvFilter, S>` is erased behind a
+/// closure: `main` constructs the reload layer, captures its handle in a
+/// `reload` closure, and hands us a `Box<dyn Fn(EnvFilter)>`. On each toggle we
+/// rebuild the `EnvFilter` from the active set and invoke the closure, which
+/// reloads it into the live subscriber. The very next `tracing` event is then
+/// gated by the new filter — no restart, no snapshot.
+pub struct EnvFilterReloadControl {
+    base_loglevel: String,
+    reload: Box<dyn Fn(tracing_subscriber::EnvFilter) + Send + Sync>,
+}
+
+impl EnvFilterReloadControl {
+    pub fn new(
+        base_loglevel: String,
+        reload: Box<dyn Fn(tracing_subscriber::EnvFilter) + Send + Sync>,
+    ) -> Self {
+        Self {
+            base_loglevel,
+            reload,
+        }
+    }
+}
+
+impl rustoshi_rpc::logging::LiveLogControl for EnvFilterReloadControl {
+    fn apply(&self, active: &std::collections::BTreeSet<String>) {
+        let active_vec: Vec<String> = active.iter().cloned().collect();
+        let spec = envfilter_spec_for_categories(&self.base_loglevel, &active_vec);
+        // A malformed spec should never happen (directives are vetted), but if
+        // it does, fall back to the base level rather than panic in the RPC path.
+        let filter = tracing_subscriber::EnvFilter::try_new(&spec)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&self.base_loglevel));
+        (self.reload)(filter);
+    }
+}
+
+// ============================================================
 // LOG-FILE OUTPUT (with reload support for SIGHUP)
 // ============================================================
 
@@ -439,6 +504,48 @@ mod tests {
         let old_contents = std::fs::read_to_string(&rotated).unwrap();
         assert_eq!(new_contents, "line2\n");
         assert_eq!(old_contents, "line1\n");
+    }
+
+    #[test]
+    fn logging_categories_match_ops_mapping() {
+        // Every category the `logging` RPC exposes MUST be one `map_debug_
+        // category` actually recognizes (maps to a non-fallback directive set),
+        // so toggling it via the RPC starts/stops a REAL subsystem's logs rather
+        // than the catch-all `rustoshi=debug` fallback. This guards the
+        // RPC-registry-vs-ops-mapping invariant the rpc-crate module documents.
+        for cat in rustoshi_rpc::logging::LOG_CATEGORIES {
+            // Special tokens are never in the exposed set.
+            assert!(
+                !rustoshi_rpc::logging::is_all_token(cat),
+                "exposed category {cat} must not be a special token"
+            );
+            // A recognized non-fallback category yields a directive set that is
+            // NOT the unknown catch-all. Confirm at least one directive comes
+            // back (every recognized token does).
+            let (directives, unknown) = debug_categories_to_directives(cat);
+            assert!(
+                unknown.is_empty(),
+                "exposed category {cat} flagged unknown by ops mapping"
+            );
+            assert!(
+                !directives.is_empty(),
+                "exposed category {cat} produced no tracing directive"
+            );
+        }
+    }
+
+    #[test]
+    fn envfilter_spec_from_categories_parses() {
+        use tracing_subscriber::EnvFilter;
+        let spec = envfilter_spec_for_categories(
+            "info",
+            &["net".to_string(), "rpc".to_string()],
+        );
+        assert!(spec.starts_with("info"));
+        assert!(EnvFilter::try_new(&spec).is_ok());
+        // Empty set -> just the base level (Core "none").
+        let empty = envfilter_spec_for_categories("info", &[]);
+        assert_eq!(empty, "info");
     }
 
     #[test]
