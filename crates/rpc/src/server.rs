@@ -684,6 +684,18 @@ pub trait RustoshiRpc {
     #[method(name = "getnetworkinfo")]
     async fn get_network_info(&self) -> RpcResult<NetworkInfo>;
 
+    /// Disable/enable all p2p network activity.
+    ///
+    /// Mirrors Bitcoin Core `setnetworkactive` (rpc/net.cpp:889). The single
+    /// `state` param is taken as a raw JSON value (not a typed `bool`) so we can
+    /// reproduce Core's exact error codes: a MISSING arg is
+    /// `RPC_INVALID_PARAMETER` (-8) and a NON-bool (incl. int/float, matching
+    /// `get_bool()`'s strictness) is `RPC_TYPE_ERROR` (-3) — the jsonrpsee
+    /// auto-`bool` deserializer would instead collapse both to a generic
+    /// `-32602`. Returns the bare read-back boolean.
+    #[method(name = "setnetworkactive")]
+    async fn set_network_active(&self, state: Option<serde_json::Value>) -> RpcResult<bool>;
+
     /// Get connection count.
     #[method(name = "getconnectioncount")]
     async fn get_connection_count(&self) -> RpcResult<u32>;
@@ -6924,6 +6936,44 @@ impl RustoshiRpcServer for RpcServerImpl {
         Ok(json!({ "success": success }))
     }
 
+    async fn set_network_active(&self, state: Option<serde_json::Value>) -> RpcResult<bool> {
+        // Required positional bool. Core reads `request.params[0].get_bool()`;
+        // a missing arg is RPC_INVALID_PARAMETER (-8) and a non-bool a
+        // RPC_TYPE_ERROR (-3). Reproduce both exactly (the typed-`bool`
+        // deserializer would collapse them to a generic -32602). Match
+        // `get_bool()`'s strictness: a JSON number (int/float) is NOT a bool.
+        let state = match state {
+            None | Some(serde_json::Value::Null) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    "Missing required argument: state",
+                ));
+            }
+            Some(serde_json::Value::Bool(b)) => b,
+            Some(_) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    "JSON value is not a boolean as expected",
+                ));
+            }
+        };
+
+        // EnsureConnman parity (server_util.cpp:100): a missing connection
+        // manager is RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success.
+        // `set_network_active` takes `&self` (atomic store), so a read lock
+        // suffices — no need to acquire the write lock.
+        let peer_state = self.peer_state.read().await;
+        let pm = peer_state.peer_manager.as_ref().ok_or_else(|| {
+            Self::rpc_error(
+                rpc_error::RPC_CLIENT_P2P_DISABLED,
+                "Error: Peer-to-peer functionality missing or disabled",
+            )
+        })?;
+
+        // SetNetworkActive then return the read-back value (Core net.cpp:904-906).
+        Ok(pm.set_network_active(state))
+    }
+
     async fn get_network_info(&self) -> RpcResult<NetworkInfo> {
         let peer_state = self.peer_state.read().await;
 
@@ -6940,13 +6990,16 @@ impl RustoshiRpcServer for RpcServerImpl {
             )
         };
 
-        let (connections, connections_in, connections_out, local_services) =
+        let (connections, connections_in, connections_out, local_services, network_active) =
             if let Some(ref pm) = peer_state.peer_manager {
                 (
                     pm.peer_count() as u32,
                     pm.inbound_count() as u32,
                     pm.outbound_count() as u32,
                     pm.local_services(),
+                    // Mirror the node-global P2P-active flag toggled by
+                    // `setnetworkactive` (Core GetNetworkActive(), net.cpp:709).
+                    pm.network_active(),
                 )
             } else {
                 // No peer manager (e.g. -nonetwork): report the static default
@@ -6954,7 +7007,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // value local_services() returns when networking is up.
                 // NODE_NETWORK(0x1) | NODE_WITNESS(0x8) |
                 // NODE_NETWORK_LIMITED(0x400) | NODE_P2P_V2(0x800) = 0xC09.
-                (0, 0, 0, 0xC09u64)
+                // With no connman the flag has no backing store; report the
+                // Core default (true) — matches the hardcoded prior value.
+                (0, 0, 0, 0xC09u64, true)
             };
 
         Ok(NetworkInfo {
@@ -6971,7 +7026,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             connections,
             connections_in,
             connections_out,
-            networkactive: true,
+            networkactive: network_active,
             // Core's GetNetworksInfo (rpc/net.cpp) iterates Network 0..NET_MAX,
             // skipping NET_UNROUTABLE and NET_INTERNAL, emitting one entry per
             // routable network in enum order: ipv4, ipv6, onion, i2p, cjdns.
@@ -9997,6 +10052,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getmempoolancestors" => "getmempoolancestors \"txid\" ( verbose )\nReturns all in-mempool ancestors.",
                 "getmempooldescendants" => "getmempooldescendants \"txid\" ( verbose )\nReturns all in-mempool descendants.",
                 "getnetworkinfo" => "getnetworkinfo\nReturns an object containing various state info regarding P2P networking.",
+                "setnetworkactive" => "setnetworkactive state\nDisable/enable all p2p network activity.",
                 "getpeerinfo" => "getpeerinfo\nReturns data about each connected network node.",
                 "getnodeaddresses" => "getnodeaddresses ( count \"network\" )\nReturn known addresses, after filtering for quality and recency.",
                 "addpeeraddress" => "addpeeraddress \"address\" port ( tried )\nAdd the address of a potential peer to an address manager table. For testing only.",
@@ -10045,6 +10101,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "== Network ==",
                 "addnode", "addpeeraddress", "clearbanned", "disconnectnode", "getconnectioncount",
                 "getnetworkinfo", "getnodeaddresses", "getpeerinfo", "listbanned", "setban",
+                "setnetworkactive",
                 "",
                 "== Rawtransactions ==",
                 "createrawtransaction", "decoderawtransaction", "decodescript",

@@ -2421,6 +2421,21 @@ pub struct PeerManager {
     /// an error. Distinct from `addr_manager`'s address book (which also holds
     /// gossiped/seed addresses); only operator-pinned entries live here.
     added_nodes: Vec<String>,
+    /// Node-global "P2P network active" flag — faithful port of Core's
+    /// `CConnman::fNetworkActive` (`std::atomic<bool> ... {true}`, net.h:1592 /
+    /// `SetNetworkActive` net.cpp:3361 / `GetNetworkActive` net.h:1164).
+    /// Toggled by the `setnetworkactive` RPC and surfaced read-only as
+    /// `networkactive` in getnetworkinfo. An `Arc<AtomicBool>` (not a plain
+    /// bool) so the spawned inbound-listener task — which runs outside the
+    /// manager's `&mut self` — can capture a clone and consult it at accept
+    /// time, exactly as Core's atomic is read from the socket-handler thread.
+    /// When `false` we suppress NEW connection establishment ONLY — existing
+    /// peers are NOT force-dropped (Core's contract): (a) inbound accepts are
+    /// refused (the listener-loop gate), (b) the outbound auto-dial refill is
+    /// skipped (`fill_outbound_connections` + `maybe_open_feeler`), and (c)
+    /// DNS/fixed-seed re-seeding plus the `--connect` pinned-reconnect loop are
+    /// held off. Default `true`; not persisted (resets to enabled on restart).
+    network_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Minimum interval between reconnect attempts to a single pinned `-connect`
@@ -2468,6 +2483,7 @@ impl PeerManager {
             fixed_seeds_added: false,
             start_instant: None,
             added_nodes: Vec::new(),
+            network_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -2524,6 +2540,7 @@ impl PeerManager {
             fixed_seeds_added: false,
             start_instant: None,
             added_nodes: Vec::new(),
+            network_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -2535,6 +2552,40 @@ impl PeerManager {
     /// Set the current best block height (used in version messages).
     pub fn set_start_height(&mut self, height: i32) {
         self.start_height = height;
+    }
+
+    /// Enable/disable all NEW P2P network activity — faithful port of Core's
+    /// `CConnman::SetNetworkActive` (`src/net.cpp:3361`).
+    ///
+    /// Idempotent: when the flag already equals `state` it logs and early-returns
+    /// the current value (Core's `if (fNetworkActive == active) return;`, no
+    /// observer notification). Otherwise it flips the atomic flag. Returns the
+    /// read-back value (Core's `GetNetworkActive()` equivalent), which absent a
+    /// race equals `state`.
+    ///
+    /// Takes `&self` (the flag is an atomic) so it is callable behind a read
+    /// lock. Setting `false` suppresses only NEW connection establishment
+    /// (inbound accept, outbound auto-dial refill, DNS/fixed-seed re-seeding,
+    /// and the `--connect` pinned-reconnect loop) — it does NOT disconnect any
+    /// existing/established peer (Core's contract). Not persisted; resets to
+    /// enabled on restart. The GUI `NotifyNetworkActiveChanged` hook is a no-op
+    /// for this headless node.
+    pub fn set_network_active(&self, state: bool) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.network_active.load(Ordering::SeqCst) == state {
+            tracing::info!("SetNetworkActive: {} (unchanged)", state);
+            return state;
+        }
+        self.network_active.store(state, Ordering::SeqCst);
+        tracing::info!("SetNetworkActive: {}", state);
+        self.network_active.load(Ordering::SeqCst)
+    }
+
+    /// Read the node-global "P2P network active" flag (Core's
+    /// `CConnman::GetNetworkActive`, net.h:1164). Surfaced read-only as
+    /// `networkactive` in getnetworkinfo. Default `true`.
+    pub fn network_active(&self) -> bool {
+        self.network_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Service flags advertised by this node (NODE_NETWORK | NODE_WITNESS |
@@ -2667,6 +2718,13 @@ impl PeerManager {
                     // misbehavior-driven bans take effect on the next
                     // connection without extra plumbing.
                     let ban_path = self.config.data_dir.clone();
+                    // Clone the node-global network-active flag so the listener
+                    // task (which lives outside the manager's `&mut self`) can
+                    // consult it at accept time — the inbound-accept gate of
+                    // `setnetworkactive` (Core net.cpp:1786 `if (!fNetworkActive)
+                    // ... return`). The atomic is read from the socket-handler
+                    // thread exactly as Core reads `fNetworkActive` there.
+                    let network_active = self.network_active.clone();
                     tokio::spawn(async move {
                         // Cheap, per-accept ban check: re-read the persisted
                         // banlist file on disk.  This means RPC `setban` /
@@ -2675,6 +2733,23 @@ impl PeerManager {
                         loop {
                             match listener.accept().await {
                                 Ok((stream, addr)) => {
+                                    // Network-active gate (Core net.cpp:1786):
+                                    // while networking is disabled
+                                    // (`setnetworkactive false`) refuse NEW
+                                    // inbound connections. Existing peers are
+                                    // untouched — only new establishment is
+                                    // suppressed. Checked before the ban read so
+                                    // a disabled node does no per-accept work.
+                                    if !network_active
+                                        .load(std::sync::atomic::Ordering::SeqCst)
+                                    {
+                                        tracing::debug!(
+                                            "Rejecting inbound connection from {}: networking inactive",
+                                            addr
+                                        );
+                                        drop(stream);
+                                        continue;
+                                    }
                                     // Refuse banned addresses at accept time
                                     // so a banned peer can't burn handshake
                                     // bandwidth or refill connection slots.
@@ -2953,6 +3028,19 @@ impl PeerManager {
     /// This enforces network group diversity: no two IPv4/IPv6 outbound connections
     /// may share the same /16 (IPv4) or /32 (IPv6) network group.
     pub async fn fill_outbound_connections(&mut self) {
+        // Network-active gate (Core net.cpp:2351/3022/3219): while networking is
+        // disabled (`setnetworkactive false`) the outbound connect loop holds
+        // off establishing ANY new connection. This is the single chokepoint for
+        // all three auto-outbound sources — full-relay + block-relay-only refill
+        // from addrman AND the `--connect` pinned-reconnect loop
+        // (`maintain_connect_peers`, reached via the `connect_peers` branch
+        // below) — so the one early-return suppresses every NEW outbound dial at
+        // once. Existing peers stay up (the health/stale sweeps run
+        // unconditionally elsewhere); only NEW establishment is suppressed.
+        if !self.network_active() {
+            return;
+        }
+
         // `-connect` mode: dial ONLY the pinned peers, never the addrman.
         // This is the single chokepoint reached on startup, on the reactive
         // PeerEvent::Disconnected path, and on the periodic maintenance tick,
@@ -3095,6 +3183,16 @@ impl PeerManager {
     /// (peer_manager.rs `add_dns_addresses`), so no seed is duplicated or
     /// un-banned.
     fn maybe_add_fixed_seeds(&mut self, start: Instant) -> bool {
+        // (0) NETWORK-ACTIVE — while networking is disabled
+        // (`setnetworkactive false`) hold off DNS/fixed-seed re-seeding (Core
+        // net.cpp:2351 spins ThreadDNSAddressSeed / fixed-seed injection on the
+        // flag). Belt-and-suspenders: the periodic call site
+        // (`fill_outbound_connections`) is already gated, but `start()` calls
+        // this directly, so guard it here too. NOT latched as the one-shot, so
+        // re-enabling networking lets it fire normally.
+        if !self.network_active() {
+            return false;
+        }
         // (3) ONE-SHOT — cheapest check first.
         if self.fixed_seeds_added {
             return false;
@@ -3227,6 +3325,13 @@ impl PeerManager {
     /// when `-connect` pinning is active (the addrman is intentionally unused)
     /// or when the NEW table yields no eligible candidate.
     pub async fn maybe_open_feeler(&mut self) {
+        // Network-active gate (Core net.cpp:3022/3219): a feeler is a NEW
+        // outbound establishment, so it is suppressed while networking is
+        // disabled (`setnetworkactive false`) — same contract as the
+        // `fill_outbound_connections` refill.
+        if !self.network_active() {
+            return;
+        }
         // `-connect` mode makes no addrman-driven outbound (Core / blockbrew
         // peermgr.go:1260) — the feeler probe is addrman-driven, so skip it.
         if !self.config.connect_peers.is_empty() {
