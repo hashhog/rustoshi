@@ -690,6 +690,39 @@ pub trait RustoshiRpc {
     #[method(name = "getaddrmaninfo")]
     async fn get_addrman_info(&self) -> RpcResult<serde_json::Value>;
 
+    /// Return an object containing information about memory usage. Mirrors
+    /// Bitcoin Core's `getmemoryinfo ( "mode" )` (rpc/node.cpp:145-198, helpers
+    /// `RPCLockedMemoryInfo` :113-124 and `RPCMallocInfo` :126-143).
+    ///
+    /// IMPORTANT SEMANTICS: this reports Core's SECURE LOCKED-MEMORY POOL
+    /// (`LockedPoolManager` — the `mlock()`-backed allocator that keeps secrets
+    /// such as wallet private keys OFF swap), NOT general process/heap memory,
+    /// and NOT the transaction "memory pool" (mempool).
+    ///
+    /// The single optional `mode` (default `"stats"`) is taken as a raw JSON
+    /// value (not a typed `String`) so we can reproduce Core's exact type
+    /// checking: a NON-string `mode` is `RPC_TYPE_ERROR` (-3) before any handler
+    /// logic (Core reads it via `Arg<std::string_view>`), where the jsonrpsee
+    /// auto-`String` deserializer would instead collapse to a generic `-32602`.
+    ///
+    /// - `mode == "stats"` (default) → `{"locked": {used, free, total, locked,
+    ///   chunks_used, chunks_free}}`, all six non-negative integers in that
+    ///   pushKV order, always present. rustoshi has NO `mlock()`-backed secure
+    ///   pool (no LockedPool/mlock/VirtualLock in the source), so every counter
+    ///   is an honest `0` — a node with an empty/absent locked pool legitimately
+    ///   reports zeros; the shape is byte-identical to Core.
+    /// - `mode == "mallocinfo"` → Core returns a glibc `malloc_info(3)` XML
+    ///   string ONLY when built with glibc (`HAVE_MALLOC_INFO`); on every other
+    ///   build it raises `RPC_INVALID_PARAMETER` (-8) "mallocinfo mode not
+    ///   available". rustoshi has no `malloc_info` equivalent, so we faithfully
+    ///   take Core's non-glibc path (the exact -8 error) rather than fabricate a
+    ///   stub XML string Core never emits.
+    /// - Any other mode → `RPC_INVALID_PARAMETER` (-8) "unknown mode <mode>"
+    ///   (Core node.cpp:194, `tfm::format("unknown mode %s", mode)`).
+    #[method(name = "getmemoryinfo")]
+    async fn get_memory_info(&self, mode: Option<serde_json::Value>)
+        -> RpcResult<serde_json::Value>;
+
     /// Get network information.
     #[method(name = "getnetworkinfo")]
     async fn get_network_info(&self) -> RpcResult<NetworkInfo>;
@@ -7001,6 +7034,86 @@ impl RustoshiRpcServer for RpcServerImpl {
         );
 
         Ok(serde_json::Value::Object(ret))
+    }
+
+    async fn get_memory_info(
+        &self,
+        mode: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value> {
+        use serde_json::json;
+
+        // Core reads `mode` via `self.Arg<std::string_view>("mode")`: omitted ⇒
+        // the default "stats"; a NON-string value is a JSON type error BEFORE
+        // any handler logic runs. Reproduce both exactly — taking `mode` as a
+        // raw JSON value (not a typed `String`) so a non-string surfaces as
+        // RPC_TYPE_ERROR (-3) rather than the jsonrpsee deserializer's generic
+        // -32602.
+        let mode: String = match mode {
+            // Omitted / explicit JSON null ⇒ Core's default "stats".
+            None | Some(serde_json::Value::Null) => "stats".to_string(),
+            Some(serde_json::Value::String(s)) => s,
+            Some(other) => {
+                // Match Core's UniValue type-error text (univalue.cpp
+                // `uvTypeName`): null/bool/object/array/string/number. Mirrors
+                // rustoshi's existing "JSON value of type <T> is not of expected
+                // type <X>" phrasing used elsewhere in this file.
+                let actual = match other {
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    // String/Null are handled above; unreachable, but keep the
+                    // match total without a panic.
+                    serde_json::Value::String(_) | serde_json::Value::Null => "null",
+                };
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {actual} is not of expected type string"
+                    ),
+                ));
+            }
+        };
+
+        if mode == "stats" {
+            // Core RPCLockedMemoryInfo() reads
+            // `LockedPoolManager::Instance().stats()` and emits the six counters
+            // under "locked" in this exact pushKV order. rustoshi has no
+            // mlock'd secure allocator (no LockedPool/mlock/VirtualLock in the
+            // source), so every counter is an honest 0; the keys are always
+            // present and identical to Core. Values are size_t → non-negative
+            // integers.
+            return Ok(json!({
+                "locked": {
+                    "used": 0,
+                    "free": 0,
+                    "total": 0,
+                    "locked": 0,
+                    "chunks_used": 0,
+                    "chunks_free": 0,
+                }
+            }));
+        }
+
+        if mode == "mallocinfo" {
+            // Core returns glibc malloc_info(3) XML ONLY when built with glibc
+            // (HAVE_MALLOC_INFO); on every other build it raises
+            // -8 "mallocinfo mode not available" (node.cpp:191). rustoshi has no
+            // malloc_info equivalent, so we faithfully take Core's non-glibc
+            // path — the exact -8 error — rather than fabricate a stub XML
+            // string Core never emits.
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "mallocinfo mode not available",
+            ));
+        }
+
+        // Any other mode is Core's RPC_INVALID_PARAMETER (-8)
+        // tfm::format("unknown mode %s", mode) (node.cpp:194).
+        Err(Self::rpc_error(
+            rpc_error::RPC_INVALID_PARAMETER,
+            format!("unknown mode {mode}"),
+        ))
     }
 
     async fn set_network_active(&self, state: Option<serde_json::Value>) -> RpcResult<bool> {
