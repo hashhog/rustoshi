@@ -3777,6 +3777,55 @@ impl PeerManager {
         }
     }
 
+    /// Send a BIP-31 `ping` (with a fresh nonce) to every established peer.
+    ///
+    /// Reference: Bitcoin Core `PeerManager::SendPings` (net_processing.cpp),
+    /// invoked by the `ping` RPC (rpc/net.cpp:84-107). Core's RPC sets
+    /// `m_ping_queued = true` on every peer and the next `SendMessages` pass
+    /// emits the actual PING; rustoshi's keepalive lives in the per-peer
+    /// message-loop task, so here we emit the PING immediately via each peer's
+    /// command channel (the same `command_tx` `broadcast`/`announce_block`
+    /// use) and record the outstanding nonce at the manager layer so the pong
+    /// handler in [`PeerManager::handle_event`] can match it and populate
+    /// `ping_time` / `min_ping_time` — which `getpeerinfo` reports as
+    /// `pingtime` / `minping`.
+    ///
+    /// Fire-and-forget: it does NOT measure RTT synchronously or wait for the
+    /// PONGs. With zero peers it is a successful no-op (the loop has nothing to
+    /// iterate). Matching Core, a peer whose channel send fails is tolerated
+    /// (it has dropped) and does not abort the sweep.
+    pub async fn send_pings(&mut self) {
+        for peer in self.peers.values_mut() {
+            if peer.info.state != PeerState::Established {
+                continue;
+            }
+
+            // Fresh per-peer nonce (Core picks a random nonce per PING).
+            let nonce: u64 = rand::random();
+
+            // Queue the PING on the peer's command channel. A send error means
+            // the peer task is gone; skip it without recording a pending ping
+            // (so it is not later mistaken for a ping-timeout candidate).
+            if peer
+                .command_tx
+                .send(PeerCommand::SendMessage(NetworkMessage::Ping(nonce)))
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            // Record the outstanding ping at the manager layer so the matching
+            // PONG (handle_event, the `NetworkMessage::Pong` arm) computes the
+            // RTT from `last_send` and updates `ping_time` / `min_ping_time`.
+            peer.info.ping_nonce = Some(nonce);
+            peer.info.last_send = Instant::now();
+            // Mirror Core's PingStart / stale-tracking so an unanswered ping is
+            // subject to the existing ping-timeout disconnect path.
+            peer.stale_state.ping_sent();
+        }
+    }
+
     /// Announce a newly connected block to all established peers, honoring
     /// BIP-130: peers that have sent us `sendheaders` receive a `headers`
     /// message containing the new block header; everyone else receives an
