@@ -5078,8 +5078,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         nblocks: Option<i64>,
     ) -> RpcResult<bool> {
         use rustoshi_consensus::validation::{
-            check_block, disconnect_block, CoinEntry as VCoinEntry, DisconnectResult,
-            UndoData as VUndoData,
+            check_block, disconnect_block, DisconnectResult, UndoData as VUndoData,
         };
 
         // Core: nCheckLevel = std::max(0, std::min(4, nCheckLevel)). Default 3.
@@ -5098,13 +5097,24 @@ impl RustoshiRpcServer for RpcServerImpl {
         // bump only).  BlockStore<'_> borrows &ChainDb, so we construct it
         // from the owned Arc after the lock is dropped, keeping the Arc alive
         // for the duration of the scan via the local binding `db_arc`.
-        let (params, tip_hash, tip_height, db_arc) = {
+        let (params, tip_hash, tip_height, db_arc, prune_or_snapshot) = {
             let state = self.state.read().await;
+            // Core VerifyDB gates the "stop at the first block without data"
+            // short-circuit on `IsPruneMode() || m_from_snapshot_blockhash`
+            // (validation.cpp:42). On a pruned node or under an assumeutxo
+            // snapshot, the verify window can legitimately reach back past the
+            // point where block bodies / undo were ever stored — Core treats
+            // that as "go back only as far as we have data" and returns
+            // SUCCESS, NOT a coin-db-inconsistency failure. Capture both
+            // conditions here so the walk below can mirror that break.
+            let prune_or_snapshot =
+                state.prune_mode || state.chainstate_manager.is_snapshot_active();
             (
                 state.params.clone(),
                 state.best_hash,
                 state.best_height,
                 Arc::clone(&state.db),
+                prune_or_snapshot,
             )
         }; // read lock released here
         let store = BlockStore::new(&db_arc);
@@ -5154,10 +5164,55 @@ impl RustoshiRpcServer for RpcServerImpl {
                 break;
             }
 
+            // Read the block-index entry up front so we can mirror Core's
+            // pruned/snapshot data-availability gates (HAVE_DATA / HAVE_UNDO)
+            // before attempting to read body or undo from disk.
+            let index_entry = store.get_block_index(&cursor).ok().flatten();
+
+            // Core (validation.cpp:42-47): under prune mode OR an assumeutxo
+            // snapshot, if this block has no body data (`!(nStatus &
+            // BLOCK_HAVE_DATA)`), STOP walking back and return SUCCESS —
+            // verification only goes back as far as the data we kept. This is
+            // the exact path a snapshot-backed mainnet node hits: a window
+            // block below the data-retention floor is unavailable, and Core
+            // does NOT report a coin-db inconsistency for it. Without this the
+            // walk falls into the `get_block == None` arm below and returns
+            // FALSE — the live-mainnet L3 spot-check failure.
+            let have_data = index_entry
+                .as_ref()
+                .map(|e| e.status.has(rustoshi_storage::block_store::BlockStatus::HAVE_DATA))
+                .unwrap_or(false);
+            if prune_or_snapshot && !have_data {
+                tracing::info!(
+                    "verifychain: stopping at height {} hash {} (no block data — \
+                     pruning or assumeutxo snapshot)",
+                    height,
+                    cursor
+                );
+                floor_hash = cursor;
+                break;
+            }
+
             // Level 0: read block from disk.
             let block = match store.get_block(&cursor) {
                 Ok(Some(b)) => b,
                 Ok(None) => {
+                    // No body on disk. On a pruned/snapshot node this is the
+                    // "go back only as far as we have data" boundary (Core
+                    // breaks + returns success); mirror that even if the index
+                    // HAVE_DATA flag was stale. On a fully-archival node a
+                    // missing body for a block that claims HAVE_DATA is a real
+                    // corruption — Core returns CORRUPTED_BLOCK_DB there.
+                    if prune_or_snapshot {
+                        tracing::info!(
+                            "verifychain: stopping at height {} hash {} (body unavailable — \
+                             pruning or assumeutxo snapshot)",
+                            height,
+                            cursor
+                        );
+                        floor_hash = cursor;
+                        break;
+                    }
                     tracing::error!(
                         "verifychain: ReadBlock failed at height {} hash {} (no block data)",
                         height,
@@ -5192,19 +5247,44 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
 
             // Level 2: read + shape-check undo data.
+            //
+            // Core (validation.cpp:62-67) only attempts to read undo when the
+            // block has a non-null undo pos (`!pindex->GetUndoPos().IsNull()`),
+            // i.e. it carries the HAVE_UNDO status flag. A block with NO undo
+            // pos (a coinbase-only block, or — on a pruned/snapshot node — a
+            // block whose undo was never stored / was pruned) is NOT read and
+            // NOT a failure. The ONLY L2 failure is a present-but-unreadable
+            // undo (real disk corruption → CORRUPTED_BLOCK_DB).
+            let has_undo_pos = index_entry
+                .as_ref()
+                .map(|e| e.status.has(rustoshi_storage::block_store::BlockStatus::HAVE_UNDO))
+                .unwrap_or(true); // unknown index ⇒ fall back to a read attempt
             let storage_undo = if check_level >= 2 {
                 match store.get_undo(&cursor) {
                     Ok(Some(u)) => Some(u),
                     Ok(None) => {
-                        // A coinbase-only block legitimately has no spent coins.
-                        // Core treats a NULL undo pos as "nothing to read"; a
-                        // present-but-unreadable undo is the failure case. Here
-                        // a genuinely missing undo for a block that spends inputs
-                        // is a corruption — but for a coinbase-only block it's
-                        // fine. Distinguish by the block's non-coinbase inputs.
+                        // No undo on disk. If the index says this block never
+                        // had undo (HAVE_UNDO clear), that is Core's null-pos
+                        // "nothing to read" case — fine. On a pruned/snapshot
+                        // node, treat a missing undo as the data-retention
+                        // boundary and STOP (Core would have broken at the
+                        // HAVE_DATA gate; we mirror the same "go back only as
+                        // far as we have data" success). Only on a fully
+                        // archival node does a spends-bearing block with a
+                        // genuinely missing undo indicate corruption.
                         let has_spends =
                             block.transactions.iter().skip(1).any(|tx| !tx.inputs.is_empty());
-                        if has_spends {
+                        if has_spends && has_undo_pos {
+                            if prune_or_snapshot {
+                                tracing::info!(
+                                    "verifychain: stopping at height {} hash {} (undo \
+                                     unavailable — pruning or assumeutxo snapshot)",
+                                    height,
+                                    cursor
+                                );
+                                floor_hash = cursor;
+                                break;
+                            }
                             tracing::error!(
                                 "verifychain: found bad undo data at height {} hash {} (missing)",
                                 height,
@@ -5228,23 +5308,21 @@ impl RustoshiRpcServer for RpcServerImpl {
                 None
             };
 
-            // Level 3: disconnect this tip block against the coins overlay.
+            // Level 3: disconnect this tip block against the coins overlay,
+            // reusing the EXACT machinery the live reorg path runs. The undo
+            // is converted with the SAME `storage_undo_to_validation` helper
+            // that `disconnect_to` (the real P2P/invalidateblock reorg
+            // disconnect) uses, and fed to the SAME `validation::disconnect_block`
+            // — there is no verifychain-private disconnect/undo path. The only
+            // difference from a real reorg is the target: an in-memory overlay
+            // (`coins`) we never flush, so the on-disk chainstate is untouched.
             if check_level >= 3 {
-                let v_undo = VUndoData {
-                    spent_coins: storage_undo
-                        .as_ref()
-                        .map(|u| {
-                            u.spent_coins
-                                .iter()
-                                .map(|c| VCoinEntry {
-                                    height: c.height,
-                                    is_coinbase: c.is_coinbase,
-                                    value: c.value,
-                                    script_pubkey: c.script_pubkey.clone(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                let v_undo = match storage_undo.as_ref() {
+                    Some(u) => storage_undo_to_validation(u),
+                    // A coinbase-only / null-undo block: empty spent set, which
+                    // disconnect_block accepts for a `vtx.len() <= 1`-or-no-spend
+                    // block (Gate 1).
+                    None => VUndoData { spent_coins: Vec::new() },
                 };
 
                 match disconnect_block(&block, &v_undo, &mut coins, height, &params) {
