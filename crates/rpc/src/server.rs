@@ -723,6 +723,18 @@ pub trait RustoshiRpc {
     #[method(name = "submitblock")]
     async fn submit_block(&self, hex: String) -> RpcResult<Option<String>>;
 
+    /// Decode `hexdata` as an 80-byte block header and submit it as a candidate
+    /// chain tip if valid. Mirrors Bitcoin Core's `submitheader "hexdata"`
+    /// (`rpc/mining.cpp::submitheader`). Returns JSON `null` on success (or for
+    /// an already-known header — `ProcessNewBlockHeaders` is idempotent).
+    /// Errors (byte-identical to Core):
+    ///   - -22 "Block header decode failed"        — bad hex / not 80 bytes.
+    ///   - -25 "Must submit previous header (<prevhash>) first" — parent unknown
+    ///     (`<prevhash>` is the big-endian display hex, Core's `GetHex()`).
+    ///   - -25 "<reject-reason>"                    — PoW / contextual failure.
+    #[method(name = "submitheader")]
+    async fn submit_header(&self, hexdata: String) -> RpcResult<Option<serde_json::Value>>;
+
     /// Get mining information.
     #[method(name = "getmininginfo")]
     async fn get_mining_info(&self) -> RpcResult<MiningInfo>;
@@ -2275,6 +2287,105 @@ fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> u32 {
     }
     timestamps.sort_unstable();
     timestamps[timestamps.len() / 2]
+}
+
+/// Recompute the consensus-mandated `nBits` for the header that extends
+/// `parent_hash`, by walking the stored ancestor chain and running rustoshi's
+/// real `get_next_work_required` (the SAME function the miner/block-template
+/// and header-sync paths use). This is the input to Core's FIRST contextual
+/// header gate (`ContextualCheckBlockHeader`, validation.cpp:4088:
+/// `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))`).
+///
+/// `new_block_time` is the timestamp of the header being validated (needed for
+/// the testnet min-difficulty rule). Returns `None` if the parent chain cannot
+/// be walked from the store, in which case the caller skips the diffbits gate
+/// rather than false-rejecting — same convention as the MTP walk and
+/// `rustoshi/src/main.rs::compute_expected_bits_via_store`, which this mirrors
+/// (kept crate-local here to avoid pulling the binary helper into the RPC
+/// crate; both walk the same `BlockStore::get_header` chain).
+fn compute_expected_bits_via_store(
+    block_store: &BlockStore,
+    parent_hash: &Hash256,
+    new_block_time: u32,
+    params: &ChainParams,
+) -> Option<u32> {
+    use rustoshi_consensus::{
+        get_next_work_required, BlockIndex as PowBlockIndex, DIFFICULTY_ADJUSTMENT_INTERVAL,
+    };
+
+    // Walk back at most one full retarget interval (+2 buffer) from the parent.
+    let needed = (DIFFICULTY_ADJUSTMENT_INTERVAL + 2) as usize;
+
+    // Resolve the parent (= pindexPrev) height. If absent the chain can't be
+    // placed, so skip the gate.
+    let parent_height = match block_store.get_height(parent_hash) {
+        Ok(Some(h)) => h,
+        _ => return None,
+    };
+
+    // Collect parent + ancestors, parent-first (oldest last).
+    let mut headers: Vec<rustoshi_primitives::BlockHeader> = Vec::with_capacity(needed);
+    let mut cursor = *parent_hash;
+    for _ in 0..needed {
+        match block_store.get_header(&cursor) {
+            Ok(Some(hdr)) => {
+                let prev = hdr.prev_block_hash;
+                headers.push(hdr);
+                if prev == Hash256::ZERO {
+                    break;
+                }
+                cursor = prev;
+            }
+            _ => break,
+        }
+    }
+    if headers.is_empty() {
+        return None;
+    }
+
+    // Build a linked BlockIndex chain (headers[0] = parent/tip, oldest last).
+    struct SimpleBlockIndex {
+        height: u32,
+        timestamp: u32,
+        bits: u32,
+        prev: Option<Box<SimpleBlockIndex>>,
+    }
+    impl PowBlockIndex for SimpleBlockIndex {
+        fn height(&self) -> u32 {
+            self.height
+        }
+        fn timestamp(&self) -> u32 {
+            self.timestamp
+        }
+        fn bits(&self) -> u32 {
+            self.bits
+        }
+        fn prev(&self) -> Option<&Self> {
+            self.prev.as_deref()
+        }
+        fn ancestor(&self, target_height: u32) -> Option<&Self> {
+            if target_height > self.height {
+                return None;
+            }
+            let mut cur = self;
+            while cur.height > target_height {
+                cur = cur.prev.as_deref()?;
+            }
+            Some(cur)
+        }
+    }
+
+    let mut node: Option<Box<SimpleBlockIndex>> = None;
+    for (i, hdr) in headers.iter().enumerate().rev() {
+        let h = parent_height.saturating_sub(i as u32);
+        node = Some(Box::new(SimpleBlockIndex {
+            height: h,
+            timestamp: hdr.timestamp,
+            bits: hdr.bits,
+            prev: node,
+        }));
+    }
+    node.map(|tip| get_next_work_required(&*tip, new_block_time, params))
 }
 
 /// Admit an already-signed transaction into the node mempool.
@@ -7196,6 +7307,208 @@ impl RustoshiRpcServer for RpcServerImpl {
                 Ok(Some(e.bip22_string().to_string()))
             }
         }
+    }
+
+    /// `submitheader "hexdata"` — Bitcoin Core `rpc/mining.cpp::submitheader`.
+    ///
+    /// Reuses the SAME header-validation path as the headers-first P2P sync
+    /// (`rustoshi/src/main.rs`'s `process_headers` closure) and the
+    /// `submitblock` connect path — no parallel validator:
+    ///   * decode → 80-byte `BlockHeader`,
+    ///   * parent-known check via `BlockStore::has_header` (Core's
+    ///     `LookupBlockIndex(hashPrevBlock)`),
+    ///   * idempotency via `BlockStore::has_header(blockhash)` (Core's
+    ///     `ProcessNewBlockHeaders` is a no-op for an already-known header),
+    ///   * `check_proof_of_work` (Core `CheckBlockHeader`),
+    ///   * `contextual_check_block_header` with `expected_bits` recomputed via
+    ///     `get_next_work_required` over the stored ancestor chain + the inline
+    ///     MTP gate (Core `ContextualCheckBlockHeader`) — the exact gates the
+    ///     P2P header path runs,
+    ///   * store via `put_header` + `put_height_index`.
+    async fn submit_header(&self, hexdata: String) -> RpcResult<Option<serde_json::Value>> {
+        // --- Step 1: decode the hex-encoded 80-byte header -------------------
+        // Core: DecodeHexBlockHeader(h, request.params[0].get_str())
+        //   bad hex OR not exactly 80 bytes -> RPC_DESERIALIZATION_ERROR (-22).
+        let bytes = match hex::decode(hexdata.trim()) {
+            Ok(b) => b,
+            Err(_) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DESERIALIZATION_ERROR,
+                    "Block header decode failed",
+                ));
+            }
+        };
+        if bytes.len() != rustoshi_primitives::BlockHeader::SIZE {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_DESERIALIZATION_ERROR,
+                "Block header decode failed",
+            ));
+        }
+        let header = match rustoshi_primitives::BlockHeader::deserialize(&bytes) {
+            Ok(h) => h,
+            Err(_) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DESERIALIZATION_ERROR,
+                    "Block header decode failed",
+                ));
+            }
+        };
+
+        let block_hash = header.block_hash();
+
+        let mut state = self.state.write().await;
+        let store = BlockStore::new(&state.db);
+
+        // --- Step 2: parent-known check -------------------------------------
+        // Core (cs_main held): if (!LookupBlockIndex(h.hashPrevBlock))
+        //   throw RPC_VERIFY_ERROR "Must submit previous header (<prevhash>) first"
+        // <prevhash> is the big-endian DISPLAY hex (CBlockHeader::GetHex()),
+        // which `Hash256::to_hex()` produces.
+        match store.has_header(&header.prev_block_hash) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TRANSACTION_ERROR,
+                    format!(
+                        "Must submit previous header ({}) first",
+                        header.prev_block_hash.to_hex()
+                    ),
+                ));
+            }
+            Err(e) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DATABASE_ERROR,
+                    format!("Database error: {}", e),
+                ));
+            }
+        }
+
+        // --- Step 3: idempotency --------------------------------------------
+        // Core's ProcessNewBlockHeaders is idempotent: an already-known header
+        // succeeds with state.IsValid() == true -> return null.
+        if let Ok(true) = store.has_header(&block_hash) {
+            return Ok(None);
+        }
+
+        // --- Step 4: derive the parent's height ------------------------------
+        // Needed for the new header's height (parent_height + 1), which the
+        // contextual gates (bad-diffbits / BIP-34 version / BIP-94) key off.
+        let new_height = match store.get_height(&header.prev_block_hash) {
+            Ok(Some(h)) => h + 1,
+            // Parent header exists but has no height-index entry: fall back to
+            // tip + 1 when the parent IS the tip, else reject as unknown (we
+            // cannot place the header in the chain). This keeps parity with the
+            // common case (submitting the next header on the active tip).
+            _ => {
+                if header.prev_block_hash == state.best_hash {
+                    state.best_height + 1
+                } else {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_ERROR,
+                        format!(
+                            "Must submit previous header ({}) first",
+                            header.prev_block_hash.to_hex()
+                        ),
+                    ));
+                }
+            }
+        };
+
+        // --- Step 5: context-free PoW (Core CheckBlockHeader) ----------------
+        // `check_proof_of_work` verifies hash <= target AND target <= pow_limit
+        // (the SAME consensus helper the block path uses via check_block).
+        if !rustoshi_consensus::check_proof_of_work(
+            block_hash.as_bytes(),
+            header.bits,
+            &state.params,
+        ) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_TRANSACTION_ERROR,
+                "high-hash",
+            ));
+        }
+
+        // --- Step 6: contextual header checks (Core ContextualCheckBlockHeader)
+        // Mirrors rustoshi/src/main.rs's process_headers validate_and_store
+        // closure exactly: recompute expected nBits over the stored ancestor
+        // chain (bad-diffbits, Core's FIRST gate), then run
+        // contextual_check_block_header (BIP-94 timewarp / 7200-future /
+        // BIP-34/65/66 version), then the inline BIP-113 MTP gate.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let expected_bits = compute_expected_bits_via_store(
+            &store,
+            &header.prev_block_hash,
+            header.timestamp,
+            &state.params,
+        );
+
+        // prev_entry placeholder: only `timestamp` is read by the BIP-94 gate,
+        // and only at retarget boundaries (mainnet-disabled). Matches the
+        // header-sync path's StubChainContext convention.
+        let prev_entry = rustoshi_consensus::BlockIndexEntry {
+            height: new_height.saturating_sub(1),
+            timestamp: 0,
+            bits: 0,
+            prev_hash: header.prev_block_hash,
+            chain_work: [0u8; 32],
+        };
+
+        if let Err(e) = rustoshi_consensus::contextual_check_block_header(
+            &header,
+            new_height,
+            &prev_entry,
+            &rustoshi_consensus::StubChainContext,
+            &state.params,
+            now_secs,
+            expected_bits,
+        ) {
+            // Canonical BIP-22 reject string (Core BIP22ValidationResult /
+            // state.GetRejectReason()), e.g. "bad-diffbits" — NOT the Rust
+            // Debug repr. Same mapping submit_block uses.
+            return Err(Self::rpc_error(
+                rpc_error::RPC_TRANSACTION_ERROR,
+                e.bip22_string(),
+            ));
+        }
+
+        // BIP-113 MTP gate (the real check; StubChainContext returns MTP=0).
+        // Walks ancestors via the store, same as the header-sync path.
+        let mtp = compute_prev_block_mtp(&store, &header.prev_block_hash);
+        if mtp > 0 && header.timestamp <= mtp {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_TRANSACTION_ERROR,
+                "time-too-old",
+            ));
+        }
+
+        // --- Step 7: store the validated header ------------------------------
+        // Core: ProcessNewBlockHeaders adds the CBlockIndex; we persist the
+        // header + its height-index entry (the same two writes the P2P
+        // header-sync path does). The active tip is NOT advanced here — like
+        // Core, submitheader only adds a candidate header; the body must arrive
+        // (P2P / submitblock) before the chain connects it.
+        if let Err(e) = store.put_header(&block_hash, &header) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_DATABASE_ERROR,
+                format!("Database error: {}", e),
+            ));
+        }
+        if let Err(e) = store.put_height_index(new_height, &block_hash) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_DATABASE_ERROR,
+                format!("Database error: {}", e),
+            ));
+        }
+        if new_height > state.header_height {
+            state.header_height = new_height;
+        }
+
+        // Success -> JSON null (Core: return UniValue::VNULL).
+        Ok(None)
     }
 
     async fn get_mining_info(&self) -> RpcResult<MiningInfo> {
