@@ -1241,7 +1241,16 @@ pub trait RustoshiRpc {
     async fn create_raw_transaction(
         &self,
         inputs: Vec<serde_json::Value>,
-        outputs: Vec<serde_json::Value>,
+        // Core's ConstructTransaction (rawtransaction_util.cpp::NormalizeOutputs)
+        // accepts the `outputs` argument as EITHER a JSON object
+        // `{address:amount,...,"data":hex}` OR a JSON array of single-key objects
+        // `[{address:amount},{"data":hex}]`. Typing this as `serde_json::Value`
+        // (not `Vec<...>`) lets the deserializer admit BOTH shapes; the handler
+        // then normalizes via the same array/object → ordered (key,value) list
+        // that Core uses. Was `Vec<serde_json::Value>`, which made the
+        // jsonrpsee param deserializer reject the object form with a
+        // "deserialize" error before the handler ever ran.
+        outputs: serde_json::Value,
         locktime: Option<u32>,
         replaceable: Option<bool>,
     ) -> RpcResult<String>;
@@ -10558,7 +10567,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn create_raw_transaction(
         &self,
         inputs: Vec<serde_json::Value>,
-        outputs: Vec<serde_json::Value>,
+        outputs: serde_json::Value,
         locktime: Option<u32>,
         replaceable: Option<bool>,
     ) -> RpcResult<String> {
@@ -10606,49 +10615,119 @@ impl RustoshiRpcServer for RpcServerImpl {
             });
         }
 
-        // Parse outputs
-        let mut tx_outputs = Vec::new();
-        for output in &outputs {
-            if let Some(obj) = output.as_object() {
-                for (key, val) in obj {
-                    if key == "data" {
-                        // OP_RETURN output
-                        let data_hex = val.as_str().unwrap_or("");
-                        let data = hex::decode(data_hex).map_err(|_| {
-                            Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid data hex")
-                        })?;
-                        let mut script = vec![0x6a]; // OP_RETURN
-                        if data.len() <= 75 {
-                            script.push(data.len() as u8);
-                        } else {
-                            script.push(0x4c); // OP_PUSHDATA1
-                            script.push(data.len() as u8);
-                        }
-                        script.extend_from_slice(&data);
-                        tx_outputs.push(TxOut {
-                            value: 0,
-                            script_pubkey: script,
-                        });
-                    } else {
-                        // Address output: key is address, val is amount in BTC
-                        let amount_btc = val.as_f64().ok_or_else(|| {
-                            Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid amount")
-                        })?;
-                        let amount_sat = (amount_btc * COIN as f64) as u64;
-                        let address = rustoshi_crypto::address::Address::from_string(key, None)
-                            .map_err(|e| {
-                                Self::rpc_error(
-                                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
-                                    format!("Invalid address: {}", e),
-                                )
-                            })?;
-                        let script = address.to_script_pubkey();
-                        tx_outputs.push(TxOut {
-                            value: amount_sat,
-                            script_pubkey: script,
-                        });
+        // Parse outputs.
+        //
+        // Core's NormalizeOutputs (rawtransaction_util.cpp:74-99) accepts the
+        // `outputs` argument as EITHER:
+        //   - a JSON object `{address:amount,...,"data":hex}`, or
+        //   - a JSON array of single-key objects
+        //     `[{address:amount},{"data":hex}]`
+        // translating the array form into an ordered (key,value) list. We
+        // normalize both into `norm_outputs` so the downstream ParseOutputs
+        // logic (duplicate detection, OP_RETURN, address→spk) is identical for
+        // both shapes. Previously this handler only accepted the array form
+        // (the param was typed `Vec<serde_json::Value>`), so the object form was
+        // rejected by the deserializer before reaching here.
+        let mut norm_outputs: Vec<(String, serde_json::Value)> = Vec::new();
+        match &outputs {
+            serde_json::Value::Object(map) => {
+                // serde_json's Map preserves insertion order (preserve_order /
+                // default IndexMap), so this matches Core's UniValue key order.
+                for (key, val) in map {
+                    norm_outputs.push((key.clone(), val.clone()));
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for entry in arr {
+                    let obj = entry.as_object().ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INVALID_PARAMS,
+                            "Invalid parameter, key-value pair not an object as expected",
+                        )
+                    })?;
+                    if obj.len() != 1 {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_INVALID_PARAMS,
+                            "Invalid parameter, key-value pair must contain exactly one key",
+                        ));
+                    }
+                    for (key, val) in obj {
+                        norm_outputs.push((key.clone(), val.clone()));
                     }
                 }
+            }
+            _ => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMS,
+                    "Expected type object or array for outputs",
+                ));
+            }
+        }
+
+        let mut tx_outputs = Vec::new();
+        let mut seen_data = false;
+        let mut seen_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (key, val) in &norm_outputs {
+            if key == "data" {
+                // OP_RETURN output. Core ParseOutputs rejects a duplicate
+                // "data" key (rawtransaction_util.cpp:109-111).
+                if seen_data {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMS,
+                        "Invalid parameter, duplicate key: data",
+                    ));
+                }
+                seen_data = true;
+                let data_hex = val.as_str().ok_or_else(|| {
+                    Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Data must be hexadecimal string")
+                })?;
+                let data = hex::decode(data_hex).map_err(|_| {
+                    Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid data hex")
+                })?;
+                // OP_RETURN <push data>. Match Core's CScript << OP_RETURN << data
+                // minimal-push encoding (direct push ≤75, OP_PUSHDATA1 ≤255,
+                // OP_PUSHDATA2 otherwise — LE length).
+                let mut script = vec![0x6a]; // OP_RETURN
+                if data.len() <= 75 {
+                    script.push(data.len() as u8);
+                } else if data.len() <= 255 {
+                    script.push(0x4c); // OP_PUSHDATA1
+                    script.push(data.len() as u8);
+                } else {
+                    script.push(0x4d); // OP_PUSHDATA2
+                    script.extend_from_slice(&(data.len() as u16).to_le_bytes());
+                }
+                script.extend_from_slice(&data);
+                tx_outputs.push(TxOut {
+                    value: 0,
+                    script_pubkey: script,
+                });
+            } else {
+                // Address output: key is address, val is amount in BTC.
+                let amount_btc = val.as_f64().ok_or_else(|| {
+                    Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid amount")
+                })?;
+                let amount_sat = (amount_btc * COIN as f64).round() as u64;
+                let address = rustoshi_crypto::address::Address::from_string(key, None)
+                    .map_err(|e| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                            format!("Invalid address: {}", e),
+                        )
+                    })?;
+                // Core ParseOutputs rejects a duplicated address
+                // (rawtransaction_util.cpp:124-126).
+                if !seen_addrs.insert(key.clone()) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMS,
+                        format!("Invalid parameter, duplicated address: {}", key),
+                    ));
+                }
+                let script = address.to_script_pubkey();
+                tx_outputs.push(TxOut {
+                    value: amount_sat,
+                    script_pubkey: script,
+                });
             }
         }
 
@@ -22013,9 +22092,11 @@ mod tests {
             "txid": "00".repeat(32),
             "vout": 0,
         })];
-        let outputs = vec![serde_json::json!({
+        // OBJECT form: exercises the NormalizeOutputs object branch (the form
+        // that was previously rejected with a deserialize error).
+        let outputs = serde_json::json!({
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
-        })];
+        });
         let hex = server
             .create_raw_transaction(inputs, outputs, None, None)
             .await
@@ -22039,9 +22120,10 @@ mod tests {
             "txid": "00".repeat(32),
             "vout": 0,
         })];
-        let outputs = vec![serde_json::json!({
+        // ARRAY form: exercises the NormalizeOutputs array branch.
+        let outputs = serde_json::json!([{
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
-        })];
+        }]);
         let hex = server
             .create_raw_transaction(inputs, outputs, Some(500_000), Some(false))
             .await
@@ -22064,9 +22146,10 @@ mod tests {
             "txid": "00".repeat(32),
             "vout": 0,
         })];
-        let outputs = vec![serde_json::json!({
+        // ARRAY form: exercises the NormalizeOutputs array branch.
+        let outputs = serde_json::json!([{
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
-        })];
+        }]);
         let hex = server
             .create_raw_transaction(inputs, outputs, Some(0), Some(false))
             .await
