@@ -514,6 +514,33 @@ pub trait RustoshiRpc {
     #[method(name = "getblockcount")]
     async fn get_block_count(&self) -> RpcResult<u32>;
 
+    /// Verify the integrity of the blockchain database.
+    ///
+    /// Mirrors `bitcoin-core/src/rpc/blockchain.cpp::verifychain`, which calls
+    /// `CVerifyDB().VerifyDB(...)` (validation.cpp). Re-reads and re-validates
+    /// the last `nblocks` blocks from the tip backward at the requested
+    /// `checklevel`, reusing the SAME `check_block` / `disconnect_block` /
+    /// `connect_block_with_sequence_locks` machinery the node runs during sync.
+    ///
+    /// `checklevel` (default 3, clamped to 0..=4):
+    ///   0 = read block from disk
+    ///   1 = + verify block validity (`check_block`)
+    ///   2 = + read undo data
+    ///   3 = + disconnect tip blocks against an in-memory coins overlay
+    ///   4 = + reconnect them (`connect_block_with_sequence_locks`)
+    /// `nblocks` (default 6; 0 or > height = all blocks).
+    ///
+    /// Returns `true` if every check passes, `false` otherwise (matching Core's
+    /// `VerifyDBResult::SUCCESS` bool projection). The on-disk chainstate is
+    /// never mutated — the coins overlay is an in-memory `BlockStoreUtxoView`
+    /// cache that is dropped without flushing.
+    #[method(name = "verifychain")]
+    async fn verify_chain(
+        &self,
+        checklevel: Option<i64>,
+        nblocks: Option<i64>,
+    ) -> RpcResult<bool>;
+
     /// Get the hash of the best (tip) block.
     #[method(name = "getbestblockhash")]
     async fn get_best_block_hash(&self) -> RpcResult<String>;
@@ -5043,6 +5070,265 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_block_count(&self) -> RpcResult<u32> {
         let state = self.state.read().await;
         Ok(state.best_height)
+    }
+
+    async fn verify_chain(
+        &self,
+        checklevel: Option<i64>,
+        nblocks: Option<i64>,
+    ) -> RpcResult<bool> {
+        use rustoshi_consensus::validation::{
+            check_block, disconnect_block, CoinEntry as VCoinEntry, DisconnectResult,
+            UndoData as VUndoData,
+        };
+
+        // Core: nCheckLevel = std::max(0, std::min(4, nCheckLevel)). Default 3.
+        let check_level: i64 = checklevel.unwrap_or(3).clamp(0, 4);
+        // Core DEFAULT_CHECKBLOCKS = 6; 0 or > height means "all".
+        let raw_depth: i64 = nblocks.unwrap_or(6);
+
+        // Extract everything the scan needs from the shared state, then release
+        // the read lock BEFORE the validation loop.  The scan reads historical
+        // blocks and builds an in-memory UTXO overlay; it never mutates live
+        // state.  Holding the read lock for the entire walk (potentially all
+        // ~850 k blocks at checklevel 4) would block every self.state.write()
+        // caller — new block connection, reorgs, IBD — for minutes.
+        //
+        // state.db is Arc<ChainDb>, so cloning it is cheap (reference-count
+        // bump only).  BlockStore<'_> borrows &ChainDb, so we construct it
+        // from the owned Arc after the lock is dropped, keeping the Arc alive
+        // for the duration of the scan via the local binding `db_arc`.
+        let (params, tip_hash, tip_height, db_arc) = {
+            let state = self.state.read().await;
+            (
+                state.params.clone(),
+                state.best_hash,
+                state.best_height,
+                Arc::clone(&state.db),
+            )
+        }; // read lock released here
+        let store = BlockStore::new(&db_arc);
+
+        // Core VerifyDB: a chain with only the genesis block (Tip()->pprev ==
+        // nullptr) trivially succeeds — nothing to verify.
+        if tip_height == 0 {
+            return Ok(true);
+        }
+
+        // Core: if (nCheckDepth <= 0 || nCheckDepth > Height()) nCheckDepth = Height();
+        let check_depth: u32 = if raw_depth <= 0 || raw_depth > tip_height as i64 {
+            tip_height
+        } else {
+            raw_depth as u32
+        };
+
+        tracing::info!(
+            "verifychain: verifying last {} blocks at level {}",
+            check_depth,
+            check_level
+        );
+
+        // The floor height we walk back to (exclusive lower bound is floor; we
+        // verify blocks (floor, tip]). Core stops when
+        // pindex->nHeight <= Height() - nCheckDepth.
+        let floor_height = tip_height.saturating_sub(check_depth);
+
+        // In-memory coins overlay over CF_UTXO. disconnect_block mutates THIS
+        // (add_utxo / spend_coin_returning) — we NEVER flush it, so the on-disk
+        // chainstate is untouched. Mirrors Core's `CCoinsViewCache coins(&coinsview)`.
+        let mut coins = store.utxo_view();
+
+        // Collect the disconnected blocks (ascending height) so level 4 can
+        // reconnect them forward — mirrors Core re-walking pindex via Next().
+        // (hash, height, block) for each block we disconnected.
+        let mut disconnected: Vec<(Hash256, u32, Block)> = Vec::new();
+        let floor_hash: Hash256;
+
+        // ── Walk tip → floor ────────────────────────────────────────────────
+        let mut cursor = tip_hash;
+        let mut height = tip_height;
+        loop {
+            // Core breaks when pindex->nHeight <= Height() - nCheckDepth.
+            if height <= floor_height {
+                floor_hash = cursor;
+                break;
+            }
+
+            // Level 0: read block from disk.
+            let block = match store.get_block(&cursor) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    tracing::error!(
+                        "verifychain: ReadBlock failed at height {} hash {} (no block data)",
+                        height,
+                        cursor
+                    );
+                    return Ok(false);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "verifychain: read error at height {} hash {}: {}",
+                        height,
+                        cursor,
+                        e
+                    );
+                    return Ok(false);
+                }
+            };
+
+            let prev_hash = block.header.prev_block_hash;
+
+            // Level 1: verify block validity (CheckBlock).
+            if check_level >= 1 {
+                if let Err(e) = check_block(&block, &params) {
+                    tracing::error!(
+                        "verifychain: found bad block at height {} hash {}: {}",
+                        height,
+                        cursor,
+                        e
+                    );
+                    return Ok(false);
+                }
+            }
+
+            // Level 2: read + shape-check undo data.
+            let storage_undo = if check_level >= 2 {
+                match store.get_undo(&cursor) {
+                    Ok(Some(u)) => Some(u),
+                    Ok(None) => {
+                        // A coinbase-only block legitimately has no spent coins.
+                        // Core treats a NULL undo pos as "nothing to read"; a
+                        // present-but-unreadable undo is the failure case. Here
+                        // a genuinely missing undo for a block that spends inputs
+                        // is a corruption — but for a coinbase-only block it's
+                        // fine. Distinguish by the block's non-coinbase inputs.
+                        let has_spends =
+                            block.transactions.iter().skip(1).any(|tx| !tx.inputs.is_empty());
+                        if has_spends {
+                            tracing::error!(
+                                "verifychain: found bad undo data at height {} hash {} (missing)",
+                                height,
+                                cursor
+                            );
+                            return Ok(false);
+                        }
+                        None
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "verifychain: undo read error at height {} hash {}: {}",
+                            height,
+                            cursor,
+                            e
+                        );
+                        return Ok(false);
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Level 3: disconnect this tip block against the coins overlay.
+            if check_level >= 3 {
+                let v_undo = VUndoData {
+                    spent_coins: storage_undo
+                        .as_ref()
+                        .map(|u| {
+                            u.spent_coins
+                                .iter()
+                                .map(|c| VCoinEntry {
+                                    height: c.height,
+                                    is_coinbase: c.is_coinbase,
+                                    value: c.value,
+                                    script_pubkey: c.script_pubkey.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                };
+
+                match disconnect_block(&block, &v_undo, &mut coins, height, &params) {
+                    Ok(DisconnectResult::Ok) => {}
+                    Ok(DisconnectResult::Unclean) => {
+                        // Core: UNCLEAN marks pindexFailure → CORRUPTED_BLOCK_DB
+                        // (coin-database inconsistency). verifychain returns false.
+                        tracing::error!(
+                            "verifychain: coin database inconsistency (UNCLEAN disconnect) at height {} hash {}",
+                            height,
+                            cursor
+                        );
+                        return Ok(false);
+                    }
+                    Ok(DisconnectResult::Failed) => {
+                        tracing::error!(
+                            "verifychain: irrecoverable inconsistency in block data at height {} hash {}",
+                            height,
+                            cursor
+                        );
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "verifychain: disconnect_block failed at height {} hash {}: {}",
+                            height,
+                            cursor,
+                            e
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+
+            disconnected.push((cursor, height, block));
+            cursor = prev_hash;
+            height -= 1;
+        }
+
+        // ── Level 4: reconnect every disconnected block forward ─────────────
+        // Core: while (pindex != Tip()) { pindex = Next(pindex); ReadBlock;
+        // ConnectBlock(...); }. We replay the disconnected blocks in ascending
+        // height order through the SAME ChainState::process_block path the node
+        // uses during sync (check_block + contextual_check_block +
+        // connect_block_with_sequence_locks), against the in-memory coins
+        // overlay that now holds the floor-block UTXO state. Nothing is flushed.
+        if check_level >= 4 {
+            let mut chain_state = ChainState::new(floor_hash, floor_height, params.clone());
+
+            // Reconnect in ascending height order (disconnected was tip→floor).
+            for (hash, h, block) in disconnected.iter().rev() {
+                // BIP-113 lock_time_cutoff: MTP of the parent block, computed
+                // from the on-disk header chain (same helper the connect path
+                // uses). The parent is the previous block in the active chain.
+                let prev_block_mtp =
+                    compute_prev_block_mtp(&store, &block.header.prev_block_hash);
+
+                match chain_state.process_block(
+                    block,
+                    &mut coins,
+                    prev_block_mtp,
+                    /* f_requested */ true,
+                    rustoshi_consensus::current_time_secs(),
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            "verifychain: found unconnectable block at height {} hash {}: {}",
+                            h,
+                            hash,
+                            e
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "verifychain: no inconsistencies in last {} blocks (level {})",
+            check_depth,
+            check_level
+        );
+        Ok(true)
     }
 
     async fn get_best_block_hash(&self) -> RpcResult<String> {
