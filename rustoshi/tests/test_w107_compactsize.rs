@@ -384,17 +384,25 @@ fn g16_varint_roundtrip_via_serialization() {
 // ────────────────────────────────────────────────────────────────
 #[test]
 fn g17_varint_multi_byte_known_vectors() {
-    // Cross-check against Core's serial test vectors (serialize.h comments):
-    //   128:  [0x80 0x00]
-    //   255:  [0x80 0x7F]
-    //   256:  [0x81 0x00]
-    // These are covered by snapshot::test_varint_known_byte_vectors already;
-    // we confirm the CompactSize layer doesn't confuse the two formats.
-    // CompactSize 128 → [0xFD, 0x80, 0x00] (3 bytes, not VarInt)
-    let mut buf = Vec::new();
-    write_compact_size(&mut buf, 128).unwrap();
-    assert_eq!(buf[0], 0xFD, "CompactSize must not be confused with VarInt format");
-    assert_eq!(buf.len(), 3);
+    // CompactSize is NOT Core's base-128 CVarInt (UTXO/undo serialization).
+    // The two formats diverge at 128: Core's CVarInt(128) is [0x80, 0x00], but
+    // CompactSize(128) is the single minimal byte [0x80] (128 < 0xFD=253).
+    // Confirm CompactSize never borrows the VarInt encoding, and spot-check the
+    // genuine multi-byte CompactSize forms (0xFD/0xFE prefix + value little-endian).
+    // Core ref: serialize.h WriteCompactSize (val<253 → 1 byte; ≤0xFFFF → 0xFD+u16;
+    // ≤0xFFFF_FFFF → 0xFE+u32). The 3-byte 0xFD form is reserved for 253..=0xFFFF,
+    // so 128 must NOT use it (that would be a non-minimal encoding Core rejects).
+    let cs = |v: u64| {
+        let mut b = Vec::new();
+        write_compact_size(&mut b, v).unwrap();
+        b
+    };
+    assert_eq!(cs(128), vec![0x80], "CompactSize(128) is single byte 0x80, not VarInt [0x80,0x00]");
+    assert_eq!(cs(252), vec![0xFC], "252 < 0xFD → single byte");
+    assert_eq!(cs(253), vec![0xFD, 0xFD, 0x00], "253 → 0xFD prefix + u16 LE");
+    assert_eq!(cs(256), vec![0xFD, 0x00, 0x01], "256 → 0xFD prefix + u16 LE");
+    assert_eq!(cs(0xFFFF), vec![0xFD, 0xFF, 0xFF], "0xFFFF → 0xFD prefix + u16 LE");
+    assert_eq!(cs(0x1_0000), vec![0xFE, 0x00, 0x00, 0x01, 0x00], "0x10000 → 0xFE prefix + u32 LE");
 }
 
 // ────────────────────────────────────────────────────────────────
