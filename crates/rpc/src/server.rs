@@ -4626,7 +4626,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         // ── Phase 3: build verbose response from local block data ────────────
         // (Used when CF_BLOCKS is populated; the Core fallback is the primary
         // production path for the current live fleet.)
-        let (height, next_hash, chainwork_hex, mediantime, best_height) = {
+        let (height, next_hash, chainwork_hex, mediantime, best_height, in_active_chain) = {
             let state = self.state.read().await;
             let store = BlockStore::new(&state.db);
 
@@ -4664,14 +4664,31 @@ impl RustoshiRpcServer for RpcServerImpl {
                 timestamps[timestamps.len() / 2] as u64
             };
 
-            (h, next_h, cw, mtp, state.best_height)
+            // Active-chain membership (Core ComputeNextBlockAndDepth): the
+            // active-chain block at `h` must be THIS block. A stale/fork block
+            // can be in the index but off the active chain. The `h <=
+            // best_height` guard rejects a block above the tip (get_hash_by_height
+            // can return a stale above-tip entry after a bare invalidateblock),
+            // matching getblockheader.
+            let in_active_chain = h <= state.best_height
+                && store
+                    .get_hash_by_height(h)
+                    .ok()
+                    .flatten()
+                    .map(|hh| hh == block_hash)
+                    .unwrap_or(false);
+            (h, next_h, cw, mtp, state.best_height, in_active_chain)
         };
 
-        let confirmations = if best_height >= height {
+        let confirmations = if in_active_chain {
             (best_height - height + 1) as i32
         } else {
-            0
+            -1
         };
+
+        // nextblockhash is only meaningful when this block is itself on the
+        // active chain (Core emits it only for in-chain, non-tip blocks).
+        let next_hash = if in_active_chain { next_hash } else { None };
 
         let prev_hash = if block.header.prev_block_hash != Hash256::ZERO {
             Some(block.header.prev_block_hash.to_hex())
@@ -4935,12 +4952,16 @@ impl RustoshiRpcServer for RpcServerImpl {
             // only for in-chain blocks that are not the tip. A header can be in
             // the index but NOT on the active chain (a stale/fork header), in
             // which case the active-chain hash at `height` differs from ours.
-            let in_active_chain = store
-                .get_hash_by_height(height)
-                .ok()
-                .flatten()
-                .map(|h| h == block_hash)
-                .unwrap_or(false);
+            // The `height <= best_height` guard rejects a block above the tip
+            // (get_hash_by_height can return a stale above-tip entry after a bare
+            // invalidateblock) so it reports confirmations -1, not 0.
+            let in_active_chain = height <= state.best_height
+                && store
+                    .get_hash_by_height(height)
+                    .ok()
+                    .flatten()
+                    .map(|h| h == block_hash)
+                    .unwrap_or(false);
 
             let next_hash = if in_active_chain && height < state.best_height {
                 store
