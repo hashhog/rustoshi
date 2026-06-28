@@ -13626,16 +13626,11 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Resolve block.
         let block = if let Some(bh_hex) = blockhash {
-            let bh_bytes = hex::decode(&bh_hex).map_err(|_| {
-                Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "Invalid blockhash")
-            })?;
-            if bh_bytes.len() != 32 {
-                return Err(Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "blockhash must be 32 bytes"));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bh_bytes);
-            arr.reverse();
-            let hash = Hash256(arr);
+            // ParseHashV: a malformed blockhash (non-hex / wrong-length) -> -8
+            // RPC_INVALID_PARAMETER at the parse boundary with Core's message
+            // (was -5 RPC_INVALID_ADDRESS_OR_KEY). parse_hash returns the
+            // display-order-reversed (internal) Hash256, as getblock uses it.
+            let hash = Self::parse_hash(&bh_hex)?;
             store.get_block(&hash).map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
                 .ok_or_else(|| Self::rpc_error(rpc_error::RPC_BLOCK_NOT_FOUND, "Block not found"))?
         } else {
