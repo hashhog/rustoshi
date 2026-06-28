@@ -1885,7 +1885,7 @@ mod tests {
     #[test]
     fn test_getblockchaininfo_testnet_chain() {
         let info = BlockchainInfo {
-            chain: "test4".to_string(),
+            chain: "testnet4".to_string(),
             blocks: 50000,
             headers: 50000,
             bestblockhash: "00000000".repeat(8),
@@ -1905,7 +1905,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&info).unwrap();
-        assert!(json.contains("\"chain\":\"test4\""));
+        assert!(json.contains("\"chain\":\"testnet4\""));
         // Core v31.99 parity: getblockchaininfo must NOT emit softforks.
         assert!(!json.contains("\"softforks\""));
     }

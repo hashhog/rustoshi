@@ -1347,8 +1347,8 @@ async fn rest_chaininfo(
 
     let chain_name = match rpc_state.params.network_id {
         rustoshi_consensus::params::NetworkId::Mainnet => "main",
-        rustoshi_consensus::params::NetworkId::Testnet3 => "test3",
-        rustoshi_consensus::params::NetworkId::Testnet4 => "test4",
+        rustoshi_consensus::params::NetworkId::Testnet3 => "test",
+        rustoshi_consensus::params::NetworkId::Testnet4 => "testnet4",
         rustoshi_consensus::params::NetworkId::Signet => "signet",
         rustoshi_consensus::params::NetworkId::Regtest => "regtest",
     };

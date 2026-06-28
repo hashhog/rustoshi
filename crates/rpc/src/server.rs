@@ -4432,10 +4432,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             1.0
         };
 
+        // Core GetChainTypeString (util/chaintype.cpp): testnet3 -> "test",
+        // testnet4 -> "testnet4" (was "test3"/"test4", which broke clients
+        // gating on chain=="testnet4").
         let chain_name = match state.params.network_id {
             NetworkId::Mainnet => "main",
-            NetworkId::Testnet3 => "test3",
-            NetworkId::Testnet4 => "test4",
+            NetworkId::Testnet3 => "test",
+            NetworkId::Testnet4 => "testnet4",
             NetworkId::Signet => "signet",
             NetworkId::Regtest => "regtest",
         };
@@ -6813,7 +6816,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                     weight: entry.weight as u32,
                     fee: BtcAmount::from_sats(entry.fee),
                     modifiedfee: BtcAmount::from_sats(modified_fee_sats),
-                    time: entry.time_added.elapsed().as_secs(),
+                    // Core: count_seconds(e.GetTime()) — the absolute Unix epoch
+                    // second the tx entered the pool, not its dwell time/age.
+                    time: entry.time_seconds as u64,
                     height: state.best_height,
                     descendantcount: entry.descendant_count as u32,
                     descendantsize: entry.descendant_size as u32,
@@ -7920,10 +7925,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             (1.0, "1d00ffff".to_string(), 0x1d00ffff_u32)
         };
 
+        // Core GetChainTypeString (util/chaintype.cpp): testnet3 -> "test",
+        // testnet4 -> "testnet4" (was "test3"/"test4", which broke clients
+        // gating on chain=="testnet4").
         let chain_name = match state.params.network_id {
             NetworkId::Mainnet => "main",
-            NetworkId::Testnet3 => "test3",
-            NetworkId::Testnet4 => "test4",
+            NetworkId::Testnet3 => "test",
+            NetworkId::Testnet4 => "testnet4",
             NetworkId::Signet => "signet",
             NetworkId::Regtest => "regtest",
         };
@@ -11507,7 +11515,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                     weight: entry.weight as u32,
                     fee: BtcAmount::from_sats(entry.fee),
                     modifiedfee: BtcAmount::from_sats(modified_fee_sats),
-                    time: entry.time_added.elapsed().as_secs(),
+                    // Core: count_seconds(e.GetTime()) — the absolute Unix epoch
+                    // second the tx entered the pool, not its dwell time/age.
+                    time: entry.time_seconds as u64,
                     height: state.best_height,
                     descendantcount: entry.descendant_count as u32,
                     descendantsize: entry.descendant_size as u32,
