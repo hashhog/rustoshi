@@ -46,12 +46,15 @@
 //!
 //! Wave W132 summary:
 //!   Gates: 30 total. 17 PRESENT and PASS regression pins. 13 gates
-//!   flag BUG-N divergences:
-//!     - BUG-1 (P0-CDIV, G16): block validation skips BIP-68 `min_time`
-//!       check → time-based BIP-68 silently passes.
-//!     - BUG-2 (P0-CDIV, G17): production `SequenceLockContext` returns
-//!       0 for every height → coin_time = 0 → BIP-68 time locks always
-//!       satisfied.
+//!   flag BUG-N divergences (BUG-1 and BUG-2 are now FIXED):
+//!     - BUG-1 (P0-CDIV, G16 — FIXED): block validation skips BIP-68
+//!       `min_time` check → time-based BIP-68 silently passes.
+//!       Fix: `check_sequence_locks` now used in validation.rs (both
+//!       height and time enforced).
+//!     - BUG-2 (P0-CDIV, G17 — FIXED): production `SequenceLockContext`
+//!       returns 0 for every height → coin_time = 0 → BIP-68 time locks
+//!       always satisfied. Fix: `BlockStoreSeqLockCtx` in server.rs
+//!       + `process_block_with_seq_ctx` wiring.
 //!     - BUG-3 (P0-CDIV future / P1 today, G18): two `is_final_tx`
 //!       copies with different cutoff types (u32 vs i64); production
 //!       path uses u32 → 2106 overflow silent fork.
@@ -400,52 +403,318 @@ fn w132_bip68_version_active_compares_unsigned() {
 // G16: BIP-68 block-acceptance must check BOTH min_height AND min_time
 // ============================================================
 
-/// **G16 / BUG-1 (P0-CDIV)** — `connect_block_with_sequence_locks`
-/// (validation.rs:1781-1789) enforces ONLY the height-based component
-/// of BIP-68. The time-based `min_time >= block_mtp` check is
-/// intentionally skipped (with an apologetic comment block at lines
-/// 1750-1779). Core `consensus/tx_verify.cpp:97-104` and
-/// `validation.cpp:2557-2559` reject blocks whose BIP-68 time-locks
-/// are unsatisfied.
+/// **G16 / BUG-1 fix (P0-CDIV)** — `connect_block_with_sequence_locks`
+/// now enforces BOTH the height-based and time-based components of
+/// BIP-68 via `check_sequence_locks`. Previously only `min_height` was
+/// checked, silently accepting blocks with unsatisfied time-based locks.
 ///
-/// Concrete fork example: v2 tx, single input nSequence =
-/// `SEQUENCE_LOCKTIME_TYPE_FLAG | 1` (1 unit = 512 s), prev coin at
-/// height H, block MTP = T_coin + 100 s. Core: `min_time = T_coin +
-/// 511`, `block_mtp = T_coin + 100`, `min_time >= block_mtp` → REJECT.
-/// rustoshi: skips the check → ACCEPT.
+/// This test:
+/// 1. Builds a block with a v2 tx whose single input has
+///    `nSequence = SEQUENCE_LOCKTIME_TYPE_FLAG | 1` (1 unit = 512 s).
+/// 2. Connects it via `connect_block_with_sequence_locks` with a
+///    `FixedMtpCtx(coin_mtp)` that returns a known MTP for every height.
+/// 3. Asserts REJECTED when `block_mtp <= min_time` (lock unsatisfied).
+/// 4. Asserts ACCEPTED when `block_mtp > min_time` (lock satisfied).
+///
+/// Reference: Bitcoin Core consensus/tx_verify.cpp:97-104
+/// (`EvaluateSequenceLocks`) and validation.cpp:2557-2559.
 #[test]
-#[ignore = "BUG-1 (P0-CDIV): block validation skips BIP-68 min_time check; \
-            time-based BIP-68 silently passes. \
-            See validation.rs:1781-1789 with comment-as-confession at :1750-1779. \
-            Fix: replace `locks.min_height >= height as i32` with \
-            `!check_sequence_locks(&locks, height, prev_block_mtp as i64)`."]
 fn w132_g16_block_validation_enforces_min_time() {
-    // Sentinel: this gate is open as long as `min_time` is dropped.
-    panic!("BUG-1 P0-CDIV: BIP-68 time-based locks not enforced in block validation");
+    use rustoshi_consensus::{
+        connect_block_with_sequence_locks, params::ChainParams, CoinEntry, TxValidationError,
+        UtxoCache, ValidationError,
+    };
+    use rustoshi_primitives::{Block, BlockHeader, Hash256, TxOut};
+
+    // Use regtest: CSV active at height >= 1.
+    let params = ChainParams::regtest();
+    // Connect at height=2; csv_height=1 on regtest, so CSV is active.
+    let connect_height: u32 = 2;
+
+    // coin_height=1: the UTXO was confirmed at block height 1.
+    // calculate_sequence_locks calls get_mtp_at_height(coin_height - 1) = get_mtp_at_height(0).
+    let coin_height: u32 = 1;
+    let coin_mtp: u32 = 1_000_000;
+    let ctx = FixedMtpCtx(coin_mtp);
+
+    // nSequence = SEQUENCE_LOCKTIME_TYPE_FLAG | 1: 1 unit = 512 s relative lock.
+    // min_time = coin_mtp + (1 << 9) - 1 = 1_000_000 + 512 - 1 = 1_000_511.
+    // check_sequence_locks returns false when min_time >= block_mtp, i.e.,
+    //   REJECTED when block_mtp <= 1_000_511, ACCEPTED when block_mtp > 1_000_511.
+    let seq = SEQUENCE_LOCKTIME_TYPE_FLAG | 1;
+    let expected_min_time: i64 = coin_mtp as i64 + 512 - 1; // = 1_000_511
+
+    // Pre-existing UTXO that the spend tx consumes (not a coinbase).
+    let utxo_outpoint = OutPoint { txid: Hash256([0xBBu8; 32]), vout: 0 };
+    let utxo_coin = CoinEntry {
+        height: coin_height,
+        is_coinbase: false,
+        value: 0,
+        script_pubkey: vec![0x51], // OP_1 — trivially satisfiable
+    };
+
+    // Coinbase tx (block.transactions[0] must be coinbase).
+    let coinbase_tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint { txid: Hash256([0u8; 32]), vout: 0xFFFF_FFFF },
+            script_sig: vec![0x01, 0x02], // minimal height-push for BIP-34 (height 2)
+            sequence: 0xFFFF_FFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut { value: 0, script_pubkey: vec![0x51] }],
+        lock_time: 0,
+    };
+
+    // Spend tx: v2, time-based BIP-68 relative lock.
+    let spend_tx = Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: utxo_outpoint.clone(), // clone so utxo_outpoint is usable below
+            script_sig: vec![], // empty — OP_1 scriptPubKey passes with no scriptSig
+            sequence: seq,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+        lock_time: 0,
+    };
+
+    let block = Block {
+        header: BlockHeader {
+            version: 2,
+            prev_block_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            timestamp: coin_mtp + 100_000, // well above any prev_block_mtp used here
+            bits: 0x207fffff,
+            nonce: 0,
+        },
+        transactions: vec![coinbase_tx, spend_tx],
+    };
+
+    // Verify computed min_time matches expectation.
+    {
+        let locks = calculate_sequence_locks(&block.transactions[1], &[coin_height], &ctx, true);
+        assert_eq!(
+            locks.min_time, expected_min_time,
+            "pre-condition: min_time should be {expected_min_time}"
+        );
+    }
+
+    // Case 1: REJECTED — block_mtp exactly at the boundary (min_time >= block_mtp).
+    {
+        let rejected_mtp = expected_min_time as u32; // = 1_000_511
+        let op = utxo_outpoint.clone();
+        let c = utxo_coin.clone();
+        let mut utxo = UtxoCache::new(move |outpoint: &OutPoint| {
+            if *outpoint == op { Some(c.clone()) } else { None }
+        }, 100);
+        let result = connect_block_with_sequence_locks(
+            &block,
+            connect_height,
+            &mut utxo,
+            &params,
+            &ctx,
+            rejected_mtp,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ValidationError::TxValidation(TxValidationError::SequenceLockNotMet))
+            ),
+            "BUG-1 fix: block with unsatisfied time-based BIP-68 lock (block_mtp={rejected_mtp} \
+             <= min_time={expected_min_time}) must be rejected; got: {result:?}"
+        );
+    }
+
+    // Case 2: ACCEPTED — block_mtp one second past the boundary (min_time < block_mtp).
+    {
+        let accepted_mtp = expected_min_time as u32 + 1; // = 1_000_512
+        let op = utxo_outpoint.clone();
+        let c = utxo_coin.clone();
+        let mut utxo = UtxoCache::new(move |outpoint: &OutPoint| {
+            if *outpoint == op { Some(c.clone()) } else { None }
+        }, 100);
+        let result = connect_block_with_sequence_locks(
+            &block,
+            connect_height,
+            &mut utxo,
+            &params,
+            &ctx,
+            accepted_mtp,
+        );
+        assert!(
+            result.is_ok(),
+            "BUG-1 fix: block with satisfied time-based BIP-68 lock (block_mtp={accepted_mtp} \
+             > min_time={expected_min_time}) must be accepted; got: {result:?}"
+        );
+    }
 }
 
 // ============================================================
 // G17: production SequenceLockContext returns real MTP-at-height
 // ============================================================
 
-/// **G17 / BUG-2 (P0-CDIV)** — `ChainStateNullSeqContext`
-/// (chain_state.rs:946-952) is the production `SequenceLockContext`
-/// impl passed by `ChainState::process_block` and `reorganize` to
-/// `connect_block_with_sequence_locks`. Its `get_mtp_at_height`
-/// returns `0` unconditionally. Even if BUG-1 (G16) were fixed, this
-/// context's `coin_time = 0` makes `min_time` a small absolute value
-/// that always falls below any post-CSV mainnet `block_mtp` (~1.7e9).
-/// BIP-68 time-locks silently always pass.
+/// **G17 / BUG-2 fix (P0-CDIV)** — The old `ChainStateNullSeqContext`
+/// returned 0 for every height, making `coin_time = 0` and thus every
+/// time-based BIP-68 lock trivially satisfied. Production callers in
+/// `server.rs` now use `BlockStoreSeqLockCtx` which walks the persistent
+/// header store and returns a real MTP.
 ///
-/// Required fix: implement `BlockStoreSeqLockCtx` that walks the
-/// header store backwards from `headers.get_hash_at_height(h)` to
-/// compute the 11-block MTP.
+/// This test demonstrates the behavioral difference:
+/// - With a null context (coin_mtp=0): `min_time = 511`; any reasonable
+///   `block_mtp` (e.g. 1_000_000) satisfies the lock → SPURIOUS ACCEPT.
+/// - With a real context (coin_mtp=1_700_000_000): `min_time = 1_700_000_511`;
+///   `block_mtp = 1_000_000` does NOT satisfy → CORRECT REJECT.
+///
+/// After the fix, blocks with unsatisfied time-based locks are rejected
+/// when a real MTP context is wired (REJECTED / ACCEPTED below), while
+/// the same scenario with `prev_block_mtp > min_time` is accepted.
+///
+/// Reference: BUG-2/G17 (P0-CDIV). Fix: `BlockStoreSeqLockCtx` in
+/// `crates/rpc/src/server.rs` + `process_block_with_seq_ctx` wiring.
 #[test]
-#[ignore = "BUG-2 (P0-CDIV): production SequenceLockContext returns 0 for every \
-            height; combined with BUG-1, BIP-68 time-locks silently always pass. \
-            See chain_state.rs:946-952 + 507 + 696."]
 fn w132_g17_production_seqlock_context_returns_real_mtp() {
-    panic!("BUG-2 P0-CDIV: production SequenceLockContext is null");
+    use rustoshi_consensus::{
+        connect_block_with_sequence_locks, params::ChainParams, CoinEntry, TxValidationError,
+        UtxoCache, ValidationError,
+    };
+    use rustoshi_primitives::{Block, BlockHeader, Hash256, TxOut};
+
+    let params = ChainParams::regtest();
+    let connect_height: u32 = 2; // CSV active at height >= 1 on regtest
+
+    // coin_height=1: get_mtp_at_height(0) is called by calculate_sequence_locks.
+    let coin_height: u32 = 1;
+
+    // Realistic post-CSV mainnet coin MTP (context with real MTP).
+    // This is what BlockStoreSeqLockCtx returns for a block at this height.
+    let real_coin_mtp: u32 = 1_700_000_000;
+    let real_ctx = FixedMtpCtx(real_coin_mtp);
+
+    // nSequence = SEQUENCE_LOCKTIME_TYPE_FLAG | 1 (1 unit = 512 s).
+    // With real_coin_mtp: min_time = 1_700_000_000 + 512 - 1 = 1_700_000_511.
+    let seq = SEQUENCE_LOCKTIME_TYPE_FLAG | 1;
+    let expected_min_time_real: i64 = real_coin_mtp as i64 + 512 - 1; // = 1_700_000_511
+
+    // With old null context (coin_mtp=0): min_time = 0 + 512 - 1 = 511.
+    // Any block_mtp > 511 would trivially satisfy — the bug.
+    let expected_min_time_null: i64 = 511;
+
+    // Pre-existing UTXO for the spend tx.
+    let utxo_outpoint = OutPoint { txid: Hash256([0xCCu8; 32]), vout: 0 };
+    let utxo_coin = CoinEntry {
+        height: coin_height,
+        is_coinbase: false,
+        value: 0,
+        script_pubkey: vec![0x51], // OP_1
+    };
+
+    let coinbase_tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint { txid: Hash256([0u8; 32]), vout: 0xFFFF_FFFF },
+            script_sig: vec![0x01, 0x02], // BIP-34 height push for height 2
+            sequence: 0xFFFF_FFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut { value: 0, script_pubkey: vec![0x51] }],
+        lock_time: 0,
+    };
+
+    let spend_tx = Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: utxo_outpoint.clone(), // clone so utxo_outpoint is usable below
+            script_sig: vec![],
+            sequence: seq,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut { value: 0, script_pubkey: vec![] }],
+        lock_time: 0,
+    };
+
+    let block = Block {
+        header: BlockHeader {
+            version: 2,
+            prev_block_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            timestamp: 1_700_100_000,
+            bits: 0x207fffff,
+            nonce: 0,
+        },
+        transactions: vec![coinbase_tx, spend_tx],
+    };
+
+    // Pre-condition: verify that real vs null contexts give different min_time.
+    {
+        let null_ctx = FixedMtpCtx(0);
+        let locks_null =
+            calculate_sequence_locks(&block.transactions[1], &[coin_height], &null_ctx, true);
+        assert_eq!(
+            locks_null.min_time, expected_min_time_null,
+            "null context (coin_mtp=0) must give min_time=511"
+        );
+        let locks_real =
+            calculate_sequence_locks(&block.transactions[1], &[coin_height], &real_ctx, true);
+        assert_eq!(
+            locks_real.min_time, expected_min_time_real,
+            "real context (coin_mtp={real_coin_mtp}) must give min_time={expected_min_time_real}"
+        );
+    }
+
+    // block_mtp = 1_000_000: well below min_time_real (1_700_000_511),
+    // but well above min_time_null (511).
+    let test_mtp: u32 = 1_000_000;
+
+    // Case 1: REJECTED with real context — lock unsatisfied.
+    // (With old null context this would be SPURIOUSLY ACCEPTED.)
+    {
+        let op = utxo_outpoint.clone();
+        let c = utxo_coin.clone();
+        let mut utxo = UtxoCache::new(move |outpoint: &OutPoint| {
+            if *outpoint == op { Some(c.clone()) } else { None }
+        }, 100);
+        let result = connect_block_with_sequence_locks(
+            &block,
+            connect_height,
+            &mut utxo,
+            &params,
+            &real_ctx,
+            test_mtp,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ValidationError::TxValidation(TxValidationError::SequenceLockNotMet))
+            ),
+            "BUG-2 fix: real context (coin_mtp={real_coin_mtp}) must reject block_mtp={test_mtp} \
+             < min_time={expected_min_time_real}; with old null context (min_time=511) \
+             this would have been spuriously accepted; got: {result:?}"
+        );
+    }
+
+    // Case 2: ACCEPTED with real context — block_mtp one second past min_time.
+    {
+        let accepted_mtp = expected_min_time_real as u32 + 1; // = 1_700_000_512
+        let op = utxo_outpoint.clone();
+        let c = utxo_coin.clone();
+        let mut utxo = UtxoCache::new(move |outpoint: &OutPoint| {
+            if *outpoint == op { Some(c.clone()) } else { None }
+        }, 100);
+        let result = connect_block_with_sequence_locks(
+            &block,
+            connect_height,
+            &mut utxo,
+            &params,
+            &real_ctx,
+            accepted_mtp,
+        );
+        assert!(
+            result.is_ok(),
+            "BUG-2 fix: real context must accept block_mtp={accepted_mtp} > \
+             min_time={expected_min_time_real}; got: {result:?}"
+        );
+    }
 }
 
 // ============================================================

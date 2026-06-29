@@ -414,7 +414,7 @@ impl ChainState {
         f_requested: bool,
         current_time: u64,
     ) -> Result<(UndoData, u64), ValidationError> {
-        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None, current_time)
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None, current_time, &ChainStateNullSeqContext)
     }
 
     /// Variant of `process_block` that accepts an explicit `claimed_height`.
@@ -434,10 +434,34 @@ impl ChainState {
         claimed_height: u32,
         current_time: u64,
     ) -> Result<(UndoData, u64), ValidationError> {
-        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, Some(claimed_height), current_time)
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, Some(claimed_height), current_time, &ChainStateNullSeqContext)
     }
 
-    fn process_block_inner<U: UtxoView>(
+    /// Variant of `process_block` that accepts a real `SequenceLockContext`.
+    ///
+    /// Production callers in `crates/rpc/src/server.rs` use this with a
+    /// `BlockStoreSeqLockCtx` so that time-based BIP-68 relative lock-times
+    /// are correctly enforced (BUG-2/G17 fix). The plain `process_block` still
+    /// delegates with `ChainStateNullSeqContext` (returns MTP=0) for backward
+    /// compatibility with test callers that do not carry a block store.
+    ///
+    /// CONSENSUS NOTE: passing `ChainStateNullSeqContext` or any other null
+    /// context makes every time-based BIP-68 lock trivially satisfied. Use
+    /// this method — with a real store-backed context — whenever the node is
+    /// accepting blocks from the network or an RPC submission.
+    pub fn process_block_with_seq_ctx<U: UtxoView, C: SequenceLockContext>(
+        &mut self,
+        block: &Block,
+        utxo_cache: &mut U,
+        prev_block_mtp: u32,
+        f_requested: bool,
+        current_time: u64,
+        seq_ctx: &C,
+    ) -> Result<(UndoData, u64), ValidationError> {
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None, current_time, seq_ctx)
+    }
+
+    fn process_block_inner<U: UtxoView, C: SequenceLockContext>(
         &mut self,
         block: &Block,
         utxo_cache: &mut U,
@@ -445,6 +469,7 @@ impl ChainState {
         f_requested: bool,
         claimed_height: Option<u32>,
         current_time: u64,
+        seq_ctx: &C,
     ) -> Result<(UndoData, u64), ValidationError> {
         let hash = block.block_hash();
         let new_height = self.tip_height + 1;
@@ -549,7 +574,7 @@ impl ChainState {
         // both gaps to slip through silently (silent consensus split).
         contextual_check_block(block, new_height, &StubChainContext, &self.params)?;
 
-        // Connect block (validates scripts and updates UTXOs).
+        // Connect block (validates scripts, BIP-68, and updates UTXOs).
         //
         // We pass `prev_block_mtp` so that `is_final_tx` (BIP-113) sees
         // the parent's median-time-past as `lock_time_cutoff` once CSV is
@@ -558,20 +583,18 @@ impl ChainState {
         // activates (mainnet h>=419,328) — this is the regression that
         // wedged rustoshi at the snapshot tip on 2026-05-02.
         //
-        // For BIP-68 sequence-lock height-based MTP lookups (the
-        // `seq_context` argument), we still pass a null context: those
-        // queries need MTP at *arbitrary* historical heights, which
-        // requires the full block store. The current `NullSequenceLockContext`
-        // returns 0 for all heights, which only affects time-based
-        // BIP-68 sequence locks (a narrower path than BIP-113).  Wiring
-        // a real `SequenceLockContext` is tracked separately.
-        let null_seq_context = ChainStateNullSeqContext;
+        // `seq_ctx` provides MTP-at-height lookups for time-based BIP-68
+        // relative lock-time enforcement.  Production callers pass a
+        // `BlockStoreSeqLockCtx`; test callers may pass
+        // `ChainStateNullSeqContext` (returns 0), which makes every
+        // time-based lock trivially satisfied.  Use `process_block_with_seq_ctx`
+        // (with a real store-backed context) for production block acceptance.
         let (undo_data, fees) = connect_block_with_sequence_locks(
             block,
             new_height,
             utxo_cache,
             &self.params,
-            &null_seq_context,
+            seq_ctx,
             prev_block_mtp,
         )?;
 
@@ -634,6 +657,38 @@ impl ChainState {
         FB: Fn(&Hash256) -> Option<Block>,
         FU: Fn(&Hash256) -> Option<UndoData>,
         FI: Fn(&Hash256) -> Option<BlockIndexEntry>,
+    {
+        self.reorganize_with_seq_ctx(
+            new_tip_hash,
+            get_block,
+            get_undo,
+            get_block_index,
+            utxo_cache,
+            &ChainStateNullSeqContext,
+        )
+    }
+
+    /// Variant of `reorganize` that accepts a real `SequenceLockContext`.
+    ///
+    /// Production callers in `crates/rpc/src/server.rs` use this with a
+    /// `BlockStoreSeqLockCtx` so that time-based BIP-68 relative lock-times
+    /// are correctly enforced on blocks connected during reorgs.
+    /// The plain `reorganize` delegates with `ChainStateNullSeqContext`.
+    pub fn reorganize_with_seq_ctx<U, FB, FU, FI, C>(
+        &mut self,
+        new_tip_hash: Hash256,
+        get_block: &FB,
+        get_undo: &FU,
+        get_block_index: &FI,
+        utxo_cache: &mut U,
+        seq_ctx: &C,
+    ) -> Result<(usize, Vec<(Hash256, u32, UndoData)>), ValidationError>
+    where
+        U: UtxoView,
+        FB: Fn(&Hash256) -> Option<Block>,
+        FU: Fn(&Hash256) -> Option<UndoData>,
+        FI: Fn(&Hash256) -> Option<BlockIndexEntry>,
+        C: SequenceLockContext,
     {
         // Find the fork point
         let mut old_chain: Vec<Hash256> = Vec::new();
@@ -765,13 +820,12 @@ impl ChainState {
             if prev_block_mtp > 0 && block.header.timestamp <= prev_block_mtp {
                 return Err(ValidationError::TimeTooOld);
             }
-            let null_seq_context = ChainStateNullSeqContext;
             let (undo, _fees) = connect_block_with_sequence_locks(
                 &block,
                 new_height,
                 utxo_cache,
                 &self.params,
-                &null_seq_context,
+                seq_ctx,
                 prev_block_mtp,
             )?;
             self.tip_hash = *hash;
