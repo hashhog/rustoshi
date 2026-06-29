@@ -6910,19 +6910,23 @@ impl RustoshiRpcServer for RpcServerImpl {
                 let mem_entry = MempoolEntry {
                     vsize: entry.vsize as u32,
                     weight: entry.weight as u32,
-                    fee: BtcAmount::from_sats(entry.fee),
-                    modifiedfee: BtcAmount::from_sats(modified_fee_sats),
                     // Core: count_seconds(e.GetTime()) — the absolute Unix epoch
                     // second the tx entered the pool, not its dwell time/age.
                     time: entry.time_seconds as u64,
                     height: state.best_height,
                     descendantcount: entry.descendant_count as u32,
                     descendantsize: entry.descendant_size as u32,
-                    descendantfees: entry.descendant_fees,
                     ancestorcount: entry.ancestor_count as u32,
                     ancestorsize: entry.ancestor_size as u32,
-                    ancestorfees: entry.ancestor_fees,
                     wtxid: entry.tx.wtxid().to_hex(),
+                    // Nested fees object matching Bitcoin Core's entryToJSON shape
+                    // (rpc/mempool.cpp:527-532): base, modified, ancestor, descendant.
+                    fees: MempoolFees {
+                        base: BtcAmount::from_sats(entry.fee),
+                        modified: BtcAmount::from_sats(modified_fee_sats),
+                        ancestor: BtcAmount::from_sats(entry.ancestor_fees),
+                        descendant: BtcAmount::from_sats(entry.descendant_fees),
+                    },
                     depends: vec![],
                     spentby: vec![],
                     bip125_replaceable: false,
@@ -8143,7 +8147,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                         addr: info.addr.to_string(),
                         addrbind: None,
                         addrlocal: None,
-                        network: "ipv4".to_string(),
+                        network: peer_network_str(&info.addr),
                         services: format!("{:016x}", info.services),
                         servicesnames: decode_services(info.services),
                         relaytxes: info.relay,
@@ -11613,19 +11617,23 @@ impl RustoshiRpcServer for RpcServerImpl {
                 let mem_entry = MempoolEntry {
                     vsize: entry.vsize as u32,
                     weight: entry.weight as u32,
-                    fee: BtcAmount::from_sats(entry.fee),
-                    modifiedfee: BtcAmount::from_sats(modified_fee_sats),
                     // Core: count_seconds(e.GetTime()) — the absolute Unix epoch
                     // second the tx entered the pool, not its dwell time/age.
                     time: entry.time_seconds as u64,
                     height: state.best_height,
                     descendantcount: entry.descendant_count as u32,
                     descendantsize: entry.descendant_size as u32,
-                    descendantfees: entry.descendant_fees,
                     ancestorcount: entry.ancestor_count as u32,
                     ancestorsize: entry.ancestor_size as u32,
-                    ancestorfees: entry.ancestor_fees,
                     wtxid: entry.tx.wtxid().to_hex(),
+                    // Nested fees object matching Bitcoin Core's entryToJSON shape
+                    // (rpc/mempool.cpp:527-532): base, modified, ancestor, descendant.
+                    fees: MempoolFees {
+                        base: BtcAmount::from_sats(entry.fee),
+                        modified: BtcAmount::from_sats(modified_fee_sats),
+                        ancestor: BtcAmount::from_sats(entry.ancestor_fees),
+                        descendant: BtcAmount::from_sats(entry.descendant_fees),
+                    },
                     depends: vec![],
                     spentby: vec![],
                     bip125_replaceable: replaceable,
@@ -11839,24 +11847,40 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         if verbose {
             // Build JSON manually to preserve BtcAmount's 8-decimal format.
+            // Use MempoolEntry for each ancestor so the fees sub-object shape
+            // matches Core's entryToJSON (rpc/mempool.cpp:508-568).
             let mut json = String::from("{");
             let mut first = true;
             for ancestor_txid in &ancestors {
                 if let Some(entry) = state.mempool.get(ancestor_txid) {
                     if !first { json.push(','); }
                     first = false;
-                    let fee = BtcAmount::from_sats(entry.fee);
-                    let fee_str = serde_json::to_string(&fee).unwrap();
-                    json.push_str(&format!(
-                        "\"{}\":{{\"vsize\":{},\"weight\":{},\"fee\":{},\"ancestorcount\":{},\"ancestorsize\":{},\"ancestorfees\":{}}}",
-                        ancestor_txid,
-                        entry.vsize,
-                        entry.weight,
-                        fee_str,
-                        entry.ancestor_count,
-                        entry.ancestor_size,
-                        entry.ancestor_fees,
-                    ));
+                    let modified_fee_sats = rustoshi_consensus::mempool::Mempool::get_modified_fee(entry);
+                    let mem_entry = MempoolEntry {
+                        vsize: entry.vsize as u32,
+                        weight: entry.weight as u32,
+                        time: entry.time_seconds as u64,
+                        height: state.best_height,
+                        descendantcount: entry.descendant_count as u32,
+                        descendantsize: entry.descendant_size as u32,
+                        ancestorcount: entry.ancestor_count as u32,
+                        ancestorsize: entry.ancestor_size as u32,
+                        wtxid: entry.tx.wtxid().to_hex(),
+                        fees: MempoolFees {
+                            base: BtcAmount::from_sats(entry.fee),
+                            modified: BtcAmount::from_sats(modified_fee_sats),
+                            ancestor: BtcAmount::from_sats(entry.ancestor_fees),
+                            descendant: BtcAmount::from_sats(entry.descendant_fees),
+                        },
+                        depends: vec![],
+                        spentby: vec![],
+                        bip125_replaceable: false,
+                        unbroadcast: false,
+                    };
+                    json.push('"');
+                    json.push_str(&ancestor_txid.to_hex());
+                    json.push_str("\":");
+                    json.push_str(&serde_json::to_string(&mem_entry).unwrap());
                 }
             }
             json.push('}');
@@ -11890,24 +11914,40 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         if verbose {
             // Build JSON manually to preserve BtcAmount's 8-decimal format.
+            // Use MempoolEntry for each descendant so the fees sub-object shape
+            // matches Core's entryToJSON (rpc/mempool.cpp:508-568).
             let mut json = String::from("{");
             let mut first = true;
             for d in &descendants {
                 if let Some(entry) = state.mempool.get(d) {
                     if !first { json.push(','); }
                     first = false;
-                    let fee = BtcAmount::from_sats(entry.fee);
-                    let fee_str = serde_json::to_string(&fee).unwrap();
-                    json.push_str(&format!(
-                        "\"{}\":{{\"vsize\":{},\"weight\":{},\"fee\":{},\"descendantcount\":{},\"descendantsize\":{},\"descendantfees\":{}}}",
-                        d,
-                        entry.vsize,
-                        entry.weight,
-                        fee_str,
-                        entry.descendant_count,
-                        entry.descendant_size,
-                        entry.descendant_fees,
-                    ));
+                    let modified_fee_sats = rustoshi_consensus::mempool::Mempool::get_modified_fee(entry);
+                    let mem_entry = MempoolEntry {
+                        vsize: entry.vsize as u32,
+                        weight: entry.weight as u32,
+                        time: entry.time_seconds as u64,
+                        height: state.best_height,
+                        descendantcount: entry.descendant_count as u32,
+                        descendantsize: entry.descendant_size as u32,
+                        ancestorcount: entry.ancestor_count as u32,
+                        ancestorsize: entry.ancestor_size as u32,
+                        wtxid: entry.tx.wtxid().to_hex(),
+                        fees: MempoolFees {
+                            base: BtcAmount::from_sats(entry.fee),
+                            modified: BtcAmount::from_sats(modified_fee_sats),
+                            ancestor: BtcAmount::from_sats(entry.ancestor_fees),
+                            descendant: BtcAmount::from_sats(entry.descendant_fees),
+                        },
+                        depends: vec![],
+                        spentby: vec![],
+                        bip125_replaceable: false,
+                        unbroadcast: false,
+                    };
+                    json.push('"');
+                    json.push_str(&d.to_hex());
+                    json.push_str("\":");
+                    json.push_str(&serde_json::to_string(&mem_entry).unwrap());
                 }
             }
             json.push('}');
@@ -17096,6 +17136,32 @@ fn connection_type_str(ct: rustoshi_network::ConnectionType) -> &'static str {
         rustoshi_network::ConnectionType::Manual => "manual",
         // Core ConnectionTypeAsString(FEELER) — short-lived addrman probe.
         rustoshi_network::ConnectionType::Feeler => "feeler",
+    }
+}
+
+/// Derive the Bitcoin Core `getpeerinfo.network` string from a peer's socket
+/// address — matching Bitcoin Core's `GetNetworkName(stats.m_network)` in
+/// `rpc/net.cpp:235`.
+///
+/// Mapping:
+///   IPv4 SocketAddr           → "ipv4"
+///   IPv6 SocketAddr, first byte 0xFC (CJDNS_PREFIX, netaddress.h:83) → "cjdns"
+///   IPv6 SocketAddr, other    → "ipv6"
+///
+/// Tor v3 and I2P peers have bespoke address types that don't flow through a
+/// standard `SocketAddr`, so they cannot be detected here; rustoshi currently
+/// only connects over clearnet (IPv4/IPv6 TCP) so this covers all live cases.
+fn peer_network_str(addr: &std::net::SocketAddr) -> String {
+    match addr {
+        std::net::SocketAddr::V4(_) => "ipv4".to_string(),
+        std::net::SocketAddr::V6(v6) => {
+            // CJDNS: fc00::/8 — first byte is 0xFC (Bitcoin Core netaddress.h:83).
+            if v6.ip().octets()[0] == 0xFC {
+                "cjdns".to_string()
+            } else {
+                "ipv6".to_string()
+            }
+        }
     }
 }
 
