@@ -1911,46 +1911,27 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
             return Err(ValidationError::SigopsLimitExceeded(block_sigop_cost));
         }
 
-        // BIP-68: Check sequence locks
-        // BIP-68 only applies if tx version >= 2 and CSV is active.
+        // BIP-68 / CSV: enforce BOTH height-based and time-based relative
+        // lock-times via the unified `check_sequence_locks` helper.
         //
-        // We evaluate ONLY the height-based component of BIP-68 here and
-        // defer the time-based component to the BIP-112 OP_CSV opcode at
-        // script-eval time.  Reason: rustoshi's `process_block` wires a
-        // `ChainStateNullSeqContext` (chain_state.rs:790-796) whose
-        // `get_mtp_at_height` returns 0 for every height because
-        // `ChainState` does not own a block store / header index that can
-        // serve MTP at arbitrary historical heights.  With `coin_time = 0`
-        // the time-based comparison `min_time = lock_value << 9 - 1` is
-        // structurally meaningless — it always falls below any post-CSV
-        // mainnet `block_mtp` (~1.7e9), so time-based BIP-68 silently
-        // passes regardless of whether the lock is satisfied.  That is
-        // an under-rejection / consensus-split bug under a malicious-miner
-        // scenario.  Until a real `SequenceLockContext` (DB-backed
-        // MTP-at-height lookup) is plumbed through process_block, the
-        // safe parity-with-Core behaviour is to skip the time-based
-        // branch here and rely on BIP-112 (OP_CSV) inside the script
-        // interpreter — which has full per-tx context and already runs
-        // for every input.
+        // Reference: Bitcoin Core consensus/tx_verify.cpp:39-104
+        // (`CalculateSequenceLocks`, `EvaluateSequenceLocks`) and
+        // validation.cpp:2557-2559 (ConnectBlock).
         //
-        // Height-based locks remain enforced here: `coin_height` from the
-        // UTXO row is correct for both external and intra-block prevouts,
-        // so the height comparison is byte-for-byte the same as Core.
-        //
-        // Reference: clearbit's matching resolution (clearbit 44454c1,
-        // src/validation.zig).  Cross-impl audit:
-        // CORE-PARITY-AUDIT/_ibd-context-wiring-cross-impl-2026-05-05.md.
-        // Bitcoin Core split: validation.cpp::CheckSequenceLocks
-        // (full chain-access path) + script/interpreter.cpp OP_CSV
-        // (script-eval path with full per-tx sighash context).
+        // `seq_context.get_mtp_at_height(h)` must return the MTP of the
+        // active-chain block at height h, backed by the persistent header
+        // store.  Callers MUST supply a real `BlockStoreSeqLockCtx` for
+        // production block validation.  A null/zero context (the old
+        // `ChainStateNullSeqContext`) made every time-based lock trivially
+        // satisfied — that was BUG-2/G17 (P0-CDIV chain split).
+        // Previously only `min_height` was checked here, skipping `min_time`
+        // entirely — that was BUG-1/G16 (P0-CDIV chain split).
         let enforce_bip68 = bip68_version_active(tx.version) && csv_active;
         if enforce_bip68 {
             let locks = calculate_sequence_locks(tx, &spent_heights, seq_context, true);
-            // Height-only check: ignore `min_time` because the wired
-            // `SequenceLockContext` cannot provide real MTP-at-height
-            // (see comment above).  Time-based locks are enforced via
-            // OP_CSV at script-eval.
-            if locks.min_height >= height as i32 {
+            // Enforce BOTH height and time components (EvaluateSequenceLocks,
+            // consensus/tx_verify.cpp:97-104).
+            if !check_sequence_locks(&locks, height, prev_block_mtp as i64) {
                 return Err(TxValidationError::SequenceLockNotMet.into());
             }
         }

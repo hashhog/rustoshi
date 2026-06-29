@@ -37,7 +37,8 @@ use rustoshi_consensus::{
     mempool::{Mempool, MempoolConfig, MAX_BIP125_RBF_SEQUENCE},
     orphanage::TxOrphanage,
     versionbits::{get_deployments, get_state_for, DeploymentId, ThresholdState},
-    ChainParams, ChainState, NetworkId, COIN, MAX_SEQUENCE_NONFINAL, SEQUENCE_FINAL,
+    ChainParams, ChainState, NetworkId, SequenceLockContext, COIN, MAX_SEQUENCE_NONFINAL,
+    SEQUENCE_FINAL,
 };
 use rustoshi_network::message::{InvType, InvVector, NetworkMessage};
 use rustoshi_network::peer_manager::PeerManager;
@@ -2325,6 +2326,73 @@ fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> u32 {
     timestamps[timestamps.len() / 2]
 }
 
+/// A `SequenceLockContext` backed by the persistent block/header store.
+///
+/// For each height h, `get_mtp_at_height(h)` returns the median-time-past
+/// of the active-chain block at height h — i.e., the median of the timestamps
+/// of blocks at heights h, h-1, …, max(h-10, 0), looked up via
+/// `get_hash_by_height` + `get_header`.
+///
+/// Uses Core's "use what you have" semantics (chain.h:233-245): if fewer than
+/// 11 ancestors are available (genesis-adjacent or partial store), the median
+/// is computed from however many ARE available.  Never returns 0 on a short
+/// walk — only returns 0 when the block at height h itself is not found in
+/// the store (which should not happen during normal block validation, since
+/// we only call this for coins whose UTXO height is confirmed in the store).
+///
+/// This is the fix for BUG-2/G17 (P0-CDIV): the old `ChainStateNullSeqContext`
+/// returned 0 for every height, making every time-based BIP-68 relative lock
+/// trivially satisfied.
+struct BlockStoreSeqLockCtx<'a> {
+    block_store: &'a BlockStore<'a>,
+}
+
+impl<'a> SequenceLockContext for BlockStoreSeqLockCtx<'a> {
+    fn get_mtp_at_height(&self, height: u32) -> u32 {
+        use rustoshi_consensus::params::MEDIAN_TIME_PAST_WINDOW;
+        // Look up the active-chain block hash at this height.
+        let hash = match self.block_store.get_hash_by_height(height) {
+            Ok(Some(h)) => h,
+            // Height not in the active chain index — should not happen during
+            // block validation (we only call this for UTXOs whose coin height
+            // is confirmed). Return 0 so the caller sees coin_time=0, which
+            // makes time-based locks trivially satisfied (conservative fallback,
+            // same as the null context we replaced).
+            _ => return 0,
+        };
+        // Walk back up to 11 ancestors collecting timestamps.
+        // Core's "use what you have" semantics: stop on the first header miss
+        // rather than aborting the whole walk (mirrors CBlockIndex::GetMedianTimePast,
+        // chain.h:233-245 `for (... && pindex; ..., pindex = pindex->pprev)`).
+        let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
+        let mut current = hash;
+        for _ in 0..MEDIAN_TIME_PAST_WINDOW {
+            match self.block_store.get_header(&current) {
+                Ok(Some(header)) => {
+                    timestamps.push(header.timestamp);
+                    if header.prev_block_hash == Hash256::ZERO {
+                        break; // reached the genesis sentinel
+                    }
+                    current = header.prev_block_hash;
+                }
+                // Partial walk — use whatever was collected rather than 0.
+                // This is the BUG-5/G20 fix: Core never aborts to 0 on a
+                // missing ancestor; it computes the median of what it got.
+                _ => break,
+            }
+        }
+        if timestamps.is_empty() {
+            // We got a valid hash_by_height but could not read its header.
+            // Extremely unlikely in normal operation; 0 is the safe fallback
+            // (same behavior as the null context, conservatively false-accepts
+            // rather than false-rejects or panics).
+            return 0;
+        }
+        timestamps.sort_unstable();
+        timestamps[timestamps.len() / 2]
+    }
+}
+
 /// Recompute the consensus-mandated `nBits` for the header that extends
 /// `parent_hash`, by walking the stored ancestor chain and running rustoshi's
 /// real `get_next_work_required` (the SAME function the miner/block-template
@@ -3180,19 +3248,24 @@ pub fn try_attach_and_reorg(
         ));
     }
 
-    // `reorganize` surfaces the per-block undo data for every block it
-    // connects on the new branch (ascending height order). We persist that
-    // undo (so a later reorg back across these blocks can disconnect them)
-    // and feed its spent-prevout scriptPubKeys into the block filter index
-    // below.
+    // `reorganize_with_seq_ctx` surfaces the per-block undo data for every
+    // block it connects on the new branch (ascending height order). We persist
+    // that undo (so a later reorg back across these blocks can disconnect them)
+    // and feed its spent-prevout scriptPubKeys into the block filter index below.
+    //
+    // BlockStoreSeqLockCtx provides real MTP-at-height lookups (BUG-2/G17 fix)
+    // so that time-based BIP-68 relative lock-times are enforced on reorg-
+    // connected blocks, exactly as on the main process_block path.
+    let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
     let (_disconnected_count, connected_blocks): (usize, Vec<(Hash256, u32, validation::UndoData)>) =
         chain_state
-            .reorganize(
+            .reorganize_with_seq_ctx(
                 *block_hash,
                 &get_block,
                 &get_undo,
                 &get_block_index,
                 &mut utxo_view,
+                &seq_ctx,
             )
             .map_err(|e| format!("reorganize: {}", e))?;
 
@@ -5428,12 +5501,14 @@ impl RustoshiRpcServer for RpcServerImpl {
                 let prev_block_mtp =
                     compute_prev_block_mtp(&store, &block.header.prev_block_hash);
 
-                match chain_state.process_block(
+                let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
+                match chain_state.process_block_with_seq_ctx(
                     block,
                     &mut coins,
                     prev_block_mtp,
                     /* f_requested */ true,
                     rustoshi_consensus::current_time_secs(),
+                    &seq_ctx,
                 ) {
                     Ok(_) => {}
                     Err(e) => {
@@ -7418,7 +7493,11 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Apply the fTooFarAhead anti-DoS gate.  A block submitted via RPC
         // extends the active tip by definition (height = best_height + 1),
         // so the gate can never fire here in practice (1 ≤ MIN_BLOCKS_TO_KEEP).
-        match chain_state.process_block(&block, &mut utxo_view, prev_block_mtp, false, rustoshi_consensus::current_time_secs()) {
+        //
+        // Use process_block_with_seq_ctx + BlockStoreSeqLockCtx so that
+        // time-based BIP-68 relative lock-times are enforced (BUG-1+2 fix).
+        let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
+        match chain_state.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, false, rustoshi_consensus::current_time_secs(), &seq_ctx) {
             Ok((undo_data, _fees)) => {
                 // Store header and block data
                 if let Err(e) = store.put_header(&block_hash, &block.header) {
@@ -15291,7 +15370,11 @@ impl RpcServerImpl {
 
         // f_requested=true: generateblock/generatetoaddress blocks are
         // self-mined (trusted path) — no fTooFarAhead guard needed.
-        match chain_state.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
+        //
+        // Use process_block_with_seq_ctx + BlockStoreSeqLockCtx so that
+        // time-based BIP-68 relative lock-times are enforced (BUG-1+2 fix).
+        let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
+        match chain_state.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &seq_ctx) {
             Ok((_undo_data, _fees)) => {
                 // Store the raw block bytes (after validation succeeds, matching
                 // submit_block's ordering to avoid persisting invalid data).
