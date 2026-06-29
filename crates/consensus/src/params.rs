@@ -4,6 +4,7 @@
 //! genesis blocks, and soft fork activation heights for mainnet, testnet3,
 //! testnet4, signet, and regtest.
 
+use crate::script::ScriptFlags;
 use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint, Transaction, TxIn, TxOut};
 use std::collections::BTreeMap;
 
@@ -552,6 +553,19 @@ pub struct ChainParams {
     // Reference: Bitcoin Core validation.cpp:2201-2202 (DisconnectBlock).
     pub bip30_disconnect_exception_blocks: Vec<(u32, Hash256)>,
 
+    // Per-block script flag exceptions for historical blocks that violate the
+    // script rules that would normally apply at their height.  Maps block hashes
+    // (internal byte order, same convention as bip30_exception_blocks) to the
+    // exact ScriptFlags that MUST be used when validating that block, bypassing
+    // the usual by-height derivation.
+    //
+    // Bitcoin Core equivalent: validation.cpp GetBlockScriptFlags,
+    // g_script_flag_exceptions (kernel/chainparams.cpp).
+    //
+    // Populated for mainnet (2 entries) and testnet3 (1 entry).
+    // Empty for testnet4, signet, and regtest (no known violators).
+    pub script_flag_exceptions: BTreeMap<Hash256, ScriptFlags>,
+
     // BIP-34 canonical chain hash: the block hash at BIP34Height on the canonical
     // chain.  Used to confirm we are on the known chain before skipping the BIP-30
     // duplicate-UTXO check for heights >= BIP34Height.  None means the check cannot
@@ -650,6 +664,32 @@ impl ChainParams {
                     .expect("valid bip30 disconnect exception hash"),
                 ),
             ],
+            // Script flag exceptions for mainnet historical blocks that violate current rules.
+            // Bitcoin Core: kernel/chainparams.cpp g_script_flag_exceptions (mainnet).
+            script_flag_exceptions: {
+                let mut m = BTreeMap::new();
+                // BIP16 P2SH violator (block 170060): a transaction in this block does not
+                // pass P2SH validation.  Must be validated with NO script flags (NONE).
+                // Bitcoin Core: g_script_flag_exceptions entry 1.
+                m.insert(
+                    Hash256::from_hex(
+                        "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+                    )
+                    .expect("valid mainnet BIP16 exception hash"),
+                    ScriptFlags::default(),
+                );
+                // Taproot violator: one historical block violates taproot rules.
+                // Must be validated with P2SH + WITNESS only (taproot OFF, nothing else).
+                // Bitcoin Core: g_script_flag_exceptions entry 2.
+                m.insert(
+                    Hash256::from_hex(
+                        "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+                    )
+                    .expect("valid mainnet taproot exception hash"),
+                    ScriptFlags { verify_p2sh: true, verify_witness: true, ..Default::default() },
+                );
+                m
+            },
             // BIP-34 canonical chain hash at height 227,931 (mainnet).
             // Bitcoin Core kernel/chainparams.cpp:89-90.
             bip34_hash: Some(
@@ -857,6 +897,20 @@ impl ChainParams {
             taproot_height: 2032291, // testnet3 taproot approximate
             bip30_exception_blocks: vec![],
             bip30_disconnect_exception_blocks: vec![],
+            // Script flag exception for testnet3 BIP16 P2SH violator.
+            // Bitcoin Core: kernel/chainparams.cpp g_script_flag_exceptions (testnet3).
+            script_flag_exceptions: {
+                let mut m = BTreeMap::new();
+                // Testnet3 BIP16 P2SH violator: must be validated with NO script flags.
+                m.insert(
+                    Hash256::from_hex(
+                        "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105",
+                    )
+                    .expect("valid testnet3 BIP16 exception hash"),
+                    ScriptFlags::default(),
+                );
+                m
+            },
             // Testnet3 BIP34Hash from Bitcoin Core kernel/chainparams.cpp:213
             bip34_hash: Some(
                 Hash256::from_hex(
@@ -916,6 +970,8 @@ impl ChainParams {
             taproot_height: 1,
             bip30_exception_blocks: vec![],
             bip30_disconnect_exception_blocks: vec![],
+            // Testnet4 has no script flag exceptions.
+            script_flag_exceptions: BTreeMap::new(),
             // Testnet4: BIP34 active from genesis with null hash (Bitcoin Core
             // kernel/chainparams.cpp:455-456 — BIP34Hash = uint256{}).
             bip34_hash: None,
@@ -1008,6 +1064,8 @@ impl ChainParams {
             taproot_height: 1,
             bip30_exception_blocks: vec![],
             bip30_disconnect_exception_blocks: vec![],
+            // Signet has no script flag exceptions.
+            script_flag_exceptions: BTreeMap::new(),
             // Signet: BIP34 active from genesis with null hash.
             bip34_hash: None,
             assumed_valid_block: None,
@@ -1051,6 +1109,8 @@ impl ChainParams {
             taproot_height: 1,
             bip30_exception_blocks: vec![],
             bip30_disconnect_exception_blocks: vec![],
+            // Regtest has no script flag exceptions.
+            script_flag_exceptions: BTreeMap::new(),
             // Regtest: BIP34 always active from height 1; null BIP34Hash
             // (Bitcoin Core kernel/chainparams.cpp:536-537).
             bip34_hash: None,
