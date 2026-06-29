@@ -641,43 +641,72 @@ pub struct MempoolInfo {
     pub optimal: bool,
 }
 
-/// Entry in mempool for `getrawmempool` verbose mode.
+/// Nested fee object for `getmempoolentry` / `getrawmempool` verbose entries.
+///
+/// Bitcoin Core `entryToJSON` (rpc/mempool.cpp:527-532) builds a `fees`
+/// sub-object with four keys in this exact order: `base`, `modified`,
+/// `ancestor`, `descendant` (plus `chunk` for cluster-mempool, omitted here
+/// as a TODO until cluster mempool is implemented).  All values are BTC amounts
+/// (8 decimal places, matching `ValueFromAmount`).
+///
+/// Reference: bitcoin-core/src/rpc/mempool.cpp::entryToJSON (lines 527-533).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MempoolFees {
+    /// Base fee (unmodified) in BTC — serialized as Core's `%d.%08d`.
+    pub base: BtcAmount,
+    /// Modified fee (base + prioritisetransaction delta) in BTC.
+    pub modified: BtcAmount,
+    /// Total ancestor fees (including this tx) in BTC.
+    pub ancestor: BtcAmount,
+    /// Total descendant fees (including this tx) in BTC.
+    pub descendant: BtcAmount,
+    // TODO: `chunk` fee from cluster mempool (Bitcoin Core 31.99+ only);
+    // requires cluster-mempool tracking in consensus/mempool.rs before it
+    // can be populated.
+}
+
+/// Entry in mempool for `getrawmempool` verbose mode and `getmempoolentry`.
+///
+/// Field order matches Bitcoin Core's `entryToJSON`
+/// (bitcoin-core/src/rpc/mempool.cpp:508-568):
+///   vsize, weight, time, height,
+///   descendantcount, descendantsize, ancestorcount, ancestorsize,
+///   wtxid, fees{base, modified, ancestor, descendant},
+///   depends, spentby, bip125-replaceable, unbroadcast.
+///
+/// The old flat fields (`fee`, `modifiedfee`, `descendantfees`, `ancestorfees`)
+/// are REMOVED — they diverged from Core's wire shape and broke clients that
+/// parse the standard nested `fees` object.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MempoolEntry {
     /// Virtual size of transaction.
     pub vsize: u32,
     /// Transaction weight.
     pub weight: u32,
-    /// Transaction fee in BTC — serialized as Core's ValueFromAmount `%d.%08d`.
-    pub fee: BtcAmount,
-    /// Modified fee for mining prioritization — serialized as `%d.%08d`.
-    pub modifiedfee: BtcAmount,
-    /// Time transaction entered mempool.
+    /// Time transaction entered mempool (Unix epoch seconds).
     pub time: u64,
-    /// Block height when entered mempool.
+    /// Block height when transaction entered mempool.
     pub height: u32,
-    /// Number of descendant transactions.
+    /// Number of in-mempool descendant transactions (including this one).
     pub descendantcount: u32,
-    /// Total size of descendants.
+    /// Total virtual size of descendants (including this tx).
     pub descendantsize: u32,
-    /// Total fees of descendants.
-    pub descendantfees: u64,
-    /// Number of ancestor transactions.
+    /// Number of in-mempool ancestor transactions (including this one).
     pub ancestorcount: u32,
-    /// Total size of ancestors.
+    /// Total virtual size of ancestors (including this tx).
     pub ancestorsize: u32,
-    /// Total fees of ancestors.
-    pub ancestorfees: u64,
     /// Witness transaction ID.
     pub wtxid: String,
-    /// Transaction IDs this depends on.
+    /// Nested fee sub-object (base, modified, ancestor, descendant) in BTC.
+    pub fees: MempoolFees,
+    /// Transaction IDs this transaction depends on (unconfirmed parents).
     pub depends: Vec<String>,
-    /// Transaction IDs that depend on this.
+    /// Transaction IDs that spend outputs of this transaction.
     pub spentby: Vec<String>,
-    /// Whether transaction is BIP125-replaceable.
+    /// Whether transaction signals BIP-125 replaceability.
     #[serde(rename = "bip125-replaceable")]
     pub bip125_replaceable: bool,
-    /// Whether this transaction has been broadcast.
+    /// Whether this transaction has not yet been broadcast to the P2P network.
     pub unbroadcast: bool,
 }
 
@@ -2032,17 +2061,19 @@ mod tests {
         let entry = MempoolEntry {
             vsize: 250,
             weight: 1000,
-            fee: BtcAmount::from_btc(0.000025),
-            modifiedfee: BtcAmount::from_btc(0.000025),
             time: 1710000000,
             height: 850000,
             descendantcount: 1,
             descendantsize: 250,
-            descendantfees: 2500,
             ancestorcount: 0,
             ancestorsize: 0,
-            ancestorfees: 0,
             wtxid: "abcd".repeat(16),
+            fees: MempoolFees {
+                base: BtcAmount::from_btc(0.000025),
+                modified: BtcAmount::from_btc(0.000025),
+                ancestor: BtcAmount::from_sats(0),
+                descendant: BtcAmount::from_sats(2500),
+            },
             depends: vec!["1234".repeat(16)],
             spentby: vec![],
             bip125_replaceable: true,
@@ -2051,20 +2082,27 @@ mod tests {
 
         let json = serde_json::to_string(&entry).unwrap();
 
-        // Bitcoin Core mempool entry fields
-        assert!(json.contains("\"vsize\":250"));
-        assert!(json.contains("\"weight\":1000"));
-        assert!(json.contains("\"fee\":0.00002500"), "fee precision: {}", json);
-        assert!(json.contains("\"modifiedfee\":0.00002500"), "modifiedfee precision: {}", json);
-        assert!(json.contains("\"time\":"));
-        assert!(json.contains("\"height\":850000"));
-        assert!(json.contains("\"descendantcount\":1"));
-        assert!(json.contains("\"ancestorcount\":0"));
-        assert!(json.contains("\"wtxid\":"));
-        assert!(json.contains("\"depends\":"));
-        assert!(json.contains("\"spentby\":"));
-        assert!(json.contains("\"bip125-replaceable\":true"));
-        assert!(json.contains("\"unbroadcast\":false"));
+        // Bitcoin Core mempool entry fields (nested fees object, Core shape)
+        assert!(json.contains("\"vsize\":250"), "vsize: {}", json);
+        assert!(json.contains("\"weight\":1000"), "weight: {}", json);
+        assert!(json.contains("\"time\":"), "time: {}", json);
+        assert!(json.contains("\"height\":850000"), "height: {}", json);
+        assert!(json.contains("\"descendantcount\":1"), "descendantcount: {}", json);
+        assert!(json.contains("\"ancestorcount\":0"), "ancestorcount: {}", json);
+        assert!(json.contains("\"wtxid\":"), "wtxid: {}", json);
+        // Nested fees object — Core shape (not flat fee/modifiedfee fields)
+        assert!(json.contains("\"fees\":{"), "fees nested object: {}", json);
+        assert!(json.contains("\"base\":0.00002500"), "fees.base precision: {}", json);
+        assert!(json.contains("\"modified\":0.00002500"), "fees.modified precision: {}", json);
+        assert!(json.contains("\"ancestor\":0.00000000"), "fees.ancestor: {}", json);
+        assert!(json.contains("\"descendant\":0.00002500"), "fees.descendant: {}", json);
+        // Flat fee/modifiedfee must NOT appear at top level
+        assert!(!json.contains("\"fee\":"), "flat fee field must be absent: {}", json);
+        assert!(!json.contains("\"modifiedfee\":"), "flat modifiedfee must be absent: {}", json);
+        assert!(json.contains("\"depends\":"), "depends: {}", json);
+        assert!(json.contains("\"spentby\":"), "spentby: {}", json);
+        assert!(json.contains("\"bip125-replaceable\":true"), "bip125-replaceable: {}", json);
+        assert!(json.contains("\"unbroadcast\":false"), "unbroadcast: {}", json);
     }
 
     // ============================================================
