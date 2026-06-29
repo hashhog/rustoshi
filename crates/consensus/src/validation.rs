@@ -1697,7 +1697,12 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     seq_context: &C,
     prev_block_mtp: u32,
 ) -> Result<(UndoData, u64), ValidationError> {
-    let flags = script_flags_for_height(height, params);
+    // Compute block hash once at the top: used for script flag exception lookup AND
+    // BIP-30 duplicate-coinbase check below.  block_hash() is double-SHA256 of the
+    // header serialization, returned in internal (little-endian) byte order — the
+    // same convention used by bip30_exception_blocks and script_flag_exceptions.
+    let block_hash = block.block_hash();
+    let flags = script_flags_for_height(height, block_hash, params);
     let csv_active = height >= params.csv_height;
     let mut total_fees: u64 = 0;
     let mut spent_coins = Vec::new();
@@ -1755,7 +1760,6 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     //
     // Reference: Bitcoin Core validation.cpp ConnectBlock:2402-2476, IsBIP30Repeat():6189.
     let bip34_implies_bip30_limit: u32 = 1_983_702;
-    let block_hash = block.block_hash();
     let is_bip30_exception = params
         .bip30_exception_blocks
         .iter()
@@ -2540,7 +2544,17 @@ pub fn disconnect_block(
 ///
 /// NULLFAIL (BIP-146) is a STANDARD_SCRIPT_VERIFY_FLAG (policy only) per
 /// Bitcoin Core policy/policy.h:125.  It must NOT appear here.
-fn script_flags_for_height(height: u32, params: &ChainParams) -> ScriptFlags {
+fn script_flags_for_height(height: u32, block_hash: Hash256, params: &ChainParams) -> ScriptFlags {
+    // Per-block script flag exceptions (BIP16 violator + taproot violator).
+    // These historical blocks must be accepted with the flags active at the time
+    // they were mined, NOT the flags that would normally apply at their height.
+    // Bitcoin Core: validation.cpp GetBlockScriptFlags, g_script_flag_exceptions.
+    // The lookup uses internal byte order (same convention as bip30_exception_blocks:
+    // Hash256::from_hex reverses display→internal, block_hash() returns internal).
+    if let Some(override_flags) = params.script_flag_exceptions.get(&block_hash) {
+        return override_flags.clone();
+    }
+
     // NOTE: Do NOT add policy flags here!
     // CLEANSTACK, LOW_S, STRICTENC, MINIMALDATA, MINIMALIF, NULLFAIL,
     // WITNESS_PUBKEYTYPE, etc. are policy-only and must NOT be enforced
@@ -3375,7 +3389,7 @@ mod tests {
     #[test]
     fn script_flags_mainnet_genesis() {
         let params = ChainParams::mainnet();
-        let flags = script_flags_for_height(0, &params);
+        let flags = script_flags_for_height(0, Hash256::ZERO, &params);
 
         // Only P2SH should be enabled at genesis
         assert!(flags.verify_p2sh);
@@ -3387,7 +3401,7 @@ mod tests {
     #[test]
     fn script_flags_mainnet_post_segwit() {
         let params = ChainParams::mainnet();
-        let flags = script_flags_for_height(500000, &params);
+        let flags = script_flags_for_height(500000, Hash256::ZERO, &params);
 
         assert!(flags.verify_p2sh);
         assert!(flags.verify_dersig);
@@ -3401,7 +3415,7 @@ mod tests {
     #[test]
     fn script_flags_testnet4_all_active() {
         let params = ChainParams::testnet4();
-        let flags = script_flags_for_height(1, &params);
+        let flags = script_flags_for_height(1, Hash256::ZERO, &params);
 
         // All soft forks active from height 1 on testnet4
         assert!(flags.verify_p2sh);
@@ -3420,7 +3434,7 @@ mod tests {
         // per Bitcoin Core policy/policy.h:119-132.
         // Ref: Bitcoin Core validation.cpp:2250-2289.
         let params = ChainParams::mainnet();
-        let flags = script_flags_for_height(800000, &params);
+        let flags = script_flags_for_height(800000, Hash256::ZERO, &params);
 
         // These should all be false (policy only — never in consensus path)
         assert!(!flags.verify_strictenc);
@@ -3432,6 +3446,94 @@ mod tests {
         // verify_nullfail is policy-only (BIP-146 is NOT a consensus rule).
         // Bitcoin Core validation.cpp:2250-2289 does NOT set SCRIPT_VERIFY_NULLFAIL.
         assert!(!flags.verify_nullfail);
+    }
+
+    // Script-flag EXCEPTION tests (new: BIP16 violator + taproot violator)
+    // -----------------------------------------------------------------------
+    // Effectiveness proof: (a) the override fires for a known exception hash,
+    // returning the canonical override flags; (b) a NON-exception hash at the
+    // SAME height returns the normal by-height flags (proving the table is
+    // not over-triggering).
+    // Bitcoin Core: validation.cpp GetBlockScriptFlags, g_script_flag_exceptions.
+
+    #[test]
+    fn script_flags_exception_mainnet_bip16_violator_override() {
+        let params = ChainParams::mainnet();
+        // Mainnet BIP16 exception block (display order → internal via from_hex).
+        let bip16_exception = Hash256::from_hex(
+            "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+        )
+        .unwrap();
+
+        // (a) Exception hash at any height → override NONE (all flags false).
+        let exc_flags = script_flags_for_height(170_060, bip16_exception, &params);
+        assert!(!exc_flags.verify_p2sh,    "BIP16 exception: verify_p2sh must be OFF");
+        assert!(!exc_flags.verify_dersig,  "BIP16 exception: verify_dersig must be OFF");
+        assert!(!exc_flags.verify_witness, "BIP16 exception: verify_witness must be OFF");
+        assert!(!exc_flags.verify_taproot, "BIP16 exception: verify_taproot must be OFF");
+
+        // (b) Non-exception hash at the same height → normal by-height flags (P2SH on,
+        // DERSIG off since 170060 < bip66_height=363725).
+        let normal_flags = script_flags_for_height(170_060, Hash256::ZERO, &params);
+        assert!(normal_flags.verify_p2sh,    "normal path h=170060: verify_p2sh must be ON");
+        assert!(!normal_flags.verify_dersig, "normal path h=170060: verify_dersig must be OFF (<363725)");
+    }
+
+    #[test]
+    fn script_flags_exception_mainnet_taproot_violator_override() {
+        let params = ChainParams::mainnet();
+        // Mainnet taproot exception block.
+        let taproot_exception = Hash256::from_hex(
+            "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+        )
+        .unwrap();
+
+        // (a) Exception hash at a height where taproot would normally be active
+        //     → override P2SH + WITNESS only; taproot MUST be OFF.
+        let exc_flags = script_flags_for_height(750_000, taproot_exception, &params);
+        assert!(exc_flags.verify_p2sh,    "taproot exception: verify_p2sh must be ON");
+        assert!(exc_flags.verify_witness, "taproot exception: verify_witness must be ON");
+        assert!(!exc_flags.verify_taproot, "taproot exception: verify_taproot must be OFF");
+        assert!(!exc_flags.verify_dersig,  "taproot exception: verify_dersig must be OFF (only p2sh+witness)");
+
+        // (b) Non-exception hash at the same height → taproot ON (normal path).
+        let normal_flags = script_flags_for_height(750_000, Hash256::ZERO, &params);
+        assert!(normal_flags.verify_taproot, "normal path h=750000: verify_taproot must be ON (>=709632)");
+        assert!(normal_flags.verify_dersig,  "normal path h=750000: verify_dersig must be ON (>=363725)");
+    }
+
+    #[test]
+    fn script_flags_exception_testnet3_bip16_violator_override() {
+        let params = ChainParams::testnet3();
+        // Testnet3 BIP16 exception block.
+        let exc_hash = Hash256::from_hex(
+            "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105",
+        )
+        .unwrap();
+
+        // (a) Exception hash → NONE (all flags false).
+        let exc_flags = script_flags_for_height(0, exc_hash, &params);
+        assert!(!exc_flags.verify_p2sh, "testnet3 BIP16 exception: verify_p2sh must be OFF");
+
+        // (b) Non-exception hash at the same height → normal by-height flags.
+        let normal_flags = script_flags_for_height(0, Hash256::ZERO, &params);
+        assert!(normal_flags.verify_p2sh, "testnet3 normal path h=0: verify_p2sh must be ON");
+    }
+
+    #[test]
+    fn script_flags_exception_testnet4_no_exceptions() {
+        // testnet4 has no exceptions — all lookups must fall through to height-based flags.
+        let params = ChainParams::testnet4();
+        // Use the mainnet BIP16 exception hash: MUST NOT match on testnet4.
+        let mainnet_exc = Hash256::from_hex(
+            "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+        )
+        .unwrap();
+        let flags = script_flags_for_height(1, mainnet_exc, &params);
+        // testnet4 has all forks active from height 1, so verify_p2sh must be true
+        // (if this hash incorrectly triggered an exception it would return all-false).
+        assert!(flags.verify_p2sh,    "testnet4: mainnet exception hash must NOT fire, verify_p2sh ON");
+        assert!(flags.verify_taproot, "testnet4: mainnet exception hash must NOT fire, verify_taproot ON");
     }
 
     // =========================
