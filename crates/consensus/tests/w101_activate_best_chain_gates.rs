@@ -217,12 +217,12 @@ fn g10_invalid_found_triggers_retry_to_next_best_chain() {
 /// threads (P2P, wallet, RPC) can make progress.
 ///
 /// Rustoshi's `try_attach_and_reorg` holds the `RwLock<RpcState>` write-lock
-/// for the entire reorg duration.  For deep reorgs (up to MAX_REORG_DEPTH=100
+/// for the entire reorg duration.  For deep reorgs (up to MAX_REORG_DEPTH=288
 /// blocks) this starves all concurrent RPC calls for the full reorg window.
 /// There is no explicit chunking mechanism.
 #[test]
 #[ignore = "BUG G13: ActivateBestChain limit_until/pindexStop chunking absent; \
-            deep reorgs hold the RPC write-lock for all 100 blocks at once \
+            deep reorgs hold the RPC write-lock for all 288 blocks at once \
             (CORRECTNESS / soft-DOS)"]
 fn g13_limit_until_chunking_absent() {
     assert!(
@@ -861,14 +861,14 @@ fn is_ancestor_height_guard() {
 /// MAX_REORG_DEPTH constant is documented and accessible (G13 bound).
 #[test]
 fn max_reorg_depth_constant_check() {
-    // The 100-block cap is documented in server.rs.
-    // We verify the value here as a documentation pin.
-    // Core's effective depth (from assumption of 100-block finality) matches.
-    const EXPECTED_MAX_REORG_DEPTH: u32 = 100;
-    // This is a documentation test — the constant is in crates/rpc/src/server.rs.
+    // Implementation-specific memory-safety cap aligned with Bitcoin Core's
+    // MIN_BLOCKS_TO_KEEP (288) pruned-node undo-retention floor.
+    // Core itself has NO reorg-depth cap; this bound is rustoshi-only.
+    // The constant lives in crates/rpc/src/server.rs.
+    const EXPECTED_MAX_REORG_DEPTH: u32 = 288;
     assert_eq!(
         EXPECTED_MAX_REORG_DEPTH,
-        100,
-        "MAX_REORG_DEPTH should be 100 to match Core's finality assumption"
+        288,
+        "MAX_REORG_DEPTH should be 288 (impl-specific memory-safety cap aligned with Core MIN_BLOCKS_TO_KEEP)"
     );
 }

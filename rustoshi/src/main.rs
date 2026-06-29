@@ -619,7 +619,7 @@ fn connect_undo_to_storage(
 /// Reorg-retention window (Unit B): how many blocks of body + undo, below
 /// the tip, the linear connect path keeps on disk so a P2P-delivered reorg
 /// can disconnect them. Core's `MIN_BLOCKS_TO_KEEP` (288) — a comfortable
-/// superset of rustoshi's `MAX_REORG_DEPTH` (100). Bodies/undo strictly
+/// superset of rustoshi's `MAX_REORG_DEPTH` (288). Bodies/undo strictly
 /// below `tip - REORG_RETENTION_BLOCKS` are dropped by the retention pruner.
 const REORG_RETENTION_BLOCKS: u32 = 288;
 
@@ -3159,10 +3159,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     //
     // Retention floor = `tip - REORG_RETENTION_BLOCKS`. We use Core's
     // `MIN_BLOCKS_TO_KEEP` (288) which is a comfortable superset of
-    // rustoshi's `MAX_REORG_DEPTH` (100, `server.rs`): any reorg the node
-    // will attempt is bounded by 100 blocks, so 288 blocks of bodies/undo
-    // is always enough to disconnect back to the fork point, with ~188
-    // blocks of head-room. 288 mainnet blocks ≈ 1 GB of bodies — bounded,
+    // rustoshi's `MAX_REORG_DEPTH` (288, `server.rs`): any reorg the node
+    // will attempt is bounded by 288 blocks, so 288 blocks of bodies/undo
+    // is exactly enough to disconnect back to the deepest fork point.
+    // 288 mainnet blocks ≈ 1 GB of bodies — bounded,
     // and dwarfed by the chainstate itself.
     //
     // Crash safety: the body + undo for a block are committed in the same
@@ -4130,7 +4130,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     //     best_hash / best_height / header_height / mempool /
                                     //     txindex / coinstats / txospender / filter updates as
                                     //     submitblock (single shared impl — they cannot diverge);
-                                    //   * rejects (Err) a reorg deeper than MAX_REORG_DEPTH=100
+                                    //   * rejects (Err) a reorg deeper than MAX_REORG_DEPTH=288
                                     //     rather than attempting a non-atomic split.
                                     //
                                     // Unit B interaction: Unit B persists block+undo only on the
