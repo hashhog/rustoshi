@@ -2539,18 +2539,18 @@ fn storage_undo_to_validation(
 /// tx-index puts/deletes into one in-memory `WriteBatch` before
 /// committing. That batch grows roughly linearly in the number of blocks
 /// (and in the per-block tx count). Capping the depth bounds peak heap
-/// usage and matches Bitcoin Core's `MAX_REORG_LENGTH = 100` safety
-/// bound (`bitcoin-core/src/validation.cpp` — Core enforces this on a
-/// 100-block-deep finality assumption rather than purely on memory, but
-/// the practical effect is the same: anything past 100 blocks is either
-/// adversarial or a catastrophic chain-split that requires manual
-/// intervention).
+/// usage. **This is an implementation-specific memory-safety bound —
+/// Bitcoin Core has NO reorg-depth cap and follows most-work only,
+/// bounded by prune/undo retention (`MIN_BLOCKS_TO_KEEP`), not a fixed
+/// block count.** Setting this to 288 aligns the cap with Core's
+/// `MIN_BLOCKS_TO_KEEP` (288), the pruned-node undo-retention floor,
+/// so any reorg a pruned Core node can service we can also handle.
 ///
 /// Callers that hit this cap return a graceful error rather than
 /// silently falling back to a non-atomic path — a partial multi-block
 /// commit is precisely the failure mode this constant exists to
 /// prevent.
-pub const MAX_REORG_DEPTH: u32 = 100;
+pub const MAX_REORG_DEPTH: u32 = 288;
 
 /// Maintain the per-height coinstatsindex on block CONNECT.
 ///
