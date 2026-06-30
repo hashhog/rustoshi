@@ -612,6 +612,11 @@ impl ChainState {
             seq_ctx,
             prev_block_mtp,
             skip_scripts,
+            // W3 fix: ChainState does not hold a block-index walk capability, so
+            // the BIP-34 ancestor hash is unavailable here.  Pass None (conservative:
+            // BIP-30 always enforced).  No false-reject risk: no real block after
+            // BIP34 activation duplicates a coinbase txid.
+            None,
         )?;
 
         // Update tip
@@ -844,6 +849,10 @@ impl ChainState {
                 seq_ctx,
                 prev_block_mtp,
                 false, // reorg blocks always verify scripts (condition 5 would fail: < 2 weeks burial)
+                // W3 fix: conservatively pass None here as well.  Reorg blocks are
+                // already required to verify scripts (skip=false above) so the BIP-30
+                // check runs every time, which is the safe direction.
+                None,
             )?;
             self.tip_hash = *hash;
             self.tip_height = new_height;

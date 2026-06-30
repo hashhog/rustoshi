@@ -516,6 +516,7 @@ fn w132_g16_block_validation_enforces_min_time() {
             &ctx,
             rejected_mtp,
             false, // always verify scripts in tests
+            None,
         );
         assert!(
             matches!(
@@ -543,6 +544,7 @@ fn w132_g16_block_validation_enforces_min_time() {
             &ctx,
             accepted_mtp,
             false, // always verify scripts in tests
+            None,
         );
         assert!(
             result.is_ok(),
@@ -684,6 +686,7 @@ fn w132_g17_production_seqlock_context_returns_real_mtp() {
             &real_ctx,
             test_mtp,
             false, // always verify scripts in tests
+            None,
         );
         assert!(
             matches!(
@@ -712,6 +715,7 @@ fn w132_g17_production_seqlock_context_returns_real_mtp() {
             &real_ctx,
             accepted_mtp,
             false, // always verify scripts in tests
+            None,
         );
         assert!(
             result.is_ok(),

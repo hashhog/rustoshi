@@ -538,7 +538,7 @@ fn g16_parallel_verify_wired_into_connect_block() {
     );
 
     let result =
-        connect_block_with_sequence_locks(&block, height, &mut view, &params, &ZeroSeqCtx, 0, false);
+        connect_block_with_sequence_locks(&block, height, &mut view, &params, &ZeroSeqCtx, 0, false, None);
 
     // The ONLY failing gate is script verification, which only runs if the
     // parallel helper is actually wired into the connect path.  A dead helper

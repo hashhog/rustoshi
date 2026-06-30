@@ -2012,6 +2012,14 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     seq_context: &C,
     prev_block_mtp: u32,
     skip_scripts: bool,
+    // Hash of the block at `params.bip34_height` on THIS block's own
+    // ancestry (pindexBIP34height->GetBlockHash() in Core terms).
+    // When Some(h) and h == params.bip34_hash the short-circuit fires
+    // and BIP-30 is skipped for heights in [bip34_height, 1_983_702).
+    // Pass None when ancestry is unavailable — conservatively keeps
+    // BIP-30 enforced (matches Core when pindexBIP34height is null).
+    // Reference: Bitcoin Core validation.cpp:2460-2462.
+    bip34_ancestor_hash: Option<Hash256>,
 ) -> Result<(UndoData, u64), ValidationError> {
     // Compute block hash once at the top: used for script flag exception lookup AND
     // BIP-30 duplicate-coinbase check below.  block_hash() is double-SHA256 of the
@@ -2064,12 +2072,20 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     // or h=91880 regardless of its hash.
     //
     // BIP-34 short-circuit: once BIP-34 is active AND we can confirm we are on the
-    // canonical chain via params.bip34_hash, future duplicate txids are practically
-    // impossible and the check is skipped.  The canonical-chain confirmation mirrors
-    // Core's `pindexBIP34height->GetBlockHash() == params.GetConsensus().BIP34Hash`
-    // check (validation.cpp:2460-2462).  If params.bip34_hash is None (regtest/
-    // testnet4/signet with BIP34 always active), we conservatively keep enforcing
-    // BIP-30 for heights below BIP34_IMPLIES_BIP30_LIMIT.
+    // canonical chain (by verifying that the block at BIP34Height on THIS block's
+    // own ancestry matches params.bip34_hash), future duplicate txids are practically
+    // impossible and the check is skipped.
+    //
+    // W3 fix: the previous code used `params.bip34_hash.is_some()` as a proxy for
+    // "canonical chain", which incorrectly skips BIP-30 on ANY fork whose height >=
+    // bip34_height — even forks that diverged before BIP34Height and whose ancestor
+    // at that height differs from the canonical block.  Core (validation.cpp:2460-2462)
+    // actually fetches `pindexBIP34height = pindex->pprev->GetAncestor(BIP34Height)`
+    // and compares its hash; only when the hashes match is BIP-30 disabled.
+    //
+    // The `bip34_ancestor_hash` parameter carries that ancestor hash from the caller.
+    // `None` means the ancestry was unavailable — conservatively keep BIP-30 enforced,
+    // matching Core's behaviour when `pindexBIP34height` is null.
     //
     // BIP34_IMPLIES_BIP30_LIMIT=1,983,702: above this height BIP-34 modular
     // arithmetic begins to repeat pre-BIP34 coinbase heights, so BIP-30 is
@@ -2081,16 +2097,16 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
         .bip30_exception_blocks
         .iter()
         .any(|(exc_h, exc_hash)| *exc_h == height && *exc_hash == block_hash);
-    // BIP-34 short-circuit: safe to skip BIP-30 when BIP34 is active AND we are on
-    // the canonical chain (confirmed by bip34_hash).  When bip34_hash is None we
-    // cannot confirm chain identity and keep BIP-30 active.
+    // BIP-34 short-circuit: fires only when the block at BIP34Height on THIS block's
+    // own ancestry (bip34_ancestor_hash) matches the canonical BIP34Hash
+    // (params.bip34_hash).  Both must be Some and equal — None on either side keeps
+    // BIP-30 enforced (conservative / matches Core null-ancestor behaviour).
     let bip34_short_circuit = height >= params.bip34_height
         && height < bip34_implies_bip30_limit
-        && params
-            .bip34_hash
-            .as_ref()
-            .map(|_| true) // bip34_hash present → trust the height gate (IBD context)
-            .unwrap_or(false);
+        && matches!(
+            (&bip34_ancestor_hash, &params.bip34_hash),
+            (Some(anc), Some(exp)) if anc == exp
+        );
     // Match Core's combined gate at validation.cpp:2467:
     //   if (fEnforceBIP30 || pindex->nHeight >= BIP34_IMPLIES_BIP30_LIMIT)
     // The `>= LIMIT` branch re-enables BIP-30 unconditionally once we are
@@ -5540,7 +5556,7 @@ mod tests {
         // 1000 >= 500 and sequence != SEQUENCE_FINAL → non-final
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 500, &mut utxo, &params, &null_ctx, 1_699_999_000, false
+            &block, 500, &mut utxo, &params, &null_ctx, 1_699_999_000, false, None
         );
         assert!(
             matches!(result, Err(ValidationError::NonFinalTx)),
@@ -6474,7 +6490,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 91842, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 91842, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         // Must not be Bip30DuplicateOutput (may succeed or fail for another reason).
         assert!(
@@ -6496,7 +6512,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 91880, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 91880, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         assert!(
             !matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6543,7 +6559,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block_wrong_hash, 91842, &mut utxo, &params, &null_ctx, 0, false,
+            &block_wrong_hash, 91842, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6565,7 +6581,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 91843, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 91843, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6588,7 +6604,7 @@ mod tests {
             utxo.seed_coin(coinbase_txid);
 
             let result = connect_block_with_sequence_locks(
-                &block, wrong_h, &mut utxo, &params, &null_ctx, 0, false,
+                &block, wrong_h, &mut utxo, &params, &null_ctx, 0, false, None,
             );
             assert!(
                 matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6634,6 +6650,9 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
             &block, 500_000, &mut utxo, &params, &null_ctx, 0, false,
+            // W3 fix: supply the correct bip34_ancestor_hash so the short-circuit
+            // fires as Core would (ancestor at BIP34Height matches params.bip34_hash).
+            params.bip34_hash,
         );
         // BIP-30 must be skipped — should NOT return Bip30DuplicateOutput.
         assert!(
@@ -6655,7 +6674,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 100_000, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 100_000, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6680,7 +6699,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 1_983_702, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 1_983_702, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6703,6 +6722,8 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
             &block, 1_983_701, &mut utxo, &params, &null_ctx, 0, false,
+            // W3 fix: supply the correct ancestor hash so the short-circuit fires.
+            params.bip34_hash,
         );
         assert!(
             !matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6733,11 +6754,68 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 500, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 500, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
             "bip34_hash=None must keep BIP-30 enforcement at h=500; got: {result:?}",
+        );
+    }
+
+    // W3 fix: EFFECTIVE regression test for the BIP-34→BIP-30 ancestor-hash
+    // short-circuit.  The pre-fix code used `bip34_hash.is_some()` as a proxy
+    // for "we're on the canonical chain" — which incorrectly skipped BIP-30 on
+    // ANY fork at height >= bip34_height, even if that fork's block at
+    // BIP34Height differed from the canonical block.
+    //
+    // Reference: Bitcoin Core validation.cpp:2460-2462
+    //   `pindexBIP34height = pindex->pprev->GetAncestor(BIP34Height);`
+    //   `fEnforceBIP30 = fEnforceBIP30 && (!pindexBIP34height ||`
+    //   `  !(pindexBIP34height->GetBlockHash() == BIP34Hash));`
+    //
+    // PRE-FIX:  bip34_hash.is_some() → short-circuit always fires → BIP-30 skipped → ACCEPT (false-accept)
+    // POST-FIX: ancestor_hash ≠ bip34_hash → short-circuit blocked → BIP-30 enforced → REJECT
+    #[test]
+    fn w3_bip34_short_circuit_requires_ancestor_hash_match() {
+        // Mainnet-like params: bip34_height=227_931, bip34_hash=Some(canonical_hash).
+        let params = bip34_shortcircuit_params();
+        let canonical_bip34_hash = params.bip34_hash;
+        assert!(canonical_bip34_hash.is_some(), "test requires mainnet bip34_hash");
+
+        // A block at h=500_000 (>= bip34_height, < 1_983_702) with a duplicate coinbase.
+        let coinbase = make_coinbase_tx(500_000, 5_000_000_000);
+        let coinbase_txid = coinbase.txid();
+        let block = make_bip30_test_block(coinbase);
+
+        let mut utxo = Bip30Utxo::new();
+        utxo.seed_coin(coinbase_txid); // pre-existing UTXO at the same txid
+
+        let null_ctx = NullSequenceLockContext;
+
+        // Case A: ancestor hash MATCHES canonical → BIP-30 short-circuit fires → accepted
+        // (demonstrates the skip still works on the canonical chain).
+        let result_canonical = connect_block_with_sequence_locks(
+            &block, 500_000, &mut utxo, &params, &null_ctx, 0, false,
+            canonical_bip34_hash,
+        );
+        assert!(
+            !matches!(result_canonical, Err(ValidationError::Bip30DuplicateOutput)),
+            "w3: canonical ancestor → BIP-30 must be skipped at h=500_000; got: {result_canonical:?}",
+        );
+
+        // Case B: ancestor hash is WRONG (fork that diverged before BIP34Height).
+        // POST-FIX: BIP-30 must be enforced → Bip30DuplicateOutput.
+        // PRE-FIX: the old `bip34_hash.is_some()` guard incorrectly skipped BIP-30
+        // here, making this an EFFECTIVE regression differentiator.
+        let wrong_ancestor = Some(Hash256::from_bytes([0xabu8; 32])); // arbitrary ≠ canonical
+        assert_ne!(wrong_ancestor, canonical_bip34_hash);
+        let result_fork = connect_block_with_sequence_locks(
+            &block, 500_000, &mut utxo, &params, &null_ctx, 0, false,
+            wrong_ancestor,
+        );
+        assert!(
+            matches!(result_fork, Err(ValidationError::Bip30DuplicateOutput)),
+            "w3: wrong ancestor (fork) → BIP-30 must be enforced at h=500_000; got: {result_fork:?}",
         );
     }
 
@@ -6946,7 +7024,7 @@ mod tests {
         let mut utxo = seeded_utxo(prev_txid);
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 944_184, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 944_184, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         assert!(
             matches!(result, Err(ValidationError::NonFinalTx)),
@@ -6984,7 +7062,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         // prev_block_mtp = lock_time + 1 → tx is final.
         let result = connect_block_with_sequence_locks(
-            &block, 944_184, &mut utxo, &params, &null_ctx, lock_time + 1, false,
+            &block, 944_184, &mut utxo, &params, &null_ctx, lock_time + 1, false, None,
         );
         assert!(
             !matches!(result, Err(ValidationError::NonFinalTx)),
@@ -7020,7 +7098,7 @@ mod tests {
         let mut utxo = seeded_utxo(prev_txid);
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 100_000, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 100_000, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         // Pre-CSV: must NOT be NonFinalTx with this construction.
         assert!(
@@ -7880,7 +7958,7 @@ mod tests {
         let mut utxo = coinbase_utxo(coin_txid, 1, 5_000_000_000);
         let block = make_spend_block(100, coin_txid, 5_000_000_000);
         let null_ctx = NullSequenceLockContext;
-        let result = connect_block_with_sequence_locks(&block, 100, &mut utxo, &params, &null_ctx, 0, false);
+        let result = connect_block_with_sequence_locks(&block, 100, &mut utxo, &params, &null_ctx, 0, false, None);
         assert!(
             matches!(
                 result,
@@ -7900,7 +7978,7 @@ mod tests {
         let mut utxo = coinbase_utxo(coin_txid, 1, 5_000_000_000);
         let block = make_spend_block(101, coin_txid, 5_000_000_000);
         let null_ctx = NullSequenceLockContext;
-        let result = connect_block_with_sequence_locks(&block, 101, &mut utxo, &params, &null_ctx, 0, false);
+        let result = connect_block_with_sequence_locks(&block, 101, &mut utxo, &params, &null_ctx, 0, false, None);
         assert!(
             !matches!(
                 result,
@@ -7918,7 +7996,7 @@ mod tests {
         let mut utxo = coinbase_utxo(coin_txid, 1, 5_000_000_000);
         let block = make_spend_block(102, coin_txid, 5_000_000_000);
         let null_ctx = NullSequenceLockContext;
-        let result = connect_block_with_sequence_locks(&block, 102, &mut utxo, &params, &null_ctx, 0, false);
+        let result = connect_block_with_sequence_locks(&block, 102, &mut utxo, &params, &null_ctx, 0, false, None);
         assert!(
             !matches!(
                 result,
@@ -7952,7 +8030,7 @@ mod tests {
         };
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
-        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0, false);
+        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0, false, None);
         assert!(
             matches!(result, Err(ValidationError::BadSubsidy(_, _))),
             "coinbase claiming subsidy+1 must be rejected as BadSubsidy; got: {result:?}"
@@ -7978,7 +8056,7 @@ mod tests {
         };
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
-        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0, false);
+        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0, false, None);
         assert!(
             !matches!(result, Err(ValidationError::BadSubsidy(_, _))),
             "coinbase claiming exactly subsidy must NOT fail BadSubsidy; got: {result:?}"
@@ -8004,7 +8082,7 @@ mod tests {
         };
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
-        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0, false);
+        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0, false, None);
         assert!(
             !matches!(result, Err(ValidationError::BadSubsidy(_, _))),
             "coinbase claiming less than subsidy must be valid; got: {result:?}"
@@ -8058,7 +8136,7 @@ mod tests {
         };
 
         let null_ctx = NullSequenceLockContext;
-        let result = connect_block_with_sequence_locks(&block, 200, &mut u, &params, &null_ctx, 0, false);
+        let result = connect_block_with_sequence_locks(&block, 200, &mut u, &params, &null_ctx, 0, false, None);
         assert!(
             matches!(
                 result,
@@ -8921,7 +8999,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
         let _ = connect_block_with_sequence_locks(
-            &block, 1, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 1, &mut utxo, &params, &null_ctx, 0, false, None,
         )
         .expect("oversized-script coinbase output should not fail validation");
 
@@ -8958,7 +9036,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
         let _ = connect_block_with_sequence_locks(
-            &block, 1, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 1, &mut utxo, &params, &null_ctx, 0, false, None,
         )
         .expect("0-value empty-script coinbase must pass connect");
 
@@ -8995,7 +9073,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
         let _ = connect_block_with_sequence_locks(
-            &block, 1, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 1, &mut utxo, &params, &null_ctx, 0, false, None,
         )
         .expect("OP_RETURN coinbase must pass connect");
 
@@ -9043,7 +9121,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, height, &mut utxo, &params, &null_ctx, 0, false,
+            &block, height, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         assert!(result.is_ok(), "block should connect; got: {result:?}");
 
@@ -9088,7 +9166,7 @@ mod tests {
         // bypass CheckBlock by calling connect directly.  Connect must reject
         // with SigopsLimitExceeded.
         let result = connect_block_with_sequence_locks(
-            &block, 1, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 1, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         assert!(
             matches!(result, Err(ValidationError::SigopsLimitExceeded(_))),
@@ -9125,7 +9203,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
         let result = connect_block_with_sequence_locks(
-            &block, 0, &mut utxo, &params, &null_ctx, 0, false,
+            &block, 0, &mut utxo, &params, &null_ctx, 0, false, None,
         );
         // Either BadSubsidy directly, or some earlier rejection.  Crucially
         // we must NOT accept silently (which would be the case with the
@@ -9166,7 +9244,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let (undo, _fees) = connect_block_with_sequence_locks(
-            &block, height, &mut utxo, &params, &null_ctx, 0, false,
+            &block, height, &mut utxo, &params, &null_ctx, 0, false, None,
         )
         .expect("must connect");
 
@@ -9205,7 +9283,7 @@ mod tests {
         utxo.seed_coin(coinbase_txid);
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 2_000_000, &mut utxo, &p, &null_ctx, 0, false,
+            &block, 2_000_000, &mut utxo, &p, &null_ctx, 0, false, None,
         );
         // Despite the exception entry, BIP-30 must be enforced because
         // 2_000_000 >= BIP34_IMPLIES_BIP30_LIMIT (1_983_702).
