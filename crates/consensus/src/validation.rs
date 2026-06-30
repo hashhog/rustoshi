@@ -31,7 +31,7 @@ use crate::params::{
     MAX_SCRIPT_SIZE, MAX_TIMEWARP, SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_MASK,
     SEQUENCE_LOCKTIME_TYPE_FLAG, WITNESS_SCALE_FACTOR,
 };
-use crate::pow::check_proof_of_work;
+use crate::pow::{check_proof_of_work, get_block_proof};
 use crate::script::{
     is_p2sh, is_push_only, parse_witness_program, verify_script, ScriptFlags, SigVersion,
     SignatureChecker,
@@ -1674,6 +1674,297 @@ impl SequenceLockContext for NullSequenceLockContext {
     }
 }
 
+// ============================================================
+// AssumeValid script-skip gate (faithful 5-condition, Core parity)
+// ============================================================
+
+/// Subtract b from a (256-bit big-endian). Assumes a >= b; returns a - b.
+/// If a < b returns [0u8; 32] (saturating).
+fn sub256_be(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let load = |x: &[u8; 32]| -> [u64; 4] {
+        let mut w = [0u64; 4];
+        for i in 0..4 {
+            w[i] = u64::from_be_bytes(x[i * 8..(i + 1) * 8].try_into().unwrap());
+        }
+        w
+    };
+    let aw = load(a);
+    let bw = load(b);
+    let mut out = [0u64; 4];
+    let mut borrow = 0u64;
+    for i in (0..4).rev() {
+        let (d1, o1) = aw[i].overflowing_sub(bw[i]);
+        let (d2, o2) = d1.overflowing_sub(borrow);
+        out[i] = d2;
+        borrow = if o1 || o2 { 1 } else { 0 };
+    }
+    if borrow != 0 {
+        // a < b — return zero (defensive)
+        return [0u8; 32];
+    }
+    let mut result = [0u8; 32];
+    for i in 0..4 {
+        result[i * 8..(i + 1) * 8].copy_from_slice(&out[i].to_be_bytes());
+    }
+    result
+}
+
+/// Multiply a 256-bit big-endian number by a u64. Returns [0xff;32] on
+/// overflow (saturating), which maps to i64::MAX in the gate so we never
+/// incorrectly skip.
+fn mul256_u64(a: &[u8; 32], b: u64) -> [u8; 32] {
+    let mut words = [0u64; 4];
+    for i in 0..4 {
+        words[i] = u64::from_be_bytes(a[i * 8..(i + 1) * 8].try_into().unwrap());
+    }
+    let mut result = [0u64; 4];
+    let mut carry: u128 = 0;
+    for i in (0..4).rev() {
+        let prod = words[i] as u128 * b as u128 + carry;
+        result[i] = prod as u64;
+        carry = prod >> 64;
+    }
+    if carry > 0 {
+        return [0xff; 32]; // saturate
+    }
+    let mut out = [0u8; 32];
+    for i in 0..4 {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&result[i].to_be_bytes());
+    }
+    out
+}
+
+/// Compute the equivalent number of seconds between `base` and `best` in
+/// chain-work terms, using the best header's nBits to scale work to time.
+///
+/// Mirrors Bitcoin Core chain.cpp::GetBlockProofEquivalentTime called as
+///   GetBlockProofEquivalentTime(*best, *base, *best, params)
+///   → r = (best.chain_work - base.chain_work) * nPowTargetSpacing / GetBlockProof(best.bits)
+///
+/// Result is clamped to i64::MAX (matching Core's `r.bits() > 63` guard).
+/// Returns 0 if best_work < base_work or best_bits is invalid.
+fn get_block_proof_equivalent_time_secs(
+    best_chain_work: &[u8; 32],
+    best_bits: u32,
+    base_chain_work: &[u8; 32],
+    pow_target_spacing: u64,
+) -> i64 {
+    // best must have >= work than base
+    for i in 0..32 {
+        match best_chain_work[i].cmp(&base_chain_work[i]) {
+            std::cmp::Ordering::Greater => break,
+            std::cmp::Ordering::Less => return 0,
+            std::cmp::Ordering::Equal => {
+                if i == 31 { return 0; } // equal → 0 seconds elapsed
+            }
+        }
+    }
+    let diff = sub256_be(best_chain_work, base_chain_work);
+    let scaled = mul256_u64(&diff, pow_target_spacing);
+    let best_proof = get_block_proof(best_bits).0;
+    if best_proof.iter().all(|&b| b == 0) {
+        return 0;
+    }
+    // quotient = scaled / best_proof (256-bit division)
+    // We inline a lightweight division: if scaled < best_proof → 0
+    let mut is_less = false;
+    for i in 0..32 {
+        match scaled[i].cmp(&best_proof[i]) {
+            std::cmp::Ordering::Less => { is_less = true; break; }
+            std::cmp::Ordering::Greater => break,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    if is_less {
+        return 0;
+    }
+    // Use a simple 256-bit divide: count how many times best_proof fits.
+    // For the 2-week threshold check this needs to be accurate enough.
+    // We store result as u64 after confirming upper bytes are zero.
+    //
+    // Load as u64 words (big-endian):
+    let load_words = |x: &[u8; 32]| -> [u64; 4] {
+        let mut w = [0u64; 4];
+        for i in 0..4 {
+            w[i] = u64::from_be_bytes(x[i * 8..(i + 1) * 8].try_into().unwrap());
+        }
+        w
+    };
+    // Long division using the same algorithm as pow.rs::divide_256 —
+    // but inline here so we don't need to make that fn public.
+    let divisor = load_words(&best_proof);
+    let mut rem = load_words(&scaled);
+    let mut quot = [0u64; 4];
+
+    let count_bits = |w: &[u64; 4]| -> u32 {
+        for (idx, &d) in w.iter().enumerate() {
+            if d != 0 {
+                return (3 - idx as u32) * 64 + (64 - d.leading_zeros());
+            }
+        }
+        0
+    };
+    let div_bits = count_bits(&divisor);
+    if div_bits == 0 { return 0; }
+    let rem_bits = count_bits(&rem);
+    if rem_bits < div_bits { return 0; }
+
+    let shl = |w: &[u64; 4], n: u32| -> [u64; 4] {
+        if n == 0 { return *w; }
+        let ws = (n / 64) as usize;
+        let bs = n % 64;
+        let mut out = [0u64; 4];
+        for i in 0..4 {
+            let src = i + ws;
+            if src < 4 {
+                out[i] |= w[src] << bs;
+                if bs > 0 && src + 1 < 4 {
+                    out[i] |= w[src + 1] >> (64 - bs);
+                }
+            }
+        }
+        out
+    };
+    let shr1 = |w: &[u64; 4]| -> [u64; 4] {
+        let mut out = [0u64; 4];
+        for i in (0..4).rev() {
+            out[i] = w[i] >> 1;
+            if i > 0 { out[i] |= w[i - 1] << 63; }
+        }
+        out
+    };
+    let cmp_w = |a: &[u64; 4], b: &[u64; 4]| -> std::cmp::Ordering {
+        for i in 0..4 {
+            match a[i].cmp(&b[i]) { std::cmp::Ordering::Equal => {}, ord => return ord }
+        }
+        std::cmp::Ordering::Equal
+    };
+    let sub_w = |a: &[u64; 4], b: &[u64; 4]| -> [u64; 4] {
+        let mut out = [0u64; 4];
+        let mut borrow = 0u64;
+        for i in (0..4).rev() {
+            let (d1, o1) = a[i].overflowing_sub(b[i]);
+            let (d2, o2) = d1.overflowing_sub(borrow);
+            out[i] = d2;
+            borrow = if o1 || o2 { 1 } else { 0 };
+        }
+        out
+    };
+
+    let shift = rem_bits - div_bits;
+    let mut shifted = shl(&divisor, shift);
+    for bit in (0..=shift).rev() {
+        if cmp_w(&rem, &shifted) != std::cmp::Ordering::Less {
+            rem = sub_w(&rem, &shifted);
+            let word = 3 - (bit / 64) as usize;
+            let b = bit % 64;
+            quot[word] |= 1u64 << b;
+        }
+        shifted = shr1(&shifted);
+    }
+
+    // If any of the top 3 words are nonzero, the quotient exceeds i64::MAX.
+    if quot[0] != 0 || quot[1] != 0 || quot[2] != 0 { return i64::MAX; }
+    let low = quot[3];
+    if low > i64::MAX as u64 { i64::MAX } else { low as i64 }
+}
+
+/// Faithful 5-condition assumevalid script-skip gate.
+///
+/// Mirrors Bitcoin Core `ConnectBlock` (validation.cpp:2346-2382). Returns
+/// `true` (skip script verification) ONLY when ALL of the following hold:
+///
+///   1. `params.assumed_valid_block` is configured (non-null).
+///   2+3. The assumed-valid block AND the block being connected are BOTH on
+///        the best-known header chain at their respective heights:
+///        `hash_at_height(block_height) == block_hash` AND
+///        `hash_at_height(av_height) == av_hash`.
+///        Core's `GetAncestor` traversal is equivalent: O(1) here via the
+///        canonical height index. A fork block at `block_height` returns a
+///        DIFFERENT hash and fails condition 3 → scripts are verified.
+///   4. `best_header_chain_work >= params.minimum_chain_work` (eclipse defence).
+///   5. `GetBlockProofEquivalentTime(best, block) > 1_209_600 s` (DoS defence:
+///        recent blocks are always script-verified, matching Core's guard).
+///
+/// **Fail-safe**: this gate is STRICTLY NARROWER than the old height-only
+/// check — it can only INCREASE verification, never skip more.
+///
+/// # Parameters
+/// - `block_hash`: hash of the block being connected.
+/// - `block_height`: height of that block.
+/// - `block_chain_work`: cumulative chain work at `block_height` (256-bit BE).
+/// - `best_header_chain_work`: cumulative work of the best-known header (256-bit BE).
+/// - `best_header_bits`: compact difficulty bits of the best-known header.
+/// - `hash_at_height`: closure returning the canonical chain hash at height `h`.
+/// - `params`: chain parameters.
+pub fn should_skip_scripts(
+    block_hash: &Hash256,
+    block_height: u32,
+    block_chain_work: &[u8; 32],
+    best_header_chain_work: &[u8; 32],
+    best_header_bits: u32,
+    hash_at_height: &impl Fn(u32) -> Option<Hash256>,
+    params: &ChainParams,
+) -> bool {
+    const TWO_WEEKS_SECS: i64 = 1_209_600; // 60 * 60 * 24 * 7 * 2
+
+    // Condition 1: assumed_valid_block must be configured.
+    let av_hash = match &params.assumed_valid_block {
+        Some(h) => *h,
+        None => return false,
+    };
+    let av_height = match params.assumed_valid_height {
+        Some(h) => h,
+        None => return false,
+    };
+
+    // Early exit: block height must not exceed AV height (matches Core's
+    // `pindex->nHeight > it->second.nHeight` guard inside the GetAncestor branch).
+    if block_height > av_height {
+        return false;
+    }
+
+    // Conditions 2 + 3a: The AV block must be on the canonical chain at av_height,
+    // AND the block being connected must be on the canonical chain at block_height.
+    // This is the O(1) equivalent of Core's GetAncestor traversal:
+    //   it->second.GetAncestor(pindex->nHeight) == pindex   [3a: block is AV ancestor]
+    //   m_best_header->GetAncestor(pindex->nHeight) == pindex [3b: block on best-hdr chain]
+    // Because the height index reflects the SAME chain for both AV and block, these
+    // two conditions collapse into one check per height: hash_at_height(h) == expected.
+    match hash_at_height(av_height) {
+        Some(h) if h == av_hash => {}
+        _ => return false, // AV block not in our canonical chain
+    }
+    match hash_at_height(block_height) {
+        Some(h) if h == *block_hash => {}
+        _ => return false, // Block not in our canonical chain at this height
+    }
+
+    // Condition 4: best_header.chain_work >= minimum_chain_work (eclipse defence).
+    // Compare big-endian 256-bit values.
+    for i in 0..32 {
+        match best_header_chain_work[i].cmp(&params.minimum_chain_work[i]) {
+            std::cmp::Ordering::Greater => break,
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+
+    // Condition 5: equivalent PoW time between best header and this block > 2 weeks.
+    // Matches Core: GetBlockProofEquivalentTime(*best_header, *pindex, *best_header, params)
+    let equiv_secs = get_block_proof_equivalent_time_secs(
+        best_header_chain_work,
+        best_header_bits,
+        block_chain_work,
+        crate::params::TARGET_BLOCK_TIME as u64,
+    );
+    if equiv_secs <= TWO_WEEKS_SECS {
+        return false;
+    }
+
+    true
+}
+
 /// Connect a block with full BIP-68 sequence lock enforcement.
 ///
 /// This is the full-featured version that validates sequence locks
@@ -1686,6 +1977,10 @@ impl SequenceLockContext for NullSequenceLockContext {
 /// * `params` - Chain parameters.
 /// * `seq_context` - Context for sequence lock MTP lookups.
 /// * `prev_block_mtp` - The median-time-past of the previous block.
+/// * `skip_scripts` - Pre-computed assume-valid decision (caller's responsibility).
+///   When `true`, script verification is skipped. Callers MUST use
+///   `should_skip_scripts` (the faithful 5-condition gate) to compute this
+///   value; passing `true` unconditionally is a consensus bug.
 ///
 /// # Returns
 /// (undo_data, total_fees) on success.
@@ -1696,6 +1991,7 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     params: &ChainParams,
     seq_context: &C,
     prev_block_mtp: u32,
+    skip_scripts: bool,
 ) -> Result<(UndoData, u64), ValidationError> {
     // Compute block hash once at the top: used for script flag exception lookup AND
     // BIP-30 duplicate-coinbase check below.  block_hash() is double-SHA256 of the
@@ -1717,11 +2013,12 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     // all non-script gates and UTXO mutations have run in order.  See W105 G16.
     let mut all_coins: Vec<Vec<CoinEntry>> = Vec::with_capacity(block.transactions.len());
 
-    // Assume-valid: skip script verification for blocks at or below the assume-valid height
-    let skip_scripts = match params.assumed_valid_height {
-        Some(av_height) => height <= av_height,
-        None => false,
-    };
+    // skip_scripts is now a caller-supplied parameter (pre-computed via
+    // should_skip_scripts / the faithful 5-condition assumevalid gate).
+    // The old height-only derivation has been removed (was:
+    //   match params.assumed_valid_height { Some(av) => height <= av, None => false }).
+    // Test callers pass `false` (always verify); production callers use
+    // should_skip_scripts for the full Core-faithful gate.
 
     // ContextualCheckBlock: enforce IsFinalTx for every transaction
     // (Core validation.cpp:4146). This is a consensus rule that runs even
@@ -5223,7 +5520,7 @@ mod tests {
         // 1000 >= 500 and sequence != SEQUENCE_FINAL → non-final
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 500, &mut utxo, &params, &null_ctx, 1_699_999_000
+            &block, 500, &mut utxo, &params, &null_ctx, 1_699_999_000, false
         );
         assert!(
             matches!(result, Err(ValidationError::NonFinalTx)),
@@ -6157,7 +6454,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 91842, &mut utxo, &params, &null_ctx, 0,
+            &block, 91842, &mut utxo, &params, &null_ctx, 0, false,
         );
         // Must not be Bip30DuplicateOutput (may succeed or fail for another reason).
         assert!(
@@ -6179,7 +6476,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 91880, &mut utxo, &params, &null_ctx, 0,
+            &block, 91880, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(
             !matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6226,7 +6523,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block_wrong_hash, 91842, &mut utxo, &params, &null_ctx, 0,
+            &block_wrong_hash, 91842, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6248,7 +6545,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 91843, &mut utxo, &params, &null_ctx, 0,
+            &block, 91843, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6271,7 +6568,7 @@ mod tests {
             utxo.seed_coin(coinbase_txid);
 
             let result = connect_block_with_sequence_locks(
-                &block, wrong_h, &mut utxo, &params, &null_ctx, 0,
+                &block, wrong_h, &mut utxo, &params, &null_ctx, 0, false,
             );
             assert!(
                 matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6316,7 +6613,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 500_000, &mut utxo, &params, &null_ctx, 0,
+            &block, 500_000, &mut utxo, &params, &null_ctx, 0, false,
         );
         // BIP-30 must be skipped — should NOT return Bip30DuplicateOutput.
         assert!(
@@ -6338,7 +6635,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 100_000, &mut utxo, &params, &null_ctx, 0,
+            &block, 100_000, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6363,7 +6660,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 1_983_702, &mut utxo, &params, &null_ctx, 0,
+            &block, 1_983_702, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6385,7 +6682,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 1_983_701, &mut utxo, &params, &null_ctx, 0,
+            &block, 1_983_701, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(
             !matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6416,7 +6713,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 500, &mut utxo, &params, &null_ctx, 0,
+            &block, 500, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(
             matches!(result, Err(ValidationError::Bip30DuplicateOutput)),
@@ -6629,7 +6926,7 @@ mod tests {
         let mut utxo = seeded_utxo(prev_txid);
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 944_184, &mut utxo, &params, &null_ctx, 0,
+            &block, 944_184, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(
             matches!(result, Err(ValidationError::NonFinalTx)),
@@ -6667,7 +6964,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         // prev_block_mtp = lock_time + 1 → tx is final.
         let result = connect_block_with_sequence_locks(
-            &block, 944_184, &mut utxo, &params, &null_ctx, lock_time + 1,
+            &block, 944_184, &mut utxo, &params, &null_ctx, lock_time + 1, false,
         );
         assert!(
             !matches!(result, Err(ValidationError::NonFinalTx)),
@@ -6703,7 +7000,7 @@ mod tests {
         let mut utxo = seeded_utxo(prev_txid);
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 100_000, &mut utxo, &params, &null_ctx, 0,
+            &block, 100_000, &mut utxo, &params, &null_ctx, 0, false,
         );
         // Pre-CSV: must NOT be NonFinalTx with this construction.
         assert!(
@@ -7534,7 +7831,7 @@ mod tests {
         let mut utxo = coinbase_utxo(coin_txid, 1, 5_000_000_000);
         let block = make_spend_block(100, coin_txid, 5_000_000_000);
         let null_ctx = NullSequenceLockContext;
-        let result = connect_block_with_sequence_locks(&block, 100, &mut utxo, &params, &null_ctx, 0);
+        let result = connect_block_with_sequence_locks(&block, 100, &mut utxo, &params, &null_ctx, 0, false);
         assert!(
             matches!(
                 result,
@@ -7554,7 +7851,7 @@ mod tests {
         let mut utxo = coinbase_utxo(coin_txid, 1, 5_000_000_000);
         let block = make_spend_block(101, coin_txid, 5_000_000_000);
         let null_ctx = NullSequenceLockContext;
-        let result = connect_block_with_sequence_locks(&block, 101, &mut utxo, &params, &null_ctx, 0);
+        let result = connect_block_with_sequence_locks(&block, 101, &mut utxo, &params, &null_ctx, 0, false);
         assert!(
             !matches!(
                 result,
@@ -7572,7 +7869,7 @@ mod tests {
         let mut utxo = coinbase_utxo(coin_txid, 1, 5_000_000_000);
         let block = make_spend_block(102, coin_txid, 5_000_000_000);
         let null_ctx = NullSequenceLockContext;
-        let result = connect_block_with_sequence_locks(&block, 102, &mut utxo, &params, &null_ctx, 0);
+        let result = connect_block_with_sequence_locks(&block, 102, &mut utxo, &params, &null_ctx, 0, false);
         assert!(
             !matches!(
                 result,
@@ -7606,7 +7903,7 @@ mod tests {
         };
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
-        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0);
+        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0, false);
         assert!(
             matches!(result, Err(ValidationError::BadSubsidy(_, _))),
             "coinbase claiming subsidy+1 must be rejected as BadSubsidy; got: {result:?}"
@@ -7632,7 +7929,7 @@ mod tests {
         };
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
-        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0);
+        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0, false);
         assert!(
             !matches!(result, Err(ValidationError::BadSubsidy(_, _))),
             "coinbase claiming exactly subsidy must NOT fail BadSubsidy; got: {result:?}"
@@ -7658,7 +7955,7 @@ mod tests {
         };
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
-        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0);
+        let result = connect_block_with_sequence_locks(&block, 0, &mut utxo, &params, &null_ctx, 0, false);
         assert!(
             !matches!(result, Err(ValidationError::BadSubsidy(_, _))),
             "coinbase claiming less than subsidy must be valid; got: {result:?}"
@@ -7712,7 +8009,7 @@ mod tests {
         };
 
         let null_ctx = NullSequenceLockContext;
-        let result = connect_block_with_sequence_locks(&block, 200, &mut u, &params, &null_ctx, 0);
+        let result = connect_block_with_sequence_locks(&block, 200, &mut u, &params, &null_ctx, 0, false);
         assert!(
             matches!(
                 result,
@@ -8575,7 +8872,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
         let _ = connect_block_with_sequence_locks(
-            &block, 1, &mut utxo, &params, &null_ctx, 0,
+            &block, 1, &mut utxo, &params, &null_ctx, 0, false,
         )
         .expect("oversized-script coinbase output should not fail validation");
 
@@ -8612,7 +8909,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
         let _ = connect_block_with_sequence_locks(
-            &block, 1, &mut utxo, &params, &null_ctx, 0,
+            &block, 1, &mut utxo, &params, &null_ctx, 0, false,
         )
         .expect("0-value empty-script coinbase must pass connect");
 
@@ -8649,7 +8946,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
         let _ = connect_block_with_sequence_locks(
-            &block, 1, &mut utxo, &params, &null_ctx, 0,
+            &block, 1, &mut utxo, &params, &null_ctx, 0, false,
         )
         .expect("OP_RETURN coinbase must pass connect");
 
@@ -8697,7 +8994,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, height, &mut utxo, &params, &null_ctx, 0,
+            &block, height, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(result.is_ok(), "block should connect; got: {result:?}");
 
@@ -8742,7 +9039,7 @@ mod tests {
         // bypass CheckBlock by calling connect directly.  Connect must reject
         // with SigopsLimitExceeded.
         let result = connect_block_with_sequence_locks(
-            &block, 1, &mut utxo, &params, &null_ctx, 0,
+            &block, 1, &mut utxo, &params, &null_ctx, 0, false,
         );
         assert!(
             matches!(result, Err(ValidationError::SigopsLimitExceeded(_))),
@@ -8779,7 +9076,7 @@ mod tests {
         let null_ctx = NullSequenceLockContext;
         let mut utxo = Bip30Utxo::new();
         let result = connect_block_with_sequence_locks(
-            &block, 0, &mut utxo, &params, &null_ctx, 0,
+            &block, 0, &mut utxo, &params, &null_ctx, 0, false,
         );
         // Either BadSubsidy directly, or some earlier rejection.  Crucially
         // we must NOT accept silently (which would be the case with the
@@ -8820,7 +9117,7 @@ mod tests {
 
         let null_ctx = NullSequenceLockContext;
         let (undo, _fees) = connect_block_with_sequence_locks(
-            &block, height, &mut utxo, &params, &null_ctx, 0,
+            &block, height, &mut utxo, &params, &null_ctx, 0, false,
         )
         .expect("must connect");
 
@@ -8859,7 +9156,7 @@ mod tests {
         utxo.seed_coin(coinbase_txid);
         let null_ctx = NullSequenceLockContext;
         let result = connect_block_with_sequence_locks(
-            &block, 2_000_000, &mut utxo, &p, &null_ctx, 0,
+            &block, 2_000_000, &mut utxo, &p, &null_ctx, 0, false,
         );
         // Despite the exception entry, BIP-30 must be enforced because
         // 2_000_000 >= BIP34_IMPLIES_BIP30_LIMIT (1_983_702).
