@@ -544,55 +544,68 @@ pub fn is_block_mutated(block: &Block, segwit_active: bool) -> bool {
         return true;
     }
 
-    if !segwit_active {
-        return false;
-    }
+    // Gate 2: witness commitment (Core: CheckWitnessMalleation, validation.cpp:3870-3916).
+    //
+    // The early `if !segwit_active { return false }` that was here previously was
+    // wrong: it prevented the unexpected-witness loop from running for pre-segwit
+    // blocks, silently accepting blocks that carry witness data before activation.
+    // Core always calls CheckWitnessMalleation unconditionally; only the commitment-
+    // scan / commitment-verify branch is gated on `expect_witness_commitment`
+    // (= segwit_active here).  The unexpected-witness loop runs for ALL blocks when
+    // no valid commitment is present.
+    if segwit_active {
+        // Scan coinbase outputs for the last BIP-141 commitment pattern.
+        // Pattern: OP_RETURN (0x6a) || 0x24 || 0xaa21a9ed || <32-byte hash> (≥38 bytes).
+        const MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+        let coinbase = match block.transactions.first() {
+            Some(cb) => cb,
+            None => return true, // no coinbase — mutated
+        };
 
-    // Gate 2: witness commitment (Core: CheckWitnessMalleation).
-    // Scan coinbase outputs for the last one matching the BIP-141 commitment pattern.
-    // Pattern: OP_RETURN (0x6a) || 0x24 || 0xaa21a9ed || <32-byte hash>  (≥38 bytes).
-    const MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
-    let coinbase = match block.transactions.first() {
-        Some(cb) => cb,
-        None => return true, // no coinbase — mutated
-    };
-
-    let mut commit_out_idx: Option<usize> = None;
-    for (i, output) in coinbase.outputs.iter().enumerate() {
-        let s = &output.script_pubkey;
-        if s.len() >= 38
-            && s[0] == 0x6a // OP_RETURN
-            && s[1] == 0x24 // push 36 bytes
-            && s[2..6] == MAGIC
-        {
-            commit_out_idx = Some(i);
-        }
-    }
-
-    if let Some(idx) = commit_out_idx {
-        // Coinbase input[0] witness must be exactly 1 stack item of exactly 32 bytes.
-        let witness_stack = &coinbase.inputs[0].witness;
-        if witness_stack.len() != 1 || witness_stack[0].len() != 32 {
-            return true; // bad-witness-nonce-size
-        }
-
-        // Compute SHA256d(witness_merkle_root || nonce).
-        let witness_root = block.compute_witness_root();
-        let mut preimage = [0u8; 64];
-        preimage[..32].copy_from_slice(witness_root.as_bytes());
-        preimage[32..].copy_from_slice(&witness_stack[0]);
-        let computed_commitment = sha256d(&preimage);
-
-        // Compare to bytes [6..38] of the commitment output script.
-        if coinbase.outputs[idx].script_pubkey[6..38] != computed_commitment.0 {
-            return true; // bad-witness-merkle-match
-        }
-    } else {
-        // No commitment: no transaction (including coinbase) may carry witness data.
-        for tx in &block.transactions {
-            if tx.has_witness() {
-                return true; // unexpected-witness
+        let mut commit_out_idx: Option<usize> = None;
+        for (i, output) in coinbase.outputs.iter().enumerate() {
+            let s = &output.script_pubkey;
+            if s.len() >= 38
+                && s[0] == 0x6a // OP_RETURN
+                && s[1] == 0x24 // push 36 bytes
+                && s[2..6] == MAGIC
+            {
+                commit_out_idx = Some(i);
             }
+        }
+
+        if let Some(idx) = commit_out_idx {
+            // Coinbase input[0] witness must be exactly 1 stack item of exactly 32 bytes.
+            let witness_stack = &coinbase.inputs[0].witness;
+            if witness_stack.len() != 1 || witness_stack[0].len() != 32 {
+                return true; // bad-witness-nonce-size
+            }
+
+            // Compute SHA256d(witness_merkle_root || nonce).
+            let witness_root = block.compute_witness_root();
+            let mut preimage = [0u8; 64];
+            preimage[..32].copy_from_slice(witness_root.as_bytes());
+            preimage[32..].copy_from_slice(&witness_stack[0]);
+            let computed_commitment = sha256d(&preimage);
+
+            // Compare to bytes [6..38] of the commitment output script.
+            if coinbase.outputs[idx].script_pubkey[6..38] != computed_commitment.0 {
+                return true; // bad-witness-merkle-match
+            }
+
+            // Commitment is valid — no unexpected-witness check needed.
+            return false;
+        }
+        // segwit active but no commitment found: fall through to the
+        // unexpected-witness loop below (same as !segwit_active path).
+    }
+
+    // No valid commitment present (or segwit not active) — no transaction
+    // (including coinbase) may carry witness data.
+    // Core: validation.cpp:3905-3913.
+    for tx in &block.transactions {
+        if tx.has_witness() {
+            return true; // unexpected-witness
         }
     }
 
@@ -1366,7 +1379,80 @@ mod tests {
 
     #[test]
     fn test_partially_downloaded_block_fill() {
-        let block = create_test_block(5);
+        // Build a no-witness block so the reconstruction test is not entangled with
+        // witness-commitment checking.  After the wave-2 fix, a block with witness
+        // data but no commitment is mutated even when segwit_active=false
+        // (Core's unexpected-witness loop runs unconditionally); using a no-witness
+        // block lets this test focus on compact-block reconstruction.
+        use rustoshi_crypto::sha256d;
+
+        let coinbase = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: vec![0x03, 0x01, 0x00, 0x00],
+                sequence: 0xFFFFFFFF,
+                witness: vec![], // no witness — pre-segwit style
+            }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+        };
+        let make_tx = |seed: u64| Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256([seed as u8; 32]),
+                    vout: 0,
+                },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+                witness: vec![], // no witness
+            }],
+            outputs: vec![TxOut {
+                value: seed * 1_000_000,
+                script_pubkey: vec![0x00; 22],
+            }],
+            lock_time: 0,
+        };
+        let transactions: Vec<Transaction> =
+            std::iter::once(coinbase)
+                .chain((1u64..=4).map(make_tx))
+                .collect();
+
+        let merkle_root = {
+            let mut hashes: Vec<[u8; 32]> =
+                transactions.iter().map(|tx| tx.txid().0).collect();
+            while hashes.len() > 1 {
+                if hashes.len() % 2 == 1 {
+                    hashes.push(*hashes.last().unwrap());
+                }
+                let mut next = Vec::new();
+                for pair in hashes.chunks(2) {
+                    let mut c = [0u8; 64];
+                    c[..32].copy_from_slice(&pair[0]);
+                    c[32..].copy_from_slice(&pair[1]);
+                    next.push(sha256d(&c).0);
+                }
+                hashes = next;
+            }
+            Hash256(hashes[0])
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 0x20000000,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root,
+                timestamp: 1234567890,
+                bits: 0x1d00ffff,
+                nonce: 0,
+            },
+            transactions,
+        };
+
         let compact = CmpctBlock::from_block(&block, 0x12345);
 
         // Empty mempool
@@ -1840,10 +1926,13 @@ mod tests {
         };
 
         // is_block_mutated with wrong commitment:
-        // segwit_active=false → only txid merkle, not mutated (merkle root is correct)
-        assert!(!is_block_mutated(&block_bad, false),
-            "segwit_active=false should not check witness commitment");
-        // segwit_active=true → witnesses commitment mismatch → mutated
+        // segwit_active=false: the unexpected-witness loop still runs (Core always
+        // executes CheckWitnessMalleation unconditionally; only the commitment-scan
+        // branch is gated on segwit_active).  block_bad carries witness data in both
+        // the coinbase (nonce vec) and non_cb_tx — so it is mutated regardless.
+        assert!(is_block_mutated(&block_bad, false),
+            "block with witness data but no valid commitment must be mutated even when segwit_active=false");
+        // segwit_active=true → commitment mismatch → mutated
         assert!(is_block_mutated(&block_bad, true),
             "wrong witness commitment with segwit_active=true must be detected as mutated");
 
@@ -1860,7 +1949,10 @@ mod tests {
             PartiallyDownloadedBlock::init_data(&compact_bad, mempool_refs.into_iter(), &[]).unwrap();
         assert!(partial_bad.is_complete(), "partial block should be complete after mempool fill");
 
-        // segwit_active=false → txid merkle passes → Ok
+        // segwit_active=false: block carries witness data (coinbase nonce + non_cb_tx
+        // witness stack) with no valid commitment → unexpected-witness → Failed.
+        // Core's CheckWitnessMalleation runs the unexpected-witness loop even when
+        // expect_witness_commitment=false (pre-segwit).
         let mempool2: Vec<(Hash256, Arc<Transaction>)> = vec![
             (ncb_wtxid, Arc::new(block_bad.transactions[1].clone())),
         ];
@@ -1869,8 +1961,8 @@ mod tests {
         let mut partial_bad2 =
             PartiallyDownloadedBlock::init_data(&compact_bad, mempool_refs2.into_iter(), &[]).unwrap();
         let result_no_segwit = partial_bad2.fill_block(vec![], false);
-        assert!(result_no_segwit.is_ok(),
-            "segwit_active=false should only check txid merkle root, not witness commitment");
+        assert_eq!(result_no_segwit.err(), Some(ReadStatus::Failed),
+            "block with unexpected witness data must be Failed even when segwit_active=false");
 
         // segwit_active=true → witness commitment mismatch → Failed
         let result_segwit = partial_bad.fill_block(vec![], true);
@@ -2064,11 +2156,14 @@ mod tests {
 
         // segwit_active=true + no witness commitment + tx has witness → mutated.
         assert!(is_block_mutated(&block, true),
-            "block with unexpected witness and no commitment should be mutated");
+            "block with unexpected witness and no commitment should be mutated (segwit_active=true)");
 
-        // segwit_active=false → only txid merkle check; should NOT be mutated
-        // (the txid merkle root is correct).
-        assert!(!is_block_mutated(&block, false),
-            "segwit_active=false should not check witness; block should not be mutated");
+        // segwit_active=false: the unexpected-witness loop still runs (Core always
+        // calls CheckWitnessMalleation unconditionally; only the commitment-scan
+        // branch is gated on expect_witness_commitment / segwit_active).
+        // A pre-segwit block that carries witness data must be considered mutated.
+        // Fix: wave-2 w77 pre-segwit unexpected-witness (validation.cpp:3905-3913).
+        assert!(is_block_mutated(&block, false),
+            "block with unexpected witness must be mutated even when segwit_active=false");
     }
 }

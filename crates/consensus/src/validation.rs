@@ -1236,10 +1236,13 @@ pub fn contextual_check_block(
         }
     }
 
-    // SegWit: Check witness commitment
-    if height >= params.segwit_height {
-        check_witness_commitment(block)?;
-    }
+    // Witness malleation check — called UNCONDITIONALLY, mirroring Core's
+    // `CheckWitnessMalleation(block, DeploymentActiveAfter(...SEGWIT), state)`
+    // at validation.cpp:4169.  When segwit is inactive the commitment branch is
+    // skipped, but the unexpected-witness loop still runs so blocks that smuggle
+    // witness data before segwit activation are correctly rejected.
+    let segwit_active = height >= params.segwit_height;
+    check_witness_commitment(block, segwit_active)?;
 
     Ok(())
 }
@@ -1312,67 +1315,84 @@ pub(crate) fn encode_bip34_height(height: u32) -> Vec<u8> {
 /// The commitment is an OP_RETURN output in the coinbase with:
 /// - `OP_RETURN (0x6a) OP_PUSHBYTES_36 (0x24) 0xaa21a9ed <32-byte hash>`  (38 bytes total)
 ///
-/// The commitment hash is: SHA256d(witness_root || witness_nonce) where:
-/// - witness_root = BlockWitnessMerkleRoot (coinbase wtxid = 32 zeros, others = wtxid)
-/// - witness_nonce = coinbase.inputs[0].witness.stack[0] (must be exactly 1 × 32 bytes)
+/// Mirrors Bitcoin Core's `CheckWitnessMalleation` (validation.cpp:3870-3916).
 ///
-/// Gate selection (called when segwit is active, i.e. height >= segwit_height):
-/// 1. Scan ALL coinbase outputs; the LAST matching output wins (Core overwrites commitpos
-///    in the loop — validation.h:147-165 GetWitnessCommitmentIndex).
+/// This function is ALWAYS called from `contextual_check_block`, regardless of
+/// whether segwit is active.  The `segwit_active` flag gates only the
+/// commitment-scanning / commitment-verification block:
+///
+/// - If `segwit_active && commitment_found`: verify the commitment (nonce size,
+///   witness-root hash).  Returns early on success.
+/// - In all other cases (no commitment, or `!segwit_active`): the unexpected-witness
+///   loop runs unconditionally — "no witness data is allowed in blocks that don't
+///   commit to witness data" (Core:3905-3913).
+///
+/// Gate selection:
+/// 1. (segwit_active only) Scan ALL coinbase outputs; the LAST matching output wins
+///    (Core overwrites commitpos in the loop — validation.h:147-165).
 /// 2. If a commitment output is found:
 ///    a. Coinbase vin[0].witness stack must be exactly 1 item of exactly 32 bytes
 ///       → else `bad-witness-nonce-size` (Core:3880-3884).
 ///    b. Compute SHA256d(witness_root || nonce) and compare bytes [6..38] in the output
 ///       → else `bad-witness-merkle-match` (Core:3893-3898).
-/// 3. If NO commitment output found: every transaction (including coinbase) must have
-///    no witness data → else `unexpected-witness` (Core:3906-3912).
-fn check_witness_commitment(block: &Block) -> Result<(), ValidationError> {
-    let coinbase = &block.transactions[0];
+///    c. Return Ok(()) (commitment valid; no unexpected-witness check needed).
+/// 3. No valid commitment (or `!segwit_active`): every transaction (including coinbase)
+///    must have no witness data → else `unexpected-witness` (Core:3906-3912).
+fn check_witness_commitment(block: &Block, segwit_active: bool) -> Result<(), ValidationError> {
+    // Only scan / verify the BIP-141 commitment when segwit is active.
+    if segwit_active {
+        let coinbase = &block.transactions[0];
 
-    // Scan ALL coinbase outputs forward, overwrite commitpos on each match so the
-    // LAST matching output wins (Core GetWitnessCommitmentIndex behaviour).
-    // Minimum 38 bytes: 1 (OP_RETURN) + 1 (0x24 push-36) + 4 (magic) + 32 (hash).
-    const MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
-    let mut commit_out_idx: Option<usize> = None;
+        // Scan ALL coinbase outputs forward, overwrite commitpos on each match so
+        // the LAST matching output wins (Core GetWitnessCommitmentIndex behaviour).
+        // Minimum 38 bytes: 1 (OP_RETURN) + 1 (0x24 push-36) + 4 (magic) + 32 (hash).
+        const MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+        let mut commit_out_idx: Option<usize> = None;
 
-    for (i, output) in coinbase.outputs.iter().enumerate() {
-        let s = &output.script_pubkey;
-        if s.len() >= 38
-            && s[0] == 0x6a   // OP_RETURN
-            && s[1] == 0x24   // push 36 bytes
-            && s[2..6] == MAGIC
-        {
-            commit_out_idx = Some(i); // overwrite — last match wins
+        for (i, output) in coinbase.outputs.iter().enumerate() {
+            let s = &output.script_pubkey;
+            if s.len() >= 38
+                && s[0] == 0x6a // OP_RETURN
+                && s[1] == 0x24 // push 36 bytes
+                && s[2..6] == MAGIC
+            {
+                commit_out_idx = Some(i); // overwrite — last match wins
+            }
         }
+
+        if let Some(idx) = commit_out_idx {
+            // Gate 6 (Core:3880-3884): coinbase vin[0] witness must be exactly
+            // 1 stack item of exactly 32 bytes ("bad-witness-nonce-size").
+            let witness_stack = &coinbase.inputs[0].witness;
+            if witness_stack.len() != 1 || witness_stack[0].len() != 32 {
+                return Err(ValidationError::BadWitnessNonceSize);
+            }
+
+            // Gate 5: witness merkle root — coinbase wtxid is 32 zeros.
+            let witness_root = block.compute_witness_root();
+
+            // Gate 7: SHA256d(witness_root || nonce) — double SHA256, not single.
+            let mut preimage = [0u8; 64];
+            preimage[..32].copy_from_slice(witness_root.as_bytes());
+            preimage[32..].copy_from_slice(&witness_stack[0]);
+            let computed = sha256d(&preimage);
+
+            // Gate 10: compare bytes [6..38] of the commitment output script.
+            if coinbase.outputs[idx].script_pubkey[6..38] != computed.0 {
+                return Err(ValidationError::BadWitnessCommitment);
+            }
+
+            // Commitment is valid — no unexpected-witness check is needed.
+            return Ok(());
+        }
+        // segwit active but no commitment found: fall through to the
+        // unexpected-witness loop (same path as !segwit_active).
     }
 
-    if let Some(idx) = commit_out_idx {
-        // Gate 6 (Core:3880-3884): coinbase vin[0] witness must be exactly
-        // 1 stack item of exactly 32 bytes ("bad-witness-nonce-size").
-        let witness_stack = &coinbase.inputs[0].witness;
-        if witness_stack.len() != 1 || witness_stack[0].len() != 32 {
-            return Err(ValidationError::BadWitnessNonceSize);
-        }
-
-        // Gate 5: witness merkle root — coinbase wtxid is 32 zeros.
-        let witness_root = block.compute_witness_root();
-
-        // Gate 7: SHA256d(witness_root || nonce) — double SHA256, not single.
-        let mut preimage = [0u8; 64];
-        preimage[..32].copy_from_slice(witness_root.as_bytes());
-        preimage[32..].copy_from_slice(&witness_stack[0]);
-        let computed = sha256d(&preimage);
-
-        // Gate 10: compare bytes [6..38] of the commitment output script.
-        if coinbase.outputs[idx].script_pubkey[6..38] != computed.0 {
-            return Err(ValidationError::BadWitnessCommitment);
-        }
-
-        return Ok(());
-    }
-
-    // Gate 9: no commitment found — NO transaction (including coinbase) may carry
-    // witness data. Core loops `for (const auto& tx : block.vtx)` (validation.cpp:3906).
+    // No valid commitment present (or segwit not active) — no transaction
+    // (including coinbase) may carry witness data.
+    // Core: validation.cpp:3905-3913 "No witness data is allowed in blocks
+    // that don't commit to witness data".
     for tx in &block.transactions {
         if tx.has_witness() {
             return Err(ValidationError::UnexpectedWitness);
@@ -7321,12 +7341,20 @@ mod tests {
         assert!(res.is_ok(), "correctly formed segwit block must pass: {res:?}");
     }
 
-    /// W77: pre-segwit blocks (below segwit_height) are not checked for commitment.
+    /// W77 / wave-2: pre-segwit blocks with witness data must be rejected.
+    ///
+    /// Core's `CheckWitnessMalleation` (validation.cpp:3870-3916) is called
+    /// UNCONDITIONALLY from `ContextualCheckBlock` (validation.cpp:4169).
+    /// The unexpected-witness loop (3905-3913) runs whenever no valid commitment
+    /// is present, which includes ALL pre-segwit blocks.  A pre-segwit tx with
+    /// witness data therefore MUST trigger `unexpected-witness`.
+    ///
+    /// Old wrong behaviour: `check_witness_commitment` was only called when
+    /// `height >= segwit_height`; a witness-bearing tx below that height was
+    /// silently accepted (false-accept).
     #[test]
-    fn w77_pre_segwit_witness_in_tx_is_not_checked() {
-        // Below segwit_height → check_witness_commitment is NOT called at all.
-        // A non-coinbase tx with witness data must NOT trigger unexpected-witness
-        // in the pre-segwit path.
+    fn w77_pre_segwit_witness_in_tx_rejected() {
+        // Build a non-coinbase tx with witness data.
         let mut non_coinbase = make_simple_tx(Hash256::from_bytes([9u8; 32]), 0, 50);
         non_coinbase.inputs[0].witness = vec![vec![0x01; 32]];
 
@@ -7336,20 +7364,41 @@ mod tests {
             header: BlockHeader::default(),
             transactions: vec![coinbase, non_coinbase],
         };
-        // height 0 is below regtest segwit_height (0 is the segwit_height for regtest,
-        // so use a mainnet-like check: test at height below segwit_height).
-        // For regtest segwit_height=0, ALL heights are >= segwit_height. Use mainnet
-        // params where segwit activated at height 481,824.
+
+        // Use mainnet params so height 0 is pre-segwit (segwit_height = 481_824).
         let params = ChainParams::mainnet();
-        // height 0 is pre-segwit for mainnet
         let res = contextual_check_block(&block, 0, &StubChainContext, &params);
-        // BIP-34 requires height in coinbase (height 0 → segwit also 0 for mainnet
-        // means segwit IS active at 481,824 but NOT at 0). So witness in tx at h=0
-        // should be fine (no commitment check triggered).
-        // The block may fail BIP-34 but not for witness reasons.
+
+        // Post-fix: unexpected-witness must be raised.
+        // (The block fails BIP-34 at height 0 too, but the witness check fires
+        //  first when contextual_check_block is structured as Core's
+        //  ContextualCheckBlock — either rejection is acceptable as long as it
+        //  is not an accept.)
         assert!(
-            !matches!(res, Err(ValidationError::UnexpectedWitness)),
-            "pre-segwit block must not trigger unexpected-witness: {res:?}"
+            matches!(
+                res,
+                Err(ValidationError::UnexpectedWitness) | Err(ValidationError::BadCoinbaseHeight)
+            ),
+            "pre-segwit block with witness data must be rejected: {res:?}"
+        );
+        // Isolate the unexpected-witness path: use a height above BIP-34 activation
+        // (so the BIP-34 check passes) but below segwit (so no commitment is expected).
+        // make_coinbase_tx already encodes the BIP-34 height in script_sig.
+        let pre_segwit_height = params.bip34_height + 1; // e.g. 227_932 for mainnet
+        let coinbase2 = make_coinbase_tx(pre_segwit_height, 5_000_000_000);
+        let mut non_coinbase2 = make_simple_tx(Hash256::from_bytes([7u8; 32]), 0, 50);
+        non_coinbase2.inputs[0].witness = vec![vec![0x02; 32]];
+        let block2 = Block {
+            header: BlockHeader::default(),
+            transactions: vec![coinbase2, non_coinbase2],
+        };
+        let res2 = contextual_check_block(&block2, pre_segwit_height, &StubChainContext, &params);
+        assert_eq!(
+            res2,
+            Err(ValidationError::UnexpectedWitness),
+            "pre-segwit block with witness data must be rejected with unexpected-witness \
+             (height {pre_segwit_height}, segwit activates at {}): {res2:?}",
+            params.segwit_height
         );
     }
 
