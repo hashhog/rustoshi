@@ -413,8 +413,10 @@ impl ChainState {
         prev_block_mtp: u32,
         f_requested: bool,
         current_time: u64,
+        skip_scripts: bool,
+        prev_timestamp: u32,
     ) -> Result<(UndoData, u64), ValidationError> {
-        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None, current_time, &ChainStateNullSeqContext)
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None, current_time, &ChainStateNullSeqContext, skip_scripts, prev_timestamp)
     }
 
     /// Variant of `process_block` that accepts an explicit `claimed_height`.
@@ -433,8 +435,10 @@ impl ChainState {
         f_requested: bool,
         claimed_height: u32,
         current_time: u64,
+        skip_scripts: bool,
+        prev_timestamp: u32,
     ) -> Result<(UndoData, u64), ValidationError> {
-        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, Some(claimed_height), current_time, &ChainStateNullSeqContext)
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, Some(claimed_height), current_time, &ChainStateNullSeqContext, skip_scripts, prev_timestamp)
     }
 
     /// Variant of `process_block` that accepts a real `SequenceLockContext`.
@@ -457,8 +461,10 @@ impl ChainState {
         f_requested: bool,
         current_time: u64,
         seq_ctx: &C,
+        skip_scripts: bool,
+        prev_timestamp: u32,
     ) -> Result<(UndoData, u64), ValidationError> {
-        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None, current_time, seq_ctx)
+        self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None, current_time, seq_ctx, skip_scripts, prev_timestamp)
     }
 
     fn process_block_inner<U: UtxoView, C: SequenceLockContext>(
@@ -470,6 +476,8 @@ impl ChainState {
         claimed_height: Option<u32>,
         current_time: u64,
         seq_ctx: &C,
+        skip_scripts: bool,
+        prev_timestamp: u32,
     ) -> Result<(UndoData, u64), ValidationError> {
         let hash = block.block_hash();
         let new_height = self.tip_height + 1;
@@ -539,9 +547,16 @@ impl ChainState {
         // zero placeholder is safe). MTP comes from the StubChainContext
         // (returns 0) — the inline check above already enforces it, so the
         // double check is harmless.
+        // Finding 16 (BIP-94 timewarp): prev_timestamp is the REAL parent block
+        // timestamp supplied by the caller (look up from block_store before
+        // calling process_block). With the old placeholder of 0, the BIP-94
+        // gate `block_time < (0 - MAX_TIMEWARP=600)` was always false → the
+        // gate was silently disabled on testnet4/regtest. Callers that cannot
+        // provide the real parent timestamp pass 0 (gate stays skipped, which
+        // is safe for mainnet where enforce_bip94=false, and safe for tests).
         let prev_entry = BlockIndexEntry {
             height: self.tip_height,
-            timestamp: 0,
+            timestamp: prev_timestamp,
             bits: 0,
             prev_hash: block.header.prev_block_hash,
             chain_work: [0u8; 32],
@@ -596,6 +611,7 @@ impl ChainState {
             &self.params,
             seq_ctx,
             prev_block_mtp,
+            skip_scripts,
         )?;
 
         // Update tip
@@ -827,6 +843,7 @@ impl ChainState {
                 &self.params,
                 seq_ctx,
                 prev_block_mtp,
+                false, // reorg blocks always verify scripts (condition 5 would fail: < 2 weeks burial)
             )?;
             self.tip_hash = *hash;
             self.tip_height = new_height;
@@ -1274,7 +1291,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache, 0, true, 0);
+        let result = state.process_block(&block, &mut cache, 0, true, 0, false, 0);
 
         assert!(result.is_err());
         match result {
@@ -1364,7 +1381,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache, 0, true, 0);
+        let result = state.process_block(&block, &mut cache, 0, true, 0, false, 0);
         if let Err(ValidationError::PrevBlockNotFound(h)) = &result {
             panic!(
                 "ChainState::new(snapshot_hash, snapshot_height) did not bind \
@@ -1438,7 +1455,7 @@ mod tests {
         };
 
         let mut cache = empty_cache();
-        let result = state.process_block(&block, &mut cache, 0, true, 0);
+        let result = state.process_block(&block, &mut cache, 0, true, 0, false, 0);
 
         // We may get *some* validation error (e.g. the merkle root may be
         // computed differently, or PoW may fail), but we MUST NOT get
@@ -2195,7 +2212,7 @@ mod tests {
         // Recompute merkle root so we don't fail check_block first.
         block.header.merkle_root = block.compute_merkle_root();
 
-        let result = state.process_block(&block, &mut cache, 0, true, 0);
+        let result = state.process_block(&block, &mut cache, 0, true, 0, false, 0);
         // Either BadWitnessCommitment surfaces, or pow check fires first
         // (depends on regtest params).  We accept either rejection — the
         // critical thing is that the block is NOT silently accepted.
