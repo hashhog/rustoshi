@@ -98,48 +98,124 @@ fn push_encode(data: &[u8]) -> Vec<u8> {
     result
 }
 
+/// Advance past one opcode at position `i` in `script`, returning the index of
+/// the next opcode boundary.  Returns `None` when `i >= script.len()` (end of
+/// script or truncated push data).
+///
+/// Mirrors Bitcoin Core's `CScript::GetOp` (script/script.h): the returned
+/// index points to the first byte after the current opcode and all of its
+/// push-data bytes.  Truncated push-data is clamped to `script.len()`.
+fn get_op_end(script: &[u8], i: usize) -> Option<usize> {
+    if i >= script.len() {
+        return None;
+    }
+    let opcode = script[i];
+    let after = i + 1;
+    let end = script.len();
+    let next = match opcode {
+        // Direct push: `opcode` bytes of data follow.
+        0x01..=0x4b => after + opcode as usize,
+        // OP_PUSHDATA1: 1 length byte + that many data bytes.
+        0x4c => {
+            if after >= end {
+                return None;
+            }
+            after + 1 + script[after] as usize
+        }
+        // OP_PUSHDATA2: 2 LE length bytes + data.
+        0x4d => {
+            if after + 1 >= end {
+                return None;
+            }
+            let len = u16::from_le_bytes([script[after], script[after + 1]]) as usize;
+            after + 2 + len
+        }
+        // OP_PUSHDATA4: 4 LE length bytes + data.
+        0x4e => {
+            if after + 3 >= end {
+                return None;
+            }
+            let len = u32::from_le_bytes([
+                script[after],
+                script[after + 1],
+                script[after + 2],
+                script[after + 3],
+            ]) as usize;
+            after + 4 + len
+        }
+        // Non-push opcode: just skip the single byte.
+        _ => after,
+    };
+    // Clamp to script.len() for truncated push-data (matches Core's GetOp
+    // behaviour where pc may advance past `end`, causing the outer do-while
+    // to exit on the next iteration).
+    Some(next.min(end))
+}
+
 /// Remove all occurrences of the push-encoded signature from the script.
 ///
-/// This is the "FindAndDelete" operation required for legacy sighash computation.
-/// It removes all instances where the signature appears as a pushed value in the
-/// script. This is necessary because when we're verifying a signature, we need
-/// to compute the sighash over a version of the script that doesn't contain
-/// the signature itself (since it didn't exist when the signer created it).
+/// This is Bitcoin Core's `FindAndDelete` (script/interpreter.cpp:229-255)
+/// translated to Rust.  Critically, **matches are only recognised at opcode
+/// boundaries**: the function walks the script opcode-by-opcode (via
+/// `get_op_end`) and checks for the pattern only at each boundary, so an
+/// occurrence of `push_encode(sig)` that begins *inside* a push payload is
+/// never removed.
 ///
-/// The signature should include the sighash type byte at the end.
+/// This is necessary because when verifying a signature the sighash is
+/// computed over a version of the scriptCode from which the signature has been
+/// deleted — but only where it appeared as a genuine top-level push operand,
+/// not as a coincidental byte sequence inside another push.
 ///
-/// # Arguments
-/// * `script` - The scriptCode (script bytes)
-/// * `sig` - The signature bytes (including sighash type byte)
-///
-/// # Returns
-/// A new script with all push-encoded occurrences of the signature removed.
+/// The signature should include the sighash-type byte at the end.
 pub fn find_and_delete(script: &[u8], sig: &[u8]) -> Vec<u8> {
     if sig.is_empty() {
         return script.to_vec();
     }
-
     let pattern = push_encode(sig);
-    if pattern.is_empty() || pattern.len() > script.len() {
+    if pattern.is_empty() {
         return script.to_vec();
     }
 
-    // Find and remove all occurrences of the pattern
+    // Mirrors Core's do-while loop (interpreter.cpp:237-247):
+    //   do {
+    //     result += [pc2, pc);           // append since last boundary
+    //     while match_at(pc) { pc += b.size(); ++nFound; }
+    //     pc2 = pc;
+    //   } while (GetOp(pc, opcode));    // advance to next boundary
+    //   if (nFound > 0) result += [pc2, end);
     let mut result = Vec::with_capacity(script.len());
-    let mut i = 0;
+    let mut pc: usize = 0; // current opcode boundary
+    let mut pc2: usize = 0; // start of the current "keep" run
+    let mut found: usize = 0;
 
-    while i < script.len() {
-        // Check if pattern matches at current position
-        if i + pattern.len() <= script.len() && script[i..i + pattern.len()] == pattern[..] {
-            // Skip the pattern
-            i += pattern.len();
-        } else {
-            result.push(script[i]);
-            i += 1;
+    loop {
+        // Append unchanged bytes from the previous boundary up to the current one.
+        result.extend_from_slice(&script[pc2..pc]);
+
+        // Consume all consecutive matches at the current boundary.
+        while pc + pattern.len() <= script.len()
+            && script[pc..pc + pattern.len()] == pattern[..]
+        {
+            pc += pattern.len();
+            found += 1;
+        }
+        pc2 = pc;
+
+        // Advance past one opcode (= Core's GetOp call in the while condition).
+        match get_op_end(script, pc) {
+            None => break,
+            Some(next) => pc = next,
         }
     }
 
-    result
+    if found > 0 {
+        // Append anything after the last match/boundary.
+        result.extend_from_slice(&script[pc2..]);
+        result
+    } else {
+        // No deletions: return a fresh copy (mirrors Core's `if (nFound > 0) script = result`).
+        script.to_vec()
+    }
 }
 
 /// Count how many push-encoded occurrences of `sig` `find_and_delete` would
@@ -147,31 +223,36 @@ pub fn find_and_delete(script: &[u8], sig: &[u8]) -> Vec<u8> {
 ///
 /// Mirrors the `int` return value of Bitcoin Core's
 /// `FindAndDelete(CScript& script, const CScript& b)`
-/// (script/interpreter.cpp:229). Core's legacy CHECKSIG / CHECKMULTISIG
-/// paths use that count: if `found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE)`
-/// the script fails with `SCRIPT_ERR_SIG_FINDANDDELETE`
-/// (interpreter.cpp:330-332 and 1146-1148). The interpreter needs the count
-/// (not the rewritten script) to enforce that consensus rule, so this is a
-/// dedicated helper that scans with the SAME non-overlapping forward-match
-/// semantics as `find_and_delete` above.
+/// (script/interpreter.cpp:229).  Uses the same opcode-aligned walk as
+/// `find_and_delete`: matches inside push payloads are NOT counted.
+///
+/// Core's legacy CHECKSIG / CHECKMULTISIG paths use that count: if
+/// `found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE)` the script fails
+/// with `SCRIPT_ERR_SIG_FINDANDDELETE` (interpreter.cpp:330-332, 1146-1148).
 pub fn find_and_delete_count(script: &[u8], sig: &[u8]) -> usize {
     if sig.is_empty() {
         return 0;
     }
-
     let pattern = push_encode(sig);
-    if pattern.is_empty() || pattern.len() > script.len() {
+    if pattern.is_empty() {
         return 0;
     }
 
-    let mut count = 0;
-    let mut i = 0;
-    while i < script.len() {
-        if i + pattern.len() <= script.len() && script[i..i + pattern.len()] == pattern[..] {
+    let mut count: usize = 0;
+    let mut pc: usize = 0;
+
+    loop {
+        // Consume all consecutive matches at this boundary.
+        while pc + pattern.len() <= script.len()
+            && script[pc..pc + pattern.len()] == pattern[..]
+        {
+            pc += pattern.len();
             count += 1;
-            i += pattern.len();
-        } else {
-            i += 1;
+        }
+        // Advance past one opcode.
+        match get_op_end(script, pc) {
+            None => break,
+            Some(next) => pc = next,
         }
     }
     count
@@ -915,5 +996,92 @@ mod tests {
         let expected = Hash256(expected_bytes);
 
         assert_eq!(hash, expected, "BIP-143 P2SH-P2WPKH sighash mismatch");
+    }
+
+    // ---- FindAndDelete opcode-alignment tests (wave-2 fix) -------------------------
+    // These lock in that find_and_delete / find_and_delete_count only match at
+    // opcode boundaries, mirroring Core's GetOp-based loop
+    // (bitcoin-core/src/script/interpreter.cpp:229-255).
+
+    /// A signature embedded inside an OP_PUSHDATA1 payload must NOT be deleted.
+    /// Pre-fix (raw byte scan): the 2-byte pattern [0x01, 0x42] at offset 2
+    /// inside the 3-byte payload would be removed, corrupting the script.
+    /// Post-fix (opcode-aligned): the pattern is only checked at position 0
+    /// (opcode 0x4c), which does not match, so the script is unchanged.
+    #[test]
+    fn find_and_delete_no_match_inside_pushdata1_payload() {
+        let sig = [0x42u8]; // 1-byte sig
+        // push_encode(&sig) = [0x01, 0x42]
+        // Script: OP_PUSHDATA1 <3 bytes: 0x01, 0x42, 0x00> OP_CHECKSIG
+        // The sig pattern [0x01, 0x42] appears at offset 2 inside the payload,
+        // NOT at an opcode boundary.
+        let script = vec![0x4c, 0x03, 0x01, 0x42, 0x00, 0xac];
+        let result = find_and_delete(&script, &sig);
+        assert_eq!(
+            result, script,
+            "find_and_delete must not remove sig embedded inside a push payload"
+        );
+    }
+
+    /// The count variant must likewise return 0 for an in-payload occurrence.
+    #[test]
+    fn find_and_delete_count_no_match_inside_pushdata1_payload() {
+        let sig = [0x42u8];
+        // Same script as above: sig bytes inside OP_PUSHDATA1 payload.
+        let script = vec![0x4c, 0x03, 0x01, 0x42, 0x00, 0xac];
+        assert_eq!(
+            find_and_delete_count(&script, &sig),
+            0,
+            "find_and_delete_count must not count sig embedded inside a push payload"
+        );
+    }
+
+    /// A signature appearing AS a top-level direct push (at an opcode boundary)
+    /// must be removed.
+    #[test]
+    fn find_and_delete_removes_at_opcode_boundary() {
+        let sig = [0x42u8];
+        // Script: [0x01, 0x42] OP_CHECKSIG — pattern is a direct push at boundary
+        let script = vec![0x01, 0x42, 0xac];
+        let result = find_and_delete(&script, &sig);
+        assert_eq!(
+            result,
+            vec![0xac],
+            "find_and_delete must remove sig at opcode boundary"
+        );
+    }
+
+    /// Count must be 1 for a boundary-aligned occurrence.
+    #[test]
+    fn find_and_delete_count_boundary_occurrence() {
+        let sig = [0x42u8];
+        let script = vec![0x01, 0x42, 0xac];
+        assert_eq!(find_and_delete_count(&script, &sig), 1);
+    }
+
+    /// Two consecutive boundary-aligned occurrences → both removed.
+    #[test]
+    fn find_and_delete_removes_multiple_boundary_occurrences() {
+        let sig = [0x42u8];
+        // [0x01,0x42] [0x01,0x42] OP_CHECKSIG
+        let script = vec![0x01, 0x42, 0x01, 0x42, 0xac];
+        let result = find_and_delete(&script, &sig);
+        assert_eq!(result, vec![0xac]);
+        assert_eq!(find_and_delete_count(&script, &sig), 2);
+    }
+
+    /// Boundary occurrence followed by an in-payload near-miss: only the boundary
+    /// one is removed; the in-payload bytes are preserved intact.
+    #[test]
+    fn find_and_delete_boundary_plus_payload_mixed() {
+        let sig = [0x42u8];
+        // Script: [0x01, 0x42]            <- boundary push, must be deleted
+        //         [0x4c, 0x02, 0x01, 0x42] <- OP_PUSHDATA1 2-byte payload with sig bytes
+        //         [0xac]                   <- OP_CHECKSIG
+        let script = vec![0x01, 0x42, 0x4c, 0x02, 0x01, 0x42, 0xac];
+        let result = find_and_delete(&script, &sig);
+        // Only the first push should be removed; the OP_PUSHDATA1 block is intact.
+        assert_eq!(result, vec![0x4c, 0x02, 0x01, 0x42, 0xac]);
+        assert_eq!(find_and_delete_count(&script, &sig), 1);
     }
 }
