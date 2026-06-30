@@ -5501,6 +5501,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                 let prev_block_mtp =
                     compute_prev_block_mtp(&store, &block.header.prev_block_hash);
 
+                // Finding 16 (BIP-94 timewarp): real parent timestamp for gate.
+                let prev_timestamp = store
+                    .get_header(&block.header.prev_block_hash)
+                    .ok()
+                    .flatten()
+                    .map(|h| h.timestamp)
+                    .unwrap_or(0);
                 let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
                 match chain_state.process_block_with_seq_ctx(
                     block,
@@ -5509,6 +5516,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                     /* f_requested */ true,
                     rustoshi_consensus::current_time_secs(),
                     &seq_ctx,
+                    false, // verifychain always verifies scripts (correctness check)
+                    prev_timestamp,
                 ) {
                     Ok(_) => {}
                     Err(e) => {
@@ -7493,15 +7502,28 @@ impl RustoshiRpcServer for RpcServerImpl {
         // chains with < 11 ancestors).
         let prev_block_mtp = compute_prev_block_mtp(&store, &state.best_hash);
 
+        // Finding 16 (BIP-94 timewarp): real parent timestamp for the gate.
+        let prev_timestamp = store
+            .get_header(&block.header.prev_block_hash)
+            .ok()
+            .flatten()
+            .map(|h| h.timestamp)
+            .unwrap_or(0);
+
         // f_requested=false: submitblock is an external (unrequested) submission.
         // Apply the fTooFarAhead anti-DoS gate.  A block submitted via RPC
         // extends the active tip by definition (height = best_height + 1),
         // so the gate can never fire here in practice (1 ≤ MIN_BLOCKS_TO_KEEP).
         //
+        // Finding 4 (assumevalid): skip_scripts=false for submitblock — submitted
+        // blocks are at the tip (no ≥2-week burial), so the 5-condition gate
+        // would return false anyway. Explicit false is clearer and avoids
+        // the cost of the block_store lookups.
+        //
         // Use process_block_with_seq_ctx + BlockStoreSeqLockCtx so that
         // time-based BIP-68 relative lock-times are enforced (BUG-1+2 fix).
         let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
-        match chain_state.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, false, rustoshi_consensus::current_time_secs(), &seq_ctx) {
+        match chain_state.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, false, rustoshi_consensus::current_time_secs(), &seq_ctx, false, prev_timestamp) {
             Ok((undo_data, _fees)) => {
                 // Store header and block data
                 if let Err(e) = store.put_header(&block_hash, &block.header) {
@@ -15408,13 +15430,24 @@ impl RpcServerImpl {
         // (reuses the same module-level helper as submit_block).
         let prev_block_mtp = compute_prev_block_mtp(&store, &prev_hash);
 
+        // Finding 16 (BIP-94 timewarp): real parent timestamp for the gate.
+        let prev_timestamp = store
+            .get_header(&prev_hash)
+            .ok()
+            .flatten()
+            .map(|h| h.timestamp)
+            .unwrap_or(0);
+
         // f_requested=true: generateblock/generatetoaddress blocks are
         // self-mined (trusted path) — no fTooFarAhead guard needed.
+        //
+        // Finding 4 (assumevalid): skip_scripts=false — freshly mined blocks
+        // never satisfy the ≥2-week burial condition.
         //
         // Use process_block_with_seq_ctx + BlockStoreSeqLockCtx so that
         // time-based BIP-68 relative lock-times are enforced (BUG-1+2 fix).
         let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
-        match chain_state.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &seq_ctx) {
+        match chain_state.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &seq_ctx, false, prev_timestamp) {
             Ok((_undo_data, _fees)) => {
                 // Store the raw block bytes (after validation succeeds, matching
                 // submit_block's ordering to avoid persisting invalid data).

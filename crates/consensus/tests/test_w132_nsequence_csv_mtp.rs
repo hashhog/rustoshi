@@ -515,6 +515,7 @@ fn w132_g16_block_validation_enforces_min_time() {
             &params,
             &ctx,
             rejected_mtp,
+            false, // always verify scripts in tests
         );
         assert!(
             matches!(
@@ -541,6 +542,7 @@ fn w132_g16_block_validation_enforces_min_time() {
             &params,
             &ctx,
             accepted_mtp,
+            false, // always verify scripts in tests
         );
         assert!(
             result.is_ok(),
@@ -681,6 +683,7 @@ fn w132_g17_production_seqlock_context_returns_real_mtp() {
             &params,
             &real_ctx,
             test_mtp,
+            false, // always verify scripts in tests
         );
         assert!(
             matches!(
@@ -708,6 +711,7 @@ fn w132_g17_production_seqlock_context_returns_real_mtp() {
             &params,
             &real_ctx,
             accepted_mtp,
+            false, // always verify scripts in tests
         );
         assert!(
             result.is_ok(),
@@ -972,7 +976,7 @@ fn w132_g26_contextual_check_block_header_wired() {
 
     // current_time=0 skips gate 3 (future-time) so we ensure gate 4 fires,
     // not gate 3. f_requested=true skips fTooFarAhead.
-    let result = state.process_block(&block, &mut cache, 0, true, 0);
+    let result = state.process_block(&block, &mut cache, 0, true, 0, false, 0);
     assert!(
         matches!(result, Err(ValidationError::BadVersion(1))),
         "production process_block must reject a block with version=1 at \

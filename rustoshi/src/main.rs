@@ -27,8 +27,8 @@ use ops::{
 };
 
 use rustoshi_consensus::{
-    dump_mempool, get_block_proof, load_mempool, ChainParams, ChainState, ChainWork, FeeEstimator,
-    NetworkId, ValidationError,
+    dump_mempool, get_block_proof, load_mempool, should_skip_scripts, ChainParams, ChainState,
+    ChainWork, FeeEstimator, NetworkId, ValidationError,
 };
 use rustoshi_network::{
     asmap as asmap_mod, BlockDownloader, CFCheckptMessage, CFHeadersMessage, CFilterMessage,
@@ -575,6 +575,65 @@ fn mtp_for_connect(
     params
         .assumeutxo_for_blockhash(parent_hash)
         .and_then(|d| d.base_mtp)
+}
+
+/// Compute the faithful 5-condition assumevalid skip-scripts decision for a block
+/// about to be connected.
+///
+/// Mirrors Bitcoin Core `validation.cpp:2346-2382`. The caller provides the
+/// best-header hash so this helper can look up that header's chain_work and bits
+/// from block_store (condition 4 + condition 5). The block's own chain_work is
+/// computed locally as `prev_chain_work + get_block_proof(bits)` because
+/// `put_block_index` for THIS block happens AFTER `process_block` returns.
+///
+/// # Safety
+/// - Returning `true` skips script validation. Callers MUST pass the real
+///   `best_header_hash` from `header_sync.best_header_hash()` — never a zero
+///   sentinel — so conditions 2–5 are faithfully evaluated.
+/// - For paths without a live header sync (import from blk files), pass
+///   `skip_scripts: false` directly rather than calling this function.
+fn compute_skip_scripts(
+    block_hash: &Hash256,
+    block_height: u32,
+    block_bits: u32,
+    prev_block_hash: &Hash256,
+    best_header_hash: Hash256,
+    block_store: &BlockStore,
+    params: &ChainParams,
+) -> bool {
+    // Condition 1 early-exit: only compute if assumevalid is configured.
+    if params.assumed_valid_block.is_none() || params.assumed_valid_height.is_none() {
+        return false;
+    }
+
+    // Compute this block's chain work = prev_work + get_block_proof(bits).
+    let prev_chain_work = block_store
+        .get_block_index(prev_block_hash)
+        .ok()
+        .flatten()
+        .map(|e| e.chain_work)
+        .unwrap_or([0u8; 32]);
+    let block_chain_work = ChainWork::from_be_bytes(prev_chain_work)
+        .saturating_add(&get_block_proof(block_bits))
+        .0;
+
+    // Get the best-header's chain_work and bits for conditions 4 and 5.
+    let (best_header_chain_work, best_header_bits) = block_store
+        .get_block_index(&best_header_hash)
+        .ok()
+        .flatten()
+        .map(|e| (e.chain_work, e.bits))
+        .unwrap_or(([0u8; 32], 0));
+
+    should_skip_scripts(
+        block_hash,
+        block_height,
+        &block_chain_work,
+        &best_header_chain_work,
+        best_header_bits,
+        &|h| block_store.get_hash_by_height(h).ok().flatten(),
+        params,
+    )
 }
 
 /// Pattern C0 (txindex-on-connect): persist a `txid -> block_hash` mapping
@@ -1428,9 +1487,22 @@ fn run_import_from_blk_files(
         let prev_block_mtp =
             compute_mtp_via_store(block_store, &chain_state.tip_hash()).unwrap_or(0);
 
+        // Finding 16 (BIP-94 timewarp): real parent timestamp for the gate.
+        let prev_timestamp = block_store
+            .get_header(&block.header.prev_block_hash)
+            .ok()
+            .flatten()
+            .map(|h| h.timestamp)
+            .unwrap_or(0);
+
+        // Finding 4 (assumevalid): import path has no live header_sync, so
+        // we conservatively verify all scripts (correct; faster paths use
+        // compute_skip_scripts with a real best_header_hash).
+        let skip_scripts = false;
+
         // Validate and process (f_requested=true: import-from-Core-datadir is
         // a requested/trusted path — no fTooFarAhead guard needed).
-        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
+        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
             Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", height, e);
@@ -1639,9 +1711,21 @@ fn run_import_from_stdin(
         let prev_block_mtp =
             compute_mtp_via_store(block_store, &chain_state.tip_hash()).unwrap_or(0);
 
+        // Finding 16 (BIP-94 timewarp): real parent timestamp for the gate.
+        let prev_timestamp = block_store
+            .get_header(&block.header.prev_block_hash)
+            .ok()
+            .flatten()
+            .map(|h| h.timestamp)
+            .unwrap_or(0);
+
+        // Finding 4 (assumevalid): import path has no live header_sync, so
+        // we conservatively verify all scripts.
+        let skip_scripts = false;
+
         // Validate and process (f_requested=true: snapshot-import is a
         // requested/trusted path — no fTooFarAhead guard needed).
-        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
+        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
             Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", frame_height, e);
@@ -3316,9 +3400,26 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         let prev_block_mtp =
                             mtp_for_connect(&block_store, &cs.tip_hash(), &params)
                                 .unwrap_or(0);
+                        // Finding 16 (BIP-94 timewarp): real parent timestamp.
+                        let prev_timestamp = block_store
+                            .get_header(&block.header.prev_block_hash)
+                            .ok()
+                            .flatten()
+                            .map(|h| h.timestamp)
+                            .unwrap_or(0);
+                        // Finding 4 (assumevalid): faithful 5-condition gate.
+                        let skip_scripts = compute_skip_scripts(
+                            &block_hash,
+                            height,
+                            block.header.bits,
+                            &block.header.prev_block_hash,
+                            header_sync.best_header_hash(),
+                            &block_store,
+                            &params,
+                        );
                         // f_requested=true: blocks from the IBD block downloader
                         // are actively requested via getdata — no fTooFarAhead guard.
-                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
+                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
                             Ok((undo, _fees)) => Some(undo),
                             Err(e) => {
                                 tracing::warn!(
@@ -4077,9 +4178,26 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         let prev_block_mtp =
                                             mtp_for_connect(&block_store, &cs.tip_hash(), &params)
                                                 .unwrap_or(0);
+                                        // Finding 16 (BIP-94 timewarp): real parent timestamp.
+                                        let prev_timestamp = block_store
+                                            .get_header(&block.header.prev_block_hash)
+                                            .ok()
+                                            .flatten()
+                                            .map(|h| h.timestamp)
+                                            .unwrap_or(0);
+                                        // Finding 4 (assumevalid): faithful 5-condition gate.
+                                        let skip_scripts = compute_skip_scripts(
+                                            &block_hash,
+                                            height,
+                                            block.header.bits,
+                                            &block.header.prev_block_hash,
+                                            header_sync.best_header_hash(),
+                                            &block_store,
+                                            &params,
+                                        );
                                         // f_requested=true: blocks from the P2P block downloader
                                         // are actively requested via getdata — no fTooFarAhead guard.
-                                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs()) {
+                                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
                                             Ok((undo, _fees)) => Some(undo),
                                             Err(e) => {
                                                 tracing::warn!(

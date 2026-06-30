@@ -228,7 +228,7 @@ fn g7_contextual_check_block_header_is_wired_into_production() {
         }
     }
 
-    let result = state.process_block(&block, &mut cache, 0, true, current_time);
+    let result = state.process_block(&block, &mut cache, 0, true, current_time, false, 0);
     assert!(
         matches!(result, Err(ValidationError::TimeTooNew)),
         "production process_block must reject a block timestamped {} \
@@ -242,7 +242,7 @@ fn g7_contextual_check_block_header_is_wired_into_production() {
     // does NOT reject for TimeTooNew — proves the gate is gated on
     // current_time and not always-on. The block may still fail for some
     // other downstream reason, but it must NOT be TimeTooNew.
-    let result_skip = state.process_block(&block, &mut cache, 0, true, 0);
+    let result_skip = state.process_block(&block, &mut cache, 0, true, 0, false, 0);
     assert!(
         !matches!(result_skip, Err(ValidationError::TimeTooNew)),
         "with current_time=0 the 7200-future gate must be skipped; got: {:?}",
@@ -487,7 +487,7 @@ fn g19c_unrequested_block_too_far_ahead_rejected() {
     let claimed_height = MIN_BLOCKS_TO_KEEP + 1; // 289
     let block = build_minimal_block(genesis_hash);
 
-    let result = state.process_block_at_height(&block, &mut cache, 0, false, claimed_height, 0);
+    let result = state.process_block_at_height(&block, &mut cache, 0, false, claimed_height, 0, false, 0);
     assert!(
         matches!(result, Err(ValidationError::BlockTooFarAhead(289, 0))),
         "unrequested block at claimed height {claimed_height} (> tip 0 + MIN_BLOCKS_TO_KEEP {MIN_BLOCKS_TO_KEEP}) \
@@ -512,7 +512,7 @@ fn g19c_unrequested_block_at_gate_not_too_far() {
     let claimed_height = MIN_BLOCKS_TO_KEEP; // exactly 288
     let block = build_minimal_block(genesis_hash);
 
-    let result = state.process_block_at_height(&block, &mut cache, 0, false, claimed_height, 0);
+    let result = state.process_block_at_height(&block, &mut cache, 0, false, claimed_height, 0, false, 0);
     assert!(
         !matches!(result, Err(ValidationError::BlockTooFarAhead(_, _))),
         "block at claimed height {claimed_height} (== tip 0 + {MIN_BLOCKS_TO_KEEP}) \
@@ -536,7 +536,7 @@ fn g19c_requested_block_far_ahead_accepted_past_gate() {
     let claimed_height = MIN_BLOCKS_TO_KEEP + 1; // 289
     let block = build_minimal_block(genesis_hash);
 
-    let result = state.process_block_at_height(&block, &mut cache, 0, true, claimed_height, 0);
+    let result = state.process_block_at_height(&block, &mut cache, 0, true, claimed_height, 0, false, 0);
     assert!(
         !matches!(result, Err(ValidationError::BlockTooFarAhead(_, _))),
         "requested block at claimed height {claimed_height} must NOT be rejected \
