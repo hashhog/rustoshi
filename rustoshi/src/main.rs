@@ -3530,10 +3530,23 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // territory and starts per-block-flushing (the
                         // 2026-05-27 saw-tooth). Time- and block-count
                         // triggers: pre-existing safety floors.
+                        // At-tip trigger: mirror of the P2P-block connect path
+                        // (see the matching `at_header_tip` site in the
+                        // NetworkMessage::Block branch for the full rationale) —
+                        // once the connected block reaches the announced header
+                        // tip, flush the accumulated coin delta + bodies/undo
+                        // atomically with the tip advance so the durable
+                        // (RPC-visible) UTXO set stays coherent with the reported
+                        // tip. Prevents the post-reorg tip-block delta from being
+                        // stranded in the write-back cache. Fires once on
+                        // catch-up, not per bulk-IBD block.
+                        let at_header_tip = utxo_view.cache_len() > 0
+                            && block_hash == header_sync.best_header_hash();
                         let should_flush = cache_state == UtxoCacheState::Critical
                             || (cache_state == UtxoCacheState::Large
                                 && blocks_since_flush >= UTXO_FLUSH_INTERVAL_LARGE_BLOCKS)
                             || blocks_since_flush >= UTXO_FLUSH_INTERVAL_BLOCKS
+                            || at_header_tip
                             || (time_since_flush.as_secs() >= UTXO_FLUSH_INTERVAL_SECS
                                 && utxo_view.cache_len() > 0);
                         if should_flush {
@@ -4463,9 +4476,35 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         blocks_since_flush += 1;
                                         let cache_state = utxo_view.cache_state();
                                         let time_since_flush = last_flush_instant.elapsed();
+                                        // At-tip trigger (P2P-reorg UTXO corruption fix):
+                                        // when the block we just connected IS the current
+                                        // best header, we have caught up to the announced
+                                        // tip — there are no more bodies in flight. rustoshi's
+                                        // gettxout/gettxoutsetinfo read RocksDB directly (not
+                                        // this in-memory write-back cache), while the RPC tip
+                                        // pointer advances eagerly per connected block below.
+                                        // Under the block-count/time/size triggers alone, a
+                                        // short post-reorg tail (the reorg's fresh view resets
+                                        // the flush accounting, then a handful of follow-up
+                                        // blocks connect) leaves the tip block's coin delta
+                                        // stranded in the cache: the RPC tip says height N but
+                                        // the durable UTXO set still reflects the last flushed
+                                        // block, so newly-created outputs read as absent and
+                                        // freshly-spent coins read as still-present. Flushing
+                                        // the whole accumulated delta + bodies/undo atomically
+                                        // with the tip advance the instant we reach the header
+                                        // tip keeps the durable (RPC-visible) UTXO set coherent
+                                        // with the reported tip — Core's ConnectTip likewise
+                                        // keeps its CCoinsViewCache (which gettxout reads)
+                                        // consistent with the active tip. It fires once on
+                                        // catch-up, not per bulk-IBD block, so it does not
+                                        // reintroduce the per-block-flush pace decay.
+                                        let at_header_tip = utxo_view.cache_len() > 0
+                                            && block_hash == header_sync.best_header_hash();
                                         let should_flush = cache_state == UtxoCacheState::Critical
                                             || (cache_state == UtxoCacheState::Large && blocks_since_flush > 0)
                                             || blocks_since_flush >= UTXO_FLUSH_INTERVAL_BLOCKS
+                                            || at_header_tip
                                             || (time_since_flush.as_secs() >= UTXO_FLUSH_INTERVAL_SECS
                                                 && utxo_view.cache_len() > 0);
                                         if should_flush {
