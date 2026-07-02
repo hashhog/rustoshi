@@ -340,6 +340,18 @@ struct Cli {
     #[arg(long = "cjdnsreachable", default_value = "false")]
     cjdnsreachable: bool,
 
+    /// Override the built-in assumevalid script-verification skip.
+    ///
+    /// Mirrors Bitcoin Core's `-assumevalid=<hex>`. Pass `0` (or an all-zero
+    /// 32-byte hash) to DISABLE the skip entirely so every block below the
+    /// built-in assumevalid height is FULLY script-verified — this is what the
+    /// mainnet-history replay harness uses (`--assumevalid=0`). Pass a 32-byte
+    /// hex block hash to set a custom assumed-valid point.
+    ///
+    /// Example: `--assumevalid=0`
+    #[arg(long = "assumevalid", value_name = "HEX|0")]
+    assumevalid: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -575,6 +587,51 @@ fn mtp_for_connect(
     params
         .assumeutxo_for_blockhash(parent_hash)
         .and_then(|d| d.base_mtp)
+}
+
+/// Apply a `--assumevalid=<hex|0>` CLI override onto the chain params.
+///
+/// Mirrors Bitcoin Core's `-assumevalid`. `0` (or an all-zero 32-byte hash)
+/// clears BOTH `assumed_valid_block` and `assumed_valid_height`, so the faithful
+/// 5-condition gate (`should_skip_scripts`) short-circuits to `false` for every
+/// block — the whole chain is fully script-verified. This is the knob the
+/// mainnet-history replay harness drives.
+///
+/// A non-zero 32-byte hex value sets a custom assumed-valid block hash. The
+/// height-indexed gate additionally requires a PAIRED height that cannot be
+/// resolved at config time (Core derives it dynamically via `GetAncestor`), so
+/// the height is cleared to `None`; this keeps the skip disabled (fail-safe,
+/// full verification) rather than pairing the custom hash with the built-in
+/// 938343 height — which would be the nimrod-class hash/height mismatch bug.
+fn apply_assumevalid_override(params: &mut ChainParams, value: &str) -> anyhow::Result<()> {
+    let trimmed = value.trim();
+    let stripped = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+
+    // `0` or an all-zero 256-bit hash => DISABLE the assumevalid skip entirely.
+    let is_zero =
+        stripped == "0" || (stripped.len() == 64 && stripped.bytes().all(|b| b == b'0'));
+    if is_zero {
+        params.assumed_valid_block = None;
+        params.assumed_valid_height = None;
+        tracing::info!(
+            "assumevalid DISABLED via --assumevalid=0: full script verification of all history"
+        );
+        return Ok(());
+    }
+
+    let hash = Hash256::from_hex(stripped).map_err(|_| {
+        anyhow::anyhow!(
+            "invalid --assumevalid value {:?}: expected a 32-byte hex block hash or 0",
+            value
+        )
+    })?;
+    params.assumed_valid_block = Some(hash);
+    params.assumed_valid_height = None;
+    tracing::warn!(
+        "custom --assumevalid hash set but no paired height is known; assumevalid skip stays \
+         DISABLED (fail-safe full verification)"
+    );
+    Ok(())
 }
 
 /// Compute the faithful 5-condition assumevalid skip-scripts decision for a block
@@ -2065,7 +2122,7 @@ fn split_dbcache(dbcache_mib: usize) -> (usize, usize) {
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // Resolve network early so we can place the debug log under the
     // network-specific data directory.
-    let params = match cli.network.as_str() {
+    let mut params = match cli.network.as_str() {
         "mainnet" | "main" => ChainParams::mainnet(),
         "testnet3" | "testnet" => ChainParams::testnet3(),
         "testnet4" => ChainParams::testnet4(),
@@ -2073,6 +2130,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         "regtest" => ChainParams::regtest(),
         _ => anyhow::bail!("Unknown network: {}", cli.network),
     };
+
+    // `--assumevalid=<hex|0>` override (mainnet-history replay harness /
+    // full-history script verification). `=0` disables the assumevalid skip so
+    // the faithful 5-condition gate always returns false (full verify).
+    if let Some(ref av) = cli.assumevalid {
+        apply_assumevalid_override(&mut params, av)?;
+    }
 
     // Resolve datadirs eagerly so we can write the PID file + debug log.
     let base_datadir = resolve_base_datadir(&cli.datadir);
@@ -6092,6 +6156,91 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EFFECTIVE assumevalid-disable test: a block far below the built-in
+    /// mainnet assumevalid height (938343) is SKIPPED by the gate under default
+    /// params, but `--assumevalid=0` forces the gate to `false` (full script
+    /// verification). Asserts both the pre-override skip AND the post-override
+    /// full-verify, so the assertion cannot pass by some other unmet condition.
+    #[test]
+    fn test_assumevalid_disable_forces_full_script_verification() {
+        let mut params = ChainParams::mainnet();
+
+        // A block well below the AV height (200_000 < 938_343).
+        let block_height: u32 = 200_000;
+        let block_hash = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000deadbeef",
+        )
+        .unwrap();
+        let av_hash = params.assumed_valid_block.expect("mainnet has assumevalid");
+        let av_height = params.assumed_valid_height.expect("mainnet has av height");
+
+        // Canonical-chain oracle: correct hashes at both AV height and block height.
+        let hash_at_height = |h: u32| -> Option<Hash256> {
+            if h == av_height {
+                Some(av_hash)
+            } else if h == block_height {
+                Some(block_hash)
+            } else {
+                None
+            }
+        };
+
+        // Conditions 4 + 5: best-header work == minimum_chain_work (passes the
+        // eclipse guard), block's own work 0 (huge equivalent-time gap → passes
+        // the 2-week DoS guard). best_header_bits = genesis difficulty.
+        let block_chain_work = [0u8; 32];
+        let best_header_chain_work = params.minimum_chain_work;
+        let best_header_bits: u32 = 0x1d00_ffff;
+
+        // Pre-override: all 5 conditions hold → the gate SKIPS scripts.
+        assert!(
+            should_skip_scripts(
+                &block_hash,
+                block_height,
+                &block_chain_work,
+                &best_header_chain_work,
+                best_header_bits,
+                &hash_at_height,
+                &params,
+            ),
+            "default mainnet params should skip scripts for a block below AV height"
+        );
+
+        // Disable via the CLI knob.
+        apply_assumevalid_override(&mut params, "0").unwrap();
+        assert!(params.assumed_valid_block.is_none());
+        assert!(params.assumed_valid_height.is_none());
+
+        // Post-override: identical conditions → the gate FULLY VERIFIES (false).
+        assert!(
+            !should_skip_scripts(
+                &block_hash,
+                block_height,
+                &block_chain_work,
+                &best_header_chain_work,
+                best_header_bits,
+                &hash_at_height,
+                &params,
+            ),
+            "--assumevalid=0 must force full script verification (skip == false)"
+        );
+    }
+
+    #[test]
+    fn test_assumevalid_override_all_zero_hash_disables() {
+        let mut params = ChainParams::mainnet();
+        let zeros = "0".repeat(64);
+        apply_assumevalid_override(&mut params, &zeros).unwrap();
+        assert!(params.assumed_valid_block.is_none());
+        assert!(params.assumed_valid_height.is_none());
+    }
+
+    #[test]
+    fn test_assumevalid_override_invalid_errors() {
+        let mut params = ChainParams::mainnet();
+        assert!(apply_assumevalid_override(&mut params, "not-a-hash").is_err());
+    }
 
     #[test]
     fn test_resolve_datadir_mainnet_no_subdirectory() {
