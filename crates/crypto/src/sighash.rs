@@ -168,9 +168,11 @@ fn get_op_end(script: &[u8], i: usize) -> Option<usize> {
 ///
 /// The signature should include the sighash-type byte at the end.
 pub fn find_and_delete(script: &[u8], sig: &[u8]) -> Vec<u8> {
-    if sig.is_empty() {
-        return script.to_vec();
-    }
+    // Core gates on `b.empty()` (interpreter.cpp:231), where `b = CScript() <<
+    // vchSig` is the PUSH-ENCODING of the sig — NOT the raw sig. That encoding
+    // is never empty: an empty sig push-encodes to the single byte [0x00]
+    // (OP_0), which Core still searches for and can delete. So do NOT early-out
+    // on an empty raw sig; only the (impossible) empty-pattern case short-cuts.
     let pattern = push_encode(sig);
     if pattern.is_empty() {
         return script.to_vec();
@@ -230,9 +232,10 @@ pub fn find_and_delete(script: &[u8], sig: &[u8]) -> Vec<u8> {
 /// `found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE)` the script fails
 /// with `SCRIPT_ERR_SIG_FINDANDDELETE` (interpreter.cpp:330-332, 1146-1148).
 pub fn find_and_delete_count(script: &[u8], sig: &[u8]) -> usize {
-    if sig.is_empty() {
-        return 0;
-    }
+    // Core gates on `b.empty()` (the push-ENCODING of the sig), never on the
+    // raw sig being empty. An empty sig encodes to [0x00] and IS searched for,
+    // so an empty sig can still return a non-zero count (matching a leading
+    // OP_0). Do NOT early-out on an empty raw sig.
     let pattern = push_encode(sig);
     if pattern.is_empty() {
         return 0;
@@ -1049,6 +1052,34 @@ mod tests {
             vec![0xac],
             "find_and_delete must remove sig at opcode boundary"
         );
+    }
+
+    /// Glass-box finding 2026-07-01 (CONST_SCRIPTCODE empty-sig FindAndDelete):
+    /// Core builds the search pattern as `CScript() << vchSig`, so an EMPTY sig
+    /// encodes to the single byte [0x00] (OP_0) — NOT the empty pattern. Core's
+    /// FindAndDelete only short-circuits on an empty PATTERN (`if (b.empty())`),
+    /// which never happens. So an empty sig must still be searched for and can
+    /// match a leading OP_0. This locks the fix that removed the erroneous
+    /// `if sig.is_empty() { return }` early-out.
+    #[test]
+    fn find_and_delete_empty_sig_matches_leading_op0() {
+        // scriptCode `00 21 <33-byte pubkey> ac 91` (OP_0 <pk> CHECKSIG NOT).
+        let mut script = vec![0x00u8, 0x21];
+        script.extend_from_slice(&[0x02u8; 33]);
+        script.push(0xac);
+        script.push(0x91);
+        // Empty sig -> pattern [0x00] -> matches the leading OP_0 exactly once.
+        assert_eq!(
+            find_and_delete_count(&script, &[]),
+            1,
+            "empty sig must match the leading OP_0 (pattern is [0x00], not empty)"
+        );
+        let deleted = find_and_delete(&script, &[]);
+        assert_eq!(
+            deleted[0], 0x21,
+            "the leading OP_0 must be deleted, exposing the pubkey push"
+        );
+        assert_eq!(deleted.len(), script.len() - 1);
     }
 
     /// Count must be 1 for a boundary-aligned occurrence.
