@@ -2618,6 +2618,24 @@ fn storage_undo_to_validation(
 /// silently falling back to a non-atomic path — a partial multi-block
 /// commit is precisely the failure mode this constant exists to
 /// prevent.
+///
+/// **Core-parity gate (2026-07):** this cap is now enforced ONLY when
+/// pruning is enabled (`RpcState::prune_mode`). Bitcoin Core has no
+/// reorg-depth cap and follows the most-work valid chain to ANY depth
+/// on an archive node (all undo present); only a PRUNED node is bounded,
+/// by its undo-retention window (`MIN_BLOCKS_TO_KEEP`), not by policy.
+/// In archive mode (the default) the connect path retains the full
+/// body+undo history (see `reorg_retention_prune_targets` in `main.rs`),
+/// so a deep disconnect always finds its undo and this cap is skipped —
+/// making rustoshi follow a >288-deep higher-work chain exactly like an
+/// archive Core node instead of silently staying on a lower-work
+/// minority chain (the Class-A consensus divergence this gate closes).
+/// Residual: an *astronomically* deep archive reorg still accumulates
+/// one large in-memory `WriteBatch` (rustoshi's Pattern-D single-atomic
+/// commit); practical deep reorgs (hundreds–low-thousands of blocks) are
+/// fine, but a chunked-commit refactor would be needed for a truly
+/// unbounded (e.g. 100k-block) reorg. Pruned mode keeps the 288 cap:
+/// undo beyond the retention window is genuinely absent there.
 pub const MAX_REORG_DEPTH: u32 = 288;
 
 /// Maintain the per-height coinstatsindex on block CONNECT.
@@ -2805,10 +2823,16 @@ fn disconnect_to(
     // prevent.
     let original_height = state.best_height;
     let depth = original_height.saturating_sub(target_height);
-    if depth > MAX_REORG_DEPTH {
+    // Core-parity gate (2026-07): enforce the depth cap ONLY in prune mode.
+    // In archive mode the connect path retains the full undo history, so a
+    // deep disconnect always finds its undo and we follow the most-work
+    // chain to any depth like Core. In prune mode undo beyond the 288-block
+    // retention window is genuinely gone, so the cap prevents attempting a
+    // reorg that would otherwise fail on missing undo.
+    if state.prune_mode && depth > MAX_REORG_DEPTH {
         return Err(format!(
-            "disconnect_to depth {} exceeds MAX_REORG_DEPTH ({}); refusing \
-             non-atomic fallback",
+            "disconnect_to depth {} exceeds MAX_REORG_DEPTH ({}) in prune mode; \
+             refusing reorg past the undo-retention window",
             depth, MAX_REORG_DEPTH
         ));
     }
@@ -3240,10 +3264,16 @@ pub fn try_attach_and_reorg(
         original_tip_height.saturating_sub(approx_disconnect),
     );
     let total = approx_disconnect.saturating_add(approx_connect);
-    if total > MAX_REORG_DEPTH {
+    // Core-parity gate (2026-07): enforce the depth cap ONLY in prune mode
+    // (see `disconnect_to` and the `MAX_REORG_DEPTH` doc comment). In archive
+    // mode the connect path retains the full body+undo history, so a deep
+    // reorg to a higher-work chain has the undo it needs and we follow it to
+    // any depth like Core rather than staying on a lower-work minority chain.
+    if state.prune_mode && total > MAX_REORG_DEPTH {
         return Err(format!(
             "reorg span {} (disconnect={} + connect={}) exceeds \
-             MAX_REORG_DEPTH ({}); refusing non-atomic fallback",
+             MAX_REORG_DEPTH ({}) in prune mode; refusing reorg past the \
+             undo-retention window",
             total, approx_disconnect, approx_connect, MAX_REORG_DEPTH
         ));
     }
@@ -22049,12 +22079,12 @@ mod tests {
         );
     }
 
-    /// Pattern D fleet-wide closure (2026-05-07): a reorg whose
-    /// disconnect+reconnect span exceeds `MAX_REORG_DEPTH` must error
-    /// gracefully. Allowing it to proceed would let an unbounded
-    /// `WriteBatch` accumulate in memory; allowing a silent fallback to
-    /// per-block-atomic would re-introduce the partial-commit window
-    /// this whole refactor closes.
+    /// Pattern D fleet-wide closure (2026-05-07): in PRUNE mode a reorg
+    /// whose disconnect+reconnect span exceeds `MAX_REORG_DEPTH` must
+    /// error gracefully — undo beyond the retention window is genuinely
+    /// gone, so attempting the reorg would fail on missing undo. (Archive
+    /// mode has no such cap — see
+    /// `disconnect_to_does_not_cap_in_archive_mode`.)
     #[tokio::test]
     async fn disconnect_to_errors_when_depth_exceeds_cap() {
         use rustoshi_consensus::ChainParams;
@@ -22062,7 +22092,10 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
-        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        // Prune mode: the depth cap is active only when pruning is on.
+        let mut rpc_state =
+            RpcState::with_prune_config(db.clone(), ChainParams::mainnet(), 550 * 1024 * 1024);
+        assert!(rpc_state.prune_mode, "test precondition: prune mode on");
 
         // Synthetic chain: a tip at height MAX_REORG_DEPTH + 5 with
         // target=0 forces a disconnect span of MAX_REORG_DEPTH + 5.
@@ -22096,6 +22129,47 @@ mod tests {
         );
         // In-memory tip is unchanged too.
         assert_eq!(rpc_state.best_height, MAX_REORG_DEPTH + 5);
+    }
+
+    /// Core-parity gate (2026-07): in ARCHIVE mode (default, pruning off)
+    /// `disconnect_to` does NOT enforce `MAX_REORG_DEPTH` — Bitcoin Core
+    /// follows the most-work valid chain to any depth on an archive node.
+    /// A span past the cap must get PAST the depth check (it then fails on
+    /// the missing synthetic block index, NOT on the depth-cap error),
+    /// proving the gate no longer refuses a deep reorg on an archive node.
+    #[tokio::test]
+    async fn disconnect_to_does_not_cap_in_archive_mode() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        // Archive mode (default): no prune, so no reorg-depth cap.
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        assert!(!rpc_state.prune_mode, "test precondition: archive mode");
+
+        rpc_state.best_hash = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000deadbeef",
+        )
+        .unwrap();
+        rpc_state.best_height = MAX_REORG_DEPTH + 5;
+
+        let target_hash = Hash256::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000123",
+        )
+        .unwrap();
+
+        // The depth (MAX_REORG_DEPTH + 5) exceeds the cap, but in archive
+        // mode the cap is skipped: `disconnect_to` proceeds into the plan
+        // walk and fails looking up the (synthetic, absent) block index —
+        // a DIFFERENT error than the depth-cap refusal.
+        let err = disconnect_to(&mut rpc_state, target_hash, 0)
+            .expect_err("synthetic chain has no real block index");
+        assert!(
+            !err.contains("exceeds MAX_REORG_DEPTH"),
+            "archive mode must NOT refuse on the depth cap; got: {}",
+            err
+        );
     }
 
     // ============================================================

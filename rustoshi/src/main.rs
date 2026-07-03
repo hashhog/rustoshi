@@ -3623,11 +3623,28 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             // the CONTIGUOUS range up to the floor, so the prune
                             // is cadence-independent (no fixed scan window that
                             // a fast/large flush could skip over).
-                            let prune_plan = reorg_retention_prune_targets(
-                                &block_store,
-                                height,
-                                REORG_RETENTION_BLOCKS,
-                            );
+                            //
+                            // Core-parity retention (2026-07): run the
+                            // reorg-retention prune ONLY in PRUNE mode. In
+                            // archive mode (default) we RETAIN the full
+                            // body+undo history so a deep (>288) reorg to a
+                            // higher-work chain always has the undo it needs —
+                            // matching Bitcoin Core's archive node, which never
+                            // prunes. This is what makes gating off the
+                            // `MAX_REORG_DEPTH` cap in archive mode (server.rs)
+                            // safe: the undo the deep disconnect needs is there.
+                            let prune_plan = if prune_cfg.is_prune_mode() {
+                                reorg_retention_prune_targets(
+                                    &block_store,
+                                    height,
+                                    REORG_RETENTION_BLOCKS,
+                                )
+                            } else {
+                                ReorgPrunePlan {
+                                    targets: Vec::new(),
+                                    new_watermark: None,
+                                }
+                            };
                             match utxo_view.flush_with_tip_and_blocks(
                                 &block_hash,
                                 height,
@@ -4578,11 +4595,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             // retention floor in the same batch.
                                             // Watermark-resumed contiguous sweep
                                             // (cadence-independent).
-                                            let prune_plan = reorg_retention_prune_targets(
-                                                &block_store,
-                                                height,
-                                                REORG_RETENTION_BLOCKS,
-                                            );
+                                            //
+                                            // Core-parity retention (2026-07):
+                                            // prune ONLY in PRUNE mode; archive
+                                            // mode retains the full body+undo
+                                            // history so a deep (>288) reorg has
+                                            // its undo (see server.rs cap gate).
+                                            let prune_plan = if prune_cfg.is_prune_mode() {
+                                                reorg_retention_prune_targets(
+                                                    &block_store,
+                                                    height,
+                                                    REORG_RETENTION_BLOCKS,
+                                                )
+                                            } else {
+                                                ReorgPrunePlan {
+                                                    targets: Vec::new(),
+                                                    new_watermark: None,
+                                                }
+                                            };
                                             match utxo_view.flush_with_tip_and_blocks(
                                                 &block_hash,
                                                 height,
