@@ -1681,22 +1681,28 @@ fn eval_script_internal(
                         return Err(ScriptError::WitnessPubkeyType);
                     }
 
+                    // Compute the scriptCode starting at the BYTE OFFSET just
+                    // after the last executed OP_CODESEPARATOR (Core's
+                    // pbegincodehash). For legacy this subscript is then
+                    // FindAndDelete'd; for WITNESS_V0 it is the witnessScript
+                    // slice. Either way it is a byte slice, NOT an opcode-index
+                    // slice — so pass codesep_byte_offset, not codesep_pos.
+                    let subscript = get_subscript(full_script, ctx.codesep_byte_offset);
+                    // CONST_SCRIPTCODE: reject if FindAndDelete would strip the
+                    // sig from the scriptCode on the legacy path (Core
+                    // interpreter.cpp:329-333). Core runs FindAndDelete
+                    // UNCONDITIONALLY for SigVersion::BASE — including for an
+                    // EMPTY sig, whose push-encoding is the single byte [0x00]
+                    // and so matches a leading OP_0 in the scriptCode. Run the
+                    // check BEFORE the empty-sig short-circuit so an empty sig is
+                    // FindAndDelete-checked exactly as Core does.
+                    check_const_scriptcode_findanddelete(
+                        &sig, subscript, ctx.sig_version, ctx.flags,
+                    )?;
+
                     let success = if sig.is_empty() {
                         false
                     } else {
-                        // Compute the scriptCode starting at the BYTE OFFSET just
-                        // after the last executed OP_CODESEPARATOR (Core's
-                        // pbegincodehash). For legacy this subscript is then
-                        // FindAndDelete'd; for WITNESS_V0 it is the witnessScript
-                        // slice. Either way it is a byte slice, NOT an opcode-index
-                        // slice — so pass codesep_byte_offset, not codesep_pos.
-                        let subscript = get_subscript(full_script, ctx.codesep_byte_offset);
-                        // CONST_SCRIPTCODE: reject if FindAndDelete would strip
-                        // the sig from the scriptCode on the legacy path
-                        // (Core interpreter.cpp:330-332).
-                        check_const_scriptcode_findanddelete(
-                            &sig, subscript, ctx.sig_version, ctx.flags,
-                        )?;
                         // Pass full signature including sighash type byte
                         ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
                     };
@@ -1777,22 +1783,28 @@ fn eval_script_internal(
                         return Err(ScriptError::WitnessPubkeyType);
                     }
 
+                    // Compute the scriptCode starting at the BYTE OFFSET just
+                    // after the last executed OP_CODESEPARATOR (Core's
+                    // pbegincodehash). For legacy this subscript is then
+                    // FindAndDelete'd; for WITNESS_V0 it is the witnessScript
+                    // slice. Either way it is a byte slice, NOT an opcode-index
+                    // slice — so pass codesep_byte_offset, not codesep_pos.
+                    let subscript = get_subscript(full_script, ctx.codesep_byte_offset);
+                    // CONST_SCRIPTCODE: reject if FindAndDelete would strip the
+                    // sig from the scriptCode on the legacy path (Core
+                    // interpreter.cpp:329-333). Core runs FindAndDelete
+                    // UNCONDITIONALLY for SigVersion::BASE — including for an
+                    // EMPTY sig, whose push-encoding is the single byte [0x00]
+                    // and so matches a leading OP_0 in the scriptCode. Run the
+                    // check BEFORE the empty-sig short-circuit so an empty sig is
+                    // FindAndDelete-checked exactly as Core does.
+                    check_const_scriptcode_findanddelete(
+                        &sig, subscript, ctx.sig_version, ctx.flags,
+                    )?;
+
                     let success = if sig.is_empty() {
                         false
                     } else {
-                        // Compute the scriptCode starting at the BYTE OFFSET just
-                        // after the last executed OP_CODESEPARATOR (Core's
-                        // pbegincodehash). For legacy this subscript is then
-                        // FindAndDelete'd; for WITNESS_V0 it is the witnessScript
-                        // slice. Either way it is a byte slice, NOT an opcode-index
-                        // slice — so pass codesep_byte_offset, not codesep_pos.
-                        let subscript = get_subscript(full_script, ctx.codesep_byte_offset);
-                        // CONST_SCRIPTCODE: reject if FindAndDelete would strip
-                        // the sig from the scriptCode on the legacy path
-                        // (Core interpreter.cpp:330-332).
-                        check_const_scriptcode_findanddelete(
-                            &sig, subscript, ctx.sig_version, ctx.flags,
-                        )?;
                         // Pass full signature including sighash type byte
                         ctx.checker.check_sig(&sig, &pubkey, subscript, ctx.sig_version)
                     };
@@ -1876,9 +1888,12 @@ fn eval_script_internal(
                 let subscript: &[u8] = if ctx.sig_version == SigVersion::Base {
                     let mut sc = subscript.to_vec();
                     for sig in &sigs {
-                        if sig.is_empty() {
-                            continue;
-                        }
+                        // Core FindAndDeletes EVERY signature INCLUDING empty
+                        // ones (interpreter.cpp:1141-1150 — the loop has no
+                        // empty-sig skip). An empty sig push-encodes to the
+                        // single byte [0x00], which matches a leading OP_0 in
+                        // the scriptCode, so it can be found and deleted and can
+                        // trip CONST_SCRIPTCODE. Do NOT skip empty sigs.
                         // CONST_SCRIPTCODE: reject if FindAndDelete removed any
                         // occurrence while the flag is set (Core
                         // interpreter.cpp:1147-1148). Mirror Core's cumulative
@@ -2019,9 +2034,11 @@ fn eval_script_internal(
                 let subscript: &[u8] = if ctx.sig_version == SigVersion::Base {
                     let mut sc = subscript.to_vec();
                     for sig in &sigs {
-                        if sig.is_empty() {
-                            continue;
-                        }
+                        // Core FindAndDeletes EVERY signature INCLUDING empty
+                        // ones (interpreter.cpp:1141-1150 — no empty-sig skip).
+                        // An empty sig push-encodes to [0x00] and can match a
+                        // leading OP_0 in the scriptCode, tripping
+                        // CONST_SCRIPTCODE. Do NOT skip empty sigs.
                         let found = rustoshi_crypto::find_and_delete_count(&sc, sig);
                         if found > 0 && ctx.flags.verify_const_scriptcode {
                             return Err(ScriptError::SigFindAndDelete);
@@ -3237,11 +3254,14 @@ fn verify_witness_program(
                     // and annex stripping only fires when `witness.len() >= 2`).
                     Err(ScriptError::WitnessProgramMismatch)
                 }
-            } else if program.len() == 2 && program[0] == 0x4e && program[1] == 0x73 {
+            } else if !is_p2sh && program.len() == 2 && program[0] == 0x4e && program[1] == 0x73 {
                 // BIP-444 Pay-to-Anchor (P2A): OP_1 <0x4e73>. Always spendable;
                 // the relay DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM flag does NOT
-                // apply (Core script/interpreter.cpp:1990 returns true
-                // unconditionally for P2A).
+                // apply. Core gates this on `!is_p2sh && IsPayToAnchor(...)`
+                // (script/interpreter.cpp:1990): a P2SH-WRAPPED P2A program is
+                // NOT anchor-spendable and instead falls through to the else
+                // branch, where DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM rejects
+                // under standard flags. Mirror the `!is_p2sh` guard exactly.
                 Ok(())
             } else {
                 // v1 + non-32 (non-P2A) or taproot inactive: anyone-can-spend
@@ -4774,6 +4794,57 @@ mod tests {
         let checker = DummyChecker;
         let result = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
         assert!(result.is_ok(), "P2A must bypass DISCOURAGE flag: {result:?}");
+    }
+
+    #[test]
+    fn verify_witness_program_p2a_under_p2sh_rejected_by_discourage() {
+        // Glass-box finding 2026-07-01 (P2A-under-P2SH): a P2SH-WRAPPED
+        // Pay-to-Anchor program (v1 + 0x4e73, is_p2sh=true) must NOT take the
+        // unconditional-accept P2A path. Core gates P2A on `!is_p2sh`
+        // (interpreter.cpp:1990); with is_p2sh=true it falls through to the else
+        // branch where SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM (in
+        // STANDARD flags) rejects. Pre-fix rustoshi lacked the !is_p2sh guard
+        // and returned Ok -> ACCEPT where Core REJECTS (testmempoolaccept split).
+        let program = [0x4eu8, 0x73];
+        let witness: Vec<Vec<u8>> = vec![];
+        let flags = ScriptFlags::standard_flags();
+        let checker = DummyChecker;
+        // is_p2sh = true is the P2SH-wrapped case Core rejects.
+        let result = verify_witness_program(&witness, 1, &program, &flags, &checker, true);
+        assert!(
+            matches!(result, Err(ScriptError::WitnessProgramLength)),
+            "P2SH-wrapped P2A must be rejected under standard (discourage) flags: {result:?}"
+        );
+        // Sanity: the NON-p2sh P2A spend is still unconditionally valid.
+        let ok = verify_witness_program(&witness, 1, &program, &flags, &checker, false);
+        assert!(ok.is_ok(), "native (non-p2sh) P2A must still succeed: {ok:?}");
+    }
+
+    #[test]
+    fn checksig_empty_sig_const_scriptcode_findanddelete_rejects() {
+        // Glass-box finding 2026-07-01 (CONST_SCRIPTCODE empty-sig FindAndDelete):
+        // bare scriptPubKey `00 21 <33-byte pubkey> ac 91`
+        // (OP_0 <pubkey> OP_CHECKSIG OP_NOT), empty scriptSig, STANDARD flags.
+        // OP_0 pushes the empty sig; OP_CHECKSIG pops it. Core runs
+        // FindAndDelete(scriptCode, CScript()<<vchSig) UNCONDITIONALLY for BASE
+        // (interpreter.cpp:329-333); for an empty sig the pattern is [0x00],
+        // which matches the leading OP_0 -> found>0 && CONST_SCRIPTCODE ->
+        // SCRIPT_ERR_SIG_FINDANDDELETE -> REJECT. Pre-fix rustoshi skipped the
+        // check for empty sigs (pushed false, OP_NOT -> true -> ACCEPT), a
+        // testmempoolaccept divergence. Post-fix it must REJECT like Core.
+        let mut script = vec![0x00u8, 0x21];
+        script.push(0x02); // valid compressed-pubkey prefix
+        script.extend_from_slice(&[0x11u8; 32]);
+        script.push(0xac); // OP_CHECKSIG
+        script.push(0x91); // OP_NOT
+        let flags = ScriptFlags::standard_flags();
+        let checker = DummyChecker;
+        let mut stack = Stack::new();
+        let result = eval_script(&mut stack, &script, &flags, &checker, SigVersion::Base);
+        assert!(
+            matches!(result, Err(ScriptError::SigFindAndDelete)),
+            "empty-sig CHECKSIG must trip CONST_SCRIPTCODE FindAndDelete (Core rejects): {result:?}"
+        );
     }
 
     #[test]
