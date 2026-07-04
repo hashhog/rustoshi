@@ -7540,6 +7540,38 @@ impl RustoshiRpcServer for RpcServerImpl {
             .map(|h| h.timestamp)
             .unwrap_or(0);
 
+        // bad-diffbits (Core's FIRST contextual header gate, validation.cpp:4088:
+        // `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))`
+        // -> BLOCK_INVALID_HEADER "bad-diffbits"). `process_block_with_seq_ctx`
+        // runs `contextual_check_block_header` with `expected_bits = None`
+        // (ChainState cannot itself walk the header chain), so the nBits-equals-
+        // required gate is a NO-OP on the connect path. The P2P header-sync path
+        // (rustoshi/src/main.rs) and `submitheader` both recompute the mandated
+        // nBits over the stored ancestor chain and enforce it — submitblock MUST
+        // too, or it FALSE-ACCEPTS a block whose difficulty differs from the
+        // network-mandated retarget value (off-schedule difficulty = consensus
+        // fork). Reachable for tip-extending AND side-branch submissions: the
+        // gate keys off the block's REAL parent, so it runs before the
+        // tip-extend/reorg split below. `None` means the ancestor chain isn't
+        // walkable from the store (orphan / snapshot base) — skip rather than
+        // false-reject, same convention as `submitheader` and the header path.
+        if let Some(expected_bits) = compute_expected_bits_via_store(
+            &store,
+            &block.header.prev_block_hash,
+            block.header.timestamp,
+            &state.params,
+        ) {
+            if block.header.bits != expected_bits {
+                tracing::warn!(
+                    "submitblock: block {} rejected: bad-diffbits (nBits {:#010x} != required {:#010x})",
+                    block_hash,
+                    block.header.bits,
+                    expected_bits
+                );
+                return Ok(Some("bad-diffbits".to_string()));
+            }
+        }
+
         // f_requested=false: submitblock is an external (unrequested) submission.
         // Apply the fTooFarAhead anti-DoS gate.  A block submitted via RPC
         // extends the active tip by definition (height = best_height + 1),
