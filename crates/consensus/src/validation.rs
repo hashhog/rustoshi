@@ -5656,6 +5656,99 @@ mod tests {
         assert!(res.is_ok(), "header > MTP must be accepted: {res:?}");
     }
 
+    /// Regression (submitblock bad-diffbits): the FIRST contextual header gate
+    /// (Core validation.cpp:4088 `block.nBits != GetNextWorkRequired(...)`)
+    /// must reject a header whose claimed `nBits` differs from the mandated
+    /// value WHEN the caller supplies `expected_bits = Some(...)`, and MUST
+    /// skip (never false-reject) when the caller passes `None`.
+    ///
+    /// This is the exact gate `rpc::submit_block` now feeds: pre-fix it ran the
+    /// connect-path `contextual_check_block_header` with `expected_bits = None`
+    /// (a NO-OP for diffbits), so a block claiming an off-schedule difficulty
+    /// (fuzz vector A06: nBits=0x207ffffe, in-range but HARDER than the
+    /// regtest-mandated 0x207fffff, PoW-solved to meet it) CONNECTED while Core
+    /// rejects `bad-diffbits` — a consensus fork. The fix recomputes the
+    /// required nBits over the stored ancestor chain and passes `Some(...)`,
+    /// exactly like `submitheader` and the P2P header path. This pins both
+    /// halves of the contract the fix relies on.
+    #[test]
+    fn contextual_check_block_header_enforces_bad_diffbits_when_expected_some() {
+        let prev_hash = Hash256::from_bytes([0xab; 32]);
+        let mut mtp = HashMap::new();
+        mtp.insert(prev_hash, 1_700_000_000);
+        let ctx = MtpStubContext { mtp_by_hash: mtp };
+        let params = ChainParams::regtest();
+
+        // Header fully valid EXCEPT nBits: passes MTP (> 1_700_000_000),
+        // version (>= 4), and future-drift (current_time well ahead) so the
+        // ONLY gate under test is diffbits.
+        let required_bits = params.genesis_block.header.bits; // 0x207fffff (regtest)
+        let a06_bad_bits = 0x207f_fffeu32; // in-range but HARDER than required
+        assert_ne!(a06_bad_bits, required_bits);
+
+        let mut header = BlockHeader {
+            version: 4,
+            prev_block_hash: prev_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: 1_700_000_001,
+            bits: a06_bad_bits,
+            nonce: 0,
+        };
+
+        // expected_bits = Some(required): mismatch -> BadDifficulty ("bad-diffbits").
+        let res = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            1_700_000_500,
+            Some(required_bits),
+        );
+        assert!(
+            matches!(res, Err(ValidationError::BadDifficulty)),
+            "off-schedule nBits with Some(expected) must reject: {res:?}"
+        );
+        assert_eq!(
+            ValidationError::BadDifficulty.bip22_string(),
+            "bad-diffbits",
+            "reject reason string must match Core's BIP-22 code"
+        );
+
+        // expected_bits = None: gate is skipped (the pre-fix connect-path
+        // no-op that let submitblock accept the off-schedule block).
+        let res_none = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            1_700_000_500,
+            None,
+        );
+        assert!(
+            res_none.is_ok(),
+            "None expected_bits must skip the diffbits gate (never false-reject): {res_none:?}"
+        );
+
+        // A block claiming the mandated nBits passes with Some(expected) — no
+        // false-reject of the valid control (fuzz vector B01).
+        header.bits = required_bits;
+        let res_ok = contextual_check_block_header(
+            &header,
+            10,
+            &dummy_block_index_entry(),
+            &ctx,
+            &params,
+            1_700_000_500,
+            Some(required_bits),
+        );
+        assert!(
+            res_ok.is_ok(),
+            "matching nBits with Some(expected) must accept: {res_ok:?}"
+        );
+    }
+
     #[test]
     fn contextual_check_block_header_rejects_time_too_new() {
         // Bug 0a (future-drift): a header whose timestamp > now + 7200
