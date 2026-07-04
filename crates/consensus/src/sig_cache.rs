@@ -313,9 +313,21 @@ impl SigCache {
             }
         });
         // If probabilistic eviction removed nothing, forcibly remove one entry.
+        //
+        // NOTE: the victim key MUST be copied out into a local `let` binding
+        // *before* calling `remove`.  Writing this as
+        // `if let Some(k) = self.cache.iter().next().map(|e| *e.key()) { remove(k) }`
+        // extends the lifetime of the temporary `Iter` (which holds a
+        // shard *read* guard) across the whole `if let` block, so the
+        // subsequent `remove` — which needs a *write* guard on that same
+        // shard — self-deadlocks the calling thread.  Binding to a local
+        // drops the `Iter` (and its read guard) at the `;`, releasing the
+        // shard before `remove` runs.  This deadlock is what hung the
+        // `eviction_when_full` test for 50+ minutes.
         if evicted == 0 {
-            if let Some(entry) = self.cache.iter().next().map(|e| *e.key()) {
-                self.cache.remove(&entry);
+            let victim = self.cache.iter().next().map(|e| *e.key());
+            if let Some(key) = victim {
+                self.cache.remove(&key);
             }
         }
     }
@@ -452,17 +464,41 @@ mod tests {
 
     #[test]
     fn eviction_when_full() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
         let max_entries = 10;
-        let cache = SigCache::new(max_entries);
+        let cache = Arc::new(SigCache::new(max_entries));
 
-        // Insert max_entries + 5 items
-        for i in 0u8..(max_entries as u8 + 5) {
-            let script_sig = vec![i; 72];
-            let script_pubkey = vec![0x76u8; 25];
-            cache.insert(&wtxid(i), 0, &script_sig, &script_pubkey, &no_witness(), 0);
+        // Run the fill (which forces several eviction rounds) on a worker
+        // thread so that a regression reintroducing the evict_batch deadlock
+        // fails this test in bounded time instead of hanging the whole
+        // `cargo test` run for 50+ minutes (as it historically did).
+        let worker = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                // Insert max_entries + 5 items
+                for i in 0u8..(max_entries as u8 + 5) {
+                    let script_sig = vec![i; 72];
+                    let script_pubkey = vec![0x76u8; 25];
+                    cache.insert(&wtxid(i), 0, &script_sig, &script_pubkey, &no_witness(), 0);
+                }
+            })
+        };
+
+        // Bounded-time guard: eviction must be O(1)/bounded — never loop or
+        // deadlock. 10s is astronomically generous for 15 tiny inserts.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "sig-cache eviction hung: evict_batch deadlocked or looped (regression)"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
+        worker.join().unwrap();
 
-        // Cache should not exceed max_entries
+        // Cache should not exceed max_entries (+1 slack for the forced single eviction).
         assert!(cache.len() <= max_entries + 1);
     }
 
