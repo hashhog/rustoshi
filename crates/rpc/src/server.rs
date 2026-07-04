@@ -3136,6 +3136,86 @@ pub fn try_attach_and_reorg(
         .ok_or_else(|| format!("tip {} missing from block index", state.best_hash))?;
     let tip_work_bytes = tip_entry.chain_work;
 
+    // ── Core AcceptBlockHeader parity (validation.cpp:4224 → ContextualCheck
+    // BlockHeader, validation.cpp:4088-4118) ────────────────────────────────
+    // Core runs the FULL contextual HEADER validation on EVERY header, on ANY
+    // branch, BEFORE it enters the block index (AcceptBlockHeader). An invalid
+    // side-branch header is therefore refused *before storage*, so no reorg
+    // onto it is ever possible. rustoshi's linear tip-extend path
+    // (chain_state.rs:573), the P2P header-sync path (rustoshi/src/main.rs),
+    // and submitheader all enforce this — but the side-branch STORE below did
+    // NOT. It persisted the header + block + index entry unconditionally and
+    // only re-ran check_block / contextual_check_block (the block-body gates,
+    // NOT the *header* gates) at reconnect (chain_state.rs:810-860). Result: a
+    // side-branch block with a bad nVersion (BIP-34/65/66), a future timestamp
+    // (> now + 7200 = time-too-new), a stale timestamp (<= parent MTP =
+    // time-too-old), off-schedule nBits (bad-diffbits), or a timewarp-violating
+    // timestamp (BIP-94) was STORED and, once a heavier child arrived, the
+    // active tip REORGED onto it — a live consensus fork Core never enters.
+    // Enforce the same gates here, before the first write, matching Core
+    // AcceptBlockHeader (reject-before-index). Companion to 0d8dd26, which
+    // closed the LINEAR/tip-extend (submitblock) diffbits gap; this closes the
+    // REORGANIZE/side-branch gap. The gate runs before the work comparison
+    // below, so a bad header is refused even when its branch is lighter — Core
+    // validates all candidate headers regardless of eventual best-chain status.
+    {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // expected_bits recomputed over the block's REAL parent chain (same as
+        // 0d8dd26 and submitheader); None = parent chain not walkable (orphan /
+        // snapshot base) → skip that single gate rather than false-reject.
+        let expected_bits = compute_expected_bits_via_store(
+            &store,
+            &block.header.prev_block_hash,
+            block.header.timestamp,
+            &state.params,
+        );
+        // prev_entry placeholder: contextual_check_block_header reads only
+        // `timestamp` from it, and only at BIP-94 retarget boundaries
+        // (mainnet-disabled). Matches the submitheader / header-sync convention.
+        let prev_entry = rustoshi_consensus::BlockIndexEntry {
+            height: parent_entry.height,
+            timestamp: 0,
+            bits: 0,
+            prev_hash: block.header.prev_block_hash,
+            chain_work: [0u8; 32],
+        };
+        if let Err(e) = rustoshi_consensus::contextual_check_block_header(
+            &block.header,
+            new_height,
+            &prev_entry,
+            &rustoshi_consensus::StubChainContext,
+            &state.params,
+            now_secs,
+            expected_bits,
+        ) {
+            // Reject before storage — the header never enters the index, so no
+            // reorg onto it is possible. Canonical BIP-22 reject string (e.g.
+            // "bad-version", "time-too-new", "bad-diffbits"), matching the
+            // strings submit_block / submitheader surface.
+            tracing::warn!(
+                "try_attach_and_reorg: side-branch block {} rejected at store: {}",
+                block_hash,
+                e.bip22_string()
+            );
+            return Err(e.bip22_string());
+        }
+
+        // BIP-113 MTP gate (time-too-old): the real check; StubChainContext
+        // returns MTP=0. Walks the parent's 11 ancestors via the store, exactly
+        // like submitheader / the header-sync path.
+        let mtp = compute_prev_block_mtp(&store, &block.header.prev_block_hash);
+        if mtp > 0 && block.header.timestamp <= mtp {
+            tracing::warn!(
+                "try_attach_and_reorg: side-branch block {} rejected at store: time-too-old (ts {} <= parent MTP {})",
+                block_hash, block.header.timestamp, mtp
+            );
+            return Err("time-too-old".to_string());
+        }
+    }
+
     // Persist header, block, and a placeholder block-index entry so the
     // reorg path's get_block_index closure can find this block. We mark it
     // HAVE_DATA but not VALID_SCRIPTS - that flag is set by the connect
