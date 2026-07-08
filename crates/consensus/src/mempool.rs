@@ -1080,6 +1080,184 @@ pub enum MempoolError {
     ConsensusScriptCheckFailed(usize, String),
 }
 
+impl MempoolError {
+    /// Map this mempool rejection to Bitcoin Core's canonical **bare** reject
+    /// token, exactly as the `testmempoolaccept` / `sendrawtransaction` RPC
+    /// layer surfaces it.
+    ///
+    /// Core's RPC (`rpc/mempool.cpp`) reports the bare `state.GetRejectReason()`
+    /// for a rejected tx, with a single remap: `TX_MISSING_INPUTS` becomes
+    /// `"missing-inputs"`. The reason strings themselves are set at the
+    /// consensus/policy call sites (`consensus/tx_check.cpp`,
+    /// `consensus/tx_verify.cpp`, `policy/policy.cpp`, `validation.cpp`).
+    ///
+    /// This is the mempool-path analogue of
+    /// [`crate::validation::ValidationError::bip22_string`] (which is wired to
+    /// the `submitblock` / BIP-22 path). It changes only the emitted *string*;
+    /// the accept/reject decision is unaffected.
+    pub fn reject_token(&self) -> String {
+        use crate::validation::ValidationError;
+        match self {
+            // ---- TX_CONFLICT family (validation.cpp:825/829/862) ----
+            MempoolError::AlreadyExists | MempoolError::WtxidAlreadyInMempool => {
+                "txn-already-in-mempool".to_string()
+            }
+            MempoolError::TxidSameNonwitnessData => {
+                "txn-same-nonwitness-data-in-mempool".to_string()
+            }
+            MempoolError::TxnAlreadyKnown => "txn-already-known".to_string(),
+            // Non-RBF double-spend of an in-mempool prevout.
+            MempoolError::Conflict(_) => "txn-mempool-conflict".to_string(),
+
+            // ---- Fee floors (validation.cpp:705/709 CheckFeeRate) ----
+            // Static min-relay floor.
+            MempoolError::InsufficientFee(_, _) => "min relay fee not met".to_string(),
+            // Dynamic rolling mempool-min-fee floor.
+            MempoolError::MempoolMinFeeNotMet(_, _) => "mempool min fee not met".to_string(),
+
+            // ---- Mempool capacity / chain limits ----
+            MempoolError::MempoolFull => "mempool full".to_string(),
+            // Ancestor/descendant package-graph limits. Core's cluster-mempool
+            // surfaces "too-large-cluster" (validation.cpp:1024/1343); the
+            // classic pre-cluster token was "too-long-mempool-chain". We keep the
+            // classic token for the count/size graph limits and the cluster token
+            // for the explicit cluster-size gate.
+            MempoolError::TooManyAncestors(_, _)
+            | MempoolError::AncestorSizeTooLarge(_, _)
+            | MempoolError::TooManyDescendants(_, _)
+            | MempoolError::DescendantSizeTooLarge(_, _) => "too-long-mempool-chain".to_string(),
+            MempoolError::ClusterSizeLimitExceeded(_, _) => "too-large-cluster".to_string(),
+
+            // ---- Standardness (policy/policy.cpp IsStandardTx) ----
+            // The inner string already leads with the Core token plus prose
+            // detail; strip to the bare token.
+            MempoolError::NonStandard(reason) => Self::standard_reason_token(reason),
+
+            // ---- CheckTransaction / CheckTxInputs family via the wrapped
+            // TxValidationError. Reuse the BIP-22 map for a single source of
+            // truth, then apply the RPC-layer TX_MISSING_INPUTS remap. ----
+            MempoolError::Validation(TxValidationError::MissingInput(_, _)) => {
+                "missing-inputs".to_string()
+            }
+            MempoolError::Validation(verr) => {
+                ValidationError::TxValidation(verr.clone()).bip22_string()
+            }
+
+            // ---- Missing / already-spent inputs → RPC remap "missing-inputs".
+            MempoolError::MissingInput(_, _) => "missing-inputs".to_string(),
+
+            // sum(inputs) < sum(outputs) (tx_verify.cpp:197).
+            MempoolError::InsufficientFunds => "bad-txns-in-belowout".to_string(),
+
+            // Input value / fee out of MoneyRange (tx_verify.cpp:187/209).
+            MempoolError::InputValueOutOfRange(_) => {
+                "bad-txns-inputvalues-outofrange".to_string()
+            }
+
+            // AreInputsStandard → TX_INPUTS_NOT_STANDARD (policy.cpp:222+).
+            MempoolError::InputsNonStandard(_) => "bad-txns-nonstandard-inputs".to_string(),
+
+            // ---- RBF rule failures (policy/rbf.cpp, validation.cpp) ----
+            MempoolError::RbfNotSignaling => "txn-mempool-conflict".to_string(),
+            MempoolError::RbfTooManyReplacements(_, _) => {
+                "too many potential replacements".to_string()
+            }
+            MempoolError::RbfInsufficientAbsoluteFee(_, _)
+            | MempoolError::RbfInsufficientFeeRate(_, _)
+            | MempoolError::RbfInsufficientBandwidthFee(_, _) => "insufficient fee".to_string(),
+            MempoolError::RbfSpendsConflicting => "bad-txns-spends-conflicting-tx".to_string(),
+            MempoolError::ReplacementDisallowed => "bip125-replacement-disallowed".to_string(),
+
+            // ---- TRUC / v3 topology (validation.cpp:974 "TRUC-violation") ----
+            MempoolError::TrucTxTooLarge(_, _, _)
+            | MempoolError::TrucChildTooLarge(_, _, _)
+            | MempoolError::TrucTooManyAncestors(_, _, _)
+            | MempoolError::TrucTooManyDescendants(_)
+            | MempoolError::TrucSpendingNonTruc(_, _)
+            | MempoolError::NonTrucSpendingTruc(_, _) => "TRUC-violation".to_string(),
+
+            // ---- Package-level (surfaced on package RPC paths, not the single-tx
+            // testmempoolaccept / sendrawtransaction paths this map serves). ----
+            MempoolError::PackageTooManyTx(_, _) => "package-too-many-transactions".to_string(),
+            MempoolError::PackageTooLarge(_, _) => "package-too-large".to_string(),
+            MempoolError::PackageDuplicateTx => "conflict-in-package".to_string(),
+            MempoolError::PackageNotSorted => "package-not-sorted".to_string(),
+            MempoolError::PackageConflict => "conflict-in-package".to_string(),
+            MempoolError::PackageInsufficientFee(_, _) => "min relay fee not met".to_string(),
+            MempoolError::PackageInvalidTopology => "package-not-child-with-parents".to_string(),
+            MempoolError::PackageTxFailed(_, _) => "package-tx-failed".to_string(),
+
+            // ---- Ephemeral dust (policy.cpp / validation.cpp:1530) ----
+            MempoolError::EphemeralDustNonZeroFee => "dust".to_string(),
+            MempoolError::EphemeralDustUnspent(_)
+            | MempoolError::EphemeralDustNotFullySpent(_, _) => "unspent-dust".to_string(),
+
+            // ---- Locktime / sequence locks ----
+            // nLockTime not satisfied at tip+1 (validation.cpp:820).
+            MempoolError::NonFinal => "non-final".to_string(),
+            // BIP-68 relative locktime not satisfied (validation.cpp:888).
+            MempoolError::SequenceLockNotSatisfied => "non-BIP68-final".to_string(),
+            // Immature coinbase spend (tx_verify.cpp CheckTxInputs).
+            MempoolError::CoinbaseNotMature { .. } => {
+                "bad-txns-premature-spend-of-coinbase".to_string()
+            }
+
+            // Loose coinbase tx (validation.cpp:804, TX_CONSENSUS).
+            MempoolError::CoinbaseRejected => "coinbase".to_string(),
+
+            // ---- Script verification (validation.cpp:2120/2122) ----
+            // Policy (STANDARD) flags failing → mempool-only reject.
+            MempoolError::PolicyScriptCheckFailed(_, _) => {
+                "mempool-script-verify-flag-failed".to_string()
+            }
+            // Mandatory (consensus) flags failing during the defense-in-depth
+            // re-check.
+            MempoolError::ConsensusScriptCheckFailed(_, _) => {
+                "mandatory-script-verify-flag-failed".to_string()
+            }
+        }
+    }
+
+    /// Extract the bare Core standardness token from a `NonStandard` reason
+    /// string. Our construction sites prefix each reason with the canonical
+    /// Core token (per `policy/policy.cpp::IsStandardTx` and the
+    /// `IsWitnessStandard` / sigops gates) followed by prose detail
+    /// (e.g. `"scriptpubkey at index 0"`); this returns just the token.
+    fn standard_reason_token(reason: &str) -> String {
+        // Ordered longest-prefix-first so "tx-size-small" wins over "tx-size".
+        const KNOWN: &[&str] = &[
+            "tx-size-small",
+            "tx-size",
+            "scriptsig-size",
+            "scriptsig-not-pushonly",
+            "scriptpubkey",
+            "datacarrier",
+            "bare-multisig",
+            "dust",
+            "coinbase",
+            "bad-txns-too-many-sigops",
+            "bad-witness-nonstandard",
+        ];
+        for tok in KNOWN {
+            if reason == *tok || reason.starts_with(&format!("{tok} ")) || reason.starts_with(&format!("{tok}:")) {
+                return (*tok).to_string();
+            }
+        }
+        // "bad version: N" (nVersion out of the standard range) → Core "version".
+        if reason.starts_with("bad version") {
+            return "version".to_string();
+        }
+        // Defensive fallback: strip any prose detail after the first delimiter so
+        // an unrecognized reason still surfaces as a bare leading token rather
+        // than a full Display sentence.
+        reason
+            .split([' ', ':'])
+            .next()
+            .unwrap_or(reason)
+            .to_string()
+    }
+}
+
 // ============================================================
 // FEE RATE KEY
 // ============================================================
@@ -11164,5 +11342,147 @@ mod tests {
             "test_accept must succeed for a valid tx, got {:?}", result);
         assert!(!mempool.contains(&txid),
             "test_accept must NOT insert; mempool should not contain {}", txid);
+    }
+
+    // ---- reject-reason token parity (mempool RPC paths) ----------------
+    //
+    // Asserts MempoolError::reject_token() emits Bitcoin Core's BARE canonical
+    // reject tokens (as rpc/mempool.cpp surfaces them), not Rust Display
+    // strings. These are the exact strings the testmempoolaccept /
+    // sendrawtransaction RPC paths now emit. Cross-checked against
+    // bitcoin-core/src (tx_check.cpp, tx_verify.cpp, policy.cpp, validation.cpp).
+
+    #[test]
+    fn reject_token_conflict_family() {
+        let h = Hash256::from_bytes([7u8; 32]);
+        assert_eq!(MempoolError::AlreadyExists.reject_token(), "txn-already-in-mempool");
+        assert_eq!(MempoolError::WtxidAlreadyInMempool.reject_token(), "txn-already-in-mempool");
+        assert_eq!(
+            MempoolError::TxidSameNonwitnessData.reject_token(),
+            "txn-same-nonwitness-data-in-mempool"
+        );
+        assert_eq!(MempoolError::TxnAlreadyKnown.reject_token(), "txn-already-known");
+        assert_eq!(MempoolError::Conflict(h).reject_token(), "txn-mempool-conflict");
+    }
+
+    #[test]
+    fn reject_token_fee_floors() {
+        assert_eq!(MempoolError::InsufficientFee(0.5, 1000).reject_token(), "min relay fee not met");
+        assert_eq!(
+            MempoolError::MempoolMinFeeNotMet(100, 1000).reject_token(),
+            "mempool min fee not met"
+        );
+    }
+
+    #[test]
+    fn reject_token_missing_inputs_rpc_remap() {
+        let h = Hash256::from_bytes([9u8; 32]);
+        // Core remaps TX_MISSING_INPUTS -> "missing-inputs" at the RPC layer,
+        // NOT the internal "bad-txns-inputs-missingorspent".
+        assert_eq!(MempoolError::MissingInput(h, 0).reject_token(), "missing-inputs");
+        assert_eq!(
+            MempoolError::Validation(TxValidationError::MissingInput(h, 0)).reject_token(),
+            "missing-inputs"
+        );
+    }
+
+    #[test]
+    fn reject_token_checktransaction_family_via_validation() {
+        // Wrapped TxValidationError reuses the BIP-22 map (single source of truth).
+        assert_eq!(
+            MempoolError::Validation(TxValidationError::EmptyInputs).reject_token(),
+            "bad-txns-vin-empty"
+        );
+        assert_eq!(
+            MempoolError::Validation(TxValidationError::EmptyOutputs).reject_token(),
+            "bad-txns-vout-empty"
+        );
+        assert_eq!(
+            MempoolError::Validation(TxValidationError::NegativeOutput).reject_token(),
+            "bad-txns-vout-negative"
+        );
+        assert_eq!(
+            MempoolError::Validation(TxValidationError::OutputTooLarge(1)).reject_token(),
+            "bad-txns-vout-toolarge"
+        );
+        assert_eq!(
+            MempoolError::Validation(TxValidationError::TotalOutputTooLarge(1)).reject_token(),
+            "bad-txns-txouttotal-toolarge"
+        );
+        assert_eq!(
+            MempoolError::Validation(TxValidationError::DuplicateInputs).reject_token(),
+            "bad-txns-inputs-duplicate"
+        );
+        assert_eq!(
+            MempoolError::Validation(TxValidationError::NullPrevout).reject_token(),
+            "bad-txns-prevout-null"
+        );
+        assert_eq!(
+            MempoolError::Validation(TxValidationError::TooLarge(1)).reject_token(),
+            "bad-txns-oversize"
+        );
+    }
+
+    #[test]
+    fn reject_token_txinputs_family() {
+        assert_eq!(MempoolError::InsufficientFunds.reject_token(), "bad-txns-in-belowout");
+        assert_eq!(
+            MempoolError::InputValueOutOfRange(21_000_001 * 100_000_000).reject_token(),
+            "bad-txns-inputvalues-outofrange"
+        );
+        assert_eq!(
+            MempoolError::CoinbaseNotMature { age: 10, required: 100 }.reject_token(),
+            "bad-txns-premature-spend-of-coinbase"
+        );
+        assert_eq!(MempoolError::InputsNonStandard(0).reject_token(), "bad-txns-nonstandard-inputs");
+        assert_eq!(MempoolError::CoinbaseRejected.reject_token(), "coinbase");
+    }
+
+    #[test]
+    fn reject_token_locktime_family() {
+        assert_eq!(MempoolError::NonFinal.reject_token(), "non-final");
+        assert_eq!(MempoolError::SequenceLockNotSatisfied.reject_token(), "non-BIP68-final");
+    }
+
+    #[test]
+    fn reject_token_standardness_bare_tokens() {
+        // NonStandard(String) carries the Core token + prose detail; reject_token
+        // strips to the bare token exactly as policy/policy.cpp::IsStandardTx sets it.
+        let cases = [
+            ("coinbase", "coinbase"),
+            ("bad version: 5", "version"),
+            ("tx-size", "tx-size"),
+            ("tx-size-small", "tx-size-small"),
+            ("scriptsig-size at input 0", "scriptsig-size"),
+            ("scriptsig-not-pushonly at input 0", "scriptsig-not-pushonly"),
+            ("scriptpubkey at index 0", "scriptpubkey"),
+            ("datacarrier at index 0 (datacarrier disabled)", "datacarrier"),
+            ("bare-multisig at index 0", "bare-multisig"),
+            ("dust at index 0", "dust"),
+            ("bad-txns-too-many-sigops: cost 20000 > limit 16000", "bad-txns-too-many-sigops"),
+            ("bad-witness-nonstandard: P2WSH input 0 has empty witness stack", "bad-witness-nonstandard"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(
+                MempoolError::NonStandard(reason.to_string()).reject_token(),
+                expected,
+                "NonStandard({reason:?}) should map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_token_never_contains_display_prose() {
+        // Guard: the emitted token must never leak Rust Display sentences.
+        let h = Hash256::from_bytes([3u8; 32]);
+        for tok in [
+            MempoolError::InsufficientFunds.reject_token(),
+            MempoolError::NonFinal.reject_token(),
+            MempoolError::MissingInput(h, 0).reject_token(),
+            MempoolError::NonStandard("dust at index 3".into()).reject_token(),
+        ] {
+            assert!(!tok.contains("transaction"), "token leaked Display prose: {tok}");
+            assert!(!tok.contains(" at index "), "token leaked prose detail: {tok}");
+        }
     }
 }
