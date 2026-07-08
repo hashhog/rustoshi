@@ -3604,6 +3604,18 @@ impl Mempool {
         self.transactions.get(txid)
     }
 
+    /// Get a transaction by its wtxid (BIP 339).
+    ///
+    /// Companion to [`get`] for the wtxid-relay serve path: a peer that
+    /// negotiated wtxidrelay requests txs via `getdata(MsgWtx, wtxid)`, so the
+    /// server must resolve the wtxid → txid via `wtxid_index` before returning
+    /// the entry.
+    pub fn get_by_wtxid(&self, wtxid: &Hash256) -> Option<&MempoolEntry> {
+        self.wtxid_index
+            .get(wtxid)
+            .and_then(|txid| self.transactions.get(txid))
+    }
+
     /// Collect all mempool transactions as (wtxid, Arc<Transaction>) pairs.
     /// Used for BIP152 compact block reconstruction.
     pub fn collect_for_compact_block(&self) -> Vec<(Hash256, Arc<Transaction>)> {
@@ -5885,6 +5897,46 @@ mod tests {
         expected_wtxids.sort();
         assert_eq!(txids, expected_txids);
         assert_eq!(wtxids, expected_wtxids);
+    }
+
+    /// BIP 339 serve path: `get_by_wtxid` resolves a wtxid → the mempool entry
+    /// (so a `getdata(MsgWtx, wtxid)` from a wtxidrelay peer can be served), and
+    /// returns None for an unknown wtxid (→ the p2p layer replies notfound).
+    #[test]
+    fn test_get_by_wtxid_serve_path() {
+        let config = MempoolConfig::default();
+        let mut mempool = Mempool::new(config);
+
+        let prev =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000021")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev, vout: 0 }, 100_000)]);
+
+        let tx = make_tx(vec![(prev, 0)], vec![90_000], 1);
+        let txid = tx.txid();
+        let wtxid = tx.wtxid();
+
+        // Unknown wtxid before admission: no entry, no dedup hit.
+        assert!(mempool.get_by_wtxid(&wtxid).is_none());
+        assert!(!mempool.contains_wtxid(&wtxid));
+
+        mempool
+            .add_transaction(tx, &|op| utxos.get(op).cloned())
+            .expect("tx accepted");
+
+        // After admission the wtxid resolves to the same tx as the txid path.
+        assert!(mempool.contains_wtxid(&wtxid));
+        let by_wtxid = mempool.get_by_wtxid(&wtxid).expect("entry by wtxid");
+        assert_eq!(by_wtxid.tx.txid(), txid);
+        assert_eq!(by_wtxid.tx.wtxid(), wtxid);
+        // Same underlying entry as the txid lookup.
+        assert_eq!(by_wtxid.txid, mempool.get(&txid).unwrap().txid);
+
+        // A different (unknown) wtxid still misses.
+        let other =
+            Hash256::from_hex("00000000000000000000000000000000000000000000000000000000000000ff")
+                .unwrap();
+        assert!(mempool.get_by_wtxid(&other).is_none());
     }
 
     #[test]
