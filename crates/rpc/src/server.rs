@@ -2554,7 +2554,9 @@ pub fn broadcast_signed_tx(
             use rustoshi_consensus::mempool::MempoolError;
             match &e {
                 MempoolError::AlreadyExists => Ok(txid),
-                other => Err(format!("Transaction rejected: {}", other)),
+                // Bare canonical Core reject token, matching the
+                // sendrawtransaction / testmempoolaccept RPC paths.
+                other => Err(other.reject_token()),
             }
         }
     }
@@ -6761,28 +6763,14 @@ impl RustoshiRpcServer for RpcServerImpl {
                         // Already in mempool - return txid without error
                         Ok(txid.to_hex())
                     }
-                    MempoolError::MissingInput(prev_txid, vout) => Err(Self::rpc_error(
+                    // Every other rejection surfaces Bitcoin Core's bare
+                    // canonical reject token (rpc/mempool.cpp reports the bare
+                    // state.GetRejectReason(); TX_MISSING_INPUTS remaps to
+                    // "missing-inputs"), not a Rust Display sentence. The
+                    // accept/reject decision is unchanged — only the string.
+                    other => Err(Self::rpc_error(
                         rpc_error::RPC_TRANSACTION_REJECTED,
-                        format!("Missing input: {}:{}", prev_txid.to_hex(), vout),
-                    )),
-                    MempoolError::Conflict(conflicting_txid) => Err(Self::rpc_error(
-                        rpc_error::RPC_TRANSACTION_REJECTED,
-                        format!(
-                            "Transaction conflicts with mempool entry {}",
-                            conflicting_txid.to_hex()
-                        ),
-                    )),
-                    MempoolError::InsufficientFee(rate, min) => Err(Self::rpc_error(
-                        rpc_error::RPC_TRANSACTION_REJECTED,
-                        format!("Fee rate too low: {:.2} sat/vB (minimum: {})", rate, min),
-                    )),
-                    MempoolError::Validation(verr) => Err(Self::rpc_error(
-                        rpc_error::RPC_TRANSACTION_REJECTED,
-                        format!("Transaction validation failed: {}", verr),
-                    )),
-                    _ => Err(Self::rpc_error(
-                        rpc_error::RPC_TRANSACTION_REJECTED,
-                        format!("Transaction rejected: {}", e),
+                        other.reject_token(),
                     )),
                 }
             }
@@ -11219,7 +11207,10 @@ impl RustoshiRpcServer for RpcServerImpl {
                         "txid": txid.to_hex(),
                         "wtxid": wtxid.to_hex(),
                         "allowed": false,
-                        "reject-reason": format!("{}", e)
+                        // Emit Bitcoin Core's bare canonical reject token
+                        // (rpc/mempool.cpp surfaces state.GetRejectReason()),
+                        // not the Rust Display string.
+                        "reject-reason": e.reject_token()
                     }));
                 }
             }
