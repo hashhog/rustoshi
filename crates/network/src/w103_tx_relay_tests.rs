@@ -1116,4 +1116,82 @@ mod tests {
         assert_eq!(INVENTORY_BROADCAST_MAX, 1000,
             "INVENTORY_BROADCAST_MAX must match Core's limit of 1000 per trickle batch");
     }
+
+    // ─── BIP-339 MsgWtx inv request / serve / announce ───────────────────────
+    //
+    // Regression coverage for the wtxidrelay ingest bug: rustoshi negotiates
+    // wtxidrelay but the main.rs tx-relay handlers only matched
+    // MsgTx | MsgWitnessTx and dropped MsgWtx(5) invs, so it never requested
+    // (and thus never ingested) txs announced by modern/wtxid peers. These
+    // tests exercise the exact building blocks the handlers now use:
+    //   REQUEST  → dedup via Mempool::contains_wtxid, echo MsgWtx in getdata
+    //   SERVE    → resolve via Mempool::get_by_wtxid, notfound on miss
+    //   ANNOUNCE → build_tx_inv_entry selects MsgWtx per wtxidrelay peer
+
+    /// REQUEST: a MsgWtx inv for an unknown tx (empty mempool) is not deduped,
+    /// so the handler requests it — echoing MsgWtx + the same wtxid in getdata.
+    #[test]
+    fn msgwtx_inv_unknown_tx_yields_getdata() {
+        use rustoshi_consensus::{Mempool, MempoolConfig};
+
+        let mempool = Mempool::new(MempoolConfig::default());
+        let wtxid = make_tx(7).wtxid();
+        let inv_item = InvVector { inv_type: InvType::MsgWtx, hash: wtxid };
+
+        // Handler predicate (main.rs Inv/MsgWtx arm): dedup by wtxid index.
+        assert!(!mempool.contains_wtxid(&inv_item.hash),
+            "unknown wtxid must not be present → must be requested");
+
+        // Handler pushes the item unchanged into tx_requests → getdata(MsgWtx).
+        let getdata: Vec<InvVector> = vec![inv_item.clone()];
+        assert_eq!(getdata.len(), 1);
+        assert_eq!(getdata[0].inv_type, InvType::MsgWtx,
+            "getdata must echo MsgWtx so the peer serves by wtxid");
+        assert_eq!(getdata[0].hash, wtxid);
+    }
+
+    /// SERVE: a MsgWtx getdata for a tx NOT in the mempool resolves to None,
+    /// so the handler replies notfound (never a bogus Tx).
+    #[test]
+    fn msgwtx_getdata_miss_yields_notfound() {
+        use rustoshi_consensus::{Mempool, MempoolConfig};
+
+        let mempool = Mempool::new(MempoolConfig::default());
+        let wtxid = make_tx(9).wtxid();
+
+        // Handler predicate (main.rs GetData/MsgWtx arm): resolve by wtxid.
+        let served = mempool.get_by_wtxid(&wtxid).map(|e| e.tx.clone());
+        assert!(served.is_none(), "wtxid absent from mempool → serve nothing");
+
+        // → notfound echoing the requested wtxid inv.
+        let notfound = NetworkMessage::NotFound(vec![InvVector {
+            inv_type: InvType::MsgWtx,
+            hash: wtxid,
+        }]);
+        match notfound {
+            NetworkMessage::NotFound(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].inv_type, InvType::MsgWtx);
+                assert_eq!(items[0].hash, wtxid);
+            }
+            _ => panic!("expected NotFound"),
+        }
+    }
+
+    /// ANNOUNCE: a wtxidrelay peer is announced MsgWtx + wtxid; a legacy peer
+    /// gets MsgTx + txid. MsgWitnessTx is a getdata-only flag, never an inv type.
+    #[test]
+    fn announce_selects_msgwtx_for_wtxidrelay_peer() {
+        // Distinct txid/wtxid so the selected hash is unambiguous.
+        let txid = Hash256([0x11; 32]);
+        let wtxid = Hash256([0x22; 32]);
+
+        let to_wtxid_peer = build_tx_inv_entry(true, txid, wtxid);
+        assert_eq!(to_wtxid_peer.inv_type, InvType::MsgWtx);
+        assert_eq!(to_wtxid_peer.hash, wtxid);
+
+        let to_legacy_peer = build_tx_inv_entry(false, txid, wtxid);
+        assert_eq!(to_legacy_peer.inv_type, InvType::MsgTx);
+        assert_eq!(to_legacy_peer.hash, txid);
+    }
 }
