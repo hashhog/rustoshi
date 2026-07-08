@@ -1106,8 +1106,14 @@ impl MempoolError {
                 "txn-same-nonwitness-data-in-mempool".to_string()
             }
             MempoolError::TxnAlreadyKnown => "txn-already-known".to_string(),
-            // Non-RBF double-spend of an in-mempool prevout.
-            MempoolError::Conflict(_) => "txn-mempool-conflict".to_string(),
+            // Non-RBF double-spend of an in-mempool prevout. Current Core emits
+            // "bip125-replacement-disallowed" (validation.cpp:839, the
+            // `!args.m_allow_replacement` conflict branch). The legacy
+            // "txn-mempool-conflict" token was removed when full-RBF became the
+            // default and the per-tx BIP125 signaling gate was replaced by the
+            // context-level m_allow_replacement flag — it no longer appears
+            // anywhere in bitcoin-core/src.
+            MempoolError::Conflict(_) => "bip125-replacement-disallowed".to_string(),
 
             // ---- Fee floors (validation.cpp:705/709 CheckFeeRate) ----
             // Static min-relay floor.
@@ -1158,7 +1164,11 @@ impl MempoolError {
             MempoolError::InputsNonStandard(_) => "bad-txns-nonstandard-inputs".to_string(),
 
             // ---- RBF rule failures (policy/rbf.cpp, validation.cpp) ----
-            MempoolError::RbfNotSignaling => "txn-mempool-conflict".to_string(),
+            // A conflict whose to-be-replaced tx does not signal replaceability
+            // (and full-RBF is off) is a refusal to replace: current Core emits
+            // "bip125-replacement-disallowed" (validation.cpp:839), not the
+            // removed legacy "txn-mempool-conflict" token.
+            MempoolError::RbfNotSignaling => "bip125-replacement-disallowed".to_string(),
             MempoolError::RbfTooManyReplacements(_, _) => {
                 "too many potential replacements".to_string()
             }
@@ -11362,7 +11372,23 @@ mod tests {
             "txn-same-nonwitness-data-in-mempool"
         );
         assert_eq!(MempoolError::TxnAlreadyKnown.reject_token(), "txn-already-known");
-        assert_eq!(MempoolError::Conflict(h).reject_token(), "txn-mempool-conflict");
+        // Non-RBF double-spend of an in-mempool prevout. Current Core emits
+        // "bip125-replacement-disallowed" (validation.cpp:839); the legacy
+        // "txn-mempool-conflict" token was removed with full-RBF-by-default.
+        assert_eq!(
+            MempoolError::Conflict(h).reject_token(),
+            "bip125-replacement-disallowed"
+        );
+        // A non-signaling conflict (full-RBF off) is likewise a refusal to
+        // replace and shares the same current-Core token.
+        assert_eq!(
+            MempoolError::RbfNotSignaling.reject_token(),
+            "bip125-replacement-disallowed"
+        );
+        // The dead legacy token must not reappear on any conflict/RBF path.
+        for e in [MempoolError::Conflict(h), MempoolError::RbfNotSignaling] {
+            assert_ne!(e.reject_token(), "txn-mempool-conflict");
+        }
     }
 
     #[test]
