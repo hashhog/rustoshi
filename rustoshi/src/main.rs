@@ -4815,6 +4815,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 tx_requests.push(item.clone());
                                             }
                                         }
+                                        InvType::MsgWtx => {
+                                            // BIP 339: a wtxidrelay peer announces a tx by
+                                            // its wtxid. `item.hash` is a WTXID, so dedup
+                                            // against the mempool's wtxid index (not the
+                                            // txid index). The recently-rejected set is
+                                            // keyed by txid, so it cannot short-circuit a
+                                            // wtxid inv — that's fine (Core also tracks
+                                            // rejected wtxids separately; a redundant
+                                            // getdata is harmless). We echo the same
+                                            // MsgWtx type back in the getdata so the peer
+                                            // serves the tx keyed by wtxid.
+                                            let rpc = rpc_state.read().await;
+                                            if !rpc.mempool.contains_wtxid(&item.hash) {
+                                                tx_requests.push(item.clone());
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -4940,26 +4956,39 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }
 
                                         drop(rpc);
-                                        // Relay to all peers except the source
+                                        // Relay to all peers except the source.
+                                        // BIP 339: announce by wtxid+MsgWtx to peers that
+                                        // negotiated wtxidrelay, else by txid+MsgWitnessTx
+                                        // (legacy). Select per peer using the peer's
+                                        // supports_wtxid_relay flag — mirrors the RPC/mempool
+                                        // relay path's per-peer type selection.
                                         let ps = peer_state.read().await;
                                         if let Some(ref pm) = ps.peer_manager {
-                                            let inv = InvVector {
-                                                inv_type: InvType::MsgWitnessTx,
-                                                hash: wtxid,
-                                            };
-                                            let peers: Vec<_> = pm
+                                            // Snapshot (peer_id, wants_wtxid) so we don't
+                                            // hold the borrow across the async sends.
+                                            let peers: Vec<(rustoshi_network::PeerId, bool)> = pm
                                                 .connected_peers()
                                                 .iter()
-                                                .map(|(id, _)| *id)
+                                                .map(|(id, info)| (*id, info.supports_wtxid_relay))
                                                 .collect();
-                                            for pid in peers {
-                                                if pid != peer_id {
-                                                    pm.send_to_peer(
-                                                        pid,
-                                                        NetworkMessage::Inv(vec![inv.clone()]),
-                                                    )
-                                                    .await;
+                                            for (pid, wants_wtxid) in peers {
+                                                if pid == peer_id {
+                                                    continue;
                                                 }
+                                                // Canonical per-peer selection (BIP-339):
+                                                // MsgWtx+wtxid for wtxidrelay peers, else
+                                                // MsgTx+txid. MsgWitnessTx is a getdata-only
+                                                // flag, never a valid inv type.
+                                                let inv = rustoshi_network::build_tx_inv_entry(
+                                                    wants_wtxid,
+                                                    txid,
+                                                    wtxid,
+                                                );
+                                                pm.send_to_peer(
+                                                    pid,
+                                                    NetworkMessage::Inv(vec![inv]),
+                                                )
+                                                .await;
                                             }
                                         }
                                     }
@@ -5119,7 +5148,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             }
                                         }
                                         InvType::MsgTx | InvType::MsgWitnessTx => {
-                                            // Serve transaction from mempool
+                                            // Serve transaction from mempool (by txid)
                                             let rpc = rpc_state.read().await;
                                             if let Some(entry) = rpc.mempool.get(&item.hash) {
                                                 let tx = entry.tx.clone();
@@ -5130,6 +5159,38 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                         peer_id,
                                                         NetworkMessage::Tx(tx),
                                                     );
+                                                }
+                                            }
+                                        }
+                                        InvType::MsgWtx => {
+                                            // BIP 339: a wtxidrelay peer requests a tx by
+                                            // its wtxid. Resolve the wtxid → entry via the
+                                            // mempool's wtxid index and serve the full tx.
+                                            // On miss, reply with notfound (Core sends a
+                                            // notfound so the peer can retry elsewhere).
+                                            let rpc = rpc_state.read().await;
+                                            let served = rpc
+                                                .mempool
+                                                .get_by_wtxid(&item.hash)
+                                                .map(|entry| entry.tx.clone());
+                                            drop(rpc);
+                                            let ps = peer_state.read().await;
+                                            if let Some(ref pm) = ps.peer_manager {
+                                                match served {
+                                                    Some(tx) => {
+                                                        pm.try_send_to_peer(
+                                                            peer_id,
+                                                            NetworkMessage::Tx(tx),
+                                                        );
+                                                    }
+                                                    None => {
+                                                        pm.try_send_to_peer(
+                                                            peer_id,
+                                                            NetworkMessage::NotFound(vec![
+                                                                item.clone(),
+                                                            ]),
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
