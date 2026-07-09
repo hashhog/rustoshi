@@ -4103,28 +4103,82 @@ impl PeerManager {
                         id.0,
                         self.inbound_cmd_txs.is_some()
                     );
-                    if let Some(ref inbound_map) = self.inbound_cmd_txs {
-                        if let Some(cmd_tx) = inbound_map.lock().unwrap().remove(id) {
-                            self.peers.insert(
-                                *id,
-                                PeerHandle {
-                                    info: info.clone(),
-                                    command_tx: cmd_tx,
-                                    conn_type: ConnectionType::Inbound,
-                                    noban: false,
-                                    connected_time: Instant::now(),
-                                    min_ping_time: None,
-                                    last_block_time: None,
-                                    last_tx_time: None,
-                                    stale_state: StalePeerState::new(),
-                                    stats: std::sync::Arc::clone(stats),
-                                    getaddr_recvd: false,
-                                    addr_token_bucket: 1.0,
-                                    addr_token_timestamp: Instant::now(),
-                                },
-                            );
-                            self.addr_manager.mark_inbound_success(&info.addr);
+                    // Pull the command sender the accept loop stashed for this
+                    // inbound peer OUT of the map first. That ends the borrow of
+                    // `self.inbound_cmd_txs` so the inbound-cap + eviction logic
+                    // below can take `&mut self` (disconnect_peer) and `&self`
+                    // (inbound_count / select_inbound_to_evict).
+                    let inbound_cmd_tx = self
+                        .inbound_cmd_txs
+                        .as_ref()
+                        .and_then(|m| m.lock().unwrap().remove(id));
+                    if let Some(cmd_tx) = inbound_cmd_tx {
+                        // Inbound-slot cap + eviction, mirroring Bitcoin Core's
+                        // CreateNodeFromAcceptedSocket (net.cpp:1820):
+                        //   if (nInbound >= m_max_inbound) {
+                        //       if (!AttemptToEvictConnection()) return; // full
+                        //   }
+                        // Only ConnectionType::Inbound peers count against the cap
+                        // (inbound_count() filters on `info.inbound`); outbound,
+                        // block-relay, feeler and manual peers are excluded, exactly
+                        // as Core counts only IsInboundConn(). When we are already at
+                        // the cap we ask the eviction ladder (eviction.rs, reused via
+                        // select_inbound_to_evict) for a victim: Some -> disconnect
+                        // it and admit the newcomer; None (every inbound peer is
+                        // protected) -> refuse the new connection. Before this was
+                        // wired the accept path admitted inbound peers unconditionally
+                        // -> unbounded inbound connections (a resource-exhaustion / DoS
+                        // surface). The ban and network-active gates run earlier in the
+                        // accept loop; this is purely the slot cap.
+                        if self.inbound_count() >= self.config.max_inbound {
+                            match self.select_inbound_to_evict() {
+                                Some(victim) => {
+                                    tracing::info!(
+                                        "Inbound slots full ({}/{}); evicting peer {} to admit inbound peer {} from {}",
+                                        self.inbound_count(),
+                                        self.config.max_inbound,
+                                        victim.0,
+                                        id.0,
+                                        info.addr
+                                    );
+                                    self.disconnect_peer(victim).await;
+                                }
+                                None => {
+                                    tracing::info!(
+                                        "Inbound slots full ({}/{}) and no eviction candidate; rejecting inbound peer {} from {}",
+                                        self.inbound_count(),
+                                        self.config.max_inbound,
+                                        id.0,
+                                        info.addr
+                                    );
+                                    // Refuse: tear the just-handshaked peer down and
+                                    // do NOT register it. cmd_tx is dropped after the
+                                    // send, so the peer task's command channel closes.
+                                    let _ = cmd_tx.send(PeerCommand::Disconnect).await;
+                                    return Some(event);
+                                }
+                            }
                         }
+
+                        self.peers.insert(
+                            *id,
+                            PeerHandle {
+                                info: info.clone(),
+                                command_tx: cmd_tx,
+                                conn_type: ConnectionType::Inbound,
+                                noban: false,
+                                connected_time: Instant::now(),
+                                min_ping_time: None,
+                                last_block_time: None,
+                                last_tx_time: None,
+                                stale_state: StalePeerState::new(),
+                                stats: std::sync::Arc::clone(stats),
+                                getaddr_recvd: false,
+                                addr_token_bucket: 1.0,
+                                addr_token_timestamp: Instant::now(),
+                            },
+                        );
+                        self.addr_manager.mark_inbound_success(&info.addr);
                     }
                 }
 
@@ -8261,5 +8315,203 @@ mod tests {
             before2,
             "drained bucket must drop all addrs in the immediate next message"
         );
+    }
+
+    // ========================================================================
+    // Inbound-connection cap + eviction on the accept/registration path
+    // (Core net.cpp:1820 CreateNodeFromAcceptedSocket -> AttemptToEvictConnection).
+    // These drive the SAME code path the live accept loop uses: an inbound
+    // command sender is stashed in `inbound_cmd_txs` (as the accept loop does)
+    // and a `PeerEvent::Connected` is fed through `handle_event`. Before the fix
+    // the accept path admitted inbound peers unconditionally -> unbounded inbound.
+    // ========================================================================
+
+    /// Drive one inbound peer through the accept/registration path: stash a
+    /// command sender in `inbound_cmd_txs` (mirroring the live accept loop),
+    /// then feed a `PeerEvent::Connected` through `handle_event`. Returns the
+    /// receiver so a test can observe whether the peer was told to Disconnect
+    /// (rejected/evicted) vs admitted.
+    async fn drive_inbound_registration(
+        mgr: &mut PeerManager,
+        peer_id: PeerId,
+        addr: SocketAddr,
+    ) -> mpsc::Receiver<PeerCommand> {
+        if mgr.inbound_cmd_txs.is_none() {
+            mgr.inbound_cmd_txs =
+                Some(std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())));
+        }
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        mgr.inbound_cmd_txs
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .insert(peer_id, cmd_tx);
+
+        let info = PeerInfo {
+            addr,
+            version: PROTOCOL_VERSION,
+            services: NODE_NETWORK | NODE_WITNESS,
+            user_agent: String::new(),
+            start_height: 0,
+            relay: true,
+            inbound: true,
+            state: PeerState::Established,
+            last_send: Instant::now(),
+            last_recv: Instant::now(),
+            ping_nonce: None,
+            ping_time: None,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            time_offset: 0,
+            supports_witness: true,
+            supports_sendheaders: false,
+            supports_wtxid_relay: false,
+            supports_addrv2: false,
+            feefilter: 0,
+        };
+        let stats = std::sync::Arc::new(crate::peer::PeerStats::new());
+        mgr.handle_event(PeerEvent::Connected(peer_id, info, stats))
+            .await;
+        cmd_rx
+    }
+
+    /// The accept/registration path must BOUND the number of inbound peers to
+    /// `max_inbound`. With a small cap and every existing inbound peer protected
+    /// by the eviction ladder, connections beyond the cap are refused, so the
+    /// inbound count stops growing.
+    ///
+    /// Pre-fix (no cap wired): all 20 registrations were admitted unconditionally
+    /// -> inbound_count() == 20 (unbounded). Post-fix it caps at max_inbound.
+    #[tokio::test]
+    async fn inbound_cap_bounds_admission() {
+        let mut config = PeerManagerConfig::testnet4();
+        config.max_inbound = 4;
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        // Feed far more inbound peers than the cap, each in a distinct /16 so
+        // the (few, all-protected) existing peers yield no eviction candidate
+        // and the surplus is rejected.
+        let mut receivers = Vec::new();
+        for i in 1..=20u32 {
+            let addr: SocketAddr = format!("8.{}.0.1:8333", i).parse().unwrap();
+            receivers.push(drive_inbound_registration(&mut mgr, PeerId(i as u64), addr).await);
+        }
+
+        assert_eq!(
+            mgr.inbound_count(),
+            4,
+            "inbound must be capped at max_inbound (4); pre-fix this was 20 (unbounded)"
+        );
+        assert!(
+            mgr.inbound_count() <= mgr.config.max_inbound,
+            "inbound count must never exceed max_inbound"
+        );
+    }
+
+    /// When the inbound slots are full AND the eviction ladder finds a victim,
+    /// the accept path evicts that victim (sends it Disconnect) and admits the
+    /// newcomer. Uses many same-netgroup inbound peers so `select_inbound_to_evict`
+    /// returns Some (Core AttemptToEvictConnection == true).
+    #[tokio::test]
+    async fn inbound_eviction_fires_and_admits_newcomer() {
+        let mut config = PeerManagerConfig::testnet4();
+        config.max_inbound = 8;
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        // Prepopulate 40 established inbound peers all in the SAME /16 so the
+        // eviction protections (netgroup/ping/tx/block/ratio) cannot protect all
+        // of them and a victim is selectable. insert_test_peer bypasses the cap.
+        let mut existing = Vec::new();
+        for i in 0..40u32 {
+            let addr: SocketAddr = format!("8.8.{}.{}:8333", i / 256, i % 256)
+                .parse()
+                .unwrap();
+            let rx = mgr.insert_test_peer(PeerId(1000 + i as u64), addr, false, true);
+            existing.push(rx);
+        }
+        assert_eq!(mgr.inbound_count(), 40, "prepopulated 40 inbound peers");
+        assert!(
+            mgr.select_inbound_to_evict().is_some(),
+            "with 40 same-netgroup inbound peers the eviction ladder must find a victim"
+        );
+
+        // Drive a fresh inbound peer through the accept path. Slots are full
+        // (40 >= 8), eviction fires, the newcomer is admitted.
+        let newcomer = PeerId(9000);
+        let _new_rx =
+            drive_inbound_registration(&mut mgr, newcomer, "9.9.9.9:8333".parse().unwrap()).await;
+
+        assert!(
+            mgr.peers.contains_key(&newcomer),
+            "newcomer must be admitted after a victim is evicted"
+        );
+
+        // Exactly one existing peer must have been told to Disconnect (the victim).
+        let mut evicted = 0;
+        for rx in &mut existing {
+            if let Ok(PeerCommand::Disconnect) = rx.try_recv() {
+                evicted += 1;
+            }
+        }
+        assert_eq!(
+            evicted, 1,
+            "eviction must Disconnect exactly one existing inbound peer (the victim)"
+        );
+    }
+
+    /// When the inbound slots are full and EVERY existing inbound peer is
+    /// protected (eviction ladder returns None), the accept path refuses the new
+    /// connection: it is not registered and is told to Disconnect, while no
+    /// existing peer is disturbed. Mirrors Core's `if (!AttemptToEvictConnection())
+    /// return;` (net.cpp:1822).
+    #[tokio::test]
+    async fn inbound_all_protected_rejects_new() {
+        let mut config = PeerManagerConfig::testnet4();
+        config.max_inbound = 3;
+        let params = ChainParams::testnet4();
+        let mut mgr = PeerManager::new(config, params);
+
+        // 3 established inbound peers in distinct /16 groups — all protected, so
+        // the eviction ladder returns None.
+        let mut existing = Vec::new();
+        for i in 0..3u32 {
+            let addr: SocketAddr = format!("8.{}.0.1:8333", 100 + i).parse().unwrap();
+            existing.push(mgr.insert_test_peer(PeerId(i as u64 + 1), addr, false, true));
+        }
+        assert_eq!(mgr.inbound_count(), 3);
+        assert!(
+            mgr.select_inbound_to_evict().is_none(),
+            "3 diverse inbound peers are all protected -> no eviction candidate"
+        );
+
+        let newcomer = PeerId(500);
+        let mut new_rx =
+            drive_inbound_registration(&mut mgr, newcomer, "9.9.9.9:8333".parse().unwrap()).await;
+
+        // Newcomer refused: not registered, and told to Disconnect.
+        assert!(
+            !mgr.peers.contains_key(&newcomer),
+            "newcomer must be rejected when all inbound peers are protected"
+        );
+        assert_eq!(
+            mgr.inbound_count(),
+            3,
+            "inbound count must be unchanged after a rejected connection"
+        );
+        match new_rx.try_recv() {
+            Ok(PeerCommand::Disconnect) => {}
+            other => panic!("rejected newcomer must receive Disconnect, got {:?}", other),
+        }
+
+        // No existing peer was disturbed.
+        for rx in &mut existing {
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "a protected existing peer must NOT be disconnected"
+            );
+        }
     }
 }
