@@ -3099,6 +3099,21 @@ fn disconnect_to(
 /// the two callers can never diverge. The internal `MAX_REORG_DEPTH` cap
 /// (server.rs:2549) applies to both callers, so a P2P-delivered reorg deeper
 /// than `MAX_REORG_DEPTH` is rejected with an `Err`, not attempted.
+///
+/// Sentinel prefix used to carry a canonical BIP-22 reject code out of the
+/// reorg-CONNECT arm through this function's `Result<bool, String>` error
+/// channel. A consensus failure encountered while connecting the heavier
+/// branch (e.g. a coinbase-overpay tripping `ConnectBlock`) must surface the
+/// SAME BIP-22 reason Core does (`bad-cb-amount`), identical to the
+/// direct-tip-extend path — not a free-form Display string wrapped in
+/// "rejected: ". `submit_block`'s reorg `Err` arm strips this prefix and emits
+/// the bare code; structural/IO errors (no prefix) keep the "rejected: <msg>"
+/// fallback. Core parity: `BIP22ValidationResult()` returns the same reason on
+/// `ConnectTip` failure whether the block extended the tip or arrived via a
+/// reorg. Byte `\u{1}` (SOH) can never appear in a bip22 code, so the prefix is
+/// unambiguous.
+pub(crate) const REORG_CONSENSUS_REJECT_SENTINEL: &str = "\u{1}reorg-bip22\u{1}";
+
 pub fn try_attach_and_reorg(
     state: &mut RpcState,
     block: &Block,
@@ -3379,7 +3394,12 @@ pub fn try_attach_and_reorg(
                 &mut utxo_view,
                 &seq_ctx,
             )
-            .map_err(|e| format!("reorganize: {}", e))?;
+            // A consensus failure while CONNECTING the heavier branch is a real
+            // block rejection, not an internal error: preserve its canonical
+            // BIP-22 code (via the sentinel) so submitblock reports the same
+            // reason Core does on the reorg arm (e.g. `bad-cb-amount`) instead
+            // of the free-form "reorganize: bad subsidy: …" Display string.
+            .map_err(|e| format!("{}{}", REORG_CONSENSUS_REJECT_SENTINEL, e.bip22_string()))?;
 
     // Pattern D (post-reorg-consistency, 2026-05-05):
     // The reorg commit must be ALL-OR-NOTHING on disk. Build a single
@@ -7954,7 +7974,17 @@ impl RustoshiRpcServer for RpcServerImpl {
                     }
                     Err(e) => {
                         tracing::warn!("submitblock: reorg attempt failed for {}: {}", block_hash, e);
-                        Ok(Some(format!("rejected: {}", e)))
+                        if let Some(code) = e.strip_prefix(REORG_CONSENSUS_REJECT_SENTINEL) {
+                            // Consensus failure on the reorg-CONNECT arm: emit the
+                            // bare canonical BIP-22 code, identical to the
+                            // direct-tip-extend `Err(e)` arm below. Core parity:
+                            // ConnectTip failure reports the same reason string
+                            // regardless of how the block reached ConnectBlock.
+                            Ok(Some(code.to_string()))
+                        } else {
+                            // Structural / IO / depth-cap errors: unchanged.
+                            Ok(Some(format!("rejected: {}", e)))
+                        }
                     }
                 }
             }
