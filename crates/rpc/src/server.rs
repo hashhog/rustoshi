@@ -7951,6 +7951,68 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Reorg P0 (rustoshi) — wire reorganize() into the live
                 // submitblock path. See CORE-PARITY-AUDIT
                 // _reorg-correctness-cross-impl-2026-05-05.md.
+
+                // Context-free CheckBlock BEFORE the side-branch store (Core
+                // parity). Core's `ProcessNewBlock` (validation.cpp:4416) runs
+                // `CheckBlock` and `AcceptBlock` then re-runs `CheckBlock` +
+                // `ContextualCheckBlock` (validation.cpp:4350-4351) BEFORE it
+                // stores ANY block — including a non-tip-extending side-branch
+                // sibling. The tip-extend arm above runs the identical gates
+                // through `process_block_with_seq_ctx` → `check_block`
+                // (chain_state.rs:530), but a sibling short-circuits with
+                // `PrevBlockNotFound` *before* that call, so `try_attach_and_reorg`
+                // previously persisted the block having run only the contextual
+                // HEADER gates (0d8dd26). That admitted every context-free body /
+                // PoW defect — high-hash (no valid PoW → a DoS storage vector),
+                // bad-txnmrklroot, the CVE-2012-2459 duplicate-tx merkle mutation,
+                // bad-blk-length/weight, bad-blk-sigops — as a stored
+                // `inconclusive`. Run the SAME EXISTING context-free `check_block`
+                // here (PoW, merkle+mutation, size/weight, legacy sigops, per-tx
+                // checks) so a body/PoW-invalid sibling is rejected with Core's
+                // reason string instead of stored. This is on the submitblock RPC
+                // path ONLY — the P2P/connect path (rustoshi/src/main.rs) already
+                // context-free-validates before routing forks into
+                // `try_attach_and_reorg`, and the direct `try_attach_and_reorg`
+                // reorg unit tests are untouched.
+                // Ref: CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md
+                if let Err(e) =
+                    rustoshi_consensus::validation::check_block(&block, &state.params)
+                {
+                    tracing::warn!(
+                        "submitblock: side-branch block {} rejected (context-free CheckBlock): {}",
+                        block_hash,
+                        e.bip22_string()
+                    );
+                    return Ok(Some(e.bip22_string().to_string()));
+                }
+                // Witness-commitment malleation (`bad-witness-merkle-match`) lives
+                // in Core's `ContextualCheckBlock`, NOT context-free `CheckBlock`
+                // (validation.cpp:3943), but Core still runs it before store in
+                // `AcceptBlock`. It needs the side-branch height to gate the
+                // segwit-active branch; derive it from the parent's stored
+                // block-index entry (the same lookup `try_attach_and_reorg` does).
+                // If the parent isn't indexed the block cannot be attached anyway
+                // (`try_attach_and_reorg` will Err), so skip rather than guess a
+                // height — never a false-reject.
+                if let Ok(Some(parent_idx)) =
+                    store.get_block_index(&block.header.prev_block_hash)
+                {
+                    let side_height = parent_idx.height + 1;
+                    if let Err(e) = rustoshi_consensus::validation::contextual_check_block(
+                        &block,
+                        side_height,
+                        &rustoshi_consensus::StubChainContext,
+                        &state.params,
+                    ) {
+                        tracing::warn!(
+                            "submitblock: side-branch block {} rejected (ContextualCheckBlock): {}",
+                            block_hash,
+                            e.bip22_string()
+                        );
+                        return Ok(Some(e.bip22_string().to_string()));
+                    }
+                }
+
                 drop(utxo_view);
                 drop(chain_state);
                 drop(store);
