@@ -56,6 +56,43 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, RwLock};
 
+/// Total on-disk byte usage of the block/chain storage under `data_dir`.
+///
+/// Mirrors Bitcoin Core's `getblockchaininfo` `size_on_disk`
+/// (`rpc/blockchain.cpp` → `BlockManager::CalculateCurrentUsage()`), which sums
+/// the bytes of the block+undo storage. rustoshi keeps full block bodies and the
+/// chainstate together in a single RocksDB rooted at `<data_dir>/chainstate`
+/// (see `rustoshi/src/main.rs`: `datadir.join("chainstate")`), so the analogous
+/// figure is the recursive size of that directory. Cosmetic/reporting only — the
+/// value is never consulted by any validation or fork-choice path.
+///
+/// Best-effort: file/dir stat errors are skipped (a transient RocksDB compaction
+/// renaming an SST must not fail the RPC), and a missing directory yields 0.
+fn chainstate_size_on_disk(data_dir: &std::path::Path) -> u64 {
+    fn dir_bytes(path: &std::path::Path) -> u64 {
+        let entries = match std::fs::read_dir(path) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+        let mut total: u64 = 0;
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => total = total.saturating_add(dir_bytes(&entry.path())),
+                Ok(ft) if ft.is_file() => {
+                    if let Ok(meta) = entry.metadata() {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+                // Symlinks / errors: skip (RocksDB never stores block data behind
+                // a symlink; following one could double-count or escape the dir).
+                _ => {}
+            }
+        }
+        total
+    }
+    dir_bytes(&data_dir.join("chainstate"))
+}
+
 // ============================================================
 // RPC ERROR CODES
 // ============================================================
@@ -4710,7 +4747,17 @@ impl RustoshiRpcServer for RpcServerImpl {
             verificationprogress: progress,
             initialblockdownload: state.is_ibd,
             chainwork: chainwork_hex,
-            size_on_disk: 0,           // would need filesystem stat
+            // Core parity: sum the on-disk bytes of the block/chain storage
+            // (Core's BlockManager::CalculateCurrentUsage). rustoshi stores
+            // blocks + chainstate in a single RocksDB under
+            // `<data_dir>/chainstate`, so we stat that directory. When no datadir
+            // was wired (in-memory / test harness) we report 0, matching Core's
+            // "nothing on disk" reading.
+            size_on_disk: state
+                .data_dir
+                .as_deref()
+                .map(chainstate_size_on_disk)
+                .unwrap_or(0),
             pruned: state.prune_mode,
             pruneheight,
             prune_target_size,

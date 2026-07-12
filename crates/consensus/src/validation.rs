@@ -82,6 +82,18 @@ pub enum ValidationError {
     #[error("block too large: weight {0} exceeds {MAX_BLOCK_WEIGHT}")]
     BlockTooLarge(u64),
 
+    /// Block fails Core's EARLY context-free size gate: the non-witness
+    /// serialized size × WITNESS_SCALE_FACTOR exceeds MAX_BLOCK_WEIGHT (or the
+    /// raw tx count × 4 does). This is `CheckBlock`'s FIRST size check
+    /// (`validation.cpp:3947`, "size limits failed" → `bad-blk-length`), which
+    /// runs before the per-transaction `CheckTransaction` loop and therefore
+    /// before the tx-level `bad-txns-oversize` gate. Carries the offending
+    /// non-witness weight (base_size × WITNESS_SCALE_FACTOR). Decision is
+    /// unchanged — the block still rejects; this variant only lets the advisory
+    /// BIP-22 reason name Core's real early gate.
+    #[error("block base size too large: non-witness weight {0} exceeds {MAX_BLOCK_WEIGHT}")]
+    BlockLengthTooLarge(u64),
+
     #[error("no transactions in block")]
     NoTransactions,
 
@@ -420,6 +432,12 @@ impl ValidationError {
             ValidationError::WeightExceeded(_) | ValidationError::BlockTooLarge(_) => {
                 "bad-blk-weight".to_string()
             }
+            // EARLY size gate: non-witness serialized size × 4 over MAX_BLOCK_WEIGHT.
+            // Bitcoin Core CheckBlock validation.cpp:3947-3948 emits "bad-blk-length"
+            // ("size limits failed") BEFORE the per-tx CheckTransaction loop, so a
+            // block carrying an oversize non-witness payload is reported as
+            // bad-blk-length rather than the later per-tx bad-txns-oversize.
+            ValidationError::BlockLengthTooLarge(_) => "bad-blk-length".to_string(),
             // Coinbase missing / not first: Core CheckBlock validation.cpp:
             //   vtx empty or !vtx[0]->IsCoinBase() → "bad-cb-missing".
             ValidationError::NoCoinbase => "bad-cb-missing".to_string(),
@@ -553,6 +571,41 @@ pub fn check_block_with_pow(
     // Must have at least one transaction
     if block.transactions.is_empty() {
         return Err(ValidationError::NoTransactions);
+    }
+
+    // EARLY size gate (Core CheckBlock validation.cpp:3946-3948, "Size limits").
+    //
+    //   if (block.vtx.empty()
+    //       || block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+    //       || GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT)
+    //       return state.Invalid(... "bad-blk-length", "size limits failed");
+    //
+    // Core evaluates this NON-WITNESS gate before the per-transaction
+    // CheckTransaction loop, so an oversize block whose payload is dominated by
+    // a single fat non-witness tx is reported as `bad-blk-length` rather than
+    // the later per-tx `bad-txns-oversize`. rustoshi previously had only the
+    // witness-inclusive weight gate (`bad-blk-weight`) at the tail of CheckBlock,
+    // so it surfaced the per-tx `bad-txns-oversize` first. This gate restores
+    // Core's reason string. DECISION IS UNCHANGED: block_weight = base_size × 4 +
+    // witness_bytes >= base_size × 4, so any block this gate rejects also fails
+    // the weight gate (and Core rejects it with the same `bad-blk-length`); any
+    // block that passes proceeds exactly as before.
+    let tx_count = block.transactions.len() as u64;
+    // Non-witness serialized size of the block: header + tx-count CompactSize +
+    // Σ base_size(tx). base_size() is the TX_NO_WITNESS (stripped) per-tx size.
+    let base_size: u64 = (BlockHeader::SIZE as u64)
+        + (compact_size_len(tx_count) as u64)
+        + block
+            .transactions
+            .iter()
+            .map(|tx| tx.base_size() as u64)
+            .sum::<u64>();
+    if tx_count.saturating_mul(WITNESS_SCALE_FACTOR) > MAX_BLOCK_WEIGHT
+        || base_size.saturating_mul(WITNESS_SCALE_FACTOR) > MAX_BLOCK_WEIGHT
+    {
+        return Err(ValidationError::BlockLengthTooLarge(
+            base_size.saturating_mul(WITNESS_SCALE_FACTOR),
+        ));
     }
 
     // First transaction must be coinbase
@@ -7603,6 +7656,14 @@ mod tests {
         // Core tx_check.cpp:19-21: "bad-txns-oversize"
         let e = ValidationError::TxValidation(TxValidationError::TooLarge(99_999_999));
         assert_eq!(e.bip22_string(), "bad-txns-oversize");
+    }
+
+    #[test]
+    fn bip22_string_blk_length() {
+        // Core CheckBlock validation.cpp:3947-3948: early non-witness size gate
+        // emits "bad-blk-length" BEFORE the per-tx bad-txns-oversize loop.
+        let e = ValidationError::BlockLengthTooLarge(4_205_736);
+        assert_eq!(e.bip22_string(), "bad-blk-length");
     }
 
     #[test]
