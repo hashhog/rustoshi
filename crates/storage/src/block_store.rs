@@ -1319,6 +1319,21 @@ pub struct BlockStoreUtxoView<'a> {
     estimated_mem: usize,
     /// Maximum cache size in bytes before triggering a flush.
     max_cache_bytes: usize,
+    /// Per-block savepoint journal (issue #5 — Core's ConnectTip reset guard,
+    /// `bitcoin-core/src/validation.cpp:3035`). When `Some`, records the
+    /// pre-savepoint slot value of every cache key mutated since
+    /// `begin_savepoint`, so a block that fails to connect on the long-lived
+    /// linear/P2P path can be rolled back wholesale WITHOUT poisoning the
+    /// shared write-back cache (the spend at `validation.rs:2338` runs before
+    /// the value/script rejects at `:2347`/`:2402`). `None` when no savepoint
+    /// is open — zero overhead on every read/mutation in that state. The value
+    /// `Option<Option<CoinEntry>>` encodes the prior cache slot: outer `None` =
+    /// key was absent from the cache, `Some(slot)` = key held `slot`
+    /// (`Some(coin)` present / `None` spent-marker).
+    journal: Option<std::collections::HashMap<OutPoint, Option<Option<CoinEntry>>>>,
+    /// `estimated_mem` captured at `begin_savepoint`, restored verbatim on
+    /// `rollback_savepoint`.
+    savepoint_mem: usize,
 }
 
 impl<'a> BlockStoreUtxoView<'a> {
@@ -1334,6 +1349,74 @@ impl<'a> BlockStoreUtxoView<'a> {
             cache: std::collections::HashMap::new(),
             estimated_mem: 0,
             max_cache_bytes,
+            journal: None,
+            savepoint_mem: 0,
+        }
+    }
+
+    /// Open a per-block savepoint (issue #5).
+    ///
+    /// Mirrors the `view.CreateResetGuard()` that Bitcoin Core wraps around
+    /// `ConnectBlock` in `Chainstate::ConnectTip`
+    /// (`bitcoin-core/src/validation.cpp:3035`): every mutation made while the
+    /// savepoint is open is journaled so it can be rolled back wholesale if the
+    /// block fails to connect. A rejected block therefore never poisons the
+    /// long-lived write-back cache the linear/P2P connect path reuses across
+    /// every block (`main.rs:3206`). Not re-entrant — opening a new savepoint
+    /// discards any prior (un-committed) journal.
+    pub fn begin_savepoint(&mut self) {
+        self.journal = Some(std::collections::HashMap::new());
+        self.savepoint_mem = self.estimated_mem;
+    }
+
+    /// Commit the open savepoint: keep the block's mutations and stop
+    /// recording. Mirrors `view.Flush()` on the ConnectTip success path — the
+    /// per-block coin delta becomes a permanent part of the long-lived cache.
+    /// No-op if no savepoint is open.
+    pub fn commit_savepoint(&mut self) {
+        self.journal = None;
+    }
+
+    /// Roll back to the open savepoint: undo every mutation made since
+    /// `begin_savepoint`, leaving the cache byte-identical to its pre-connect
+    /// state (no poison). Mirrors the reset guard firing on the ConnectTip
+    /// failure early-return (`validation.cpp:3041-3046`, before any `Flush`).
+    /// No-op if no savepoint is open.
+    pub fn rollback_savepoint(&mut self) {
+        if let Some(journal) = self.journal.take() {
+            for (outpoint, prior) in journal {
+                match prior {
+                    // Key was absent from the cache before the savepoint:
+                    // drop whatever the block inserted.
+                    None => {
+                        self.cache.remove(&outpoint);
+                    }
+                    // Key held a prior slot value: restore it exactly.
+                    Some(slot) => {
+                        self.cache.insert(outpoint, slot);
+                    }
+                }
+            }
+            self.estimated_mem = self.savepoint_mem;
+        }
+    }
+
+    /// Record the pre-savepoint slot value of `outpoint` on its FIRST mutation
+    /// within an open savepoint, so `rollback_savepoint` can restore it.
+    /// Sequential borrows (journal, then cache, then journal) keep the borrow
+    /// checker happy without cloning the whole cache.
+    fn journal_prior(&mut self, outpoint: &OutPoint) {
+        // Fast path: no savepoint open, or this key already recorded.
+        if self
+            .journal
+            .as_ref()
+            .map_or(true, |j| j.contains_key(outpoint))
+        {
+            return;
+        }
+        let prior = self.cache.get(outpoint).cloned();
+        if let Some(j) = self.journal.as_mut() {
+            j.insert(outpoint.clone(), prior);
         }
     }
 
@@ -1602,6 +1685,9 @@ impl<'a> rustoshi_consensus::validation::UtxoView for BlockStoreUtxoView<'a> {
     }
 
     fn add_utxo(&mut self, outpoint: &OutPoint, coin: rustoshi_consensus::validation::CoinEntry) {
+        // Issue #5: record the prior slot before mutating so a failed connect
+        // can be rolled back without poisoning the shared cache.
+        self.journal_prior(outpoint);
         let storage_coin = CoinEntry {
             height: coin.height,
             is_coinbase: coin.is_coinbase,
@@ -1619,6 +1705,10 @@ impl<'a> rustoshi_consensus::validation::UtxoView for BlockStoreUtxoView<'a> {
     }
 
     fn spend_utxo(&mut self, outpoint: &OutPoint) {
+        // Issue #5: record the prior slot before mutating (Core ConnectTip
+        // reset guard) — the spend at validation.rs:2338 runs before the
+        // value/script rejects, so it must be undoable on a failed connect.
+        self.journal_prior(outpoint);
         let new_size = Self::estimate_entry_size(&None);
         if let Some(old) = self.cache.insert(outpoint.clone(), None) {
             let old_size = Self::estimate_entry_size(&old);
@@ -1691,6 +1781,97 @@ mod flush_with_tip_tests {
         // Tip pointer is durable in the DB.
         assert_eq!(store.get_best_block_hash().unwrap(), Some(tip));
         assert_eq!(store.get_best_height().unwrap(), Some(948_293));
+    }
+
+    /// Issue #5: a per-block savepoint rolled back after a FAILED connect must
+    /// leave the shared view byte-identical to its pre-connect state — the
+    /// spent coin U must be spendable again (no poison), the block's new
+    /// outputs gone, and any UNFLUSHED mutations from previously-connected
+    /// blocks in the same batch preserved. Mirrors Core ConnectTip's
+    /// CreateResetGuard firing on the `!rv` early-return (validation.cpp:3035).
+    #[test]
+    fn savepoint_rollback_undoes_failed_block_without_poison() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        // Mature coinbase output U, already durable in the DB.
+        let u = outpoint_n(1);
+        {
+            let mut seed = store.utxo_view();
+            seed.add_utxo(&u, coin(5_000_000_000, 1));
+            seed.flush().expect("seed flush");
+        }
+
+        let mut view = store.utxo_view();
+        // A previously-connected-but-unflushed block's output (batching): must
+        // SURVIVE a later block's rollback.
+        let a = outpoint_n(9);
+        view.add_utxo(&a, coin(1_000, 2));
+        let len_before = view.cache_len();
+        let mem_before = view.estimated_memory();
+
+        // Connect B_bad-like block inside a savepoint: spend U (mutation before
+        // the value reject) and add its output, then FAIL → rollback.
+        view.begin_savepoint();
+        view.spend_utxo(&u);
+        let b = outpoint_n(20);
+        view.add_utxo(&b, coin(5_000_000_001, 111));
+        // Mid-connect the block sees its own mutations.
+        assert!(view.get_utxo(&u).is_none(), "U spent within the block");
+        assert!(view.get_utxo(&b).is_some(), "B output visible within the block");
+        view.rollback_savepoint();
+
+        // Poison prevented: U is spendable again.
+        let restored = view.get_utxo(&u).expect("U must be restored after rollback");
+        assert_eq!(restored.value, 5_000_000_000);
+        // The failed block's output is gone.
+        assert!(view.get_utxo(&b).is_none(), "B_bad output must not persist");
+        // The prior unflushed mutation survives.
+        assert_eq!(view.get_utxo(&a).map(|c| c.value), Some(1_000));
+        // Cache restored exactly.
+        assert_eq!(view.cache_len(), len_before);
+        assert_eq!(view.estimated_memory(), mem_before);
+    }
+
+    /// A committed savepoint keeps the block's mutations (Core `view.Flush()`
+    /// on the ConnectTip success path).
+    #[test]
+    fn savepoint_commit_keeps_mutations() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        let u = outpoint_n(1);
+        {
+            let mut seed = store.utxo_view();
+            seed.add_utxo(&u, coin(50, 1));
+            seed.flush().expect("seed flush");
+        }
+        let mut view = store.utxo_view();
+        view.begin_savepoint();
+        view.spend_utxo(&u);
+        let b = outpoint_n(20);
+        view.add_utxo(&b, coin(49, 2));
+        view.commit_savepoint();
+        // After commit the mutations stand.
+        assert!(view.get_utxo(&u).is_none(), "U stays spent after commit");
+        assert_eq!(view.get_utxo(&b).map(|c| c.value), Some(49));
+    }
+
+    /// Rollback must restore a coin that was present in the cache (not just the
+    /// DB) before the savepoint — exercises the `Some(slot)` restore branch
+    /// (e.g. a BIP30-style overwrite of an unflushed cache entry).
+    #[test]
+    fn savepoint_rollback_restores_cached_slot() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        let mut view = store.utxo_view();
+        let u = outpoint_n(1);
+        // U present in the cache (unflushed), NOT yet in the DB.
+        view.add_utxo(&u, coin(50, 1));
+        view.begin_savepoint();
+        view.spend_utxo(&u); // prior slot = Some(Some(coin50))
+        assert!(view.get_utxo(&u).is_none());
+        view.rollback_savepoint();
+        assert_eq!(view.get_utxo(&u).map(|c| c.value), Some(50));
     }
 
     /// Regression for the 2026-05-07 mainnet wedge (frozen at height
