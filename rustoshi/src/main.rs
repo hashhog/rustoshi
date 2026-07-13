@@ -1231,6 +1231,102 @@ fn misbehavior_for_block_error(e: &ValidationError) -> Option<MisbehaviorReason>
     }
 }
 
+/// rustoshi's `InvalidBlockFound` equivalent (issue #5).
+///
+/// Bitcoin Core's `Chainstate::ConnectTip` calls `InvalidBlockFound`
+/// (`bitcoin-core/src/validation.cpp:3043`) the instant `ConnectBlock` fails,
+/// which sets `BLOCK_FAILED_VALID` on the block index and drops it from the
+/// best-header candidate set so `FindMostWorkChain` adopts the honest sibling.
+/// The linear/P2P connect path previously did NEITHER: it logged + dropped the
+/// block, leaving the block-downloader to re-pin the invalid block forever
+/// (`get_hash_by_height(height)` keeps returning it) and never request the
+/// honest sibling — the issue #5 wedge (rustoshi stuck one block behind Core).
+///
+/// This helper (a) persists a `FAILED_VALIDITY` index entry for the failed
+/// block, and (b) when that block was the current best header, rewinds the
+/// header chain to its (valid) parent. The rewind is what lets an honest
+/// sibling at the same height connect: once `best_header_hash` points at the
+/// parent again, the sibling's announcement `prev_block_hash == best_header`
+/// connects as a normal extension, `put_height_index` overwrites the invalid
+/// block at `height`, and the gap-fill downloader requests the sibling body.
+///
+/// Only rewinds when the failed block IS the header tip — it never discards
+/// valid headers stacked above an invalid ancestor (that needs full
+/// `FAILED_CHILD` propagation, which the issue #5 sibling-adoption scenario
+/// does not exercise). Returns the height the header chain was rewound to, if
+/// any, so the caller can lower the reported RPC header height to match.
+fn mark_connect_failed_block_invalid(
+    block_store: &BlockStore,
+    header_sync: &mut HeaderSync,
+    block_downloader: &mut BlockDownloader,
+    block: &rustoshi_primitives::Block,
+    block_hash: Hash256,
+    height: u32,
+) -> Option<u32> {
+    // (a) Persist a BLOCK_FAILED_VALID-equivalent index entry. The connect
+    //     path drops the block before its success-path `put_block_index`, so we
+    //     synthesize the entry here (preserving any status bits an earlier
+    //     header-store already set).
+    let prev_work = if block.header.prev_block_hash != Hash256::ZERO {
+        block_store
+            .get_block_index(&block.header.prev_block_hash)
+            .ok()
+            .flatten()
+            .map(|e| ChainWork::from_be_bytes(e.chain_work))
+            .unwrap_or(ChainWork::ZERO)
+    } else {
+        ChainWork::ZERO
+    };
+    let this_work = prev_work.saturating_add(&get_block_proof(block.header.bits));
+    let mut status = block_store
+        .get_block_index(&block_hash)
+        .ok()
+        .flatten()
+        .map(|e| e.status)
+        .unwrap_or_else(BlockStatus::new);
+    status.set(BlockStatus::FAILED_VALIDITY);
+    let idx_entry = BlockIndexEntry {
+        height,
+        status,
+        n_tx: block.transactions.len() as u32,
+        timestamp: block.header.timestamp,
+        bits: block.header.bits,
+        nonce: block.header.nonce,
+        version: block.header.version,
+        prev_hash: block.header.prev_block_hash,
+        chain_work: this_work.0,
+    };
+    if let Err(e) = block_store.put_block_index(&block_hash, &idx_entry) {
+        tracing::error!(
+            "issue #5: failed to persist FAILED_VALIDITY for invalid block {} at height {}: {}",
+            block_hash, height, e
+        );
+    }
+
+    // (b) If the invalid block was the current best header, rewind the header
+    //     chain to its valid parent so the honest sibling can connect.
+    if block_hash == header_sync.best_header_hash()
+        && header_sync.best_header_height() == height
+        && height > 0
+    {
+        let parent_height = height - 1;
+        header_sync.set_best_header(parent_height, block.header.prev_block_hash);
+        block_downloader.set_best_header_height(parent_height);
+        // The failed block bumped `validated_tip_height` inside
+        // `next_block_to_validate`; realign it to the real (parent) tip so the
+        // gap-fill floors correctly and the honest sibling pops at `height`,
+        // not `height + 1` (else the index entry / getblockcount over-report).
+        block_downloader.set_validated_tip_height(parent_height);
+        tracing::info!(
+            "issue #5: invalid block {} was the best header at height {}; rewound header tip to \
+             parent {} (height {}) so an honest sibling can connect",
+            block_hash, height, block.header.prev_block_hash, parent_height
+        );
+        return Some(parent_height);
+    }
+    None
+}
+
 // ============================================================
 // COOKIE AUTH HELPERS
 // ============================================================
@@ -3150,6 +3246,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     header_sync.set_best_header(best_height, best_hash);
     let mut block_downloader = BlockDownloader::new(best_height, best_height);
 
+    // Issue #5: session-local set of block hashes that failed to connect on the
+    // linear/P2P path (marked FAILED_VALIDITY in the block index). Used to
+    // filter such blocks out of incoming header batches so a peer that keeps
+    // announcing / re-serving the invalid block cannot re-adopt it as the best
+    // header (Core drops BLOCK_FAILED_VALID blocks from the candidate set;
+    // rustoshi's linear header index would otherwise re-pin it). The durable
+    // source of truth is the FAILED_VALIDITY flag; this is an O(1) fast-path.
+    let mut invalid_block_hashes: std::collections::HashSet<Hash256> =
+        std::collections::HashSet::new();
+
     // Start peer connections (including TCP listener for inbound)
     peer_manager.start().await;
 
@@ -3445,6 +3551,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     // (first failure h=944601 on 2026-04-11; debug.log
                     // shows zero "Connected block" lines despite tip
                     // hash advancing across every restart).
+                    // Issue #5: set when a block that EXTENDS our tip fails a
+                    // late consensus gate (value/script/sigops). Acted on after
+                    // the `cs`/`utxo_view` borrow ends to mark the block invalid
+                    // and (if it was the header tip) rewind so an honest sibling
+                    // can connect. See `mark_connect_failed_block_invalid`.
+                    let mut connect_invalid = false;
                     let connected_undo: Option<rustoshi_consensus::validation::UndoData> = {
                         let mut cs = chain_state.write().await;
                         // BIP-113: compute parent MTP for `is_final_tx`'s
@@ -3481,19 +3593,65 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             &block_store,
                             &params,
                         );
+                        // Issue #5: connect this block inside a per-block
+                        // savepoint (Core ConnectTip's CreateResetGuard,
+                        // validation.cpp:3035) so a late-gate reject cannot
+                        // poison the long-lived write-back UTXO view. Committed
+                        // only on success; discarded on failure.
+                        utxo_view.begin_savepoint();
                         // f_requested=true: blocks from the IBD block downloader
                         // are actively requested via getdata — no fTooFarAhead guard.
                         match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
-                            Ok((undo, _fees)) => Some(undo),
+                            Ok((undo, _fees)) => {
+                                utxo_view.commit_savepoint();
+                                Some(undo)
+                            }
                             Err(e) => {
+                                // Discard the failed block's UTXO mutations —
+                                // the poison fix (issue #5). Without this the
+                                // spend at validation.rs:2338 outlives the reject.
+                                utxo_view.rollback_savepoint();
                                 tracing::warn!(
                                     "Block validation failed at height {}: {}",
                                     height, e
                                 );
+                                // A block that EXTENDS our tip but fails a
+                                // consensus gate is invalid — mark it so the
+                                // downloader stops re-pinning it. PrevBlockNotFound
+                                // is a fork/side-branch candidate, not an invalid
+                                // block, so it is excluded (IBD is sequential, so
+                                // it should not arise here, but stay conservative).
+                                if !matches!(
+                                    e,
+                                    rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)
+                                ) {
+                                    connect_invalid = true;
+                                }
                                 None
                             }
                         }
                     };
+
+                    // Issue #5: InvalidBlockFound-equivalent. Mark the failed
+                    // block invalid and (if it was the header tip) rewind so an
+                    // honest sibling connects instead of the downloader
+                    // re-pinning the invalid block forever.
+                    if connect_invalid {
+                        invalid_block_hashes.insert(block_hash);
+                        if let Some(parent_height) = mark_connect_failed_block_invalid(
+                            &block_store,
+                            &mut header_sync,
+                            &mut block_downloader,
+                            &block,
+                            block_hash,
+                            height,
+                        ) {
+                            let mut rpc = rpc_state.write().await;
+                            if rpc.header_height > parent_height {
+                                rpc.header_height = parent_height;
+                            }
+                        }
+                    }
 
                     if let Some(undo) = connected_undo {
                         // Store block index entry so getblockheader returns height/nTx/chainwork.
@@ -3828,6 +3986,26 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     Some(PeerEvent::Message(peer_id, msg)) => {
                         match msg {
                             NetworkMessage::Headers(headers) => {
+                                // Issue #5: drop any header whose block already
+                                // failed to connect (marked FAILED_VALIDITY).
+                                // Otherwise a peer that keeps announcing / re-
+                                // serving the invalid block lets rustoshi's
+                                // linear header index re-adopt it as the best
+                                // header — undoing the connect-fail rewind and
+                                // re-pinning the invalid block. Core drops
+                                // BLOCK_FAILED_VALID blocks from the best-header
+                                // candidate set (FindMostWorkChain skips them);
+                                // this is the linear-index analog. The honest
+                                // sibling (a DIFFERENT hash) is never filtered,
+                                // so it still connects and advances the tip.
+                                let headers: Vec<_> = if invalid_block_hashes.is_empty() {
+                                    headers
+                                } else {
+                                    headers
+                                        .into_iter()
+                                        .filter(|h| !invalid_block_hashes.contains(&h.block_hash()))
+                                        .collect()
+                                };
                                 let header_count = headers.len();
                                 let current_header_height = header_sync.best_header_height();
                                 // BIP-113 / Core ContextualCheckBlockHeader:
@@ -4261,6 +4439,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     // on AFTER the `chain_state` / `utxo_view` borrow ends so we
                                     // can flush + re-borrow cleanly.
                                     let mut reorg_candidate = false;
+                                    // Issue #5: set when a block that EXTENDS our
+                                    // tip fails a late consensus gate. Acted on
+                                    // after the borrow ends to mark the block
+                                    // invalid + rewind the header tip so an honest
+                                    // sibling can connect (InvalidBlockFound).
+                                    let mut connect_invalid = false;
                                     let connected_undo: Option<rustoshi_consensus::validation::UndoData> = {
                                         let mut cs = chain_state.write().await;
                                         // BIP-113: compute parent MTP for
@@ -4289,11 +4473,26 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             &block_store,
                                             &params,
                                         );
+                                        // Issue #5: per-block savepoint (Core
+                                        // ConnectTip CreateResetGuard) so a failed
+                                        // connect on this shared long-lived view
+                                        // never poisons it. Commit on success,
+                                        // discard on failure.
+                                        utxo_view.begin_savepoint();
                                         // f_requested=true: blocks from the P2P block downloader
                                         // are actively requested via getdata — no fTooFarAhead guard.
                                         match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
-                                            Ok((undo, _fees)) => Some(undo),
+                                            Ok((undo, _fees)) => {
+                                                utxo_view.commit_savepoint();
+                                                Some(undo)
+                                            }
                                             Err(e) => {
+                                                // Issue #5 poison fix: roll back
+                                                // the failed block's UTXO mutations
+                                                // (the spend at validation.rs:2338
+                                                // ran before this reject) so U stays
+                                                // spendable for the honest sibling.
+                                                utxo_view.rollback_savepoint();
                                                 tracing::warn!(
                                                     "Block validation failed at height {}: {}",
                                                     height, e
@@ -4316,16 +4515,46 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 // Unit C: a `PrevBlockNotFound` block is a
                                                 // fork/side-branch candidate (chain_state.rs:477-482).
                                                 // Flag it for the attach-and-reorg trigger below.
+                                                // Any OTHER error means the block extends our tip
+                                                // but is invalid (issue #5) — mark it so the
+                                                // downloader adopts the honest sibling.
                                                 if matches!(
                                                     e,
                                                     rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)
                                                 ) {
                                                     reorg_candidate = true;
+                                                } else {
+                                                    connect_invalid = true;
                                                 }
                                                 None
                                             }
                                         }
                                     };
+
+                                    // Issue #5: InvalidBlockFound-equivalent
+                                    // (Core validation.cpp:3043). Mark the failed
+                                    // tip-extending block invalid and, if it was
+                                    // the best header, rewind the header chain to
+                                    // its valid parent so the honest sibling's
+                                    // announcement connects and gets requested —
+                                    // instead of the downloader re-pinning the
+                                    // invalid block forever.
+                                    if connect_invalid {
+                                        invalid_block_hashes.insert(block_hash);
+                                        if let Some(parent_height) = mark_connect_failed_block_invalid(
+                                            &block_store,
+                                            &mut header_sync,
+                                            &mut block_downloader,
+                                            &block,
+                                            block_hash,
+                                            height,
+                                        ) {
+                                            let mut rpc = rpc_state.write().await;
+                                            if rpc.header_height > parent_height {
+                                                rpc.header_height = parent_height;
+                                            }
+                                        }
+                                    }
 
                                     // Unit C (reorg cluster): TRIGGER. A block that does not
                                     // extend the active tip was just dropped by the connect path
