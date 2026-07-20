@@ -250,10 +250,6 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(120);
 /// Timeout for pong response before disconnecting.
 pub const PING_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Timeout for inactivity (no messages received).
-#[allow(dead_code)]
-pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(600);
-
 /// Peer connection state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerState {

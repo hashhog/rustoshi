@@ -24,12 +24,6 @@ use std::time::{Duration, Instant};
 /// Supported transaction reconciliation protocol version (BIP-330).
 pub const TXRECONCILIATION_VERSION: u32 = 1;
 
-/// Minimum protocol version that supports Erlay (must support wtxid relay).
-pub const MIN_ERLAY_PROTO_VERSION: i32 = 70016;
-
-/// Field size for Minisketch (32 bits for short IDs).
-pub const MINISKETCH_FIELD_BITS: usize = 32;
-
 /// Default sketch capacity for reconciliation.
 pub const DEFAULT_SKETCH_CAPACITY: usize = 128;
 
