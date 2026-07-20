@@ -11,6 +11,19 @@ use rustoshi_primitives::serialize::{read_compact_size, write_compact_size};
 use rustoshi_primitives::{Block, BlockHeader, Decodable, Encodable, Hash256, Transaction};
 use std::io::{Cursor, Read};
 
+/// Remaining unread bytes in a message-payload cursor. A compact-size
+/// length/count prefix in a P2P message can never legitimately exceed the
+/// bytes actually present in the (transport-capped, <=4MB) payload, so this
+/// bounds every allocation driven by an untrusted count — preventing the
+/// unbounded-allocation OOM a peer could trigger with a large length prefix
+/// (fuzz-found 2026-07-20). Mirrors Bitcoin Core net.cpp
+/// MAX_PROTOCOL_MESSAGE_LENGTH + serialize.h MAX_VECTOR_ALLOCATE.
+#[inline]
+fn remaining(c: &Cursor<&[u8]>) -> usize {
+    c.get_ref().len().saturating_sub(c.position() as usize)
+}
+
+
 /// Size of the message header in bytes.
 pub const MESSAGE_HEADER_SIZE: usize = 24;
 
@@ -554,7 +567,7 @@ impl CFHeadersMessage {
                 "cfheaders body short",
             ));
         }
-        let mut filter_hashes = Vec::with_capacity(n);
+        let mut filter_hashes = Vec::with_capacity(n.min(remaining(&cursor)));
         for i in 0..n {
             let mut h = [0u8; 32];
             h.copy_from_slice(&payload[body_start + 32 * i..body_start + 32 * (i + 1)]);
@@ -657,7 +670,7 @@ impl CFCheckptMessage {
                 "cfcheckpt body short",
             ));
         }
-        let mut filter_headers = Vec::with_capacity(n);
+        let mut filter_headers = Vec::with_capacity(n.min(remaining(&cursor)));
         for i in 0..n {
             let mut h = [0u8; 32];
             h.copy_from_slice(&payload[body_start + 32 * i..body_start + 32 * (i + 1)]);
@@ -880,6 +893,12 @@ impl NetworkMessage {
                 cursor.read_exact(&mut buf8)?;
                 let nonce = u64::from_le_bytes(buf8);
                 let ua_len = read_compact_size(&mut cursor)? as usize;
+                if ua_len > remaining(&cursor) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "user-agent length exceeds payload",
+                    ));
+                }
                 let mut ua_bytes = vec![0u8; ua_len];
                 cursor.read_exact(&mut ua_bytes)?;
                 let user_agent = String::from_utf8_lossy(&ua_bytes).into_owned();
@@ -926,7 +945,7 @@ impl NetworkMessage {
                         "too many locator hashes",
                     ));
                 }
-                let mut locator_hashes = Vec::with_capacity(count);
+                let mut locator_hashes = Vec::with_capacity(count.min(remaining(&cursor)));
                 for _ in 0..count {
                     let mut hash = [0u8; 32];
                     cursor.read_exact(&mut hash)?;
@@ -951,7 +970,7 @@ impl NetworkMessage {
                         "too many locator hashes",
                     ));
                 }
-                let mut locator_hashes = Vec::with_capacity(count);
+                let mut locator_hashes = Vec::with_capacity(count.min(remaining(&cursor)));
                 for _ in 0..count {
                     let mut hash = [0u8; 32];
                     cursor.read_exact(&mut hash)?;
@@ -973,7 +992,7 @@ impl NetworkMessage {
                         "too many headers",
                     ));
                 }
-                let mut headers = Vec::with_capacity(count);
+                let mut headers = Vec::with_capacity(count.min(remaining(&cursor)));
                 for _ in 0..count {
                     let header = BlockHeader::decode(&mut cursor)?;
                     // Read and discard the tx_count (always 0)
@@ -1031,7 +1050,7 @@ impl NetworkMessage {
                         "too many addrs",
                     ));
                 }
-                let mut addrs = Vec::with_capacity(count);
+                let mut addrs = Vec::with_capacity(count.min(remaining(&cursor)));
                 for _ in 0..count {
                     let mut buf4 = [0u8; 4];
                     cursor.read_exact(&mut buf4)?;
@@ -1102,12 +1121,24 @@ impl NetworkMessage {
             )?)),
             "reject" => {
                 let msg_len = read_compact_size(&mut cursor)? as usize;
+                if msg_len > remaining(&cursor) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "reject message length exceeds payload",
+                    ));
+                }
                 let mut msg_bytes = vec![0u8; msg_len];
                 cursor.read_exact(&mut msg_bytes)?;
                 let message = String::from_utf8_lossy(&msg_bytes).into_owned();
                 let mut code = [0u8; 1];
                 cursor.read_exact(&mut code)?;
                 let reason_len = read_compact_size(&mut cursor)? as usize;
+                if reason_len > remaining(&cursor) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "reject reason length exceeds payload",
+                    ));
+                }
                 let mut reason_bytes = vec![0u8; reason_len];
                 cursor.read_exact(&mut reason_bytes)?;
                 let reason = String::from_utf8_lossy(&reason_bytes).into_owned();
@@ -1160,9 +1191,7 @@ pub fn serialize_message(magic: &[u8; 4], msg: &NetworkMessage) -> Vec<u8> {
 
 /// Parse a message header from 24 bytes.
 /// Returns (magic, command, length, checksum).
-pub fn parse_message_header(
-    data: &[u8; MESSAGE_HEADER_SIZE],
-) -> ([u8; 4], String, u32, [u8; 4]) {
+pub fn parse_message_header(data: &[u8; MESSAGE_HEADER_SIZE]) -> ([u8; 4], String, u32, [u8; 4]) {
     let mut magic = [0u8; 4];
     magic.copy_from_slice(&data[0..4]);
 
@@ -1207,7 +1236,10 @@ fn deserialize_net_address<R: Read>(reader: &mut R) -> std::io::Result<NetAddres
     Ok(NetAddress { services, ip, port })
 }
 
-fn deserialize_inv_vectors<R: Read>(reader: &mut R, count: usize) -> std::io::Result<Vec<InvVector>> {
+fn deserialize_inv_vectors<R: Read>(
+    reader: &mut R,
+    count: usize,
+) -> std::io::Result<Vec<InvVector>> {
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
         let mut buf4 = [0u8; 4];
@@ -1567,7 +1599,11 @@ mod tests {
         let payload = vec![1, 2, 3, 4, 5];
 
         let decoded = NetworkMessage::deserialize(command, &payload).unwrap();
-        if let NetworkMessage::Unknown { command: c, payload: p } = decoded {
+        if let NetworkMessage::Unknown {
+            command: c,
+            payload: p,
+        } = decoded
+        {
             assert_eq!(c, "foomessage");
             assert_eq!(p, vec![1, 2, 3, 4, 5]);
         } else {
@@ -1659,21 +1695,22 @@ mod tests {
         assert_eq!(InvType::from_u32(4), InvType::MsgCmpctBlock);
         assert_eq!(InvType::from_u32(0x40000001), InvType::MsgWitnessTx);
         assert_eq!(InvType::from_u32(0x40000002), InvType::MsgWitnessBlock);
-        assert_eq!(InvType::from_u32(0x40000003), InvType::MsgWitnessFilteredBlock);
+        assert_eq!(
+            InvType::from_u32(0x40000003),
+            InvType::MsgWitnessFilteredBlock
+        );
         assert_eq!(InvType::from_u32(999), InvType::Error);
     }
 
     #[test]
     fn getdata_notfound_roundtrip() {
-        let items = vec![
-            InvVector {
-                inv_type: InvType::MsgWitnessBlock,
-                hash: Hash256::from_hex(
-                    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-                )
-                .unwrap(),
-            },
-        ];
+        let items = vec![InvVector {
+            inv_type: InvType::MsgWitnessBlock,
+            hash: Hash256::from_hex(
+                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+            )
+            .unwrap(),
+        }];
 
         // Test getdata
         let msg = NetworkMessage::GetData(items.clone());
@@ -1745,25 +1782,41 @@ mod tests {
 
     #[test]
     fn command_name_correct() {
-        assert_eq!(NetworkMessage::Version(VersionMessage {
-            version: 70016,
-            services: 0,
-            timestamp: 0,
-            addr_recv: NetAddress { services: 0, ip: [0; 16], port: 0 },
-            addr_from: NetAddress { services: 0, ip: [0; 16], port: 0 },
-            nonce: 0,
-            user_agent: String::new(),
-            start_height: 0,
-            relay: true,
-        }).command(), "version");
+        assert_eq!(
+            NetworkMessage::Version(VersionMessage {
+                version: 70016,
+                services: 0,
+                timestamp: 0,
+                addr_recv: NetAddress {
+                    services: 0,
+                    ip: [0; 16],
+                    port: 0
+                },
+                addr_from: NetAddress {
+                    services: 0,
+                    ip: [0; 16],
+                    port: 0
+                },
+                nonce: 0,
+                user_agent: String::new(),
+                start_height: 0,
+                relay: true,
+            })
+            .command(),
+            "version"
+        );
         assert_eq!(NetworkMessage::Verack.command(), "verack");
         assert_eq!(NetworkMessage::Ping(0).command(), "ping");
         assert_eq!(NetworkMessage::Pong(0).command(), "pong");
-        assert_eq!(NetworkMessage::GetHeaders(GetHeadersMessage {
-            version: 0,
-            locator_hashes: vec![],
-            hash_stop: Hash256::ZERO,
-        }).command(), "getheaders");
+        assert_eq!(
+            NetworkMessage::GetHeaders(GetHeadersMessage {
+                version: 0,
+                locator_hashes: vec![],
+                hash_stop: Hash256::ZERO,
+            })
+            .command(),
+            "getheaders"
+        );
         assert_eq!(NetworkMessage::Headers(vec![]).command(), "headers");
         assert_eq!(NetworkMessage::Inv(vec![]).command(), "inv");
         assert_eq!(NetworkMessage::GetData(vec![]).command(), "getdata");
@@ -1859,8 +1912,8 @@ mod tests {
                 timestamp: 1700000001,
                 services: 1,
                 addr: crate::addr::NetworkAddr::Cjdns([
-                    0xfc, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+                    0xfc, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                    0x0d, 0x0e, 0x0f,
                 ]),
                 port: 8333,
             },
@@ -2004,7 +2057,7 @@ mod tests {
         payload.push(0u8); // filter_type
         payload.extend_from_slice(&[0u8; 32]); // stop
         payload.extend_from_slice(&[0u8; 32]); // prev
-        // CompactSize encoding of 2001 (MAX_GETCFHEADERS_SIZE+1) — uses 0xfd + u16 LE.
+                                               // CompactSize encoding of 2001 (MAX_GETCFHEADERS_SIZE+1) — uses 0xfd + u16 LE.
         let n: u64 = (MAX_GETCFHEADERS_SIZE as u64) + 1;
         write_compact_size(&mut payload, n).unwrap();
         // (no need to add the actual hashes — the length check should fire)
@@ -2064,7 +2117,11 @@ mod tests {
             filter_hashes: vec![],
         };
         let bytes = msg.serialize();
-        assert_eq!(bytes.len(), 66, "1 + 32 + 32 + 1 = 66 bytes for empty cfheaders");
+        assert_eq!(
+            bytes.len(),
+            66,
+            "1 + 32 + 32 + 1 = 66 bytes for empty cfheaders"
+        );
         let parsed = CFHeadersMessage::deserialize(&bytes).unwrap();
         assert_eq!(parsed, msg);
     }
@@ -2083,5 +2140,30 @@ mod tests {
         assert_eq!(bytes.len(), 34, "1 + 32 + 1 = 34 bytes for empty cfilter");
         let parsed = CFilterMessage::deserialize(&bytes).unwrap();
         assert_eq!(parsed, msg);
+    }
+
+    /// Regression: a P2P `reject` message with an oversized compact-size length
+    /// prefix must be REJECTED as a decode error, never trigger an unbounded
+    /// allocation. Fuzz-found 2026-07-20 (libFuzzer OOM, malloc ~201GB from a
+    /// 12-byte input); fixed by bounding every count/length against the
+    /// remaining payload. Any connected peer can send `reject`, so this is a
+    /// remotely-triggerable DoS if unguarded.
+    #[test]
+    fn reject_oversized_length_prefix_is_error_not_oom() {
+        // 0xff compact-size escape + an 8-byte length of ~202 billion.
+        let payload = [0x26u8, 0xff, 0x0c, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x09];
+        let r = NetworkMessage::deserialize("reject", &payload);
+        assert!(r.is_err(), "oversized reject length must be a decode error, got {:?}", r.is_ok());
+    }
+
+    /// The same class on a count-based field: a `headers` message claiming a
+    /// huge header count must not pre-reserve unbounded capacity.
+    #[test]
+    fn headers_oversized_count_does_not_over_allocate() {
+        // command "headers" + 0xff-escaped count of ~202 billion, then no data.
+        let payload = [0xffu8, 0x0c, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00];
+        // Must return an error (EOF while reading the claimed headers), not OOM.
+        let r = NetworkMessage::deserialize("headers", &payload);
+        assert!(r.is_err());
     }
 }

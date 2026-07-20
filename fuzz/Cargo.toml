@@ -1,0 +1,50 @@
+[package]
+name = "rustoshi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rustoshi-primitives = { path = "../crates/primitives" }
+rustoshi-consensus = { path = "../crates/consensus" }
+rustoshi-network = { path = "../crates/network" }
+
+# Standalone workspace: keeps libfuzzer/sanitizer deps out of the parent
+# workspace's Cargo.lock so stable `cargo build --release` is unaffected.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_block_decode"
+path = "fuzz_targets/fuzz_block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tx_decode"
+path = "fuzz_targets/fuzz_tx_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_eval_script"
+path = "fuzz_targets/fuzz_eval_script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_netmsg_decode"
+path = "fuzz_targets/fuzz_netmsg_decode.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
