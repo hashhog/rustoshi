@@ -2227,6 +2227,35 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         _ => anyhow::bail!("Unknown network: {}", cli.network),
     };
 
+    // HASHHOG_CAMPAIGN_ASSUMEUTXO — hashhog-only campaign snapshot-table
+    // extension (NOT a Bitcoin Core mechanism). See
+    // receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md (meta-repo) and
+    // `rustoshi_consensus::campaign_assumeutxo` for the full contract.
+    // Unset/empty (the default, production case): `load_and_merge` returns
+    // `Ok(None)` after a single `env::var` call -- no file I/O, no mutation
+    // of `params.assumeutxo_data`. This keeps the flag mainnet-inert.
+    match rustoshi_consensus::campaign_assumeutxo::load_and_merge(&mut params) {
+        Ok(Some(loaded)) => {
+            // Loud, greppable startup banner -- fleet-monitor alerts if this
+            // ever shows up in a production log (spec's "Security note" item 3).
+            let heights: Vec<String> =
+                loaded.entries.iter().map(|e| e.height.to_string()).collect();
+            eprintln!(
+                "[CAMPAIGN-ASSUMEUTXO] loaded {} entries from {} heights=[{}]",
+                loaded.entries.len(),
+                loaded.path,
+                heights.join(",")
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // Malformed/unreadable campaign file, or a collision with a
+            // built-in entry: refuse to start rather than silently running
+            // with a partial or untrusted table.
+            anyhow::bail!("HASHHOG_CAMPAIGN_ASSUMEUTXO: refusing to start: {e}");
+        }
+    }
+
     // `--assumevalid=<hex|0>` override (mainnet-history replay harness /
     // full-history script verification). `=0` disables the assumevalid skip so
     // the faithful 5-condition gate always returns false (full verify).

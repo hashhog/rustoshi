@@ -392,9 +392,13 @@ fn g13_testnet4_h90k_hash_serialized_matches_core() {
 }
 
 /// BUG-3 (G14 P1): regtest must have the 3 Core test entries
-/// (110/200/299) for `feature_assumeutxo.py` parity. Rustoshi has zero.
+/// (110/200/299) for `feature_assumeutxo.py` parity.
+///
+/// Fixed by the campaign snapshot-table porter slice (porter slice 10/10,
+/// receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md): `ChainParams::regtest()` now
+/// ships the 3 Core-parity entries directly (see
+/// `test_regtest_assumeutxo_matches_core` in crates/consensus/src/params.rs).
 #[test]
-#[ignore = "BUG-3 (W138 G14 P1): regtest assumeutxo_data is empty; Core regtest has 3 entries (h=110/200/299) for unit/functional/fuzz tests"]
 fn g14_regtest_matches_core_three_entries() {
     let p = ChainParams::regtest();
     // Core CRegTestParams::m_assumeutxo_data has 3 entries at heights

@@ -19732,14 +19732,19 @@ mod tests {
 
     #[tokio::test]
     async fn dumptxoutset_rollback_no_snapshots_on_regtest() {
-        // regtest has zero assumeutxo entries -> always errors on rollback.
+        // regtest's 3 Core-parity assumeutxo entries sit at heights 110/200/299
+        // (see `ChainParams::regtest()`); a tip at height 100 is below all of
+        // them, so no candidate height qualifies and rollback must still err.
         let params = rustoshi_consensus::ChainParams::regtest();
         let (_tmp, server) = dumptxoutset_test_server(params, 100).await;
 
         let res = server
             .dump_tx_outset("snap.dat".to_string(), Some("rollback".to_string()), None)
             .await;
-        assert!(res.is_err(), "regtest has no snapshots; rollback must err");
+        assert!(
+            res.is_err(),
+            "tip below every regtest assumeutxo height; rollback must err"
+        );
     }
 
     #[tokio::test]
