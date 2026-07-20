@@ -25,6 +25,7 @@
 //! block validation.
 
 pub mod block_template;
+pub mod campaign_assumeutxo;
 pub mod chain_manager;
 pub mod chain_state;
 pub mod fee_estimator;
