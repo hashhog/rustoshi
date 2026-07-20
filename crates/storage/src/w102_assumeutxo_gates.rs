@@ -578,15 +578,29 @@ mod tests {
     // G26 — m_assumeutxo_data per-network tables
     // ================================================================
 
-    /// G26: regtest must have an empty assumeutxo table (no snapshots for regtest).
+    /// G26: regtest ships exactly the 3 Core-parity assumeutxo entries
+    /// (heights 110/200/299, `CRegTestParams::m_assumeutxo_data`,
+    /// bitcoin-core/src/kernel/chainparams.cpp:607-628). Landed by the
+    /// campaign snapshot-table porter slice
+    /// (receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md); previously this table was
+    /// empty (tracked as BUG-3, W138 G14). Ad-hoc/locally-mined regtest
+    /// snapshots still go through the separate runtime whitelist
+    /// (`register_regtest_assumeutxo`), unaffected by this table.
     #[test]
-    fn g26_regtest_has_no_assumeutxo_entries() {
+    fn g26_regtest_has_three_core_parity_assumeutxo_entries() {
         use rustoshi_consensus::ChainParams;
         let params = ChainParams::regtest();
-        assert!(
-            params.assumeutxo_data.is_empty(),
-            "regtest must have no assumeutxo entries"
+        assert_eq!(
+            params.assumeutxo_data.len(),
+            3,
+            "regtest must have exactly the 3 Core-parity assumeutxo entries (110/200/299)"
         );
+        for height in [110, 200, 299] {
+            assert!(
+                params.assumeutxo_for_height(height).is_some(),
+                "regtest missing Core-parity assumeutxo entry at height {height}"
+            );
+        }
     }
 
     /// G26: mainnet table must have at least the 4 upstream entries from Core.

@@ -1119,8 +1119,70 @@ impl ChainParams {
             minimum_chain_work: [0u8; 32],
             // Regtest has no checkpoints - it's for local testing
             checkpoints: Checkpoints::empty(),
-            // Regtest allows any assumeUTXO snapshot (validated at runtime)
-            assumeutxo_data: vec![],
+            // Core-parity regtest assumeUTXO entries, byte-for-byte
+            // `CRegTestParams::m_assumeutxo_data`
+            // (bitcoin-core/src/kernel/chainparams.cpp:607-628). These are
+            // FIXED test-vector heights (110/200/299) that Core's own test
+            // suite (unit tests, fuzz/utxo_snapshot.cpp,
+            // feature_assumeutxo.py, tool_bitcoin_chainstate.py) mines
+            // deterministically from genesis, so — unlike an ad-hoc locally
+            // -mined regtest chain — these hashes are reproducible across
+            // implementations and can be hardcoded exactly like Core does.
+            // Ad-hoc/locally-mined regtest snapshots still go through the
+            // runtime whitelist (`register_regtest_assumeutxo`), which is
+            // unaffected by this table.
+            //
+            // `base_mtp: None` for all three: Core doesn't need a pinned MTP
+            // here because `ActivateSnapshot` always validates the full
+            // genesis->base header chain first, so the base block's MTP is
+            // computed normally; rustoshi's partial-window MTP fallback
+            // (see `AssumeutxoData::base_mtp` doc comment) applies the same
+            // way once the corresponding headers are present.
+            assumeutxo_data: vec![
+                AssumeutxoData {
+                    // For use by unit tests.
+                    height: 110,
+                    blockhash: Hash256::from_hex(
+                        "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 111,
+                    base_mtp: None,
+                },
+                AssumeutxoData {
+                    // For use by fuzz target src/test/fuzz/utxo_snapshot.cpp.
+                    height: 200,
+                    blockhash: Hash256::from_hex(
+                        "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 201,
+                    base_mtp: None,
+                },
+                AssumeutxoData {
+                    // For use by test/functional/feature_assumeutxo.py and
+                    // test/functional/tool_bitcoin_chainstate.py.
+                    height: 299,
+                    blockhash: Hash256::from_hex(
+                        "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2",
+                    )
+                    .expect("valid hash"),
+                    hash_serialized: AssumeutxoHash::from_hex(
+                        "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2",
+                    )
+                    .expect("valid hash"),
+                    chain_tx_count: 334,
+                    base_mtp: None,
+                },
+            ],
             // No mainnet fixed seeds on regtest (network-scoped fallback).
             fixed_seeds: Vec::new(),
         }
@@ -2408,22 +2470,28 @@ mod tests {
         )
         .unwrap();
 
-        // Regtest: registration succeeds and is queryable.
+        // Regtest: registration succeeds and is queryable. `ChainParams::regtest()`
+        // now ships the 3 Core-parity entries (heights 110/200/299 — see
+        // `test_regtest_assumeutxo_matches_core`), so the runtime-registered test
+        // entry below uses a non-colliding height (an ad-hoc locally-mined
+        // regtest chain would never land on one of Core's fixed test-vector
+        // heights).
         let mut regtest = ChainParams::regtest();
-        assert!(regtest.assumeutxo_data.is_empty());
-        assert!(regtest.register_regtest_assumeutxo(110, bh, h, 110, Some(0)));
-        assert_eq!(regtest.assumeutxo_data.len(), 1);
-        let e = regtest.assumeutxo_for_height(110).expect("entry present");
+        let builtin_count = regtest.assumeutxo_data.len();
+        assert_eq!(builtin_count, 3, "regtest ships the 3 Core-parity entries");
+        assert!(regtest.register_regtest_assumeutxo(500_000, bh, h, 110, Some(0)));
+        assert_eq!(regtest.assumeutxo_data.len(), builtin_count + 1);
+        let e = regtest.assumeutxo_for_height(500_000).expect("entry present");
         assert_eq!(e.blockhash, bh);
         assert_eq!(e.hash_serialized, h);
         // Idempotent on (height, blockhash): re-register replaces, not appends.
-        assert!(regtest.register_regtest_assumeutxo(110, bh, h, 110, Some(0)));
-        assert_eq!(regtest.assumeutxo_data.len(), 1);
+        assert!(regtest.register_regtest_assumeutxo(500_000, bh, h, 110, Some(0)));
+        assert_eq!(regtest.assumeutxo_data.len(), builtin_count + 1);
 
         // Mainnet: HARD no-op — the consensus table is untouched.
         let mut mainnet = ChainParams::mainnet();
         let before = mainnet.assumeutxo_data.clone();
-        assert!(!mainnet.register_regtest_assumeutxo(110, bh, h, 110, Some(0)));
+        assert!(!mainnet.register_regtest_assumeutxo(500_000, bh, h, 110, Some(0)));
         assert_eq!(
             mainnet.assumeutxo_data, before,
             "mainnet assumeutxo table must never be mutated at runtime"
@@ -2432,8 +2500,84 @@ mod tests {
         // Testnet4: HARD no-op.
         let mut testnet4 = ChainParams::testnet4();
         let before4 = testnet4.assumeutxo_data.clone();
-        assert!(!testnet4.register_regtest_assumeutxo(110, bh, h, 110, Some(0)));
+        assert!(!testnet4.register_regtest_assumeutxo(500_000, bh, h, 110, Some(0)));
         assert_eq!(testnet4.assumeutxo_data, before4);
+    }
+
+    /// Pin regtest assumeUTXO entries to the literal Bitcoin Core values from
+    /// `bitcoin-core/src/kernel/chainparams.cpp` (`CRegTestParams::m_assumeutxo_data`,
+    /// lines 607-628). Mirrors `test_testnet4_assumeutxo_matches_core` below.
+    #[test]
+    fn test_regtest_assumeutxo_matches_core() {
+        let params = ChainParams::regtest();
+        assert_eq!(
+            params.assumeutxo_data.len(),
+            3,
+            "regtest should have exactly 3 assumeUTXO entries (heights 110, 200, 299)"
+        );
+
+        let entry_110 = params
+            .assumeutxo_for_height(110)
+            .expect("regtest must have assumeUTXO entry at height 110");
+        assert_eq!(
+            entry_110.blockhash,
+            Hash256::from_hex(
+                "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
+            )
+            .unwrap(),
+            "regtest height-110 blockhash must match Core chainparams.cpp:612"
+        );
+        assert_eq!(
+            entry_110.hash_serialized,
+            AssumeutxoHash::from_hex(
+                "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"
+            )
+            .unwrap(),
+            "regtest height-110 hash_serialized must match Core chainparams.cpp:610"
+        );
+        assert_eq!(entry_110.chain_tx_count, 111);
+
+        let entry_200 = params
+            .assumeutxo_for_height(200)
+            .expect("regtest must have assumeUTXO entry at height 200");
+        assert_eq!(
+            entry_200.blockhash,
+            Hash256::from_hex(
+                "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"
+            )
+            .unwrap(),
+            "regtest height-200 blockhash must match Core chainparams.cpp:619"
+        );
+        assert_eq!(
+            entry_200.hash_serialized,
+            AssumeutxoHash::from_hex(
+                "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"
+            )
+            .unwrap(),
+            "regtest height-200 hash_serialized must match Core chainparams.cpp:617"
+        );
+        assert_eq!(entry_200.chain_tx_count, 201);
+
+        let entry_299 = params
+            .assumeutxo_for_height(299)
+            .expect("regtest must have assumeUTXO entry at height 299");
+        assert_eq!(
+            entry_299.blockhash,
+            Hash256::from_hex(
+                "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"
+            )
+            .unwrap(),
+            "regtest height-299 blockhash must match Core chainparams.cpp:626"
+        );
+        assert_eq!(
+            entry_299.hash_serialized,
+            AssumeutxoHash::from_hex(
+                "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"
+            )
+            .unwrap(),
+            "regtest height-299 hash_serialized must match Core chainparams.cpp:624"
+        );
+        assert_eq!(entry_299.chain_tx_count, 334);
     }
 
     /// Sanity check: ensure no testnet4 assumeUTXO hex strings are placeholder
