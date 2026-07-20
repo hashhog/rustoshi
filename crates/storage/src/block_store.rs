@@ -202,6 +202,48 @@ impl<'a> BlockStore<'a> {
         self.db.contains_key(CF_HEADERS, hash.as_bytes())
     }
 
+    /// Persist a validated assumeUTXO "base tail" header band -- real
+    /// headers for the range ending at (and including) a snapshot base --
+    /// into the header and height indexes.
+    ///
+    /// `headers` MUST already be validated (chained, ascending height order,
+    /// last header's hash == the snapshot base's hash): that check lives in
+    /// `rustoshi_consensus::campaign_assumeutxo::parse_base_tail_headers`,
+    /// run once at campaign-file load time. `base_height` is the height of
+    /// the LAST header (the snapshot base itself); earlier headers are
+    /// assigned `base_height - (headers.len() - 1 - i)`.
+    ///
+    /// Fixes M2-RUST-MTP / M2-RUST-POW-PANIC (receipts/PORTER-WAVE-NODE-BUGS.md):
+    /// without real pre-base headers, a `--load-snapshot` boot materializes
+    /// no history before the base, so (a) the MTP window for blocks in
+    /// [base+1, base+11] sees only a partial run of post-snapshot
+    /// timestamps instead of the real 11-block median (false
+    /// `time-too-old` on legitimate blocks), and (b) the difficulty-retarget
+    /// ancestor walk at the very next adjustment boundary can find no
+    /// ancestor at all. Persisting these headers gives both walks genuine
+    /// stored ancestors, matching Bitcoin Core's behaviour (which always has
+    /// the full genesis->base header chain before a snapshot activates)
+    /// instead of approximating it.
+    ///
+    /// A no-op for an empty slice (the common case: no campaign entry, or a
+    /// campaign entry without `base_tail_headers`) -- mainnet-inert by
+    /// construction.
+    pub fn put_base_tail_headers(
+        &self,
+        base_height: u32,
+        headers: &[BlockHeader],
+    ) -> Result<(), StorageError> {
+        let len = headers.len() as u32;
+        for (i, hdr) in headers.iter().enumerate() {
+            let offset_from_base = len.saturating_sub(1).saturating_sub(i as u32);
+            let height = base_height.saturating_sub(offset_from_base);
+            let hash = hdr.block_hash();
+            self.put_header(&hash, hdr)?;
+            self.put_height_index(height, &hash)?;
+        }
+        Ok(())
+    }
+
     // ---------------- BLOCKS ----------------
 
     /// Store a full block.
@@ -2183,6 +2225,108 @@ mod flush_with_tip_tests {
             large_coins_cache_threshold(default),
             default - 10 * 1024 * 1024
         );
+    }
+}
+
+// ============================================================
+// BASE-TAIL-HEADER PERSISTENCE TESTS (M2-RUST-MTP / M2-RUST-POW-PANIC)
+// ============================================================
+
+#[cfg(test)]
+mod base_tail_header_tests {
+    use super::*;
+    use crate::db::ChainDb;
+    use tempfile::TempDir;
+
+    fn temp_db() -> (TempDir, ChainDb) {
+        let dir = TempDir::new().expect("temp dir");
+        let db = ChainDb::open(dir.path()).expect("open db");
+        (dir, db)
+    }
+
+    /// Build a chained header band of `n` headers (ascending height order),
+    /// mirroring `campaign_assumeutxo`'s validated shape.
+    fn build_chain(n: usize, start_time: u32) -> Vec<BlockHeader> {
+        let mut headers = Vec::with_capacity(n);
+        let mut prev_hash = Hash256::ZERO;
+        for i in 0..n {
+            let header = BlockHeader {
+                version: 1,
+                prev_block_hash: prev_hash,
+                merkle_root: Hash256::from_bytes([i as u8; 32]),
+                timestamp: start_time + i as u32 * 600,
+                bits: 0x1d00ffff,
+                nonce: i as u32,
+            };
+            prev_hash = header.block_hash();
+            headers.push(header);
+        }
+        headers
+    }
+
+    #[test]
+    fn put_base_tail_headers_persists_headers_and_height_index() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        // 5 headers ending at base height 1000 -> heights 996..1000.
+        let chain = build_chain(5, 1_000_000);
+        let base_height = 1_000u32;
+
+        store
+            .put_base_tail_headers(base_height, &chain)
+            .expect("put_base_tail_headers");
+
+        for (i, hdr) in chain.iter().enumerate() {
+            let expected_height = base_height - (chain.len() as u32 - 1 - i as u32);
+            let hash = hdr.block_hash();
+
+            // Header retrievable by hash, byte-identical.
+            let got_header = store.get_header(&hash).unwrap().expect("header stored");
+            assert_eq!(got_header, *hdr);
+
+            // Height index resolves to the same hash.
+            let got_hash = store
+                .get_hash_by_height(expected_height)
+                .unwrap()
+                .expect("height index stored");
+            assert_eq!(got_hash, hash);
+        }
+    }
+
+    #[test]
+    fn put_base_tail_headers_last_entry_is_the_base_itself() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        let chain = build_chain(3, 2_000_000);
+        let base_height = 500u32;
+        let base_hash = chain.last().unwrap().block_hash();
+
+        store
+            .put_base_tail_headers(base_height, &chain)
+            .expect("put_base_tail_headers");
+
+        // The LAST header (index len-1) must land exactly at base_height.
+        let got_hash = store
+            .get_hash_by_height(base_height)
+            .unwrap()
+            .expect("base height index stored");
+        assert_eq!(got_hash, base_hash);
+    }
+
+    #[test]
+    fn put_base_tail_headers_empty_slice_is_a_no_op() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+
+        store
+            .put_base_tail_headers(944_183, &[])
+            .expect("empty slice must not error");
+
+        // Nothing was written for any plausible pre-base height.
+        assert_eq!(store.get_hash_by_height(944_183).unwrap(), None);
+        assert_eq!(store.get_hash_by_height(944_172).unwrap(), None);
     }
 }
 
