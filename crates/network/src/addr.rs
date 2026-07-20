@@ -414,8 +414,6 @@ impl AddrV2Entry {
 /// where checksum = SHA3-256(".onion checksum" || pubkey || version)[0:2]
 /// and version = 0x03
 pub mod torv3 {
-    /// The Tor v3 version byte.
-    pub const TORV3_VERSION: u8 = 0x03;
 
     /// Validate that a 32-byte array could be a valid ed25519 public key.
     ///

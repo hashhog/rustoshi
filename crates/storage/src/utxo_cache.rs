@@ -45,9 +45,6 @@ use std::mem;
 /// Default cache size limit in bytes (450 MiB, matching Bitcoin Core's -dbcache default).
 pub const DEFAULT_DB_CACHE_BYTES: usize = 450 * 1024 * 1024;
 
-/// Prefix byte for UTXO entries in the database (matches Bitcoin Core's 'C').
-pub const DB_COIN_PREFIX: u8 = b'C';
-
 // ============================================================
 // COIN TYPE
 // ============================================================

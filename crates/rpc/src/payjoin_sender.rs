@@ -114,10 +114,6 @@ pub struct SenderRequest {
 }
 
 impl SenderRequest {
-    /// Default 30-second timeout matches what reqwest uses for blocking
-    /// requests; long enough for Tor + slow receivers, short enough
-    /// to trigger G22 fallback in a reasonable wall-clock window.
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 }
 
 /// Parsed pieces of a `pj=` endpoint URL.

@@ -18,15 +18,6 @@ pub const META_BEST_BLOCK_HASH: &[u8] = b"best_block_hash";
 /// Metadata key for the best block height.
 pub const META_BEST_HEIGHT: &[u8] = b"best_height";
 
-/// Metadata key for the header chain tip hash (may be ahead of validated blocks).
-pub const META_HEADER_TIP_HASH: &[u8] = b"header_tip_hash";
-
-/// Metadata key for the header chain tip height.
-pub const META_HEADER_TIP_HEIGHT: &[u8] = b"header_tip_height";
-
-/// Metadata key for total chain work (256-bit big-endian).
-pub const META_CHAIN_WORK: &[u8] = b"chain_work";
-
 /// Metadata key for the prune height (blocks below this have been pruned).
 pub const META_PRUNE_HEIGHT: &[u8] = b"prune_height";
 
