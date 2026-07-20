@@ -452,13 +452,19 @@ impl CFilterMessage {
         let mut cursor = Cursor::new(&payload[33..]);
         let len = read_compact_size(&mut cursor)? as usize;
         let body_start = 33 + cursor.position() as usize;
-        if payload.len() < body_start + len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "cfilter body short",
-            ));
-        }
-        let filter_bytes = payload[body_start..body_start + len].to_vec();
+        // checked: body_start + len can overflow usize on an untrusted
+        // compact-size len; the wrapped end would then pass the < check and
+        // slice payload[body_start..wrapped] can panic (start>end) or misparse.
+        let end = body_start
+            .checked_add(len)
+            .filter(|&e| e <= payload.len())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "cfilter body short or length overflow",
+                )
+            })?;
+        let filter_bytes = payload[body_start..end].to_vec();
         Ok(Self {
             filter_type,
             block_hash: Hash256(hash),
@@ -559,12 +565,19 @@ impl CFHeadersMessage {
             ));
         }
         let body_start = 65 + cursor.position() as usize;
-        if payload.len() < body_start + 32 * n {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "cfheaders body short",
-            ));
-        }
+        // checked: 32*n and body_start+32*n can overflow usize on an
+        // untrusted count n; validate a real end so the loop slices below
+        // (which index up to this end) cannot panic or wrap.
+        let _end = n
+            .checked_mul(32)
+            .and_then(|x| body_start.checked_add(x))
+            .filter(|&e| e <= payload.len())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "cfheaders body short or count overflow",
+                )
+            })?;
         let mut filter_hashes = Vec::with_capacity(n.min(remaining(&cursor)));
         for i in 0..n {
             let mut h = [0u8; 32];
@@ -662,12 +675,19 @@ impl CFCheckptMessage {
         let mut cursor = Cursor::new(&payload[33..]);
         let n = read_compact_size(&mut cursor)? as usize;
         let body_start = 33 + cursor.position() as usize;
-        if payload.len() < body_start + 32 * n {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "cfcheckpt body short",
-            ));
-        }
+        // checked: 32*n and body_start+32*n can overflow usize on an
+        // untrusted count n; validate a real end so the loop slices below
+        // (which index up to this end) cannot panic or wrap.
+        let _end = n
+            .checked_mul(32)
+            .and_then(|x| body_start.checked_add(x))
+            .filter(|&e| e <= payload.len())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "cfcheckpt body short or count overflow",
+                )
+            })?;
         let mut filter_headers = Vec::with_capacity(n.min(remaining(&cursor)));
         for i in 0..n {
             let mut h = [0u8; 32];
@@ -2162,6 +2182,31 @@ mod tests {
         let payload = [0xffu8, 0x0c, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00];
         // Must return an error (EOF while reading the claimed headers), not OOM.
         let r = NetworkMessage::deserialize("headers", &payload);
+        assert!(r.is_err());
+    }
+
+    /// Regression: BIP-157 `cfilter`/`cfheaders` decoders computed
+    /// `body_start + len` (and `body_start + 32*n`) on an untrusted compact-size
+    /// — which overflows usize, then either panics on the resulting slice or
+    /// mis-parses. Fuzz-found 2026-07-20 (add-overflow, the bug the OOM fix
+    /// exposed). Fixed with checked arithmetic. Any peer can send these messages.
+    #[test]
+    fn cfilter_oversized_length_no_overflow_panic() {
+        // filter_type(1) + hash(32) + 0xff-escaped length ~2^63, no body.
+        let mut p = vec![0u8; 33];
+        p.push(0xff);
+        p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x80]); // len ~ 9.2e18
+        let r = CFilterMessage::deserialize(&p);
+        assert!(r.is_err(), "oversized cfilter length must error, not overflow/panic");
+    }
+
+    #[test]
+    fn cfheaders_oversized_count_no_overflow_panic() {
+        // filter_type(1) + stop_hash(32) + 0xff-escaped count ~2^60, no bodies.
+        let mut p = vec![0u8; 33];
+        p.push(0xff);
+        p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x10]);
+        let r = CFCheckptMessage::deserialize(&p);
         assert!(r.is_err());
     }
 }
