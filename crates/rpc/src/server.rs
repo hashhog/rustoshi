@@ -2526,7 +2526,12 @@ fn compute_expected_bits_via_store(
             prev: node,
         }));
     }
-    node.map(|tip| get_next_work_required(&*tip, new_block_time, params))
+    // `get_next_work_required` returns `Result<u32, PowError>` (was `u32`,
+    // panicked on a missing ancestor -- M2-RUST-POW-PANIC). `.ok()` folds a
+    // `PowError` into `None`, the same "skip the gate rather than
+    // false-reject" convention already used above for every other
+    // unreachable-ancestor case in this function.
+    node.and_then(|tip| get_next_work_required(&*tip, new_block_time, params).ok())
 }
 
 /// Admit an already-signed transaction into the node mempool.
@@ -7378,11 +7383,21 @@ impl RustoshiRpcServer for RpcServerImpl {
                     }));
                 }
                 match node {
+                    // `get_next_work_required` returns `Result<u32, PowError>`
+                    // (was `u32`, panicked on a missing ancestor --
+                    // M2-RUST-POW-PANIC). The mining template is not a
+                    // validation gate -- any block built from it is
+                    // re-validated in full when submitted -- so on a
+                    // missing ancestor this falls back to the same
+                    // genesis-fallback bits already used one branch up for
+                    // `headers.is_empty()`, matching the existing
+                    // best-effort behavior rather than crashing the RPC.
                     Some(tip_node) => get_next_work_required(
                         &*tip_node,
                         timestamp,
                         &state.params,
-                    ),
+                    )
+                    .unwrap_or(0x1d00ffff),
                     None => 0x1d00ffff,
                 }
             }
@@ -13250,6 +13265,29 @@ impl RustoshiRpcServer for RpcServerImpl {
         };
 
         let mut state = self.state.write().await;
+
+        // Persist the real pre-base header band (if the matched campaign
+        // entry supplied one) into the header + height index, same as the
+        // `--load-snapshot` CLI activation path (`rustoshi/src/main.rs`).
+        // Fixes M2-RUST-MTP / M2-RUST-POW-PANIC
+        // (receipts/PORTER-WAVE-NODE-BUGS.md): without real pre-base
+        // headers, the post-snapshot MTP window and the next
+        // difficulty-retarget ancestor walk both stop at the base. This RPC
+        // handler doesn't move the ACTIVE tip (see the doc comment above),
+        // but persisting the headers is still correct and harmless here --
+        // it only adds entries at/below the base, which the CLI activation
+        // path (the canonical tip-mover) also relies on being present.
+        // No-op for every built-in Core-parity entry (empty `base_tail_headers`).
+        if !au.base_tail_headers.is_empty() {
+            let tail_store = BlockStore::new(&state.db);
+            if let Err(e) = tail_store.put_base_tail_headers(au.height, &au.base_tail_headers) {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INTERNAL_ERROR,
+                    format!("Failed to persist base-tail headers: {e}"),
+                ));
+            }
+        }
+
         state.chainstate_manager.activate_snapshot_with_commitment(
             au.blockhash,
             au.height,

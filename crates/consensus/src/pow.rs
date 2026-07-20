@@ -38,6 +38,32 @@ pub trait BlockIndex {
     fn ancestor(&self, height: u32) -> Option<&Self>;
 }
 
+/// Errors from difficulty-retarget computation.
+///
+/// Bitcoin Core's `GetNextWorkRequired`/`CalculateNextWorkRequired` never
+/// handle a missing ancestor -- Core's own invariant guarantees the full
+/// header chain from genesis is indexed before any block is contextually
+/// validated (`ActivateSnapshot` requires the complete genesis->base header
+/// chain before a snapshot is even accepted). rustoshi's `--load-snapshot`
+/// boot can violate that invariant: if a snapshot's
+/// `AssumeutxoData::base_tail_headers` band doesn't reach far enough back to
+/// cover the very next difficulty-adjustment boundary's ancestor (an
+/// undersized/omitted tail, or a boundary further out than provisioned),
+/// the ancestor walk below finds nothing. A remote-fed block must never
+/// crash the node on this input (P1 crash-on-input class;
+/// receipts/PORTER-WAVE-NODE-BUGS.md M2-RUST-POW-PANIC) -- so this is a
+/// typed, catchable error instead of a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PowError {
+    /// The ancestor needed to compute the retarget for the block at
+    /// `height` is not reachable via `BlockIndex::ancestor`/`prev`.
+    #[error(
+        "retarget ancestor at height {ancestor_height} unreachable computing \
+         work required for block at height {height}"
+    )]
+    MissingRetargetAncestor { height: u32, ancestor_height: u32 },
+}
+
 /// Calculate the next required work (difficulty target) for a new block.
 ///
 /// This implements Bitcoin Core's `GetNextWorkRequired` function.
@@ -48,12 +74,15 @@ pub trait BlockIndex {
 /// * `params` - Chain parameters
 ///
 /// # Returns
-/// The compact target (bits) value for the next block.
+/// The compact target (bits) value for the next block, or [`PowError`] if a
+/// required ancestor is unreachable. The fast (non-error) path is identical
+/// to before this type existed -- this only changes what happens on the
+/// previously-panicking missing-ancestor case.
 pub fn get_next_work_required<I: BlockIndex>(
     last: &I,
     new_block_time: u32,
     params: &ChainParams,
-) -> u32 {
+) -> Result<u32, PowError> {
     let pow_limit_compact = target_to_compact(&params.pow_limit);
     let next_height = last.height() + 1;
 
@@ -64,24 +93,25 @@ pub fn get_next_work_required<I: BlockIndex>(
             // If the new block's timestamp is more than 2 * TARGET_BLOCK_TIME (20 minutes)
             // after the previous block, allow min-difficulty
             if new_block_time > last.timestamp() + TARGET_BLOCK_TIME * 2 {
-                return pow_limit_compact;
+                return Ok(pow_limit_compact);
             }
 
             // Otherwise, walk back to find the last non-special-min-difficulty block
-            return get_last_non_min_difficulty_bits(last, pow_limit_compact, params);
+            return Ok(get_last_non_min_difficulty_bits(last, pow_limit_compact, params));
         }
 
         // Normal case: return the previous block's difficulty
-        return last.bits();
+        return Ok(last.bits());
     }
 
     // At a retarget boundary: calculate new difficulty
     // Go back by 2015 blocks (not 2016, because we want the time difference
     // between block N-2016 and block N-1, which spans 2015 intervals)
     let first_height = next_height.saturating_sub(DIFFICULTY_ADJUSTMENT_INTERVAL);
-    let first = last
-        .ancestor(first_height)
-        .expect("ancestor must exist at retarget boundary");
+    let first = last.ancestor(first_height).ok_or(PowError::MissingRetargetAncestor {
+        height: next_height,
+        ancestor_height: first_height,
+    })?;
 
     calculate_next_work_required(last, first.timestamp(), params)
 }
@@ -124,15 +154,19 @@ fn get_last_non_min_difficulty_bits<I: BlockIndex>(
 /// * `params` - Chain parameters
 ///
 /// # Returns
-/// The new compact target (bits) value.
+/// The new compact target (bits) value, or [`PowError`] if BIP94 needs a
+/// period-start ancestor that isn't reachable (mainnet has `enforce_bip94 =
+/// false`, so this can only fire on testnet4; still hardened for the same
+/// snapshot-boot reason as the retarget-boundary ancestor in
+/// [`get_next_work_required`]).
 pub fn calculate_next_work_required<I: BlockIndex>(
     last: &I,
     first_block_time: u32,
     params: &ChainParams,
-) -> u32 {
+) -> Result<u32, PowError> {
     // Regtest: no retargeting
     if params.pow_no_retargeting {
-        return last.bits();
+        return Ok(last.bits());
     }
 
     // Calculate actual timespan and clamp to [MIN_TIMESPAN, MAX_TIMESPAN]
@@ -146,16 +180,17 @@ pub fn calculate_next_work_required<I: BlockIndex>(
     let base_bits = if params.enforce_bip94 {
         // Get the first block of this difficulty period
         let first_height = last.height().saturating_sub(DIFFICULTY_ADJUSTMENT_INTERVAL - 1);
-        let first_block = last
-            .ancestor(first_height)
-            .expect("ancestor must exist for BIP94 calculation");
+        let first_block = last.ancestor(first_height).ok_or(PowError::MissingRetargetAncestor {
+            height: last.height() + 1,
+            ancestor_height: first_height,
+        })?;
         first_block.bits()
     } else {
         last.bits()
     };
 
     // Calculate: new_target = current_target * actual_timespan / TARGET_TIMESPAN
-    calculate_retarget(base_bits, actual_timespan, TARGET_TIMESPAN, &params.pow_limit)
+    Ok(calculate_retarget(base_bits, actual_timespan, TARGET_TIMESPAN, &params.pow_limit))
 }
 
 /// Perform the actual retarget calculation.
@@ -733,7 +768,7 @@ mod tests {
         let chain = build_chain(0, 2016, 0, 600, genesis_bits);
 
         // Even at retarget boundary with any timestamp, should return same bits
-        let new_bits = get_next_work_required(&chain, 1_000_000, &params);
+        let new_bits = get_next_work_required(&chain, 1_000_000, &params).unwrap();
         assert_eq!(new_bits, genesis_bits);
     }
 
@@ -770,7 +805,7 @@ mod tests {
 
         // At height 2016 (next block after 2015), calculate new difficulty
         let new_time = chain.timestamp + TARGET_BLOCK_TIME;
-        let new_bits = get_next_work_required(&chain, new_time, &params);
+        let new_bits = get_next_work_required(&chain, new_time, &params).unwrap();
 
         // Difficulty should not change (actual_timespan == TARGET_TIMESPAN)
         assert_eq!(new_bits, genesis_bits);
@@ -786,7 +821,7 @@ mod tests {
         let chain = build_chain(0, 2015, start_time, TARGET_BLOCK_TIME / 2, genesis_bits);
 
         let new_time = chain.timestamp() + TARGET_BLOCK_TIME / 2;
-        let new_bits = get_next_work_required(&chain, new_time, &params);
+        let new_bits = get_next_work_required(&chain, new_time, &params).unwrap();
 
         // New target should be smaller (harder difficulty)
         let old_target = compact_to_target(genesis_bits);
@@ -810,7 +845,7 @@ mod tests {
         let chain = build_chain(0, 2015, start_time, TARGET_BLOCK_TIME * 2, hard_bits);
 
         let new_time = chain.timestamp() + TARGET_BLOCK_TIME * 2;
-        let new_bits = get_next_work_required(&chain, new_time, &params);
+        let new_bits = get_next_work_required(&chain, new_time, &params).unwrap();
 
         // New target should be larger (easier difficulty)
         let old_target = compact_to_target(hard_bits);
@@ -832,7 +867,7 @@ mod tests {
         let chain = build_chain(0, 2015, start_time, TARGET_BLOCK_TIME * 10, genesis_bits);
 
         // Calculate with very long timespan and with max timespan
-        let long_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME * 10, &params);
+        let long_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME * 10, &params).unwrap();
 
         // Should be same as if we used exactly MAX_TIMESPAN (4x)
         let max_timespan_bits =
@@ -850,7 +885,7 @@ mod tests {
         let start_time = 0;
         let chain = build_chain(0, 2015, start_time, 1, genesis_bits);
 
-        let fast_bits = get_next_work_required(&chain, chain.timestamp() + 1, &params);
+        let fast_bits = get_next_work_required(&chain, chain.timestamp() + 1, &params).unwrap();
 
         // Should be same as if we used exactly MIN_TIMESPAN (1/4)
         let min_timespan_bits =
@@ -870,7 +905,7 @@ mod tests {
 
         // If the new block is >20 minutes after the previous, should allow min difficulty
         let slow_block_time = chain.timestamp() + TARGET_BLOCK_TIME * 2 + 1;
-        let bits = get_next_work_required(&chain, slow_block_time, &params);
+        let bits = get_next_work_required(&chain, slow_block_time, &params).unwrap();
         assert_eq!(bits, pow_limit_bits);
     }
 
@@ -899,7 +934,7 @@ mod tests {
         // If the new block is NOT >20 minutes after the previous,
         // should walk back to find the last non-min-difficulty block
         let normal_time = chain.timestamp + TARGET_BLOCK_TIME;
-        let bits = get_next_work_required(&chain, normal_time, &params);
+        let bits = get_next_work_required(&chain, normal_time, &params).unwrap();
 
         // Should return the normal difficulty from block 10
         assert_eq!(bits, normal_bits);
@@ -928,7 +963,7 @@ mod tests {
 
         // Walk back should stop at height 2016 (retarget boundary)
         let normal_time = chain.timestamp + TARGET_BLOCK_TIME;
-        let bits = get_next_work_required(&chain, normal_time, &params);
+        let bits = get_next_work_required(&chain, normal_time, &params).unwrap();
 
         // Should return the min-difficulty (since that's what block 2016 has)
         // Wait - block 2016 was set with normal_bits. Let me re-check the walkback logic...
@@ -987,7 +1022,7 @@ mod tests {
             &params.pow_limit,
         );
 
-        let actual_bits = get_next_work_required(&chain, new_time, &params);
+        let actual_bits = get_next_work_required(&chain, new_time, &params).unwrap();
 
         // BIP94 should give us the calculation based on initial_bits
         assert_eq!(actual_bits, expected_bits);
@@ -1091,7 +1126,7 @@ mod tests {
         // At heights 1-2015 (not retarget boundaries), should return previous bits
         for h in 1..=10 {
             if let Some(block) = chain.ancestor(h - 1) {
-                let bits = get_next_work_required(block, block.timestamp() + TARGET_BLOCK_TIME, &params);
+                let bits = get_next_work_required(block, block.timestamp() + TARGET_BLOCK_TIME, &params).unwrap();
                 assert_eq!(bits, genesis_bits, "Height {} should keep same difficulty", h);
             }
         }
@@ -1251,7 +1286,7 @@ mod tests {
         // Chain of 2014 blocks at TARGET_BLOCK_TIME spacing → height 2014
         // Next height = 2015, NOT a retarget → must return genesis_bits
         let chain_2014 = build_chain(0, 2014, 0, TARGET_BLOCK_TIME, genesis_bits);
-        let bits_2015 = get_next_work_required(&chain_2014, chain_2014.timestamp() + TARGET_BLOCK_TIME, &params);
+        let bits_2015 = get_next_work_required(&chain_2014, chain_2014.timestamp() + TARGET_BLOCK_TIME, &params).unwrap();
         assert_eq!(bits_2015, genesis_bits, "height 2015 is NOT a retarget height");
 
         // Chain of 2015 blocks → height 2015
@@ -1266,7 +1301,7 @@ mod tests {
         }
         // actual_timespan = block2015.time - block0.time = 2015 * 600 = 1_209_000
         // This is slightly LESS than TARGET_TIMESPAN (1_209_600) → difficulty increases slightly
-        let bits_2016 = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        let bits_2016 = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params).unwrap();
         // The result should come from the retarget calculation, not just last.bits()
         // actual_timespan = 2015*600 = 1209000 < TARGET_TIMESPAN=1209600 → slightly harder
         let old_target = compact_to_target(genesis_bits);
@@ -1283,7 +1318,7 @@ mod tests {
 
         // Height 2014 → next = 2015, NOT a retarget
         let chain = build_chain(0, 2014, 0, TARGET_BLOCK_TIME, genesis_bits);
-        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params).unwrap();
         assert_eq!(new_bits, genesis_bits, "no retarget one block before boundary");
     }
 
@@ -1294,7 +1329,7 @@ mod tests {
 
         // Height 2016 → next = 2017, NOT a retarget
         let chain = build_chain(0, 2016, 0, TARGET_BLOCK_TIME, genesis_bits);
-        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params).unwrap();
         assert_eq!(new_bits, genesis_bits, "no retarget one block after boundary");
     }
 
@@ -1337,11 +1372,11 @@ mod tests {
 
         // Chain with 1s per block → actual_timespan ~= 2015s << MIN_TIMESPAN
         let fast_chain = build_chain(0, 2015, 0, 1, bits);
-        let fast_result = get_next_work_required(&fast_chain, fast_chain.timestamp() + 1, &params);
+        let fast_result = get_next_work_required(&fast_chain, fast_chain.timestamp() + 1, &params).unwrap();
 
         // Chain with exactly MIN_TIMESPAN → should produce same result due to clamping
         let min_chain = build_chain(0, 2015, 0, MIN_TIMESPAN / 2015, bits);
-        let min_result = get_next_work_required(&min_chain, min_chain.timestamp() + 1, &params);
+        let min_result = get_next_work_required(&min_chain, min_chain.timestamp() + 1, &params).unwrap();
 
         // Both should use MIN_TIMESPAN denominator — equal or nearly equal
         assert_eq!(fast_result, min_result,
@@ -1357,11 +1392,11 @@ mod tests {
 
         // Very slow: 10× target spacing → actual_timespan >> MAX_TIMESPAN → clamp to MAX
         let very_slow = build_chain(0, 2015, 0, TARGET_BLOCK_TIME * 10, bits);
-        let very_slow_result = get_next_work_required(&very_slow, very_slow.timestamp() + 1, &params);
+        let very_slow_result = get_next_work_required(&very_slow, very_slow.timestamp() + 1, &params).unwrap();
 
         // Also 10× but 20×: both should be clamped identically
         let super_slow = build_chain(0, 2015, 0, TARGET_BLOCK_TIME * 20, bits);
-        let super_slow_result = get_next_work_required(&super_slow, super_slow.timestamp() + 1, &params);
+        let super_slow_result = get_next_work_required(&super_slow, super_slow.timestamp() + 1, &params).unwrap();
 
         assert_eq!(very_slow_result, super_slow_result,
             "any timespan beyond MAX_TIMESPAN should produce same clamped result");
@@ -1391,12 +1426,12 @@ mod tests {
         let boundary_time = chain.timestamp() + TARGET_BLOCK_TIME * 2;
 
         // Exactly AT the threshold (== not >) → should NOT return pow_limit
-        let bits = get_next_work_required(&chain, boundary_time, &params);
+        let bits = get_next_work_required(&chain, boundary_time, &params).unwrap();
         assert_ne!(bits, pow_limit_bits, "time exactly at 2*spacing should NOT trigger min-diff (Core pow.cpp:27 uses >)");
 
         // One second over → triggers min-diff
         let over_time = chain.timestamp() + TARGET_BLOCK_TIME * 2 + 1;
-        let bits_over = get_next_work_required(&chain, over_time, &params);
+        let bits_over = get_next_work_required(&chain, over_time, &params).unwrap();
         assert_eq!(bits_over, pow_limit_bits, "one second over boundary triggers min-diff");
     }
 
@@ -1436,7 +1471,7 @@ mod tests {
         // actual_timespan = block4031.time - block2016.time = 1_814_100 - 1_209_600 = 604_500
         // 604_500 > MIN_TIMESPAN (302_400) → no clamp
         // new_target = old_target * 604_500 / 1_209_600 ≈ old_target * 0.5 → smaller → harder
-        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params).unwrap();
         let old_target = compact_to_target(starting_bits);
         let new_target = compact_to_target(new_bits);
         assert!(compare_targets(&new_target, &old_target) < 0,
@@ -1466,7 +1501,7 @@ mod tests {
 
         assert_eq!(chain.bits(), last_bits, "last block of period has last_bits");
 
-        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        let new_bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params).unwrap();
 
         // BIP-94: base = first_bits (block 0). With perfect timespan, result = first_bits.
         // Without BIP-94 it would be last_bits.
@@ -1667,7 +1702,7 @@ mod tests {
 
         for count in [2015, 2016, 4031, 4032, 10000] {
             let chain = build_chain(0, count, 0, 1, genesis_bits);
-            let new_bits = get_next_work_required(&chain, chain.timestamp() + 1, &params);
+            let new_bits = get_next_work_required(&chain, chain.timestamp() + 1, &params).unwrap();
             assert_eq!(new_bits, genesis_bits,
                 "regtest must never retarget at height {}", count);
         }
@@ -1695,7 +1730,7 @@ mod tests {
         }
 
         // New block at normal spacing → walkback should skip the min-diff blocks
-        let bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        let bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params).unwrap();
         assert_eq!(bits, normal_bits,
             "walkback should return last non-min-diff bits");
     }
@@ -1723,9 +1758,121 @@ mod tests {
         }
 
         // next_height = 2021, not a retarget.  All recent blocks are min-diff.
-        let bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        let bits = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params).unwrap();
         // Walkback stops at height 2016 (which has normal_bits)
         assert_eq!(bits, normal_bits,
             "walkback should stop at retarget boundary and return its bits");
+    }
+
+    // ============================================================
+    // M2-RUST-POW-PANIC: missing-ancestor hardening
+    //
+    // A snapshot-booted chain (`--load-snapshot`) whose `base_tail_headers`
+    // band doesn't reach far enough back must return a `PowError`, never
+    // panic. `StubIndex` simulates exactly that: only its own height is
+    // "reachable" via `ancestor()`, mirroring an undersized/absent tail.
+    // ============================================================
+
+    struct StubIndex {
+        height: u32,
+        timestamp: u32,
+        bits: u32,
+    }
+
+    impl BlockIndex for StubIndex {
+        fn height(&self) -> u32 {
+            self.height
+        }
+        fn timestamp(&self) -> u32 {
+            self.timestamp
+        }
+        fn bits(&self) -> u32 {
+            self.bits
+        }
+        fn prev(&self) -> Option<&Self> {
+            None
+        }
+        fn ancestor(&self, height: u32) -> Option<&Self> {
+            // Only itself is reachable; anything else (in particular the
+            // retarget-boundary ancestor 2016 blocks back) is not.
+            if height == self.height {
+                Some(self)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn test_missing_retarget_ancestor_returns_err_not_panic() {
+        let params = ChainParams::mainnet();
+        // height 2015 -> next_height 2016 is an exact retarget boundary.
+        let last = StubIndex {
+            height: 2015,
+            timestamp: 1_000_000,
+            bits: 0x1d00ffff,
+        };
+        let result = get_next_work_required(&last, last.timestamp + TARGET_BLOCK_TIME, &params);
+        assert_eq!(
+            result,
+            Err(PowError::MissingRetargetAncestor {
+                height: 2016,
+                ancestor_height: 0,
+            }),
+            "missing retarget ancestor must be a typed error, not a panic"
+        );
+    }
+
+    #[test]
+    fn test_missing_retarget_ancestor_at_higher_boundary_returns_err() {
+        // A boundary further from genesis: next_height = 32256 (16 * 2016),
+        // ancestor needed at 32256 - 2016 = 30240. Mirrors the real M2
+        // repro (mainnet boundary 32256, snapshot base 30223).
+        let params = ChainParams::mainnet();
+        let last = StubIndex {
+            height: 32255,
+            timestamp: 1_000_000,
+            bits: 0x1d00ffff,
+        };
+        let result = get_next_work_required(&last, last.timestamp + TARGET_BLOCK_TIME, &params);
+        assert_eq!(
+            result,
+            Err(PowError::MissingRetargetAncestor {
+                height: 32256,
+                ancestor_height: 30240,
+            })
+        );
+    }
+
+    #[test]
+    fn test_missing_bip94_period_start_ancestor_returns_err_not_panic() {
+        // BIP94 (testnet4) path in `calculate_next_work_required`: the
+        // period-start ancestor lookup must also be hardened, even though
+        // mainnet (`enforce_bip94 = false`) never reaches it.
+        let params = ChainParams::testnet4();
+        let last = StubIndex {
+            height: 2015,
+            timestamp: 1_000_000,
+            bits: 0x1d00ffff,
+        };
+        let result = calculate_next_work_required(&last, 999_000, &params);
+        assert_eq!(
+            result,
+            Err(PowError::MissingRetargetAncestor {
+                height: 2016,
+                ancestor_height: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_ancestor_present_fast_path_unchanged() {
+        // Sanity: when the ancestor DOES exist (the common case), behavior is
+        // identical to before `PowError` existed -- Ok(bits), not an error.
+        let params = ChainParams::mainnet();
+        let genesis_bits = 0x1d00ffff;
+        let chain = build_chain(0, 2015, 1_000_000, TARGET_BLOCK_TIME, genesis_bits);
+        let result = get_next_work_required(&chain, chain.timestamp() + TARGET_BLOCK_TIME, &params);
+        assert!(result.is_ok(), "ancestor present -> Ok, not Err");
     }
 }

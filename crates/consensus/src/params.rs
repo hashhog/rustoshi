@@ -77,6 +77,57 @@ pub struct AssumeutxoData {
     /// connect path falls back to a partial-window MTP computed from
     /// whatever post-snapshot headers are already stored.
     pub base_mtp: Option<u32>,
+
+    /// Real block headers for the band ending at (and including) the
+    /// snapshot base, in ascending height order (oldest first, last ==
+    /// the base block itself -- `base_tail_headers.last().block_hash() ==
+    /// blockhash`).
+    ///
+    /// Bitcoin Core never needs this: `ActivateSnapshot` requires the full
+    /// genesis->base header chain to already be indexed before a snapshot
+    /// is accepted, so the base block's `CBlockIndex` always has a real
+    /// `pprev` chain. rustoshi's `--load-snapshot` boot materializes NO
+    /// pre-base headers, which breaks two things at a campaign/snapshot
+    /// boundary:
+    ///
+    ///   1. **MTP** (`compute_mtp_via_store`): the 11-ancestor
+    ///      median-time-past window for blocks in [base+1, base+11] is
+    ///      computed over whatever post-snapshot headers have connected so
+    ///      far -- a partial window of 1-10 REAL timestamps instead of the
+    ///      genuine 11. A real block whose timestamp legitimately dips
+    ///      below its immediate predecessor's (legal under the actual MTP
+    ///      rule, which smooths over exactly this) gets misjudged against
+    ///      the too-small partial window and false-rejected `time-too-old`
+    ///      (mainnet blocks 91707 / 164662 observed; M2-RUST-MTP).
+    ///
+    ///   2. **Retarget ancestor walk**
+    ///      (`pow::get_next_work_required`/`BlockIndex::ancestor`): at an
+    ///      exact difficulty-adjustment boundary the walk needs the
+    ///      ancestor 2016 blocks back. If that ancestor predates the
+    ///      snapshot base and was never persisted, the lookup fails
+    ///      (M2-RUST-POW-PANIC).
+    ///
+    /// Persisting these headers into the header/height index at snapshot
+    /// activation (`--load-snapshot` in `rustoshi/src/main.rs`, mirrored by
+    /// the `loadtxoutset` RPC) lets both the MTP walk and the retarget
+    /// ancestor walk see genuine stored ancestors, exactly reproducing
+    /// Core's behaviour instead of approximating it.
+    ///
+    /// `2016 + 11 = 2027` headers ending at the base covers BOTH the
+    /// 11-window MTP band and the very next retarget boundary's ancestor
+    /// (which sits at most 2016 blocks before that boundary, i.e. within
+    /// 2016 blocks of a base chosen near a retarget point) -- see
+    /// `campaign_assumeutxo::parse_base_tail_headers`, which accepts
+    /// whatever count a campaign entry supplies. Empty (the default for
+    /// every built-in Core-parity entry above) means "no tail headers
+    /// baked" -- unchanged legacy behaviour, all-zero placeholder base
+    /// entry.
+    ///
+    /// Reference (independent implementation): `clearbit`'s
+    /// `consensus.BaseTailHeader` / `AssumeUtxoData.base_tail_headers`
+    /// (`clearbit/src/consensus.zig`), persisted at import in
+    /// `clearbit/src/main.zig`.
+    pub base_tail_headers: Vec<BlockHeader>,
 }
 
 // ============================================================
@@ -746,6 +797,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 991_032_194,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
                 AssumeutxoData {
                     height: 880_000,
@@ -759,6 +811,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 1_145_604_538,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
                 AssumeutxoData {
                     height: 910_000,
@@ -772,6 +825,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 1_226_586_151,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
                 AssumeutxoData {
                     height: 935_000,
@@ -785,6 +839,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 1_305_397_408,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
                 // hashhog-local snapshot at h=944183 (utxo-snapshot-raw.dat
                 // from /data/nvme1/hashhog-mainnet/), used to recover
@@ -813,6 +868,7 @@ impl ChainParams {
                     // block (944,184) gets a correct `IsFinalTx`
                     // `nLockTimeCutoff` instead of 0.
                     base_mtp: Some(1_775_650_208),
+                    base_tail_headers: Vec::new(),
                 },
             ],
             // Mainnet fixed seeds: 40 Core-vetted routable IPv4 :8333 peers,
@@ -1003,6 +1059,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 11_347_043,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
                 AssumeutxoData {
                     height: 120_000,
@@ -1016,6 +1073,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 14_141_057,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
                 AssumeutxoData {
                     height: 290_000,
@@ -1029,6 +1087,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 28_547_497,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
             ],
             // No mainnet fixed seeds on testnet4 (network-scoped fallback).
@@ -1152,6 +1211,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 111,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
                 AssumeutxoData {
                     // For use by fuzz target src/test/fuzz/utxo_snapshot.cpp.
@@ -1166,6 +1226,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 201,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
                 AssumeutxoData {
                     // For use by test/functional/feature_assumeutxo.py and
@@ -1181,6 +1242,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 334,
                     base_mtp: None,
+                    base_tail_headers: Vec::new(),
                 },
             ],
             // No mainnet fixed seeds on regtest (network-scoped fallback).
@@ -1304,6 +1366,11 @@ impl ChainParams {
             hash_serialized,
             chain_tx_count,
             base_mtp,
+            // Ad-hoc regtest chains mined by functional tests don't carry a
+            // pinned tail-header band -- only campaign-loaded entries do
+            // (`campaign_assumeutxo::load_from_path`). Empty is the same
+            // "no tail headers baked" convention as every built-in entry.
+            base_tail_headers: Vec::new(),
         });
         true
     }

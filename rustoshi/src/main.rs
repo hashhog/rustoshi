@@ -546,7 +546,16 @@ fn compute_expected_bits_via_store(
             prev: node,
         }));
     }
-    node.map(|tip| get_next_work_required(&*tip, new_block_time, params))
+    // `get_next_work_required` now returns `Result<u32, PowError>` (was `u32`,
+    // panicked on a missing ancestor -- M2-RUST-POW-PANIC). `.ok()` folds a
+    // `PowError` into `None`, exactly the pre-existing "ancestor chain isn't
+    // walkable from the store -> skip the gate rather than false-reject"
+    // convention already documented on this function and used for every
+    // other unreachable-ancestor case above (missing parent header/height,
+    // empty `headers`). With `AssumeutxoData::base_tail_headers` persisted at
+    // snapshot activation this should no longer trigger for the boundaries it
+    // covers; it remains the safety net for anything wider.
+    node.and_then(|tip| get_next_work_required(&*tip, new_block_time, params).ok())
 }
 
 /// MTP to use as the `IsFinalTx` / `ContextualCheckBlock` `nLockTimeCutoff`
@@ -2905,15 +2914,23 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         snap_status.set(BlockStatus::VALID_CHAIN);
         snap_status.set(BlockStatus::VALID_SCRIPTS);
         snap_status.set(BlockStatus::HAVE_DATA);
+        // When the matched campaign entry carries a real base-tail-header
+        // band (`AssumeutxoData::base_tail_headers`), its LAST header is the
+        // base block's own genuine header -- use it to fill in the base's
+        // BlockIndexEntry fields instead of the zeroed placeholder. Legacy
+        // entries with no tail headers keep the placeholder unchanged.
+        let base_header = assume.base_tail_headers.last();
         let snap_index_entry = BlockIndexEntry {
             height: assume.height,
             status: snap_status,
             n_tx: 0, // unknown without the block body
-            timestamp: 0,
-            bits: 0,
-            nonce: 0,
-            version: 0,
-            prev_hash: Hash256::ZERO,
+            timestamp: base_header.map(|h| h.timestamp).unwrap_or(0),
+            bits: base_header.map(|h| h.bits).unwrap_or(0),
+            nonce: base_header.map(|h| h.nonce).unwrap_or(0),
+            version: base_header.map(|h| h.version).unwrap_or(0),
+            prev_hash: base_header
+                .map(|h| h.prev_block_hash)
+                .unwrap_or(Hash256::ZERO),
             chain_work: snapshot_chain_work.0,
         };
         if let Err(e) = block_store.put_block_index(&blockhash, &snap_index_entry) {
@@ -2925,6 +2942,31 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             return Err(anyhow::anyhow!(
                 "snapshot activation: put_height_index failed: {}", e
             ));
+        }
+        // Persist the real pre-base header band (if the campaign entry
+        // supplied one) into the header + height index. Fixes
+        // M2-RUST-MTP / M2-RUST-POW-PANIC (receipts/PORTER-WAVE-NODE-BUGS.md):
+        // without this, MTP for blocks in [base+1, base+11] sees only a
+        // partial post-snapshot window (false `time-too-old`), and the
+        // difficulty-retarget ancestor walk at the next adjustment boundary
+        // can find no ancestor at all -- panicking before this fix, now a
+        // typed `PowError` even in the worst case. No-op (mainnet-inert)
+        // when the entry carries no tail headers, which is every built-in
+        // Core-parity entry.
+        if !assume.base_tail_headers.is_empty() {
+            if let Err(e) =
+                block_store.put_base_tail_headers(assume.height, &assume.base_tail_headers)
+            {
+                return Err(anyhow::anyhow!(
+                    "snapshot activation: put_base_tail_headers failed: {}", e
+                ));
+            }
+            tracing::info!(
+                "Persisted {} base-tail headers ({}..{}) for post-snapshot MTP/retarget correctness",
+                assume.base_tail_headers.len(),
+                assume.height.saturating_sub(assume.base_tail_headers.len() as u32 - 1),
+                assume.height,
+            );
         }
         if let Err(e) = block_store.set_best_block(&blockhash, assume.height) {
             return Err(anyhow::anyhow!(
