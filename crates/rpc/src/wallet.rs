@@ -2458,7 +2458,7 @@ impl WalletRpcServer for WalletRpcImpl {
         // wallet's sign_input dispatcher. Refuse anything else explicitly so
         // callers don't get a silent SIGHASH_ALL when they asked for SINGLE.
         let sighash_type_str = sighashtype.as_deref().unwrap_or("ALL");
-        if !matches!(sighash_type_str, "ALL" | "DEFAULT" | "ALL|ANYONECANPAY") {
+        if !matches!(sighash_type_str, "ALL" | "DEFAULT") {
             // For now we honestly refuse rather than lie. ANYONECANPAY parsing
             // would also require sighash propagation through the wallet sign
             // helpers, which currently hardcode 0x01.
@@ -3738,7 +3738,7 @@ impl WalletRpcServer for WalletRpcImpl {
         // (same constraint as signrawtransactionwithwallet); refuse other
         // types honestly rather than silently signing ALL.
         let sighash_type_str = sighashtype.as_deref().unwrap_or("ALL");
-        if !matches!(sighash_type_str, "ALL" | "DEFAULT" | "ALL|ANYONECANPAY") {
+        if !matches!(sighash_type_str, "ALL" | "DEFAULT") {
             return Err(Self::rpc_error(
                 wallet_error::RPC_WALLET_ERROR,
                 format!(
