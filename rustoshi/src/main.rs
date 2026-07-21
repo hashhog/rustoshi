@@ -748,6 +748,27 @@ fn connect_undo_to_storage(
 /// below `tip - REORG_RETENTION_BLOCKS` are dropped by the retention pruner.
 const REORG_RETENTION_BLOCKS: u32 = 288;
 
+/// BIP-152 / DoS parity: maximum depth below the active tip for which we will
+/// serve a *targeted* `blocktxn` (a small, cheap-to-request response that
+/// nonetheless forces a full-block disk read on our side) in reply to a
+/// `getblocktxn`. Blocks deeper than this are served as a FULL block instead,
+/// so an attacker cannot cheaply force repeated deep disk reads for a tiny
+/// response — they must receive over the network everything we read from disk.
+/// Mirrors Bitcoin Core's `MAX_BLOCKTXN_DEPTH` (net_processing.cpp:140) and its
+/// enforcement at net_processing.cpp:4276-4303.
+const MAX_BLOCKTXN_DEPTH: u32 = 10;
+
+/// True iff a `getblocktxn` for a block at `block_height` may be answered with
+/// a targeted `blocktxn` — i.e. the block is within `MAX_BLOCKTXN_DEPTH` of the
+/// active tip. Mirrors Core's
+/// `pindex->nHeight >= m_chainman.ActiveChain().Height() - MAX_BLOCKTXN_DEPTH`
+/// (net_processing.cpp:4276); `saturating_sub` handles the near-genesis case
+/// (tip within `MAX_BLOCKTXN_DEPTH` of height 0) exactly like Core's signed
+/// arithmetic, where the RHS goes negative and the comparison is always true.
+fn blocktxn_within_depth(block_height: u32, tip_height: u32) -> bool {
+    block_height >= tip_height.saturating_sub(MAX_BLOCKTXN_DEPTH)
+}
+
 /// Result of [`reorg_retention_prune_targets`]: the bodies/undo to drop
 /// this flush plus the watermark to persist atomically alongside them.
 struct ReorgPrunePlan {
@@ -6031,14 +6052,56 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 use rustoshi_network::{BlockTxnRequest, BlockTxn};
                                 match BlockTxnRequest::deserialize(&data) {
                                     Ok(req) => {
-                                        if let Ok(Some(block)) = block_store.get_block(&req.block_hash) {
-                                            let txns: Vec<Arc<rustoshi_primitives::Transaction>> = req.indices.iter()
-                                                .filter_map(|&idx| block.transactions.get(idx as usize).map(|tx| Arc::new(tx.clone())))
-                                                .collect();
-                                            let resp = BlockTxn::from_arcs(req.block_hash, txns);
-                                            let ps = peer_state.read().await;
-                                            if let Some(ref pm) = ps.peer_manager {
-                                                pm.send_to_peer(peer_id, NetworkMessage::BlockTxn(resp.serialize())).await;
+                                        // DoS parity (Finding 8, Core net_processing.cpp:4266-4303):
+                                        // only serve a targeted `blocktxn` for a block within
+                                        // MAX_BLOCKTXN_DEPTH (10) of the active tip. For anything
+                                        // deeper, send the FULL block instead of a small blocktxn —
+                                        // exactly Core's fallback (it queues a getdata
+                                        // MSG_WITNESS_BLOCK; we serve the block directly via the same
+                                        // path the getdata handler uses). This stops a single inbound
+                                        // peer from cheaply forcing repeated deep full-block disk
+                                        // reads for a tiny response (I/O + CPU amplification): the
+                                        // attacker now has to receive the whole block over the wire.
+                                        let tip_height = {
+                                            let rpc = rpc_state.read().await;
+                                            rpc.best_height
+                                        };
+                                        match block_store.get_height(&req.block_hash) {
+                                            Ok(Some(block_height)) if blocktxn_within_depth(block_height, tip_height) => {
+                                                // Near tip: serve the small targeted blocktxn.
+                                                if let Ok(Some(block)) = block_store.get_block(&req.block_hash) {
+                                                    let txns: Vec<Arc<rustoshi_primitives::Transaction>> = req.indices.iter()
+                                                        .filter_map(|&idx| block.transactions.get(idx as usize).map(|tx| Arc::new(tx.clone())))
+                                                        .collect();
+                                                    let resp = BlockTxn::from_arcs(req.block_hash, txns);
+                                                    let ps = peer_state.read().await;
+                                                    if let Some(ref pm) = ps.peer_manager {
+                                                        pm.send_to_peer(peer_id, NetworkMessage::BlockTxn(resp.serialize())).await;
+                                                    }
+                                                }
+                                            }
+                                            Ok(Some(_deep)) => {
+                                                // Too deep: send the FULL block instead of a
+                                                // targeted blocktxn (Core net_processing.cpp:4292-4302).
+                                                tracing::debug!(
+                                                    "peer {} sent getblocktxn for a block > {} deep — sending full block instead",
+                                                    peer_id.0, MAX_BLOCKTXN_DEPTH
+                                                );
+                                                if let Ok(Some(block)) = block_store.get_block(&req.block_hash) {
+                                                    let ps = peer_state.read().await;
+                                                    if let Some(ref pm) = ps.peer_manager {
+                                                        pm.try_send_to_peer(peer_id, NetworkMessage::Block(block));
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                // We have no index for this block: don't read from
+                                                // disk. Core returns silently here
+                                                // (net_processing.cpp:4271-4274).
+                                                tracing::debug!(
+                                                    "peer {} sent getblocktxn for a block we don't have ({})",
+                                                    peer_id.0, req.block_hash
+                                                );
                                             }
                                         }
                                     }
@@ -6581,6 +6644,30 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding 8 (DoS parity): the getblocktxn depth gate. A targeted blocktxn
+    /// is served ONLY for blocks within MAX_BLOCKTXN_DEPTH (10) of the tip;
+    /// deeper blocks fall through to the full-block path. Mirrors Core
+    /// net_processing.cpp:4276. Asserts both sides of the boundary so the test
+    /// can't pass by always-true / always-false.
+    #[test]
+    fn test_getblocktxn_depth_gate() {
+        let tip = 1000u32;
+        // Exactly at the boundary (tip - 10) → still served (Core uses `>=`).
+        assert!(blocktxn_within_depth(tip - MAX_BLOCKTXN_DEPTH, tip));
+        // Within the window → served.
+        assert!(blocktxn_within_depth(tip, tip));
+        assert!(blocktxn_within_depth(tip - 1, tip));
+        assert!(blocktxn_within_depth(tip - 9, tip));
+        // One deeper than the window → NOT served (full-block fallback).
+        assert!(!blocktxn_within_depth(tip - MAX_BLOCKTXN_DEPTH - 1, tip));
+        assert!(!blocktxn_within_depth(0, tip));
+        assert!(!blocktxn_within_depth(500, tip));
+        // Near genesis (tip within MAX_BLOCKTXN_DEPTH of 0): saturating_sub → 0,
+        // so any block height is within depth — matches Core's negative RHS.
+        assert!(blocktxn_within_depth(0, 5));
+        assert!(blocktxn_within_depth(5, 5));
+    }
 
     /// EFFECTIVE assumevalid-disable test: a block far below the built-in
     /// mainnet assumevalid height (938343) is SKIPPED by the gate under default
