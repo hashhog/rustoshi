@@ -7660,11 +7660,39 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         let mut state = self.state.write().await;
 
-        // Check for duplicate — block already known at our tip or in the store
+        // Check for duplicate — but key on the BLOCK INDEX entry, not the bare
+        // header (P1.6 fix, 2026-07-21). `put_block_index` is written only
+        // AFTER header + body + undo all persisted, so its presence implies a
+        // fully-stored block; a bare `get_header` hit does NOT:
+        //   * `submitheader` stores header-only (put_header + put_height_index,
+        //     see submit_header "Step 7") — Core's submitheader→submitblock
+        //     flow MUST then process the body (ProcessNewBlock treats a
+        //     known-header-without-data block as new, mining.cpp submitblock
+        //     returns "duplicate" only when !new_block, i.e. BLOCK_HAVE_DATA);
+        //     the old header-keyed check bounced the body with "duplicate"
+        //     and never connected it.
+        //   * a partial store from a mid-connect I/O failure (ENOSPC between
+        //     put_header and put_undo — observed live in the P1.6 disk_full
+        //     case) left a header-only ghost that turned every re-submission
+        //     into a no-op "duplicate", permanently wedging the datadir one
+        //     block short even after space was freed. Core cannot wedge this
+        //     way: ENOSPC is FatalError BEFORE any index mutation.
+        // A fully-stored block that is the DIRECT CHILD of the current tip but
+        // was never connected (crash/ENOSPC in the window between the index
+        // write and the tip flip) is also re-processed rather than bounced, so
+        // resubmission repairs the datadir instead of wedging it.
         {
             let store = BlockStore::new(&state.db);
-            if let Ok(Some(_)) = store.get_header(&block_hash) {
-                return Ok(Some("duplicate".to_string()));
+            if let Ok(Some(idx)) = store.get_block_index(&block_hash) {
+                let unconnected_tip_child = idx.height == state.best_height + 1
+                    && idx.prev_hash == state.best_hash;
+                if !unconnected_tip_child {
+                    return Ok(Some("duplicate".to_string()));
+                }
+                tracing::warn!(
+                    "submitblock: block {} is stored (height {}) but not connected to tip {} — re-processing (crash/ENOSPC repair)",
+                    block_hash, idx.height, state.best_height
+                );
             }
         }
 
@@ -9915,9 +9943,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             (0, 1)
         };
 
-        // Derive addresses
+        // Derive addresses. Range is INCLUSIVE of `end` — Core's
+        // DeriveAddresses loops `for (i = range_begin; i <= range_end; ++i)`
+        // (src/rpc/output_script.cpp:228), and the single-number form N means
+        // [0, N] inclusive (N+1 addresses). `start..=end`, not `start..end`.
         let mut addresses = Vec::new();
-        for pos in start..end {
+        for pos in start..=end {
             let addrs = parsed.derive_addresses(pos, network).map_err(|e| {
                 Self::rpc_error(
                     rpc_error::RPC_MISC_ERROR,
