@@ -579,6 +579,51 @@ impl Wallet {
         Ok(child.secret_key)
     }
 
+    /// Resolve the signing secret key for a wallet UTXO, honouring the
+    /// ownership route `build_script_index` recorded on the UTXO:
+    ///
+    /// - [`IMPORTED_PATH`] → an imported single key (`importprivkey` OR a
+    ///   retained private-descriptor leaf): look the secret up by scriptPubKey
+    ///   in [`Self::imported_keys`]. That is the ONLY correct key for the
+    ///   script. (Previously signing ignored `imported_keys` and blindly
+    ///   HD-derived `master_key.derive_path(IMPORTED_PATH)`, signing with an
+    ///   unrelated fixed key.)
+    /// - [`WATCHED_PATH`] → a watch-only descriptor script with no stored
+    ///   private key: REFUSE. Never fall back to an HD-derived key — that
+    ///   produced a witness for the wrong pubkey that the network rejects
+    ///   (`mempool-script-verify-flag-failed`, OP_EQUALVERIFY), a silent
+    ///   invalid-spend / funds hazard. A loud refusal is fund-safe.
+    /// - any real BIP-32 path → derive from the HD master seed (native wallet;
+    ///   unchanged behaviour).
+    ///
+    /// Mirrors Core routing a spend through the SPKM that owns the
+    /// scriptPubKey (`GetSolvingProvider`): a watch-only SPKM yields no key and
+    /// the sign fails, rather than a different key signing.
+    fn signing_key_for_utxo(
+        &self,
+        utxo: &WalletUtxo,
+    ) -> Result<secp256k1::SecretKey, WalletError> {
+        if utxo.derivation_path.as_slice() == IMPORTED_PATH {
+            return self
+                .imported_keys
+                .get(&utxo.script_pubkey)
+                .map(|k| k.secret_key)
+                .ok_or_else(|| {
+                    WalletError::SigningError(
+                        "no imported private key for this scriptPubKey".into(),
+                    )
+                });
+        }
+        if utxo.derivation_path.as_slice() == WATCHED_PATH {
+            return Err(WalletError::SigningError(
+                "watch-only: no private key for this imported-descriptor script \
+                 (import the descriptor's private key to spend)"
+                    .into(),
+            ));
+        }
+        self.get_private_key(&utxo.derivation_path)
+    }
+
     /// Derive the compressed public key + BIP32 key-origin (master
     /// fingerprint + path) for a wallet-owned derivation path.
     ///
@@ -842,7 +887,7 @@ impl Wallet {
         // Sign inputs
         let secp = secp_ctx();
         for (i, utxo) in selected_utxos.iter().enumerate() {
-            let private_key = self.get_private_key(&utxo.derivation_path)?;
+            let private_key = self.signing_key_for_utxo(utxo)?;
 
             match self.address_type {
                 AddressType::P2WPKH => {
@@ -1151,7 +1196,7 @@ impl Wallet {
         if sign {
             let secp = secp_ctx();
             for (i, utxo) in entry.spent_utxos.iter().enumerate() {
-                let private_key = self.get_private_key(&utxo.derivation_path)?;
+                let private_key = self.signing_key_for_utxo(utxo)?;
                 match self.address_type {
                     AddressType::P2WPKH => {
                         self.sign_p2wpkh_input(&mut new_tx, i, utxo, &private_key, secp)?
@@ -1251,8 +1296,9 @@ impl Wallet {
             })?
             .clone();
 
-        // Get the private key for this UTXO's derivation path.
-        let private_key = self.get_private_key(&utxo.derivation_path)?;
+        // Resolve the signing key by the UTXO's ownership route (imported /
+        // watch-only / HD), NOT a blind master-seed derivation.
+        let private_key = self.signing_key_for_utxo(&utxo)?;
         let secp = secp_ctx();
 
         // Detect script type from the actual scriptPubKey bytes, NOT
@@ -2097,6 +2143,50 @@ impl Wallet {
         }
 
         Ok(primary)
+    }
+
+    /// Retain the private keys of an imported *private* descriptor so its
+    /// scripts become spendable — the private-key counterpart to
+    /// [`Self::register_descriptor`] (which only WATCHES scripts). Derives the
+    /// leaf secret at every position in the registered range and imports it via
+    /// [`Self::import_private_key`], so each script lands in
+    /// [`Self::imported_keys`] and is routed through the signable
+    /// [`IMPORTED_PATH`] (which wins over the watch-only [`WATCHED_PATH`] in
+    /// `build_script_index`, so `signing_key_for_utxo` finds the real key).
+    ///
+    /// Mirrors Bitcoin Core `importdescriptors` -> `AddWalletDescriptor`
+    /// storing the parsed `FlatSigningProvider` keys (backup.cpp:271); the
+    /// per-position leaf derivation mirrors `ExpandPrivate` (backup.cpp:241).
+    /// Returns `(imported, all_retained)`. `all_retained` is false iff some
+    /// key expression was public-only (watch-only) — the caller then warns
+    /// exactly as Core does ("Not all private keys provided", backup.cpp:264)
+    /// and those scripts stay watch-only (never signed with a fallback key).
+    pub fn import_descriptor_private_keys(
+        &mut self,
+        parsed: &crate::descriptor::Descriptor,
+        range_end: u32,
+        label: &str,
+    ) -> Result<(usize, bool), WalletError> {
+        let positions: std::ops::RangeInclusive<u32> = if parsed.is_range() {
+            0..=range_end
+        } else {
+            0..=0
+        };
+        let mut imported = 0usize;
+        let mut all_retained = true;
+        for pos in positions {
+            let (secrets, all_private) = parsed
+                .derive_leaf_secret_keys(pos)
+                .map_err(|e| WalletError::InvalidPath(e.to_string()))?;
+            if !all_private {
+                all_retained = false;
+            }
+            for sk in secrets {
+                self.import_private_key(sk, label.to_string())?;
+                imported += 1;
+            }
+        }
+        Ok((imported, all_retained))
     }
 
     /// Number of distinct imported keys (counted by primary address).

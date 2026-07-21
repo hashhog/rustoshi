@@ -459,6 +459,50 @@ impl KeyProvider {
         }
     }
 
+    /// Get the *secret* key at the given position — the private-key mirror of
+    /// [`Self::get_pubkey`]. Returns `Ok(Some(sk))` when this key expression
+    /// embeds private material (a WIF constant or an `xprv`), `Ok(None)` for a
+    /// public-only expression (`xpub` or a hex/`Const` pubkey).
+    ///
+    /// Mirrors Bitcoin Core `BIP32PubkeyProvider::GetPrivKey`
+    /// (bitcoin-core/src/script/descriptor.cpp:573) which derives the leaf
+    /// private key from the stored root `xprv` at expansion time, and the WIF
+    /// leaf whose secret Core keeps in the FlatSigningProvider from `Parse`.
+    /// `importdescriptors` uses this to RETAIN a private descriptor's key so an
+    /// imported-descriptor spend signs correctly (backup.cpp
+    /// `AddWalletDescriptor`), instead of dropping the key to watch-only.
+    pub fn get_secret_key(
+        &self,
+        pos: u32,
+    ) -> Result<Option<secp256k1::SecretKey>, DescriptorError> {
+        match self {
+            KeyProvider::Wif { secret_key, .. } => Ok(Some(*secret_key)),
+            // Public-only expressions carry no private material.
+            KeyProvider::Const { .. } | KeyProvider::Xpub { .. } => Ok(None),
+            KeyProvider::Xprv {
+                xprv,
+                path,
+                derive_type,
+                ..
+            } => {
+                // Derive along the fixed path, then the ranged position —
+                // byte-for-byte the same derivation as `get_pubkey`, so the
+                // returned secret key's public key equals `get_pubkey(pos)`.
+                let mut derived = xprv.clone();
+                for &child in path {
+                    derived = derived.derive_child(child)?;
+                }
+                let final_key = match derive_type {
+                    DeriveType::NonRanged => derived,
+                    DeriveType::UnhardenedRanged => derived.derive_child(pos)?,
+                    DeriveType::HardenedRanged => derived.derive_child(pos | HARDENED_FLAG)?,
+                };
+                Ok(Some(final_key.secret_key))
+            }
+            KeyProvider::WithOrigin { inner, .. } => inner.get_secret_key(pos),
+        }
+    }
+
     /// Format as string for public representation.
     pub fn to_public_string(&self) -> String {
         match self {
@@ -741,6 +785,74 @@ impl Descriptor {
                 Ok(scripts)
             }
         }
+    }
+
+    /// Derive the leaf *secret* keys controlling the scripts at position `pos`,
+    /// plus whether EVERY key expression in the descriptor yielded private
+    /// material (Core's `have_all_privkeys`, backup.cpp:248-256).
+    ///
+    /// Returns `(secrets, all_private)`. `secrets` holds one entry per key
+    /// expression that embeds a private key (`xprv`/WIF); public-only
+    /// expressions (`xpub`, hex pubkey) contribute nothing and clear
+    /// `all_private`. Used by `importdescriptors` to retain a private
+    /// descriptor's keys so its scripts are spendable — mirroring Core's
+    /// `AddWalletDescriptor` storing the parsed `FlatSigningProvider` keys.
+    /// When `all_private` is false the caller keeps the descriptor watch-only
+    /// for the un-retained keys and warns (never falls back to another key).
+    pub fn derive_leaf_secret_keys(
+        &self,
+        pos: u32,
+    ) -> Result<(Vec<secp256k1::SecretKey>, bool), DescriptorError> {
+        fn from_kp(
+            kp: &KeyProvider,
+            pos: u32,
+            out: &mut Vec<secp256k1::SecretKey>,
+            all: &mut bool,
+        ) -> Result<(), DescriptorError> {
+            match kp.get_secret_key(pos)? {
+                Some(sk) => out.push(sk),
+                None => *all = false,
+            }
+            Ok(())
+        }
+        fn walk(
+            desc: &Descriptor,
+            pos: u32,
+            out: &mut Vec<secp256k1::SecretKey>,
+            all: &mut bool,
+        ) -> Result<(), DescriptorError> {
+            match desc {
+                Descriptor::Pk(k)
+                | Descriptor::Pkh(k)
+                | Descriptor::Wpkh(k)
+                | Descriptor::TrKeyOnly(k)
+                | Descriptor::Rawtr(k)
+                | Descriptor::Combo(k) => from_kp(k, pos, out, all),
+                Descriptor::Sh(inner) | Descriptor::Wsh(inner) => walk(inner, pos, out, all),
+                Descriptor::TrWithTree { internal_key, tree } => {
+                    from_kp(internal_key, pos, out, all)?;
+                    for (d, _) in tree {
+                        walk(d, pos, out, all)?;
+                    }
+                    Ok(())
+                }
+                Descriptor::Multi { keys, .. } | Descriptor::SortedMulti { keys, .. } => {
+                    for k in keys {
+                        from_kp(k, pos, out, all)?;
+                    }
+                    Ok(())
+                }
+                // No key material to retain (addr()/raw()).
+                Descriptor::Addr(_) | Descriptor::Raw(_) => {
+                    *all = false;
+                    Ok(())
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut all = true;
+        walk(self, pos, &mut out, &mut all)?;
+        Ok((out, all))
     }
 
     /// Derive addresses at the given position.
@@ -1910,6 +2022,55 @@ mod tests {
     fn test_parse_wpkh() {
         let desc = parse_descriptor("wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)").unwrap();
         assert!(matches!(desc, Descriptor::Wpkh(_)));
+    }
+
+    /// Defect A regression (wallet funding-audit finding #1): importing a
+    /// PRIVATE tprv wpkh descriptor must RETAIN a leaf key that controls the
+    /// descriptor's own script — not drop it (which made signing fall back to
+    /// an unrelated master-seed key and produce a Core-rejected wrong-key
+    /// spend). `derive_leaf_secret_keys` is the retention primitive the import
+    /// path uses; it mirrors Core's ExpandPrivate (backup.cpp:241).
+    #[test]
+    fn test_derive_leaf_secret_keys_retains_correct_key() {
+        // Frozen "wpkh-ext" descriptor body from the wallet-diff corpus
+        // (test-suite/wallet-diff/vectors-address.json), checksum stripped.
+        let body = "wpkh(tprv8ZgxMBicQKsPezmaXRsdeRnZL1RsZMcNEQEqCnrkFpsNqBYpJHQoGC714p7DTiKKzcnTxYJgfPfViWCE6Ykic9eBxFM5f3AEmRBdgb6Gso3/84h/1h/0h/0/*)";
+        let desc = parse_descriptor(body).unwrap();
+        assert!(desc.is_range());
+
+        // (a) A private descriptor yields the leaf secret, and EVERY key
+        //     expression is private (Core have_all_privkeys == true → no warn).
+        let (secrets, all_private) = desc.derive_leaf_secret_keys(0).unwrap();
+        assert_eq!(secrets.len(), 1, "single-key wpkh yields exactly one secret");
+        assert!(all_private, "a private tprv descriptor retains all keys");
+
+        // (b) The retained secret controls the SAME on-chain script the
+        //     descriptor funds at idx 0 — signing with it is Core-valid, not a
+        //     wrong-key spend. (P2WPKH witness program is network-independent.)
+        let secp = secp256k1::Secp256k1::new();
+        let pk = secp256k1::PublicKey::from_secret_key(&secp, &secrets[0]);
+        let script_from_secret = make_p2wpkh_script(&pk);
+        let script_from_desc = desc.derive_script(0, Network::Mainnet).unwrap();
+        assert_eq!(
+            script_from_secret, script_from_desc,
+            "retained leaf secret must control the descriptor's idx-0 P2WPKH script"
+        );
+
+        // A different index derives a DIFFERENT key controlling a DIFFERENT
+        // script (guards against returning a fixed key).
+        let (secrets1, _) = desc.derive_leaf_secret_keys(1).unwrap();
+        assert_ne!(secrets[0].secret_bytes(), secrets1[0].secret_bytes());
+
+        // (c) A public-only (hex pubkey) descriptor retains NO key: the import
+        //     path warns and keeps it watch-only rather than silently signing
+        //     with a fallback key (signing_key_for_utxo refuses WATCHED_PATH).
+        let pub_desc = parse_descriptor(
+            "wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)",
+        )
+        .unwrap();
+        let (pub_secrets, pub_all) = pub_desc.derive_leaf_secret_keys(0).unwrap();
+        assert!(pub_secrets.is_empty(), "a pubkey descriptor retains no private key");
+        assert!(!pub_all, "a pubkey descriptor is not all-private");
     }
 
     #[test]
