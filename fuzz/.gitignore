@@ -1,5 +1,6 @@
 target
-corpus
+# corpus/ is COMMITTED — PRODUCTION-GATE P1.2 requires "corpus committed".
+# It is cmin-minimized (coverage-equivalent seed set), not the raw accumulation.
 artifacts
 coverage
 Cargo.lock
