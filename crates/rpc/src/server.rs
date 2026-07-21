@@ -9874,9 +9874,20 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         let info = DescriptorInfo::from_descriptor(&parsed);
 
+        // Core semantics: `checksum` is GetDescriptorChecksum(input) — the
+        // checksum of the descriptor AS GIVEN (input minus any provided
+        // #checksum), kept SEPARATE from the normalized `descriptor` field.
+        // Computing it over the re-serialized canonical form is wrong: e.g. the
+        // h vs ' hardened marker differs and yields a divergent checksum.
+        // Cross-ref: bitcoin-core/src/rpc/output_script.cpp:215 +
+        // GetDescriptorChecksum -> CheckChecksum (splits at '#', checksums part[0]).
+        let cs_body = descriptor.split('#').next().unwrap_or(descriptor.as_str());
+        let checksum = rustoshi_wallet::descriptor::descriptor_checksum(cs_body)
+            .unwrap_or(info.checksum);
+
         Ok(DescriptorInfoResult {
             descriptor: info.descriptor,
-            checksum: info.checksum,
+            checksum,
             isrange: info.is_range,
             issolvable: info.is_solvable,
             hasprivatekeys: info.has_private_keys,
