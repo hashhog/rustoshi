@@ -2046,8 +2046,10 @@ impl WalletRpcServer for WalletRpcImpl {
     async fn get_new_address(
         &self,
         _label: Option<String>,
-        _address_type: Option<String>,
+        address_type: Option<String>,
     ) -> RpcResult<String> {
+        use rustoshi_wallet::AddressType;
+
         let state = self.state.read().await;
 
         let (_, wallet) = self.resolve_wallet(&state)?;
@@ -2065,8 +2067,37 @@ impl WalletRpcServer for WalletRpcImpl {
             ));
         }
 
-        let address = wallet_guard.get_new_address()
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
+        // Honour the `address_type` argument (Core: getnewaddress derives from
+        // the SPKM for the requested type — legacy/p2sh-segwit/bech32/bech32m,
+        // `rpc/addresses.cpp` GetNewAddress -> `wallet.cpp` GetNewDestination).
+        // `bech32m` yields a P2TR (BIP-86) receive address, tracked as a
+        // wallet-owned script so its UTXOs are spendable via the taproot
+        // key-path signer. Absent/unrecognised -> the wallet's default type.
+        let address = match address_type.as_deref() {
+            None => wallet_guard.get_new_address(),
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "legacy" | "p2pkh" => {
+                    wallet_guard.get_new_address_of_type(AddressType::P2PKH)
+                }
+                "p2sh-segwit" | "p2sh-p2wpkh" => {
+                    wallet_guard.get_new_address_of_type(AddressType::P2shP2wpkh)
+                }
+                "bech32" | "p2wpkh" => {
+                    wallet_guard.get_new_address_of_type(AddressType::P2WPKH)
+                }
+                "bech32m" | "p2tr" | "taproot" => {
+                    wallet_guard.get_new_address_of_type(AddressType::P2TR)
+                }
+                other => {
+                    // RPC_INVALID_PARAMETER = -8 (Core rpc/protocol.h).
+                    return Err(Self::rpc_error(
+                        -8,
+                        format!("Unknown address type '{}'", other),
+                    ));
+                }
+            },
+        }
+        .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
 
         Ok(address)
     }

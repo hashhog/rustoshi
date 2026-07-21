@@ -458,6 +458,37 @@ impl Wallet {
         Ok(address)
     }
 
+    /// Get a new receiving address of an EXPLICIT address type (honours the
+    /// `getnewaddress address_type` argument), independent of the wallet's
+    /// default `address_type`.
+    ///
+    /// Mirrors Core's default descriptor wallet, which installs one SPKM per
+    /// address type (incl. `tr()` BIP-86) and lets `getnewaddress bech32m`
+    /// hand out a P2TR address regardless of the configured default
+    /// (`bitcoin-core/src/wallet/wallet.cpp` SetupDescriptorScriptPubKeyMans,
+    /// `scriptpubkeyman.cpp` GetNewDestination). The address is derived at the
+    /// shared next-receive index on the requested type's BIP-purpose branch
+    /// (so P2WPKH `m/84'` and P2TR `m/86'` addresses never collide) and is
+    /// recorded in `self.addresses`, so `build_script_index` tracks its
+    /// scriptPubKey as wallet-owned: incoming UTXOs are credited and spendable
+    /// via the existing per-script signer (a P2TR UTXO routes to
+    /// `sign_p2tr_input`, BIP-86 tweaked).
+    pub fn get_new_address_of_type(
+        &mut self,
+        addr_type: AddressType,
+    ) -> Result<String, WalletError> {
+        if !self.private_keys_enabled {
+            return Err(WalletError::SigningError(
+                "This wallet has no available keys".into(),
+            ));
+        }
+        let path = self.derivation_path_typed(false, self.next_receive_index, addr_type);
+        let address = self.derive_address(&path)?;
+        self.addresses.insert(address.clone(), path);
+        self.next_receive_index += 1;
+        Ok(address)
+    }
+
     /// Get a new change address.
     ///
     /// Change addresses use a different derivation path branch than receiving addresses.
@@ -499,7 +530,29 @@ impl Wallet {
     /// BIP-84 (P2WPKH): m/84'/coin'/account'/change/index
     /// BIP-86 (P2TR): m/86'/coin'/account'/change/index
     fn derivation_path(&self, is_change: bool, index: u32) -> Vec<u32> {
-        let purpose = match self.address_type {
+        self.derivation_path_typed(is_change, index, self.address_type)
+    }
+
+    /// Build the derivation path for an address of an EXPLICIT address type,
+    /// independent of the wallet's default `address_type`.
+    ///
+    /// The BIP-44/49/84/86 purpose element is what distinguishes a receive
+    /// address's script type: BIP-84 (P2WPKH) vs BIP-86 (P2TR). By selecting
+    /// the purpose from the requested `addr_type` we can hand out a taproot
+    /// (bech32m) receive address from a wallet whose default is P2WPKH — Core's
+    /// default descriptor wallet installs one SPKM per address type and
+    /// `getnewaddress bech32m` derives from the `tr()` (BIP-86) descriptor
+    /// (`bitcoin-core/src/wallet/scriptpubkeyman.cpp`). Because the purpose is
+    /// encoded in the stored path, `derive_address` / `script_pubkey_for_path`
+    /// re-derive the SAME script type later (receive-tracking + signing), and
+    /// the leaf secret routes through the correct BIP-341 key-path signer.
+    fn derivation_path_typed(
+        &self,
+        is_change: bool,
+        index: u32,
+        addr_type: AddressType,
+    ) -> Vec<u32> {
+        let purpose = match addr_type {
             AddressType::P2PKH => BIP44_PURPOSE,
             AddressType::P2shP2wpkh => BIP49_PURPOSE,
             AddressType::P2WPKH => BIP84_PURPOSE,
@@ -518,14 +571,41 @@ impl Wallet {
         ]
     }
 
+    /// Map a BIP-44/49/84/86 purpose element to the address type it encodes.
+    ///
+    /// Returns `None` for a non-standard purpose (e.g. the imported/watched
+    /// sentinel paths, which never reach `derive_address`), letting the caller
+    /// fall back to the wallet's default `address_type`.
+    fn address_type_for_purpose(purpose: u32) -> Option<AddressType> {
+        match purpose {
+            p if p == BIP44_PURPOSE => Some(AddressType::P2PKH),
+            p if p == BIP49_PURPOSE => Some(AddressType::P2shP2wpkh),
+            p if p == BIP84_PURPOSE => Some(AddressType::P2WPKH),
+            p if p == BIP86_PURPOSE => Some(AddressType::P2TR),
+            _ => None,
+        }
+    }
+
     /// Derive an address from a derivation path.
+    ///
+    /// The script type is inferred from the path's BIP-44/49/84/86 PURPOSE
+    /// element rather than the wallet's default `address_type`, so a taproot
+    /// (BIP-86) receive path always re-derives a P2TR script even in a
+    /// P2WPKH-default wallet. For default-type paths the purpose matches
+    /// `self.address_type`, so behaviour is unchanged.
     fn derive_address(&self, path: &[u32]) -> Result<String, WalletError> {
         let child_key = self.master_key.derive_path(path)?;
         let secp = secp_ctx();
         let pubkey = secp256k1::PublicKey::from_secret_key(secp, &child_key.secret_key);
         let compressed: [u8; 33] = pubkey.serialize();
 
-        let addr = match self.address_type {
+        let addr_type = path
+            .first()
+            .copied()
+            .and_then(Self::address_type_for_purpose)
+            .unwrap_or(self.address_type);
+
+        let addr = match addr_type {
             AddressType::P2WPKH => Address::p2wpkh_from_pubkey(&compressed, self.network),
             AddressType::P2PKH => Address::p2pkh_from_pubkey(&compressed, self.network),
             AddressType::P2shP2wpkh => {
@@ -888,21 +968,10 @@ impl Wallet {
         let secp = secp_ctx();
         for (i, utxo) in selected_utxos.iter().enumerate() {
             let private_key = self.signing_key_for_utxo(utxo)?;
-
-            match self.address_type {
-                AddressType::P2WPKH => {
-                    self.sign_p2wpkh_input(&mut tx, i, utxo, &private_key, secp)?;
-                }
-                AddressType::P2PKH => {
-                    self.sign_p2pkh_input(&mut tx, i, utxo, &private_key, secp)?;
-                }
-                AddressType::P2shP2wpkh => {
-                    self.sign_p2sh_p2wpkh_input(&mut tx, i, utxo, &private_key, secp)?;
-                }
-                AddressType::P2TR => {
-                    self.sign_p2tr_input(&mut tx, i, utxo, &selected_utxos, &private_key, secp)?;
-                }
-            }
+            // Dispatch on the prevout's script shape, NOT self.address_type, so
+            // a mixed-type wallet (e.g. a P2WPKH default holding a P2TR receive
+            // UTXO) signs each input with the correct per-script signer.
+            self.sign_wallet_input(&mut tx, i, utxo, &selected_utxos, &private_key, secp)?;
         }
 
         // FIX-61 (W118 BUG-2 / BUG-3): record the outgoing tx so a later
@@ -1197,25 +1266,10 @@ impl Wallet {
             let secp = secp_ctx();
             for (i, utxo) in entry.spent_utxos.iter().enumerate() {
                 let private_key = self.signing_key_for_utxo(utxo)?;
-                match self.address_type {
-                    AddressType::P2WPKH => {
-                        self.sign_p2wpkh_input(&mut new_tx, i, utxo, &private_key, secp)?
-                    }
-                    AddressType::P2PKH => {
-                        self.sign_p2pkh_input(&mut new_tx, i, utxo, &private_key, secp)?
-                    }
-                    AddressType::P2shP2wpkh => {
-                        self.sign_p2sh_p2wpkh_input(&mut new_tx, i, utxo, &private_key, secp)?
-                    }
-                    AddressType::P2TR => self.sign_p2tr_input(
-                        &mut new_tx,
-                        i,
-                        utxo,
-                        &entry.spent_utxos,
-                        &private_key,
-                        secp,
-                    )?,
-                }
+                // Per-script dispatch (see create_transaction): the bumped tx
+                // reuses the original prevouts, so each input signs by its own
+                // scriptPubKey shape, not the wallet default.
+                self.sign_wallet_input(&mut new_tx, i, utxo, &entry.spent_utxos, &private_key, secp)?;
             }
             // Record the replacement so a follow-up bump can find it.
             let new_txid = new_tx.txid();
@@ -1893,6 +1947,43 @@ impl Wallet {
             added += 1;
         }
         Ok(added)
+    }
+
+    /// Sign one wallet-owned input, dispatching on the prevout's actual
+    /// scriptPubKey shape rather than the wallet's default `address_type`.
+    ///
+    /// This is what lets a P2WPKH-default wallet spend a P2TR (BIP-86) receive
+    /// UTXO: the UTXO's script selects `sign_p2tr_input` (key-path, BIP-341),
+    /// while a P2WPKH UTXO in the same wallet still routes to
+    /// `sign_p2wpkh_input`. `all_utxos` is the full spend-order prevout set,
+    /// required for the BIP-341 taproot sighash's all-prevouts commitment.
+    /// Mirrors the per-script dispatch already in `sign_input`.
+    fn sign_wallet_input(
+        &self,
+        tx: &mut Transaction,
+        input_index: usize,
+        utxo: &WalletUtxo,
+        all_utxos: &[WalletUtxo],
+        private_key: &secp256k1::SecretKey,
+        secp: &Secp256k1<secp256k1::All>,
+    ) -> Result<(), WalletError> {
+        let spk = &utxo.script_pubkey;
+        if is_p2wpkh_spk(spk) {
+            self.sign_p2wpkh_input(tx, input_index, utxo, private_key, secp)
+        } else if is_p2tr_spk(spk) {
+            self.sign_p2tr_input(tx, input_index, utxo, all_utxos, private_key, secp)
+        } else if is_p2pkh_spk(spk) {
+            self.sign_p2pkh_input(tx, input_index, utxo, private_key, secp)
+        } else if is_p2sh_spk(spk) {
+            self.sign_p2sh_p2wpkh_input(tx, input_index, utxo, private_key, secp)
+        } else {
+            Err(WalletError::SigningError(format!(
+                "unsupported scriptPubKey type for input {} (len={}, first byte=0x{:02x})",
+                input_index,
+                spk.len(),
+                spk.first().copied().unwrap_or(0)
+            )))
+        }
     }
 
     /// Sign a P2TR input (Taproot key-path spending).
