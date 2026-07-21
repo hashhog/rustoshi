@@ -124,7 +124,7 @@ pub struct PeerManagerConfig {
     pub max_outbound_full_relay: usize,
     /// Target number of block-relay-only outbound connections (default: 2).
     pub max_outbound_block_relay: usize,
-    /// Maximum inbound connections (default: 117).
+    /// Maximum inbound connections (default: 114 = 125 - 8 - 2 - 1, Core net.h:1110).
     pub max_inbound: usize,
     /// Maximum total connections (default: 125).
     pub max_total: usize,
@@ -273,12 +273,27 @@ impl PeerManagerConfig {
     }
 }
 
+/// Accept-time inbound admission gate (Finding 5, Core net.cpp:1820).
+/// Returns true when a newly accepted inbound socket must be dropped because the
+/// number of connections still in the pre-handshake phase has reached the
+/// inbound cap. This bounds the pre-handshake population that Core hard-bounds
+/// at accept but rustoshi previously left unbounded. Mirrors the shape of Core's
+/// `if (nInbound >= m_max_inbound)` check (established slots are handled
+/// separately by the post-handshake eviction ladder).
+fn reject_inbound_at_accept(pre_handshake_inbound: usize, max_inbound: usize) -> bool {
+    pre_handshake_inbound >= max_inbound
+}
+
 impl Default for PeerManagerConfig {
     fn default() -> Self {
         Self {
             max_outbound_full_relay: 8,
             max_outbound_block_relay: 2,
-            max_inbound: 117,
+            // Core derivation (net.h:1106-1110): m_max_inbound =
+            // m_max_automatic_connections - m_max_automatic_outbound
+            //   = 125 - (8 full-relay + 2 block-relay + 1 feeler) = 114.
+            // (Finding 3: was 117 = 125 - 8, subtracting only full-relay.)
+            max_inbound: 114,
             max_total: 125,
             ban_duration: Duration::from_secs(24 * 60 * 60),
             listen_port: 8333,
@@ -2808,6 +2823,10 @@ impl PeerManager {
                     // ... return`). The atomic is read from the socket-handler
                     // thread exactly as Core reads `fNetworkActive` there.
                     let network_active = self.network_active.clone();
+                    // Accept-time inbound cap (Finding 5 / Core net.cpp:1820).
+                    // Captured so the listener task can bound the pre-handshake
+                    // inbound population without reaching into `&mut self`.
+                    let max_inbound = self.config.max_inbound;
                     tokio::spawn(async move {
                         // Cheap, per-accept ban check: re-read the persisted
                         // banlist file on disk.  This means RPC `setban` /
@@ -2890,6 +2909,38 @@ impl PeerManager {
                                             drop(stream);
                                             continue;
                                         }
+                                    }
+
+                                    // Accept-time inbound cap (Finding 5, Core
+                                    // net.cpp:1780-1827). Core counts every inbound
+                                    // socket — including those still mid-handshake —
+                                    // against m_max_inbound and drops/evicts before
+                                    // creating the node, so the inbound population is
+                                    // hard-bounded at accept. rustoshi enforces the
+                                    // *established* inbound cap post-handshake (with
+                                    // eviction) in the manager, but pre-handshake
+                                    // sockets are not in `self.peers` yet, so without
+                                    // this gate the number of concurrent
+                                    // not-yet-handshaked inbound connections is
+                                    // unbounded (fd/socket exhaustion). `inbound_senders`
+                                    // holds exactly those pre-handshake connections (an
+                                    // entry is removed when the peer registers, or when
+                                    // its task ends), so bounding its length at
+                                    // max_inbound caps the pre-handshake population.
+                                    // Established slots are still handled by the
+                                    // post-handshake eviction ladder, so this does not
+                                    // change eviction behavior — it only stops the
+                                    // half-open flood Core prevents at accept.
+                                    let pre_handshake_inbound =
+                                        inbound_senders.lock().unwrap().len();
+                                    if reject_inbound_at_accept(pre_handshake_inbound, max_inbound) {
+                                        tracing::debug!(
+                                            "Rejecting inbound connection from {}: {} pre-handshake \
+                                             inbound connections already in flight (cap {})",
+                                            addr, pre_handshake_inbound, max_inbound
+                                        );
+                                        drop(stream);
+                                        continue;
                                     }
 
                                     let peer_id = PeerId(
@@ -6283,11 +6334,30 @@ pub fn dump_anchors(data_dir: &std::path::Path, anchors: &[SocketAddr]) {
 mod tests {
     use super::*;
 
+    /// Finding 5 (DoS parity): the accept-time pre-handshake inbound gate.
+    /// Reject a newly accepted socket once the pre-handshake population reaches
+    /// the inbound cap; admit it below the cap. Mirrors Core's
+    /// `if (nInbound >= m_max_inbound)` (net.cpp:1820). Asserts both sides of the
+    /// boundary so the test can't pass by an always-true / always-false gate.
+    #[test]
+    fn test_reject_inbound_at_accept_gate() {
+        let cap = 114usize;
+        // Below the cap → admit.
+        assert!(!reject_inbound_at_accept(0, cap));
+        assert!(!reject_inbound_at_accept(cap - 1, cap));
+        // At or over the cap → reject.
+        assert!(reject_inbound_at_accept(cap, cap));
+        assert!(reject_inbound_at_accept(cap + 1, cap));
+        // Uses the configured cap (a smaller cap rejects sooner).
+        assert!(reject_inbound_at_accept(4, 4));
+        assert!(!reject_inbound_at_accept(3, 4));
+    }
+
     #[test]
     fn test_peer_manager_config_default() {
         let config = PeerManagerConfig::default();
         assert_eq!(config.max_outbound_full_relay, 8);
-        assert_eq!(config.max_inbound, 117);
+        assert_eq!(config.max_inbound, 114);
         assert_eq!(config.max_total, 125);
         assert_eq!(config.ban_duration, Duration::from_secs(24 * 60 * 60));
         assert_eq!(config.listen_port, 8333);
