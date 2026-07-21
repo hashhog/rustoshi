@@ -6500,9 +6500,43 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // shutdown flush is the best-effort fast path for clean exits.
     {
         let cs = chain_state.read().await;
-        let tip_hash = cs.tip_hash();
-        let tip_height = cs.tip_height();
+        let mut tip_hash = cs.tip_hash();
+        let mut tip_height = cs.tip_height();
         drop(cs);
+        // P1.6 fix (2026-07-21): NEVER REGRESS the durable tip. Blocks
+        // connected via the RPC path (submitblock / generate*) persist
+        // UTXOs + the best-block pointer synchronously through their own
+        // store view (crates/rpc/src/server.rs submit_block ->
+        // utxo_view.flush() + set_best_block) and do NOT advance this
+        // loop's `chain_state` (the P2P sync view). Writing the stale
+        // P2P-view tip here unconditionally CLOBBERED the RPC-persisted
+        // pointer: on regtest, a clean SIGTERM after a 110-block
+        // submitblock feed rewrote the tip to genesis, and the node
+        // rebooted at height 0 with a wedged datadir (re-feeding the same
+        // blocks returns "duplicate" without re-connecting; SIGKILL —
+        // which skips this flush — preserved the chain, so graceful
+        // shutdown was strictly worse than a crash). Bitcoin Core cannot
+        // hit this because it has a single chainstate: submitblock ->
+        // ProcessNewBlock -> ActivateBestChain (validation.cpp:4398) and
+        // the DB_BEST_BLOCK write (txdb.cpp BatchWrite) always flush the
+        // one authoritative tip. Mirror that invariant here: if the
+        // persisted tip is AHEAD of this loop's view, keep the persisted
+        // tip in the atomic batch instead of regressing it. (If the two
+        // views ever diverge onto different forks at the same height the
+        // pre-existing dual-view hazard remains — this guard only removes
+        // the regression, it does not attempt cross-view reconciliation.)
+        if let Ok(Some(persisted_height)) = block_store.get_best_height() {
+            if persisted_height > tip_height {
+                if let Ok(Some(persisted_hash)) = block_store.get_best_block_hash() {
+                    tracing::info!(
+                        "shutdown flush: persisted tip {} (height {}) is ahead of the sync-loop tip {} (height {}) — keeping the persisted (RPC-connected) tip",
+                        persisted_hash, persisted_height, tip_hash, tip_height
+                    );
+                    tip_hash = persisted_hash;
+                    tip_height = persisted_height;
+                }
+            }
+        }
         let entries = utxo_view.cache_len();
         let mem_mb = utxo_view.estimated_memory() / (1024 * 1024);
         // Unit B: the connect loop may hold un-persisted block bodies + undo
