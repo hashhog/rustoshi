@@ -1838,6 +1838,79 @@ fn test_dos_w14z8m3zc_production_config_verifies_scripts() {
     );
 }
 
+/// Defect B regression (wallet funding-audit finding #1): `testmempoolaccept`
+/// must run FULL script verification even on the regtest / fixture mempool
+/// (`verify_scripts = false`), so it can NEVER report an invalidly-signed tx as
+/// `allowed`. Pre-fix the RPC handler called plain `test_accept()`, so on
+/// regtest it admitted a wrong-key P2WPKH spend that Core rejects
+/// (`mempool-script-verify-flag-failed`). The fix has the handler pass
+/// `AtmpOptions { force_script_checks: true, ..test_accept() }`.
+///
+/// Teeth: on the SAME `verify_scripts = false` config and the SAME invalid-sig
+/// tx, plain `test_accept()` ADMITS it (the old mask) while the forced-check
+/// options REJECT it at the script gate — matching Core's testmempoolaccept
+/// (validation.cpp:1382-1384). Block-connect verifies scripts unconditionally
+/// (validation.rs), so this is an RPC-path honesty fix, not a consensus change.
+#[test]
+fn test_finding1_testmempoolaccept_forces_script_verification() {
+    let prev = hash_from_u8(0x5b);
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: prev, vout: 0 }, coin(1_000_000))]
+            .into_iter()
+            .collect();
+
+    // P2PKH prevout + empty scriptSig (simple_tx default): a genuine script
+    // verification MUST fail (needs <sig> <pubkey>). require_standard=false
+    // isolates the SCRIPT gate from an earlier standardness rejection.
+    let bad_tx = simple_tx(prev, 1_000_000, 5_000, 0xffffffff);
+
+    assert!(
+        !MempoolConfig::default().verify_scripts,
+        "regtest/default mempool config keeps script verification off"
+    );
+
+    // (1) Baseline mask: plain test_accept() on the verify_scripts=false config
+    // ADMITS the invalid-sig tx — the exact lie the audit caught.
+    let mut mp_plain = Mempool::new(MempoolConfig::default());
+    let plain = mp_plain.add_transaction_with_options(
+        bad_tx.clone(),
+        &|op| utxos.get(op).cloned(),
+        AtmpOptions {
+            require_standard: false,
+            ..AtmpOptions::test_accept()
+        },
+    );
+    assert!(
+        plain.is_ok(),
+        "baseline: without forced verification the invalid-sig tx is (wrongly) \
+         accepted by test_accept; got {:?}",
+        plain
+    );
+
+    // (2) The fix: the RPC testmempoolaccept path forces verification, so the
+    // SAME tx on the SAME config is REJECTED at the script gate.
+    let mut mp_forced = Mempool::new(MempoolConfig::default());
+    let forced = mp_forced.add_transaction_with_options(
+        bad_tx,
+        &|op| utxos.get(op).cloned(),
+        AtmpOptions {
+            require_standard: false,
+            force_script_checks: true,
+            ..AtmpOptions::test_accept()
+        },
+    );
+    assert!(
+        matches!(
+            forced,
+            Err(MempoolError::PolicyScriptCheckFailed(_, _))
+                | Err(MempoolError::ConsensusScriptCheckFailed(_, _))
+        ),
+        "testmempoolaccept must force script verification and REJECT the \
+         invalid-sig tx; got {:?}",
+        forced
+    );
+}
+
 /// Helper: current wall-clock time in seconds (i64).
 fn now_secs() -> i64 {
     std::time::SystemTime::now()

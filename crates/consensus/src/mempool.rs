@@ -632,6 +632,14 @@ pub struct AtmpOptions {
     /// the original block was connected.  Equivalent to Core's
     /// implicit script-cache hit on bypass_limits + cached coin.
     pub skip_script_checks: bool,
+    /// FORCE PolicyScriptChecks + ConsensusScriptChecks even when the mempool
+    /// was built with `config.verify_scripts == false` (the regtest / unit-test
+    /// fixture config).  Set by the `testmempoolaccept` RPC path so that query
+    /// ALWAYS answers with full script verification — Core's testmempoolaccept
+    /// verifies scripts on every network (validation.cpp:1382-1384), so a node
+    /// must never report an invalidly-signed tx as `allowed`.  Superseded by
+    /// `skip_script_checks` when both are set (reorg-refill never forces).
+    pub force_script_checks: bool,
 }
 
 impl Default for AtmpOptions {
@@ -642,6 +650,7 @@ impl Default for AtmpOptions {
             require_standard: true,
             test_accept: false,
             skip_script_checks: false,
+            force_script_checks: false,
         }
     }
 }
@@ -656,10 +665,17 @@ impl AtmpOptions {
             require_standard: true,
             test_accept: false,
             skip_script_checks: true,
+            force_script_checks: false,
         }
     }
 
     /// testmempoolaccept: validate-but-don't-insert.
+    ///
+    /// NOTE: leaves `force_script_checks` false so unit-test fixtures that call
+    /// `test_accept()` on a `verify_scripts=false` mempool keep their pre-W96
+    /// behaviour.  The RPC handler opts INTO forced verification explicitly
+    /// (`AtmpOptions { force_script_checks: true, ..test_accept() }`) so the
+    /// live `testmempoolaccept` never masks an invalid signature.
     pub fn test_accept() -> Self {
         Self {
             bypass_limits: false,
@@ -667,6 +683,7 @@ impl AtmpOptions {
             require_standard: true,
             test_accept: true,
             skip_script_checks: false,
+            force_script_checks: false,
         }
     }
 }
@@ -2109,7 +2126,7 @@ impl Mempool {
         // Opt-out: `opts.skip_script_checks` for the reorg path where the
         // tx's scripts were already verified when the block was originally
         // connected.  Matches Core's `bypass_limits` script-cache hot path.
-        if self.config.verify_scripts
+        if (self.config.verify_scripts || opts.force_script_checks)
             && !opts.skip_script_checks
             && !tx.is_coinbase()
             && prevout_scripts.len() == tx.inputs.len()

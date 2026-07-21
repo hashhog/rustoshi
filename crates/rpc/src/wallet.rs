@@ -1670,9 +1670,7 @@ impl WalletRpcImpl {
         wallet: &mut rustoshi_wallet::Wallet,
         request: &crate::types::ImportDescriptorRequest,
     ) -> Result<(String, String, u32, Vec<String>), (i32, String)> {
-        use rustoshi_wallet::descriptor::{
-            descriptor_wif_secrets, parse_descriptor, DescriptorInfo,
-        };
+        use rustoshi_wallet::descriptor::{parse_descriptor, DescriptorInfo};
         const RPC_INVALID_PARAMETER: i32 = -8;
 
         let mut warnings: Vec<String> = Vec::new();
@@ -1762,18 +1760,25 @@ impl WalletRpcImpl {
                 )
             })?;
         if privkeys_enabled && info.has_private_keys {
-            let wifs = descriptor_wif_secrets(&parsed);
-            if wifs.is_empty() {
-                // xprv-bearing descriptor: scripts are watched, but extended
-                // private key material is not yet stored for signing.
-                warnings.push(
-                    "Not all private keys provided. Some wallet functionality may return \
-                     unexpected errors"
-                        .to_string(),
-                );
-            }
-            for secret in wifs {
-                if let Err(e) = wallet.import_private_key(secret, label.clone()) {
+            // Retain the descriptor's private keys — WIF leaves AND xprv-derived
+            // leaves — so an imported PRIVATE descriptor is spendable (mirrors
+            // Core AddWalletDescriptor storing the FlatSigningProvider keys,
+            // backup.cpp:271). Only warn — exactly as Core does when
+            // have_all_privkeys is false (backup.cpp:263-264) — if some key
+            // expression is public-only (watch-only): those scripts then stay
+            // watch-only and can never be silently signed with a fallback key
+            // (`signing_key_for_utxo` refuses a WATCHED_PATH spend).
+            match wallet.import_descriptor_private_keys(&parsed, range_end, &label) {
+                Ok((_imported, all_retained)) => {
+                    if !all_retained {
+                        warnings.push(
+                            "Not all private keys provided. Some wallet functionality may \
+                             return unexpected errors"
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(e) => {
                     warnings.push(format!("failed to import descriptor private key: {}", e));
                 }
             }

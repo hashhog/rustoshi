@@ -11357,7 +11357,15 @@ impl RustoshiRpcServer for RpcServerImpl {
             match state.mempool.add_transaction_with_options(
                 tx.clone(),
                 &utxo_lookup,
-                AtmpOptions::test_accept(),
+                // Force full script verification even on regtest (where the
+                // mempool runs with verify_scripts=false for the synthetic-tx
+                // fixtures). Core's testmempoolaccept verifies scripts on every
+                // network (validation.cpp:1382-1384); without this the RPC would
+                // report an invalidly-signed tx as `allowed`.
+                AtmpOptions {
+                    force_script_checks: true,
+                    ..AtmpOptions::test_accept()
+                },
             ) {
                 Ok(_) => {
                     // Enforce maxfeerate: reject if fee rate exceeds the cap.
