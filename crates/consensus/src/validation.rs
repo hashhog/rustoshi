@@ -2400,7 +2400,45 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     // `ScriptFailed` ValidationError (via `#[from] TxValidationError`),
     // rejecting the block.
     if !skip_scripts {
-        validate_scripts_parallel_with_cache(block, &all_coins, &flags, None)?;
+        // Wire the process-global signature/script verification cache.
+        //
+        // This call site previously passed `None`, so the fully-built,
+        // W160-hardened `SigCache` was dead weight in production: every input
+        // script was re-verified from scratch on every ConnectBlock, even for
+        // transactions whose scripts had already verified (mempool acceptance,
+        // a prior connect on a since-disconnected branch, or the same tx being
+        // reconsidered across a reorg).  Mirrors Bitcoin Core, which installs a
+        // single process-wide `CSignatureCache` (`InitSignatureCache`, wired
+        // through `CachingTransactionSignatureChecker`) rather than a
+        // per-ConnectBlock cache.
+        //
+        // Correctness (why a hit is safe): the cache key commits to
+        // `(wtxid, input_idx, script_sig, script_pubkey, witness, flags)`.
+        // The `wtxid` is a SHA256d over the full witness-bearing spending
+        // transaction, which fixes each input's outpoint; the outpoint's
+        // `txid` in turn cryptographically fixes the funded coin's amount AND
+        // scriptPubKey (they are hashed into that funding txid).  So a key
+        // match implies an identical spending transaction, identical prevout
+        // amount + script, and identical flags — i.e. an identical, and
+        // therefore identically-deciding, script verification.  Only
+        // *successful* verifications are inserted, so a stale entry can never
+        // turn a reject into an accept.  This is the same load-bearing
+        // property as Core's sighash-keyed cache (see `sig_cache.rs` module
+        // docs + the W160 BUG-9 regression test), reached transitively via the
+        // wtxid instead of by plumbing the sighash through every call site.
+        //
+        // Performance, not consensus: a miss costs two SHA256 hashes over the
+        // input material (lookup + insert) on top of the ECDSA/Schnorr verify
+        // it guards — negligible relative to a signature check — so wiring the
+        // cache is at worst perf-neutral (linear IBD from genesis, ~0% hit
+        // rate) and a real win whenever a script is verified more than once
+        // (steady-state mempool->block dedup, reorg re-validation).  It changes
+        // no accept/reject decision (verify-fix.sh: NO-OP).
+        use std::sync::OnceLock;
+        static PROD_SIG_CACHE: OnceLock<crate::sig_cache::SigCache> = OnceLock::new();
+        let cache = PROD_SIG_CACHE
+            .get_or_init(|| crate::sig_cache::SigCache::new(crate::sig_cache::DEFAULT_MAX_ENTRIES));
+        validate_scripts_parallel_with_cache(block, &all_coins, &flags, Some(cache))?;
     }
 
     // Check block sigop cost limit
