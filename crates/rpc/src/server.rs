@@ -21666,6 +21666,8 @@ mod tests {
                 /* prev_block_mtp */ 0,
                 /* f_requested   */ true,
                 /* current_time  */ 1_700_000_100,
+                /* skip_scripts  */ false,
+                /* prev_timestamp */ 0,
             )
             .expect(
                 "B4 must connect on top of the post-reorg tip via the recreated view; \
@@ -24432,6 +24434,8 @@ mod tests {
                     0, // prev_block_mtp: genesis-adjacent
                     true,
                     rustoshi_consensus::current_time_secs(),
+                    false, // skip_scripts: full validation (A1's spend must verify)
+                    0,     // prev_timestamp: 0 keeps the BIP-94 timewarp gate skipped (safe for tests, chain_state.rs:550)
                 )
                 .expect("A1 (coinbase + spend of X) must validate");
             utxo_view.flush().expect("flush A1 utxo");
