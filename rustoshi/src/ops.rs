@@ -25,7 +25,9 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ============================================================
 // CONFIG FILE PARSING
@@ -417,6 +419,112 @@ pub fn notify_ready(fd: i32) -> std::io::Result<()> {
 }
 
 // ============================================================
+// P2P LIVENESS WATCHDOG
+// ============================================================
+//
+// Self-heals the async task-scheduling stall (lost wakeup / silent producer-
+// task death) that froze the deployed rustoshi mainnet node on 2026-07-24:
+// every thread idle, RPC responsive, all P2P activity ceased, tip frozen — a
+// wedged tokio runtime, NOT a lock deadlock. Recovery needed a manual restart
+// (4h+ outage). See receipts/rustoshi-live-p2p-hang-2026-07-24.md.
+//
+// The liveness signal is an AtomicU64 heartbeat bumped on the single inbound-
+// P2P funnel (the event_rx arm in async_main). Both observed failure modes
+// flatline it. This watchdog runs on a DEDICATED OS THREAD (not a tokio task,
+// which could itself be starved by the same wedge) and holds only lock-free
+// handles (never a tokio async lock), so it stays live to observe and act.
+
+/// Pure fire-decision for the P2P liveness watchdog (unit-tested).
+///
+/// Fire iff ALL three hold: past the startup grace floor (`since_start >=
+/// window`), the heartbeat has been flat for at least the window
+/// (`flat_for >= window`), and at least one peer is connected (`peers >= 1`,
+/// the anti-restart-loop gate so a legitimately isolated node never restarts).
+/// `flat_for <= since_start` always holds (last-change is seeded to the thread
+/// start and only advances), so the grace floor is subsumed by the flat check —
+/// it is kept explicit as the self-documenting startup guard.
+pub fn watchdog_should_fire(
+    since_start: Duration,
+    flat_for: Duration,
+    peers: usize,
+    window: Duration,
+) -> bool {
+    since_start >= window && flat_for >= window && peers >= 1
+}
+
+/// Dedicated-OS-thread P2P liveness watchdog. Survives a wedged tokio runtime
+/// because it holds only lock-free atomics + a plain closure (no async locks,
+/// no runtime handles). On a flat heartbeat (no inbound P2P activity for
+/// `window_secs` while >=1 peer is connected, past a startup grace equal to the
+/// window) it logs loudly (`tracing::error!` — reaches debug.log regardless of
+/// subscriber state — plus a redundant `eprintln!` captured by journald) and
+/// `std::process::exit(1)`s for a crash-only restart. It deliberately does NOT
+/// attempt the async graceful-shutdown flush: that path could itself hang
+/// because the runtime is wedged; the connect loop's periodic atomic UTXO+tip
+/// flush already makes a hard exit crash-safe. Exit code 1 matches the node's
+/// other hard-exit sites so systemd `Restart=on-failure` treats it the same.
+///
+/// `frozen_height` is read only at fire time (cosmetic, for the log line) so
+/// its cost is irrelevant; it is the one non-lock-free thing the watchdog
+/// touches, and only after the fire decision is already made.
+pub fn spawn_p2p_watchdog<F>(
+    heartbeat: Arc<AtomicU64>,
+    peer_count: Arc<AtomicUsize>,
+    window_secs: u64,
+    frozen_height: F,
+) -> std::thread::JoinHandle<()>
+where
+    F: Fn() -> Option<u32> + Send + 'static,
+{
+    let window = Duration::from_secs(window_secs);
+    // Poll roughly once per window but at most every 30s (keeps the 900s
+    // default responsive to at most ~one extra poll of latency) and at least
+    // every 1s (keeps tiny test windows cheap). Detection latency is bounded by
+    // `poll` beyond `window`.
+    let poll = Duration::from_secs(window_secs.clamp(1, 30));
+    std::thread::Builder::new()
+        .name("p2p-watchdog".into())
+        .spawn(move || {
+            let start = Instant::now();
+            let mut last_hb = heartbeat.load(Ordering::Relaxed);
+            let mut last_change = start;
+            loop {
+                std::thread::sleep(poll);
+                let now = Instant::now();
+                let hb = heartbeat.load(Ordering::Relaxed);
+                if hb != last_hb {
+                    // Activity observed -> reset the flat-for clock.
+                    last_hb = hb;
+                    last_change = now;
+                    continue;
+                }
+                let peers = peer_count.load(Ordering::Relaxed);
+                if !watchdog_should_fire(
+                    now.duration_since(start),
+                    now.duration_since(last_change),
+                    peers,
+                    window,
+                ) {
+                    continue;
+                }
+                let h = frozen_height();
+                let msg = format!(
+                    "P2P WATCHDOG: no inbound P2P activity for {}s with {} connected peer(s) \
+                     (frozen tip height={:?}); async runtime appears wedged — exiting(1) for \
+                     crash-only restart (systemd relaunches; node resumes from last atomic flush)",
+                    now.duration_since(last_change).as_secs(),
+                    peers,
+                    h
+                );
+                tracing::error!("{}", msg);
+                eprintln!("{}", msg);
+                std::process::exit(1);
+            }
+        })
+        .expect("spawn p2p-watchdog thread")
+}
+
+// ============================================================
 // TESTS
 // ============================================================
 
@@ -556,5 +664,39 @@ mod tests {
         let (d, _) = debug_categories_to_directives("net,mempool,rpc");
         let filter = EnvFilter::try_new(format!("info,{}", d)).unwrap();
         let _ = filter; // just confirming parse succeeds
+    }
+
+    #[test]
+    fn watchdog_fire_matrix() {
+        let w = Duration::from_secs(900);
+        // All three conditions met -> fire.
+        assert!(watchdog_should_fire(
+            Duration::from_secs(1000),
+            Duration::from_secs(950),
+            8,
+            w
+        ));
+        // Isolated (0 peers) -> never fire (anti-restart-loop gate).
+        assert!(!watchdog_should_fire(
+            Duration::from_secs(1000),
+            Duration::from_secs(950),
+            0,
+            w
+        ));
+        // Heartbeat not flat long enough -> no fire.
+        assert!(!watchdog_should_fire(
+            Duration::from_secs(1000),
+            Duration::from_secs(100),
+            8,
+            w
+        ));
+        // Still inside the startup grace floor -> no fire (asserted
+        // independently: here flat_for == since_start < window).
+        assert!(!watchdog_should_fire(
+            Duration::from_secs(100),
+            Duration::from_secs(100),
+            8,
+            w
+        ));
     }
 }

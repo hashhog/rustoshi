@@ -197,6 +197,14 @@ struct Cli {
     #[arg(long, default_value = "9332")]
     metrics_port: u16,
 
+    /// P2P liveness watchdog: restart (exit 1) if no inbound P2P activity for
+    /// this many seconds while >=1 peer is connected. 0 disables. Default 900
+    /// (15 min): healthy nodes see ping/inv within ~2 min, so 15 min of total
+    /// P2P silence is a wedged async runtime. See
+    /// receipts/rustoshi-live-p2p-hang-2026-07-24.md.
+    #[arg(long = "p2p-watchdog-secs", default_value = "900", value_name = "SECS")]
+    p2p_watchdog_secs: u64,
+
     /// Prune blockchain data to this many MiB
     #[arg(long)]
     prune: Option<u64>,
@@ -2140,6 +2148,13 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
             }
         }
     }
+    if !was_set(raw_argv, "p2p-watchdog-secs") && !was_set(raw_argv, "p2p_watchdog_secs") {
+        if let Some(v) = conf.get("p2p_watchdog_secs") {
+            if let Ok(n) = v.parse::<u64>() {
+                cli.p2p_watchdog_secs = n;
+            }
+        }
+    }
     if !was_set(raw_argv, "prune") {
         if let Some(v) = conf.get("prune") {
             if let Ok(n) = v.parse::<u64>() {
@@ -3611,6 +3626,32 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     addrman_dump_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     addrman_dump_interval.tick().await; // consume the immediate t=0 tick
 
+    // ---------- P2P LIVENESS WATCHDOG (dedicated OS thread) ----------
+    // Self-heals the async task-scheduling stall (lost wakeup / silent
+    // producer-task death) that froze the deployed node on 2026-07-24 (all
+    // threads idle, RPC live, P2P dead — see
+    // receipts/rustoshi-live-p2p-hang-2026-07-24.md). A std::thread (which
+    // survives a fully-wedged tokio runtime — a tokio-task watchdog could
+    // itself be starved by the same lost wakeup) watches an AtomicU64 inbound-
+    // P2P heartbeat bumped in the event_rx arm below. If it flatlines for
+    // --p2p-watchdog-secs while >=1 peer is connected it logs loudly and
+    // exit(1)s for a crash-only systemd restart (the connect loop already
+    // flushes UTXO+tip atomically, so resuming from the last flush is safe).
+    let p2p_heartbeat = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let watchdog_peer_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    if cli.p2p_watchdog_secs > 0 {
+        let hb = Arc::clone(&p2p_heartbeat);
+        let pc = Arc::clone(&watchdog_peer_count);
+        let db_wd = Arc::clone(&db);
+        ops::spawn_p2p_watchdog(hb, pc, cli.p2p_watchdog_secs, move || {
+            BlockStore::new(&db_wd).get_best_height().ok().flatten()
+        });
+        tracing::info!(
+            "P2P liveness watchdog armed: exit(1) after {}s of flat inbound P2P activity with >=1 peer",
+            cli.p2p_watchdog_secs
+        );
+    }
+
     loop {
         tokio::select! {
             // Fast validation tick — process buffered blocks frequently.
@@ -4034,6 +4075,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             // Handle peer events (polled without holding any locks)
             event = event_rx.recv() => {
+                // P2P liveness heartbeat: bump on every processed peer message/
+                // event (this mpsc is the single inbound-P2P funnel — every
+                // Connected/Message/Disconnected/Misbehaving drains through here
+                // exactly once). Skip the None (channel closed / shutdown) case.
+                // Flatlines under BOTH observed wedge modes: lost wakeup (this
+                // arm stops being polled) and silent producer-task death (recv
+                // stays Pending forever). Watched by the OS-thread watchdog
+                // armed above. Relaxed is sufficient: single-writer bump here,
+                // single-reader compare in the watchdog.
+                if event.is_some() {
+                    p2p_heartbeat.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 match event {
                     Some(PeerEvent::Connected(peer_id, info, stats)) => {
                         // Register inbound peer handle in PeerManager
@@ -4054,6 +4107,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         );
                         header_sync.register_peer(peer_id, info.start_height);
                         block_downloader.add_peer(peer_id);
+                        // Keep the watchdog's lock-free connected-peer mirror in
+                        // sync (== getpeerinfo view) so its >=1 anti-restart-loop
+                        // gate is accurate.
+                        watchdog_peer_count.store(
+                            header_sync.peer_count(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
 
                         // Start header sync if we need to catch up
                         match header_sync.start_sync(|h| {
@@ -6248,6 +6308,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         tracing::info!("Peer {} disconnected: {:?}", peer_id.0, reason);
                         header_sync.remove_peer(peer_id);
                         block_downloader.remove_peer(peer_id);
+                        // Re-sync the watchdog peer mirror so the gate drops to 0
+                        // when the node becomes isolated (a legitimately peerless
+                        // node must not restart-loop).
+                        watchdog_peer_count.store(
+                            header_sync.peer_count(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         // Discard any in-flight partial block for this peer —
                         // the blocktxn response will never arrive.
                         inflight_partial_blocks.retain(|(pid, _), _| *pid != peer_id.0);
