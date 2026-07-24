@@ -189,7 +189,10 @@ pub const MAX_MULTISIG_KEYS: usize = 20;
 pub const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 
 /// Minimum relay transaction fee rate in satoshis per kvB.
-pub const DEFAULT_MIN_RELAY_TX_FEE: u64 = 1_000;
+/// Core v31 `policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE{100}` — lowered from
+/// the historical 1000. Kept in step with `mempool.rs` (min_fee_rate: 100) and
+/// `network::relay::DEFAULT_MIN_RELAY_FEE`.
+pub const DEFAULT_MIN_RELAY_TX_FEE: u64 = 100;
 
 /// Dust threshold: minimum output value (546 satoshis for P2PKH at 3000 sat/kvB).
 pub const DUST_RELAY_TX_FEE: u64 = 3_000;
