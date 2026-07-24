@@ -60,16 +60,23 @@ pub const AVG_FEEFILTER_BROADCAST_INTERVAL: Duration = Duration::from_secs(10 * 
 /// Reference: Bitcoin Core `MAX_FEEFILTER_CHANGE_DELAY`
 pub const MAX_FEEFILTER_CHANGE_DELAY: Duration = Duration::from_secs(5 * 60);
 
-/// Default minimum relay fee rate in sat/kvB (1000 sat/kvB = 1 sat/vB).
-/// This is the minimum fee rate we will relay transactions at.
-/// Reference: Bitcoin Core `DEFAULT_MIN_RELAY_TX_FEE`
-pub const DEFAULT_MIN_RELAY_FEE: u64 = 1000;
+/// Default minimum relay fee rate in sat/kvB (100 sat/kvB = 0.1 sat/vB).
+/// This is the minimum fee rate we will relay transactions at, and the floor of
+/// the BIP-133 `feefilter` we advertise to peers.
+/// Reference: Bitcoin Core `DEFAULT_MIN_RELAY_TX_FEE` (policy/policy.h:70).
+/// NB Core LOWERED this from 1000 to 100; holding 1000 here made us advertise a
+/// feefilter 10x too high, so peers withheld transactions Core relays and our
+/// mempool drifted from Core's. The consensus crate (mempool.rs) and the RPC
+/// layer already used 100 — this was the odd one out.
+pub const DEFAULT_MIN_RELAY_FEE: u64 = 100;
 
-/// Default incremental relay fee rate in sat/kvB (1000 sat/kvB = 1 sat/vB).
+/// Default incremental relay fee rate in sat/kvB (100 sat/kvB = 0.1 sat/vB).
 /// For RBF, the replacement must pay at least this much per kvB more than the original.
 /// Also used as the minimum fee rate step for mempool limiting.
-/// Reference: Bitcoin Core `DEFAULT_INCREMENTAL_RELAY_FEE`
-pub const DEFAULT_INCREMENTAL_RELAY_FEE: u64 = 1000;
+/// Reference: Bitcoin Core `DEFAULT_INCREMENTAL_RELAY_FEE` (policy/policy.h:48).
+/// Also lowered by Core from 1000 to 100; at 1000 we required a 10x-too-large
+/// fee bump and rejected replacements Core accepts.
+pub const DEFAULT_INCREMENTAL_RELAY_FEE: u64 = 100;
 
 /// Maximum money value (21 million BTC in satoshis).
 /// Used as the feefilter value during IBD to signal "don't send me txs".
@@ -1347,8 +1354,9 @@ mod tests {
     #[test]
     fn test_feefilter_constants() {
         // Verify constants match Bitcoin Core
-        assert_eq!(DEFAULT_MIN_RELAY_FEE, 1000); // 1000 sat/kvB
-        assert_eq!(DEFAULT_INCREMENTAL_RELAY_FEE, 1000); // 1000 sat/kvB
+        // Core v31 policy/policy.h:70 and :48 — both lowered from 1000 to 100.
+        assert_eq!(DEFAULT_MIN_RELAY_FEE, 100); // 100 sat/kvB = 0.1 sat/vB
+        assert_eq!(DEFAULT_INCREMENTAL_RELAY_FEE, 100); // 100 sat/kvB = 0.1 sat/vB
         assert_eq!(AVG_FEEFILTER_BROADCAST_INTERVAL, Duration::from_secs(600)); // 10 min
         assert_eq!(MAX_FEEFILTER_CHANGE_DELAY, Duration::from_secs(300)); // 5 min
         assert_eq!(MAX_MONEY, 21_000_000 * 100_000_000); // 21M BTC in satoshis
@@ -1494,8 +1502,8 @@ mod tests {
 
     #[test]
     fn test_incremental_relay_fee_constants() {
-        // Verify incremental relay fee default
-        assert_eq!(DEFAULT_INCREMENTAL_RELAY_FEE, 1000); // 1000 sat/kvB = 1 sat/vB
+        // Core v31 policy/policy.h:48 — lowered from 1000 to 100.
+        assert_eq!(DEFAULT_INCREMENTAL_RELAY_FEE, 100); // 100 sat/kvB = 0.1 sat/vB
     }
 
     #[test]
@@ -1559,8 +1567,13 @@ mod tests {
 
     #[test]
     fn test_pays_for_rbf_rule4() {
-        // Rule #4: Additional fees must cover incremental relay fee * vsize
-        let incremental_fee = DEFAULT_INCREMENTAL_RELAY_FEE; // 1000 sat/kvB
+        // Rule #4: Additional fees must cover incremental relay fee * vsize.
+        // Uses an explicit 1000 sat/kvB rather than DEFAULT_INCREMENTAL_RELAY_FEE:
+        // this test exercises the pays_for_rbf ARITHMETIC, so it must not move
+        // whenever Core retunes the default (it went 1000 -> 100 in v31). The
+        // default's value is asserted separately in
+        // test_incremental_relay_fee_constants.
+        let incremental_fee: u64 = 1000; // sat/kvB
 
         // For 1000 vB at 1000 sat/kvB, need 1000 additional sat
         // Original: 1000, Replacement: 2000, vsize: 1000
@@ -1588,8 +1601,9 @@ mod tests {
 
     #[test]
     fn test_pays_for_rbf_large_transactions() {
-        // Test with large transactions
-        let incremental_fee = DEFAULT_INCREMENTAL_RELAY_FEE;
+        // Test with large transactions. Explicit 1000 sat/kvB — arithmetic test,
+        // decoupled from the Core default (see test_pays_for_rbf_rule4).
+        let incremental_fee: u64 = 1000;
         let large_vsize: u64 = 100_000; // 100 kvB
         let required_additional = get_fee(incremental_fee, large_vsize);
 
@@ -1606,7 +1620,10 @@ mod tests {
 
     #[test]
     fn test_feefilter_manager_rbf_check() {
-        let manager = FeeFilterManager::default();
+        // Explicit 1000 sat/kvB incremental so this exercises the manager's
+        // delegation to pays_for_rbf, not the Core default's current value
+        // (which moved 1000 -> 100 in v31).
+        let manager = FeeFilterManager::new(DEFAULT_MIN_RELAY_FEE, 1000);
 
         // Test through manager interface
         assert!(manager.pays_for_rbf(1000, 2000, 1000).is_ok());
