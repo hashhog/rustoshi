@@ -116,10 +116,49 @@ pub struct ScriptFlags {
 }
 
 impl ScriptFlags {
-    /// Create flags for consensus validation at a given block height.
+    /// DEPRECATED — **NOT** the block-validation flag source. Do not use.
     ///
-    /// Only enables consensus-critical flags based on soft fork activation.
-    /// Does NOT enable policy flags.
+    /// # This is not `GetBlockScriptFlags`
+    ///
+    /// The one and only flag source for block validation is
+    /// `script_flags_for_height(height, block_hash, params)` in
+    /// `validation.rs`, reached from `connect_block_with_sequence_locks`.
+    /// That function is the analogue of Bitcoin Core
+    /// `GetBlockScriptFlags` (validation.cpp:2250-2289).
+    ///
+    /// This helper has **zero production callers** (only tests reference it)
+    /// and is kept solely so those tests keep compiling. It is wrong for
+    /// block validation in three independent ways, and each one is a
+    /// consensus divergence if it were ever wired up:
+    ///
+    /// 1. **Hash-blind.** It takes no block hash, so it cannot consult
+    ///    `script_flag_exceptions`. Blocks 170060 (BIP-16 violator) and
+    ///    692261 (Taproot violator) would be FALSE-REJECTED on any full
+    ///    revalidation. This is precisely the latent hard-fork shape that
+    ///    was found and fixed in clearbit (bc7cb98).
+    /// 2. **Height-gates the wrong flags.** It gates P2SH, WITNESS and
+    ///    TAPROOT by height. Core sets all three UNCONDITIONALLY for every
+    ///    block (validation.cpp:2262) and has no `BIP16Height` and no
+    ///    `taprootHeight`. Only DERSIG/CLTV/CSV/NULLDUMMY remain height-gated.
+    /// 3. **Leaks policy flags into a "consensus" flag set.** It sets
+    ///    `verify_nullfail` (BIP-146) and `verify_witness_pubkeytype`, both of
+    ///    which are STANDARD_SCRIPT_VERIFY_FLAGS (policy only, policy.h:125).
+    ///    Enforcing them in block validation rejects valid blocks.
+    ///
+    /// Its hard-coded mainnet heights are also duplicated state that silently
+    /// diverges from `ChainParams`. If you arrived here grepping for height
+    /// gates during a consensus change: this is the decoy, `validation.rs`
+    /// has the real one. Leave this alone.
+    ///
+    /// Retained-for-tests only; slated for deletion once the stale
+    /// `w105_checkqueue` G26/G27 gates are rewritten against
+    /// `script_flags_for_height`.
+    #[deprecated(
+        note = "NOT the block-validation flag source: hash-blind (cannot honour \
+                script_flag_exceptions), height-gates P2SH/WITNESS/TAPROOT which Core \
+                sets unconditionally, and leaks policy flags. Use \
+                validation::script_flags_for_height(height, block_hash, params)."
+    )]
     pub fn consensus_flags(height: u32, testnet4: bool) -> Self {
         // Activation heights (mainnet / testnet4)
         let p2sh_height = if testnet4 { 1 } else { 173_805 };

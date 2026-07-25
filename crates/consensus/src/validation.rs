@@ -2933,56 +2933,94 @@ pub fn disconnect_block(
 // SCRIPT FLAGS
 // ============================================================
 
-/// Get the script verification flags for a given block height.
+/// Get the script verification flags for a block, keyed on `block_hash` and `height`.
+///
+/// THIS IS THE ONE AND ONLY BLOCK-VALIDATION FLAG SOURCE. It is the exact
+/// analogue of Bitcoin Core `GetBlockScriptFlags(const CBlockIndex&, const
+/// ChainstateManager&)` (validation.cpp:2250-2289). Do not confuse it with
+/// `ScriptFlags::consensus_flags()` (script/interpreter.rs), which is a
+/// deprecated, hash-blind, hard-coded-height helper with NO production caller.
 ///
 /// **CRITICAL**: Only returns Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS.
 /// Adding policy flags here causes valid blocks to be rejected.
 ///
-/// Consensus flags by activation height:
-/// - P2SH: BIP-16 (always on after activation)
-/// - DERSIG: BIP-66
-/// - CLTV: BIP-65
-/// - CSV: BIP-68/112/113
-/// - WITNESS: BIP-141/143
-/// - NULLDUMMY: BIP-147 (activated with SegWit) — consensus rule
-/// - TAPROOT: BIP-341/342
+/// Core's algorithm, reproduced exactly, in three ordered steps:
+///
+/// 1. BASE — `SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT`
+///    UNCONDITIONALLY, for every block at every height (validation.cpp:2262).
+///    Core has had no `BIP16Height` and no `taprootHeight` gate on these three
+///    since v23; "for simplicity, always leave P2SH+WITNESS+TAPROOT on except
+///    for the violating blocks". Reintroducing a height gate here is a
+///    consensus divergence, not an optimisation.
+/// 2. EXCEPTION — on a BLOCK-HASH hit in `params.script_flag_exceptions`,
+///    **REPLACE** the whole flag set with the table value (Core: `flags =
+///    it->second;`, validation.cpp:2264-2267). Not an OR, not a subtraction,
+///    not an early return.
+/// 3. HEIGHT GATES — **THEN** OR the only four still-height-gated flags on
+///    top of whatever step 2 left: DERSIG (BIP-66), CLTV (BIP-65), CSV
+///    (BIP-68/112/113), NULLDUMMY (BIP-147, rides SegWit activation).
+///    Core validation.cpp:2268-2286.
+///
+/// Step 3 running AFTER step 2 is load-bearing and is what makes block 692261
+/// validate correctly: its exception value is `P2SH|WITNESS`, but the block
+/// still needs DERSIG|CLTV|CSV|NULLDUMMY OR-ed on because those were all
+/// active at height 692261. An early-return on the exception (the previous
+/// behaviour here) produced `P2SH|WITNESS` alone and would have wrongly
+/// ACCEPTED transactions that Core rejects under those four rules.
+///
+/// The exception lookup uses internal byte order (same convention as
+/// `bip30_exception_blocks`: `Hash256::from_hex` reverses display→internal,
+/// `block_hash()` returns internal). Do not "fix" the byte order — a
+/// fleet-wide census plus the byte-reversed negative-control tests below
+/// prove the current orientation is correct.
 ///
 /// NULLFAIL (BIP-146) is a STANDARD_SCRIPT_VERIFY_FLAG (policy only) per
 /// Bitcoin Core policy/policy.h:125.  It must NOT appear here.
 fn script_flags_for_height(height: u32, block_hash: Hash256, params: &ChainParams) -> ScriptFlags {
-    // Per-block script flag exceptions (BIP16 violator + taproot violator).
-    // These historical blocks must be accepted with the flags active at the time
-    // they were mined, NOT the flags that would normally apply at their height.
-    // Bitcoin Core: validation.cpp GetBlockScriptFlags, g_script_flag_exceptions.
-    // The lookup uses internal byte order (same convention as bip30_exception_blocks:
-    // Hash256::from_hex reverses display→internal, block_hash() returns internal).
-    if let Some(override_flags) = params.script_flag_exceptions.get(&block_hash) {
-        return override_flags.clone();
-    }
-
+    // --- Step 1: BASE. P2SH | WITNESS | TAPROOT, unconditional, every block.
+    // Bitcoin Core validation.cpp:2262:
+    //   script_verify_flags flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS
+    //                             | SCRIPT_VERIFY_TAPROOT};
+    //
     // NOTE: Do NOT add policy flags here!
     // CLEANSTACK, LOW_S, STRICTENC, MINIMALDATA, MINIMALIF, NULLFAIL,
     // WITNESS_PUBKEYTYPE, etc. are policy-only and must NOT be enforced
     // during block validation.  Ref: Bitcoin Core validation.cpp:2250-2289.
-
-    ScriptFlags {
-        // P2SH is always enabled after its activation
+    let mut flags = ScriptFlags {
+        // BIP-16: P2SH. Unconditional; block 170060 is handled by the table.
         verify_p2sh: true,
-        // BIP-66: Strict DER signatures
-        verify_dersig: height >= params.bip66_height,
-        // BIP-65: CHECKLOCKTIMEVERIFY
-        verify_checklocktimeverify: height >= params.bip65_height,
-        // BIP-68/112/113: CSV
-        verify_checksequenceverify: height >= params.csv_height,
-        // BIP-141/143: SegWit
-        verify_witness: height >= params.segwit_height,
-        // BIP-147: NULLDUMMY (activated with SegWit) — consensus rule
-        verify_nulldummy: height >= params.segwit_height,
-        // BIP-341/342: Taproot
-        verify_taproot: height >= params.taproot_height,
-        // All policy flags stay at default (false), including verify_nullfail
+        // BIP-141/143: SegWit. Unconditional.
+        verify_witness: true,
+        // BIP-341/342: Taproot. Unconditional; block 692261 is handled by the table.
+        verify_taproot: true,
+        // All other flags — including every policy flag — stay false here.
         ..Default::default()
+    };
+
+    // --- Step 2: EXCEPTION. REPLACE the flag set on a block-hash hit.
+    // Bitcoin Core validation.cpp:2264-2267:
+    //   const auto it{consensusparams.script_flag_exceptions.find(...)};
+    //   if (it != ...end()) { flags = it->second; }
+    // These historical blocks must be validated with the flags in the table,
+    // NOT the flags that would normally apply at their height.
+    if let Some(override_flags) = params.script_flag_exceptions.get(&block_hash) {
+        flags = override_flags.clone();
     }
+
+    // --- Step 3: HEIGHT GATES, OR-ed on top of step 2's result.
+    // These four are the ONLY flags Core still gates by activation, and it
+    // applies them after the exception replacement. Bitcoin Core
+    // validation.cpp:2268-2286 (`flags |= SCRIPT_VERIFY_*`).
+    // BIP-66: Strict DER signatures.
+    flags.verify_dersig |= height >= params.bip66_height;
+    // BIP-65: CHECKLOCKTIMEVERIFY.
+    flags.verify_checklocktimeverify |= height >= params.bip65_height;
+    // BIP-68/112/113: CSV.
+    flags.verify_checksequenceverify |= height >= params.csv_height;
+    // BIP-147: NULLDUMMY (activated simultaneously with SegWit) — consensus rule.
+    flags.verify_nulldummy |= height >= params.segwit_height;
+
+    flags
 }
 
 // ============================================================
@@ -3791,16 +3829,27 @@ mod tests {
     // script_flags_for_height tests
     // =========================
 
+    // WAVE B: the base trio P2SH|WITNESS|TAPROOT is now UNCONDITIONAL at every
+    // height, matching Bitcoin Core validation.cpp:2262. The assertions below
+    // previously encoded the old height-gated behaviour (e.g. "no WITNESS at
+    // genesis", "no TAPROOT at 500000"); those expectations were the divergence,
+    // so they are inverted here on purpose. Only DERSIG/CLTV/CSV/NULLDUMMY are
+    // still expected to move with height.
+
     #[test]
     fn script_flags_mainnet_genesis() {
         let params = ChainParams::mainnet();
         let flags = script_flags_for_height(0, Hash256::ZERO, &params);
 
-        // Only P2SH should be enabled at genesis
-        assert!(flags.verify_p2sh);
+        // Base trio: unconditional, even at genesis (Core validation.cpp:2262).
+        assert!(flags.verify_p2sh, "P2SH is unconditional in Core");
+        assert!(flags.verify_witness, "WITNESS is unconditional in Core");
+        assert!(flags.verify_taproot, "TAPROOT is unconditional in Core");
+        // Height-gated four: none active at genesis.
         assert!(!flags.verify_dersig);
         assert!(!flags.verify_checklocktimeverify);
-        assert!(!flags.verify_witness);
+        assert!(!flags.verify_checksequenceverify);
+        assert!(!flags.verify_nulldummy);
     }
 
     #[test]
@@ -3814,7 +3863,102 @@ mod tests {
         assert!(flags.verify_checksequenceverify);
         assert!(flags.verify_witness);
         assert!(flags.verify_nulldummy);
-        assert!(!flags.verify_taproot); // Not yet at 709632
+        // WAVE B: TAPROOT is unconditional. Core does NOT gate it on height
+        // 709632 (there is no `taprootHeight` in Core); the single historical
+        // violator, block 692261, is handled by script_flag_exceptions instead.
+        assert!(flags.verify_taproot, "TAPROOT is unconditional in Core, even below 709632");
+    }
+
+    /// WAVE B regression gate: the base trio must be on at EVERY height, and
+    /// the four height-gated flags must still track their activation heights.
+    /// This is the assertion that fails first if anyone reintroduces a
+    /// `BIP16Height` / `segwit_height` / `taproot_height` gate on the trio.
+    #[test]
+    fn script_flags_base_trio_unconditional_at_all_heights() {
+        let params = ChainParams::mainnet();
+        for h in [0u32, 1, 170_059, 170_061, 173_804, 173_805, 481_823, 692_260, 709_631, 800_000]
+        {
+            let f = script_flags_for_height(h, Hash256::ZERO, &params);
+            assert!(f.verify_p2sh, "P2SH must be unconditional at height {h}");
+            assert!(f.verify_witness, "WITNESS must be unconditional at height {h}");
+            assert!(f.verify_taproot, "TAPROOT must be unconditional at height {h}");
+            // The four that legitimately remain height-gated.
+            assert_eq!(f.verify_dersig, h >= params.bip66_height, "DERSIG gate at {h}");
+            assert_eq!(
+                f.verify_checklocktimeverify,
+                h >= params.bip65_height,
+                "CLTV gate at {h}"
+            );
+            assert_eq!(
+                f.verify_checksequenceverify,
+                h >= params.csv_height,
+                "CSV gate at {h}"
+            );
+            assert_eq!(f.verify_nulldummy, h >= params.segwit_height, "NULLDUMMY gate at {h}");
+        }
+    }
+
+    /// WAVE B regression gate: Core REPLACES the flag set on an exception hit,
+    /// then ORs the four height-gated flags ON TOP (validation.cpp:2264-2286).
+    ///
+    /// This is the assertion that fails if anyone reverts to the previous
+    /// early-return, or implements the exception subtractively. Block 692261's
+    /// override is P2SH|WITNESS, but at height 692261 DERSIG, CLTV, CSV and
+    /// NULLDUMMY were all long active and MUST still be enforced — an
+    /// early-return drops all four and wrongly accepts what Core rejects.
+    #[test]
+    fn script_flags_exception_replaces_then_ors_height_gates() {
+        let params = ChainParams::mainnet();
+        let taproot_exc = Hash256::from_hex(
+            "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+        )
+        .unwrap();
+
+        // At the violator's real height, every height gate is active.
+        let f = script_flags_for_height(692_261, taproot_exc, &params);
+
+        // From the REPLACED exception value:
+        assert!(f.verify_p2sh, "exception value supplies P2SH");
+        assert!(f.verify_witness, "exception value supplies WITNESS");
+        assert!(!f.verify_taproot, "exception value clears TAPROOT — this is the whole point");
+
+        // OR-ed on top AFTER the replacement — the early-return bug loses these:
+        assert!(f.verify_dersig, "DERSIG must be OR-ed on after the exception replace");
+        assert!(
+            f.verify_checklocktimeverify,
+            "CLTV must be OR-ed on after the exception replace"
+        );
+        assert!(f.verify_checksequenceverify, "CSV must be OR-ed on after the exception replace");
+        assert!(f.verify_nulldummy, "NULLDUMMY must be OR-ed on after the exception replace");
+
+        // Policy flags must not leak in via either step.
+        assert!(!f.verify_nullfail);
+        assert!(!f.verify_cleanstack);
+        assert!(!f.verify_witness_pubkeytype);
+
+        // The BIP16 violator (override = NONE) at a height where all four gates
+        // are active: REPLACE wipes the trio, then the four come back on top.
+        let bip16_exc = Hash256::from_hex(
+            "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+        )
+        .unwrap();
+        let g = script_flags_for_height(800_000, bip16_exc, &params);
+        assert!(!g.verify_p2sh, "NONE override clears P2SH");
+        assert!(!g.verify_witness, "NONE override clears WITNESS");
+        assert!(!g.verify_taproot, "NONE override clears TAPROOT");
+        assert!(g.verify_dersig, "height gates still OR on top of a NONE override");
+        assert!(g.verify_checklocktimeverify);
+        assert!(g.verify_checksequenceverify);
+        assert!(g.verify_nulldummy);
+
+        // ...and at the violator's OWN height (170060) none of the four are
+        // active yet, so the result is genuinely the empty set.
+        let h = script_flags_for_height(170_060, bip16_exc, &params);
+        assert!(!h.verify_p2sh);
+        assert!(!h.verify_dersig);
+        assert!(!h.verify_checklocktimeverify);
+        assert!(!h.verify_checksequenceverify);
+        assert!(!h.verify_nulldummy);
     }
 
     #[test]
@@ -3894,12 +4038,21 @@ mod tests {
         .unwrap();
 
         // (a) Exception hash at a height where taproot would normally be active
-        //     → override P2SH + WITNESS only; taproot MUST be OFF.
+        //     → override supplies P2SH + WITNESS; taproot MUST be OFF.
         let exc_flags = script_flags_for_height(750_000, taproot_exception, &params);
         assert!(exc_flags.verify_p2sh,    "taproot exception: verify_p2sh must be ON");
         assert!(exc_flags.verify_witness, "taproot exception: verify_witness must be ON");
         assert!(!exc_flags.verify_taproot, "taproot exception: verify_taproot must be OFF");
-        assert!(!exc_flags.verify_dersig,  "taproot exception: verify_dersig must be OFF (only p2sh+witness)");
+        // WAVE B: this assertion used to read `!exc_flags.verify_dersig`, which
+        // encoded the early-return divergence. Core REPLACES with the override
+        // and THEN ORs the height gates on top (validation.cpp:2264-2286), so at
+        // h=750000 (>= bip66_height 363725) DERSIG is ON. An exception must
+        // suppress ONLY the trio bits the table clears — never the four
+        // height-gated rules that were active when the block was mined.
+        assert!(
+            exc_flags.verify_dersig,
+            "taproot exception: DERSIG must still be OR-ed on at h=750000 (replace-then-OR)"
+        );
 
         // (b) Non-exception hash at the same height → taproot ON (normal path).
         let normal_flags = script_flags_for_height(750_000, Hash256::ZERO, &params);
@@ -3939,6 +4092,171 @@ mod tests {
         // (if this hash incorrectly triggered an exception it would return all-false).
         assert!(flags.verify_p2sh,    "testnet4: mainnet exception hash must NOT fire, verify_p2sh ON");
         assert!(flags.verify_taproot, "testnet4: mainnet exception hash must NOT fire, verify_taproot ON");
+    }
+
+    // -----------------------------------------------------------------------
+    // W-B0 NEGATIVE CONTROL — the BYTE-REVERSED exception hash must NOT match.
+    // -----------------------------------------------------------------------
+    // Every positive assertion above is VACUOUS on its own.  At height 170060
+    // "the exception fired and returned SCRIPT_VERIFY_NONE" and "no exception
+    // fired and every flag happens to be off by height" produce the SAME
+    // answer.  A byte-order slip anywhere in the chain (the stored constant,
+    // Hash256::from_hex, or the block-hash producer) would therefore pass the
+    // whole positive suite while the lookup never fires on a real block —
+    // exactly the silently-inert table the Wave B census was hunting.
+    //
+    // The control: feed the BYTE-REVERSED exception hash and prove it is NOT
+    // treated as an exception.  Two assertions per entry:
+    //   (a) reversed == a known-non-exception control hash at the same height
+    //       (structural equality, so it stays true across the Wave B base-trio
+    //       flip — it never hard-codes the by-height answer); and
+    //   (c) at a height where P2SH|WITNESS|TAPROOT are all live, the reversed
+    //       hash carries the FULL trio while the correct hash still returns
+    //       the override.  That pair is what a byte-order slip cannot fake.
+    // (b) is a non-vacuity guard: the CORRECT hash must differ from the
+    // control, otherwise (a) proves nothing.
+    //
+    // Bitcoin Core: validation.cpp:2262 (unconditional P2SH|WITNESS|TAPROOT),
+    // kernel/chainparams.cpp:85-88 + :210-211 (hash-keyed exceptions).
+
+    /// Structural-equality proxy for `ScriptFlags`.
+    ///
+    /// The production type derives `Debug` but not `PartialEq`; `Debug` prints
+    /// every field, so comparing the rendering compares every flag and keeps
+    /// working if fields are added later.  Deliberately avoids adding a derive
+    /// to the consensus struct just for a test.
+    fn flags_fingerprint(f: &ScriptFlags) -> String {
+        format!("{f:?}")
+    }
+
+    #[test]
+    fn script_flags_exception_mainnet_bip16_byte_reversed_does_not_fire() {
+        let params = ChainParams::mainnet();
+        let correct = Hash256::from_hex(
+            "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+        )
+        .unwrap();
+        // The byte-order slip under test: display-order bytes handed to a
+        // lookup that expects internal order (or vice versa).
+        let reversed = correct.reversed();
+        assert_ne!(correct, reversed, "exception hash must not be a byte-order palindrome");
+        assert_eq!(
+            reversed.to_hex(),
+            "229c4fac88bab194eb08f1a528cc308ded2397f4f4eb6e75dc02000000000000",
+            "byte-reversed BIP16 hash drifted — Hash256::reversed() is broken"
+        );
+
+        let control = Hash256::ZERO;
+
+        // (a) At the violator's own height the reversed hash must be ordinary.
+        assert_eq!(
+            flags_fingerprint(&script_flags_for_height(170_060, reversed, &params)),
+            flags_fingerprint(&script_flags_for_height(170_060, control, &params)),
+            "byte-reversed BIP16 hash must NOT hit the exception table at h=170060"
+        );
+
+        // (b) Non-vacuity: the correct hash MUST differ from the control there.
+        assert_ne!(
+            flags_fingerprint(&script_flags_for_height(170_060, correct, &params)),
+            flags_fingerprint(&script_flags_for_height(170_060, control, &params)),
+            "BIP16 exception must change the flags vs a non-exception hash at h=170060"
+        );
+
+        // (c) At h=800000 the base trio is live by height, so the two answers
+        //     are maximally far apart: reversed => full trio, correct => NONE.
+        let hi_reversed = script_flags_for_height(800_000, reversed, &params);
+        assert!(hi_reversed.verify_p2sh,    "reversed BIP16 hash @800000: P2SH must be ON");
+        assert!(hi_reversed.verify_witness, "reversed BIP16 hash @800000: WITNESS must be ON");
+        assert!(hi_reversed.verify_taproot, "reversed BIP16 hash @800000: TAPROOT must be ON");
+        let hi_correct = script_flags_for_height(800_000, correct, &params);
+        assert!(!hi_correct.verify_p2sh,    "BIP16 exception @800000: P2SH must be OFF (NONE)");
+        assert!(!hi_correct.verify_witness, "BIP16 exception @800000: WITNESS must be OFF (NONE)");
+        assert!(!hi_correct.verify_taproot, "BIP16 exception @800000: TAPROOT must be OFF (NONE)");
+    }
+
+    #[test]
+    fn script_flags_exception_mainnet_taproot_byte_reversed_does_not_fire() {
+        let params = ChainParams::mainnet();
+        let correct = Hash256::from_hex(
+            "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+        )
+        .unwrap();
+        let reversed = correct.reversed();
+        assert_ne!(correct, reversed, "exception hash must not be a byte-order palindrome");
+        assert_eq!(
+            reversed.to_hex(),
+            "ad95e3a15ee5ffd585c5e81d44b56a981e842d5bc3140f000000000000000000",
+            "byte-reversed taproot hash drifted — Hash256::reversed() is broken"
+        );
+
+        let control = Hash256::ZERO;
+
+        // (a) At the violator's own height (692261) the reversed hash is ordinary.
+        assert_eq!(
+            flags_fingerprint(&script_flags_for_height(692_261, reversed, &params)),
+            flags_fingerprint(&script_flags_for_height(692_261, control, &params)),
+            "byte-reversed taproot hash must NOT hit the exception table at h=692261"
+        );
+
+        // (b) Non-vacuity at the same height.
+        assert_ne!(
+            flags_fingerprint(&script_flags_for_height(692_261, correct, &params)),
+            flags_fingerprint(&script_flags_for_height(692_261, control, &params)),
+            "taproot exception must change the flags vs a non-exception hash at h=692261"
+        );
+
+        // (c) h=800000: reversed => full trio; correct => P2SH|WITNESS, no TAPROOT.
+        let hi_reversed = script_flags_for_height(800_000, reversed, &params);
+        assert!(hi_reversed.verify_p2sh,    "reversed taproot hash @800000: P2SH must be ON");
+        assert!(hi_reversed.verify_witness, "reversed taproot hash @800000: WITNESS must be ON");
+        assert!(hi_reversed.verify_taproot, "reversed taproot hash @800000: TAPROOT must be ON");
+        let hi_correct = script_flags_for_height(800_000, correct, &params);
+        assert!(hi_correct.verify_p2sh,     "taproot exception @800000: P2SH must be ON");
+        assert!(hi_correct.verify_witness,  "taproot exception @800000: WITNESS must be ON");
+        assert!(!hi_correct.verify_taproot, "taproot exception @800000: TAPROOT must be OFF");
+    }
+
+    #[test]
+    fn script_flags_exception_testnet3_bip16_byte_reversed_does_not_fire() {
+        let params = ChainParams::testnet3();
+        let correct = Hash256::from_hex(
+            "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105",
+        )
+        .unwrap();
+        let reversed = correct.reversed();
+        assert_ne!(correct, reversed, "exception hash must not be a byte-order palindrome");
+        assert_eq!(
+            reversed.to_hex(),
+            "05b132a4f74a8799a57a4202d0eeb09612cc08d295401f007c4530dd00000000",
+            "byte-reversed testnet3 BIP16 hash drifted — Hash256::reversed() is broken"
+        );
+
+        let control = Hash256::ZERO;
+
+        // (a) At the violator's own height (514) the reversed hash is ordinary.
+        assert_eq!(
+            flags_fingerprint(&script_flags_for_height(514, reversed, &params)),
+            flags_fingerprint(&script_flags_for_height(514, control, &params)),
+            "byte-reversed testnet3 hash must NOT hit the exception table at h=514"
+        );
+
+        // (b) Non-vacuity at the same height.
+        assert_ne!(
+            flags_fingerprint(&script_flags_for_height(514, correct, &params)),
+            flags_fingerprint(&script_flags_for_height(514, control, &params)),
+            "testnet3 BIP16 exception must change the flags vs a non-exception hash at h=514"
+        );
+
+        // (c) h=2_100_000 > testnet3 taproot_height (2032291): reversed => full
+        //     trio; correct => NONE.
+        let hi_reversed = script_flags_for_height(2_100_000, reversed, &params);
+        assert!(hi_reversed.verify_p2sh,    "reversed testnet3 hash @2100000: P2SH must be ON");
+        assert!(hi_reversed.verify_witness, "reversed testnet3 hash @2100000: WITNESS must be ON");
+        assert!(hi_reversed.verify_taproot, "reversed testnet3 hash @2100000: TAPROOT must be ON");
+        let hi_correct = script_flags_for_height(2_100_000, correct, &params);
+        assert!(!hi_correct.verify_p2sh,    "testnet3 exception @2100000: P2SH must be OFF (NONE)");
+        assert!(!hi_correct.verify_witness, "testnet3 exception @2100000: WITNESS must be OFF (NONE)");
+        assert!(!hi_correct.verify_taproot, "testnet3 exception @2100000: TAPROOT must be OFF (NONE)");
     }
 
     // =========================

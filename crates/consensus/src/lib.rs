@@ -21,8 +21,15 @@
 //! (CLEANSTACK, LOW_S, etc.) to block validation will cause valid blocks
 //! to be rejected, forking the node from the network.
 //!
-//! See `ScriptFlags::consensus_flags()` for the correct flags to use during
-//! block validation.
+//! The block-validation flag source is `validation::script_flags_for_height`
+//! (height + BLOCK HASH + `ChainParams`), the analogue of Bitcoin Core
+//! `GetBlockScriptFlags`. It sets P2SH|WITNESS|TAPROOT unconditionally,
+//! REPLACES the flag set on a `script_flag_exceptions` block-hash hit, then
+//! ORs the four height-gated flags (DERSIG/CLTV/CSV/NULLDUMMY) on top.
+//!
+//! Do NOT use `ScriptFlags::consensus_flags()` for block validation — it is
+//! deprecated and hash-blind, so it cannot honour the script-flag exceptions
+//! for blocks 170060 and 692261. See its doc comment.
 
 pub mod block_template;
 pub mod campaign_assumeutxo;
