@@ -27,9 +27,10 @@
 //! REPLACES the flag set on a `script_flag_exceptions` block-hash hit, then
 //! ORs the four height-gated flags (DERSIG/CLTV/CSV/NULLDUMMY) on top.
 //!
-//! Do NOT use `ScriptFlags::consensus_flags()` for block validation — it is
-//! deprecated and hash-blind, so it cannot honour the script-flag exceptions
-//! for blocks 170060 and 692261. See its doc comment.
+//! It is the ONLY flag-producing function in this crate, by design. Do not add
+//! a height-only variant: a hash-blind source cannot honour the script-flag
+//! exceptions for blocks 170060 and 692261, and having one available invites
+//! the misuse that produced clearbit's latent hard-fork path (bc7cb98).
 
 pub mod block_template;
 pub mod campaign_assumeutxo;
@@ -68,7 +69,8 @@ pub use validation::{
     accept_block_header_chain_work,
     calculate_sequence_locks, check_block, check_block_with_pow, check_sequence_locks, check_transaction,
     connect_block_with_sequence_locks, contextual_check_block, contextual_check_block_header,
-    disconnect_block, should_skip_scripts, validate_scripts_parallel_with_cache,
+    disconnect_block, script_flags_for_height, should_skip_scripts,
+    validate_scripts_parallel_with_cache,
     BlockIndexEntry, ChainContext, CoinEntry, DisconnectResult, SequenceLockContext,
     SequenceLocks, StubChainContext, TransactionSignatureChecker, TxValidationError,
     UndoData, UtxoView, ValidationError,
