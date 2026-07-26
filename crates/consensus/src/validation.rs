@@ -2937,9 +2937,14 @@ pub fn disconnect_block(
 ///
 /// THIS IS THE ONE AND ONLY BLOCK-VALIDATION FLAG SOURCE. It is the exact
 /// analogue of Bitcoin Core `GetBlockScriptFlags(const CBlockIndex&, const
-/// ChainstateManager&)` (validation.cpp:2250-2289). Do not confuse it with
-/// `ScriptFlags::consensus_flags()` (script/interpreter.rs), which is a
-/// deprecated, hash-blind, hard-coded-height helper with NO production caller.
+/// ChainstateManager&)` (validation.cpp:2250-2289).
+///
+/// It is deliberately the ONLY flag-producing function in the crate. A second,
+/// hash-blind helper (`ScriptFlags::consensus_flags`) used to live in
+/// script/interpreter.rs with no production caller; it was deleted rather than
+/// merely deprecated, because a hash-blind flag source cannot honour
+/// `script_flag_exceptions` and its mere presence invites exactly the misuse
+/// that produced clearbit's latent hard-fork path (bc7cb98).
 ///
 /// **CRITICAL**: Only returns Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS.
 /// Adding policy flags here causes valid blocks to be rejected.
@@ -2976,7 +2981,7 @@ pub fn disconnect_block(
 ///
 /// NULLFAIL (BIP-146) is a STANDARD_SCRIPT_VERIFY_FLAG (policy only) per
 /// Bitcoin Core policy/policy.h:125.  It must NOT appear here.
-fn script_flags_for_height(height: u32, block_hash: Hash256, params: &ChainParams) -> ScriptFlags {
+pub fn script_flags_for_height(height: u32, block_hash: Hash256, params: &ChainParams) -> ScriptFlags {
     // --- Step 1: BASE. P2SH | WITNESS | TAPROOT, unconditional, every block.
     // Bitcoin Core validation.cpp:2262:
     //   script_verify_flags flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS

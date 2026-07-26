@@ -116,71 +116,6 @@ pub struct ScriptFlags {
 }
 
 impl ScriptFlags {
-    /// DEPRECATED — **NOT** the block-validation flag source. Do not use.
-    ///
-    /// # This is not `GetBlockScriptFlags`
-    ///
-    /// The one and only flag source for block validation is
-    /// `script_flags_for_height(height, block_hash, params)` in
-    /// `validation.rs`, reached from `connect_block_with_sequence_locks`.
-    /// That function is the analogue of Bitcoin Core
-    /// `GetBlockScriptFlags` (validation.cpp:2250-2289).
-    ///
-    /// This helper has **zero production callers** (only tests reference it)
-    /// and is kept solely so those tests keep compiling. It is wrong for
-    /// block validation in three independent ways, and each one is a
-    /// consensus divergence if it were ever wired up:
-    ///
-    /// 1. **Hash-blind.** It takes no block hash, so it cannot consult
-    ///    `script_flag_exceptions`. Blocks 170060 (BIP-16 violator) and
-    ///    692261 (Taproot violator) would be FALSE-REJECTED on any full
-    ///    revalidation. This is precisely the latent hard-fork shape that
-    ///    was found and fixed in clearbit (bc7cb98).
-    /// 2. **Height-gates the wrong flags.** It gates P2SH, WITNESS and
-    ///    TAPROOT by height. Core sets all three UNCONDITIONALLY for every
-    ///    block (validation.cpp:2262) and has no `BIP16Height` and no
-    ///    `taprootHeight`. Only DERSIG/CLTV/CSV/NULLDUMMY remain height-gated.
-    /// 3. **Leaks policy flags into a "consensus" flag set.** It sets
-    ///    `verify_nullfail` (BIP-146) and `verify_witness_pubkeytype`, both of
-    ///    which are STANDARD_SCRIPT_VERIFY_FLAGS (policy only, policy.h:125).
-    ///    Enforcing them in block validation rejects valid blocks.
-    ///
-    /// Its hard-coded mainnet heights are also duplicated state that silently
-    /// diverges from `ChainParams`. If you arrived here grepping for height
-    /// gates during a consensus change: this is the decoy, `validation.rs`
-    /// has the real one. Leave this alone.
-    ///
-    /// Retained-for-tests only; slated for deletion once the stale
-    /// `w105_checkqueue` G26/G27 gates are rewritten against
-    /// `script_flags_for_height`.
-    #[deprecated(
-        note = "NOT the block-validation flag source: hash-blind (cannot honour \
-                script_flag_exceptions), height-gates P2SH/WITNESS/TAPROOT which Core \
-                sets unconditionally, and leaks policy flags. Use \
-                validation::script_flags_for_height(height, block_hash, params)."
-    )]
-    pub fn consensus_flags(height: u32, testnet4: bool) -> Self {
-        // Activation heights (mainnet / testnet4)
-        let p2sh_height = if testnet4 { 1 } else { 173_805 };
-        let bip66_height = if testnet4 { 1 } else { 363_725 };
-        let bip65_height = if testnet4 { 1 } else { 388_381 };
-        let csv_height = if testnet4 { 1 } else { 419_328 };
-        let segwit_height = if testnet4 { 1 } else { 481_824 };
-        let taproot_height = if testnet4 { 1 } else { 709_632 };
-
-        ScriptFlags {
-            verify_p2sh: height >= p2sh_height,
-            verify_dersig: height >= bip66_height,
-            verify_checklocktimeverify: height >= bip65_height,
-            verify_checksequenceverify: height >= csv_height,
-            verify_witness: height >= segwit_height,
-            verify_nulldummy: height >= segwit_height, // BIP-147 activated with SegWit
-            verify_nullfail: height >= segwit_height,  // BIP-146 activated with SegWit
-            verify_witness_pubkeytype: height >= segwit_height, // BIP-141 activated with SegWit
-            verify_taproot: height >= taproot_height,
-            ..Default::default()
-        }
-    }
 
     /// Create flags for mempool/policy validation.
     ///
@@ -3808,31 +3743,6 @@ mod tests {
         assert!(matches!(result, Err(ScriptError::NullFail)));
     }
 
-    #[test]
-    fn nullfail_consensus_flags_segwit_height() {
-        // Verify NULLFAIL is enabled at segwit activation height (mainnet)
-        let flags = ScriptFlags::consensus_flags(481_824, false);
-        assert!(flags.verify_nullfail);
-        assert!(flags.verify_witness);
-        assert!(flags.verify_nulldummy);
-    }
-
-    #[test]
-    fn nullfail_consensus_flags_before_segwit() {
-        // Verify NULLFAIL is NOT enabled before segwit activation
-        let flags = ScriptFlags::consensus_flags(481_823, false);
-        assert!(!flags.verify_nullfail);
-        assert!(!flags.verify_witness);
-    }
-
-    #[test]
-    fn nullfail_consensus_flags_testnet4() {
-        // Testnet4 has all soft forks active from block 1
-        let flags = ScriptFlags::consensus_flags(1, true);
-        assert!(flags.verify_nullfail);
-        assert!(flags.verify_witness);
-    }
-
     // =================================
     // WITNESS_PUBKEYTYPE (BIP-141) tests
     // =================================
@@ -4060,29 +3970,6 @@ mod tests {
         // Should succeed (pubkey is valid, sig verification fails but that's expected)
         assert!(result.is_ok());
         assert!(!stack_bool(&stack[0])); // Result is false (sig failed)
-    }
-
-    #[test]
-    fn witness_pubkeytype_consensus_flags_enabled_at_segwit() {
-        // Verify WITNESS_PUBKEYTYPE is enabled at segwit activation height (mainnet)
-        let flags = ScriptFlags::consensus_flags(481_824, false);
-        assert!(flags.verify_witness_pubkeytype);
-        assert!(flags.verify_witness);
-    }
-
-    #[test]
-    fn witness_pubkeytype_consensus_flags_disabled_before_segwit() {
-        // Verify WITNESS_PUBKEYTYPE is NOT enabled before segwit activation
-        let flags = ScriptFlags::consensus_flags(481_823, false);
-        assert!(!flags.verify_witness_pubkeytype);
-    }
-
-    #[test]
-    fn witness_pubkeytype_consensus_flags_testnet4() {
-        // Testnet4 has all soft forks active from block 1
-        let flags = ScriptFlags::consensus_flags(1, true);
-        assert!(flags.verify_witness_pubkeytype);
-        assert!(flags.verify_witness);
     }
 
     // ==================== Witness cleanstack tests ====================
@@ -4462,24 +4349,6 @@ mod tests {
 
         let result = verify_script(&script_sig, &script_pubkey2, &witness, &flags, &checker);
         assert!(result.is_ok(), "OP_1NEGATE should be valid push in scriptSig: {:?}", result);
-    }
-
-    #[test]
-    fn p2sh_push_only_consensus_flags_enabled() {
-        // Verify that P2SH is enabled at the correct activation height (mainnet)
-        let flags = ScriptFlags::consensus_flags(173_805, false);
-        assert!(flags.verify_p2sh);
-
-        // Before activation
-        let flags_before = ScriptFlags::consensus_flags(173_804, false);
-        assert!(!flags_before.verify_p2sh);
-    }
-
-    #[test]
-    fn p2sh_push_only_testnet4_always_enabled() {
-        // Testnet4 has P2SH active from block 1
-        let flags = ScriptFlags::consensus_flags(1, true);
-        assert!(flags.verify_p2sh);
     }
 
     // ==================== MINIMALIF tests ====================
