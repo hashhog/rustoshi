@@ -141,7 +141,29 @@ pub const DEFAULT_DESCENDANT_LIMIT: usize = 25;
 
 /// Maximum number of transactions in a cluster.
 /// From Bitcoin Core: DEFAULT_CLUSTER_LIMIT = 64 (policy/policy.h:72).
+///
+/// POLICY, not consensus. This module lives under `crates/consensus/` for
+/// historical reasons, but every limit in this block is mempool *policy*:
+/// none of it may affect block validation.
 pub const MAX_CLUSTER_SIZE: usize = 64;
+
+/// Maximum total size of a cluster, in **weight units**.
+///
+/// From Bitcoin Core:
+///   `DEFAULT_CLUSTER_SIZE_LIMIT_KVB{101}`            (policy/policy.h:74)
+///   `cluster_size_vbytes{DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1'000}`
+///                                                    (kernel/mempool_limits.h:22)
+///   `max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR`
+///                                                    (txmempool.cpp:181)
+/// so 101_000 vB * 4 = 404_000 weight units.
+///
+/// The comparison is done in WEIGHT UNITS end to end, with **no per-transaction
+/// division and no per-transaction rounding**, exactly as Core does. Summing
+/// per-tx ceilinged vsize instead (`Σ⌈wᵢ/4⌉ ≥ (Σwᵢ)/4`) is systematically
+/// STRICTER than Core and must not be reintroduced.
+///
+/// POLICY, not consensus.
+pub const MAX_CLUSTER_SIZE_WEIGHT: u64 = 404_000;
 
 /// CPFP carve-out: one extra descendant is allowed when the incoming transaction
 /// has exactly one in-mempool ancestor AND its virtual size is at or below this limit.
@@ -841,6 +863,18 @@ pub struct MempoolEntry {
     pub vsize: usize,
     /// Transaction weight (BIP-141).
     pub weight: usize,
+    /// Sigop-adjusted weight: `max(weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP)`.
+    ///
+    /// This is the per-transaction quantity Core feeds into TxGraph as the
+    /// transaction's size (txmempool.cpp:1017 —
+    /// `FeePerWeight feerate(fee, GetSigOpsAdjustedWeight(GetTransactionWeight(*tx),
+    /// sigops_cost, ::nBytesPerSigOp))`), and therefore the quantity summed to
+    /// obtain a cluster's total size (txgraph.cpp `GetTotalTxSize`).
+    ///
+    /// Stored rather than derived because `vsize` is the *ceilinged* form
+    /// (`⌈adjusted_weight/4⌉`) and cannot be inverted back to exact weight.
+    /// POLICY, not consensus.
+    pub sigop_adjusted_weight: u64,
     /// The cluster this transaction belongs to.
     pub cluster_id: ClusterId,
     /// Mining score: the effective fee rate of the chunk this transaction is in.
@@ -935,6 +969,14 @@ pub enum MempoolError {
 
     #[error("cluster size limit exceeded: {0} (max: {1})")]
     ClusterSizeLimitExceeded(usize, usize),
+
+    /// Cluster total size, in **weight units**, would exceed
+    /// `MAX_CLUSTER_SIZE_WEIGHT` (404_000). Mirrors the `total_size >
+    /// m_max_cluster_size` half of Core's oversizedness test
+    /// (txgraph.cpp:2059). Surfaces as `too-large-cluster`. POLICY, not
+    /// consensus.
+    #[error("cluster weight limit exceeded: {0} (max: {1})")]
+    ClusterWeightLimitExceeded(u64, u64),
 
     #[error("non-standard transaction: {0}")]
     NonStandard(String),
@@ -1140,16 +1182,23 @@ impl MempoolError {
 
             // ---- Mempool capacity / chain limits ----
             MempoolError::MempoolFull => "mempool full".to_string(),
-            // Ancestor/descendant package-graph limits. Core's cluster-mempool
-            // surfaces "too-large-cluster" (validation.cpp:1024/1343); the
-            // classic pre-cluster token was "too-long-mempool-chain". We keep the
-            // classic token for the count/size graph limits and the cluster token
-            // for the explicit cluster-size gate.
+            // UNREACHABLE on the validation path as of the Core v31 cluster
+            // mempool: the ancestor/descendant count+size gates that used to
+            // construct these variants were deleted (the cluster gates replaced
+            // them), and "too-long-mempool-chain" no longer appears anywhere in
+            // bitcoin-core/src. The variants are retained so external callers
+            // and persisted reject caches still map to a sensible token; the
+            // arm is kept for exhaustiveness, not because it can fire.
             MempoolError::TooManyAncestors(_, _)
             | MempoolError::AncestorSizeTooLarge(_, _)
             | MempoolError::TooManyDescendants(_, _)
             | MempoolError::DescendantSizeTooLarge(_, _) => "too-long-mempool-chain".to_string(),
-            MempoolError::ClusterSizeLimitExceeded(_, _) => "too-large-cluster".to_string(),
+            // Cluster limits (Core v31 cluster mempool). BOTH the count gate and
+            // the weight gate surface the same bare token `too-large-cluster`
+            // with an EMPTY debug string (validation.cpp:1024, :1116, :1343,
+            // :1521). Do not append detail here — Core does not.
+            MempoolError::ClusterSizeLimitExceeded(_, _)
+            | MempoolError::ClusterWeightLimitExceeded(_, _) => "too-large-cluster".to_string(),
 
             // ---- Standardness (policy/policy.cpp IsStandardTx) ----
             // The inner string already leads with the Core token plus prose
@@ -2043,7 +2092,21 @@ impl Mempool {
             }
         }
 
-        // Check cluster size limit (replaces ancestor/descendant limits for cluster mempool)
+        // ---- Cluster limits (Core v31 cluster mempool). POLICY, not consensus. ----
+        //
+        // These two gates REPLACE the ancestor/descendant count+size limits
+        // entirely. In Core v31 `MemPoolLimits::ancestor_count` /
+        // `descendant_count` survive only as RPC reporting and wallet
+        // coin-selection hints (rpc/mempool.cpp:519-521, wallet/spend.cpp:881,
+        // node/mini_miner.cpp:77) — nothing on the validation path consults
+        // them, and `too-long-mempool-chain` no longer exists anywhere in the
+        // Core tree. TRUC's 2-ancestor/2-descendant rules are the only
+        // surviving ancestor/descendant enforcement (see check_truc_policy).
+        //
+        // Core tests oversizedness as a single disjunction (txgraph.cpp:2059):
+        //     total_count > m_max_cluster_count || total_size > m_max_cluster_size
+        // Both comparisons are STRICTLY greater: 64 members accept / 65 reject,
+        // 404_000 weight accepts / 404_001 rejects.
         let new_cluster_size = self.calculate_new_cluster_size(&mempool_parents);
         if new_cluster_size > MAX_CLUSTER_SIZE {
             return Err(MempoolError::ClusterSizeLimitExceeded(
@@ -2052,58 +2115,33 @@ impl Mempool {
             ));
         }
 
-        // Check ancestor limits (still used for CPFP calculations and compatibility)
+        // Cluster total size in WEIGHT units. Each member contributes
+        // max(weight, sigop_cost * 20); no per-tx division, no per-tx rounding.
+        let new_tx_adjusted_weight = crate::params::get_sigops_adjusted_weight(
+            tx.weight() as u64,
+            tx_sigop_cost,
+            crate::params::DEFAULT_BYTES_PER_SIGOP,
+        );
+        let new_cluster_weight =
+            self.calculate_new_cluster_weight(&mempool_parents, new_tx_adjusted_weight);
+        if new_cluster_weight > MAX_CLUSTER_SIZE_WEIGHT {
+            return Err(MempoolError::ClusterWeightLimitExceeded(
+                new_cluster_weight,
+                MAX_CLUSTER_SIZE_WEIGHT,
+            ));
+        }
+
+        // Ancestor data is still COMPUTED — the entry carries ancestor_count /
+        // ancestor_size / ancestor_fees for RPC reporting (getmempoolentry) and
+        // for CPFP mining-score aggregation. It is no longer a GATE: the
+        // 25-ancestor, 25-descendant and 101_000 vB ancestor/descendant bounds
+        // were deleted when the cluster gates above replaced them, matching
+        // Core v31 where nothing on the validation path consults
+        // MemPoolLimits::ancestor_count / descendant_count. The CPFP carve-out
+        // (EXTRA_DESCENDANT_TX_SIZE_LIMIT) went with them — it existed only to
+        // relax the descendant-count gate, which no longer exists.
         let (ancestor_count, ancestor_size, ancestor_fees) =
             self.calculate_ancestors(&mempool_parents);
-
-        if ancestor_count + 1 > self.config.max_ancestor_count {
-            return Err(MempoolError::TooManyAncestors(
-                ancestor_count + 1,
-                self.config.max_ancestor_count,
-            ));
-        }
-        if ancestor_size + vsize > self.config.max_ancestor_size {
-            return Err(MempoolError::AncestorSizeTooLarge(
-                ancestor_size + vsize,
-                self.config.max_ancestor_size,
-            ));
-        }
-
-        // Check descendant limits for ALL ancestors (not just direct parents).
-        // Adding this transaction would increase their descendant counts.
-        // We must check every ancestor, as any of them exceeding the limit causes rejection.
-        //
-        // CPFP carve-out (Core policy/policy.h:86-90, EXTRA_DESCENDANT_TX_SIZE_LIMIT):
-        // Allow one extra descendant when the new transaction has exactly ONE in-mempool
-        // ancestor AND its vsize is at or below EXTRA_DESCENDANT_TX_SIZE_LIMIT (10 000 vB).
-        // This lets a small CPFP child bypass the descendant-count gate for the ancestor.
-        // The carve-out does NOT waive the ancestor-count gate or size gates.
-        let cpfp_carve_out_eligible =
-            ancestor_count == 1 && vsize <= EXTRA_DESCENDANT_TX_SIZE_LIMIT;
-
-        let all_ancestors = self.get_all_ancestors(&mempool_parents);
-        for ancestor_txid in &all_ancestors {
-            if let Some(ancestor_entry) = self.transactions.get(ancestor_txid) {
-                // Descendant count gate — relaxed by 1 for carve-out eligible transactions.
-                let effective_desc_limit = if cpfp_carve_out_eligible {
-                    self.config.max_descendant_count.saturating_add(1)
-                } else {
-                    self.config.max_descendant_count
-                };
-                if ancestor_entry.descendant_count + 1 > effective_desc_limit {
-                    return Err(MempoolError::TooManyDescendants(
-                        ancestor_entry.descendant_count + 1,
-                        self.config.max_descendant_count,
-                    ));
-                }
-                if ancestor_entry.descendant_size + vsize > self.config.max_descendant_size {
-                    return Err(MempoolError::DescendantSizeTooLarge(
-                        ancestor_entry.descendant_size + vsize,
-                        self.config.max_descendant_size,
-                    ));
-                }
-            }
-        }
 
         // W96 (gates 27 + 28): script verification — done LAST so CPU-expensive
         // signature checks only run after every cheap policy gate has passed.
@@ -2243,6 +2281,13 @@ impl Mempool {
             size: tx.weight() / 4, // approximate serialized size
             vsize,
             weight,
+            // Core txmempool.cpp:1017 / policy.cpp:390. Same inputs as `vsize`
+            // above, but kept UNROUNDED — this is what the cluster gate sums.
+            sigop_adjusted_weight: crate::params::get_sigops_adjusted_weight(
+                tx.weight() as u64,
+                tx_sigop_cost,
+                crate::params::DEFAULT_BYTES_PER_SIGOP,
+            ),
             cluster_id: 0, // Will be set by add_to_clusters
             mining_score: fee_rate, // Initial value, will be updated by add_to_clusters
             time_added: Instant::now(),
@@ -4209,6 +4254,52 @@ impl Mempool {
         total_size
     }
 
+    /// Total size, in **weight units**, of the cluster that would result from
+    /// adding a transaction with the given parents and the given sigop-adjusted
+    /// weight.
+    ///
+    /// Mirrors Core's TxGraph accounting: each member contributes
+    /// `max(weight, sigop_cost * 20)` (policy.cpp:390, fed in at
+    /// txmempool.cpp:1017) and a cluster's total is the plain sum of those
+    /// (`Cluster::GetTotalTxSize`, summed at txgraph.cpp:2049).
+    ///
+    /// Deliberately in weight units with NO per-transaction division and NO
+    /// per-transaction rounding. Summing `⌈wᵢ/4⌉` and comparing against 101_000
+    /// would be systematically stricter than Core.
+    ///
+    /// Computed on demand from the member entries rather than maintained as a
+    /// running field on `Cluster`, so it cannot drift out of sync across the
+    /// merge/split/evict paths. Bounded by the cluster-count gate (<= 64
+    /// members), so this is cheap.
+    ///
+    /// POLICY, not consensus.
+    fn calculate_new_cluster_weight(
+        &self,
+        mempool_parents: &HashSet<Hash256>,
+        new_tx_adjusted_weight: u64,
+    ) -> u64 {
+        // Find all clusters that would be merged (same set as the count gate).
+        let mut cluster_ids: HashSet<ClusterId> = HashSet::new();
+        for parent in mempool_parents {
+            if let Some(&cluster_id) = self.tx_to_cluster.get(parent) {
+                cluster_ids.insert(cluster_id);
+            }
+        }
+
+        let mut total_weight = new_tx_adjusted_weight; // The new transaction
+        for cluster_id in cluster_ids {
+            if let Some(cluster) = self.clusters.get(&cluster_id) {
+                for txid in &cluster.txids {
+                    if let Some(entry) = self.transactions.get(txid) {
+                        total_weight = total_weight.saturating_add(entry.sigop_adjusted_weight);
+                    }
+                }
+            }
+        }
+
+        total_weight
+    }
+
     /// Evict the transaction with the lowest mining score.
     /// This evicts from the worst cluster (lowest worst-mining-score).
     fn evict_lowest_mining_score(&mut self) -> bool {
@@ -4765,7 +4856,9 @@ impl Mempool {
             }
         }
 
-        // Check cluster size limit
+        // ---- Cluster limits (Core v31 cluster mempool). POLICY, not consensus. ----
+        // Package path — same two gates as add_transaction; see the commentary
+        // there. Strict `>` on both (txgraph.cpp:2059).
         let new_cluster_size = self.calculate_new_cluster_size(&mempool_parents);
         if new_cluster_size > MAX_CLUSTER_SIZE {
             return Err(MempoolError::ClusterSizeLimitExceeded(
@@ -4774,51 +4867,25 @@ impl Mempool {
             ));
         }
 
-        // Check ancestor limits
+        // Cluster total size in WEIGHT units: Σ max(weight, sigop_cost * 20).
+        let new_tx_adjusted_weight = crate::params::get_sigops_adjusted_weight(
+            tx.weight() as u64,
+            tx_sigop_cost,
+            crate::params::DEFAULT_BYTES_PER_SIGOP,
+        );
+        let new_cluster_weight =
+            self.calculate_new_cluster_weight(&mempool_parents, new_tx_adjusted_weight);
+        if new_cluster_weight > MAX_CLUSTER_SIZE_WEIGHT {
+            return Err(MempoolError::ClusterWeightLimitExceeded(
+                new_cluster_weight,
+                MAX_CLUSTER_SIZE_WEIGHT,
+            ));
+        }
+
+        // Ancestor data computed for entry bookkeeping only — not a gate.
+        // See the equivalent block in add_transaction for the rationale.
         let (ancestor_count, ancestor_size, ancestor_fees) =
             self.calculate_ancestors(&mempool_parents);
-
-        if ancestor_count + 1 > self.config.max_ancestor_count {
-            return Err(MempoolError::TooManyAncestors(
-                ancestor_count + 1,
-                self.config.max_ancestor_count,
-            ));
-        }
-        if ancestor_size + vsize > self.config.max_ancestor_size {
-            return Err(MempoolError::AncestorSizeTooLarge(
-                ancestor_size + vsize,
-                self.config.max_ancestor_size,
-            ));
-        }
-
-        // Check descendant limits.
-        // CPFP carve-out: allow +1 descendant when new tx has exactly one in-mempool
-        // ancestor and vsize <= EXTRA_DESCENDANT_TX_SIZE_LIMIT (Core policy/policy.h:90).
-        let cpfp_carve_out_eligible =
-            ancestor_count == 1 && vsize <= EXTRA_DESCENDANT_TX_SIZE_LIMIT;
-
-        let all_ancestors = self.get_all_ancestors(&mempool_parents);
-        for ancestor_txid in &all_ancestors {
-            if let Some(ancestor_entry) = self.transactions.get(ancestor_txid) {
-                let effective_desc_limit = if cpfp_carve_out_eligible {
-                    self.config.max_descendant_count.saturating_add(1)
-                } else {
-                    self.config.max_descendant_count
-                };
-                if ancestor_entry.descendant_count + 1 > effective_desc_limit {
-                    return Err(MempoolError::TooManyDescendants(
-                        ancestor_entry.descendant_count + 1,
-                        self.config.max_descendant_count,
-                    ));
-                }
-                if ancestor_entry.descendant_size + vsize > self.config.max_descendant_size {
-                    return Err(MempoolError::DescendantSizeTooLarge(
-                        ancestor_entry.descendant_size + vsize,
-                        self.config.max_descendant_size,
-                    ));
-                }
-            }
-        }
 
         // Evict if mempool is full, updating the rolling minimum fee rate on each eviction.
         // Mirrors CTxMemPool::TrimToSize (txmempool.cpp:861-911).
@@ -4847,6 +4914,13 @@ impl Mempool {
             size: tx.weight() / 4,
             vsize,
             weight,
+            // Core txmempool.cpp:1017 / policy.cpp:390. Same inputs as `vsize`
+            // above, but kept UNROUNDED — this is what the cluster gate sums.
+            sigop_adjusted_weight: crate::params::get_sigops_adjusted_weight(
+                tx.weight() as u64,
+                tx_sigop_cost,
+                crate::params::DEFAULT_BYTES_PER_SIGOP,
+            ),
             cluster_id: 0, // Will be set by add_to_clusters
             mining_score: fee_rate, // Initial value, will be updated by add_to_clusters
             time_added: Instant::now(),
@@ -6175,10 +6249,16 @@ mod tests {
         assert_eq!(entry.ancestor_count, 2); // self + parent
     }
 
+    /// `max_ancestor_count` is NO LONGER A GATE (Core v31 cluster mempool).
+    ///
+    /// Was: `test_ancestor_limit`, which asserted a 3-chain is rejected when
+    /// `max_ancestor_count = 2`. Core v31 deleted ancestor-count enforcement
+    /// from the validation path — the field survives only for RPC reporting and
+    /// wallet coin-selection hints. Only the cluster gates bound the graph now.
     #[test]
-    fn test_ancestor_limit() {
+    fn test_ancestor_count_config_is_not_a_gate() {
         let config = MempoolConfig {
-            max_ancestor_count: 2, // Very low limit
+            max_ancestor_count: 2, // Deliberately tiny — must have NO effect.
             ..Default::default()
         };
         let mut mempool = Mempool::new(config);
@@ -6201,10 +6281,19 @@ mod tests {
             .add_transaction(tx2, &|op| utxos.get(op).cloned())
             .unwrap();
 
-        // Third transaction should fail (would have 3 ancestors)
+        // Third transaction has 3 ancestors — accepted, the cluster is far
+        // under both 64 txs and 404_000 weight.
         let tx3 = make_tx(vec![(txid2, 0)], vec![70_000], 1);
+        let txid3 = tx3.txid();
         let result = mempool.add_transaction(tx3, &|op| utxos.get(op).cloned());
-        assert!(matches!(result, Err(MempoolError::TooManyAncestors(_, _))));
+        assert!(
+            result.is_ok(),
+            "ancestor-count limit was deleted in Core v31; 3-chain must be accepted, got {:?}",
+            result
+        );
+
+        // Bookkeeping is still populated (RPC getmempoolentry consumes it).
+        assert_eq!(mempool.get(&txid3).unwrap().ancestor_count, 3);
     }
 
     #[test]
@@ -6770,9 +6859,14 @@ mod tests {
         assert_eq!(first_entry.descendant_count, 25);
     }
 
+    /// A 26-long chain is ACCEPTED under Core v31 cluster limits.
+    ///
+    /// Was: `test_chain_of_26_transactions_fails_ancestor_limit`. Matches
+    /// diff-test corpus entry `cluster-linear-26`, empirically confirmed
+    /// against bitcoin-core v31.99.0: all 26 accept. The cluster is ~9906
+    /// weight, 2.5% of the 404_000 bound, and 26 <= 64, so neither gate fires.
     #[test]
-    fn test_chain_of_26_transactions_fails_ancestor_limit() {
-        // Default config allows 25 ancestors (including self)
+    fn test_chain_of_26_transactions_accepted_under_cluster_limits() {
         let config = MempoolConfig::default();
         let mut mempool = Mempool::new(config);
 
@@ -6806,26 +6900,31 @@ mod tests {
 
         assert_eq!(mempool.size(), 25);
 
-        // 26th transaction should fail (would have 26 ancestors)
+        // 26th transaction is ACCEPTED — the 25-ancestor gate no longer exists.
         let fee = 1000u64;
         let output_value = prev_value - fee;
         let tx26 = make_tx(vec![(prev_txid, 0)], vec![output_value], 1);
 
         let result = mempool.add_transaction(tx26, &|op| utxos.get(op).cloned());
         assert!(
-            matches!(result, Err(MempoolError::TooManyAncestors(26, 25))),
-            "26th transaction should be rejected for too many ancestors, got: {:?}",
+            result.is_ok(),
+            "26th transaction must be accepted under cluster limits (corpus cluster-linear-26), got: {:?}",
             result
         );
+        assert_eq!(mempool.size(), 26);
     }
 
+    /// `max_descendant_count` is NO LONGER A GATE (Core v31 cluster mempool).
+    ///
+    /// Was: `test_descendant_limit_blocks_new_children`, which asserted a 4th
+    /// chain member is rejected when `max_descendant_count = 3`. Core v31
+    /// deleted descendant-count enforcement from the validation path.
+    /// Descendant bookkeeping is still maintained for RPC/CPFP.
     #[test]
-    fn test_descendant_limit_blocks_new_children() {
-        // Test that descendant limit prevents adding children when an ancestor
-        // already has max descendants
+    fn test_descendant_count_config_is_not_a_gate() {
         let config = MempoolConfig {
-            max_ancestor_count: 50, // High ancestor limit
-            max_descendant_count: 3, // Low descendant limit for testing
+            max_ancestor_count: 50,
+            max_descendant_count: 3, // Deliberately tiny — must have NO effect.
             ..Default::default()
         };
         let mut mempool = Mempool::new(config);
@@ -6860,14 +6959,16 @@ mod tests {
         // Verify tx1 now has 3 descendants (including itself)
         assert_eq!(mempool.get(&txid1).unwrap().descendant_count, 3);
 
-        // tx4: child of tx3, should fail because tx1 would have 4 descendants
+        // tx4 takes tx1 to 4 descendants — accepted, no descendant gate exists.
         let tx4 = make_tx(vec![(txid3, 0)], vec![96_000_000], 1);
         let result = mempool.add_transaction(tx4, &|op| utxos.get(op).cloned());
         assert!(
-            matches!(result, Err(MempoolError::TooManyDescendants(4, 3))),
-            "tx4 should be rejected for too many descendants, got: {:?}",
+            result.is_ok(),
+            "descendant-count limit was deleted in Core v31; tx4 must be accepted, got: {:?}",
             result
         );
+        // Bookkeeping still tracks the true descendant count.
+        assert_eq!(mempool.get(&txid1).unwrap().descendant_count, 4);
     }
 
     #[test]
@@ -6928,13 +7029,16 @@ mod tests {
         assert_eq!(entry1.descendant_count, 4);
     }
 
+    /// `max_ancestor_size` is NO LONGER A GATE (Core v31 cluster mempool).
+    ///
+    /// Was: `test_ancestor_size_limit`. The old 101_000 vB ancestor bound was
+    /// rustoshi's ONLY size bound; it is replaced by the cluster weight gate
+    /// (404_000 weight units), added in the same edit that removed this one.
     #[test]
-    fn test_ancestor_size_limit() {
-        // Test that ancestor size limit is enforced
-        // Each transaction is ~86 vbytes, so set limit to allow only 2 txs
+    fn test_ancestor_size_config_is_not_a_gate() {
         let config = MempoolConfig {
             max_ancestor_count: 100,
-            max_ancestor_size: 200, // About 2 transactions worth (~86 vB each)
+            max_ancestor_size: 200, // Deliberately tiny — must have NO effect.
             ..Default::default()
         };
         let mut mempool = Mempool::new(config);
@@ -6960,28 +7064,29 @@ mod tests {
             .add_transaction(tx2, &|op| utxos.get(op).cloned())
             .unwrap();
 
-        // Third transaction should fail due to ancestor size limit
+        // Third transaction: ancestor vsize sum now exceeds the configured 200,
+        // but that bound no longer exists, so it is accepted.
         let tx3 = make_tx(vec![(txid2, 0)], vec![97_000_000], 1);
         let vsize3 = tx3.vsize();
         let result = mempool.add_transaction(tx3, &|op| utxos.get(op).cloned());
 
-        // Total ancestor size would be: vsize1 + vsize2 + vsize3 > 200
         assert!(
-            matches!(result, Err(MempoolError::AncestorSizeTooLarge(_, 200))),
-            "tx3 should be rejected for ancestor size too large, got: {:?} (vsize1={}, vsize3={})",
+            result.is_ok(),
+            "ancestor-size limit was deleted in Core v31 (cluster size is the only size bound); \
+             tx3 must be accepted, got: {:?} (vsize1={}, vsize3={})",
             result,
             vsize1,
             vsize3
         );
     }
 
+    /// `max_descendant_size` is NO LONGER A GATE (Core v31 cluster mempool).
+    /// Was: `test_descendant_size_limit`. See the ancestor-size twin above.
     #[test]
-    fn test_descendant_size_limit() {
-        // Test that descendant size limit is enforced
-        // Each transaction is ~86 vbytes, so set limit to allow only 2 txs
+    fn test_descendant_size_config_is_not_a_gate() {
         let config = MempoolConfig {
             max_descendant_count: 100,
-            max_descendant_size: 200, // About 2 transactions worth (~86 vB each)
+            max_descendant_size: 200, // Deliberately tiny — must have NO effect.
             ..Default::default()
         };
         let mut mempool = Mempool::new(config);
@@ -7006,13 +7111,14 @@ mod tests {
             .add_transaction(tx2, &|op| utxos.get(op).cloned())
             .unwrap();
 
-        // Third transaction should fail due to descendant size limit on tx1
+        // Third transaction: tx1's descendant vsize now exceeds the configured
+        // 200, but that bound no longer exists, so it is accepted.
         let tx3 = make_tx(vec![(txid2, 0)], vec![97_000_000], 1);
         let result = mempool.add_transaction(tx3, &|op| utxos.get(op).cloned());
 
         assert!(
-            matches!(result, Err(MempoolError::DescendantSizeTooLarge(_, 200))),
-            "tx3 should be rejected for descendant size too large, got: {:?}",
+            result.is_ok(),
+            "descendant-size limit was deleted in Core v31; tx3 must be accepted, got: {:?}",
             result
         );
     }
@@ -10237,10 +10343,14 @@ mod tests {
         // (We only verify it accepted; counting is verified in test_chain_of_25_transactions_passes.)
     }
 
-    /// A chain of 26 transactions must be rejected: ancestor_count would be 26 > 25.
-    /// Error must be TooManyAncestors. Core policy/policy.h:76.
+    /// A chain of 26 transactions is ACCEPTED under Core v31 cluster limits.
+    ///
+    /// Was: `test_w75_chain_26_rejected` (expected `TooManyAncestors(26, 25)`).
+    /// Core v31 removed ancestor-count enforcement from the validation path;
+    /// `DEFAULT_ANCESTOR_LIMIT` survives only as an RPC/wallet hint. Matches
+    /// diff-test corpus entry `cluster-linear-26`.
     #[test]
-    fn test_w75_chain_26_rejected() {
+    fn test_w75_chain_26_accepted() {
         let config = MempoolConfig::default();
         let mut mempool = Mempool::new(config);
 
@@ -10261,16 +10371,19 @@ mod tests {
         let tx26 = make_tx(vec![(prev_txid, 0)], vec![prev_val - 1000], 1);
         let r = mempool.add_transaction(tx26, &|op| utxos.get(op).cloned());
         assert!(
-            matches!(r, Err(MempoolError::TooManyAncestors(26, 25))),
-            "26th tx must be rejected TooManyAncestors(26,25), got {:?}", r
+            r.is_ok(),
+            "26th tx must be ACCEPTED — ancestor-count gate deleted in Core v31, got {:?}", r
         );
+        assert_eq!(mempool.size(), 26);
     }
 
-    /// Descendant-count check: when an ancestor already has 25 descendants (including
-    /// itself), adding another child must fail TooManyDescendants.
-    /// Core: txmempool.cpp CheckMemPoolPolicyLimits / CalculateDescendantData.
+    /// A 26th descendant is ACCEPTED under Core v31 cluster limits.
+    ///
+    /// Was: `test_w75_descendant_26_rejected`. Core v31 removed
+    /// descendant-count enforcement from the validation path. Matches
+    /// diff-test corpus entry `cluster-fan-26` (27 txs, all accept).
     #[test]
-    fn test_w75_descendant_26_rejected() {
+    fn test_w75_descendant_26_accepted() {
         let config = MempoolConfig {
             max_ancestor_count: 50, // High: we're testing descendant gate
             max_descendant_count: 25,
@@ -10293,23 +10406,27 @@ mod tests {
             mempool.add_transaction(tx, &|op| utxos.get(op).cloned()).unwrap();
         }
 
-        // Root's descendant_count should be 25 now.
-        // Adding tx26 would make root's descendant_count = 26 > 25 → reject.
+        // Root's descendant_count is 25. Adding tx26 takes it to 26 — accepted,
+        // since the descendant-count gate no longer exists.
         let tx26 = make_tx(vec![(prev_txid, 0)], vec![prev_val - 1000], 1);
         let r = mempool.add_transaction(tx26, &|op| utxos.get(op).cloned());
         assert!(
-            matches!(r, Err(MempoolError::TooManyDescendants(_, _))),
-            "tx26 should fail TooManyDescendants, got {:?}", r
+            r.is_ok(),
+            "tx26 must be ACCEPTED — descendant-count gate deleted in Core v31, got {:?}", r
         );
+        assert_eq!(mempool.size(), 26);
     }
 
-    /// CPFP carve-out: a small tx (vsize <= 10000) with exactly ONE in-mempool
-    /// ancestor is allowed past the descendant-count gate even when the ancestor
-    /// is already at the default limit.
+    /// The CPFP carve-out is GONE, because the gate it carved out of is gone.
     ///
-    /// Core: EXTRA_DESCENDANT_TX_SIZE_LIMIT, policy/policy.h:86-90.
+    /// Was: `test_w75_cpfp_carve_out_one_ancestor_small_tx_allowed`.
+    /// `EXTRA_DESCENDANT_TX_SIZE_LIMIT` existed only to relax the
+    /// descendant-COUNT gate by one for a small single-ancestor CPFP child.
+    /// Core v31 deleted that gate, so there is nothing left to carve out of and
+    /// every child below is simply accepted — including the `child2` case that
+    /// was previously rejected for having two ancestors.
     #[test]
-    fn test_w75_cpfp_carve_out_one_ancestor_small_tx_allowed() {
+    fn test_w75_cpfp_carve_out_no_longer_needed() {
         // Use a descendant limit of 2 so we can reach the limit cheaply.
         let config = MempoolConfig {
             max_ancestor_count: 50,
@@ -10358,32 +10475,33 @@ mod tests {
         mempool.add_transaction(child1, &|op| utxos.get(op).cloned()).unwrap();
         assert_eq!(mempool.get(&root_txid).unwrap().descendant_count, 2);
 
-        // Verify that child2 spending child1 (2 ancestors: root+child1) is NOT carve-out eligible.
+        // child2 spends child1 (2 ancestors: root+child1). Previously rejected
+        // as carve-out-ineligible; now accepted — no descendant-count gate.
         let child2 = make_tx(vec![(child1_txid, 0)], vec![47_000_000], 1);
         let r = mempool.add_transaction(child2, &|op| utxos.get(op).cloned());
         assert!(
-            matches!(r, Err(MempoolError::TooManyDescendants(_, _))),
-            "child2 with 2 ancestors should NOT get carve-out, got {:?}", r
+            r.is_ok(),
+            "child2 must be accepted — descendant-count gate deleted in Core v31, got {:?}", r
         );
 
-        // Carve-out child: spends output 1 of root — exactly ONE in-mempool ancestor (root).
-        // Root is at descendant_count = 2 = limit, but carve-out raises effective limit to 3.
-        // This should be accepted.
-        let carve_out_child = make_tx(vec![(root_txid, 1)], vec![48_500_000], 1);
-        let r2 = mempool.add_transaction(carve_out_child, &|op| utxos.get(op).cloned());
+        // A second direct child of root (one in-mempool ancestor) is likewise
+        // accepted, without needing any carve-out.
+        let extra_child = make_tx(vec![(root_txid, 1)], vec![48_500_000], 1);
+        let r2 = mempool.add_transaction(extra_child, &|op| utxos.get(op).cloned());
         assert!(
             r2.is_ok(),
-            "CPFP carve-out: small tx with exactly 1 ancestor should bypass descendant limit, got {:?}", r2
+            "second direct child of root must be accepted, got {:?}", r2
         );
     }
 
-    /// CPFP carve-out does NOT apply when new tx is larger than EXTRA_DESCENDANT_TX_SIZE_LIMIT.
-    /// Core: EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10000 vB (policy/policy.h:90).
+    /// A tx with two in-mempool ancestors is accepted regardless of the
+    /// configured descendant limit.
     ///
-    /// Note: standard test txs are ~86 vB, well below 10000. This test verifies the
-    /// eligibility logic: a tx with >1 ancestor is NOT eligible regardless of size.
+    /// Was: `test_w75_cpfp_carve_out_two_ancestors_not_eligible`, which asserted
+    /// such a tx is rejected because it cannot claim the CPFP carve-out. Both
+    /// the carve-out and the gate it applied to were removed in Core v31.
     #[test]
-    fn test_w75_cpfp_carve_out_two_ancestors_not_eligible() {
+    fn test_w75_two_ancestors_accepted_no_descendant_gate() {
         let config = MempoolConfig {
             max_ancestor_count: 50,
             max_descendant_count: 2,
@@ -10409,13 +10527,14 @@ mod tests {
         // grandparent now has 2 descendants (itself + parent) = limit.
         assert_eq!(mempool.get(&gp_txid).unwrap().descendant_count, 2);
 
-        // new tx has 2 ancestors (grandparent + parent) → not eligible for carve-out.
+        // new tx has 2 ancestors (grandparent + parent) — accepted.
         let new_tx = make_tx(vec![(p_txid, 0)], vec![97_000_000], 1);
         let r = mempool.add_transaction(new_tx, &|op| utxos.get(op).cloned());
         assert!(
-            matches!(r, Err(MempoolError::TooManyDescendants(_, _))),
-            "tx with 2 ancestors must NOT get CPFP carve-out, got {:?}", r
+            r.is_ok(),
+            "tx with 2 ancestors must be accepted — descendant-count gate deleted, got {:?}", r
         );
+        assert_eq!(mempool.get(&gp_txid).unwrap().descendant_count, 3);
     }
 
     /// Cluster size limit: a cluster growing beyond MAX_CLUSTER_SIZE (64) must be rejected.
@@ -10463,6 +10582,316 @@ mod tests {
             matches!(r, Err(MempoolError::ClusterSizeLimitExceeded(65, 64))),
             "65th cluster member must be rejected ClusterSizeLimitExceeded(65,64), got {:?}", r
         );
+    }
+
+    // ============================================================
+    // WAVE A — CORE v31 CLUSTER LIMITS (POLICY, not consensus)
+    //
+    // Core's arithmetic, in WEIGHT UNITS throughout:
+    //     per-tx contribution := max(tx_weight, tx_sigops_cost * 20)
+    //     cluster_size        := Σ (per-tx contribution)   [no per-tx rounding]
+    //     reject if cluster_size  > 404_000
+    //     reject if cluster_count > 64
+    // Citations: policy.h:50/:72/:74, mempool_limits.h:20-22,
+    // txmempool.cpp:181 and :1017, policy.cpp:390, txgraph.cpp:2059.
+    // ============================================================
+
+    /// Constants must match Core exactly, and the limits that are NOT part of
+    /// this change must be untouched.
+    #[test]
+    fn test_cluster_limit_constants_match_core() {
+        // Cluster count: DEFAULT_CLUSTER_LIMIT (policy.h:72).
+        assert_eq!(MAX_CLUSTER_SIZE, 64);
+        // Cluster size in weight units: DEFAULT_CLUSTER_SIZE_LIMIT_KVB(101) *
+        // 1000 vB (mempool_limits.h:22) * WITNESS_SCALE_FACTOR (txmempool.cpp:181).
+        assert_eq!(MAX_CLUSTER_SIZE_WEIGHT, 404_000);
+        assert_eq!(MAX_CLUSTER_SIZE_WEIGHT, 101 * 1_000 * 4);
+        // bytes-per-sigop used by the per-tx contribution (policy.h:50).
+        assert_eq!(crate::params::DEFAULT_BYTES_PER_SIGOP, 20);
+
+        // NOT part of the cluster change — these must NOT have moved.
+        // MAX_PACKAGE_COUNT is a package-relay limit, NOT the cluster count.
+        assert_eq!(MAX_PACKAGE_COUNT, 25, "MAX_PACKAGE_COUNT must stay 25");
+        // TRUC 2/2 is the only surviving ancestor/descendant enforcement.
+        assert_eq!(TRUC_ANCESTOR_LIMIT, 2);
+        assert_eq!(TRUC_DESCENDANT_LIMIT, 2);
+    }
+
+    /// Build a transaction whose sigop cost dominates its weight.
+    ///
+    /// `n_multisig` outputs of a bare `OP_CHECKMULTISIG` (20 legacy sigops each,
+    /// inaccurate counting) plus `n_checksig` outputs of a bare `OP_CHECKSIG`
+    /// (1 legacy sigop each). Legacy sigops are scaled by WITNESS_SCALE_FACTOR,
+    /// so sigop_cost = 4 * (20*n_multisig + n_checksig) and the sigop-adjusted
+    /// weight is 20 * that = 80 * (20*n_multisig + n_checksig).
+    ///
+    /// Each such output is only 10 serialized bytes, so raw weight stays tiny
+    /// and `max(weight, sigops*20)` is decided by the sigop term.
+    fn make_sigop_heavy_tx(
+        prevout: (Hash256, u32),
+        n_multisig: usize,
+        n_checksig: usize,
+        per_output_value: u64,
+    ) -> Transaction {
+        let mut outputs = Vec::with_capacity(n_multisig + n_checksig);
+        for _ in 0..n_multisig {
+            outputs.push(TxOut { value: per_output_value, script_pubkey: vec![0xaeu8] });
+        }
+        for _ in 0..n_checksig {
+            outputs.push(TxOut { value: per_output_value, script_pubkey: vec![0xacu8] });
+        }
+        // Zero-value padding output carrying NO sigops (50 * OP_0). Keeps every
+        // tx above MIN_STANDARD_TX_NONWITNESS_SIZE (65 bytes, policy.h:40) —
+        // that gate is enforced regardless of require_standard — without
+        // perturbing the sigop count the test is calibrated on.
+        outputs.push(TxOut { value: 0, script_pubkey: vec![0x00u8; 50] });
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prevout.0, vout: prevout.1 },
+                script_sig: vec![0x51], // OP_1 — no sigops
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs,
+            lock_time: 0,
+        }
+    }
+
+    /// THE BOUNDARY: a cluster of exactly 404_000 weight units ACCEPTS;
+    /// one sigop more REJECTS. Pins `>` and not `>=` (txgraph.cpp:2059).
+    ///
+    /// Also pins the UNITS: the tx below has a raw weight of ~10_700 and a
+    /// sigop-adjusted vsize of 101_000 vB. An implementation that compared raw
+    /// weight, or that summed per-tx ceilinged vsize against 101_000, would not
+    /// produce this accept/reject pair.
+    #[test]
+    fn test_cluster_weight_boundary_404000_accepts_one_sigop_more_rejects() {
+        // 252*20 + 10 = 5050 legacy sigops → cost 20_200 → adjusted weight
+        // 20_200 * 20 = 404_000 exactly.
+        let utxo_txid = Hash256::from_hex(
+            "a100000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000),
+            (OutPoint { txid: utxo_txid, vout: 1 }, 100_000_000),
+        ]);
+        // require_standard=false: the bare-CHECKMULTISIG scriptPubKey is
+        // non-standard, and 20_200 sigop cost exceeds MAX_STANDARD_TX_SIGOPS_COST.
+        // Neither gate is what we are testing here.
+        let opts = AtmpOptions { require_standard: false, ..Default::default() };
+
+        // --- Exactly 404_000: ACCEPT ---
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let tx_at = make_sigop_heavy_tx((utxo_txid, 0), 252, 10, 1_000);
+        let txid_at = tx_at.txid();
+        let raw_weight = tx_at.weight() as u64;
+        let r = mempool.add_transaction_with_options(tx_at, &|op| utxos.get(op).cloned(), opts.clone());
+        assert!(
+            r.is_ok(),
+            "cluster of exactly 404_000 weight must be ACCEPTED (strict `>`), got {:?}", r
+        );
+        let entry = mempool.get(&txid_at).unwrap();
+        assert_eq!(
+            entry.sigop_adjusted_weight, 404_000,
+            "per-tx contribution must be max(weight, sigops*20) = 404_000"
+        );
+        // The sigop term, not raw weight, is what put it at the bound.
+        assert!(
+            raw_weight < 20_000,
+            "raw weight should be tiny ({}); the sigop term must dominate", raw_weight
+        );
+        assert_eq!(entry.vsize, 101_000, "sigop-adjusted vsize = 404_000 / 4");
+
+        // --- One more OP_CHECKSIG output (+1 legacy sigop = +80 weight): REJECT ---
+        let mut mempool2 = Mempool::new(MempoolConfig::default());
+        let tx_over = make_sigop_heavy_tx((utxo_txid, 1), 252, 11, 1_000);
+        let r2 = mempool2.add_transaction_with_options(tx_over, &|op| utxos.get(op).cloned(), opts);
+        assert!(
+            matches!(r2, Err(MempoolError::ClusterWeightLimitExceeded(404_080, 404_000))),
+            "404_080 > 404_000 must be rejected ClusterWeightLimitExceeded(404_080, 404_000), got {:?}", r2
+        );
+        // Core surfaces the bare token with an EMPTY debug string
+        // (validation.cpp:1024/:1116/:1343/:1521).
+        assert_eq!(r2.unwrap_err().reject_token(), "too-large-cluster");
+    }
+
+
+    /// UNITS GUARD for Max's 2026-07-26 decision: the cluster size bound must
+    /// sum RAW sigop-adjusted WEIGHT, exactly as Core does, and must NOT sum
+    /// per-transaction ceilinged vbytes.
+    ///
+    /// Core (policy.cpp:390 + txmempool.cpp:181 + txgraph.cpp:2059):
+    ///     Σ max(wᵢ, sigopsᵢ*20)  >  404_000   → reject
+    /// The stricter form three implementations shipped before this wave:
+    ///     Σ ⌈wᵢ/4⌉               >  101_000   → reject
+    /// Because Σ⌈wᵢ/4⌉ ≥ (Σwᵢ)/4 the second is systematically over-strict.
+    ///
+    /// This test straddles the two. Two transactions whose weights are each
+    /// ≡ 2 (mod 4) — a witness makes the marker/flag bytes push weight off a
+    /// multiple of four — summing to EXACTLY 404_000:
+    ///     Core form : 201_998 + 202_002 = 404_000, not > 404_000 → ACCEPT
+    ///     Ceil form : ⌈201_998/4⌉ + ⌈202_002/4⌉ = 50_500 + 50_501
+    ///               = 101_001 > 101_000                          → REJECT
+    ///
+    /// So a node that merely swapped the CONSTANT 101_000 for 404_000 while
+    /// still rounding per transaction FAILS here, which is precisely the
+    /// regression this guard exists to catch. Verified to discriminate by
+    /// mutation: patching calculate_new_cluster_weight to round per-tx
+    /// (`w.div_ceil(4)*4`) makes this test fail with
+    /// ClusterWeightLimitExceeded(404_004, 404_000).
+    #[test]
+    fn test_cluster_weight_uses_raw_weight_not_per_tx_ceilinged_vbytes() {
+        // Build a tx whose weight is a target value ≡ 2 (mod 4). An empty
+        // witness item list of 3 entries contributes 4 witness bytes and the
+        // segwit marker+flag contributes 2, so total weight ≡ 2 (mod 4) before
+        // padding; an OP_RETURN payload then tunes it to the exact target.
+        fn tx_of_weight(prev: (Hash256, u32), target_weight: usize, value: u64) -> Transaction {
+            let mut tx = Transaction {
+                version: 2,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint { txid: prev.0, vout: prev.1 },
+                    script_sig: vec![0x51],
+                    sequence: 0xFFFFFFFF,
+                    witness: vec![vec![], vec![], vec![]],
+                }],
+                outputs: vec![TxOut { value, script_pubkey: vec![0x51] }],
+                lock_time: 0,
+            };
+            // Grow an OP_RETURN payload until the weight hits the target.
+            // Base weight is below target by construction; each payload byte
+            // adds exactly WITNESS_SCALE_FACTOR (4) to the weight, so we can
+            // land on any value congruent to the base modulo 4.
+            let mut pad = 0usize;
+            loop {
+                let mut spk = vec![0x6a]; // OP_RETURN
+                spk.extend(std::iter::repeat(0x00).take(pad));
+                tx.outputs = vec![
+                    TxOut { value, script_pubkey: vec![0x51] },
+                    TxOut { value: 0, script_pubkey: spk },
+                ];
+                let w = tx.weight() as usize;
+                if w >= target_weight {
+                    assert_eq!(
+                        w, target_weight,
+                        "could not land exactly on {} (got {} at pad {}); \
+                         the base weight's residue mod 4 does not match the target",
+                        target_weight, w, pad
+                    );
+                    return tx;
+                }
+                pad += 1;
+            }
+        }
+
+        let utxo_txid = Hash256::from_hex(
+            "a900000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000),
+        ]);
+        // Bare OP_1 / OP_RETURN outputs are non-standard and the txs are large;
+        // neither gate is what is under test here.
+        let opts = AtmpOptions { require_standard: false, ..Default::default() };
+
+        // tx_b must SPEND tx_a so the two share a connected component — two
+        // independent transactions live in separate clusters and their weights
+        // are never summed, which would make this test vacuous.
+        let tx_a = tx_of_weight((utxo_txid, 0), 201_998, 99_000_000);
+        let tx_a_txid = tx_a.txid();
+        let tx_b = tx_of_weight((tx_a_txid, 0), 202_002, 98_000_000);
+        assert_eq!(tx_a.weight() as u64 + tx_b.weight() as u64, 404_000);
+        // Each is individually well under; only the SUM sits on the bound.
+        assert_eq!(
+            (tx_a.weight() as u64).div_ceil(4) + (tx_b.weight() as u64).div_ceil(4),
+            101_001,
+            "the per-tx-ceilinged form must exceed 101_000 — otherwise this \
+             test does not discriminate"
+        );
+
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let r_a = mempool.add_transaction_with_options(
+            tx_a, &|op| utxos.get(op).cloned(), opts.clone());
+        assert!(r_a.is_ok(), "first tx must be accepted, got {:?}", r_a);
+        let r_b = mempool.add_transaction_with_options(
+            tx_b, &|op| utxos.get(op).cloned(), opts);
+        assert!(
+            r_b.is_ok(),
+            "Σweight is EXACTLY 404_000 and the comparison is strict `>`, so both \
+             transactions must be accepted. A rejection here means the size bound \
+             is summing per-tx ceilinged vbytes (101_001 > 101_000) instead of raw \
+             weight — the exact regression this guard exists to catch. Got {:?}",
+            r_b
+        );
+    }
+
+    /// The cluster weight gate sums ACROSS members: two transactions each
+    /// individually under the bound, together over it.
+    #[test]
+    fn test_cluster_weight_sums_across_members() {
+        let utxo_txid = Hash256::from_hex(
+            "a200000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000_000)]);
+        let opts = AtmpOptions { require_standard: false, ..Default::default() };
+        let mut mempool = Mempool::new(MempoolConfig::default());
+
+        // Parent: 126 multisig outputs → 2520 legacy sigops → adjusted 201_600.
+        let parent = make_sigop_heavy_tx((utxo_txid, 0), 126, 0, 100_000);
+        let parent_txid = parent.txid();
+        let r = mempool.add_transaction_with_options(parent, &|op| utxos.get(op).cloned(), opts.clone());
+        assert!(r.is_ok(), "parent alone (201_600 weight) must be accepted, got {:?}", r);
+        assert_eq!(mempool.get(&parent_txid).unwrap().sigop_adjusted_weight, 201_600);
+
+        // Child spends the parent: also 201_600 on its own — fine in isolation,
+        // but 201_600 + 201_600 = 403_200 <= 404_000, so it is ACCEPTED.
+        // per-output value 500 keeps the child's 126 outputs (63_000) inside the
+        // parent output it spends (100_000), leaving 37_000 sat of fee.
+        let child = make_sigop_heavy_tx((parent_txid, 0), 126, 0, 500);
+        let r2 = mempool.add_transaction_with_options(child, &|op| utxos.get(op).cloned(), opts.clone());
+        assert!(r2.is_ok(), "cluster of 403_200 must be accepted, got {:?}", r2);
+
+        // A third member pushes the cluster over: 403_200 + 1_600 = 404_800.
+        let child2 = make_sigop_heavy_tx((parent_txid, 1), 1, 0, 1_000);
+        let r3 = mempool.add_transaction_with_options(child2, &|op| utxos.get(op).cloned(), opts);
+        assert!(
+            matches!(r3, Err(MempoolError::ClusterWeightLimitExceeded(404_800, 404_000))),
+            "cluster totalling 404_800 must be rejected, got {:?}", r3
+        );
+    }
+
+    /// 64 members ACCEPT, the 65th REJECTS — and the reject token is the bare
+    /// `too-large-cluster`, matching Core for BOTH cluster gates.
+    #[test]
+    fn test_cluster_count_boundary_64_accepts_65_rejects() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let utxo_txid = Hash256::from_hex(
+            "a300000000000000000000000000000000000000000000000000000000000000",
+        ).unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 1_000_000_000)]);
+
+        // Root + 63 children = 64 members exactly.
+        let root_outputs: Vec<u64> = (0..65).map(|_| 10_000_000).collect();
+        let root = make_tx(vec![(utxo_txid, 0)], root_outputs, 1);
+        let root_txid = root.txid();
+        mempool.add_transaction(root, &|op| utxos.get(op).cloned()).unwrap();
+
+        for i in 0..63u32 {
+            let child = make_tx(vec![(root_txid, i)], vec![9_000_000], 1);
+            let r = mempool.add_transaction(child, &|op| utxos.get(op).cloned());
+            assert!(r.is_ok(), "member {} of 64 must be accepted, got {:?}", i + 2, r);
+        }
+        assert_eq!(mempool.size(), 64, "exactly 64 members must be in the mempool");
+
+        // The 65th member is rejected.
+        let child64 = make_tx(vec![(root_txid, 63)], vec![9_000_000], 1);
+        let r = mempool.add_transaction(child64, &|op| utxos.get(op).cloned());
+        assert!(
+            matches!(r, Err(MempoolError::ClusterSizeLimitExceeded(65, 64))),
+            "65th member must be rejected, got {:?}", r
+        );
+        assert_eq!(r.unwrap_err().reject_token(), "too-large-cluster");
+        assert_eq!(mempool.size(), 64);
     }
 
     /// no_limits() config must allow chains far beyond the default limits.
