@@ -27,7 +27,7 @@
 
 use rustoshi_consensus::{
     ChainParams, SigCache, DEFAULT_MAX_ENTRIES,
-    validate_scripts_parallel_with_cache,
+    script_flags_for_height, validate_scripts_parallel_with_cache,
 };
 // validation module items used only in ignored tests (documented structural gaps)
 #[allow(unused_imports)]
@@ -817,59 +817,90 @@ fn g25_cache_write_only_on_success() {
 }
 
 // ============================================================
-// G26 — OK: script flags computed per height with consensus flags
+// G26 — OK: script flags computed per block with consensus flags only
 //
-// Core: `GetBlockScriptFlags(pindex, chainman.GetConsensus())`
-//       returns P2SH|DERSIG|CLTV|CSV|WITNESS|NULLDUMMY|TAPROOT
-//       activated at appropriate heights.
-// Rustoshi: `script_flags_for_height()` in validation.rs:2338
-//           returns the same set. Correctly excludes policy flags
-//           (NULLFAIL, CLEANSTACK, LOW_S, etc.).
+// Core: `GetBlockScriptFlags(pindex, chainman.GetConsensus())` seeds
+//       P2SH|WITNESS|TAPROOT unconditionally, REPLACES on a
+//       script_flag_exceptions block-hash hit, then ORs the four
+//       height-gated flags (DERSIG/CLTV/CSV/NULLDUMMY).
+// Rustoshi: `validation::script_flags_for_height(height, block_hash, params)`
+//       is a literal port and is the crate's ONLY flag source.
+//
+// These two gates previously called `ScriptFlags::consensus_flags()`, a
+// hash-blind helper with no production caller, and asserted the properties
+// they claim to check ("consensus only", "no policy flags") of THAT function
+// rather than of the real one. Both failed as a result: consensus_flags
+// height-gated P2SH and leaked NULLFAIL. The helper has been deleted and the
+// gates now exercise the real block-validation path.
 // ============================================================
 
 #[test]
-fn g26_script_flags_per_height_consensus_only() {
-    // mainnet SegWit activation at h=481,824
-    let _params = ChainParams::mainnet();
-    // Below SegWit: P2SH only
-    let flags_pre = rustoshi_consensus::ScriptFlags::consensus_flags(100_000, false);
-    assert!(flags_pre.verify_p2sh);
-    assert!(!flags_pre.verify_witness);
-    assert!(!flags_pre.verify_taproot);
+fn g26_script_flags_per_block_consensus_only() {
+    let params = ChainParams::mainnet();
+    // Core sets the base trio on EVERY block, with no height gate
+    // (validation.cpp:2262) — including well below BIP-16 activation.
+    let flags_pre = script_flags_for_height(100_000, Hash256::ZERO, &params);
+    assert!(flags_pre.verify_p2sh, "P2SH is unconditional in Core");
+    assert!(flags_pre.verify_witness, "WITNESS is unconditional in Core");
+    assert!(flags_pre.verify_taproot, "TAPROOT is unconditional in Core");
+    // ...while the four height-gated flags are correctly still off here.
+    assert!(!flags_pre.verify_dersig);
+    assert!(!flags_pre.verify_checklocktimeverify);
+    assert!(!flags_pre.verify_checksequenceverify);
+    assert!(!flags_pre.verify_nulldummy);
 
-    // Post-SegWit, post-Taproot (h=709,632)
-    let flags_post = rustoshi_consensus::ScriptFlags::consensus_flags(750_000, false);
+    // Post-Taproot: trio still set, and all four height gates now open.
+    let flags_post = script_flags_for_height(750_000, Hash256::ZERO, &params);
     assert!(flags_post.verify_p2sh);
     assert!(flags_post.verify_witness);
     assert!(flags_post.verify_taproot);
-
-    // Policy flags must NOT be set
-    assert!(!flags_post.verify_nullfail, "NULLFAIL is policy-only, must not be set in block validation");
-    assert!(!flags_post.verify_cleanstack, "CLEANSTACK is policy-only");
+    assert!(flags_post.verify_dersig);
+    assert!(flags_post.verify_checklocktimeverify);
+    assert!(flags_post.verify_checksequenceverify);
+    assert!(flags_post.verify_nulldummy);
 }
 
 // ============================================================
-// G27 — OK: MANDATORY vs STANDARD flag distinction documented
+// G27 — OK: MANDATORY vs STANDARD flag distinction enforced
 //
-// Rustoshi correctly comments that only MANDATORY flags are used
-// during block validation (validation.rs:2324-2342).
+// Only MANDATORY_SCRIPT_VERIFY_FLAGS may appear in block validation;
+// STANDARD_SCRIPT_VERIFY_FLAGS (Core policy/policy.h:125) must not.
 // ============================================================
 
 #[test]
 fn g27_mandatory_vs_standard_flags_separated() {
-    // Verify no policy-only flag leaks into consensus validation path.
-    let _params = ChainParams::mainnet();
-    // Use the consensus flag path at a height where all activations are done.
-    let flags = rustoshi_consensus::ScriptFlags::consensus_flags(800_000, false);
+    let params = ChainParams::mainnet();
+    // A height where every consensus activation is long done, so anything
+    // extra that shows up here is a genuine policy leak rather than an
+    // inactive flag.
+    let flags = script_flags_for_height(800_000, Hash256::ZERO, &params);
 
-    // These are the policy-only flags that must NOT appear in block validation:
     assert!(!flags.verify_nullfail, "NULLFAIL is policy-only (BIP-146)");
     assert!(!flags.verify_cleanstack, "CLEANSTACK is policy-only");
     assert!(!flags.verify_low_s, "LOW_S is policy-only");
     assert!(!flags.verify_strictenc, "STRICTENC is policy-only");
     assert!(!flags.verify_minimaldata, "MINIMALDATA is policy-only");
-    assert!(!flags.verify_minimalif, "MINIMALIF is policy-only (in tapscript consensus: must not be in pre-tapscript block path)");
+    assert!(!flags.verify_minimalif, "MINIMALIF is policy-only in the pre-tapscript block path");
     assert!(!flags.verify_witness_pubkeytype, "WITNESS_PUBKEYTYPE is policy-only");
+
+    // The exception path must not become a policy-leak backdoor either:
+    // block 692261's table value is P2SH|WITNESS, and the four height flags
+    // OR on top — nothing else.
+    let taproot_exc = Hash256::from_hex(
+        "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+    )
+    .expect("valid hash");
+    let exc = script_flags_for_height(692_261, taproot_exc, &params);
+    assert!(exc.verify_p2sh && exc.verify_witness, "table value survives");
+    assert!(!exc.verify_taproot, "TAPROOT is what the exception removes");
+    assert!(
+        exc.verify_dersig
+            && exc.verify_checklocktimeverify
+            && exc.verify_checksequenceverify
+            && exc.verify_nulldummy,
+        "height gates OR on top of the exception (Core :2268-2286)"
+    );
+    assert!(!exc.verify_nullfail, "no policy flag via the exception path");
 }
 
 // ============================================================
