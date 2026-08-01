@@ -10021,9 +10021,15 @@ mod tests {
     //
     // Strategy: use P2SH inputs with a redeemScript of n OP_CHECKSIG opcodes.
     // P2SH sigop cost = n_sigops (accurate) × WITNESS_SCALE_FACTOR (4) per input.
-    // A redeemScript of 100 OP_CHECKSIG = 100 accurate sigops × 4 = 400 per input.
-    // 40 such inputs → 40 × 400 = 16,000 (exactly at limit, must accept).
-    // 41 such inputs → 41 × 400 = 16,400 > 16,000 (must reject).
+    //
+    // Constraint: AreInputsStandard (policy.cpp) rejects any input whose P2SH
+    // redeemScript has > MAX_P2SH_SIGOPS (15) sigops — and that gate runs BEFORE
+    // the MAX_STANDARD_TX_SIGOPS_COST check (validation.cpp), so each
+    // redeemScript must stay at ≤ 15 sigops or the tx dies as
+    // bad-txns-nonstandard-inputs first. With n = 15 (exactly at the limit,
+    // Core uses strict `>`), each input costs 15 × 4 = 60.
+    // 266 inputs → 266 × 60 = 15,960 (+4 for the P2PKH output) = 15,964 ≤ 16,000 → accept.
+    // 267 inputs → 267 × 60 = 16,020 (+4) = 16,024 > 16,000 → reject.
     // -----------------------------------------------------------------------
 
     /// Build a P2SH input spending a redeemScript of `n_checksig` OP_CHECKSIG ops.
@@ -10032,7 +10038,7 @@ mod tests {
     /// prevout scriptPubKey: OP_HASH160 <20 bytes hash> OP_EQUAL (P2SH pattern)
     ///
     /// Returns (TxIn, CoinEntry for the prevout, value=10_000_000 sats).
-    fn make_p2sh_checksig_input(txid_seed: u8, n_checksig: usize) -> (TxIn, OutPoint, CoinEntry) {
+    fn make_p2sh_checksig_input(txid_seed: u32, n_checksig: usize) -> (TxIn, OutPoint, CoinEntry) {
         // RedeemScript: n_checksig × OP_CHECKSIG
         let redeem_script: Vec<u8> = std::iter::repeat(0xacu8).take(n_checksig).collect();
 
@@ -10049,12 +10055,15 @@ mod tests {
         // P2SH scriptPubKey: OP_HASH160 (0xa9) PUSH20 (0x14) <20 bytes> OP_EQUAL (0x87)
         let p2sh_spk: Vec<u8> = {
             let mut s = vec![0xa9u8, 0x14u8];
-            s.extend(std::iter::repeat(txid_seed).take(20));
+            s.extend(std::iter::repeat(txid_seed as u8).take(20));
             s.push(0x87u8);
             s
         };
 
-        let txid = Hash256::from_bytes([txid_seed; 32]);
+        // Unique txid per seed (4-byte LE prefix; seed != 0 keeps it non-null).
+        let mut txid_bytes = [0u8; 32];
+        txid_bytes[..4].copy_from_slice(&txid_seed.to_le_bytes());
+        let txid = Hash256::from_bytes(txid_bytes);
         let outpoint = OutPoint { txid, vout: 0 };
 
         let txin = TxIn {
@@ -10085,7 +10094,7 @@ mod tests {
         let mut total_value = 0u64;
 
         for i in 0..n_inputs {
-            let seed = (i % 200 + 10) as u8; // avoid seed 0 (would be null txid)
+            let seed = i as u32 + 10; // avoid seed 0 (would be null txid)
             let (txin, outpoint, coin) = make_p2sh_checksig_input(seed, sigs_per_input);
             total_value += coin.value;
             utxos.insert(outpoint, coin);
@@ -10111,18 +10120,16 @@ mod tests {
         (tx, utxos)
     }
 
-    /// Tx with P2SH sigop cost exactly at MAX_STANDARD_TX_SIGOPS_COST (16,000) must be accepted.
+    /// Tx with P2SH sigop cost at/below MAX_STANDARD_TX_SIGOPS_COST (16,000) must be accepted.
     ///
-    /// 40 inputs × 100 OP_CHECKSIG redeemScript = 40 × 100 × 4 = 16,000 P2SH sigop cost.
-    /// Plus 1 legacy sigop from the P2PKH output × 4 = 4 → total 16,004 ... wait.
+    /// 266 inputs × 15 OP_CHECKSIG redeemScript = 266 × 15 × 4 = 15,960 P2SH sigop cost.
+    /// Plus 1 legacy sigop from the P2PKH output × 4 = 4 → total 15,964 ≤ 16,000 → accepted.
     ///
-    /// Recalculate: 40 inputs × 100 accurate sigops × 4 = 16,000.
-    /// Legacy: output P2PKH = 1 sigop × 4 = 4. Total = 16,004 > 16,000 → rejected!
+    /// The redeemScript must stay at ≤ MAX_P2SH_SIGOPS (15) sigops per input:
+    /// AreInputsStandard (Core policy.cpp) runs before the sigop-cost gate, so a
+    /// fatter redeemScript would die as bad-txns-nonstandard-inputs instead.
     ///
-    /// So use 39 inputs: 39 × 100 × 4 = 15,600. Plus 4 legacy = 15,604 < 16,000 → accepted.
-    /// And 41 inputs: 41 × 100 × 4 = 16,400. Plus 4 legacy = 16,404 > 16,000 → rejected.
-    ///
-    /// Ref: Bitcoin Core validation.cpp:941 strict `>` (=16,000 passes, >16,000 fails).
+    /// Ref: Bitcoin Core validation.cpp strict `>` (=16,000 passes, >16,000 fails).
     #[test]
     fn test_mempool_sigops_p2sh_under_limit_accepted() {
         let mut config = MempoolConfig::default();
@@ -10131,22 +10138,22 @@ mod tests {
         mempool.tip_height = 800_000;
         mempool.median_time_past = 0;
 
-        // 39 P2SH inputs × 100 OP_CHECKSIG × 4 = 15,600 P2SH cost.
+        // 266 P2SH inputs × 15 OP_CHECKSIG × 4 = 15,960 P2SH cost.
         // + P2PKH output 1 sigop × 4 = 4 legacy cost.
-        // Total: 15,604 ≤ 16,000 → must be accepted.
-        let (tx, utxos) = make_p2sh_multi_input_tx(39, 100);
+        // Total: 15,964 ≤ 16,000 → must be accepted.
+        let (tx, utxos) = make_p2sh_multi_input_tx(266, 15);
         let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
         assert!(
             result.is_ok(),
-            "39-input P2SH tx with 15,604 sigop cost must be accepted (got {:?})",
+            "266-input P2SH tx with 15,964 sigop cost must be accepted (got {:?})",
             result
         );
     }
 
     /// Tx with P2SH sigop cost over MAX_STANDARD_TX_SIGOPS_COST must be rejected.
     ///
-    /// 41 P2SH inputs × 100 OP_CHECKSIG × 4 = 16,400. Plus 4 legacy = 16,404 > 16,000.
-    /// Ref: Bitcoin Core validation.cpp:941-943.
+    /// 267 P2SH inputs × 15 OP_CHECKSIG × 4 = 16,020. Plus 4 legacy = 16,024 > 16,000.
+    /// Ref: Bitcoin Core validation.cpp.
     #[test]
     fn test_mempool_sigops_p2sh_over_limit_rejected() {
         let mut config = MempoolConfig::default();
@@ -10155,14 +10162,14 @@ mod tests {
         mempool.tip_height = 800_000;
         mempool.median_time_past = 0;
 
-        // 41 P2SH inputs × 100 OP_CHECKSIG × 4 = 16,400 P2SH cost.
+        // 267 P2SH inputs × 15 OP_CHECKSIG × 4 = 16,020 P2SH cost.
         // + P2PKH output 1 sigop × 4 = 4 legacy cost.
-        // Total: 16,404 > 16,000 → must be rejected.
-        let (tx, utxos) = make_p2sh_multi_input_tx(41, 100);
+        // Total: 16,024 > 16,000 → must be rejected.
+        let (tx, utxos) = make_p2sh_multi_input_tx(267, 15);
         let result = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
         assert!(
             matches!(result, Err(MempoolError::NonStandard(ref s)) if s.contains("bad-txns-too-many-sigops")),
-            "41-input P2SH tx with 16,404 sigop cost must be rejected with bad-txns-too-many-sigops (got {:?})",
+            "267-input P2SH tx with 16,024 sigop cost must be rejected with bad-txns-too-many-sigops (got {:?})",
             result
         );
     }

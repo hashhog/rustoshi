@@ -1602,13 +1602,17 @@ mod tests {
     fn test_version_negotiation() {
         let mut state = PeerCompactBlockState::new();
 
-        // First sendcmpct with version 1
+        // Core v24+ (net_processing.cpp SENDCMPCT handler, commit 42882fc8fc):
+        // `if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;` — version 1 is
+        // silently ignored with no state change. (Core ≤ v23 accepted v1; the
+        // current handler only supports witness compact blocks at version 2.)
         state.handle_sendcmpct(false, CMPCT_VERSION_1);
-        assert!(state.enabled);
-        assert_eq!(state.version, CMPCT_VERSION_1);
+        assert!(!state.enabled);
+        assert_eq!(state.version, 0);
 
-        // Second sendcmpct with version 2 should upgrade
+        // sendcmpct with version 2 is accepted.
         state.handle_sendcmpct(true, CMPCT_VERSION_2);
+        assert!(state.enabled);
         assert_eq!(state.version, CMPCT_VERSION_2);
     }
 

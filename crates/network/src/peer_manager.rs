@@ -3783,7 +3783,7 @@ impl PeerManager {
             addr_recv: socket_addr_to_net_address(addr, 0),
             addr_from: socket_addr_to_net_address("0.0.0.0:0".parse().unwrap(), our_services),
             nonce: rand::random(),
-            user_agent: "/Rustoshi:0.1.0/".to_string(),
+            user_agent: "/Rustoshi:1.0.0/".to_string(),
             start_height: self.start_height,
             relay,
         }
@@ -5635,7 +5635,7 @@ pub async fn run_inbound_peer(
         addr_recv: socket_addr_to_net_address(addr, their_version.services),
         addr_from: socket_addr_to_net_address("0.0.0.0:0".parse().unwrap(), our_services),
         nonce: our_nonce,
-        user_agent: "/Rustoshi:0.1.0/".to_string(),
+        user_agent: "/Rustoshi:1.0.0/".to_string(),
         start_height: our_start_height,
         relay: true,
     };
@@ -6867,7 +6867,7 @@ mod tests {
         assert_eq!(version.version, PROTOCOL_VERSION);
         assert!(version.services & NODE_NETWORK != 0);
         assert!(version.services & NODE_WITNESS != 0);
-        assert_eq!(version.user_agent, "/Rustoshi:0.1.0/");
+        assert_eq!(version.user_agent, "/Rustoshi:1.0.0/");
         assert_eq!(version.start_height, 0);
         assert!(version.relay);
     }

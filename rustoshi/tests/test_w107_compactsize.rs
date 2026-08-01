@@ -516,7 +516,7 @@ fn g21_vec_element_deserialization_roundtrip() {
 #[test]
 fn g22_user_agent_short_roundtrip() {
     // Normal user agent (< 256 bytes) must serialize/deserialize correctly.
-    let ua = "/rustoshi:0.1.0/".to_string();
+    let ua = "/rustoshi:1.0.0/".to_string();
     let msg = NetworkMessage::Version(VersionMessage {
         version: 70016,
         services: NODE_NETWORK | NODE_WITNESS,

@@ -9071,7 +9071,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         Ok(NetworkInfo {
             version: 250000, // 25.0.0
-            subversion: "/Rustoshi:0.1.0/".to_string(),
+            subversion: "/Rustoshi:1.0.0/".to_string(),
             protocolversion: 70016,
             // Derive both the hex word and the names from the SAME
             // local_services() value so they can never drift apart (Core
@@ -18354,7 +18354,9 @@ mod tests {
         let mut script = vec![0x51, 0x20]; // OP_1 <32>
         script.extend([0xab; 32]);
         let asm = disassemble_script(&script);
-        assert!(asm.contains("OP_1"));
+        // Core's ScriptToAsmStr (core_io.cpp) renders OP_1 as "1" (GetOpName).
+        let key_hex = "ab".repeat(32);
+        assert_eq!(asm, format!("1 {}", key_hex));
     }
 
     #[test]
@@ -18362,8 +18364,9 @@ mod tests {
         // OP_RETURN with data
         let script = vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef];
         let asm = disassemble_script(&script);
-        assert!(asm.contains("OP_RETURN"));
-        assert!(asm.contains("deadbeef"));
+        // Core's ScriptToAsmStr: a ≤4-byte push is emitted as a CScriptNum
+        // (signed little-endian) decimal, not hex: deadbeef → -1874767326.
+        assert_eq!(asm, "OP_RETURN -1874767326");
     }
 
     #[test]
@@ -18379,9 +18382,13 @@ mod tests {
         script.push(0xae); // OP_CHECKMULTISIG
 
         let asm = disassemble_script(&script);
-        assert!(asm.contains("OP_2"));
-        assert!(asm.contains("OP_3"));
-        assert!(asm.contains("OP_CHECKMULTISIG"));
+        // Core's ScriptToAsmStr renders OP_2/OP_3 as "2"/"3"; 33-byte pushes
+        // stay hex.
+        let pk_hex = "ab".repeat(33);
+        assert_eq!(
+            asm,
+            format!("2 {0} {0} {0} 3 OP_CHECKMULTISIG", pk_hex)
+        );
     }
 
     #[test]
@@ -18419,17 +18426,11 @@ mod tests {
 
     #[test]
     fn test_disassemble_script_small_integers() {
-        // OP_1 through OP_16
+        // OP_1 through OP_8 — Core's ScriptToAsmStr emits the numeric tokens
+        // ("1".."8"), not the "OP_N" names (GetOpName, script.cpp).
         let script = vec![0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58];
         let asm = disassemble_script(&script);
-        assert!(asm.contains("OP_1"));
-        assert!(asm.contains("OP_2"));
-        assert!(asm.contains("OP_3"));
-        assert!(asm.contains("OP_4"));
-        assert!(asm.contains("OP_5"));
-        assert!(asm.contains("OP_6"));
-        assert!(asm.contains("OP_7"));
-        assert!(asm.contains("OP_8"));
+        assert_eq!(asm, "1 2 3 4 5 6 7 8");
     }
 
     #[test]
@@ -20486,9 +20487,11 @@ mod tests {
             "rejected"
         );
         assert_eq!(ValidationError::InvalidChain.bip22_string(), "rejected");
+        // Block weight over MAX_BLOCK_WEIGHT → Core validation.cpp:4196
+        // CheckBlock "bad-blk-weight" (not the "rejected" catch-all).
         assert_eq!(
             ValidationError::BlockTooLarge(5_000_000).bip22_string(),
-            "rejected"
+            "bad-blk-weight"
         );
     }
 
@@ -20945,6 +20948,25 @@ mod tests {
         block
     }
 
+    /// ChainParams for the synthetic-PoW tests: mainnet activation heights
+    /// (BIP-34/SegWit/CSV stay inactive for the low-height fixtures, so the
+    /// OP_TRUE coinbases stay valid) but with
+    ///   (a) the PoW limit raised to the regtest limit, so the cheap-to-mine
+    ///       `mine_synth_block` fixtures (bits = 0x207fffff) pass
+    ///       CheckProofOfWork (0x207fffff > mainnet powLimit → "high-hash"),
+    ///   (b) a synthetic genesis at the same bits, so the Core bad-diffbits
+    ///       gate (nBits == GetNextWorkRequired(parent), validation.cpp:4088)
+    ///       accepts the fixture chain — with the real mainnet genesis
+    ///       (bits = 0x1d00ffff) every h=1 fixture is correctly rejected.
+    fn synth_pow_params() -> rustoshi_consensus::ChainParams {
+        let mut params = rustoshi_consensus::ChainParams::mainnet();
+        params.pow_limit = rustoshi_consensus::ChainParams::regtest().pow_limit;
+        let genesis = mine_synth_block(0, Hash256::ZERO, 0x60);
+        params.genesis_hash = genesis.block_hash();
+        params.genesis_block = genesis;
+        params
+    }
+
     /// Persist a side-branch block: header + block + index entry only
     /// (no UTXO or undo). This is what the reorg connect path needs as
     /// pre-state — it will compute UTXO + undo itself when connecting.
@@ -21161,18 +21183,18 @@ mod tests {
     /// has more chainwork than the active tip, reorganizes onto it.
     #[tokio::test]
     async fn try_attach_and_reorg_switches_to_heavier_branch() {
-        use rustoshi_consensus::ChainParams;
         use rustoshi_storage::ChainDb;
 
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
-        // Use mainnet params: BIP-34/SegWit heights are far above the
-        // synthetic blocks (heights 0..3) we mine here, so contextual
-        // checks become no-ops. Regtest activates both at height 1, which
-        // would force every test block to encode BIP-34 height + emit a
-        // valid witness commitment — orthogonal to the reorg wiring this
-        // test exercises.
-        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        // synth_pow_params: mainnet activation heights (BIP-34/SegWit far
+        // above the synthetic blocks at heights 0..3, so contextual checks
+        // become no-ops) but regtest-difficulty PoW so the cheap fixtures
+        // pass the Core bad-diffbits / high-hash header gates. Regtest
+        // activates both at height 1, which would force every test block to
+        // encode BIP-34 height + emit a valid witness commitment —
+        // orthogonal to the reorg wiring this test exercises.
+        let mut rpc_state = RpcState::new(db.clone(), synth_pow_params());
 
         // G -> A1 -> A2 (active chain, height 2)
         //  \-> B1 (side, height 1, parent hash_g) — to make B's branch
@@ -21780,8 +21802,7 @@ mod tests {
     #[tokio::test]
     async fn submit_block_writes_block_index_entry_for_accepted_block() {
         use rustoshi_consensus::pow::ChainWork;
-        use rustoshi_consensus::ChainParams;
-        let params = ChainParams::mainnet();
+        let params = synth_pow_params();
         let (db, state, server) = make_test_server(params.clone());
 
         // Mine + submit a block on top of genesis. mainnet params at h=1
@@ -21837,8 +21858,7 @@ mod tests {
     /// the base-chain blocks).
     #[tokio::test]
     async fn submit_block_accepts_side_branch_block_with_known_parent() {
-        use rustoshi_consensus::ChainParams;
-        let params = ChainParams::mainnet();
+        let params = synth_pow_params();
         let (db, state, server) = make_test_server(params.clone());
 
         let genesis_hash = params.genesis_hash;
@@ -21913,8 +21933,7 @@ mod tests {
     /// ancestor.
     #[tokio::test]
     async fn submit_block_reorgs_to_heavier_branch_via_extension() {
-        use rustoshi_consensus::ChainParams;
-        let params = ChainParams::mainnet();
+        let params = synth_pow_params();
         let (db, state, server) = make_test_server(params.clone());
 
         let genesis_hash = params.genesis_hash;
@@ -22035,8 +22054,7 @@ mod tests {
     /// only for blocks generated via the legacy `generateblocks` RPC.
     #[tokio::test]
     async fn submit_block_writes_tx_index_entries_for_accepted_block() {
-        use rustoshi_consensus::ChainParams;
-        let params = ChainParams::mainnet();
+        let params = synth_pow_params();
         let (db, _state, server) = make_test_server(params.clone());
 
         let genesis_hash = params.genesis_hash;
@@ -22075,12 +22093,11 @@ mod tests {
     /// ActivateBestChainStep.
     #[tokio::test]
     async fn try_attach_and_reorg_revert_and_replay_tx_index() {
-        use rustoshi_consensus::ChainParams;
         use rustoshi_storage::ChainDb;
 
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
-        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let mut rpc_state = RpcState::new(db.clone(), synth_pow_params());
 
         // G -> A1 -> A2 (active, height 2).
         let (hash_g, _block_g, work_g) = {
@@ -22206,12 +22223,11 @@ mod tests {
     /// disk write.
     #[tokio::test]
     async fn reorg_commits_single_batch_for_multi_block_swap() {
-        use rustoshi_consensus::ChainParams;
         use rustoshi_storage::ChainDb;
 
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
-        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let mut rpc_state = RpcState::new(db.clone(), synth_pow_params());
 
         // Old chain: G -> A1 -> A2 -> A3 (active, height 3).
         let (hash_g, _block_g, work_g) = {

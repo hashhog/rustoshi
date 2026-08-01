@@ -200,10 +200,11 @@
 //!                      runs out of space mid-IBD (relevant to mainnet
 //!                      operator filling a 4 TB NVMe).
 //!
-//!   BUG-21 (P3)        No per-category log-level dynamic adjustment via
-//!                      RPC. Core has `logging` RPC to flip categories on
-//!                      a running daemon (e.g. enable `net` debug without
-//!                      restart). rustoshi only reads `--debug=` at startup.
+//!   BUG-21 (P3) [FIXED]  `logging` RPC now exists (server.rs) with Core
+//!                      node.cpp:218-275 parity — per-category log-level
+//!                      dynamic adjustment, hot-reloaded EnvFilter.
+//!                      (Was: no RPC; rustoshi only read `--debug=` at
+//!                      startup.)
 //!
 //!   BUG-22 (P3)        `--debuglogfile` does not auto-create parent
 //!                      directory (ops.rs:206-215 uses
@@ -237,7 +238,7 @@
 //!
 //!   BUG-26 (P3)        No `--version` / `-V` machine-readable JSON
 //!                      output. `--version` shows clap-default
-//!                      `rustoshi 0.1.0` only; consensus-diff tooling
+//!                      `rustoshi 1.0.0` only; consensus-diff tooling
 //!                      can't parse build commit / build date / RocksDB
 //!                      version. Core has `bitcoind --version` + build
 //!                      info in `bitcoin-cli getnetworkinfo`.
@@ -263,13 +264,10 @@
 //!                      main.rs:1610). Operator-confusing; should
 //!                      reject if best_height > 1 unless `--force`.
 //!
-//!   BUG-30 (P3)        No `getmemoryinfo` / `getmemoryusage` parity.
-//!                      Operator chasing OOM has only `metrics`
-//!                      (height/peers/mempool_size) — no UTXO cache RSS,
-//!                      no per-thread arena info. Core's
-//!                      `getmemoryinfo` returns mallinfo + per-arena
-//!                      breakdown. Less critical than the lifecycle
-//!                      bugs above but cumulative for diagnostics.
+//!   BUG-30 (P3) [FIXED]  `getmemoryinfo` RPC now exists (server.rs) with
+//!                      Core node.cpp:145-198 parity (locked-pool shape +
+//!                      exact -8 error paths). (Was: no getmemoryinfo /
+//!                      getmemoryusage parity at all.)
 
 #![allow(clippy::needless_return)]
 
@@ -555,11 +553,16 @@ fn g17_persistence_failure_silent_in_exit_code() {
         main_rs.contains("Failed to dump mempool"),
         "G17: dump_mempool error log changed — re-verify"
     );
-    // Shutdown returns Ok unconditionally.
-    let tail = &main_rs[main_rs.len().saturating_sub(20_000)..];
+    // Shutdown returns Ok unconditionally: the final "Shutdown complete" log
+    // is immediately followed by `Ok(())` — flush errors above only log.
+    // (Anchored on the log line itself, not a fixed-distance tail window:
+    // main.rs grew a #[cfg(test)] module after the shutdown path.)
+    let sc = main_rs
+        .rfind("Shutdown complete\");")
+        .expect("G17: shutdown final log changed — re-verify");
+    let after = &main_rs[sc..(sc + 500).min(main_rs.len())];
     assert!(
-        tail.contains("Shutdown complete\");")
-            && tail.contains("Ok(())"),
+        after.contains("Ok(())"),
         "G17: shutdown return path changed — re-verify"
     );
 }
@@ -607,16 +610,17 @@ fn g20_no_startup_disk_space_check() {
 // Gates 21-30: Diagnostics, polish, CLI/help, edge cases
 // ============================================================
 
-/// G21 (MISSING — BUG-21): No `logging` RPC for runtime log-level toggle.
+/// G21 (FIXED — was BUG-21): `logging` RPC for runtime log-level toggle.
+/// The gap is closed: server.rs now implements Core's `logging` RPC
+/// (rpc/node.cpp:218-275 parity, hot-reloading EnvFilter). Regression pin:
+/// the method must stay wired.
 #[test]
-fn g21_no_logging_rpc_for_dynamic_level() {
+fn g21_logging_rpc_present() {
     let server_rs = include_str!("../../crates/rpc/src/server.rs");
-    // Core's `logging` RPC takes include / exclude category lists.
-    // We have no such method.
     assert!(
-        !server_rs.contains("async fn logging(")
-            && !server_rs.contains("fn logging("),
-        "BUG-21: a logging RPC was added — update audit"
+        server_rs.contains("#[method(name = \"logging\")]")
+            && server_rs.contains("async fn logging("),
+        "G21 regression: the `logging` RPC was removed or renamed"
     );
 }
 
@@ -743,14 +747,15 @@ fn g29_load_snapshot_doesnt_refuse_existing_chain() {
     );
 }
 
-/// G30 (MISSING — BUG-30): No `getmemoryinfo` RPC parity.
+/// G30 (FIXED — was BUG-30): `getmemoryinfo` RPC parity.
+/// The gap is closed: server.rs now implements Core's `getmemoryinfo`
+/// (rpc/node.cpp:145-198 parity). Regression pin: the method must stay wired.
 #[test]
-fn g30_no_getmemoryinfo_rpc() {
+fn g30_getmemoryinfo_rpc_present() {
     let server_rs = include_str!("../../crates/rpc/src/server.rs");
-    // No `async fn get_memory_info`.
     assert!(
-        !server_rs.contains("fn get_memory_info(")
-            && !server_rs.contains("\"getmemoryinfo\""),
-        "BUG-30: getmemoryinfo was added — update audit"
+        server_rs.contains("#[method(name = \"getmemoryinfo\")]")
+            && server_rs.contains("fn get_memory_info("),
+        "G30 regression: the `getmemoryinfo` RPC was removed or renamed"
     );
 }

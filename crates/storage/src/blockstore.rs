@@ -1439,6 +1439,12 @@ mod tests {
             store.write_block(&block, height).expect("failed to write block");
         }
 
+        // Rotate to a new write file: like Core's FindFilesToPrune
+        // (fileNumber < MaxBlockfileNum()), we never prune the file still
+        // being written, so file 0 is only a candidate after rotation.
+        store.current_file = 1;
+        store.file_info.push(BlockFileInfo::new());
+
         // Force pruning check
         store.check_for_pruning = true;
 

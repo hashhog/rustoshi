@@ -1779,7 +1779,7 @@ pub(crate) async fn perform_v2_handshake_inbound(
             port: 0,
         },
         nonce: our_nonce,
-        user_agent: "/Rustoshi:0.1.0/".to_string(),
+        user_agent: "/Rustoshi:1.0.0/".to_string(),
         start_height: our_start_height,
         relay: true,
     };
@@ -2897,7 +2897,7 @@ mod tests {
             addr_recv: NetAddress::from_ipv4([127, 0, 0, 1], 48333, NODE_NETWORK),
             addr_from: NetAddress::from_ipv4([127, 0, 0, 1], 48333, NODE_NETWORK | NODE_WITNESS),
             nonce: 0x1234567890ABCDEF,
-            user_agent: "/rustoshi:0.1.0/".to_string(),
+            user_agent: "/rustoshi:1.0.0/".to_string(),
             start_height: 50000,
             relay: true,
         }
