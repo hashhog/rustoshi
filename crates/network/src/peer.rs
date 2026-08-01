@@ -1960,6 +1960,38 @@ async fn run_outbound_v2_peer(
 
 /// Like [`v2_send_message`] but updates `stats` with the encoded
 /// ciphertext length on success.
+/// Wall-clock ceiling on a single peer send (write_all + flush).
+///
+/// WHY THIS EXISTS — the 2026-08-01 mainnet wedge, 24 watchdog kills in a week.
+///
+/// `write_all` on a TcpStream returns once the bytes are in the kernel send
+/// buffer, so it only blocks when that buffer is FULL — i.e. when the peer has
+/// stopped ACKing. If a peer blackholes (stops ACKing, sends no FIN/RST) the
+/// write parks until the kernel abandons the connection, which on Linux with
+/// the default `tcp_retries2 = 15` is roughly 924.6s for a 200ms RTO base,
+/// scaling past 1100s for high-RTT peers.
+///
+/// That is not merely a slow peer task. The main select! loop calls
+/// `PeerManager::send_to_peer`, which awaits an unbounded send into this
+/// peer's 32-slot command channel (peer_manager.rs:3796, :3558). Once the
+/// stalled writer stops draining, the channel fills and the MAIN LOOP blocks
+/// inside the arm body — every arm, including the inbound-event arm whose
+/// heartbeat the watchdog reads. One unresponsive peer freezes the whole node.
+///
+/// Measured: a gap histogram over the production log shows one continuous
+/// stall population — 10 in [780,810), 6 in [810,840), 4 in [840,870), 6 in
+/// [870,900), 20 in [900,930) — truncated dead at the 900s watchdog, with
+/// nothing above 930s. Before the watchdog existed the same population ran to
+/// 956s, 1111s, 1115s, 1124s. The node was losing a photo finish with the
+/// kernel roughly half the times this happened.
+///
+/// 120s is chosen to sit far below the kernel's ~925s while leaving generous
+/// headroom for a legitimately slow transfer: a 4 MiB block to a 1 Mbps peer
+/// needs ~32s of buffer drain, so this is ~4x that. A peer that cannot accept
+/// a message within two minutes is not usefully connected, and dropping it
+/// takes the same path a real ETIMEDOUT already takes today.
+pub const PEER_SEND_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub(crate) async fn v2_send_message_tracked<W: tokio::io::AsyncWrite + Unpin>(
     cipher: &mut Bip324Cipher,
     writer: &mut W,
@@ -2337,17 +2369,28 @@ pub async fn run_message_loop_tracked(
                 match cmd {
                     Some(PeerCommand::SendMessage(msg)) => {
                         let data = serialize_message(magic, &msg);
-                        if writer.write_all(&data).await.is_err() {
-                            let _ = event_tx.send(PeerEvent::Disconnected(
-                                peer_id, DisconnectReason::IoError("write failed".to_string())
-                            )).await;
-                            return;
-                        }
-                        if writer.flush().await.is_err() {
-                            let _ = event_tx.send(PeerEvent::Disconnected(
-                                peer_id, DisconnectReason::IoError("flush failed".to_string())
-                            )).await;
-                            return;
+                        // Bounded for the same reason as the v2 path above.
+                        match tokio::time::timeout(PEER_SEND_TIMEOUT, async {
+                            writer.write_all(&data).await?;
+                            writer.flush().await
+                        }).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                let _ = event_tx.send(PeerEvent::Disconnected(
+                                    peer_id, DisconnectReason::IoError("write failed".to_string())
+                                )).await;
+                                return;
+                            }
+                            Err(_elapsed) => {
+                                let _ = event_tx.send(PeerEvent::Disconnected(
+                                    peer_id,
+                                    DisconnectReason::IoError(format!(
+                                        "v1 send timed out after {}s (peer not draining)",
+                                        PEER_SEND_TIMEOUT.as_secs()
+                                    )),
+                                )).await;
+                                return;
+                            }
                         }
                         stats.record_send(command_static_str(msg.command()), data.len() as u64);
                     }
@@ -2604,12 +2647,31 @@ pub async fn run_message_loop_v2_tracked(
             cmd = command_rx.recv() => {
                 match cmd {
                     Some(PeerCommand::SendMessage(msg)) => {
-                        if let Err(e) = v2_send_message_tracked(&mut cipher, &mut writer, &msg, &stats).await {
-                            let _ = event_tx.send(PeerEvent::Disconnected(
-                                peer_id,
-                                DisconnectReason::IoError(format!("v2 send: {}", e)),
-                            )).await;
-                            return;
+                        // Bounded: an un-timed-out write parks for ~925s when a
+                        // peer blackholes, which wedges the MAIN LOOP through the
+                        // full command channel. See PEER_SEND_TIMEOUT.
+                        match tokio::time::timeout(
+                            PEER_SEND_TIMEOUT,
+                            v2_send_message_tracked(&mut cipher, &mut writer, &msg, &stats),
+                        ).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                let _ = event_tx.send(PeerEvent::Disconnected(
+                                    peer_id,
+                                    DisconnectReason::IoError(format!("v2 send: {}", e)),
+                                )).await;
+                                return;
+                            }
+                            Err(_elapsed) => {
+                                let _ = event_tx.send(PeerEvent::Disconnected(
+                                    peer_id,
+                                    DisconnectReason::IoError(format!(
+                                        "v2 send timed out after {}s (peer not draining)",
+                                        PEER_SEND_TIMEOUT.as_secs()
+                                    )),
+                                )).await;
+                                return;
+                            }
                         }
                     }
                     Some(PeerCommand::Disconnect) | None => {
