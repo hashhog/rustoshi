@@ -162,7 +162,7 @@ pub fn select_coins_bnb(
         .collect();
 
     // Sort by effective value descending
-    groups.sort_by(|a, b| b.effective_value.cmp(&a.effective_value));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.effective_value));
 
     // Calculate available value
     let total_available: i64 = groups.iter().map(|g| g.effective_value).sum();
@@ -370,7 +370,7 @@ pub fn select_coins_knapsack<R: Rng>(
     }
 
     // Sort applicable groups by value descending
-    applicable_groups.sort_by(|a, b| b.utxo.value.cmp(&a.utxo.value));
+    applicable_groups.sort_by_key(|g| std::cmp::Reverse(g.utxo.value));
 
     // Approximate best subset
     let (best_selection, best_value) = approximate_best_subset(
@@ -511,7 +511,7 @@ pub fn select_coins_largest_first(
         .filter(|u| u.confirmations >= 1)
         .collect();
 
-    sorted.sort_by(|a, b| b.value.cmp(&a.value));
+    sorted.sort_by_key(|u| std::cmp::Reverse(u.value));
 
     let mut selected = Vec::new();
     let mut total: u64 = 0;

@@ -899,6 +899,9 @@ pub async fn run_outbound_peer_with_proxy(
 
 /// V1 outbound flow extracted from `run_outbound_peer` so the proxy
 /// dispatch path and the legacy direct-SocketAddr path can both reuse it.
+// The parameter set is the peer-plumbing context shared by both call sites;
+// grouping it into a struct would churn both for no semantic gain.
+#[allow(clippy::too_many_arguments)]
 async fn run_v1_outbound_flow(
     peer_id: PeerId,
     addr: SocketAddr,

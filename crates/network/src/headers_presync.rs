@@ -311,14 +311,14 @@ impl HeadersPresyncState {
             PresyncState::Presync => {
                 // Core lines 83-96: PRESYNC — validate + store commitments.
                 result.success = self.validate_and_store_commitments(headers);
-                if result.success {
-                    if full_message || self.state == PresyncState::Redownload {
-                        // Full message: more headers may be available.
-                        // Transitioned to REDOWNLOAD: need to re-request from the beginning.
-                        result.request_more = true;
-                    }
-                    // If not full and still in PRESYNC: chain ended, not enough work.
+                if result.success
+                    && (full_message || self.state == PresyncState::Redownload)
+                {
+                    // Full message: more headers may be available.
+                    // Transitioned to REDOWNLOAD: need to re-request from the beginning.
+                    result.request_more = true;
                 }
+                // If not full and still in PRESYNC: chain ended, not enough work.
             }
             PresyncState::Redownload => {
                 // Core lines 98-132: REDOWNLOAD — verify commitments and buffer headers.

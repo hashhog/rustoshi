@@ -610,7 +610,7 @@ fn build_coinbase_tx(
     // Append OP_0 dummy at heights 1-16 to satisfy bad-cb-length (≥ 2 bytes).
     // Height 0 never occurs in practice (genesis is pre-created), but we guard
     // it anyway: encode_coinbase_height(0) already returns 2 bytes.
-    if height >= 1 && height <= 16 {
+    if (1..=16).contains(&height) {
         coinbase_script.push(0x00); // OP_0 dummy extranonce
     }
 
@@ -722,7 +722,7 @@ fn build_witness_commitment(txs: &[Transaction], nonce: &[u8]) -> Vec<u8> {
 ///   extranonce to satisfy the `bad-cb-length` consensus rule (≥ 2 bytes)
 ///   when height ≤ 16.**
 /// - Heights 17+: CScriptNum minimal push:
-///     `<len_byte> <value in little-endian sign-magnitude>`
+///   `<len_byte> <value in little-endian sign-magnitude>`
 ///
 /// Reference: Bitcoin Core script.h:433-447 (`push_int64`).
 pub fn encode_coinbase_height(height: u32) -> Vec<u8> {
@@ -753,33 +753,6 @@ pub fn encode_coinbase_height(height: u32) -> Vec<u8> {
     let mut result = vec![encoded.len() as u8];
     result.extend_from_slice(&encoded);
     result
-}
-
-// ============================================================
-// WEIGHT ESTIMATION
-// ============================================================
-
-/// Estimate the weight of a coinbase transaction.
-///
-/// This is a conservative estimate to ensure we leave enough room.
-fn estimate_coinbase_weight(height: u32, extra_data: &[u8]) -> u64 {
-    // Script: height encoding + extra data
-    let height_script = encode_coinbase_height(height);
-    let script_len = height_script.len() + extra_data.len();
-
-    // Base size (non-witness):
-    // version (4) + input count (1) + outpoint (32+4) + scriptSig length (1-3) + scriptSig
-    // + sequence (4) + output count (1) + value (8) + scriptPubKey length (1-3) + scriptPubKey (~34)
-    // + witness commitment output (1+8+38) + locktime (4)
-    let base_size = 4 + 1 + 36 + 1 + script_len + 4 + 1 + 8 + 2 + 34 + 1 + 8 + 38 + 4;
-
-    // Witness size: stack count (1) + item count (1) + 32 bytes nonce
-    let witness_size = 1 + 1 + 32;
-
-    // Weight = base * 4 + witness (which is part of total_size - base_size)
-    // For coinbase with witness: weight = base * 3 + total where total = base + 2 (marker/flag) + witness
-    // = base * 3 + base + 2 + witness = base * 4 + 2 + witness
-    (base_size * 4 + 2 + witness_size) as u64
 }
 
 // ============================================================
@@ -1373,18 +1346,6 @@ mod tests {
         assert_eq!(template.target[3], 0x00);
         assert_eq!(template.target[4], 0xff);
         assert_eq!(template.target[5], 0xff);
-    }
-
-    #[test]
-    fn test_estimate_coinbase_weight() {
-        // Simple sanity check
-        let weight = estimate_coinbase_weight(1, b"test");
-        assert!(weight > 0);
-        assert!(weight < 1000); // should be reasonable size
-
-        // Higher block height = slightly larger coinbase
-        let weight_high = estimate_coinbase_weight(1_000_000, b"test");
-        assert!(weight_high >= weight);
     }
 
     // ============================================================

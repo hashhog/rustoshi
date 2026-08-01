@@ -363,7 +363,7 @@ fn protect_by_ratio(candidates: &mut Vec<EvictionCandidate>) {
     let remaining_to_protect = total_protect.saturating_sub(num_protected);
     if remaining_to_protect > 0 && !candidates.is_empty() {
         // Sort by connection time (oldest first)
-        candidates.sort_by(|a, b| a.connected_time.cmp(&b.connected_time));
+        candidates.sort_by_key(|c| c.connected_time);
 
         // Remove last remaining_to_protect
         let new_len = candidates.len().saturating_sub(remaining_to_protect);

@@ -71,6 +71,7 @@ pub mod wallet_error {
 /// finalizing). Handles the single-key shapes the wallet signer produces:
 ///   - P2WPKH / P2SH-P2WPKH witness: `[sig+hashtype, pubkey(33)]`
 ///   - P2PKH scriptSig: `push(sig+hashtype) push(pubkey(33))`
+///
 /// Returns None for multi-element or unrecognised shapes (Taproot key-path
 /// sigs are not partial-sig records and are left to the finalize path).
 fn extract_single_partial_sig(
@@ -1296,6 +1297,10 @@ pub struct WalletRpcImpl {
     target_wallet: Option<String>,
 }
 
+/// Success payload / RPC error pair for `process_descriptor_import`:
+/// `(canonical_descriptor, label, range_end, warnings)` or `(code, message)`.
+type DescriptorImportResult = Result<(String, String, u32, Vec<String>), (i32, String)>;
+
 impl WalletRpcImpl {
     /// Create a new wallet RPC implementation.
     pub fn new(state: Arc<RwLock<WalletRpcState>>) -> Self {
@@ -1669,7 +1674,7 @@ impl WalletRpcImpl {
     fn process_descriptor_import(
         wallet: &mut rustoshi_wallet::Wallet,
         request: &crate::types::ImportDescriptorRequest,
-    ) -> Result<(String, String, u32, Vec<String>), (i32, String)> {
+    ) -> DescriptorImportResult {
         use rustoshi_wallet::descriptor::{parse_descriptor, DescriptorInfo};
         const RPC_INVALID_PARAMETER: i32 = -8;
 
@@ -2798,7 +2803,7 @@ impl WalletRpcServer for WalletRpcImpl {
         // SignatureData). Never fabricate completeness.
         let complete = errors.is_empty();
 
-        let signed_hex = hex::encode(&tx.serialize());
+        let signed_hex = hex::encode(tx.serialize());
 
         Ok(SignRawTransactionResult {
             hex: signed_hex,
@@ -3526,7 +3531,7 @@ impl WalletRpcServer for WalletRpcImpl {
             // Take this chance to reset the actual change_position if requested.
             if let Some(want) = opts.change_position {
                 if change_pos >= 0 && (want as usize) < tx.outputs.len() {
-                    let from = (tx.outputs.len() - 1) as usize;
+                    let from = tx.outputs.len() - 1;
                     let to = want as usize;
                     if from != to {
                         tx.outputs.swap(from, to);
@@ -3804,8 +3809,8 @@ impl WalletRpcServer for WalletRpcImpl {
         // ============================================================
         // Updater role — fill witness_utxo / scripts / bip32 derivs.
         // ============================================================
-        for i in 0..num_inputs {
-            let Some(utxo) = &prev_utxos[i] else { continue };
+        for (i, prev) in prev_utxos.iter().enumerate() {
+            let Some(utxo) = prev else { continue };
             let spk = utxo.script_pubkey.clone();
 
             // Provide the spent output as a witness_utxo for segwit inputs
@@ -3846,13 +3851,13 @@ impl WalletRpcServer for WalletRpcImpl {
         let mut complete = num_inputs > 0;
 
         if sign {
-            for i in 0..num_inputs {
+            for (i, prev) in prev_utxos.iter().enumerate() {
                 // Already finalized by a prior round: counts as done.
                 if psbt.inputs[i].is_finalized() {
                     continue;
                 }
 
-                let Some(utxo) = &prev_utxos[i] else {
+                let Some(utxo) = prev else {
                     // Foreign input — wallet has no key, cannot complete.
                     complete = false;
                     continue;
@@ -3972,7 +3977,7 @@ impl WalletRpcServer for WalletRpcImpl {
         _iswitness: Option<bool>,
     ) -> RpcResult<FundRawTransactionResult> {
         use rustoshi_primitives::{Encodable, TxOut};
-        use rustoshi_crypto::address::{Address, Network};
+        use rustoshi_crypto::address::Address;
 
         let opts = options.unwrap_or_default();
 
@@ -4028,11 +4033,7 @@ impl WalletRpcServer for WalletRpcImpl {
         let state = self.state.read().await;
         let (_, wallet) = self.resolve_wallet(&state)?;
         let net = state.wallet_manager.network();
-        let net_param = match net {
-            Network::Mainnet => Network::Mainnet,
-            Network::Testnet => Network::Testnet,
-            Network::Regtest => Network::Regtest,
-        };
+        let net_param = net;
 
         // --- Map the decoded tx's existing outputs into the recipient form
         // the selector expects: (address_string, value_sats). The selector
@@ -4394,7 +4395,7 @@ impl WalletRpcServer for WalletRpcImpl {
 
         let new_tx = wallet_guard
             .bump_fee(&hash, fee_rate_override)
-            .map_err(|e| Self::bumpfee_err_to_rpc(e))?;
+            .map_err(Self::bumpfee_err_to_rpc)?;
 
         // Look up the recorded SentTx for the new txid to learn the fee.
         let new_txid = new_tx.txid();
@@ -4451,7 +4452,7 @@ impl WalletRpcServer for WalletRpcImpl {
 
         let psbt = wallet_guard
             .psbt_bump_fee(&hash, fee_rate_override)
-            .map_err(|e| Self::bumpfee_err_to_rpc(e))?;
+            .map_err(Self::bumpfee_err_to_rpc)?;
 
         // Recompute the new fee from the unsigned-tx outputs vs the
         // recorded spent UTXOs. We don't record sent_txs for psbt path

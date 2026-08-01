@@ -366,12 +366,13 @@ impl NetGroupManager {
         if asn != 0 {
             // IPv4 and IPv6 with the same ASN share the same bucket.
             // Core: NET_IPV6 (=6) + 4-byte ASN in little-endian.
-            let mut group = Vec::with_capacity(5);
-            group.push(NET_IPV6);
-            group.push((asn) as u8);
-            group.push((asn >> 8) as u8);
-            group.push((asn >> 16) as u8);
-            group.push((asn >> 24) as u8);
+            let group = vec![
+                NET_IPV6,
+                asn as u8,
+                (asn >> 8) as u8,
+                (asn >> 16) as u8,
+                (asn >> 24) as u8,
+            ];
             return NetGroup::new(group);
         }
 

@@ -158,13 +158,7 @@ impl Num3072 {
         // can carry into prod[p+1].  We loop until clean.
         loop {
             // Does any upper limb hold non-zero data?
-            let mut has_high = false;
-            for p in LIMBS..(LIMBS * 2) {
-                if prod[p] != 0 {
-                    has_high = true;
-                    break;
-                }
-            }
+            let has_high = prod[LIMBS..].iter().any(|&x| x != 0);
             if !has_high {
                 break;
             }
@@ -197,9 +191,7 @@ impl Num3072 {
         }
 
         // ---- Step 3: write back, then reduce if still >= modulus. ----
-        for i in 0..LIMBS {
-            self.limbs[i] = prod[i];
-        }
+        self.limbs[..LIMBS].copy_from_slice(&prod[..LIMBS]);
         // After up to two `FullReduce`s `self` is in [0, p).  In practice
         // one is almost always enough, but be conservative.
         if self.is_overflow() {

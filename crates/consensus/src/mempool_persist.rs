@@ -87,9 +87,9 @@ impl<R: Read> Read for XorReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         if !is_zero_key(&self.key) {
-            for i in 0..n {
+            for (i, byte) in buf[..n].iter_mut().enumerate() {
                 let key_index = ((self.pos + i as u64) % OBFUSCATION_KEY_LEN as u64) as usize;
-                buf[i] ^= self.key[key_index];
+                *byte ^= self.key[key_index];
             }
         }
         self.pos += n as u64;

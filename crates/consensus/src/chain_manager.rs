@@ -236,13 +236,9 @@ where
     let mut current_height = block_height;
 
     while current_height > target_height {
-        match get_block_meta(&current_hash) {
-            Some(meta) => {
-                current_hash = meta.prev_hash;
-                current_height = current_height.saturating_sub(1);
-            }
-            None => return None,
-        }
+        let meta = get_block_meta(&current_hash)?;
+        current_hash = meta.prev_hash;
+        current_height = current_height.saturating_sub(1);
     }
 
     Some(current_hash)

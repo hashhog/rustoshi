@@ -201,7 +201,7 @@ impl SigCache {
         flags: u32,
     ) -> [u8; 32] {
         let mut h = Sha256::new();
-        h.update(&self.nonce);
+        h.update(self.nonce);
         h.update(wtxid);
         h.update(input_idx.to_le_bytes());
         h.update(script_sig);

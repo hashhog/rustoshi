@@ -2079,7 +2079,7 @@ impl Mempool {
                 // Must pay for bandwidth (sat/kvB × vsize / 1000, ceiling)
                 // incremental_relay_fee is in sat/kvB; mirrors Core CFeeRate::GetFee(vsize).
                 let additional_fee = fee - sibling_fee;
-                let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64 + 999) / 1000;
+                let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64).div_ceil(1000);
                 if additional_fee < required_bandwidth_fee {
                     return Err(MempoolError::RbfInsufficientBandwidthFee(
                         additional_fee,
@@ -2695,13 +2695,11 @@ impl Mempool {
             // verified at original ConnectBlock time), and (d) tag the
             // entry_sequence as 0 so reorged children sort before any
             // existing children.  Mirrors Core's `MaybeUpdateMempoolForReorg`.
-            match self.add_transaction_with_options(
-                tx.clone(),
-                utxo_lookup,
-                AtmpOptions::reorg_refill(),
-            ) {
-                Ok(_) => readded += 1,
-                Err(_) => {}
+            if self
+                .add_transaction_with_options(tx.clone(), utxo_lookup, AtmpOptions::reorg_refill())
+                .is_ok()
+            {
+                readded += 1
             }
         }
         readded
@@ -2837,15 +2835,13 @@ impl Mempool {
                     // OP_RETURN outputs are unspendable — never dust, skip dust check.
                     continue;
                 }
-                StandardScriptType::BareMultisig => {
+                StandardScriptType::BareMultisig if !self.config.permit_bare_multisig => {
                     // Mirrors Bitcoin Core IsStandardTx:
                     //   (whichType == MULTISIG) && (!permit_bare_multisig) → "bare-multisig"
-                    if !self.config.permit_bare_multisig {
-                        return Err(MempoolError::NonStandard(format!(
-                            "bare-multisig at index {}",
-                            i
-                        )));
-                    }
+                    return Err(MempoolError::NonStandard(format!(
+                        "bare-multisig at index {}",
+                        i
+                    )));
                 }
                 _ => {}
             }
@@ -3252,7 +3248,7 @@ impl Mempool {
         // Safety: new_fee >= conflicting_fees guaranteed by Rule #3 above, so no underflow.
         // incremental_relay_fee is in sat/kvB; mirrors Core CFeeRate::GetFee(vsize) (ceiling).
         let additional_fee = new_fee - conflicting_fees;
-        let required_bandwidth_fee = (self.config.incremental_relay_fee * new_vsize as u64 + 999) / 1000;
+        let required_bandwidth_fee = (self.config.incremental_relay_fee * new_vsize as u64).div_ceil(1000);
         if additional_fee < required_bandwidth_fee {
             return Err(MempoolError::RbfInsufficientBandwidthFee(
                 additional_fee,
@@ -3533,24 +3529,6 @@ impl Mempool {
         self.notify_block_connected();
         let cutoff = now_secs.saturating_sub(self.config.expiry_seconds as i64);
         self.expire(cutoff)
-    }
-
-    /// Evict the lowest fee rate transaction (and its descendants).
-    /// Uses mining score (cluster-aware fee rate) for eviction.
-    fn evict_lowest_fee_rate(&mut self) -> bool {
-        // Use mining score index for cluster-aware eviction
-        if !self.mining_score_index.is_empty() {
-            return self.evict_lowest_mining_score();
-        }
-
-        // Fallback to fee rate index if mining score index is empty
-        if let Some((key, _)) = self.fee_rate_index.iter().next() {
-            let txid = key.txid;
-            self.remove_transaction(&txid, true);
-            true
-        } else {
-            false
-        }
     }
 
     /// Get all mempool ancestors of a transaction (not including the transaction itself).
@@ -4300,20 +4278,6 @@ impl Mempool {
         total_weight
     }
 
-    /// Evict the transaction with the lowest mining score.
-    /// This evicts from the worst cluster (lowest worst-mining-score).
-    fn evict_lowest_mining_score(&mut self) -> bool {
-        // Find the transaction with the lowest mining score
-        if let Some((&_key, &txid)) = self.mining_score_index.iter().next() {
-            // Remove the transaction with lowest mining score
-            // This also removes its descendants
-            self.remove_transaction(&txid, true);
-            true
-        } else {
-            false
-        }
-    }
-
     // ============================================================
     // PACKAGE VALIDATION
     // ============================================================
@@ -4840,7 +4804,7 @@ impl Mempool {
 
                 // incremental_relay_fee is in sat/kvB; ceiling division matches Core.
                 let additional_fee = fee - sibling_fee;
-                let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64 + 999) / 1000;
+                let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64).div_ceil(1000);
                 if additional_fee < required_bandwidth_fee {
                     return Err(MempoolError::RbfInsufficientBandwidthFee(
                         additional_fee,

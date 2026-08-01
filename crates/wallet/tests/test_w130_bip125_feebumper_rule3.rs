@@ -365,7 +365,7 @@ fn g24_replacement_disallowed_error_variant_present() {
 /// `max(node_incremental_relay_fee, WALLET_INCREMENTAL_RELAY_FEE)`; with the
 /// node default `DEFAULT_INCREMENTAL_RELAY_FEE = 100` sat/kvB, the wallet
 /// floor of 5000 sat/kvB dominates. The bad 1.0 sat/vB literal is gone and
-/// the bump now uses integer-ceiling math (`(rate_kvb * vsize + 999) / 1000`,
+/// the bump now uses integer-ceiling math (`(rate_kvb * vsize).div_ceil(1000)`,
 /// `CFeeRate::GetFee` -> `CeilDiv` parity), matching the mempool Rule-4 path.
 #[test]
 fn bug1_wallet_uses_wallet_incremental_relay_fee_max_fence() {
@@ -381,11 +381,12 @@ fn bug1_wallet_uses_wallet_incremental_relay_fee_max_fence() {
          WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB (Core wallet.h:124 = 5000 sat/kvB)"
     );
     // The bump delta must use integer-ceiling math, not f64 ceil() — parity
-    // with the mempool Rule-4 path.
+    // with the mempool Rule-4 path. (.div_ceil(1000) IS CeilDiv; the
+    // (+ 999) / 1000 spelling was unified to it during the 1.97.1 lint pass.)
     assert!(
         WALLET_SRC
-            .contains("(incremental_rate_kvb.saturating_mul(entry.vsize as u64) + 999) / 1000"),
-        "incremental delta must use integer ceiling (rate_kvb * vsize + 999) / 1000 \
+            .contains("incremental_rate_kvb.saturating_mul(entry.vsize as u64).div_ceil(1000)"),
+        "incremental delta must use integer ceiling rate_kvb*vsize div_ceil 1000 \
          (CFeeRate::GetFee / CeilDiv parity)"
     );
 
@@ -637,15 +638,16 @@ fn bug8_bump_fee_calls_is_bip125_replaceable_for_ancestors() {
 /// `CeilDiv(feerate_kvb * vsize, 1000)` is applied. The f64 path diverges by a
 /// satoshi for rates not exactly representable in binary float (e.g. 1.1).
 /// FIXED: override path now calls the integer-ceiling helper
-/// `fee_for_rate_sat_per_vb`, the same `(.. + 999) / 1000` invariant as the
-/// mempool Rule-4 path. De-staled below.
+/// `fee_for_rate_sat_per_vb`, the same `.div_ceil(1000)` (CeilDiv) invariant
+/// as the mempool Rule-4 path. De-staled below.
 #[test]
 fn bug9_evaluate_fee_up_parity_uniform() {
-    // Mempool side: integer ceiling math (matches Core CeilDiv).
+    // Mempool side: integer ceiling math (matches Core CeilDiv; .div_ceil
+    // is the same math — see note at bug1 above).
     assert!(
         MEMPOOL_SRC
-            .contains("(self.config.incremental_relay_fee * new_vsize as u64 + 999) / 1000"),
-        "mempool Rule 4 must use integer ceiling +999/1000"
+            .contains("(self.config.incremental_relay_fee * new_vsize as u64).div_ceil(1000)"),
+        "mempool Rule 4 must use integer ceiling div_ceil(1000)"
     );
     // The old f64-ceil override literal must be GONE.
     assert!(
@@ -663,8 +665,8 @@ fn bug9_evaluate_fee_up_parity_uniform() {
         .expect("fee_for_rate_sat_per_vb helper must exist");
     let helper_window = &WALLET_SRC[helper_start..helper_start + 600];
     assert!(
-        helper_window.contains("+ 999) / 1000"),
-        "fee_for_rate_sat_per_vb must apply integer ceiling division (+999)/1000"
+        helper_window.contains(".div_ceil(1000)"),
+        "fee_for_rate_sat_per_vb must apply integer ceiling division (div_ceil)"
     );
     assert!(
         !helper_window.contains(".ceil()"),
@@ -737,7 +739,7 @@ fn bug10_truc_sibling_eviction_uses_full_rbf_rules() {
     // The TRUC sibling-eviction site exists and does its own fee math:
     assert!(
         MEMPOOL_SRC
-            .contains("let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64 + 999) / 1000;"),
+            .contains("let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64).div_ceil(1000);"),
         "TRUC sibling-eviction Rule 4 math must exist at mempool.rs:1765"
     );
     // But it does NOT yet call check_rbf_rules in the sibling path —
