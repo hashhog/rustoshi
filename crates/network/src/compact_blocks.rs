@@ -1696,8 +1696,6 @@ mod tests {
     /// (mirrors Core blockencodings.cpp:110-111).
     #[test]
     fn test_bucket_size_dos_protection() {
-        use std::collections::HashMap;
-
         let block = create_test_block(50);
         let nonce: u64 = 0xDEADBEEF_CAFEBABE;
 

@@ -41,10 +41,6 @@ use std::collections::HashMap;
 // Test helpers
 // ============================================================
 
-fn zero_hash() -> Hash256 {
-    Hash256::from([0u8; 32])
-}
-
 fn hash_from_u8(b: u8) -> Hash256 {
     let mut arr = [0u8; 32];
     arr[0] = b;
@@ -67,29 +63,11 @@ fn p2pkh_spk() -> Vec<u8> {
     s
 }
 
-/// Build a P2WPKH scriptPubKey (segwit v0).
-fn p2wpkh_spk() -> Vec<u8> {
-    // OP_0 <20-byte hash>
-    let mut s = vec![0x00u8, 0x14];
-    s.extend_from_slice(&[0x01u8; 20]);
-    s
-}
-
 /// Build a minimal CoinEntry (P2PKH, not coinbase, height 0).
 fn coin(value: u64) -> CoinEntry {
     CoinEntry {
         height: 0,
         is_coinbase: false,
-        value,
-        script_pubkey: p2pkh_spk(),
-    }
-}
-
-/// Build a coinbase CoinEntry at a given height.
-fn coinbase_coin(value: u64, height: u32) -> CoinEntry {
-    CoinEntry {
-        height,
-        is_coinbase: true,
         value,
         script_pubkey: p2pkh_spk(),
     }
@@ -109,24 +87,6 @@ fn simple_tx(prev_txid: Hash256, prev_vout: u32, value_in: u64, fee: u64, versio
             value: value_in.saturating_sub(fee),
             script_pubkey: p2pkh_spk(),
         }],
-        lock_time: 0,
-    }
-}
-
-/// Multi-output transaction.
-fn multi_out_tx(prev: &[(Hash256, u32)], outputs: &[(u64, Vec<u8>)], version: i32) -> Transaction {
-    Transaction {
-        version,
-        inputs: prev.iter().map(|(txid, vout)| TxIn {
-            previous_output: OutPoint { txid: *txid, vout: *vout },
-            script_sig: vec![],
-            sequence: 0xffffffff,
-            witness: vec![],
-        }).collect(),
-        outputs: outputs.iter().map(|(val, spk)| TxOut {
-            value: *val,
-            script_pubkey: spk.clone(),
-        }).collect(),
         lock_time: 0,
     }
 }
@@ -301,7 +261,7 @@ fn test_g3b_package_weight_check_uses_wrong_unit() {
 fn test_g4_reversed_topological_order_rejected() {
     let mp = test_mempool();
     let utxo_out = OutPoint { txid: hash_from_u8(0x20), vout: 0 };
-    let utxos: HashMap<OutPoint, CoinEntry> = [(utxo_out.clone(), coin(200_000))].into_iter().collect();
+    let _utxos: HashMap<OutPoint, CoinEntry> = [(utxo_out.clone(), coin(200_000))].into_iter().collect();
 
     let parent = simple_tx(utxo_out.txid, 0, 200_000, 500, 2);
     let parent_txid = parent.txid();
@@ -726,7 +686,7 @@ fn test_g14_package_atomic_rollback_on_failure() {
 
     // Child spends a non-existent UTXO (not parent, not chain UTXO)
     let fake_txid = hash_from_u8(0xff);
-    let invalid_child = simple_tx(fake_txid, 0, 100_000, 1_000, 2);
+    let _invalid_child = simple_tx(fake_txid, 0, 100_000, 1_000, 2);
 
     // Build as topologically valid package (child depends on parent only via one input,
     // but has another invalid input)
