@@ -3090,9 +3090,8 @@ fn verify_witness_program(
                     // from Core on any tx with >128 path nodes.
                     if control_block.len() < TAPROOT_CONTROL_BASE_SIZE
                         || control_block.len() > TAPROOT_CONTROL_MAX_SIZE
-                        || (control_block.len() - TAPROOT_CONTROL_BASE_SIZE)
-                            % TAPROOT_CONTROL_NODE_SIZE
-                            != 0
+                        || !(control_block.len() - TAPROOT_CONTROL_BASE_SIZE)
+                            .is_multiple_of(TAPROOT_CONTROL_NODE_SIZE)
                     {
                         return Err(ScriptError::TaprootWrongControlSize);
                     }

@@ -947,7 +947,7 @@ pub fn compress_amount(mut n: u64) -> u64 {
         return 0;
     }
     let mut e: u64 = 0;
-    while (n % 10 == 0) && e < 9 {
+    while n.is_multiple_of(10) && e < 9 {
         n /= 10;
         e += 1;
     }
@@ -1048,7 +1048,7 @@ fn try_compress_script(script: &[u8]) -> Option<(u8, Vec<u8>)> {
 fn special_script_size(n_size: u64) -> usize {
     match n_size {
         0 | 1 => 20,
-        2 | 3 | 4 | 5 => 32,
+        2..=5 => 32,
         _ => 0,
     }
 }

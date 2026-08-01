@@ -49,14 +49,14 @@ pub const META_DB_VERSION: &[u8] = b"db_version";
 ///
 /// Version history:
 /// - 1: original `serde_json::to_vec` encoding for `CoinEntry`,
-///      `BlockIndexEntry`, `UndoData`, `TxIndexEntry` in
-///      `block_store.rs` and `utxo_cache.rs` (~5-10× slower + ~4×
-///      larger on disk than the binary format below).
+///   `BlockIndexEntry`, `UndoData`, `TxIndexEntry` in
+///   `block_store.rs` and `utxo_cache.rs` (~5-10× slower + ~4×
+///   larger on disk than the binary format below).
 /// - 2: hand-rolled binary encoding for all four types
-///      (`block_store::format_v2`). See the `_rustoshi-ibd-pace-decay`
-///      diagnosis doc 2026-05-27 follow-up note for context. Format
-///      is NOT wire-compatible with v1; a v1 chainstate must be
-///      re-IBDed (`rm -rf <datadir>/chainstate`).
+///   (`block_store::format_v2`). See the `_rustoshi-ibd-pace-decay`
+///   diagnosis doc 2026-05-27 follow-up note for context. Format
+///   is NOT wire-compatible with v1; a v1 chainstate must be
+///   re-IBDed (`rm -rf <datadir>/chainstate`).
 pub const CURRENT_DB_VERSION: u32 = 2;
 
 // ============================================================

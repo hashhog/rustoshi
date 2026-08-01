@@ -1135,7 +1135,7 @@ pub fn contextual_check_block_header(
     //   `  if (block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP)`
     if params.enforce_bip94
         && height > 0
-        && height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0
+        && height.is_multiple_of(DIFFICULTY_ADJUSTMENT_INTERVAL)
     {
         let prev_time = prev_entry.timestamp as i64;
         let block_time = header.timestamp as i64;
@@ -1170,7 +1170,7 @@ pub fn contextual_check_block_header(
     // `DeploymentActiveAfter(pindexPrev, ...)` means active at the *child* block
     // (== height), not at pindexPrev (== height - 1).  Equivalent to:
     //   height >= bip34_height / bip66_height / bip65_height
-    let version = header.version as i32;
+    let version = header.version;
     if (version < 2 && height >= params.bip34_height)
         || (version < 3 && height >= params.bip66_height)
         || (version < 4 && height >= params.bip65_height)
@@ -1385,9 +1385,9 @@ pub(crate) fn encode_bip34_height(height: u32) -> Vec<u8> {
 ///    (Core overwrites commitpos in the loop — validation.h:147-165).
 /// 2. If a commitment output is found:
 ///    a. Coinbase vin[0].witness stack must be exactly 1 item of exactly 32 bytes
-///       → else `bad-witness-nonce-size` (Core:3880-3884).
+///    → else `bad-witness-nonce-size` (Core:3880-3884).
 ///    b. Compute SHA256d(witness_root || nonce) and compare bytes [6..38] in the output
-///       → else `bad-witness-merkle-match` (Core:3893-3898).
+///    → else `bad-witness-merkle-match` (Core:3893-3898).
 ///    c. Return Ok(()) (commitment valid; no unexpected-witness check needed).
 /// 3. No valid commitment (or `!segwit_active`): every transaction (including coinbase)
 ///    must have no witness data → else `unexpected-witness` (Core:3906-3912).
@@ -1887,12 +1887,12 @@ fn get_block_proof_equivalent_time_secs(
         let ws = (n / 64) as usize;
         let bs = n % 64;
         let mut out = [0u64; 4];
-        for i in 0..4 {
+        for (i, out_w) in out.iter_mut().enumerate() {
             let src = i + ws;
             if src < 4 {
-                out[i] |= w[src] << bs;
+                *out_w |= w[src] << bs;
                 if bs > 0 && src + 1 < 4 {
-                    out[i] |= w[src + 1] >> (64 - bs);
+                    *out_w |= w[src + 1] >> (64 - bs);
                 }
             }
         }
@@ -1947,17 +1947,19 @@ fn get_block_proof_equivalent_time_secs(
 /// Mirrors Bitcoin Core `ConnectBlock` (validation.cpp:2346-2382). Returns
 /// `true` (skip script verification) ONLY when ALL of the following hold:
 ///
-///   1. `params.assumed_valid_block` is configured (non-null).
-///   2+3. The assumed-valid block AND the block being connected are BOTH on
-///        the best-known header chain at their respective heights:
-///        `hash_at_height(block_height) == block_hash` AND
-///        `hash_at_height(av_height) == av_hash`.
-///        Core's `GetAncestor` traversal is equivalent: O(1) here via the
-///        canonical height index. A fork block at `block_height` returns a
-///        DIFFERENT hash and fails condition 3 → scripts are verified.
-///   4. `best_header_chain_work >= params.minimum_chain_work` (eclipse defence).
-///   5. `GetBlockProofEquivalentTime(best, block) > 1_209_600 s` (DoS defence:
-///        recent blocks are always script-verified, matching Core's guard).
+/// ```text
+/// 1. `params.assumed_valid_block` is configured (non-null).
+/// 2+3. The assumed-valid block AND the block being connected are BOTH on
+///      the best-known header chain at their respective heights:
+///      `hash_at_height(block_height) == block_hash` AND
+///      `hash_at_height(av_height) == av_hash`.
+///      Core's `GetAncestor` traversal is equivalent: O(1) here via the
+///      canonical height index. A fork block at `block_height` returns a
+///      DIFFERENT hash and fails condition 3 → scripts are verified.
+/// 4. `best_header_chain_work >= params.minimum_chain_work` (eclipse defence).
+/// 5. `GetBlockProofEquivalentTime(best, block) > 1_209_600 s` (DoS defence:
+///    recent blocks are always script-verified, matching Core's guard).
+/// ```
 ///
 /// **Fail-safe**: this gate is STRICTLY NARROWER than the old height-only
 /// check — it can only INCREASE verification, never skip more.
@@ -2015,8 +2017,11 @@ pub fn should_skip_scripts(
 
     // Condition 4: best_header.chain_work >= minimum_chain_work (eclipse defence).
     // Compare big-endian 256-bit values.
-    for i in 0..32 {
-        match best_header_chain_work[i].cmp(&params.minimum_chain_work[i]) {
+    for (ours, minimum) in best_header_chain_work
+        .iter()
+        .zip(params.minimum_chain_work.iter())
+    {
+        match ours.cmp(minimum) {
             std::cmp::Ordering::Greater => break,
             std::cmp::Ordering::Less => return false,
             std::cmp::Ordering::Equal => {}
@@ -2057,6 +2062,10 @@ pub fn should_skip_scripts(
 ///
 /// # Returns
 /// (undo_data, total_fees) on success.
+// Core-mirroring connect path: the parameter set tracks validation.cpp's
+// ConnectBlock context; grouping it into a struct would churn every caller
+// for no semantic gain.
+#[allow(clippy::too_many_arguments)]
 pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
     block: &Block,
     height: u32,

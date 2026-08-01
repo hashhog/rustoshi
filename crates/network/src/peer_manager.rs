@@ -206,7 +206,8 @@ pub struct PeerManagerConfig {
     ///   * does NOT resolve DNS seeds,
     ///   * does NOT load/dial anchors,
     ///   * does NOT auto-fill outbound slots from addrman,
-    /// and instead dials exactly these addresses (re-dialing any that drop).
+    ///     and instead dials exactly these addresses (re-dialing any that drop).
+    ///
     /// Mirrors Core's `-connect` (which implies `-dnsseed=0` and disables
     /// the addrman auto-outbound loop) and clearbit's `connect_address`
     /// branch (peer.zig:7009 skips `dnsSeeds()`; peer.zig:7050 gates the
@@ -408,6 +409,7 @@ pub(crate) fn now_unix_secs() -> u64 {
 /// - Timestamps at or before 100 000 000 (pre-2001-03-09) are obviously bogus.
 /// - Timestamps more than 10 minutes in the future are likely clock-drift or
 ///   manipulation.
+///
 /// Both cases are clamped to `now - 5 days` so the address stays discoverable
 /// but ranks below freshly-seen peers in addrman selection.
 pub(crate) fn clamp_addr_timestamp(ts: u32, now: u64) -> u64 {
@@ -811,7 +813,7 @@ impl AddrManTable {
                     // stochastic multiplicity gate: 2^refcount harder each time.
                     if info.ref_count > 0 {
                         let factor = 1u32 << info.ref_count;
-                        if rand::random::<u32>() % factor != 0 {
+                        if !rand::random::<u32>().is_multiple_of(factor) {
                             return false;
                         }
                     }
@@ -1000,7 +1002,7 @@ impl AddrManTable {
             rng.gen_bool(0.5)
         };
 
-        let (table, bucket_count): (&Box<[[NId; ADDRMAN_BUCKET_SIZE]]>, usize) = if search_tried {
+        let (table, bucket_count): (&[[NId; ADDRMAN_BUCKET_SIZE]], usize) = if search_tried {
             (&self.vv_tried, ADDRMAN_TRIED_BUCKET_COUNT)
         } else {
             (&self.vv_new, ADDRMAN_NEW_BUCKET_COUNT)
@@ -3287,7 +3289,7 @@ impl PeerManager {
     /// Whether DNS seeding is disabled for this node.
     ///
     /// Port of blockbrew 4417bac `dnsSeedingDisabled()` / Core's `!dnsseed`
-    /// + `-connect` implication. When DNS is disabled there is nothing to
+    /// and `-connect` implication. When DNS is disabled there is nothing to
     /// wait for, so the fixed-seed fallback may fire immediately rather than
     /// after the 60s grace (Core net.cpp:2620 — fire now when `!dnsseed &&
     /// !use_seednodes`; we have no `-seednode`, so the DNS predicate suffices).
@@ -4352,13 +4354,10 @@ impl PeerManager {
                             peer.last_tx_time = Some(Instant::now());
                             peer.stale_state.tx_received();
                         }
-                        NetworkMessage::Headers(headers) => {
+                        NetworkMessage::Headers(_) => {
                             // Update best known height from headers
                             // The actual height tracking is done elsewhere;
-                            // here we just note we received headers
-                            if !headers.is_empty() {
-                                // Headers received; height will be updated by header sync
-                            }
+                            // height will be updated by header sync.
                         }
                         _ => {}
                     }

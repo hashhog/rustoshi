@@ -839,6 +839,9 @@ impl Bip324Cipher {
         // `hkdf` holds a reference to ecdh_secret (already zeroed above) and
         // its internal PRK. Drop it explicitly so the compiler sees its
         // lifetime end here rather than at the enclosing scope.
+        // (Hkdf has no Drop impl; the move is deliberate — key-material
+        // hygiene — hence the allow.)
+        #[allow(clippy::drop_non_drop)]
         drop(hkdf);
     }
 

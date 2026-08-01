@@ -3866,7 +3866,7 @@ fn compact_to_target_hex(bits: u32) -> String {
     let byte1 = ((mantissa >> 8) & 0xff) as u8;
     let byte0 = (mantissa & 0xff) as u8;
 
-    if exponent >= 1 && exponent <= 32 {
+    if (1..=32).contains(&exponent) {
         let pos = 32 - exponent; // index of the most-significant mantissa byte
         if pos < 32 { target[pos] = byte2; }
         if pos + 1 < 32 { target[pos + 1] = byte1; }
@@ -4082,11 +4082,12 @@ async fn core_fallback_block_info(block_hash_hex: &str) -> Option<(u32, String)>
         }
 
         let mut response = Vec::new();
-        if let Err(_) = tokio::time::timeout(
+        if tokio::time::timeout(
             std::time::Duration::from_secs(5),
             stream.read_to_end(&mut response),
         )
         .await
+        .is_err()
         {
             continue;
         }
@@ -6025,7 +6026,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 return 0;
             }
             scores.sort_unstable();
-            if n % 2 == 0 {
+            if n.is_multiple_of(2) {
                 (scores[n / 2 - 1] + scores[n / 2]) / 2
             } else {
                 scores[n / 2]
@@ -6037,7 +6038,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         // weight; trailing percentiles filled with the largest feerate; empty
         // score set => all zeros.
         fn percentiles_by_weight(
-            scores: &mut Vec<(i64, i64)>,
+            scores: &mut [(i64, i64)],
             total_weight: i64,
         ) -> [i64; NUM_PERCENTILES] {
             let mut result = [0i64; NUM_PERCENTILES];
@@ -8105,6 +8106,9 @@ impl RustoshiRpcServer for RpcServerImpl {
 
                 drop(utxo_view);
                 drop(chain_state);
+                // Ends the BlockStore borrow before the reorg below;
+                // BlockStore has no Drop impl (the move is the point).
+                #[allow(clippy::drop_non_drop)]
                 drop(store);
                 match try_attach_and_reorg(&mut state, &block, &block_hash) {
                     Ok(true) => {
@@ -9341,12 +9345,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                     Address::P2SH { .. } => (true, false, None, None),
                     Address::P2WPKH { hash, .. } => {
                         // witness_program = 20-byte hash; isscript = program.len() > 20
-                        let prog = hex::encode(&hash.0);
+                        let prog = hex::encode(hash.0);
                         (false, true, Some(0u8), Some(prog))
                     }
                     Address::P2WSH { hash, .. } => {
                         // 32-byte program > 20 bytes → isscript = true
-                        let prog = hex::encode(&hash.0);
+                        let prog = hex::encode(hash.0);
                         (true, true, Some(0u8), Some(prog))
                     }
                     Address::P2TR { output_key, .. } => {
@@ -9473,6 +9477,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         // created after the assumeUTXO snapshot but before sync reaches their
         // block).  Fall back to Bitcoin Core to preserve byte-identity with
         // Core's output.  If Core also returns null, the UTXO is spent.
+        // Ends the BlockStore borrow before the Core fallback below;
+        // BlockStore has no Drop impl (the move is the point).
+        #[allow(clippy::drop_non_drop)]
         drop(store);
         drop(state);
         if let Some(json_str) = core_fallback_gettxout(&txid, vout).await {
@@ -10241,6 +10248,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                 new_tip_hash = entry.prev_hash;
                 new_tip_height = block_entry.height.saturating_sub(1);
 
+                // Ends the BlockStore borrow before disconnect_to re-locks;
+                // BlockStore has no Drop impl (the move is the point).
+                #[allow(clippy::drop_non_drop)]
                 drop(store);
                 disconnect_to(&mut state, new_tip_hash, new_tip_height).map_err(|e| {
                     Self::rpc_error(
@@ -12603,7 +12613,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         let n_keys = keys.len();
 
         // Validate key count (1..=16)
-        if n_keys < 1 || n_keys > 16 {
+        if !(1..=16).contains(&n_keys) {
             return Err(Self::rpc_error(
                 rpc_error::RPC_INVALID_PARAMS,
                 format!("Number of keys {} is not in range [1..16]", n_keys),
@@ -15063,14 +15073,14 @@ fn build_partial_merkle_tree_bytes(
 
     traverse(height, 0, txids, matches, n, &mut hashes, &mut bits);
 
-    let mut result = Vec::with_capacity(80 + 4 + 9 + hashes.len() * 32 + 9 + (bits.len() + 7) / 8);
+    let mut result = Vec::with_capacity(80 + 4 + 9 + hashes.len() * 32 + 9 + bits.len().div_ceil(8));
     result.extend_from_slice(header_bytes);
     result.extend_from_slice(&(n as u32).to_le_bytes());
     result.extend(encode_varint(hashes.len()));
     for h in &hashes {
         result.extend_from_slice(h);
     }
-    let flag_bytes_count = (bits.len() + 7) / 8;
+    let flag_bytes_count = bits.len().div_ceil(8);
     result.extend(encode_varint(flag_bytes_count));
     let mut flag_bytes = vec![0u8; flag_bytes_count];
     for (i, &b) in bits.iter().enumerate() {
@@ -15140,6 +15150,9 @@ fn parse_partial_merkle_tree(data: &[u8]) -> Result<(Vec<[u8; 32]>, Vec<u8>), St
     let mut bit_idx = 0usize;
     let mut matched: Vec<[u8; 32]> = Vec::new();
 
+    // Recursive merkle-block traversal: parameter set is the walk state;
+    // grouping it would obscure the recursion, not clarify it.
+    #[allow(clippy::too_many_arguments)]
     fn consume(
         h: u32,
         pos: usize,
@@ -16304,6 +16317,7 @@ fn build_tx_info(
 ///     `ScriptToUniv` — `address` is present only when the script decodes to a
 ///     standard address, `desc` is the BIP-380 `InferDescriptor` string, and
 ///     `type` comes from the Solver-style classifier.
+///
 /// The confirmation envelope (`blockhash`, `confirmations`, `time`, `blocktime`)
 /// is added by `TxToJSON` only when the tx is confirmed in the active chain.
 fn build_tx_info_verbose(
@@ -16704,6 +16718,7 @@ fn is_valid_der_sig_encoding(vch: &[u8]) -> bool {
 ///   1. Check IsValidSignatureEncoding (DER format + sighash byte).
 ///   2. If it passes, strip the last byte, map via sighash_to_string, and
 ///      append "[TYPE]" suffix if the type is defined.
+///
 /// For push-data operands ≤ 4 bytes: emit as CScriptNum decimal.
 /// Non-push opcodes: same as disassemble_script.
 ///
