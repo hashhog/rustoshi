@@ -67,9 +67,9 @@ use rustoshi_wallet::{
     entropy_to_mnemonic, mnemonic_to_entropy, mnemonic_to_seed, validate_mnemonic,
     parse_descriptor, descriptor_checksum, add_checksum, verify_checksum,
     encode_xprv, encode_xpub, decode_xprv, decode_xpub,
-    ExtendedPrivKey, ExtendedPubKey, WalletError, HARDENED_FLAG,
-    Psbt, PsbtError, PsbtInput, PsbtOutput, PsbtRole,
-    KeyOrigin, AddressType, Wallet,
+    ExtendedPrivKey, WalletError, HARDENED_FLAG,
+    Psbt, PsbtError, PsbtInput,
+    AddressType, Wallet,
 };
 use rustoshi_crypto::address::{Address, Network};
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};

@@ -175,7 +175,7 @@ fn test_g2_ancestor_limit_constant() {
 #[test]
 fn test_g3_ancestor_traversal_includes_self() {
     let mut mp = test_mempool();
-    let root_txid = hash_from_u8(1);
+    let _root_txid = hash_from_u8(1);
     let root_utxo = OutPoint { txid: zero_hash(), vout: 0 };
     let root_tx = simple_tx(zero_hash(), 100_000, 1_000, 0xffffffff);
 
@@ -479,7 +479,7 @@ fn test_g11_rbf_signaling_threshold() {
         "sequence 0xFFFFFFFE must NOT signal RBF");
 
     // sequence 0xFFFFFFFD must signal RBF
-    let mut utxos2: HashMap<OutPoint, CoinEntry> = [(OutPoint { txid: hash_from_u8(1), vout: 0 }, coin(100_000))].into_iter().collect();
+    let utxos2: HashMap<OutPoint, CoinEntry> = [(OutPoint { txid: hash_from_u8(1), vout: 0 }, coin(100_000))].into_iter().collect();
     let rbf_tx = simple_tx(hash_from_u8(1), 100_000, 1_000, 0xFFFFFFFD);
     let rbf_id = mp.add_transaction(rbf_tx, &|op| utxos2.get(op).cloned()).unwrap();
     assert!(mp.is_bip125_replaceable(&rbf_id),
@@ -717,7 +717,7 @@ fn test_g16_max_replacement_candidates_constant() {
 /// Status: OK for count-based enforcement
 #[test]
 fn test_g16b_too_many_replacements_rejected() {
-    let mut mp = Mempool::new(MempoolConfig {
+    let _mp = Mempool::new(MempoolConfig {
         verify_scripts: false,
 
         full_rbf: true,

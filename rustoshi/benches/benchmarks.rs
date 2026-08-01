@@ -83,7 +83,7 @@ fn bench_sha256d_64(c: &mut Criterion) {
 
     c.bench_function("sha256d_64", |b| {
         b.iter(|| {
-            let mut input = data;
+            let input = data;
             // Use the accelerated implementation through merkle_root-style call
             let result = sha256d(black_box(&input));
             black_box(result)
