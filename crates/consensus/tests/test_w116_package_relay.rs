@@ -1051,7 +1051,7 @@ fn test_g22_parent_below_min_relay_accepted_if_package_sufficient() {
 /// Status: OK — package feerate check rejects under-fee packages.
 #[test]
 fn test_g23_insufficient_package_feerate_rejected() {
-    let min_fee_rate = 10u64; // 10 sat/vB
+    let min_fee_rate = 100u64; // 100 sat/kvB = 0.1 sat/vB (Core v31 DEFAULT_MIN_RELAY_TX_FEE)
     let mut mp = Mempool::new(MempoolConfig {
         verify_scripts: false,
         min_fee_rate,
@@ -1061,7 +1061,8 @@ fn test_g23_insufficient_package_feerate_rejected() {
     let utxo_out = OutPoint { txid: hash_from_u16(0x0f01), vout: 0 };
     let utxos: HashMap<OutPoint, CoinEntry> = [(utxo_out.clone(), coin(200_000))].into_iter().collect();
 
-    // Both parent and child pay very low fees (package total below min)
+    // Both parent and child pay very low fees (package total below min):
+    // 2 sats over ~170 vB ≈ 11.8 sat/kvB < 100 sat/kvB floor.
     let parent = simple_tx(utxo_out.txid, 0, 200_000, 1, 2);  // 1 sat fee
     let parent_txid = parent.txid();
     let child = simple_tx(parent_txid, 0, 199_999, 1, 2);       // 1 sat fee

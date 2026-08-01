@@ -1292,7 +1292,7 @@ mod tests {
             addr_recv: NetAddress::from_ipv4([127, 0, 0, 1], 8333, NODE_NETWORK),
             addr_from: NetAddress::from_ipv4([192, 168, 1, 1], 8333, NODE_NETWORK | NODE_WITNESS),
             nonce: 0xDEADBEEF12345678,
-            user_agent: "/rustoshi:0.1.0/".to_string(),
+            user_agent: "/rustoshi:1.0.0/".to_string(),
             start_height: 750000,
             relay: true,
         };

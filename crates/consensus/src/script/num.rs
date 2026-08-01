@@ -118,7 +118,7 @@ pub fn decode_script_num(data: &[u8], require_minimal: bool, max_len: usize) -> 
 /// ```
 /// use rustoshi_consensus::script::num::encode_script_num;
 ///
-/// assert_eq!(encode_script_num(0), vec![]);
+/// assert_eq!(encode_script_num(0), Vec::<u8>::new());
 /// assert_eq!(encode_script_num(1), vec![0x01]);
 /// assert_eq!(encode_script_num(-1), vec![0x81]);
 /// assert_eq!(encode_script_num(127), vec![0x7f]);
