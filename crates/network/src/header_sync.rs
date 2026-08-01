@@ -298,7 +298,7 @@ impl HeaderSync {
         // fallback only fires when best_sync_peer is None AND state is
         // DownloadingHeaders, so it is a no-op for normal IBD (where a taller
         // peer always exists) and cannot loop at tip (state is Idle there).
-        let target = self.best_sync_peer().or_else(|| {
+        let target = self.best_sync_peer().or({
             if let SyncState::DownloadingHeaders { peer, .. } = &self.state {
                 Some(*peer)
             } else {

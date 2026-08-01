@@ -267,7 +267,7 @@ fn parse_amount_btc(s: &str) -> Result<u64, Bip21Error> {
             s
         )));
     }
-    if s.contains(|c: char| c == 'e' || c == 'E') {
+    if s.contains(['e', 'E']) {
         return Err(Bip21Error::InvalidAmount(format!(
             "scientific notation not allowed: {}",
             s

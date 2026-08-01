@@ -839,6 +839,9 @@ impl Bip324Cipher {
         // `hkdf` holds a reference to ecdh_secret (already zeroed above) and
         // its internal PRK. Drop it explicitly so the compiler sees its
         // lifetime end here rather than at the enclosing scope.
+        // (Hkdf has no Drop impl; the move is deliberate — key-material
+        // hygiene — hence the allow.)
+        #[allow(clippy::drop_non_drop)]
         drop(hkdf);
     }
 
@@ -1385,7 +1388,20 @@ pub fn decode_message_type_and_payload(contents: &[u8]) -> Result<(String, Vec<u
         }
 
         let type_bytes = &contents[1..13];
-        let end = type_bytes.iter().position(|&b| b == 0).unwrap_or(12);
+        // Core V2Transport::GetMessageType (src/net.cpp): message type bytes
+        // before the first NUL must be in [0x20..=0x7F] (printable ASCII), and
+        // all bytes after the first NUL must also be NUL.  Anything else is
+        // rejected (Core returns std::nullopt → message is dropped).
+        let mut end = 0;
+        while end < 12 && type_bytes[end] != 0 {
+            if !(0x20..=0x7f).contains(&type_bytes[end]) {
+                return Err(Bip324Error::InvalidMessageType);
+            }
+            end += 1;
+        }
+        if type_bytes[end..].iter().any(|&b| b != 0) {
+            return Err(Bip324Error::InvalidMessageType);
+        }
         let msg_type = String::from_utf8_lossy(&type_bytes[..end]).to_string();
 
         Ok((msg_type, contents[13..].to_vec()))
@@ -2146,11 +2162,10 @@ mod tests {
         );
     }
 
-    /// G22-BUG: Long-form message type decoding (first byte == 0) does NOT
-    /// validate that each byte before the first NUL is in [0x20..=0x7F]
-    /// (printable ASCII), and does NOT require that all bytes after the first
-    /// NUL are also NUL.  Bitcoin Core's GetMessageType() enforces both.
-    /// Non-ASCII or mixed-NUL type strings should be rejected (return error).
+    /// G22: Long-form message type decoding (first byte == 0) must validate
+    /// that each byte before the first NUL is in [0x20..=0x7F] (printable
+    /// ASCII), matching Bitcoin Core's V2Transport::GetMessageType().
+    /// Non-ASCII type strings must be rejected (return error).
     #[test]
     fn test_g22_long_form_rejects_non_ascii_command_bytes() {
         // Build a long-form contents buffer:
@@ -2165,11 +2180,10 @@ mod tests {
         // payload = contents[13..] = [0, 0]
 
         let result = decode_message_type_and_payload(&contents);
-        // Correct (spec) behaviour: control byte 0x01 is invalid, must error.
-        // BUG: rustoshi currently accepts this and produces "inv\x01" via from_utf8_lossy.
+        // Spec (Core) behaviour: control byte 0x01 is invalid, must error.
         assert!(
             result.is_err(),
-            "G22 BUG: non-ASCII command byte 0x01 must be rejected in long-form encoding"
+            "G22: non-ASCII command byte 0x01 must be rejected in long-form encoding"
         );
     }
 
@@ -2191,7 +2205,7 @@ mod tests {
         let result = decode_message_type_and_payload(&contents);
         assert!(
             result.is_err(),
-            "G22 BUG: non-NUL byte after first NUL in long-form command must be rejected"
+            "G22: non-NUL byte after first NUL in long-form command must be rejected"
         );
     }
 

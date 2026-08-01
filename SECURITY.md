@@ -26,7 +26,8 @@ There are no fund-grade guarantees. Run from a pinned commit.
 
 | Version | Supported |
 |---------|-----------|
-| `v0.1.0-rc1` (pinned `e735ef1`) | Validator RC — best-effort; no security SLA until the final `v0.1.0` |
+| `v1.0.0` | Current release — best-effort; no security SLA |
+| `v0.1.0-rc1` (pinned `e735ef1`) | Superseded validator RC — upgrade to `v1.0.0` |
 | pre-release (`master`) | Best-effort |
 
 ## Reporting a vulnerability

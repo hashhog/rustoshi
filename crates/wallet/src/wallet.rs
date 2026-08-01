@@ -106,7 +106,7 @@ pub fn fee_for_rate_sat_per_vb(rate_sat_per_vb: f64, vsize: u64) -> u64 {
     // (round-half-to-even is irrelevant here; 3 decimals of sat/vB is exact).
     let rate_sat_per_kvb = (rate_sat_per_vb * 1000.0).round() as u64;
     // CFeeRate::GetFee -> CeilDiv(feerate_kvb * vsize, 1000).
-    (rate_sat_per_kvb.saturating_mul(vsize) + 999) / 1000
+    rate_sat_per_kvb.saturating_mul(vsize).div_ceil(1000)
 }
 
 /// Sentinel derivation path stored on UTXOs / index entries that belong to an
@@ -1185,7 +1185,7 @@ impl Wallet {
         // `(rate_kvb * vsize + 999) / 1000`).
         let incremental_rate_kvb = WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB;
         let incremental_delta =
-            (incremental_rate_kvb.saturating_mul(entry.vsize as u64) + 999) / 1000;
+            incremental_rate_kvb.saturating_mul(entry.vsize as u64).div_ceil(1000);
         // Floor: orig_fee + 1 sat/vB * vsize  (BIP-125 rule 4 + Core rule 6).
         let min_new_fee = entry.fee_sats.saturating_add(incremental_delta.max(1));
         // If caller specifies an explicit rate, target that rate but never
@@ -1712,6 +1712,9 @@ impl Wallet {
     ///
     /// Reference: BIP-141 §"Backward compatibility" + `script/interpreter.cpp::EvalScript`
     /// (the P2SH unwrap branch when the redeem script is a witness program).
+    // Signing context mirrors the other per-input signers; grouping it into a
+    // struct would churn callers for no semantic gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_p2sh_p2wsh_input(
         &self,
         tx: &mut Transaction,
@@ -2323,7 +2326,7 @@ impl Wallet {
         if self.private_keys_enabled {
             // (a) every already-generated address (path tells us the chain
             //     branch).
-            for (_addr, path) in self.addresses.iter() {
+            for path in self.addresses.values() {
                 if let Ok(spk) = self.script_pubkey_for_path(path) {
                     // change branch is index [3] == 1 in the BIP-44/49/84/86 path.
                     let is_change = path.get(3).copied() == Some(1);

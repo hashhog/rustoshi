@@ -923,7 +923,7 @@ fn write_tx_index_entries(
 /// node's block-connect loop had ZERO wallet hooks, so funds received via
 /// normal sync were never credited until a manual rescan. We clone the shared
 /// `WalletRpcState` handle under the RPC read-guard, drop the guard, then scan
-/// + persist the watermark without holding the node's RPC lock across the
+/// and persist the watermark without holding the node's RPC lock across the
 /// wallet mutation. Best-effort: any wallet error is logged and swallowed so it
 /// can never roll back an already-persisted, fully-validated block.
 async fn connect_block_into_wallets(
@@ -1321,7 +1321,7 @@ fn mark_connect_failed_block_invalid(
         .ok()
         .flatten()
         .map(|e| e.status)
-        .unwrap_or_else(BlockStatus::new);
+        .unwrap_or_default();
     status.set(BlockStatus::FAILED_VALIDITY);
     let idx_entry = BlockIndexEntry {
         height,
@@ -1620,6 +1620,9 @@ fn read_block_at(
 
 /// Run the block import from blk*.dat files.
 /// Reads blocks from disk and feeds them to validation in height order.
+// Import plumbing threads the node's storage/validation handles through;
+// grouping them into a struct would churn the importer for no semantic gain.
+#[allow(clippy::too_many_arguments)]
 fn run_import_from_blk_files(
     blocks_dir: &std::path::Path,
     params: &ChainParams,
@@ -2848,7 +2851,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 .put_utxo(&outpoint, &entry)
                 .map_err(|e| anyhow::anyhow!("put_utxo: {}", e))?;
             loaded += 1;
-            if loaded % 1_000_000 == 0 {
+            if loaded.is_multiple_of(1_000_000) {
                 tracing::info!(
                     "snapshot import progress: {} / {} coins ({:.1}%)",
                     loaded,
@@ -3218,14 +3221,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let tor_proxy = parse_proxy_arg("proxy", cli.proxy.as_ref());
     let onion_proxy = parse_proxy_arg("onion", cli.onion.as_ref());
     let i2p_sam = parse_proxy_arg("i2psam", cli.i2psam.as_ref());
-    if tor_proxy.is_some() {
-        tracing::info!("Clearnet SOCKS5 proxy: {}", tor_proxy.unwrap());
+    if let Some(proxy) = tor_proxy {
+        tracing::info!("Clearnet SOCKS5 proxy: {}", proxy);
     }
-    if onion_proxy.is_some() {
-        tracing::info!("Tor onion SOCKS5 proxy: {}", onion_proxy.unwrap());
+    if let Some(proxy) = onion_proxy {
+        tracing::info!("Tor onion SOCKS5 proxy: {}", proxy);
     }
-    if i2p_sam.is_some() {
-        tracing::info!("I2P SAM bridge: {}", i2p_sam.unwrap());
+    if let Some(sam) = i2p_sam {
+        tracing::info!("I2P SAM bridge: {}", sam);
     }
     if cli.cjdnsreachable {
         tracing::info!("CJDNS reachability enabled (fc00::/8 native routing)");
@@ -3238,10 +3241,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // `--blockfilterindex`: `0`/`false`/`""` => off; everything else
     // (including `1`, `true`, `basic`) => on.  rustoshi only supports the
     // BIP-158 basic filter type today.
-    let blockfilterindex_enabled = match cli.blockfilterindex.to_ascii_lowercase().as_str() {
-        "" | "0" | "false" | "off" | "no" => false,
-        _ => true,
-    };
+    let blockfilterindex_enabled = !matches!(
+        cli.blockfilterindex.to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "off" | "no"
+    );
     if cli.peerblockfilters && !blockfilterindex_enabled {
         tracing::error!(
             "-peerblockfilters requires -blockfilterindex (matches Core init.cpp:994-996)"

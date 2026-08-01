@@ -2659,7 +2659,7 @@ fn decode_psbt_output<R: Read>(reader: &mut R) -> Result<PsbtOutput, PsbtError> 
                 let mut agg = [0u8; 33];
                 agg.copy_from_slice(&key[1..34]);
 
-                if value.len() % 33 != 0 {
+                if !value.len().is_multiple_of(33) {
                     return Err(PsbtError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "musig2 participant pubkeys value size is not a multiple of 33",

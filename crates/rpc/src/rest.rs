@@ -1183,7 +1183,7 @@ fn compact_to_target_hex_rest(bits: u32) -> String {
     let byte2 = ((mantissa >> 16) & 0xff) as u8;
     let byte1 = ((mantissa >> 8) & 0xff) as u8;
     let byte0 = (mantissa & 0xff) as u8;
-    if exponent >= 1 && exponent <= 32 {
+    if (1..=32).contains(&exponent) {
         let pos = 32 - exponent;
         if pos < 32 { target[pos] = byte2; }
         if pos + 1 < 32 { target[pos + 1] = byte1; }

@@ -46,11 +46,10 @@
 // properties that should be preserved when ASMap support is added.
 
 use crate::asmap::{
-    asmap_version_hex, check_standard_asmap, decode_asmap, interpret, sanity_check_asmap,
-    MAX_ASMAP_FILESIZE,
+    asmap_version_hex, decode_asmap, interpret, sanity_check_asmap, MAX_ASMAP_FILESIZE,
 };
 use crate::netgroup::{asmap_health_check, NetGroup, NetGroupManager, NetworkType};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 /// The reference asmap data from Bitcoin Core's netbase_tests.cpp.
 fn core_reference_asmap() -> Vec<u8> {

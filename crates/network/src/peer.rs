@@ -899,6 +899,9 @@ pub async fn run_outbound_peer_with_proxy(
 
 /// V1 outbound flow extracted from `run_outbound_peer` so the proxy
 /// dispatch path and the legacy direct-SocketAddr path can both reuse it.
+// The parameter set is the peer-plumbing context shared by both call sites;
+// grouping it into a struct would churn both for no semantic gain.
+#[allow(clippy::too_many_arguments)]
 async fn run_v1_outbound_flow(
     peer_id: PeerId,
     addr: SocketAddr,
@@ -1779,7 +1782,7 @@ pub(crate) async fn perform_v2_handshake_inbound(
             port: 0,
         },
         nonce: our_nonce,
-        user_agent: "/Rustoshi:0.1.0/".to_string(),
+        user_agent: "/Rustoshi:1.0.0/".to_string(),
         start_height: our_start_height,
         relay: true,
     };
@@ -2897,7 +2900,7 @@ mod tests {
             addr_recv: NetAddress::from_ipv4([127, 0, 0, 1], 48333, NODE_NETWORK),
             addr_from: NetAddress::from_ipv4([127, 0, 0, 1], 48333, NODE_NETWORK | NODE_WITNESS),
             nonce: 0x1234567890ABCDEF,
-            user_agent: "/rustoshi:0.1.0/".to_string(),
+            user_agent: "/rustoshi:1.0.0/".to_string(),
             start_height: 50000,
             relay: true,
         }

@@ -1,0 +1,9 @@
+{
+  "entries": {
+    "192.0.2.55": {
+      "ban_created": 1785554773,
+      "ban_until": 1785641173,
+      "reason": "manually banned"
+    }
+  }
+}

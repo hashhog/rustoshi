@@ -317,6 +317,10 @@ pub struct ChainState {
     mtp_cache: HashMap<Hash256, u32>,
 }
 
+/// Per-block record produced by a reorg connect: `(block_hash, height, undo)`.
+/// Factored out of `reorganize`'s return type (clippy::type_complexity).
+type ConnectedBlockUndo = (Hash256, u32, UndoData);
+
 impl ChainState {
     /// Create a new ChainState.
     ///
@@ -406,6 +410,10 @@ impl ChainState {
     /// - The block fails script verification
     /// - The block subsidy is invalid
     /// - A non-coinbase transaction has `nLockTime > prev_block_mtp` (BIP-113)
+    // Core-mirroring validation entry point: the parameter set tracks
+    // validation.cpp's AcceptBlock/ConnectBlock context; grouping it into a
+    // struct would churn every caller for no semantic gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_block<U: UtxoView>(
         &mut self,
         block: &Block,
@@ -427,6 +435,10 @@ impl ChainState {
     ///
     /// Mirrors Bitcoin Core `AcceptBlock` (validation.cpp:4325) where
     /// `pindex->nHeight` is the height assigned during header processing.
+    // Core-mirroring validation entry point: the parameter set tracks
+    // validation.cpp's AcceptBlock/ConnectBlock context; grouping it into a
+    // struct would churn every caller for no semantic gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_block_at_height<U: UtxoView>(
         &mut self,
         block: &Block,
@@ -453,6 +465,10 @@ impl ChainState {
     /// context makes every time-based BIP-68 lock trivially satisfied. Use
     /// this method — with a real store-backed context — whenever the node is
     /// accepting blocks from the network or an RPC submission.
+    // Core-mirroring validation entry point: the parameter set tracks
+    // validation.cpp's AcceptBlock/ConnectBlock context; grouping it into a
+    // struct would churn every caller for no semantic gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_block_with_seq_ctx<U: UtxoView, C: SequenceLockContext>(
         &mut self,
         block: &Block,
@@ -467,6 +483,10 @@ impl ChainState {
         self.process_block_inner(block, utxo_cache, prev_block_mtp, f_requested, None, current_time, seq_ctx, skip_scripts, prev_timestamp)
     }
 
+    // Core-mirroring validation entry point: the parameter set tracks
+    // validation.cpp's AcceptBlock/ConnectBlock context; grouping it into a
+    // struct would churn every caller for no semantic gain.
+    #[allow(clippy::too_many_arguments)]
     fn process_block_inner<U: UtxoView, C: SequenceLockContext>(
         &mut self,
         block: &Block,
@@ -672,7 +692,7 @@ impl ChainState {
         get_undo: &FU,
         get_block_index: &FI,
         utxo_cache: &mut U,
-    ) -> Result<(usize, Vec<(Hash256, u32, UndoData)>), ValidationError>
+    ) -> Result<(usize, Vec<ConnectedBlockUndo>), ValidationError>
     where
         U: UtxoView,
         FB: Fn(&Hash256) -> Option<Block>,
@@ -703,7 +723,7 @@ impl ChainState {
         get_block_index: &FI,
         utxo_cache: &mut U,
         seq_ctx: &C,
-    ) -> Result<(usize, Vec<(Hash256, u32, UndoData)>), ValidationError>
+    ) -> Result<(usize, Vec<ConnectedBlockUndo>), ValidationError>
     where
         U: UtxoView,
         FB: Fn(&Hash256) -> Option<Block>,

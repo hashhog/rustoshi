@@ -1452,7 +1452,7 @@ impl<'a> BlockStoreUtxoView<'a> {
         if self
             .journal
             .as_ref()
-            .map_or(true, |j| j.contains_key(outpoint))
+            .is_none_or(|j| j.contains_key(outpoint))
         {
             return;
         }
@@ -1625,7 +1625,7 @@ impl<'a> BlockStoreUtxoView<'a> {
     /// reorg arriving over P2P failed at "missing undo data for disconnect").
     ///
     /// Atomicity invariant (mirrors Bitcoin Core `CCoinsViewDB::BatchWrite`
-    /// + `ConnectTip`'s "write block before advancing tip"): the tip pointer
+    /// and `ConnectTip`'s "write block before advancing tip"): the tip pointer
     /// is staged into the SAME batch as the block bodies, undo, and coins,
     /// so a SIGKILL/OOM/crash mid-commit either leaves EVERYTHING durable or
     /// NOTHING — the tip never names a block whose body/undo or coins are
