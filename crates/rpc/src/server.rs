@@ -8133,6 +8133,23 @@ impl RustoshiRpcServer for RpcServerImpl {
                             // ConnectTip failure reports the same reason string
                             // regardless of how the block reached ConnectBlock.
                             Ok(Some(code.to_string()))
+                        } else if e.contains("not in block index") {
+                            // Unknown parent. Core sets this reason explicitly in
+                            // AcceptBlockHeader (validation.cpp:4217,
+                            // "prev-blk-not-found") and BIP22ValidationResult
+                            // (rpc/mining.cpp:587-601) returns GetRejectReason()
+                            // verbatim — "rejected" is only the fallback for an
+                            // EMPTY reason, which this is not.
+                            //
+                            // This arm carries a String, not a ValidationError, so
+                            // it never reaches ValidationError::bip22_string();
+                            // fixing the mapping there alone left this path
+                            // unchanged, verified against a live bitcoind before
+                            // and after.
+                            //
+                            // Decision is unchanged — the block is rejected either
+                            // way. R2 reason-code parity only.
+                            Ok(Some("prev-blk-not-found".to_string()))
                         } else {
                             // Structural / IO / depth-cap errors: unchanged.
                             Ok(Some(format!("rejected: {}", e)))
@@ -20483,12 +20500,24 @@ mod tests {
         // Catch-all: structural errors map to "rejected"
         assert_eq!(
             ValidationError::PrevBlockNotFound("abc".to_string()).bip22_string(),
-            "rejected"
+            // Core sets this reason explicitly (validation.cpp:4217) and
+            // BIP22ValidationResult returns it verbatim; "rejected" is only the
+            // fallback for an EMPTY reason. This assertion previously pinned the
+            // generic value and so locked in the divergence.
+            "prev-blk-not-found"
         );
         assert_eq!(ValidationError::InvalidChain.bip22_string(), "rejected");
         assert_eq!(
             ValidationError::BlockTooLarge(5_000_000).bip22_string(),
-            "rejected"
+            // Pre-existing stale assertion (failing before this commit too —
+            // verified by stashing). Core never answers a generic "rejected"
+            // for an oversized block: CheckBlock emits "bad-blk-weight" when
+            // the weight exceeds MAX_BLOCK_WEIGHT and "bad-blk-length" when the
+            // serialized size exceeds MAX_BLOCK_SERIALIZED_SIZE. rustoshi
+            // carries both variants — BlockLengthTooLarge maps to
+            // bad-blk-length — so BlockTooLarge is the WEIGHT case and the
+            // implementation was already right; only this assertion was wrong.
+            "bad-blk-weight"
         );
     }
 

@@ -443,7 +443,22 @@ impl ValidationError {
             ValidationError::NoCoinbase => "bad-cb-missing".to_string(),
             // More than one coinbase: validation.cpp → "bad-cb-multiple".
             ValidationError::MultipleCoinbase => "bad-cb-multiple".to_string(),
-            // Catch-all: covers structural/prev-block/chain errors
+            // Unknown parent. Core sets this reject reason explicitly in
+            // AcceptBlockHeader — validation.cpp:4217:
+            //   state.Invalid(BlockValidationResult::BLOCK_MISSING_PREV,
+            //                 "prev-blk-not-found")
+            // and BIP22ValidationResult (rpc/mining.cpp:587-601) returns
+            // GetRejectReason() verbatim, falling back to "rejected" ONLY when
+            // the reason is empty. It is not empty here, so Core answers
+            // "prev-blk-not-found" and rustoshi answered the generic
+            // "rejected" via the catch-all below.
+            //
+            // Confirmed two ways: Core's source, and Core's live answer in the
+            // 2026-08-02 corpus sweep (`bitcoin-core: reject:prev-blk-not-found`).
+            // Decision is unchanged — the block is rejected either way — this
+            // is R2 reason-code parity.
+            ValidationError::PrevBlockNotFound(_) => "prev-blk-not-found".to_string(),
+            // Catch-all: covers remaining structural/chain errors
             _ => "rejected".to_string(),
         }
     }
