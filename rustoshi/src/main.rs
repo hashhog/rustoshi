@@ -3748,6 +3748,57 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     "Block validation failed at height {}: {}",
                                     height, e
                                 );
+                                // CHAINSTATE-CORRUPTION SIGNAL.
+                                //
+                                // A block that extends our tip and fails ONLY
+                                // because its inputs are missing from our UTXO
+                                // set is ambiguous: either the block really is
+                                // invalid, or OUR chainstate is wrong. We cannot
+                                // tell from here — but staying silent about the
+                                // second possibility is how a node ends up
+                                // serving a stale tip for hours while answering
+                                // getblockchaininfo as if healthy.
+                                //
+                                // 2026-08-04: exactly that happened. A disk-full
+                                // left the UTXO set inconsistent with the stored
+                                // tip; block 960959 — carried on the main chain by
+                                // bitcoin-core and six other fleet nodes — was
+                                // rejected here as bad-txns-inputs-missingorspent
+                                // and marked invalid. The node then reported a
+                                // healthy tip of 960958 for 20+ hours, with no
+                                // error, indistinguishable from merely being
+                                // behind. See
+                                // receipts/rustoshi-block-gap-wedge-2026-08-04.md.
+                                //
+                                // Core never reaches this state: it validates
+                                // chainstate consistency at LOAD (node/chainstate.cpp
+                                // -> "Corrupted block database detected",
+                                // ChainstateLoadStatus::FAILURE) and refuses to
+                                // start. We have no such gate, so this is the
+                                // earliest point the condition is observable.
+                                //
+                                // We still mark the block invalid below (DoS
+                                // protection: a peer must not be able to make us
+                                // retry a bad block forever), but the operator is
+                                // told loudly which of the two it might be.
+                                if matches!(
+                                    e,
+                                    rustoshi_consensus::validation::ValidationError::TxValidation(
+                                        rustoshi_consensus::validation::TxValidationError::MissingInput(_, _)
+                                    )
+                                ) {
+                                    tracing::error!(
+                                        "POSSIBLE CHAINSTATE CORRUPTION: block at height {} \
+                                         extends our tip but its inputs are missing from our \
+                                         UTXO set (bad-txns-inputs-missingorspent). Either the \
+                                         block is invalid, or this node's UTXO set does not \
+                                         match its own tip. If the rest of the network carries \
+                                         this block, the chainstate is corrupt and must be \
+                                         rebuilt — the tip will not advance and this node is \
+                                         NOT healthy despite what getblockchaininfo reports.",
+                                        height
+                                    );
+                                }
                                 // A block that EXTENDS our tip but fails a
                                 // consensus gate is invalid — mark it so the
                                 // downloader stops re-pinning it. PrevBlockNotFound
