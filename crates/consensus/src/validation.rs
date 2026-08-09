@@ -650,7 +650,7 @@ pub fn check_block_with_pow(
     }
 
     // Validate proof of work (Core fCheckPOW gate).
-    // Use check_proof_of_work (not just validate_pow) so we also verify that the
+    // Use check_proof_of_work (not just validate_pow_against_declared_target) so we also verify that the
     // encoded target does not exceed pow_limit. Core's DeriveTarget enforces this
     // as part of CheckProofOfWork (pow.cpp:154-155). A block with bits encoding a
     // target above pow_limit must be rejected even if its hash is below that target.
@@ -1093,12 +1093,37 @@ pub trait ChainContext {
 /// - Block version must be valid for the height (BIP-34/66/65 `bad-version`,
 ///   validation.cpp:4112).
 ///
-/// `expected_bits` is `Some(GetNextWorkRequired(pindexPrev, &block, params))`
-/// when the caller has the ancestor chain to recompute the retarget value;
-/// pass `None` only where that chain is genuinely unavailable (the gate is then
-/// skipped — never a false-reject). Core always has `pindexPrev` so it always
-/// runs this gate; rustoshi callers on top of a header store should always pass
-/// `Some`.
+/// # `expected_bits` — read this before passing `None`
+///
+/// `expected_bits` is `Some(GetNextWorkRequired(pindexPrev, &block, params))`.
+/// `None` DISABLES the gate entirely, and that is the shape of a real
+/// vulnerability, not a convenience: until 2026-08-09 the only production
+/// supplier of `Some(..)` on the header path resolved the parent's height
+/// through `CF_BLOCK_INDEX`, which headers-first sync never populates for a
+/// header-only parent. It therefore returned `None` for essentially every
+/// header, this gate was skipped, and an attacker could feed an arbitrarily
+/// long difficulty-1 header chain. The old doc here — "pass `None` only where
+/// that chain is genuinely unavailable (never a false-reject)" — is what
+/// licensed that.
+///
+/// Rules now:
+///
+/// * Every production caller with a header store MUST pass `Some(..)`,
+///   computed by `rustoshi_storage::header_context::diffbits_gate_for_header`,
+///   which resolves the retarget window by `prev_block_hash` pointers (never a
+///   height→hash index — that index is attacker-poisonable) and REJECTS rather
+///   than returning "no value".
+/// * The single legitimate `None` on a production path is
+///   `DiffBitsGate::DegradedSnapshotBase`: the chain terminates at a hard-coded
+///   assumeUTXO base from chainparams, the gate has already been downgraded to
+///   Core's `PermittedDifficultyTransition` and logged at WARN, and an attacker
+///   cannot steer into it.
+/// * `ChainState::process_block` passes `None` because it holds no header
+///   chain; `rustoshi/src/main.rs::check_connect_diffbits` runs the equivalent
+///   check immediately before the connect instead.
+/// * Tests may pass `None` to isolate the other gates.
+///
+/// Core always has `pindexPrev`, so Core always runs this gate.
 ///
 /// `current_time` is the node's wall-clock seconds since epoch, used for
 /// the future-drift check.  Pass `0` to skip the future-time check (only
@@ -1122,8 +1147,12 @@ pub fn contextual_check_block_header(
     // it a block with an easier nBits whose hash meets that easier target would
     // be FALSE-ACCEPTED (difficulty manipulation / chain split). `expected_bits`
     // is computed by the caller via `get_next_work_required` over the real
-    // ancestor chain; `None` means the caller could not build that chain and
-    // intentionally skips the gate (never a false-reject).
+    // ancestor chain, resolved BY POINTERS
+    // (`rustoshi_storage::header_context`).
+    //
+    // `None` SKIPS this gate. It is not a "safe" default — see the
+    // `expected_bits` section of this function's doc comment for why, and for
+    // the one narrow production case (`DegradedSnapshotBase`) that may pass it.
     if let Some(expected) = expected_bits {
         if header.bits != expected {
             return Err(ValidationError::BadDifficulty);

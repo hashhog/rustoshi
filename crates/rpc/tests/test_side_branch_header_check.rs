@@ -93,7 +93,7 @@ fn rt_mine(prev: Hash256, ts: u32, txs: Vec<Transaction>) -> Block {
     let mut nonce: u32 = 0;
     loop {
         block.header.nonce = nonce;
-        if block.header.validate_pow() {
+        if block.header.validate_pow_against_declared_target() {
             break;
         }
         nonce = nonce.wrapping_add(1);

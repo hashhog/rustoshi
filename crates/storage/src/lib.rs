@@ -44,6 +44,7 @@ pub mod block_store;
 pub mod blockstore;
 pub mod columns;
 pub mod db;
+pub mod header_context;
 pub mod indexes;
 pub mod prune;
 pub mod snapshot;
@@ -65,6 +66,11 @@ pub use prune::{auto_prune, manual_prune_to_height, PruneCoordConfig, PruneOutco
 pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;
 pub use db::{ChainDb, StorageError, CURRENT_DB_VERSION};
+pub use header_context::{
+    diffbits_gate_for_header, expected_bits_for_child, window_floor, DiffBitsGate,
+    ExpectedBitsError, HeaderCache, HeaderMeta, HeaderProvider, IndexedBlock,
+    DEFAULT_HEADER_CACHE_ENTRIES, HEIGHT_ANCHOR_WALK_LIMIT,
+};
 pub use indexes::{
     compute_next_entry as coinstats_compute_next_entry, genesis_entry as coinstats_genesis_entry,
     BlockFilter, BlockFilterError, BlockFilterIndex, BlockFilterType, CoinStatsEntry,

@@ -800,7 +800,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 991_032_194,
                     base_mtp: None,
-                    base_tail_headers: Vec::new(),
+                    base_tail_headers: crate::assumeutxo_tails::mainnet_tail(840_000).to_vec(),
                 },
                 AssumeutxoData {
                     height: 880_000,
@@ -814,7 +814,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 1_145_604_538,
                     base_mtp: None,
-                    base_tail_headers: Vec::new(),
+                    base_tail_headers: crate::assumeutxo_tails::mainnet_tail(880_000).to_vec(),
                 },
                 AssumeutxoData {
                     height: 910_000,
@@ -828,7 +828,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 1_226_586_151,
                     base_mtp: None,
-                    base_tail_headers: Vec::new(),
+                    base_tail_headers: crate::assumeutxo_tails::mainnet_tail(910_000).to_vec(),
                 },
                 AssumeutxoData {
                     height: 935_000,
@@ -842,7 +842,7 @@ impl ChainParams {
                     .expect("valid hash"),
                     chain_tx_count: 1_305_397_408,
                     base_mtp: None,
-                    base_tail_headers: Vec::new(),
+                    base_tail_headers: crate::assumeutxo_tails::mainnet_tail(935_000).to_vec(),
                 },
                 // hashhog-local snapshot at h=944183 (utxo-snapshot-raw.dat
                 // from /data/nvme1/hashhog-mainnet/), used to recover
@@ -871,7 +871,7 @@ impl ChainParams {
                     // block (944,184) gets a correct `IsFinalTx`
                     // `nLockTimeCutoff` instead of 0.
                     base_mtp: Some(1_775_650_208),
-                    base_tail_headers: Vec::new(),
+                    base_tail_headers: crate::assumeutxo_tails::mainnet_tail(944_183).to_vec(),
                 },
             ],
             // Mainnet fixed seeds: 40 Core-vetted routable IPv4 :8333 peers,
@@ -2002,7 +2002,7 @@ mod tests {
     #[test]
     fn test_mainnet_genesis_pow() {
         let params = ChainParams::mainnet();
-        assert!(params.genesis_block.header.validate_pow());
+        assert!(params.genesis_block.header.validate_pow_against_declared_target());
     }
 
     #[test]
@@ -2020,7 +2020,7 @@ mod tests {
     #[test]
     fn test_regtest_genesis_pow() {
         let params = ChainParams::regtest();
-        assert!(params.genesis_block.header.validate_pow());
+        assert!(params.genesis_block.header.validate_pow_against_declared_target());
     }
 
     #[test]

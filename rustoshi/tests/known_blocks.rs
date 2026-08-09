@@ -222,7 +222,7 @@ fn test_all_genesis_blocks_have_zero_prev_hash() {
 fn test_mainnet_genesis_pow() {
     let params = ChainParams::mainnet();
     assert!(
-        params.genesis_block.header.validate_pow(),
+        params.genesis_block.header.validate_pow_against_declared_target(),
         "Mainnet genesis block should pass PoW validation"
     );
 }
@@ -231,7 +231,7 @@ fn test_mainnet_genesis_pow() {
 fn test_regtest_genesis_pow() {
     let params = ChainParams::regtest();
     assert!(
-        params.genesis_block.header.validate_pow(),
+        params.genesis_block.header.validate_pow_against_declared_target(),
         "Regtest genesis block should pass PoW validation"
     );
 }

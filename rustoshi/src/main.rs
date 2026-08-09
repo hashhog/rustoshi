@@ -453,117 +453,66 @@ fn compute_mtp_via_store(
     median_time_past(&mut timestamps)
 }
 
-/// Compute the `nBits` the difficulty-retarget algorithm mandates for the block
-/// whose parent (tip) is `parent_hash`, by walking the stored ancestor chain
-/// and running rustoshi's real `get_next_work_required` (the SAME function the
-/// miner/block-template path uses, pow.rs).
-///
-/// This is the input to Core's FIRST contextual header gate
-/// (`validation.cpp::ContextualCheckBlockHeader`, validation.cpp:4088:
+/// Connect-time backstop for Core's FIRST contextual header gate,
+/// `bad-diffbits` (bitcoin-core/src/validation.cpp:4088:
 /// `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))`).
-/// `new_block_time` is the timestamp of the block being validated (needed for
-/// the testnet min-difficulty rule). Returns `None` if the parent chain cannot
-/// be walked from the store (e.g. an assumeUTXO snapshot base with no stored
-/// ancestor headers), in which case the caller skips the diffbits gate rather
-/// than false-rejecting.
-fn compute_expected_bits_via_store(
+///
+/// The header-acceptance path already runs this gate (see the
+/// `process_headers` closure below). This runs it a SECOND time, immediately
+/// before the block is connected, for two reasons:
+///
+/// * `ChainState::process_block` calls `contextual_check_block_header` with
+///   `expected_bits = None` — it holds no header chain and cannot recompute
+///   `GetNextWorkRequired` itself — so without this the nBits-equals-required
+///   comparison happens nowhere on the connect path.
+/// * It is independent of the header path, so anything admitted through the
+///   narrow assumeUTXO snapshot-base carve-out is still caught before it can
+///   mutate the UTXO set.
+///
+/// The parent height is read from `CF_BLOCK_INDEX` (authoritative — the parent
+/// of a block we are about to connect is by definition already connected, or is
+/// the assumeUTXO base), never from the height→hash index: that index is
+/// attacker-poisonable and resolving retarget ancestors through it inverts the
+/// check. See `rustoshi_storage::header_context` for the full argument.
+fn check_connect_diffbits(
     block_store: &BlockStore,
-    parent_hash: &rustoshi_primitives::Hash256,
-    new_block_time: u32,
+    header: &rustoshi_primitives::BlockHeader,
     params: &rustoshi_consensus::ChainParams,
-) -> Option<u32> {
-    use rustoshi_consensus::params::DIFFICULTY_ADJUSTMENT_INTERVAL;
-    use rustoshi_consensus::pow::{get_next_work_required, BlockIndex as PowBlockIndex};
-
-    // Walk back at most one full retarget interval (+2 buffer) from the parent.
-    // get_next_work_required needs the tip plus, on a retarget boundary, the
-    // ancestor at `h - 2016`; the testnet min-difficulty walk-back also wants
-    // the recent chain.
-    let needed = (DIFFICULTY_ADJUSTMENT_INTERVAL + 2) as usize;
-
-    // First resolve the parent (= tip / pindexPrev) header + its height.
-    let parent_header = match block_store.get_header(parent_hash) {
-        Ok(Some(h)) => h,
-        _ => return None,
+) -> Result<(), String> {
+    let parent_height = match block_store.get_block_index(&header.prev_block_hash) {
+        Ok(Some(entry)) => entry.height,
+        // The parent is not in the block index, so this block does not extend
+        // anything we have connected. `process_block` rejects it with
+        // `PrevBlockNotFound` (and the reorg path re-validates it against its
+        // real parent); there is no height to gate against here.
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(format!("bad-diffbits: block index read failed: {}", e)),
     };
-    let parent_height = match block_store.get_height(parent_hash) {
-        Ok(Some(h)) => h,
-        _ => return None,
-    };
-
-    // Collect parent + ancestors, oldest-last.
-    let mut headers: Vec<rustoshi_primitives::BlockHeader> = Vec::with_capacity(needed);
-    let mut cursor = *parent_hash;
-    for _ in 0..needed {
-        match block_store.get_header(&cursor) {
-            Ok(Some(hdr)) => {
-                let prev = hdr.prev_block_hash;
-                headers.push(hdr);
-                if prev == rustoshi_primitives::Hash256::ZERO {
-                    break;
-                }
-                cursor = prev;
+    let mut cache = rustoshi_storage::HeaderCache::new(256);
+    match rustoshi_storage::diffbits_gate_for_header(
+        block_store,
+        &mut cache,
+        &header.prev_block_hash,
+        header.bits,
+        header.timestamp,
+        parent_height.saturating_add(1),
+        None,
+        params,
+    )? {
+        rustoshi_storage::DiffBitsGate::Required(expected) => {
+            if header.bits != expected {
+                Err(format!(
+                    "bad-diffbits: nBits {:#010x} != required {:#010x} (parent {} at height {})",
+                    header.bits, expected, header.prev_block_hash, parent_height
+                ))
+            } else {
+                Ok(())
             }
-            _ => break,
         }
+        // Already downgraded to Core's PermittedDifficultyTransition and logged
+        // at WARN inside the gate.
+        rustoshi_storage::DiffBitsGate::DegradedSnapshotBase => Ok(()),
     }
-    if headers.is_empty() {
-        return None;
-    }
-
-    // Build a linked BlockIndex chain (headers[0] = parent/tip, oldest last).
-    struct SimpleBlockIndex {
-        height: u32,
-        timestamp: u32,
-        bits: u32,
-        prev: Option<Box<SimpleBlockIndex>>,
-    }
-    impl PowBlockIndex for SimpleBlockIndex {
-        fn height(&self) -> u32 {
-            self.height
-        }
-        fn timestamp(&self) -> u32 {
-            self.timestamp
-        }
-        fn bits(&self) -> u32 {
-            self.bits
-        }
-        fn prev(&self) -> Option<&Self> {
-            self.prev.as_deref()
-        }
-        fn ancestor(&self, target_height: u32) -> Option<&Self> {
-            if target_height > self.height {
-                return None;
-            }
-            let mut cur = self;
-            while cur.height > target_height {
-                cur = cur.prev.as_deref()?;
-            }
-            Some(cur)
-        }
-    }
-
-    let _ = parent_header; // height already taken; header kept only for the get_header guard above
-    let mut node: Option<Box<SimpleBlockIndex>> = None;
-    for (i, hdr) in headers.iter().enumerate().rev() {
-        let h = parent_height.saturating_sub(i as u32);
-        node = Some(Box::new(SimpleBlockIndex {
-            height: h,
-            timestamp: hdr.timestamp,
-            bits: hdr.bits,
-            prev: node,
-        }));
-    }
-    // `get_next_work_required` now returns `Result<u32, PowError>` (was `u32`,
-    // panicked on a missing ancestor -- M2-RUST-POW-PANIC). `.ok()` folds a
-    // `PowError` into `None`, exactly the pre-existing "ancestor chain isn't
-    // walkable from the store -> skip the gate rather than false-reject"
-    // convention already documented on this function and used for every
-    // other unreachable-ancestor case above (missing parent header/height,
-    // empty `headers`). With `AssumeutxoData::base_tail_headers` persisted at
-    // snapshot activation this should no longer trigger for the boundaries it
-    // covers; it remains the safety net for anything wider.
-    node.and_then(|tip| get_next_work_required(&*tip, new_block_time, params).ok())
 }
 
 /// MTP to use as the `IsFinalTx` / `ContextualCheckBlock` `nLockTimeCutoff`
@@ -3652,6 +3601,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
+    // Header-window cache for the bad-diffbits gate (Core validation.cpp:4088).
+    // The gate now fires on EVERY header, so its ancestor walk is live code for
+    // the first time: 1 header for 2015 of every 2016 on mainnet, 2016 at each
+    // retarget boundary, up to 2015 on the testnet4 min-difficulty walk-back.
+    // This keeps those windows in RAM so a boundary costs point lookups only
+    // once. `RefCell` because the `process_headers` validate-and-store closure
+    // borrows it mutably while sibling closures in the same call borrow
+    // `block_store` immutably.
+    let header_diffbits_cache = std::cell::RefCell::new(rustoshi_storage::HeaderCache::default());
+
     loop {
         tokio::select! {
             // Fast validation tick — process buffered blocks frequently.
@@ -3732,9 +3691,27 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // poison the long-lived write-back UTXO view. Committed
                         // only on success; discarded on failure.
                         utxo_view.begin_savepoint();
-                        // f_requested=true: blocks from the IBD block downloader
-                        // are actively requested via getdata — no fTooFarAhead guard.
-                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
+                        // bad-diffbits backstop (Core validation.cpp:4088).
+                        // `process_block` -> `contextual_check_block_header` is
+                        // called with `expected_bits = None` (ChainState holds no
+                        // header chain), so without this the nBits-equals-required
+                        // comparison never runs on the connect path. See
+                        // `check_connect_diffbits`.
+                        let connect_res = match check_connect_diffbits(&block_store, &block.header, &params) {
+                            Ok(()) => {
+                                // f_requested=true: blocks from the IBD block downloader
+                                // are actively requested via getdata — no fTooFarAhead guard.
+                                cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp)
+                            }
+                            Err(reason) => {
+                                tracing::error!(
+                                    "connect-path bad-diffbits backstop rejected block {} at height {}: {}",
+                                    block_hash, height, reason
+                                );
+                                Err(rustoshi_consensus::validation::ValidationError::BadDifficulty)
+                            }
+                        };
+                        match connect_res {
                             Ok((undo, _fees)) => {
                                 utxo_view.commit_savepoint();
                                 Some(undo)
@@ -4254,20 +4231,92 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             prev_hash: rustoshi_primitives::Hash256::ZERO,
                                             chain_work: [0u8; 32],
                                         };
+                                        // Core CheckBlockHeader (validation.cpp:4197 →
+                                        // pow.cpp::CheckProofOfWorkImpl/DeriveTarget) runs
+                                        // BEFORE the contextual gates. HeaderSync already ran
+                                        // `validate_pow_against_declared_target`, but that is
+                                        // params-free: it compares the hash to the target the
+                                        // header DECLARES and never bounds that target by
+                                        // `pow_limit`. Without this line a peer can declare
+                                        // nBits easier than the network minimum
+                                        // (mainnet 0x1d00ffff) and mine the header trivially —
+                                        // the block-body path enforces it (validation.rs
+                                        // check_block_with_pow) but the header path did not.
+                                        // Reference: bitcoin-core/src/pow.cpp
+                                        //   `if (fNegative || bnTarget == 0 || fOverflow ||`
+                                        //   `    bnTarget > UintToArith256(params.powLimit))`
+                                        if !rustoshi_consensus::check_proof_of_work(
+                                            header.block_hash().as_bytes(),
+                                            header.bits,
+                                            &params,
+                                        ) {
+                                            return Err("high-hash".to_string());
+                                        }
+
                                         // bad-diffbits (Core's FIRST contextual header gate,
                                         // validation.cpp:4088): recompute GetNextWorkRequired
                                         // over the stored ancestor chain and require the
-                                        // header's nBits to match. `None` only when the
-                                        // ancestor chain isn't reachable from the store
-                                        // (e.g. an assumeUTXO snapshot base) — then we skip
-                                        // rather than false-reject, same convention as the
-                                        // MTP walk below.
-                                        let expected_bits = compute_expected_bits_via_store(
-                                            &block_store,
-                                            &header.prev_block_hash,
-                                            header.timestamp,
-                                            &params,
-                                        );
+                                        // header's nBits to match.
+                                        //
+                                        // FAIL CLOSED. Until 2026-08-09 this resolved the
+                                        // parent's height through `BlockStore::get_height`
+                                        // (CF_BLOCK_INDEX), which headers-first sync NEVER
+                                        // populates for a header-only parent — so the helper
+                                        // returned None on essentially every header and the
+                                        // caller read None as "no check". The gate ran at most
+                                        // once per session and the ancestor walk behind it was
+                                        // dead code. `diffbits_gate_for_header` resolves the
+                                        // window by prev_block_hash POINTERS ONLY (never the
+                                        // poisonable height→hash index) and returns an error
+                                        // instead of a silent skip; the sole carve-out is a
+                                        // hard-coded assumeUTXO snapshot base, which downgrades
+                                        // to Core's PermittedDifficultyTransition and logs at
+                                        // WARN.
+                                        //
+                                        // The height hint is pointer-derived and safe: HeaderSync
+                                        // is re-seeded from the CONNECTED BLOCK TIP at startup
+                                        // (set_best_header below) and every step of the batch is
+                                        // chain-verified by prev-hash, so `height` is
+                                        // validated_tip_height + pointer steps. See
+                                        // rustoshi_storage::header_context for the full invariant.
+                                        let expected_bits = {
+                                            let mut cache = header_diffbits_cache.borrow_mut();
+                                            match rustoshi_storage::diffbits_gate_for_header(
+                                                &block_store,
+                                                &mut cache,
+                                                &header.prev_block_hash,
+                                                header.bits,
+                                                header.timestamp,
+                                                height,
+                                                Some(height.saturating_sub(1)),
+                                                &params,
+                                            ) {
+                                                Ok(rustoshi_storage::DiffBitsGate::Required(b)) => {
+                                                    Some(b)
+                                                }
+                                                Ok(rustoshi_storage::DiffBitsGate::DegradedSnapshotBase) => {
+                                                    // Already checked + logged inside the gate.
+                                                    None
+                                                }
+                                                Err(reason) => {
+                                                    // Log declared-vs-required, parent hash and
+                                                    // resolved height so a FALSE-REJECT (the
+                                                    // dominant risk now that this gate fires on
+                                                    // every header instead of ~never) is
+                                                    // diagnosable from one line.
+                                                    tracing::warn!(
+                                                        "header {} at height {} rejected: {} \
+                                                         (declared nBits {:#010x}, parent {})",
+                                                        header.block_hash(),
+                                                        height,
+                                                        reason,
+                                                        header.bits,
+                                                        header.prev_block_hash,
+                                                    );
+                                                    return Err(reason);
+                                                }
+                                            }
+                                        };
                                         rustoshi_consensus::contextual_check_block_header(
                                             header,
                                             height,
@@ -4682,9 +4731,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // never poisons it. Commit on success,
                                         // discard on failure.
                                         utxo_view.begin_savepoint();
-                                        // f_requested=true: blocks from the P2P block downloader
-                                        // are actively requested via getdata — no fTooFarAhead guard.
-                                        match cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
+                                        // bad-diffbits backstop (Core validation.cpp:4088) —
+                                        // see the matching site in the validation_interval
+                                        // branch above and `check_connect_diffbits`.
+                                        let connect_res = match check_connect_diffbits(&block_store, &block.header, &params) {
+                                            Ok(()) => {
+                                                // f_requested=true: blocks from the P2P block downloader
+                                                // are actively requested via getdata — no fTooFarAhead guard.
+                                                cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp)
+                                            }
+                                            Err(reason) => {
+                                                tracing::error!(
+                                                    "connect-path bad-diffbits backstop rejected block {} at height {}: {}",
+                                                    block_hash, height, reason
+                                                );
+                                                Err(rustoshi_consensus::validation::ValidationError::BadDifficulty)
+                                            }
+                                        };
+                                        match connect_res {
                                             Ok((undo, _fees)) => {
                                                 utxo_view.commit_savepoint();
                                                 Some(undo)

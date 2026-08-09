@@ -40,7 +40,7 @@ fn test_genesis_block_validation_mainnet() {
     assert_eq!(computed, genesis.header.merkle_root);
 
     // Verify genesis header PoW
-    assert!(genesis.header.validate_pow());
+    assert!(genesis.header.validate_pow_against_declared_target());
 
     // Verify genesis coinbase
     assert!(genesis.transactions[0].is_coinbase());

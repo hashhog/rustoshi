@@ -97,13 +97,27 @@ impl BlockHeader {
         target
     }
 
-    /// Check that the block hash is at or below the target encoded in `bits`,
-    /// and that the target itself is valid (non-zero, non-negative, non-overflow).
+    /// Check that the block hash is at or below the target this header
+    /// **declares** in `bits`, and that the declared target is structurally
+    /// valid (non-zero, non-negative, non-overflow).
     ///
-    /// Does NOT enforce the pow_limit bound — callers that have access to
-    /// `ChainParams` should use `check_proof_of_work()` from the consensus crate
-    /// which additionally verifies `target <= pow_limit` (Core pow.cpp DeriveTarget).
-    pub fn validate_pow(&self) -> bool {
+    /// # This is NOT a consensus PoW check
+    ///
+    /// It is a strict subset of Core's `CheckProofOfWork`: it has no
+    /// `ChainParams`, so it cannot enforce `target <= pow_limit`
+    /// (bitcoin-core/src/pow.cpp `DeriveTarget`:
+    /// `bnTarget > UintToArith256(pow_limit) -> return {}`). A peer may declare
+    /// `nBits` far easier than the network minimum (mainnet 0x1d00ffff) and
+    /// mine such a header on a laptop; this function returns `true` for it.
+    ///
+    /// The name says "against declared target" precisely so that a call site
+    /// which needs the real gate is self-documenting as wrong. Any path that has
+    /// `ChainParams` MUST use `rustoshi_consensus::check_proof_of_work`, which
+    /// additionally bounds the target by `pow_limit`. Callers must ALSO run the
+    /// nBits-vs-required gate (`bad-diffbits`,
+    /// bitcoin-core/src/validation.cpp:4088) — the two are different checks and
+    /// neither implies the other.
+    pub fn validate_pow_against_declared_target(&self) -> bool {
         let hash = self.block_hash();
         let target = self.target();
 
@@ -420,10 +434,10 @@ mod tests {
             nonce: 2083236893,
         };
 
-        assert!(genesis_header.validate_pow());
+        assert!(genesis_header.validate_pow_against_declared_target());
     }
 
-    // --- W83: compact encoding + validate_pow edge cases ---
+    // --- W83: compact encoding + validate_pow_against_declared_target edge cases ---
 
     /// Zero mantissa is an invalid compact encoding — must be rejected.
     #[test]
@@ -431,8 +445,8 @@ mod tests {
         let header = BlockHeader { bits: 0x1d00_0000, ..Default::default() };
         // target() returns [0u8; 32] for zero mantissa
         assert_eq!(header.target(), [0u8; 32]);
-        // validate_pow rejects zero target (would accept any-zero hash otherwise)
-        assert!(!header.validate_pow());
+        // validate_pow_against_declared_target rejects zero target (would accept any-zero hash otherwise)
+        assert!(!header.validate_pow_against_declared_target());
     }
 
     /// Negative compact target (high bit of mantissa set) is invalid.
@@ -440,7 +454,7 @@ mod tests {
     fn target_negative_rejected() {
         let header = BlockHeader { bits: 0x1d80_0000, ..Default::default() };
         assert_eq!(header.target(), [0u8; 32]);
-        assert!(!header.validate_pow());
+        assert!(!header.validate_pow_against_declared_target());
     }
 
     /// Exponent 0 is an invalid compact encoding.
@@ -448,23 +462,23 @@ mod tests {
     fn target_zero_exponent_rejected() {
         let header = BlockHeader { bits: 0x0000_ffff, ..Default::default() };
         assert_eq!(header.target(), [0u8; 32]);
-        assert!(!header.validate_pow());
+        assert!(!header.validate_pow_against_declared_target());
     }
 
     /// Exponent > 32 would overflow the 256-bit target array.
     /// Before W83 this caused usize underflow (panic in debug, wrap in release).
-    /// After the fix, target() returns [0u8;32] and validate_pow() returns false.
+    /// After the fix, target() returns [0u8;32] and validate_pow_against_declared_target() returns false.
     #[test]
     fn target_overflow_exponent_rejected() {
         // exponent = 33 (0x21) — exceeds 32-byte array
         let header = BlockHeader { bits: 0x2100_0001, ..Default::default() };
         assert_eq!(header.target(), [0u8; 32]);
-        assert!(!header.validate_pow());
+        assert!(!header.validate_pow_against_declared_target());
 
         // exponent = 0xff (max) — should also be safely rejected
         let header2 = BlockHeader { bits: 0xff00_0001, ..Default::default() };
         assert_eq!(header2.target(), [0u8; 32]);
-        assert!(!header2.validate_pow());
+        assert!(!header2.validate_pow_against_declared_target());
     }
 
     /// Exponent exactly 32 (the boundary) must be accepted when mantissa is valid.

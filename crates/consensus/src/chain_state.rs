@@ -562,14 +562,23 @@ impl ChainState {
             chain_work: [0u8; 32],
         };
         // `expected_bits = None`: `ChainState` does not itself hold the header
-        // chain, so it cannot recompute `GetNextWorkRequired` here. The
-        // canonical bad-diffbits enforcement lives on the header-sync path
-        // (rustoshi/src/main.rs), which has `block_store` access to walk the
-        // ancestor chain and passes `Some(expected_bits)` — exactly as the
-        // real MTP enforcement is done inline there rather than via the
-        // StubChainContext (which returns MTP=0). Passing `None` here keeps
-        // this connect-time call a no-op for the diffbits gate (never a
-        // false-reject); the header was already diffbits-checked at acceptance.
+        // chain, so it cannot recompute `GetNextWorkRequired` here. This call is
+        // therefore a NO-OP for the bad-diffbits gate.
+        //
+        // The comment that used to sit here — "the header was already
+        // diffbits-checked at acceptance" — was FALSE, and stating it is part of
+        // how the hole survived review. Until 2026-08-09 the header-acceptance
+        // path resolved the parent's height via `CF_BLOCK_INDEX`, which
+        // headers-first sync never populates for a header-only parent, so it
+        // passed `None` too: during IBD the claimed nBits was compared against
+        // the required value NOWHERE.
+        //
+        // The header path now fails closed
+        // (`rustoshi_storage::header_context::diffbits_gate_for_header`), and
+        // `rustoshi/src/main.rs::check_connect_diffbits` runs the same gate
+        // immediately before every connect as an independent backstop. Do not
+        // reintroduce a claim that some other layer has already checked this —
+        // if you need the guarantee here, resolve the window and pass `Some`.
         contextual_check_block_header(
             &block.header,
             new_height,

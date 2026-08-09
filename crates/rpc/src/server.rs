@@ -2430,108 +2430,54 @@ impl<'a> SequenceLockContext for BlockStoreSeqLockCtx<'a> {
     }
 }
 
-/// Recompute the consensus-mandated `nBits` for the header that extends
-/// `parent_hash`, by walking the stored ancestor chain and running rustoshi's
-/// real `get_next_work_required` (the SAME function the miner/block-template
-/// and header-sync paths use). This is the input to Core's FIRST contextual
-/// header gate (`ContextualCheckBlockHeader`, validation.cpp:4088:
-/// `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))`).
+/// Run Core's FIRST contextual header gate (`bad-diffbits`,
+/// bitcoin-core/src/validation.cpp:4088:
+/// `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))`) for a
+/// header submitted over RPC, and return the value
+/// `contextual_check_block_header` should compare against.
 ///
-/// `new_block_time` is the timestamp of the header being validated (needed for
-/// the testnet min-difficulty rule). Returns `None` if the parent chain cannot
-/// be walked from the store, in which case the caller skips the diffbits gate
-/// rather than false-rejecting — same convention as the MTP walk and
-/// `rustoshi/src/main.rs::compute_expected_bits_via_store`, which this mirrors
-/// (kept crate-local here to avoid pulling the binary helper into the RPC
-/// crate; both walk the same `BlockStore::get_header` chain).
-fn compute_expected_bits_via_store(
+/// Thin wrapper over the SHARED implementation in
+/// `rustoshi_storage::header_context`. There used to be a byte-for-byte copy of
+/// the resolver here and another in `rustoshi/src/main.rs`; both short-circuited
+/// on `BlockStore::get_height` (CF_BLOCK_INDEX), which header-only ancestors
+/// never populate, and both then folded the failure into `None` — read by every
+/// caller as "no check". Two divergent copies of a fail-open is how that
+/// survived. There is now exactly one implementation and it returns `Result`.
+///
+/// `parent_height_hint` is `Some(..)` only where the caller already resolved
+/// the parent through `CF_BLOCK_INDEX` (submitblock / side-branch attach); the
+/// hint invariant is documented on
+/// `rustoshi_storage::header_context::expected_bits_for_child`.
+///
+/// `Err` is a BIP-22 reject string and MUST be surfaced, never swallowed.
+fn diffbits_expected_for_header(
     block_store: &BlockStore,
     parent_hash: &Hash256,
-    new_block_time: u32,
+    header_bits: u32,
+    header_time: u32,
+    height: u32,
+    parent_height_hint: Option<u32>,
     params: &ChainParams,
-) -> Option<u32> {
-    use rustoshi_consensus::{
-        get_next_work_required, BlockIndex as PowBlockIndex, DIFFICULTY_ADJUSTMENT_INTERVAL,
-    };
-
-    // Walk back at most one full retarget interval (+2 buffer) from the parent.
-    let needed = (DIFFICULTY_ADJUSTMENT_INTERVAL + 2) as usize;
-
-    // Resolve the parent (= pindexPrev) height. If absent the chain can't be
-    // placed, so skip the gate.
-    let parent_height = match block_store.get_height(parent_hash) {
-        Ok(Some(h)) => h,
-        _ => return None,
-    };
-
-    // Collect parent + ancestors, parent-first (oldest last).
-    let mut headers: Vec<rustoshi_primitives::BlockHeader> = Vec::with_capacity(needed);
-    let mut cursor = *parent_hash;
-    for _ in 0..needed {
-        match block_store.get_header(&cursor) {
-            Ok(Some(hdr)) => {
-                let prev = hdr.prev_block_hash;
-                headers.push(hdr);
-                if prev == Hash256::ZERO {
-                    break;
-                }
-                cursor = prev;
-            }
-            _ => break,
-        }
+) -> Result<Option<u32>, String> {
+    // One-shot RPC call: a small cache is enough to serve a single retarget
+    // window walk without holding memory between requests.
+    let mut cache = rustoshi_storage::HeaderCache::new(4096);
+    match rustoshi_storage::diffbits_gate_for_header(
+        block_store,
+        &mut cache,
+        parent_hash,
+        header_bits,
+        header_time,
+        height,
+        parent_height_hint,
+        params,
+    )? {
+        rustoshi_storage::DiffBitsGate::Required(bits) => Ok(Some(bits)),
+        // Narrow assumeUTXO snapshot-base carve-out: already downgraded to
+        // Core's PermittedDifficultyTransition and logged at WARN inside the
+        // gate, so the equality comparison is intentionally not run.
+        rustoshi_storage::DiffBitsGate::DegradedSnapshotBase => Ok(None),
     }
-    if headers.is_empty() {
-        return None;
-    }
-
-    // Build a linked BlockIndex chain (headers[0] = parent/tip, oldest last).
-    struct SimpleBlockIndex {
-        height: u32,
-        timestamp: u32,
-        bits: u32,
-        prev: Option<Box<SimpleBlockIndex>>,
-    }
-    impl PowBlockIndex for SimpleBlockIndex {
-        fn height(&self) -> u32 {
-            self.height
-        }
-        fn timestamp(&self) -> u32 {
-            self.timestamp
-        }
-        fn bits(&self) -> u32 {
-            self.bits
-        }
-        fn prev(&self) -> Option<&Self> {
-            self.prev.as_deref()
-        }
-        fn ancestor(&self, target_height: u32) -> Option<&Self> {
-            if target_height > self.height {
-                return None;
-            }
-            let mut cur = self;
-            while cur.height > target_height {
-                cur = cur.prev.as_deref()?;
-            }
-            Some(cur)
-        }
-    }
-
-    let mut node: Option<Box<SimpleBlockIndex>> = None;
-    for (i, hdr) in headers.iter().enumerate().rev() {
-        let h = parent_height.saturating_sub(i as u32);
-        node = Some(Box::new(SimpleBlockIndex {
-            height: h,
-            timestamp: hdr.timestamp,
-            bits: hdr.bits,
-            prev: node,
-        }));
-    }
-    // `get_next_work_required` returns `Result<u32, PowError>` (was `u32`,
-    // panicked on a missing ancestor -- M2-RUST-POW-PANIC). `.ok()` folds a
-    // `PowError` into `None`, the same "skip the gate rather than
-    // false-reject" convention already used above for every other
-    // unreachable-ancestor case in this function.
-    node.and_then(|tip| get_next_work_required(&*tip, new_block_time, params).ok())
 }
 
 /// Admit an already-signed transaction into the node mempool.
@@ -3222,15 +3168,34 @@ pub fn try_attach_and_reorg(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // expected_bits recomputed over the block's REAL parent chain (same as
-        // 0d8dd26 and submitheader); None = parent chain not walkable (orphan /
-        // snapshot base) → skip that single gate rather than false-reject.
-        let expected_bits = compute_expected_bits_via_store(
+        // expected_bits recomputed over the block's REAL parent chain by
+        // prev_block_hash pointers (NEVER the poisonable height→hash index).
+        // `parent_entry` was already resolved from CF_BLOCK_INDEX above, so the
+        // hint is authoritative. An unresolvable window is now a REJECT, not a
+        // silent skip — the only exception is a hard-coded assumeUTXO snapshot
+        // base, which the shared gate downgrades to Core's
+        // PermittedDifficultyTransition and returns as `None` here.
+        let expected_bits = match diffbits_expected_for_header(
             &store,
             &block.header.prev_block_hash,
+            block.header.bits,
             block.header.timestamp,
+            new_height,
+            Some(parent_entry.height),
             &state.params,
-        );
+        ) {
+            Ok(v) => v,
+            Err(reason) => {
+                tracing::warn!(
+                    "try_attach_and_reorg: side-branch block {} rejected at store: {}",
+                    block_hash,
+                    reason
+                );
+                // Canonical BIP-22 reject string on the wire; the detail is in
+                // the log line above.
+                return Err("bad-diffbits".to_string());
+            }
+        };
         // prev_entry placeholder: contextual_check_block_header reads only
         // `timestamp` from it, and only at BIP-94 retarget boundaries
         // (mainnet-disabled). Matches the submitheader / header-sync convention.
@@ -7730,22 +7695,72 @@ impl RustoshiRpcServer for RpcServerImpl {
         // network-mandated retarget value (off-schedule difficulty = consensus
         // fork). Reachable for tip-extending AND side-branch submissions: the
         // gate keys off the block's REAL parent, so it runs before the
-        // tip-extend/reorg split below. `None` means the ancestor chain isn't
-        // walkable from the store (orphan / snapshot base) — skip rather than
-        // false-reject, same convention as `submitheader` and the header path.
-        if let Some(expected_bits) = compute_expected_bits_via_store(
+        // tip-extend/reorg split below. An unwalkable ancestor chain is now a
+        // REJECT, not a silent skip; the sole exception is a hard-coded
+        // assumeUTXO snapshot base, which the shared gate downgrades to Core's
+        // PermittedDifficultyTransition (and logs at WARN) before returning
+        // `Ok(None)` here.
+        //
+        // ORDER MATTERS. Core's `AcceptBlockHeader` looks the parent up and
+        // returns `prev-blk-not-found` (validation.cpp:4217) BEFORE
+        // `ContextualCheckBlockHeader` runs, so an orphan must be reported as
+        // an orphan, not as bad-diffbits. Without this guard the fail-CLOSED
+        // gate below would relabel every orphan submission — regressing
+        // db23aec ("answer prev-blk-not-found for an unknown parent, as Core
+        // does"). The decision is a reject either way; only the reason code is
+        // at stake, and reason codes are what operators and the diff-test
+        // corpus compare. The assumeUTXO base is exempt: its header is
+        // legitimately absent on a --load-snapshot boot, and the gate handles
+        // it via the documented carve-out.
+        let parent_header_known = store
+            .has_header(&block.header.prev_block_hash)
+            .unwrap_or(false)
+            || state
+                .params
+                .assumeutxo_for_blockhash(&block.header.prev_block_hash)
+                .is_some();
+        if !parent_header_known {
+            tracing::warn!(
+                "submitblock: block {} has an unknown parent {} — prev-blk-not-found",
+                block_hash,
+                block.header.prev_block_hash
+            );
+            return Ok(Some("prev-blk-not-found".to_string()));
+        }
+
+        // The parent height comes from CF_BLOCK_INDEX — authoritative, and NOT
+        // the attacker-poisonable height→hash index.
+        let submit_parent_height = store
+            .get_block_index(&block.header.prev_block_hash)
+            .ok()
+            .flatten()
+            .map(|e| e.height);
+        let submit_height = submit_parent_height
+            .map(|h| h.saturating_add(1))
+            .unwrap_or_else(|| state.best_height.saturating_add(1));
+        match diffbits_expected_for_header(
             &store,
             &block.header.prev_block_hash,
+            block.header.bits,
             block.header.timestamp,
+            submit_height,
+            submit_parent_height,
             &state.params,
         ) {
-            if block.header.bits != expected_bits {
-                tracing::warn!(
-                    "submitblock: block {} rejected: bad-diffbits (nBits {:#010x} != required {:#010x})",
-                    block_hash,
-                    block.header.bits,
-                    expected_bits
-                );
+            Ok(Some(expected_bits)) => {
+                if block.header.bits != expected_bits {
+                    tracing::warn!(
+                        "submitblock: block {} rejected: bad-diffbits (nBits {:#010x} != required {:#010x})",
+                        block_hash,
+                        block.header.bits,
+                        expected_bits
+                    );
+                    return Ok(Some("bad-diffbits".to_string()));
+                }
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                tracing::warn!("submitblock: block {} rejected: {}", block_hash, reason);
                 return Ok(Some("bad-diffbits".to_string()));
             }
         }
@@ -8296,12 +8311,32 @@ impl RustoshiRpcServer for RpcServerImpl {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let expected_bits = compute_expected_bits_via_store(
+        // Step 4 above derived `new_height` either from CF_BLOCK_INDEX (the
+        // authoritative case) or, when the parent header exists but has no index
+        // entry, from `state.best_height` because the parent IS the tip. Both are
+        // pointer-derived, so `new_height - 1` is a legitimate hint. The old
+        // helper resolved the height itself via `get_height` and returned `None`
+        // in exactly that fallback case, silently disabling the gate for
+        // submitheader — the same fail-open as the P2P header path. An
+        // unresolvable window is now an RPC error, not a silent accept.
+        let expected_bits = match diffbits_expected_for_header(
             &store,
             &header.prev_block_hash,
+            header.bits,
             header.timestamp,
+            new_height,
+            Some(new_height.saturating_sub(1)),
             &state.params,
-        );
+        ) {
+            Ok(v) => v,
+            Err(reason) => {
+                tracing::warn!("submitheader: header {} rejected: {}", block_hash, reason);
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TRANSACTION_ERROR,
+                    "bad-diffbits",
+                ));
+            }
+        };
 
         // prev_entry placeholder: only `timestamp` is read by the BIP-94 gate,
         // and only at retarget boundaries (mainnet-disabled). Matches the
@@ -20963,7 +20998,7 @@ mod tests {
         let mut nonce: u32 = 0;
         loop {
             block.header.nonce = nonce;
-            if block.header.validate_pow() {
+            if block.header.validate_pow_against_declared_target() {
                 break;
             }
             nonce = nonce.wrapping_add(1);
@@ -24332,7 +24367,7 @@ mod tests {
             let mut nonce: u32 = 0;
             loop {
                 block.header.nonce = nonce;
-                if block.header.validate_pow() {
+                if block.header.validate_pow_against_declared_target() {
                     break;
                 }
                 nonce = nonce.wrapping_add(1);

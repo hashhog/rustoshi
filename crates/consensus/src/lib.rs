@@ -32,6 +32,7 @@
 //! exceptions for blocks 170060 and 692261, and having one available invites
 //! the misuse that produced clearbit's latent hard-fork path (bc7cb98).
 
+pub mod assumeutxo_tails;
 pub mod block_template;
 pub mod campaign_assumeutxo;
 pub mod chain_manager;

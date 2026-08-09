@@ -519,12 +519,25 @@ impl HeaderSync {
 
             let height = base_height + 1 + i as u32;
 
-            // Validate proof of work
-            if !header.validate_pow() {
+            // Cheap, params-free pre-filter ONLY. This compares the hash to the
+            // target the header DECLARES; it does NOT bound that target by
+            // `pow_limit` (Core pow.cpp `DeriveTarget`), and it is NOT the
+            // nBits-vs-required `bad-diffbits` gate
+            // (bitcoin-core/src/validation.cpp:4088). `HeaderSync` has no
+            // `ChainParams`, so it cannot run either of those.
+            //
+            // INSUFFICIENT ON ITS OWN: without a params-aware check downstream, a
+            // peer can declare nBits easier than the network minimum and mine the
+            // header trivially. The real gates live in the `validate_and_store`
+            // closure the caller supplies (rustoshi/src/main.rs runs
+            // `check_proof_of_work` and `diffbits_gate_for_header` there); this
+            // just rejects the obviously-bogus without paying for a store walk.
+            if !header.validate_pow_against_declared_target() {
                 return Err("bad proof of work".into());
             }
 
-            // Store and validate the header
+            // Store and validate the header — this is where the params-aware
+            // PoW / difficulty gates actually run.
             validate_and_store(header, height)?;
 
             prev_hash = header.block_hash();
@@ -623,7 +636,7 @@ mod tests {
             let mut nonce = 0u32;
             loop {
                 let header = make_test_header(prev_hash, nonce);
-                if header.validate_pow() {
+                if header.validate_pow_against_declared_target() {
                     prev_hash = header.block_hash();
                     headers.push(header);
                     break;

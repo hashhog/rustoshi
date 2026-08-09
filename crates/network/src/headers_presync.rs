@@ -629,7 +629,7 @@ mod tests {
         for _i in 0..count {
             for nonce in 0..10000u32 {
                 let header = make_test_header(prev_hash, bits, nonce);
-                if header.validate_pow() {
+                if header.validate_pow_against_declared_target() {
                     prev_hash = header.block_hash();
                     headers.push(header);
                     break;
