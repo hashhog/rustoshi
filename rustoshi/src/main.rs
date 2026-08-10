@@ -2201,6 +2201,78 @@ fn main() -> anyhow::Result<()> {
 /// (clamped) total. Clamped to [4, 65536] MiB so a fat-fingered `--dbcache=0`
 /// cannot zero a cache. For the default 2560 MiB: 512 MiB block + 2048 MiB
 /// coins — byte-for-byte the prior hardcoded-512-block + 2048-coins behavior.
+/// Make the baked assumeUTXO base-tail bands retroactive.
+///
+/// Snapshot activation persists a band via `put_base_tail_headers`, but that
+/// only runs at activation. Datadirs activated before the bands existed have no
+/// stored header for their own snapshot base, so
+/// `header_context::degrade_at_snapshot_base` resolves its nBits to `None` and
+/// (since 2026-08-09) REFUSES the header rather than skipping the difficulty
+/// check. Backfilling here gives those datadirs the same ancestry a fresh
+/// snapshot boot gets.
+///
+/// Deliberately conservative — it writes only when BOTH hold:
+///   * the height index already maps the base's height to the base's hash, i.e.
+///     this base really is on our active chain (never trust the entry alone);
+///   * the base's header is genuinely absent.
+///
+/// Failures are logged, not fatal: an unwritable band leaves the node exactly
+/// where it was, and the difficulty gate stays fail-closed either way.
+fn backfill_assumeutxo_base_tails(
+    block_store: &rustoshi_storage::BlockStore,
+    params: &ChainParams,
+) {
+    for assume in &params.assumeutxo_data {
+        if assume.base_tail_headers.is_empty() {
+            continue;
+        }
+        // Is this base on OUR chain?
+        match block_store.get_hash_by_height(assume.height) {
+            Ok(Some(h)) if h == assume.blockhash => {}
+            Ok(Some(_)) => continue, // different chain at that height -- leave it
+            Ok(None) => continue,    // we do not have that height at all
+            Err(e) => {
+                tracing::warn!(
+                    "assumeutxo tail backfill: height-index read failed at {}: {}",
+                    assume.height,
+                    e
+                );
+                continue;
+            }
+        }
+        // Already have the base's header? Then the band is already in place.
+        match block_store.get_header(&assume.blockhash) {
+            Ok(Some(_)) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    "assumeutxo tail backfill: header read failed for base {}: {}",
+                    assume.blockhash,
+                    e
+                );
+                continue;
+            }
+            Ok(None) => {}
+        }
+        match block_store.put_base_tail_headers(assume.height, &assume.base_tail_headers) {
+            Ok(()) => tracing::info!(
+                "assumeutxo tail backfill: persisted {} headers ending at base {} (height {}) -- \
+                 this datadir was snapshot-activated before the bands were baked in, so the \
+                 bad-diffbits retarget walk had no pre-base ancestry",
+                assume.base_tail_headers.len(),
+                assume.blockhash,
+                assume.height,
+            ),
+            Err(e) => tracing::warn!(
+                "assumeutxo tail backfill: put_base_tail_headers failed for base {} (height {}): \
+                 {} -- continuing; the difficulty gate remains fail-closed",
+                assume.blockhash,
+                assume.height,
+                e
+            ),
+        }
+    }
+}
+
 fn split_dbcache(dbcache_mib: usize) -> (usize, usize) {
     let mib = dbcache_mib.clamp(4, 65536);
     let total = mib * 1024 * 1024;
@@ -2462,6 +2534,29 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     // Initialize with genesis block
     block_store.init_genesis(&params)?;
+
+    // Backfill baked assumeUTXO base-tail headers.
+    //
+    // `put_base_tail_headers` is otherwise called ONLY from snapshot activation
+    // (see the `--load-snapshot` path below). A datadir activated BEFORE the
+    // bands were baked into chainparams therefore has NO stored header for its
+    // own snapshot base -- confirmed on the live mainnet node, whose chainstate
+    // was activated at base 944183: `getblockhash(944183)` returns the right
+    // hash while `getblockheader` on it answers "Block not found".
+    //
+    // That leaves such a datadir in the one state the bad-diffbits work does
+    // not help: `degrade_at_snapshot_base` still resolves the base's nBits to
+    // `None` and now REFUSES, so the node gains no protection and carries a
+    // wedge risk if any retarget walk ever reaches back that far. Backfilling
+    // at startup makes the bands retroactive, which is the whole point of
+    // baking them.
+    //
+    // Idempotent and cheap: it writes only when the base is genuinely on OUR
+    // chain (the height index already maps its height to its hash) AND its
+    // header is genuinely absent. It never invents chain data -- if the height
+    // index disagrees with the entry's blockhash, this is a different chain and
+    // we leave it alone.
+    backfill_assumeutxo_base_tails(&block_store, &params);
 
     // BIP-157/158: index the GENESIS block's basic filter + filter header at
     // startup. Bitcoin Core's `BlockFilterIndex` indexes every connected block
@@ -2935,9 +3030,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         // partial post-snapshot window (false `time-too-old`), and the
         // difficulty-retarget ancestor walk at the next adjustment boundary
         // can find no ancestor at all -- panicking before this fix, now a
-        // typed `PowError` even in the worst case. No-op (mainnet-inert)
-        // when the entry carries no tail headers, which is every built-in
-        // Core-parity entry.
+        // typed `PowError` even in the worst case. No-op when the entry
+        // carries no tail headers.
+        //
+        // NOTE (2026-08-09): every built-in MAINNET entry now bakes a 2027-
+        // header band (`consensus::assumeutxo_tails`), so this is no longer
+        // mainnet-inert — it is the path that gives a fresh snapshot boot real
+        // pre-base ancestry. Datadirs activated BEFORE the bands existed are
+        // handled separately by `backfill_assumeutxo_base_tails` at startup,
+        // because this branch only runs at activation time.
         if !assume.base_tail_headers.is_empty() {
             if let Err(e) =
                 block_store.put_base_tail_headers(assume.height, &assume.base_tail_headers)
@@ -6826,6 +6927,84 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backfill must be RETROACTIVE but never inventive.
+    ///
+    /// A datadir snapshot-activated before the tail bands were baked into
+    /// chainparams has no stored header for its own base (confirmed live:
+    /// rustoshi at base 944183 answers getblockhash but "Block not found" for
+    /// getblockheader). Without a backfill the bands help only fresh boots,
+    /// and the now-refusing `degrade_at_snapshot_base` arm gets no ancestry on
+    /// exactly the node we are deploying to.
+    ///
+    /// Asserts both directions, so it cannot pass by always-writing:
+    ///   * base on our chain + header missing  -> band written;
+    ///   * height index maps to a DIFFERENT hash -> nothing written.
+    #[test]
+    fn test_backfill_assumeutxo_base_tails() {
+        use rustoshi_primitives::Hash256;
+        let params = ChainParams::mainnet();
+        let assume = params
+            .assumeutxo_data
+            .iter()
+            .find(|a| !a.base_tail_headers.is_empty())
+            .expect("mainnet entries carry baked bands");
+
+        // --- case 1: base IS on our chain and its header is absent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = std::sync::Arc::new(
+            rustoshi_storage::ChainDb::open(dir.path()).expect("open db"),
+        );
+        let store = rustoshi_storage::BlockStore::new(&db);
+        store
+            .put_height_index(assume.height, &assume.blockhash)
+            .expect("seed height index");
+        assert!(
+            store.get_header(&assume.blockhash).expect("read").is_none(),
+            "precondition: base header absent"
+        );
+
+        backfill_assumeutxo_base_tails(&store, &params);
+
+        let hdr = store
+            .get_header(&assume.blockhash)
+            .expect("read")
+            .expect("backfill must persist the base header");
+        assert_eq!(hdr.block_hash(), assume.blockhash);
+        assert_ne!(hdr.bits, 0, "backfilled base must carry REAL bits");
+
+        // The pre-base ancestor the next retarget needs must be there too.
+        let older = assume.height - (assume.base_tail_headers.len() as u32 - 1);
+        assert!(
+            store.get_hash_by_height(older).expect("read").is_some(),
+            "band must extend back {} blocks",
+            assume.base_tail_headers.len()
+        );
+
+        // --- case 2: the height index names a DIFFERENT block. Not our chain;
+        // the backfill must not overwrite or invent anything.
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        let db2 = std::sync::Arc::new(
+            rustoshi_storage::ChainDb::open(dir2.path()).expect("open db"),
+        );
+        let store2 = rustoshi_storage::BlockStore::new(&db2);
+        let foreign = Hash256([0x11u8; 32]);
+        store2
+            .put_height_index(assume.height, &foreign)
+            .expect("seed foreign height index");
+
+        backfill_assumeutxo_base_tails(&store2, &params);
+
+        assert!(
+            store2.get_header(&assume.blockhash).expect("read").is_none(),
+            "backfill must NOT write a band onto a chain that disagrees at that height"
+        );
+        assert_eq!(
+            store2.get_hash_by_height(assume.height).expect("read"),
+            Some(foreign),
+            "backfill must not clobber the existing height index"
+        );
+    }
 
     /// Finding 8 (DoS parity): the getblocktxn depth gate. A targeted blocktxn
     /// is served ONLY for blocks within MAX_BLOCKTXN_DEPTH (10) of the tip;
