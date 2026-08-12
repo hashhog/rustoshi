@@ -438,6 +438,17 @@ impl ValidationError {
             // block carrying an oversize non-witness payload is reported as
             // bad-blk-length rather than the later per-tx bad-txns-oversize.
             ValidationError::BlockLengthTooLarge(_) => "bad-blk-length".to_string(),
+            // Empty block (zero transactions). Core folds `block.vtx.empty()`
+            // into the SAME size-limits gate (CheckBlock validation.cpp:3947-3948:
+            //   if (block.vtx.empty() || ... ) → "bad-blk-length", "size limits
+            //   failed")
+            // so an empty block is reported as bad-blk-length, NOT bad-cb-missing
+            // (the coinbase gate at :3951 re-tests vtx.empty() but is unreachable
+            // for it — the size gate runs first). rustoshi previously let this
+            // variant fall to the generic "rejected" catch-all (bwmc corpus
+            // A2-empty-block divergence, 2026-08-09 sweep). Decision unchanged:
+            // reject either way; reason-token parity only.
+            ValidationError::NoTransactions => "bad-blk-length".to_string(),
             // Coinbase missing / not first: Core CheckBlock validation.cpp:
             //   vtx empty or !vtx[0]->IsCoinBase() → "bad-cb-missing".
             ValidationError::NoCoinbase => "bad-cb-missing".to_string(),
@@ -8068,6 +8079,18 @@ mod tests {
         // Core CheckBlock validation.cpp:3947-3948: early non-witness size gate
         // emits "bad-blk-length" BEFORE the per-tx bad-txns-oversize loop.
         let e = ValidationError::BlockLengthTooLarge(4_205_736);
+        assert_eq!(e.bip22_string(), "bad-blk-length");
+    }
+
+    #[test]
+    fn bip22_string_empty_block_is_blk_length() {
+        // Core CheckBlock validation.cpp:3947-3948: `block.vtx.empty()` is part
+        // of the size-limits gate → "bad-blk-length" ("size limits failed"),
+        // NOT bad-cb-missing (the :3951 coinbase gate re-tests vtx.empty() but
+        // the size gate runs first). bwmc corpus A2-empty-block: Core answered
+        // reject:bad-blk-length; rustoshi previously fell to the "rejected"
+        // catch-all.
+        let e = ValidationError::NoTransactions;
         assert_eq!(e.bip22_string(), "bad-blk-length");
     }
 
