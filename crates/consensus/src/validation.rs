@@ -646,6 +646,21 @@ pub fn check_block_with_pow(
         }
     }
 
+    // CVE-2012-2459 mutated-merkle detection MUST run before the explicit
+    // duplicate-txid scan below. Core has no dup-txid scan at all: an ALIGNED
+    // duplicate surfaces as the `mutated` out-param inside CheckMerkleRoot
+    // (validation.cpp:3841-3858, consensus/merkle.cpp) -> `bad-txns-duplicate`,
+    // while a MISALIGNED duplicate passes CheckBlock and is only caught by
+    // ConnectBlock's spent-prevout check -> `bad-txns-inputs-missingorspent`.
+    // Any mutated tx-list necessarily contains a duplicate txid, so with the
+    // dup scan first the `mutated` branch was dead code and EVERY mutated
+    // block mis-reported as bad-txns-inputs-missingorspent. Reason-string
+    // only: both orderings reject exactly the same blocks.
+    let (computed_merkle_root, merkle_mutated) = block.compute_merkle_root_mutated();
+    if merkle_mutated {
+        return Err(ValidationError::BadTxnsDuplicate);
+    }
+
     // Check for duplicate transactions
     let mut seen_txids = HashSet::new();
     for tx in &block.transactions {
@@ -677,15 +692,12 @@ pub fn check_block_with_pow(
     // Core CheckMerkleRoot (validation.cpp:3850-3858) computes the root with
     // a `mutated` out-param and rejects on EITHER a root mismatch
     // (bad-txnmrklroot) OR `mutated == true` (bad-txns-duplicate, the
-    // CVE-2012-2459 duplicate-txid malleation). The malleated block has the
-    // SAME root as the honest one, so checking root equality alone is a
-    // false-accept — we must also reject when the mutation flag is set.
-    let (computed, mutated) = block.compute_merkle_root_mutated();
-    if computed != block.header.merkle_root {
+    // CVE-2012-2459 duplicate-txid malleation). The mutated branch runs
+    // earlier in this function (before the duplicate-txid scan — see the
+    // comment there); here we reuse the root computed at that point and
+    // enforce the mismatch half.
+    if computed_merkle_root != block.header.merkle_root {
         return Err(ValidationError::BadMerkleRoot);
-    }
-    if mutated {
-        return Err(ValidationError::BadTxnsDuplicate);
     }
 
     // Check block weight
