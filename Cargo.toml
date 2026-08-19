@@ -39,3 +39,23 @@ tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rayon = "1.8"
 zmq = "0.10"
+
+# Runtime integer-overflow checks ON in release.
+#
+# Rust's default release profile sets overflow-checks = false, so `a + b` on
+# fixed-width integers WRAPS silently. For a consensus validator that is the
+# wrong default: a wrapped length or index does not stop the node, it makes it
+# compute a different answer than Bitcoin Core and keep going.
+#
+# Concretely, on 2026-08-19 the same bug class in clearbit's tapscript
+# OP_SUCCESS pre-scan behaved like this on identical input:
+#     checks ON  -> loud crash, caught immediately, node restarted
+#     checks OFF -> reported a push PAYLOAD byte as OP_SUCCESSx, i.e. declared
+#                   an invalid script unconditionally VALID under BIP-342
+# See receipts/clearbit-tapscript-pushdata1-overflow-2026-08-19.md.
+#
+# Cost is affordable here: rustoshi has already completed its from-genesis R4
+# run (T2-1) and now follows tip, where it has orders of magnitude of headroom.
+# A crash is observable and recoverable; a silent divergence is neither.
+[profile.release]
+overflow-checks = true
