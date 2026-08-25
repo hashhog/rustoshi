@@ -6621,33 +6621,124 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 if queue_len == 0 && in_flight == 0 {
                     let best_header = block_downloader.best_header_height();
                     const GAP_FILL_MAX: u32 = 1000;
-                    let gap = rustoshi_network::block_download::compute_gap_fill(
-                        tip,
-                        best_header,
-                        GAP_FILL_MAX,
-                        |h| block_store.get_hash_by_height(h).ok().flatten(),
-                        |hash| block_store.has_block(hash).unwrap_or(false),
-                    );
-                    if !gap.to_request.is_empty() {
-                        tracing::warn!(
-                            "Gap fill: {} block(s) missing above validated tip {} (best header {}) — re-enqueueing",
-                            gap.to_request.len(), tip, best_header
+
+                    // Which repair is needed depends on whether our active tip is
+                    // ON the header chain or on a losing fork beside it — and that
+                    // question has an O(1) answer here, but NOT the obvious one.
+                    //
+                    // The height index CANNOT be read as "the active chain",
+                    // despite what block_store's doc comments used to say. Header
+                    // sync calls put_height_index for EVERY accepted header
+                    // (see validate_and_store in the headers handler), so the
+                    // index tracks the HEADER chain. Above a fork it names the
+                    // COMPETING branch, not ours.
+                    //
+                    // That is exactly what makes this check work: if the header
+                    // chain has a DIFFERENT block at our own tip height, we are on
+                    // a losing fork. Verified against the live wedged node on
+                    // 2026-08-25 — active tip …ec5e4ceb at 963853, while
+                    // getblockhash(963853) returned Core's …0258f8.
+                    //
+                    // Deciding this BEFORE the by-height fill matters. On a losing
+                    // fork the competing branch's upper bodies are often missing
+                    // too, so the by-height fill returns work and looks healthy —
+                    // while the one body the reorg actually needs sits at our own
+                    // tip height on the other branch, where a `tip + 1 ..` window
+                    // can never look. Gating the fork walk on "the by-height fill
+                    // came back empty" would leave the node re-requesting the
+                    // upper branch every 10s, forever, and still wedged.
+                    let (active_hash, active_height) = {
+                        let cs = chain_state.read().await;
+                        (cs.tip_hash(), cs.tip_height())
+                    };
+                    let on_losing_fork = block_store
+                        .get_hash_by_height(active_height)
+                        .ok()
+                        .flatten()
+                        .map_or(false, |h| h != active_hash);
+
+                    if on_losing_fork {
+                        // Bound the prev-walk so a deep or unresolvable fork
+                        // cannot burn the tick. 2000 is one headers batch and
+                        // ~7x MAX_REORG_DEPTH (288) — any fork we could actually
+                        // reorg onto is far inside it.
+                        const FORK_FILL_MAX_WALK: u32 = 2000;
+                        let fork = rustoshi_network::block_download::compute_fork_branch_fill(
+                            (header_sync.best_header_hash(), header_sync.best_header_height()),
+                            (active_hash, active_height),
+                            FORK_FILL_MAX_WALK,
+                            |hash| {
+                                block_store
+                                    .get_header(hash)
+                                    .ok()
+                                    .flatten()
+                                    .map(|hdr| hdr.prev_block_hash)
+                            },
+                            |hash| block_store.has_block(hash).unwrap_or(false),
                         );
-                        block_downloader.enqueue_blocks(gap.to_request);
-                    } else if gap.already_stored > 0 {
-                        // Behind the header tip, yet every height in the window
-                        // resolves — through the ACTIVE-chain height index — to a
-                        // block whose body we already hold. That is the
-                        // losing-fork signature: a by-height fill cannot repair
-                        // it, because the index points at our own branch. The
-                        // reorg needs the competing branch's bodies BY HASH. Say
-                        // so rather than spinning silently.
-                        tracing::warn!(
-                            "Gap fill: behind by {} (tip {} vs best header {}) but every height in the \
-                             window already resolves to a stored block — losing-fork signature; \
-                             competing-branch bodies must be fetched BY HASH, not by height",
-                            best_header.saturating_sub(tip), tip, best_header
+                        if fork.truncated {
+                            // No fork point within the walk bound (or a hole in
+                            // the header store). The hashes we did collect are
+                            // the TOP of the branch and cannot connect to
+                            // anything we hold, so requesting them would only
+                            // stall the pending queue. Report instead.
+                            tracing::warn!(
+                                "Gap fill: losing-fork signature (behind by {}, tip {} vs best header {}), \
+                                 but the header walk from {} did not reach a fork point with our tip {} \
+                                 within {} steps — not requesting a partial branch",
+                                best_header.saturating_sub(tip), tip, best_header,
+                                header_sync.best_header_hash(), active_hash, FORK_FILL_MAX_WALK
+                            );
+                        } else if !fork.to_request.is_empty() {
+                            tracing::warn!(
+                                "Fork-aware fill: losing fork detected (our tip {} at {}, header tip {} at {}, \
+                                 fork@{:?}) — requesting {} competing-branch body(ies) BY HASH ({} already stored)",
+                                active_hash, active_height,
+                                header_sync.best_header_hash(), header_sync.best_header_height(),
+                                fork.fork_height, fork.to_request.len(), fork.already_stored
+                            );
+                            block_downloader.enqueue_blocks(fork.to_request);
+                        } else {
+                            // The header walk found nothing to fetch: either the
+                            // header tip is on our own chain after all, or every
+                            // competing-branch body is already on disk. Either
+                            // way the blocker is not download — it is the
+                            // reorg itself failing to fire, and more getdata
+                            // cannot help. Say which, so the next hop is clear.
+                            tracing::warn!(
+                                "Gap fill: losing-fork signature (behind by {}, tip {} vs best header {}), \
+                                 fork@{:?}, header walk found {} competing-branch block(s) and every one \
+                                 is already stored — NOT a download problem; the reorg is not firing",
+                                best_header.saturating_sub(tip), tip, best_header,
+                                fork.fork_height, fork.already_stored
+                            );
+                        }
+                    } else if tip < best_header {
+                        // Ordinary case: our tip IS on the header chain, just
+                        // behind it. Rebuild the missing set by height.
+                        let gap = rustoshi_network::block_download::compute_gap_fill(
+                            tip,
+                            best_header,
+                            GAP_FILL_MAX,
+                            |h| block_store.get_hash_by_height(h).ok().flatten(),
+                            |hash| block_store.has_block(hash).unwrap_or(false),
                         );
+                        if !gap.to_request.is_empty() {
+                            tracing::warn!(
+                                "Gap fill: {} block(s) missing above validated tip {} (best header {}) — re-enqueueing",
+                                gap.to_request.len(), tip, best_header
+                            );
+                            block_downloader.enqueue_blocks(gap.to_request);
+                        } else if gap.already_stored > 0 {
+                            // On the header chain, behind it, and every body in
+                            // the window is already on disk. Downloading cannot
+                            // help — the connect side is not consuming them.
+                            tracing::warn!(
+                                "Gap fill: behind by {} (tip {} vs best header {}) but every body in the \
+                                 window is already stored — NOT a download problem; the connect path is stalled",
+                                best_header.saturating_sub(tip), tip, best_header
+                            );
+                        }
                     }
                 }
 

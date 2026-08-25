@@ -290,14 +290,27 @@ impl<'a> BlockStore<'a> {
 
     // ---------------- HEIGHT INDEX ----------------
 
-    /// Store the block hash at a given height (for the active chain).
+    /// Store the block hash at a given height.
+    ///
+    /// NOTE: this index tracks the **header** chain, not the active chain.
+    /// Header sync calls this for every accepted header, so above a fork it
+    /// names the COMPETING branch rather than the one we have connected.
+    /// Verified live 2026-08-25 on a node wedged on a losing fork: its active
+    /// tip was …ec5e4ceb at 963853 while this index returned Core's …0258f8
+    /// for that height. Anything reasoning about "which chain are we on" must
+    /// compare against the chainstate tip, not read it from here.
     pub fn put_height_index(&self, height: u32, hash: &Hash256) -> Result<(), StorageError> {
         // Use big-endian for height so RocksDB iteration is numerically sorted
         self.db
             .put_cf(CF_HEIGHT_INDEX, &height.to_be_bytes(), hash.as_bytes())
     }
 
-    /// Get the block hash at a given height in the active chain.
+    /// Get the block hash at a given height on the **header** chain.
+    ///
+    /// See `put_height_index`: this is NOT the active chain. On a losing fork
+    /// it returns the competing branch's block for our own tip height, which
+    /// is precisely what makes it a usable fork detector — and a trap for any
+    /// caller that assumes otherwise.
     pub fn get_hash_by_height(&self, height: u32) -> Result<Option<Hash256>, StorageError> {
         match self.db.get_cf(CF_HEIGHT_INDEX, &height.to_be_bytes())? {
             Some(data) => {

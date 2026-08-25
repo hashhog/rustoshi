@@ -151,8 +151,9 @@ pub struct GapFill {
 /// node is stuck on a losing fork, those heights resolve to its OWN branch, whose
 /// bodies it already holds. In that case `to_request` is empty while
 /// `already_stored` is not — the caller should treat that as the losing-fork
-/// signature and report it, because a by-height fill cannot repair it; the
-/// competing branch's bodies have to be fetched by hash.
+/// signature and hand it to [`compute_fork_branch_fill`], because a by-height
+/// fill cannot repair it; the competing branch's bodies have to be fetched by
+/// hash, walking the header chain's prev pointers.
 pub fn compute_gap_fill<F, G>(
     validated_tip: u32,
     best_header: u32,
@@ -177,6 +178,185 @@ where
             } else {
                 out.to_request.push((hash, h));
             }
+        }
+    }
+    out
+}
+
+/// Outcome of a fork-aware, BY-HASH branch reconciliation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ForkBranchFill {
+    /// Competing-branch blocks whose body we do NOT hold, in ascending-height
+    /// (chain) order. These are the bodies a reorg onto that branch needs.
+    pub to_request: Vec<(Hash256, u32)>,
+    /// Competing-branch blocks walked whose body we already hold.
+    pub already_stored: u32,
+    /// Height of the fork point (last common ancestor of the two tips), or
+    /// `None` when the walk gave up before reaching it.
+    pub fork_height: Option<u32>,
+    /// True when the walk hit `max_walk`, or ran out of headers, before it
+    /// reached the fork point. The collected prefix is then the TOP of the
+    /// branch, which cannot connect to anything we have, so a caller should
+    /// report it rather than request it.
+    pub truncated: bool,
+}
+
+/// Walk the HEADER chain back from the best header to its fork point with the
+/// ACTIVE chain and return the competing branch's real block hashes whose body
+/// we are missing — Bitcoin Core's `FindNextBlocksToDownload` operating on
+/// `CBlockIndex::pprev` rather than on the active-chain height map.
+///
+/// [`compute_gap_fill`] cannot repair a losing fork and says so: it resolves
+/// heights through the ACTIVE-chain height index, so on a losing fork every
+/// height in the gap resolves to a block we already hold and it returns an empty
+/// request set with a non-zero `already_stored`. THIS is the function that
+/// handles that signature. The distinction is the same one haskoin's
+/// `requestForkBlocks` documents: the bodies the reorg needs belong to the
+/// COMPETING branch and are reachable only by hash, by walking prev pointers.
+///
+/// Live case (2026-08-24 mainnet, receipt
+/// `receipts/one-block-race-recovery-class-2026-08-24.md`): two valid blocks
+/// were mined at height 963853 seconds apart; rustoshi connected `…ec5e4ceb`,
+/// the network kept `…0258f8`. Fork point 963852, header tip 963894, peers
+/// healthy, ten hours wedged. The competing branch's LATER blocks arrive at the
+/// tip and `try_attach_and_reorg` persists them as side-branch bodies, so a
+/// `validated_tip+1 ..` window can find every height already stored and nothing
+/// to request — the losing-fork signature — while the one body that would let
+/// the reorg assemble, the competing 963853, sits BELOW the node's own tip
+/// height, where that window can never look.
+///
+/// The fork point is found the way Core's `LastCommonAncestor` finds it: bring
+/// both tips to a common height by prev-walking the deeper one, then step both
+/// back in lockstep until the hashes are equal. It deliberately does NOT consult
+/// the height index, because rustoshi rewrites that index for every accepted
+/// header (`put_height_index` in the header-sync `validate_and_store` closure),
+/// which means above the fork point it names the COMPETING branch, not the
+/// active chain — so "is this hash the one at its height?" is not a fork test
+/// here. Comparing hashes cannot invent a fork point: a wrong height only makes
+/// the two walks fail to meet, which reports `truncated`, never a false fork.
+///
+/// The fork point itself is excluded — we have it, by definition.
+///
+/// # Arguments
+/// * `header_tip` - `(hash, height)` of the best known header.
+/// * `active_tip` - `(hash, height)` of the connected chainstate tip.
+/// * `max_walk` - hard cap on prev-pointer steps, so a deep or unresolvable
+///   fork cannot build an unbounded vector inside a timer tick.
+/// * `prev_of` - parent of a block by hash (its header's `prev_block_hash`),
+///   `None` if the header is not stored. Must see BOTH branches — a
+///   hash-keyed header lookup, never a height lookup.
+/// * `have_body` - whether the block's body is already on disk.
+pub fn compute_fork_branch_fill<P, G>(
+    header_tip: (Hash256, u32),
+    active_tip: (Hash256, u32),
+    max_walk: u32,
+    prev_of: P,
+    have_body: G,
+) -> ForkBranchFill
+where
+    P: Fn(&Hash256) -> Option<Hash256>,
+    G: Fn(&Hash256) -> bool,
+{
+    let (mut branch_hash, mut branch_height) = header_tip;
+    let (mut ours_hash, mut ours_height) = active_tip;
+
+    // Competing-branch blocks, collected descending as we walk; reversed below.
+    let mut branch: Vec<(Hash256, u32)> = Vec::new();
+    let mut steps: u32 = 0;
+    let mut truncated = false;
+    let mut fork_height: Option<u32> = None;
+
+    // `loop` purely so the three phases below can bail out to one exit.
+    loop {
+        // Phase 1: bring the two tips to a common height. Only the competing
+        // side's blocks are collected — the active side's are ones we connected.
+        while branch_height > ours_height {
+            if steps >= max_walk {
+                truncated = true;
+                break;
+            }
+            branch.push((branch_hash, branch_height));
+            match prev_of(&branch_hash) {
+                Some(parent) if branch_height > 0 => {
+                    branch_hash = parent;
+                    branch_height -= 1;
+                }
+                _ => {
+                    truncated = true;
+                    break;
+                }
+            }
+            steps += 1;
+        }
+        if truncated {
+            break;
+        }
+
+        while ours_height > branch_height {
+            if steps >= max_walk {
+                truncated = true;
+                break;
+            }
+            match prev_of(&ours_hash) {
+                Some(parent) if ours_height > 0 => {
+                    ours_hash = parent;
+                    ours_height -= 1;
+                }
+                _ => {
+                    truncated = true;
+                    break;
+                }
+            }
+            steps += 1;
+        }
+        if truncated {
+            break;
+        }
+
+        // Phase 2: equal heights — step both back together until they meet.
+        // The two sides stay at the same height from here, so only
+        // `branch_height` is tracked (it is the height of both walks).
+        while branch_hash != ours_hash {
+            if steps >= max_walk {
+                truncated = true;
+                break;
+            }
+            branch.push((branch_hash, branch_height));
+            match (prev_of(&branch_hash), prev_of(&ours_hash)) {
+                (Some(bp), Some(op)) if branch_height > 0 => {
+                    branch_hash = bp;
+                    ours_hash = op;
+                    branch_height -= 1;
+                }
+                _ => {
+                    truncated = true;
+                    break;
+                }
+            }
+            steps += 1;
+        }
+        if truncated {
+            break;
+        }
+
+        // Met: `branch_hash == ours_hash` is the fork point, and it is NOT in
+        // `branch` — we never push a hash we have already matched against the
+        // active side.
+        fork_height = Some(branch_height);
+        break;
+    }
+
+    let mut out = ForkBranchFill {
+        to_request: Vec::new(),
+        already_stored: 0,
+        fork_height,
+        truncated,
+    };
+    for (hash, height) in branch.into_iter().rev() {
+        if have_body(&hash) {
+            out.already_stored += 1;
+        } else {
+            out.to_request.push((hash, height));
         }
     }
     out
@@ -626,6 +806,210 @@ mod tests {
         let g = compute_gap_fill(0, 4, 1000, |ht| if ht == 2 { None } else { Some(h(ht as u8)) }, |_| false);
         assert_eq!(g.to_request, vec![(h(1), 1), (h(3), 3), (h(4), 4)]);
     }
+
+    // ---- fork-aware by-hash branch fill (compute_fork_branch_fill) ----
+
+    /// Fixture hash: `tag` selects the branch (0 = shared trunk, 1 = ours,
+    /// 2 = the competing branch), `height` makes it unique. Analytic rather
+    /// than a map so the tests can use REAL mainnet heights (963_852+) without
+    /// materialising a million-entry chain.
+    fn fh(tag: u8, height: u32) -> Hash256 {
+        let mut b = [0u8; 32];
+        b[0] = tag;
+        b[1..5].copy_from_slice(&height.to_le_bytes());
+        Hash256(b)
+    }
+
+    /// `prev_of` over a two-branch fixture: a shared trunk (tag 0) up to
+    /// `fork`, then two competing branches (tags 1 and 2) both rooted at
+    /// `fh(0, fork)`.
+    fn fork_prev(fork: u32) -> impl Fn(&Hash256) -> Option<Hash256> {
+        move |hash: &Hash256| {
+            let tag = hash.0[0];
+            let height = u32::from_le_bytes(hash.0[1..5].try_into().unwrap());
+            if height == 0 {
+                return None; // genesis has no parent
+            }
+            if tag == 0 {
+                return Some(fh(0, height - 1)); // shared trunk
+            }
+            if height == fork + 1 {
+                return Some(fh(0, fork)); // branch root attaches to the trunk
+            }
+            Some(fh(tag, height - 1))
+        }
+    }
+
+    #[test]
+    fn fork_fill_requests_the_competing_branch_by_hash() {
+        // THE WEDGE, to scale. 2026-08-24 mainnet: two valid blocks at 963853,
+        // rustoshi connected one, the network kept the other. Fork point
+        // 963852, our tip 963853 (branch 1), header tip 963894 (branch 2).
+        // Every competing block ABOVE our tip already has a body — they arrived
+        // at the tip and try_attach_and_reorg persisted them as side-branch
+        // blocks — so a by-height window over 963854..=963894 sees nothing
+        // missing. The body that would let the reorg assemble is the competing
+        // 963853, which sits BELOW our own tip height where that window cannot
+        // look. Only the header walk finds it.
+        const FORK: u32 = 963_852;
+        let missing = fh(2, 963_853);
+        let f = compute_fork_branch_fill(
+            (fh(2, 963_894), 963_894),
+            (fh(1, 963_853), 963_853),
+            2000,
+            fork_prev(FORK),
+            |h: &Hash256| *h != missing,
+        );
+        assert_eq!(
+            f.to_request,
+            vec![(missing, 963_853)],
+            "must request the competing 963853 by its OWN hash"
+        );
+        assert_eq!(f.already_stored, 41); // 963854..=963894
+        assert_eq!(f.fork_height, Some(FORK));
+        assert!(!f.truncated);
+        // And it must never ask for our own branch's blocks back.
+        assert!(f.to_request.iter().all(|(h, _)| h.0[0] != 1));
+    }
+
+    #[test]
+    fn fork_fill_walks_the_whole_branch_in_ascending_order() {
+        // Same fork, but none of the competing bodies ever arrived: the full
+        // branch is requested, lowest height first, so the reorg can assemble
+        // from the fork point upward.
+        const FORK: u32 = 963_852;
+        let f = compute_fork_branch_fill(
+            (fh(2, 963_856), 963_856),
+            (fh(1, 963_853), 963_853),
+            2000,
+            fork_prev(FORK),
+            |_: &Hash256| false,
+        );
+        assert_eq!(
+            f.to_request,
+            vec![
+                (fh(2, 963_853), 963_853),
+                (fh(2, 963_854), 963_854),
+                (fh(2, 963_855), 963_855),
+                (fh(2, 963_856), 963_856),
+            ]
+        );
+        assert_eq!(f.already_stored, 0);
+        assert_eq!(f.fork_height, Some(FORK));
+    }
+
+    #[test]
+    fn fork_fill_is_silent_when_we_are_on_the_right_chain() {
+        // CONTROL — this is what proves the mechanism cannot fire spuriously.
+        // Header tip IS our tip: there is no competing branch, so the walk
+        // yields nothing to request even though `have_body` says we hold
+        // nothing at all.
+        let f = compute_fork_branch_fill(
+            (fh(0, 963_894), 963_894),
+            (fh(0, 963_894), 963_894),
+            2000,
+            fork_prev(963_852),
+            |_: &Hash256| false,
+        );
+        assert!(
+            f.to_request.is_empty(),
+            "must not request anything when we are on the header chain"
+        );
+        assert_eq!(f.already_stored, 0);
+        assert_eq!(f.fork_height, Some(963_894));
+        assert!(!f.truncated);
+    }
+
+    #[test]
+    fn fork_fill_on_the_right_chain_but_behind_requests_only_our_own_chain() {
+        // Second control: same chain, we are simply 3 blocks behind. The walk
+        // must yield exactly those 3 — all on the trunk we are already on —
+        // and never a hash from another branch.
+        let f = compute_fork_branch_fill(
+            (fh(0, 963_894), 963_894),
+            (fh(0, 963_891), 963_891),
+            2000,
+            fork_prev(963_852),
+            |_: &Hash256| false,
+        );
+        assert_eq!(
+            f.to_request,
+            vec![
+                (fh(0, 963_892), 963_892),
+                (fh(0, 963_893), 963_893),
+                (fh(0, 963_894), 963_894),
+            ]
+        );
+        assert_eq!(f.fork_height, Some(963_891));
+        assert!(f.to_request.iter().all(|(h, _)| h.0[0] == 0));
+    }
+
+    #[test]
+    fn fork_fill_excludes_the_fork_point_itself() {
+        // The last common ancestor is a block we already have and already
+        // connected. Requesting it would be a wasted getdata at best and, at
+        // the head of the pending queue, a self-inflicted stall at worst.
+        const FORK: u32 = 100;
+        let f = compute_fork_branch_fill(
+            (fh(2, 105), 105),
+            (fh(1, 101), 101),
+            2000,
+            fork_prev(FORK),
+            |_: &Hash256| false,
+        );
+        assert_eq!(f.fork_height, Some(FORK));
+        assert!(
+            !f.to_request.iter().any(|(h, _)| *h == fh(0, FORK)),
+            "fork point must be excluded"
+        );
+        assert_eq!(f.to_request.first().unwrap().1, FORK + 1);
+        assert_eq!(f.to_request.last().unwrap().1, 105);
+    }
+
+    #[test]
+    fn fork_fill_walk_is_bounded() {
+        // A fork point 500k blocks back must not build a 500k-entry vector
+        // inside a 10-second timer tick. The walk stops at `max_walk` and
+        // reports `truncated` with no fork point — the collected prefix is the
+        // TOP of the branch and cannot connect to anything we hold, which is
+        // why the caller reports a truncated walk instead of requesting it.
+        let f = compute_fork_branch_fill(
+            (fh(2, 500_000), 500_000),
+            (fh(1, 500_000), 500_000),
+            16,
+            fork_prev(0),
+            |_: &Hash256| false,
+        );
+        assert!(f.truncated);
+        assert_eq!(f.fork_height, None);
+        assert_eq!(f.to_request.len(), 16, "bounded by max_walk");
+        assert_eq!(f.to_request.last().unwrap().1, 500_000);
+        assert_eq!(f.to_request.first().unwrap().1, 500_000 - 15);
+    }
+
+    #[test]
+    fn fork_fill_truncates_when_a_header_is_missing() {
+        // A prev pointer we cannot resolve (header not stored) is not a fork
+        // point. Reporting `truncated` keeps us from mistaking a hole in the
+        // header store for "the branches met here".
+        let f = compute_fork_branch_fill(
+            (fh(2, 200), 200),
+            (fh(1, 200), 200),
+            2000,
+            |h: &Hash256| {
+                let height = u32::from_le_bytes(h.0[1..5].try_into().unwrap());
+                if height <= 195 {
+                    None
+                } else {
+                    Some(fh(h.0[0], height - 1))
+                }
+            },
+            |_: &Hash256| false,
+        );
+        assert!(f.truncated);
+        assert_eq!(f.fork_height, None);
+    }
+
     use super::*;
     use rustoshi_primitives::BlockHeader;
 
