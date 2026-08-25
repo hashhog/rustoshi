@@ -2863,21 +2863,55 @@ pub fn disconnect_block(
         .any(|(exc_h, exc_hash)| *exc_h == height && *exc_hash == block_hash);
 
     // ============================================================
-    // Gate 3: walk transactions in REVERSE (Core:2205).
-    // Each tx is unwound in reverse output-then-input order: first
-    // spend the outputs the block created, then restore the inputs.
     // ============================================================
-    for (tx_idx_back, tx) in block.transactions.iter().enumerate().rev() {
+    // Gate 3: walk transactions in REVERSE (Core:2205), and for EACH tx
+    // undo its outputs and THEN restore its inputs before moving to the
+    // next tx (Core:2213-2241).
+    //
+    // The per-tx interleave is load-bearing, not a stylistic choice.
+    // Consider an intra-block chain — txA creates P, a later txB in the
+    // same block spends it. After connecting, P is NOT in the UTXO set.
+    // Core's order handles that naturally:
+    //
+    //   txB: remove its outputs; restore its inputs -> P is added back
+    //   txA: remove its outputs -> P is found and removed
+    //
+    // Two separate full passes (every output first, then every input)
+    // break both halves: txA's removal of P finds nothing and raises a
+    // spurious UNCLEAN, and the later input pass then re-adds P and
+    // leaves it in the set. That phantom coin is not cosmetic — competing
+    // branches share transactions, so on the reconnect the winning
+    // branch's copy of txA re-creates P and fails BIP-30, aborting the
+    // reorg. Mainnet rustoshi wedged at 963853 for ~19h emitting exactly
+    // that pair: `disconnect_block returned UNCLEAN` then
+    // `attach-and-reorg declined ...: reorg-bip22bad-txns-BIP30`.
+    //
+    // We need each tx's slice of the flat `undo.spent_coins` vector,
+    // which is ordered (tx_index ascending, input_index ascending), so
+    // compute the offsets up front and index them inside the reverse walk.
+    // ============================================================
+    let mut tx_slice_offsets: Vec<usize> = Vec::with_capacity(block.transactions.len());
+    {
+        let mut cursor = 0usize;
+        for tx in block.transactions.iter() {
+            tx_slice_offsets.push(cursor);
+            if !tx.is_coinbase() {
+                cursor += tx.inputs.len();
+            }
+        }
+    }
+
+    for (i, tx) in block.transactions.iter().enumerate().rev() {
         let txid = tx.txid();
         let is_coinbase = tx.is_coinbase();
         // is_bip30_exception is per-tx in Core but the exception only applies
         // to coinbases (the overwriting coinbase txid is what's duplicated).
         let is_bip30_exception_tx = is_coinbase && is_bip30_disconnect_exception;
 
-        // ----- Pass A: undo outputs (Core:2213-2224) -----
-        // For each output of this tx, verify it currently lives in the
-        // UTXO set with matching metadata, then remove it. Skip
-        // unspendable outputs (they were never added).
+        // ----- Pass A: undo this tx's outputs (Core:2213-2224) -----
+        // For each output, verify it currently lives in the UTXO set with
+        // matching metadata, then remove it. Skip unspendable outputs
+        // (they were never added).
         for o in 0..tx.outputs.len() {
             if is_unspendable(&tx.outputs[o].script_pubkey) {
                 // Core line 2214: never spend back what was never added.
@@ -2905,59 +2939,22 @@ pub fn disconnect_block(
             }
         }
 
-        // ----- Pass B: restore inputs for non-coinbase (Core:2226-2241) -----
-        if tx_idx_back > 0 {
-            // tx_idx_back > 0 means this is NOT the coinbase (which is
-            // always at index 0). Note: in Core's `for i = N-1; i >= 0; i--`,
-            // `i > 0` plays the same role.
-            //
-            // Core indexes vtxundo by `i - 1` because the coinbase has no
-            // undo entry. Our `undo.spent_coins` is a flat vector ordered
-            // by (tx_index_ascending, input_index_ascending), which we
-            // walk in reverse via a running cursor below.
-            //
-            // First validate per-tx undo size (Core:2228-2232 →
-            // DISCONNECT_FAILED on mismatch).
-            // (This is a structural per-tx check; the global Gate 1
-            // already validated the total, but we re-check per-tx so
-            // that an off-by-one in undo construction is caught early.)
-        }
-    }
-
-    // ----- Pass B (separated, with cursor): restore all inputs -----
-    //
-    // We need the per-tx vprevout slice. Since UndoData uses a flat
-    // vector, we compute each tx's slice by walking the txs in
-    // ascending order and tracking the offset, then iterate the
-    // resulting slices in descending order.
-    //
-    // This matches Core's `txundo = blockUndo.vtxundo[i-1]` lookup
-    // and gives the same iteration order: outermost tx loop descends,
-    // input loop descends within each tx.
-    let mut tx_slice_offsets: Vec<usize> = Vec::with_capacity(block.transactions.len());
-    {
-        let mut cursor = 0usize;
-        for tx in block.transactions.iter() {
-            tx_slice_offsets.push(cursor);
-            if !tx.is_coinbase() {
-                cursor += tx.inputs.len();
-            }
-        }
-    }
-
-    for (i, tx) in block.transactions.iter().enumerate().rev() {
-        if i == 0 || tx.is_coinbase() {
-            // Coinbase has no inputs to restore (Core:2227 — `if (i > 0)`).
+        // ----- Pass B: restore this tx's inputs (Core:2226-2241) -----
+        // Core guards with `if (i > 0)` because the coinbase has no undo
+        // entry; its inputs are not real prevouts.
+        if i == 0 || is_coinbase {
             continue;
         }
         let start = tx_slice_offsets[i];
         let end = start + tx.inputs.len();
-        // Gate: per-tx undo slice size matches input count.
+        // Gate: per-tx undo slice size matches input count (Core:2228-2232
+        // → DISCONNECT_FAILED on mismatch). The global Gate 1 already
+        // validated the total; this catches an off-by-one in construction.
         if end > undo.spent_coins.len() {
             tracing::error!(
                 "disconnect_block: per-tx undo slice overflow for tx {} \
                  at index {} (start={}, end={}, total={})",
-                tx.txid(),
+                txid,
                 i,
                 start,
                 end,
@@ -8896,6 +8893,184 @@ mod tests {
             txid: coinbase.txid(),
             vout: 0,
         }));
+    }
+
+    /// INTRA-BLOCK CHAIN on the DISCONNECT side.
+    ///
+    /// The test above deliberately stops short — its own comment says "the
+    /// simplest proof here is to just verify the existing happy-path". This
+    /// one builds the case that actually distinguishes Core's algorithm from
+    /// a two-pass one: a tx that spends an output created by an EARLIER tx in
+    /// the SAME block.
+    ///
+    /// Block at height 10:
+    ///   tx0 coinbase
+    ///   tx1 (txA): spends external X, creates P = txA:0
+    ///   tx2 (txB): spends P (intra-block), creates Q = txB:0
+    ///
+    /// After connecting, the UTXO set holds coinbase:0 and Q. It does NOT
+    /// hold P — P was created and spent inside the same block.
+    ///
+    /// Core (validation.cpp:2205-2241) walks txs in reverse and, FOR EACH TX,
+    /// undoes that tx's outputs and then restores that tx's inputs before
+    /// moving to the next tx. So txB restores P before txA tries to remove it:
+    ///
+    ///   txB: remove Q          -> ok;  restore P     -> P now present
+    ///   txA: remove P          -> ok;  restore X     -> X restored
+    ///   tx0: remove coinbase:0 -> ok
+    ///
+    /// Result: clean, and P is gone. Two separate passes (all outputs, then
+    /// all inputs) get BOTH of those wrong: txA's removal of P finds nothing
+    /// (spurious UNCLEAN) and pass B then re-adds P and leaves it there — a
+    /// phantom UTXO that survives the disconnect.
+    ///
+    /// The phantom is not cosmetic. Competing chains share transactions, so
+    /// on the reconnect the winning block re-creates P and trips BIP-30
+    /// ("bad-txns-BIP30"), which aborts the reorg. That is the exact pair of
+    /// log lines mainnet rustoshi emitted while wedged at 963853:
+    /// `disconnect_block returned UNCLEAN` followed by
+    /// `attach-and-reorg declined block ...: reorg-bip22bad-txns-BIP30`.
+    #[test]
+    fn w92_disconnect_intra_block_chain_leaves_no_phantom_utxo() {
+        let params = w92_regtest();
+        let height = 10u32;
+
+        let coinbase = make_coinbase_tx(height, 5_000_000_000);
+
+        // External coin spent by txA.
+        let external = OutPoint {
+            txid: Hash256::from_bytes([0x33; 32]),
+            vout: 0,
+        };
+        let external_coin = CoinEntry {
+            height: 5,
+            is_coinbase: false,
+            value: 5_000_000_000,
+            script_pubkey: vec![0x51],
+        };
+
+        let tx_a = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: external.clone(),
+                script_sig: vec![0x51],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_999_000,
+                script_pubkey: vec![0x52],
+            }],
+            lock_time: 0,
+        };
+        let p = OutPoint {
+            txid: tx_a.txid(),
+            vout: 0,
+        };
+
+        // txB spends P — the intra-block chain.
+        let tx_b = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: p.clone(),
+                script_sig: vec![0x52],
+                sequence: 0xFFFFFFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 4_999_998_000,
+                script_pubkey: vec![0x53],
+            }],
+            lock_time: 0,
+        };
+        let q = OutPoint {
+            txid: tx_b.txid(),
+            vout: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase.clone(), tx_a.clone(), tx_b.clone()],
+        };
+
+        // Undo data is flat, ordered (tx asc, input asc): txA's input then
+        // txB's input. txB spent P, which this very block created — so its
+        // undo entry carries THIS block's height and is_coinbase=false.
+        let undo = UndoData {
+            spent_coins: vec![
+                external_coin.clone(),
+                CoinEntry {
+                    height,
+                    is_coinbase: false,
+                    value: 4_999_999_000,
+                    script_pubkey: vec![0x52],
+                },
+            ],
+        };
+
+        // Post-connect UTXO state: coinbase:0 and Q. P is absent.
+        let mut view = W92Utxo::new();
+        view.add_utxo(
+            &OutPoint {
+                txid: coinbase.txid(),
+                vout: 0,
+            },
+            CoinEntry {
+                height,
+                is_coinbase: true,
+                value: 5_000_000_000,
+                script_pubkey: vec![0x51],
+            },
+        );
+        view.add_utxo(
+            &q,
+            CoinEntry {
+                height,
+                is_coinbase: false,
+                value: 4_999_998_000,
+                script_pubkey: vec![0x53],
+            },
+        );
+        assert!(!view.0.contains_key(&p), "precondition: P absent post-connect");
+
+        let result = disconnect_block(&block, &undo, &mut view, height, &params).unwrap();
+
+        // (1) An intra-block chain is ordinary mainnet content, not a
+        //     BIP-30 overwrite. Disconnecting it must be CLEAN.
+        assert_eq!(
+            result,
+            DisconnectResult::Ok,
+            "intra-block chain must disconnect cleanly, not UNCLEAN"
+        );
+
+        // (2) The load-bearing assertion: no phantom P survives. This is
+        //     what trips BIP-30 on the reconnect and aborts the reorg.
+        assert!(
+            !view.0.contains_key(&p),
+            "PHANTOM UTXO: P was created and spent inside this block, so \
+             disconnecting the block must leave it absent — leaving it \
+             behind makes the winning branch's copy of txA fail BIP-30"
+        );
+
+        // (3) The external coin txA spent is restored, and the block's own
+        //     outputs are gone.
+        assert!(view.0.contains_key(&external), "external coin restored");
+        assert!(!view.0.contains_key(&q), "Q removed");
+        assert!(
+            !view.0.contains_key(&OutPoint {
+                txid: coinbase.txid(),
+                vout: 0,
+            }),
+            "coinbase output removed"
+        );
+        assert_eq!(view.count(), 1, "only the restored external coin remains");
     }
 
     /// Gate 4: vtxundo.size() + 1 != block.vtx.size() → FAILED.
