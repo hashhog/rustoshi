@@ -122,6 +122,66 @@ pub struct BlockDownloader {
     pending_set: std::collections::HashSet<Hash256>,
 }
 
+/// Outcome of a level-triggered gap-fill reconciliation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GapFill {
+    /// Blocks whose bodies we are missing and should request, in chain order.
+    pub to_request: Vec<(Hash256, u32)>,
+    /// Heights in the examined window whose body we already hold.
+    pub already_stored: u32,
+}
+
+/// Recompute, from scratch, which block bodies are missing between the
+/// validated tip and the best known header — Bitcoin Core's
+/// `FindNextBlocksToDownload`.
+///
+/// rustoshi's only non-test caller of [`BlockDownloader::enqueue_blocks`] is the
+/// `headers` message handler, gated on the header tip having advanced. That makes
+/// block download EDGE-TRIGGERED: once we reach the header tip, peers stop sending
+/// headers, so a body that was never delivered is never re-requested. The queue
+/// drains, the periodic retry has nothing to retry, and the node sits behind a
+/// hole with healthy peers and zero getdata indefinitely (observed 2026-08-24:
+/// nine hours at height 963853 with 7-9 peers all at the tip).
+///
+/// Core never relies on remembering an earlier decision — it recomputes the needed
+/// set on every `SendMessages` tick. This is that recomputation, factored out of
+/// the tick handler so it can be tested.
+///
+/// `hash_at_height` resolves the ACTIVE-chain height index. That matters: when the
+/// node is stuck on a losing fork, those heights resolve to its OWN branch, whose
+/// bodies it already holds. In that case `to_request` is empty while
+/// `already_stored` is not — the caller should treat that as the losing-fork
+/// signature and report it, because a by-height fill cannot repair it; the
+/// competing branch's bodies have to be fetched by hash.
+pub fn compute_gap_fill<F, G>(
+    validated_tip: u32,
+    best_header: u32,
+    max_window: u32,
+    hash_at_height: F,
+    have_body: G,
+) -> GapFill
+where
+    F: Fn(u32) -> Option<Hash256>,
+    G: Fn(&Hash256) -> bool,
+{
+    let mut out = GapFill { to_request: Vec::new(), already_stored: 0 };
+    if validated_tip >= best_header || max_window == 0 {
+        return out;
+    }
+    let from = validated_tip + 1;
+    let to = std::cmp::min(best_header, validated_tip.saturating_add(max_window));
+    for h in from..=to {
+        if let Some(hash) = hash_at_height(h) {
+            if have_body(&hash) {
+                out.already_stored += 1;
+            } else {
+                out.to_request.push((hash, h));
+            }
+        }
+    }
+    out
+}
+
 impl BlockDownloader {
     /// Create a new block downloader.
     ///
@@ -514,6 +574,58 @@ impl BlockDownloader {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- level-triggered gap fill (compute_gap_fill) ----
+
+    fn h(n: u8) -> Hash256 { Hash256([n; 32]) }
+
+    #[test]
+    fn gap_fill_requests_a_missing_body_when_the_queue_is_idle() {
+        // THE REGRESSION. Validated tip 100, best header 103, and the body for
+        // 102 was never delivered. Pre-fix nothing re-enqueued it, because the
+        // only enqueue site fires on header arrival and headers had stopped.
+        let stored = |x: &Hash256| *x != h(102);
+        let g = compute_gap_fill(100, 103, 1000, |ht| Some(h(ht as u8)), stored);
+        assert_eq!(g.to_request, vec![(h(102), 102)]);
+        assert_eq!(g.already_stored, 2); // 101 and 103
+    }
+
+    #[test]
+    fn gap_fill_is_empty_when_caught_up() {
+        // CONTROL: at the header tip there is nothing to do, so the tick stays
+        // silent and cannot spam getdata.
+        let g = compute_gap_fill(103, 103, 1000, |ht| Some(h(ht as u8)), |_| true);
+        assert!(g.to_request.is_empty());
+        assert_eq!(g.already_stored, 0);
+    }
+
+    #[test]
+    fn gap_fill_reports_the_losing_fork_signature() {
+        // Behind the header tip, but every height in the gap resolves — through
+        // the ACTIVE-chain height index — to a block we already hold. That is
+        // the losing-fork case: a by-height fill cannot repair it, and the
+        // caller must say so rather than spin. to_request MUST stay empty so we
+        // do not re-request our own branch in a loop.
+        let g = compute_gap_fill(100, 110, 1000, |ht| Some(h(ht as u8)), |_| true);
+        assert!(g.to_request.is_empty(), "must not re-request our own branch");
+        assert_eq!(g.already_stored, 10);
+    }
+
+    #[test]
+    fn gap_fill_window_is_bounded() {
+        // A 100k-block gap must not build a 100k-entry vector in one tick.
+        let g = compute_gap_fill(0, 100_000, 16, |ht| Some(h(ht as u8)), |_| false);
+        assert_eq!(g.to_request.len(), 16);
+        assert_eq!(g.to_request.first().unwrap().1, 1);
+        assert_eq!(g.to_request.last().unwrap().1, 16);
+    }
+
+    #[test]
+    fn gap_fill_skips_heights_with_no_header() {
+        // A height index hole must be skipped, not treated as missing-body.
+        let g = compute_gap_fill(0, 4, 1000, |ht| if ht == 2 { None } else { Some(h(ht as u8)) }, |_| false);
+        assert_eq!(g.to_request, vec![(h(1), 1), (h(3), 3), (h(4), 4)]);
+    }
     use super::*;
     use rustoshi_primitives::BlockHeader;
 

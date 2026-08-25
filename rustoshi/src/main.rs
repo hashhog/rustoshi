@@ -6601,6 +6601,56 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     );
                 }
 
+                // LEVEL-TRIGGERED GAP FILL — Core's FindNextBlocksToDownload.
+                //
+                // The only non-test caller of `enqueue_blocks` is the `headers`
+                // handler, gated on `new_best > old_best`: block download is
+                // EDGE-TRIGGERED on header arrival. Once we reach the header tip
+                // peers stop sending headers, so if a body is never delivered
+                // nothing re-enqueues it. The queue drains to empty, the retry
+                // below finds nothing to retry, and the node sits behind a hole
+                // with healthy peers and zero getdata for as long as it is left
+                // running — observed 2026-08-24, 9h at height 963853 with 7-9
+                // peers all at the tip.
+                //
+                // Core does not remember an earlier download decision; it
+                // recomputes the needed set from the header chain on every
+                // SendMessages tick. Do the same: whenever we are behind the best
+                // header with nothing queued and nothing in flight, rebuild the
+                // request set from the height index.
+                if queue_len == 0 && in_flight == 0 {
+                    let best_header = block_downloader.best_header_height();
+                    const GAP_FILL_MAX: u32 = 1000;
+                    let gap = rustoshi_network::block_download::compute_gap_fill(
+                        tip,
+                        best_header,
+                        GAP_FILL_MAX,
+                        |h| block_store.get_hash_by_height(h).ok().flatten(),
+                        |hash| block_store.has_block(hash).unwrap_or(false),
+                    );
+                    if !gap.to_request.is_empty() {
+                        tracing::warn!(
+                            "Gap fill: {} block(s) missing above validated tip {} (best header {}) — re-enqueueing",
+                            gap.to_request.len(), tip, best_header
+                        );
+                        block_downloader.enqueue_blocks(gap.to_request);
+                    } else if gap.already_stored > 0 {
+                        // Behind the header tip, yet every height in the window
+                        // resolves — through the ACTIVE-chain height index — to a
+                        // block whose body we already hold. That is the
+                        // losing-fork signature: a by-height fill cannot repair
+                        // it, because the index points at our own branch. The
+                        // reorg needs the competing branch's bodies BY HASH. Say
+                        // so rather than spinning silently.
+                        tracing::warn!(
+                            "Gap fill: behind by {} (tip {} vs best header {}) but every height in the \
+                             window already resolves to a stored block — losing-fork signature; \
+                             competing-branch bodies must be fetched BY HASH, not by height",
+                            best_header.saturating_sub(tip), tip, best_header
+                        );
+                    }
+                }
+
                 if !block_downloader.download_queue_empty() {
                     let requests = block_downloader.assign_requests();
                     if !requests.is_empty() {
