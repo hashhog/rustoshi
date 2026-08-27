@@ -360,7 +360,6 @@ fn g12_mainnet_has_only_core_entries() {
 /// claims "Heights 90000, 120000, 290000" are "lifted verbatim from
 /// Bitcoin Core" — Core defines only 90000 and 120000.
 #[test]
-#[ignore = "BUG-2 (W138 G13 P0-CDIV): testnet4 assumeutxo_data has FABRICATED h=290_000 entry with NO Core provenance; comment at params.rs:837 falsely claims 'lifted verbatim from Core'; comment-as-confession"]
 fn g13_testnet4_matches_core_two_entries_only() {
     let p = ChainParams::testnet4();
     // Core CTestNet4Params::m_assumeutxo_data has exactly TWO entries:

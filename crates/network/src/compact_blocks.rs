@@ -1600,16 +1600,22 @@ mod tests {
 
     #[test]
     fn test_version_negotiation() {
+        // FLIPPED to modern-Core semantics: sendcmpct with any version other
+        // than 2 is silently IGNORED (net_processing.cpp:3907 `if
+        // (sendcmpct_version != CMPCTBLOCKS_VERSION) return;`).  The old test
+        // asserted the removed v1-then-upgrade protocol; production was fixed
+        // in the G25/BUG-3 wave and this test had been RED since.
         let mut state = PeerCompactBlockState::new();
 
-        // First sendcmpct with version 1
+        // sendcmpct v1: ignored, no state change.
         state.handle_sendcmpct(false, CMPCT_VERSION_1);
-        assert!(state.enabled);
-        assert_eq!(state.version, CMPCT_VERSION_1);
+        assert!(!state.enabled, "v1 sendcmpct must be ignored (Core :3907)");
 
-        // Second sendcmpct with version 2 should upgrade
+        // sendcmpct v2: enables compact-block relay.
         state.handle_sendcmpct(true, CMPCT_VERSION_2);
+        assert!(state.enabled);
         assert_eq!(state.version, CMPCT_VERSION_2);
+        assert!(state.wants_high_bandwidth);
     }
 
     #[test]

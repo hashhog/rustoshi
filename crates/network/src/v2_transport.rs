@@ -1386,6 +1386,17 @@ pub fn decode_message_type_and_payload(contents: &[u8]) -> Result<(String, Vec<u
 
         let type_bytes = &contents[1..13];
         let end = type_bytes.iter().position(|&b| b == 0).unwrap_or(12);
+        // Core parity (CMessageHeader::IsCommandValid semantics applied to
+        // the BIP-324 long form): every byte after the first NUL must be
+        // NUL, and command bytes must be printable ASCII (0x20..=0x7e).
+        // The old from_utf8_lossy smuggled control bytes through as
+        // replacement text (w138 G22: "inv\x01" decoded fine).
+        if type_bytes[end..].iter().any(|&b| b != 0) {
+            return Err(Bip324Error::InvalidMessageType);
+        }
+        if type_bytes[..end].iter().any(|&b| !(0x20..=0x7e).contains(&b)) {
+            return Err(Bip324Error::InvalidMessageType);
+        }
         let msg_type = String::from_utf8_lossy(&type_bytes[..end]).to_string();
 
         Ok((msg_type, contents[13..].to_vec()))

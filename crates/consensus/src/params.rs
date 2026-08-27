@@ -1048,7 +1048,12 @@ impl ChainParams {
             ]),
             // Testnet4 assumeUTXO snapshots — values lifted verbatim from
             // `bitcoin-core/src/kernel/chainparams.cpp` `CTestNet4Params`
-            // `m_assumeutxo_data`. Heights 90000, 120000, 290000.
+            // `m_assumeutxo_data`. Core defines exactly TWO entries: 90000
+            // and 120000 (chainparams.cpp:376-389).  A third entry at
+            // 290000 used to sit here — it was Core's SIGNET record
+            // (chainparams.cpp:496-501) pasted into the wrong network: a
+            // testnet4 node would have accepted a signet UTXO snapshot as a
+            // trust anchor (#51, w138 G13).
             assumeutxo_data: vec![
                 AssumeutxoData {
                     height: 90_000,
@@ -1075,20 +1080,6 @@ impl ChainParams {
                     )
                     .expect("valid hash"),
                     chain_tx_count: 14_141_057,
-                    base_mtp: None,
-                    base_tail_headers: Vec::new(),
-                },
-                AssumeutxoData {
-                    height: 290_000,
-                    blockhash: Hash256::from_hex(
-                        "0000000577f2741bb30cd9d39d6d71b023afbeb9764f6260786a97969d5c9ac0",
-                    )
-                    .expect("valid hash"),
-                    hash_serialized: AssumeutxoHash::from_hex(
-                        "97267e000b4b876800167e71b9123f1529d13b14308abec2888bbd2160d14545",
-                    )
-                    .expect("valid hash"),
-                    chain_tx_count: 28_547_497,
                     base_mtp: None,
                     base_tail_headers: Vec::new(),
                 },
@@ -2441,10 +2432,17 @@ mod tests {
     #[test]
     fn test_testnet4_assumeutxo_matches_core() {
         let params = ChainParams::testnet4();
+        // FLIPPED (#51): Core testnet4 defines exactly TWO entries; the old
+        // third entry was Core's SIGNET record in the wrong network's table
+        // (and this test asserted it as Core-correct).  FAILS AT PARENT.
         assert_eq!(
             params.assumeutxo_data.len(),
-            3,
-            "testnet4 should have exactly 3 assumeUTXO entries (heights 90000, 120000, 290000)"
+            2,
+            "testnet4 has exactly 2 assumeUTXO entries (heights 90000, 120000; chainparams.cpp:376-389)"
+        );
+        assert!(
+            params.assumeutxo_for_height(290_000).is_none(),
+            "h=290000 is Core's SIGNET entry and must not be in the testnet4 table"
         );
 
         // Entry 1: height 90,000
@@ -2499,31 +2497,6 @@ mod tests {
             "testnet4 height-120000 chain_tx_count must match Core chainparams.cpp:386"
         );
 
-        // Entry 3: height 290,000
-        let entry_290k = params
-            .assumeutxo_for_height(290_000)
-            .expect("testnet4 must have assumeUTXO entry at height 290000");
-        assert_eq!(entry_290k.height, 290_000);
-        assert_eq!(
-            entry_290k.blockhash,
-            Hash256::from_hex(
-                "0000000577f2741bb30cd9d39d6d71b023afbeb9764f6260786a97969d5c9ac0"
-            )
-            .unwrap(),
-            "testnet4 height-290000 blockhash must match Core chainparams.cpp"
-        );
-        assert_eq!(
-            entry_290k.hash_serialized,
-            AssumeutxoHash::from_hex(
-                "97267e000b4b876800167e71b9123f1529d13b14308abec2888bbd2160d14545"
-            )
-            .unwrap(),
-            "testnet4 height-290000 hash_serialized must match Core chainparams.cpp"
-        );
-        assert_eq!(
-            entry_290k.chain_tx_count, 28_547_497,
-            "testnet4 height-290000 chain_tx_count must match Core chainparams.cpp"
-        );
     }
 
     /// The runtime regtest assumeutxo registrar must add an entry on regtest
