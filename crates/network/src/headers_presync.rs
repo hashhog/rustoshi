@@ -355,19 +355,38 @@ impl HeadersPresyncState {
 
     /// Get a block locator for the next getheaders request.
     ///
-    /// Reference: `HeadersSyncState::NextHeadersRequestLocator` in `headerssync.cpp` lines 296-317.
-    pub fn next_locator(&self) -> Vec<Hash256> {
-        match self.state {
+    /// Reference: `HeadersSyncState::NextHeadersRequestLocator` in `headerssync.cpp` lines 296-317,
+    /// which appends `LocatorEntries(&m_chain_start)` (`chain.cpp:26-43`): chain_start's own hash
+    /// plus exponentially spaced ancestors down to and INCLUDING genesis. A bare
+    /// `[continue_from, chain_start]` pair is the 2-hash anti-pattern this fleet has fixed live
+    /// six times (nimrod 4deead0, camlcoin, clearbit 7b97bce, blockbrew 7009b2b, hotbuns
+    /// 0e5e25c, beamchain a982f50): if the peer recognizes neither hash it serves from genesis
+    /// and the sync tears down. `best_tip` resolves heights on our header chain; unresolvable
+    /// heights are skipped, genesis is still always attempted. (This module is not yet wired
+    /// into the live sync path — fixed here so the wiring inherits the correct shape.)
+    pub fn next_locator(&self, best_tip: impl Fn(u32) -> Option<Hash256>) -> Vec<Hash256> {
+        let continue_from = match self.state {
             // Core line 306: PRESYNC uses last received header hash.
-            PresyncState::Presync => {
-                vec![self.last_header_hash, self.chain_start_hash]
-            }
+            PresyncState::Presync => self.last_header_hash,
             // Core line 311: REDOWNLOAD uses last hash from redownload buffer.
-            PresyncState::Redownload => {
-                vec![self.redownload_buffer_last_hash, self.chain_start_hash]
+            PresyncState::Redownload => self.redownload_buffer_last_hash,
+            PresyncState::Final => return vec![],
+        };
+        let mut locator = vec![continue_from, self.chain_start_hash];
+        let mut step: u32 = 1;
+        let mut height = self.chain_start_height;
+        let mut entries: usize = 1; // counts chain-start-walk entries incl. chain_start itself
+        while height > 0 {
+            height = height.saturating_sub(step);
+            if entries > 10 {
+                step *= 2;
             }
-            PresyncState::Final => vec![],
+            if let Some(h) = best_tip(height) {
+                locator.push(h);
+                entries += 1;
+            }
         }
+        locator
     }
 
     /// Mark this sync as complete/failed and free all per-sync state.
@@ -1153,7 +1172,7 @@ mod tests {
         );
 
         // In PRESYNC, locator[0] = last_header_hash (= chain_start_hash initially).
-        let locator = state.next_locator();
+        let locator = state.next_locator(|_| None);
         assert_eq!(locator.len(), 2);
         assert_eq!(locator[0], genesis_hash);
         assert_eq!(locator[1], genesis_hash);
@@ -1181,7 +1200,7 @@ mod tests {
         assert_eq!(state.state(), PresyncState::Redownload);
 
         // In REDOWNLOAD, locator[0] = redownload_buffer_last_hash (= chain_start_hash, not last presync).
-        let locator = state.next_locator();
+        let locator = state.next_locator(|_| None);
         assert_eq!(locator[0], genesis_hash, "REDOWNLOAD locator[0] should be chain_start_hash (redownload starts from scratch)");
     }
 
@@ -1237,5 +1256,46 @@ mod tests {
         let result = state.process_next_headers(&headers, false);
         assert!(result.success);
         assert!(!result.pow_validated_headers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod locator_entries_tests {
+    use super::*;
+
+    // meta #72: the chain-start locator must be Core's LocatorEntries walk
+    // (exponential, genesis-terminated), never the bare 2-hash pair. Fails
+    // at the parent (locator.len() == 2).
+    #[test]
+    fn test_locator_walks_chain_start_entries_to_genesis() {
+        let params = ChainParams::regtest();
+        let min_work = ChainWork::from_hex("1").unwrap();
+        let chain_start_hash = Hash256([0xC5; 32]);
+        let state = HeadersPresyncState::new(
+            params,
+            chain_start_hash,
+            1000,
+            0x207fffff,
+            ChainWork::ZERO,
+            0,
+            min_work,
+        );
+
+        let genesis = Hash256([0xEE; 32]);
+        let locator = state.next_locator(|h| {
+            if h == 0 {
+                Some(genesis)
+            } else {
+                let mut b = [0xE0u8; 32];
+                b[1] = (h & 0xff) as u8;
+                b[2] = ((h >> 8) & 0xff) as u8;
+                Some(Hash256(b))
+            }
+        });
+
+        assert!(locator.len() > 3, "bare 2-hash chain_start shape: {}", locator.len());
+        assert_eq!(locator[1], chain_start_hash);
+        assert_eq!(*locator.last().unwrap(), genesis, "locator must end at genesis");
+        assert!(locator.len() < 64, "walk is not exponential: {}", locator.len());
     }
 }
