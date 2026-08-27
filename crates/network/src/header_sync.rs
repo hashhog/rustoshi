@@ -1330,6 +1330,88 @@ mod tests {
         assert_eq!(sync.take_pending_rewind(), None);
     }
 
+    // #47 chain-selection tier (2026-08-27): the CROSS cases regtest
+    // cannot express — work and length disagree. The fork side's work
+    // comes from its real header bits; OUR side's work comes from the
+    // get_existing_header_bits closure, so the tests set per-height bits
+    // freely without mining harder headers.
+    // compact 0x21008000 -> target 2^255 -> work 1/block
+    // regtest  0x207fffff -> target ~2^255-1 -> work 2/block
+    // compact 0x21004000 -> target 2^254 -> work 4/block
+
+    #[test]
+    fn test_e2_heavier_but_shorter_fork_rewinds() {
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(1);
+        sync.register_peer(peer, 100);
+
+        // Our chain: 4 headers (tip height 4).
+        let (h2hash, _h2bits, our) = seed_chain(&mut sync, peer, genesis, 4);
+
+        // Fork from height 1: 2 real regtest headers (work 2 each = 4),
+        // fork tip height 3 — SHORTER than our tip 4.
+        let fork_point_hash = our[0].block_hash();
+        let fork = make_valid_header_chain(fork_point_hash, 2);
+
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: sync.best_header_hash(),
+        };
+        let find = |hash: &Hash256| -> Option<u32> {
+            h2hash.iter().find(|(_, v)| *v == hash).map(|(k, _)| *k)
+        };
+        // OUR suffix (heights 2..=4): exponent>0x20 clamps to MAX target ->
+        // work 1/block -> 3 total < fork 4 (2 regtest headers x work 2).
+        let weak_bits = |_height: u32| -> Option<u32> { Some(0x21008000) };
+
+        let r = sync.process_headers(peer, fork, &mut |_, _| Ok(()), &find, &weak_bits);
+        assert_eq!(r, Ok(false));
+        assert_eq!(
+            sync.best_header_height(),
+            3,
+            "heavier-but-SHORTER fork must rewind and win — length never decides"
+        );
+        assert_eq!(sync.take_pending_rewind(), Some(1));
+    }
+
+    #[test]
+    fn test_e2_longer_but_lighter_fork_refused() {
+        let genesis = Hash256([0u8; 32]);
+        let mut sync = HeaderSync::new(genesis);
+        let peer = PeerId(1);
+        sync.register_peer(peer, 100);
+
+        // Our chain: 3 headers (tip height 3).
+        let (h2hash, _h2bits, our) = seed_chain(&mut sync, peer, genesis, 3);
+
+        // Fork from height 1: 3 real regtest headers (work 2 each = 6),
+        // fork tip height 4 — LONGER than our tip 3.
+        let fork_point_hash = our[0].block_hash();
+        let fork = make_valid_header_chain(fork_point_hash, 3);
+
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: sync.best_header_hash(),
+        };
+        let find = |hash: &Hash256| -> Option<u32> {
+            h2hash.iter().find(|(_, v)| *v == hash).map(|(k, _)| *k)
+        };
+        // OUR suffix (heights 2..=3): compact 0x20200000 -> target 2^253 ->
+        // work 7/block -> 14 total > fork 6. (Exponent must stay <= 0x20:
+        // larger exponents clamp to max target = work 1.)
+        let strong_bits = |_height: u32| -> Option<u32> { Some(0x20200000) };
+
+        let r = sync.process_headers(peer, fork, &mut |_, _| Ok(()), &find, &strong_bits);
+        assert_eq!(r, Ok(false));
+        assert_eq!(
+            sync.best_header_height(),
+            3,
+            "LONGER-but-lighter fork must be refused — length never decides"
+        );
+        assert_eq!(sync.take_pending_rewind(), None);
+    }
+
     #[test]
     fn test_e2_lighter_shorter_fork_refused_no_rewind() {
         let genesis = Hash256([0u8; 32]);
