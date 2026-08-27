@@ -4195,7 +4195,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         let ps = peer_state.read().await;
                         if let Some(ref pm) = ps.peer_manager {
                             for (peer, msg) in requests {
-                                pm.send_to_peer(peer, msg).await;
+                                if !pm.send_to_peer(peer, msg).await {
+                                    // #74: send channel dead — requeue immediately.
+                                    block_downloader.remove_peer(peer);
+                                }
                             }
                         }
                     }
@@ -4494,7 +4497,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }) {
                                             let ps = peer_state.read().await;
                                             if let Some(ref pm) = ps.peer_manager {
-                                                pm.send_to_peer(target, msg).await;
+                                                let _ = pm.send_to_peer(target, msg).await;
                                             }
                                         }
                                     }
@@ -4530,7 +4533,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 );
                                                 let ps = peer_state.read().await;
                                                 if let Some(ref pm) = ps.peer_manager {
-                                                    pm.send_to_peer(hint_peer, gh).await;
+                                                    let _ = pm.send_to_peer(hint_peer, gh).await;
                                                 }
                                             }
                                         }
@@ -4666,7 +4669,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     let ps = peer_state.read().await;
                                                     if let Some(ref pm) = ps.peer_manager {
                                                         for (peer, msg) in &requests {
-                                                            pm.send_to_peer(*peer, msg.clone()).await;
+                                                            if !pm.send_to_peer(*peer, msg.clone()).await {
+                                                                // #74: send channel dead — requeue now.
+                                                                block_downloader.remove_peer(*peer);
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -4722,7 +4728,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 }) {
                                                     let ps = peer_state.read().await;
                                                     if let Some(ref pm) = ps.peer_manager {
-                                                        pm.send_to_peer(target, msg).await;
+                                                        let _ = pm.send_to_peer(target, msg).await;
                                                     }
                                                 }
                                             }
@@ -5364,7 +5370,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     let ps = peer_state.read().await;
                                     if let Some(ref pm) = ps.peer_manager {
                                         for (peer, msg) in requests {
-                                            pm.send_to_peer(peer, msg).await;
+                                            if !pm.send_to_peer(peer, msg).await {
+                                                // #74: the getdata never left — requeue this
+                                                // peer's in-flight blocks now, not after the
+                                                // block timeout (the blockbrew-wedge shape).
+                                                block_downloader.remove_peer(peer);
+                                            }
                                         }
                                     }
                                 }
@@ -5434,7 +5445,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 if !tx_requests.is_empty() {
                                     let ps = peer_state.read().await;
                                     if let Some(ref pm) = ps.peer_manager {
-                                        pm.send_to_peer(
+                                        let _ = pm.send_to_peer(
                                             peer_id,
                                             NetworkMessage::GetData(tx_requests),
                                         )
@@ -5456,7 +5467,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     );
                                     let ps = peer_state.read().await;
                                     if let Some(ref pm) = ps.peer_manager {
-                                        pm.send_to_peer(disc_peer, gh).await;
+                                        let _ = pm.send_to_peer(disc_peer, gh).await;
                                     }
                                 }
                             }
@@ -5581,7 +5592,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     txid,
                                                     wtxid,
                                                 );
-                                                pm.send_to_peer(
+                                                let _ = pm.send_to_peer(
                                                     pid,
                                                     NetworkMessage::Inv(vec![inv]),
                                                 )
@@ -6268,7 +6279,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                             let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
                                                             let ps = peer_state.read().await;
                                                             if let Some(ref pm) = ps.peer_manager {
-                                                                pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
+                                                                let _ = pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
                                                             }
                                                         }
                                                     }
@@ -6279,7 +6290,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                         let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
                                                         let ps = peer_state.read().await;
                                                         if let Some(ref pm) = ps.peer_manager {
-                                                            pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
+                                                            let _ = pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
                                                         }
                                                     } else {
                                                         tracing::info!("Compact block {} missing {} txns (mempool_hits={}), sending getblocktxn", block_hash, missing.len(), from_mempool);
@@ -6292,7 +6303,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                             .insert((peer_id.0, block_hash), partial);
                                                         let ps = peer_state.read().await;
                                                         if let Some(ref pm) = ps.peer_manager {
-                                                            pm.send_to_peer(peer_id, NetworkMessage::GetBlockTxn(req.serialize())).await;
+                                                            if !pm.send_to_peer(peer_id, NetworkMessage::GetBlockTxn(req.serialize())).await {
+                                                                // #74: getblocktxn never left — free the
+                                                                // one-per-peer partial-block slot instead of
+                                                                // stranding it until remove_peer.
+                                                                inflight_partial_blocks.remove(&(peer_id.0, block_hash));
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -6303,7 +6319,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
                                                 let ps = peer_state.read().await;
                                                 if let Some(ref pm) = ps.peer_manager {
-                                                    pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
+                                                    let _ = pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
                                                 }
                                             }
                                         }
@@ -6352,7 +6368,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     let resp = BlockTxn::from_arcs(req.block_hash, txns);
                                                     let ps = peer_state.read().await;
                                                     if let Some(ref pm) = ps.peer_manager {
-                                                        pm.send_to_peer(peer_id, NetworkMessage::BlockTxn(resp.serialize())).await;
+                                                        let _ = pm.send_to_peer(peer_id, NetworkMessage::BlockTxn(resp.serialize())).await;
                                                     }
                                                 }
                                             }
@@ -6461,7 +6477,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                         };
                                                         let ps = peer_state.read().await;
                                                         if let Some(ref pm) = ps.peer_manager {
-                                                            pm.send_to_peer(
+                                                            let _ = pm.send_to_peer(
                                                                 peer_id,
                                                                 NetworkMessage::GetData(vec![inv]),
                                                             )
@@ -6482,7 +6498,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                         };
                                                         let ps = peer_state.read().await;
                                                         if let Some(ref pm) = ps.peer_manager {
-                                                            pm.send_to_peer(
+                                                            let _ = pm.send_to_peer(
                                                                 peer_id,
                                                                 NetworkMessage::GetData(vec![inv]),
                                                             )
@@ -6749,7 +6765,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         let ps = peer_state.read().await;
                         if let Some(ref pm) = ps.peer_manager {
                             for (peer, msg) in requests {
-                                pm.send_to_peer(peer, msg).await;
+                                if !pm.send_to_peer(peer, msg).await {
+                                    // #74: send channel dead — requeue immediately.
+                                    block_downloader.remove_peer(peer);
+                                }
                             }
                         }
                     }
@@ -6867,7 +6886,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         );
                         let ps = peer_state.read().await;
                         if let Some(ref pm) = ps.peer_manager {
-                            pm.send_to_peer(target, msg).await;
+                            let _ = pm.send_to_peer(target, msg).await;
                         }
                     }
                 }

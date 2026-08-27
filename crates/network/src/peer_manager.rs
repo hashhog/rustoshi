@@ -3793,13 +3793,27 @@ impl PeerManager {
     /// Uses blocking send to ensure critical messages (getheaders, getdata)
     /// are not dropped. For bulk responses (headers serving), use
     /// try_send_to_peer instead.
+    #[must_use = "a false return means the message was NEVER SENT — callers with \
+                  request-tracking state (getdata/getheaders) must revert it (#74)"]
     pub async fn send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> bool {
         if let Some(peer) = self.peers.get(&peer_id) {
-            peer.command_tx
+            let ok = peer
+                .command_tx
                 .send(PeerCommand::SendMessage(msg))
                 .await
-                .is_ok()
+                .is_ok();
+            if !ok {
+                tracing::warn!(
+                    "send_to_peer: command channel closed for peer {:?} — message dropped",
+                    peer_id
+                );
+            }
+            ok
         } else {
+            tracing::warn!(
+                "send_to_peer: unknown peer {:?} — message dropped",
+                peer_id
+            );
             false
         }
     }
