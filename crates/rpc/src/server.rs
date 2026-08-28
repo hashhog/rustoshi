@@ -1316,7 +1316,14 @@ pub trait RustoshiRpc {
         // jsonrpsee param deserializer reject the object form with a
         // "deserialize" error before the handler ever ran.
         outputs: serde_json::Value,
-        locktime: Option<u32>,
+        // Typed `serde_json::Value`, not `Option<u32>`: with the narrow type the
+        // jsonrpsee deserializer rejected `locktime: -1` before the handler ran,
+        // with RPC_INVALID_PARAMS (-32602) and a leaked serde message ("invalid
+        // value: integer `-1`, expected u32 at line 1 column 2"). Core rejects it
+        // at RPC_INVALID_PARAMETER (-8) "Invalid parameter, locktime out of
+        // range" (rawtransaction_util.cpp ConstructTransaction:151-155), which
+        // the handler can only produce if it sees the raw value.
+        locktime: Option<serde_json::Value>,
         replaceable: Option<bool>,
     ) -> RpcResult<String>;
 
@@ -1834,20 +1841,121 @@ impl RpcServerImpl {
     /// name, so it uses the neutral "hash" — the code (-8) and the
     /// length-vs-hex distinction are the consensus-relevant parity points.
     fn parse_hash(hash: &str) -> Result<Hash256, ErrorObjectOwned> {
+        Self::parse_hash_named("hash", hash)
+    }
+
+    /// Core's `ParseHashV` (bitcoin-core/src/rpc/util.cpp:117) puts the
+    /// ARGUMENT NAME in its message, and the name differs per RPC --
+    /// `createrawtransaction` passes "txid" via `ParseHashO(o, "txid")`.
+    /// `parse_hash` hardcodes "hash", which happens to be right only for
+    /// `getblockheader`; other callers are a residue of this sweep, not
+    /// changed here.
+    fn parse_hash_named(name: &str, hash: &str) -> Result<Hash256, ErrorObjectOwned> {
         Hash256::from_hex(hash).map_err(|e| {
             let msg = match e {
                 HexError::InvalidLength { expected, .. } => format!(
-                    "hash must be of length {} (not {}, for '{}')",
+                    "{} must be of length {} (not {}, for '{}')",
+                    name,
                     expected,
                     hash.len(),
                     hash
                 ),
                 HexError::InvalidChar { .. } => {
-                    format!("hash must be hexadecimal string (not '{}')", hash)
+                    format!("{} must be hexadecimal string (not '{}')", name, hash)
                 }
             };
             Self::rpc_error(rpc_error::RPC_INVALID_PARAMETER, msg)
         })
+    }
+
+    /// `createrawtransaction` numeric-argument validation.
+    ///
+    /// Core reads `vout` with `getInt<int>()`, so the RANGE check -- univalue
+    /// parsing into a 32-bit `int` -- fires BEFORE the sign test, and an
+    /// out-of-int32 value reports "JSON integer out of range" at
+    /// RPC_MISC_ERROR even though it is also out of domain for a vout. That
+    /// ordering is Core's, not the obvious one, and is preserved deliberately.
+    /// (rawtransaction_util.cpp AddInputs:38-45.)
+    fn parse_createraw_vout(v: Option<&serde_json::Value>) -> Result<u32, ErrorObjectOwned> {
+        let n = match v {
+            Some(serde_json::Value::Number(n)) => n,
+            _ => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    "Invalid parameter, missing vout key",
+                ))
+            }
+        };
+        // `as_i64` also rejects non-integral numbers, matching univalue's
+        // `from_chars`, which stops at the '.' and reports the same error.
+        let i = n.as_i64().ok_or_else(|| {
+            Self::rpc_error(rpc_error::RPC_MISC_ERROR, "JSON integer out of range")
+        })?;
+        if i < i64::from(i32::MIN) || i > i64::from(i32::MAX) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "JSON integer out of range",
+            ));
+        }
+        if i < 0 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Invalid parameter, vout cannot be negative",
+            ));
+        }
+        Ok(i as u32)
+    }
+
+    /// Core range-checks `sequence` only when it IS a number
+    /// (`if (sequenceObj.isNum())`, rawtransaction_util.cpp:57-65); a
+    /// non-numeric one is ignored and the caller's default applies.
+    fn parse_createraw_sequence(
+        v: Option<&serde_json::Value>,
+        default: u32,
+    ) -> Result<u32, ErrorObjectOwned> {
+        match v {
+            Some(serde_json::Value::Number(n)) => {
+                let i = n.as_i64().ok_or_else(|| {
+                    Self::rpc_error(rpc_error::RPC_MISC_ERROR, "JSON integer out of range")
+                })?;
+                if i < 0 || i > i64::from(u32::MAX) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Invalid parameter, sequence number is out of range",
+                    ));
+                }
+                Ok(i as u32)
+            }
+            _ => Ok(default),
+        }
+    }
+
+    /// Core ConstructTransaction (rawtransaction_util.cpp:151-155);
+    /// LOCKTIME_MAX is 0xFFFFFFFF.
+    fn parse_createraw_locktime(
+        v: Option<&serde_json::Value>,
+    ) -> Result<u32, ErrorObjectOwned> {
+        match v {
+            None | Some(serde_json::Value::Null) => Ok(0),
+            Some(serde_json::Value::Number(n)) => {
+                let i = n.as_i64().ok_or_else(|| {
+                    Self::rpc_error(rpc_error::RPC_MISC_ERROR, "JSON integer out of range")
+                })?;
+                if i < 0 || i > i64::from(u32::MAX) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Invalid parameter, locktime out of range",
+                    ));
+                }
+                Ok(i as u32)
+            }
+            // Core: getInt<int64_t>() on a non-number throws from checkType,
+            // which the RPC layer reports as RPC_MISC_ERROR.
+            _ => Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "JSON value is not an integer as expected",
+            )),
+        }
     }
 
     // ── wait-family RPC helpers ─────────────────────────────────────────────
@@ -11479,10 +11587,10 @@ impl RustoshiRpcServer for RpcServerImpl {
         &self,
         inputs: Vec<serde_json::Value>,
         outputs: serde_json::Value,
-        locktime: Option<u32>,
+        locktime: Option<serde_json::Value>,
         replaceable: Option<bool>,
     ) -> RpcResult<String> {
-        let locktime = locktime.unwrap_or(0);
+        let locktime = Self::parse_createraw_locktime(locktime.as_ref())?;
         // FIX-70 / W120 BUG-3: Core's `createrawtransaction` defaults `rbf` to
         // TRUE (see bitcoin-core/src/rpc/rawtransaction.cpp::createrawtransaction
         // — `std::optional<bool> rbf` is unset when the param is null, then
@@ -11493,14 +11601,23 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Parse inputs
         let mut tx_inputs = Vec::new();
         for input in &inputs {
-            let txid_str = input["txid"]
-                .as_str()
-                .ok_or_else(|| Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Missing txid"))?;
-            let txid = Self::parse_hash(txid_str)?;
-            let vout = input["vout"]
-                .as_u64()
-                .ok_or_else(|| Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Missing vout"))?
-                as u32;
+            let txid_str = input["txid"].as_str().ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "JSON value is not a string as expected",
+                )
+            })?;
+            // Core names the ARGUMENT in ParseHashV's message; for this RPC it
+            // is "txid", not the generic "hash" `parse_hash` emits.
+            let txid = Self::parse_hash_named("txid", txid_str)?;
+            // `as_u64() ... as u32` accepted anything non-negative and then
+            // TRUNCATED it: vout 2^32 and vout 2^33 both silently became vout
+            // 0, i.e. a request to spend one outpoint quietly became a request
+            // to spend a DIFFERENT, probably real one. A negative vout took the
+            // ok_or_else arm and reported "Missing vout" at RPC_INVALID_PARAMS,
+            // which is both the wrong code and a false statement -- the key was
+            // present, its value was out of domain.
+            let vout = Self::parse_createraw_vout(input.get("vout"))?;
             // FIX-70 / W120 BUG-2: mirror Core's `ConstructTransaction` mapping
             // (bitcoin-core/src/rpc/rawtransaction_util.cpp:47-55):
             //   replaceable → MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD)
@@ -11509,15 +11626,24 @@ impl RustoshiRpcServer for RpcServerImpl {
             // Explicit per-input `sequence` always wins. Was emitting 0xFFFFFFFE
             // unconditionally when explicit-replaceable=false; the locktime
             // case was correct but the !locktime case was wrong.
-            let sequence = if let Some(seq) = input.get("sequence") {
-                seq.as_u64().unwrap_or(SEQUENCE_FINAL as u64) as u32
-            } else if replaceable {
+            let default_sequence = if replaceable {
                 MAX_BIP125_RBF_SEQUENCE
             } else if locktime != 0 {
                 MAX_SEQUENCE_NONFINAL
             } else {
                 SEQUENCE_FINAL
             };
+            // The old expression was wrong in two directions at once.
+            // `as_u64() ... as u32` TRUNCATED an out-of-range sequence -- 2^32
+            // became 0, which CLEARS the BIP-68 disable bit and signals BIP-125
+            // replaceability, the opposite of what was asked for. And
+            // `unwrap_or(SEQUENCE_FINAL)` fired for any NON-numeric sequence,
+            // which Core simply ignores (`if (sequenceObj.isNum())`), applying
+            // the default -- so `"sequence": "nope"` produced a NON-replaceable
+            // transaction here and a replaceable one from Core, with no bad
+            // input involved at all.
+            let sequence =
+                Self::parse_createraw_sequence(input.get("sequence"), default_sequence)?;
             tx_inputs.push(TxIn {
                 previous_output: OutPoint { txid, vout },
                 script_sig: vec![],
@@ -23165,6 +23291,200 @@ mod tests {
         );
     }
 
+    // ── createrawtransaction: numeric arguments are RANGE-CHECKED ──────────
+    //
+    // Found 2026-08-28 by the fleet sweep that began with clearbit's
+    // unchecked-cast node-kill on this same RPC. rustoshi neither crashed nor
+    // errored -- it TRUNCATED, via `as_u64() ... as u32`:
+    //
+    //   vout 2^32 and vout 2^33  -> both became vout 0, so a request to spend
+    //                               one outpoint quietly became a request to
+    //                               spend a DIFFERENT, probably real one
+    //   sequence 2^32            -> became 0, which CLEARS the BIP-68 disable
+    //                               bit AND signals BIP-125 replaceability
+    //
+    // and misreported two more:
+    //
+    //   vout -1                  -> "Missing vout" at -32602; the key was
+    //                               present, its value was out of domain
+    //   sequence "nope"          -> SEQUENCE_FINAL via unwrap_or, where Core
+    //                               ignores a non-numeric sequence and applies
+    //                               the default -- so a NON-replaceable tx here
+    //                               and a replaceable one from Core, with no
+    //                               bad input involved at all
+    //
+    // Core: rawtransaction_util.cpp AddInputs:38-65, ConstructTransaction:151-155.
+
+    /// Decode the first input's outpoint index and sequence from a raw tx hex.
+    #[cfg(test)]
+    fn decode_first_input(hex_tx: &str) -> (u32, u32) {
+        use rustoshi_primitives::{Decodable, Transaction};
+        let bytes = hex::decode(hex_tx).expect("hex");
+        let mut slice = bytes.as_slice();
+        let tx = Transaction::decode(&mut slice).expect("decode tx");
+        (tx.inputs[0].previous_output.vout, tx.inputs[0].sequence)
+    }
+
+    #[cfg(test)]
+    async fn createraw_err(
+        input: serde_json::Value,
+        locktime: Option<serde_json::Value>,
+    ) -> (i32, String) {
+        let server = setup_test_server();
+        let outputs = serde_json::json!({});
+        match server
+            .create_raw_transaction(vec![input], outputs, locktime, None)
+            .await
+        {
+            Ok(hex) => panic!("expected an error, got a transaction: {hex}"),
+            Err(e) => (e.code(), e.message().to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_vout_beyond_u32_is_rejected_not_wrapped_to_zero() {
+        // THE REGRESSION: at the parent commit this returned Ok with vout 0.
+        let (code, msg) = createraw_err(
+            serde_json::json!({"txid": "aa".repeat(32), "vout": 4294967296u64}),
+            None,
+        )
+        .await;
+        assert_eq!(code, -1, "got {code} / {msg}");
+        assert_eq!(msg, "JSON integer out of range");
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_vout_beyond_int32_matches_core_range_error() {
+        // Core reads vout with getInt<int>(), so the int32 bound applies even
+        // though the wire type could hold more.
+        let (code, msg) = createraw_err(
+            serde_json::json!({"txid": "aa".repeat(32), "vout": 2147483648u64}),
+            None,
+        )
+        .await;
+        assert_eq!(code, -1, "got {code} / {msg}");
+        assert_eq!(msg, "JSON integer out of range");
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_negative_vout_says_negative_not_missing() {
+        let (code, msg) =
+            createraw_err(serde_json::json!({"txid": "aa".repeat(32), "vout": -1}), None).await;
+        assert_eq!(code, -8, "got {code} / {msg}");
+        assert_eq!(msg, "Invalid parameter, vout cannot be negative");
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_missing_vout_key() {
+        let (code, msg) = createraw_err(serde_json::json!({"txid": "aa".repeat(32)}), None).await;
+        assert_eq!(code, -8, "got {code} / {msg}");
+        assert_eq!(msg, "Invalid parameter, missing vout key");
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_sequence_beyond_u32_is_rejected_not_wrapped_to_zero() {
+        // THE OTHER REGRESSION: at the parent commit this returned Ok with
+        // sequence 0 -- BIP-68 enabled and RBF signalled.
+        let (code, msg) = createraw_err(
+            serde_json::json!({"txid": "aa".repeat(32), "vout": 0, "sequence": 4294967296u64}),
+            None,
+        )
+        .await;
+        assert_eq!(code, -8, "got {code} / {msg}");
+        assert_eq!(msg, "Invalid parameter, sequence number is out of range");
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_negative_sequence_is_rejected_not_final() {
+        // At the parent commit this silently became SEQUENCE_FINAL.
+        let (code, msg) = createraw_err(
+            serde_json::json!({"txid": "aa".repeat(32), "vout": 0, "sequence": -1}),
+            None,
+        )
+        .await;
+        assert_eq!(code, -8, "got {code} / {msg}");
+        assert_eq!(msg, "Invalid parameter, sequence number is out of range");
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_negative_locktime_matches_core_message() {
+        // At the parent commit `locktime: Option<u32>` made the jsonrpsee
+        // deserializer reject this with -32602 and a leaked serde message
+        // before the handler ran.
+        let (code, msg) = createraw_err(
+            serde_json::json!({"txid": "aa".repeat(32), "vout": 0}),
+            Some(serde_json::json!(-1)),
+        )
+        .await;
+        assert_eq!(code, -8, "got {code} / {msg}");
+        assert_eq!(msg, "Invalid parameter, locktime out of range");
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_locktime_beyond_u32_is_rejected() {
+        let (code, msg) = createraw_err(
+            serde_json::json!({"txid": "aa".repeat(32), "vout": 0}),
+            Some(serde_json::json!(4294967296u64)),
+        )
+        .await;
+        assert_eq!(code, -8, "got {code} / {msg}");
+        assert_eq!(msg, "Invalid parameter, locktime out of range");
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_malformed_txid_names_txid_not_hash() {
+        // Core's ParseHashV puts the ARGUMENT NAME in the message, and for this
+        // RPC the argument is "txid". `parse_hash` hardcoded "hash".
+        let (code, msg) =
+            createraw_err(serde_json::json!({"txid": "abc", "vout": 0}), None).await;
+        assert_eq!(code, -8, "got {code} / {msg}");
+        assert_eq!(msg, "txid must be of length 64 (not 3, for 'abc')");
+    }
+
+    /// Core guards the sequence range check with `if (sequenceObj.isNum())`, so
+    /// a NON-numeric sequence is ignored and the DEFAULT applies -- which with
+    /// replaceable defaulting to true is MAX_BIP125_RBF_SEQUENCE, not
+    /// SEQUENCE_FINAL. This is a divergence with no malformed input at all.
+    #[tokio::test]
+    async fn createrawtransaction_non_numeric_sequence_takes_the_rbf_default() {
+        let server = setup_test_server();
+        let inputs = vec![serde_json::json!({
+            "txid": "aa".repeat(32), "vout": 0, "sequence": "nope",
+        })];
+        let hex = server
+            .create_raw_transaction(inputs, serde_json::json!({}), None, None)
+            .await
+            .expect("createrawtransaction must succeed");
+        let (_vout, seq) = decode_first_input(&hex);
+        assert_eq!(
+            seq, 0xFFFFFFFD,
+            "non-numeric sequence must fall back to the RBF default like Core, \
+             not SEQUENCE_FINAL; got 0x{seq:08x}"
+        );
+    }
+
+    /// CONTROL. Without this, every assertion above is satisfiable by a handler
+    /// that rejects everything.
+    #[tokio::test]
+    async fn createrawtransaction_boundary_values_are_still_accepted() {
+        let server = setup_test_server();
+        let inputs = vec![serde_json::json!({
+            "txid": "aa".repeat(32), "vout": 2147483647u64, "sequence": 4294967295u64,
+        })];
+        let hex = server
+            .create_raw_transaction(
+                inputs,
+                serde_json::json!({}),
+                Some(serde_json::json!(4294967295u64)),
+                None,
+            )
+            .await
+            .expect("int32-max vout, SEQUENCE_FINAL and max locktime are all legal");
+        let (vout, seq) = decode_first_input(&hex);
+        assert_eq!(vout, 2147483647);
+        assert_eq!(seq, 0xFFFFFFFF);
+    }
+
     /// FIX-70 G24c: `createrawtransaction` default replaceable=true → 0xFFFFFFFD.
     /// Was `unwrap_or(false)` pre-FIX-70 (W120 BUG-3 P1).
     #[tokio::test]
@@ -23208,7 +23528,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         }]);
         let hex = server
-            .create_raw_transaction(inputs, outputs, Some(500_000), Some(false))
+            .create_raw_transaction(inputs, outputs, Some(serde_json::json!(500_000)), Some(false))
             .await
             .expect("createrawtransaction must succeed");
         let bytes = hex::decode(&hex).expect("hex");
@@ -23234,7 +23554,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         }]);
         let hex = server
-            .create_raw_transaction(inputs, outputs, Some(0), Some(false))
+            .create_raw_transaction(inputs, outputs, Some(serde_json::json!(0)), Some(false))
             .await
             .expect("createrawtransaction must succeed");
         let bytes = hex::decode(&hex).expect("hex");
