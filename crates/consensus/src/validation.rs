@@ -5967,6 +5967,115 @@ mod tests {
         assert!(is_final_tx(&tx, 100, 900_000_000));
     }
 
+    /// #64 — REORG CONNECT path with an INTRA-BLOCK tx chain.
+    ///
+    /// The 2026-08-24 fleet audit found that no implementation exercised an
+    /// intra-block chain on the reorg CONNECT side; every reorg suite connected
+    /// coinbase-only blocks.  rustoshi already pinned the DISCONNECT side
+    /// (`w92_disconnect_intra_block_chain_leaves_no_phantom_utxo`, the d086a76
+    /// two-pass phantom), but nothing covered connect.
+    ///
+    /// `ChainState::reorganize_with_seq_ctx` (chain_state.rs) connects each new
+    /// block by calling THIS function, so driving it directly with an
+    /// intra-block chain covers the reorg connect arm — the same
+    /// shared-path argument that makes ouroboros covered by its
+    /// connect_blocks_atomic test.
+    ///
+    /// The invariant a coinbase-only reorg test can never state: a coin that is
+    /// both CREATED and SPENT inside the connected block must NOT survive.  A
+    /// connect that adds every output first and only then spends inputs (or
+    /// that skips same-block prevouts) leaves it behind as a phantom, which is
+    /// precisely the defect that hit four implementations.
+    #[test]
+    fn w64_connect_block_intra_block_chain_leaves_no_phantom_utxo() {
+        use crate::params::ChainParams;
+        use rustoshi_primitives::BlockHeader;
+
+        let params = ChainParams::regtest();
+
+        // A mature, NON-coinbase coin already on disk — avoids coinbase
+        // maturity entirely, which is what makes this fixture stable.
+        let funded = OutPoint { txid: Hash256::from_bytes([7u8; 32]), vout: 0 };
+
+        // tx1 spends the on-disk coin and creates P = tx1:0.
+        let tx1 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: funded.clone(),
+                script_sig: vec![0x51],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 900, script_pubkey: vec![0x51] }],
+            lock_time: 0,
+        };
+        let tx1_txid = tx1.txid();
+
+        // tx2 spends P — the intra-block chain.  P exists only inside this
+        // block when tx2 is processed.
+        let tx2 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: tx1_txid, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 800, script_pubkey: vec![0x51] }],
+            lock_time: 0,
+        };
+        let tx2_txid = tx2.txid();
+
+        // Regtest halves every 150 blocks, so the subsidy at height 200 is
+        // 25 BTC, not 50.  Fees = (1000-900) + (900-800) = 200.  Claiming the
+        // un-halved 50 BTC fails BadSubsidy long before the UTXO assertions —
+        // a fixture error that reads exactly like a connect-path defect.
+        let coinbase = make_coinbase_tx(200, 2_500_000_000 + 200);
+        let header = BlockHeader {
+            version: 1,
+            prev_block_hash: Hash256::from_bytes([0u8; 32]),
+            merkle_root: Hash256::from_bytes([0u8; 32]),
+            timestamp: 1_700_000_000,
+            bits: 0x207fffff,
+            nonce: 0,
+        };
+        let block = Block { header, transactions: vec![coinbase, tx1, tx2] };
+
+        struct SimpleUtxo(HashMap<OutPoint, CoinEntry>);
+        impl UtxoView for SimpleUtxo {
+            fn get_utxo(&self, op: &OutPoint) -> Option<CoinEntry> { self.0.get(op).cloned() }
+            fn add_utxo(&mut self, op: &OutPoint, coin: CoinEntry) { self.0.insert(op.clone(), coin); }
+            fn spend_utxo(&mut self, op: &OutPoint) { self.0.remove(op); }
+        }
+
+        let mut utxo = SimpleUtxo(HashMap::new());
+        utxo.add_utxo(&funded, CoinEntry {
+            height: 1,
+            is_coinbase: false,
+            value: 1_000,
+            script_pubkey: vec![0x51],
+        });
+
+        let null_ctx = NullSequenceLockContext;
+        let result = connect_block_with_sequence_locks(
+            &block, 200, &mut utxo, &params, &null_ctx, 1_699_999_000, false, None
+        );
+        assert!(result.is_ok(), "intra-block chain must connect cleanly: {:?}", result.err());
+
+        // THE assertion: P was created and spent inside this block, so it must
+        // be gone.  If it survives, a later block could spend it again.
+        assert!(
+            utxo.get_utxo(&OutPoint { txid: tx1_txid, vout: 0 }).is_none(),
+            "tx1:0 was created AND spent inside the block — it must not survive as a phantom"
+        );
+        // tx2's output is genuinely unspent and must be present.
+        let tx2_coin = utxo.get_utxo(&OutPoint { txid: tx2_txid, vout: 0 });
+        assert!(tx2_coin.is_some(), "tx2:0 is unspent and must be in the UTXO set");
+        assert_eq!(tx2_coin.unwrap().value, 800);
+        // The on-disk coin tx1 consumed must be gone.
+        assert!(utxo.get_utxo(&funded).is_none(), "tx1's on-disk input must be spent");
+    }
+
     #[test]
     fn connect_block_rejects_non_final_tx() {
         // Build a block where a non-coinbase tx has lock_time = 1000
