@@ -11596,6 +11596,16 @@ impl RustoshiRpcServer for RpcServerImpl {
         // — `std::optional<bool> rbf` is unset when the param is null, then
         // `rbf.value_or(true)` is applied inside `ConstructTransaction`). Was
         // `unwrap_or(false)` → API divergence + non-signaling tx by default.
+        //
+        // Keep the ABSENT-vs-EXPLICIT distinction alive. Core carries `rbf` as a
+        // `std::optional<bool>` all the way to the END of `ConstructTransaction`
+        // precisely because its two consumers read it DIFFERENTLY: choosing the
+        // default sequence uses `rbf.value_or(true)` (absent == true), while the
+        // contradiction check at the bottom of this handler uses
+        // `rbf.has_value() && rbf.value()` (absent == no check at all). Folding
+        // the option into a bool here and throwing the original away would
+        // destroy the second reading, so capture it before the shadowing.
+        let rbf_explicit = replaceable;
         let replaceable = replaceable.unwrap_or(true);
 
         // Parse inputs
@@ -11766,6 +11776,56 @@ impl RustoshiRpcServer for RpcServerImpl {
                     script_pubkey: script,
                 });
             }
+        }
+
+        // Core: `ConstructTransaction` (rawtransaction_util.cpp:166-168), run
+        // AFTER both AddInputs AND AddOutputs:
+        //
+        //   if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+        //       !SignalsOptInRBF(CTransaction(rawTx))) {
+        //       throw JSONRPCError(RPC_INVALID_PARAMETER,
+        //           "Invalid parameter combination: Sequence number(s) contradict replaceable option");
+        //   }
+        //
+        // with `SignalsOptInRBF` (util/rbf.cpp:9-17) true iff ANY input has
+        // `nSequence <= MAX_BIP125_RBF_SEQUENCE` (util/rbf.h:12, 0xfffffffd).
+        //
+        // WHY THIS MATTERS: nine of the ten nodes in this repo silently ACCEPT
+        // the contradiction today. A caller who explicitly asks for
+        // `replaceable=true` and ALSO pins a final sequence (0xFFFFFFFF, or the
+        // 0xFFFFFFFE that a non-final-locktime workflow hands you) gets back a
+        // perfectly well-formed transaction that CANNOT be fee-bumped, with no
+        // error and no warning: the explicit per-input sequence wins, the
+        // `replaceable` flag is quietly discarded, and the caller only finds out
+        // when `bumpfee` refuses it (BIP-125 Rule 1) with the fee already stuck.
+        // Core refuses to guess which half of the request was meant and errors
+        // out; so do we.
+        //
+        // The three conditions, and why each is exactly as narrow as Core's:
+        //   1. `rbf_explicit == Some(true)` — the flag was SUPPLIED as true.
+        //      An ABSENT (or JSON-null) `replaceable` does NOT arm this check
+        //      even though it still DEFAULTS to true for picking the sequence
+        //      above. That asymmetry is real and deliberate in Core
+        //      (`rbf.value_or(true)` for the default vs
+        //      `rbf.has_value() && rbf.value()` here): omitting the argument is
+        //      not a request, so a caller who only sets `sequence` has not
+        //      contradicted anything and must not be rejected.
+        //   2. at least one input — a no-input skeleton (the PSBT/funding
+        //      workflow's starting point) has no sequence to contradict.
+        //   3. NO input signals — one signaling input is enough to make the
+        //      transaction replaceable, so a mixed set is legal. Rejecting on
+        //      "not ALL inputs signal" would break multi-input RBF.
+        //
+        // Placed here, after outputs are parsed, so an output error still wins —
+        // same ordering as Core.
+        let signals_opt_in_rbf = tx_inputs
+            .iter()
+            .any(|txin| txin.sequence <= MAX_BIP125_RBF_SEQUENCE);
+        if rbf_explicit == Some(true) && !tx_inputs.is_empty() && !signals_opt_in_rbf {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Invalid parameter combination: Sequence number(s) contradict replaceable option",
+            ));
         }
 
         let tx = Transaction {
@@ -23580,6 +23640,216 @@ mod tests {
         assert_eq!(
             SEQUENCE_FINAL, 0xFFFFFFFF,
             "SEQUENCE_FINAL must equal Core's CTxIn::SEQUENCE_FINAL"
+        );
+    }
+
+    // ── createrawtransaction: replaceable=true + a NON-signaling sequence is
+    //    a CONTRADICTION, and Core refuses to guess ──────────────────────────
+    //
+    // Core: `ConstructTransaction` (rawtransaction_util.cpp:166-168), the very
+    // last thing it does, after AddInputs AND AddOutputs:
+    //
+    //   if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+    //       !SignalsOptInRBF(CTransaction(rawTx)))
+    //       throw JSONRPCError(RPC_INVALID_PARAMETER,
+    //           "Invalid parameter combination: Sequence number(s) contradict replaceable option");
+    //
+    // `SignalsOptInRBF` (util/rbf.cpp:9-17) is true iff ANY input carries
+    // `nSequence <= MAX_BIP125_RBF_SEQUENCE` (util/rbf.h:12 = 0xfffffffd).
+    //
+    // WHAT WAS WRONG: rustoshi -- and nine of the ten nodes in this repo -- took
+    // `replaceable=true` together with `"sequence": 4294967295` and returned a
+    // transaction, no error. The explicit sequence won, the `replaceable` flag
+    // was silently dropped, and the caller got back a tx that CANNOT be
+    // fee-bumped while believing it asked for one. The failure surfaces later
+    // and elsewhere: `bumpfee` rejects it under BIP-125 Rule 1, by which point
+    // the transaction is broadcast and the fee is stuck. Core does not pick a
+    // winner between the two halves of a self-contradicting request; it errors.
+    //
+    // The ABSENT-vs-EXPLICIT asymmetry is the subtle part and it is deliberate
+    // in Core: `rbf` is a `std::optional<bool>`, and the sequence DEFAULT reads
+    // it as `rbf.value_or(true)` (absent behaves as true) while this check reads
+    // it as `rbf.has_value() && rbf.value()` (absent arms nothing). Omitting the
+    // argument is not a request, so a caller who sets only `sequence` has
+    // contradicted nothing. Row 1 below pins that, and row 6 pins the other easy
+    // mistake -- ONE signaling input is enough, so "not all inputs signal" must
+    // NOT reject or multi-input RBF breaks.
+    //
+    // The oracle table was verified against a LIVE Bitcoin Core node; all eight
+    // rows are reproduced here, the four ACCEPTs as controls that stop an
+    // over-eager check from breaking ordinary RBF usage.
+    //
+    //   # | rbf arg | inputs                          | expected
+    //   1 | ABSENT  | one, sequence 0xFFFFFFFF        | ACCEPT (no explicit rbf)
+    //   2 | true    | one, sequence 0xFFFFFFFD        | ACCEPT (signals)
+    //   3 | true    | one, sequence 0xFFFFFFFE        | REJECT -8
+    //   4 | true    | one, sequence 0xFFFFFFFF        | REJECT -8
+    //   5 | true    | NONE                            | ACCEPT (no inputs)
+    //   6 | true    | two: 0xFFFFFFFF and 0           | ACCEPT (one signals)
+    //   7 | false   | one, sequence 0xFFFFFFFF        | ACCEPT
+    //   8 | true    | one, NO explicit sequence       | ACCEPT (default IS RBF)
+
+    /// The exact message Core throws. Any drift here is an API divergence.
+    #[cfg(test)]
+    const RBF_CONTRADICTION_MSG: &str =
+        "Invalid parameter combination: Sequence number(s) contradict replaceable option";
+
+    /// Drive the REAL handler with an explicit `replaceable` argument and a
+    /// fixed, always-valid single output.
+    #[cfg(test)]
+    async fn createraw_rbf(
+        inputs: Vec<serde_json::Value>,
+        replaceable: Option<bool>,
+    ) -> Result<String, (i32, String)> {
+        let server = setup_test_server();
+        let outputs = serde_json::json!({
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
+        });
+        server
+            .create_raw_transaction(inputs, outputs, None, replaceable)
+            .await
+            .map_err(|e| (e.code(), e.message().to_string()))
+    }
+
+    /// One input with an explicit sequence.
+    #[cfg(test)]
+    fn rbf_input(txid_byte: &str, sequence: u64) -> serde_json::Value {
+        serde_json::json!({
+            "txid": txid_byte.repeat(32), "vout": 0, "sequence": sequence,
+        })
+    }
+
+    /// Every input's sequence, in order, decoded from the returned hex.
+    #[cfg(test)]
+    fn decode_input_sequences(hex_tx: &str) -> Vec<u32> {
+        use rustoshi_primitives::{Decodable, Transaction};
+        let bytes = hex::decode(hex_tx).expect("hex");
+        let mut slice = bytes.as_slice();
+        let tx = Transaction::decode(&mut slice).expect("decode tx");
+        tx.inputs.iter().map(|i| i.sequence).collect()
+    }
+
+    /// ROW 1 (CONTROL). `replaceable` ABSENT + SEQUENCE_FINAL → ACCEPT.
+    /// The asymmetry: absent still DEFAULTS to true for choosing the sequence,
+    /// but `rbf.has_value()` is false so the contradiction check never arms.
+    /// Getting this wrong rejects the single most common non-RBF call there is.
+    #[tokio::test]
+    async fn createrawtransaction_rbf_absent_with_final_sequence_is_accepted() {
+        let hex = createraw_rbf(vec![rbf_input("aa", 0xFFFFFFFF)], None)
+            .await
+            .expect("absent replaceable must NOT arm the contradiction check");
+        let (_vout, seq) = decode_first_input(&hex);
+        assert_eq!(
+            seq, 0xFFFFFFFF,
+            "the explicit sequence must survive untouched, got 0x{seq:08x}"
+        );
+    }
+
+    /// ROW 2 (CONTROL). replaceable=true + 0xFFFFFFFD → ACCEPT. This is the
+    /// boundary: `<=` MAX_BIP125_RBF_SEQUENCE signals, so 0xFFFFFFFD is legal.
+    #[tokio::test]
+    async fn createrawtransaction_rbf_true_with_signaling_sequence_is_accepted() {
+        let hex = createraw_rbf(vec![rbf_input("aa", 0xFFFFFFFD)], Some(true))
+            .await
+            .expect("0xFFFFFFFD signals opt-in RBF and must be accepted");
+        let (_vout, seq) = decode_first_input(&hex);
+        assert_eq!(seq, 0xFFFFFFFD, "got 0x{seq:08x}");
+    }
+
+    /// ROW 3. replaceable=true + 0xFFFFFFFE → REJECT -8. One above the BIP-125
+    /// threshold: non-final (so locktime still works) but NOT replaceable.
+    #[tokio::test]
+    async fn createrawtransaction_rbf_true_with_nonfinal_sequence_is_rejected() {
+        // THE REGRESSION: at the parent commit this returned Ok with a
+        // non-replaceable transaction.
+        let (code, msg) = createraw_rbf(vec![rbf_input("aa", 0xFFFFFFFE)], Some(true))
+            .await
+            .expect_err("0xFFFFFFFE does not signal RBF; must contradict replaceable=true");
+        assert_eq!(code, -8, "got {code} / {msg}");
+        assert_eq!(msg, RBF_CONTRADICTION_MSG);
+    }
+
+    /// ROW 4. replaceable=true + SEQUENCE_FINAL → REJECT -8.
+    #[tokio::test]
+    async fn createrawtransaction_rbf_true_with_final_sequence_is_rejected() {
+        // THE REGRESSION: at the parent commit this returned Ok too.
+        let (code, msg) = createraw_rbf(vec![rbf_input("aa", 0xFFFFFFFF)], Some(true))
+            .await
+            .expect_err("SEQUENCE_FINAL must contradict replaceable=true");
+        assert_eq!(code, -8, "got {code} / {msg}");
+        assert_eq!(msg, RBF_CONTRADICTION_MSG);
+    }
+
+    /// ROW 5 (CONTROL). replaceable=true with NO inputs → ACCEPT. Core guards on
+    /// `rawTx.vin.size() > 0`: an empty skeleton (the funding/PSBT starting
+    /// point) has no sequence to contradict.
+    #[tokio::test]
+    async fn createrawtransaction_rbf_true_with_no_inputs_is_accepted() {
+        let hex = createraw_rbf(vec![], Some(true))
+            .await
+            .expect("a no-input skeleton contradicts nothing and must be accepted");
+        // A 0-input transaction cannot be round-tripped through
+        // `Transaction::decode`: serialized non-witness it reads
+        // `version || 0x00 || <output count> || …`, and the decoder takes that
+        // leading 0x00 as the BIP-144 segwit MARKER and the following 0x01 (the
+        // output count) as the FLAG. That ambiguity exists in Core as well, so
+        // assert on the returned hex bytes directly instead.
+        assert!(
+            hex.starts_with("0200000000"),
+            "expected version 2 (02000000) followed by a ZERO input count (00), got {hex}"
+        );
+        assert!(
+            hex.ends_with("00000000"),
+            "expected locktime 0 in the trailing 4 bytes, got {hex}"
+        );
+    }
+
+    /// ROW 6 (CONTROL). replaceable=true, two inputs, only ONE signaling →
+    /// ACCEPT. `SignalsOptInRBF` is ANY, not ALL. A check written as "all
+    /// inputs must signal" passes rows 1-5 and 7-8 and still breaks every
+    /// multi-party RBF workflow, which is exactly the mistake BIP-125's
+    /// any-input rule exists to prevent.
+    #[tokio::test]
+    async fn createrawtransaction_rbf_true_with_one_signaling_input_of_two_is_accepted() {
+        let hex = createraw_rbf(
+            vec![rbf_input("aa", 0xFFFFFFFF), rbf_input("bb", 0)],
+            Some(true),
+        )
+        .await
+        .expect("one signaling input makes the whole transaction replaceable");
+        let seqs = decode_input_sequences(&hex);
+        assert_eq!(
+            seqs,
+            vec![0xFFFFFFFFu32, 0u32],
+            "both explicit sequences must survive in order, got {seqs:08x?}"
+        );
+    }
+
+    /// ROW 7 (CONTROL). replaceable=false + SEQUENCE_FINAL → ACCEPT. Agreement,
+    /// not contradiction; `rbf.value()` is false so the check never arms.
+    #[tokio::test]
+    async fn createrawtransaction_rbf_false_with_final_sequence_is_accepted() {
+        let hex = createraw_rbf(vec![rbf_input("aa", 0xFFFFFFFF)], Some(false))
+            .await
+            .expect("replaceable=false agrees with SEQUENCE_FINAL");
+        let (_vout, seq) = decode_first_input(&hex);
+        assert_eq!(seq, 0xFFFFFFFF, "got 0x{seq:08x}");
+    }
+
+    /// ROW 8 (CONTROL). replaceable=true with NO explicit sequence → ACCEPT,
+    /// because the default the flag itself selects IS the signaling one
+    /// (MAX_BIP125_RBF_SEQUENCE). If this ever rejects, the check is reading the
+    /// sequence before AddInputs has filled the default in.
+    #[tokio::test]
+    async fn createrawtransaction_rbf_true_without_explicit_sequence_is_accepted() {
+        let inputs = vec![serde_json::json!({"txid": "aa".repeat(32), "vout": 0})];
+        let hex = createraw_rbf(inputs, Some(true))
+            .await
+            .expect("the replaceable=true default sequence signals RBF by construction");
+        let (_vout, seq) = decode_first_input(&hex);
+        assert_eq!(
+            seq, MAX_BIP125_RBF_SEQUENCE,
+            "replaceable=true must default to 0xFFFFFFFD, got 0x{seq:08x}"
         );
     }
 
