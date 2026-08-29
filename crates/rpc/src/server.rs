@@ -756,7 +756,11 @@ pub trait RustoshiRpc {
 
     /// Estimate the fee rate for confirmation within `conf_target` blocks.
     #[method(name = "estimatesmartfee")]
-    async fn estimate_smart_fee(&self, conf_target: u32) -> RpcResult<FeeEstimateResult>;
+    async fn estimate_smart_fee(
+        &self,
+        conf_target: serde_json::Value,
+        estimate_mode: Option<serde_json::Value>,
+    ) -> RpcResult<FeeEstimateResult>;
 
     /// Estimate the raw fee data per fee-rate bucket for `conf_target` blocks.
     ///
@@ -1924,6 +1928,67 @@ impl RpcServerImpl {
     /// RPC_MISC_ERROR even though it is also out of domain for a vout. That
     /// ordering is Core's, not the obvious one, and is preserved deliberately.
     /// (rawtransaction_util.cpp AddInputs:38-45.)
+    /// Core: rpc/util.cpp `ParseConfirmTarget` — getInt<int> first (width), then
+    /// the domain test against the estimator's highest tracked target.
+    fn parse_confirm_target(
+        v: &serde_json::Value,
+        max_target: i64,
+    ) -> Result<u32, ErrorObjectOwned> {
+        let n = match v {
+            serde_json::Value::Number(n) => n,
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type number",
+                        Self::json_uvtype(other)
+                    ),
+                ))
+            }
+        };
+        let i = n.as_i64().ok_or_else(|| {
+            Self::rpc_error(rpc_error::RPC_MISC_ERROR, "JSON integer out of range")
+        })?;
+        if i < i64::from(i32::MIN) || i > i64::from(i32::MAX) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "JSON integer out of range",
+            ));
+        }
+        if i < 1 || i > max_target {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                format!("Invalid conf_target, must be between 1 and {max_target}"),
+            ));
+        }
+        Ok(i as u32)
+    }
+
+    /// Core: `FeeModeFromString` (common/messages.cpp) compares after ToUpper,
+    /// so the match is case-insensitive and anything else is -8.
+    fn check_estimate_mode(v: Option<&serde_json::Value>) -> Result<(), ErrorObjectOwned> {
+        match v {
+            None | Some(serde_json::Value::Null) => Ok(()),
+            Some(serde_json::Value::String(s)) => {
+                match s.to_ascii_uppercase().as_str() {
+                    "UNSET" | "ECONOMICAL" | "CONSERVATIVE" => Ok(()),
+                    _ => Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Invalid estimate_mode parameter, must be one of: \
+                         \"unset\", \"economical\", \"conservative\"",
+                    )),
+                }
+            }
+            Some(other) => Err(Self::rpc_error(
+                rpc_error::RPC_TYPE_ERROR,
+                format!(
+                    "JSON value of type {} is not of expected type string",
+                    Self::json_uvtype(other)
+                ),
+            )),
+        }
+    }
+
     fn parse_createraw_vout(v: Option<&serde_json::Value>) -> Result<u32, ErrorObjectOwned> {
         let n = match v {
             Some(serde_json::Value::Number(n)) => n,
@@ -2048,6 +2113,17 @@ impl RpcServerImpl {
             // A JSON bool is NOT a number to Core's getInt (VBOOL != VNUM).
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
+                    // Core reads these with getInt<int> — a THIRTY-TWO bit
+                    // parse — and the width check lives INSIDE the conversion,
+                    // so it fires before the handler's own tests (the negative
+                    // timeout check, the height comparison). Without it a
+                    // hostile height was clamped into a u32 and waited on.
+                    if i < i64::from(i32::MIN) || i > i64::from(i32::MAX) {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_MISC_ERROR,
+                            "JSON integer out of range",
+                        ));
+                    }
                     Ok(i)
                 } else {
                     // Fractional / out-of-i64-range number: Core's getInt<int>
@@ -7339,7 +7415,22 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
-    async fn estimate_smart_fee(&self, conf_target: u32) -> RpcResult<FeeEstimateResult> {
+    async fn estimate_smart_fee(
+        &self,
+        conf_target: serde_json::Value,
+        estimate_mode: Option<serde_json::Value>,
+    ) -> RpcResult<FeeEstimateResult> {
+        // Core: ParseConfirmTarget (rpc/util.cpp) reads conf_target with
+        // getInt<int> and then REJECTS anything outside
+        // [1, HighestTargetTracked]. Taking the argument as a typed `u32` let
+        // jsonrpsee accept 2147483648 — a perfectly good u32, and a target
+        // Core refuses — and answered for it.
+        let conf_target = Self::parse_confirm_target(&conf_target, 1008)?;
+        // estimate_mode: Core validates it with FeeModeFromString
+        // (common/messages.cpp), case-insensitively. The argument was not even
+        // in the signature, so a caller passing one got an arity error and a
+        // caller passing garbage never learned it was garbage.
+        Self::check_estimate_mode(estimate_mode.as_ref())?;
         let state = self.state.read().await;
 
         match state.fee_estimator.estimate_fee(conf_target as usize) {
@@ -8853,6 +8944,15 @@ impl RustoshiRpcServer for RpcServerImpl {
         // ── 1. count (positional 0, default 1) ─────────────────────────────
         // count == 0 → return ALL; count < 0 → error -8.
         let count: i64 = count.unwrap_or(1);
+        // Core: getInt<int> BEFORE the handler's own -8 range test, so an
+        // out-of-int32 count fails the CONVERSION (-1) while an in-range
+        // negative one reaches the domain error (-8).
+        if count < i64::from(i32::MIN) || count > i64::from(i32::MAX) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "JSON integer out of range",
+            ));
+        }
         if count < 0 {
             return Err(Self::rpc_error(
                 rpc_error::RPC_INVALID_PARAMETER,
@@ -17873,6 +17973,135 @@ fn peer_network_str(addr: &std::net::SocketAddr) -> String {
 mod tests {
     use super::*;
     use rustoshi_consensus::chain_manager::{block_status, get_ancestor, is_ancestor};
+
+    // ==================================================================
+    // #81 round 2: RPC integer arguments must be read at CORE'S WIDTH.
+    //
+    // Core reads every numeric argument through UniValue::getInt<T>()
+    // (univalue.h), which runs std::from_chars INTO THE DESTINATION WIDTH, so
+    // the width check lives inside the CONVERSION and fires BEFORE the
+    // handler's own domain test:
+    //
+    //   out of width / fractional -> RPC_MISC_ERROR (-1) "JSON integer out of
+    //                                range"
+    //   converts, violates range  -> RPC_INVALID_PARAMETER (-8)
+    //
+    // Measured against a regtest Bitcoin Core oracle
+    // (tools/rpc-arg-differential.py), rustoshi ACCEPTED 6 such arguments:
+    // waitforblockheight's height (3 rows), getnodeaddresses' count (2) and
+    // estimatesmartfee's conf_target (1). Nothing crashed and nothing wrapped
+    // visibly — the handler simply acted on a value Core refuses. conf_target
+    // was the interesting one: its argument was typed `u32` in the trait, so
+    // jsonrpsee happily deserialized 2147483648 (a perfectly good u32, and a
+    // target Core rejects) and the node answered for it.
+    //
+    // TEETH: each rejection is paired with a CONTROL that must still succeed,
+    // so a bound off by one in the tight direction fails loudly.
+    // ==================================================================
+
+    fn err_of(r: Result<impl std::fmt::Debug, ErrorObjectOwned>) -> (i32, String) {
+        match r {
+            Ok(v) => (0, format!("(no error - call succeeded: {v:?})")),
+            Err(e) => (e.code(), e.message().to_string()),
+        }
+    }
+
+    const OUT_OF_INT32: [i64; 4] = [2147483648, -2147483649, 4294967296, -4294967297];
+
+    #[test]
+    fn test_wait_int_rejects_out_of_int32() {
+        for v in OUT_OF_INT32 {
+            let (code, msg) = err_of(RpcServerImpl::parse_wait_int(&serde_json::json!(v)));
+            assert_eq!(
+                (code, msg.as_str()),
+                (rpc_error::RPC_MISC_ERROR, "JSON integer out of range"),
+                "wait-family int {v} must fail the CONVERSION"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wait_timeout_width_beats_the_negative_test() {
+        // -4294967297 is BOTH negative and out of int32; Core answers with the
+        // conversion error, not "Negative timeout".
+        let (code, msg) =
+            err_of(RpcServerImpl::parse_wait_timeout(Some(&serde_json::json!(-4294967297i64))));
+        assert_eq!((code, msg.as_str()),
+            (rpc_error::RPC_MISC_ERROR, "JSON integer out of range"));
+    }
+
+    #[test]
+    fn test_control_in_range_negative_timeout_still_says_negative_timeout() {
+        let (code, msg) =
+            err_of(RpcServerImpl::parse_wait_timeout(Some(&serde_json::json!(-1))));
+        assert_eq!((code, msg.as_str()), (rpc_error::RPC_MISC_ERROR, "Negative timeout"));
+    }
+
+    #[test]
+    fn test_control_in_range_wait_ints_are_accepted() {
+        for v in [0i64, 1, 2147483647, -2147483648] {
+            assert_eq!(
+                RpcServerImpl::parse_wait_int(&serde_json::json!(v)).unwrap(),
+                v,
+                "int32 boundary value {v} must be ACCEPTED"
+            );
+        }
+    }
+
+    #[test]
+    fn test_confirm_target_rejects_out_of_int32() {
+        for v in OUT_OF_INT32 {
+            let (code, msg) =
+                err_of(RpcServerImpl::parse_confirm_target(&serde_json::json!(v), 1008));
+            assert_eq!((code, msg.as_str()),
+                (rpc_error::RPC_MISC_ERROR, "JSON integer out of range"));
+        }
+    }
+
+    #[test]
+    fn test_confirm_target_rejects_out_of_domain_instead_of_clamping() {
+        for v in [0i64, -1, 1009, 99999] {
+            let (code, msg) =
+                err_of(RpcServerImpl::parse_confirm_target(&serde_json::json!(v), 1008));
+            assert_eq!(
+                (code, msg.as_str()),
+                (rpc_error::RPC_INVALID_PARAMETER,
+                 "Invalid conf_target, must be between 1 and 1008"),
+                "conf_target {v} must be REJECTED, not clamped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_control_confirm_target_boundaries_are_accepted() {
+        for v in [1i64, 6, 1008] {
+            assert_eq!(
+                RpcServerImpl::parse_confirm_target(&serde_json::json!(v), 1008).unwrap(),
+                v as u32
+            );
+        }
+    }
+
+    #[test]
+    fn test_estimate_mode_rejects_unknown_and_accepts_the_three_modes() {
+        for m in ["", "garbage", "ECONOMICALLY"] {
+            let (code, msg) =
+                err_of(RpcServerImpl::check_estimate_mode(Some(&serde_json::json!(m))));
+            assert_eq!(
+                (code, msg.as_str()),
+                (rpc_error::RPC_INVALID_PARAMETER,
+                 "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\""),
+                "estimate_mode {m:?} must be rejected"
+            );
+        }
+        // CONTROL: case-insensitive, and absent/null is the default.
+        for m in ["unset", "economical", "CONSERVATIVE", "Economical"] {
+            assert!(RpcServerImpl::check_estimate_mode(Some(&serde_json::json!(m))).is_ok(),
+                "estimate_mode {m:?} must be accepted");
+        }
+        assert!(RpcServerImpl::check_estimate_mode(None).is_ok());
+        assert!(RpcServerImpl::check_estimate_mode(Some(&serde_json::Value::Null)).is_ok());
+    }
 
     // getindexinfo `synced` must be FALSE while an AssumeUTXO snapshot is active
     // but not yet background-validated (the genesis-side coverage gap that makes
