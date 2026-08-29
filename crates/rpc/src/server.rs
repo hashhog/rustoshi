@@ -1206,6 +1206,10 @@ pub trait RustoshiRpc {
         outputs: Vec<serde_json::Value>,
         locktime: Option<u32>,
         replaceable: Option<bool>,
+        // Core builds createpsbt and createrawtransaction from the SAME
+        // routine (ConstructTransaction), so it takes the same 5th `version`
+        // argument (rpc/rawtransaction.cpp:1642).  It was missing here too.
+        version: Option<serde_json::Value>,
     ) -> RpcResult<String>;
 
     /// Decode a PSBT to JSON.
@@ -1325,6 +1329,12 @@ pub trait RustoshiRpc {
         // the handler can only produce if it sees the raw value.
         locktime: Option<serde_json::Value>,
         replaceable: Option<bool>,
+        // Core's 5th argument (rpc/rawtransaction.cpp:122), read as
+        // `self.Arg<uint32_t>("version")`.  Typed as a raw Value for the same
+        // reason as `locktime` above: a narrow type makes the jsonrpsee
+        // deserializer answer -32602 with a serde message before the handler
+        // can produce Core's -1 / -8.
+        version: Option<serde_json::Value>,
     ) -> RpcResult<String>;
 
     /// Decode a hex-encoded script.
@@ -1866,6 +1876,44 @@ impl RpcServerImpl {
             };
             Self::rpc_error(rpc_error::RPC_INVALID_PARAMETER, msg)
         })
+    }
+
+    /// Core's `version` argument for the createrawtransaction family.
+    ///
+    /// Core reads it as `self.Arg<uint32_t>("version")` -- a THIRTY-TWO BIT
+    /// UNSIGNED parse, unlike the int32 used for vout -- then bounds it against
+    /// [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+    /// (policy/policy.h:152-153) inside ConstructTransaction
+    /// (rawtransaction_util.cpp:158-161).  The UNSIGNED width is what decides
+    /// which error you get: `2147483648` fits a uint32, so it survives the
+    /// conversion and reaches the DOMAIN error (-8), while `-1` and
+    /// `4294967296` fail the CONVERSION first (-1).
+    ///
+    /// Absent means Core's DEFAULT_RAWTX_VERSION (CTransaction::CURRENT_VERSION
+    /// = 2) -- which this handler used to hardcode unconditionally, so a caller
+    /// asking for version 3 got a version 2 transaction and a success reply.
+    fn parse_createraw_version(
+        v: Option<&serde_json::Value>,
+    ) -> Result<u32, ErrorObjectOwned> {
+        match v {
+            None | Some(serde_json::Value::Null) => Ok(2),
+            Some(serde_json::Value::Number(n)) => {
+                let u = n.as_u64().filter(|u| *u <= u64::from(u32::MAX)).ok_or_else(|| {
+                    Self::rpc_error(rpc_error::RPC_MISC_ERROR, "JSON integer out of range")
+                })?;
+                if !(1..=3).contains(&u) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Invalid parameter, version out of range(1~3)",
+                    ));
+                }
+                Ok(u as u32)
+            }
+            _ => Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "JSON value is not an integer as expected",
+            )),
+        }
     }
 
     /// `createrawtransaction` numeric-argument validation.
@@ -10579,7 +10627,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         outputs: Vec<serde_json::Value>,
         locktime: Option<u32>,
         replaceable: Option<bool>,
+        version: Option<serde_json::Value>,
     ) -> RpcResult<String> {
+        let tx_version = Self::parse_createraw_version(version.as_ref())?;
         let state = self.state.read().await;
 
         // Build the unsigned transaction
@@ -10688,7 +10738,8 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Create the unsigned transaction
         let tx = Transaction {
-            version: 2,
+            // Was hardcoded 2, discarding the caller's `version`.
+            version: tx_version as i32,
             inputs: tx_inputs,
             outputs: tx_outputs,
             lock_time,
@@ -11589,8 +11640,10 @@ impl RustoshiRpcServer for RpcServerImpl {
         outputs: serde_json::Value,
         locktime: Option<serde_json::Value>,
         replaceable: Option<bool>,
+        version: Option<serde_json::Value>,
     ) -> RpcResult<String> {
         let locktime = Self::parse_createraw_locktime(locktime.as_ref())?;
+        let tx_version = Self::parse_createraw_version(version.as_ref())?;
         // FIX-70 / W120 BUG-3: Core's `createrawtransaction` defaults `rbf` to
         // TRUE (see bitcoin-core/src/rpc/rawtransaction.cpp::createrawtransaction
         // — `std::optional<bool> rbf` is unset when the param is null, then
@@ -11829,7 +11882,11 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         let tx = Transaction {
-            version: 2,
+            // Was hardcoded 2, which silently discarded the caller's
+            // `version` and returned a v2 transaction with a success reply.
+            // The cast is safe by construction: parse_createraw_version has
+            // already bounded the value to [1, 3].
+            version: tx_version as i32,
             inputs: tx_inputs,
             outputs: tx_outputs,
             lock_time: locktime,
@@ -23242,7 +23299,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, None, None)
+            .createpsbt(inputs, outputs, None, None, None)
             .await
             .expect("createpsbt must succeed with valid inputs/outputs");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -23270,7 +23327,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, Some(0), Some(true))
+            .createpsbt(inputs, outputs, Some(0), Some(true), None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -23294,7 +23351,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, Some(0), Some(false))
+            .createpsbt(inputs, outputs, Some(0), Some(false), None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -23318,7 +23375,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, Some(500_000), Some(false))
+            .createpsbt(inputs, outputs, Some(500_000), Some(false), None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -23341,7 +23398,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, None, None)
+            .createpsbt(inputs, outputs, None, None, None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -23393,11 +23450,108 @@ mod tests {
         let server = setup_test_server();
         let outputs = serde_json::json!({});
         match server
-            .create_raw_transaction(vec![input], outputs, locktime, None)
+            .create_raw_transaction(vec![input], outputs, locktime, None, None)
             .await
         {
             Ok(hex) => panic!("expected an error, got a transaction: {hex}"),
             Err(e) => (e.code(), e.message().to_string()),
+        }
+    }
+
+    // ── createrawtransaction: the `version` argument is HONOURED ──────────
+    //
+    // Found 2026-08-29 by tools/rpc-arg-differential.py, which compares against
+    // a real regtest Core. Core's createrawtransaction takes a 5th argument,
+    // `version` (rpc/rawtransaction.cpp:122), reads it as
+    // `self.Arg<uint32_t>("version")`, bounds it to
+    // [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+    // (policy/policy.h:152-153) and EMITS it (rawtransaction_util.cpp:161).
+    //
+    // rustoshi's trait declared only four arguments, so jsonrpsee silently
+    // dropped the fifth and the handler hardcoded `version: 2`. Measured across
+    // the fleet, seven implementations behaved identically: asked for version
+    // 1, 2 or 3 they all returned 02000000, and they all ACCEPTED version 4,
+    // which Core rejects. That is the fabrication shape -- a success reply for
+    // a request that was not honoured -- and it matters because v3 is TRUC
+    // (BIP 431) and carries different policy rules.
+    //
+    // THE UNSIGNED WIDTH DECIDES WHICH ERROR YOU GET, which is why the two
+    // out-of-range cases below expect DIFFERENT codes: `version` is read as
+    // uint32, not the int32 used for vout, so 2147483648 survives the
+    // conversion and reaches the DOMAIN error (-8), while -1 and 4294967296
+    // fail the CONVERSION first (-1). Getting this backwards would look
+    // "close enough" and be wrong in both directions.
+    //
+    // Each case below asserts the VERSION BYTES on the returned transaction.
+    // Asserting that the call was accepted is exactly the pre-fix behaviour.
+
+    /// Decode the version field from a raw tx hex.
+    #[cfg(test)]
+    fn decode_tx_version(hex_tx: &str) -> i32 {
+        use rustoshi_primitives::{Decodable, Transaction};
+        let bytes = hex::decode(hex_tx).expect("hex");
+        let mut slice = bytes.as_slice();
+        Transaction::decode(&mut slice).expect("decode tx").version
+    }
+
+    #[cfg(test)]
+    async fn createraw_version(v: Option<serde_json::Value>) -> Result<String, (i32, String)> {
+        let server = setup_test_server();
+        let input = serde_json::json!({"txid": "aa".repeat(32), "vout": 0});
+        let outputs = serde_json::json!({"data": "deadbeef"});
+        server
+            .create_raw_transaction(vec![input], outputs, None, None, v)
+            .await
+            .map_err(|e| (e.code(), e.message().to_string()))
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_version_1_2_3_are_emitted_not_forced_to_2() {
+        for want in [1i32, 2, 3] {
+            let hex = createraw_version(Some(serde_json::json!(want)))
+                .await
+                .unwrap_or_else(|e| panic!("version {want} rejected: {e:?}"));
+            assert_eq!(
+                decode_tx_version(&hex),
+                want,
+                "asked for version {want}, transaction carries a different version"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_version_absent_defaults_to_2() {
+        // Core's DEFAULT_RAWTX_VERSION is CTransaction::CURRENT_VERSION = 2.
+        let hex = createraw_version(None).await.expect("absent version is valid");
+        assert_eq!(decode_tx_version(&hex), 2);
+        let hex = createraw_version(Some(serde_json::Value::Null))
+            .await
+            .expect("null version is valid");
+        assert_eq!(decode_tx_version(&hex), 2);
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_version_outside_1_to_3_is_rejected() {
+        for bad in [0i64, 4, 2147483648] {
+            let (code, msg) = createraw_version(Some(serde_json::json!(bad)))
+                .await
+                .expect_err(&format!("version {bad} must be rejected"));
+            assert_eq!(code, -8, "version {bad}: wrong code ({msg})");
+            assert_eq!(msg, "Invalid parameter, version out of range(1~3)");
+        }
+    }
+
+    #[tokio::test]
+    async fn createrawtransaction_version_outside_uint32_fails_conversion_first() {
+        // Core reads `version` as uint32, so these fail INSIDE the conversion
+        // and never reach the [1,3] domain test -- -1, not -8. The pair with
+        // the test above is what pins the boundary in both directions.
+        for bad in [-1i64, -2147483649, 4294967296] {
+            let (code, msg) = createraw_version(Some(serde_json::json!(bad)))
+                .await
+                .expect_err(&format!("version {bad} must be rejected"));
+            assert_eq!(code, -1, "version {bad}: wrong code ({msg})");
+            assert_eq!(msg, "JSON integer out of range");
         }
     }
 
@@ -23512,7 +23666,7 @@ mod tests {
             "txid": "aa".repeat(32), "vout": 0, "sequence": "nope",
         })];
         let hex = server
-            .create_raw_transaction(inputs, serde_json::json!({}), None, None)
+            .create_raw_transaction(inputs, serde_json::json!({}), None, None, None)
             .await
             .expect("createrawtransaction must succeed");
         let (_vout, seq) = decode_first_input(&hex);
@@ -23536,6 +23690,7 @@ mod tests {
                 inputs,
                 serde_json::json!({}),
                 Some(serde_json::json!(4294967295u64)),
+                None,
                 None,
             )
             .await
@@ -23561,7 +23716,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         });
         let hex = server
-            .create_raw_transaction(inputs, outputs, None, None)
+            .create_raw_transaction(inputs, outputs, None, None, None)
             .await
             .expect("createrawtransaction must succeed");
         let bytes = hex::decode(&hex).expect("hex");
@@ -23588,7 +23743,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         }]);
         let hex = server
-            .create_raw_transaction(inputs, outputs, Some(serde_json::json!(500_000)), Some(false))
+            .create_raw_transaction(inputs, outputs, Some(serde_json::json!(500_000)), Some(false), None)
             .await
             .expect("createrawtransaction must succeed");
         let bytes = hex::decode(&hex).expect("hex");
@@ -23614,7 +23769,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         }]);
         let hex = server
-            .create_raw_transaction(inputs, outputs, Some(serde_json::json!(0)), Some(false))
+            .create_raw_transaction(inputs, outputs, Some(serde_json::json!(0)), Some(false), None)
             .await
             .expect("createrawtransaction must succeed");
         let bytes = hex::decode(&hex).expect("hex");
@@ -23706,7 +23861,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         });
         server
-            .create_raw_transaction(inputs, outputs, None, replaceable)
+            .create_raw_transaction(inputs, outputs, None, replaceable, None)
             .await
             .map_err(|e| (e.code(), e.message().to_string()))
     }
