@@ -10829,12 +10829,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         }
 
-        if tx_inputs.is_empty() {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                "Inputs array is empty",
-            ));
-        }
+        // NO empty-inputs rejection. Core's createpsbt builds through
+        // ConstructTransaction (rpc/rawtransaction_util.cpp), which has no such
+        // check — `createpsbt [] [] 1 true 1` returns a PSBT with zero inputs.
+        // The invented -32602 here was a SPURIOUS-REJECT: the differential's
+        // CONTROL (an in-range call both sides must accept) failed on it, which
+        // is exactly what controls are for.
 
         // Create the unsigned transaction
         let tx = Transaction {
