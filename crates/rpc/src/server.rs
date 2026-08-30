@@ -523,7 +523,7 @@ pub trait RustoshiRpc {
 
     /// Get the hash of a block at a given height.
     #[method(name = "getblockhash")]
-    async fn get_block_hash(&self, height: u32) -> RpcResult<String>;
+    async fn get_block_hash(&self, height: serde_json::Value) -> RpcResult<String>;
 
     /// Get a block by its hash. Verbosity: 0=hex, 1=json, 2=json+tx details.
     ///
@@ -532,7 +532,7 @@ pub trait RustoshiRpc {
     /// going through serde_json's f64 re-serialiser (which would change
     /// `0.00000000` to `0.0`, breaking byte-identity with Core 31.99).
     #[method(name = "getblock")]
-    async fn get_block(&self, hash: String, verbosity: Option<u8>) -> RpcResult<Box<serde_json::value::RawValue>>;
+    async fn get_block(&self, hash: String, verbosity: Option<serde_json::Value>) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Get a block header by hash.
     ///
@@ -1030,7 +1030,7 @@ pub trait RustoshiRpc {
     async fn get_tx_out(
         &self,
         txid: String,
-        vout: u32,
+        vout: serde_json::Value,
         include_mempool: Option<bool>,
     ) -> RpcResult<Option<Box<serde_json::value::RawValue>>>;
 
@@ -1047,7 +1047,7 @@ pub trait RustoshiRpc {
         &self,
         subnet: String,
         command: String,
-        bantime: Option<u64>,
+        bantime: Option<serde_json::Value>,
         absolute: Option<bool>,
     ) -> RpcResult<()>;
 
@@ -1208,7 +1208,7 @@ pub trait RustoshiRpc {
         &self,
         inputs: Vec<CreatePsbtInput>,
         outputs: Vec<serde_json::Value>,
-        locktime: Option<u32>,
+        locktime: Option<serde_json::Value>,
         replaceable: Option<bool>,
         // Core builds createpsbt and createrawtransaction from the SAME
         // routine (ConstructTransaction), so it takes the same 5th `version`
@@ -1364,7 +1364,7 @@ pub trait RustoshiRpc {
     async fn disconnect_node(
         &self,
         address: Option<String>,
-        nodeid: Option<u32>,
+        nodeid: Option<serde_json::Value>,
     ) -> RpcResult<()>;
 
     /// Get mempool entry for a given transaction.
@@ -1515,7 +1515,7 @@ pub trait RustoshiRpc {
     #[method(name = "createmultisig")]
     async fn create_multisig(
         &self,
-        nrequired: u32,
+        nrequired: serde_json::Value,
         keys: Vec<String>,
         address_type: Option<String>,
     ) -> RpcResult<CreateMultisigResult>;
@@ -1928,6 +1928,61 @@ impl RpcServerImpl {
     /// RPC_MISC_ERROR even though it is also out of domain for a vout. That
     /// ordering is Core's, not the obvious one, and is preserved deliberately.
     /// (rawtransaction_util.cpp AddInputs:38-45.)
+    /// Core's `UniValue::getInt<T>()` at the RPC argument boundary.
+    ///
+    /// getInt runs `std::from_chars` INTO THE DESTINATION WIDTH, so the width
+    /// check lives inside the CONVERSION and fires BEFORE the handler's own
+    /// domain test: out of width is RPC_MISC_ERROR (-1) "JSON integer out of
+    /// range", and only surviving values reach a -8 / -5 / lookup answer.
+    ///
+    /// These exist because typing an RPC parameter as `u32` in the jsonrpsee
+    /// trait makes serde reject the whole CALL: jsonrpsee answers -32602
+    /// "Invalid params" before the handler runs, so an argument the caller
+    /// SUPPLIED is reported as a malformed request. Reading the raw
+    /// `serde_json::Value` and converting here is what puts the error back
+    /// where Core puts it.
+    fn core_get_i64(v: &serde_json::Value) -> Result<i64, ErrorObjectOwned> {
+        match v {
+            serde_json::Value::Number(n) => n.as_i64().ok_or_else(|| {
+                Self::rpc_error(rpc_error::RPC_MISC_ERROR, "JSON integer out of range")
+            }),
+            other => Err(Self::rpc_error(
+                rpc_error::RPC_TYPE_ERROR,
+                format!(
+                    "JSON value of type {} is not of expected type number",
+                    Self::json_uvtype(other)
+                ),
+            )),
+        }
+    }
+
+    /// `getInt<int>()` — the 32-bit signed destination.
+    fn core_get_i32(v: &serde_json::Value) -> Result<i32, ErrorObjectOwned> {
+        let i = Self::core_get_i64(v)?;
+        if i < i64::from(i32::MIN) || i > i64::from(i32::MAX) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "JSON integer out of range",
+            ));
+        }
+        Ok(i as i32)
+    }
+
+    /// `getInt<uint32_t>()` — `from_chars` accepts NO SIGN for an unsigned
+    /// destination, so a negative value fails the CONVERSION with the same -1
+    /// as one above 2^32-1. This is why `gettxout <txid> -1` is -1 and not a
+    /// lookup miss, while `2147483648` is a perfectly valid vout.
+    fn core_get_u32(v: &serde_json::Value) -> Result<u32, ErrorObjectOwned> {
+        let i = Self::core_get_i64(v)?;
+        if i < 0 || i > i64::from(u32::MAX) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "JSON integer out of range",
+            ));
+        }
+        Ok(i as u32)
+    }
+
     /// Core: rpc/util.cpp `ParseConfirmTarget` — getInt<int> first (width), then
     /// the domain test against the estimator's highest tracked target.
     fn parse_confirm_target(
@@ -4967,7 +5022,21 @@ impl RustoshiRpcServer for RpcServerImpl {
         })
     }
 
-    async fn get_block_hash(&self, height: u32) -> RpcResult<String> {
+    async fn get_block_hash(&self, height: serde_json::Value) -> RpcResult<String> {
+        // Core reads height as getInt<int>, and the CONVERSION fires before
+        // the range test. Typing this `u32` made serde reject the whole call
+        // with -32602 "Invalid params" for three of the four hostile widths --
+        // an argument that WAS supplied, reported as a malformed request --
+        // and hid the signed half of Core's guard entirely.
+        let height_i = Self::core_get_i32(&height)?;
+        if height_i < 0 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Block height out of range",
+            ));
+        }
+        let height = height_i as u32;
+
         let state = self.state.read().await;
         let store = BlockStore::new(&state.db);
 
@@ -5034,9 +5103,20 @@ impl RustoshiRpcServer for RpcServerImpl {
         })
     }
 
-    async fn get_block(&self, hash: String, verbosity: Option<u8>) -> RpcResult<Box<serde_json::value::RawValue>> {
+    async fn get_block(&self, hash: String, verbosity: Option<serde_json::Value>) -> RpcResult<Box<serde_json::value::RawValue>> {
         let block_hash = Self::parse_hash(&hash)?;
-        let verbosity = verbosity.unwrap_or(1);
+        // getInt<int> before the block lookup: an out-of-int32 verbosity was
+        // refused at DESERIALIZATION with -32602 where Core answers -1.
+        let verbosity: u8 = match verbosity {
+            None | Some(serde_json::Value::Null) => 1,
+            Some(ref v) => {
+                let n = Self::core_get_i32(v)?;
+                // Beyond the meaningful range Core still converts, then treats
+                // it as the top verbosity; clamp AFTER the conversion so the
+                // ordering stays Core's.
+                n.clamp(0, 3) as u8
+            }
+        };
 
         // Helper to wrap a serialized JSON string as a RawValue.
         let raw = |s: String| {
@@ -6056,6 +6136,16 @@ impl RustoshiRpcServer for RpcServerImpl {
         let blockcount: i64 = match nblocks {
             None => default_blockcount.min(height_i - 1).max(0),
             Some(n) => {
+                // getInt<int> fails in the CONVERSION, so an out-of-int32
+                // nblocks never reaches the domain test below. `i64` here
+                // deserializes all four hostile widths happily, which is why
+                // this one answered -8 rather than -32602.
+                if n < i64::from(i32::MIN) || n > i64::from(i32::MAX) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_MISC_ERROR,
+                        "JSON integer out of range",
+                    ));
+                }
                 if n < 0 || (n > 0 && n >= height_i) {
                     return Err(Self::rpc_error(
                         rpc_error::RPC_INVALID_PARAMETER,
@@ -6653,8 +6743,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             None => 0,
             Some(serde_json::Value::Bool(false)) => 0,
             Some(serde_json::Value::Bool(true)) => 1,
-            Some(serde_json::Value::Number(n)) => {
-                n.as_u64().unwrap_or(0).min(255) as u8
+            Some(v @ serde_json::Value::Number(_)) => {
+                // Core reads verbosity with getInt<int>, and the conversion
+                // runs before the tx lookup. `as_u64().unwrap_or(0)` silently
+                // turned every out-of-range value into 0 and then answered -5
+                // "No such mempool or blockchain transaction".
+                Self::core_get_i32(v)?.clamp(0, 255) as u8
             }
             Some(_) => 0,
         };
@@ -9697,9 +9791,14 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_tx_out(
         &self,
         txid: String,
-        vout: u32,
+        vout: serde_json::Value,
         include_mempool: Option<bool>,
     ) -> RpcResult<Option<Box<serde_json::value::RawValue>>> {
+        // Core reads `n` as getInt<uint32_t>: a negative vout is a CONVERSION
+        // failure, not a lookup miss, and 2147483648 is a VALID vout. Typing
+        // this `u32` made serde reject the whole call as -32602 "Invalid
+        // params" -- a supplied argument reported as a malformed request.
+        let vout = Self::core_get_u32(&vout)?;
         // Helper: wrap a raw JSON string as a boxed RawValue.
         let raw = |s: String| -> Box<serde_json::value::RawValue> {
             serde_json::value::RawValue::from_string(s)
@@ -9814,9 +9913,16 @@ impl RustoshiRpcServer for RpcServerImpl {
         &self,
         subnet: String,
         command: String,
-        bantime: Option<u64>,
+        bantime: Option<serde_json::Value>,
         absolute: Option<bool>,
     ) -> RpcResult<()> {
+        // Core reads bantime as getInt<int64_t> and has NO positivity check:
+        // 0 means "use the default" and a negative relative bantime records an
+        // already-expired ban. Typing this `u64` refused both with -32602.
+        let bantime: Option<i64> = match bantime {
+            None | Some(serde_json::Value::Null) => None,
+            Some(ref v) => Some(Self::core_get_i64(v)?),
+        };
         // Parse IP address (we don't support subnets yet, just IPs).
         // Core's `setban` raises RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) with the
         // exact message "Error: Invalid IP/Subnet" when the subnet/IP argument
@@ -9834,9 +9940,31 @@ impl RustoshiRpcServer for RpcServerImpl {
         if let Some(ref mut pm) = peer_state.peer_manager {
             match command.as_str() {
                 "add" => {
-                    // Default ban time is 24 hours (86400 seconds)
-                    let duration_secs = bantime.unwrap_or(86400);
-                    let duration = std::time::Duration::from_secs(duration_secs);
+                    // Default ban time is 24 hours (86400 seconds); Core reads
+                    // bantime 0 as "use the default" too.
+                    let raw = match bantime {
+                        None | Some(0) => 86400_i64,
+                        Some(b) => b,
+                    };
+                    let is_absolute = absolute.unwrap_or(false);
+                    // Core refuses an ABSOLUTE bantime already in the past
+                    // (strictly banTime < GetTime()) instead of recording an
+                    // already-expired ban. Found by the differential CONTROL.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    if is_absolute && raw < now {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_INVALID_PARAMETER,
+                            "Error: Absolute timestamp is in the past",
+                        ));
+                    }
+                    // ban_ip takes a DURATION; an absolute timestamp must be
+                    // converted, not passed through as a length of time.
+                    let duration_secs = if is_absolute { raw - now } else { raw };
+                    let duration =
+                        std::time::Duration::from_secs(duration_secs.max(0) as u64);
                     let reason = if absolute.unwrap_or(false) {
                         "manually banned (absolute)".to_string()
                     } else {
@@ -10725,7 +10853,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         &self,
         inputs: Vec<CreatePsbtInput>,
         outputs: Vec<serde_json::Value>,
-        locktime: Option<u32>,
+        locktime: Option<serde_json::Value>,
         replaceable: Option<bool>,
         version: Option<serde_json::Value>,
     ) -> RpcResult<String> {
@@ -10733,7 +10861,25 @@ impl RustoshiRpcServer for RpcServerImpl {
         let state = self.state.read().await;
 
         // Build the unsigned transaction
-        let lock_time = locktime.unwrap_or(0);
+        // Core reads locktime with getInt<int64_t> and then bounds it:
+        //   if (nLockTime < 0 || nLockTime > LOCKTIME_MAX) throw -8
+        //     "Invalid parameter, locktime out of range"
+        // (rawtransaction_util.cpp ConstructTransaction). All four hostile
+        // widths are valid int64 and therefore reach that -8 -- but typing
+        // this `u32` made serde refuse the call with -32602 first.
+        let lock_time: u32 = match locktime {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(ref v) => {
+                let n = Self::core_get_i64(v)?;
+                if n < 0 || n > i64::from(u32::MAX) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Invalid parameter, locktime out of range",
+                    ));
+                }
+                n as u32
+            }
+        };
         // FIX-70 / W120 BUG-2: Core's `createpsbt` defaults `rbf` to TRUE (see
         // bitcoin-core/src/rpc/rawtransaction.cpp::createpsbt — std::optional<bool>
         // rbf is unset when param is null and then `rbf.value_or(true)` is applied
@@ -12290,8 +12436,15 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn disconnect_node(
         &self,
         address: Option<String>,
-        nodeid: Option<u32>,
+        nodeid: Option<serde_json::Value>,
     ) -> RpcResult<()> {
+        // Core reads nodeid as getInt<int64_t>, so 4294967296 is a legal id
+        // that simply is not connected (-29). Typing this `u32` made serde
+        // refuse the call with -32602 before the peer table was consulted.
+        let nodeid: Option<i64> = match nodeid {
+            None | Some(serde_json::Value::Null) => None,
+            Some(ref v) => Some(Self::core_get_i64(v)?),
+        };
         if address.is_none() && nodeid.is_none() {
             return Err(Self::rpc_error(
                 rpc_error::RPC_INVALID_PARAMS,
@@ -12530,8 +12683,11 @@ impl RustoshiRpcServer for RpcServerImpl {
     ) -> RpcResult<bool> {
         if let Some(d) = dummy {
             if d != 0.0 {
+                // Core throws RPC_INVALID_PARAMETER (-8), not the JSON-RPC
+                // transport code -32602 (rpc/mining.cpp). The MESSAGE already
+                // matched exactly, which is why only comparing codes caught it.
                 return Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
+                    rpc_error::RPC_INVALID_PARAMETER,
                     "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.",
                 ));
             }
@@ -12983,10 +13139,13 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn create_multisig(
         &self,
-        nrequired: u32,
+        nrequired: serde_json::Value,
         keys: Vec<String>,
         address_type: Option<String>,
     ) -> RpcResult<CreateMultisigResult> {
+        // The conversion runs before the key-count checks: Core answers -1 for
+        // an out-of-int32 nrequired even when pubkeys is ALSO empty.
+        let nrequired = Self::core_get_i32(&nrequired)?;
         use rustoshi_crypto::{
             address::{Address, Network},
             hash160, sha256,
@@ -18046,6 +18205,84 @@ mod tests {
                 "int32 boundary value {v} must be ACCEPTED"
             );
         }
+    }
+
+    // ==================================================================
+    // #41: the CONVERSION runs before the lookup -- and typing an RPC
+    // parameter in the jsonrpsee trait moves the error to the wrong place.
+    //
+    // #81 fixed the arguments rustoshi ACCEPTED out of range. This is the
+    // other half. Measured against a regtest Core oracle
+    // (tools/rpc-arg-differential.py): 35 findings + 1 control failure, the
+    // largest residue in the fleet, and MOST OF IT WAS ONE ROOT CAUSE.
+    //
+    // `height: u32`, `vout: u32`, `nrequired: u32`, `nodeid: Option<u32>`,
+    // `bantime: Option<u64>`, `locktime: Option<u32>` in the #[rpc] trait mean
+    // SERDE rejects the whole CALL: jsonrpsee answers
+    // -32602 "Invalid params" before the handler ever runs. An argument the
+    // caller SUPPLIED is reported as a malformed request -- the same lie
+    // haskoin told with "Missing height parameter", arriving by a different
+    // route. Reading the raw Value and converting in the handler is what puts
+    // the error back where Core puts it.
+    //
+    // Three more were ordering or code-only:
+    //   getchaintxstats <nblocks>  -8 domain test ran before the width check
+    //   getrawtransaction <verb>   as_u64().unwrap_or(0) SILENTLY became 0,
+    //                              then answered -5 from the tx lookup
+    //   prioritisetransaction      right MESSAGE, wrong CODE (-32602 vs -8)
+    //
+    // TEETH: the controls assert the int32/uint32 BOUNDARY values still
+    // convert (a bound off by one in the tight direction would reject half the
+    // legal vout range), and that a converting-but-illegal value still reaches
+    // the handler's own domain error rather than the conversion error.
+
+    #[test]
+    fn test_core_get_i32_rejects_out_of_int32() {
+        for v in OUT_OF_INT32 {
+            let (code, msg) = err_of(RpcServerImpl::core_get_i32(&serde_json::json!(v)));
+            assert_eq!(
+                (code, msg.as_str()),
+                (rpc_error::RPC_MISC_ERROR, "JSON integer out of range"),
+                "getInt<int> must refuse {v} in the CONVERSION"
+            );
+        }
+    }
+
+    #[test]
+    fn test_core_get_u32_refuses_any_sign() {
+        // from_chars accepts NO SIGN for an unsigned destination, so a
+        // negative vout is a CONVERSION failure, not a lookup miss.
+        for v in [-1i64, -2147483649, 4294967296, -4294967297] {
+            let (code, msg) = err_of(RpcServerImpl::core_get_u32(&serde_json::json!(v)));
+            assert_eq!(
+                (code, msg.as_str()),
+                (rpc_error::RPC_MISC_ERROR, "JSON integer out of range"),
+                "getInt<uint32_t> must refuse {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_control_int32_and_uint32_boundaries_convert() {
+        // A bound off by one in the tight direction would reject these.
+        for v in [2147483647i64, -2147483648] {
+            assert_eq!(RpcServerImpl::core_get_i32(&serde_json::json!(v)).unwrap(), v as i32);
+        }
+        for v in [0i64, 2147483648, 4294967295] {
+            assert_eq!(
+                RpcServerImpl::core_get_u32(&serde_json::json!(v)).unwrap(),
+                v as u32,
+                "{v} is a VALID uint32 vout and must survive the conversion"
+            );
+        }
+    }
+
+    #[test]
+    fn test_core_get_int_type_error_on_non_number() {
+        // Core's getInt on a non-number is a TYPE error (-3), not the range
+        // error -- the two must not be collapsed.
+        let (code, _) = err_of(RpcServerImpl::core_get_i32(&serde_json::json!("7")));
+        assert_eq!(code, rpc_error::RPC_TYPE_ERROR);
     }
 
     #[test]
@@ -23556,7 +23793,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, Some(0), Some(true), None)
+            .createpsbt(inputs, outputs, Some(serde_json::json!(0)), Some(true), None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -23580,7 +23817,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, Some(0), Some(false), None)
+            .createpsbt(inputs, outputs, Some(serde_json::json!(0)), Some(false), None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -23604,7 +23841,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, Some(500_000), Some(false), None)
+            .createpsbt(inputs, outputs, Some(serde_json::json!(500_000)), Some(false), None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -24504,7 +24741,7 @@ mod tests {
 
         // gettxout(txid)
         for bad in [&short, &nonhex] {
-            let err = RustoshiRpcServer::get_tx_out(&server, bad.clone(), 0, None)
+            let err = RustoshiRpcServer::get_tx_out(&server, bad.clone(), serde_json::json!(0), None)
                 .await
                 .expect_err("malformed txid must error");
             assert_eq!(
@@ -24597,7 +24834,7 @@ mod tests {
         );
 
         // gettxout: absent → Ok(None) (JSON null), NOT an error.
-        let out = RustoshiRpcServer::get_tx_out(&server, zero.clone(), 0, None)
+        let out = RustoshiRpcServer::get_tx_out(&server, zero.clone(), serde_json::json!(0), None)
             .await
             .expect("gettxout on absent outpoint returns null, not an error");
         assert!(
