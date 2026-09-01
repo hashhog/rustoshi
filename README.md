@@ -14,6 +14,8 @@ This starts rustoshi on mainnet with data persisted to a Docker volume. Ports 83
 
 ### Build from Source
 
+Requires Rust 1.74 or newer (pinned via `rust-version` in `Cargo.toml`) and `librocksdb-dev` (RocksDB headers/library).
+
 ```bash
 # Install dependencies (Debian/Ubuntu)
 sudo apt-get install -y build-essential librocksdb-dev
