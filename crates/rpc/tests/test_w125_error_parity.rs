@@ -502,7 +502,7 @@ async fn g19_disconnectnode_unknown_peer_emits_node_not_connected() {
     );
 
     // disconnect-by-nodeid for an id that is not connected → -29.
-    let err = RustoshiRpcServer::disconnect_node(&server, None, Some(424242))
+    let err = RustoshiRpcServer::disconnect_node(&server, None, Some(serde_json::json!(424242)))
         .await
         .expect_err("disconnectnode for an unknown nodeid must error");
     assert_eq!(
@@ -520,7 +520,7 @@ async fn g19_disconnectnode_unknown_peer_emits_node_not_connected() {
     let err = RustoshiRpcServer::disconnect_node(
         &server,
         Some(String::new()),
-        Some(424242),
+        Some(serde_json::json!(424242)),
     )
     .await
     .expect_err("disconnectnode \"\" <unknown-id> must error");
@@ -537,7 +537,7 @@ async fn g19_disconnectnode_unknown_peer_emits_node_not_connected() {
     let err = RustoshiRpcServer::disconnect_node(
         &server,
         Some("192.0.2.99:18333".to_string()),
-        Some(7),
+        Some(serde_json::json!(7)),
     )
     .await
     .expect_err("disconnectnode with both address and nodeid must error");
@@ -758,14 +758,16 @@ async fn g29_getblockhash_oor_emits_invalid_parameter() {
     let server = RpcServerImpl::new(state, peer_state);
 
     // height 0 (genesis) is valid → returns a 64-hex hash, not an error.
-    let ok = RustoshiRpcServer::get_block_hash(&server, 0)
+    // Since f4781114 (#41) the trait takes serde_json::Value so the handler,
+    // not the deserializer, converts the integer (Core's getInt<T> shape).
+    let ok = RustoshiRpcServer::get_block_hash(&server, serde_json::json!(0))
         .await
         .expect("getblockhash(0) must succeed for genesis");
     assert_eq!(ok.len(), 64, "genesis block hash must be 64 hex chars, got {:?}", ok);
 
     // Out-of-range height (way past the tip) → Core's RPC_INVALID_PARAMETER (-8)
     // with the exact Core message, NOT the JSON-RPC transport code -32602.
-    let err = RustoshiRpcServer::get_block_hash(&server, 999_999)
+    let err = RustoshiRpcServer::get_block_hash(&server, serde_json::json!(999_999))
         .await
         .expect_err("getblockhash for out-of-range height must error");
     assert_eq!(
