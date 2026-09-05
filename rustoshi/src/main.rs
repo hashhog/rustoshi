@@ -579,9 +579,16 @@ fn apply_assumevalid_override(params: &mut ChainParams, value: &str) -> anyhow::
     if is_zero {
         params.assumed_valid_block = None;
         params.assumed_valid_height = None;
-        tracing::info!(
-            "assumevalid DISABLED via --assumevalid=0: full script verification of all history"
-        );
+        // NO logging here, on purpose. `apply_assumevalid_override` is called
+        // from `async_main` BEFORE `tracing_subscriber::...init()` (see the
+        // "LOGGING SETUP" block below), so a `tracing::` event emitted at this
+        // point has no global subscriber installed and is silently DROPPED --
+        // it reaches neither stdout nor debug.log. That is exactly why the
+        // 2026-09-05 boundary-campaign run recorded `ack=n/a` for rustoshi
+        // despite a real `--assumevalid=0` launch: the flag WAS honoured, the
+        // banner just never made it to a sink. The operator-visible banner now
+        // lives after logging init and is read off the EFFECTIVE `params`, so
+        // it cannot assert something the skip gate does not actually do.
         return Ok(());
     }
 
@@ -593,9 +600,14 @@ fn apply_assumevalid_override(params: &mut ChainParams, value: &str) -> anyhow::
     })?;
     params.assumed_valid_block = Some(hash);
     params.assumed_valid_height = None;
-    tracing::warn!(
-        "custom --assumevalid hash set but no paired height is known; assumevalid skip stays \
-         DISABLED (fail-safe full verification)"
+    // `eprintln!`, not `tracing::warn!`, for the same pre-subscriber reason as
+    // the zero branch above: this runs before logging init, so a tracing event
+    // here would be dropped and the operator would never see the warning. The
+    // file already uses bare `eprintln!` for pre-init diagnostics (see the
+    // `-debug: unknown category` path in `async_main`).
+    eprintln!(
+        "rustoshi: custom --assumevalid hash set but no paired height is known; \
+         assumevalid skip stays DISABLED (fail-safe full verification)"
     );
     Ok(())
 }
@@ -2446,6 +2458,36 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     tracing::info!("Network: {:?}", params.network_id);
     tracing::info!("Genesis: {}", params.genesis_hash);
+
+    // ---------- SCRIPTS-ON EVIDENCE BANNER ----------
+    //
+    // Read off the EFFECTIVE `params` -- the very binding the connect loop
+    // hands to `compute_skip_scripts` (see the two call sites in the
+    // validation-interval and P2P-drain arms below), which forwards it to
+    // `rustoshi_consensus::should_skip_scripts`. That gate's condition 1
+    // returns `false` the moment either `assumed_valid_block` or
+    // `assumed_valid_height` is `None`, so with both cleared EVERY connected
+    // block has all of its input scripts verified. `params` is never rebuilt
+    // after `apply_assumevalid_override` ran above; the clones handed to
+    // `ChainState::new`, `RpcState`, and `PeerManager::new_with_netgroup` all
+    // carry the cleared fields.
+    //
+    // The `cli.assumevalid.is_some()` conjunct is what makes this line
+    // DISCRIMINATING rather than decorative: regtest has no built-in
+    // assumevalid at all, so the effective-params test alone would print on a
+    // plain regtest run and prove nothing. Both halves together say "the flag
+    // was supplied AND it reached the params the gate reads".
+    //
+    // Consumed by the boundary campaign's ack check:
+    // tools/lib/campaign-impl-lib.sh `_campaign_scripts_on_ack_re` (meta-repo).
+    if cli.assumevalid.is_some()
+        && params.assumed_valid_block.is_none()
+        && params.assumed_valid_height.is_none()
+    {
+        tracing::info!(
+            "assumevalid DISABLED (--assumevalid=0): verifying ALL scripts from genesis"
+        );
+    }
 
     // ---------- PID FILE ----------
     let pid_path = match &cli.pidfile {
