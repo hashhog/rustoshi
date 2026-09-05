@@ -2803,15 +2803,62 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("snapshot header parse: {}", e))?;
 
         let blockhash = reader.metadata().base_blockhash;
-        let assume = params
-            .assumeutxo_for_blockhash(&blockhash)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
+        // HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from the
+        // chainparams assumeutxo whitelist. Core (and this node by default)
+        // only accepts snapshots whose base blockhash is a hardcoded trust
+        // anchor, because loadtxoutset is a trust shortcut for end users.
+        // Setting this variable to the snapshot's base height accepts ANY
+        // snapshot and takes that height on faith -- it exists so the fleet
+        // can validate arbitrary block ranges in parallel from a locally
+        // generated snapshot ladder, where correctness is established by
+        // checking the range's OUTPUT utxo hash against an independent
+        // commitment, not by trusting the input. ONLY the whitelist
+        // membership requirement and its paired hardcoded `hash_serialized`
+        // comparison are bypassed; snapshot format, magic, coin count,
+        // per-coin parsing and the trailing-data guard all still run.
+        // Unset (the default, and what ships) = unchanged Core-equivalent
+        // behaviour.
+        let unsafe_snapshot_height = std::env::var("HASHHOG_UNSAFE_SNAPSHOT_HEIGHT").ok();
+        let whitelisted = params.assumeutxo_for_blockhash(&blockhash).cloned();
+        let whitelist_bypassed = whitelisted.is_none() && unsafe_snapshot_height.is_some();
+        let assume = match (whitelisted, unsafe_snapshot_height.as_deref()) {
+            (Some(entry), _) => entry,
+            (None, Some(raw)) => {
+                let height: u32 = raw.trim().parse().map_err(|e| {
+                    anyhow::anyhow!(
+                        "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT={:?} is not a block height: {}",
+                        raw,
+                        e
+                    )
+                })?;
+                tracing::warn!(
+                    "*** UNVERIFIED SNAPSHOT ACCEPTED *** HASHHOG_UNSAFE_SNAPSHOT_HEIGHT={} \
+                     bypassed the assumeutxo whitelist: base blockhash {} is NOT a chainparams \
+                     trust anchor, so its hardcoded hash_serialized commitment does not exist \
+                     and was NOT checked. Base height {} is taken on faith from the \
+                     environment. DEVELOPMENT ONLY -- never enable this in production.",
+                    height,
+                    blockhash.to_hex(),
+                    height
+                );
+                rustoshi_consensus::AssumeutxoData {
+                    height,
+                    blockhash,
+                    // No trust anchor exists for this base; the comparison
+                    // below is skipped via `whitelist_bypassed`.
+                    hash_serialized: rustoshi_consensus::AssumeutxoHash(Hash256::ZERO),
+                    chain_tx_count: 0,
+                    base_mtp: None,
+                    base_tail_headers: Vec::new(),
+                }
+            }
+            (None, None) => {
+                return Err(anyhow::anyhow!(
                     "snapshot blockhash {} not in chainparams.assumeutxo_data",
                     blockhash.to_hex()
-                )
-            })?;
+                ));
+            }
+        };
         let coins_total = reader.metadata().coins_count;
         tracing::info!(
             "Snapshot recognized: height={} coins={} expected_hash={}",
@@ -2926,7 +2973,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let computed_legacy = finalize_sha256d(legacy_hasher);
         let computed_core = finalize_sha256d(core_hasher);
         let expected = assume.hash_serialized.0;
-        if computed_legacy != expected && computed_core != expected {
+        // The hardcoded `hash_serialized` comparison is the other half of the
+        // whitelist trust anchor, so it is skipped -- and only it -- when
+        // HASHHOG_UNSAFE_SNAPSHOT_HEIGHT accepted a non-whitelisted base.
+        if !whitelist_bypassed && computed_legacy != expected && computed_core != expected {
             return Err(anyhow::anyhow!(
                 "snapshot txoutset_hash mismatch: computed {} (core form; legacy form was {}) expected {}",
                 computed_core.to_hex(),
