@@ -290,6 +290,18 @@ pub struct RpcState {
     /// it WITHOUT holding the `RpcState` lock (the lock is only taken to read
     /// the tip each wake). See `crate::tip_notifier`.
     pub tip_notifier: Arc<crate::tip_notifier::TipNotifier>,
+    /// Force-flush handshake with the owner of the live UTXO write-back
+    /// cache (the P2P connect loop in `rustoshi/src/main.rs`).
+    ///
+    /// rustoshi's UTXO-set surfaces (`gettxoutsetinfo`, `dumptxoutset`)
+    /// iterate `CF_UTXO` straight out of RocksDB, so they see only what has
+    /// been FLUSHED. Bitcoin Core's equivalents call
+    /// `ForceFlushStateToDisk(/*wipe_cache=*/false)` first
+    /// (`rpc/blockchain.cpp:1075` and `:3257` inside `PrepareUTXOSnapshot`);
+    /// this is how the RPC thread asks for the same thing across the task
+    /// boundary. Unarmed by default, which makes the wait a no-op on nodes
+    /// that have no connect loop (unit tests, RPC-only harnesses).
+    pub chainstate_flush: Arc<rustoshi_storage::ChainstateFlushSignal>,
 }
 
 /// Select the mempool configuration appropriate for `network`.
@@ -369,6 +381,7 @@ impl RpcState {
             blockfilterindex_enabled: false,
             chainstate_manager: ChainstateManager::new(),
             tip_notifier: crate::tip_notifier::TipNotifier::shared(),
+            chainstate_flush: Arc::new(rustoshi_storage::ChainstateFlushSignal::new()),
         }
     }
 
@@ -404,6 +417,7 @@ impl RpcState {
             blockfilterindex_enabled: false,
             chainstate_manager: ChainstateManager::new(),
             tip_notifier: crate::tip_notifier::TipNotifier::shared(),
+            chainstate_flush: Arc::new(rustoshi_storage::ChainstateFlushSignal::new()),
         }
     }
 
@@ -1811,6 +1825,102 @@ impl RpcServerImpl {
             peer_state,
             zmq_notifier: None,
         }
+    }
+
+    /// Force the live chainstate (dirty coins + the tip pointer that names
+    /// them) to disk, so a UTXO-set read that iterates `CF_UTXO` sees the
+    /// state AT THE CURRENT TIP.
+    ///
+    /// Mirrors Bitcoin Core's `ForceFlushStateToDisk(/*wipe_cache=*/false)`,
+    /// which BOTH UTXO-set surfaces call before they touch `CoinsDB()`:
+    ///   * `gettxoutsetinfo` — `rpc/blockchain.cpp:1075`, immediately before
+    ///     `GetUTXOStats(&active_chainstate.CoinsDB(), ...)`;
+    ///   * `dumptxoutset`    — `rpc/blockchain.cpp:3257`, inside
+    ///     `PrepareUTXOSnapshot`, before the stats pass and the coins cursor.
+    ///
+    /// Core does it inline under `cs_main`. rustoshi cannot: the write-back
+    /// coin cache is a `&mut` local owned by the P2P connect loop
+    /// (`rustoshi/src/main.rs`), and these handlers only hold an
+    /// `Arc<ChainDb>`. So this hands the request across the task boundary via
+    /// [`ChainstateFlushSignal`](rustoshi_storage::ChainstateFlushSignal) and
+    /// waits for the connect loop to commit the atomic UTXO+tip batch.
+    ///
+    /// Without it, everything the connect loop has not yet flushed is
+    /// invisible here. The connect loop's schedule (cache CRITICAL/LARGE,
+    /// every 2000 blocks, every 60 min, or on reaching the announced header
+    /// tip) is deliberately coarse, so a short P2P range — measured
+    /// 2026-09-05 on ladder range 91,795 -> 91,825 — trips none of it: the
+    /// tip was correct at 91,825 while `gettxoutsetinfo` still hashed the
+    /// 91,795 coin set. A stale set reported under a fresh tip is worse than
+    /// a plain error: it reads as a consensus divergence.
+    ///
+    /// Best-effort by construction. An UNARMED signal (no connect loop —
+    /// unit tests, RPC-only harnesses, `submitblock`-driven rigs whose own
+    /// path already flushes per block) returns immediately, and so does a
+    /// timeout; the caller then reports the coins DB's OWN best block
+    /// alongside its coin set (see [`Self::coins_db_tip`]), so the answer
+    /// stays internally consistent rather than mislabelled.
+    async fn force_flush_chainstate_to_disk(&self) {
+        /// How long to wait for the connect loop to service the request. It
+        /// services between blocks on a 100 ms tick, so this is orders of
+        /// magnitude of headroom; it exists only so a wedged loop cannot
+        /// hang an RPC forever.
+        const FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+        // Clone the handle out from under the lock and DROP the guard before
+        // awaiting: the connect loop takes the `RpcState` WRITE lock on every
+        // block-connect, so holding a read guard across this wait would
+        // deadlock against the very loop we are waiting on.
+        let signal = { self.state.read().await.chainstate_flush.clone() };
+        if !signal.is_armed() {
+            return;
+        }
+        let ticket = signal.request();
+        let started = std::time::Instant::now();
+        let mut backoff = std::time::Duration::from_millis(2);
+        while !signal.is_satisfied(ticket) {
+            if started.elapsed() >= FLUSH_WAIT {
+                tracing::warn!(
+                    "force-flush of the chainstate was not serviced within {:?}; \
+                     reporting the UTXO set at the coins DB's own best block",
+                    FLUSH_WAIT
+                );
+                return;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// The best block of the COINS DB — the block whose UTXO set is actually
+    /// on disk — or `None` when the pointer is absent or unset.
+    ///
+    /// This is what Core reports, and it is deliberately NOT the in-memory
+    /// tip. `ComputeUTXOStats` seeds its result from the cursor it is about
+    /// to iterate:
+    ///
+    /// ```text
+    ///   pcursor = view->Cursor();
+    ///   pindex  = blockman.LookupBlockIndex(pcursor->GetBestBlock());
+    ///   CCoinsStats stats{pindex->nHeight, pindex->GetBlockHash()};
+    /// ```
+    /// (`kernel/coinstats.cpp:147-157`)
+    ///
+    /// so `height`/`bestblock` always describe the very set being hashed.
+    /// Reading them from the in-memory tip instead is what turns a
+    /// not-yet-flushed cache into a mismatching-but-plausible pair. The
+    /// force-flush above normally makes the two equal; this keeps the answer
+    /// honest in the window where a block connects between the flush and the
+    /// scan, and when no connect loop is there to service the flush at all.
+    fn coins_db_tip(store: &BlockStore<'_>) -> Option<(Hash256, u32)> {
+        let hash = store.get_best_block_hash().ok().flatten()?;
+        // A fresh datadir seeds META_BEST_BLOCK_HASH with 32 zero bytes
+        // (`db.rs`), which names no block; fall back to the caller's tip.
+        if hash == Hash256::ZERO {
+            return None;
+        }
+        let height = store.get_best_height().ok().flatten()?;
+        Some((hash, height))
     }
 
     /// Create a new RPC server implementation with ZMQ notifications.
@@ -13376,6 +13486,16 @@ impl RustoshiRpcServer for RpcServerImpl {
         // `options` is an object that may contain `{"rollback": <h | hash>}`.
         let snap_type = snapshot_type.unwrap_or_default();
 
+        // Core: `PrepareUTXOSnapshot` force-flushes before it takes the stats
+        // and the coins cursor (`rpc/blockchain.cpp:3257`). Do it FIRST here,
+        // before any lock is taken, for two reasons: the "latest" dump below
+        // iterates `CF_UTXO` straight off disk and would otherwise capture the
+        // last FLUSHED height rather than the tip; and the rollback dance needs
+        // a complete starting point, because it rewinds through its own store
+        // view, which cannot see coins still sitting in the connect loop's
+        // cache.
+        self.force_flush_chainstate_to_disk().await;
+
         // Snapshot the tip metadata up-front; needed for both rollback target
         // resolution and the "latest" fast path. The rollback path needs a
         // write lock once it actually mutates the chainstate; we acquire that
@@ -13611,8 +13731,19 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Tip metadata. `tip_height` was bound at the top of the method so the
         // rollback-target resolver could see it; rebinding the hash + index
         // here keeps the rest of the body unchanged.
+        //
+        // The base reported for the dump is the COINS DB's own best block, not
+        // the in-memory tip — Core takes it from the cursor it is about to
+        // iterate (`WriteUTXOSnapshot`'s `tip` comes from
+        // `maybe_stats->hashBlock`, itself `pcursor->GetBestBlock()`), so the
+        // metadata can never name a height whose coins are not in the file.
+        // The force-flush at the top of this method normally makes the two
+        // equal; this is what keeps them equal when it could not run.
         let store = BlockStore::new(&state.db);
-        let tip_hash = state.best_hash;
+        let (tip_hash, tip_height) = match Self::coins_db_tip(&store) {
+            Some(pair) => pair,
+            None => (state.best_hash, tip_height),
+        };
         let tip_index = store
             .get_block_index(&tip_hash)
             .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
@@ -14042,9 +14173,25 @@ impl RustoshiRpcServer for RpcServerImpl {
         use_index: Option<bool>,
     ) -> RpcResult<serde_json::Value> {
         use rustoshi_storage::CoinStatsIndex;
+
+        // Core force-flushes the active chainstate before it reads `CoinsDB()`
+        // (`rpc/blockchain.cpp:1075`), unconditionally and ahead of every
+        // parameter check — so do it here, before the state lock is taken.
+        // rustoshi's full-scan path below iterates `CF_UTXO` straight out of
+        // RocksDB, which sees only FLUSHED coins; without this it answers with
+        // the last flushed set while labelling it with the live tip.
+        self.force_flush_chainstate_to_disk().await;
+
         let state = self.state.read().await;
+        // The ACTIVE-CHAIN tip. Core's `ParseHashOrHeight` range-checks a
+        // requested height against `chainman.ActiveChain().Height()`, and the
+        // coinstatsindex fast path answers for the active tip after
+        // `BlockUntilSyncedToCurrentChain()` — both are chain questions, not
+        // coins-DB questions, so they keep using this.
         let height = state.best_height;
-        let best_hash = state.best_hash;
+        // Fallback label for the full-scan path when the coins DB carries no
+        // best-block pointer yet (fresh datadir).
+        let best_hash_at_entry = state.best_hash;
 
         // Default per Core: hash_serialized_3 (set in rpc/blockchain.cpp:1017
         // RPCArg::Default{"hash_serialized_3"}).
@@ -14363,9 +14510,27 @@ impl RustoshiRpcServer for RpcServerImpl {
         // assignments, putting the hash at the very end and `transactions`
         // ahead of `total_amount`. With `preserve_order` the Map insertion
         // order is the wire order, so we insert in Core's exact sequence.
+        // `height` / `bestblock` must describe the set that was just hashed, so
+        // they come from the COINS DB's own best block. Core seeds `CCoinsStats`
+        // from the cursor it is about to iterate —
+        //   `pindex = blockman.LookupBlockIndex(pcursor->GetBestBlock());`
+        //   `CCoinsStats stats{pindex->nHeight, pindex->GetBlockHash()};`
+        // (`kernel/coinstats.cpp:147-157`) — never from the in-memory tip.
+        // The force-flush at the top of this method normally makes the two
+        // equal; taking them from the coins DB is what keeps the triple
+        // coherent when it could not (a block connecting between the flush and
+        // this scan, or no connect loop armed to service the flush at all).
+        // Reporting the live tip over an older set is the failure mode that
+        // reads as a consensus divergence.
+        let (scanned_hash, scanned_height) =
+            Self::coins_db_tip(&BlockStore::new(&state.db))
+                .unwrap_or((best_hash_at_entry, height));
         let mut result = serde_json::Map::new();
-        result.insert("height".to_string(), serde_json::json!(height));
-        result.insert("bestblock".to_string(), serde_json::json!(best_hash.to_hex()));
+        result.insert("height".to_string(), serde_json::json!(scanned_height));
+        result.insert(
+            "bestblock".to_string(),
+            serde_json::json!(scanned_hash.to_hex()),
+        );
         result.insert("txouts".to_string(), serde_json::json!(txouts));
         result.insert("bogosize".to_string(), serde_json::json!(bogosize));
         if let Some(hex_str) = hash_serialized_hex {

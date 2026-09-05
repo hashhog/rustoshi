@@ -44,6 +44,7 @@ pub mod block_store;
 pub mod blockstore;
 pub mod columns;
 pub mod db;
+pub mod flush_signal;
 pub mod header_context;
 pub mod indexes;
 pub mod prune;
@@ -66,6 +67,7 @@ pub use prune::{auto_prune, manual_prune_to_height, PruneCoordConfig, PruneOutco
 pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;
 pub use db::{ChainDb, StorageError, CURRENT_DB_VERSION};
+pub use flush_signal::ChainstateFlushSignal;
 pub use header_context::{
     diffbits_gate_for_header, expected_bits_for_child, window_floor, DiffBitsGate,
     ExpectedBitsError, HeaderCache, HeaderMeta, HeaderProvider, IndexedBlock,

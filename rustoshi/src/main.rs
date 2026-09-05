@@ -3214,6 +3214,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // Force-flush handshake between the RPC handlers and this loop, which
+    // owns the only write-back UTXO cache. `gettxoutsetinfo` / `dumptxoutset`
+    // read `CF_UTXO` off disk, so they need the cache down first — Bitcoin
+    // Core does the same with `ForceFlushStateToDisk(/*wipe_cache=*/false)`
+    // (`rpc/blockchain.cpp:1075`, and `:3257` in `PrepareUTXOSnapshot`).
+    // Armed just before the event loop starts servicing it.
+    let flush_signal = Arc::new(rustoshi_storage::ChainstateFlushSignal::new());
+    rpc_state_inner.chainstate_flush = flush_signal.clone();
+
     let rpc_state = Arc::new(RwLock::new(rpc_state_inner));
 
     // Build the prune coordinator config once. Re-used by every
@@ -3804,6 +3813,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // `block_store` immutably.
     let header_diffbits_cache = std::cell::RefCell::new(rustoshi_storage::HeaderCache::default());
 
+    // From here on this loop services force-flush requests from the RPC
+    // handlers (see the `flush_signal` declaration above). Arming after every
+    // fallible setup step means a node that never reaches the loop leaves the
+    // signal unarmed, and the RPC-side wait degrades to a no-op instead of
+    // blocking for its full timeout.
+    flush_signal.arm();
+
     loop {
         tokio::select! {
             // Fast validation tick — process buffered blocks frequently.
@@ -3811,6 +3827,84 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             // Even if peer events dominate, this will statistically fire
             // ~50% of the time when both are ready.
             _ = validation_interval.tick() => {
+                // ============================================================
+                // FORCE-FLUSH SERVICE (Core `ForceFlushStateToDisk`)
+                // ============================================================
+                //
+                // Serviced HERE, at the top of the tick and before any block is
+                // connected, because this is a point where `utxo_view`,
+                // `pending_blocks` and `chain_state` are mutually consistent:
+                // no connect is half-done and no lock is held. The 100 ms tick
+                // bounds the latency an RPC caller sees.
+                //
+                // The scheduled flush triggers below (cache CRITICAL/LARGE,
+                // every UTXO_FLUSH_INTERVAL_BLOCKS blocks, every
+                // UTXO_FLUSH_INTERVAL_SECS, or on reaching the announced header
+                // tip) are tuned for IBD throughput and deliberately let coins
+                // sit in RAM. That is invisible to a node's own operation but
+                // NOT to `gettxoutsetinfo` / `dumptxoutset`, which iterate
+                // `CF_UTXO` off disk: on ladder range 91,795 -> 91,825
+                // (2026-09-05) none of the triggers fired — 30 blocks is far
+                // short of the block/time/size thresholds, and `at_header_tip`
+                // could not fire because the replay peer serves headers for the
+                // whole chain, so the header tip stayed ~866k blocks ahead —
+                // and the RPC answered with the 91,795 coin set under a 91,825
+                // tip.
+                if let Some(flush_seq) = flush_signal.pending() {
+                    let (mut tip_hash, mut tip_height) = {
+                        let cs = chain_state.read().await;
+                        (cs.tip_hash(), cs.tip_height())
+                    };
+                    // NEVER REGRESS the durable tip — same guard, and the same
+                    // reason, as the shutdown flush: blocks connected through
+                    // the RPC path (submitblock / generate*) persist their own
+                    // coins + tip pointer and do not advance this loop's
+                    // `chain_state`, so writing this view's tip unconditionally
+                    // would clobber a newer one.
+                    if let Ok(Some(persisted_height)) = block_store.get_best_height() {
+                        if persisted_height > tip_height {
+                            if let Ok(Some(persisted_hash)) = block_store.get_best_block_hash() {
+                                tip_hash = persisted_hash;
+                                tip_height = persisted_height;
+                            }
+                        }
+                    }
+                    let entries = utxo_view.cache_len();
+                    let had_work = entries > 0 || !pending_blocks.is_empty();
+                    // No retention prune on this path: it is demand-driven and
+                    // must stay cheap and predictable. `None` leaves the prune
+                    // watermark untouched so the contiguous sweep resumes
+                    // correctly on the next scheduled flush.
+                    match utxo_view.flush_with_tip_and_blocks(
+                        &tip_hash,
+                        tip_height,
+                        &pending_blocks,
+                        &[],
+                        None,
+                    ) {
+                        Ok(()) => {
+                            if had_work {
+                                tracing::info!(
+                                    "force-flush (RPC request): {} entries + {} blocks committed atomically with tip {} at height {}",
+                                    entries, pending_blocks.len(), tip_hash, tip_height
+                                );
+                            }
+                            pending_blocks.clear();
+                            blocks_since_flush = 0;
+                            last_flush_instant = std::time::Instant::now();
+                        }
+                        Err(e) => {
+                            // Do NOT clear `pending_blocks` / reset the flush
+                            // accounting — the scheduled path retries.
+                            tracing::error!("force-flush (RPC request) failed: {}", e);
+                        }
+                    }
+                    // Complete even on error: the caller labels its answer with
+                    // the coins DB's own best block, so it reports a coherent
+                    // (older) triple rather than hanging until its timeout.
+                    flush_signal.complete(flush_seq);
+                }
+
                 const MAX_BLOCKS_VALIDATE: usize = 8;
                 let mut blocks_validated = 0usize;
 
