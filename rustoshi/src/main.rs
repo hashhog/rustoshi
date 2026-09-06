@@ -13,7 +13,6 @@ use rand::RngCore;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::signal;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -3820,6 +3819,33 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // blocking for its full timeout.
     flush_signal.arm();
 
+    // Shutdown signal streams are created ONCE, here, and only `.recv()`ed
+    // inside the select! below.
+    //
+    // They used to be constructed inside the loop — `signal::ctrl_c()` and a
+    // fresh `signal(SignalKind::terminate())` per iteration. tokio::select!
+    // DROPS the futures of every branch that did not win, so a signal
+    // delivered while another branch was running was thrown away with its
+    // future, and the next iteration subscribed anew and never saw it. While
+    // the node was connecting blocks another branch won essentially every
+    // time, so SIGTERM was silently and permanently lost: measured six
+    // SIGTERMs over 220s ignored on a syncing node, with the handler
+    // demonstrably installed (SigCgt bit 15 set). The same node exits in
+    // 1-4s on the first SIGTERM once idle.
+    //
+    // The cost was not just an awkward stop: tools/stop_mainnet.sh sends
+    // SIGTERM, waits 30s, then SIGKILLs, so every restart of a syncing
+    // rustoshi took the SIGKILL path and discarded the graceful shutdown
+    // flush. Same failure class as the beamchain W10 SIGTERM incident
+    // recorded in CLAUDE.md.
+    //
+    // Held across iterations, a Signal stream latches delivery, so a signal
+    // arriving mid-iteration is still pending at the next select!.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| anyhow::anyhow!("failed to install SIGTERM handler: {e}"))?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|e| anyhow::anyhow!("failed to install SIGINT handler: {e}"))?;
+
     loop {
         tokio::select! {
             // Fast validation tick — process buffered blocks frequently.
@@ -7111,16 +7137,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             // Handle shutdown signal (Ctrl+C in foreground; SIGTERM under
             // daemon mode / supervisor).  Both produce a graceful shutdown.
-            _ = signal::ctrl_c() => {
-                tracing::info!("Received shutdown signal (Ctrl+C)");
+            _ = sigint.recv() => {
+                tracing::info!("Received shutdown signal (SIGINT/Ctrl+C)");
                 break;
             }
-            _ = async {
-                use tokio::signal::unix::{signal, SignalKind};
-                if let Ok(mut s) = signal(SignalKind::terminate()) {
-                    s.recv().await;
-                }
-            } => {
+            _ = sigterm.recv() => {
                 tracing::info!("Received shutdown signal (SIGTERM)");
                 break;
             }
