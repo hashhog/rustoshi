@@ -259,16 +259,31 @@ pub fn load_from_path(
             })?;
 
         // Refuse collisions with a built-in (production) entry: same height
-        // OR same block hash. Campaign data may never override a production
-        // hash.
-        if builtin
+        // OR same block hash with a DIFFERENT commitment. Campaign data may
+        // never override a production hash.
+        //
+        // An entry that is byte-identical to a built-in is not an override;
+        // it is a second source agreeing with the first. The snapshot ladder
+        // minted a rung at 910,000 on 2026-09-09 by descending a Core clone
+        // and dumping there, and its hash_serialized came out equal to the
+        // anchor Core hardcodes for that height — the strongest attestation a
+        // rung can have. Refusing it as a "collision" blocked the range on
+        // exactly the rung with the best provenance. Such an entry is skipped,
+        // not staged: the built-in already covers it.
+        if let Some(b) = builtin
             .iter()
-            .any(|b| b.height == r.height || b.blockhash == blockhash)
+            .find(|b| b.height == r.height || b.blockhash == blockhash)
         {
-            return Err(CampaignAssumeutxoError::CollidesWithBuiltin {
-                index,
-                height: r.height,
-            });
+            let identical = b.height == r.height
+                && b.blockhash == blockhash
+                && b.hash_serialized == hash_serialized;
+            if !identical {
+                return Err(CampaignAssumeutxoError::CollidesWithBuiltin {
+                    index,
+                    height: r.height,
+                });
+            }
+            continue;
         }
         // Refuse duplicates within the campaign file itself.
         if staged
@@ -455,6 +470,37 @@ mod tests {
             err,
             CampaignAssumeutxoError::CollidesWithBuiltin { .. }
         ));
+    }
+
+    #[test]
+    fn accepts_entry_identical_to_builtin_and_does_not_stage_it() {
+        // Same height, blockhash AND hash_serialized as the built-in: a
+        // confirmation, not a collision. The real 910,000 anchor.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_json(
+            tmp.path(),
+            "campaign.json",
+            r#"[ { "height": 910000,
+                   "blockhash": "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+                   "hash_serialized": "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+                   "m_chain_tx_count": 1226586151 } ]"#,
+        );
+        let builtin = vec![AssumeutxoData {
+            height: 910_000,
+            blockhash: Hash256::from_hex(
+                "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+            )
+            .unwrap(),
+            hash_serialized: AssumeutxoHash::from_hex(
+                "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+            )
+            .unwrap(),
+            chain_tx_count: 1_226_586_151,
+            base_mtp: None,
+            base_tail_headers: Vec::new(),
+        }];
+        let staged = load_from_path(&path, &builtin).expect("identical entry is a confirmation");
+        assert!(staged.is_empty(), "the built-in already covers it; nothing staged");
     }
 
     #[test]
