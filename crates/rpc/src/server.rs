@@ -165,6 +165,46 @@ pub mod rpc_error {
     pub const RPC_BLOCK_NOT_FOUND: i32 = -5;
 }
 
+/// Help text thrown as `RPC_MISC_ERROR` (-1) when `addnode` is given a
+/// command other than add/remove/onetry. Bitcoin Core raises
+/// `std::runtime_error(self.ToString())` (`rpc/net.cpp:336-339`), which
+/// `CRPCTable::ExecuteCommand` maps to -1 with the RPCHelpMan dump
+/// (`rpc/server.cpp:515`). The T1 probe `invalid-command` scores the code.
+const ADDNODE_HELP: &str = "\
+addnode \"node\" \"command\" ( v2transport )
+
+Attempts to add or remove a node from the addnode list.
+Or try a connection to a node once.
+Nodes added using addnode (or -connect) are protected from DoS disconnection and are not required to be
+full nodes/support SegWit as other outbound peers are (though such peers will not be synced from).
+
+Arguments:
+1. node           (string, required) The IP address/hostname optionally followed by :port of the peer to connect to
+2. command        (string, required) 'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once
+3. v2transport    (boolean, optional) Attempt to connect using BIP324 v2 transport protocol (ignored for 'remove' command)
+
+Result:
+null    (json null)
+";
+
+/// Help text thrown as `RPC_MISC_ERROR` (-1) when `clearbanned` is given an
+/// extra positional argument. Core's `RPCHelpMan::HandleRequest` rejects
+/// `!IsValidNumArgs` with `HelpResult{ToString()}` (`rpc/util.cpp:644-646`),
+/// mapped to -1 (`rpc/server.cpp:515`). jsonrpsee 0.22 ignores extra args on
+/// a zero-arg method, so the handler takes one optional slot and rejects it.
+const CLEARBANNED_HELP: &str = "\
+clearbanned
+
+Clear all banned IPs.
+
+Result:
+null    (json null)
+";
+
+/// Core `rpc/mining.cpp:856` — GBT without `"segwit"` in `rules`.
+const GBT_MISSING_SEGWIT: &str =
+    "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})";
+
 // ============================================================
 // RPC STATE
 // ============================================================
@@ -1000,6 +1040,10 @@ pub trait RustoshiRpc {
     async fn get_connection_count(&self) -> RpcResult<u32>;
 
     /// Add a node to connect to.
+    ///
+    /// Commands: "add", "remove", "onetry". Any other string is Core's
+    /// `RPCHelpMan` dump as `RPC_MISC_ERROR` (-1), not `-8` / `-32602`
+    /// (`rpc/net.cpp:336-339`).
     #[method(name = "addnode")]
     async fn add_node(&self, addr: String, command: String) -> RpcResult<()>;
 
@@ -1066,8 +1110,13 @@ pub trait RustoshiRpc {
     ) -> RpcResult<()>;
 
     /// Clear all banned IPs.
+    ///
+    /// Core takes no arguments (`rpc/net.cpp:867-886`). An extra positional
+    /// arg is `RPC_MISC_ERROR` (-1) with the method help text
+    /// (`rpc/util.cpp:644-646`). The optional `extra` slot exists only so
+    /// jsonrpsee surfaces that arg instead of dropping it.
     #[method(name = "clearbanned")]
-    async fn clear_banned(&self) -> RpcResult<()>;
+    async fn clear_banned(&self, extra: Option<serde_json::Value>) -> RpcResult<()>;
 
     /// Prune blockchain up to specified height.
     ///
@@ -1712,11 +1761,15 @@ pub trait RustoshiRpc {
 
     /// Estimated network hash rate over a window of blocks.
     /// Mirrors Bitcoin Core rpc/mining.cpp GetNetworkHashPS.
+    ///
+    /// Both args are raw JSON so a non-number (`"foo"`) is `RPC_TYPE_ERROR`
+    /// (-3) with Core's `RPCHelpMan` MatchesType message (`rpc/util.cpp:655-657`),
+    /// not jsonrpsee's `-32602` "Invalid params".
     #[method(name = "getnetworkhashps")]
     async fn get_network_hash_ps(
         &self,
-        nblocks: Option<i64>,
-        height: Option<i64>,
+        nblocks: Option<serde_json::Value>,
+        height: Option<serde_json::Value>,
     ) -> RpcResult<f64>;
 
     /// Generate a merkle proof (CMerkleBlock) for a set of transactions.
@@ -2298,6 +2351,39 @@ impl RpcServerImpl {
                 }
             }
             _ => Err(type_err()),
+        }
+    }
+
+    /// Parse an optional numeric RPC argument the way Core's `RPCHelpMan`
+    /// MatchesType + `Arg<int>` do (`rpc/util.cpp:647-657`).
+    ///
+    /// Omitted / JSON null → `default`. A present non-number is
+    /// `RPC_TYPE_ERROR` (-3) with Core's "Wrong type passed:" object naming
+    /// the 1-based position and argument name. Used by `getnetworkhashps`
+    /// so `"foo"` scores T1 `type-error` as -3 rather than jsonrpsee's -32602.
+    fn parse_rpcarg_int(
+        v: Option<&serde_json::Value>,
+        position: usize,
+        name: &str,
+        default: i64,
+    ) -> Result<i64, ErrorObjectOwned> {
+        match v {
+            None | Some(serde_json::Value::Null) => Ok(default),
+            Some(serde_json::Value::Number(n)) => n.as_i64().ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "Wrong type passed:\n{{\n    \"Position {position} ({name})\": \"JSON value of type number is not of expected type number\"\n}}"
+                    ),
+                )
+            }),
+            Some(other) => Err(Self::rpc_error(
+                rpc_error::RPC_TYPE_ERROR,
+                format!(
+                    "Wrong type passed:\n{{\n    \"Position {position} ({name})\": \"JSON value of type {} is not of expected type number\"\n}}",
+                    Self::json_uvtype(other)
+                ),
+            )),
         }
     }
 
@@ -7712,8 +7798,50 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn get_block_template(
         &self,
-        _params: Option<serde_json::Value>,
+        params: Option<serde_json::Value>,
     ) -> RpcResult<serde_json::Value> {
+        // Core rpc/mining.cpp:754-857: collect `template_request.rules`, then
+        // require "segwit" with RPC_INVALID_PARAMETER (-8). The T1 probe
+        // `missing-segwit-rule` is `params: [{}]`. Reject BEFORE taking the
+        // chain lock so a miner that omitted the rule does not pay for a
+        // template. IBD / not-connected gates are not applied here: Core
+        // skips them on test chains, and the existing GBT unit tests run on
+        // a fresh regtest RpcState (`is_ibd: true`).
+        let mut client_rules: HashSet<String> = HashSet::new();
+        if let Some(ref p) = params {
+            if !p.is_null() {
+                let obj = p.as_object().ok_or_else(|| {
+                    Self::rpc_error(
+                        rpc_error::RPC_TYPE_ERROR,
+                        format!(
+                            "JSON value of type {} is not of expected type object",
+                            Self::json_uvtype(p)
+                        ),
+                    )
+                })?;
+                if let Some(serde_json::Value::Array(rules)) = obj.get("rules") {
+                    for r in rules {
+                        let s = r.as_str().ok_or_else(|| {
+                            Self::rpc_error(
+                                rpc_error::RPC_TYPE_ERROR,
+                                format!(
+                                    "JSON value of type {} is not of expected type string",
+                                    Self::json_uvtype(r)
+                                ),
+                            )
+                        })?;
+                        client_rules.insert(s.to_string());
+                    }
+                }
+            }
+        }
+        if !client_rules.contains("segwit") {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                GBT_MISSING_SEGWIT,
+            ));
+        }
+
         let state = self.state.read().await;
 
         let timestamp = SystemTime::now()
@@ -9661,6 +9789,17 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn add_node(&self, addr: String, command: String) -> RpcResult<()> {
+        // Core checks the command enum BEFORE EnsureConnman
+        // (`rpc/net.cpp:335-339`): an unknown string throws the help dump as
+        // RPC_MISC_ERROR (-1), even if P2P is disabled. The T1 probe
+        // `invalid-command` is `["192.0.2.1:8333", "notacommand"]`.
+        match command.as_str() {
+            "onetry" | "add" | "remove" => {}
+            _ => {
+                return Err(Self::rpc_error(rpc_error::RPC_MISC_ERROR, ADDNODE_HELP));
+            }
+        }
+
         let mut peer_state = self.peer_state.write().await;
 
         if let Some(ref mut pm) = peer_state.peer_manager {
@@ -9706,10 +9845,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     }
                     Ok(())
                 }
-                _ => Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
-                    "Invalid command",
-                )),
+                _ => unreachable!("command validated above"),
             }
         } else {
             Err(Self::rpc_error(
@@ -10104,7 +10240,15 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
-    async fn clear_banned(&self) -> RpcResult<()> {
+    async fn clear_banned(&self, extra: Option<serde_json::Value>) -> RpcResult<()> {
+        // Core rejects extra args at RPCHelpMan::HandleRequest, before
+        // EnsureAnyBanman. Check arity first so the T1 extra-arg probe
+        // (`params: ["x"]`) is -1 even when P2P is disabled, and so the
+        // ban list is not touched.
+        if extra.is_some() {
+            return Err(Self::rpc_error(rpc_error::RPC_MISC_ERROR, CLEARBANNED_HELP));
+        }
+
         let mut peer_state = self.peer_state.write().await;
 
         if let Some(ref mut pm) = peer_state.peer_manager {
@@ -13022,7 +13166,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "addpeeraddress" => "addpeeraddress \"address\" port ( tried )\nAdd the address of a potential peer to an address manager table. For testing only.",
                 "getaddrmaninfo" => "getaddrmaninfo\nProvides information about the node's address manager by returning the number of addresses in the `new` and `tried` tables and their sum for all networks.",
                 "getconnectioncount" => "getconnectioncount\nReturns the number of connections to other nodes.",
-                "addnode" => "addnode \"node\" \"command\"\nAttempts to add or remove a node from the addnode list.",
+                "addnode" => ADDNODE_HELP,
+                "clearbanned" => CLEARBANNED_HELP,
                 "getaddednodeinfo" => "getaddednodeinfo ( \"node\" )\nReturns information about the given added node, or all added nodes (note that onetry addnodes are not listed here).",
                 "disconnectnode" => "disconnectnode ( \"address\" nodeid )\nDisconnects from the specified peer node.",
                 "getblocktemplate" => "getblocktemplate ( \"template_request\" )\nReturns data needed to construct a block.",
@@ -13435,10 +13580,22 @@ impl RustoshiRpcServer for RpcServerImpl {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        // `uploadtarget` is the T1 `getnettotals` shape field. Core always
+        // emits it (`rpc/net.cpp:597-604`). rustoshi has no `-maxuploadtarget`
+        // accounting, so this is Core's unlimited default (`target` 0,
+        // `timeframe` 86400s, historical blocks still served).
         Ok(serde_json::json!({
             "totalbytesrecv": bytes_recv,
             "totalbytessent": bytes_sent,
-            "timemillis": now * 1000
+            "timemillis": now * 1000,
+            "uploadtarget": {
+                "timeframe": 86400,
+                "target": 0,
+                "target_reached": false,
+                "serve_historical_blocks": true,
+                "bytes_left_in_cycle": 0,
+                "time_left_in_cycle": 0
+            }
         }))
     }
 
@@ -14194,8 +14351,20 @@ impl RustoshiRpcServer for RpcServerImpl {
         let best_hash_at_entry = state.best_hash;
 
         // Default per Core: hash_serialized_3 (set in rpc/blockchain.cpp:1017
-        // RPCArg::Default{"hash_serialized_3"}).
+        // RPCArg::Default{"hash_serialized_3"}). Unknown hash_type is
+        // RPC_INVALID_PARAMETER (-8) with Core's message
+        // (`rpc/blockchain.cpp:967-977` ParseHashType). The T1 probe
+        // `bad-hashtype` is `params: ["bogus"]`.
         let ht = hash_type.as_deref().unwrap_or("hash_serialized_3");
+        match ht {
+            "hash_serialized_3" | "hash_serialized_2" | "hash_serialized" | "muhash" | "none" => {}
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    format!("'{other}' is not a valid hash_type"),
+                ));
+            }
+        }
 
         // `use_index` is accepted for Core-signature compatibility but does
         // not change behaviour here (we always compute base chainstate stats
@@ -14411,8 +14580,8 @@ impl RustoshiRpcServer for RpcServerImpl {
             "none" => {} // counters only, no hash
             other => {
                 return Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
-                    format!("'{}' is not a valid hash_type", other),
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    format!("'{other}' is not a valid hash_type"),
                 ));
             }
         }
@@ -14856,20 +15025,27 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn get_network_hash_ps(
         &self,
-        nblocks: Option<i64>,
-        height: Option<i64>,
+        nblocks: Option<serde_json::Value>,
+        height: Option<serde_json::Value>,
     ) -> RpcResult<f64> {
+        // Type-check before the chain lock. Core's RPCHelpMan MatchesType
+        // (`rpc/util.cpp:647-657`) throws RPC_TYPE_ERROR (-3) for a non-number
+        // `nblocks` — T1 probe `type-error` is `params: ["foo"]`.
+        let nblocks = Self::parse_rpcarg_int(nblocks.as_ref(), 1, "nblocks", 120)?;
+        let height = Self::parse_rpcarg_int(height.as_ref(), 2, "height", -1)?;
+
         // Mirrors Bitcoin Core src/rpc/mining.cpp GetNetworkHashPS.
         let state = self.state.read().await;
         let best_height = state.best_height as i64;
         let store = BlockStore::new(&state.db);
 
-        let tip_h = match height {
-            Some(h) if h >= 0 && h <= best_height => h as u32,
-            _ => state.best_height,
+        let tip_h = if height >= 0 && height <= best_height {
+            height as u32
+        } else {
+            state.best_height
         };
 
-        let mut nb = nblocks.unwrap_or(120);
+        let mut nb = nblocks;
         if nb <= 0 {
             // -1 means use the current epoch length
             nb = (tip_h % 2016) as i64;
@@ -18646,7 +18822,7 @@ mod tests {
         };
 
         let result = rpc
-            .get_block_template(None)
+            .get_block_template(Some(serde_json::json!({"rules": ["segwit"]})))
             .await
             .expect("getblocktemplate must succeed");
         let txs = result
@@ -26226,5 +26402,165 @@ mod tests {
             .await
             .expect_err("unknown option key must be rejected");
         assert!(format!("{:?}", e).contains("bogus_opt"), "got {:?}", e);
+    }
+
+    // ============================================================
+    // T1 R5 probe error/shape parity (QUEUES.md rustoshi item 1)
+    //
+    // Live `tools/r5_probe.py --tier T1` FAILs vs Core v31.99. Each test
+    // dispatches the probe's JSON-RPC params through jsonrpsee so a revert
+    // of the handler (or of the extra-arg slot / Value-typed nblocks) fails
+    // the same way the probe does.
+    // ============================================================
+
+    async fn t1_dispatch(
+        server: RpcServerImpl,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let module = server.into_rpc();
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "t1",
+            "method": method,
+            "params": params,
+        })
+        .to_string();
+        let (resp, _) = module
+            .raw_json_request(&req, 1)
+            .await
+            .expect("jsonrpsee dispatch");
+        serde_json::from_str(&resp).expect("rpc response json")
+    }
+
+    fn t1_err_code(resp: &serde_json::Value) -> i64 {
+        resp.get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_i64())
+            .unwrap_or_else(|| panic!("expected error object, got {resp}"))
+    }
+
+    #[tokio::test]
+    async fn t1_r5_gettxoutsetinfo_bad_hashtype_is_invalid_parameter() {
+        let resp = t1_dispatch(
+            setup_test_server(),
+            "gettxoutsetinfo",
+            serde_json::json!(["bogus"]),
+        )
+        .await;
+        assert_eq!(t1_err_code(&resp), -8, "got {resp}");
+        assert_eq!(
+            resp["error"]["message"].as_str().unwrap(),
+            "'bogus' is not a valid hash_type"
+        );
+    }
+
+    #[tokio::test]
+    async fn t1_r5_addnode_invalid_command_is_misc_error() {
+        let resp = t1_dispatch(
+            setup_test_server(),
+            "addnode",
+            serde_json::json!(["192.0.2.1:8333", "notacommand"]),
+        )
+        .await;
+        assert_eq!(t1_err_code(&resp), -1, "got {resp}");
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("addnode "),
+            "Core help-text family, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t1_r5_clearbanned_extra_arg_is_misc_error() {
+        let resp = t1_dispatch(
+            setup_test_server(),
+            "clearbanned",
+            serde_json::json!(["x"]),
+        )
+        .await;
+        assert_eq!(t1_err_code(&resp), -1, "got {resp}");
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("clearbanned"),
+            "Core help-text family, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t1_r5_getnettotals_has_uploadtarget_object() {
+        let resp = t1_dispatch(setup_test_server(), "getnettotals", serde_json::json!([])).await;
+        assert!(
+            resp.get("error").is_none() || resp["error"].is_null(),
+            "getnettotals must succeed, got {resp}"
+        );
+        let ut = resp["result"]
+            .get("uploadtarget")
+            .expect("uploadtarget field");
+        assert!(ut.is_object(), "uploadtarget must be an object, got {ut}");
+        for k in [
+            "timeframe",
+            "target",
+            "target_reached",
+            "serve_historical_blocks",
+            "bytes_left_in_cycle",
+            "time_left_in_cycle",
+        ] {
+            assert!(ut.get(k).is_some(), "uploadtarget missing {k}: {ut}");
+        }
+    }
+
+    #[tokio::test]
+    async fn t1_r5_getnetworkhashps_type_error_is_minus_three() {
+        let resp = t1_dispatch(
+            setup_test_server(),
+            "getnetworkhashps",
+            serde_json::json!(["foo"]),
+        )
+        .await;
+        assert_eq!(t1_err_code(&resp), -3, "got {resp}");
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("Position 1 (nblocks)"),
+            "Core MatchesType family, got {msg:?}"
+        );
+        assert!(
+            msg.contains("JSON value of type string is not of expected type number"),
+            "got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t1_r5_getblocktemplate_missing_segwit_is_invalid_parameter() {
+        let resp = t1_dispatch(
+            setup_test_server(),
+            "getblocktemplate",
+            serde_json::json!([{}]),
+        )
+        .await;
+        assert_eq!(t1_err_code(&resp), -8, "got {resp}");
+        assert_eq!(
+            resp["error"]["message"].as_str().unwrap(),
+            GBT_MISSING_SEGWIT
+        );
+    }
+
+    #[tokio::test]
+    async fn t1_r5_getblocktemplate_with_segwit_rule_succeeds() {
+        let resp = t1_dispatch(
+            setup_test_server(),
+            "getblocktemplate",
+            serde_json::json!([{"rules": ["segwit"]}]),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_none() || resp["error"].is_null(),
+            "getblocktemplate with rules=[segwit] must succeed, got {resp}"
+        );
+        let result = resp.get("result").expect("success");
+        assert!(result.get("version").is_some(), "{result}");
+        assert!(result.get("previousblockhash").is_some(), "{result}");
+        assert!(result.get("height").is_some(), "{result}");
+        assert!(result.get("bits").is_some(), "{result}");
     }
 }
