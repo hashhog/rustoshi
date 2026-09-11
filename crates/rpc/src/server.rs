@@ -1880,6 +1880,104 @@ impl RpcServerImpl {
         }
     }
 
+    /// Make an authenticated UTXO snapshot the live active chain tip and
+    /// persist it so a restart reloads it.
+    ///
+    /// Mirrors the CLI `--load-snapshot` activation (`rustoshi/src/main.rs`)
+    /// and Core `ActivateSnapshot` + `WriteSnapshotBaseBlockhash`
+    /// (`validation.cpp`): ingest the snapshot coins into `CF_UTXO`, write
+    /// the base block-index / height-index entries, `set_best_block`, persist
+    /// `base_blockhash`, and re-point `RpcState.best_hash` / `best_height`.
+    /// The in-process `ChainState` / `HeaderSync` / `BlockDownloader` owned
+    /// by the main loop are reconstructed from the persisted tip on the next
+    /// start; boot-smoke `tip` / `restart` read the RPC tip and that
+    /// persisted pointer.
+    fn activate_loaded_snapshot(
+        state: &mut RpcState,
+        base_blockhash: Hash256,
+        base_height: u32,
+        coins: &[(OutPoint, Coin)],
+    ) -> RpcResult<()> {
+        use rustoshi_storage::block_store::{
+            BlockIndexEntry as StorageBlockIndexEntry, BlockStatus,
+        };
+
+        let store = BlockStore::new(&state.db);
+        for (outpoint, coin) in coins {
+            store.put_utxo(outpoint, &coin.to_entry()).map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_INTERNAL_ERROR,
+                    format!("Failed to ingest snapshot coin: {e}"),
+                )
+            })?;
+        }
+
+        let base_header = store.get_header(&base_blockhash).ok().flatten();
+        let mut snap_status = BlockStatus::new();
+        snap_status.set(BlockStatus::VALID_HEADER);
+        snap_status.set(BlockStatus::VALID_TREE);
+        snap_status.set(BlockStatus::VALID_TRANSACTIONS);
+        snap_status.set(BlockStatus::VALID_CHAIN);
+        snap_status.set(BlockStatus::VALID_SCRIPTS);
+        snap_status.set(BlockStatus::HAVE_DATA);
+        let snap_index_entry = StorageBlockIndexEntry {
+            height: base_height,
+            status: snap_status,
+            n_tx: 0,
+            timestamp: base_header.as_ref().map(|h| h.timestamp).unwrap_or(0),
+            bits: base_header.as_ref().map(|h| h.bits).unwrap_or(0),
+            nonce: base_header.as_ref().map(|h| h.nonce).unwrap_or(0),
+            version: base_header.as_ref().map(|h| h.version).unwrap_or(0),
+            prev_hash: base_header
+                .as_ref()
+                .map(|h| h.prev_block_hash)
+                .unwrap_or(Hash256::ZERO),
+            chain_work: state.params.minimum_chain_work,
+        };
+        store
+            .put_block_index(&base_blockhash, &snap_index_entry)
+            .map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_INTERNAL_ERROR,
+                    format!("snapshot activation: put_block_index failed: {e}"),
+                )
+            })?;
+        store
+            .put_height_index(base_height, &base_blockhash)
+            .map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_INTERNAL_ERROR,
+                    format!("snapshot activation: put_height_index failed: {e}"),
+                )
+            })?;
+        store
+            .set_best_block(&base_blockhash, base_height)
+            .map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_INTERNAL_ERROR,
+                    format!("snapshot activation: set_best_block failed: {e}"),
+                )
+            })?;
+
+        if let Some(ref data_dir) = state.data_dir {
+            if let Err(e) =
+                rustoshi_storage::write_snapshot_blockhash(data_dir, &base_blockhash)
+            {
+                tracing::warn!(
+                    "write_snapshot_blockhash failed (tip is still persisted via set_best_block): {e}"
+                );
+            }
+        }
+
+        state.best_hash = base_blockhash;
+        state.best_height = base_height;
+        if state.header_height < base_height {
+            state.header_height = base_height;
+        }
+        state.notify_tip_changed();
+        Ok(())
+    }
+
     /// Force the live chainstate (dirty coins + the tip pointer that names
     /// them) to disk, so a UTXO-set read that iterates `CF_UTXO` sees the
     /// state AT THE CURRENT TIP.
@@ -2933,6 +3031,47 @@ impl<'a> SequenceLockContext for BlockStoreSeqLockCtx<'a> {
 /// `rustoshi_storage::header_context::expected_bits_for_child`.
 ///
 /// `Err` is a BIP-22 reject string and MUST be surfaced, never swallowed.
+/// Height of a header already accepted into the header / height indexes.
+///
+/// `BlockStore::get_height` reads `CF_BLOCK_INDEX`. `submitheader` historically
+/// wrote only `put_header` + `put_height_index` (no block-index row), so the
+/// second header of a sequential ferry failed with "Must submit previous
+/// header" even though the parent header was on disk — boot-smoke reported
+/// `headers via submitheader: 1(partial)`. Fall back to the height index
+/// (sequential tip first, then a bounded walk), matching the P2P header-sync
+/// path in `rustoshi/src/main.rs`.
+fn height_of_known_header(
+    store: &BlockStore,
+    hash: &Hash256,
+    header_height: u32,
+    best_hash: Hash256,
+    best_height: u32,
+) -> Option<u32> {
+    if let Ok(Some(h)) = store.get_height(hash) {
+        return Some(h);
+    }
+    if *hash == best_hash {
+        return Some(best_height);
+    }
+    if let Ok(Some(at_header_tip)) = store.get_hash_by_height(header_height) {
+        if at_header_tip == *hash {
+            return Some(header_height);
+        }
+    }
+    let start = header_height.min(1_000_000);
+    for h in (0..=start).rev() {
+        if let Ok(Some(stored)) = store.get_hash_by_height(h) {
+            if stored == *hash {
+                return Some(h);
+            }
+        }
+        if start.saturating_sub(h) > 10_000 {
+            break;
+        }
+    }
+    None
+}
+
 fn diffbits_expected_for_header(
     block_store: &BlockStore,
     parent_hash: &Hash256,
@@ -8844,24 +8983,28 @@ impl RustoshiRpcServer for RpcServerImpl {
         // --- Step 4: derive the parent's height ------------------------------
         // Needed for the new header's height (parent_height + 1), which the
         // contextual gates (bad-diffbits / BIP-34 version / BIP-94) key off.
-        let new_height = match store.get_height(&header.prev_block_hash) {
-            Ok(Some(h)) => h + 1,
-            // Parent header exists but has no height-index entry: fall back to
-            // tip + 1 when the parent IS the tip, else reject as unknown (we
-            // cannot place the header in the chain). This keeps parity with the
-            // common case (submitting the next header on the active tip).
-            _ => {
-                if header.prev_block_hash == state.best_hash {
-                    state.best_height + 1
-                } else {
-                    return Err(Self::rpc_error(
-                        rpc_error::RPC_TRANSACTION_ERROR,
-                        format!(
-                            "Must submit previous header ({}) first",
-                            header.prev_block_hash.to_hex()
-                        ),
-                    ));
-                }
+        //
+        // Step 2 already proved the parent HEADER is on disk. Height may live
+        // in the block index (connected blocks) OR only in the height index
+        // (`submitheader` itself writes the latter, not the former). Looking
+        // only at `get_height` (block index) rejected every header after the
+        // first as "Must submit previous header".
+        let new_height = match height_of_known_header(
+            &store,
+            &header.prev_block_hash,
+            state.header_height,
+            state.best_hash,
+            state.best_height,
+        ) {
+            Some(h) => h + 1,
+            None => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TRANSACTION_ERROR,
+                    format!(
+                        "Must submit previous header ({}) first",
+                        header.prev_block_hash.to_hex()
+                    ),
+                ));
             }
         };
 
@@ -14056,17 +14199,15 @@ impl RustoshiRpcServer for RpcServerImpl {
         //   hash passes the load-time gate (hash-of-self) but FAILS here
         //   because the genesis->base replay computes a different hash.
         //
-        // NOTE on the active tip: re-pointing the live `BlockDownloader` /
-        // `HeaderSync` / `ChainState` at the snapshot tip from inside an RPC
-        // handler is unsafe in this build (they are owned by the main loop, not
-        // reachable from `RpcServerImpl`); the CLI `--load-snapshot=<path>`
-        // path is the canonical activation for the ACTIVE tip. This handler
-        // therefore drives the SAFE half: it authenticates the file and runs
-        // the background re-derivation (which only reads blocks from the store
-        // and writes to its OWN separate in-memory store — touching nothing the
-        // download manager owns), then records the verdict in the
-        // `ChainstateManager` so `getchainstates` reports `validated` /
-        // `snapshot_blockhash` exactly like Core mid-validation.
+        //   ACTIVE TIP (Core `ActivateSnapshot` + `WriteSnapshotBaseBlockhash`):
+        //   on a successful load (hash gate passed, and background validation
+        //   either matched or is pending missing bodies) ingest the coins,
+        //   `set_best_block`, persist `base_blockhash`, and re-point
+        //   `RpcState.best_hash` / `best_height` so `getblockcount` /
+        //   `getbestblockhash` serve the snapshot base and a restart reloads
+        //   it. The in-process `BlockDownloader` / `HeaderSync` / `ChainState`
+        //   owned by the main loop are reconstructed from that persisted tip
+        //   on the next start.
 
         // Resolve the path relative to the data dir (Core `AbsPathForConfigVal`).
         let resolved = {
@@ -14197,7 +14338,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 .then(a.0.vout.cmp(&b.0.vout))
         });
         let file_hash =
-            rustoshi_storage::compute_hash_serialized(file_coins.into_iter());
+            rustoshi_storage::compute_hash_serialized(file_coins.iter().cloned());
         if whitelist_bypassed {
             // The hardcoded `hash_serialized` comparison is the other half of
             // the whitelist trust anchor, so it is skipped -- and only it --
@@ -14220,6 +14361,11 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
+        // Flush the live UTXO write-back cache so the coin ingest below is
+        // not overwritten by a later connect-loop flush of pre-snapshot
+        // coins. Unarmed in unit tests (no-op).
+        self.force_flush_chainstate_to_disk().await;
+
         // --- Activate + start the REAL background validation 2nd chainstate ---
         // Active coins-store identity for the aliasing guard: the live ChainDb's
         // allocation address. The background store is a SEPARATE in-memory store
@@ -14237,12 +14383,8 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Fixes M2-RUST-MTP / M2-RUST-POW-PANIC
         // (receipts/PORTER-WAVE-NODE-BUGS.md): without real pre-base
         // headers, the post-snapshot MTP window and the next
-        // difficulty-retarget ancestor walk both stop at the base. This RPC
-        // handler doesn't move the ACTIVE tip (see the doc comment above),
-        // but persisting the headers is still correct and harmless here --
-        // it only adds entries at/below the base, which the CLI activation
-        // path (the canonical tip-mover) also relies on being present.
-        // No-op for every built-in Core-parity entry (empty `base_tail_headers`).
+        // difficulty-retarget ancestor walk both stop at the base. No-op
+        // for every built-in Core-parity entry (empty `base_tail_headers`).
         if !au.base_tail_headers.is_empty() {
             let tail_store = BlockStore::new(&state.db);
             if let Err(e) = tail_store.put_base_tail_headers(au.height, &au.base_tail_headers) {
@@ -14274,6 +14416,24 @@ impl RustoshiRpcServer for RpcServerImpl {
         let verdict = state
             .chainstate_manager
             .run_background_validation(get_block);
+
+        // Core activates the snapshot chainstate as soon as the file is
+        // authenticated, even while genesis->base replay is still pending.
+        // Do the same on Valid and on MissingBlock (headers-only ferry);
+        // never move the live tip for an Invalid (tampered) snapshot.
+        let should_activate = matches!(
+            &verdict,
+            Ok(SnapshotVerdict::Valid)
+                | Err(rustoshi_storage::BackgroundValidationError::MissingBlock(_))
+        );
+        if should_activate {
+            Self::activate_loaded_snapshot(
+                &mut state,
+                au.blockhash,
+                au.height,
+                &file_coins,
+            )?;
+        }
 
         match verdict {
             Ok(SnapshotVerdict::Valid) => Ok(serde_json::json!({
@@ -21691,10 +21851,9 @@ mod tests {
     //      re-derivation in a SEPARATE store; record the verdict in the
     //      `ChainstateManager` so `getchainstates` reports
     //      `validated`/`snapshot_blockhash`.
-    //
-    // It still does NOT re-point the live active tip (the download manager
-    // is owned by the main loop, not reachable here) and never writes
-    // CF_UTXO — the background store is in-memory and distinct.
+    //   3. ACTIVE TIP — on Valid / MissingBlock, ingest coins, move
+    //      `best_height`/`best_hash`, persist `set_best_block` +
+    //      `base_blockhash`. A rejected snapshot must not move the tip.
 
     #[tokio::test]
     async fn test_loadtxoutset_rpc_errors_on_missing_file() {
@@ -21718,11 +21877,12 @@ mod tests {
         );
     }
 
-    /// Regression guard: the RPC handler must NOT touch the UTXO column
-    /// family. The background-validation store is in-memory and entirely
-    /// separate from the active coins db, so CF_UTXO stays empty.
+    /// A missing file is rejected at the open gate and must not move the
+    /// tip or write coins. (Previously this test asserted the handler never
+    /// wrote CF_UTXO even on a successful load — that was the
+    /// success-without-activation bug.)
     #[tokio::test]
-    async fn test_loadtxoutset_rpc_does_not_write_utxos() {
+    async fn test_loadtxoutset_missing_file_does_not_move_tip() {
         use rustoshi_storage::{ChainDb, CF_UTXO};
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -21733,16 +21893,17 @@ mod tests {
         let peer_state = Arc::new(RwLock::new(PeerState::default()));
         let rpc = RpcServerImpl::new(state, peer_state);
 
-        let _ = rpc.load_tx_outset("ignored.dat".to_string()).await;
+        let _ = rpc
+            .load_tx_outset("ignored.dat".to_string())
+            .await
+            .expect_err("missing file must error");
 
+        assert_eq!(rpc.get_block_count().await.unwrap(), 0);
         let utxo_count = db_for_check
             .iter_cf(CF_UTXO)
             .map(|iter| iter.count())
             .unwrap_or(0);
-        assert_eq!(
-            utxo_count, 0,
-            "loadtxoutset RPC must not write any coins to CF_UTXO"
-        );
+        assert_eq!(utxo_count, 0, "a rejected open must not write CF_UTXO");
     }
 
     // ============================================================
@@ -21929,7 +22090,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_loadtxoutset_accept_drives_bg_validation_and_getchainstates() {
-        use rustoshi_storage::{compute_hash_serialized, ChainDb};
+        use rustoshi_storage::{compute_hash_serialized, ChainDb, CF_UTXO};
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
@@ -21950,7 +22111,10 @@ mod tests {
         // Write a snapshot file containing the genuine set.
         let snap = au_write_snapshot(tmp.path(), base_hash, &utxo, magic);
 
-        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        let db_for_check = db.clone();
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.data_dir = Some(tmp.path().to_path_buf());
+        let state = Arc::new(RwLock::new(rpc_state));
         let peer_state = Arc::new(RwLock::new(PeerState::default()));
         let rpc = RpcServerImpl::new(state, peer_state);
 
@@ -21959,6 +22123,51 @@ mod tests {
             .await
             .expect("loadtxoutset must accept the correct snapshot");
         assert_eq!(res["validated"], serde_json::Value::Bool(true));
+
+        // Active tip must move (boot-smoke `tip` cell).
+        assert_eq!(
+            rpc.get_block_count().await.unwrap(),
+            base_height,
+            "loadtxoutset must move getblockcount to the snapshot base"
+        );
+        assert_eq!(
+            rpc.get_best_block_hash().await.unwrap(),
+            base_hash.to_hex(),
+            "loadtxoutset must move getbestblockhash to the snapshot base"
+        );
+
+        // Coins ingested into the live UTXO set (CLI --load-snapshot does this).
+        let utxo_count = db_for_check
+            .iter_cf(CF_UTXO)
+            .map(|iter| iter.count())
+            .unwrap_or(0);
+        assert_eq!(
+            utxo_count,
+            utxo.len(),
+            "loadtxoutset must write the snapshot coins to CF_UTXO"
+        );
+
+        // Persisted tip + base_blockhash (boot-smoke `restart` cell).
+        let store = BlockStore::new(&db_for_check);
+        assert_eq!(
+            store.get_best_height().unwrap(),
+            Some(base_height),
+            "set_best_block must persist the snapshot height"
+        );
+        assert_eq!(
+            store.get_best_block_hash().unwrap(),
+            Some(base_hash),
+            "set_best_block must persist the snapshot hash"
+        );
+        let persisted = rustoshi_storage::read_snapshot_blockhash(tmp.path())
+            .expect("read base_blockhash")
+            .expect("base_blockhash written");
+        assert_eq!(persisted, base_hash);
+
+        let mut reloaded = RpcState::new(db_for_check, rustoshi_consensus::ChainParams::regtest());
+        reloaded.init_from_db().expect("init_from_db");
+        assert_eq!(reloaded.best_height, base_height);
+        assert_eq!(reloaded.best_hash, base_hash);
 
         // getchainstates must report the snapshot chainstate validated=true
         // with its snapshot_blockhash.
@@ -22042,6 +22251,13 @@ mod tests {
             err.message().contains("REJECTED"),
             "reject error must explain the re-derivation mismatch, got: {}",
             err.message()
+        );
+
+        // A rejected snapshot must not move the live tip.
+        assert_eq!(
+            rpc.get_block_count().await.unwrap(),
+            0,
+            "rejected loadtxoutset must leave getblockcount at genesis"
         );
 
         // getchainstates must report the snapshot chainstate as NOT validated.
