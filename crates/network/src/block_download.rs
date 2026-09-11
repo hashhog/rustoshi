@@ -23,6 +23,24 @@ use tokio::time::{Duration, Instant};
 /// monopolizing the download pipeline.
 const MAX_BLOCKS_IN_FLIGHT_PER_PEER: usize = 16;
 
+/// Runtime per-peer in-flight cap. Core's 16 assumes many peers; a node fed
+/// by ONE local replay peer (the snapshot-ladder campaign, `--connect` to a
+/// single feeder) spends more than half its time waiting: it asks for 8-16
+/// blocks, validates them in ~90 ms each, and asks again (measured 2026-09-05:
+/// 5.2 blk/s observed against a 10.6 blk/s validator, half a core busy).
+/// `HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER` raises the cap for that case only;
+/// unset, behaviour is exactly the constant above. Read once.
+fn max_blocks_in_flight_per_peer() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1 && n <= MAX_BLOCKS_IN_FLIGHT)
+            .unwrap_or(MAX_BLOCKS_IN_FLIGHT_PER_PEER)
+    })
+}
+
 /// Maximum total number of blocks in flight across all peers.
 /// Bitcoin Core uses 1024 but we limit to 128 to bound memory for large mainnet blocks.
 const MAX_BLOCKS_IN_FLIGHT: usize = 128;
@@ -473,7 +491,7 @@ impl BlockDownloader {
             .peer_states
             .iter()
             .filter(|(_, state)| {
-                state.blocks_in_flight < MAX_BLOCKS_IN_FLIGHT_PER_PEER
+                state.blocks_in_flight < max_blocks_in_flight_per_peer()
             })
             .map(|(id, _)| *id)
             .collect();
@@ -542,7 +560,7 @@ impl BlockDownloader {
 
             if let Some(state) = self.peer_states.get_mut(&peer_id) {
                 state.blocks_in_flight += 1;
-                if state.blocks_in_flight >= MAX_BLOCKS_IN_FLIGHT_PER_PEER {
+                if state.blocks_in_flight >= max_blocks_in_flight_per_peer() {
                     available_peers.retain(|id| *id != peer_id);
                 }
             }
