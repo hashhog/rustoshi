@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-12
 
+- feat(net): single `--connect` peer defaults to 128 in-flight; refill on receipt
 - 6b17c37f test: make every zmq pub/sub test deterministic
 - c336b9eb chore: gitignore crates/rpc/banlist.json — runtime setban list was dirtying the tree and blocking the node-owner bot
 - cae549a7 test: make zmq pub/sub rawtx deterministic
@@ -18,6 +19,7 @@
 Changes since `v1.0.1`:
 
 - fix(rpc): T1 error/shape parity — gettxoutsetinfo -8, addnode -1, clearbanned extra-arg, getnettotals.uploadtarget, getnetworkhashps -3, getblocktemplate missing-segwit
+- feat(net): single `--connect` peer defaults the per-peer in-flight cap to 128 (was 16; `HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER` still overrides), and a received block refills the window immediately instead of waiting for the 10s retry tick
 - feat(net): `HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER` — raise the per-peer in-flight block cap (default 16, max 128) for single-feeder syncs; A/B in progress, default unchanged (a74be105)
 - fix: a campaign entry identical to Core's built-in assumeutxo anchor is a confirmation, not a collision — it is skipped, not staged (7d4d7972)
 

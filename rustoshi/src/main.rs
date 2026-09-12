@@ -30,10 +30,10 @@ use rustoshi_consensus::{
     ChainWork, FeeEstimator, NetworkId, ValidationError,
 };
 use rustoshi_network::{
-    asmap as asmap_mod, BlockDownloader, CFCheckptMessage, CFHeadersMessage, CFilterMessage,
-    HeaderSync, InvType, InvVector, MisbehaviorReason, NetGroupManager, NetworkMessage, PeerEvent,
-    PeerManager, PeerManagerConfig, CFCHECKPT_INTERVAL, MAX_GETCFHEADERS_SIZE,
-    MAX_GETCFILTERS_SIZE, NODE_COMPACT_FILTERS,
+    asmap as asmap_mod, resolve_blocks_in_flight_per_peer, BlockDownloader, CFCheckptMessage,
+    CFHeadersMessage, CFilterMessage, HeaderSync, InvType, InvVector, MisbehaviorReason,
+    NetGroupManager, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig, CFCHECKPT_INTERVAL,
+    MAX_GETCFHEADERS_SIZE, MAX_GETCFILTERS_SIZE, NODE_COMPACT_FILTERS,
 };
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
 use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
@@ -1226,6 +1226,26 @@ fn misbehavior_for_block_error(e: &ValidationError) -> Option<MisbehaviorReason>
         | ValidationError::UnexpectedWitness => Some(MisbehaviorReason::MutatedBlock),
         // Any other consensus failure: generic invalid block.
         _ => Some(MisbehaviorReason::InvalidBlock),
+    }
+}
+
+/// Send getdata produced by the block downloader. Dead send channels requeue
+/// that peer's in-flight blocks immediately (#74).
+async fn send_download_requests(
+    block_downloader: &mut BlockDownloader,
+    peer_state: &RwLock<PeerState>,
+    requests: Vec<(rustoshi_network::PeerId, NetworkMessage)>,
+) {
+    if requests.is_empty() {
+        return;
+    }
+    let ps = peer_state.read().await;
+    if let Some(ref pm) = ps.peer_manager {
+        for (peer, msg) in requests {
+            if !pm.send_to_peer(peer, msg).await {
+                block_downloader.remove_peer(peer);
+            }
+        }
     }
 }
 
@@ -3501,7 +3521,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     //     block to validate, re-validating from genesis indefinitely.
     let mut header_sync = HeaderSync::new(params.genesis_hash);
     header_sync.set_best_header(best_height, best_hash);
-    let mut block_downloader = BlockDownloader::new(best_height, best_height);
+    let per_peer_in_flight = resolve_blocks_in_flight_per_peer(cli.connect.len());
+    let mut block_downloader =
+        BlockDownloader::with_per_peer_cap(best_height, best_height, per_peer_in_flight);
+    if cli.connect.len() == 1 {
+        tracing::info!(
+            "single --connect peer: per-peer in-flight cap {} (HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER overrides)",
+            per_peer_in_flight
+        );
+    }
 
     // Issue #5: session-local set of block hashes that failed to connect on the
     // linear/P2P path (marked FAILED_VALIDITY in the block index). Used to
@@ -4964,6 +4992,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                             NetworkMessage::Block(block) => {
                                 block_downloader.block_received(peer_id, block);
+                                // Refill in-flight now — do not wait for the 10s retry
+                                // tick or the post-validation assign_requests below.
+                                // The 128-cap A/B was quantized in whole batches because
+                                // the scheduler drained between ticks.
+                                let refill = block_downloader.take_refill_requests();
+                                send_download_requests(
+                                    &mut block_downloader,
+                                    &peer_state,
+                                    refill,
+                                )
+                                .await;
 
                                 // Process blocks in order, but cap the number validated per
                                 // event-loop iteration to prevent starving timers and peer I/O.
@@ -6485,6 +6524,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                                 block_hash, prefilled, from_mempool
                                                             );
                                                             block_downloader.block_received(peer_id, block);
+                                                            let refill = block_downloader.take_refill_requests();
+                                                            send_download_requests(
+                                                                &mut block_downloader,
+                                                                &peer_state,
+                                                                refill,
+                                                            )
+                                                            .await;
                                                         }
                                                         Err(_) => {
                                                             tracing::warn!("Compact block {} merkle mismatch, requesting full block", block_hash);
@@ -6663,6 +6709,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                         );
                                                         block_downloader
                                                             .block_received(peer_id, block);
+                                                        let refill = block_downloader.take_refill_requests();
+                                                        send_download_requests(
+                                                            &mut block_downloader,
+                                                            &peer_state,
+                                                            refill,
+                                                        )
+                                                        .await;
                                                     }
                                                     Err(rustoshi_network::compact_blocks::ReadStatus::Failed) => {
                                                         // Merkle mismatch or wrong tx count —

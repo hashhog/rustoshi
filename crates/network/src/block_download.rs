@@ -3,10 +3,12 @@
 //! This module manages parallel block downloading from multiple peers using a
 //! sliding window approach. Key features:
 //!
-//! - Parallel downloads from multiple peers (up to 16 blocks per peer)
+//! - Parallel downloads from multiple peers (16 per peer by default; 128
+//!   when `--connect` names a single feeder)
 //! - Sliding window that downloads ahead of the validation point
 //! - Adaptive timeout handling with stall detection
 //! - Out-of-order block reception with in-order validation
+//! - Refill in-flight on block receipt, not only on the retry tick
 //!
 //! IBD (Initial Block Download) is the process of downloading and validating
 //! the entire blockchain from genesis. This is typically the longest phase of
@@ -21,29 +23,48 @@ use tokio::time::{Duration, Instant};
 /// Maximum number of blocks in flight from a single peer.
 /// Bitcoin Core uses 16 as the default to prevent a single slow peer from
 /// monopolizing the download pipeline.
-const MAX_BLOCKS_IN_FLIGHT_PER_PEER: usize = 16;
-
-/// Runtime per-peer in-flight cap. Core's 16 assumes many peers; a node fed
-/// by ONE local replay peer (the snapshot-ladder campaign, `--connect` to a
-/// single feeder) spends more than half its time waiting: it asks for 8-16
-/// blocks, validates them in ~90 ms each, and asks again (measured 2026-09-05:
-/// 5.2 blk/s observed against a 10.6 blk/s validator, half a core busy).
-/// `HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER` raises the cap for that case only;
-/// unset, behaviour is exactly the constant above. Read once.
-fn max_blocks_in_flight_per_peer() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1 && n <= MAX_BLOCKS_IN_FLIGHT)
-            .unwrap_or(MAX_BLOCKS_IN_FLIGHT_PER_PEER)
-    })
-}
+pub const MAX_BLOCKS_IN_FLIGHT_PER_PEER: usize = 16;
 
 /// Maximum total number of blocks in flight across all peers.
 /// Bitcoin Core uses 1024 but we limit to 128 to bound memory for large mainnet blocks.
-const MAX_BLOCKS_IN_FLIGHT: usize = 128;
+pub const MAX_BLOCKS_IN_FLIGHT: usize = 128;
+
+/// Per-peer cap when `--connect` names exactly one peer (campaign feeder /
+/// isolated replay). Matches [`MAX_BLOCKS_IN_FLIGHT`] so a single feeder can
+/// fill the global window. Paired A/B at 930k–950k: 128 → 2.22 blk/s, 16 →
+/// 0.97 (`receipts/feeder-cap-ab-rustoshi-2026-09-11.md`).
+pub const SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER: usize = MAX_BLOCKS_IN_FLIGHT;
+
+/// Resolve the per-peer in-flight cap.
+///
+/// `HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER` wins when it parses as 1..=128.
+/// Otherwise a node with exactly one `--connect` peer defaults to 128;
+/// every other topology keeps Core's 16.
+pub fn resolve_blocks_in_flight_per_peer(connect_peer_count: usize) -> usize {
+    resolve_blocks_in_flight_per_peer_with_env(
+        connect_peer_count,
+        std::env::var("HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn resolve_blocks_in_flight_per_peer_with_env(
+    connect_peer_count: usize,
+    env: Option<&str>,
+) -> usize {
+    if let Some(n) = env
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| (1..=MAX_BLOCKS_IN_FLIGHT).contains(&n))
+    {
+        return n;
+    }
+    if connect_peer_count == 1 {
+        SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER
+    } else {
+        MAX_BLOCKS_IN_FLIGHT_PER_PEER
+    }
+}
 
 /// Base timeout for a single block request.
 /// We use adaptive timeouts: double on stall, decay on success.
@@ -138,6 +159,13 @@ pub struct BlockDownloader {
     /// a HashSet on every enqueue_blocks call (which was O(n) for
     /// 900K+ blocks and caused multi-second stalls).
     pending_set: std::collections::HashSet<Hash256>,
+    /// Per-peer in-flight cap for this downloader. 16 matches Core; 128 is
+    /// the single-`--connect` feeder default.
+    max_per_peer: usize,
+    /// Getdata produced by refill-on-receipt. The event loop must send these
+    /// without waiting for the 10s retry tick (or the post-validation
+    /// `assign_requests` call, which runs only after up to 8 slow connects).
+    pending_refill: Vec<(PeerId, NetworkMessage)>,
 }
 
 /// Outcome of a level-triggered gap-fill reconciliation.
@@ -387,6 +415,23 @@ impl BlockDownloader {
     /// * `validated_tip_height` - Height of the last fully validated block
     /// * `best_header_height` - Height of the best known header
     pub fn new(validated_tip_height: u32, best_header_height: u32) -> Self {
+        Self::with_per_peer_cap(
+            validated_tip_height,
+            best_header_height,
+            MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+        )
+    }
+
+    /// Construct with an explicit per-peer in-flight cap (clamped to 1..=128).
+    ///
+    /// Production uses [`resolve_blocks_in_flight_per_peer`] so a single
+    /// `--connect` peer defaults to 128. Tests keep [`new`], which is always 16,
+    /// so they do not depend on process environment.
+    pub fn with_per_peer_cap(
+        validated_tip_height: u32,
+        best_header_height: u32,
+        per_peer: usize,
+    ) -> Self {
         Self {
             download_queue: VecDeque::new(),
             in_flight: HashMap::new(),
@@ -396,7 +441,20 @@ impl BlockDownloader {
             received_blocks: HashMap::new(),
             pending_hashes: VecDeque::new(),
             pending_set: std::collections::HashSet::new(),
+            max_per_peer: per_peer.clamp(1, MAX_BLOCKS_IN_FLIGHT),
+            pending_refill: Vec::new(),
         }
+    }
+
+    /// Per-peer in-flight cap this downloader was constructed with.
+    pub fn max_per_peer(&self) -> usize {
+        self.max_per_peer
+    }
+
+    /// Take getdata produced by refill-on-receipt. Empty if nothing was
+    /// queued since the last take / [`Self::assign_requests`].
+    pub fn take_refill_requests(&mut self) -> Vec<(PeerId, NetworkMessage)> {
+        std::mem::take(&mut self.pending_refill)
     }
 
     /// Add a range of block hashes to download (after headers are synced).
@@ -480,7 +538,10 @@ impl BlockDownloader {
     /// Returns a list of (peer_id, getdata_message) to send.
     /// Messages are batched per peer to reduce round-trips.
     pub fn assign_requests(&mut self) -> Vec<(PeerId, NetworkMessage)> {
-        let mut requests: Vec<(PeerId, NetworkMessage)> = Vec::new();
+        // Drain any refill-on-receipt getdata first so a later tick /
+        // post-validation `assign_requests` still sends them if the event
+        // loop missed `take_refill_requests`.
+        let mut requests: Vec<(PeerId, NetworkMessage)> = std::mem::take(&mut self.pending_refill);
 
         // Find peers with available capacity.
         // Don't exclude "stalling" peers — they may just have had a transient
@@ -490,9 +551,7 @@ impl BlockDownloader {
         let mut available_peers: Vec<PeerId> = self
             .peer_states
             .iter()
-            .filter(|(_, state)| {
-                state.blocks_in_flight < max_blocks_in_flight_per_peer()
-            })
+            .filter(|(_, state)| state.blocks_in_flight < self.max_per_peer)
             .map(|(id, _)| *id)
             .collect();
 
@@ -560,7 +619,7 @@ impl BlockDownloader {
 
             if let Some(state) = self.peer_states.get_mut(&peer_id) {
                 state.blocks_in_flight += 1;
-                if state.blocks_in_flight >= max_blocks_in_flight_per_peer() {
+                if state.blocks_in_flight >= self.max_per_peer {
                     available_peers.retain(|id| *id != peer_id);
                 }
             }
@@ -586,7 +645,10 @@ impl BlockDownloader {
 
     /// Handle a received block from a peer.
     ///
-    /// Returns the block hash if the block was expected.
+    /// Returns the block hash if the block was expected. Frees the in-flight
+    /// slot and immediately refills from the download queue — the caller must
+    /// send [`Self::take_refill_requests`] (or a subsequent
+    /// [`Self::assign_requests`]) without waiting for the retry tick.
     pub fn block_received(&mut self, peer_id: PeerId, block: Block) -> Option<Hash256> {
         let hash = block.block_hash();
 
@@ -605,6 +667,14 @@ impl BlockDownloader {
         }
 
         self.received_blocks.insert(hash, block);
+
+        // Refill on receipt. `assign_requests` drains `pending_refill` first,
+        // so stash the newly assigned getdata for the event loop to send
+        // before it starts the slow connect loop.
+        let refill = self.assign_requests();
+        if !refill.is_empty() {
+            self.pending_refill.extend(refill);
+        }
         Some(hash)
     }
 
@@ -1663,5 +1733,129 @@ mod tests {
             "gap-fill must enqueue every missing height between chain tip and header tip"
         );
         assert_eq!(dl.pending_hashes_len(), 1000);
+    }
+
+    /// Control for the single-feeder refill: a received block must free a
+    /// slot AND pull the next queued hash into in-flight. The caller does
+    /// not invoke `assign_requests` again — that would be the periodic 10s
+    /// retry tick, which is what quantized the 128-cap A/B into whole
+    /// batches (`receipts/feeder-cap-ab-rustoshi-2026-09-11.md`).
+    #[test]
+    fn received_block_refills_in_flight_without_a_tick() {
+        let mut dl = BlockDownloader::new(0, 100);
+        let peer = PeerId(1);
+        dl.add_peer(peer);
+
+        let blocks: Vec<Block> = (1u8..=32).map(make_test_block).collect();
+        let queued: Vec<(Hash256, u32)> = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.block_hash(), (i as u32) + 1))
+            .collect();
+        dl.enqueue_blocks(queued);
+
+        let requests = dl.assign_requests();
+        assert_eq!(
+            dl.blocks_in_flight(),
+            MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+            "first window fills the per-peer cap"
+        );
+        assert!(!requests.is_empty());
+        assert_eq!(
+            dl.download_queue_len(),
+            32 - MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+            "remainder stays queued for the next window"
+        );
+
+        let _ = dl.block_received(peer, blocks[0].clone());
+
+        assert_eq!(
+            dl.blocks_in_flight(),
+            MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+            "a received block must refill in-flight without waiting for the tick"
+        );
+        assert_eq!(
+            dl.download_queue_len(),
+            32 - MAX_BLOCKS_IN_FLIGHT_PER_PEER - 1,
+            "refill must consume one queued hash"
+        );
+        let refill = dl.take_refill_requests();
+        let n: usize = refill
+            .iter()
+            .filter_map(|(_, msg)| {
+                if let NetworkMessage::GetData(items) = msg {
+                    Some(items.len())
+                } else {
+                    None
+                }
+            })
+            .sum();
+        assert_eq!(n, 1, "exactly one freed slot should be refilled");
+    }
+
+    #[test]
+    fn resolve_cap_is_128_for_exactly_one_connect_peer() {
+        assert_eq!(
+            resolve_blocks_in_flight_per_peer_with_env(1, None),
+            SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER
+        );
+        assert_eq!(
+            resolve_blocks_in_flight_per_peer_with_env(0, None),
+            MAX_BLOCKS_IN_FLIGHT_PER_PEER
+        );
+        assert_eq!(
+            resolve_blocks_in_flight_per_peer_with_env(2, None),
+            MAX_BLOCKS_IN_FLIGHT_PER_PEER
+        );
+        assert_eq!(
+            resolve_blocks_in_flight_per_peer_with_env(1, Some("16")),
+            16,
+            "env override wins over the single-connect default"
+        );
+        assert_eq!(
+            resolve_blocks_in_flight_per_peer_with_env(1, Some("64")),
+            64
+        );
+        assert_eq!(
+            resolve_blocks_in_flight_per_peer_with_env(1, Some("999")),
+            SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER,
+            "out-of-range env is ignored"
+        );
+        assert_eq!(
+            resolve_blocks_in_flight_per_peer_with_env(1, Some("nope")),
+            SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER
+        );
+    }
+
+    #[test]
+    fn single_connect_cap_fills_128() {
+        let mut dl = BlockDownloader::with_per_peer_cap(
+            0,
+            1000,
+            SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER,
+        );
+        dl.add_peer(PeerId(1));
+        let blocks: Vec<(Hash256, u32)> = (1..=200)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                (Hash256(bytes), i)
+            })
+            .collect();
+        dl.enqueue_blocks(blocks);
+        let requests = dl.assign_requests();
+        let total: usize = requests
+            .iter()
+            .filter_map(|(_, msg)| {
+                if let NetworkMessage::GetData(items) = msg {
+                    Some(items.len())
+                } else {
+                    None
+                }
+            })
+            .sum();
+        assert_eq!(total, MAX_BLOCKS_IN_FLIGHT);
+        assert_eq!(dl.blocks_in_flight(), MAX_BLOCKS_IN_FLIGHT);
+        assert_eq!(dl.max_per_peer(), SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER);
     }
 }
