@@ -678,7 +678,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// ZMQ PUB/SUB over TCP is lossy across the handshake and the four
     /// integration tests bind neighbouring ports; run them one at a time so a
@@ -689,6 +689,42 @@ mod tests {
         ZMQ_INTEGRATION
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn ephemeral_zmq_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("ephemeral bind")
+            .local_addr()
+            .expect("local_addr")
+            .port()
+    }
+
+    /// Poll a SUB socket for a 3-frame notification until `deadline`.
+    ///
+    /// A single blocking `recv` after a fixed sleep loses the ZMQ slow-joiner
+    /// race: if the PUB send lands before the SUB filter is on the socket,
+    /// the message is dropped and the recv times out with `None`.
+    fn recv_notification_until(
+        socket: &zmq::Socket,
+        deadline: Instant,
+    ) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout_ms = remaining.as_millis().min(50) as i64;
+            if timeout_ms == 0 {
+                break;
+            }
+            match socket.poll(zmq::POLLIN, timeout_ms) {
+                Ok(n) if n > 0 => {
+                    let topic = socket.recv_bytes(0).ok()?;
+                    let body = socket.recv_bytes(0).ok()?;
+                    let seq = socket.recv_bytes(0).ok()?;
+                    return Some((topic, body, seq));
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     #[test]
@@ -994,52 +1030,48 @@ mod tests {
     #[test]
     fn test_zmq_pub_sub_rawtx() {
         let _guard = zmq_integration_lock();
-        let port = 28700 + (std::process::id() % 100) as u16;
-        let address = format!("tcp://127.0.0.1:{}", port);
+        let address = format!("tcp://127.0.0.1:{}", ephemeral_zmq_port());
 
         let configs = vec![ZmqNotifierConfig::new(ZmqTopic::RawTx, address.clone())];
-        let mut notifier = match ZmqNotifier::create(configs) {
-            Ok(Some(n)) => n,
-            Ok(None) => panic!("Expected notifier"),
-            Err(e) => {
-                eprintln!("Skipping test: {}", e);
-                return;
-            }
-        };
+        let mut notifier = ZmqNotifier::create(configs)
+            .unwrap_or_else(|e| panic!("zmq notifier: {e}"))
+            .expect("Expected notifier");
 
         let sub_address = address.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
             let context = zmq::Context::new();
-            let socket = context.socket(zmq::SUB).unwrap();
-            socket.connect(&sub_address).unwrap();
-            socket.set_subscribe(b"rawtx").unwrap();
-            socket.set_rcvtimeo(2000).unwrap();
-
-            thread::sleep(Duration::from_millis(100));
-
-            let topic = socket.recv_bytes(0).ok();
-            let body = socket.recv_bytes(0).ok();
-            let seq = socket.recv_bytes(0).ok();
-
-            (topic, body, seq)
+            let socket = context.socket(zmq::SUB).expect("sub socket");
+            socket.set_linger(0).ok();
+            socket.connect(&sub_address).expect("sub connect");
+            socket.set_subscribe(b"rawtx").expect("subscribe rawtx");
+            let _ = ready_tx.send(());
+            recv_notification_until(&socket, Instant::now() + Duration::from_secs(2))
         });
 
-        thread::sleep(Duration::from_millis(200));
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("subscriber connected");
 
-        // Create test transaction
         let tx = create_test_tx();
         let expected_raw = tx.serialize();
-        notifier.notify_transaction(&tx);
 
-        thread::sleep(Duration::from_millis(100));
+        // Slow-joiner: a PUB send that beats the SUB filter is dropped.
+        // Keep publishing until the subscriber poll observes a message.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !handle.is_finished() {
+            notifier.notify_transaction(&tx);
+            thread::sleep(Duration::from_millis(20));
+        }
 
-        let (topic, body, seq) = handle.join().unwrap();
+        let (topic, body, seq) = handle
+            .join()
+            .expect("subscriber thread")
+            .expect("timed out waiting for rawtx notification");
 
-        assert_eq!(topic, Some(b"rawtx".to_vec()));
-        assert!(body.is_some());
-        let body = body.unwrap();
+        assert_eq!(topic, b"rawtx");
         assert_eq!(body, expected_raw);
-        assert!(seq.is_some());
+        assert_eq!(seq.len(), 4);
 
         notifier.shutdown();
     }
