@@ -298,14 +298,20 @@ mod tests {
     fn g6_testnet4_assumeutxo_table_has_core_entries() {
         use rustoshi_consensus::ChainParams;
         let params = ChainParams::testnet4();
-        // Bitcoin Core testnet4 entries: h=90000, 120000, 290000
-        for height in [90_000u32, 120_000, 290_000] {
+        // Bitcoin Core CTestNet4Params::m_assumeutxo_data is exactly two
+        // entries (heights 90000 and 120000). Height 290000 is Core's
+        // SIGNET record and must not appear here (params.rs #51 / w138 G13).
+        for height in [90_000u32, 120_000] {
             let entry = params.assumeutxo_for_height(height);
             assert!(
                 entry.is_some(),
                 "testnet4 assumeutxo table must contain height {}", height
             );
         }
+        assert!(
+            params.assumeutxo_for_height(290_000).is_none(),
+            "h=290000 is Core's SIGNET entry and must not be in the testnet4 table"
+        );
     }
 
     /// G6: unknown blockhash must not match any assumeutxo entry.

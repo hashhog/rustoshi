@@ -74,7 +74,7 @@ fn make_coinbase() -> Transaction {
             previous_output: OutPoint::null(),
             script_sig: vec![0x03, 0x01, 0x00, 0x00],
             sequence: 0xFFFFFFFF,
-            witness: vec![vec![0u8; 32]],
+            witness: vec![],
         }],
         outputs: vec![TxOut {
             value: 50_0000_0000,
@@ -94,7 +94,7 @@ fn make_tx(seed: u64) -> Transaction {
             },
             script_sig: vec![],
             sequence: 0xFFFFFFFF,
-            witness: vec![vec![0x30, 0x44], vec![0x02, 0x21]],
+            witness: vec![],
         }],
         outputs: vec![TxOut {
             value: seed,
@@ -405,8 +405,8 @@ fn g17_fill_block_mutation_check_runs() {
         &[],
     )
     .expect("init_data");
-    // segwit_active=false to bypass coinbase witness commitment check (our
-    // make_coinbase has a witness but no commitment output).
+    // segwit_active=false: helpers are witness-free, so the unexpected-witness
+    // loop in is_block_mutated does not fire.
     let res = partial.fill_block(vec![], false);
     assert!(res.is_ok(), "fill_block ok on clean reconstruction");
 }

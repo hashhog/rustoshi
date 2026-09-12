@@ -162,7 +162,7 @@ use rustoshi_wallet::{
     CoinSelectionParams, SelectionAlgorithm,
 };
 use rustoshi_wallet::wallet::{AddressType, Wallet, WalletUtxo};
-use rustoshi_crypto::address::Network;
+use rustoshi_crypto::address::{Address, Network};
 use rustoshi_primitives::{Hash256, OutPoint};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -211,6 +211,35 @@ fn default_params(target: u64) -> CoinSelectionParams {
     }
 }
 
+/// BIP-84 receive path m/84'/1'/0'/0/{index} for a regtest P2WPKH wallet.
+fn p2wpkh_regtest_receive_path(index: u32) -> Vec<u32> {
+    const H: u32 = 0x8000_0000;
+    vec![84 | H, 1 | H, 0 | H, 0, index]
+}
+
+/// Insert a wallet-owned P2WPKH UTXO that `create_transaction` can actually sign.
+/// Dummy `script_pubkey: vec![]` UTXOs used to pass the selector; signing now
+/// dispatches on the prevout script and rejects the empty script.
+fn fund_wallet(wallet: &mut Wallet, value: u64, confirmations: u32, vout: u32) {
+    let addr = wallet.get_address_at(false, 0).expect("receive address");
+    let script_pubkey = Address::from_string(&addr, Some(Network::Regtest))
+        .expect("parse address")
+        .to_script_pubkey();
+    wallet.add_utxo(WalletUtxo {
+        outpoint: OutPoint {
+            txid: Hash256::ZERO,
+            vout,
+        },
+        value,
+        script_pubkey,
+        derivation_path: p2wpkh_regtest_receive_path(0),
+        confirmations,
+        is_change: false,
+        is_coinbase: false,
+        height: Some(100),
+    });
+}
+
 // ---------------------------------------------------------------------------
 // G1 — BnB algorithm present
 // ---------------------------------------------------------------------------
@@ -235,9 +264,7 @@ fn g1_bnb_dead_helper_create_transaction_bypasses_bnb() {
 
     // Add many UTXOs that BnB would combine into an exact match
     for i in 0u32..5 {
-        let mut utxo = make_utxo_with_vout(10_000, 6, i);
-        utxo.is_change = false;
-        wallet.add_utxo(utxo);
+        fund_wallet(&mut wallet, 10_000, 6, i);
     }
 
     let recipient = wallet.peek_address().unwrap();
@@ -304,14 +331,10 @@ fn g4_create_transaction_ignores_effective_value() {
     // UTXO worth only 200 sats — at 1 sat/vbyte, input fee ~68 sats.
     // Effective value = 200 - 68 = 132 sats.
     // BnB should consider this; inline largest-first just uses raw 200.
-    let mut utxo = make_utxo_with_vout(200, 6, 0);
-    utxo.derivation_path = vec![];
-    wallet.add_utxo(utxo);
+    fund_wallet(&mut wallet, 200, 6, 0);
 
     // Separately, a large UTXO to fund the actual payment
-    let mut big_utxo = make_utxo_with_vout(1_000_000, 6, 1);
-    big_utxo.derivation_path = vec![];
-    wallet.add_utxo(big_utxo);
+    fund_wallet(&mut wallet, 1_000_000, 6, 1);
 
     let recipient = wallet.peek_address().unwrap();
     // create_transaction selects by largest-first (raw value), not effective value
@@ -708,9 +731,7 @@ fn g22_dust_suppression_works() {
     let mut wallet = Wallet::from_seed(&seed, Network::Regtest, AddressType::P2WPKH).unwrap();
 
     // UTXO = 10_600: output = 10_000, fee ~141, change = 459 sats < 546 (dust)
-    let mut utxo = make_utxo_with_vout(10_600, 6, 0);
-    utxo.derivation_path = vec![];
-    wallet.add_utxo(utxo);
+    fund_wallet(&mut wallet, 10_600, 6, 0);
 
     let recipient = wallet.peek_address().unwrap();
     let tx = wallet.create_transaction(vec![(recipient, 10_000)], 1.0).unwrap();
@@ -763,9 +784,7 @@ fn g24_change_from_internal_keypool() {
     let mut wallet = Wallet::from_seed(&seed, Network::Regtest, AddressType::P2WPKH).unwrap();
 
     for i in 0u32..3 {
-        let mut utxo = make_utxo_with_vout(100_000, 6, i);
-        utxo.derivation_path = vec![];
-        wallet.add_utxo(utxo);
+        fund_wallet(&mut wallet, 100_000, 6, i);
     }
 
     let recipient = wallet.peek_address().unwrap();
@@ -829,9 +848,7 @@ fn g27_nsequence_rbf_and_locktime_compatible() {
     let seed = [7u8; 32];
     let mut wallet = Wallet::from_seed(&seed, Network::Regtest, AddressType::P2WPKH).unwrap();
 
-    let mut utxo = make_utxo_with_vout(1_000_000, 6, 0);
-    utxo.derivation_path = vec![];
-    wallet.add_utxo(utxo);
+    fund_wallet(&mut wallet, 1_000_000, 6, 0);
 
     let recipient = wallet.peek_address().unwrap();
     let tx = wallet.create_transaction(vec![(recipient, 100_000)], 1.0).unwrap();
@@ -855,9 +872,7 @@ fn g28_rbf_signal_present() {
     let seed = [8u8; 32];
     let mut wallet = Wallet::from_seed(&seed, Network::Regtest, AddressType::P2WPKH).unwrap();
 
-    let mut utxo = make_utxo_with_vout(1_000_000, 6, 0);
-    utxo.derivation_path = vec![];
-    wallet.add_utxo(utxo);
+    fund_wallet(&mut wallet, 1_000_000, 6, 0);
 
     let recipient = wallet.peek_address().unwrap();
     let tx = wallet.create_transaction(vec![(recipient, 100_000)], 1.0).unwrap();

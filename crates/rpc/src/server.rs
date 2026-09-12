@@ -19689,16 +19689,18 @@ mod tests {
         let mut script = vec![0x51, 0x20]; // OP_1 <32>
         script.extend([0xab; 32]);
         let asm = disassemble_script(&script);
-        assert!(asm.contains("OP_1"));
+        // Core ScriptToAsmStr emits OP_1..OP_16 as decimal tokens, not "OP_1".
+        assert!(asm.starts_with("1 "), "P2TR asm starts with 1, got {asm:?}");
     }
 
     #[test]
     fn test_disassemble_script_op_return() {
-        // OP_RETURN with data
-        let script = vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef];
+        // OP_RETURN with a 5-byte push so ScriptToAsmStr keeps hex (pushes of
+        // <=4 bytes are decoded as CScriptNum decimals).
+        let script = vec![0x6a, 0x05, 0xde, 0xad, 0xbe, 0xef, 0x00];
         let asm = disassemble_script(&script);
         assert!(asm.contains("OP_RETURN"));
-        assert!(asm.contains("deadbeef"));
+        assert!(asm.contains("deadbeef00"), "got {asm:?}");
     }
 
     #[test]
@@ -19714,8 +19716,9 @@ mod tests {
         script.push(0xae); // OP_CHECKMULTISIG
 
         let asm = disassemble_script(&script);
-        assert!(asm.contains("OP_2"));
-        assert!(asm.contains("OP_3"));
+        // Core ScriptToAsmStr: OP_2/OP_3 -> "2"/"3".
+        assert!(asm.starts_with("2 "), "got {asm:?}");
+        assert!(asm.contains(" 3 "), "got {asm:?}");
         assert!(asm.contains("OP_CHECKMULTISIG"));
     }
 
@@ -19757,14 +19760,9 @@ mod tests {
         // OP_1 through OP_16
         let script = vec![0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58];
         let asm = disassemble_script(&script);
-        assert!(asm.contains("OP_1"));
-        assert!(asm.contains("OP_2"));
-        assert!(asm.contains("OP_3"));
-        assert!(asm.contains("OP_4"));
-        assert!(asm.contains("OP_5"));
-        assert!(asm.contains("OP_6"));
-        assert!(asm.contains("OP_7"));
-        assert!(asm.contains("OP_8"));
+        // Core ScriptToAsmStr emits OP_1..OP_16 as decimal tokens.
+        let tokens: Vec<&str> = asm.split_whitespace().collect();
+        assert_eq!(tokens, ["1", "2", "3", "4", "5", "6", "7", "8"]);
     }
 
     #[test]
@@ -22318,6 +22316,22 @@ mod tests {
     /// from the coinbase txid and the nonce is incremented until the hash
     /// meets target. Regtest difficulty is trivial so this terminates in
     /// a handful of iterations.
+    /// Mainnet consensus rules (BIP-34/SegWit/CSV inactive at height 1-4)
+    /// with the regtest pow_limit and genesis nBits so `0x207fffff` synthetic
+    /// blocks pass both `check_proof_of_work` (target <= pow_limit) and
+    /// submitblock's `nBits == GetNextWorkRequired` gate. Matches the
+    /// already-green unit_c/unit_d setup, plus genesis-bits so height-1
+    /// required nBits is `0x207fffff` rather than mainnet `0x1d00ffff`.
+    fn mainnet_params_for_synth_blocks() -> rustoshi_consensus::ChainParams {
+        let mut p = rustoshi_consensus::ChainParams::mainnet();
+        let mut regtest_limit = [0xffu8; 32];
+        regtest_limit[0] = 0x7f;
+        p.pow_limit = regtest_limit;
+        p.genesis_block.header.bits = 0x207fffff;
+        p.genesis_hash = p.genesis_block.block_hash();
+        p
+    }
+
     fn mine_synth_block(h: u32, prev_hash: Hash256, marker: u8) -> Block {
         use rustoshi_primitives::BlockHeader;
         let coinbase = synth_coinbase(h, marker);
@@ -22363,7 +22377,7 @@ mod tests {
         let block = mine_synth_block(h, prev_hash, marker);
         let block_hash = block.block_hash();
         let this_work =
-            ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(0x207fffff));
+            ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(block.header.bits));
 
         store.put_block(&block_hash, &block).unwrap();
         store.put_header(&block_hash, &block.header).unwrap();
@@ -22403,7 +22417,7 @@ mod tests {
         let coinbase = block.transactions[0].clone();
         let block_hash = block.block_hash();
         let this_work =
-            ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(0x207fffff));
+            ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(block.header.bits));
 
         store.put_block(&block_hash, &block).unwrap();
         store.put_header(&block_hash, &block.header).unwrap();
@@ -22575,7 +22589,7 @@ mod tests {
         // would force every test block to encode BIP-34 height + emit a
         // valid witness commitment — orthogonal to the reorg wiring this
         // test exercises.
-        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let mut rpc_state = RpcState::new(db.clone(), mainnet_params_for_synth_blocks());
 
         // G -> A1 -> A2 (active chain, height 2)
         //  \-> B1 (side, height 1, parent hash_g) — to make B's branch
@@ -23183,8 +23197,7 @@ mod tests {
     #[tokio::test]
     async fn submit_block_writes_block_index_entry_for_accepted_block() {
         use rustoshi_consensus::pow::ChainWork;
-        use rustoshi_consensus::ChainParams;
-        let params = ChainParams::mainnet();
+        let params = mainnet_params_for_synth_blocks();
         let (db, state, server) = make_test_server(params.clone());
 
         // Mine + submit a block on top of genesis. mainnet params at h=1
@@ -23240,8 +23253,7 @@ mod tests {
     /// the base-chain blocks).
     #[tokio::test]
     async fn submit_block_accepts_side_branch_block_with_known_parent() {
-        use rustoshi_consensus::ChainParams;
-        let params = ChainParams::mainnet();
+        let params = mainnet_params_for_synth_blocks();
         let (db, state, server) = make_test_server(params.clone());
 
         let genesis_hash = params.genesis_hash;
@@ -23316,8 +23328,7 @@ mod tests {
     /// ancestor.
     #[tokio::test]
     async fn submit_block_reorgs_to_heavier_branch_via_extension() {
-        use rustoshi_consensus::ChainParams;
-        let params = ChainParams::mainnet();
+        let params = mainnet_params_for_synth_blocks();
         let (db, state, server) = make_test_server(params.clone());
 
         let genesis_hash = params.genesis_hash;
@@ -23438,8 +23449,7 @@ mod tests {
     /// only for blocks generated via the legacy `generateblocks` RPC.
     #[tokio::test]
     async fn submit_block_writes_tx_index_entries_for_accepted_block() {
-        use rustoshi_consensus::ChainParams;
-        let params = ChainParams::mainnet();
+        let params = mainnet_params_for_synth_blocks();
         let (db, _state, server) = make_test_server(params.clone());
 
         let genesis_hash = params.genesis_hash;
@@ -23478,12 +23488,11 @@ mod tests {
     /// ActivateBestChainStep.
     #[tokio::test]
     async fn try_attach_and_reorg_revert_and_replay_tx_index() {
-        use rustoshi_consensus::ChainParams;
         use rustoshi_storage::ChainDb;
 
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
-        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let mut rpc_state = RpcState::new(db.clone(), mainnet_params_for_synth_blocks());
 
         // G -> A1 -> A2 (active, height 2).
         let (hash_g, _block_g, work_g) = {
@@ -23609,12 +23618,11 @@ mod tests {
     /// disk write.
     #[tokio::test]
     async fn reorg_commits_single_batch_for_multi_block_swap() {
-        use rustoshi_consensus::ChainParams;
         use rustoshi_storage::ChainDb;
 
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
-        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let mut rpc_state = RpcState::new(db.clone(), mainnet_params_for_synth_blocks());
 
         // Old chain: G -> A1 -> A2 -> A3 (active, height 3).
         let (hash_g, _block_g, work_g) = {

@@ -1439,6 +1439,11 @@ mod tests {
             store.write_block(&block, height).expect("failed to write block");
         }
 
+        // find_files_to_prune skips the current write file (Core: never prune
+        // the file still being appended). Rotate so file 0 is complete.
+        store.current_file = 1;
+        store.file_info.push(BlockFileInfo::new());
+
         // Force pruning check
         store.check_for_pruning = true;
 

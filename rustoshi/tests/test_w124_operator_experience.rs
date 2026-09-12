@@ -555,11 +555,15 @@ fn g17_persistence_failure_silent_in_exit_code() {
         main_rs.contains("Failed to dump mempool"),
         "G17: dump_mempool error log changed — re-verify"
     );
-    // Shutdown returns Ok unconditionally.
-    let tail = &main_rs[main_rs.len().saturating_sub(20_000)..];
+    // Shutdown still returns Ok unconditionally. Search from the log line
+    // rather than the file tail — tests appended after `fn main` pushed the
+    // return path out of the last 20k chars.
+    let shutdown = main_rs
+        .find("tracing::info!(\"Shutdown complete\");")
+        .expect("G17: shutdown complete log changed — re-verify");
+    let after = &main_rs[shutdown..shutdown.saturating_add(80)];
     assert!(
-        tail.contains("Shutdown complete\");")
-            && tail.contains("Ok(())"),
+        after.contains("Ok(())"),
         "G17: shutdown return path changed — re-verify"
     );
 }
@@ -607,16 +611,18 @@ fn g20_no_startup_disk_space_check() {
 // Gates 21-30: Diagnostics, polish, CLI/help, edge cases
 // ============================================================
 
-/// G21 (MISSING — BUG-21): No `logging` RPC for runtime log-level toggle.
+/// G21: `logging` RPC exists for runtime log-level toggle (T1 operator subset).
 #[test]
-fn g21_no_logging_rpc_for_dynamic_level() {
+fn g21_logging_rpc_for_dynamic_level() {
     let server_rs = include_str!("../../crates/rpc/src/server.rs");
     // Core's `logging` RPC takes include / exclude category lists.
-    // We have no such method.
     assert!(
-        !server_rs.contains("async fn logging(")
-            && !server_rs.contains("fn logging("),
-        "BUG-21: a logging RPC was added — update audit"
+        server_rs.contains("async fn logging("),
+        "G21: logging RPC must remain (T1 operator subset)"
+    );
+    assert!(
+        server_rs.contains("#[method(name = \"logging\")]"),
+        "G21: logging must be registered as an RPC method"
     );
 }
 
@@ -743,14 +749,16 @@ fn g29_load_snapshot_doesnt_refuse_existing_chain() {
     );
 }
 
-/// G30 (MISSING — BUG-30): No `getmemoryinfo` RPC parity.
+/// G30: `getmemoryinfo` RPC exists (T1 operator subset).
 #[test]
-fn g30_no_getmemoryinfo_rpc() {
+fn g30_getmemoryinfo_rpc() {
     let server_rs = include_str!("../../crates/rpc/src/server.rs");
-    // No `async fn get_memory_info`.
     assert!(
-        !server_rs.contains("fn get_memory_info(")
-            && !server_rs.contains("\"getmemoryinfo\""),
-        "BUG-30: getmemoryinfo was added — update audit"
+        server_rs.contains("fn get_memory_info("),
+        "G30: getmemoryinfo handler must remain (T1 operator subset)"
+    );
+    assert!(
+        server_rs.contains("#[method(name = \"getmemoryinfo\")]"),
+        "G30: getmemoryinfo must be registered as an RPC method"
     );
 }

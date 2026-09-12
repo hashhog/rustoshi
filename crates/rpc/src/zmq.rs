@@ -676,8 +676,20 @@ pub fn parse_zmq_args(args: &[(String, String)]) -> Vec<ZmqNotifierConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
+
+    /// ZMQ PUB/SUB over TCP is lossy across the handshake and the four
+    /// integration tests bind neighbouring ports; run them one at a time so a
+    /// loaded `cargo test --workspace` does not drop the first message.
+    static ZMQ_INTEGRATION: Mutex<()> = Mutex::new(());
+
+    fn zmq_integration_lock() -> std::sync::MutexGuard<'static, ()> {
+        ZMQ_INTEGRATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_topic_as_str() {
@@ -757,6 +769,7 @@ mod tests {
 
     #[test]
     fn test_zmq_pub_sub_hashblock() {
+        let _guard = zmq_integration_lock();
         // Use a unique port to avoid conflicts
         let port = 28400 + (std::process::id() % 100) as u16;
         let address = format!("tcp://127.0.0.1:{}", port);
@@ -823,6 +836,7 @@ mod tests {
 
     #[test]
     fn test_zmq_pub_sub_sequence() {
+        let _guard = zmq_integration_lock();
         // Use a unique port
         let port = 28500 + (std::process::id() % 100) as u16;
         let address = format!("tcp://127.0.0.1:{}", port);
@@ -881,6 +895,7 @@ mod tests {
 
     #[test]
     fn test_zmq_sequence_mempool_acceptance() {
+        let _guard = zmq_integration_lock();
         let port = 28600 + (std::process::id() % 100) as u16;
         let address = format!("tcp://127.0.0.1:{}", port);
 
@@ -900,7 +915,7 @@ mod tests {
             let socket = context.socket(zmq::SUB).unwrap();
             socket.connect(&sub_address).unwrap();
             socket.set_subscribe(b"sequence").unwrap();
-            socket.set_rcvtimeo(2000).unwrap();
+            socket.set_rcvtimeo(5000).unwrap();
 
             thread::sleep(Duration::from_millis(100));
 
@@ -911,14 +926,17 @@ mod tests {
             (topic, body)
         });
 
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(300));
 
         let txid = Hash256::from_hex(
             "7f6b3f6d7c8b9a0e1d2c3b4a5f6e7d8c9b0a1e2d3c4b5a6f7e8d9c0b1a2e3d4c"
         ).unwrap();
-        notifier.notify_tx_acceptance(&txid, 12345);
-
-        thread::sleep(Duration::from_millis(100));
+        // ZMQ PUB/SUB is lossy across the handshake; re-send so a slow SUB still
+        // observes one message under a loaded `cargo test --workspace`.
+        for _ in 0..5 {
+            notifier.notify_tx_acceptance(&txid, 12345);
+            thread::sleep(Duration::from_millis(50));
+        }
 
         let (topic, body) = handle.join().unwrap();
 
@@ -975,6 +993,7 @@ mod tests {
 
     #[test]
     fn test_zmq_pub_sub_rawtx() {
+        let _guard = zmq_integration_lock();
         let port = 28700 + (std::process::id() % 100) as u16;
         let address = format!("tcp://127.0.0.1:{}", port);
 

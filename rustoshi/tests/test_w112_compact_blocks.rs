@@ -50,7 +50,7 @@ fn make_coinbase() -> Transaction {
             previous_output: OutPoint::null(),
             script_sig: vec![0x03, 0x01, 0x00, 0x00],
             sequence: 0xFFFF_FFFF,
-            witness: vec![vec![0u8; 32]],
+            witness: vec![],
         }],
         outputs: vec![TxOut {
             value: 50_0000_0000,
@@ -70,7 +70,7 @@ fn make_tx(seed: u64) -> Transaction {
             },
             script_sig: vec![],
             sequence: 0xFFFF_FFFF,
-            witness: vec![vec![0x30, 0x44], vec![0x02, 0x21]],
+            witness: vec![],
         }],
         outputs: vec![TxOut {
             value: seed * 1_000,
@@ -260,7 +260,13 @@ fn g7_version_2_indicates_segwit() {
 
     let mut state1 = PeerCompactBlockState::new();
     state1.handle_sendcmpct(false, CMPCT_VERSION_1);
-    assert_eq!(state1.version, CMPCT_VERSION_1, "version=1 must be accepted for legacy compact blocks");
+    // Core net_processing.cpp: `if (sendcmpct.version != CMPCTBLOCKS_VERSION) return;`
+    // Compact-block relay is only enabled at version 2. v1 is silently ignored.
+    assert_eq!(
+        state1.version, 0,
+        "version=1 must be ignored (Core only enables compact blocks at v2)"
+    );
+    assert!(!state1.enabled, "v1 sendcmpct must not enable compact-block relay");
 }
 
 // ---------------------------------------------------------------------------
@@ -729,25 +735,31 @@ fn g24_merkle_mismatch_returns_failed() {
 fn g25_segwit_witness_commitment_check() {
     use rustoshi_network::compact_blocks::is_block_mutated;
 
-    let block = make_block(2); // make_tx produces witness txs
+    let mut block = make_block(2);
+    // Attach witness so the unexpected-witness / commitment checks fire.
+    // make_block itself is witness-free so reconstruction tests can pass
+    // `segwit_active=false` without tripping Core's unexpected-witness loop.
+    block.transactions[1].inputs[0].witness = vec![vec![0x30, 0x44], vec![0x02, 0x21]];
 
-    // Block without witness commitment: segwit_active=true detects witness data
-    // Only if the non-cb tx has witness AND no commitment in coinbase → mutated
-    // In make_block, coinbase has no commitment but txs have witness data.
-    // segwit_active=true should detect this as mutated.
+    // Block without witness commitment: segwit_active=true detects witness data.
     let result = is_block_mutated(&block, true);
-    // make_coinbase has no commitment output, make_tx has witness → mutated
     assert!(
         result,
         "block with witness tx but no coinbase commitment must be mutated when segwit_active=true"
     );
 
-    // segwit_active=false → only txid merkle check
+    // Core CheckWitnessMalleation: the unexpected-witness loop runs for ALL
+    // blocks when no valid commitment is present, even if segwit is inactive.
     let result_noseg = is_block_mutated(&block, false);
-    // merkle root IS correct (we computed it) → not mutated
     assert!(
-        !result_noseg,
-        "correct txid merkle root → not mutated when segwit_active=false"
+        result_noseg,
+        "witness without a commitment is mutated even when segwit_active=false (unexpected-witness)"
+    );
+
+    let clean = make_block(2);
+    assert!(
+        !is_block_mutated(&clean, false),
+        "witness-free block with correct merkle root is not mutated"
     );
 }
 

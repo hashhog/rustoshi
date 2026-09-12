@@ -1051,7 +1051,10 @@ fn test_g22_parent_below_min_relay_accepted_if_package_sufficient() {
 /// Status: OK — package feerate check rejects under-fee packages.
 #[test]
 fn test_g23_insufficient_package_feerate_rejected() {
-    let min_fee_rate = 10u64; // 10 sat/vB
+    // `MempoolConfig::min_fee_rate` is sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE).
+    // 10 sat/vB = 10_000 sat/kvB. A 1-sat fee on a ~60 vB tx is ~16 sat/kvB
+    // and must fail that floor.
+    let min_fee_rate = 10_000u64;
     let mut mp = Mempool::new(MempoolConfig {
         verify_scripts: false,
         min_fee_rate,
