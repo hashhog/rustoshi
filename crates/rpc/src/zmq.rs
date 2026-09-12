@@ -188,10 +188,7 @@ enum ZmqCommand {
         raw_block: Vec<u8>,
     },
     /// Publish a transaction notification
-    NotifyTransaction {
-        txid: Hash256,
-        raw_tx: Vec<u8>,
-    },
+    NotifyTransaction { txid: Hash256, raw_tx: Vec<u8> },
     /// Publish block connect sequence event
     BlockConnect { block_hash: Hash256 },
     /// Publish block disconnect sequence event
@@ -263,16 +260,14 @@ impl ZmqPublisher {
                 .map_err(|e| ZmqError::SetOption(format!("TCP_KEEPALIVE: {}", e)))?;
 
             // Bind to the address
-            socket.bind(&config.address).map_err(|e| ZmqError::BindFailed {
-                address: config.address.clone(),
-                reason: e.to_string(),
-            })?;
+            socket
+                .bind(&config.address)
+                .map_err(|e| ZmqError::BindFailed {
+                    address: config.address.clone(),
+                    reason: e.to_string(),
+                })?;
 
-            info!(
-                "ZMQ {} bound to {}",
-                config.topic.as_str(),
-                config.address
-            );
+            info!("ZMQ {} bound to {}", config.topic.as_str(), config.address);
             sockets.insert(config.address.clone(), socket);
         }
 
@@ -347,7 +342,11 @@ impl ZmqPublisher {
                 txid,
                 mempool_sequence,
             } => {
-                self.send_sequence(&txid, SequenceLabel::MempoolAcceptance, Some(mempool_sequence));
+                self.send_sequence(
+                    &txid,
+                    SequenceLabel::MempoolAcceptance,
+                    Some(mempool_sequence),
+                );
             }
             ZmqCommand::TxRemoval {
                 txid,
@@ -363,12 +362,14 @@ impl ZmqPublisher {
 
     fn notify_block(&mut self, block_hash: &Hash256, raw_block: &[u8]) {
         // Collect addresses for each topic to avoid borrow conflicts
-        let hashblock_addrs: Vec<_> = self.notifiers
+        let hashblock_addrs: Vec<_> = self
+            .notifiers
             .iter()
             .filter(|c| c.topic == ZmqTopic::HashBlock)
             .map(|c| c.address.clone())
             .collect();
-        let rawblock_addrs: Vec<_> = self.notifiers
+        let rawblock_addrs: Vec<_> = self
+            .notifiers
             .iter()
             .filter(|c| c.topic == ZmqTopic::RawBlock)
             .map(|c| c.address.clone())
@@ -397,12 +398,14 @@ impl ZmqPublisher {
     }
 
     fn notify_transaction(&mut self, txid: &Hash256, raw_tx: &[u8]) {
-        let hashtx_addrs: Vec<_> = self.notifiers
+        let hashtx_addrs: Vec<_> = self
+            .notifiers
             .iter()
             .filter(|c| c.topic == ZmqTopic::HashTx)
             .map(|c| c.address.clone())
             .collect();
-        let rawtx_addrs: Vec<_> = self.notifiers
+        let rawtx_addrs: Vec<_> = self
+            .notifiers
             .iter()
             .filter(|c| c.topic == ZmqTopic::RawTx)
             .map(|c| c.address.clone())
@@ -430,8 +433,14 @@ impl ZmqPublisher {
         }
     }
 
-    fn send_sequence(&mut self, hash: &Hash256, label: SequenceLabel, mempool_sequence: Option<u64>) {
-        let sequence_addrs: Vec<_> = self.notifiers
+    fn send_sequence(
+        &mut self,
+        hash: &Hash256,
+        label: SequenceLabel,
+        mempool_sequence: Option<u64>,
+    ) {
+        let sequence_addrs: Vec<_> = self
+            .notifiers
             .iter()
             .filter(|c| c.topic == ZmqTopic::Sequence)
             .map(|c| c.address.clone())
@@ -455,10 +464,7 @@ impl ZmqPublisher {
         for address in sequence_addrs {
             let seq = self.next_sequence(ZmqTopic::Sequence);
             if self.send_multipart(&address, "sequence", &body, seq) {
-                debug!(
-                    "Published sequence {} {:?} to {}",
-                    hash, label, address
-                );
+                debug!("Published sequence {} {:?} to {}", hash, label, address);
             }
         }
     }
@@ -567,7 +573,9 @@ impl ZmqNotifier {
     pub fn notify_transaction(&self, tx: &Transaction) {
         let txid = tx.txid();
         let raw_tx = tx.serialize();
-        let _ = self.command_tx.send(ZmqCommand::NotifyTransaction { txid, raw_tx });
+        let _ = self
+            .command_tx
+            .send(ZmqCommand::NotifyTransaction { txid, raw_tx });
     }
 
     /// Notify subscribers of block connection.
@@ -680,15 +688,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    /// ZMQ PUB/SUB over TCP is lossy across the handshake and the four
-    /// integration tests bind neighbouring ports; run them one at a time so a
-    /// loaded `cargo test --workspace` does not drop the first message.
+    /// ZMQ PUB/SUB over TCP is lossy across the handshake. Serialize the
+    /// integration tests so a loaded `cargo test --workspace` does not drop
+    /// the first message, and never skip-on-bind-fail (that masks a red run).
     static ZMQ_INTEGRATION: Mutex<()> = Mutex::new(());
 
     fn zmq_integration_lock() -> std::sync::MutexGuard<'static, ()> {
-        ZMQ_INTEGRATION
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        ZMQ_INTEGRATION.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn ephemeral_zmq_port() -> u16 {
@@ -727,6 +733,52 @@ mod tests {
         None
     }
 
+    /// Bind an ephemeral PUB, wait until the SUB has connected and subscribed,
+    /// then keep calling `publish` until the SUB observes a 3-frame notification
+    /// or `wait` elapses. Republishing is required: a PUB send that beats the
+    /// SUB filter is dropped (ZMQ slow-joiner).
+    fn zmq_pubsub_roundtrip<F>(
+        topic: ZmqTopic,
+        wait: Duration,
+        mut publish: F,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>, ZmqNotifier)
+    where
+        F: FnMut(&ZmqNotifier),
+    {
+        let _guard = zmq_integration_lock();
+        let address = format!("tcp://127.0.0.1:{}", ephemeral_zmq_port());
+        let configs = vec![ZmqNotifierConfig::new(topic, address.clone())];
+        let notifier = ZmqNotifier::create(configs)
+            .unwrap_or_else(|e| panic!("zmq notifier: {e}"))
+            .expect("Expected notifier");
+
+        let topic_bytes = topic.as_str().as_bytes().to_vec();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let context = zmq::Context::new();
+            let socket = context.socket(zmq::SUB).expect("sub socket");
+            socket.set_linger(0).ok();
+            socket.connect(&address).expect("sub connect");
+            socket.set_subscribe(&topic_bytes).expect("subscribe");
+            let _ = ready_tx.send(());
+            recv_notification_until(&socket, Instant::now() + wait)
+        });
+
+        ready_rx.recv_timeout(wait).expect("subscriber connected");
+
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline && !handle.is_finished() {
+            publish(&notifier);
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let (topic, body, seq) = handle
+            .join()
+            .expect("subscriber thread")
+            .unwrap_or_else(|| panic!("timed out waiting for {} notification", topic.as_str()));
+        (topic, body, seq, notifier)
+    }
+
     #[test]
     fn test_topic_as_str() {
         assert_eq!(ZmqTopic::HashBlock.as_str(), "hashblock");
@@ -738,11 +790,20 @@ mod tests {
 
     #[test]
     fn test_topic_from_arg() {
-        assert_eq!(ZmqTopic::from_arg("zmqpubhashblock"), Some(ZmqTopic::HashBlock));
+        assert_eq!(
+            ZmqTopic::from_arg("zmqpubhashblock"),
+            Some(ZmqTopic::HashBlock)
+        );
         assert_eq!(ZmqTopic::from_arg("zmqpubhashtx"), Some(ZmqTopic::HashTx));
-        assert_eq!(ZmqTopic::from_arg("zmqpubrawblock"), Some(ZmqTopic::RawBlock));
+        assert_eq!(
+            ZmqTopic::from_arg("zmqpubrawblock"),
+            Some(ZmqTopic::RawBlock)
+        );
         assert_eq!(ZmqTopic::from_arg("zmqpubrawtx"), Some(ZmqTopic::RawTx));
-        assert_eq!(ZmqTopic::from_arg("zmqpubsequence"), Some(ZmqTopic::Sequence));
+        assert_eq!(
+            ZmqTopic::from_arg("zmqpubsequence"),
+            Some(ZmqTopic::Sequence)
+        );
         assert_eq!(ZmqTopic::from_arg("invalid"), None);
     }
 
@@ -756,9 +817,9 @@ mod tests {
 
     #[test]
     fn test_reverse_hash() {
-        let hash = Hash256::from_hex(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-        ).unwrap();
+        let hash =
+            Hash256::from_hex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .unwrap();
         let reversed = reverse_hash(&hash);
         // The reversed bytes should start with 0x00 (the leading zeros of the hash display)
         assert_eq!(reversed[0], 0x00);
@@ -769,9 +830,18 @@ mod tests {
     #[test]
     fn test_parse_zmq_args() {
         let args = vec![
-            ("zmqpubhashblock".to_string(), "tcp://127.0.0.1:28332".to_string()),
-            ("zmqpubhashtx".to_string(), "tcp://127.0.0.1:28332".to_string()),
-            ("zmqpubrawblock".to_string(), "tcp://127.0.0.1:28333".to_string()),
+            (
+                "zmqpubhashblock".to_string(),
+                "tcp://127.0.0.1:28332".to_string(),
+            ),
+            (
+                "zmqpubhashtx".to_string(),
+                "tcp://127.0.0.1:28332".to_string(),
+            ),
+            (
+                "zmqpubrawblock".to_string(),
+                "tcp://127.0.0.1:28333".to_string(),
+            ),
             ("invalid".to_string(), "ignored".to_string()),
         ];
 
@@ -805,186 +875,55 @@ mod tests {
 
     #[test]
     fn test_zmq_pub_sub_hashblock() {
-        let _guard = zmq_integration_lock();
-        // Use a unique port to avoid conflicts
-        let port = 28400 + (std::process::id() % 100) as u16;
-        let address = format!("tcp://127.0.0.1:{}", port);
-
-        // Create publisher
-        let configs = vec![ZmqNotifierConfig::new(ZmqTopic::HashBlock, address.clone())];
-        let mut notifier = match ZmqNotifier::create(configs) {
-            Ok(Some(n)) => n,
-            Ok(None) => panic!("Expected notifier to be created"),
-            Err(e) => {
-                // Skip test if port is in use
-                eprintln!("Skipping test, bind failed: {}", e);
-                return;
-            }
-        };
-
-        // Create subscriber in a separate thread
-        let sub_address = address.clone();
-        let handle = thread::spawn(move || {
-            let context = zmq::Context::new();
-            let socket = context.socket(zmq::SUB).unwrap();
-            socket.connect(&sub_address).unwrap();
-            socket.set_subscribe(b"hashblock").unwrap();
-            socket.set_rcvtimeo(2000).unwrap();
-
-            // Wait a bit for connection to establish
-            thread::sleep(Duration::from_millis(100));
-
-            // Receive message
-            let topic = socket.recv_bytes(0).ok();
-            let body = socket.recv_bytes(0).ok();
-            let seq = socket.recv_bytes(0).ok();
-
-            (topic, body, seq)
-        });
-
-        // Give subscriber time to connect
-        thread::sleep(Duration::from_millis(200));
-
-        // Create a dummy block and notify
         let block = create_test_block();
-        notifier.notify_block(&block);
+        let (topic, body, seq, mut notifier) =
+            zmq_pubsub_roundtrip(ZmqTopic::HashBlock, Duration::from_secs(2), |n| {
+                n.notify_block(&block)
+            });
 
-        // Give worker time to process
-        thread::sleep(Duration::from_millis(100));
-
-        // Get result from subscriber
-        let (topic, body, seq) = handle.join().unwrap();
-
-        // Verify received data
-        assert_eq!(topic, Some(b"hashblock".to_vec()));
-        assert!(body.is_some());
-        let body = body.unwrap();
+        assert_eq!(topic, b"hashblock");
         assert_eq!(body.len(), 32);
-
-        assert!(seq.is_some());
-        let seq = seq.unwrap();
         assert_eq!(seq.len(), 4);
-        // First message should have sequence 0
-        assert_eq!(u32::from_le_bytes(seq.try_into().unwrap()), 0);
 
         notifier.shutdown();
     }
 
     #[test]
     fn test_zmq_pub_sub_sequence() {
-        let _guard = zmq_integration_lock();
-        // Use a unique port
-        let port = 28500 + (std::process::id() % 100) as u16;
-        let address = format!("tcp://127.0.0.1:{}", port);
+        let block_hash =
+            Hash256::from_hex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .unwrap();
+        let (topic, body, seq, mut notifier) =
+            zmq_pubsub_roundtrip(ZmqTopic::Sequence, Duration::from_secs(2), |n| {
+                n.notify_block_connect(&block_hash)
+            });
 
-        // Create publisher with sequence topic
-        let configs = vec![ZmqNotifierConfig::new(ZmqTopic::Sequence, address.clone())];
-        let mut notifier = match ZmqNotifier::create(configs) {
-            Ok(Some(n)) => n,
-            Ok(None) => panic!("Expected notifier to be created"),
-            Err(e) => {
-                eprintln!("Skipping test, bind failed: {}", e);
-                return;
-            }
-        };
-
-        // Create subscriber
-        let sub_address = address.clone();
-        let handle = thread::spawn(move || {
-            let context = zmq::Context::new();
-            let socket = context.socket(zmq::SUB).unwrap();
-            socket.connect(&sub_address).unwrap();
-            socket.set_subscribe(b"sequence").unwrap();
-            socket.set_rcvtimeo(2000).unwrap();
-
-            thread::sleep(Duration::from_millis(100));
-
-            let topic = socket.recv_bytes(0).ok();
-            let body = socket.recv_bytes(0).ok();
-            let seq = socket.recv_bytes(0).ok();
-
-            (topic, body, seq)
-        });
-
-        thread::sleep(Duration::from_millis(200));
-
-        // Send a block connect notification
-        let block_hash = Hash256::from_hex(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-        ).unwrap();
-        notifier.notify_block_connect(&block_hash);
-
-        thread::sleep(Duration::from_millis(100));
-
-        let (topic, body, _seq) = handle.join().unwrap();
-
-        assert_eq!(topic, Some(b"sequence".to_vec()));
-        assert!(body.is_some());
-        let body = body.unwrap();
+        assert_eq!(topic, b"sequence");
         // 32 bytes hash + 1 byte label (no mempool sequence for block events)
         assert_eq!(body.len(), 33);
-        // Last byte is the label 'C' for block connect
         assert_eq!(body[32], b'C');
+        assert_eq!(seq.len(), 4);
 
         notifier.shutdown();
     }
 
     #[test]
     fn test_zmq_sequence_mempool_acceptance() {
-        let _guard = zmq_integration_lock();
-        let port = 28600 + (std::process::id() % 100) as u16;
-        let address = format!("tcp://127.0.0.1:{}", port);
+        let txid =
+            Hash256::from_hex("7f6b3f6d7c8b9a0e1d2c3b4a5f6e7d8c9b0a1e2d3c4b5a6f7e8d9c0b1a2e3d4c")
+                .unwrap();
+        let (topic, body, seq, mut notifier) =
+            zmq_pubsub_roundtrip(ZmqTopic::Sequence, Duration::from_secs(2), |n| {
+                n.notify_tx_acceptance(&txid, 12345)
+            });
 
-        let configs = vec![ZmqNotifierConfig::new(ZmqTopic::Sequence, address.clone())];
-        let mut notifier = match ZmqNotifier::create(configs) {
-            Ok(Some(n)) => n,
-            Ok(None) => panic!("Expected notifier"),
-            Err(e) => {
-                eprintln!("Skipping test: {}", e);
-                return;
-            }
-        };
-
-        let sub_address = address.clone();
-        let handle = thread::spawn(move || {
-            let context = zmq::Context::new();
-            let socket = context.socket(zmq::SUB).unwrap();
-            socket.connect(&sub_address).unwrap();
-            socket.set_subscribe(b"sequence").unwrap();
-            socket.set_rcvtimeo(5000).unwrap();
-
-            thread::sleep(Duration::from_millis(100));
-
-            let topic = socket.recv_bytes(0).ok();
-            let body = socket.recv_bytes(0).ok();
-            let _seq = socket.recv_bytes(0).ok();
-
-            (topic, body)
-        });
-
-        thread::sleep(Duration::from_millis(300));
-
-        let txid = Hash256::from_hex(
-            "7f6b3f6d7c8b9a0e1d2c3b4a5f6e7d8c9b0a1e2d3c4b5a6f7e8d9c0b1a2e3d4c"
-        ).unwrap();
-        // ZMQ PUB/SUB is lossy across the handshake; re-send so a slow SUB still
-        // observes one message under a loaded `cargo test --workspace`.
-        for _ in 0..5 {
-            notifier.notify_tx_acceptance(&txid, 12345);
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        let (topic, body) = handle.join().unwrap();
-
-        assert_eq!(topic, Some(b"sequence".to_vec()));
-        assert!(body.is_some());
-        let body = body.unwrap();
+        assert_eq!(topic, b"sequence");
         // 32 bytes hash + 1 byte label + 8 bytes mempool sequence
         assert_eq!(body.len(), 41);
         assert_eq!(body[32], b'A'); // Mempool Acceptance
-        // Verify mempool sequence number
         let mempool_seq = u64::from_le_bytes(body[33..41].try_into().unwrap());
         assert_eq!(mempool_seq, 12345);
+        assert_eq!(seq.len(), 4);
 
         notifier.shutdown();
     }
@@ -1029,45 +968,12 @@ mod tests {
 
     #[test]
     fn test_zmq_pub_sub_rawtx() {
-        let _guard = zmq_integration_lock();
-        let address = format!("tcp://127.0.0.1:{}", ephemeral_zmq_port());
-
-        let configs = vec![ZmqNotifierConfig::new(ZmqTopic::RawTx, address.clone())];
-        let mut notifier = ZmqNotifier::create(configs)
-            .unwrap_or_else(|e| panic!("zmq notifier: {e}"))
-            .expect("Expected notifier");
-
-        let sub_address = address.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let handle = thread::spawn(move || {
-            let context = zmq::Context::new();
-            let socket = context.socket(zmq::SUB).expect("sub socket");
-            socket.set_linger(0).ok();
-            socket.connect(&sub_address).expect("sub connect");
-            socket.set_subscribe(b"rawtx").expect("subscribe rawtx");
-            let _ = ready_tx.send(());
-            recv_notification_until(&socket, Instant::now() + Duration::from_secs(2))
-        });
-
-        ready_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("subscriber connected");
-
         let tx = create_test_tx();
         let expected_raw = tx.serialize();
-
-        // Slow-joiner: a PUB send that beats the SUB filter is dropped.
-        // Keep publishing until the subscriber poll observes a message.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && !handle.is_finished() {
-            notifier.notify_transaction(&tx);
-            thread::sleep(Duration::from_millis(20));
-        }
-
-        let (topic, body, seq) = handle
-            .join()
-            .expect("subscriber thread")
-            .expect("timed out waiting for rawtx notification");
+        let (topic, body, seq, mut notifier) =
+            zmq_pubsub_roundtrip(ZmqTopic::RawTx, Duration::from_secs(2), |n| {
+                n.notify_transaction(&tx)
+            });
 
         assert_eq!(topic, b"rawtx");
         assert_eq!(body, expected_raw);
@@ -1084,8 +990,9 @@ mod tests {
             inputs: vec![TxIn {
                 previous_output: OutPoint {
                     txid: Hash256::from_hex(
-                        "0000000000000000000000000000000000000000000000000000000000000001"
-                    ).unwrap(),
+                        "0000000000000000000000000000000000000000000000000000000000000001",
+                    )
+                    .unwrap(),
                     vout: 0,
                 },
                 script_sig: vec![0x00],
@@ -1094,9 +1001,10 @@ mod tests {
             }],
             outputs: vec![TxOut {
                 value: 50_000,
-                script_pubkey: vec![0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                script_pubkey: vec![
+                    0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ],
             }],
             lock_time: 0,
         }
