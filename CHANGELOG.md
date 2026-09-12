@@ -1,6 +1,19 @@
 # Changelog
 
-## v1.0.2 (unreleased)
+## v1.0.2 — 2026-09-12
+
+- 6b17c37f test: make every zmq pub/sub test deterministic
+- c336b9eb chore: gitignore crates/rpc/banlist.json — runtime setban list was dirtying the tree and blocking the node-owner bot
+- cae549a7 test: make zmq pub/sub rawtx deterministic
+- 435ceefd test: close the 33 unit-test failures blocking v1.0.2
+- 1624a17a fix: loadtxoutset activates the snapshot tip and persists it
+- 319b8ffa docs: split the changelog — v1.0.1 shipped 2026-09-07, v1.0.2 is what is new since
+- a74be105 feat(net): HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER — raise the per-peer cap for a single replay feeder
+- b6781578 fix(rpc): T1 probe error/shape parity vs Core
+- 7d4d7972 fix: a campaign entry identical to a built-in anchor is a confirmation, not a collision
+
+
+## v1.0.2 — 2026-09-12
 
 Changes since `v1.0.1`:
 
