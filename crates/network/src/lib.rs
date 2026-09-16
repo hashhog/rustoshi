@@ -2,8 +2,8 @@
 //!
 //! Bitcoin P2P networking: peer connections, message encoding, protocol handling.
 
-pub mod asmap;
 pub mod addr;
+pub mod asmap;
 pub mod block_download;
 pub mod compact_blocks;
 pub mod erlay;
@@ -35,8 +35,8 @@ mod w104_addrman_tests;
 #[cfg(test)]
 mod w115_asmap_tests;
 
-pub use asmap::*;
 pub use addr::*;
+pub use asmap::*;
 pub use block_download::*;
 pub use compact_blocks::*;
 pub use erlay::*;

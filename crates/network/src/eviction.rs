@@ -88,7 +88,12 @@ pub fn select_node_to_evict(candidates: Vec<EvictionCandidate>) -> Option<PeerId
     }
 
     // Protect 4 peers by keyed netgroup (deterministic protection)
-    erase_last_k_by(&mut candidates, |c| c.keyed_netgroup, PROTECTED_PER_CATEGORY, |_| true);
+    erase_last_k_by(
+        &mut candidates,
+        |c| c.keyed_netgroup,
+        PROTECTED_PER_CATEGORY,
+        |_| true,
+    );
 
     // Protect 8 peers with lowest ping time
     erase_last_k_by_reverse(
@@ -172,9 +177,7 @@ pub fn select_node_to_evict(candidates: Vec<EvictionCandidate>) -> Option<PeerId
 
     // Evict the youngest peer from the most-connected group
     let group = netgroup_counts.get(&evict_group)?;
-    let to_evict = group
-        .iter()
-        .max_by_key(|c| c.connected_time)?;
+    let to_evict = group.iter().max_by_key(|c| c.connected_time)?;
 
     Some(to_evict.peer_id)
 }
@@ -291,8 +294,10 @@ fn protect_by_ratio(candidates: &mut Vec<EvictionCandidate>) {
             break;
         }
 
-        let protect_per_network =
-            std::cmp::max((max_protect_by_network - num_protected) / networks_with_peers.len(), 1);
+        let protect_per_network = std::cmp::max(
+            (max_protect_by_network - num_protected) / networks_with_peers.len(),
+            1,
+        );
 
         let mut protected_any = false;
 

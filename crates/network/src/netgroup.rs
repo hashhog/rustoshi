@@ -339,11 +339,7 @@ impl NetGroupManager {
         }
 
         // Documentation (2001:db8::/32) — RFC 3849
-        if octets[0] == 0x20
-            && octets[1] == 0x01
-            && octets[2] == 0x0d
-            && octets[3] == 0xb8
-        {
+        if octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0d && octets[3] == 0xb8 {
             return NetworkType::Unroutable;
         }
 

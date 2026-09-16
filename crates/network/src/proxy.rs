@@ -368,7 +368,10 @@ impl Socks5Proxy {
             )));
         }
 
-        debug!("SOCKS5 connecting to {}:{} via {}", host, port, self.proxy_addr);
+        debug!(
+            "SOCKS5 connecting to {}:{} via {}",
+            host, port, self.proxy_addr
+        );
 
         // Connect to proxy server
         let stream = timeout(self.timeout, TcpStream::connect(self.proxy_addr))
@@ -381,15 +384,17 @@ impl Socks5Proxy {
     }
 
     /// Connect to a NetworkAddr through the proxy.
-    pub async fn connect_addr(&self, addr: &NetworkAddr, port: u16) -> Result<TcpStream, ProxyError> {
+    pub async fn connect_addr(
+        &self,
+        addr: &NetworkAddr,
+        port: u16,
+    ) -> Result<TcpStream, ProxyError> {
         match addr {
             NetworkAddr::Ipv4(ip) => {
                 // Direct IP connection through SOCKS5
                 self.connect_ip((*ip).into(), port).await
             }
-            NetworkAddr::Ipv6(ip) => {
-                self.connect_ip((*ip).into(), port).await
-            }
+            NetworkAddr::Ipv6(ip) => self.connect_ip((*ip).into(), port).await,
             NetworkAddr::TorV3(pubkey) => {
                 // Convert to .onion address
                 let hostname = torv3_pubkey_to_hostname(pubkey);
@@ -412,7 +417,10 @@ impl Socks5Proxy {
 
     /// Connect to an IP address through the proxy.
     async fn connect_ip(&self, ip: std::net::IpAddr, port: u16) -> Result<TcpStream, ProxyError> {
-        debug!("SOCKS5 connecting to {}:{} via {}", ip, port, self.proxy_addr);
+        debug!(
+            "SOCKS5 connecting to {}:{} via {}",
+            ip, port, self.proxy_addr
+        );
 
         let stream = timeout(self.timeout, TcpStream::connect(self.proxy_addr))
             .await
@@ -433,7 +441,8 @@ impl Socks5Proxy {
         let creds = self.effective_credentials();
 
         // Step 1: Version/method selection
-        self.send_version_request(&mut stream, creds.is_some()).await?;
+        self.send_version_request(&mut stream, creds.is_some())
+            .await?;
         let method = self.recv_version_response(&mut stream).await?;
 
         // Step 2: Authentication if required
@@ -446,7 +455,8 @@ impl Socks5Proxy {
         }
 
         // Step 3: CONNECT request
-        self.send_connect_request_domain(&mut stream, host, port).await?;
+        self.send_connect_request_domain(&mut stream, host, port)
+            .await?;
         self.recv_connect_response(&mut stream).await?;
 
         debug!("SOCKS5 connected to {}:{}", host, port);
@@ -464,7 +474,8 @@ impl Socks5Proxy {
         let creds = self.effective_credentials();
 
         // Step 1: Version/method selection
-        self.send_version_request(&mut stream, creds.is_some()).await?;
+        self.send_version_request(&mut stream, creds.is_some())
+            .await?;
         let method = self.recv_version_response(&mut stream).await?;
 
         // Step 2: Authentication if required
@@ -898,10 +909,14 @@ impl TorControl {
             TorControlAuth::Cookie(path) => {
                 let cookie = tokio::fs::read(path).await.map_err(ProxyError::Io)?;
                 let hex_cookie = hex::encode(&cookie);
-                session.send_command(&format!("AUTHENTICATE {}", hex_cookie)).await?;
+                session
+                    .send_command(&format!("AUTHENTICATE {}", hex_cookie))
+                    .await?;
             }
             TorControlAuth::HashedPassword(pass) => {
-                session.send_command(&format!("AUTHENTICATE \"{}\"", pass)).await?;
+                session
+                    .send_command(&format!("AUTHENTICATE \"{}\"", pass))
+                    .await?;
             }
         }
 
@@ -999,9 +1014,8 @@ impl TorControlSession {
             }
         }
 
-        let hostname = hostname.ok_or_else(|| {
-            ProxyError::TorControl("no ServiceID in response".to_string())
-        })?;
+        let hostname = hostname
+            .ok_or_else(|| ProxyError::TorControl("no ServiceID in response".to_string()))?;
 
         info!("Created Tor hidden service: {}", hostname);
 
@@ -1014,7 +1028,8 @@ impl TorControlSession {
     /// Delete a hidden service.
     pub async fn del_onion(&mut self, service_id: &str) -> Result<(), ProxyError> {
         let service_id = service_id.trim_end_matches(".onion");
-        self.send_command(&format!("DEL_ONION {}", service_id)).await?;
+        self.send_command(&format!("DEL_ONION {}", service_id))
+            .await?;
         self.expect_response("250").await?;
         Ok(())
     }
@@ -1086,16 +1101,23 @@ impl I2pSession {
     /// Get our I2P address (creates session if needed).
     pub async fn my_address(&mut self) -> Result<I2pAddress, ProxyError> {
         self.create_if_needed().await?;
-        self.my_addr.clone().ok_or_else(|| {
-            ProxyError::I2pSam(I2pError::GenericError("no address".to_string()))
-        })
+        self.my_addr
+            .clone()
+            .ok_or_else(|| ProxyError::I2pSam(I2pError::GenericError("no address".to_string())))
     }
 
     /// Connect to an I2P destination.
-    pub async fn connect(&mut self, dest: &NetworkAddr, port: u16) -> Result<TcpStream, ProxyError> {
+    pub async fn connect(
+        &mut self,
+        dest: &NetworkAddr,
+        port: u16,
+    ) -> Result<TcpStream, ProxyError> {
         // I2P SAM 3.1 doesn't use ports - verify it's the expected port
         if port != I2P_SAM_PORT {
-            warn!("I2P connections use fixed port {}, ignoring port {}", I2P_SAM_PORT, port);
+            warn!(
+                "I2P connections use fixed port {}, ignoring port {}",
+                I2P_SAM_PORT, port
+            );
         }
 
         let hash = match dest {
@@ -1123,7 +1145,8 @@ impl I2pSession {
 
         // Connect to the destination
         debug!("I2P connecting to {}", b32_addr);
-        self.stream_connect(&mut sock, &session_id, &dest_b64).await?;
+        self.stream_connect(&mut sock, &session_id, &dest_b64)
+            .await?;
 
         info!("I2P connected to {}", b32_addr);
         Ok(sock)
@@ -1220,7 +1243,11 @@ impl I2pSession {
 
         info!(
             "Creating {} I2P SAM session {} with {}",
-            if self.transient { "transient" } else { "persistent" },
+            if self.transient {
+                "transient"
+            } else {
+                "persistent"
+            },
             self.session_id,
             self.sam_addr
         );
@@ -1299,7 +1326,10 @@ impl I2pSession {
         info!(
             "I2P SAM session {} created, my address={}",
             self.session_id,
-            self.my_addr.as_ref().map(|a| &a.b32_addr).unwrap_or(&"?".to_string())
+            self.my_addr
+                .as_ref()
+                .map(|a| &a.b32_addr)
+                .unwrap_or(&"?".to_string())
         );
 
         self.control_sock = Some(sock);
@@ -1359,9 +1389,10 @@ impl I2pSession {
             return Err(ProxyError::I2pSam(I2pError::LookupFailed(name.to_string())));
         }
 
-        reply.get("VALUE").cloned().ok_or_else(|| {
-            ProxyError::I2pSam(I2pError::LookupFailed(name.to_string()))
-        })
+        reply
+            .get("VALUE")
+            .cloned()
+            .ok_or_else(|| ProxyError::I2pSam(I2pError::LookupFailed(name.to_string())))
     }
 
     /// Perform STREAM CONNECT.
@@ -1371,7 +1402,10 @@ impl I2pSession {
         session_id: &str,
         dest: &str,
     ) -> Result<(), ProxyError> {
-        let cmd = format!("STREAM CONNECT ID={} DESTINATION={} SILENT=false", session_id, dest);
+        let cmd = format!(
+            "STREAM CONNECT ID={} DESTINATION={} SILENT=false",
+            session_id, dest
+        );
         self.send_request(sock, &cmd).await?;
 
         let reply = timeout(I2P_TIMEOUT, self.recv_reply_from(sock))
@@ -1382,14 +1416,10 @@ impl I2pSession {
 
         match result.map(|s| s.as_str()) {
             Some("OK") => Ok(()),
-            Some("INVALID_ID") => {
-                Err(ProxyError::I2pSam(I2pError::InvalidSessionId))
-            }
-            Some("CANT_REACH_PEER") | Some("TIMEOUT") => {
-                Err(ProxyError::PeerUnreachable(
-                    reply.get("MESSAGE").cloned().unwrap_or_default(),
-                ))
-            }
+            Some("INVALID_ID") => Err(ProxyError::I2pSam(I2pError::InvalidSessionId)),
+            Some("CANT_REACH_PEER") | Some("TIMEOUT") => Err(ProxyError::PeerUnreachable(
+                reply.get("MESSAGE").cloned().unwrap_or_default(),
+            )),
             _ => Err(ProxyError::I2pSam(I2pError::ConnectFailed(
                 reply.get("MESSAGE").cloned().unwrap_or_default(),
             ))),
@@ -1399,18 +1429,26 @@ impl I2pSession {
     /// Send a SAM request.
     async fn send_request(&self, sock: &mut TcpStream, cmd: &str) -> Result<(), ProxyError> {
         let msg = format!("{}\n", cmd);
-        sock.write_all(msg.as_bytes()).await.map_err(ProxyError::Io)?;
+        sock.write_all(msg.as_bytes())
+            .await
+            .map_err(ProxyError::Io)?;
         sock.flush().await.map_err(ProxyError::Io)?;
         Ok(())
     }
 
     /// Receive and parse a SAM reply.
-    async fn recv_reply(&self, sock: &mut TcpStream) -> Result<std::collections::HashMap<String, String>, ProxyError> {
+    async fn recv_reply(
+        &self,
+        sock: &mut TcpStream,
+    ) -> Result<std::collections::HashMap<String, String>, ProxyError> {
         self.recv_reply_from(sock).await
     }
 
     /// Receive and parse a SAM reply from a socket.
-    async fn recv_reply_from(&self, sock: &mut TcpStream) -> Result<std::collections::HashMap<String, String>, ProxyError> {
+    async fn recv_reply_from(
+        &self,
+        sock: &mut TcpStream,
+    ) -> Result<std::collections::HashMap<String, String>, ProxyError> {
         let mut reader = BufReader::new(sock);
         let mut line = String::new();
         reader.read_line(&mut line).await.map_err(ProxyError::Io)?;
@@ -1444,7 +1482,9 @@ pub fn i2p_hash_to_b32(hash: &[u8; 32]) -> String {
 
 /// Parse a .b32.i2p address to a 32-byte hash.
 pub fn b32_to_i2p_hash(addr: &str) -> Result<[u8; 32], ProxyError> {
-    let addr = addr.trim_end_matches(".b32.i2p").trim_end_matches(".B32.I2P");
+    let addr = addr
+        .trim_end_matches(".b32.i2p")
+        .trim_end_matches(".B32.I2P");
     if addr.len() != 52 {
         return Err(ProxyError::InvalidAddress(format!(
             "invalid b32 address length: {}",
@@ -1772,8 +1812,7 @@ mod tests {
 
     #[test]
     fn test_proxy_config_can_reach() {
-        let config = ProxyConfig::new()
-            .with_onion_proxy("127.0.0.1:9050".parse().unwrap());
+        let config = ProxyConfig::new().with_onion_proxy("127.0.0.1:9050".parse().unwrap());
 
         assert!(config.can_reach(&NetworkAddr::Ipv4(std::net::Ipv4Addr::LOCALHOST)));
         assert!(config.can_reach(&NetworkAddr::TorV3([0; 32])));
@@ -1897,7 +1936,10 @@ mod tests {
 
         if require_auth {
             // Reply: use username/password auth
-            stream.write_all(&[SOCKS5_VERSION, Socks5AuthMethod::UsernamePassword as u8]).await.unwrap();
+            stream
+                .write_all(&[SOCKS5_VERSION, Socks5AuthMethod::UsernamePassword as u8])
+                .await
+                .unwrap();
 
             // Read auth request (RFC 1929)
             let mut auth_ver = [0u8; 1];
@@ -1915,7 +1957,10 @@ mod tests {
             stream.write_all(&[0x01, 0x00]).await.unwrap();
         } else {
             // Reply: no auth needed
-            stream.write_all(&[SOCKS5_VERSION, Socks5AuthMethod::NoAuth as u8]).await.unwrap();
+            stream
+                .write_all(&[SOCKS5_VERSION, Socks5AuthMethod::NoAuth as u8])
+                .await
+                .unwrap();
         }
 
         // Read connect request
@@ -1944,24 +1989,38 @@ mod tests {
         // Send reply
         if success {
             // Success with bound address 0.0.0.0:0
-            stream.write_all(&[
-                SOCKS5_VERSION,
-                0x00, // success
-                0x00, // reserved
-                0x01, // IPv4
-                0, 0, 0, 0, // address
-                0, 0, // port
-            ]).await.unwrap();
+            stream
+                .write_all(&[
+                    SOCKS5_VERSION,
+                    0x00, // success
+                    0x00, // reserved
+                    0x01, // IPv4
+                    0,
+                    0,
+                    0,
+                    0, // address
+                    0,
+                    0, // port
+                ])
+                .await
+                .unwrap();
         } else {
             // Connection refused
-            stream.write_all(&[
-                SOCKS5_VERSION,
-                Socks5Error::ConnectionRefused as u8,
-                0x00,
-                0x01,
-                0, 0, 0, 0,
-                0, 0,
-            ]).await.unwrap();
+            stream
+                .write_all(&[
+                    SOCKS5_VERSION,
+                    Socks5Error::ConnectionRefused as u8,
+                    0x00,
+                    0x01,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ])
+                .await
+                .unwrap();
         }
     }
 
@@ -1992,8 +2051,7 @@ mod tests {
             run_mock_socks5_server(listener, true, true).await;
         });
 
-        let proxy = Socks5Proxy::new(addr)
-            .with_credentials(Socks5Credentials::new("user", "pass"));
+        let proxy = Socks5Proxy::new(addr).with_credentials(Socks5Credentials::new("user", "pass"));
         let result = proxy.connect("example.com", 8333).await;
         assert!(result.is_ok());
 
@@ -2092,10 +2150,8 @@ mod tests {
 
     #[test]
     fn test_i2p_session_types() {
-        let persistent = I2pSession::new_persistent(
-            "127.0.0.1:7656".parse().unwrap(),
-            "/tmp/test_key".into(),
-        );
+        let persistent =
+            I2pSession::new_persistent("127.0.0.1:7656".parse().unwrap(), "/tmp/test_key".into());
         assert!(!persistent.transient);
 
         let transient = I2pSession::new_transient("127.0.0.1:7656".parse().unwrap());

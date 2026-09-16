@@ -37,14 +37,15 @@
 //!   G29 ASN used as bucketing key in addrman add path (asmap → bucket)
 //!   G30 peers.dat persistence + uint256 bucket-key + anchors load is_banned check
 
-use rustoshi_network::eviction::{select_node_to_evict, EvictionCandidate, EvictionCandidateBuilder};
+use rustoshi_network::eviction::{
+    select_node_to_evict, EvictionCandidate, EvictionCandidateBuilder,
+};
 use rustoshi_network::netgroup::{NetGroup, NetGroupManager, NetworkType};
 use rustoshi_network::peer::PeerId;
 use rustoshi_network::peer_manager::{
-    AddrManTable, AddressManager, ConnectionType, PeerManagerConfig,
-    ADDRMAN_BUCKET_SIZE, ADDRMAN_HORIZON_SECS, ADDRMAN_MAX_FAILURES, ADDRMAN_MIN_FAIL_SECS,
-    ADDRMAN_NEW_BUCKET_COUNT, ADDRMAN_RETRIES, ADDRMAN_TRIED_BUCKET_COUNT, FEELER_INTERVAL,
-    MAX_BLOCK_RELAY_ONLY_ANCHORS,
+    AddrManTable, AddressManager, ConnectionType, PeerManagerConfig, ADDRMAN_BUCKET_SIZE,
+    ADDRMAN_HORIZON_SECS, ADDRMAN_MAX_FAILURES, ADDRMAN_MIN_FAIL_SECS, ADDRMAN_NEW_BUCKET_COUNT,
+    ADDRMAN_RETRIES, ADDRMAN_TRIED_BUCKET_COUNT, FEELER_INTERVAL, MAX_BLOCK_RELAY_ONLY_ANCHORS,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -56,8 +57,10 @@ use tokio::time::Instant;
 /// matches at peer_manager.rs:53.
 #[test]
 fn g1_max_block_relay_only_anchors_is_2() {
-    assert_eq!(MAX_BLOCK_RELAY_ONLY_ANCHORS, 2,
-        "MAX_BLOCK_RELAY_ONLY_ANCHORS must equal Core's net.cpp:57 value");
+    assert_eq!(
+        MAX_BLOCK_RELAY_ONLY_ANCHORS, 2,
+        "MAX_BLOCK_RELAY_ONLY_ANCHORS must equal Core's net.cpp:57 value"
+    );
 }
 
 // ─── G2: max_outbound_full_relay=8 ──────────────────────────────────────────
@@ -67,8 +70,10 @@ fn g1_max_block_relay_only_anchors_is_2() {
 #[test]
 fn g2_max_outbound_full_relay_default_is_8() {
     let cfg = PeerManagerConfig::default();
-    assert_eq!(cfg.max_outbound_full_relay, 8,
-        "max_outbound_full_relay must equal Core's MAX_OUTBOUND_FULL_RELAY_CONNECTIONS=8");
+    assert_eq!(
+        cfg.max_outbound_full_relay, 8,
+        "max_outbound_full_relay must equal Core's MAX_OUTBOUND_FULL_RELAY_CONNECTIONS=8"
+    );
 }
 
 // ─── G3: max_outbound_block_relay=2 ─────────────────────────────────────────
@@ -78,8 +83,10 @@ fn g2_max_outbound_full_relay_default_is_8() {
 #[test]
 fn g3_max_outbound_block_relay_default_is_2() {
     let cfg = PeerManagerConfig::default();
-    assert_eq!(cfg.max_outbound_block_relay, 2,
-        "max_outbound_block_relay must equal Core's MAX_BLOCK_RELAY_ONLY_CONNECTIONS=2");
+    assert_eq!(
+        cfg.max_outbound_block_relay, 2,
+        "max_outbound_block_relay must equal Core's MAX_BLOCK_RELAY_ONLY_CONNECTIONS=2"
+    );
 }
 
 // ─── G4: Bucket-based AddrMan (vvNew/vvTried) ───────────────────────────────
@@ -94,22 +101,38 @@ fn g3_max_outbound_block_relay_default_is_2() {
 #[test]
 fn g4_addrman_buckets_present() {
     // Bucket geometry constants are exported and match Core.
-    assert_eq!(ADDRMAN_NEW_BUCKET_COUNT, 1024,
-        "BUG-1: ADDRMAN_NEW_BUCKET_COUNT must equal Core's 1<<10");
-    assert_eq!(ADDRMAN_TRIED_BUCKET_COUNT, 256,
-        "BUG-1: ADDRMAN_TRIED_BUCKET_COUNT must equal Core's 1<<8");
-    assert_eq!(ADDRMAN_BUCKET_SIZE, 64,
-        "BUG-1: ADDRMAN_BUCKET_SIZE must equal Core's 1<<6");
+    assert_eq!(
+        ADDRMAN_NEW_BUCKET_COUNT, 1024,
+        "BUG-1: ADDRMAN_NEW_BUCKET_COUNT must equal Core's 1<<10"
+    );
+    assert_eq!(
+        ADDRMAN_TRIED_BUCKET_COUNT, 256,
+        "BUG-1: ADDRMAN_TRIED_BUCKET_COUNT must equal Core's 1<<8"
+    );
+    assert_eq!(
+        ADDRMAN_BUCKET_SIZE, 64,
+        "BUG-1: ADDRMAN_BUCKET_SIZE must equal Core's 1<<6"
+    );
 
     // A heard address lands in the NEW table (not a flat undifferentiated map).
     let ng = NetGroupManager::with_key(0xDEADBEEF);
     let mut table = AddrManTable::with_nkey([0x11; 32]);
     let addr: SocketAddr = "8.8.8.8:8333".parse().unwrap();
     let source: IpAddr = "1.2.3.4".parse().unwrap();
-    assert!(table.add(addr, source, 1, 1_700_000_000, &ng),
-        "BUG-1: add() of a routable addr must insert into a NEW bucket");
-    assert_eq!(table.total_count(), 1, "BUG-1: table holds exactly one addr");
-    assert_eq!(table.new_count(), 1, "BUG-1: the addr lives in the NEW table");
+    assert!(
+        table.add(addr, source, 1, 1_700_000_000, &ng),
+        "BUG-1: add() of a routable addr must insert into a NEW bucket"
+    );
+    assert_eq!(
+        table.total_count(),
+        1,
+        "BUG-1: table holds exactly one addr"
+    );
+    assert_eq!(
+        table.new_count(),
+        1,
+        "BUG-1: the addr lives in the NEW table"
+    );
     assert_eq!(table.tried_count(), 0, "BUG-1: add() must not touch TRIED");
 }
 
@@ -129,26 +152,39 @@ fn g5_bucket_selection_hashing_present() {
     let mut table = AddrManTable::with_nkey([0x11; 32]);
     let addr: SocketAddr = "8.8.8.8:8333".parse().unwrap();
     let source: IpAddr = "1.2.3.4".parse().unwrap();
-    assert!(table.add(addr, source, 1, 1_700_000_000, &ng),
-        "BUG-2: routable addr must be admitted");
+    assert!(
+        table.add(addr, source, 1, 1_700_000_000, &ng),
+        "BUG-2: routable addr must be admitted"
+    );
 
-    let slot = table.new_slot_of(&addr, &ng)
+    let slot = table
+        .new_slot_of(&addr, &ng)
         .expect("BUG-2: added addr must occupy a computed NEW slot");
     let (bucket, pos) = slot;
-    assert!(bucket < ADDRMAN_NEW_BUCKET_COUNT,
-        "BUG-2: bucket {bucket} must be < {ADDRMAN_NEW_BUCKET_COUNT}");
-    assert!(pos < ADDRMAN_BUCKET_SIZE,
-        "BUG-2: pos {pos} must be < {ADDRMAN_BUCKET_SIZE}");
+    assert!(
+        bucket < ADDRMAN_NEW_BUCKET_COUNT,
+        "BUG-2: bucket {bucket} must be < {ADDRMAN_NEW_BUCKET_COUNT}"
+    );
+    assert!(
+        pos < ADDRMAN_BUCKET_SIZE,
+        "BUG-2: pos {pos} must be < {ADDRMAN_BUCKET_SIZE}"
+    );
 
     // Deterministic on re-query of the same table.
-    assert_eq!(table.new_slot_of(&addr, &ng), Some(slot),
-        "BUG-2: bucket selection must be deterministic across re-query");
+    assert_eq!(
+        table.new_slot_of(&addr, &ng),
+        Some(slot),
+        "BUG-2: bucket selection must be deterministic across re-query"
+    );
 
     // Deterministic across a second table with the SAME nkey + same netgroup.
     let mut table2 = AddrManTable::with_nkey([0x11; 32]);
     assert!(table2.add(addr, source, 1, 1_700_000_000, &ng));
-    assert_eq!(table2.new_slot_of(&addr, &ng), Some(slot),
-        "BUG-2: same nkey + same addr must hash to the same (bucket,pos)");
+    assert_eq!(
+        table2.new_slot_of(&addr, &ng),
+        Some(slot),
+        "BUG-2: same nkey + same addr must hash to the same (bucket,pos)"
+    );
 }
 
 // ─── G6: MakeTried new→tried promotion ──────────────────────────────────────
@@ -172,12 +208,20 @@ fn g6_make_tried_promotion_present() {
     // into the NEW table) and then promotes NEW -> TRIED via addrman.good.
     mgr.mark_outbound_success(&addr, &ng);
 
-    assert!(mgr.addrman().is_in_tried(&addr),
-        "BUG-3: successful outbound peer must be promoted to TRIED");
-    assert_eq!(mgr.addrman().tried_count(), 1,
-        "BUG-3: exactly one addr should live in TRIED after promotion");
-    assert_eq!(mgr.addrman().new_count(), 0,
-        "BUG-3: the promoted addr must leave the NEW table");
+    assert!(
+        mgr.addrman().is_in_tried(&addr),
+        "BUG-3: successful outbound peer must be promoted to TRIED"
+    );
+    assert_eq!(
+        mgr.addrman().tried_count(),
+        1,
+        "BUG-3: exactly one addr should live in TRIED after promotion"
+    );
+    assert_eq!(
+        mgr.addrman().new_count(),
+        0,
+        "BUG-3: the promoted addr must leave the NEW table"
+    );
 }
 
 // ─── G7: ConnectionType::Manual exempt from ban ─────────────────────────────
@@ -204,7 +248,10 @@ fn g8_noban_field_referenced_in_ban_path() {
     // to gate on it. We can't reflect the field directly from outside,
     // but the ConnectionType::Manual exemption above proves the
     // ban-exempt machinery is in place.
-    assert!(true, "ban_peer_with_reason() at peer_manager.rs:1813 checks peer.noban");
+    assert!(
+        true,
+        "ban_peer_with_reason() at peer_manager.rs:1813 checks peer.noban"
+    );
 }
 
 // ─── G9: ResolveCollisions / SelectTriedCollision ───────────────────────────
@@ -216,8 +263,10 @@ fn g8_noban_field_referenced_in_ban_path() {
 #[test]
 #[ignore = "BUG-4 P0: no ResolveCollisions / SelectTriedCollision / m_tried_collisions — tried-bucket evictions skip test-before-evict"]
 fn g9_tried_collision_resolution_present() {
-    assert!(false,
-        "BUG-4 P0: no tried-collision resolution path (ADDRMAN_SET_TRIED_COLLISION_SIZE=10)");
+    assert!(
+        false,
+        "BUG-4 P0: no tried-collision resolution path (ADDRMAN_SET_TRIED_COLLISION_SIZE=10)"
+    );
 }
 
 // ─── G10: Select() weighted-RNG ─────────────────────────────────────────────
@@ -230,8 +279,10 @@ fn g9_tried_collision_resolution_present() {
 #[test]
 #[ignore = "BUG-5 P0: no weighted-RNG Select() — next_addr_to_try is FIFO; attacker addr-flood order controls connect order"]
 fn g10_select_weighted_rng_present() {
-    assert!(false,
-        "BUG-5 P0: Select() weighted RNG / GetChance() / 50-50 new-vs-tried absent");
+    assert!(
+        false,
+        "BUG-5 P0: Select() weighted RNG / GetChance() / 50-50 new-vs-tried absent"
+    );
 }
 
 // ─── G11: IsTerrible eviction ───────────────────────────────────────────────
@@ -243,14 +294,24 @@ fn g10_select_weighted_rng_present() {
 /// 30 d, retries 3, max-failures 10, min-fail 7 d. Core: addrman.cpp:49-72.
 #[test]
 fn g11_is_terrible_eviction_present() {
-    assert_eq!(ADDRMAN_HORIZON_SECS, 30 * 24 * 60 * 60,
-        "BUG-6: ADDRMAN_HORIZON must be 30 days (Core addrman.h)");
-    assert_eq!(ADDRMAN_RETRIES, 3,
-        "BUG-6: ADDRMAN_RETRIES must be 3 (Core addrman.h)");
-    assert_eq!(ADDRMAN_MAX_FAILURES, 10,
-        "BUG-6: ADDRMAN_MAX_FAILURES must be 10 (Core addrman.h)");
-    assert_eq!(ADDRMAN_MIN_FAIL_SECS, 7 * 24 * 60 * 60,
-        "BUG-6: ADDRMAN_MIN_FAIL must be 7 days (Core addrman.h)");
+    assert_eq!(
+        ADDRMAN_HORIZON_SECS,
+        30 * 24 * 60 * 60,
+        "BUG-6: ADDRMAN_HORIZON must be 30 days (Core addrman.h)"
+    );
+    assert_eq!(
+        ADDRMAN_RETRIES, 3,
+        "BUG-6: ADDRMAN_RETRIES must be 3 (Core addrman.h)"
+    );
+    assert_eq!(
+        ADDRMAN_MAX_FAILURES, 10,
+        "BUG-6: ADDRMAN_MAX_FAILURES must be 10 (Core addrman.h)"
+    );
+    assert_eq!(
+        ADDRMAN_MIN_FAIL_SECS,
+        7 * 24 * 60 * 60,
+        "BUG-6: ADDRMAN_MIN_FAIL must be 7 days (Core addrman.h)"
+    );
 }
 
 // ─── G12: ConnectionType::Feeler + FEELER_INTERVAL ──────────────────────────
@@ -266,11 +327,17 @@ fn g12_connection_type_feeler_present() {
     // The Feeler variant exists and is distinct from the other variants.
     let feeler = ConnectionType::Feeler;
     assert_eq!(feeler, ConnectionType::Feeler);
-    assert_ne!(feeler, ConnectionType::FullRelay,
-        "BUG-7: Feeler must be a distinct ConnectionType variant");
+    assert_ne!(
+        feeler,
+        ConnectionType::FullRelay,
+        "BUG-7: Feeler must be a distinct ConnectionType variant"
+    );
     // The feeler cadence matches Core's 2-minute interval.
-    assert_eq!(FEELER_INTERVAL, Duration::from_secs(120),
-        "BUG-7: FEELER_INTERVAL must equal Core's net.h:61 value (2 min)");
+    assert_eq!(
+        FEELER_INTERVAL,
+        Duration::from_secs(120),
+        "BUG-7: FEELER_INTERVAL must equal Core's net.h:61 value (2 min)"
+    );
 }
 
 // ─── G13: ConnectionType::AddrFetch ─────────────────────────────────────────
@@ -282,8 +349,7 @@ fn g12_connection_type_feeler_present() {
 #[test]
 #[ignore = "BUG-8 P1: no ConnectionType::AddrFetch — DNS-seed connections occupy persistent FullRelay slots"]
 fn g13_connection_type_addr_fetch_present() {
-    assert!(false,
-        "BUG-8 P1: ConnectionType::AddrFetch variant absent");
+    assert!(false, "BUG-8 P1: ConnectionType::AddrFetch variant absent");
 }
 
 // ─── G14: ProtectNoBanConnections (PASS) ────────────────────────────────────
@@ -302,15 +368,21 @@ fn g14_protect_noban_connections() {
         "8.8.8.8:8333".parse().unwrap(),
         now - Duration::from_secs(100),
         Some(Duration::from_millis(50)),
-        None, None,
-        true, true, false, false,
+        None,
+        None,
+        true,
+        true,
+        false,
+        false,
         true, // noban
     );
     c1.noban = true;
 
     let result = select_node_to_evict(vec![c1]);
-    assert_eq!(result, None,
-        "G14: NoBan peer must never be selected for eviction");
+    assert_eq!(
+        result, None,
+        "G14: NoBan peer must never be selected for eviction"
+    );
 }
 
 // ─── G15: NetGroup::keyed via SHA256d (PASS) ────────────────────────────────
@@ -328,7 +400,10 @@ fn g15_netgroup_keyed_uses_sha256d() {
     let g2 = NetGroup::new(vec![0u8, 4, 5, 6]);
     let k1 = g1.keyed(0xDEADBEEF);
     let k2 = g2.keyed(0xDEADBEEF);
-    assert_ne!(k1, k2, "G15: SHA256d-keyed groups must differ for distinct inputs");
+    assert_ne!(
+        k1, k2,
+        "G15: SHA256d-keyed groups must differ for distinct inputs"
+    );
     assert_ne!(k1, 0, "G15: keyed result must not be zero");
     assert_ne!(k1, 0xDEADBEEF, "G15: keyed result must not equal the key");
 }
@@ -341,8 +416,10 @@ fn g15_netgroup_keyed_uses_sha256d() {
 #[test]
 #[ignore = "BUG-9 P1: no EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL=5min rotation — block-relay-only peers never cycled"]
 fn g16_extra_block_relay_rotation_present() {
-    assert!(false,
-        "BUG-9 P1: EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL=5min rotation absent");
+    assert!(
+        false,
+        "BUG-9 P1: EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL=5min rotation absent"
+    );
 }
 
 // ─── G17: MaybePickPreferredNetwork ─────────────────────────────────────────
@@ -353,8 +430,10 @@ fn g16_extra_block_relay_rotation_present() {
 #[test]
 #[ignore = "BUG-10 P1: no MaybePickPreferredNetwork — reachable-network selection bias absent"]
 fn g17_maybe_pick_preferred_network_present() {
-    assert!(false,
-        "BUG-10 P1: MaybePickPreferredNetwork() reachable-net bias absent");
+    assert!(
+        false,
+        "BUG-10 P1: MaybePickPreferredNetwork() reachable-net bias absent"
+    );
 }
 
 // ─── G18: count_failures gating ─────────────────────────────────────────────
@@ -367,8 +446,10 @@ fn g17_maybe_pick_preferred_network_present() {
 #[test]
 #[ignore = "BUG-11 P1: no count_failures gate — offline node poisons own addrman with attempt_count increments"]
 fn g18_count_failures_gated_on_outbound_diversity() {
-    assert!(false,
-        "BUG-11 P1: count_failures gating on ≥2 outbound netgroups absent");
+    assert!(
+        false,
+        "BUG-11 P1: count_failures gating on ≥2 outbound netgroups absent"
+    );
 }
 
 // ─── G19: Eviction tie-break uses m_connected, not Instant::now() ───────────
@@ -381,8 +462,10 @@ fn g18_count_failures_gated_on_outbound_diversity() {
 #[test]
 #[ignore = "BUG-12 P1: select_node_to_evict uses Instant::now() per-iteration for tie-break — should use candidate.connected_time"]
 fn g19_eviction_tiebreak_uses_connected_time_not_now() {
-    assert!(false,
-        "BUG-12 P1: eviction tie-break Instant::now() drift breaks netgroup determinism");
+    assert!(
+        false,
+        "BUG-12 P1: eviction tie-break Instant::now() drift breaks netgroup determinism"
+    );
 }
 
 // ─── G20: EvictionCandidate.bloom_filter wired ──────────────────────────────
@@ -393,8 +476,10 @@ fn g19_eviction_tiebreak_uses_connected_time_not_now() {
 #[test]
 #[ignore = "BUG-13 P1: EvictionCandidate.bloom_filter hardcoded false at peer_manager.rs:2500 — CompareNodeTXTime tiebreak inert"]
 fn g20_eviction_bloom_filter_wired() {
-    assert!(false,
-        "BUG-13 P1: bloom_filter field unwired from peer state (hardcoded false)");
+    assert!(
+        false,
+        "BUG-13 P1: bloom_filter field unwired from peer state (hardcoded false)"
+    );
 }
 
 // ─── G21: EvictionCandidate.prefer_evict wired ──────────────────────────────
@@ -405,8 +490,10 @@ fn g20_eviction_bloom_filter_wired() {
 #[test]
 #[ignore = "BUG-14 P1: EvictionCandidate.prefer_evict hardcoded false — version-handshake-suspect carve-out dead"]
 fn g21_eviction_prefer_evict_wired() {
-    assert!(false,
-        "BUG-14 P1: prefer_evict field unwired from peer state (hardcoded false)");
+    assert!(
+        false,
+        "BUG-14 P1: prefer_evict field unwired from peer state (hardcoded false)"
+    );
 }
 
 // ─── G22: protect_by_ratio CompareNodeNetworkTime semantics ─────────────────
@@ -419,8 +506,10 @@ fn g21_eviction_prefer_evict_wired() {
 #[test]
 #[ignore = "BUG-15 P1: protect_by_ratio sort-then-retain split breaks CompareNodeNetworkTime single-comparator invariant"]
 fn g22_protect_by_ratio_compare_node_network_time() {
-    assert!(false,
-        "BUG-15 P1: protect_by_ratio's sort-and-retain splits CompareNodeNetworkTime semantics");
+    assert!(
+        false,
+        "BUG-15 P1: protect_by_ratio's sort-and-retain splits CompareNodeNetworkTime semantics"
+    );
 }
 
 // ─── G23: EvictionCandidate.noban wired from PeerHandle ─────────────────────
@@ -433,8 +522,10 @@ fn g22_protect_by_ratio_compare_node_network_time() {
 #[test]
 #[ignore = "BUG-16 P1: select_inbound_to_evict passes noban=false hardcoded — PeerHandle.noban not plumbed"]
 fn g23_eviction_noban_wired_from_peer_handle() {
-    assert!(false,
-        "BUG-16 P1: PeerHandle.noban not plumbed into EvictionCandidate.noban");
+    assert!(
+        false,
+        "BUG-16 P1: PeerHandle.noban not plumbed into EvictionCandidate.noban"
+    );
 }
 
 // ─── G24: select_inbound_to_evict has a caller ──────────────────────────────
@@ -449,8 +540,10 @@ fn g23_eviction_noban_wired_from_peer_handle() {
 #[ignore = "BUG-17 P1: select_inbound_to_evict has no caller — AttemptToEvictConnection critical-section unwired"]
 fn g24_select_inbound_to_evict_called_from_accept_path() {
     // Dead-code detection at audit time only.
-    assert!(false,
-        "BUG-17 P1: select_inbound_to_evict is dead code (no accept-path caller)");
+    assert!(
+        false,
+        "BUG-17 P1: select_inbound_to_evict is dead code (no accept-path caller)"
+    );
 }
 
 // ─── G25: Discourage uses in-memory set, not persisted banlist ──────────────
@@ -463,8 +556,10 @@ fn g24_select_inbound_to_evict_called_from_accept_path() {
 #[test]
 #[ignore = "BUG-18 P1: every misbehavior-disconnect persists to banlist.json — no in-memory m_discouraged set"]
 fn g25_discourage_in_memory_set_present() {
-    assert!(false,
-        "BUG-18 P1: BanManager has no Discourage() / m_discouraged distinct from persistent bans");
+    assert!(
+        false,
+        "BUG-18 P1: BanManager has no Discourage() / m_discouraged distinct from persistent bans"
+    );
 }
 
 // ─── G26: IsDiscouraged predicate ───────────────────────────────────────────
@@ -476,8 +571,10 @@ fn g25_discourage_in_memory_set_present() {
 #[test]
 #[ignore = "BUG-19 P1: BanManager::is_discouraged() predicate absent — only is_banned exists"]
 fn g26_is_discouraged_predicate_present() {
-    assert!(false,
-        "BUG-19 P1: BanManager has no is_discouraged() predicate");
+    assert!(
+        false,
+        "BUG-19 P1: BanManager has no is_discouraged() predicate"
+    );
 }
 
 // ─── G27: BanMan SweepBanned periodic scheduler call ────────────────────────
@@ -489,8 +586,10 @@ fn g26_is_discouraged_predicate_present() {
 #[test]
 #[ignore = "BUG-20 P1: BanManager::sweep_banned not on periodic scheduler — expired bans persist on quiescent nodes"]
 fn g27_ban_manager_periodic_sweep_present() {
-    assert!(false,
-        "BUG-20 P1: SweepBanned not invoked from a periodic scheduler");
+    assert!(
+        false,
+        "BUG-20 P1: SweepBanned not invoked from a periodic scheduler"
+    );
 }
 
 // ─── G28: IPv4 /16 netgroup grouping (PASS) ─────────────────────────────────
@@ -523,28 +622,44 @@ fn g29_asn_used_as_bucketing_key_on_add() {
     // Minimal valid asmap: RETURN ASN=1 for ANY IP (asmap.rs minimal_asmap_asn1).
     let asmap = vec![0x00u8, 0x00, 0x00];
     let ng = NetGroupManager::with_asmap(0xDEAD, asmap);
-    assert!(ng.using_asmap(), "G29: asmap must be loaded for ASN bucketing");
+    assert!(
+        ng.using_asmap(),
+        "G29: asmap must be loaded for ASN bucketing"
+    );
 
     // Two addrs in DIFFERENT /16 IPv4 prefixes — under /16 bucketing these would
     // (almost surely) differ; under ASN bucketing they share ASN=1.
     let addr1: SocketAddr = "8.8.8.8:8333".parse().unwrap();
     let addr2: SocketAddr = "200.1.2.3:8333".parse().unwrap();
     // Sanity: same ASN, distinct /16 groups would-be.
-    assert_eq!(ng.get_group(&addr1.ip()), ng.get_group(&addr2.ip()),
-        "BUG-21: both addrs must share the asmap-derived (ASN) group");
+    assert_eq!(
+        ng.get_group(&addr1.ip()),
+        ng.get_group(&addr2.ip()),
+        "BUG-21: both addrs must share the asmap-derived (ASN) group"
+    );
 
     let src: IpAddr = "1.2.3.4".parse().unwrap();
     let mut table = AddrManTable::with_nkey([0x11; 32]);
-    assert!(table.add(addr1, src, 1, 1_700_000_000, &ng),
-        "BUG-21: addr1 must be admitted to NEW");
-    assert!(table.add(addr2, src, 1, 1_700_000_000, &ng),
-        "BUG-21: addr2 must be admitted to NEW");
+    assert!(
+        table.add(addr1, src, 1, 1_700_000_000, &ng),
+        "BUG-21: addr1 must be admitted to NEW"
+    );
+    assert!(
+        table.add(addr2, src, 1, 1_700_000_000, &ng),
+        "BUG-21: addr2 must be admitted to NEW"
+    );
 
-    let (b1, _) = table.new_slot_of(&addr1, &ng).expect("BUG-21: addr1 in NEW");
-    let (b2, _) = table.new_slot_of(&addr2, &ng).expect("BUG-21: addr2 in NEW");
-    assert_eq!(b1, b2,
+    let (b1, _) = table
+        .new_slot_of(&addr1, &ng)
+        .expect("BUG-21: addr1 in NEW");
+    let (b2, _) = table
+        .new_slot_of(&addr2, &ng)
+        .expect("BUG-21: addr2 in NEW");
+    assert_eq!(
+        b1, b2,
         "BUG-21: same-ASN addrs in different /16s must share one NEW bucket — \
-         proving the asmap-derived netgroup is the bucketing key on add");
+         proving the asmap-derived netgroup is the bucketing key on add"
+    );
 }
 
 // ─── G30: peers.dat persistence + uint256 bucket key + anchors is_banned ────

@@ -95,39 +95,39 @@ use constants::*;
 /// Short message IDs as defined in BIP324.
 /// Index 0 means long encoding (12 bytes follow).
 const V2_MESSAGE_IDS: [&str; 33] = [
-    "",           // 0: long encoding follows
-    "addr",       // 1
-    "block",      // 2
-    "blocktxn",   // 3
-    "cmpctblock", // 4
-    "feefilter",  // 5
-    "filteradd",  // 6
-    "filterclear", // 7
-    "filterload", // 8
-    "getblocks",  // 9
-    "getblocktxn", // 10
-    "getdata",    // 11
-    "getheaders", // 12
-    "headers",    // 13
-    "inv",        // 14
-    "mempool",    // 15
-    "merkleblock", // 16
-    "notfound",   // 17
-    "ping",       // 18
-    "pong",       // 19
-    "sendcmpct",  // 20
-    "tx",         // 21
-    "getcfilters", // 22
-    "cfilter",    // 23
+    "",             // 0: long encoding follows
+    "addr",         // 1
+    "block",        // 2
+    "blocktxn",     // 3
+    "cmpctblock",   // 4
+    "feefilter",    // 5
+    "filteradd",    // 6
+    "filterclear",  // 7
+    "filterload",   // 8
+    "getblocks",    // 9
+    "getblocktxn",  // 10
+    "getdata",      // 11
+    "getheaders",   // 12
+    "headers",      // 13
+    "inv",          // 14
+    "mempool",      // 15
+    "merkleblock",  // 16
+    "notfound",     // 17
+    "ping",         // 18
+    "pong",         // 19
+    "sendcmpct",    // 20
+    "tx",           // 21
+    "getcfilters",  // 22
+    "cfilter",      // 23
     "getcfheaders", // 24
-    "cfheaders",  // 25
+    "cfheaders",    // 25
     "getcfcheckpt", // 26
-    "cfcheckpt",  // 27
-    "addrv2",     // 28
-    "",           // 29: reserved
-    "",           // 30: reserved
-    "",           // 31: reserved
-    "",           // 32: reserved
+    "cfcheckpt",    // 27
+    "addrv2",       // 28
+    "",             // 29: reserved
+    "",             // 30: reserved
+    "",             // 31: reserved
+    "",             // 32: reserved
 ];
 
 /// Map from message type string to short ID.
@@ -368,8 +368,8 @@ impl FSChaCha20 {
             let need = out.len() - written;
             let take = avail.min(need);
             out[written..written + take].copy_from_slice(
-                &self.keystream_buf[self.keystream_used as usize
-                    ..self.keystream_used as usize + take],
+                &self.keystream_buf
+                    [self.keystream_used as usize..self.keystream_used as usize + take],
             );
             self.keystream_used += take as u8;
             written += take;
@@ -528,12 +528,8 @@ impl FSChaCha20Poly1305 {
         combined.copy_from_slice(data);
 
         // Decrypt in place
-        let result = cipher.decrypt_in_place_detached(
-            (&nonce).into(),
-            aad,
-            &mut combined,
-            tag.into(),
-        );
+        let result =
+            cipher.decrypt_in_place_detached((&nonce).into(), aad, &mut combined, tag.into());
 
         if result.is_ok() {
             plain1.copy_from_slice(&combined[..plain1.len()]);
@@ -775,12 +771,8 @@ impl Bip324Cipher {
         let secret_key = self.secret_key.take().expect("already initialized");
 
         // Compute ECDH shared secret
-        let mut ecdh_secret = compute_bip324_ecdh_secret(
-            &secret_key,
-            &self.our_pubkey,
-            their_pubkey,
-            initiator,
-        );
+        let mut ecdh_secret =
+            compute_bip324_ecdh_secret(&secret_key, &self.our_pubkey, their_pubkey, initiator);
 
         // Derive keys using HKDF
         let mut salt = b"bitcoin_v2_shared_secret".to_vec();
@@ -799,7 +791,8 @@ impl Bip324Cipher {
         hkdf.expand(b"initiator_P", &mut initiator_p_key).unwrap();
         hkdf.expand(b"responder_L", &mut responder_l_key).unwrap();
         hkdf.expand(b"responder_P", &mut responder_p_key).unwrap();
-        hkdf.expand(b"garbage_terminators", &mut garbage_terminators).unwrap();
+        hkdf.expand(b"garbage_terminators", &mut garbage_terminators)
+            .unwrap();
         hkdf.expand(b"session_id", &mut self.session_id).unwrap();
 
         // Assign ciphers based on role
@@ -819,11 +812,15 @@ impl Bip324Cipher {
 
         // Assign garbage terminators
         if initiator {
-            self.send_garbage_terminator.copy_from_slice(&garbage_terminators[..16]);
-            self.recv_garbage_terminator.copy_from_slice(&garbage_terminators[16..]);
+            self.send_garbage_terminator
+                .copy_from_slice(&garbage_terminators[..16]);
+            self.recv_garbage_terminator
+                .copy_from_slice(&garbage_terminators[16..]);
         } else {
-            self.recv_garbage_terminator.copy_from_slice(&garbage_terminators[..16]);
-            self.send_garbage_terminator.copy_from_slice(&garbage_terminators[16..]);
+            self.recv_garbage_terminator
+                .copy_from_slice(&garbage_terminators[..16]);
+            self.send_garbage_terminator
+                .copy_from_slice(&garbage_terminators[16..]);
         }
 
         // Zeroize all intermediate key material after cipher contexts are
@@ -914,11 +911,13 @@ impl Bip324Cipher {
         }
 
         let mut decrypted = [0u8; LENGTH_LEN];
-        self.recv_l_cipher.as_mut().unwrap().crypt(input, &mut decrypted);
+        self.recv_l_cipher
+            .as_mut()
+            .unwrap()
+            .crypt(input, &mut decrypted);
 
-        let len = (decrypted[0] as u32)
-            | ((decrypted[1] as u32) << 8)
-            | ((decrypted[2] as u32) << 16);
+        let len =
+            (decrypted[0] as u32) | ((decrypted[1] as u32) << 8) | ((decrypted[2] as u32) << 16);
 
         Ok(len)
     }
@@ -949,12 +948,12 @@ impl Bip324Cipher {
 
         let mut header = [0u8; HEADER_LEN];
 
-        if !self.recv_p_cipher.as_mut().unwrap().decrypt(
-            input,
-            aad,
-            &mut header,
-            contents,
-        ) {
+        if !self
+            .recv_p_cipher
+            .as_mut()
+            .unwrap()
+            .decrypt(input, aad, &mut header, contents)
+        {
             return Err(Bip324Error::AuthenticationFailed);
         }
 
@@ -1134,7 +1133,10 @@ impl V2Transport {
     /// Receive bytes from the network.
     ///
     /// Returns the number of bytes consumed and any complete message.
-    pub fn receive_bytes(&mut self, data: &[u8]) -> Result<(usize, Option<ReceivedMessage>), Bip324Error> {
+    pub fn receive_bytes(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(usize, Option<ReceivedMessage>), Bip324Error> {
         let mut consumed = 0;
 
         while consumed < data.len() {
@@ -1145,7 +1147,8 @@ impl V2Transport {
                     let available = data.len() - consumed;
                     let to_copy = needed.min(available);
 
-                    self.recv_buffer.extend_from_slice(&data[consumed..consumed + to_copy]);
+                    self.recv_buffer
+                        .extend_from_slice(&data[consumed..consumed + to_copy]);
                     consumed += to_copy;
 
                     if self.recv_buffer.len() >= V1_PREFIX_LEN {
@@ -1173,15 +1176,18 @@ impl V2Transport {
                     let available = data.len() - consumed;
                     let to_copy = needed.min(available);
 
-                    self.recv_buffer.extend_from_slice(&data[consumed..consumed + to_copy]);
+                    self.recv_buffer
+                        .extend_from_slice(&data[consumed..consumed + to_copy]);
                     consumed += to_copy;
 
                     if self.recv_buffer.len() >= ELLSWIFT_PUBKEY_LEN {
                         // Got the peer's public key
-                        let their_pubkey = EllSwiftPubKey::from_bytes(&self.recv_buffer[..ELLSWIFT_PUBKEY_LEN])?;
+                        let their_pubkey =
+                            EllSwiftPubKey::from_bytes(&self.recv_buffer[..ELLSWIFT_PUBKEY_LEN])?;
 
                         // Initialize cipher
-                        self.cipher.initialize(&their_pubkey, self.initiator, &self.network_magic);
+                        self.cipher
+                            .initialize(&their_pubkey, self.initiator, &self.network_magic);
 
                         // Start looking for garbage terminator
                         self.recv_buffer.clear();
@@ -1204,7 +1210,8 @@ impl V2Transport {
 
                         // Check if buffer ends with terminator
                         if self.recv_buffer.len() >= GARBAGE_TERMINATOR_LEN {
-                            let suffix = &self.recv_buffer[self.recv_buffer.len() - GARBAGE_TERMINATOR_LEN..];
+                            let suffix = &self.recv_buffer
+                                [self.recv_buffer.len() - GARBAGE_TERMINATOR_LEN..];
                             if suffix == terminator {
                                 // Found terminator, save garbage as AAD
                                 let garbage_len = self.recv_buffer.len() - GARBAGE_TERMINATOR_LEN;
@@ -1225,11 +1232,13 @@ impl V2Transport {
                         let available = data.len() - consumed;
                         let to_copy = needed.min(available);
 
-                        self.recv_buffer.extend_from_slice(&data[consumed..consumed + to_copy]);
+                        self.recv_buffer
+                            .extend_from_slice(&data[consumed..consumed + to_copy]);
                         consumed += to_copy;
 
                         if self.recv_buffer.len() >= LENGTH_LEN {
-                            let len_bytes: [u8; LENGTH_LEN] = self.recv_buffer[..LENGTH_LEN].try_into().unwrap();
+                            let len_bytes: [u8; LENGTH_LEN] =
+                                self.recv_buffer[..LENGTH_LEN].try_into().unwrap();
                             self.recv_len = Some(self.cipher.decrypt_length(&len_bytes)?);
                             self.recv_buffer.clear();
                         }
@@ -1242,7 +1251,8 @@ impl V2Transport {
                         let available = data.len() - consumed;
                         let to_copy = needed.min(available);
 
-                        self.recv_buffer.extend_from_slice(&data[consumed..consumed + to_copy]);
+                        self.recv_buffer
+                            .extend_from_slice(&data[consumed..consumed + to_copy]);
                         consumed += to_copy;
 
                         if self.recv_buffer.len() >= total_len {
@@ -1254,7 +1264,8 @@ impl V2Transport {
                                 &[]
                             };
 
-                            let ignore = self.cipher.decrypt(&self.recv_buffer, aad, &mut contents)?;
+                            let ignore =
+                                self.cipher.decrypt(&self.recv_buffer, aad, &mut contents)?;
 
                             self.recv_buffer.clear();
                             self.recv_len = None;
@@ -1394,7 +1405,10 @@ pub fn decode_message_type_and_payload(contents: &[u8]) -> Result<(String, Vec<u
         if type_bytes[end..].iter().any(|&b| b != 0) {
             return Err(Bip324Error::InvalidMessageType);
         }
-        if type_bytes[..end].iter().any(|&b| !(0x20..=0x7e).contains(&b)) {
+        if type_bytes[..end]
+            .iter()
+            .any(|&b| !(0x20..=0x7e).contains(&b))
+        {
             return Err(Bip324Error::InvalidMessageType);
         }
         let msg_type = String::from_utf8_lossy(&type_bytes[..end]).to_string();
@@ -1715,11 +1729,15 @@ mod tests {
         // Test that we can create an ElligatorSwift pubkey and use it for ECDH
         // Use valid secret keys from the test vectors
         let alice_secret = SecretKey::from_slice(
-            &hex::decode("61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7").unwrap()
-        ).unwrap();
+            &hex::decode("61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7")
+                .unwrap(),
+        )
+        .unwrap();
         let bob_secret = SecretKey::from_slice(
-            &hex::decode("1f9c581b35231838f0f17cf0c979835baccb7f3abbbb96ffcc318ab71e6e126f").unwrap()
-        ).unwrap();
+            &hex::decode("1f9c581b35231838f0f17cf0c979835baccb7f3abbbb96ffcc318ab71e6e126f")
+                .unwrap(),
+        )
+        .unwrap();
 
         let alice_entropy = [0x11u8; 32];
         let bob_entropy = [0x22u8; 32];
@@ -1766,15 +1784,21 @@ mod tests {
         let plaintext = b"Hello, BIP324!";
         let mut ciphertext = vec![0u8; plaintext.len() + EXPANSION];
 
-        alice.encrypt(plaintext, &[], false, &mut ciphertext).unwrap();
+        alice
+            .encrypt(plaintext, &[], false, &mut ciphertext)
+            .unwrap();
 
         // Decrypt the length
-        let len = bob.decrypt_length(&ciphertext[..LENGTH_LEN].try_into().unwrap()).unwrap();
+        let len = bob
+            .decrypt_length(&ciphertext[..LENGTH_LEN].try_into().unwrap())
+            .unwrap();
         assert_eq!(len as usize, plaintext.len());
 
         // Decrypt the contents
         let mut decrypted = vec![0u8; len as usize];
-        let ignore = bob.decrypt(&ciphertext[LENGTH_LEN..], &[], &mut decrypted).unwrap();
+        let ignore = bob
+            .decrypt(&ciphertext[LENGTH_LEN..], &[], &mut decrypted)
+            .unwrap();
 
         assert!(!ignore);
         assert_eq!(&decrypted[..], plaintext);
@@ -1783,11 +1807,16 @@ mod tests {
         let bob_message = b"Hello from Bob!";
         let mut bob_ciphertext = vec![0u8; bob_message.len() + EXPANSION];
 
-        bob.encrypt(bob_message, &[], false, &mut bob_ciphertext).unwrap();
+        bob.encrypt(bob_message, &[], false, &mut bob_ciphertext)
+            .unwrap();
 
-        let bob_len = alice.decrypt_length(&bob_ciphertext[..LENGTH_LEN].try_into().unwrap()).unwrap();
+        let bob_len = alice
+            .decrypt_length(&bob_ciphertext[..LENGTH_LEN].try_into().unwrap())
+            .unwrap();
         let mut bob_decrypted = vec![0u8; bob_len as usize];
-        alice.decrypt(&bob_ciphertext[LENGTH_LEN..], &[], &mut bob_decrypted).unwrap();
+        alice
+            .decrypt(&bob_ciphertext[LENGTH_LEN..], &[], &mut bob_decrypted)
+            .unwrap();
 
         assert_eq!(&bob_decrypted[..], bob_message);
     }
@@ -1845,11 +1874,17 @@ mod tests {
         let plaintext = b"Ignore me!";
         let mut ciphertext = vec![0u8; plaintext.len() + EXPANSION];
 
-        alice.encrypt(plaintext, &[], true, &mut ciphertext).unwrap();
+        alice
+            .encrypt(plaintext, &[], true, &mut ciphertext)
+            .unwrap();
 
-        let len = bob.decrypt_length(&ciphertext[..LENGTH_LEN].try_into().unwrap()).unwrap();
+        let len = bob
+            .decrypt_length(&ciphertext[..LENGTH_LEN].try_into().unwrap())
+            .unwrap();
         let mut decrypted = vec![0u8; len as usize];
-        let ignore = bob.decrypt(&ciphertext[LENGTH_LEN..], &[], &mut decrypted).unwrap();
+        let ignore = bob
+            .decrypt(&ciphertext[LENGTH_LEN..], &[], &mut decrypted)
+            .unwrap();
 
         assert!(ignore, "Ignore flag should be set");
         assert_eq!(&decrypted[..], plaintext);
@@ -1859,10 +1894,14 @@ mod tests {
     fn test_bip324_packet_test_vector_1() {
         // First test vector from Bitcoin Core bip324_tests.cpp
         // This tests the full cipher operation with known inputs
-        let priv_ours = hex::decode("61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7").unwrap();
+        let priv_ours =
+            hex::decode("61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7")
+                .unwrap();
         let ellswift_ours = hex::decode("ec0adff257bbfe500c188c80b4fdd640f6b45a482bbc15fc7cef5931deff0aa186f6eb9bba7b85dc4dcc28b28722de1e3d9108b985e2967045668f66098e475b").unwrap();
         let ellswift_theirs = hex::decode("a4a94dfce69b4a2a0a099313d10f9f7e7d649d60501c9e1d274c300e0d89aafaffffffffffffffffffffffffffffffffffffffffffffffffffffffff8faf88d5").unwrap();
-        let expected_session_id = hex::decode("ce72dffb015da62b0d0f5474cab8bc72605225b0cee3f62312ec680ec5f41ba5").unwrap();
+        let expected_session_id =
+            hex::decode("ce72dffb015da62b0d0f5474cab8bc72605225b0cee3f62312ec680ec5f41ba5")
+                .unwrap();
         let expected_send_garbage = hex::decode("faef555dfcdb936425d84aba524758f3").unwrap();
         let expected_recv_garbage = hex::decode("02cb8ff24307a6e27de3b4e7ea3fa65b").unwrap();
 
@@ -1880,11 +1919,23 @@ mod tests {
         cipher.initialize(&their_pubkey, true, &magic);
 
         // Verify session ID
-        assert_eq!(cipher.session_id().as_slice(), expected_session_id.as_slice(), "Session ID mismatch");
+        assert_eq!(
+            cipher.session_id().as_slice(),
+            expected_session_id.as_slice(),
+            "Session ID mismatch"
+        );
 
         // Verify garbage terminators
-        assert_eq!(cipher.send_garbage_terminator().as_slice(), expected_send_garbage.as_slice(), "Send garbage terminator mismatch");
-        assert_eq!(cipher.recv_garbage_terminator().as_slice(), expected_recv_garbage.as_slice(), "Recv garbage terminator mismatch");
+        assert_eq!(
+            cipher.send_garbage_terminator().as_slice(),
+            expected_send_garbage.as_slice(),
+            "Send garbage terminator mismatch"
+        );
+        assert_eq!(
+            cipher.recv_garbage_terminator().as_slice(),
+            expected_recv_garbage.as_slice(),
+            "Recv garbage terminator mismatch"
+        );
     }
 
     // =========================================================================
@@ -1933,12 +1984,14 @@ mod tests {
         assert!(result.is_ok());
         // After fix: magic + non-version-cmd advances to RecvState::Key (V2).
         assert_ne!(
-            transport.recv_state, RecvState::V1,
+            transport.recv_state,
+            RecvState::V1,
             "G13: V2Transport must NOT misclassify magic-only match as V1; \
              full 16-byte version-prefix check is required"
         );
         assert_eq!(
-            transport.recv_state, RecvState::Key,
+            transport.recv_state,
+            RecvState::Key,
             "G13: magic-only match must advance to RecvState::Key (V2 path)"
         );
     }
@@ -1965,11 +2018,13 @@ mod tests {
         assert!(result.is_ok(), "G14: should not error on V2 pubkey prefix");
         // Must be treated as V2 (Key state), NOT V1 fallback.
         assert_ne!(
-            transport.recv_state, RecvState::V1,
+            transport.recv_state,
+            RecvState::V1,
             "G14: V2 EllSwift pubkey starting with magic must NOT be classified as V1"
         );
         assert_eq!(
-            transport.recv_state, RecvState::Key,
+            transport.recv_state,
+            RecvState::Key,
             "G14: V2 EllSwift pubkey starting with magic must advance to RecvState::Key"
         );
     }
@@ -1987,7 +2042,8 @@ mod tests {
         let result = transport.receive_bytes(&v1_buf);
         assert!(result.is_ok(), "V1 prefix must be accepted without error");
         assert_eq!(
-            transport.recv_state, RecvState::V1,
+            transport.recv_state,
+            RecvState::V1,
             "G13: full 16-byte V1 prefix must set RecvState::V1"
         );
     }
@@ -2062,10 +2118,7 @@ mod tests {
             .decrypt(&decoy_pkt[LENGTH_LEN..], &[], &mut contents_buf)
             .expect("decrypt decoy");
 
-        assert!(
-            ignore,
-            "G18: decoy version packet must have ignore=true"
-        );
+        assert!(ignore, "G18: decoy version packet must have ignore=true");
         // Correct behaviour: when ignore=true, state should NOT advance to APP.
         // A real implementation must keep reading until the first non-decoy.
         // (The cipher itself is correct; the state machine in receive_bytes is where the bug is.)
@@ -2124,8 +2177,14 @@ mod tests {
         c2.initialize(&pub1, false, &magic);
 
         // (a) Both ciphers are fully initialized.
-        assert!(c1.is_initialized(), "G10: c1 must be initialized after ECDH");
-        assert!(c2.is_initialized(), "G10: c2 must be initialized after ECDH");
+        assert!(
+            c1.is_initialized(),
+            "G10: c1 must be initialized after ECDH"
+        );
+        assert!(
+            c2.is_initialized(),
+            "G10: c2 must be initialized after ECDH"
+        );
 
         // (b) Round-trip: encrypt with c1, decrypt with c2.
         // Zeroize calls fire AFTER cipher seeding — if they ran too early the
@@ -2138,7 +2197,11 @@ mod tests {
         let len = c2
             .decrypt_length(&ciphertext[..LENGTH_LEN].try_into().unwrap())
             .expect("G10: decrypt_length must succeed");
-        assert_eq!(len as usize, plaintext.len(), "G10: decrypted length must match");
+        assert_eq!(
+            len as usize,
+            plaintext.len(),
+            "G10: decrypted length must match"
+        );
 
         let mut decrypted = vec![0u8; len as usize];
         c2.decrypt(&ciphertext[LENGTH_LEN..], &[], &mut decrypted)
@@ -2172,8 +2235,8 @@ mod tests {
         contents[2] = b'n'; // 'n'
         contents[3] = b'v'; // 'v'
         contents[4] = 0x01; // NON-ASCII control byte — MUST be rejected
-        // bytes 5..12 = 0 (padding)
-        // payload = contents[13..] = [0, 0]
+                            // bytes 5..12 = 0 (padding)
+                            // payload = contents[13..] = [0, 0]
 
         let result = decode_message_type_and_payload(&contents);
         // Correct (spec) behaviour: control byte 0x01 is invalid, must error.
@@ -2197,7 +2260,7 @@ mod tests {
         // contents[4] = 0 (first NUL — terminates command)
         // contents[5..12] mostly 0 but one non-NUL
         contents[9] = 0x01; // non-NUL after first NUL — MUST be rejected
-        // payload = contents[13..] = [0, 0]
+                            // payload = contents[13..] = [0, 0]
 
         let result = decode_message_type_and_payload(&contents);
         assert!(
@@ -2253,7 +2316,8 @@ mod tests {
         );
         // Confirm the payload portion is exactly Core's decimal limit.
         assert_eq!(
-            MAX_CONTENTS_LEN - 13, 4_000_000,
+            MAX_CONTENTS_LEN - 13,
+            4_000_000,
             "G24: payload portion must be 4_000_000 (4 * 1000 * 1000 per Core net.h:65)"
         );
         // Explicitly NOT 4 * 1024 * 1024 (binary MiB) — Core uses decimal.
@@ -2303,8 +2367,8 @@ mod tests {
         let a_pub = alice.our_pubkey().clone();
         let b_pub = bob.our_pubkey().clone();
 
-        alice.initialize(&b_pub, true, &magic);  // initiator
-        bob.initialize(&a_pub, false, &magic);   // responder
+        alice.initialize(&b_pub, true, &magic); // initiator
+        bob.initialize(&a_pub, false, &magic); // responder
 
         // Initiator send == responder recv
         assert_eq!(
@@ -2359,8 +2423,13 @@ mod tests {
         let enc_len: [u8; LENGTH_LEN] = pkt_normal[..LENGTH_LEN].try_into().unwrap();
         let dec_len = dec.decrypt_length(&enc_len).unwrap();
         let mut out = vec![0u8; dec_len as usize];
-        let ignore = dec.decrypt(&pkt_normal[LENGTH_LEN..], &[], &mut out).unwrap();
-        assert!(!ignore, "G8: ignore=false packet must decode to ignore=false");
+        let ignore = dec
+            .decrypt(&pkt_normal[LENGTH_LEN..], &[], &mut out)
+            .unwrap();
+        assert!(
+            !ignore,
+            "G8: ignore=false packet must decode to ignore=false"
+        );
 
         // Send with ignore=true (decoy)
         let (mut enc2, mut dec2) = Bip324Cipher::pair_for_test();
@@ -2369,7 +2438,9 @@ mod tests {
         let enc_len2: [u8; LENGTH_LEN] = pkt_decoy[..LENGTH_LEN].try_into().unwrap();
         let dec_len2 = dec2.decrypt_length(&enc_len2).unwrap();
         let mut out2 = vec![0u8; dec_len2 as usize];
-        let ignore2 = dec2.decrypt(&pkt_decoy[LENGTH_LEN..], &[], &mut out2).unwrap();
+        let ignore2 = dec2
+            .decrypt(&pkt_decoy[LENGTH_LEN..], &[], &mut out2)
+            .unwrap();
         assert!(ignore2, "G8: ignore=true packet must decode to ignore=true");
     }
 
@@ -2429,26 +2500,29 @@ mod tests {
         // Verify the spec-mandated salt prefix.
         let salt_prefix = b"bitcoin_v2_shared_secret";
         assert_eq!(
-            salt_prefix,
-            b"bitcoin_v2_shared_secret",
+            salt_prefix, b"bitcoin_v2_shared_secret",
             "G2: HKDF salt must start with 'bitcoin_v2_shared_secret'"
         );
 
         // Verify the labels match the spec by running a full ECDH and checking
         // the session ID against the known test vector from test_bip324_packet_test_vector_1.
         use secp256k1::SecretKey;
-        let priv_ours: [u8; 32] = hex::decode(
-            "61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7"
-        ).unwrap().try_into().unwrap();
+        let priv_ours: [u8; 32] =
+            hex::decode("61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7")
+                .unwrap()
+                .try_into()
+                .unwrap();
         let ellswift_ours: [u8; 64] = hex::decode(
             "ec0adff257bbfe500c188c80b4fdd640f6b45a482bbc15fc7cef5931deff0aa186f6eb9bba7b85dc4dcc28b28722de1e3d9108b985e2967045668f66098e475b"
         ).unwrap().try_into().unwrap();
         let ellswift_theirs: [u8; 64] = hex::decode(
             "a4a94dfce69b4a2a0a099313d10f9f7e7d649d60501c9e1d274c300e0d89aafaffffffffffffffffffffffffffffffffffffffffffffffffffffffff8faf88d5"
         ).unwrap().try_into().unwrap();
-        let expected_session_id: [u8; 32] = hex::decode(
-            "ce72dffb015da62b0d0f5474cab8bc72605225b0cee3f62312ec680ec5f41ba5"
-        ).unwrap().try_into().unwrap();
+        let expected_session_id: [u8; 32] =
+            hex::decode("ce72dffb015da62b0d0f5474cab8bc72605225b0cee3f62312ec680ec5f41ba5")
+                .unwrap()
+                .try_into()
+                .unwrap();
 
         let sk = SecretKey::from_slice(&priv_ours).unwrap();
         let our_pk = EllSwiftPubKey(ellswift_ours);

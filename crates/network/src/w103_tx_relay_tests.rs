@@ -40,20 +40,18 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::message::{
-        InvType, InvVector, NetworkMessage, MAX_INV_SIZE, MAX_GETDATA_SZ,
-    };
-    use rustoshi_consensus::orphanage::{
-        TxOrphanage, MAX_ORPHAN_TRANSACTIONS, MAX_ORPHANS_PER_PEER, OrphanEntry, OrphanError,
-        ORPHAN_TX_EXPIRE_TIME,
-    };
+    use crate::message::{InvType, InvVector, NetworkMessage, MAX_GETDATA_SZ, MAX_INV_SIZE};
+    use crate::peer::PeerId;
     use crate::relay::{
         batch_getdata_items, build_tx_inv_entry, InventoryTrickle, PeerRelayState,
-        INVENTORY_BROADCAST_MAX, INBOUND_INVENTORY_BROADCAST_INTERVAL,
+        INBOUND_INVENTORY_BROADCAST_INTERVAL, INVENTORY_BROADCAST_MAX,
         OUTBOUND_INVENTORY_BROADCAST_INTERVAL,
     };
-    use crate::peer::PeerId;
-    use rustoshi_primitives::{Hash256, Transaction, TxIn, TxOut, OutPoint};
+    use rustoshi_consensus::orphanage::{
+        OrphanEntry, OrphanError, TxOrphanage, MAX_ORPHANS_PER_PEER, MAX_ORPHAN_TRANSACTIONS,
+        ORPHAN_TX_EXPIRE_TIME,
+    };
+    use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -80,7 +78,10 @@ mod tests {
     }
 
     fn make_inv_vector(inv_type: InvType, seed: u8) -> InvVector {
-        InvVector { inv_type, hash: Hash256([seed; 32]) }
+        InvVector {
+            inv_type,
+            hash: Hash256([seed; 32]),
+        }
     }
 
     // ─── G1: MAX_INV_SIZE=50_000 enforced ────────────────────────────────────
@@ -94,13 +95,15 @@ mod tests {
     /// Misbehaving + disconnect; the behaviour is still correct (connection drops).
     #[test]
     fn g1_max_inv_size_constant_is_50000() {
-        assert_eq!(MAX_INV_SIZE, 50_000,
-            "MAX_INV_SIZE must be 50_000 matching Core's MAX_INV_SZ");
+        assert_eq!(
+            MAX_INV_SIZE, 50_000,
+            "MAX_INV_SIZE must be 50_000 matching Core's MAX_INV_SZ"
+        );
         // Verify getdata uses the same constant by crafting an over-limit count manually.
         // Serialise an inv header with count=50_001 (compact_size 0xfd 0x51 0xC4)
         // and verify parse returns Err.
         let payload = vec![0xfd, 0x51, 0xC4]; // compact_size 50001
-        // We need at least 1 inv vector length (36 bytes) but parse fails at count check
+                                              // We need at least 1 inv vector length (36 bytes) but parse fails at count check
         let result = NetworkMessage::deserialize("inv", &payload);
         assert!(result.is_err(), "inv with count > 50_000 must fail");
 
@@ -217,15 +220,22 @@ mod tests {
     #[test]
     fn g5_max_getdata_sz_batch_cap() {
         // Constant is correct.
-        assert_eq!(MAX_GETDATA_SZ, 1_000,
-            "MAX_GETDATA_SZ must be 1000 matching Core's protocol.h:482");
+        assert_eq!(
+            MAX_GETDATA_SZ, 1_000,
+            "MAX_GETDATA_SZ must be 1000 matching Core's protocol.h:482"
+        );
         // MAX_INV_SIZE is the parse-time cap; MAX_GETDATA_SZ is the per-batch response cap.
-        assert!(MAX_INV_SIZE > MAX_GETDATA_SZ,
-            "MAX_INV_SIZE ({MAX_INV_SIZE}) must exceed MAX_GETDATA_SZ ({MAX_GETDATA_SZ})");
+        assert!(
+            MAX_INV_SIZE > MAX_GETDATA_SZ,
+            "MAX_INV_SIZE ({MAX_INV_SIZE}) must exceed MAX_GETDATA_SZ ({MAX_GETDATA_SZ})"
+        );
 
         // Empty input → empty output (no panic, no empty chunk).
         let batches = batch_getdata_items(vec![]);
-        assert!(batches.is_empty(), "empty input should yield empty batch list");
+        assert!(
+            batches.is_empty(),
+            "empty input should yield empty batch list"
+        );
 
         // Exactly 1000 items → one batch of 1000.
         let items_1000: Vec<InvVector> = (0..1000_u32)
@@ -258,11 +268,17 @@ mod tests {
             })
             .collect();
         let batches = batch_getdata_items(big_items);
-        assert_eq!(batches.len(), 50,
-            "MAX_INV_SZ=50000 items must split into exactly 50 getdata batches");
+        assert_eq!(
+            batches.len(),
+            50,
+            "MAX_INV_SZ=50000 items must split into exactly 50 getdata batches"
+        );
         for (idx, batch) in batches.iter().enumerate() {
-            assert_eq!(batch.len(), MAX_GETDATA_SZ,
-                "batch {idx} should be exactly MAX_GETDATA_SZ items");
+            assert_eq!(
+                batch.len(),
+                MAX_GETDATA_SZ,
+                "batch {idx} should be exactly MAX_GETDATA_SZ items"
+            );
         }
     }
 
@@ -294,8 +310,10 @@ mod tests {
     fn g6_wtxidrelay_ordering_across_all_handshake_paths() {
         use crate::message::WTXID_RELAY_VERSION;
         // Minimum version requirement is correct: 70016
-        assert_eq!(WTXID_RELAY_VERSION, 70016,
-            "WTXID_RELAY_VERSION must be 70016 per BIP-339");
+        assert_eq!(
+            WTXID_RELAY_VERSION, 70016,
+            "WTXID_RELAY_VERSION must be 70016 per BIP-339"
+        );
         // Fix: audit each handshake path and confirm wtxidrelay is sent AFTER
         // VERSION received and BEFORE VERACK sent.
     }
@@ -314,8 +332,10 @@ mod tests {
         use crate::peer_manager::PeerManagerConfig;
 
         let config = PeerManagerConfig::default();
-        assert!(!config.peer_bloom_filters,
-            "peer_bloom_filters must default to false matching Core's default");
+        assert!(
+            !config.peer_bloom_filters,
+            "peer_bloom_filters must default to false matching Core's default"
+        );
 
         // NODE_BLOOM bit value per BIP-111
         assert_eq!(NODE_BLOOM, 1 << 2, "NODE_BLOOM must be bit 2 per BIP-111");
@@ -342,7 +362,9 @@ mod tests {
         // No m_recently_confirmed_transactions exists in rustoshi crates.
         // relay.rs tracks tx_inventory_to_send (wtxids queued for INV) but
         // has no mechanism to serve the actual serialized transaction on request.
-        todo!("implement ProcessGetData with mempool lookup + tx serialization + notfound fallback");
+        todo!(
+            "implement ProcessGetData with mempool lookup + tx serialization + notfound fallback"
+        );
     }
 
     // ─── G9: no MAX_PEER_TX_ANNOUNCEMENTS=5000 cap ───────────────────────────
@@ -379,8 +401,10 @@ mod tests {
             trickle.queue_transaction_for_relay(hash, hash);
         }
         // No panic, no error — but Core would have capped at 5000.
-        assert!(trickle.pending_count(peer) > 5000,
-            "5001 items accepted — Core would have capped at 5000 per peer");
+        assert!(
+            trickle.pending_count(peer) > 5000,
+            "5001 items accepted — Core would have capped at 5000 per peer"
+        );
     }
 
     // ─── G10: no MAX_PEER_TX_REQUEST_IN_FLIGHT=100 ───────────────────────────
@@ -439,10 +463,16 @@ mod tests {
     #[ignore = "G12 MISSING: no NONPREF_PEER_TX_DELAY=2s for inbound announcement requests — implement preferred-peer-first scheduling in TxRequestTracker"]
     fn g12_nonpref_peer_tx_delay_absent() {
         // Verify the trickle intervals exist (these are for announce, not request):
-        assert_eq!(OUTBOUND_INVENTORY_BROADCAST_INTERVAL, Duration::from_secs(2),
-            "outbound announce interval must be 2s");
-        assert_eq!(INBOUND_INVENTORY_BROADCAST_INTERVAL, Duration::from_secs(5),
-            "inbound announce interval must be 5s");
+        assert_eq!(
+            OUTBOUND_INVENTORY_BROADCAST_INTERVAL,
+            Duration::from_secs(2),
+            "outbound announce interval must be 2s"
+        );
+        assert_eq!(
+            INBOUND_INVENTORY_BROADCAST_INTERVAL,
+            Duration::from_secs(5),
+            "inbound announce interval must be 5s"
+        );
         // Missing: NONPREF_PEER_TX_DELAY=2s on the *request* (getdata) side.
     }
 
@@ -468,12 +498,12 @@ mod tests {
         // queue entries simultaneously with no differential delay.
         let mut trickle = InventoryTrickle::new();
         let wtxid_peer = PeerId(1);
-        let txid_peer  = PeerId(2);
+        let txid_peer = PeerId(2);
 
-        trickle.add_peer(wtxid_peer, false, true,  true); // wtxid-relay
-        trickle.add_peer(txid_peer,  false, false, true); // txid-only
+        trickle.add_peer(wtxid_peer, false, true, true); // wtxid-relay
+        trickle.add_peer(txid_peer, false, false, true); // txid-only
 
-        let txid  = Hash256([0xaa; 32]);
+        let txid = Hash256([0xaa; 32]);
         let wtxid = Hash256([0xbb; 32]);
         trickle.queue_transaction_for_relay(txid, wtxid);
 
@@ -551,8 +581,10 @@ mod tests {
         let mut state = PeerRelayState::new(false, false, false); // relay=false
         let hash = Hash256([1u8; 32]);
         // Outgoing queue correctly rejects relay=false:
-        assert!(!state.queue_transaction(hash),
-            "outgoing relay must be blocked when relay=false");
+        assert!(
+            !state.queue_transaction(hash),
+            "outgoing relay must be blocked when relay=false"
+        );
         // But incoming msgs from relay=false peers are not rejected in handle_event.
     }
 
@@ -585,8 +617,10 @@ mod tests {
             });
             state.mark_known(hash);
         }
-        assert!(state.tx_inventory_known.len() >= 100_000,
-            "tx_inventory_known grows unbounded — Core would cap via LRU eviction");
+        assert!(
+            state.tx_inventory_known.len() >= 100_000,
+            "tx_inventory_known grows unbounded — Core would cap via LRU eviction"
+        );
     }
 
     // ─── G18: no mempool query rate-limit ────────────────────────────────────
@@ -636,12 +670,18 @@ mod tests {
         let child = Arc::new(Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: parent_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
                 script_sig: Vec::new(),
                 sequence: 0xffffffff,
                 witness: Vec::new(),
             }],
-            outputs: vec![TxOut { value: 10_000, script_pubkey: vec![0x6a] }],
+            outputs: vec![TxOut {
+                value: 10_000,
+                script_pubkey: vec![0x6a],
+            }],
             lock_time: 0,
         });
         orphanage.add(child.clone(), 1, 100).unwrap();
@@ -651,7 +691,11 @@ mod tests {
         // would now find_children(parent_txid) and retry the child.
         // In rustoshi: nothing is called. The orphan stays forever.
         let children = orphanage.find_children(&parent_txid);
-        assert_eq!(children.len(), 1, "find_children works but is never called automatically");
+        assert_eq!(
+            children.len(),
+            1,
+            "find_children works but is never called automatically"
+        );
         // Fix: after ATMP success, call orphanage.find_children(txid) and retry each child.
     }
 
@@ -669,29 +713,41 @@ mod tests {
     /// `RelayTransaction` and `m_relay_to_set` handling.
     #[test]
     fn g20a_tx_relay_wire_format_msg_wtx_not_msg_witness_tx() {
-        let txid  = Hash256([0xaa; 32]);
+        let txid = Hash256([0xaa; 32]);
         let wtxid = Hash256([0xbb; 32]);
 
         // 1. wtxid-relay peer: inv type must be MSG_WTX(5), hash must be wtxid.
         let inv_wtxid = build_tx_inv_entry(true, txid, wtxid);
-        assert_eq!(inv_wtxid.inv_type, InvType::MsgWtx,
-            "wtxid-relay peer must receive MSG_WTX(5), not MSG_WITNESS_TX(0x40000001)");
-        assert_eq!(inv_wtxid.inv_type as u32, 5,
-            "MSG_WTX wire value must be 5 per BIP-339 / Core protocol.h:481");
-        assert_eq!(inv_wtxid.hash, wtxid,
-            "wtxid-relay peer inv hash must be the wtxid, not txid");
+        assert_eq!(
+            inv_wtxid.inv_type,
+            InvType::MsgWtx,
+            "wtxid-relay peer must receive MSG_WTX(5), not MSG_WITNESS_TX(0x40000001)"
+        );
+        assert_eq!(
+            inv_wtxid.inv_type as u32, 5,
+            "MSG_WTX wire value must be 5 per BIP-339 / Core protocol.h:481"
+        );
+        assert_eq!(
+            inv_wtxid.hash, wtxid,
+            "wtxid-relay peer inv hash must be the wtxid, not txid"
+        );
 
         // 2. Legacy (txid-relay) peer: inv type must be MSG_TX(1), hash must be txid.
         let inv_txid = build_tx_inv_entry(false, txid, wtxid);
-        assert_eq!(inv_txid.inv_type, InvType::MsgTx,
-            "legacy peer must receive MSG_TX(1) keyed by txid");
+        assert_eq!(
+            inv_txid.inv_type,
+            InvType::MsgTx,
+            "legacy peer must receive MSG_TX(1) keyed by txid"
+        );
         assert_eq!(inv_txid.inv_type as u32, 1);
-        assert_eq!(inv_txid.hash, txid,
-            "legacy peer inv hash must be the txid");
+        assert_eq!(inv_txid.hash, txid, "legacy peer inv hash must be the txid");
 
         // 3. Verify MSG_WITNESS_TX(0x40000001) is NOT used for any relay inv.
-        assert_ne!(inv_wtxid.inv_type, InvType::MsgWitnessTx,
-            "MSG_WITNESS_TX(0x40000001) is a getdata flag, not a valid inv type");
+        assert_ne!(
+            inv_wtxid.inv_type,
+            InvType::MsgWitnessTx,
+            "MSG_WITNESS_TX(0x40000001) is a getdata flag, not a valid inv type"
+        );
         assert_ne!(inv_txid.inv_type, InvType::MsgWitnessTx);
 
         // 4. trickle queue agrees: wtxid-relay peer gets MsgWtx from get_pending_inv.
@@ -699,8 +755,11 @@ mod tests {
         state.queue_transaction(wtxid);
         let inv = state.get_pending_inv(10);
         assert_eq!(inv.len(), 1);
-        assert_eq!(inv[0].inv_type, InvType::MsgWtx,
-            "PeerRelayState::get_pending_inv must also use MSG_WTX for wtxid-relay peers");
+        assert_eq!(
+            inv[0].inv_type,
+            InvType::MsgWtx,
+            "PeerRelayState::get_pending_inv must also use MSG_WTX for wtxid-relay peers"
+        );
         assert_eq!(inv[0].hash, wtxid);
     }
 
@@ -732,8 +791,11 @@ mod tests {
 
         // Simulate: tx arrives (handle_event sees NetworkMessage::Tx) but
         // queue_transaction_for_relay is never invoked.
-        assert_eq!(trickle.pending_count(peer), 0,
-            "no tx queued for relay — Core would have called InitiateTxBroadcastToAll");
+        assert_eq!(
+            trickle.pending_count(peer),
+            0,
+            "no tx queued for relay — Core would have called InitiateTxBroadcastToAll"
+        );
         // Fix: after ATMP accept, call: trickle.queue_transaction_for_relay(txid, wtxid)
     }
 
@@ -743,8 +805,10 @@ mod tests {
     /// FIFO eviction. Matches Core's `DEFAULT_MAX_ORPHAN_TRANSACTIONS=100`.
     #[test]
     fn g21_max_orphan_transactions_is_100() {
-        assert_eq!(MAX_ORPHAN_TRANSACTIONS, 100,
-            "must match Core's DEFAULT_MAX_ORPHAN_TRANSACTIONS");
+        assert_eq!(
+            MAX_ORPHAN_TRANSACTIONS, 100,
+            "must match Core's DEFAULT_MAX_ORPHAN_TRANSACTIONS"
+        );
         // Verify FIFO eviction enforces the cap.
         let mut orphanage = TxOrphanage::new();
         for i in 0..MAX_ORPHAN_TRANSACTIONS as u32 {
@@ -807,7 +871,10 @@ mod tests {
         // "now" is in the past relative to inserted_at → nothing should be evicted.
         let past = t0; // t0 predates both add() calls
         let evicted = orphanage.expire_orphans(past);
-        assert_eq!(evicted, 0, "orphans inserted after 'now' must not be evicted");
+        assert_eq!(
+            evicted, 0,
+            "orphans inserted after 'now' must not be evicted"
+        );
         assert_eq!(orphanage.len(), 2);
 
         // "now" is ORPHAN_TX_EXPIRE_TIME after the entries were inserted → both evicted.
@@ -819,12 +886,16 @@ mod tests {
         // --- fresh entry added after expiry sweep survives a sweep at "now" ---
         orphanage.add(make_tx(20), 3, 100).unwrap();
         let evicted = orphanage.expire_orphans(Instant::now());
-        assert_eq!(evicted, 0, "freshly inserted orphan must not be evicted immediately");
+        assert_eq!(
+            evicted, 0,
+            "freshly inserted orphan must not be evicted immediately"
+        );
         assert_eq!(orphanage.len(), 1);
 
         // Only the expired one is evicted; the fresh one survives.
         orphanage.add(make_tx(30), 4, 100).unwrap();
-        let evicted = orphanage.expire_orphans(Instant::now() + ORPHAN_TX_EXPIRE_TIME + Duration::from_secs(1));
+        let evicted = orphanage
+            .expire_orphans(Instant::now() + ORPHAN_TX_EXPIRE_TIME + Duration::from_secs(1));
         assert_eq!(evicted, 2);
         assert_eq!(orphanage.len(), 0);
     }
@@ -840,8 +911,10 @@ mod tests {
         let wtxid = tx.wtxid();
 
         orphanage.add(tx.clone(), 1, 100).unwrap();
-        assert!(orphanage.contains(&wtxid),
-            "orphanage must be keyed by wtxid per BIP-339");
+        assert!(
+            orphanage.contains(&wtxid),
+            "orphanage must be keyed by wtxid per BIP-339"
+        );
         // Duplicate by wtxid → AlreadyKnown
         let err = orphanage.add(tx.clone(), 2, 100).unwrap_err();
         assert_eq!(err, OrphanError::AlreadyKnown);
@@ -894,12 +967,18 @@ mod tests {
         let parent = Arc::new(Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: grandparent_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: grandparent_txid,
+                    vout: 0,
+                },
                 script_sig: Vec::new(),
                 sequence: 0xffffffff,
                 witness: Vec::new(),
             }],
-            outputs: vec![TxOut { value: 40_000, script_pubkey: vec![0x6a] }],
+            outputs: vec![TxOut {
+                value: 40_000,
+                script_pubkey: vec![0x6a],
+            }],
             lock_time: 0,
         });
         let parent_txid = parent.txid();
@@ -908,12 +987,18 @@ mod tests {
         let child = Arc::new(Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: parent_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
                 script_sig: Vec::new(),
                 sequence: 0xffffffff,
                 witness: Vec::new(),
             }],
-            outputs: vec![TxOut { value: 30_000, script_pubkey: vec![0x6a] }],
+            outputs: vec![TxOut {
+                value: 30_000,
+                script_pubkey: vec![0x6a],
+            }],
             lock_time: 0,
         });
 
@@ -927,7 +1012,11 @@ mod tests {
         // Parent accepted → find child (direct child of parent).
         // find_children is NOT called automatically; it doesn't recurse.
         let level2 = orphanage.find_children(&parent_txid);
-        assert_eq!(level2.len(), 1, "child found as child of parent — but needs explicit 2nd call");
+        assert_eq!(
+            level2.len(),
+            1,
+            "child found as child of parent — but needs explicit 2nd call"
+        );
 
         // Fix: implement a BFS loop that keeps calling find_children until empty,
         // processing each resolved orphan through ATMP and enqueueing its own children.
@@ -959,8 +1048,11 @@ mod tests {
         let services_without: u64 = 0;
 
         assert_ne!(services_with_network & NODE_NETWORK, 0);
-        assert_eq!(services_without & NODE_NETWORK, 0,
-            "peer without NODE_NETWORK should not be asked for tx data");
+        assert_eq!(
+            services_without & NODE_NETWORK,
+            0,
+            "peer without NODE_NETWORK should not be asked for tx data"
+        );
         todo!("add CanRequestTxFrom(peer) check before adding peer to tx-request tracker");
     }
 
@@ -1034,13 +1126,15 @@ mod tests {
     /// wave). BIP-37 bloom filter messages themselves are not served.
     #[test]
     fn g30_peerbloomfilters_config_wired() {
-        use crate::peer_manager::PeerManagerConfig;
         use crate::message::NODE_BLOOM;
+        use crate::peer_manager::PeerManagerConfig;
 
         // Default: bloom filters disabled.
         let config = PeerManagerConfig::default();
-        assert!(!config.peer_bloom_filters,
-            "-peerbloomfilters must default to false");
+        assert!(
+            !config.peer_bloom_filters,
+            "-peerbloomfilters must default to false"
+        );
 
         // When enabled: NODE_BLOOM bit included in services.
         let mut config_bloom = PeerManagerConfig::default();
@@ -1057,8 +1151,7 @@ mod tests {
     /// Matches Core's per-peer orphan submission limiting.
     #[test]
     fn orphan_per_peer_cap_enforced() {
-        assert_eq!(MAX_ORPHANS_PER_PEER, 100,
-            "per-peer orphan cap must be 100");
+        assert_eq!(MAX_ORPHANS_PER_PEER, 100, "per-peer orphan cap must be 100");
         let mut orphanage = TxOrphanage::new();
         for i in 0..MAX_ORPHANS_PER_PEER as u8 {
             orphanage.add(make_tx(i), 7, 100).unwrap();
@@ -1079,19 +1172,35 @@ mod tests {
         let child_a = Arc::new(Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: parent_txid, vout: 0 },
-                script_sig: Vec::new(), sequence: 0xffffffff, witness: Vec::new(),
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0xffffffff,
+                witness: Vec::new(),
             }],
-            outputs: vec![TxOut { value: 1000, script_pubkey: vec![0x51] }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![0x51],
+            }],
             lock_time: 0,
         });
         let child_b = Arc::new(Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: parent_txid, vout: 1 },
-                script_sig: Vec::new(), sequence: 0xffffffff, witness: Vec::new(),
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
+                script_sig: Vec::new(),
+                sequence: 0xffffffff,
+                witness: Vec::new(),
             }],
-            outputs: vec![TxOut { value: 2000, script_pubkey: vec![0x51] }],
+            outputs: vec![TxOut {
+                value: 2000,
+                script_pubkey: vec![0x51],
+            }],
             lock_time: 0,
         });
         let unrelated = make_tx(42);
@@ -1113,8 +1222,10 @@ mod tests {
     /// Supplemental: INVENTORY_BROADCAST_MAX=1000 matches Core's limit.
     #[test]
     fn inventory_broadcast_max_is_1000() {
-        assert_eq!(INVENTORY_BROADCAST_MAX, 1000,
-            "INVENTORY_BROADCAST_MAX must match Core's limit of 1000 per trickle batch");
+        assert_eq!(
+            INVENTORY_BROADCAST_MAX, 1000,
+            "INVENTORY_BROADCAST_MAX must match Core's limit of 1000 per trickle batch"
+        );
     }
 
     // ─── BIP-339 MsgWtx inv request / serve / announce ───────────────────────
@@ -1136,17 +1247,25 @@ mod tests {
 
         let mempool = Mempool::new(MempoolConfig::default());
         let wtxid = make_tx(7).wtxid();
-        let inv_item = InvVector { inv_type: InvType::MsgWtx, hash: wtxid };
+        let inv_item = InvVector {
+            inv_type: InvType::MsgWtx,
+            hash: wtxid,
+        };
 
         // Handler predicate (main.rs Inv/MsgWtx arm): dedup by wtxid index.
-        assert!(!mempool.contains_wtxid(&inv_item.hash),
-            "unknown wtxid must not be present → must be requested");
+        assert!(
+            !mempool.contains_wtxid(&inv_item.hash),
+            "unknown wtxid must not be present → must be requested"
+        );
 
         // Handler pushes the item unchanged into tx_requests → getdata(MsgWtx).
         let getdata: Vec<InvVector> = vec![inv_item.clone()];
         assert_eq!(getdata.len(), 1);
-        assert_eq!(getdata[0].inv_type, InvType::MsgWtx,
-            "getdata must echo MsgWtx so the peer serves by wtxid");
+        assert_eq!(
+            getdata[0].inv_type,
+            InvType::MsgWtx,
+            "getdata must echo MsgWtx so the peer serves by wtxid"
+        );
         assert_eq!(getdata[0].hash, wtxid);
     }
 
@@ -1161,7 +1280,10 @@ mod tests {
 
         // Handler predicate (main.rs GetData/MsgWtx arm): resolve by wtxid.
         let served = mempool.get_by_wtxid(&wtxid).map(|e| e.tx.clone());
-        assert!(served.is_none(), "wtxid absent from mempool → serve nothing");
+        assert!(
+            served.is_none(),
+            "wtxid absent from mempool → serve nothing"
+        );
 
         // → notfound echoing the requested wtxid inv.
         let notfound = NetworkMessage::NotFound(vec![InvVector {

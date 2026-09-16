@@ -1052,7 +1052,9 @@ impl AddrManTable {
     /// so this exactly partitions the table into the two Core-equivalent
     /// counters without double-counting (Core `Size(net, in_new)`).
     pub fn iter_addrs(&self) -> impl Iterator<Item = (SocketAddr, bool)> + '_ {
-        self.map_info.values().map(|info| (info.addr, info.in_tried))
+        self.map_info
+            .values()
+            .map(|info| (info.addr, info.in_tried))
     }
 
     /// Whether `addr` is in the TRIED table (test/inspection helper).
@@ -1779,7 +1781,12 @@ impl AddressManager {
             attempt_count: 0,
             source: AddrSource::Peer(addr),
         });
-        self.bucket_add(addr, addr.ip(), NODE_NETWORK | NODE_WITNESS, now_unix_secs());
+        self.bucket_add(
+            addr,
+            addr.ip(),
+            NODE_NETWORK | NODE_WITNESS,
+            now_unix_secs(),
+        );
     }
 
     /// Test-only: mark a shareable entry (record a successful connect) so it is
@@ -2683,7 +2690,8 @@ impl PeerManager {
     /// `CConnman::GetNetworkActive`, net.h:1164). Surfaced read-only as
     /// `networkactive` in getnetworkinfo. Default `true`.
     pub fn network_active(&self) -> bool {
-        self.network_active.load(std::sync::atomic::Ordering::SeqCst)
+        self.network_active
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Service flags advertised by this node (NODE_NETWORK | NODE_WITNESS |
@@ -2842,9 +2850,7 @@ impl PeerManager {
                                     // untouched — only new establishment is
                                     // suppressed. Checked before the ban read so
                                     // a disabled node does no per-accept work.
-                                    if !network_active
-                                        .load(std::sync::atomic::Ordering::SeqCst)
-                                    {
+                                    if !network_active.load(std::sync::atomic::Ordering::SeqCst) {
                                         tracing::debug!(
                                             "Rejecting inbound connection from {}: networking inactive",
                                             addr
@@ -2933,7 +2939,8 @@ impl PeerManager {
                                     // half-open flood Core prevents at accept.
                                     let pre_handshake_inbound =
                                         inbound_senders.lock().unwrap().len();
-                                    if reject_inbound_at_accept(pre_handshake_inbound, max_inbound) {
+                                    if reject_inbound_at_accept(pre_handshake_inbound, max_inbound)
+                                    {
                                         tracing::debug!(
                                             "Rejecting inbound connection from {}: {} pre-handshake \
                                              inbound connections already in flight (cap {})",
@@ -3490,7 +3497,8 @@ impl PeerManager {
         };
         self.addr_manager.attempt_addr(&addr);
         tracing::debug!("Making feeler connection to {}", addr);
-        self.connect_to_with_type(addr, ConnectionType::Feeler).await;
+        self.connect_to_with_type(addr, ConnectionType::Feeler)
+            .await;
     }
 
     /// Refill a peer's inbound-addr token bucket and consume up to `requested`
@@ -3810,10 +3818,7 @@ impl PeerManager {
             }
             ok
         } else {
-            tracing::warn!(
-                "send_to_peer: unknown peer {:?} — message dropped",
-                peer_id
-            );
+            tracing::warn!("send_to_peer: unknown peer {:?} — message dropped", peer_id);
             false
         }
     }
@@ -4472,11 +4477,7 @@ impl PeerManager {
                     // ones are ignored. We set the per-peer flag here and bail
                     // early on repeats (the flag is reset only when the peer
                     // reconnects and gets a fresh PeerHandle).
-                    let already = self
-                        .peers
-                        .get(id)
-                        .map(|p| p.getaddr_recvd)
-                        .unwrap_or(true);
+                    let already = self.peers.get(id).map(|p| p.getaddr_recvd).unwrap_or(true);
                     if already {
                         tracing::debug!("Ignoring repeated getaddr from peer {}", id.0);
                     } else {
@@ -8163,7 +8164,11 @@ mod tests {
         assert_eq!(getaddr_cap(0), 0, "empty addrman shares nothing");
         // FLOOR, no min-1 clamp: 23*1/100 = 0 (Core shares nothing on a 1-entry
         // addrman). The old ceil/max(1) wrongly returned 1.
-        assert_eq!(getaddr_cap(1), 0, "23*1/100 floors to 0 — Core shares nothing");
+        assert_eq!(
+            getaddr_cap(1),
+            0,
+            "23*1/100 floors to 0 — Core shares nothing"
+        );
         assert_eq!(getaddr_cap(4), 0, "23*4/100 = 92/100 floors to 0, NOT 1");
         // DISTINGUISHING: 23*10/100 = 230/100 = 2 (floor) vs 3 (ceil).
         assert_eq!(getaddr_cap(10), 2, "23*10/100 floors to 2, NOT 3 (ceil)");
@@ -8196,7 +8201,10 @@ mod tests {
 
         // select_for_feeler draws from the NEW table.
         let selected = mgr.select_for_feeler();
-        assert!(selected.is_some(), "NEW table must yield a feeler candidate");
+        assert!(
+            selected.is_some(),
+            "NEW table must yield a feeler candidate"
+        );
 
         // SUCCESS: handshake completed -> promote NEW->TRIED.
         mgr.mark_feeler_success(&probed, &ng);
@@ -8297,7 +8305,10 @@ mod tests {
         );
         // getaddr_recvd flag set.
         assert!(
-            mgr.peers.get(&pid).map(|p| p.getaddr_recvd).unwrap_or(false),
+            mgr.peers
+                .get(&pid)
+                .map(|p| p.getaddr_recvd)
+                .unwrap_or(false),
             "getaddr_recvd must be set after first getaddr"
         );
 
@@ -8421,8 +8432,7 @@ mod tests {
         addr: SocketAddr,
     ) -> mpsc::Receiver<PeerCommand> {
         if mgr.inbound_cmd_txs.is_none() {
-            mgr.inbound_cmd_txs =
-                Some(std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())));
+            mgr.inbound_cmd_txs = Some(std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())));
         }
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         mgr.inbound_cmd_txs
@@ -8510,9 +8520,7 @@ mod tests {
         // of them and a victim is selectable. insert_test_peer bypasses the cap.
         let mut existing = Vec::new();
         for i in 0..40u32 {
-            let addr: SocketAddr = format!("8.8.{}.{}:8333", i / 256, i % 256)
-                .parse()
-                .unwrap();
+            let addr: SocketAddr = format!("8.8.{}.{}:8333", i / 256, i % 256).parse().unwrap();
             let rx = mgr.insert_test_peer(PeerId(1000 + i as u64), addr, false, true);
             existing.push(rx);
         }

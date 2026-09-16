@@ -239,11 +239,7 @@ impl FeeFilterState {
         }
 
         // During IBD, signal that we don't want transactions
-        let current_filter = if is_ibd {
-            MAX_MONEY
-        } else {
-            current_min_fee
-        };
+        let current_filter = if is_ibd { MAX_MONEY } else { current_min_fee };
 
         // If we sent MAX_MONEY during IBD and are now out of IBD,
         // force an immediate update
@@ -675,10 +671,7 @@ impl PeerRelayState {
                 InvType::MsgTx
             };
 
-            inv.push(InvVector {
-                inv_type,
-                hash,
-            });
+            inv.push(InvVector { inv_type, hash });
 
             // Mark as known
             self.tx_inventory_known.insert(hash);
@@ -911,9 +904,15 @@ pub fn create_block_inv(block_hash: Hash256, witness: bool) -> InvVector {
 /// `MSG_WITNESS_TX (0x40000001)` is a BIP-144 getdata flag, not a valid inv type.
 pub fn build_tx_inv_entry(supports_wtxid_relay: bool, txid: Hash256, wtxid: Hash256) -> InvVector {
     if supports_wtxid_relay {
-        InvVector { inv_type: InvType::MsgWtx, hash: wtxid }
+        InvVector {
+            inv_type: InvType::MsgWtx,
+            hash: wtxid,
+        }
     } else {
-        InvVector { inv_type: InvType::MsgTx, hash: txid }
+        InvVector {
+            inv_type: InvType::MsgTx,
+            hash: txid,
+        }
     }
 }
 
@@ -1238,7 +1237,10 @@ mod tests {
     fn test_inventory_broadcast_constants() {
         // Verify constants match Bitcoin Core
         assert_eq!(INBOUND_INVENTORY_BROADCAST_INTERVAL, Duration::from_secs(5));
-        assert_eq!(OUTBOUND_INVENTORY_BROADCAST_INTERVAL, Duration::from_secs(2));
+        assert_eq!(
+            OUTBOUND_INVENTORY_BROADCAST_INTERVAL,
+            Duration::from_secs(2)
+        );
         assert_eq!(INVENTORY_BROADCAST_MAX, 1000);
         assert_eq!(INVENTORY_BROADCAST_PER_SECOND, 14);
         assert_eq!(INVENTORY_BROADCAST_TARGET, 70); // 14 * 5
@@ -1303,7 +1305,10 @@ mod tests {
         assert_eq!(inv.len(), INVENTORY_BROADCAST_TARGET);
 
         // Remaining should still be pending
-        assert_eq!(trickle.pending_count(peer), 100 - INVENTORY_BROADCAST_TARGET);
+        assert_eq!(
+            trickle.pending_count(peer),
+            100 - INVENTORY_BROADCAST_TARGET
+        );
     }
 
     #[test]
@@ -1562,7 +1567,11 @@ mod tests {
         let result = pays_for_rbf(1000, 999, 100, 0);
         assert!(result.is_err());
         let err_msg = result.unwrap_err();
-        assert!(err_msg.contains("insufficient fee"), "Error should mention insufficient fee: {}", err_msg);
+        assert!(
+            err_msg.contains("insufficient fee"),
+            "Error should mention insufficient fee: {}",
+            err_msg
+        );
     }
 
     #[test]

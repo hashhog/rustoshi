@@ -117,8 +117,8 @@ const MATCH_BIT_SIZES: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
 
 // JUMP offset: minimum value 17. Variable-length for large subtree skips.
 const JUMP_BIT_SIZES: &[u8] = &[
-    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-    29, 30,
+    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+    30,
 ];
 
 /// Instruction type.
@@ -253,7 +253,10 @@ pub fn interpret(asmap: &[u8], ip: &[u8]) -> u32 {
     }
     // Reached EOF without RETURN, or aborted — should have been caught by SanityCheckAsmap.
     // Return 0 (unknown) rather than panic in production.
-    debug_assert!(false, "interpret: reached EOF without RETURN — asmap not sanity-checked");
+    debug_assert!(
+        false,
+        "interpret: reached EOF without RETURN — asmap not sanity-checked"
+    );
     0
 }
 
@@ -425,10 +428,7 @@ pub fn decode_asmap(path: &std::path::Path) -> Vec<u8> {
     );
 
     if !check_standard_asmap(&data) {
-        tracing::warn!(
-            "Sanity check of asmap file {} failed",
-            path.display()
-        );
+        tracing::warn!("Sanity check of asmap file {} failed", path.display());
         return Vec::new();
     }
 
@@ -492,7 +492,10 @@ mod tests {
         // Any IP, any length — RETURN is immediate
         let ip = [0u8; 16];
         let asn = interpret(&asmap, &ip);
-        assert_eq!(asn, 1, "minimal asmap (RETURN ASN=1) should return 1 for any IP");
+        assert_eq!(
+            asn, 1,
+            "minimal asmap (RETURN ASN=1) should return 1 for any IP"
+        );
     }
 
     #[test]
@@ -507,13 +510,19 @@ mod tests {
     #[test]
     fn test_sanity_check_empty_fails() {
         // Empty file: no RETURN instruction → invalid
-        assert!(!sanity_check_asmap(&[], 128), "empty asmap should fail sanity check");
+        assert!(
+            !sanity_check_asmap(&[], 128),
+            "empty asmap should fail sanity check"
+        );
     }
 
     #[test]
     fn test_check_standard_asmap() {
         let asmap = minimal_asmap_asn1();
-        assert!(check_standard_asmap(&asmap), "minimal asmap should pass check_standard_asmap");
+        assert!(
+            check_standard_asmap(&asmap),
+            "minimal asmap should pass check_standard_asmap"
+        );
     }
 
     #[test]
@@ -532,7 +541,10 @@ mod tests {
 
     #[test]
     fn test_max_asmap_filesize_constant() {
-        assert_eq!(MAX_ASMAP_FILESIZE, 8_388_608, "MAX_ASMAP_FILESIZE should be 8 MiB");
+        assert_eq!(
+            MAX_ASMAP_FILESIZE, 8_388_608,
+            "MAX_ASMAP_FILESIZE should be 8 MiB"
+        );
     }
 
     /// Verify decode_bits works for a simple case: RETURN encoding.

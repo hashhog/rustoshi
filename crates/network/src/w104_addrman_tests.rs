@@ -1753,13 +1753,15 @@ fn g3g_clamp_pre2001_timestamp() {
 
     // Must NOT equal the raw timestamp
     assert_ne!(
-        result,
-        ancient as u64,
+        result, ancient as u64,
         "pre-2001 timestamp must not be stored verbatim"
     );
     // Must equal now - 5 days
     let expected = now - 5 * 24 * 60 * 60;
-    assert_eq!(result, expected, "pre-2001 timestamp must clamp to now-5days");
+    assert_eq!(
+        result, expected,
+        "pre-2001 timestamp must clamp to now-5days"
+    );
 }
 
 /// Exactly 100_000_000 is still in the "pre-2001" band (<=, not <).
@@ -1798,8 +1800,7 @@ fn g3g_no_clamp_within_tolerance() {
     let result = clamp_addr_timestamp(just_ok, now);
 
     assert_eq!(
-        result,
-        just_ok as u64,
+        result, just_ok as u64,
         "timestamp <= now+10min must not be clamped"
     );
 }
@@ -1812,7 +1813,10 @@ fn g3g_no_clamp_normal_timestamp() {
 
     let result = clamp_addr_timestamp(recent, now);
 
-    assert_eq!(result, recent as u64, "recent valid timestamp must not be clamped");
+    assert_eq!(
+        result, recent as u64,
+        "recent valid timestamp must not be clamped"
+    );
 }
 
 /// Legacy ADDR path: add_peer_addresses stores the clamped timestamp.
@@ -1854,8 +1858,7 @@ fn g3g_add_peer_addresses_clamps_timestamp() {
         .get(&peer_addr)
         .expect("address must be stored");
     assert_ne!(
-        stored.time_unix,
-        ancient_ts as u64,
+        stored.time_unix, ancient_ts as u64,
         "stored timestamp must not be the raw pre-2001 value"
     );
     // Must be in the vicinity of now - 5 days (within 60s for test clock drift).
@@ -1890,8 +1893,7 @@ fn g3g_add_addrv2_addresses_clamps_timestamp() {
         .get(&peer_addr)
         .expect("address must be stored");
     assert_ne!(
-        stored.time_unix,
-        far_future_ts as u64,
+        stored.time_unix, far_future_ts as u64,
         "far-future timestamp must not be stored verbatim"
     );
     let now = crate::peer_manager::now_unix_secs();
