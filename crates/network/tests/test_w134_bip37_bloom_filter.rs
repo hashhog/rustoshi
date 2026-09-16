@@ -52,7 +52,11 @@ use rustoshi_network::peer_manager::{PeerManager, PeerManagerConfig};
 // ─────────────────────────────────────────────────────────────────────────────
 #[test]
 fn g1_node_bloom_is_bit_2() {
-    assert_eq!(NODE_BLOOM, 1u64 << 2, "NODE_BLOOM must be bit 2 per BIP-111");
+    assert_eq!(
+        NODE_BLOOM,
+        1u64 << 2,
+        "NODE_BLOOM must be bit 2 per BIP-111"
+    );
     assert_eq!(NODE_BLOOM, 4u64, "NODE_BLOOM = 4 matches protocol.h");
 
     // Distinct from siblings (no bit-aliasing)
@@ -72,7 +76,10 @@ fn g1_node_bloom_is_bit_2() {
 #[test]
 fn g2_inv_type_msg_filtered_block_constants() {
     assert_eq!(InvType::from_u32(3), InvType::MsgFilteredBlock);
-    assert_eq!(InvType::from_u32(0x40000003), InvType::MsgWitnessFilteredBlock);
+    assert_eq!(
+        InvType::from_u32(0x40000003),
+        InvType::MsgWitnessFilteredBlock
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,8 +95,10 @@ fn g2_inv_type_msg_filtered_block_constants() {
             matched TX messages (net_processing.cpp:2438-2460). When \
             peer_bloom_filters=true is advertised, peers expect this path."]
 fn g3_getdata_msg_filtered_block_serves_merkleblock() {
-    todo!("wire getdata MsgFilteredBlock → build CMerkleBlock(block, filter) \
-          and send merkleblock + matched tx messages")
+    todo!(
+        "wire getdata MsgFilteredBlock → build CMerkleBlock(block, filter) \
+          and send merkleblock + matched tx messages"
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,8 +112,10 @@ fn g3_getdata_msg_filtered_block_serves_merkleblock() {
             vData.size()>36000 or nHashFuncs>50 and Misbehaving(100) the peer \
             BEFORE installing the filter (CVE-class DoS at first wiring)"]
 fn g4_is_within_size_constraints_dos_guard() {
-    todo!("implement IsWithinSizeConstraints + enforce in filterload handler \
-          + Misbehaving(100) + peer disconnect on violation")
+    todo!(
+        "implement IsWithinSizeConstraints + enforce in filterload handler \
+          + Misbehaving(100) + peer disconnect on violation"
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -352,8 +363,10 @@ fn g26_outpoint_bloom_serialization_absent() {
 #[ignore = "BUG-23 (P3): CMerkleBlock(block, filter) constructor absent — \
             two-pipeline risk with crates/rpc/src/server.rs:8738 PMT helper"]
 fn g27_cmerkleblock_from_filter_absent() {
-    todo!("call IsRelevantAndUpdate per tx; feed matched set into PMT traversal \
-          (reuse build_partial_merkle_tree_bytes, do NOT duplicate)")
+    todo!(
+        "call IsRelevantAndUpdate per tx; feed matched set into PMT traversal \
+          (reuse build_partial_merkle_tree_bytes, do NOT duplicate)"
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

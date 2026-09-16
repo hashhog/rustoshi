@@ -48,19 +48,17 @@
 //!
 //! Cross-wave refs: W112 BUG-G27/G29/G30, W123 G14/G15/G16.
 
+use rustoshi_crypto::sha256d;
 use rustoshi_network::compact_blocks::{
     is_block_mutated, BlockTxn, BlockTxnRequest, CmpctBlock, CompactBlockMode,
-    PartiallyDownloadedBlock, PeerCompactBlockState, PrefilledTx, ReadStatus,
-    CMPCT_VERSION_1, CMPCT_VERSION_2, MAX_BLOCK_WEIGHT, MAX_CMPCTBLOCK_PEERS_HB,
+    PartiallyDownloadedBlock, PeerCompactBlockState, PrefilledTx, ReadStatus, CMPCT_VERSION_1,
+    CMPCT_VERSION_2, MAX_BLOCK_WEIGHT, MAX_CMPCTBLOCK_PEERS_HB,
     MIN_SERIALIZABLE_TRANSACTION_WEIGHT, SHORTTXIDS_LENGTH,
 };
-use rustoshi_network::message::{
-    NetworkMessage, SendCmpctMessage, SENDCMPCT_VERSION,
-};
+use rustoshi_network::message::{NetworkMessage, SendCmpctMessage, SENDCMPCT_VERSION};
 use rustoshi_network::peer::PeerId;
 use rustoshi_primitives::transaction::{OutPoint, TxIn, TxOut};
 use rustoshi_primitives::{Block, BlockHeader, Hash256, Transaction};
-use rustoshi_crypto::sha256d;
 use std::sync::Arc;
 
 // ============================================================================
@@ -208,7 +206,10 @@ fn g5_short_id_uses_wtxid() {
 /// Core: `protocol.h::SENDCMPCT` payload "bool + uint64".
 #[test]
 fn g6_sendcmpct_wire_codec() {
-    let msg = SendCmpctMessage { announce: true, version: 2 };
+    let msg = SendCmpctMessage {
+        announce: true,
+        version: 2,
+    };
     let nm = NetworkMessage::SendCmpct(msg);
     let payload = nm.serialize_payload();
     assert_eq!(payload.len(), 9, "1B announce + 8B version");
@@ -285,7 +286,10 @@ fn g11_init_data_max_tx_count_dos_cap() {
     assert_eq!(MAX_BLOCK_WEIGHT, 4_000_000);
     assert_eq!(MIN_SERIALIZABLE_TRANSACTION_WEIGHT, 60);
     // MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 66_666.
-    assert_eq!(MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT, 66_666);
+    assert_eq!(
+        MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT,
+        66_666
+    );
 }
 
 /// G12 — `InitData` empty/null guard returns `ReadStatus::Invalid`.
@@ -310,9 +314,10 @@ fn g13_init_data_bucket_load_dos_guard() {
     // We can't easily synthesize such a collision in a unit test without
     // mining for it; instead pin the helper is implemented + actively called.
     // Source-grep guard:
-    let src = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/compact_blocks.rs"),
-    )
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/compact_blocks.rs"
+    ))
     .expect("read compact_blocks.rs");
     assert!(
         src.contains("if *load > 12"),
@@ -356,12 +361,8 @@ fn g15_init_data_mempool_first_match_fill() {
     let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
         mempool.iter().map(|(h, t)| (h, t)).collect();
 
-    let partial = PartiallyDownloadedBlock::init_data(
-        &compact,
-        mempool_refs.into_iter(),
-        &[],
-    )
-    .expect("init_data ok");
+    let partial = PartiallyDownloadedBlock::init_data(&compact, mempool_refs.into_iter(), &[])
+        .expect("init_data ok");
     let (prefilled, from_mempool, _extra) = partial.stats();
     assert_eq!(prefilled, 1, "coinbase prefilled");
     assert_eq!(from_mempool, 3, "3 non-coinbase txs filled from mempool");
@@ -372,9 +373,10 @@ fn g15_init_data_mempool_first_match_fill() {
 /// Core: `blockencodings.cpp:163-164`.  Pinned via source-grep.
 #[test]
 fn g16_init_data_extra_txn_wtxid_discriminator() {
-    let src = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/compact_blocks.rs"),
-    )
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/compact_blocks.rs"
+    ))
     .expect("read compact_blocks.rs");
     // Comment + code reference the wtxid-vs-wtxid compare for the
     // dedup-mempool-vs-extra path.
@@ -399,12 +401,8 @@ fn g17_fill_block_mutation_check_runs() {
         .collect();
     let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
         mempool.iter().map(|(h, t)| (h, t)).collect();
-    let mut partial = PartiallyDownloadedBlock::init_data(
-        &compact,
-        mempool_refs.into_iter(),
-        &[],
-    )
-    .expect("init_data");
+    let mut partial = PartiallyDownloadedBlock::init_data(&compact, mempool_refs.into_iter(), &[])
+        .expect("init_data");
     // segwit_active=false: helpers are witness-free, so the unexpected-witness
     // loop in is_block_mutated does not fire.
     let res = partial.fill_block(vec![], false);
@@ -429,12 +427,8 @@ fn g18_fill_block_resets_state_after_fill() {
         .collect();
     let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
         mempool.iter().map(|(h, t)| (h, t)).collect();
-    let mut partial = PartiallyDownloadedBlock::init_data(
-        &compact,
-        mempool_refs.into_iter(),
-        &[],
-    )
-    .expect("init_data");
+    let mut partial = PartiallyDownloadedBlock::init_data(&compact, mempool_refs.into_iter(), &[])
+        .expect("init_data");
     // First fill — succeeds, header reset.
     let res = partial.fill_block(vec![], false);
     assert!(res.is_ok(), "first fill_block ok");
@@ -446,8 +440,10 @@ fn g18_fill_block_resets_state_after_fill() {
     );
     // Second fill — must report Invalid because header is null.
     let res2 = partial.fill_block(vec![], false);
-    assert!(matches!(res2, Err(ReadStatus::Invalid)),
-        "second fill_block must return Invalid (header reset)");
+    assert!(
+        matches!(res2, Err(ReadStatus::Invalid)),
+        "second fill_block must return Invalid (header reset)"
+    );
 }
 
 // ============================================================================
@@ -458,10 +454,8 @@ fn g18_fill_block_resets_state_after_fill() {
 /// Core `net_processing.cpp:3870`. Source-grep across peer.rs.
 #[test]
 fn g19_peer_sends_sendcmpct_announce_false_v2() {
-    let src = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/peer.rs"),
-    )
-    .expect("read peer.rs");
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/peer.rs"))
+        .expect("read peer.rs");
     // Three sites: v1 outbound (line 1015-1026), v1 inbound (1241-1254),
     // v2 BIP-324 (1945-1957).  Each should send announce=false, version=2.
     let occurrences = src.matches("announce: false").count();
@@ -470,7 +464,10 @@ fn g19_peer_sends_sendcmpct_announce_false_v2() {
         "expected at least 3 `announce: false` sites (v1-in, v1-out, v2-in), found {}",
         occurrences
     );
-    assert!(src.contains("SENDCMPCT_VERSION"), "SENDCMPCT_VERSION gate referenced");
+    assert!(
+        src.contains("SENDCMPCT_VERSION"),
+        "SENDCMPCT_VERSION gate referenced"
+    );
     assert_eq!(SENDCMPCT_VERSION, 70014, "protocol version gate");
 }
 
@@ -479,9 +476,14 @@ fn g19_peer_sends_sendcmpct_announce_false_v2() {
 #[test]
 fn g20_cmpctblock_handler_decodes_and_misbehaves_on_bad_decode() {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let main_rs = std::path::Path::new(manifest).parent().unwrap()
-        .parent().unwrap()
-        .join("rustoshi").join("src").join("main.rs");
+    let main_rs = std::path::Path::new(manifest)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("rustoshi")
+        .join("src")
+        .join("main.rs");
     let src = std::fs::read_to_string(&main_rs).expect("read main.rs");
     assert!(
         src.contains("CmpctBlock::decode"),
@@ -520,9 +522,14 @@ fn g21_getblocktxn_out_of_range_misbehaves() {
 #[test]
 fn g22_blocktxn_handler_completes_reconstruction() {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let main_rs = std::path::Path::new(manifest).parent().unwrap()
-        .parent().unwrap()
-        .join("rustoshi").join("src").join("main.rs");
+    let main_rs = std::path::Path::new(manifest)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("rustoshi")
+        .join("src")
+        .join("main.rs");
     let src = std::fs::read_to_string(&main_rs).expect("read main.rs");
     // Must look up the in-flight partial block AND call fill_block AND submit
     // to block_downloader.

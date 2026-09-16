@@ -14,7 +14,9 @@
 //!   cargo test -p rustoshi-network --test test_feefilter_wiring
 
 use rustoshi_network::peer::PeerId;
-use rustoshi_network::relay::{FeeFilterManager, FeeFilterRounder, DEFAULT_INCREMENTAL_RELAY_FEE, MAX_MONEY};
+use rustoshi_network::relay::{
+    FeeFilterManager, FeeFilterRounder, DEFAULT_INCREMENTAL_RELAY_FEE, MAX_MONEY,
+};
 use std::time::{Duration, Instant};
 
 // ─── Test 1: periodic broadcast fires when the timer elapses (not before) ───
@@ -30,7 +32,9 @@ fn periodic_broadcast_fires_only_when_timer_elapses() {
     let peer = PeerId(1);
 
     // Eligible peer (supports feefilter, not block-only), anchored at t0.
-    mgr.add_peer_at(t0, peer, /*supports_feefilter=*/ true, /*is_block_only=*/ false);
+    mgr.add_peer_at(
+        t0, peer, /*supports_feefilter=*/ true, /*is_block_only=*/ false,
+    );
 
     // Pin the next-send deadline well into the future.
     let deadline = t0 + Duration::from_secs(600);
@@ -145,7 +149,9 @@ fn block_relay_only_peer_gets_no_feefilter() {
     let block_only = PeerId(2);
     let full = PeerId(3);
 
-    mgr.add_peer_at(t0, block_only, /*supports_feefilter=*/ true, /*is_block_only=*/ true);
+    mgr.add_peer_at(
+        t0, block_only, /*supports_feefilter=*/ true, /*is_block_only=*/ true,
+    );
     mgr.add_peer_at(t0, full, true, false);
 
     // Force both timers due.
@@ -211,8 +217,14 @@ fn ibd_sends_max_money_filter() {
     assert!(mgr.set_next_send_for_test(peer, due));
 
     // mempool_min_fee is deliberately small; IBD must override it with MAX_MONEY.
-    let pending = mgr.get_pending_feefilters_at(t0, /*mempool_min_fee=*/ 1_000, /*is_ibd=*/ true);
-    assert_eq!(pending.len(), 1, "IBD peer must receive a feefilter, got {:?}", pending);
+    let pending =
+        mgr.get_pending_feefilters_at(t0, /*mempool_min_fee=*/ 1_000, /*is_ibd=*/ true);
+    assert_eq!(
+        pending.len(),
+        1,
+        "IBD peer must receive a feefilter, got {:?}",
+        pending
+    );
     assert_eq!(pending[0].0, peer);
 
     let rounder = FeeFilterRounder::new(DEFAULT_INCREMENTAL_RELAY_FEE);

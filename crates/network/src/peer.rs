@@ -15,7 +15,7 @@ use crate::message::{
     MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE, MIN_WITNESS_PROTO_VERSION, NODE_WITNESS,
     SENDCMPCT_VERSION, SENDHEADERS_VERSION, WTXID_RELAY_VERSION,
 };
-use crate::proxy::{ProxyConfig, ProxyError, Socks5Proxy, I2pSession};
+use crate::proxy::{I2pSession, ProxyConfig, ProxyError, Socks5Proxy};
 use crate::v2_transport::{
     constants::{
         ELLSWIFT_PUBKEY_LEN, EXPANSION, GARBAGE_TERMINATOR_LEN, HEADER_LEN, LENGTH_LEN,
@@ -98,12 +98,9 @@ impl PeerStats {
         let now = current_unix_secs();
         // Only set once; ignore if already non-zero (defensive against a
         // task accidentally re-stamping post-reconnect).
-        let _ = self.conn_time_unix.compare_exchange(
-            0,
-            now,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        let _ = self
+            .conn_time_unix
+            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// Record an outbound write of `nbytes` (full framed bytes, header +
@@ -496,7 +493,9 @@ impl MessageReader {
 
         // Read payload
         if !self.payload_buf.is_empty() {
-            reader.read_exact(&mut self.payload_buf[..length as usize]).await?;
+            reader
+                .read_exact(&mut self.payload_buf[..length as usize])
+                .await?;
         }
 
         // Validate checksum
@@ -869,7 +868,9 @@ pub async fn run_outbound_peer_with_proxy(
             let reason = match e {
                 OutboundConnectError::Timeout => DisconnectReason::Timeout,
                 OutboundConnectError::Io(io_err) => DisconnectReason::IoError(io_err.to_string()),
-                OutboundConnectError::Proxy(pe) => DisconnectReason::IoError(format!("proxy: {}", pe)),
+                OutboundConnectError::Proxy(pe) => {
+                    DisconnectReason::IoError(format!("proxy: {}", pe))
+                }
                 OutboundConnectError::Unreachable(msg) => DisconnectReason::IoError(msg),
                 #[cfg(test)]
                 OutboundConnectError::TestOverride(msg) => DisconnectReason::IoError(msg),
@@ -1600,14 +1601,12 @@ pub(crate) async fn v2_recv_message<R: tokio::io::AsyncRead + Unpin>(
         reader.read_exact(&mut aead_buf).await?;
 
         let mut contents = vec![0u8; plain_len];
-        let ignore = cipher
-            .decrypt(&aead_buf, &[], &mut contents)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("v2 AEAD decrypt: {}", e),
-                )
-            })?;
+        let ignore = cipher.decrypt(&aead_buf, &[], &mut contents).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("v2 AEAD decrypt: {}", e),
+            )
+        })?;
 
         if ignore {
             // Decoy packet — caller asked for a real message, keep reading.
@@ -1643,8 +1642,12 @@ pub(crate) async fn perform_v2_handshake_outbound(
     our_version: &VersionMessage,
 ) -> Result<HandshakeResult, HandshakeError> {
     // Send our VERSION first.
-    v2_send_message(cipher, writer, &NetworkMessage::Version(our_version.clone()))
-        .await?;
+    v2_send_message(
+        cipher,
+        writer,
+        &NetworkMessage::Version(our_version.clone()),
+    )
+    .await?;
 
     // Receive their VERSION.
     let their_version_msg = v2_recv_message(cipher, reader).await?;
@@ -2047,14 +2050,12 @@ pub(crate) async fn v2_recv_message_tracked<R: tokio::io::AsyncRead + Unpin>(
         let bytes_total = (LENGTH_LEN + aead_len) as u64;
 
         let mut contents = vec![0u8; plain_len];
-        let ignore = cipher
-            .decrypt(&aead_buf, &[], &mut contents)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("v2 AEAD decrypt: {}", e),
-                )
-            })?;
+        let ignore = cipher.decrypt(&aead_buf, &[], &mut contents).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("v2 AEAD decrypt: {}", e),
+            )
+        })?;
 
         if ignore {
             // Decoy: still account the bytes (peer did make us read
@@ -2064,13 +2065,12 @@ pub(crate) async fn v2_recv_message_tracked<R: tokio::io::AsyncRead + Unpin>(
         }
 
         // Step 3: decode v2 envelope (short id / 12-byte command + payload).
-        let (command, payload) =
-            decode_message_type_and_payload(&contents).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("v2 envelope: {}", e),
-                )
-            })?;
+        let (command, payload) = decode_message_type_and_payload(&contents).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("v2 envelope: {}", e),
+            )
+        })?;
 
         stats.record_recv(command_static_str(&command), bytes_total);
         return NetworkMessage::deserialize(&command, &payload);
@@ -2158,7 +2158,14 @@ async fn perform_handshake(
     magic: &[u8; 4],
     our_nonce: u64,
 ) -> Result<HandshakeResult, HandshakeError> {
-    perform_handshake_tracked(reader, writer, magic, our_nonce, &Arc::new(PeerStats::new())).await
+    perform_handshake_tracked(
+        reader,
+        writer,
+        magic,
+        our_nonce,
+        &Arc::new(PeerStats::new()),
+    )
+    .await
 }
 
 /// Like [`perform_handshake`] but updates `stats` for every byte read or
@@ -2809,7 +2816,9 @@ async fn handle_message_v2_tracked(
         msg.command(),
         peer_id.0
     );
-    let _ = event_tx.send(PeerEvent::Message(peer_id, msg.clone())).await;
+    let _ = event_tx
+        .send(PeerEvent::Message(peer_id, msg.clone()))
+        .await;
     Ok(())
 }
 
@@ -2875,7 +2884,11 @@ async fn handle_message_tracked(
     }
 
     // Forward all messages to the event handler
-    tracing::debug!("Forwarding {} message from peer {} to main loop", msg.command(), peer_id.0);
+    tracing::debug!(
+        "Forwarding {} message from peer {} to main loop",
+        msg.command(),
+        peer_id.0
+    );
     let _ = event_tx.send(PeerEvent::Message(peer_id, msg)).await;
 
     Ok(())
@@ -2933,8 +2946,8 @@ pub async fn read_message<R: AsyncReadExt + Unpin>(
 mod tests {
     use super::*;
     use crate::message::{
-        InvType, InvVector, NetAddress, NetworkMessage, VersionMessage,
-        NODE_NETWORK, NODE_WITNESS, PROTOCOL_VERSION,
+        InvType, InvVector, NetAddress, NetworkMessage, VersionMessage, NODE_NETWORK, NODE_WITNESS,
+        PROTOCOL_VERSION,
     };
     use std::io::Cursor;
     use std::sync::MutexGuard;
@@ -3369,7 +3382,8 @@ mod tests {
                 start_height: 100,
                 relay: true,
             };
-            let version_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version));
+            let version_msg =
+                serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version));
             stream.write_all(&version_msg).await.unwrap();
 
             // Send verack
@@ -3502,7 +3516,10 @@ mod tests {
             let data = serialize_message(&TESTNET4_MAGIC, &msg);
             let mut cursor = Cursor::new(data);
 
-            let read_msg = reader.read_message(&mut cursor, &TESTNET4_MAGIC).await.unwrap();
+            let read_msg = reader
+                .read_message(&mut cursor, &TESTNET4_MAGIC)
+                .await
+                .unwrap();
 
             // Verify message was read correctly
             match (&msg, &read_msg) {
@@ -3664,7 +3681,8 @@ mod tests {
                 start_height: 100,
                 relay: true,
             };
-            let version_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(old_version));
+            let version_msg =
+                serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(old_version));
             stream.write_all(&version_msg).await.unwrap();
             stream.flush().await.unwrap();
         });
@@ -3740,7 +3758,10 @@ mod tests {
                 start_height: 100,
                 relay: true,
             };
-            let version_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version.clone()));
+            let version_msg = serialize_message(
+                &TESTNET4_MAGIC,
+                &NetworkMessage::Version(server_version.clone()),
+            );
             stream.write_all(&version_msg).await.unwrap();
 
             // Send DUPLICATE version (protocol violation)
@@ -3827,7 +3848,8 @@ mod tests {
                 start_height: 100,
                 relay: true,
             };
-            let version_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version));
+            let version_msg =
+                serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version));
             stream.write_all(&version_msg).await.unwrap();
             stream.flush().await.unwrap();
         });
@@ -3901,7 +3923,8 @@ mod tests {
                 start_height: 100,
                 relay: true,
             };
-            let version_msg = serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version));
+            let version_msg =
+                serialize_message(&TESTNET4_MAGIC, &NetworkMessage::Version(server_version));
             stream.write_all(&version_msg).await.unwrap();
 
             // Send wtxidrelay BEFORE verack (this is allowed per BIP 339)
@@ -4076,9 +4099,7 @@ mod tests {
             // Use 198.51.100.0/16 reserved-for-documentation range.
             let oct_a = (i / 256) as u8;
             let oct_b = (i % 256) as u8;
-            let addr: SocketAddr = format!("198.51.{}.{}:8333", oct_a, oct_b)
-                .parse()
-                .unwrap();
+            let addr: SocketAddr = format!("198.51.{}.{}:8333", oct_a, oct_b).parse().unwrap();
             mark_v1_only(addr);
         }
         // Cache size must be <= V2_FALLBACK_CACHE_MAX (we evict on
@@ -4196,8 +4217,10 @@ mod tests {
     async fn test_v2_send_recv_roundtrip_via_duplex() {
         let (mut alice, mut bob) = Bip324Cipher::pair_for_test();
         let (a_to_b, b_from_a) = tokio::io::duplex(64 * 1024);
-        let (mut a_writer, mut b_reader) =
-            (tokio::io::BufWriter::new(a_to_b), tokio::io::BufReader::new(b_from_a));
+        let (mut a_writer, mut b_reader) = (
+            tokio::io::BufWriter::new(a_to_b),
+            tokio::io::BufReader::new(b_from_a),
+        );
 
         let messages = vec![
             NetworkMessage::Ping(0x1234_5678_9ABC_DEF0),
@@ -4209,7 +4232,9 @@ mod tests {
         ];
 
         for msg in &messages {
-            v2_send_message(&mut alice, &mut a_writer, msg).await.unwrap();
+            v2_send_message(&mut alice, &mut a_writer, msg)
+                .await
+                .unwrap();
         }
         a_writer.flush().await.unwrap();
 
@@ -4276,8 +4301,10 @@ mod tests {
         use crate::v2_transport::constants::REKEY_INTERVAL;
         let (mut alice, mut bob) = Bip324Cipher::pair_for_test();
         let (a_to_b, b_from_a) = tokio::io::duplex(1024 * 1024);
-        let (mut a_writer, mut b_reader) =
-            (tokio::io::BufWriter::new(a_to_b), tokio::io::BufReader::new(b_from_a));
+        let (mut a_writer, mut b_reader) = (
+            tokio::io::BufWriter::new(a_to_b),
+            tokio::io::BufReader::new(b_from_a),
+        );
 
         let total = (REKEY_INTERVAL as u64) + 26; // 250 messages
         for i in 0..total {
@@ -4291,7 +4318,8 @@ mod tests {
             let msg = v2_recv_message(&mut bob, &mut b_reader).await.unwrap();
             match msg {
                 NetworkMessage::Ping(n) => assert_eq!(
-                    n, i,
+                    n,
+                    i,
                     "packet {} (post-rekey={}) round-trip diverged",
                     i,
                     i >= REKEY_INTERVAL as u64
@@ -4355,8 +4383,10 @@ mod tests {
     async fn test_v2_recv_skips_ignore_flag_packets() {
         let (mut alice, mut bob) = Bip324Cipher::pair_for_test();
         let (a_to_b, b_from_a) = tokio::io::duplex(8192);
-        let (mut a_writer, mut b_reader) =
-            (tokio::io::BufWriter::new(a_to_b), tokio::io::BufReader::new(b_from_a));
+        let (mut a_writer, mut b_reader) = (
+            tokio::io::BufWriter::new(a_to_b),
+            tokio::io::BufReader::new(b_from_a),
+        );
 
         // Send a decoy: contents must be non-empty (so the v2 envelope
         // decodes), but with the ignore bit set the receiver should

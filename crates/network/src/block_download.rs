@@ -211,7 +211,10 @@ where
     F: Fn(u32) -> Option<Hash256>,
     G: Fn(&Hash256) -> bool,
 {
-    let mut out = GapFill { to_request: Vec::new(), already_stored: 0 };
+    let mut out = GapFill {
+        to_request: Vec::new(),
+        already_stored: 0,
+    };
     if validated_tip >= best_header || max_window == 0 {
         return out;
     }
@@ -565,7 +568,9 @@ impl BlockDownloader {
         // and NOT in_flight, we MUST bypass backpressure to fetch it — otherwise
         // the buffer can never drain and we deadlock.
         if self.received_blocks.len() >= MAX_RECEIVED_BLOCKS {
-            let next_needed_available = self.pending_hashes.front()
+            let next_needed_available = self
+                .pending_hashes
+                .front()
                 .map(|h| self.received_blocks.contains_key(h) || self.in_flight.contains_key(h))
                 .unwrap_or(true);
             if next_needed_available {
@@ -845,7 +850,9 @@ mod tests {
 
     // ---- level-triggered gap fill (compute_gap_fill) ----
 
-    fn h(n: u8) -> Hash256 { Hash256([n; 32]) }
+    fn h(n: u8) -> Hash256 {
+        Hash256([n; 32])
+    }
 
     #[test]
     fn gap_fill_requests_a_missing_body_when_the_queue_is_idle() {
@@ -875,7 +882,10 @@ mod tests {
         // caller must say so rather than spin. to_request MUST stay empty so we
         // do not re-request our own branch in a loop.
         let g = compute_gap_fill(100, 110, 1000, |ht| Some(h(ht as u8)), |_| true);
-        assert!(g.to_request.is_empty(), "must not re-request our own branch");
+        assert!(
+            g.to_request.is_empty(),
+            "must not re-request our own branch"
+        );
         assert_eq!(g.already_stored, 10);
     }
 
@@ -891,7 +901,13 @@ mod tests {
     #[test]
     fn gap_fill_skips_heights_with_no_header() {
         // A height index hole must be skipped, not treated as missing-body.
-        let g = compute_gap_fill(0, 4, 1000, |ht| if ht == 2 { None } else { Some(h(ht as u8)) }, |_| false);
+        let g = compute_gap_fill(
+            0,
+            4,
+            1000,
+            |ht| if ht == 2 { None } else { Some(h(ht as u8)) },
+            |_| false,
+        );
         assert_eq!(g.to_request, vec![(h(1), 1), (h(3), 3), (h(4), 4)]);
     }
 
@@ -1146,9 +1162,7 @@ mod tests {
         dl.add_peer(peer2);
 
         // Enqueue some blocks
-        let blocks: Vec<(Hash256, u32)> = (1..=10)
-            .map(|i| (Hash256([i as u8; 32]), i))
-            .collect();
+        let blocks: Vec<(Hash256, u32)> = (1..=10).map(|i| (Hash256([i as u8; 32]), i)).collect();
         dl.enqueue_blocks(blocks);
 
         // Assign requests
@@ -1296,9 +1310,7 @@ mod tests {
         dl.add_peer(peer2);
 
         // Enqueue blocks
-        let blocks: Vec<(Hash256, u32)> = (1..=4)
-            .map(|i| (Hash256([i as u8; 32]), i))
-            .collect();
+        let blocks: Vec<(Hash256, u32)> = (1..=4).map(|i| (Hash256([i as u8; 32]), i)).collect();
         dl.enqueue_blocks(blocks);
 
         // Assign to peers
@@ -1307,11 +1319,7 @@ mod tests {
         assert_eq!(initial_in_flight, 4);
 
         // Count how many were assigned to peer1
-        let peer1_blocks: Vec<_> = dl
-            .in_flight
-            .values()
-            .filter(|b| b.peer == peer1)
-            .collect();
+        let peer1_blocks: Vec<_> = dl.in_flight.values().filter(|b| b.peer == peer1).collect();
         let peer1_count = peer1_blocks.len();
 
         // Remove peer1
@@ -1370,9 +1378,7 @@ mod tests {
         dl.peer_states.get_mut(&peer1).unwrap().stalling = true;
 
         // Enqueue blocks
-        let blocks: Vec<(Hash256, u32)> = (1..=4)
-            .map(|i| (Hash256([i as u8; 32]), i))
-            .collect();
+        let blocks: Vec<(Hash256, u32)> = (1..=4).map(|i| (Hash256([i as u8; 32]), i)).collect();
         dl.enqueue_blocks(blocks);
 
         // Assign requests — both peers should get blocks
@@ -1461,9 +1467,7 @@ mod tests {
         dl.add_peer(peer);
 
         // Enqueue more blocks than the per-peer limit
-        let blocks: Vec<(Hash256, u32)> = (1..=20)
-            .map(|i| (Hash256([i as u8; 32]), i))
-            .collect();
+        let blocks: Vec<(Hash256, u32)> = (1..=20).map(|i| (Hash256([i as u8; 32]), i)).collect();
         dl.enqueue_blocks(blocks);
 
         // Assign requests
@@ -1512,9 +1516,7 @@ mod tests {
         let peer = PeerId(1);
         dl.add_peer(peer);
 
-        let blocks: Vec<(Hash256, u32)> = (1..=5)
-            .map(|i| (Hash256([i as u8; 32]), i))
-            .collect();
+        let blocks: Vec<(Hash256, u32)> = (1..=5).map(|i| (Hash256([i as u8; 32]), i)).collect();
         dl.enqueue_blocks(blocks);
 
         let requests = dl.assign_requests();
@@ -1682,7 +1684,10 @@ mod tests {
 
         // And it must be assignable + receivable again.
         let requests2 = dl.assign_requests();
-        assert!(!requests2.is_empty(), "re-enqueued block should be assigned");
+        assert!(
+            !requests2.is_empty(),
+            "re-enqueued block should be assigned"
+        );
         assert_eq!(dl.blocks_in_flight(), 1);
         let received2 = dl.block_received(peer, block);
         assert_eq!(received2, Some(hash));
@@ -1829,11 +1834,8 @@ mod tests {
 
     #[test]
     fn single_connect_cap_fills_128() {
-        let mut dl = BlockDownloader::with_per_peer_cap(
-            0,
-            1000,
-            SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER,
-        );
+        let mut dl =
+            BlockDownloader::with_per_peer_cap(0, 1000, SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER);
         dl.add_peer(PeerId(1));
         let blocks: Vec<(Hash256, u32)> = (1..=200)
             .map(|i| {
@@ -1857,5 +1859,113 @@ mod tests {
         assert_eq!(total, MAX_BLOCKS_IN_FLIGHT);
         assert_eq!(dl.blocks_in_flight(), MAX_BLOCKS_IN_FLIGHT);
         assert_eq!(dl.max_per_peer(), SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER);
+    }
+
+    fn make_test_block_n(n: u32) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1231006505,
+                bits: 0x207fffff,
+                nonce: n,
+            },
+            transactions: vec![],
+        }
+    }
+
+    fn first_window_for_cap(cap: usize, n: usize) -> usize {
+        let mut dl = BlockDownloader::with_per_peer_cap(0, n as u32, cap);
+        dl.add_peer(PeerId(1));
+        let queued: Vec<(Hash256, u32)> = (1..=n as u32)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&i.to_le_bytes());
+                (Hash256(bytes), i)
+            })
+            .collect();
+        dl.enqueue_blocks(queued);
+        let _ = dl.assign_requests();
+        dl.blocks_in_flight()
+    }
+
+    /// One RTT-wave: every currently in-flight hash arrives together, then
+    /// refill-on-receipt opens the next window. Models a single `--connect`
+    /// feeder whose parallelism is the per-peer cap.
+    fn rtt_waves_for_cap(cap: usize, n: usize) -> usize {
+        let peer = PeerId(1);
+        let mut dl = BlockDownloader::with_per_peer_cap(0, n as u32, cap);
+        dl.add_peer(peer);
+        let blocks: Vec<Block> = (1..=n as u32).map(make_test_block_n).collect();
+        let by_hash: std::collections::HashMap<Hash256, Block> =
+            blocks.iter().map(|b| (b.block_hash(), b.clone())).collect();
+        assert_eq!(by_hash.len(), n, "nonces 1..={n} must hash uniquely");
+        let queued: Vec<(Hash256, u32)> = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.block_hash(), (i as u32) + 1))
+            .collect();
+        dl.enqueue_blocks(queued);
+        let _ = dl.assign_requests();
+        let mut waves = 0usize;
+        while dl.blocks_in_flight() > 0 || dl.download_queue_len() > 0 {
+            let due: Vec<Hash256> = dl.in_flight.keys().copied().collect();
+            if due.is_empty() {
+                let _ = dl.assign_requests();
+                assert!(
+                    dl.blocks_in_flight() > 0,
+                    "queue={n} cap={cap}: assign_requests made no progress"
+                );
+                continue;
+            }
+            waves += 1;
+            assert!(
+                waves <= n,
+                "queue={n} cap={cap}: did not drain in {n} waves"
+            );
+            for h in due {
+                let block = by_hash.get(&h).expect("queued hash").clone();
+                let _ = dl.block_received(peer, block);
+                let _ = dl.take_refill_requests();
+                while dl.next_block_to_validate().is_some() {}
+            }
+        }
+        waves
+    }
+
+    /// Control for QUEUES.md item 3: a 10k single-feeder window must fill 128,
+    /// not Core's multi-peer 16. Cap 16 takes 625 RTT-waves to drain 10k;
+    /// cap 128 takes 79. `BlockDownloader::new` stays at 16 on purpose.
+    #[test]
+    fn ten_k_range_default_cap_first_window_is_16() {
+        assert_eq!(
+            first_window_for_cap(MAX_BLOCKS_IN_FLIGHT_PER_PEER, 10_000),
+            16,
+            "multi-peer / BlockDownloader::new must stay at Core's 16"
+        );
+        assert_eq!(
+            rtt_waves_for_cap(MAX_BLOCKS_IN_FLIGHT_PER_PEER, 10_000),
+            625,
+            "10k / 16 = 625 RTT-waves"
+        );
+    }
+
+    #[test]
+    fn ten_k_range_single_connect_first_window_is_128() {
+        assert_eq!(
+            first_window_for_cap(SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER, 10_000),
+            128,
+            "single --connect peer must fill the global 128 window"
+        );
+        assert_eq!(
+            rtt_waves_for_cap(SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER, 10_000),
+            79,
+            "10k / 128 = 79 RTT-waves (ceil)"
+        );
+        assert_eq!(
+            resolve_blocks_in_flight_per_peer_with_env(1, None),
+            SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER
+        );
     }
 }

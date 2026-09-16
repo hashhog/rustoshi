@@ -45,14 +45,13 @@
 //!   G30 wtxidrelay gated on common_version >= 70016 (PASS)
 
 use rustoshi_network::message::{
-    InvType, InvVector, NetworkMessage, FEEFILTER_VERSION, SENDHEADERS_VERSION,
-    WTXID_RELAY_VERSION,
-};
-use rustoshi_network::relay::{
-    pays_for_rbf, AVG_FEEFILTER_BROADCAST_INTERVAL, FeeFilterManager, FeeFilterRounder,
-    FeeFilterState, InventoryTrickle, MAX_FEEFILTER_CHANGE_DELAY, MAX_MONEY,
+    InvType, InvVector, NetworkMessage, FEEFILTER_VERSION, SENDHEADERS_VERSION, WTXID_RELAY_VERSION,
 };
 use rustoshi_network::peer::PeerId;
+use rustoshi_network::relay::{
+    pays_for_rbf, FeeFilterManager, FeeFilterRounder, FeeFilterState, InventoryTrickle,
+    AVG_FEEFILTER_BROADCAST_INTERVAL, MAX_FEEFILTER_CHANGE_DELAY, MAX_MONEY,
+};
 
 // ============================================================================
 // BIP-130 sendheaders
@@ -65,16 +64,25 @@ use rustoshi_network::peer::PeerId;
 #[test]
 fn g1_sendheaders_message_variant_and_codec() {
     let msg = NetworkMessage::SendHeaders;
-    assert_eq!(msg.command(), "sendheaders",
-        "G1: NetworkMessage::SendHeaders.command() must be \"sendheaders\"");
+    assert_eq!(
+        msg.command(),
+        "sendheaders",
+        "G1: NetworkMessage::SendHeaders.command() must be \"sendheaders\""
+    );
     // The payload is empty for sendheaders; the codec must serialize without
     // error and the resulting payload must be 0 bytes.
     let buf = msg.serialize_payload();
-    assert_eq!(buf.len(), 0, "G1: sendheaders payload must be empty (BIP-130)");
+    assert_eq!(
+        buf.len(),
+        0,
+        "G1: sendheaders payload must be empty (BIP-130)"
+    );
     // Deserialize round-trip.
     let decoded = NetworkMessage::deserialize("sendheaders", &[]).expect("decode sendheaders");
-    assert!(matches!(decoded, NetworkMessage::SendHeaders),
-        "G1: deserialize must yield SendHeaders");
+    assert!(
+        matches!(decoded, NetworkMessage::SendHeaders),
+        "G1: deserialize must yield SendHeaders"
+    );
 }
 
 // ─── G2: SENDHEADERS_VERSION = 70012 constant ───────────────────────────────
@@ -83,8 +91,10 @@ fn g1_sendheaders_message_variant_and_codec() {
 /// matches at message.rs:291.
 #[test]
 fn g2_sendheaders_version_is_70012() {
-    assert_eq!(SENDHEADERS_VERSION, 70012,
-        "G2: SENDHEADERS_VERSION must equal Core protocol_version.h:24 value of 70012");
+    assert_eq!(
+        SENDHEADERS_VERSION, 70012,
+        "G2: SENDHEADERS_VERSION must equal Core protocol_version.h:24 value of 70012"
+    );
 }
 
 // ─── G3: supports_sendheaders field on PeerInfo ─────────────────────────────
@@ -113,9 +123,11 @@ fn g4_sendheaders_message_flips_flag_in_handler() {
     // We cannot reach the handler from a #[test] without spinning a tokio
     // runtime + PeerManager; the in-file test at peer_manager.rs:5117 does
     // this.  Our gate documents the contract.
-    assert!(true,
+    assert!(
+        true,
         "G4: peer_manager.rs:2156-2160 SendHeaders arm flips supports_sendheaders=true; \
-         verified by in-file tokio::test test_sendheaders_message_flips_flag");
+         verified by in-file tokio::test test_sendheaders_message_flips_flag"
+    );
 }
 
 // ─── G5: announce_block branches headers vs inv per-peer ────────────────────
@@ -127,9 +139,11 @@ fn g4_sendheaders_message_flips_flag_in_handler() {
 /// exercises all three branches.
 #[test]
 fn g5_announce_block_branches_on_sendheaders() {
-    assert!(true,
+    assert!(
+        true,
         "G5: announce_block branches headers vs inv based on supports_sendheaders \
-         (peer_manager.rs:1744); verified by in-file test_announce_block_branches_on_sendheaders");
+         (peer_manager.rs:1744); verified by in-file test_announce_block_branches_on_sendheaders"
+    );
 }
 
 // ─── G6: announce_block called from chain-advance path ──────────────────────
@@ -145,8 +159,10 @@ fn g5_announce_block_branches_on_sendheaders() {
 #[test]
 #[ignore = "BUG-11 P1: announce_block never called from P2P connect-tip path in main.rs — only from generateblock RPC"]
 fn g6_announce_block_called_from_chain_advance() {
-    assert!(false,
-        "BUG-11 P1: announce_block has no caller in rustoshi/src/main.rs P2P chain-advance path");
+    assert!(
+        false,
+        "BUG-11 P1: announce_block has no caller in rustoshi/src/main.rs P2P chain-advance path"
+    );
 }
 
 // ─── G7: MaybeSendSendHeaders MinimumChainWork gate ─────────────────────────
@@ -189,8 +205,10 @@ fn g8_sendheaders_idempotent_once_per_peer() {
 #[test]
 #[ignore = "BUG-14 P2: no MAX_BLOCKS_TO_ANNOUNCE = 8 cap — announce_block is single-block-per-call only"]
 fn g9_max_blocks_to_announce_cap() {
-    assert!(false,
-        "BUG-14 P2: no MAX_BLOCKS_TO_ANNOUNCE = 8 batching cap (net_processing.cpp:5840)");
+    assert!(
+        false,
+        "BUG-14 P2: no MAX_BLOCKS_TO_ANNOUNCE = 8 batching cap (net_processing.cpp:5840)"
+    );
 }
 
 // ─── G10: fRevertToInv on multi-block / reorg ───────────────────────────────
@@ -204,8 +222,10 @@ fn g9_max_blocks_to_announce_cap() {
 #[test]
 #[ignore = "BUG-15 P2: no fRevertToInv multi-block/reorg gate (Core net_processing.cpp:5838-5890)"]
 fn g10_revert_to_inv_on_multi_block_reorg() {
-    assert!(false,
-        "BUG-15 P2: no fRevertToInv revert-to-inv guard on multi-block batching");
+    assert!(
+        false,
+        "BUG-15 P2: no fRevertToInv revert-to-inv guard on multi-block batching"
+    );
 }
 
 // ============================================================================
@@ -219,12 +239,22 @@ fn g10_revert_to_inv_on_multi_block_reorg() {
 #[test]
 fn g11_feefilter_message_variant_and_codec() {
     let msg = NetworkMessage::FeeFilter(123_456);
-    assert_eq!(msg.command(), "feefilter",
-        "G11: NetworkMessage::FeeFilter.command() must be \"feefilter\"");
+    assert_eq!(
+        msg.command(),
+        "feefilter",
+        "G11: NetworkMessage::FeeFilter.command() must be \"feefilter\""
+    );
     let buf = msg.serialize_payload();
-    assert_eq!(buf.len(), 8, "G11: feefilter payload must be exactly 8 bytes (u64 LE)");
-    assert_eq!(buf, 123_456u64.to_le_bytes().to_vec(),
-        "G11: feefilter payload must be u64 LE per BIP-133");
+    assert_eq!(
+        buf.len(),
+        8,
+        "G11: feefilter payload must be exactly 8 bytes (u64 LE)"
+    );
+    assert_eq!(
+        buf,
+        123_456u64.to_le_bytes().to_vec(),
+        "G11: feefilter payload must be u64 LE per BIP-133"
+    );
     let decoded = NetworkMessage::deserialize("feefilter", &buf).expect("decode feefilter");
     if let NetworkMessage::FeeFilter(v) = decoded {
         assert_eq!(v, 123_456u64);
@@ -239,8 +269,10 @@ fn g11_feefilter_message_variant_and_codec() {
 /// matches at message.rs:293.
 #[test]
 fn g12_feefilter_version_is_70013() {
-    assert_eq!(FEEFILTER_VERSION, 70013,
-        "G12: FEEFILTER_VERSION must equal Core protocol_version.h:27 value of 70013");
+    assert_eq!(
+        FEEFILTER_VERSION, 70013,
+        "G12: FEEFILTER_VERSION must equal Core protocol_version.h:27 value of 70013"
+    );
 }
 
 // ─── G13: FeeFilterRounder 1.1x geometric helper exists ─────────────────────
@@ -251,8 +283,10 @@ fn g12_feefilter_version_is_70013() {
 #[test]
 fn g13_fee_filter_rounder_present() {
     let rounder = FeeFilterRounder::default();
-    assert!(rounder.bucket_count() > 0,
-        "G13: FeeFilterRounder::default() must produce at least 1 bucket");
+    assert!(
+        rounder.bucket_count() > 0,
+        "G13: FeeFilterRounder::default() must produce at least 1 bucket"
+    );
     // Round a sample value; output must be a valid u64.
     let _ = rounder.round(10_000);
     assert!(true, "G13: FeeFilterRounder helper exists at relay.rs:97");
@@ -294,10 +328,15 @@ fn g14_feefilter_manager_wired_into_peer_manager() {
 fn g15_periodic_feefilter_broadcast_10min_poisson() {
     // The constant exists in relay.rs:56 (10 * 60 sec); the broadcast
     // scheduler that would use it does not.
-    assert_eq!(AVG_FEEFILTER_BROADCAST_INTERVAL.as_secs(), 600,
-        "G15: AVG_FEEFILTER_BROADCAST_INTERVAL must equal 10 minutes per Core");
-    assert!(false,
-        "BUG-4 P0: no periodic feefilter broadcast scheduler — only initial send at handshake");
+    assert_eq!(
+        AVG_FEEFILTER_BROADCAST_INTERVAL.as_secs(),
+        600,
+        "G15: AVG_FEEFILTER_BROADCAST_INTERVAL must equal 10 minutes per Core"
+    );
+    assert!(
+        false,
+        "BUG-4 P0: no periodic feefilter broadcast scheduler — only initial send at handshake"
+    );
 }
 
 // ─── G16: MAX_FEEFILTER_CHANGE_DELAY 5-min snap-forward ─────────────────────
@@ -311,8 +350,11 @@ fn g15_periodic_feefilter_broadcast_10min_poisson() {
 #[test]
 #[ignore = "BUG-5 P1: MAX_FEEFILTER_CHANGE_DELAY snap-forward implemented in relay.rs but unwired via BUG-1"]
 fn g16_max_feefilter_change_delay_snap_forward() {
-    assert_eq!(MAX_FEEFILTER_CHANGE_DELAY.as_secs(), 300,
-        "G16: MAX_FEEFILTER_CHANGE_DELAY must equal 5 minutes per Core");
+    assert_eq!(
+        MAX_FEEFILTER_CHANGE_DELAY.as_secs(),
+        300,
+        "G16: MAX_FEEFILTER_CHANGE_DELAY must equal 5 minutes per Core"
+    );
     assert!(false,
         "BUG-5 P1: MAX_FEEFILTER_CHANGE_DELAY snap-forward logic exists in relay.rs:255-262 but is unwired");
 }
@@ -370,10 +412,14 @@ fn g19_outbound_tx_inv_filterrate_gate() {
     // With fee_filter_received == 0 (default), should_relay accepts any
     // positive fee rate (or zero).  This confirms the helper exists and
     // is correct.  The BUG is that the helper has no caller.
-    assert!(state.should_relay(1_000),
-        "G19 helper: FeeFilterState::should_relay correctly accepts when filter=0");
-    assert!(false,
-        "BUG-8 P1: FeeFilterState::should_relay (relay.rs:204) has no caller in outbound INV paths");
+    assert!(
+        state.should_relay(1_000),
+        "G19 helper: FeeFilterState::should_relay correctly accepts when filter=0"
+    );
+    assert!(
+        false,
+        "BUG-8 P1: FeeFilterState::should_relay (relay.rs:204) has no caller in outbound INV paths"
+    );
 }
 
 // ─── G20: feefilter sent during IBD = MAX_MONEY ─────────────────────────────
@@ -393,8 +439,11 @@ fn g19_outbound_tx_inv_filterrate_gate() {
 #[test]
 fn g20_feefilter_during_ibd_is_max_money() {
     // MAX_MONEY constant sanity (Core consensus/amount.h).
-    assert_eq!(MAX_MONEY, 21_000_000 * 100_000_000,
-        "G20: MAX_MONEY must equal 21M BTC in sats per Core consensus/amount.h");
+    assert_eq!(
+        MAX_MONEY,
+        21_000_000 * 100_000_000,
+        "G20: MAX_MONEY must equal 21M BTC in sats per Core consensus/amount.h"
+    );
 
     let min_relay_fee = 1_000u64;
     let incremental = 1_000u64;
@@ -404,7 +453,9 @@ fn g20_feefilter_during_ibd_is_max_money() {
     // MAX_MONEY signal — the production formula is
     // `rounder.round(MAX_MONEY).max(min_relay_fee)`.
     let ibd_peer = PeerId(1);
-    manager.add_peer(ibd_peer, /* supports_feefilter */ true, /* is_block_only */ false);
+    manager.add_peer(
+        ibd_peer, /* supports_feefilter */ true, /* is_block_only */ false,
+    );
     let expected_ibd = FeeFilterRounder::new(incremental)
         .round(MAX_MONEY)
         .max(min_relay_fee);
@@ -450,14 +501,22 @@ fn g20_feefilter_during_ibd_is_max_money() {
 #[test]
 fn g21_wtxidrelay_message_variant_and_codec() {
     let msg = NetworkMessage::WtxidRelay;
-    assert_eq!(msg.command(), "wtxidrelay",
-        "G21: NetworkMessage::WtxidRelay.command() must be \"wtxidrelay\"");
+    assert_eq!(
+        msg.command(),
+        "wtxidrelay",
+        "G21: NetworkMessage::WtxidRelay.command() must be \"wtxidrelay\""
+    );
     let buf = msg.serialize_payload();
-    assert_eq!(buf.len(), 0,
-        "G21: wtxidrelay payload must be empty per BIP-339");
+    assert_eq!(
+        buf.len(),
+        0,
+        "G21: wtxidrelay payload must be empty per BIP-339"
+    );
     let decoded = NetworkMessage::deserialize("wtxidrelay", &[]).expect("decode wtxidrelay");
-    assert!(matches!(decoded, NetworkMessage::WtxidRelay),
-        "G21: deserialize must yield WtxidRelay");
+    assert!(
+        matches!(decoded, NetworkMessage::WtxidRelay),
+        "G21: deserialize must yield WtxidRelay"
+    );
 }
 
 // ─── G22: WTXID_RELAY_VERSION = 70016 constant ──────────────────────────────
@@ -466,8 +525,10 @@ fn g21_wtxidrelay_message_variant_and_codec() {
 /// rustoshi matches at message.rs:289.
 #[test]
 fn g22_wtxid_relay_version_is_70016() {
-    assert_eq!(WTXID_RELAY_VERSION, 70016,
-        "G22: WTXID_RELAY_VERSION must equal Core protocol_version.h:36 value of 70016");
+    assert_eq!(
+        WTXID_RELAY_VERSION, 70016,
+        "G22: WTXID_RELAY_VERSION must equal Core protocol_version.h:36 value of 70016"
+    );
 }
 
 // ─── G23: supports_wtxid_relay on PeerInfo ──────────────────────────────────
@@ -477,9 +538,11 @@ fn g22_wtxid_relay_version_is_70016() {
 /// peer_manager.rs and main.rs.)
 #[test]
 fn g23_peer_info_has_supports_wtxid_relay_field() {
-    assert!(true,
+    assert!(
+        true,
         "G23: PeerInfo.supports_wtxid_relay exists at peer.rs:313; \
-         removal would break peer_manager.rs:998 / 1218 / 2680 and main.rs:3747");
+         removal would break peer_manager.rs:998 / 1218 / 2680 and main.rs:3747"
+    );
 }
 
 // ─── G24: wtxidrelay sent BEFORE verack (BIP-339 ordering) ──────────────────
@@ -507,9 +570,11 @@ fn g24_wtxidrelay_sent_before_verack_outbound() {
 #[test]
 #[ignore = "BUG-16 P2: no wtxidrelay-after-verack disconnect — post-handshake event loop has no WtxidRelay arm at all"]
 fn g25_wtxidrelay_after_verack_disconnects() {
-    assert!(false,
+    assert!(
+        false,
         "BUG-16 P2: wtxidrelay arriving after verack is silently ignored; \
-         Core net_processing.cpp:3921-3927 sets pfrom.fDisconnect = true");
+         Core net_processing.cpp:3921-3927 sets pfrom.fDisconnect = true"
+    );
 }
 
 // ─── G26: v1 INBOUND wtxidrelay flips supports_wtxid_relay ──────────────────
@@ -525,9 +590,11 @@ fn g25_wtxidrelay_after_verack_disconnects() {
 #[test]
 #[ignore = "BUG-3 P0: v1 inbound handshake silently drops wtxidrelay flag — PeerInfo.supports_wtxid_relay hardcoded false at peer_manager.rs:3237"]
 fn g26_v1_inbound_wtxidrelay_flips_supports_wtxid_relay() {
-    assert!(false,
+    assert!(
+        false,
         "BUG-3 P0: v1 inbound handshake at peer_manager.rs:3186 has no wants_wtxid_relay capture; \
-         supports_wtxid_relay hardcoded false at line 3237");
+         supports_wtxid_relay hardcoded false at line 3237"
+    );
 }
 
 // ─── G27: Outbound tx-INV uses MsgWtx(5) for wtxid-relay peers ──────────────
@@ -544,12 +611,21 @@ fn g26_v1_inbound_wtxidrelay_flips_supports_wtxid_relay() {
 #[ignore = "BUG-9 P1: main.rs:3779-3789 uses MsgWitnessTx(0x40000001) for wtxid-relay peers — Core uses MsgWtx(5)"]
 fn g27_outbound_tx_inv_uses_msg_wtx_for_wtxid_peers() {
     // Confirm the InvType variants exist and have the right values.
-    assert_eq!(InvType::MsgTx as u32, 1,
-        "G27: MsgTx must equal 1 per BIP / Core");
-    assert_eq!(InvType::MsgWtx as u32, 5,
-        "G27: MsgWtx must equal 5 per BIP-339");
-    assert_eq!(InvType::MsgWitnessTx as u32, 0x40000001,
-        "G27: MsgWitnessTx must equal 0x40000001 (getdata-only flavour)");
+    assert_eq!(
+        InvType::MsgTx as u32,
+        1,
+        "G27: MsgTx must equal 1 per BIP / Core"
+    );
+    assert_eq!(
+        InvType::MsgWtx as u32,
+        5,
+        "G27: MsgWtx must equal 5 per BIP-339"
+    );
+    assert_eq!(
+        InvType::MsgWitnessTx as u32,
+        0x40000001,
+        "G27: MsgWitnessTx must equal 0x40000001 (getdata-only flavour)"
+    );
     assert!(false,
         "BUG-9 P1: main.rs:3779-3789 uses InvType::MsgWitnessTx for wtxid-relay peers — must be InvType::MsgWtx");
 }
@@ -608,12 +684,16 @@ fn g29_duplicate_wtxidrelay_logged_at_debug() {
 fn g30_wtxidrelay_gated_on_common_version_70016() {
     // The constant itself is the load-bearing check; if it changes,
     // the gates change with it.
-    assert_eq!(WTXID_RELAY_VERSION, 70016,
-        "G30: WTXID_RELAY_VERSION must be 70016 for the gating to make sense");
+    assert_eq!(
+        WTXID_RELAY_VERSION, 70016,
+        "G30: WTXID_RELAY_VERSION must be 70016 for the gating to make sense"
+    );
     // The outbound send-side gates at peer.rs:1669, 1796, 2168 all
     // compare against this constant, which we verify exists.
-    assert!(true,
-        "G30: outbound wtxidrelay sends are gated on their_version.version >= WTXID_RELAY_VERSION");
+    assert!(
+        true,
+        "G30: outbound wtxidrelay sends are gated on their_version.version >= WTXID_RELAY_VERSION"
+    );
 }
 
 // ============================================================================

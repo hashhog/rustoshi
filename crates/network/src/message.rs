@@ -23,7 +23,6 @@ fn remaining(c: &Cursor<&[u8]>) -> usize {
     c.get_ref().len().saturating_sub(c.position() as usize)
 }
 
-
 /// Size of the message header in bytes.
 pub const MESSAGE_HEADER_SIZE: usize = 24;
 
@@ -2169,9 +2168,15 @@ mod tests {
     #[test]
     fn reject_oversized_length_prefix_is_error_not_oom() {
         // 0xff compact-size escape + an 8-byte length of ~202 billion.
-        let payload = [0x26u8, 0xff, 0x0c, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x09];
+        let payload = [
+            0x26u8, 0xff, 0x0c, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x09,
+        ];
         let r = NetworkMessage::deserialize("reject", &payload);
-        assert!(r.is_err(), "oversized reject length must be a decode error, got {:?}", r.is_ok());
+        assert!(
+            r.is_err(),
+            "oversized reject length must be a decode error, got {:?}",
+            r.is_ok()
+        );
     }
 
     /// The same class on a count-based field: a `headers` message claiming a
@@ -2197,7 +2202,10 @@ mod tests {
         p.push(0xff);
         p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x80]); // len ~ 9.2e18
         let r = CFilterMessage::deserialize(&p);
-        assert!(r.is_err(), "oversized cfilter length must error, not overflow/panic");
+        assert!(
+            r.is_err(),
+            "oversized cfilter length must error, not overflow/panic"
+        );
     }
 
     #[test]

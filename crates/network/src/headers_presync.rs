@@ -37,12 +37,11 @@
 //!   (Core: `m_max_commitments = 6 * max_seconds_since_start / commitment_period`)
 
 use rustoshi_consensus::{
-    get_block_proof, permitted_difficulty_transition, ChainParams, ChainWork,
-    MAX_FUTURE_BLOCK_TIME,
+    get_block_proof, permitted_difficulty_transition, ChainParams, ChainWork, MAX_FUTURE_BLOCK_TIME,
 };
 use rustoshi_primitives::{BlockHeader, Hash256};
-use std::collections::VecDeque;
 use siphasher::sip::SipHasher24;
+use std::collections::VecDeque;
 use std::hash::Hasher;
 
 /// Maximum headers per message (same as Bitcoin Core).
@@ -109,8 +108,7 @@ impl CompressedHeader {
 }
 
 /// Result of processing headers.
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ProcessingResult {
     /// Headers that have been fully validated and can be added to the chain.
     pub pow_validated_headers: Vec<BlockHeader>,
@@ -119,7 +117,6 @@ pub struct ProcessingResult {
     /// Whether we should request more headers.
     pub request_more: bool,
 }
-
 
 /// Header sync state machine implementing PRESYNC/REDOWNLOAD anti-DoS protection.
 ///
@@ -206,10 +203,7 @@ impl HeadersPresyncState {
     ) -> Self {
         // Generate random hasher key for commitments — unique per peer sync.
         // Core: `SaltedUint256Hasher m_hasher` (secret salt, never reused across syncs).
-        let hasher_key = (
-            rand::random::<u64>(),
-            rand::random::<u64>(),
-        );
+        let hasher_key = (rand::random::<u64>(), rand::random::<u64>());
 
         // Random offset for commitment positions — prevents an attacker from knowing
         // which heights are committed and crafting a chain that avoids those heights.
@@ -527,7 +521,12 @@ impl HeadersPresyncState {
 
         // Core line 237: verify difficulty transition.
         // Note: PoW hash check is NOT done here — caller already verified it.
-        if !permitted_difficulty_transition(next_height as u32, prev_bits, header.bits, &self.params) {
+        if !permitted_difficulty_transition(
+            next_height as u32,
+            prev_bits,
+            header.bits,
+            &self.params,
+        ) {
             tracing::debug!(
                 "REDOWNLOAD: invalid difficulty transition at height {}",
                 next_height
@@ -548,15 +547,10 @@ impl HeadersPresyncState {
         // Skip commitment check once process_all_remaining is set — the peer may have
         // extended its chain between our first sync and our second, and we don't want
         // to fail because we ran out of stored commitments.
-        if !self.process_all_remaining
-            && next_height % COMMITMENT_PERIOD == self.commit_offset
-        {
+        if !self.process_all_remaining && next_height % COMMITMENT_PERIOD == self.commit_offset {
             // Core line 257: abort if we've run out of commitments (commitment overrun).
             if self.header_commitments.is_empty() {
-                tracing::debug!(
-                    "REDOWNLOAD: commitment overrun at height {}",
-                    next_height
-                );
+                tracing::debug!("REDOWNLOAD: commitment overrun at height {}", next_height);
                 return false;
             }
 
@@ -576,7 +570,8 @@ impl HeadersPresyncState {
         }
 
         // Core lines 272-275: store in buffer.
-        self.redownload_buffer.push_back(CompressedHeader::from_header(header));
+        self.redownload_buffer
+            .push_back(CompressedHeader::from_header(header));
         self.redownload_buffer_last_height = next_height;
         self.redownload_buffer_last_hash = header.block_hash();
 
@@ -700,7 +695,10 @@ mod tests {
             })
             .collect();
         let all_same = offsets.iter().all(|&x| x == offsets[0]);
-        assert!(!all_same, "commit_offset should be randomized, not deterministic");
+        assert!(
+            !all_same,
+            "commit_offset should be randomized, not deterministic"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1063,7 +1061,8 @@ mod tests {
         assert_eq!(state.state(), PresyncState::Redownload);
 
         // Make the REDOWNLOAD phase never reach process_all_remaining (big min work).
-        state.minimum_required_work = ChainWork::from_hex("ffffffffffffffffffffffffffffffffffff").unwrap();
+        state.minimum_required_work =
+            ChainWork::from_hex("ffffffffffffffffffffffffffffffffffff").unwrap();
         state.redownload_chain_work = ChainWork::ZERO;
 
         // Clear all stored commitments — first commitment boundary in REDOWNLOAD will overrun.
@@ -1102,7 +1101,8 @@ mod tests {
         assert_eq!(state.state(), PresyncState::Redownload);
 
         // Make the REDOWNLOAD phase never reach process_all_remaining (big min work).
-        state.minimum_required_work = ChainWork::from_hex("ffffffffffffffffffffffffffffffffffff").unwrap();
+        state.minimum_required_work =
+            ChainWork::from_hex("ffffffffffffffffffffffffffffffffffff").unwrap();
         state.redownload_chain_work = ChainWork::ZERO;
 
         // Only flip commitments if any exist (if commit_offset fell beyond our chain, skip).
@@ -1112,8 +1112,10 @@ mod tests {
 
             // Feed the same headers — should fail at the first commitment check.
             let redownload_result = state.process_next_headers(&chain_a, true);
-            assert!(!redownload_result.success,
-                "REDOWNLOAD should reject headers with flipped (mismatched) commitments");
+            assert!(
+                !redownload_result.success,
+                "REDOWNLOAD should reject headers with flipped (mismatched) commitments"
+            );
         }
         // If no commitments were stored (commit_offset > chain length), test is vacuously ok.
     }
@@ -1201,7 +1203,10 @@ mod tests {
 
         // In REDOWNLOAD, locator[0] = redownload_buffer_last_hash (= chain_start_hash, not last presync).
         let locator = state.next_locator(|_| None);
-        assert_eq!(locator[0], genesis_hash, "REDOWNLOAD locator[0] should be chain_start_hash (redownload starts from scratch)");
+        assert_eq!(
+            locator[0], genesis_hash,
+            "REDOWNLOAD locator[0] should be chain_start_hash (redownload starts from scratch)"
+        );
     }
 
     #[test]
@@ -1293,9 +1298,21 @@ mod locator_entries_tests {
             }
         });
 
-        assert!(locator.len() > 3, "bare 2-hash chain_start shape: {}", locator.len());
+        assert!(
+            locator.len() > 3,
+            "bare 2-hash chain_start shape: {}",
+            locator.len()
+        );
         assert_eq!(locator[1], chain_start_hash);
-        assert_eq!(*locator.last().unwrap(), genesis, "locator must end at genesis");
-        assert!(locator.len() < 64, "walk is not exponential: {}", locator.len());
+        assert_eq!(
+            *locator.last().unwrap(),
+            genesis,
+            "locator must end at genesis"
+        );
+        assert!(
+            locator.len() < 64,
+            "walk is not exponential: {}",
+            locator.len()
+        );
     }
 }

@@ -196,7 +196,10 @@ impl HeaderSync {
     /// Read the current unconnecting-headers count for `peer_id`. Used by tests.
     #[cfg(test)]
     pub fn unconnecting_headers_count(&self, peer_id: PeerId) -> u32 {
-        self.unconnecting_headers.get(&peer_id).copied().unwrap_or(0)
+        self.unconnecting_headers
+            .get(&peer_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Read the currently tracked best height for `peer_id`. Used by tests.
@@ -424,7 +427,8 @@ impl HeaderSync {
             // extend our chain (new block announcements).
             tracing::info!(
                 "Processing {} unsolicited header(s) from peer {} (new block announcement)",
-                headers.len(), peer_id.0
+                headers.len(),
+                peer_id.0
             );
         }
 
@@ -653,19 +657,12 @@ mod tests {
 
     #[test]
     fn test_block_locator_at_height_0() {
-        let genesis_hash = Hash256::from_hex(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
+        let genesis_hash =
+            Hash256::from_hex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .unwrap();
         let sync = HeaderSync::new(genesis_hash);
 
-        let locator = sync.build_block_locator(|h| {
-            if h == 0 {
-                Some(genesis_hash)
-            } else {
-                None
-            }
-        });
+        let locator = sync.build_block_locator(|h| if h == 0 { Some(genesis_hash) } else { None });
 
         assert_eq!(locator.len(), 1);
         assert_eq!(locator[0], genesis_hash);
@@ -673,21 +670,16 @@ mod tests {
 
     #[test]
     fn test_block_locator_at_height_10() {
-        let genesis_hash = Hash256::from_hex(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
+        let genesis_hash =
+            Hash256::from_hex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .unwrap();
         let mut sync = HeaderSync::new(genesis_hash);
         sync.best_header_height = 10;
 
         // Create mock hashes for each height
-        let hashes: Vec<Hash256> = (0..=10)
-            .map(|i| Hash256([i as u8; 32]))
-            .collect();
+        let hashes: Vec<Hash256> = (0..=10).map(|i| Hash256([i as u8; 32])).collect();
 
-        let locator = sync.build_block_locator(|h| {
-            hashes.get(h as usize).copied()
-        });
+        let locator = sync.build_block_locator(|h| hashes.get(h as usize).copied());
 
         // At height 10, locator should have heights: 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
         // That's 11 entries (step=1 for all since we haven't reached 10 entries yet)
@@ -698,25 +690,22 @@ mod tests {
 
     #[test]
     fn test_block_locator_at_height_100() {
-        let genesis_hash = Hash256::from_hex(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
+        let genesis_hash =
+            Hash256::from_hex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .unwrap();
         let mut sync = HeaderSync::new(genesis_hash);
         sync.best_header_height = 100;
 
         // Create mock hashes
-        let hashes: Vec<Hash256> = (0..=100)
-            .map(|i| Hash256([i as u8; 32]))
-            .collect();
+        let hashes: Vec<Hash256> = (0..=100).map(|i| Hash256([i as u8; 32])).collect();
 
-        let locator = sync.build_block_locator(|h| {
-            hashes.get(h as usize).copied()
-        });
+        let locator = sync.build_block_locator(|h| hashes.get(h as usize).copied());
 
         // Heights should be: 100, 99, 98, 97, 96, 95, 94, 93, 92, 91 (first 10, step=1)
         // Then: 89, 85, 77, 61, 29, 0 (step doubles each time)
-        let expected_heights = vec![100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 89, 85, 77, 61, 29, 0];
+        let expected_heights = vec![
+            100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 89, 85, 77, 61, 29, 0,
+        ];
         assert_eq!(locator.len(), expected_heights.len());
         for (i, &height) in expected_heights.iter().enumerate() {
             assert_eq!(locator[i], hashes[height], "mismatch at index {}", i);
@@ -753,7 +742,13 @@ mod tests {
         // Create a header that doesn't connect to genesis
         let bad_header = make_test_header(Hash256([1; 32]), 0);
 
-        let result = sync.process_headers(peer, vec![bad_header], &mut |_, _| Ok(()), &|_| None, &|_| None);
+        let result = sync.process_headers(
+            peer,
+            vec![bad_header],
+            &mut |_, _| Ok(()),
+            &|_| None,
+            &|_| None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("prev_hash"));
     }
@@ -882,13 +877,7 @@ mod tests {
         let genesis_hash = Hash256([0; 32]);
         let mut sync = HeaderSync::new(genesis_hash);
 
-        let result = sync.start_sync(|h| {
-            if h == 0 {
-                Some(genesis_hash)
-            } else {
-                None
-            }
-        });
+        let result = sync.start_sync(|h| if h == 0 { Some(genesis_hash) } else { None });
 
         assert!(result.is_none());
         assert_eq!(sync.state, SyncState::Idle);
@@ -901,13 +890,7 @@ mod tests {
         let peer = PeerId(1);
         sync.register_peer(peer, 100);
 
-        let result = sync.start_sync(|h| {
-            if h == 0 {
-                Some(genesis_hash)
-            } else {
-                None
-            }
-        });
+        let result = sync.start_sync(|h| if h == 0 { Some(genesis_hash) } else { None });
 
         assert!(result.is_some());
         let (returned_peer, msg) = result.unwrap();
@@ -998,10 +981,16 @@ mod tests {
         let headers = make_valid_header_chain(genesis_hash, 3);
         let mut heights = Vec::new();
 
-        let result = sync.process_headers(peer, headers, &mut |_, h| {
-            heights.push(h);
-            Ok(())
-        }, &|_| None, &|_| None);
+        let result = sync.process_headers(
+            peer,
+            headers,
+            &mut |_, h| {
+                heights.push(h);
+                Ok(())
+            },
+            &|_| None,
+            &|_| None,
+        );
 
         assert!(result.is_ok());
         assert_eq!(heights, vec![1, 2, 3]);
@@ -1022,14 +1011,20 @@ mod tests {
         let headers = make_valid_header_chain(genesis_hash, 5);
         let mut count = 0;
 
-        let result = sync.process_headers(peer, headers, &mut |_, h| {
-            count += 1;
-            if h == 3 {
-                Err("validation failed".into())
-            } else {
-                Ok(())
-            }
-        }, &|_| None, &|_| None);
+        let result = sync.process_headers(
+            peer,
+            headers,
+            &mut |_, h| {
+                count += 1;
+                if h == 3 {
+                    Err("validation failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+            &|_| None,
+            &|_| None,
+        );
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("validation failed"));
@@ -1234,7 +1229,8 @@ mod tests {
         // headers / BIP 130). After processing, its tracked height is raised
         // to 11.
         let new_header = vec![chain[10].clone()];
-        let result = sync.process_headers(peer, new_header, &mut |_, _| Ok(()), &|_| None, &|_| None);
+        let result =
+            sync.process_headers(peer, new_header, &mut |_, _| Ok(()), &|_| None, &|_| None);
         assert_eq!(result, Ok(false));
         assert_eq!(sync.best_header_height(), 11);
         assert_eq!(sync.peer_height(peer), Some(11));
@@ -1289,11 +1285,16 @@ mod tests {
             peer,
             last_hash: genesis,
         };
-        let r = sync.process_headers(peer, chain.clone(), &mut |_, _| Ok(()), &|_| None, &|_| None);
+        let r = sync.process_headers(peer, chain.clone(), &mut |_, _| Ok(()), &|_| None, &|_| {
+            None
+        });
         assert_eq!(r, Ok(false));
         assert_eq!(sync.best_header_height(), len as u32);
         // The seeding processed no fork, so nothing should be pending.
-        assert_eq!(sync.pending_rewind, None, "seeding must not set pending_rewind");
+        assert_eq!(
+            sync.pending_rewind, None,
+            "seeding must not set pending_rewind"
+        );
         (h2hash, h2bits, chain)
     }
 
@@ -1488,7 +1489,10 @@ mod tests {
         assert!(matches!(msg, NetworkMessage::GetHeaders(_)));
         match sync.state() {
             SyncState::DownloadingHeaders { peer: p, .. } => assert_eq!(*p, peer),
-            other => panic!("expected DownloadingHeaders for the targeted peer, got {:?}", other),
+            other => panic!(
+                "expected DownloadingHeaders for the targeted peer, got {:?}",
+                other
+            ),
         }
     }
 
@@ -1564,7 +1568,13 @@ mod tests {
             peer,
             last_hash: sync.best_header_hash(),
         };
-        let r = sync.start_sync(|h| if h <= 100 { Some(Hash256([h as u8; 32])) } else { None });
+        let r = sync.start_sync(|h| {
+            if h <= 100 {
+                Some(Hash256([h as u8; 32]))
+            } else {
+                None
+            }
+        });
         let (target, msg) = r.expect("fallback should request from the active peer");
         assert_eq!(target, peer);
         assert!(matches!(msg, NetworkMessage::GetHeaders(_)));

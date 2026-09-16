@@ -89,13 +89,19 @@ fn core_reference_asmap() -> Vec<u8> {
 fn g1_asmap_startup_arg_recognized() {
     // NetGroupManager::new() defaults to no asmap (subnet bucketing).
     let mgr_default = NetGroupManager::new();
-    assert!(!mgr_default.using_asmap(), "default NetGroupManager should have no asmap");
+    assert!(
+        !mgr_default.using_asmap(),
+        "default NetGroupManager should have no asmap"
+    );
 
     // NetGroupManager::with_asmap() enables AS-based bucketing.
     // Use a minimal valid asmap (RETURN ASN=1, 3 bytes, see asmap.rs tests).
     let asmap_data = vec![0x00u8, 0x00, 0x00];
     let mgr_asmap = NetGroupManager::with_asmap(42, asmap_data);
-    assert!(mgr_asmap.using_asmap(), "NetGroupManager with asmap should report using_asmap=true");
+    assert!(
+        mgr_asmap.using_asmap(),
+        "NetGroupManager with asmap should report using_asmap=true"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -114,7 +120,10 @@ fn g1_asmap_startup_arg_recognized() {
 fn g2_asmap_binary_parser_present() {
     // decode_asmap returns empty Vec for a non-existent file (non-fatal).
     let result = decode_asmap(std::path::Path::new("/nonexistent/asmap.bin"));
-    assert!(result.is_empty(), "decode_asmap on missing file should return empty vec");
+    assert!(
+        result.is_empty(),
+        "decode_asmap on missing file should return empty vec"
+    );
 
     // interpret is callable and returns 0 for any IP when asmap is empty
     // (interpret on empty is handled by SanityCheckAsmap; real test in asmap::tests).
@@ -137,15 +146,24 @@ fn g2_asmap_binary_parser_present() {
 #[test]
 fn g3_sanity_check_asmap_validates() {
     // Empty file is invalid
-    assert!(!sanity_check_asmap(&[], 128), "empty data should fail sanity check");
+    assert!(
+        !sanity_check_asmap(&[], 128),
+        "empty data should fail sanity check"
+    );
 
     // Minimal valid asmap: RETURN + ASN=1 (3 bytes, 17 used bits + 7 zero padding)
     let valid = vec![0x00u8, 0x00, 0x00];
-    assert!(sanity_check_asmap(&valid, 128), "minimal valid asmap should pass sanity check");
+    assert!(
+        sanity_check_asmap(&valid, 128),
+        "minimal valid asmap should pass sanity check"
+    );
 
     // Single non-zero byte: not a valid RETURN instruction with proper padding
     let malformed = vec![0xFFu8];
-    assert!(!sanity_check_asmap(&malformed, 128), "all-ones byte should fail sanity check");
+    assert!(
+        !sanity_check_asmap(&malformed, 128),
+        "all-ones byte should fail sanity check"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -170,7 +188,11 @@ fn g4_default_no_asmap_loaded() {
     let group = mgr.get_group(&addr);
     let bytes = group.as_bytes();
     // Network-type byte (0 = Ipv4) + first two octets (8, 8)
-    assert_eq!(bytes[0], NetworkType::Ipv4 as u8, "network type should be Ipv4");
+    assert_eq!(
+        bytes[0],
+        NetworkType::Ipv4 as u8,
+        "network type should be Ipv4"
+    );
     assert_eq!(bytes[1], 8, "first octet of /16 group should be 8");
     assert_eq!(bytes[2], 8, "second octet of /16 group should be 8");
     // Total group length: 3 bytes (type + 2 prefix bytes)
@@ -202,7 +224,10 @@ fn g5_asmap_path_relative_resolution_logic() {
     } else {
         datadir.join(&relative)
     };
-    assert_eq!(resolved, std::path::PathBuf::from("/home/user/.rustoshi/testnet4/ip_asn.map"));
+    assert_eq!(
+        resolved,
+        std::path::PathBuf::from("/home/user/.rustoshi/testnet4/ip_asn.map")
+    );
 
     let absolute = std::path::PathBuf::from("/etc/bitcoin/asmap.bin");
     let resolved2 = if absolute.is_absolute() {
@@ -210,7 +235,10 @@ fn g5_asmap_path_relative_resolution_logic() {
     } else {
         datadir.join(&absolute)
     };
-    assert_eq!(resolved2, absolute, "absolute path should not be prefixed with datadir");
+    assert_eq!(
+        resolved2, absolute,
+        "absolute path should not be prefixed with datadir"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -229,11 +257,17 @@ fn g6_asmap_bitvector_storage_present() {
     // Verify that with_asmap() stores the data and using_asmap() reflects it.
     let data = vec![0x01u8, 0x02, 0x03];
     let mgr = NetGroupManager::with_asmap(0, data.clone());
-    assert!(mgr.using_asmap(), "asmap should be loaded after with_asmap()");
+    assert!(
+        mgr.using_asmap(),
+        "asmap should be loaded after with_asmap()"
+    );
 
     // Default manager has no asmap
     let mgr_default = NetGroupManager::new();
-    assert!(!mgr_default.using_asmap(), "default manager should have no asmap");
+    assert!(
+        !mgr_default.using_asmap(),
+        "default manager should have no asmap"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -252,7 +286,10 @@ fn g7_asn_lookup_trie_traversal_present() {
     let asmap = vec![0x00u8, 0x00, 0x00];
     let ip = [0u8; 16]; // Any 128-bit IP
     let asn = interpret(&asmap, &ip);
-    assert_eq!(asn, 1, "minimal RETURN-ASN=1 asmap should return ASN 1 for any IP");
+    assert_eq!(
+        asn, 1,
+        "minimal RETURN-ASN=1 asmap should return ASN 1 for any IP"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -290,13 +327,21 @@ fn g9_default_asn_zero_unknown() {
     // When no asmap is loaded, get_mapped_as returns 0.
     let mgr = NetGroupManager::new();
     let addr: IpAddr = "8.8.8.8".parse().unwrap();
-    assert_eq!(mgr.get_mapped_as(&addr), 0, "no asmap → get_mapped_as should return 0");
+    assert_eq!(
+        mgr.get_mapped_as(&addr),
+        0,
+        "no asmap → get_mapped_as should return 0"
+    );
 
     // Core reference asmap: IP "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38" → ASN 0 (not in map).
     let asmap = core_reference_asmap();
     let mgr_asmap = NetGroupManager::with_asmap(0, asmap);
     let unmapped: IpAddr = "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38".parse().unwrap();
-    assert_eq!(mgr_asmap.get_mapped_as(&unmapped), 0, "IP not in asmap should return ASN 0");
+    assert_eq!(
+        mgr_asmap.get_mapped_as(&unmapped),
+        0,
+        "IP not in asmap should return ASN 0"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -316,7 +361,11 @@ fn g10_ipv6_128bit_asn_lookup() {
 
     // IPv6 lookup: 19 Core vectors all use IPv6 addresses.
     let ipv6: IpAddr = "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap();
-    assert_eq!(mgr.get_mapped_as(&ipv6), 961340, "IPv6 lookup should return correct ASN");
+    assert_eq!(
+        mgr.get_mapped_as(&ipv6),
+        961340,
+        "IPv6 lookup should return correct ASN"
+    );
 
     // IPv4 lookup: uses IPv4-mapped-in-IPv6 form internally.
     // The Core reference asmap is IPv6-biased; IPv4 may return 0 (not in map).
@@ -344,11 +393,18 @@ fn g11_get_mapped_as_present() {
     // Known vector: should return non-zero ASN
     let addr: IpAddr = "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap();
     let asn = mgr.get_mapped_as(&addr);
-    assert_eq!(asn, 961340, "get_mapped_as should delegate to interpret() correctly");
+    assert_eq!(
+        asn, 961340,
+        "get_mapped_as should delegate to interpret() correctly"
+    );
 
     // Without asmap: always 0
     let mgr_no_asmap = NetGroupManager::new();
-    assert_eq!(mgr_no_asmap.get_mapped_as(&addr), 0, "no-asmap manager should return 0");
+    assert_eq!(
+        mgr_no_asmap.get_mapped_as(&addr),
+        0,
+        "no-asmap manager should return 0"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -382,7 +438,11 @@ fn g12_tried_bucket_no_asn_keying() {
         mgr.get_mapped_as(&addr_b),
         "pre-condition: both addresses must resolve to the same ASN"
     );
-    assert_ne!(mgr.get_mapped_as(&addr_a), 0, "ASN must be non-zero for test to be meaningful");
+    assert_ne!(
+        mgr.get_mapped_as(&addr_a),
+        0,
+        "ASN must be non-zero for test to be meaningful"
+    );
 
     // With asmap loaded, get_group() returns ASN-keyed group for both → same tried-bucket.
     let bucket_a = mgr.get_group(&addr_a);
@@ -402,7 +462,11 @@ fn g12_tried_bucket_no_asn_keying() {
 
     // Verify the group format: [NET_IPV6=6, b0, b1, b2, b3] — 5 bytes.
     let bytes = bucket_a.as_bytes();
-    assert_eq!(bytes.len(), 5, "ASN group must be 5 bytes (NET_IPV6 + 4-byte ASN)");
+    assert_eq!(
+        bytes.len(),
+        5,
+        "ASN group must be 5 bytes (NET_IPV6 + 4-byte ASN)"
+    );
     assert_eq!(bytes[0], 6, "ASN group must start with NET_IPV6=6");
 }
 
@@ -465,7 +529,8 @@ fn g13_new_bucket_no_asn_keying() {
     // With asmap, the type byte must be NET_IPV6=6.
     let group_with_asmap = mgr.get_group(&addr_a);
     assert_eq!(
-        group_with_asmap.as_bytes()[0], 6,
+        group_with_asmap.as_bytes()[0],
+        6,
         "G13: with asmap the group type byte must be NET_IPV6=6 (ASN marker)"
     );
 }
@@ -493,7 +558,10 @@ fn g14_fallback_to_get_group_when_no_asmap() {
     // Unroutable — same group regardless.
     let ga = mgr.get_group(&a);
     let gb = mgr.get_group(&b);
-    assert_eq!(ga, gb, "same /24 documentation range → same unroutable group");
+    assert_eq!(
+        ga, gb,
+        "same /24 documentation range → same unroutable group"
+    );
 
     // Diverse routable IPs should be in different /16 groups.
     let x: IpAddr = "8.8.8.8".parse().unwrap();
@@ -578,7 +646,10 @@ fn g15_asn_bucket_count_equals_subnet_bucket_count() {
     // Verify the key mechanism (SHA256d keyed) works for ASN groups just as it
     // does for subnet groups — same function, same bucket machinery.
     let key_r = group_r_asmap.keyed(42);
-    assert_ne!(key_p, key_r, "G15: different ASN groups must produce different bucket keys");
+    assert_ne!(
+        key_p, key_r,
+        "G15: different ASN groups must produce different bucket keys"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -636,7 +707,10 @@ fn g17_asmap_version_hash_missing() {
 /// Core reference: `MAX_ASMAP_FILESIZE = 0x800000` (8 MiB).
 #[test]
 fn g18_asmap_file_size_cap() {
-    assert_eq!(MAX_ASMAP_FILESIZE, 8_388_608, "MAX_ASMAP_FILESIZE must be 8 MiB");
+    assert_eq!(
+        MAX_ASMAP_FILESIZE, 8_388_608,
+        "MAX_ASMAP_FILESIZE must be 8 MiB"
+    );
 
     // Verify decode_asmap rejects an oversized file.
     // We create a temp file larger than 8 MiB and verify it is rejected.
@@ -644,7 +718,10 @@ fn g18_asmap_file_size_cap() {
     let oversized = vec![0u8; MAX_ASMAP_FILESIZE + 1];
     std::io::Write::write_all(&mut tmp.as_file(), &oversized).unwrap();
     let result = decode_asmap(tmp.path());
-    assert!(result.is_empty(), "file > MAX_ASMAP_FILESIZE should be rejected");
+    assert!(
+        result.is_empty(),
+        "file > MAX_ASMAP_FILESIZE should be rejected"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -665,12 +742,18 @@ fn g19_asmap_hash_available() {
     let data = vec![0x00u8, 0x00, 0x00];
     let hex = asmap_version_hex(&data);
     assert_eq!(hex.len(), 8, "version hex should be 8 chars");
-    assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "version hex should be hex");
+    assert!(
+        hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "version hex should be hex"
+    );
 
     // Also available through NetGroupManager.
     let mgr = NetGroupManager::with_asmap(0, data);
     let version = mgr.asmap_version_hex();
-    assert!(version.is_some(), "mgr with asmap should return Some(version_hex)");
+    assert!(
+        version.is_some(),
+        "mgr with asmap should return Some(version_hex)"
+    );
     assert_eq!(version.unwrap().len(), 8);
 
     // Empty asmap → None.
@@ -807,7 +890,7 @@ fn g25_asmap_cardinality_reporting() {
     // The 19 Core test vectors contain 7 distinct non-zero ASNs
     // (and 2 addresses that return ASN 0 — not in map).
     let ips: Vec<IpAddr> = vec![
-        "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap(),   // ASN 961340
+        "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap(), // ASN 961340
         "d0:d493:faa0:8609:e927:8b75:293c:f5a4".parse().unwrap(), // ASN 961340 (dup)
         "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f".parse().unwrap(), // ASN 693761
         "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38".parse().unwrap(), // ASN 0 (not in map)
@@ -815,8 +898,8 @@ fn g25_asmap_cardinality_reporting() {
         "1d56:abd0:a52f:a8d5:d5a7:a610:581d:d792".parse().unwrap(), // ASN 499880
         "378e:7290:54e5:bd36:4760:971c:e9b9:570d".parse().unwrap(), // ASN 0 (not in map)
         "406c:820b:272a:c045:b74e:fc0a:9ef2:cecc".parse().unwrap(), // ASN 248495
-        "50d2:3db6:52fa:2e7:12ec:5bc4:1bd1:49f9".parse().unwrap(),  // ASN 124471
-        "53e1:1812:ffa:dccf:f9f2:64be:75fa:795".parse().unwrap(),   // ASN 539993
+        "50d2:3db6:52fa:2e7:12ec:5bc4:1bd1:49f9".parse().unwrap(), // ASN 124471
+        "53e1:1812:ffa:dccf:f9f2:64be:75fa:795".parse().unwrap(), // ASN 539993
     ];
 
     let stats = asmap_health_check(&mgr, &ips, 5)
@@ -841,7 +924,8 @@ fn g25_asmap_cardinality_reporting() {
     );
 
     // Convenience method on NetGroupManager produces the same result
-    let stats2 = mgr.health_check(&ips, 5)
+    let stats2 = mgr
+        .health_check(&ips, 5)
         .expect("NetGroupManager::health_check must return Some when asmap loaded");
     assert_eq!(stats, stats2, "G25: free function and method must agree");
 }
@@ -862,13 +946,19 @@ fn g26_asmap_prefix_coverage_reporting() {
 
     // When ALL addresses are in the asmap, coverage = 100%.
     let all_mapped: Vec<IpAddr> = vec![
-        "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap(),   // ASN 961340
+        "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap(), // ASN 961340
         "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f".parse().unwrap(), // ASN 693761
         "1336:1ad6:2f26:4fe3:d809:7321:6e0d:4615".parse().unwrap(), // ASN 672176
     ];
     let stats_all = mgr.health_check(&all_mapped, 5).unwrap();
-    assert_eq!(stats_all.unmapped_count, 0, "G26: all-mapped set must have 0 unmapped");
-    assert_eq!(stats_all.mapped_count, 3, "G26: all-mapped set must have 3 mapped");
+    assert_eq!(
+        stats_all.unmapped_count, 0,
+        "G26: all-mapped set must have 0 unmapped"
+    );
+    assert_eq!(
+        stats_all.mapped_count, 3,
+        "G26: all-mapped set must have 3 mapped"
+    );
 
     // When ALL addresses are NOT in the asmap, coverage = 0%.
     let all_unmapped: Vec<IpAddr> = vec![
@@ -876,9 +966,18 @@ fn g26_asmap_prefix_coverage_reporting() {
         "378e:7290:54e5:bd36:4760:971c:e9b9:570d".parse().unwrap(), // ASN 0
     ];
     let stats_none = mgr.health_check(&all_unmapped, 5).unwrap();
-    assert_eq!(stats_none.unmapped_count, 2, "G26: all-unmapped set must have 2 unmapped");
-    assert_eq!(stats_none.mapped_count, 0, "G26: all-unmapped set must have 0 mapped");
-    assert_eq!(stats_none.unique_asn_count, 0, "G26: no distinct ASNs when nothing mapped");
+    assert_eq!(
+        stats_none.unmapped_count, 2,
+        "G26: all-unmapped set must have 2 unmapped"
+    );
+    assert_eq!(
+        stats_none.mapped_count, 0,
+        "G26: all-unmapped set must have 0 mapped"
+    );
+    assert_eq!(
+        stats_none.unique_asn_count, 0,
+        "G26: no distinct ASNs when nothing mapped"
+    );
 
     // summary_line() is available for logging.
     let line = stats_none.summary_line();
@@ -915,7 +1014,7 @@ fn g27_coverage_warning_below_90pct() {
 
     // Mix: 8 mapped + 2 unmapped out of 10 = 80% coverage < 90%.
     let ips: Vec<IpAddr> = vec![
-        "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap(),   // ASN 961340
+        "0:1559:183:3728:224c:65a5:62e6:e991".parse().unwrap(), // ASN 961340
         "d0:d493:faa0:8609:e927:8b75:293c:f5a4".parse().unwrap(), // ASN 961340
         "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f".parse().unwrap(), // ASN 693761
         "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38".parse().unwrap(), // ASN 0 (not in map)
@@ -923,8 +1022,8 @@ fn g27_coverage_warning_below_90pct() {
         "1d56:abd0:a52f:a8d5:d5a7:a610:581d:d792".parse().unwrap(), // ASN 499880
         "378e:7290:54e5:bd36:4760:971c:e9b9:570d".parse().unwrap(), // ASN 0 (not in map)
         "406c:820b:272a:c045:b74e:fc0a:9ef2:cecc".parse().unwrap(), // ASN 248495
-        "50d2:3db6:52fa:2e7:12ec:5bc4:1bd1:49f9".parse().unwrap(),  // ASN 124471
-        "53e1:1812:ffa:dccf:f9f2:64be:75fa:795".parse().unwrap(),   // ASN 539993
+        "50d2:3db6:52fa:2e7:12ec:5bc4:1bd1:49f9".parse().unwrap(), // ASN 124471
+        "53e1:1812:ffa:dccf:f9f2:64be:75fa:795".parse().unwrap(), // ASN 539993
     ];
 
     let stats = mgr.health_check(&ips, 5).unwrap();
@@ -1034,9 +1133,9 @@ fn structural_diverse_ips_in_different_groups() {
     let mgr = NetGroupManager::with_key(0xDEAD_BEEF_CAFE_BABE_u64);
 
     let addrs: Vec<IpAddr> = vec![
-        "8.8.8.8".parse().unwrap(),    // Google DNS (AS15169)
-        "1.1.1.1".parse().unwrap(),    // Cloudflare (AS13335)
-        "9.9.9.9".parse().unwrap(),    // Quad9 (AS19281)
+        "8.8.8.8".parse().unwrap(),        // Google DNS (AS15169)
+        "1.1.1.1".parse().unwrap(),        // Cloudflare (AS13335)
+        "9.9.9.9".parse().unwrap(),        // Quad9 (AS19281)
         "208.67.222.222".parse().unwrap(), // OpenDNS (AS36692)
     ];
 
@@ -1065,7 +1164,11 @@ fn structural_key_random_and_stable() {
     // Two distinct instances should have different keys with overwhelming probability.
     let mgr2 = NetGroupManager::new();
     // This could theoretically fail (1 in 2^64 chance) — acceptable.
-    assert_ne!(mgr.key(), mgr2.key(), "two new() instances must have independent random keys");
+    assert_ne!(
+        mgr.key(),
+        mgr2.key(),
+        "two new() instances must have independent random keys"
+    );
 }
 
 /// PASS — get_group() returns consistent results (deterministic given the same key).
@@ -1078,7 +1181,10 @@ fn structural_get_group_deterministic() {
 
     let g1 = mgr.get_group(&addr);
     let g2 = mgr.get_group(&addr);
-    assert_eq!(g1, g2, "get_group() must be deterministic for the same address and key");
+    assert_eq!(
+        g1, g2,
+        "get_group() must be deterministic for the same address and key"
+    );
 }
 
 /// PASS — IPv6 /32 grouping works correctly.
@@ -1101,5 +1207,8 @@ fn structural_ipv6_slash32_grouping() {
     assert_eq!(ga, gb, "same /32 prefix should yield same group");
     // 2001:db8::/32 is documentation range — classified as Unroutable by rustoshi.
     // So gc != ga because ga is Ipv6 type and gc is Unroutable type.
-    assert_ne!(ga, gc, "different /32 prefix (one is documentation range) → different group");
+    assert_ne!(
+        ga, gc,
+        "different /32 prefix (one is documentation range) → different group"
+    );
 }

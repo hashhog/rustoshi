@@ -641,8 +641,8 @@ mod tests {
     fn test_cjdns_invalid_prefix() {
         // CJDNS address without fc prefix
         let data = vec![
-            6,    // Network ID = CJDNS
-            16,   // Address length
+            6,  // Network ID = CJDNS
+            16, // Address length
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, // Not starting with fc
             0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
         ];
@@ -656,8 +656,8 @@ mod tests {
     fn test_unknown_network_skipped() {
         // Network ID 99 with 10 bytes of data
         let data = vec![
-            99,   // Unknown network ID
-            10,   // Address length
+            99, // Unknown network ID
+            10, // Address length
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, // Dummy data
         ];
 
@@ -670,8 +670,8 @@ mod tests {
     fn test_wrong_length_error() {
         // IPv4 with wrong length
         let data = vec![
-            1,  // Network ID = IPv4
-            6,  // Wrong length (should be 4)
+            1, // Network ID = IPv4
+            6, // Wrong length (should be 4)
             0, 0, 0, 0, 0, 0,
         ];
 
@@ -704,7 +704,10 @@ mod tests {
     #[test]
     fn test_addrv2_entry_torv3() {
         let mut pubkey = [0u8; 32];
-        pubkey.iter_mut().enumerate().for_each(|(i, b)| *b = i as u8);
+        pubkey
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, b)| *b = i as u8);
 
         let entry = AddrV2Entry {
             timestamp: 1700000000,
@@ -856,7 +859,9 @@ mod tests {
         let encoded = i2p::encode_base32(&hash);
         // 32 bytes = 256 bits, base32 needs 52 chars (256/5 = 51.2, round up)
         assert_eq!(encoded.len(), 52);
-        assert!(encoded.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(encoded
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
     }
 
     #[test]

@@ -476,12 +476,7 @@ impl MisbehaviorTracker {
     ///
     /// Per Core PR #25974 (2022): always returns true — one Misbehaving call
     /// immediately sets should_discourage=true and triggers disconnection.
-    pub fn misbehaving_with_score(
-        &mut self,
-        peer_id: PeerId,
-        howmuch: u32,
-        message: &str,
-    ) -> bool {
+    pub fn misbehaving_with_score(&mut self, peer_id: PeerId, howmuch: u32, message: &str) -> bool {
         let peer = self.peers.entry(peer_id).or_default();
         peer.add_score(howmuch);
 
@@ -542,9 +537,15 @@ mod tests {
         assert!(!peer.should_discourage);
 
         // A single low-score call must discourage immediately (not wait for 100).
-        assert!(peer.add_score(10), "first add_score must return true (single-event)");
+        assert!(
+            peer.add_score(10),
+            "first add_score must return true (single-event)"
+        );
         assert_eq!(peer.score, 10);
-        assert!(peer.should_discourage, "should_discourage must be true after first call");
+        assert!(
+            peer.should_discourage,
+            "should_discourage must be true after first call"
+        );
 
         // Score accumulates for logging purposes.
         assert!(peer.add_score(50));
@@ -573,10 +574,15 @@ mod tests {
         let peer2 = PeerId(2);
 
         // Peer 1: invalid transaction (10 points) — single-event: discouraged immediately.
-        assert!(tracker.misbehaving(peer1, MisbehaviorReason::InvalidTransaction),
-            "single-event: first Misbehaving call must return true");
+        assert!(
+            tracker.misbehaving(peer1, MisbehaviorReason::InvalidTransaction),
+            "single-event: first Misbehaving call must return true"
+        );
         assert_eq!(tracker.get_score(peer1), 10);
-        assert!(tracker.should_disconnect(peer1), "peer1 must be marked for discourage on first call");
+        assert!(
+            tracker.should_disconnect(peer1),
+            "peer1 must be marked for discourage on first call"
+        );
 
         // Peer 2: invalid block header (instant ban).
         assert!(tracker.misbehaving(peer2, MisbehaviorReason::InvalidBlockHeader));
@@ -710,7 +716,10 @@ mod tests {
         assert_eq!(MisbehaviorReason::MutatedBlock.score(), 100);
         assert_eq!(MisbehaviorReason::InvalidTransaction.score(), 10);
         assert_eq!(MisbehaviorReason::UnsolicitedMessage.score(), 20);
-        assert_eq!(MisbehaviorReason::ProtocolViolation("test".to_string()).score(), 10);
+        assert_eq!(
+            MisbehaviorReason::ProtocolViolation("test".to_string()).score(),
+            10
+        );
     }
 
     #[test]
@@ -719,10 +728,7 @@ mod tests {
             MisbehaviorReason::InvalidBlockHeader.to_string(),
             "bad-header"
         );
-        assert_eq!(
-            MisbehaviorReason::MutatedBlock.to_string(),
-            "mutated-block"
-        );
+        assert_eq!(MisbehaviorReason::MutatedBlock.to_string(), "mutated-block");
         assert_eq!(
             MisbehaviorReason::ProtocolViolation("bad message".to_string()).to_string(),
             "protocol violation: bad message"
@@ -735,10 +741,15 @@ mod tests {
         let peer_id = PeerId(1);
 
         // Single-event: first call immediately triggers discourage, regardless of score.
-        assert!(tracker.misbehaving_with_score(peer_id, 50, "custom reason"),
-            "single-event: first misbehaving_with_score must return true");
+        assert!(
+            tracker.misbehaving_with_score(peer_id, 50, "custom reason"),
+            "single-event: first misbehaving_with_score must return true"
+        );
         assert_eq!(tracker.get_score(peer_id), 50);
-        assert!(tracker.should_disconnect(peer_id), "should_disconnect after first call");
+        assert!(
+            tracker.should_disconnect(peer_id),
+            "should_disconnect after first call"
+        );
 
         // Subsequent calls continue accumulating score for log context.
         assert!(tracker.misbehaving_with_score(peer_id, 50, "another reason"));
@@ -854,10 +865,7 @@ mod tests {
             })
             .unwrap_or(false);
 
-        assert!(
-            !still_banned,
-            "expired ban must not block new connections"
-        );
+        assert!(!still_banned, "expired ban must not block new connections");
     }
 
     #[test]

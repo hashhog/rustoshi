@@ -305,7 +305,8 @@ impl PeerReconciliationState {
     /// Request sketch extension.
     pub fn request_extension(&mut self) {
         self.phase = ReconciliationPhase::AwaitingExtendedSketch;
-        self.current_capacity = (self.current_capacity * SKETCH_EXTENSION_FACTOR).min(MAX_SKETCH_CAPACITY);
+        self.current_capacity =
+            (self.current_capacity * SKETCH_EXTENSION_FACTOR).min(MAX_SKETCH_CAPACITY);
         self.extension_used = true;
     }
 
@@ -372,19 +373,15 @@ impl TxReconciliationTracker {
     /// in our sendtxrcncl message.
     pub fn pre_register_peer(&mut self, peer_id: PeerId) -> u64 {
         let local_salt = rand::random();
-        self.pre_registered.insert(
-            peer_id,
-            PreRegisteredPeer { local_salt },
-        );
+        self.pre_registered
+            .insert(peer_id, PreRegisteredPeer { local_salt });
         local_salt
     }
 
     /// Pre-register with a specific salt (for testing).
     pub fn pre_register_peer_with_salt(&mut self, peer_id: PeerId, salt: u64) -> u64 {
-        self.pre_registered.insert(
-            peer_id,
-            PreRegisteredPeer { local_salt: salt },
-        );
+        self.pre_registered
+            .insert(peer_id, PreRegisteredPeer { local_salt: salt });
         salt
     }
 

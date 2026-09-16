@@ -44,12 +44,12 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::misbehavior::{
-        BanManager, MisbehaviorReason, MisbehaviorTracker, PeerMisbehavior,
+    use crate::header_sync::{
+        HeaderSync, MAX_HEADERS_PER_REQUEST, MAX_NUM_UNCONNECTING_HEADERS_MSGS,
     };
-    use crate::peer::{PeerId, PING_TIMEOUT};
-    use crate::header_sync::{HeaderSync, MAX_HEADERS_PER_REQUEST, MAX_NUM_UNCONNECTING_HEADERS_MSGS};
     use crate::message::{InvType, InvVector, NetworkMessage, MAX_ADDR, MAX_MESSAGE_SIZE};
+    use crate::misbehavior::{BanManager, MisbehaviorReason, MisbehaviorTracker, PeerMisbehavior};
+    use crate::peer::{PeerId, PING_TIMEOUT};
     use rustoshi_primitives::{BlockHeader, Hash256};
     use std::net::IpAddr;
     use std::time::Duration;
@@ -95,7 +95,10 @@ mod tests {
             );
         }
         assert_eq!(p.score, 90, "score accumulated to 90 for log context");
-        assert!(p.should_discourage, "should_discourage set on first of 9 calls");
+        assert!(
+            p.should_discourage,
+            "should_discourage set on first of 9 calls"
+        );
 
         // Verify via MisbehaviorTracker too.
         let mut tracker = MisbehaviorTracker::new();
@@ -126,8 +129,7 @@ mod tests {
     use std::net::SocketAddr;
 
     fn make_test_manager_in(tmp: &TempDir) -> PeerManager {
-        let config = PeerManagerConfig::testnet4()
-            .with_data_dir(tmp.path().to_path_buf());
+        let config = PeerManagerConfig::testnet4().with_data_dir(tmp.path().to_path_buf());
         PeerManager::new(config, ChainParams::testnet4())
     }
 
@@ -152,7 +154,8 @@ mod tests {
         );
 
         // Attempt to ban — must be a no-op.
-        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string()).await;
+        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string())
+            .await;
 
         // Peer must still be in the peers map (not disconnected).
         let peers = mgr.connected_peers();
@@ -187,7 +190,8 @@ mod tests {
             false, // noban not needed; Manual alone is sufficient
         );
 
-        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string()).await;
+        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string())
+            .await;
 
         // Peer must still be in the peers map.
         let peers = mgr.connected_peers();
@@ -215,14 +219,11 @@ mod tests {
         // 127.0.0.1 is loopback — treated as local.
         let addr: SocketAddr = "127.0.0.1:8333".parse().unwrap();
 
-        let _cmd_rx = mgr.insert_test_peer_with_flags(
-            peer_id,
-            addr,
-            ConnectionType::Inbound,
-            false,
-        );
+        let _cmd_rx =
+            mgr.insert_test_peer_with_flags(peer_id, addr, ConnectionType::Inbound, false);
 
-        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string()).await;
+        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string())
+            .await;
 
         // Ban-list must NOT contain the loopback address.
         assert!(
@@ -252,7 +253,8 @@ mod tests {
             false, // no noban permission
         );
 
-        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string()).await;
+        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string())
+            .await;
 
         // Ban-list MUST contain this address.
         assert!(
@@ -342,7 +344,11 @@ mod tests {
         let peer = PeerId(1);
         sync.register_peer(peer, 1000);
         let result = sync.process_headers(peer, vec![], &mut |_, _| Ok(()), &|_| None, &|_| None);
-        assert_eq!(result.unwrap(), false, "empty headers = no more, not an error");
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "empty headers = no more, not an error"
+        );
     }
 
     // ─── G11: orphan pool size ────────────────────────────────────────────────
@@ -395,12 +401,18 @@ mod tests {
         let tx_a = Arc::new(Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: prev_hash, vout: 0 },
+                previous_output: OutPoint {
+                    txid: prev_hash,
+                    vout: 0,
+                },
                 script_sig: vec![],
                 sequence: 0xffffffff,
                 witness: vec![vec![0x01u8]], // witness item: [0x01]
             }],
-            outputs: vec![TxOut { value: 1000, script_pubkey: vec![] }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![],
+            }],
             lock_time: 0,
         });
 
@@ -408,12 +420,18 @@ mod tests {
         let tx_b = Arc::new(Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: prev_hash, vout: 0 },
+                previous_output: OutPoint {
+                    txid: prev_hash,
+                    vout: 0,
+                },
                 script_sig: vec![],
                 sequence: 0xffffffff,
                 witness: vec![vec![0x02u8]], // different witness item: [0x02]
             }],
-            outputs: vec![TxOut { value: 1000, script_pubkey: vec![] }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: vec![],
+            }],
             lock_time: 0,
         });
 
@@ -423,7 +441,10 @@ mod tests {
         let wtxid_b = tx_b.wtxid();
 
         // Both transactions must have the same txid (same non-witness content).
-        assert_eq!(txid_a, txid_b, "malleated txs must share the same stripped txid");
+        assert_eq!(
+            txid_a, txid_b,
+            "malleated txs must share the same stripped txid"
+        );
         // But they must have different wtxids (different witness data).
         assert_ne!(wtxid_a, wtxid_b, "malleated txs must have different wtxids");
 
@@ -439,17 +460,30 @@ mod tests {
         // 3. find_children() by parent txid returns both (child-parent resolution
         //    by txid is preserved — TxIn::previous_output.txid is non-witness).
         let children = o.find_children(&prev_hash);
-        assert_eq!(children.len(), 2, "find_children by parent txid must return both malleated orphans");
+        assert_eq!(
+            children.len(),
+            2,
+            "find_children by parent txid must return both malleated orphans"
+        );
         let returned_wtxids: std::collections::HashSet<Hash256> =
             children.iter().map(|e| e.tx.wtxid()).collect();
-        assert!(returned_wtxids.contains(&wtxid_a), "wtxid_a must be in find_children result");
-        assert!(returned_wtxids.contains(&wtxid_b), "wtxid_b must be in find_children result");
+        assert!(
+            returned_wtxids.contains(&wtxid_a),
+            "wtxid_a must be in find_children result"
+        );
+        assert!(
+            returned_wtxids.contains(&wtxid_b),
+            "wtxid_b must be in find_children result"
+        );
 
         // 4. Erase one; the other survives.
         o.erase(&wtxid_a);
         assert_eq!(o.len(), 1, "after erasing wtxid_a, one orphan remains");
         assert!(!o.contains(&wtxid_a), "wtxid_a must be gone after erase");
-        assert!(o.contains(&wtxid_b), "wtxid_b must survive after wtxid_a erasure");
+        assert!(
+            o.contains(&wtxid_b),
+            "wtxid_b must survive after wtxid_a erasure"
+        );
     }
 
     // ─── G16: BLOCK_MUTATED → MisbehaviorReason::MutatedBlock (FIXED) ──────────
@@ -476,16 +510,25 @@ mod tests {
 
         // 1. Variant exists and is distinct from InvalidBlock.
         let reason = MisbehaviorReason::MutatedBlock;
-        assert_ne!(reason, MisbehaviorReason::InvalidBlock,
-            "MutatedBlock must be a separate variant from InvalidBlock");
+        assert_ne!(
+            reason,
+            MisbehaviorReason::InvalidBlock,
+            "MutatedBlock must be a separate variant from InvalidBlock"
+        );
 
         // 2. Score is 100 (instant ban, matching Core).
-        assert_eq!(reason.score(), 100,
-            "BLOCK_MUTATED must be a 100-pt instant ban per Core MaybePunishNodeForBlock");
+        assert_eq!(
+            reason.score(),
+            100,
+            "BLOCK_MUTATED must be a 100-pt instant ban per Core MaybePunishNodeForBlock"
+        );
 
         // 3. Display string matches Core's Misbehaving() message.
-        assert_eq!(reason.to_string(), "mutated-block",
-            "display must be 'mutated-block' to match Core log output");
+        assert_eq!(
+            reason.to_string(),
+            "mutated-block",
+            "display must be 'mutated-block' to match Core log output"
+        );
 
         // 4. MisbehaviorTracker reaches ban threshold on first hit.
         let mut tracker = MisbehaviorTracker::new();
@@ -493,8 +536,10 @@ mod tests {
         let banned = tracker.misbehaving(peer, MisbehaviorReason::MutatedBlock);
         assert!(banned,
             "peer sending mutated block must be banned immediately (score=100 >= BAN_THRESHOLD=100)");
-        assert!(tracker.should_disconnect(peer),
-            "peer must be marked for disconnect after MutatedBlock");
+        assert!(
+            tracker.should_disconnect(peer),
+            "peer must be marked for disconnect after MutatedBlock"
+        );
         assert_eq!(tracker.get_score(peer), 100);
     }
 
@@ -525,26 +570,39 @@ mod tests {
         let reason = MisbehaviorReason::InvalidBlockHeader;
 
         // 1. Score is 100 (instant ban).
-        assert_eq!(reason.score(), 100,
-            "BLOCK_INVALID_HEADER must be a 100-pt instant ban per Core MaybePunishNodeForBlock");
+        assert_eq!(
+            reason.score(),
+            100,
+            "BLOCK_INVALID_HEADER must be a 100-pt instant ban per Core MaybePunishNodeForBlock"
+        );
 
         // 2. Display string matches Core's Misbehaving() message ("bad-header").
-        assert_eq!(reason.to_string(), "bad-header",
-            "display must be 'bad-header' to match Core log output");
+        assert_eq!(
+            reason.to_string(),
+            "bad-header",
+            "display must be 'bad-header' to match Core log output"
+        );
 
         // 3. MisbehaviorTracker reaches ban threshold on first hit.
         let mut tracker = MisbehaviorTracker::new();
         let peer = PeerId(98);
         let banned = tracker.misbehaving(peer, MisbehaviorReason::InvalidBlockHeader);
-        assert!(banned,
-            "peer sending invalid block header must be banned immediately");
-        assert!(tracker.should_disconnect(peer),
-            "peer must be marked for disconnect after InvalidBlockHeader");
+        assert!(
+            banned,
+            "peer sending invalid block header must be banned immediately"
+        );
+        assert!(
+            tracker.should_disconnect(peer),
+            "peer must be marked for disconnect after InvalidBlockHeader"
+        );
         assert_eq!(tracker.get_score(peer), 100);
 
         // 4. Distinct from old "invalid block header" string (pre-fix display).
-        assert_ne!(reason.to_string(), "invalid block header",
-            "display must have been updated from old 'invalid block header' to 'bad-header'");
+        assert_ne!(
+            reason.to_string(),
+            "invalid block header",
+            "display must have been updated from old 'invalid block header' to 'bad-header'"
+        );
     }
 
     // ─── G19: duplicate version → disconnect ─────────────────────────────────
@@ -605,37 +663,57 @@ mod tests {
     fn g22_node_compact_filters_gate_active() {
         use crate::message::{NODE_COMPACT_FILTERS, NODE_NETWORK, NODE_WITNESS};
         use crate::peer_manager::{
-            should_advertise_compact_filters, BIP157_P2P_HANDLERS_REGISTERED,
-            PeerManager, PeerManagerConfig,
+            should_advertise_compact_filters, PeerManager, PeerManagerConfig,
+            BIP157_P2P_HANDLERS_REGISTERED,
         };
         use rustoshi_consensus::ChainParams;
 
         // The constant value matches BIP-157.
-        assert_eq!(NODE_COMPACT_FILTERS, 1 << 6,
-            "constant value must match BIP-157 definition");
+        assert_eq!(
+            NODE_COMPACT_FILTERS,
+            1 << 6,
+            "constant value must match BIP-157 definition"
+        );
 
         // FIX-82: handlers are registered.
-        assert_eq!(BIP157_P2P_HANDLERS_REGISTERED, true,
+        assert_eq!(
+            BIP157_P2P_HANDLERS_REGISTERED, true,
             "FIX-82: BIP-157 P2P handlers (ProcessGetCFilters/CFHeaders/\
-             CFCheckPt) are now wired in rustoshi/src/main.rs");
+             CFCheckPt) are now wired in rustoshi/src/main.rs"
+        );
 
         // The gate still returns FALSE unless BOTH config flags are set
         // (matches Core's init.cpp 992-999 invariants).
-        assert_eq!(should_advertise_compact_filters(false, false), false,
-            "no index, no peerblockfilters → gate false");
-        assert_eq!(should_advertise_compact_filters(true, false), false,
-            "index without peerblockfilters → gate false");
-        assert_eq!(should_advertise_compact_filters(false, true), false,
-            "peerblockfilters without index → gate false (matches Core init.cpp:994 check)");
+        assert_eq!(
+            should_advertise_compact_filters(false, false),
+            false,
+            "no index, no peerblockfilters → gate false"
+        );
+        assert_eq!(
+            should_advertise_compact_filters(true, false),
+            false,
+            "index without peerblockfilters → gate false"
+        );
+        assert_eq!(
+            should_advertise_compact_filters(false, true),
+            false,
+            "peerblockfilters without index → gate false (matches Core init.cpp:994 check)"
+        );
         // FIX-82: when BOTH flags are set, the gate now returns TRUE.
-        assert_eq!(should_advertise_compact_filters(true, true), true,
-            "FIX-82: both flags set AND handlers registered → gate TRUE");
+        assert_eq!(
+            should_advertise_compact_filters(true, true),
+            true,
+            "FIX-82: both flags set AND handlers registered → gate TRUE"
+        );
 
         // local_services() respects the gate.
         let cfg_off = PeerManagerConfig::testnet4();
         let mgr_off = PeerManager::new(cfg_off, ChainParams::testnet4());
-        assert_eq!(mgr_off.local_services() & NODE_COMPACT_FILTERS, 0,
-            "default config: NODE_COMPACT_FILTERS not advertised");
+        assert_eq!(
+            mgr_off.local_services() & NODE_COMPACT_FILTERS,
+            0,
+            "default config: NODE_COMPACT_FILTERS not advertised"
+        );
 
         let mut cfg_on = PeerManagerConfig::testnet4();
         cfg_on.block_filter_index_enabled = true;
@@ -650,12 +728,16 @@ mod tests {
         );
 
         // Sanity: NODE_NETWORK | NODE_WITNESS still advertised in both modes.
-        assert_eq!(mgr_off.local_services() & (NODE_NETWORK | NODE_WITNESS),
+        assert_eq!(
+            mgr_off.local_services() & (NODE_NETWORK | NODE_WITNESS),
             NODE_NETWORK | NODE_WITNESS,
-            "NODE_NETWORK | NODE_WITNESS must always be advertised");
-        assert_eq!(mgr_on.local_services() & (NODE_NETWORK | NODE_WITNESS),
+            "NODE_NETWORK | NODE_WITNESS must always be advertised"
+        );
+        assert_eq!(
+            mgr_on.local_services() & (NODE_NETWORK | NODE_WITNESS),
             NODE_NETWORK | NODE_WITNESS,
-            "NODE_NETWORK | NODE_WITNESS must always be advertised");
+            "NODE_NETWORK | NODE_WITNESS must always be advertised"
+        );
     }
 
     /// G22 forward-regression guard: documentation test — confirms the gate
@@ -675,9 +757,12 @@ mod tests {
         let f: fn(bool, bool) -> bool = should_advertise_compact_filters;
         // FIX-82: now returns TRUE for (true, true) because P2P handlers
         // are registered.
-        assert_eq!(f(true, true), true,
+        assert_eq!(
+            f(true, true),
+            true,
             "FIX-82: P2P handlers wired, gate now returns true under valid \
-             config conditions");
+             config conditions"
+        );
     }
 
     /// G22 source-level regression guard: scan crate sources for any
@@ -698,8 +783,7 @@ mod tests {
         // Files in `crates/network/src/` that could legitimately advertise the
         // bit. Limit the scan to this crate; test code may use it freely.
         let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let entries = fs::read_dir(&src_dir)
-            .expect("src dir must exist");
+        let entries = fs::read_dir(&src_dir).expect("src dir must exist");
         let mut bad_lines: Vec<String> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
@@ -708,8 +792,10 @@ mod tests {
             }
             // Skip tests in this same crate; they may reference the constant.
             let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if file_name.starts_with("w99_") || file_name.starts_with("w103_")
-                || file_name.starts_with("w104_") || file_name.starts_with("w115_")
+            if file_name.starts_with("w99_")
+                || file_name.starts_with("w103_")
+                || file_name.starts_with("w104_")
+                || file_name.starts_with("w115_")
             {
                 continue;
             }
@@ -754,8 +840,11 @@ mod tests {
         assert_eq!(MAX_MESSAGE_SIZE, 4_000_000,
             "must be exactly 4,000,000 bytes per Core MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000");
         // Explicitly not 4 * 1024 * 1024 (= 4,194,304 MiB) — Core uses decimal MB.
-        assert_ne!(MAX_MESSAGE_SIZE, 4 * 1024 * 1024,
-            "must NOT be 4 MiB binary; Core net.h uses 4 * 1000 * 1000 not 4 * 1024 * 1024");
+        assert_ne!(
+            MAX_MESSAGE_SIZE,
+            4 * 1024 * 1024,
+            "must NOT be 4 MiB binary; Core net.h uses 4 * 1000 * 1000 not 4 * 1024 * 1024"
+        );
     }
 
     // ─── G24: unknown message type → Unknown variant, no Misbehaving ──────────
@@ -791,18 +880,26 @@ mod tests {
         use crate::relay::PeerRelayState;
 
         // 1. Constant: MsgWtx must be 5 per BIP-339 / Core protocol.h:481.
-        assert_eq!(InvType::MsgWtx as u32, 5,
-            "MSG_WTX must be 5 per BIP-339");
+        assert_eq!(InvType::MsgWtx as u32, 5, "MSG_WTX must be 5 per BIP-339");
 
         // 2. MsgWitnessTx is still 0x40000001 (BIP-144, block download) — not BIP-339.
-        assert_eq!(InvType::MsgWitnessTx as u32, 0x40000001,
-            "MsgWitnessTx must remain 0x40000001 (BIP-144 block download)");
+        assert_eq!(
+            InvType::MsgWitnessTx as u32,
+            0x40000001,
+            "MsgWitnessTx must remain 0x40000001 (BIP-144 block download)"
+        );
 
         // 3. from_u32 round-trip for both types.
-        assert_eq!(InvType::from_u32(5), InvType::MsgWtx,
-            "InvType::from_u32(5) must return MsgWtx");
-        assert_eq!(InvType::from_u32(0x40000001), InvType::MsgWitnessTx,
-            "InvType::from_u32(0x40000001) must return MsgWitnessTx");
+        assert_eq!(
+            InvType::from_u32(5),
+            InvType::MsgWtx,
+            "InvType::from_u32(5) must return MsgWtx"
+        );
+        assert_eq!(
+            InvType::from_u32(0x40000001),
+            InvType::MsgWitnessTx,
+            "InvType::from_u32(0x40000001) must return MsgWitnessTx"
+        );
 
         // 4. wtxid-relay peer gets MsgWtx(5) keyed by wtxid.
         let wtxid = Hash256([0xaa; 32]);
@@ -810,10 +907,15 @@ mod tests {
         state_wtxid.queue_transaction(wtxid);
         let inv = state_wtxid.get_pending_inv(10);
         assert_eq!(inv.len(), 1, "should have one pending inv item");
-        assert_eq!(inv[0].inv_type, InvType::MsgWtx,
-            "wtxid-relay peer must receive MSG_WTX (5), not MSG_WITNESS_TX (0x40000001)");
-        assert_eq!(inv[0].hash, wtxid,
-            "hash must be the wtxid for wtxid-relay peers");
+        assert_eq!(
+            inv[0].inv_type,
+            InvType::MsgWtx,
+            "wtxid-relay peer must receive MSG_WTX (5), not MSG_WITNESS_TX (0x40000001)"
+        );
+        assert_eq!(
+            inv[0].hash, wtxid,
+            "hash must be the wtxid for wtxid-relay peers"
+        );
 
         // 5. Non-wtxid-relay peer gets MsgTx(1) keyed by txid.
         let txid = Hash256([0xbb; 32]);
@@ -821,10 +923,15 @@ mod tests {
         state_txid.queue_transaction(txid);
         let inv2 = state_txid.get_pending_inv(10);
         assert_eq!(inv2.len(), 1, "should have one pending inv item");
-        assert_eq!(inv2[0].inv_type, InvType::MsgTx,
-            "non-wtxid-relay peer must receive MSG_TX (1) keyed by txid");
-        assert_eq!(inv2[0].hash, txid,
-            "hash must be the txid for non-wtxid-relay peers");
+        assert_eq!(
+            inv2[0].inv_type,
+            InvType::MsgTx,
+            "non-wtxid-relay peer must receive MSG_TX (1) keyed by txid"
+        );
+        assert_eq!(
+            inv2[0].hash, txid,
+            "hash must be the txid for non-wtxid-relay peers"
+        );
     }
 
     // ─── G26: InvType::Error not filtered ────────────────────────────────────
@@ -836,8 +943,11 @@ mod tests {
     fn g26_unknown_inv_type_deserialises_to_error_not_filtered() {
         // inv type 999 is not a valid type
         let inv_type = InvType::from_u32(999);
-        assert_eq!(inv_type, InvType::Error,
-            "unknown inv type must map to Error variant");
+        assert_eq!(
+            inv_type,
+            InvType::Error,
+            "unknown inv type must map to Error variant"
+        );
         // The Error variant is accepted without Misbehaving — document this gap.
         // Core: "known-bad" inv types cause the connection to be dropped.
     }
@@ -858,8 +968,10 @@ mod tests {
     fn g29_ping_timeout_constant_sane() {
         // 20-second timeout matches Core's TIMEOUT_INTERVAL default
         assert!(PING_TIMEOUT.as_secs() > 0, "ping timeout must be non-zero");
-        assert!(PING_TIMEOUT <= Duration::from_secs(120),
-            "ping timeout should not exceed 2 min");
+        assert!(
+            PING_TIMEOUT <= Duration::from_secs(120),
+            "ping timeout should not exceed 2 min"
+        );
     }
 
     // ─── G30: feefilter accepted before verack ────────────────────────────────
@@ -901,10 +1013,15 @@ mod tests {
         let mut tracker = MisbehaviorTracker::new();
         let id = PeerId(42);
         // Single-event: first call immediately discourages, regardless of score.
-        assert!(tracker.misbehaving_with_score(id, 50, "half"),
-            "single-event: first misbehaving_with_score must return true");
+        assert!(
+            tracker.misbehaving_with_score(id, 50, "half"),
+            "single-event: first misbehaving_with_score must return true"
+        );
         assert_eq!(tracker.get_score(id), 50);
-        assert!(tracker.should_disconnect(id), "should_disconnect after first call");
+        assert!(
+            tracker.should_disconnect(id),
+            "should_disconnect after first call"
+        );
         assert!(tracker.misbehaving_with_score(id, 50, "full"));
         assert_eq!(tracker.get_score(id), 100);
         assert!(tracker.should_disconnect(id));
@@ -931,6 +1048,10 @@ mod tests {
             })
             .collect();
         let r = sync.process_headers(peer, bad_headers, &mut |_, _| Ok(()), &|_| None, &|_| None);
-        assert!(r.is_err(), "must reject {} headers", MAX_HEADERS_PER_REQUEST + 1);
+        assert!(
+            r.is_err(),
+            "must reject {} headers",
+            MAX_HEADERS_PER_REQUEST + 1
+        );
     }
 }

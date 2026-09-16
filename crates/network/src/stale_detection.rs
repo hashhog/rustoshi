@@ -41,7 +41,6 @@ pub const CHAIN_SYNC_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Bitcoin Core: 2 minutes
 pub const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(2 * 60);
 
-
 /// Ping timeout: disconnect if pong not received within this time.
 /// Bitcoin Core: 20 minutes (configurable via -peertimeout)
 pub const PING_TIMEOUT_INTERVAL: Duration = Duration::from_secs(20 * 60);
@@ -392,7 +391,9 @@ impl StalePeerDetector {
         // Peer is behind - check timeout
         if peer_state.chain_sync.timeout.is_none() {
             // No timeout yet - set one
-            peer_state.chain_sync.set_timeout(our_height, CHAIN_SYNC_TIMEOUT);
+            peer_state
+                .chain_sync
+                .set_timeout(our_height, CHAIN_SYNC_TIMEOUT);
             return None;
         }
 
@@ -405,7 +406,9 @@ impl StalePeerDetector {
         if peer_state.chain_sync.has_caught_up(peer_height) {
             // They caught up to what we required, but we've advanced.
             // Reset timeout with new target.
-            peer_state.chain_sync.set_timeout(our_height, CHAIN_SYNC_TIMEOUT);
+            peer_state
+                .chain_sync
+                .set_timeout(our_height, CHAIN_SYNC_TIMEOUT);
             return None;
         }
 
@@ -413,16 +416,16 @@ impl StalePeerDetector {
         if !peer_state.chain_sync.sent_getheaders {
             // First timeout: send getheaders and set shorter timeout
             peer_state.getheaders_sent();
-            peer_state
-                .chain_sync
-                .timeout = Some(Instant::now() + HEADERS_RESPONSE_TIME);
+            peer_state.chain_sync.timeout = Some(Instant::now() + HEADERS_RESPONSE_TIME);
             return Some(true); // Send getheaders
         }
 
         // Second timeout (after getheaders): disconnect unless protected
         if is_protected {
             // Reset and try again
-            peer_state.chain_sync.set_timeout(our_height, CHAIN_SYNC_TIMEOUT);
+            peer_state
+                .chain_sync
+                .set_timeout(our_height, CHAIN_SYNC_TIMEOUT);
             return None;
         }
 
@@ -476,7 +479,7 @@ mod tests {
         assert_eq!(EXTRA_PEER_CHECK_INTERVAL, Duration::from_secs(45)); // 45 sec
         assert_eq!(CHAIN_SYNC_TIMEOUT, Duration::from_secs(1200)); // 20 min
         assert_eq!(HEADERS_RESPONSE_TIME, Duration::from_secs(120)); // 2 min
-        // PING_INTERVAL is defined in peer.rs, also 2 min (matches Bitcoin Core)
+                                                                     // PING_INTERVAL is defined in peer.rs, also 2 min (matches Bitcoin Core)
         assert_eq!(PING_TIMEOUT_INTERVAL, Duration::from_secs(1200)); // 20 min
         assert_eq!(MINIMUM_CONNECT_TIME, Duration::from_secs(30)); // 30 sec
         assert_eq!(MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT, 4);
