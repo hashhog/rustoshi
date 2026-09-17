@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-12
 
+- feat(rpc): script-verification counter on getchainstates (`script_checks`)
 - feat(net): single `--connect` peer defaults to 128 in-flight; refill on receipt
 - 6b17c37f test: make every zmq pub/sub test deterministic
 - c336b9eb chore: gitignore crates/rpc/banlist.json — runtime setban list was dirtying the tree and blocking the node-owner bot

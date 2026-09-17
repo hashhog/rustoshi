@@ -26,8 +26,8 @@ use ops::{
 };
 
 use rustoshi_consensus::{
-    dump_mempool, get_block_proof, load_mempool, should_skip_scripts, ChainParams, ChainState,
-    ChainWork, FeeEstimator, NetworkId, ValidationError,
+    dump_mempool, get_block_proof, load_mempool, read_script_checks_total, should_skip_scripts,
+    ChainParams, ChainState, ChainWork, FeeEstimator, NetworkId, ValidationError,
 };
 use rustoshi_network::{
     asmap as asmap_mod, resolve_blocks_in_flight_per_peer, BlockDownloader, CFCheckptMessage,
@@ -1160,6 +1160,7 @@ async fn start_metrics_server(
                 ps.peer_manager.as_ref().map_or(0, |pm| pm.peer_count() as u32)
             };
 
+            let script_checks = read_script_checks_total();
             let body = format!(
                 "# HELP bitcoin_blocks_total Current block height\n\
                  # TYPE bitcoin_blocks_total gauge\n\
@@ -1169,8 +1170,11 @@ async fn start_metrics_server(
                  bitcoin_peers_connected {}\n\
                  # HELP bitcoin_mempool_size Mempool transaction count\n\
                  # TYPE bitcoin_mempool_size gauge\n\
-                 bitcoin_mempool_size {}\n",
-                height, peers, mempool_size,
+                 bitcoin_mempool_size {}\n\
+                 # HELP bitcoin_script_checks_total Input scripts actually verified (not skipped via assumevalid)\n\
+                 # TYPE bitcoin_script_checks_total counter\n\
+                 bitcoin_script_checks_total {}\n",
+                height, peers, mempool_size, script_checks,
             );
 
             let response = format!(

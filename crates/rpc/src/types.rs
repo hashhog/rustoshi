@@ -249,6 +249,9 @@ pub struct BlockchainInfo {
 /// omits the key entirely, matching Core. `coins_db_cache_bytes` /
 /// `coins_tip_cache_bytes` are ALWAYS emitted (Core pushes them
 /// unconditionally), so they carry no skip attribute.
+///
+/// `script_checks` is a hashhog extension AFTER Core's last field
+/// (`validated`): process-wide count of input scripts actually verified.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChainStateInfo {
     /// Number of blocks (height) in this chainstate (`CChain::Height()`).
@@ -281,6 +284,14 @@ pub struct ChainStateInfo {
     /// validated chainstate; `false` for a snapshot chainstate not yet
     /// validated.
     pub validated: bool,
+    /// Hashhog extension (after Core's last field): process-wide count of
+    /// input scripts actually verified (not skipped via assumevalid). A
+    /// range-runner takes the delta of this field at window start vs end
+    /// instead of grepping the assumevalid-disable log banner. Not persisted;
+    /// resets on process start. `serde(default)` so Core-shaped JSON without
+    /// the key still deserializes.
+    #[serde(default)]
+    pub script_checks: u64,
 }
 
 /// Response for the `getchainstates` RPC.

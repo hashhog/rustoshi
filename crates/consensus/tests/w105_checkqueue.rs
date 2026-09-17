@@ -29,11 +29,10 @@ use rustoshi_consensus::{
     ChainParams, SigCache, DEFAULT_MAX_ENTRIES,
     script_flags_for_height, validate_scripts_parallel_with_cache,
 };
+use rustoshi_consensus::validation::connect_block_with_sequence_locks;
 // validation module items used only in ignored tests (documented structural gaps)
 #[allow(unused_imports)]
-use rustoshi_consensus::validation::{
-    connect_block_with_sequence_locks, StubChainContext,
-};
+use rustoshi_consensus::validation::StubChainContext;
 use rustoshi_primitives::{Block, BlockHeader, Hash256, Transaction, TxIn, TxOut, OutPoint};
 use rustoshi_consensus::CoinEntry;
 use rustoshi_consensus::UtxoView;
@@ -1044,4 +1043,176 @@ fn parallel_function_with_cache_smoke() {
     assert!(result.is_ok());
     // Cache should still be empty (no non-coinbase inputs)
     assert!(cache.is_empty());
+}
+
+// ============================================================
+// Script-verification counter (QUEUES.md rustoshi item 4)
+//
+// Process-wide count of input scripts actually dispatched (not skipped
+// via assumevalid). Range-runner / getchainstates read this instead of
+// grepping the assumevalid-disable log banner.
+//
+// Revert control: validate_scripts_parallel_with_cache must record
+// every check it actually executes. A restore of the pre-fix body (no
+// record_script_checks) fails the source scan; a counter that does not
+// move when skip_scripts=false fails the runtime delta.
+// ============================================================
+
+fn function_src(src: &str, sig: &str) -> String {
+    let start = src.find(sig).unwrap_or_else(|| panic!("missing {sig}"));
+    let rest = &src[start..];
+    let end = rest[sig.len()..]
+        .find("\npub fn ")
+        .map(|i| sig.len() + i)
+        .unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// One coinbase + one OP_TRUE spend. Empty scriptSig, scriptPubKey=OP_1.
+fn op_true_spend_fixture() -> (Block, Vec<Vec<CoinEntry>>, MapUtxo) {
+    let funded = OutPoint {
+        txid: Hash256([7u8; 32]),
+        vout: 0,
+    };
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Hash256([0u8; 32]),
+                vout: 0xFFFF_FFFF,
+            },
+            script_sig: vec![0x01, 0x01],
+            sequence: 0xFFFF_FFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            // Height 200 on regtest: subsidy 25 BTC. Spend 1000→900 leaves
+            // 100 sats of fees; claiming more fails BadSubsidy.
+            value: 2_500_000_100,
+            script_pubkey: vec![0x51],
+        }],
+        lock_time: 0,
+    };
+    let spend = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: funded.clone(),
+            script_sig: vec![],
+            sequence: 0xFFFF_FFFF,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: 900,
+            script_pubkey: vec![0x51],
+        }],
+        lock_time: 0,
+    };
+    let block = Block {
+        header: BlockHeader {
+            version: 1,
+            prev_block_hash: Hash256([0u8; 32]),
+            merkle_root: Hash256([0u8; 32]),
+            timestamp: 1_700_000_000,
+            bits: 0x207fffff,
+            nonce: 0,
+        },
+        transactions: vec![coinbase, spend],
+    };
+    let coin = CoinEntry {
+        height: 1,
+        is_coinbase: false,
+        value: 1_000,
+        script_pubkey: vec![0x51],
+    };
+    let coins = vec![vec![coin.clone()]];
+    let mut utxo = MapUtxo(HashMap::new());
+    utxo.add_utxo(&funded, coin);
+    (block, coins, utxo)
+}
+
+struct NullSeq;
+impl rustoshi_consensus::SequenceLockContext for NullSeq {
+    fn get_mtp_at_height(&self, _height: u32) -> u32 {
+        0
+    }
+}
+
+#[test]
+fn script_verification_counter_recorded_in_parallel_helper() {
+    let src = include_str!("../src/validation.rs");
+    let body = function_src(src, "pub fn validate_scripts_parallel_with_cache");
+    assert!(
+        body.contains("record_script_checks"),
+        "validate_scripts_parallel_with_cache must record the checks it actually \
+         dispatches so a range can prove scripts ran without grepping a log banner"
+    );
+}
+
+#[test]
+fn script_verification_counter_increments_by_verified_inputs() {
+    use rustoshi_consensus::read_script_checks_total;
+
+    // Sequential inside one test so the process-wide atom is not raced by
+    // sibling tests in this binary. Other w105 tests only dispatch 0 checks
+    // (coinbase-only), so they cannot bump the counter.
+    let flags = rustoshi_consensus::ScriptFlags {
+        verify_p2sh: true,
+        ..Default::default()
+    };
+    let params = ChainParams::regtest();
+
+    // skip_scripts=true must not bump, even with a non-coinbase OP_TRUE input.
+    let (block, _, mut utxo) = op_true_spend_fixture();
+    let before_skip = read_script_checks_total();
+    connect_block_with_sequence_locks(
+        &block,
+        200,
+        &mut utxo,
+        &params,
+        &NullSeq,
+        1_699_999_000,
+        true,
+        None,
+    )
+    .expect("skip_scripts=true must still connect (non-script gates only)");
+    let after_skip = read_script_checks_total();
+    assert_eq!(
+        after_skip, before_skip,
+        "skip_scripts=true must not bump the counter (before={before_skip} after={after_skip})"
+    );
+
+    // Direct helper: one input → +1.
+    let (block, coins, _) = op_true_spend_fixture();
+    let before_helper = read_script_checks_total();
+    validate_scripts_parallel_with_cache(&block, &coins, &flags, None)
+        .expect("OP_TRUE spend must verify");
+    let after_helper = read_script_checks_total();
+    assert_eq!(
+        after_helper - before_helper,
+        1,
+        "one non-coinbase input must bump script_checks by 1 \
+         (before={before_helper} after={after_helper})"
+    );
+
+    // Connect with skip_scripts=false must bump by the same input count.
+    let (block, _, mut utxo) = op_true_spend_fixture();
+    let before_run = read_script_checks_total();
+    connect_block_with_sequence_locks(
+        &block,
+        200,
+        &mut utxo,
+        &params,
+        &NullSeq,
+        1_699_999_000,
+        false,
+        None,
+    )
+    .expect("skip_scripts=false must connect the OP_TRUE spend");
+    let after_run = read_script_checks_total();
+    assert_eq!(
+        after_run - before_run,
+        1,
+        "connect with skip_scripts=false must bump by the number of input scripts \
+         (before={before_run} after={after_run})"
+    );
 }

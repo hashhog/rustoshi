@@ -40,6 +40,7 @@ use rayon::prelude::*;
 use rustoshi_crypto::sha256d;
 use rustoshi_primitives::{compact_size_len, Block, BlockHeader, Hash256, OutPoint, Transaction};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use thiserror::Error;
 
@@ -70,6 +71,26 @@ fn script_check_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("script-check rayon pool must build")
     })
+}
+
+/// Process-wide count of input scripts actually dispatched for verification
+/// (not skipped via assumevalid). Range-runner / getchainstates read this
+/// instead of grepping a log banner. Not persisted; resets on process start.
+static SCRIPT_CHECKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Increment the process-wide script-check counter by `n`. `n == 0` is a no-op.
+fn record_script_checks(n: u64) {
+    if n > 0 {
+        SCRIPT_CHECKS_TOTAL.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Read the process-wide count of input scripts actually verified.
+///
+/// Hashhog extension consumed by `getchainstates.script_checks` so a range
+/// can prove scripts ran without grepping the assumevalid-disable banner.
+pub fn read_script_checks_total() -> u64 {
+    SCRIPT_CHECKS_TOTAL.load(Ordering::Relaxed)
 }
 
 // ============================================================
@@ -2619,6 +2640,10 @@ pub fn validate_scripts_parallel_with_cache(
             })
         })
         .collect();
+
+    // Count every input dispatched (including later cache hits). Assumevalid
+    // never reaches this helper, so skip_scripts=true does not increment.
+    record_script_checks(script_checks.len() as u64);
 
     // Validate all scripts in parallel on the dedicated, core-capped pool
     // (W105 G1/G4) with first-failure short-circuit (W105 G11).

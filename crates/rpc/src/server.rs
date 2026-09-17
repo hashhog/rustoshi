@@ -12764,6 +12764,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             true
         };
 
+        let script_checks = rustoshi_consensus::read_script_checks_total();
         let active_chainstate = ChainStateInfo {
             blocks: state.best_height,
             bestblockhash: state.best_hash.to_hex(),
@@ -12776,6 +12777,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             coins_tip_cache_bytes,
             snapshot_blockhash: if snapshot_active { snapshot_blockhash } else { None },
             validated: active_validated,
+            script_checks,
         };
 
         // Core orders `chainstates` by work, most-work (active) chainstate
@@ -12801,6 +12803,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 coins_tip_cache_bytes,
                 snapshot_blockhash: None,
                 validated: true,
+                script_checks,
             });
         }
         chainstates.push(active_chainstate);
@@ -13340,7 +13343,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getblockfrompeer" => "getblockfrompeer \"blockhash\" peer_id\nAttempt to fetch block from a given peer.",
                 "gettxoutproof" => "gettxoutproof [\"txid\",...] ( \"blockhash\" )\nReturns a hex-encoded proof that \"txid\" was included in a block.",
                 "gettxspendingprevout" => "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...]\nScans the mempool to find transactions spending any of the given outputs.",
-                "getchainstates" => "getchainstates\nReturn information about chainstates.",
+                "getchainstates" => "getchainstates\nReturn information about chainstates.\nEach chainstate includes script_checks: input scripts actually verified (hashhog extension; process-wide; not skipped via assumevalid).",
                 "getrpcinfo" => "getrpcinfo\nReturns details of the RPC server.",
                 "submitheader" => "submitheader \"hexdata\"\nDecode the given hexdata as a header and submit it as a candidate chain tip if valid.",
                 "analyzepsbt" => "analyzepsbt \"psbt\"\nAnalyzes and provides information about the current status of a PSBT and its inputs.",
@@ -24369,6 +24372,43 @@ mod tests {
         );
         assert_eq!(result.chainstates.len(), 1);
         assert!(result.chainstates[0].validated);
+    }
+
+    /// Hashhog extension on `getchainstates`: `script_checks` is the
+    /// process-wide count of input scripts actually verified (not skipped
+    /// via assumevalid). A range takes the delta of this field instead of
+    /// grepping the assumevalid-disable log banner. Emitted after Core's
+    /// last field (`validated`).
+    #[tokio::test]
+    async fn getchainstates_script_checks() {
+        let server = setup_test_server();
+        let result = server
+            .get_chain_states()
+            .await
+            .expect("getchainstates must succeed");
+        let v = serde_json::to_value(&result).expect("serialize");
+        let sc = v["chainstates"][0]
+            .get("script_checks")
+            .and_then(|x| x.as_u64());
+        assert!(
+            sc.is_some(),
+            "getchainstates.chainstates[0].script_checks must be a u64 \
+             (hashhog extension after Core's last field); got {}",
+            v["chainstates"][0]
+        );
+        assert_eq!(
+            sc.unwrap(),
+            rustoshi_consensus::read_script_checks_total(),
+            "script_checks must equal the process-wide counter"
+        );
+        let wire = serde_json::to_string(&result).expect("wire");
+        let pos_validated = wire.find("\"validated\"").expect("validated on wire");
+        let pos_checks = wire.find("\"script_checks\"").expect("script_checks on wire");
+        assert!(
+            pos_validated < pos_checks,
+            "script_checks is a hashhog extension after Core's last field \
+             validated: {wire}"
+        );
     }
 
     fn decode_psbt_first_input_sequence(psbt_b64: &str) -> u32 {
