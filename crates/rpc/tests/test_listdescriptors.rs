@@ -30,9 +30,7 @@ use std::sync::Arc;
 
 use rustoshi_crypto::address::Network;
 use rustoshi_rpc::{ImportDescriptorRequest, WalletRpcImpl, WalletRpcServer, WalletRpcState};
-use rustoshi_wallet::{
-    descriptor_checksum, encode_xpub, ExtendedPrivKey, WalletManager,
-};
+use rustoshi_wallet::{descriptor_checksum, encode_xpub, ExtendedPrivKey, WalletManager};
 use serde_json::json;
 use tempfile::tempdir;
 use tokio::sync::RwLock;
@@ -75,7 +73,7 @@ fn with_checksum(body: &str) -> String {
 async fn listdescriptors_core_shape_checksum_sort_and_private_error() {
     let rpc = watch_only_rpc("listdesc-wo");
     rpc.create_wallet(
-        "listdesc-wo".to_string(),
+        Some("listdesc-wo".to_string()),
         /* disable_private_keys */ Some(true),
         None,
         None,
@@ -170,11 +168,7 @@ async fn listdescriptors_core_shape_checksum_sort_and_private_error() {
         // (recomputed independently from the body).
         let desc = e.get("desc").and_then(|v| v.as_str()).unwrap();
         let (body, checksum) = desc.rsplit_once('#').expect("desc has #checksum");
-        assert_eq!(
-            checksum.len(),
-            8,
-            "BIP-380 checksum is 8 chars: {desc}"
-        );
+        assert_eq!(checksum.len(), 8, "BIP-380 checksum is 8 chars: {desc}");
         let expected = descriptor_checksum(body).expect("body checksummable");
         assert_eq!(
             checksum, expected,

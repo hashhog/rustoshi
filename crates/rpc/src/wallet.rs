@@ -18,13 +18,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use jsonrpsee::core::{async_trait, RpcResult};
-use rustoshi_storage::block_store::BlockStore;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
-use rustoshi_wallet::{CreateWalletOptions, WalletManager, WalletDirEntry};
+use rustoshi_storage::block_store::BlockStore;
+use rustoshi_wallet::{CreateWalletOptions, WalletDirEntry, WalletManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-
 
 /// Wallet RPC error codes (Bitcoin Core compatible).
 pub mod wallet_error {
@@ -63,6 +62,14 @@ pub mod wallet_error {
     /// (Core's RPC_DESERIALIZATION_ERROR), e.g. a malformed base64 PSBT in
     /// `walletprocesspsbt` (spend.cpp: "TX decode failed").
     pub const RPC_DESERIALIZATION_ERROR: i32 = -22;
+    /// Unexpected type (`bitcoin-core/src/rpc/protocol.h::RPC_TYPE_ERROR`).
+    pub const RPC_TYPE_ERROR: i32 = -3;
+    /// Invalid parameter (`protocol.h::RPC_INVALID_PARAMETER`).
+    pub const RPC_INVALID_PARAMETER: i32 = -8;
+    /// Help-dump / arity (`protocol.h::RPC_MISC_ERROR`). Core's
+    /// `RPCHelpMan::HandleRequest` rejects `!IsValidNumArgs` as -1
+    /// (`rpc/util.cpp:644-646` + `rpc/server.cpp:515`).
+    pub const RPC_MISC_ERROR: i32 = -1;
 }
 
 /// Extract a single (33-byte compressed pubkey, DER-sig+hashtype) partial-sig
@@ -73,9 +80,7 @@ pub mod wallet_error {
 ///   - P2PKH scriptSig: `push(sig+hashtype) push(pubkey(33))`
 /// Returns None for multi-element or unrecognised shapes (Taproot key-path
 /// sigs are not partial-sig records and are left to the finalize path).
-fn extract_single_partial_sig(
-    input: &rustoshi_primitives::TxIn,
-) -> Option<([u8; 33], Vec<u8>)> {
+fn extract_single_partial_sig(input: &rustoshi_primitives::TxIn) -> Option<([u8; 33], Vec<u8>)> {
     // Witness shape (P2WPKH / P2SH-P2WPKH): [sig, pubkey33].
     if input.witness.len() == 2 {
         let sig = &input.witness[0];
@@ -152,6 +157,10 @@ pub struct UnspentOutput {
     /// Address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// Label associated with the address (empty string when unlabeled).
+    /// Core's listunspent always emits this for an address-bearing coin
+    /// (`wallet/rpc/coins.cpp`).
+    pub label: String,
     /// Script pubkey (hex).
     #[serde(rename = "scriptPubKey")]
     pub script_pubkey: String,
@@ -163,8 +172,35 @@ pub struct UnspentOutput {
     pub spendable: bool,
     /// Whether the output is solvable.
     pub solvable: bool,
+    /// Inferred descriptor for this output (descriptor wallets).
+    pub desc: String,
+    /// Wallet descriptors that generated this script.
+    pub parent_descs: Vec<String>,
     /// Whether the output is safe to spend.
     pub safe: bool,
+}
+
+/// `lastprocessedblock` object Core appends to wallet reads
+/// (`wallet/rpc/util.cpp::AppendLastProcessedBlock`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LastProcessedBlock {
+    /// Tip hash (display hex).
+    pub hash: String,
+    /// Tip height.
+    pub height: u32,
+}
+
+/// Result of Core's `send` RPC (`wallet/rpc/spend.cpp`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SendResult {
+    /// Whether the transaction has a complete set of signatures.
+    pub complete: bool,
+    /// Broadcast txid (display hex). Present when complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txid: Option<String>,
+    /// Hex of the signed tx. Omitted on the broadcast path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hex: Option<String>,
 }
 
 /// Balance information.
@@ -176,6 +212,8 @@ pub struct BalanceInfo {
     /// Watch-only balance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watchonly: Option<BalanceDetails>,
+    /// Chain tip the balances are valid through.
+    pub lastprocessedblock: LastProcessedBlock,
 }
 
 /// Balance details.
@@ -348,6 +386,12 @@ pub struct WalletInfo {
     pub descriptors: bool,
     /// Whether this wallet uses an external signer.
     pub external_signer: bool,
+    /// Whether this wallet intentionally contains no keys (`WALLET_FLAG_BLANK_WALLET`).
+    pub blank: bool,
+    /// Currently-set wallet flags (Core `WALLET_FLAG_TO_STRING` names).
+    pub flags: Vec<String>,
+    /// Chain tip the wallet has processed.
+    pub lastprocessedblock: LastProcessedBlock,
 }
 
 /// Result of signrawtransactionwithwallet RPC.
@@ -437,7 +481,10 @@ pub struct FundedPsbtOptions {
     #[serde(rename = "changePosition", skip_serializing_if = "Option::is_none")]
     pub change_position: Option<u32>,
     /// Whether to subtract fee from outputs (indices into the outputs array).
-    #[serde(rename = "subtractFeeFromOutputs", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "subtractFeeFromOutputs",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub subtract_fee_from_outputs: Option<Vec<u32>>,
     /// Mark the transaction BIP-125 replaceable (default: true).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -498,13 +545,25 @@ pub struct WalletProcessPsbtResult {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct FundRawTransactionOptions {
     /// The bitcoin address to receive the change.
-    #[serde(rename = "changeAddress", alias = "change_address", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "changeAddress",
+        alias = "change_address",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub change_address: Option<String>,
     /// The index of the change output.
-    #[serde(rename = "changePosition", alias = "change_position", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "changePosition",
+        alias = "change_position",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub change_position: Option<u32>,
     /// Output indices whose amounts the fee should be subtracted from.
-    #[serde(rename = "subtractFeeFromOutputs", alias = "subtract_fee_from_outputs", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "subtractFeeFromOutputs",
+        alias = "subtract_fee_from_outputs",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub subtract_fee_from_outputs: Option<Vec<u32>>,
     /// Fee rate in sat/vB (Core `fee_rate`).
     #[serde(rename = "fee_rate", skip_serializing_if = "Option::is_none")]
@@ -516,10 +575,18 @@ pub struct FundRawTransactionOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaceable: Option<bool>,
     /// (DEPRECATED in Core) No longer used; accepted for compatibility.
-    #[serde(rename = "includeWatching", alias = "include_watching", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "includeWatching",
+        alias = "include_watching",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub include_watching: Option<bool>,
     /// Lock selected unspent outputs (accepted; not yet applied).
-    #[serde(rename = "lockUnspents", alias = "lock_unspents", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "lockUnspents",
+        alias = "lock_unspents",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub lock_unspents: Option<bool>,
     /// Confirmation target in blocks (accepted; fee estimator not wired).
     #[serde(rename = "conf_target", skip_serializing_if = "Option::is_none")]
@@ -568,7 +635,10 @@ pub struct BumpFeeOptions {
     #[serde(rename = "estimate_mode", skip_serializing_if = "Option::is_none")]
     pub estimate_mode: Option<String>,
     /// Originally specified change index (deferred).
-    #[serde(rename = "original_change_index", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "original_change_index",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub original_change_index: Option<u32>,
     /// Replace the outputs list explicitly (deferred — not supported).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -718,6 +788,51 @@ impl WalletRpcState {
     }
 }
 
+/// Help dump thrown as RPC_MISC_ERROR (-1) when `createwallet` is called
+/// with no name. Core `RPCHelpMan::HandleRequest` (`rpc/util.cpp:644-646`).
+const CREATEWALLET_HELP: &str = "\
+createwallet \"wallet_name\" ( disable_private_keys blank \"passphrase\" avoid_reuse descriptors load_on_startup external_signer )
+
+Creates and loads a new wallet.
+
+Arguments:
+1. wallet_name             (string, required) The name for the new wallet. If this is a path, the wallet will be created at the path location.
+2. disable_private_keys    (boolean, optional, default=false) Disable the possibility of private keys (only watchonlys are possible in this mode).
+3. blank                   (boolean, optional, default=false) Create a blank wallet. A blank wallet has no keys or HD seed.
+4. passphrase              (string, optional) Encrypt the wallet with this passphrase.
+5. avoid_reuse             (boolean, optional, default=false) Keep track of coin reuse, and treat dirty and clean coins differently with privacy considerations in mind.
+6. descriptors             (boolean, optional, default=true) Create a native descriptor wallet. Defaults to true. Set to false only for backwards compatibility.
+7. load_on_startup         (boolean, optional) Save wallet name to persistent settings and load on startup. True to add wallet to startup list, false to remove, null to leave unchanged.
+8. external_signer         (boolean, optional, default=false) Use an external signer such as a hardware wallet.
+
+Result:
+{                   (json object)
+  \"name\" : \"str\",     (string) The wallet name if created successfully. If the wallet was created using a full path, the wallet_name will be the full path.
+  \"warnings\" : [      (json array, optional) Warning messages, if any, related to creating and loading the wallet.
+    \"str\",            (string)
+    ...
+  ]
+}
+";
+
+const GETWALLETINFO_HELP: &str = "\
+getwalletinfo
+
+Returns an object containing various wallet state info.
+";
+
+const GETBALANCES_HELP: &str = "\
+getbalances
+
+Returns an object with all balances in BTC.
+";
+
+const LISTWALLETS_HELP: &str = "\
+listwallets
+
+Returns a list of currently loaded wallets.
+";
+
 /// Wallet RPC trait.
 #[rpc(server)]
 pub trait WalletRpc {
@@ -734,7 +849,7 @@ pub trait WalletRpc {
     #[method(name = "createwallet")]
     async fn create_wallet(
         &self,
-        wallet_name: String,
+        wallet_name: Option<String>,
         disable_private_keys: Option<bool>,
         blank: Option<bool>,
         passphrase: Option<String>,
@@ -769,7 +884,7 @@ pub trait WalletRpc {
 
     /// List currently loaded wallets.
     #[method(name = "listwallets")]
-    async fn list_wallets(&self) -> RpcResult<Vec<String>>;
+    async fn list_wallets(&self, extra: Option<serde_json::Value>) -> RpcResult<Vec<String>>;
 
     /// List wallet directories.
     #[method(name = "listwalletdir")]
@@ -793,7 +908,7 @@ pub trait WalletRpc {
 
     /// Get detailed balance information.
     #[method(name = "getbalances")]
-    async fn get_balances(&self) -> RpcResult<BalanceInfo>;
+    async fn get_balances(&self, extra: Option<serde_json::Value>) -> RpcResult<BalanceInfo>;
 
     /// List unspent transaction outputs.
     ///
@@ -849,6 +964,36 @@ pub trait WalletRpc {
         estimate_mode: Option<String>,
     ) -> RpcResult<String>;
 
+    /// Send a transaction (Core's `send`, `wallet/rpc/spend.cpp`).
+    ///
+    /// Parameters:
+    /// - outputs: array of `{address: amount}` objects
+    /// - conf_target, estimate_mode: fee estimation (ignored when fee_rate set)
+    /// - fee_rate: sat/vB
+    #[method(name = "send")]
+    async fn wallet_send(
+        &self,
+        outputs: Vec<serde_json::Value>,
+        conf_target: Option<serde_json::Value>,
+        estimate_mode: Option<serde_json::Value>,
+        fee_rate: Option<serde_json::Value>,
+        options: Option<serde_json::Value>,
+    ) -> RpcResult<SendResult>;
+
+    /// Copy the wallet directory to `destination` (Core `backupwallet`).
+    /// Returns JSON null on success.
+    #[method(name = "backupwallet")]
+    async fn backup_wallet(&self, destination: String) -> RpcResult<serde_json::Value>;
+
+    /// Restore a wallet from a backupwallet destination (Core `restorewallet`).
+    #[method(name = "restorewallet")]
+    async fn restore_wallet(
+        &self,
+        wallet_name: String,
+        backup_file: String,
+        load_on_startup: Option<bool>,
+    ) -> RpcResult<LoadWalletResult>;
+
     /// List wallet transactions.
     ///
     /// Parameters:
@@ -860,8 +1005,8 @@ pub trait WalletRpc {
     async fn list_transactions(
         &self,
         label: Option<String>,
-        count: Option<usize>,
-        skip: Option<usize>,
+        count: Option<i64>,
+        skip: Option<i64>,
         include_watchonly: Option<bool>,
     ) -> RpcResult<Vec<WalletTransaction>>;
 
@@ -882,7 +1027,7 @@ pub trait WalletRpc {
 
     /// Get wallet information.
     #[method(name = "getwalletinfo")]
-    async fn get_wallet_info(&self) -> RpcResult<WalletInfo>;
+    async fn get_wallet_info(&self, extra: Option<serde_json::Value>) -> RpcResult<WalletInfo>;
 
     /// Sign a raw transaction with wallet keys.
     ///
@@ -1061,11 +1206,7 @@ pub trait WalletRpc {
     /// - timeout: timeout in seconds (Core's max is 100,000,000s; we cap
     ///   identically).
     #[method(name = "walletpassphrase")]
-    async fn wallet_passphrase(
-        &self,
-        passphrase: String,
-        timeout: u64,
-    ) -> RpcResult<()>;
+    async fn wallet_passphrase(&self, passphrase: String, timeout: u64) -> RpcResult<()>;
 
     /// Re-lock an encrypted wallet, scrubbing the master key from memory.
     /// Mirrors Bitcoin Core's `walletlock` RPC.
@@ -1390,6 +1531,127 @@ impl WalletRpcImpl {
         (btc * 100_000_000.0).round() as u64
     }
 
+    /// Core `AmountFromValue` (`rpc/util.cpp:98-108`): number in MoneyRange,
+    /// else RPC_TYPE_ERROR (-3).
+    fn amount_from_value(v: &serde_json::Value) -> Result<u64, ErrorObjectOwned> {
+        let n = match v {
+            serde_json::Value::Number(num) => num
+                .as_f64()
+                .ok_or_else(|| Self::rpc_error(wallet_error::RPC_TYPE_ERROR, "Invalid amount"))?,
+            serde_json::Value::String(s) => s
+                .parse::<f64>()
+                .map_err(|_| Self::rpc_error(wallet_error::RPC_TYPE_ERROR, "Invalid amount"))?,
+            _ => {
+                return Err(Self::rpc_error(
+                    wallet_error::RPC_TYPE_ERROR,
+                    "Amount is not a number or string",
+                ))
+            }
+        };
+        if n < 0.0 || n > 21_000_000.0 {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_TYPE_ERROR,
+                "Amount out of range",
+            ));
+        }
+        Ok(Self::btc_to_sats(n))
+    }
+
+    /// Extra positional arg on a zero-arg method → Core help dump as -1.
+    fn reject_extra(extra: Option<serde_json::Value>, help: &str) -> Result<(), ErrorObjectOwned> {
+        if extra.is_some() {
+            Err(Self::rpc_error(wallet_error::RPC_MISC_ERROR, help))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn last_processed_block(state: &WalletRpcState) -> LastProcessedBlock {
+        if let Some(node) = &state.node {
+            if let Ok(ns) = node.try_read() {
+                return LastProcessedBlock {
+                    hash: ns.best_hash.to_hex(),
+                    height: ns.best_height,
+                };
+            }
+        }
+        LastProcessedBlock {
+            hash: "0".repeat(64),
+            height: 0,
+        }
+    }
+
+    fn format_bip32_path(path: &[u32]) -> String {
+        let mut s = String::new();
+        for i in path {
+            s.push('/');
+            if i & rustoshi_wallet::HARDENED_FLAG != 0 {
+                s.push_str(&format!("{}h", i & !rustoshi_wallet::HARDENED_FLAG));
+            } else {
+                s.push_str(&i.to_string());
+            }
+        }
+        s
+    }
+
+    /// Infer `desc` + `parent_desc` for a wallet-owned script (Core
+    /// `getaddressinfo` / `listunspent` descriptor fields).
+    fn infer_output_descs(
+        wallet: &rustoshi_wallet::Wallet,
+        address: Option<&str>,
+        derivation_path: &[u32],
+        spk: &[u8],
+    ) -> (String, String) {
+        let path: Vec<u32> = if !derivation_path.is_empty() {
+            derivation_path.to_vec()
+        } else if let Some(addr) = address {
+            wallet
+                .get_derivation_path(addr)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !path.is_empty() {
+            if let Ok((pk, origin)) = wallet.pubkey_and_origin(&path) {
+                let fp = hex::encode(origin.fingerprint);
+                let path_fmt = Self::format_bip32_path(&path);
+                let key_expr = format!("[{fp}{path_fmt}]{}", hex::encode(pk));
+                let body = if spk.len() == 22
+                    && spk.first() == Some(&0x00)
+                    && spk.get(1) == Some(&0x14)
+                {
+                    format!("wpkh({key_expr})")
+                } else if spk.len() == 34 && spk.first() == Some(&0x51) && spk.get(1) == Some(&0x20)
+                {
+                    format!("tr({key_expr})")
+                } else if spk.first() == Some(&0x76) {
+                    format!("pkh({key_expr})")
+                } else if spk.first() == Some(&0xa9) {
+                    format!("sh(wpkh({key_expr}))")
+                } else {
+                    format!("wpkh({key_expr})")
+                };
+                let desc = rustoshi_wallet::add_checksum(&body).unwrap_or(body);
+                let parent = if path.len() > 1 {
+                    let pp = Self::format_bip32_path(&path[..path.len() - 1]);
+                    let pbody = format!("wpkh([{fp}{pp}]{})", hex::encode(pk));
+                    rustoshi_wallet::add_checksum(&pbody).unwrap_or(pbody)
+                } else {
+                    desc.clone()
+                };
+                return (desc, parent);
+            }
+        }
+        if let Some(w) = wallet.watched_script(spk) {
+            return (w.descriptor.clone(), w.descriptor.clone());
+        }
+        // Fallback so the field is still present (descriptor wallet contract).
+        let fallback =
+            rustoshi_wallet::add_checksum("addr()").unwrap_or_else(|| "addr()".to_string());
+        (fallback.clone(), fallback)
+    }
+
     /// Decode a raw transaction from bytes, mirroring Core's `DecodeHexTx`
     /// try-witness-then-no-witness heuristic
     /// (`bitcoin-core/src/core_io.h::DecodeHexTx`).
@@ -1421,18 +1683,17 @@ impl WalletRpcImpl {
             // Caller insisted on witness decoding and it failed.
             return Err("TX decode failed (witness)".to_string());
         }
-        Self::decode_raw_tx_no_witness(bytes)
-            .map_err(|e| format!("TX decode failed: {}", e))
+        Self::decode_raw_tx_no_witness(bytes).map_err(|e| format!("TX decode failed: {}", e))
     }
 
     /// Force a non-witness decode (no SegWit marker interpretation). Mirrors
     /// `Transaction::decode` but always reads the byte(s) after the version as
     /// the input count. Used as the `fundrawtransaction` fallback for the
     /// zero-input case (see `decode_raw_tx_heuristic`).
-    fn decode_raw_tx_no_witness(
-        bytes: &[u8],
-    ) -> std::io::Result<rustoshi_primitives::Transaction> {
-        use rustoshi_primitives::{read_compact_size, Decodable, OutPoint, Transaction, TxIn, TxOut};
+    fn decode_raw_tx_no_witness(bytes: &[u8]) -> std::io::Result<rustoshi_primitives::Transaction> {
+        use rustoshi_primitives::{
+            read_compact_size, Decodable, OutPoint, Transaction, TxIn, TxOut,
+        };
         use std::io::Read;
 
         let mut reader = bytes;
@@ -1480,10 +1741,7 @@ impl WalletRpcImpl {
     /// Translate `WalletError::WalletLocked` into Core's
     /// `RPC_WALLET_UNLOCK_NEEDED` (-13). Every signing RPC funnels through
     /// here so the error message is uniform.
-    fn require_unlocked(
-        state: &WalletRpcState,
-        name: &str,
-    ) -> Result<(), ErrorObjectOwned> {
+    fn require_unlocked(state: &WalletRpcState, name: &str) -> Result<(), ErrorObjectOwned> {
         state.wallet_manager.require_unlocked(name).map_err(|e| {
             use rustoshi_wallet::WalletError;
             match e {
@@ -1544,9 +1802,7 @@ impl WalletRpcImpl {
     /// value is a TOP-LEVEL RPC_TYPE_ERROR (-3) throw — probe-confirmed
     /// against Core v31.99. Returns `Ok(None)` for `"now"`, `Ok(Some(ts))`
     /// for a numeric timestamp.
-    fn parse_import_timestamp(
-        value: &serde_json::Value,
-    ) -> Result<Option<u64>, ErrorObjectOwned> {
+    fn parse_import_timestamp(value: &serde_json::Value) -> Result<Option<u64>, ErrorObjectOwned> {
         const RPC_TYPE_ERROR: i32 = -3;
         match value {
             serde_json::Value::Null => Err(Self::rpc_error(
@@ -1792,7 +2048,7 @@ impl WalletRpcImpl {
 impl WalletRpcServer for WalletRpcImpl {
     async fn create_wallet(
         &self,
-        wallet_name: String,
+        wallet_name: Option<String>,
         disable_private_keys: Option<bool>,
         blank: Option<bool>,
         passphrase: Option<String>,
@@ -1800,6 +2056,28 @@ impl WalletRpcServer for WalletRpcImpl {
         descriptors: Option<bool>,
         load_on_startup: Option<bool>,
     ) -> RpcResult<CreateWalletResult> {
+        // Missing required name: Core dumps RPCHelpMan as RPC_MISC_ERROR (-1)
+        // (`rpc/util.cpp:644-646`). jsonrpsee would otherwise raise -32602.
+        let wallet_name = match wallet_name {
+            Some(n) if !n.is_empty() => n,
+            _ => {
+                return Err(Self::rpc_error(
+                    wallet_error::RPC_MISC_ERROR,
+                    CREATEWALLET_HELP,
+                ));
+            }
+        };
+
+        // Descriptor-only: Core wallet.cpp:403-404. Must refuse BEFORE
+        // creating so a `descriptors=false` call cannot leave a second
+        // wallet loaded (which perturbs later endpoint-less probes).
+        if descriptors == Some(false) {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "descriptors argument must be set to \"true\"; it is no longer possible to create a legacy wallet.",
+            ));
+        }
+
         let mut state = self.state.write().await;
 
         let options = CreateWalletOptions {
@@ -1807,23 +2085,25 @@ impl WalletRpcServer for WalletRpcImpl {
             blank: blank.unwrap_or(false),
             passphrase,
             avoid_reuse: avoid_reuse.unwrap_or(false),
-            descriptors: descriptors.unwrap_or(true),
+            descriptors: true,
             load_on_startup,
         };
 
-        let result = state.wallet_manager.create_wallet(&wallet_name, options)
+        let result = state
+            .wallet_manager
+            .create_wallet(&wallet_name, options)
             .map_err(|e| {
                 let msg = e.to_string();
-                // Core's HandleWalletError (wallet/rpc/util.cpp:127-156) maps
-                // DatabaseStatus::FAILED_ALREADY_LOADED -> RPC_WALLET_ALREADY_LOADED
-                // (-35) and FAILED_ALREADY_EXISTS -> RPC_WALLET_ALREADY_EXISTS (-36),
-                // both distinct from the generic RPC_WALLET_ERROR (-4). The manager
-                // returns "already loaded" when the name is in memory and
-                // "already exists" when the on-disk wallet dir is present.
-                if msg.contains("already loaded") {
-                    Self::rpc_error(wallet_error::RPC_WALLET_ALREADY_LOADED, msg)
-                } else if msg.contains("already exists") {
-                    Self::rpc_error(wallet_error::RPC_WALLET_ALREADY_EXISTS, msg)
+                // createwallet already-exists / already-loaded: CreateWallet
+                // overwrites FAILED_ALREADY_EXISTS with FAILED_VERIFY
+                // (`wallet.cpp` "Wallet file verification failed."), which
+                // HandleWalletError's default arm maps to RPC_WALLET_ERROR
+                // (-4). -36 is restorewallet-only; -35 is loadwallet-only.
+                if msg.contains("already loaded") || msg.contains("already exists") {
+                    Self::rpc_error(
+                        wallet_error::RPC_WALLET_ERROR,
+                        "Wallet file verification failed.",
+                    )
                 } else {
                     Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
                 }
@@ -1842,17 +2122,16 @@ impl WalletRpcServer for WalletRpcImpl {
     ) -> RpcResult<LoadWalletResult> {
         let mut state = self.state.write().await;
 
-        let result = state.wallet_manager.load_wallet(&filename)
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("already loaded") {
-                    Self::rpc_error(wallet_error::RPC_WALLET_ALREADY_LOADED, msg)
-                } else if msg.contains("not found") {
-                    Self::rpc_error(wallet_error::RPC_WALLET_NOT_FOUND, msg)
-                } else {
-                    Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
-                }
-            })?;
+        let result = state.wallet_manager.load_wallet(&filename).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("already loaded") {
+                Self::rpc_error(wallet_error::RPC_WALLET_ALREADY_LOADED, msg)
+            } else if msg.contains("not found") {
+                Self::rpc_error(wallet_error::RPC_WALLET_NOT_FOUND, msg)
+            } else {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
+            }
+        })?;
 
         Ok(LoadWalletResult {
             name: result.name,
@@ -1885,20 +2164,35 @@ impl WalletRpcServer for WalletRpcImpl {
                 }
             })?;
 
-        state.wallet_manager.unload_wallet(&name, true)
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
+        state
+            .wallet_manager
+            .unload_wallet(&name, true)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("not loaded") {
+                    Self::rpc_error(
+                        wallet_error::RPC_WALLET_NOT_FOUND,
+                        "Requested wallet does not exist or is not loaded",
+                    )
+                } else {
+                    Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
+                }
+            })?;
 
         Ok(UnloadWalletResult { warning: None })
     }
 
-    async fn list_wallets(&self) -> RpcResult<Vec<String>> {
+    async fn list_wallets(&self, extra: Option<serde_json::Value>) -> RpcResult<Vec<String>> {
+        Self::reject_extra(extra, LISTWALLETS_HELP)?;
         let state = self.state.read().await;
         Ok(state.wallet_manager.list_wallets())
     }
 
     async fn list_wallet_dir(&self) -> RpcResult<ListWalletDirResult> {
         let state = self.state.read().await;
-        let wallets = state.wallet_manager.list_wallet_dir()
+        let wallets = state
+            .wallet_manager
+            .list_wallet_dir()
             .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
         Ok(ListWalletDirResult { wallets })
     }
@@ -1914,8 +2208,9 @@ impl WalletRpcServer for WalletRpcImpl {
 
         let (_, wallet) = self.resolve_wallet(&state)?;
 
-        let wallet_guard = wallet.lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         // Core's getbalance reports the TRUSTED, SPENDABLE balance: confirmed
         // and (for coinbase) mature. Immature coinbase and unconfirmed coins
@@ -1941,17 +2236,20 @@ impl WalletRpcServer for WalletRpcImpl {
         Ok(Self::sats_to_btc(balance))
     }
 
-    async fn get_balances(&self) -> RpcResult<BalanceInfo> {
+    async fn get_balances(&self, extra: Option<serde_json::Value>) -> RpcResult<BalanceInfo> {
+        Self::reject_extra(extra, GETBALANCES_HELP)?;
         let state = self.state.read().await;
 
         let (_, wallet) = self.resolve_wallet(&state)?;
 
-        let wallet_guard = wallet.lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         let trusted = Self::sats_to_btc(wallet_guard.confirmed_balance());
         let untrusted = Self::sats_to_btc(wallet_guard.unconfirmed_balance());
         let immature = Self::sats_to_btc(wallet_guard.immature_balance());
+        let lastprocessedblock = Self::last_processed_block(&state);
 
         Ok(BalanceInfo {
             mine: Some(BalanceDetails {
@@ -1960,6 +2258,7 @@ impl WalletRpcServer for WalletRpcImpl {
                 immature,
             }),
             watchonly: None,
+            lastprocessedblock,
         })
     }
 
@@ -1975,8 +2274,9 @@ impl WalletRpcServer for WalletRpcImpl {
 
         let (_, wallet) = self.resolve_wallet(&state)?;
 
-        let wallet_guard = wallet.lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         let min_confirmations = minconf.unwrap_or(1);
         let max_confirmations = maxconf.unwrap_or(9999999);
@@ -1986,10 +2286,32 @@ impl WalletRpcServer for WalletRpcImpl {
         // wallet only holds wallet-owned coins, so this is `ExtractDestination`
         // over a known-standard script.
         let network = state.wallet_manager.network();
-        let want_addrs: Option<std::collections::HashSet<String>> = addresses
-            .as_ref()
-            .filter(|a| !a.is_empty())
-            .map(|a| a.iter().cloned().collect());
+        // Core coins.cpp:535-546: invalid address → -5, duplicate → -8,
+        // BEFORE any filtering. An empty list is not an error.
+        let want_addrs: Option<std::collections::HashSet<String>> = if let Some(list) = &addresses {
+            if list.is_empty() {
+                None
+            } else {
+                let mut seen = std::collections::HashSet::new();
+                for a in list {
+                    if rustoshi_crypto::address::Address::from_string(a, Some(network)).is_err() {
+                        return Err(Self::rpc_error(
+                            wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                            format!("Invalid Bitcoin address: {}", a),
+                        ));
+                    }
+                    if !seen.insert(a.clone()) {
+                        return Err(Self::rpc_error(
+                            wallet_error::RPC_INVALID_PARAMETER,
+                            format!("Invalid parameter, duplicated address: {}", a),
+                        ));
+                    }
+                }
+                Some(seen)
+            }
+        } else {
+            None
+        };
 
         let utxos: Vec<UnspentOutput> = wallet_guard
             .list_unspent()
@@ -2026,15 +2348,32 @@ impl WalletRpcServer for WalletRpcImpl {
                     .watched_script(&utxo.script_pubkey)
                     .map(|w| w.solvable)
                     .unwrap_or(true);
+                let (desc, parent) = Self::infer_output_descs(
+                    &wallet_guard,
+                    addr.as_deref(),
+                    &utxo.derivation_path,
+                    &utxo.script_pubkey,
+                );
                 Some(UnspentOutput {
-                    txid: hex::encode(utxo.outpoint.txid.0.iter().rev().copied().collect::<Vec<_>>()),
+                    txid: hex::encode(
+                        utxo.outpoint
+                            .txid
+                            .0
+                            .iter()
+                            .rev()
+                            .copied()
+                            .collect::<Vec<_>>(),
+                    ),
                     vout: utxo.outpoint.vout,
                     address: addr,
+                    label: String::new(),
                     script_pubkey: hex::encode(&utxo.script_pubkey),
                     amount: Self::sats_to_btc(utxo.value),
                     confirmations: utxo.confirmations,
                     spendable,
                     solvable,
+                    desc,
+                    parent_descs: vec![parent],
                     safe: utxo.confirmations >= 1,
                 })
             })
@@ -2054,8 +2393,9 @@ impl WalletRpcServer for WalletRpcImpl {
 
         let (_, wallet) = self.resolve_wallet(&state)?;
 
-        let mut wallet_guard = wallet.lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let mut wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         // Core: getnewaddress on a disable_private_keys wallet -> -4
         // "Error: This wallet has no available keys" (addresses.cpp:47 via
@@ -2076,22 +2416,18 @@ impl WalletRpcServer for WalletRpcImpl {
         let address = match address_type.as_deref() {
             None => wallet_guard.get_new_address(),
             Some(s) => match s.to_ascii_lowercase().as_str() {
-                "legacy" | "p2pkh" => {
-                    wallet_guard.get_new_address_of_type(AddressType::P2PKH)
-                }
+                "legacy" | "p2pkh" => wallet_guard.get_new_address_of_type(AddressType::P2PKH),
                 "p2sh-segwit" | "p2sh-p2wpkh" => {
                     wallet_guard.get_new_address_of_type(AddressType::P2shP2wpkh)
                 }
-                "bech32" | "p2wpkh" => {
-                    wallet_guard.get_new_address_of_type(AddressType::P2WPKH)
-                }
+                "bech32" | "p2wpkh" => wallet_guard.get_new_address_of_type(AddressType::P2WPKH),
                 "bech32m" | "p2tr" | "taproot" => {
                     wallet_guard.get_new_address_of_type(AddressType::P2TR)
                 }
                 other => {
-                    // RPC_INVALID_PARAMETER = -8 (Core rpc/protocol.h).
+                    // Core addresses.cpp ParseOutputType → RPC_INVALID_ADDRESS_OR_KEY (-5).
                     return Err(Self::rpc_error(
-                        -8,
+                        wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
                         format!("Unknown address type '{}'", other),
                     ));
                 }
@@ -2134,6 +2470,15 @@ impl WalletRpcServer for WalletRpcImpl {
         // P0-SECURITY gate (W118 BUG-1): signing requires an unlocked wallet.
         Self::require_unlocked(&state, &name)?;
 
+        // Core AmountFromValue: negative / out of MoneyRange is RPC_TYPE_ERROR
+        // (-3) "Amount out of range" (`rpc/util.cpp:105-106`), not a wallet
+        // error. Check BEFORE converting to sats (a negative f64 would wrap).
+        if amount < 0.0 || amount > 21_000_000.0 {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_TYPE_ERROR,
+                "Amount out of range",
+            ));
+        }
         let amount_sats = Self::btc_to_sats(amount);
         // Default fee rate in sat/vByte. Padded above the 1 sat/vB relay floor
         // so the wallet's vsize estimate (which can undershoot the final
@@ -2181,9 +2526,8 @@ impl WalletRpcServer for WalletRpcImpl {
         })?;
         {
             let mut node_state = node.write().await;
-            crate::server::broadcast_signed_tx(&mut node_state, tx).map_err(|msg| {
-                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
-            })?;
+            crate::server::broadcast_signed_tx(&mut node_state, tx)
+                .map_err(|msg| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg))?;
         }
 
         // Return the Core-style display txid (reversed).
@@ -2191,22 +2535,204 @@ impl WalletRpcServer for WalletRpcImpl {
         Ok(txid_hex)
     }
 
+    async fn wallet_send(
+        &self,
+        outputs: Vec<serde_json::Value>,
+        _conf_target: Option<serde_json::Value>,
+        _estimate_mode: Option<serde_json::Value>,
+        fee_rate: Option<serde_json::Value>,
+        _options: Option<serde_json::Value>,
+    ) -> RpcResult<SendResult> {
+        if outputs.is_empty() {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_INVALID_PARAMETER,
+                "No recipient addresses specified",
+            ));
+        }
+
+        let mut parsed: Vec<(String, u64)> = Vec::new();
+        for out in &outputs {
+            let obj = out.as_object().ok_or_else(|| {
+                Self::rpc_error(
+                    wallet_error::RPC_INVALID_PARAMETER,
+                    "Invalid parameter, key-value pair not an object as expected",
+                )
+            })?;
+            if obj.is_empty() {
+                return Err(Self::rpc_error(
+                    wallet_error::RPC_INVALID_PARAMETER,
+                    "No recipient addresses specified",
+                ));
+            }
+            for (k, v) in obj {
+                if k == "data" {
+                    continue;
+                }
+                let sats = Self::amount_from_value(v)?;
+                parsed.push((k.clone(), sats));
+            }
+        }
+        if parsed.is_empty() {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_INVALID_PARAMETER,
+                "No recipient addresses specified",
+            ));
+        }
+
+        let fee_rate_sat_vb = match &fee_rate {
+            Some(v) if !v.is_null() => {
+                let n = v.as_f64().ok_or_else(|| {
+                    Self::rpc_error(wallet_error::RPC_TYPE_ERROR, "Invalid amount")
+                })?;
+                if n > 0.0 {
+                    n
+                } else {
+                    10.0
+                }
+            }
+            _ => 10.0,
+        };
+
+        let state = self.state.read().await;
+        let (name, wallet) = self.resolve_wallet(&state)?;
+        // Core ParseOutputs (rawtransaction_util.cpp:118-121) rejects a bad
+        // destination with -5 BEFORE coin selection, so an empty wallet still
+        // answers RPC_INVALID_ADDRESS_OR_KEY rather than insufficient-funds.
+        let network = state.wallet_manager.network();
+        for (addr, _) in &parsed {
+            if rustoshi_crypto::address::Address::from_string(addr, Some(network)).is_err() {
+                return Err(Self::rpc_error(
+                    wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                    format!("Invalid Bitcoin address: {addr}"),
+                ));
+            }
+        }
+        {
+            let wallet_guard = wallet.lock().map_err(|_| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+            })?;
+            if !wallet_guard.private_keys_enabled() {
+                return Err(Self::rpc_error(
+                    wallet_error::RPC_WALLET_ERROR,
+                    "Error: Private keys are disabled for this wallet",
+                ));
+            }
+        }
+        Self::require_unlocked(&state, &name)?;
+
+        let tx = {
+            let mut wallet_guard = wallet.lock().map_err(|_| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+            })?;
+            wallet_guard
+                .create_transaction(parsed, fee_rate_sat_vb)
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("nsufficient") {
+                        Self::rpc_error(wallet_error::RPC_WALLET_INSUFFICIENT_FUNDS, msg)
+                    } else if msg.contains("address") {
+                        Self::rpc_error(
+                            wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                            format!("Invalid Bitcoin address: {msg}"),
+                        )
+                    } else {
+                        Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
+                    }
+                })?
+        };
+        let txid = tx.txid();
+        let node = state.node.clone();
+        drop(state);
+        let node = node.ok_or_else(|| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "wallet not wired to node mempool (send cannot broadcast)",
+            )
+        })?;
+        {
+            let mut node_state = node.write().await;
+            crate::server::broadcast_signed_tx(&mut node_state, tx)
+                .map_err(|msg| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg))?;
+        }
+        let txid_hex = hex::encode(txid.0.iter().rev().copied().collect::<Vec<_>>());
+        Ok(SendResult {
+            complete: true,
+            txid: Some(txid_hex),
+            hex: None,
+        })
+    }
+
+    async fn backup_wallet(&self, destination: String) -> RpcResult<serde_json::Value> {
+        let state = self.state.read().await;
+        let (name, _) = self.resolve_wallet(&state)?;
+        state
+            .wallet_manager
+            .backup_wallet(&name, &destination)
+            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
+        Ok(serde_json::Value::Null)
+    }
+
+    async fn restore_wallet(
+        &self,
+        wallet_name: String,
+        backup_file: String,
+        _load_on_startup: Option<bool>,
+    ) -> RpcResult<LoadWalletResult> {
+        let mut state = self.state.write().await;
+        let result = state
+            .wallet_manager
+            .restore_wallet(&wallet_name, &backup_file)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("Backup file does not exist") {
+                    Self::rpc_error(wallet_error::RPC_INVALID_PARAMETER, msg)
+                } else if msg.contains("already exists")
+                    || msg.contains("Database file exists")
+                    || msg.contains("already loaded")
+                {
+                    Self::rpc_error(wallet_error::RPC_WALLET_ALREADY_EXISTS, msg)
+                } else {
+                    Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
+                }
+            })?;
+        Ok(LoadWalletResult {
+            name: result.name,
+            warnings: result.warnings,
+        })
+    }
+
     async fn list_transactions(
         &self,
         _label: Option<String>,
-        count: Option<usize>,
-        skip: Option<usize>,
+        count: Option<i64>,
+        skip: Option<i64>,
         _include_watchonly: Option<bool>,
     ) -> RpcResult<Vec<WalletTransaction>> {
         let state = self.state.read().await;
 
         let (wallet_name, wallet) = self.resolve_wallet(&state)?;
 
-        let wallet_guard = wallet.lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
-        let count = count.unwrap_or(10);
-        let skip = skip.unwrap_or(0);
+        // Core transactions.cpp:490-492: Negative count / Negative from → -8.
+        let n_count = count.unwrap_or(10);
+        let n_skip = skip.unwrap_or(0);
+        if n_count < 0 {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_INVALID_PARAMETER,
+                "Negative count",
+            ));
+        }
+        if n_skip < 0 {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_INVALID_PARAMETER,
+                "Negative from",
+            ));
+        }
+        let count = n_count as usize;
+        let skip = n_skip as usize;
 
         // Build one WalletTransaction per details[] line item across the
         // wallet's transaction history, mirroring Core's ListTransactions
@@ -2222,8 +2748,7 @@ impl WalletRpcServer for WalletRpcImpl {
         // history Vec is already in block-connect (oldest-first) order; we emit
         // line items in that order, then apply the from-the-end pagination.
         for entry in wallet_guard.history() {
-            let txid_hex =
-                hex::encode(entry.txid.0.iter().rev().copied().collect::<Vec<_>>());
+            let txid_hex = hex::encode(entry.txid.0.iter().rev().copied().collect::<Vec<_>>());
             let confirmations = wallet_guard.history_confirmations(entry) as i32;
             let generated = if entry.is_coinbase { Some(true) } else { None };
             let blockhash = if entry.block_hash == rustoshi_primitives::Hash256::ZERO {
@@ -2233,22 +2758,25 @@ impl WalletRpcServer for WalletRpcImpl {
                     entry.block_hash.0.iter().rev().copied().collect::<Vec<_>>(),
                 ))
             };
-            let blocktime = if entry.block_time == 0 { None } else { Some(entry.block_time) };
+            let blocktime = if entry.block_time == 0 {
+                None
+            } else {
+                Some(entry.block_time)
+            };
 
             for d in &entry.details {
                 // For a coinbase receive, refine generate -> immature when the
                 // coinbase has not yet reached maturity at the current tip.
-                let category = if entry.is_coinbase
-                    && (d.category == "generate" || d.category == "receive")
-                {
-                    if wallet_guard.history_coinbase_is_mature(entry) {
-                        "generate".to_string()
+                let category =
+                    if entry.is_coinbase && (d.category == "generate" || d.category == "receive") {
+                        if wallet_guard.history_coinbase_is_mature(entry) {
+                            "generate".to_string()
+                        } else {
+                            "immature".to_string()
+                        }
                     } else {
-                        "immature".to_string()
-                    }
-                } else {
-                    d.category.clone()
-                };
+                        d.category.clone()
+                    };
 
                 transactions.push(WalletTransaction {
                     address: d.address.clone(),
@@ -2279,8 +2807,7 @@ impl WalletRpcServer for WalletRpcImpl {
         let total = transactions.len();
         let end = total.saturating_sub(skip);
         let start = end.saturating_sub(count);
-        let transactions: Vec<WalletTransaction> =
-            transactions[start..end].to_vec();
+        let transactions: Vec<WalletTransaction> = transactions[start..end].to_vec();
 
         tracing::debug!(
             "listtransactions for wallet {}: {} results",
@@ -2300,9 +2827,9 @@ impl WalletRpcServer for WalletRpcImpl {
 
         let (_wallet_name, wallet) = self.resolve_wallet(&state)?;
 
-        let wallet_guard = wallet
-            .lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         let txid_internal = Self::parse_txid_hex(&txid)?;
         let entry = wallet_guard.history_entry(&txid_internal).ok_or_else(|| {
@@ -2331,23 +2858,26 @@ impl WalletRpcServer for WalletRpcImpl {
                 entry.block_hash.0.iter().rev().copied().collect::<Vec<_>>(),
             ))
         };
-        let blocktime = if entry.block_time == 0 { None } else { Some(entry.block_time) };
+        let blocktime = if entry.block_time == 0 {
+            None
+        } else {
+            Some(entry.block_time)
+        };
 
         let details: Vec<TransactionDetail> = entry
             .details
             .iter()
             .map(|d| {
-                let category = if entry.is_coinbase
-                    && (d.category == "generate" || d.category == "receive")
-                {
-                    if wallet_guard.history_coinbase_is_mature(entry) {
-                        "generate".to_string()
+                let category =
+                    if entry.is_coinbase && (d.category == "generate" || d.category == "receive") {
+                        if wallet_guard.history_coinbase_is_mature(entry) {
+                            "generate".to_string()
+                        } else {
+                            "immature".to_string()
+                        }
                     } else {
-                        "immature".to_string()
-                    }
-                } else {
-                    d.category.clone()
-                };
+                        d.category.clone()
+                    };
                 TransactionDetail {
                     address: d.address.clone(),
                     category,
@@ -2358,8 +2888,7 @@ impl WalletRpcServer for WalletRpcImpl {
             })
             .collect();
 
-        let txid_hex =
-            hex::encode(entry.txid.0.iter().rev().copied().collect::<Vec<_>>());
+        let txid_hex = hex::encode(entry.txid.0.iter().rev().copied().collect::<Vec<_>>());
 
         Ok(GetTransactionResult {
             amount: Self::sats_to_btc_signed(amount_sats),
@@ -2379,21 +2908,26 @@ impl WalletRpcServer for WalletRpcImpl {
         })
     }
 
-    async fn get_wallet_info(&self) -> RpcResult<WalletInfo> {
+    async fn get_wallet_info(&self, extra: Option<serde_json::Value>) -> RpcResult<WalletInfo> {
+        Self::reject_extra(extra, GETWALLETINFO_HELP)?;
         let state = self.state.read().await;
 
         let (wallet_name, wallet) = self.resolve_wallet(&state)?;
 
-        let wallet_guard = wallet.lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         let balance = Self::sats_to_btc(wallet_guard.confirmed_balance());
         let unconfirmed_balance = Self::sats_to_btc(wallet_guard.unconfirmed_balance());
         let immature_balance = Self::sats_to_btc(wallet_guard.immature_balance());
-        let tx_count = wallet_guard.list_unspent().len(); // Approximation
+        // Core getwalletinfo.txcount is mapWallet.size() (confirmed + mempool
+        // wallet txs), not the live UTXO count.
+        let tx_count = wallet_guard.history().len();
         // Core: private_keys_enabled = !IsWalletFlagSet(
         // WALLET_FLAG_DISABLE_PRIVATE_KEYS) (wallet/rpc/wallet.cpp:50,98).
         let private_keys_enabled = wallet_guard.private_keys_enabled();
+        let lastprocessedblock = Self::last_processed_block(&state);
 
         Ok(WalletInfo {
             walletname: wallet_name,
@@ -2417,6 +2951,9 @@ impl WalletRpcServer for WalletRpcImpl {
             scanning: serde_json::Value::Bool(false),
             descriptors: true,
             external_signer: false,
+            blank: false,
+            flags: vec!["descriptor_wallet".to_string()],
+            lastprocessedblock,
         })
     }
 
@@ -2426,7 +2963,7 @@ impl WalletRpcServer for WalletRpcImpl {
         prevtxs: Option<Vec<PrevTx>>,
         sighashtype: Option<String>,
     ) -> RpcResult<SignRawTransactionResult> {
-        use rustoshi_primitives::{Transaction, Decodable, Encodable};
+        use rustoshi_primitives::{Decodable, Encodable, Transaction};
         use rustoshi_wallet::WalletUtxo;
 
         let state = self.state.read().await;
@@ -2436,8 +2973,9 @@ impl WalletRpcServer for WalletRpcImpl {
         // P0-SECURITY gate (W118 BUG-1): signing requires an unlocked wallet.
         Self::require_unlocked(&state, &name)?;
 
-        let wallet_guard = wallet.lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         // Watch-only wallets cannot sign (Core: private keys disabled -> -4).
         if !wallet_guard.private_keys_enabled() {
@@ -2448,11 +2986,19 @@ impl WalletRpcServer for WalletRpcImpl {
         }
 
         // Decode the transaction
-        let tx_bytes = hex::decode(&hexstring)
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, format!("Invalid hex: {}", e)))?;
+        let tx_bytes = hex::decode(&hexstring).map_err(|e| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                format!("Invalid hex: {}", e),
+            )
+        })?;
 
-        let mut tx = Transaction::deserialize(&tx_bytes)
-            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, format!("Failed to decode transaction: {}", e)))?;
+        let mut tx = Transaction::deserialize(&tx_bytes).map_err(|e| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                format!("Failed to decode transaction: {}", e),
+            )
+        })?;
 
         // Sighash type — currently only SIGHASH_ALL (default) is wired into the
         // wallet's sign_input dispatcher. Refuse anything else explicitly so
@@ -2542,10 +3088,7 @@ impl WalletRpcServer for WalletRpcImpl {
                 // wallet for this output" message.
                 let provided_in_prevtxs = prevtxs
                     .as_ref()
-                    .map(|list| {
-                        list.iter()
-                            .any(|p| p.txid == txid_hex && p.vout == vout)
-                    })
+                    .map(|list| list.iter().any(|p| p.txid == txid_hex && p.vout == vout))
                     .unwrap_or(false);
                 let msg = if provided_in_prevtxs {
                     "Unable to sign input, key not in wallet"
@@ -2602,7 +3145,11 @@ impl WalletRpcServer for WalletRpcImpl {
         Ok(SignRawTransactionResult {
             hex: signed_hex,
             complete,
-            errors: if errors.is_empty() { None } else { Some(errors) },
+            errors: if errors.is_empty() {
+                None
+            } else {
+                Some(errors)
+            },
         })
     }
 
@@ -2642,7 +3189,10 @@ impl WalletRpcServer for WalletRpcImpl {
 
         // Decode the raw transaction.
         let tx_bytes = hex::decode(&hexstring).map_err(|e| {
-            Self::rpc_error(wallet_error::RPC_DESERIALIZATION_ERROR, format!("Invalid hex: {}", e))
+            Self::rpc_error(
+                wallet_error::RPC_DESERIALIZATION_ERROR,
+                format!("Invalid hex: {}", e),
+            )
         })?;
         let mut tx = Transaction::deserialize(&tx_bytes).map_err(|e| {
             Self::rpc_error(
@@ -2699,7 +3249,10 @@ impl WalletRpcServer for WalletRpcImpl {
                     None => 0,
                 };
                 prevout_info.insert(
-                    OutPoint { txid: Hash256(arr), vout: p.vout },
+                    OutPoint {
+                        txid: Hash256(arr),
+                        vout: p.vout,
+                    },
                     (spk, value),
                 );
             }
@@ -2710,7 +3263,10 @@ impl WalletRpcServer for WalletRpcImpl {
         // zeroed placeholder; an input with no prevout info is reported as an
         // error rather than signed.
         let placeholder = WalletUtxo {
-            outpoint: OutPoint { txid: Hash256([0u8; 32]), vout: 0 },
+            outpoint: OutPoint {
+                txid: Hash256([0u8; 32]),
+                vout: 0,
+            },
             value: 0,
             script_pubkey: vec![],
             derivation_path: vec![],
@@ -2744,10 +3300,21 @@ impl WalletRpcServer for WalletRpcImpl {
             .iter()
             .map(|inp| {
                 let txid_hex = hex::encode(
-                    inp.previous_output.txid.0.iter().rev().copied().collect::<Vec<_>>(),
+                    inp.previous_output
+                        .txid
+                        .0
+                        .iter()
+                        .rev()
+                        .copied()
+                        .collect::<Vec<_>>(),
                 );
                 let has_prevout = prevout_info.contains_key(&inp.previous_output);
-                (txid_hex, inp.previous_output.vout, inp.sequence, has_prevout)
+                (
+                    txid_hex,
+                    inp.previous_output.vout,
+                    inp.sequence,
+                    has_prevout,
+                )
             })
             .collect();
 
@@ -2776,8 +3343,7 @@ impl WalletRpcServer for WalletRpcImpl {
                     vout,
                     script_sig: hex::encode(&tx.inputs[i].script_sig),
                     sequence,
-                    error: "Unable to sign input, missing private key for scriptPubKey"
-                        .to_string(),
+                    error: "Unable to sign input, missing private key for scriptPubKey".to_string(),
                 });
                 continue;
             }
@@ -2803,7 +3369,11 @@ impl WalletRpcServer for WalletRpcImpl {
         Ok(SignRawTransactionResult {
             hex: signed_hex,
             complete,
-            errors: if errors.is_empty() { None } else { Some(errors) },
+            errors: if errors.is_empty() {
+                None
+            } else {
+                Some(errors)
+            },
         })
     }
 
@@ -2840,7 +3410,11 @@ impl WalletRpcServer for WalletRpcImpl {
                     Ok((canonical, label, range_end, warnings)) => {
                         results.push(crate::types::ImportDescriptorResult {
                             success: true,
-                            warnings: if warnings.is_empty() { None } else { Some(warnings) },
+                            warnings: if warnings.is_empty() {
+                                None
+                            } else {
+                                Some(warnings)
+                            },
                             error: None,
                         });
                         any_success = true;
@@ -3036,7 +3610,12 @@ impl WalletRpcServer for WalletRpcImpl {
                             .unwrap_or(range_end > 0);
                         entries.insert(
                             descriptor.clone(),
-                            DescEntry { descriptor, timestamp, range_end, is_range },
+                            DescEntry {
+                                descriptor,
+                                timestamp,
+                                range_end,
+                                is_range,
+                            },
                         );
                     }
                 }
@@ -3057,7 +3636,12 @@ impl WalletRpcServer for WalletRpcImpl {
                     .unwrap_or(false);
                 entries.insert(
                     descriptor.clone(),
-                    DescEntry { descriptor, timestamp: 0, range_end: 0, is_range },
+                    DescEntry {
+                        descriptor,
+                        timestamp: 0,
+                        range_end: 0,
+                        is_range,
+                    },
                 );
             }
         }
@@ -3069,7 +3653,11 @@ impl WalletRpcServer for WalletRpcImpl {
             // Guarantee the trailing #checksum is present and canonical: strip
             // any stored checksum and recompute via the shared BIP-380 routine
             // (descriptor.rs:92 descriptor_checksum) — never fabricated.
-            let payload = entry.descriptor.split('#').next().unwrap_or(&entry.descriptor);
+            let payload = entry
+                .descriptor
+                .split('#')
+                .next()
+                .unwrap_or(&entry.descriptor);
             let desc = match descriptor_checksum(payload) {
                 Some(cs) => format!("{}#{}", payload, cs),
                 // Unparseable payload (shouldn't happen for stored descriptors):
@@ -3144,25 +3732,19 @@ impl WalletRpcServer for WalletRpcImpl {
         obj.insert("scriptPubKey".into(), json!(hex::encode(&spk)));
         obj.insert("ismine".into(), json!(ismine));
         obj.insert("solvable".into(), json!(solvable));
-        // desc — ONLY when solvable (addresses.cpp:454-463). Best-effort:
-        // emitted for single-key descriptors whose pubkey is recorded.
+        // desc — ONLY when solvable (addresses.cpp:454-463). HD-owned
+        // addresses get an inferred wpkh()/pkh()/tr() descriptor from the
+        // derivation path; imported descriptors reuse the stored string.
         if solvable {
-            if let Some(pk) = watched.as_ref().and_then(|w| w.pubkey.as_ref()) {
-                let body = match &addr {
-                    Address::P2WPKH { .. } => Some(format!("wpkh({})", hex::encode(pk))),
-                    Address::P2PKH { .. } => Some(format!("pkh({})", hex::encode(pk))),
-                    _ => None,
-                };
-                if let Some(desc) =
-                    body.and_then(|b| rustoshi_wallet::descriptor::add_checksum(&b))
-                {
-                    obj.insert("desc".into(), json!(desc));
-                }
-            }
-        }
-        if let Some(w) = &watched {
-            // The wallet descriptor this address belongs to
-            // (addresses.cpp:465-476).
+            let (desc, parent) = Self::infer_output_descs(
+                &wallet_guard,
+                Some(&address),
+                hd_path.as_deref().unwrap_or(&[]),
+                &spk,
+            );
+            obj.insert("desc".into(), json!(desc));
+            obj.insert("parent_desc".into(), json!(parent));
+        } else if let Some(w) = &watched {
             obj.insert("parent_desc".into(), json!(w.descriptor));
         }
         // DEPRECATED, hardcoded false (addresses.cpp:383,478).
@@ -3226,7 +3808,10 @@ impl WalletRpcServer for WalletRpcImpl {
         if seed_bytes.len() != 64 {
             return Err(Self::rpc_error(
                 wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
-                format!("seed must be 64 bytes (128 hex chars), got {}", seed_bytes.len()),
+                format!(
+                    "seed must be 64 bytes (128 hex chars), got {}",
+                    seed_bytes.len()
+                ),
             ));
         }
 
@@ -3267,9 +3852,9 @@ impl WalletRpcServer for WalletRpcImpl {
         let state = self.state.read().await;
         let (_, wallet) = self.resolve_wallet(&state)?;
 
-        let mut wallet_guard = wallet
-            .lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let mut wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         // No transactions list + unlock=true => clear all locks (Core).
         let Some(txs) = transactions else {
@@ -3340,9 +3925,9 @@ impl WalletRpcServer for WalletRpcImpl {
         let state = self.state.read().await;
         let (_, wallet) = self.resolve_wallet(&state)?;
 
-        let wallet_guard = wallet
-            .lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         let mut out: Vec<LockedOutpoint> = wallet_guard
             .locked_coins()
@@ -3385,14 +3970,18 @@ impl WalletRpcServer for WalletRpcImpl {
         options: Option<FundedPsbtOptions>,
         _bip32derivs: Option<bool>,
     ) -> RpcResult<WalletCreateFundedPsbtResult> {
-        use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
         use rustoshi_crypto::address::{Address, Network};
+        use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
         use rustoshi_wallet::psbt::Psbt;
 
         if outputs.is_empty() {
+            // Core ConstructTransaction → NormalizeOutputs/ParseOutputs then
+            // FundTransaction; empty outputs is RPC_INVALID_PARAMETER (-8)
+            // "Invalid parameter, output argument cannot be an empty array"
+            // (spend.cpp:1076, same family as send's empty-outputs probe).
             return Err(Self::rpc_error(
-                wallet_error::RPC_WALLET_ERROR,
-                "outputs must contain at least one entry",
+                wallet_error::RPC_INVALID_PARAMETER,
+                "Invalid parameter, output argument cannot be an empty array",
             ));
         }
 
@@ -3452,9 +4041,9 @@ impl WalletRpcServer for WalletRpcImpl {
         // wallet only adds change if needed; empty `inputs` → wallet-driven
         // coin selection via `Wallet::create_transaction`.
         let (unsigned_tx, fee_sats, changepos): (Transaction, u64, i32) = if inputs.is_empty() {
-            let mut wallet_guard = wallet
-                .lock()
-                .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+            let mut wallet_guard = wallet.lock().map_err(|_| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+            })?;
             // create_transaction signs in-place; rebuild an unsigned mirror.
             let signed = wallet_guard
                 .create_transaction(parsed_outputs.clone(), fee_rate_sat_vb)
@@ -3499,11 +4088,7 @@ impl WalletRpcServer for WalletRpcImpl {
             let in_value: u64 = tx
                 .inputs
                 .iter()
-                .filter_map(|i| {
-                    wallet_guard
-                        .get_utxo(&i.previous_output)
-                        .map(|u| u.value)
-                })
+                .filter_map(|i| wallet_guard.get_utxo(&i.previous_output).map(|u| u.value))
                 .sum();
             let out_value: u64 = tx.outputs.iter().map(|o| o.value).sum();
             let fee = in_value.saturating_sub(out_value);
@@ -3542,20 +4127,19 @@ impl WalletRpcServer for WalletRpcImpl {
                 ));
             }
             // Note: change_pos was computed pre-swap so re-derive if swapped.
-            let final_change_pos = if let (Some(want), true) =
-                (opts.change_position, change_pos >= 0)
-            {
-                want as i32
-            } else {
-                change_pos
-            };
+            let final_change_pos =
+                if let (Some(want), true) = (opts.change_position, change_pos >= 0) {
+                    want as i32
+                } else {
+                    change_pos
+                };
             (tx, fee, final_change_pos)
         } else {
             // Explicit-inputs path: build inputs, fetch values from wallet
             // (or fail loudly), build outputs, compute fee from rate.
-            let wallet_guard = wallet
-                .lock()
-                .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+            let wallet_guard = wallet.lock().map_err(|_| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+            })?;
 
             let net_param = match net {
                 Network::Mainnet => Some(Network::Mainnet),
@@ -3641,17 +4225,14 @@ impl WalletRpcServer for WalletRpcImpl {
                         // Fresh change address from the wallet.
                         drop(wallet_guard);
                         let mut wallet_guard = wallet.lock().map_err(|_| {
-                            Self::rpc_error(
-                                wallet_error::RPC_WALLET_ERROR,
-                                "Failed to lock wallet",
-                            )
+                            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
                         })?;
-                        wallet_guard
-                            .get_change_address()
-                            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?
+                        wallet_guard.get_change_address().map_err(|e| {
+                            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string())
+                        })?
                     };
-                    let change_addr = Address::from_string(&change_addr_str, net_param)
-                        .map_err(|e| {
+                    let change_addr =
+                        Address::from_string(&change_addr_str, net_param).map_err(|e| {
                             Self::rpc_error(
                                 wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
                                 format!("Invalid change address {}: {}", change_addr_str, e),
@@ -3764,9 +4345,9 @@ impl WalletRpcServer for WalletRpcImpl {
             Self::require_unlocked(&state, &name)?;
         }
 
-        let wallet_guard = wallet
-            .lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         let num_inputs = psbt.unsigned_tx.inputs.len();
 
@@ -3830,8 +4411,7 @@ impl WalletRpcServer for WalletRpcImpl {
             // BIP-32 derivation record (genuine pubkey + master-fingerprint
             // origin, derived via the same HD engine the signer uses).
             if bip32derivs {
-                if let Ok((pubkey, origin)) =
-                    wallet_guard.pubkey_and_origin(&utxo.derivation_path)
+                if let Ok((pubkey, origin)) = wallet_guard.pubkey_and_origin(&utxo.derivation_path)
                 {
                     let _ = psbt.add_input_derivation(i, pubkey, origin);
                 }
@@ -3971,8 +4551,8 @@ impl WalletRpcServer for WalletRpcImpl {
         options: Option<FundRawTransactionOptions>,
         _iswitness: Option<bool>,
     ) -> RpcResult<FundRawTransactionResult> {
-        use rustoshi_primitives::{Encodable, TxOut};
         use rustoshi_crypto::address::{Address, Network};
+        use rustoshi_primitives::{Encodable, TxOut};
 
         let opts = options.unwrap_or_default();
 
@@ -4010,9 +4590,8 @@ impl WalletRpcServer for WalletRpcImpl {
                 format!("TX decode failed: invalid hex: {}", e),
             )
         })?;
-        let decoded = Self::decode_raw_tx_heuristic(&tx_bytes, _iswitness).map_err(|e| {
-            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e)
-        })?;
+        let decoded = Self::decode_raw_tx_heuristic(&tx_bytes, _iswitness)
+            .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e))?;
 
         // subtractFeeFromOutputs / changeAddress are not yet wired through the
         // shared selector (it owns change-address generation and fee
@@ -4065,9 +4644,9 @@ impl WalletRpcServer for WalletRpcImpl {
         // --- Reuse the shared coin-selection engine. This is the SAME
         // `Wallet::create_transaction` that walletcreatefundedpsbt's
         // no-inputs path calls (crates/rpc/src/wallet.rs ~line 2768). ---
-        let mut wallet_guard = wallet
-            .lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let mut wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         let selected = wallet_guard
             .create_transaction(recipients.clone(), fee_rate_sat_vb)
@@ -4129,12 +4708,13 @@ impl WalletRpcServer for WalletRpcImpl {
             // already sized it). This is a faithful override: the amount is
             // still the genuine computed change.
             if let Some(change_addr_str) = &opts.change_address {
-                let change_addr = Address::from_string(change_addr_str, Some(net_param)).map_err(|e| {
-                    Self::rpc_error(
-                        wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
-                        format!("Change address must be a valid bitcoin address: {}", e),
-                    )
-                })?;
+                let change_addr =
+                    Address::from_string(change_addr_str, Some(net_param)).map_err(|e| {
+                        Self::rpc_error(
+                            wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                            format!("Change address must be a valid bitcoin address: {}", e),
+                        )
+                    })?;
                 change.script_pubkey = change_addr.to_script_pubkey();
             }
             let insert_at = match opts.change_position {
@@ -4178,11 +4758,7 @@ impl WalletRpcServer for WalletRpcImpl {
         })
     }
 
-    async fn wallet_passphrase(
-        &self,
-        passphrase: String,
-        timeout: u64,
-    ) -> RpcResult<()> {
+    async fn wallet_passphrase(&self, passphrase: String, timeout: u64) -> RpcResult<()> {
         // Core caps timeout at 100,000,000 seconds (~3.17 years); mirror that.
         const MAX_TIMEOUT_SECS: u64 = 100_000_000;
         if timeout == 0 {
@@ -4195,9 +4771,9 @@ impl WalletRpcServer for WalletRpcImpl {
 
         // Need write access — unlock swaps the in-memory wallet object.
         let mut state = self.state.write().await;
-        let name = self.effective_wallet().or_else(|| {
-            state.wallet_manager.get_default_wallet().map(|(n, _)| n)
-        });
+        let name = self
+            .effective_wallet()
+            .or_else(|| state.wallet_manager.get_default_wallet().map(|(n, _)| n));
         let name = name.ok_or_else(|| {
             Self::rpc_error(
                 wallet_error::RPC_WALLET_NOT_SPECIFIED,
@@ -4230,9 +4806,9 @@ impl WalletRpcServer for WalletRpcImpl {
 
     async fn wallet_lock(&self) -> RpcResult<()> {
         let mut state = self.state.write().await;
-        let name = self.effective_wallet().or_else(|| {
-            state.wallet_manager.get_default_wallet().map(|(n, _)| n)
-        });
+        let name = self
+            .effective_wallet()
+            .or_else(|| state.wallet_manager.get_default_wallet().map(|(n, _)| n));
         let name = name.ok_or_else(|| {
             Self::rpc_error(
                 wallet_error::RPC_WALLET_NOT_SPECIFIED,
@@ -4260,9 +4836,9 @@ impl WalletRpcServer for WalletRpcImpl {
             ));
         }
         let mut state = self.state.write().await;
-        let name = self.effective_wallet().or_else(|| {
-            state.wallet_manager.get_default_wallet().map(|(n, _)| n)
-        });
+        let name = self
+            .effective_wallet()
+            .or_else(|| state.wallet_manager.get_default_wallet().map(|(n, _)| n));
         let name = name.ok_or_else(|| {
             Self::rpc_error(
                 wallet_error::RPC_WALLET_NOT_SPECIFIED,
@@ -4289,10 +4865,9 @@ impl WalletRpcServer for WalletRpcImpl {
             .map_err(|e| {
                 use rustoshi_wallet::WalletError;
                 match e {
-                    WalletError::EncryptionState(msg) => Self::rpc_error(
-                        wallet_error::RPC_WALLET_WRONG_ENC_STATE,
-                        msg,
-                    ),
+                    WalletError::EncryptionState(msg) => {
+                        Self::rpc_error(wallet_error::RPC_WALLET_WRONG_ENC_STATE, msg)
+                    }
                     other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
                 }
             })?;
@@ -4306,9 +4881,9 @@ impl WalletRpcServer for WalletRpcImpl {
         newpassphrase: String,
     ) -> RpcResult<()> {
         let mut state = self.state.write().await;
-        let name = self.effective_wallet().or_else(|| {
-            state.wallet_manager.get_default_wallet().map(|(n, _)| n)
-        });
+        let name = self
+            .effective_wallet()
+            .or_else(|| state.wallet_manager.get_default_wallet().map(|(n, _)| n));
         let name = name.ok_or_else(|| {
             Self::rpc_error(
                 wallet_error::RPC_WALLET_NOT_SPECIFIED,
@@ -4326,10 +4901,9 @@ impl WalletRpcServer for WalletRpcImpl {
                         wallet_error::RPC_WALLET_PASSPHRASE_INCORRECT,
                         "Error: The wallet passphrase entered was incorrect.",
                     ),
-                    WalletError::EncryptionState(msg) => Self::rpc_error(
-                        wallet_error::RPC_WALLET_WRONG_ENC_STATE,
-                        msg,
-                    ),
+                    WalletError::EncryptionState(msg) => {
+                        Self::rpc_error(wallet_error::RPC_WALLET_WRONG_ENC_STATE, msg)
+                    }
                     other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
                 }
             })
@@ -4366,9 +4940,9 @@ impl WalletRpcServer for WalletRpcImpl {
 
         Self::require_unlocked(&state, &name)?;
 
-        let mut wallet_guard = wallet
-            .lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let mut wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         // Core spend.cpp:1036 (bumpfee signs; psbtbumpfee remains available).
         if !wallet_guard.private_keys_enabled() {
@@ -4432,9 +5006,9 @@ impl WalletRpcServer for WalletRpcImpl {
         // refuses both bumpfee variants on a locked wallet).
         Self::require_unlocked(&state, &name)?;
 
-        let mut wallet_guard = wallet
-            .lock()
-            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet"))?;
+        let mut wallet_guard = wallet.lock().map_err(|_| {
+            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
+        })?;
 
         let orig_fee_sats = wallet_guard
             .get_sent_tx(&hash)
@@ -4489,28 +5063,25 @@ impl WalletRpcServer for WalletRpcImpl {
             ));
         }
         let state = self.state.read().await;
-        let endpoint = state
-            .payjoin_endpoint
-            .clone()
-            .ok_or_else(|| {
-                Self::rpc_error(
-                    wallet_error::RPC_WALLET_ERROR,
-                    "no PayJoin endpoint configured on this node (operator must set \
+        let endpoint = state.payjoin_endpoint.clone().ok_or_else(|| {
+            Self::rpc_error(
+                wallet_error::RPC_WALLET_ERROR,
+                "no PayJoin endpoint configured on this node (operator must set \
                      WalletRpcState::payjoin_endpoint at startup)",
-                )
-            })?;
+            )
+        })?;
 
         let (name, wallet) = self.resolve_wallet(&state)?;
         Self::require_unlocked(&state, &name)?;
-        let mut w = wallet.lock().map_err(|_| {
-            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "wallet lock poisoned")
-        })?;
+        let mut w = wallet
+            .lock()
+            .map_err(|_| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "wallet lock poisoned"))?;
 
         let addr = match address {
             Some(a) => a,
-            None => w.get_new_address().map_err(|e| {
-                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string())
-            })?,
+            None => w
+                .get_new_address()
+                .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?,
         };
 
         // BIP-21 URI: bitcoin:<addr>?amount=<btc>&pj=<endpoint>
@@ -4563,9 +5134,7 @@ impl WalletRpcServer for WalletRpcImpl {
         // pjos=0 forbids substitution, pjos=1 or absent allows it.
         let pjos_disabled = parsed.pjos == Some(false);
 
-        let disable_sub = opts
-            .disable_output_substitution
-            .unwrap_or(pjos_disabled);
+        let disable_sub = opts.disable_output_substitution.unwrap_or(pjos_disabled);
 
         // 2. Build the Original PSBT by running create_transaction
         //    (which selects coins + signs sender inputs). We then drop
@@ -4592,28 +5161,21 @@ impl WalletRpcServer for WalletRpcImpl {
             // Build a PSBT from the signed transaction so the receiver
             // can see input prevouts + amounts. We use the recorded
             // sent_tx to populate witness_utxo for every input.
-            let sent_tx = w
-                .get_sent_tx(&tx.txid())
-                .cloned()
-                .ok_or_else(|| {
-                    Self::rpc_error(
-                        wallet_error::RPC_WALLET_ERROR,
-                        "internal: create_transaction did not record sent_tx",
-                    )
-                })?;
+            let sent_tx = w.get_sent_tx(&tx.txid()).cloned().ok_or_else(|| {
+                Self::rpc_error(
+                    wallet_error::RPC_WALLET_ERROR,
+                    "internal: create_transaction did not record sent_tx",
+                )
+            })?;
             // Build the unsigned-tx half (strip witness for PSBT shape).
             let mut bare_tx = tx.clone();
             for ti in bare_tx.inputs.iter_mut() {
                 ti.script_sig = vec![];
                 ti.witness = vec![];
             }
-            let mut psbt =
-                Psbt::from_unsigned_tx(bare_tx).map_err(|e| {
-                    Self::rpc_error(
-                        wallet_error::RPC_WALLET_ERROR,
-                        format!("PSBT build: {e}"),
-                    )
-                })?;
+            let mut psbt = Psbt::from_unsigned_tx(bare_tx).map_err(|e| {
+                Self::rpc_error(wallet_error::RPC_WALLET_ERROR, format!("PSBT build: {e}"))
+            })?;
             for (i, utxo) in sent_tx.spent_utxos.iter().enumerate() {
                 psbt.inputs[i].witness_utxo = Some(rustoshi_primitives::TxOut {
                     value: utxo.value,
@@ -4718,14 +5280,8 @@ impl WalletRpcServer for WalletRpcImpl {
         //    recomputed. We compute the proposed txid AFTER signing —
         //    once the witness is fully populated the wtxid stabilises.
         let proposed_txid = proposed.unsigned_tx.txid();
-        let proposed_txid_hex = hex::encode(
-            proposed_txid
-                .0
-                .iter()
-                .rev()
-                .copied()
-                .collect::<Vec<_>>(),
-        );
+        let proposed_txid_hex =
+            hex::encode(proposed_txid.0.iter().rev().copied().collect::<Vec<_>>());
         // Re-signing the sender's inputs to match the new output set is
         // the sender's last responsibility per BIP-78. We don't actually
         // mutate the on-wire tx here because the wallet-side signer for
@@ -4752,7 +5308,6 @@ impl WalletRpcServer for WalletRpcImpl {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4773,80 +5328,90 @@ mod tests {
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
 
-        let result = rpc.create_wallet(
-            "test_wallet".to_string(),
-            None, None, None, None, None, None,
-        ).await;
+        let result = rpc
+            .create_wallet(
+                Some("test_wallet".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
 
         assert!(result.is_ok());
         let wallet_result = result.unwrap();
         assert_eq!(wallet_result.name, "test_wallet");
     }
 
-    /// createwallet on a wallet whose DB exists on disk (but is not loaded)
-    /// returns the GENUINE Core code `RPC_WALLET_ALREADY_EXISTS = -36`
-    /// (protocol.h:83), NOT the generic `RPC_WALLET_ERROR = -4`. Core maps
-    /// DatabaseStatus::FAILED_ALREADY_EXISTS to this code (wallet/rpc/util.cpp:142).
-    /// Proves the call-site wiring, not just the constant. We unload first so the
-    /// manager's "already loaded" branch is bypassed and the on-disk
-    /// "already exists" branch fires (Core's FAILED_ALREADY_EXISTS).
+    /// createwallet on a name that already exists (loaded or on disk) maps to
+    /// RPC_WALLET_ERROR (-4). Core's CreateWallet overwrites
+    /// FAILED_ALREADY_EXISTS with FAILED_VERIFY ("Wallet file verification
+    /// failed."), and HandleWalletError's default arm is -4. -36 is
+    /// restorewallet-only; -35 is loadwallet-only. Validated by the R5
+    /// regtest lane (`createwallet: already-exists`).
     #[tokio::test]
     async fn test_create_wallet_already_exists_code() {
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
 
-        // Create, then unload so the on-disk wallet dir survives but the name is
-        // no longer in memory (so the "already loaded" path is NOT taken).
-        rpc.create_wallet("dupe".to_string(), None, None, None, None, None, None)
+        rpc.create_wallet(Some("dupe".to_string()), None, None, None, None, None, None)
             .await
             .expect("first createwallet must succeed");
         rpc.unload_wallet(Some("dupe".to_string()), None)
             .await
             .expect("unload must succeed");
 
-        // Re-create with the same name: the on-disk dir exists -> Core's
-        // FAILED_ALREADY_EXISTS -> RPC_WALLET_ALREADY_EXISTS (-36).
         let err = rpc
-            .create_wallet("dupe".to_string(), None, None, None, None, None, None)
+            .create_wallet(Some("dupe".to_string()), None, None, None, None, None, None)
             .await
             .expect_err("re-create of existing on-disk wallet must error");
         assert_eq!(
             err.code(),
-            wallet_error::RPC_WALLET_ALREADY_EXISTS,
-            "re-create of existing wallet must emit RPC_WALLET_ALREADY_EXISTS"
-        );
-        assert_eq!(err.code(), -36, "and that code is the genuine Core value -36");
-        assert_ne!(
-            err.code(),
             wallet_error::RPC_WALLET_ERROR,
-            "must NOT collapse to the generic RPC_WALLET_ERROR (-4)"
+            "createwallet already-exists is RPC_WALLET_ERROR (-4), matching Core CreateWallet FAILED_VERIFY"
         );
+        assert_eq!(err.code(), -4);
     }
 
-    /// createwallet on an ALREADY-LOADED wallet maps to Core's
-    /// FAILED_ALREADY_LOADED -> RPC_WALLET_ALREADY_LOADED (-35), distinct from
-    /// both the generic -4 and the on-disk-exists -36. Guards the call-site
-    /// branch order (loaded check before exists check, matching the manager).
+    /// createwallet on an ALREADY-LOADED wallet is also -4 (same CreateWallet
+    /// FAILED_VERIFY overwrite). loadwallet is the RPC that returns -35.
     #[tokio::test]
     async fn test_create_wallet_already_loaded_code() {
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
 
-        rpc.create_wallet("loaded".to_string(), None, None, None, None, None, None)
-            .await
-            .expect("first createwallet must succeed");
+        rpc.create_wallet(
+            Some("loaded".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("first createwallet must succeed");
 
-        // Same name while still loaded -> RPC_WALLET_ALREADY_LOADED (-35).
         let err = rpc
-            .create_wallet("loaded".to_string(), None, None, None, None, None, None)
+            .create_wallet(
+                Some("loaded".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect_err("re-create of loaded wallet must error");
         assert_eq!(
             err.code(),
-            wallet_error::RPC_WALLET_ALREADY_LOADED,
-            "re-create of loaded wallet must emit RPC_WALLET_ALREADY_LOADED (-35)"
+            wallet_error::RPC_WALLET_ERROR,
+            "createwallet already-loaded is RPC_WALLET_ERROR (-4)"
         );
-        assert_eq!(err.code(), -35, "genuine Core value");
+        assert_eq!(err.code(), -4);
     }
 
     #[tokio::test]
@@ -4855,10 +5420,30 @@ mod tests {
         let rpc = WalletRpcImpl::new(state.clone());
 
         // Create a wallet
-        rpc.create_wallet("wallet1".to_string(), None, None, None, None, None, None).await.unwrap();
-        rpc.create_wallet("wallet2".to_string(), None, None, None, None, None, None).await.unwrap();
+        rpc.create_wallet(
+            Some("wallet1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        rpc.create_wallet(
+            Some("wallet2".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
-        let wallets = rpc.list_wallets().await.unwrap();
+        let wallets = rpc.list_wallets(None).await.unwrap();
         assert_eq!(wallets.len(), 2);
         assert!(wallets.contains(&"wallet1".to_string()));
         assert!(wallets.contains(&"wallet2".to_string()));
@@ -4870,11 +5455,23 @@ mod tests {
         let rpc = WalletRpcImpl::new(state.clone());
 
         // Create and unload
-        rpc.create_wallet("test_wallet".to_string(), None, None, None, None, None, None).await.unwrap();
-        rpc.unload_wallet(Some("test_wallet".to_string()), None).await.unwrap();
+        rpc.create_wallet(
+            Some("test_wallet".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        rpc.unload_wallet(Some("test_wallet".to_string()), None)
+            .await
+            .unwrap();
 
         // Verify unloaded
-        let wallets = rpc.list_wallets().await.unwrap();
+        let wallets = rpc.list_wallets(None).await.unwrap();
         assert!(wallets.is_empty());
 
         // Reload
@@ -4882,7 +5479,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify loaded
-        let wallets = rpc.list_wallets().await.unwrap();
+        let wallets = rpc.list_wallets(None).await.unwrap();
         assert_eq!(wallets.len(), 1);
     }
 
@@ -4891,7 +5488,17 @@ mod tests {
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
 
-        rpc.create_wallet("test_wallet".to_string(), None, None, None, None, None, None).await.unwrap();
+        rpc.create_wallet(
+            Some("test_wallet".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let addr1 = rpc.get_new_address(None, None).await.unwrap();
         let addr2 = rpc.get_new_address(None, None).await.unwrap();
@@ -4899,7 +5506,12 @@ mod tests {
         // Addresses should be different
         assert_ne!(addr1, addr2);
         // Should be testnet addresses
-        assert!(addr1.starts_with("tb1") || addr1.starts_with("m") || addr1.starts_with("n") || addr1.starts_with("2"));
+        assert!(
+            addr1.starts_with("tb1")
+                || addr1.starts_with("m")
+                || addr1.starts_with("n")
+                || addr1.starts_with("2")
+        );
     }
 
     #[tokio::test]
@@ -4907,7 +5519,17 @@ mod tests {
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
 
-        rpc.create_wallet("test_wallet".to_string(), None, None, None, None, None, None).await.unwrap();
+        rpc.create_wallet(
+            Some("test_wallet".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let balance = rpc.get_balance(None, None, None, None).await.unwrap();
         assert_eq!(balance, 0.0);
@@ -4918,9 +5540,22 @@ mod tests {
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
 
-        rpc.create_wallet("test_wallet".to_string(), None, None, None, None, None, None).await.unwrap();
+        rpc.create_wallet(
+            Some("test_wallet".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
-        let utxos = rpc.list_unspent(None, None, None, None, None).await.unwrap();
+        let utxos = rpc
+            .list_unspent(None, None, None, None, None)
+            .await
+            .unwrap();
         assert!(utxos.is_empty());
     }
 
@@ -4930,8 +5565,28 @@ mod tests {
         let rpc = WalletRpcImpl::new(state.clone());
 
         // Create two wallets
-        rpc.create_wallet("wallet1".to_string(), None, None, None, None, None, None).await.unwrap();
-        rpc.create_wallet("wallet2".to_string(), None, None, None, None, None, None).await.unwrap();
+        rpc.create_wallet(
+            Some("wallet1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        rpc.create_wallet(
+            Some("wallet2".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Try to get balance without specifying wallet
         let result = rpc.get_balance(None, None, None, None).await;
@@ -4942,7 +5597,12 @@ mod tests {
     // CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md
 
     /// Build a raw-tx hex spending a specific outpoint. The tx is unsigned.
-    fn build_unsigned_tx_hex(prev_txid: [u8; 32], prev_vout: u32, value: u64, out_spk: Vec<u8>) -> String {
+    fn build_unsigned_tx_hex(
+        prev_txid: [u8; 32],
+        prev_vout: u32,
+        value: u64,
+        out_spk: Vec<u8>,
+    ) -> String {
         use rustoshi_primitives::{Encodable, Hash256, OutPoint, Transaction, TxIn, TxOut};
         let tx = Transaction {
             version: 2,
@@ -4973,12 +5633,9 @@ mod tests {
         use rustoshi_crypto::address::{Address, Network};
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
-        rpc.create_wallet(
-            "w".to_string(),
-            None, None, None, None, None, None,
-        )
-        .await
-        .unwrap();
+        rpc.create_wallet(Some("w".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
 
         let dummy_addr = Address::from_string(
             "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
@@ -5020,12 +5677,9 @@ mod tests {
 
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
-        rpc.create_wallet(
-            "w".to_string(),
-            None, None, None, None, None, None,
-        )
-        .await
-        .unwrap();
+        rpc.create_wallet(Some("w".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
 
         // Reach into the wallet, generate an address, and inject a matching
         // UTXO so we can test the signing path without needing a live chain.
@@ -5061,7 +5715,8 @@ mod tests {
             Some(Network::Testnet),
         )
         .unwrap();
-        let hexstr = build_unsigned_tx_hex(prev_txid, prev_vout, 90_000, dummy_addr.to_script_pubkey());
+        let hexstr =
+            build_unsigned_tx_hex(prev_txid, prev_vout, 90_000, dummy_addr.to_script_pubkey());
 
         let result = rpc
             .sign_raw_transaction_with_wallet(hexstr.clone(), None, None)
@@ -5075,10 +5730,7 @@ mod tests {
         );
         assert!(result.errors.is_none());
         // Bytes changed — proves we actually signed (not a lying echo).
-        assert_ne!(
-            result.hex, hexstr,
-            "signed hex must differ from input hex"
-        );
+        assert_ne!(result.hex, hexstr, "signed hex must differ from input hex");
         // Decode and verify witness is populated.
         let signed_bytes = hex::decode(&result.hex).unwrap();
         let signed_tx = Transaction::deserialize(&signed_bytes).unwrap();
@@ -5099,12 +5751,9 @@ mod tests {
         // silently sign with SIGHASH_ALL when the caller asked for SINGLE.
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
-        rpc.create_wallet(
-            "w".to_string(),
-            None, None, None, None, None, None,
-        )
-        .await
-        .unwrap();
+        rpc.create_wallet(Some("w".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
 
         let result = rpc
             .sign_raw_transaction_with_wallet(
@@ -5123,8 +5772,28 @@ mod tests {
         // Create two wallets
         {
             let rpc = WalletRpcImpl::new(state.clone());
-            rpc.create_wallet("wallet1".to_string(), None, None, None, None, None, None).await.unwrap();
-            rpc.create_wallet("wallet2".to_string(), None, None, None, None, None, None).await.unwrap();
+            rpc.create_wallet(
+                Some("wallet1".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            rpc.create_wallet(
+                Some("wallet2".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         // Use wallet-specific RPC
@@ -5147,7 +5816,7 @@ mod tests {
         // with the same big-endian txid hex string.
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
-        rpc.create_wallet("w".to_string(), None, None, None, None, None, None)
+        rpc.create_wallet(Some("w".to_string()), None, None, None, None, None, None)
             .await
             .unwrap();
 
@@ -5178,7 +5847,10 @@ mod tests {
         let again = rpc
             .lock_unspent(false, Some(vec![outpoint.clone()]), None)
             .await;
-        assert!(again.is_err(), "locking an already-locked output must error");
+        assert!(
+            again.is_err(),
+            "locking an already-locked output must error"
+        );
 
         // Unlock it.
         let ok = rpc
@@ -5219,7 +5891,7 @@ mod tests {
 
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
-        rpc.create_wallet("w".to_string(), None, None, None, None, None, None)
+        rpc.create_wallet(Some("w".to_string()), None, None, None, None, None, None)
             .await
             .unwrap();
 
@@ -5297,7 +5969,7 @@ mod tests {
     async fn walletcreatefundedpsbt_rejects_empty_outputs() {
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
-        rpc.create_wallet("w".to_string(), None, None, None, None, None, None)
+        rpc.create_wallet(Some("w".to_string()), None, None, None, None, None, None)
             .await
             .unwrap();
 
@@ -5317,13 +5989,16 @@ mod tests {
 
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
-        rpc.create_wallet("w".to_string(), None, None, None, None, None, None)
+        rpc.create_wallet(Some("w".to_string()), None, None, None, None, None, None)
             .await
             .unwrap();
 
         let outpoint_txid = [0xaau8; 32];
-        let outpoint_txid_hex_be: String =
-            outpoint_txid.iter().rev().map(|b| format!("{:02x}", b)).collect();
+        let outpoint_txid_hex_be: String = outpoint_txid
+            .iter()
+            .rev()
+            .map(|b| format!("{:02x}", b))
+            .collect();
 
         {
             let st = state.read().await;
@@ -5388,7 +6063,7 @@ mod tests {
 
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
-        rpc.create_wallet("w".to_string(), None, None, None, None, None, None)
+        rpc.create_wallet(Some("w".to_string()), None, None, None, None, None, None)
             .await
             .unwrap();
 
@@ -5398,7 +6073,10 @@ mod tests {
         let utxo_value: u64 = 1_000_000; // 0.01 BTC
         {
             let st = state.read().await;
-            let wallet_arc = st.wallet_manager.get_wallet("w").expect("wallet should exist");
+            let wallet_arc = st
+                .wallet_manager
+                .get_wallet("w")
+                .expect("wallet should exist");
             let mut wallet = wallet_arc.lock().unwrap();
             let addr = wallet.get_new_address().unwrap();
             let addr_obj = Address::from_string(&addr, Some(Network::Testnet)).unwrap();
@@ -5538,7 +6216,7 @@ mod tests {
 
         let state = setup_wallet_state();
         let rpc = WalletRpcImpl::new(state.clone());
-        rpc.create_wallet("w".to_string(), None, None, None, None, None, None)
+        rpc.create_wallet(Some("w".to_string()), None, None, None, None, None, None)
             .await
             .unwrap();
 
@@ -5563,5 +6241,209 @@ mod tests {
 
         let res = rpc.fund_raw_transaction(raw_hex, None, None).await;
         assert!(res.is_err(), "funding an empty wallet must error");
+    }
+
+    // -----------------------------------------------------------------------
+    // T3 / R5 wallet-RPC rejection probes (Core-validated codes).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn t3_createwallet_legacy_refused_and_no_name() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        let err = rpc
+            .create_wallet(
+                Some("r5legacy".to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+            )
+            .await
+            .expect_err("descriptors=false must be refused");
+        assert_eq!(err.code(), wallet_error::RPC_WALLET_ERROR);
+        assert!(err.message().contains("legacy wallet"), "{}", err.message());
+
+        let err = rpc
+            .create_wallet(None, None, None, None, None, None, None)
+            .await
+            .expect_err("no-name must dump help as -1");
+        assert_eq!(err.code(), wallet_error::RPC_MISC_ERROR);
+    }
+
+    #[tokio::test]
+    async fn t3_listunspent_rejects_invalid_and_duplicate_address() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(Some("r5".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let err = rpc
+            .list_unspent(
+                Some(1),
+                Some(9999999),
+                Some(vec!["notanaddress".into()]),
+                None,
+                None,
+            )
+            .await
+            .expect_err("invalid address");
+        assert_eq!(err.code(), wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY);
+
+        let dup = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_string();
+        let err = rpc
+            .list_unspent(
+                Some(1),
+                Some(9999999),
+                Some(vec![dup.clone(), dup]),
+                None,
+                None,
+            )
+            .await
+            .expect_err("duplicate address");
+        assert_eq!(err.code(), wallet_error::RPC_INVALID_PARAMETER);
+    }
+
+    #[tokio::test]
+    async fn t3_listtransactions_negative_count_and_skip() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(Some("r5".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let err = rpc
+            .list_transactions(Some("*".into()), Some(-1), None, None)
+            .await
+            .expect_err("negative count");
+        assert_eq!(err.code(), wallet_error::RPC_INVALID_PARAMETER);
+        let err = rpc
+            .list_transactions(Some("*".into()), Some(10), Some(-1), None)
+            .await
+            .expect_err("negative skip");
+        assert_eq!(err.code(), wallet_error::RPC_INVALID_PARAMETER);
+    }
+
+    #[tokio::test]
+    async fn t3_getwalletinfo_shape_and_wrong_arity() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(Some("r5".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let info = rpc.get_wallet_info(None).await.unwrap();
+        assert_eq!(info.walletname, "r5");
+        assert!(info.descriptors);
+        assert!(!info.blank);
+        assert!(info.flags.contains(&"descriptor_wallet".to_string()));
+        assert_eq!(info.lastprocessedblock.hash.len(), 64);
+        let err = rpc
+            .get_wallet_info(Some(serde_json::json!("unexpected")))
+            .await
+            .expect_err("wrong-arity");
+        assert_eq!(err.code(), wallet_error::RPC_MISC_ERROR);
+    }
+
+    #[tokio::test]
+    async fn t3_sendtoaddress_invalid_amount_and_newaddress_bad_type() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(Some("r5".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let err = rpc
+            .send_to_address(
+                "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".into(),
+                -1.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("negative amount");
+        assert_eq!(err.code(), wallet_error::RPC_TYPE_ERROR);
+
+        let err = rpc
+            .get_new_address(Some("".into()), Some("bogustype".into()))
+            .await
+            .expect_err("bad address type");
+        assert_eq!(err.code(), wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY);
+    }
+
+    #[tokio::test]
+    async fn t3_backup_restore_missing_and_already_exists() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(Some("r5".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let err = rpc
+            .restore_wallet(
+                "r5probe_fresh".into(),
+                "/nonexistent/r5probe-nope.bak".into(),
+                None,
+            )
+            .await
+            .expect_err("missing backup");
+        assert_eq!(err.code(), wallet_error::RPC_INVALID_PARAMETER);
+
+        let dest = {
+            let st = state.read().await;
+            st.wallet_manager.wallets_dir().join("r5.bak")
+        };
+        rpc.backup_wallet(dest.to_string_lossy().into_owned())
+            .await
+            .expect("backup");
+        let err = rpc
+            .restore_wallet("r5".into(), dest.to_string_lossy().into_owned(), None)
+            .await
+            .expect_err("already exists");
+        assert_eq!(err.code(), wallet_error::RPC_WALLET_ALREADY_EXISTS);
+    }
+
+    #[tokio::test]
+    async fn t3_unloadwallet_not_loaded() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(Some("r5".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let err = rpc
+            .unload_wallet(Some("r5probe_missing".into()), None)
+            .await
+            .expect_err("not loaded");
+        assert_eq!(err.code(), wallet_error::RPC_WALLET_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn t3_walletcreatefundedpsbt_no_outputs() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(Some("r5".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let err = rpc
+            .wallet_create_funded_psbt(vec![], vec![], None, None, None)
+            .await
+            .expect_err("no outputs");
+        assert_eq!(err.code(), wallet_error::RPC_INVALID_PARAMETER);
+    }
+
+    #[tokio::test]
+    async fn t3_send_no_outputs() {
+        let state = setup_wallet_state();
+        let rpc = WalletRpcImpl::new(state.clone());
+        rpc.create_wallet(Some("r5".to_string()), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let err = rpc
+            .wallet_send(vec![], None, None, None, None)
+            .await
+            .expect_err("no outputs");
+        assert_eq!(err.code(), wallet_error::RPC_INVALID_PARAMETER);
     }
 }

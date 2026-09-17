@@ -1102,8 +1102,13 @@ pub trait RustoshiRpc {
     ) -> RpcResult<serde_json::Value>;
 
     /// Stop the node.
+    ///
+    /// Core accepts a hidden `wait` numeric argument (`rpc/server.cpp:145-168`).
+    /// A non-number is `RPC_TYPE_ERROR` (-3) via `MatchesType` BEFORE the
+    /// shutdown is requested (`rpc/util.cpp:648`). jsonrpsee 0.22 ignores extra
+    /// args on a zero-arg method, so this optional slot exists to capture it.
     #[method(name = "stop")]
-    async fn stop(&self) -> RpcResult<String>;
+    async fn stop(&self, wait: Option<serde_json::Value>) -> RpcResult<String>;
 
     /// Validate an address.
     #[method(name = "validateaddress")]
@@ -10167,7 +10172,25 @@ impl RustoshiRpcServer for RpcServerImpl {
         Ok(serde_json::Value::Array(ret))
     }
 
-    async fn stop(&self) -> RpcResult<String> {
+    async fn stop(&self, wait: Option<serde_json::Value>) -> RpcResult<String> {
+        // Type-check the hidden `wait` arg BEFORE acting. Core MatchesType
+        // (`rpc/util.cpp:648`) raises RPC_TYPE_ERROR (-3) and stays up.
+        if let Some(v) = &wait {
+            if !v.is_null() && !v.is_number() {
+                let got = match v {
+                    serde_json::Value::String(_) => "str",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    _ => "unknown",
+                };
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!("JSON value of type {got} is not of expected type number"),
+                ));
+            }
+        }
+
         let mut state = self.state.write().await;
 
         if let Some(tx) = state.shutdown_tx.take() {
@@ -13404,7 +13427,22 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "listlockunspent" => "listlockunspent\nReturns the list of currently locked UTXOs.",
                 "walletcreatefundedpsbt" => "walletcreatefundedpsbt [{\"txid\":..,\"vout\":..},...] [{addr:amt},...] ( locktime options bip32derivs )\nCreate and fund a PSBT.",
                 "walletprocesspsbt" => "walletprocesspsbt \"psbt\" ( sign \"sighashtype\" bip32derivs finalize )\nUpdate, sign, and finalize a PSBT with wallet data. Returns {psbt, complete} (+ hex when complete).",
-                "stop" => "stop\nRequest a graceful shutdown.",
+                "stop" => "stop ( wait )\nRequest a graceful shutdown of rustoshi.",
+                "createwallet" => "createwallet \"wallet_name\" ( disable_private_keys blank \"passphrase\" avoid_reuse descriptors load_on_startup )\nCreates and loads a new wallet.",
+                "loadwallet" => "loadwallet \"filename\" ( load_on_startup )\nLoads a wallet from a wallet file or directory.",
+                "unloadwallet" => "unloadwallet ( \"wallet_name\" load_on_startup )\nUnloads the wallet referenced by the request endpoint or the wallet_name argument.",
+                "listwallets" => "listwallets\nReturns a list of currently loaded wallets.",
+                "getwalletinfo" => "getwalletinfo\nReturns an object containing various wallet state info.",
+                "getnewaddress" => "getnewaddress ( \"label\" \"address_type\" )\nReturns a new Bitcoin address for receiving payments.",
+                "getaddressinfo" => "getaddressinfo \"address\"\nReturn information about the given bitcoin address.",
+                "getbalances" => "getbalances\nReturns an object with all balances in BTC.",
+                "listunspent" => "listunspent ( minconf maxconf [\"addresses\",...] include_unsafe query_options )\nReturns array of unspent transaction outputs.",
+                "listtransactions" => "listtransactions ( \"label\" count skip include_watchonly )\nIf a label name is provided, this will return only incoming transactions paying to addresses with the specified label.",
+                "sendtoaddress" => "sendtoaddress \"address\" amount ( \"comment\" \"comment_to\" subtractfeefromamount replaceable conf_target \"estimate_mode\" )\nSend an amount to a given address.",
+                "send" => "send [{\"address\":amount},...] ( conf_target \"estimate_mode\" fee_rate options )\nEXPERIMENTAL warning: this call may be changed in future releases.",
+                "backupwallet" => "backupwallet \"destination\"\nSafely copies current wallet file to destination.",
+                "restorewallet" => "restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )\nRestore and loads a wallet from backup.",
+                "getbalance" => "getbalance ( dummy minconf include_watchonly avoid_reuse )\nReturns the total available balance.",
                 "help" => "help ( \"command\" )\nList all commands, or get help for a specified command.",
                 "walletpassphrase" => "walletpassphrase \"passphrase\" timeout\nStores the wallet decryption key in memory for 'timeout' seconds.",
                 "walletlock" => "walletlock\nRemoves the wallet encryption key from memory, locking the wallet.",
@@ -13461,8 +13499,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getrawtransaction", "sendrawtransaction", "signrawtransactionwithkey",
                 "",
                 "== Wallet ==",
-                "createmultisig", "deriveaddresses", "getdescriptorinfo", "listlockunspent", "lockunspent",
-                "setlabel", "signmessage", "signmessagewithprivkey", "validateaddress",
+                "backupwallet", "createwallet", "createmultisig", "deriveaddresses",
+                "getaddressinfo", "getbalance", "getbalances", "getdescriptorinfo",
+                "getnewaddress", "getwalletinfo", "listlockunspent", "listtransactions",
+                "listunspent", "listwallets", "loadwallet", "lockunspent",
+                "restorewallet", "send", "sendtoaddress", "setlabel", "signmessage",
+                "signmessagewithprivkey", "unloadwallet", "validateaddress",
                 "walletcreatefundedpsbt", "walletlock", "walletpassphrase",
                 "",
                 "== PSBT ==",

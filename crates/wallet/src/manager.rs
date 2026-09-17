@@ -34,6 +34,22 @@ const SEED_FILE_NAME: &str = "wallet_seed.bin";
 /// and BIP-39 64-byte seeds).
 const SEED_LEN: usize = 64;
 
+/// Recursively copy a wallet directory (sqlite + seed file).
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), WalletError> {
+    fs::create_dir_all(dst).map_err(WalletError::Io)?;
+    for entry in fs::read_dir(src).map_err(WalletError::Io)? {
+        let entry = entry.map_err(WalletError::Io)?;
+        let ty = entry.file_type().map_err(WalletError::Io)?;
+        let dest_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dest_path)?;
+        } else {
+            fs::copy(entry.path(), dest_path).map_err(WalletError::Io)?;
+        }
+    }
+    Ok(())
+}
+
 /// Atomically write a byte payload to `<wallet_dir>/wallet_seed.bin`.
 ///
 /// Writes to a temp file in the same directory, fsyncs, then renames over
@@ -827,6 +843,81 @@ impl WalletManager {
     /// List loaded wallet names.
     pub fn list_wallets(&self) -> Vec<String> {
         self.wallets.keys().cloned().collect()
+    }
+
+    /// Copy a loaded wallet's on-disk directory to `destination`.
+    ///
+    /// Mirrors Bitcoin Core's `backupwallet` (`wallet/rpc/backup.cpp`): the
+    /// destination is a path the operator names. rustoshi wallets are a
+    /// directory (`wallet.sqlite` + `wallet_seed.bin`), so the destination
+    /// is created as a directory with those files. Missing parent directory
+    /// is an I/O error (Core: RPC_WALLET_ERROR -4).
+    pub fn backup_wallet(&self, name: &str, destination: &str) -> Result<(), WalletError> {
+        if !self.wallets.contains_key(name) {
+            return Err(WalletError::InvalidPath(
+                "Requested wallet does not exist or is not loaded".into(),
+            ));
+        }
+        let dest = PathBuf::from(destination);
+        let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
+        match parent {
+            Some(p) if !p.exists() => {
+                return Err(WalletError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("backup destination parent does not exist: {}", p.display()),
+                )));
+            }
+            None if dest.is_absolute() => {
+                return Err(WalletError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "backup destination has no parent",
+                )));
+            }
+            _ => {}
+        }
+        let src = self.wallets_dir.join(name);
+        if !src.exists() {
+            return Err(WalletError::InvalidPath(format!(
+                "wallet '{}' has no on-disk directory to back up",
+                name
+            )));
+        }
+        if dest.exists() {
+            if dest.is_dir() {
+                fs::remove_dir_all(&dest).map_err(WalletError::Io)?;
+            } else {
+                fs::remove_file(&dest).map_err(WalletError::Io)?;
+            }
+        }
+        copy_dir_all(&src, &dest)
+    }
+
+    /// Restore a wallet from a `backupwallet` directory.
+    ///
+    /// Core `RestoreWallet` (`wallet/wallet.cpp`): missing backup is
+    /// FAILED_INVALID_BACKUP_FILE (RPC -8); an existing wallet directory is
+    /// FAILED_ALREADY_EXISTS (RPC -36). The missing-backup check fires
+    /// first.
+    pub fn restore_wallet(
+        &mut self,
+        name: &str,
+        backup_file: &str,
+    ) -> Result<WalletResult, WalletError> {
+        let backup = Path::new(backup_file);
+        if !backup.exists() {
+            return Err(WalletError::InvalidPath(
+                "Backup file does not exist".into(),
+            ));
+        }
+        let dest = self.wallets_dir.join(name);
+        if self.wallets.contains_key(name) || dest.exists() {
+            return Err(WalletError::InvalidPath(format!(
+                "Failed to restore wallet. Database file exists '{}'.",
+                name
+            )));
+        }
+        copy_dir_all(backup, &dest)?;
+        self.load_wallet(name)
     }
 
     /// Scan a connected block into every loaded wallet's UTXO ledger.
