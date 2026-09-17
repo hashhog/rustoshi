@@ -147,6 +147,13 @@ impl HeaderSync {
         self.peer_heights.len()
     }
 
+    /// Any currently registered peer. Historical backfill requests genesis-side
+    /// headers from whoever is connected — not only a peer taller than the
+    /// (snapshot) header tip, which `best_sync_peer` requires.
+    pub fn some_peer(&self) -> Option<PeerId> {
+        self.peer_heights.keys().next().copied()
+    }
+
     /// Remove a disconnected peer.
     ///
     /// If we were syncing from this peer, reset state to Idle so we can

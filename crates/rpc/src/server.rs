@@ -5339,11 +5339,10 @@ impl RustoshiRpcServer for RpcServerImpl {
         // genesis, a baked assumeutxo tail band, and post-base headers —
         // not 1..floor-1. Core would still have a dense header index, and
         // `pruned` is true whenever the node does not hold the full chain
-        // (`rpc/blockchain.cpp`). Until genesis→base background backfill
-        // exists (main.rs: "background validation of 0..N is NOT performed
-        // in this single-chainstate build"), report the truth: pruned=true
-        // and pruneheight=the first contiguous indexed height. Do not
-        // invent prune_target_size when `-prune` is off.
+        // (`rpc/blockchain.cpp`). While `HistoricalBackfill` is filling
+        // that hole, report pruned=true and pruneheight=the original floor
+        // (`prune_report_floor`). Once the height index is dense, this
+        // branch is a no-op and pruned follows `-prune` only.
         let store = BlockStore::new(&state.db);
         let (mut pruneheight, prune_target_size) = if state.prune_mode {
             let watermark = store.get_prune_height().unwrap_or(0);
@@ -5356,7 +5355,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             (None, None)
         };
         let mut pruned = state.prune_mode;
-        if let Ok(Some(floor)) = store.snapshot_index_floor(state.best_height) {
+        if let Ok(Some(floor)) = store.prune_report_floor(state.best_height) {
             pruned = true;
             pruneheight = Some(pruneheight.map(|p| p.max(floor)).unwrap_or(floor));
         }
@@ -24397,6 +24396,268 @@ mod tests {
         assert_eq!(neg.code(), rpc_error::RPC_INVALID_PARAMETER);
         assert_eq!(neg.message(), "Block height out of range");
     }
+
+    /// CHARTER control for genesis→base backfill: after HistoricalBackfill
+    /// fills a snapshot hole, getblockhash(1) and getblockheader succeed,
+    /// getblockchaininfo reports pruned:false, and getblock / getchaintxstats
+    /// on a historical height work. Mini-chain analogue of the live mainnet
+    /// hole (floor 942157).
+    fn seed_backfill_chain(
+        db: &ChainDb,
+        floor: u32,
+        tip: u32,
+    ) -> (
+        rustoshi_consensus::ChainParams,
+        Vec<rustoshi_primitives::Block>,
+    ) {
+        use rustoshi_consensus::pow::get_block_proof;
+        use rustoshi_primitives::{Block, BlockHeader, OutPoint, Transaction, TxIn, TxOut};
+        use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let store = BlockStore::new(db);
+        let mut blocks = Vec::with_capacity(tip as usize + 1);
+        blocks.push(params.genesis_block.clone());
+        let mut prev = params.genesis_hash;
+        let mut ts = params.genesis_block.header.timestamp;
+        let bits = params.genesis_block.header.bits;
+        for h in 1..=tip {
+            ts += 600;
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: vec![
+                        0x03,
+                        (h & 0xff) as u8,
+                        ((h >> 8) & 0xff) as u8,
+                        ((h >> 16) & 0xff) as u8,
+                    ],
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                }],
+                outputs: vec![TxOut {
+                    value: 50_0000_0000,
+                    script_pubkey: vec![0x51],
+                }],
+                lock_time: 0,
+            };
+            let merkle = tx.txid();
+            let mut header = BlockHeader {
+                version: 1,
+                prev_block_hash: prev,
+                merkle_root: merkle,
+                timestamp: ts,
+                bits,
+                nonce: 0,
+            };
+            while !header.validate_pow_against_declared_target() {
+                header.nonce = header.nonce.wrapping_add(1);
+            }
+            let block = Block {
+                header: header.clone(),
+                transactions: vec![tx],
+            };
+            prev = block.header.block_hash();
+            blocks.push(block);
+        }
+
+        let g = &blocks[0];
+        let g_hash = g.header.block_hash();
+        store.put_header(&g_hash, &g.header).unwrap();
+        store.put_block(&g_hash, g).unwrap();
+        let mut status = BlockStatus::new();
+        status.set(BlockStatus::VALID_HEADER);
+        status.set(BlockStatus::HAVE_DATA);
+        store
+            .put_block_index(
+                &g_hash,
+                &BlockIndexEntry {
+                    height: 0,
+                    status,
+                    n_tx: 1,
+                    timestamp: g.header.timestamp,
+                    bits: g.header.bits,
+                    nonce: g.header.nonce,
+                    version: g.header.version,
+                    prev_hash: g.header.prev_block_hash,
+                    chain_work: get_block_proof(g.header.bits).0,
+                },
+            )
+            .unwrap();
+        store.put_height_index(0, &g_hash).unwrap();
+        for n in floor..=tip {
+            let b = &blocks[n as usize];
+            let hash = b.header.block_hash();
+            store.put_header(&hash, &b.header).unwrap();
+            store.put_height_index(n, &hash).unwrap();
+            let mut st = BlockStatus::new();
+            st.set(BlockStatus::VALID_HEADER);
+            store
+                .put_block_index(
+                    &hash,
+                    &BlockIndexEntry {
+                        height: n,
+                        status: st,
+                        n_tx: 0,
+                        timestamp: b.header.timestamp,
+                        bits: b.header.bits,
+                        nonce: b.header.nonce,
+                        version: b.header.version,
+                        prev_hash: b.header.prev_block_hash,
+                        chain_work: [0u8; 32],
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .set_best_block(&blocks[tip as usize].header.block_hash(), tip)
+            .unwrap();
+        (params, blocks)
+    }
+
+    #[tokio::test]
+    async fn snapshot_backfill_getblockhash_1_and_header_after_fill() {
+        use rustoshi_storage::{ChainDb, HistoricalBackfill};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (params, blocks) = seed_backfill_chain(&db, 10, 20);
+        let store = BlockStore::new(&db);
+        let mut bf = HistoricalBackfill::detect(&store, params.genesis_hash, 20)
+            .unwrap()
+            .expect("hole");
+        let hole: Vec<_> = (1..10).map(|h| blocks[h].header.clone()).collect();
+        bf.accept_headers(&hole, &store, &params).unwrap();
+        for h in 1..10 {
+            bf.accept_block(&blocks[h], &store).unwrap();
+        }
+
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.best_height = 20;
+        rpc_state.best_hash = blocks[20].header.block_hash();
+        rpc_state.header_height = 20;
+        rpc_state.is_ibd = false;
+        let rpc = RpcServerImpl::new(
+            Arc::new(RwLock::new(rpc_state)),
+            Arc::new(RwLock::new(PeerState::default())),
+        );
+
+        let h1 = rpc
+            .get_block_hash(serde_json::json!(1))
+            .await
+            .expect("getblockhash(1) after backfill");
+        assert_eq!(h1, blocks[1].header.block_hash().to_hex());
+
+        let hdr = rpc
+            .get_block_header(h1.clone(), Some(true))
+            .await
+            .expect("getblockheader after backfill");
+        let v: serde_json::Value = serde_json::from_str(hdr.get()).unwrap();
+        assert_eq!(v["height"], 1);
+        assert_eq!(v["hash"], h1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_backfill_getblockchaininfo_unpruned_after_fill() {
+        use rustoshi_storage::{ChainDb, HistoricalBackfill};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (params, blocks) = seed_backfill_chain(&db, 10, 20);
+
+        // Before: hole reports pruned.
+        let mut rpc_state = RpcState::new(db.clone(), params.clone());
+        rpc_state.best_height = 20;
+        rpc_state.best_hash = blocks[20].header.block_hash();
+        rpc_state.header_height = 20;
+        let rpc = RpcServerImpl::new(
+            Arc::new(RwLock::new(rpc_state)),
+            Arc::new(RwLock::new(PeerState::default())),
+        );
+        let before = rpc.get_blockchain_info().await.expect("info");
+        assert!(before.pruned, "pre-backfill must stay pruned=true");
+        assert_eq!(before.pruneheight, Some(10));
+
+        let store = BlockStore::new(&db);
+        let mut bf = HistoricalBackfill::detect(&store, params.genesis_hash, 20)
+            .unwrap()
+            .unwrap();
+        let hole: Vec<_> = (1..10).map(|h| blocks[h].header.clone()).collect();
+        bf.accept_headers(&hole, &store, &params).unwrap();
+        for h in 1..10 {
+            bf.accept_block(&blocks[h], &store).unwrap();
+        }
+
+        let after = rpc.get_blockchain_info().await.expect("info after");
+        assert!(
+            !after.pruned,
+            "after backfill pruned must be false, got {}",
+            after.pruned
+        );
+        assert_eq!(after.pruneheight, None);
+        let json = serde_json::to_string(&after).unwrap();
+        assert!(json.contains("\"pruned\":false"), "wire: {}", json);
+        assert!(
+            !json.contains("\"pruneheight\""),
+            "wire must omit pruneheight: {}",
+            json
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_backfill_getblock_and_chaintxstats_after_fill() {
+        use rustoshi_storage::{ChainDb, HistoricalBackfill};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (params, blocks) = seed_backfill_chain(&db, 10, 20);
+        let store = BlockStore::new(&db);
+        let mut bf = HistoricalBackfill::detect(&store, params.genesis_hash, 20)
+            .unwrap()
+            .unwrap();
+        let hole: Vec<_> = (1..10).map(|h| blocks[h].header.clone()).collect();
+        bf.accept_headers(&hole, &store, &params).unwrap();
+        for h in 1..10 {
+            bf.accept_block(&blocks[h], &store).unwrap();
+        }
+
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.best_height = 20;
+        rpc_state.best_hash = blocks[20].header.block_hash();
+        rpc_state.header_height = 20;
+        rpc_state.is_ibd = false;
+        let rpc = RpcServerImpl::new(
+            Arc::new(RwLock::new(rpc_state)),
+            Arc::new(RwLock::new(PeerState::default())),
+        );
+
+        let h5 = blocks[5].header.block_hash().to_hex();
+        let block_json = rpc
+            .get_block(h5.clone(), Some(serde_json::json!(1)))
+            .await
+            .expect("getblock at historical height 5");
+        let v: serde_json::Value = serde_json::from_str(block_json.get()).unwrap();
+        assert_eq!(v["height"], 5);
+        assert_eq!(v["hash"], h5);
+
+        let stats = rpc
+            .get_chain_tx_stats(Some(2), Some(h5))
+            .await
+            .expect("getchaintxstats at historical height 5");
+        assert!(
+            stats.get("txcount").is_some(),
+            "getchaintxstats must return txcount, got {stats}"
+        );
+        assert!(
+            stats.get("window_final_block_hash").is_some()
+                || stats.get("windowfinalblockhash").is_some()
+                || stats.get("window_final_block_height").is_some()
+                || stats.get("time").is_some(),
+            "getchaintxstats shape: {stats}"
+        );
+    }
+
 
     #[test]
     fn test_connection_type_str() {

@@ -46,6 +46,7 @@ pub mod columns;
 pub mod db;
 pub mod flush_signal;
 pub mod header_context;
+pub mod historical_backfill;
 pub mod indexes;
 pub mod prune;
 pub mod snapshot;
@@ -93,6 +94,7 @@ pub use snapshot::{
     SNAPSHOT_BLOCKHASH_FILENAME, SNAPSHOT_CACHE_PERCENT, SNAPSHOT_CHAINSTATE_SUFFIX,
     SNAPSHOT_MAGIC_BYTES, SNAPSHOT_VERSION,
 };
+pub use historical_backfill::{BackfillError, HistoricalBackfill, BACKFILL_BODIES_PER_REQUEST};
 
 #[cfg(test)]
 mod tests {

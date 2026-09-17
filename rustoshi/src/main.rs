@@ -31,9 +31,10 @@ use rustoshi_consensus::{
 };
 use rustoshi_network::{
     asmap as asmap_mod, resolve_blocks_in_flight_per_peer, BlockDownloader, CFCheckptMessage,
-    CFHeadersMessage, CFilterMessage, HeaderSync, InvType, InvVector, MisbehaviorReason,
-    NetGroupManager, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig, CFCHECKPT_INTERVAL,
-    MAX_GETCFHEADERS_SIZE, MAX_GETCFILTERS_SIZE, NODE_COMPACT_FILTERS,
+    CFHeadersMessage, CFilterMessage, GetHeadersMessage, HeaderSync, InvType, InvVector,
+    MisbehaviorReason, NetGroupManager, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig,
+    CFCHECKPT_INTERVAL, MAX_GETCFHEADERS_SIZE, MAX_GETCFILTERS_SIZE, NODE_COMPACT_FILTERS,
+    PROTOCOL_VERSION,
 };
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
 use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
@@ -41,7 +42,8 @@ use rustoshi_storage::{
     block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry},
     coinstats_compute_next_entry, coinstats_genesis_entry,
     indexes::BlockFilterIndex,
-    BlockStore, ChainDb, CoinStatsIndex, UtxoCacheState,
+    BlockStore, ChainDb, CoinStatsIndex, HistoricalBackfill, UtxoCacheState,
+    BACKFILL_BODIES_PER_REQUEST,
 };
 
 // ============================================================
@@ -1250,6 +1252,62 @@ async fn send_download_requests(
                 block_downloader.remove_peer(peer);
             }
         }
+    }
+}
+
+/// Drive one round of assumeUTXO historical backfill: getheaders from the
+/// genesis-side locator and getdata for missing bodies. Historical batches
+/// must never enter the forward HeaderSync (that would rewind the snapshot
+/// tip to genesis).
+async fn drive_historical_backfill(
+    backfill: &mut Option<HistoricalBackfill>,
+    store: &BlockStore<'_>,
+    peer: Option<rustoshi_network::PeerId>,
+    peer_state: &RwLock<PeerState>,
+) {
+    let Some(bf) = backfill.as_mut() else {
+        return;
+    };
+    let Some(peer) = peer else {
+        return;
+    };
+    let ps = peer_state.read().await;
+    let Some(ref pm) = ps.peer_manager else {
+        return;
+    };
+    if !bf.headers_complete() {
+        let msg = NetworkMessage::GetHeaders(GetHeadersMessage {
+            version: PROTOCOL_VERSION as u32,
+            locator_hashes: bf.locator(),
+            hash_stop: bf.hash_stop(),
+        });
+        let _ = pm.send_to_peer(peer, msg).await;
+    }
+    match bf.next_body_hashes(store, BACKFILL_BODIES_PER_REQUEST) {
+        Ok(hashes) if !hashes.is_empty() => {
+            let inv: Vec<InvVector> = hashes
+                .iter()
+                .map(|(_, h)| InvVector {
+                    inv_type: InvType::MsgWitnessBlock,
+                    hash: *h,
+                })
+                .collect();
+            let _ = pm.send_to_peer(peer, NetworkMessage::GetData(inv)).await;
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("historical backfill: body scan failed: {e}"),
+    }
+    if bf.is_complete() {
+        tracing::info!(
+            "historical backfill complete: genesis→{} indexed (getblockhash(1) is live)",
+            bf.target_floor().saturating_sub(1)
+        );
+    }
+}
+
+fn finish_historical_backfill_if_done(backfill: &mut Option<HistoricalBackfill>) {
+    if backfill.as_ref().is_some_and(|b| b.is_complete()) {
+        *backfill = None;
     }
 }
 
@@ -3075,14 +3133,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         //
         // We mirror Core's `validation.cpp::ActivateSnapshot` effects
         // (`Chainstate::m_chain.SetTip`, plus the persisted "best block"
-        // pointer in the leveldb meta column).  Background validation of
-        // 0..snapshot is NOT performed here — it requires a second
-        // chainstate + a separate UTXO column family, which this single-
-        // chainstate codebase doesn't have.  The trade-off is that the
-        // snapshot is treated as a hard checkpoint until proper dual-
-        // chainstate support lands; the operator-facing benefit is that
-        // the node is at the snapshot tip immediately and can serve the
-        // mainnet tip ~minutes after recovery instead of ~weeks.
+        // pointer in the leveldb meta column). The snapshot chainstate is
+        // the active tip immediately. A second, background path
+        // (`HistoricalBackfill`) then downloads genesis→base headers and
+        // bodies into the height/header/block indexes so historical RPCs
+        // work and `getblockchaininfo` returns `pruned: false` once the
+        // hole closes — Core's dual-chainstate IBD, minus a RAM-backed
+        // 166M-coin UTXO replay (that would OOM; `ChainstateManager` still
+        // does the small-chain replay used by `loadtxoutset` tests).
         //
         // chain_work for the snapshot tip is set to `minimum_chain_work`
         // from chainparams. We don't have the real cumulative work
@@ -3182,14 +3240,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         best_height = assume.height;
 
         tracing::info!(
-            "Snapshot loaded + activated: {} coins, tip {} at height {} (chain_work=minimum_chain_work; \
-             foreground IBD will extend past this point — background validation of 0..{} is NOT \
-             performed in this single-chainstate build)",
+            "Snapshot loaded + activated: {} coins, tip {} at height {} \
+             (chain_work=minimum_chain_work; foreground IBD extends past this \
+             point; background backfill will download genesis→{} headers/bodies)",
             loaded,
             blockhash.to_hex(),
             assume.height,
             assume.height,
         );
+        rpc_state_inner.chainstate_manager.activate_snapshot_with_commitment(
+            blockhash,
+            assume.height,
+            assume.hash_serialized,
+        );
+        rpc_state_inner
+            .chainstate_manager
+            .start_background_validation(Arc::as_ptr(&db) as usize);
     }
 
     // Load persisted fee estimates if available
@@ -3544,6 +3610,48 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // source of truth is the FAILED_VALIDITY flag; this is an O(1) fast-path.
     let mut invalid_block_hashes: std::collections::HashSet<Hash256> =
         std::collections::HashSet::new();
+
+    // AssumeUTXO hole: genesis + tail band, nothing in 1..floor-1. Arm a
+    // background header/body backfill that talks to the same peers as
+    // forward sync but NEVER feeds those headers into HeaderSync (that
+    // would rewind the snapshot tip to genesis). Resumes across restart
+    // via META_HISTORICAL_BACKFILL_FLOOR.
+    let mut historical_backfill = match HistoricalBackfill::detect(
+        &block_store,
+        params.genesis_hash,
+        best_height,
+    ) {
+        Ok(bf) => bf,
+        Err(e) => {
+            tracing::warn!("historical backfill detect failed: {e}");
+            None
+        }
+    };
+    if let Some(ref bf) = historical_backfill {
+        tracing::info!(
+            "historical backfill armed: genesis-side tip {} → floor {} \
+             (P2P headers+bodies; forward HeaderSync stays at the snapshot tip)",
+            bf.genesis_tip(),
+            bf.target_floor()
+        );
+        let mut rpc = rpc_state.write().await;
+        if !rpc.chainstate_manager.is_snapshot_active() {
+            if let Ok(Some(base)) = rustoshi_storage::read_snapshot_blockhash(&datadir) {
+                let (height, commitment) = match params.assumeutxo_for_blockhash(&base) {
+                    Some(au) => (au.height, au.hash_serialized),
+                    None => (
+                        bf.target_floor(),
+                        rustoshi_consensus::AssumeutxoHash(Hash256::ZERO),
+                    ),
+                };
+                rpc.chainstate_manager.activate_snapshot_with_commitment(
+                    base, height, commitment,
+                );
+                rpc.chainstate_manager
+                    .start_background_validation(std::sync::Arc::as_ptr(&db) as usize);
+            }
+        }
+    }
 
     // Start peer connections (including TCP listener for inbound)
     peer_manager.start().await;
@@ -4509,6 +4617,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     header_sync.peer_count());
                             }
                         }
+                        if historical_backfill.is_some() {
+                            drive_historical_backfill(
+                                &mut historical_backfill,
+                                &block_store,
+                                Some(peer_id),
+                                &peer_state,
+                            )
+                            .await;
+                            finish_historical_backfill_if_done(&mut historical_backfill);
+                        }
                     }
 
                     Some(PeerEvent::Message(peer_id, msg)) => {
@@ -4534,6 +4652,33 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         .filter(|h| !invalid_block_hashes.contains(&h.block_hash()))
                                         .collect()
                                 };
+                                let is_historical = historical_backfill
+                                    .as_ref()
+                                    .map(|bf| bf.is_backfill_batch(&block_store, &headers))
+                                    .unwrap_or(false);
+                                if is_historical {
+                                    if let Some(ref mut bf) = historical_backfill {
+                                        match bf.accept_headers(&headers, &block_store, &params) {
+                                            Ok(n) => tracing::info!(
+                                                "historical backfill: stored {} headers, genesis_tip={}/{}",
+                                                n,
+                                                bf.genesis_tip(),
+                                                bf.target_floor().saturating_sub(1)
+                                            ),
+                                            Err(e) => tracing::warn!(
+                                                "historical backfill: header batch rejected: {e}"
+                                            ),
+                                        }
+                                    }
+                                    drive_historical_backfill(
+                                        &mut historical_backfill,
+                                        &block_store,
+                                        Some(peer_id),
+                                        &peer_state,
+                                    )
+                                    .await;
+                                    finish_historical_backfill_if_done(&mut historical_backfill);
+                                } else {
                                 let header_count = headers.len();
                                 let current_header_height = header_sync.best_header_height();
                                 // BIP-113 / Core ContextualCheckBlockHeader:
@@ -4992,9 +5137,37 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                                } // else: not a historical-backfill header batch
                             }
 
                             NetworkMessage::Block(block) => {
+                                let hist_hash = block.block_hash();
+                                let is_historical_block = historical_backfill
+                                    .as_ref()
+                                    .map(|bf| bf.wants_hash(&block_store, &hist_hash))
+                                    .unwrap_or(false);
+                                if is_historical_block {
+                                    if let Some(ref mut bf) = historical_backfill {
+                                        match bf.accept_block(&block, &block_store) {
+                                            Ok(true) => tracing::debug!(
+                                                "historical backfill: stored body {}",
+                                                hist_hash
+                                            ),
+                                            Ok(false) => {}
+                                            Err(e) => tracing::warn!(
+                                                "historical backfill: body rejected: {e}"
+                                            ),
+                                        }
+                                    }
+                                    drive_historical_backfill(
+                                        &mut historical_backfill,
+                                        &block_store,
+                                        Some(peer_id),
+                                        &peer_state,
+                                    )
+                                    .await;
+                                    finish_historical_backfill_if_done(&mut historical_backfill);
+                                } else {
                                 block_downloader.block_received(peer_id, block);
                                 // Refill in-flight now — do not wait for the 10s retry
                                 // tick or the post-validation assign_requests below.
@@ -5634,6 +5807,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                                } // else: not a historical-backfill body
                             }
 
                             NetworkMessage::Inv(inv_items) => {
@@ -7158,6 +7332,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             let _ = pm.send_to_peer(target, msg).await;
                         }
                     }
+                }
+                if historical_backfill.is_some() {
+                    historical_backfill
+                        .as_mut()
+                        .map(|bf| bf.clear_in_flight());
+                    drive_historical_backfill(
+                        &mut historical_backfill,
+                        &block_store,
+                        header_sync.some_peer(),
+                        &peer_state,
+                    )
+                    .await;
+                    finish_historical_backfill_if_done(&mut historical_backfill);
                 }
             }
 

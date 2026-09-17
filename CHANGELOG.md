@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-12
 
+- feat: background backfill of genesis→snapshot-base after `--load-snapshot` (headers+bodies into the height index; `getblockhash(1)` / `pruned:false` once the hole closes). Not deployed.
 - feat(rpc): script-verification counter on getchainstates (`script_checks`)
 - feat(net): single `--connect` peer defaults to 128 in-flight; refill on receipt
 - 6b17c37f test: make every zmq pub/sub test deterministic

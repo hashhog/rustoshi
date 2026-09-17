@@ -1366,7 +1366,7 @@ async fn rest_chaininfo(
         None
     };
     let mut pruned = rpc_state.prune_mode;
-    if let Ok(Some(floor)) = store.snapshot_index_floor(rpc_state.best_height) {
+    if let Ok(Some(floor)) = store.prune_report_floor(rpc_state.best_height) {
         pruned = true;
         pruneheight = Some(pruneheight.map(|p| p.max(floor)).unwrap_or(floor));
     }

@@ -5,8 +5,8 @@
 
 use crate::columns::*;
 use crate::db::{
-    ChainDb, StorageError, META_BEST_BLOCK_HASH, META_BEST_HEIGHT, META_PRUNE_HEIGHT,
-    META_REORG_PRUNE_HEIGHT,
+    ChainDb, StorageError, META_BEST_BLOCK_HASH, META_BEST_HEIGHT, META_HISTORICAL_BACKFILL_FLOOR,
+    META_PRUNE_HEIGHT, META_REORG_PRUNE_HEIGHT,
 };
 use rocksdb::WriteBatch;
 use rustoshi_primitives::{Block, BlockHeader, Decodable, Encodable, Hash256, OutPoint};
@@ -351,11 +351,12 @@ impl<'a> BlockStore<'a> {
     ///     indexed height in `1..=tip` (or `tip` itself if even the tip
     ///     row is missing).
     ///
-    /// Intent: this is an honest-limitation detector, not a substitute for
-    /// Core's background backfill of genesis→snapshot. `--load-snapshot`
-    /// currently logs that background validation of `0..base` is NOT
-    /// performed. Until that backfill exists, RPC must not claim
-    /// `pruned: false`.
+    /// Intent: this is an honest-limitation detector for the *initial*
+    /// assumeutxo hole (height 1 missing). [`crate::historical_backfill::HistoricalBackfill`]
+    /// fills that hole from genesis; while it runs, height 1 becomes present
+    /// before the gap closes, so this method returns `None` too early.
+    /// The original floor is persisted as `META_HISTORICAL_BACKFILL_FLOOR`
+    /// and is what RPC consults until the backfill completes.
     pub fn snapshot_index_floor(&self, tip: u32) -> Result<Option<u32>, StorageError> {
         if tip == 0 {
             return Ok(None);
@@ -380,6 +381,50 @@ impl<'a> BlockStore<'a> {
             }
         }
         Ok(Some(hi))
+    }
+
+    /// Original assumeutxo index floor persisted while a historical backfill
+    /// is in progress. `None` if no backfill is running (or it has completed).
+    pub fn historical_backfill_floor(&self) -> Result<Option<u32>, StorageError> {
+        match self.db.get_cf(CF_META, META_HISTORICAL_BACKFILL_FLOOR)? {
+            Some(bytes) if bytes.len() == 4 => {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&bytes);
+                Ok(Some(u32::from_le_bytes(b)))
+            }
+            Some(_) => Err(StorageError::Corruption(
+                "historical_backfill_floor is not 4 bytes".into(),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the backfill target floor so a restart can resume after
+    /// height 1 is already indexed.
+    pub fn set_historical_backfill_floor(&self, floor: u32) -> Result<(), StorageError> {
+        self.db
+            .put_cf(CF_META, META_HISTORICAL_BACKFILL_FLOOR, &floor.to_le_bytes())
+    }
+
+    /// Clear the backfill-floor marker. Called when genesis→floor is dense.
+    pub fn clear_historical_backfill_floor(&self) -> Result<(), StorageError> {
+        self.db.delete_cf(CF_META, META_HISTORICAL_BACKFILL_FLOOR)
+    }
+
+    /// Floor to report as `pruneheight` while the node does not hold a dense
+    /// genesis→tip height index. Prefers the live snapshot hole; falls back
+    /// to a persisted in-progress backfill floor when height 1 is already
+    /// indexed but the genesis-side run has not yet met the tail.
+    pub fn prune_report_floor(&self, tip: u32) -> Result<Option<u32>, StorageError> {
+        if let Some(floor) = self.snapshot_index_floor(tip)? {
+            return Ok(Some(floor));
+        }
+        if let Some(floor) = self.historical_backfill_floor()? {
+            if floor > 1 && self.get_hash_by_height(floor.saturating_sub(1))?.is_none() {
+                return Ok(Some(floor));
+            }
+        }
+        Ok(None)
     }
 
     // ---------------- CHAIN METADATA ----------------

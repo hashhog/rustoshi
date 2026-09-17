@@ -39,6 +39,15 @@ pub const META_PRUNE_HEIGHT: &[u8] = b"prune_height";
 /// collision in `CF_META`.
 pub const META_REORG_PRUNE_HEIGHT: &[u8] = b"reorg_prune_height";
 
+/// Metadata key for an in-progress genesis→snapshot-base header/body backfill.
+///
+/// Stores the original assumeutxo index floor (u32 LE) so a restart can
+/// resume after height 1 is already indexed (at which point
+/// [`crate::block_store::BlockStore::snapshot_index_floor`] returns `None`
+/// even though a gap remains below the tail). Additive, no format bump:
+/// a datadir without the key is "no backfill in progress".
+pub const META_HISTORICAL_BACKFILL_FLOOR: &[u8] = b"historical_backfill_floor";
+
 /// Metadata key for the database version.
 pub const META_DB_VERSION: &[u8] = b"db_version";
 
