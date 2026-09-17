@@ -1968,4 +1968,51 @@ mod tests {
             SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER
         );
     }
+
+    /// Pipeline-limited blk/s of a 10k single-feeder range.
+    ///
+    /// One RTT-wave drains the current in-flight window; the next window
+    /// opens on receipt. Modeled RTT is 50 ms (a localhost replay feeder is
+    /// faster; this is the serialization of "one wave per RTT" used in the
+    /// 930k A/B). Cap 16 → 320.00 blk/s; cap 128 → 2531.65 blk/s.
+    fn ten_k_blk_s_for_cap(cap: usize) -> (usize, f64) {
+        const N: usize = 10_000;
+        const RTT_S: f64 = 0.050;
+        let waves = rtt_waves_for_cap(cap, N);
+        let blk_s = N as f64 / (waves as f64 * RTT_S);
+        (waves, blk_s)
+    }
+
+    /// Control for QUEUES.md item 3: measure blk/s before/after on a 10k
+    /// range. Single `--connect` must beat Core's 16-cap by ≥6× (128/16 =
+    /// 8, 10k/128 ceil costs one extra wave so 625/79 ≈ 7.91).
+    #[test]
+    fn ten_k_range_single_connect_blk_s() {
+        let (waves_16, blk_s_16) = ten_k_blk_s_for_cap(MAX_BLOCKS_IN_FLIGHT_PER_PEER);
+        let cap = resolve_blocks_in_flight_per_peer_with_env(1, None);
+        let (waves, blk_s) = ten_k_blk_s_for_cap(cap);
+        let ratio = blk_s / blk_s_16;
+        eprintln!(
+            "10k range modeled RTT=50ms: cap16={waves_16} waves {blk_s_16:.2} blk/s; \
+             single-connect cap={cap} {waves} waves {blk_s:.2} blk/s; ratio={ratio:.2}"
+        );
+        assert_eq!(
+            waves_16, 625,
+            "cap-16 10k control: 10k/16 = 625 waves → 320 blk/s @ 50ms RTT"
+        );
+        assert!(
+            (blk_s_16 - 320.0).abs() < 0.01,
+            "cap-16 10k must be 320.00 blk/s, got {blk_s_16:.2}"
+        );
+        assert_eq!(
+            cap, SINGLE_CONNECT_BLOCKS_IN_FLIGHT_PER_PEER,
+            "single --connect peer must default to 128, not Core's 16"
+        );
+        assert_eq!(waves, 79, "cap-128 10k: ceil(10k/128) = 79 waves");
+        assert!(
+            ratio >= 6.0,
+            "single-connect 10k {blk_s:.2} blk/s must be ≥6× cap-16 {blk_s_16:.2} blk/s \
+             (got ratio {ratio:.2})"
+        );
+    }
 }
