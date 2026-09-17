@@ -201,6 +201,26 @@ Result:
 null    (json null)
 ";
 
+/// Help text thrown as `RPC_MISC_ERROR` (-1) when `savemempool` is given an
+/// extra positional argument. Core's `RPCHelpMan::HandleRequest` rejects
+/// `!IsValidNumArgs` with `HelpResult{ToString()}` (`rpc/util.cpp:644-646`),
+/// mapped to -1 (`rpc/server.cpp:515`). jsonrpsee 0.22 ignores extra args on
+/// a zero-arg method, so the handler takes one optional slot and rejects it.
+const SAVEMEMPOOL_HELP: &str = "\
+savemempool
+
+Dumps the mempool to disk. It will fail until the previous dump is fully loaded.
+
+Result:
+{                        (json object)
+  \"filename\" : \"str\"     (string) the directory and file where the mempool was saved
+}
+
+Examples:
+> bitcoin-cli savemempool
+> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"savemempool\", \"params\": []}' -H 'content-type: application/json' http://127.0.0.1:8332/
+";
+
 /// Core `rpc/mining.cpp:856` — GBT without `"segwit"` in `rules`.
 const GBT_MISSING_SEGWIT: &str =
     "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})";
@@ -777,11 +797,12 @@ pub trait RustoshiRpc {
     /// segwit marker/flag iff ANY input has a non-empty witness (the codec's
     /// `Transaction::has_witness`, == Core `CTransaction::HasWitness`). This is
     /// BYTE-IDENTICAL to Core for single-key inputs (P2PKH/P2WPKH/P2SH-P2WPKH).
-    /// OUT OF SCOPE (documented, NOT faked): merging PARTIAL multisig sigs
-    /// WITHIN one input (two variants each holding one of M sigs) — we keep the
-    /// longer scriptSig, no Solver/sigdata-splice — and the -25 "Input not found
-    /// or already spent" prevout path (combine is a pure function of the
-    /// variants here; no chainstate/UTXO lookup).
+    /// Each prevout is loaded from the chain UTXO set overlayed with the
+    /// mempool (`rawtransaction.cpp:625-653`); a missing or spent coin is
+    /// `RPC_VERIFY_ERROR` (-25) "Input not found or already spent". OUT OF
+    /// SCOPE (documented, NOT faked): merging PARTIAL multisig sigs WITHIN
+    /// one input (two variants each holding one of M sigs) — we keep the
+    /// longer scriptSig, no Solver/sigdata-splice.
     #[method(name = "combinerawtransaction")]
     async fn combine_raw_transaction(&self, txs: Option<serde_json::Value>) -> RpcResult<String>;
 
@@ -832,8 +853,13 @@ pub trait RustoshiRpc {
 
     /// Persist the mempool to `mempool.dat`. Alias of `dumpmempool` matching
     /// Bitcoin Core's `savemempool`. Returns `{"filename": "..."}`.
+    ///
+    /// Core takes no arguments (`rpc/mempool.cpp:1164-1199`). An extra
+    /// positional arg is `RPC_MISC_ERROR` (-1) with the method help text
+    /// (`rpc/util.cpp:644-646`). The optional `extra` slot exists only so
+    /// jsonrpsee surfaces that arg instead of dropping it.
     #[method(name = "savemempool")]
-    async fn save_mempool(&self) -> RpcResult<serde_json::Value>;
+    async fn save_mempool(&self, extra: Option<serde_json::Value>) -> RpcResult<serde_json::Value>;
 
     /// Get a block template for mining.
     #[method(name = "getblocktemplate")]
@@ -7585,6 +7611,30 @@ impl RustoshiRpcServer for RpcServerImpl {
         //    its version / lock_time / vin / vout define the result; only each
         //    input's scriptSig + witness get rebuilt below.
         let template = &variants[0];
+
+        // Core loads every prevout from CoinsTip+mempool and throws
+        // RPC_VERIFY_ERROR (-25) "Input not found or already spent" when the
+        // coin is missing or spent (rawtransaction.cpp:637-653). Combine is
+        // not a pure function of the hex variants.
+        {
+            let state = self.state.read().await;
+            let store = BlockStore::new(&state.db);
+            for vin in &template.inputs {
+                let in_chain = store
+                    .get_utxo(&vin.previous_output)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let in_mempool = state.mempool.get_utxo(&vin.previous_output).is_some();
+                if !in_chain && !in_mempool {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_ERROR,
+                        "Input not found or already spent",
+                    ));
+                }
+            }
+        }
+
         let mut merged_inputs: Vec<TxIn> = Vec::with_capacity(template.inputs.len());
 
         for i in 0..template.inputs.len() {
@@ -7777,7 +7827,15 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
-    async fn save_mempool(&self) -> RpcResult<serde_json::Value> {
+    async fn save_mempool(&self, extra: Option<serde_json::Value>) -> RpcResult<serde_json::Value> {
+        // Core rejects extra args at RPCHelpMan::HandleRequest, before
+        // EnsureAnyMemPool. Check arity first so the T2 extra-arg probe
+        // (`params: ["r5-probe-extra-arg"]`) is -1 and so mempool.dat is not
+        // written on a malformed call.
+        if extra.is_some() {
+            return Err(Self::rpc_error(rpc_error::RPC_MISC_ERROR, SAVEMEMPOOL_HELP));
+        }
+
         // Bitcoin Core's `savemempool` is a thin alias for `dumpmempool` that
         // returns `{"filename": "..."}`. Reuse the same persistence call so
         // both RPCs always agree on disk state.
@@ -10159,7 +10217,25 @@ impl RustoshiRpcServer for RpcServerImpl {
                     error_locations: None,
                 })
             }
-            Err(_err) => {
+            Err(err) => {
+                // Core `DecodeDestination` (key_io.cpp:85-128) classifies the
+                // failure: a string that Base58-decodes but fails the checksum
+                // / 21-byte payload check is NOT the generic "unsupported
+                // encoding" message. The T2 exact-invalid probe (`notanaddress`)
+                // is that checksum/length path.
+                use rustoshi_crypto::address::AddressError;
+                use rustoshi_crypto::base58::Base58Error;
+                let error = match &err {
+                    AddressError::Base58(Base58Error::ChecksumMismatch)
+                    | AddressError::Base58(Base58Error::TooShort)
+                    | AddressError::InvalidLength(_) => {
+                        "Invalid checksum or length of Base58 address (P2PKH or P2SH)".to_string()
+                    }
+                    AddressError::UnknownVersion(_) => {
+                        "Invalid or unsupported Base58-encoded address.".to_string()
+                    }
+                    _ => "Invalid or unsupported Segwit (Bech32) or Base58 encoding.".to_string(),
+                };
                 Ok(ValidateAddressResult {
                     isvalid: false,
                     address: None,
@@ -10168,9 +10244,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     iswitness: None,
                     witness_version: None,
                     witness_program: None,
-                    error: Some(
-                        "Invalid or unsupported Segwit (Bech32) or Base58 encoding.".to_string(),
-                    ),
+                    error: Some(error),
                     error_locations: Some(vec![]),
                 })
             }
@@ -10783,8 +10857,10 @@ impl RustoshiRpcServer for RpcServerImpl {
                 }
             }
         } else {
-            // Non-ranged descriptor, derive a single address
-            (0, 1)
+            // Non-ranged descriptor, derive a single address. The loop below
+            // is inclusive (`start..=end`, matching Core `i <= range_end`),
+            // so a singleton is (0, 0) not (0, 1).
+            (0, 0)
         };
 
         // Derive addresses. Range is INCLUSIVE of `end` — Core's
@@ -13289,6 +13365,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getindexinfo" => "getindexinfo ( \"index_name\" )\nReturns the status of one or all available indices.",
                 "sendrawtransaction" => "sendrawtransaction \"hexstring\" ( maxfeerate )\nSubmit a raw transaction to the network.",
                 "decoderawtransaction" => "decoderawtransaction \"hexstring\" ( iswitness )\nDecode a raw transaction.",
+                "combinerawtransaction" => "combinerawtransaction [\"hexstring\",...]\nCombine multiple partially signed transactions into one transaction.",
                 "createrawtransaction" => "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )\nCreate a transaction spending the given inputs and creating new outputs.",
                 "decodescript" => "decodescript \"hexstring\"\nDecode a hex-encoded script.",
                 "testmempoolaccept" => "testmempoolaccept [\"rawtx\",...] ( maxfeerate )\nReturns result of mempool acceptance tests.",
@@ -13380,7 +13457,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getmemoryinfo", "getrpcinfo", "logging", "stop", "uptime",
                 "",
                 "== Rawtransactions ==",
-                "createrawtransaction", "decoderawtransaction", "decodescript",
+                "combinerawtransaction", "createrawtransaction", "decoderawtransaction", "decodescript",
                 "getrawtransaction", "sendrawtransaction", "signrawtransactionwithkey",
                 "",
                 "== Wallet ==",
@@ -20822,7 +20899,7 @@ mod tests {
         let peer_state = Arc::new(RwLock::new(PeerState::default()));
         let server = RpcServerImpl::new(state, peer_state);
 
-        let resp = server.save_mempool().await.expect("savemempool");
+        let resp = server.save_mempool(None).await.expect("savemempool");
         assert_eq!(resp["filename"], serde_json::json!(dat.display().to_string()));
         assert!(dat.exists(), "savemempool must write the file to disk");
     }
@@ -20840,7 +20917,7 @@ mod tests {
         )));
         let peer_state = Arc::new(RwLock::new(PeerState::default()));
         let server = RpcServerImpl::new(state, peer_state);
-        assert!(server.save_mempool().await.is_err());
+        assert!(server.save_mempool(None).await.is_err());
     }
 
     /// `getprioritisedtransactions` — Core parity (rpc/mining.cpp:547).
@@ -26826,5 +26903,173 @@ mod tests {
         assert!(result.get("previousblockhash").is_some(), "{result}");
         assert!(result.get("height").is_some(), "{result}");
         assert!(result.get("bits").is_some(), "{result}");
+    }
+
+    // ============================================================
+    // T2 R5 probe: accepts-invalid + wrong-result (QUEUES.md rustoshi item 0)
+    //
+    // Live `tools/r5_probe.py --impl rustoshi` FAILs vs Core v31.99. Each
+    // test dispatches the probe's JSON-RPC params through jsonrpsee.
+    // ============================================================
+
+    /// Probe hex: combinerawtransaction unknown-input (prevout = 32 0xaa).
+    const COMBINE_UNKNOWN_HEX: &str = "0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000fdffffff01a086010000000000160014751e76e8199196d454941c45d1b3a323f1433bd600000000";
+
+    fn help_lists(text: &str, method: &str) -> bool {
+        text.lines().any(|l| {
+            let l = l.trim();
+            !l.is_empty()
+                && !l.starts_with('=')
+                && l.split_whitespace()
+                    .next()
+                    .map(|tok| tok.split('(').next() == Some(method))
+                    .unwrap_or(false)
+        })
+    }
+
+    #[tokio::test]
+    async fn t2_r5_combinerawtransaction_unknown_input_is_verify_error() {
+        let resp = t1_dispatch(
+            setup_test_server(),
+            "combinerawtransaction",
+            serde_json::json!([[COMBINE_UNKNOWN_HEX, COMBINE_UNKNOWN_HEX]]),
+        )
+        .await;
+        assert_eq!(t1_err_code(&resp), -25, "got {resp}");
+        assert_eq!(
+            resp["error"]["message"].as_str().unwrap(),
+            "Input not found or already spent"
+        );
+    }
+
+    #[tokio::test]
+    async fn t2_r5_combinerawtransaction_succeeds_when_utxo_exists() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::block_store::{BlockStore, CoinEntry};
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        {
+            let store = BlockStore::new(&db);
+            store
+                .put_utxo(
+                    &OutPoint {
+                        txid: Hash256::from_bytes([0xaa; 32]),
+                        vout: 0,
+                    },
+                    &CoinEntry {
+                        height: 1,
+                        is_coinbase: false,
+                        value: 200_000,
+                        script_pubkey: hex::decode(
+                            "0014751e76e8199196d454941c45d1b3a323f1433bd6",
+                        )
+                        .unwrap(),
+                    },
+                )
+                .unwrap();
+        }
+        let state = Arc::new(RwLock::new(RpcState::new(db, ChainParams::regtest())));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state, peer_state);
+
+        let resp = t1_dispatch(
+            server,
+            "combinerawtransaction",
+            serde_json::json!([[COMBINE_UNKNOWN_HEX, COMBINE_UNKNOWN_HEX]]),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_none() || resp["error"].is_null(),
+            "combine of a real UTXO must succeed, got {resp}"
+        );
+        assert_eq!(resp["result"].as_str().unwrap(), COMBINE_UNKNOWN_HEX);
+    }
+
+    #[tokio::test]
+    async fn t2_r5_combinerawtransaction_listed_in_help() {
+        let resp = t1_dispatch(setup_test_server(), "help", serde_json::json!([])).await;
+        let text = resp["result"].as_str().expect("help string");
+        assert!(
+            help_lists(text, "combinerawtransaction"),
+            "combinerawtransaction missing from help:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t2_r5_savemempool_extra_arg_is_misc_error() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let dat = tmp.path().join("mempool.dat");
+        let mut rpc_state = RpcState::new(db, ChainParams::regtest());
+        rpc_state.mempool_dat_path = Some(dat.clone());
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let server = RpcServerImpl::new(state, peer_state);
+
+        let resp = t1_dispatch(
+            server,
+            "savemempool",
+            serde_json::json!(["r5-probe-extra-arg"]),
+        )
+        .await;
+        assert_eq!(t1_err_code(&resp), -1, "got {resp}");
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("savemempool"),
+            "Core help-text family, got {msg:?}"
+        );
+        assert!(
+            !dat.exists(),
+            "extra-arg must be rejected before dumping mempool.dat"
+        );
+    }
+
+    #[tokio::test]
+    async fn t2_r5_deriveaddresses_unranged_is_one_address() {
+        let resp = t1_dispatch(
+            setup_test_server(),
+            "deriveaddresses",
+            serde_json::json!([
+                "wpkh(03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd)#e72f49hy"
+            ]),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_none() || resp["error"].is_null(),
+            "got {resp}"
+        );
+        let arr = resp["result"].as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            1,
+            "unranged descriptor must yield one address, got {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn t2_r5_validateaddress_exact_invalid_matches_core() {
+        let resp = t1_dispatch(
+            setup_test_server(),
+            "validateaddress",
+            serde_json::json!(["notanaddress"]),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_none() || resp["error"].is_null(),
+            "got {resp}"
+        );
+        let r = &resp["result"];
+        assert_eq!(r["isvalid"], false, "got {resp}");
+        assert_eq!(
+            r["error"].as_str().unwrap(),
+            "Invalid checksum or length of Base58 address (P2PKH or P2SH)",
+            "got {resp}"
+        );
+        assert_eq!(r["error_locations"], serde_json::json!([]), "got {resp}");
     }
 }
