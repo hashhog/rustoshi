@@ -208,8 +208,13 @@ pub struct BlockchainInfo {
     /// Estimated size of the block and undo files on disk.
     pub size_on_disk: u64,
     /// Whether the blockchain is pruned.
+    ///
+    /// True when `-prune` is on OR when the height index has a snapshot-boot
+    /// hole (assumeutxo datadir that does not retain 1..floor-1). Core's
+    /// `pruned` is true whenever the node does not hold the full chain.
     pub pruned: bool,
-    /// Lowest-height complete block stored (only present when pruning is on).
+    /// Lowest-height complete block stored (present when pruning is on, or
+    /// when a snapshot-boot hole makes the node not retain the full chain).
     /// Mirrors Core's `getblockchaininfo.pruneheight`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pruneheight: Option<u32>,

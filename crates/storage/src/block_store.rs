@@ -334,6 +334,54 @@ impl<'a> BlockStore<'a> {
         self.db.delete_cf(CF_HEIGHT_INDEX, &height.to_be_bytes())
     }
 
+    /// Lowest height of the contiguous tip-connected height index, if the
+    /// index has a hole below that floor.
+    ///
+    /// Bitcoin Core's block index is dense from genesis even on a pruned
+    /// node — `getblockhash(1)` always resolves, and `pruned`/`pruneheight`
+    /// describe missing *bodies*. rustoshi's `--load-snapshot` boot writes
+    /// genesis, a baked assumeutxo tail band (2027 headers ending at the
+    /// snapshot base), and then everything after the base. Heights
+    /// `1..floor-1` are simply absent from `CF_HEIGHT_INDEX`. That is the
+    /// live mainnet shape (floor 942157 for the 944183 snapshot).
+    ///
+    /// Returns:
+    ///   * `None` if `tip == 0` or height 1 is indexed (no snapshot hole).
+    ///   * `Some(floor)` if height 1 is missing: `floor` is the lowest
+    ///     indexed height in `1..=tip` (or `tip` itself if even the tip
+    ///     row is missing).
+    ///
+    /// Intent: this is an honest-limitation detector, not a substitute for
+    /// Core's background backfill of genesis→snapshot. `--load-snapshot`
+    /// currently logs that background validation of `0..base` is NOT
+    /// performed. Until that backfill exists, RPC must not claim
+    /// `pruned: false`.
+    pub fn snapshot_index_floor(&self, tip: u32) -> Result<Option<u32>, StorageError> {
+        if tip == 0 {
+            return Ok(None);
+        }
+        if self.get_hash_by_height(1)?.is_some() {
+            return Ok(None);
+        }
+        if self.get_hash_by_height(tip)?.is_none() {
+            return Ok(Some(tip));
+        }
+        // Height 1 missing, tip present: binary-search the first indexed
+        // height. The assumeutxo hole is a prefix of 1..=tip (plus isolated
+        // genesis at 0), so "mid is present" iff "mid..=tip are present".
+        let mut lo = 1u32;
+        let mut hi = tip;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.get_hash_by_height(mid)?.is_some() {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Ok(Some(hi))
+    }
+
     // ---------------- CHAIN METADATA ----------------
 
     /// Set the best (tip) block hash and height.
@@ -2340,6 +2388,83 @@ mod base_tail_header_tests {
         // Nothing was written for any plausible pre-base height.
         assert_eq!(store.get_hash_by_height(944_183).unwrap(), None);
         assert_eq!(store.get_hash_by_height(944_172).unwrap(), None);
+    }
+}
+
+// ============================================================
+// SNAPSHOT-BOOT HEIGHT-INDEX HOLE (getblockchaininfo pruned:true)
+// ============================================================
+
+#[cfg(test)]
+mod snapshot_index_floor_tests {
+    use super::*;
+    use crate::db::ChainDb;
+    use tempfile::TempDir;
+
+    fn temp_db() -> (TempDir, ChainDb) {
+        let dir = TempDir::new().expect("temp dir");
+        let db = ChainDb::open(dir.path()).expect("open db");
+        (dir, db)
+    }
+
+    fn h(n: u32) -> Hash256 {
+        let mut b = [0u8; 32];
+        b[0..4].copy_from_slice(&n.to_be_bytes());
+        Hash256(b)
+    }
+
+    #[test]
+    fn snapshot_index_floor_none_when_tip_is_genesis() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        store.put_height_index(0, &h(0)).unwrap();
+        assert_eq!(store.snapshot_index_floor(0).unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_index_floor_none_when_height_one_is_indexed() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        for n in 0..=10 {
+            store.put_height_index(n, &h(n)).unwrap();
+        }
+        assert_eq!(store.snapshot_index_floor(10).unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_index_floor_finds_assumeutxo_tail_start() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        // Live mainnet shape: genesis + hole + contiguous tail→tip.
+        store.put_height_index(0, &h(0)).unwrap();
+        for n in 10..=20 {
+            store.put_height_index(n, &h(n)).unwrap();
+        }
+        assert_eq!(store.snapshot_index_floor(20).unwrap(), Some(10));
+        assert_eq!(store.get_hash_by_height(9).unwrap(), None);
+        assert_eq!(store.get_hash_by_height(10).unwrap(), Some(h(10)));
+    }
+
+    #[test]
+    fn snapshot_index_floor_tip_missing_reports_tip() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        store.put_height_index(0, &h(0)).unwrap();
+        assert_eq!(store.snapshot_index_floor(50).unwrap(), Some(50));
+    }
+
+    #[test]
+    fn snapshot_index_floor_matches_live_944183_tail_band() {
+        // 2027-header band ending at 944183 starts at 942157.
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        store.put_height_index(0, &h(0)).unwrap();
+        let floor = 942_157u32;
+        let tip = 944_183u32;
+        for n in floor..=tip {
+            store.put_height_index(n, &h(n)).unwrap();
+        }
+        assert_eq!(store.snapshot_index_floor(tip).unwrap(), Some(floor));
     }
 }
 

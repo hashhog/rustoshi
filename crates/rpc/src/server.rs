@@ -5334,8 +5334,18 @@ impl RustoshiRpcServer for RpcServerImpl {
         // the lowest block whose data we still hold (= prune_height + 1
         // post-pass; we expose the watermark + 1 to match Core's
         // "lowest-complete-block" semantics).
-        let (pruneheight, prune_target_size) = if state.prune_mode {
-            let store = BlockStore::new(&state.db);
+        //
+        // SNAPSHOT-BOOT HOLE: rustoshi's `--load-snapshot` path writes
+        // genesis, a baked assumeutxo tail band, and post-base headers —
+        // not 1..floor-1. Core would still have a dense header index, and
+        // `pruned` is true whenever the node does not hold the full chain
+        // (`rpc/blockchain.cpp`). Until genesis→base background backfill
+        // exists (main.rs: "background validation of 0..N is NOT performed
+        // in this single-chainstate build"), report the truth: pruned=true
+        // and pruneheight=the first contiguous indexed height. Do not
+        // invent prune_target_size when `-prune` is off.
+        let store = BlockStore::new(&state.db);
+        let (mut pruneheight, prune_target_size) = if state.prune_mode {
             let watermark = store.get_prune_height().unwrap_or(0);
             // Core reports the height of the lowest block we still have.
             // If we've pruned through `watermark`, the lowest-complete is
@@ -5345,6 +5355,11 @@ impl RustoshiRpcServer for RpcServerImpl {
         } else {
             (None, None)
         };
+        let mut pruned = state.prune_mode;
+        if let Ok(Some(floor)) = store.snapshot_index_floor(state.best_height) {
+            pruned = true;
+            pruneheight = Some(pruneheight.map(|p| p.max(floor)).unwrap_or(floor));
+        }
 
         Ok(BlockchainInfo {
             chain: chain_name.to_string(),
@@ -5381,7 +5396,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 .as_deref()
                 .map(chainstate_size_on_disk)
                 .unwrap_or(0),
-            pruned: state.prune_mode,
+            pruned,
             pruneheight,
             prune_target_size,
             warnings: Vec::new(),
@@ -5404,21 +5419,26 @@ impl RustoshiRpcServer for RpcServerImpl {
         let height = height_i as u32;
 
         let state = self.state.read().await;
+        // Core: `nHeight < 0 || nHeight > active_chain.Height()` → -8
+        // "Block height out of range" (rpc/blockchain.cpp::getblockhash).
+        // A height inside 0..=tip that we simply do not retain is NOT a
+        // bad parameter — Core would still return the hash because its
+        // index is dense. rustoshi's assumeutxo hole is the latter; -8
+        // there reads as "the caller asked for a height that cannot
+        // exist". Use Core's pruned-data wording instead.
+        if height > state.best_height {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Block height out of range",
+            ));
+        }
         let store = BlockStore::new(&state.db);
 
         match store.get_hash_by_height(height) {
             Ok(Some(hash)) => Ok(hash.to_hex()),
-            // Core parity: `getblockhash` height-out-of-range throws
-            // RPC_INVALID_PARAMETER (-8), not the JSON-RPC transport code
-            // RPC_INVALID_PARAMS (-32602). See bitcoin-core
-            // src/rpc/blockchain.cpp::getblockhash:
-            //   if (nHeight < 0 || nHeight > active_chain.Height())
-            //       throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
-            // Message text matches Core exactly (no height interpolation) so
-            // operator scripts grepping by message also match. (W125 BUG-17 / G29.)
             Ok(None) => Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMETER,
-                "Block height out of range",
+                rpc_error::RPC_MISC_ERROR,
+                "Block not available (pruned data)",
             )),
             Err(e) => Err(Self::rpc_error(
                 rpc_error::RPC_DATABASE_ERROR,
@@ -24230,6 +24250,152 @@ mod tests {
         assert!(info.pruned);
         assert_eq!(info.pruneheight, Some(6)); // lowest-complete = watermark + 1
         assert_eq!(info.prune_target_size, Some(PRUNE_MANUAL_SENTINEL));
+    }
+
+    /// Assumeutxo-boot hole: genesis + heights 10..=20, tip 20.
+    /// Mirrors the live mainnet shape (genesis + tail band, hole in 1..floor-1).
+    fn seed_snapshot_hole_chain(db: &ChainDb, floor: u32, tip: u32) -> Hash256 {
+        fn h(n: u32) -> Hash256 {
+            let mut b = [0u8; 32];
+            b[0..4].copy_from_slice(&n.to_be_bytes());
+            Hash256(b)
+        }
+        let store = BlockStore::new(db);
+        store.put_height_index(0, &h(0)).unwrap();
+        for n in floor..=tip {
+            store.put_height_index(n, &h(n)).unwrap();
+        }
+        let tip_hash = h(tip);
+        store.set_best_block(&tip_hash, tip).unwrap();
+        tip_hash
+    }
+
+    /// Snapshot-boot datadir must not claim `pruned: false`.
+    ///
+    /// Control for QUEUES 2026-09-17: live rustoshi served no height-index
+    /// below 942157 but `getblockchaininfo.pruned` was false. Core's
+    /// contract (`rpc/blockchain.cpp`): `pruned` is true whenever the node
+    /// does not hold the full chain, and `pruneheight` names the first
+    /// complete block.
+    #[tokio::test]
+    async fn snapshot_hole_getblockchaininfo_reports_pruned_and_pruneheight() {
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let tip_hash = seed_snapshot_hole_chain(&db, 10, 20);
+
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.best_height = 20;
+        rpc_state.best_hash = tip_hash;
+        rpc_state.header_height = 20;
+        rpc_state.is_ibd = false;
+        assert!(
+            !rpc_state.prune_mode,
+            "precondition: archive-mode flag is off (the lie this test catches)"
+        );
+
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        let info = rpc.get_blockchain_info().await.expect("getblockchaininfo");
+        assert!(
+            info.pruned,
+            "snapshot hole must report pruned=true, got pruned={}",
+            info.pruned
+        );
+        assert_eq!(
+            info.pruneheight,
+            Some(10),
+            "pruneheight must be the first contiguous indexed height"
+        );
+        assert!(
+            info.prune_target_size.is_none(),
+            "do not invent prune_target_size when -prune is off"
+        );
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"pruned\":true"), "wire: {}", json);
+        assert!(json.contains("\"pruneheight\":10"), "wire: {}", json);
+        assert!(
+            !json.contains("\"prune_target_size\""),
+            "wire must omit prune_target_size: {}",
+            json
+        );
+    }
+
+    /// `getblockhash` for a height the node does not retain must not read
+    /// as "bad parameter". Height 5 is inside 0..=tip; Core would return
+    /// the hash. We don't have the index row, so the honest error is
+    /// RPC_MISC_ERROR (-1) "Block not available (pruned data)" — Core's
+    /// getblock wording for pruned data (`rpc/blockchain.cpp`).
+    #[tokio::test]
+    async fn snapshot_hole_getblockhash_in_range_is_not_oor() {
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let tip_hash = seed_snapshot_hole_chain(&db, 10, 20);
+
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.best_height = 20;
+        rpc_state.best_hash = tip_hash;
+        rpc_state.header_height = 20;
+
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        // Genesis is retained.
+        let genesis = rpc
+            .get_block_hash(serde_json::json!(0))
+            .await
+            .expect("getblockhash(0)");
+        assert_eq!(genesis.len(), 64);
+
+        // Floor of the contiguous range is retained.
+        let at_floor = rpc
+            .get_block_hash(serde_json::json!(10))
+            .await
+            .expect("getblockhash(10)");
+        assert_eq!(at_floor.len(), 64);
+
+        // Inside the tip range but not retained: NOT "Block height out of range".
+        let err = rpc
+            .get_block_hash(serde_json::json!(5))
+            .await
+            .expect_err("getblockhash(5) must error (not retained)");
+        assert_eq!(
+            err.code(),
+            rpc_error::RPC_MISC_ERROR,
+            "not-retained must be -1 (RPC_MISC_ERROR), not -8; got {}: {}",
+            err.code(),
+            err.message()
+        );
+        assert_eq!(err.message(), "Block not available (pruned data)");
+        assert_ne!(
+            err.message(),
+            "Block height out of range",
+            "in-range missing height must not look like a bad parameter"
+        );
+
+        // Genuinely past the tip is still -8.
+        let oor = rpc
+            .get_block_hash(serde_json::json!(21))
+            .await
+            .expect_err("getblockhash(21) is past the tip");
+        assert_eq!(oor.code(), rpc_error::RPC_INVALID_PARAMETER);
+        assert_eq!(oor.message(), "Block height out of range");
+
+        let neg = rpc
+            .get_block_hash(serde_json::json!(-1))
+            .await
+            .expect_err("negative height is out of range");
+        assert_eq!(neg.code(), rpc_error::RPC_INVALID_PARAMETER);
+        assert_eq!(neg.message(), "Block height out of range");
     }
 
     #[test]

@@ -141,6 +141,10 @@ pub enum RestError {
     HeaderNotFound,
     /// Height out of range.
     HeightOutOfRange,
+    /// Height is in 0..=tip but the node does not retain that index row
+    /// (assumeutxo snapshot hole). Distinct from HeightOutOfRange so an
+    /// operator does not read a missing historical block as a bad parameter.
+    PrunedData,
     /// Invalid height.
     InvalidHeight,
     /// Invalid count.
@@ -175,6 +179,7 @@ impl IntoResponse for RestError {
             RestError::TxNotFound => (StatusCode::NOT_FOUND, "Transaction not found"),
             RestError::HeaderNotFound => (StatusCode::NOT_FOUND, "Header not found"),
             RestError::HeightOutOfRange => (StatusCode::NOT_FOUND, "Block height out of range"),
+            RestError::PrunedData => (StatusCode::NOT_FOUND, "Block not available (pruned data)"),
             RestError::InvalidHeight => (StatusCode::BAD_REQUEST, "Invalid height"),
             RestError::InvalidCount => (StatusCode::BAD_REQUEST, "Invalid count"),
             RestError::TooManyOutpoints => (StatusCode::BAD_REQUEST, "Too many outpoints"),
@@ -478,7 +483,7 @@ async fn rest_blockhashbyheight(
     let hash = store
         .get_hash_by_height(height)
         .map_err(|e| RestError::DatabaseError(e.to_string()))?
-        .ok_or(RestError::HeightOutOfRange)?;
+        .ok_or(RestError::PrunedData)?;
 
     match format {
         RestFormat::Binary => {
@@ -1353,13 +1358,18 @@ async fn rest_chaininfo(
         rustoshi_consensus::params::NetworkId::Regtest => "regtest",
     };
 
-    let pruneheight = if rpc_state.prune_mode {
+    let mut pruneheight = if rpc_state.prune_mode {
         let watermark = store.get_prune_height().unwrap_or(0);
         let lowest_complete = if watermark == 0 { 0 } else { watermark + 1 };
         Some(lowest_complete)
     } else {
         None
     };
+    let mut pruned = rpc_state.prune_mode;
+    if let Ok(Some(floor)) = store.snapshot_index_floor(rpc_state.best_height) {
+        pruned = true;
+        pruneheight = Some(pruneheight.map(|p| p.max(floor)).unwrap_or(floor));
+    }
 
     let info = RestChainInfo {
         chain: chain_name.to_string(),
@@ -1371,7 +1381,7 @@ async fn rest_chaininfo(
         verificationprogress: progress,
         initialblockdownload: rpc_state.is_ibd,
         chainwork: chainwork_hex,
-        pruned: rpc_state.prune_mode,
+        pruned,
         pruneheight,
         warnings: String::new(),
     };
