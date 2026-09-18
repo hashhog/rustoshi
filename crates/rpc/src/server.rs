@@ -5335,14 +5335,12 @@ impl RustoshiRpcServer for RpcServerImpl {
         // post-pass; we expose the watermark + 1 to match Core's
         // "lowest-complete-block" semantics).
         //
-        // SNAPSHOT-BOOT HOLE: rustoshi's `--load-snapshot` path writes
-        // genesis, a baked assumeutxo tail band, and post-base headers —
-        // not 1..floor-1. Core would still have a dense header index, and
-        // `pruned` is true whenever the node does not hold the full chain
-        // (`rpc/blockchain.cpp`). While `HistoricalBackfill` is filling
-        // that hole, report pruned=true and pruneheight=the original floor
-        // (`prune_report_floor`). Once the height index is dense, this
-        // branch is a no-op and pruned follows `-prune` only.
+        // SNAPSHOT-BOOT HOLE / BODY AVAILABILITY: Core's pruneheight is the
+        // lowest height with complete BLOCK DATA (`GetPruneHeight` + 1), not
+        // the first height-index row. `prune_report_floor` rebuilds a missing
+        // height index from stored bodies, then reports the start of the
+        // contiguous local-body suffix. `None` ⇒ bodies complete from height 1
+        // and this branch is a no-op (`pruned` follows `-prune` only).
         let store = BlockStore::new(&state.db);
         let (mut pruneheight, prune_target_size) = if state.prune_mode {
             let watermark = store.get_prune_height().unwrap_or(0);
@@ -5424,7 +5422,8 @@ impl RustoshiRpcServer for RpcServerImpl {
         // bad parameter — Core would still return the hash because its
         // index is dense. rustoshi's assumeutxo hole is the latter; -8
         // there reads as "the caller asked for a height that cannot
-        // exist". Use Core's pruned-data wording instead.
+        // exist". Name the missing INDEX; do not borrow getblock's
+        // "pruned data" string (the body may still be in CF_BLOCKS).
         if height > state.best_height {
             return Err(Self::rpc_error(
                 rpc_error::RPC_INVALID_PARAMETER,
@@ -5435,10 +5434,21 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         match store.get_hash_by_height(height) {
             Ok(Some(hash)) => Ok(hash.to_hex()),
-            Ok(None) => Err(Self::rpc_error(
-                rpc_error::RPC_MISC_ERROR,
-                "Block not available (pruned data)",
-            )),
+            Ok(None) => {
+                // Index hole, not (necessarily) pruned bodies: try to rebuild
+                // height→hash from stored CF_BLOCKS / block-index entries.
+                if let Ok(n) = store.rebuild_height_index_from_bodies() {
+                    if n > 0 {
+                        if let Ok(Some(hash)) = store.get_hash_by_height(height) {
+                            return Ok(hash.to_hex());
+                        }
+                    }
+                }
+                Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    format!("Block hash index missing at height {height}"),
+                ))
+            }
             Err(e) => Err(Self::rpc_error(
                 rpc_error::RPC_DATABASE_ERROR,
                 format!("Database error: {}", e),
@@ -24261,8 +24271,24 @@ mod tests {
         }
         let store = BlockStore::new(db);
         store.put_height_index(0, &h(0)).unwrap();
+        // Genesis body so height 0 is complete; dummy bodies on the indexed
+        // tail so pruneheight follows BLOCK DATA (the tail start), not "tip
+        // has no body". The hole 1..floor-1 stays body-less and unindexed.
+        let dummy = rustoshi_primitives::Block {
+            header: rustoshi_primitives::BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1,
+                bits: 0x207f_ffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+        store.put_block(&h(0), &dummy).unwrap();
         for n in floor..=tip {
             store.put_height_index(n, &h(n)).unwrap();
+            store.put_block(&h(n), &dummy).unwrap();
         }
         let tip_hash = h(tip);
         store.set_best_block(&tip_hash, tip).unwrap();
@@ -24308,7 +24334,7 @@ mod tests {
         assert_eq!(
             info.pruneheight,
             Some(10),
-            "pruneheight must be the first contiguous indexed height"
+            "pruneheight must be the first height with complete block data"
         );
         assert!(
             info.prune_target_size.is_none(),
@@ -24327,9 +24353,10 @@ mod tests {
 
     /// `getblockhash` for a height the node does not retain must not read
     /// as "bad parameter". Height 5 is inside 0..=tip; Core would return
-    /// the hash. We don't have the index row, so the honest error is
-    /// RPC_MISC_ERROR (-1) "Block not available (pruned data)" — Core's
-    /// getblock wording for pruned data (`rpc/blockchain.cpp`).
+    /// the hash. We don't have the index row (and this seed has no body
+    /// either), so the honest error is RPC_MISC_ERROR (-1) naming the
+    /// missing INDEX — not Core's getblock "pruned data" string, which
+    /// asserts something false about the block.
     #[tokio::test]
     async fn snapshot_hole_getblockhash_in_range_is_not_oor() {
         use rustoshi_storage::ChainDb;
@@ -24374,7 +24401,12 @@ mod tests {
             err.code(),
             err.message()
         );
-        assert_eq!(err.message(), "Block not available (pruned data)");
+        assert_eq!(err.message(), "Block hash index missing at height 5");
+        assert_ne!(
+            err.message(),
+            "Block not available (pruned data)",
+            "missing height-index must not borrow the pruned-data string"
+        );
         assert_ne!(
             err.message(),
             "Block height out of range",
@@ -24490,16 +24522,18 @@ mod tests {
             let b = &blocks[n as usize];
             let hash = b.header.block_hash();
             store.put_header(&hash, &b.header).unwrap();
+            store.put_block(&hash, b).unwrap();
             store.put_height_index(n, &hash).unwrap();
             let mut st = BlockStatus::new();
             st.set(BlockStatus::VALID_HEADER);
+            st.set(BlockStatus::HAVE_DATA);
             store
                 .put_block_index(
                     &hash,
                     &BlockIndexEntry {
                         height: n,
                         status: st,
-                        n_tx: 0,
+                        n_tx: b.transactions.len() as u32,
                         timestamp: b.header.timestamp,
                         bits: b.header.bits,
                         nonce: b.header.nonce,
@@ -24658,6 +24692,170 @@ mod tests {
         );
     }
 
+    /// Snapshot-hole chain whose height-index floor and body floor can differ.
+    ///
+    /// Height index: genesis + `index_floor..=tip` (from [`seed_backfill_chain`]).
+    /// Bodies + `CF_BLOCK_INDEX`: genesis, plus `body_floor..=tip`, plus — when
+    /// `bodies_in_index_hole` — every height in `1..index_floor` (no height-index
+    /// row). That last case is the operator-reported "body is local, getblockhash
+    /// cannot name it" shape.
+    fn seed_snapshot_hole_with_bodies(
+        db: &ChainDb,
+        index_floor: u32,
+        body_floor: u32,
+        tip: u32,
+        bodies_in_index_hole: bool,
+    ) -> (
+        rustoshi_consensus::ChainParams,
+        Vec<rustoshi_primitives::Block>,
+    ) {
+        use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+
+        let (params, blocks) = seed_backfill_chain(db, index_floor, tip);
+        let store = BlockStore::new(db);
+        // seed_backfill_chain now stores bodies on the indexed tail. Drop
+        // those below `body_floor` so the two floors can differ.
+        if body_floor > index_floor {
+            for n in index_floor..body_floor {
+                store
+                    .prune_block(&blocks[n as usize].header.block_hash())
+                    .unwrap();
+            }
+        }
+        for n in 1..=tip {
+            let b = &blocks[n as usize];
+            let hash = b.header.block_hash();
+            store.put_header(&hash, &b.header).unwrap();
+            let in_hole = n < index_floor;
+            let has_body = n >= body_floor || (bodies_in_index_hole && in_hole);
+            if has_body {
+                store.put_block(&hash, b).unwrap();
+            }
+            let mut st = BlockStatus::new();
+            st.set(BlockStatus::VALID_HEADER);
+            if has_body {
+                st.set(BlockStatus::HAVE_DATA);
+            }
+            store
+                .put_block_index(
+                    &hash,
+                    &BlockIndexEntry {
+                        height: n,
+                        status: st,
+                        n_tx: b.transactions.len() as u32,
+                        timestamp: b.header.timestamp,
+                        bits: b.header.bits,
+                        nonce: b.header.nonce,
+                        version: b.header.version,
+                        prev_hash: b.header.prev_block_hash,
+                        chain_work: [0u8; 32],
+                    },
+                )
+                .unwrap();
+        }
+        (params, blocks)
+    }
+
+    fn rpc_for_seed(
+        db: Arc<ChainDb>,
+        params: rustoshi_consensus::ChainParams,
+        blocks: &[rustoshi_primitives::Block],
+        tip: u32,
+    ) -> RpcServerImpl {
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.best_height = tip;
+        rpc_state.best_hash = blocks[tip as usize].header.block_hash();
+        rpc_state.header_height = tip;
+        rpc_state.is_ibd = false;
+        RpcServerImpl::new(
+            Arc::new(RwLock::new(rpc_state)),
+            Arc::new(RwLock::new(PeerState::default())),
+        )
+    }
+
+    /// CONTROL (QUEUES rustoshi 2026-09-18): `pruneheight` is the lowest
+    /// height whose LOCAL body is readable, not the height-index floor.
+    /// Index starts at 10; bodies only at 0 and 15..=20 → pruneheight=15.
+    #[tokio::test]
+    async fn snapshot_hole_pruneheight_follows_body_not_index() {
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (params, blocks) = seed_snapshot_hole_with_bodies(&db, 10, 15, 20, false);
+        let rpc = rpc_for_seed(db, params, &blocks, 20);
+
+        let info = rpc.get_blockchain_info().await.expect("getblockchaininfo");
+        assert!(info.pruned, "body hole must report pruned=true");
+        assert_eq!(
+            info.pruneheight,
+            Some(15),
+            "pruneheight must be the first height with a local body in the tip suffix, not the index floor 10"
+        );
+
+        // Index exists at 12 even though the body does not: getblockhash must
+        // still resolve (Core's index is dense; this row is present).
+        let h12 = rpc
+            .get_block_hash(serde_json::json!(12))
+            .await
+            .expect("getblockhash(12) uses the height index, not the body");
+        assert_eq!(h12, blocks[12].header.block_hash().to_hex());
+
+        // Height 5: no index row. Must not borrow the pruned-data string.
+        let err = rpc
+            .get_block_hash(serde_json::json!(5))
+            .await
+            .expect_err("getblockhash(5) has no height-index row");
+        assert_eq!(err.code(), rpc_error::RPC_MISC_ERROR);
+        assert!(
+            err.message().contains("index missing")
+                || err.message().contains("hash index missing"),
+            "in-range missing index must say the INDEX is missing, not pruned data; got {:?}",
+            err.message()
+        );
+        assert_ne!(err.message(), "Block not available (pruned data)");
+    }
+
+    /// CONTROL (QUEUES rustoshi 2026-09-18): when bodies exist across the
+    /// snapshot hole, rebuild the height index from them, then
+    /// `getblock(getblockhash(h))` round-trips and `pruned` is false.
+    #[tokio::test]
+    async fn snapshot_hole_bodies_rebuild_getblock_roundtrip() {
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (params, blocks) = seed_snapshot_hole_with_bodies(&db, 10, 1, 20, true);
+        let rpc = rpc_for_seed(db, params, &blocks, 20);
+
+        let info = rpc.get_blockchain_info().await.expect("getblockchaininfo");
+        assert!(
+            !info.pruned,
+            "every body from 0 is local: pruned must be false, got pruned={} pruneheight={:?}",
+            info.pruned,
+            info.pruneheight
+        );
+        assert_eq!(info.pruneheight, None);
+
+        for h in [0u32, 1, 2, 5, 9, 10, 15, 20] {
+            let hash = rpc
+                .get_block_hash(serde_json::json!(h))
+                .await
+                .unwrap_or_else(|e| panic!("getblockhash({h}) after body-index rebuild: {e}"));
+            assert_eq!(
+                hash,
+                blocks[h as usize].header.block_hash().to_hex(),
+                "getblockhash({h})"
+            );
+            let block_json = rpc
+                .get_block(hash.clone(), Some(serde_json::json!(1)))
+                .await
+                .unwrap_or_else(|e| panic!("getblock(getblockhash({h})): {e}"));
+            let v: serde_json::Value = serde_json::from_str(block_json.get()).unwrap();
+            assert_eq!(v["hash"], hash, "round-trip hash at {h}");
+            assert_eq!(v["height"], h, "round-trip height at {h}");
+        }
+    }
 
     #[test]
     fn test_connection_type_str() {

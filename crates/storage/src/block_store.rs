@@ -402,8 +402,11 @@ impl<'a> BlockStore<'a> {
     /// Persist the backfill target floor so a restart can resume after
     /// height 1 is already indexed.
     pub fn set_historical_backfill_floor(&self, floor: u32) -> Result<(), StorageError> {
-        self.db
-            .put_cf(CF_META, META_HISTORICAL_BACKFILL_FLOOR, &floor.to_le_bytes())
+        self.db.put_cf(
+            CF_META,
+            META_HISTORICAL_BACKFILL_FLOOR,
+            &floor.to_le_bytes(),
+        )
     }
 
     /// Clear the backfill-floor marker. Called when genesis→floor is dense.
@@ -411,27 +414,125 @@ impl<'a> BlockStore<'a> {
         self.db.delete_cf(CF_META, META_HISTORICAL_BACKFILL_FLOOR)
     }
 
-    /// Floor to report as `pruneheight` while the node does not hold a dense
-    /// genesis→tip height index. Prefers the live snapshot hole; falls back
-    /// to a persisted in-progress backfill floor when height 1 is already
-    /// indexed but the genesis-side run has not yet met the tail.
-    pub fn prune_report_floor(&self, tip: u32) -> Result<Option<u32>, StorageError> {
-        if let Some(floor) = self.snapshot_index_floor(tip)? {
-            return Ok(Some(floor));
+    /// Whether the active-chain block at `height` has a local body in `CF_BLOCKS`.
+    ///
+    /// Missing height-index row ⇒ no body we can name at that height.
+    pub fn height_has_body(&self, height: u32) -> Result<bool, StorageError> {
+        match self.get_hash_by_height(height)? {
+            Some(hash) => self.has_block(&hash),
+            None => Ok(false),
         }
-        if let Some(floor) = self.historical_backfill_floor()? {
-            if floor > 1 && self.get_hash_by_height(floor.saturating_sub(1))?.is_none() {
-                return Ok(Some(floor));
+    }
+
+    /// Fill missing `CF_HEIGHT_INDEX` rows from block-index entries that
+    /// already have a stored body.
+    ///
+    /// The assumeutxo hole is a missing *height→hash* map, not missing
+    /// bytes: `getblock` by hash can succeed (local `CF_BLOCKS`) while
+    /// `getblockhash(h)` returns nothing. Walking `CF_BLOCK_INDEX` for
+    /// entries with a body and writing the height row is an index rebuild,
+    /// not a 600 G backfill.
+    ///
+    /// Returns the number of height-index rows written.
+    pub fn rebuild_height_index_from_bodies(&self) -> Result<u32, StorageError> {
+        let mut to_fill: Vec<(u32, Hash256)> = Vec::new();
+        for (hash, entry) in self.iter_block_index()? {
+            if self.get_hash_by_height(entry.height)?.is_some() {
+                continue;
+            }
+            if self.has_block(&hash)? {
+                to_fill.push((entry.height, hash));
             }
         }
-        Ok(None)
+        for (height, hash) in &to_fill {
+            self.put_height_index(*height, hash)?;
+        }
+        Ok(to_fill.len() as u32)
+    }
+
+    /// Lowest height `h` such that every block in `h..=tip` has a local body.
+    ///
+    /// Core's `GetPruneHeight` + 1 (`rpc/blockchain.cpp`): the first unpruned
+    /// block of the active-chain suffix. An isolated genesis body does not
+    /// make the chain complete.
+    ///
+    /// Returns `None` when bodies are complete from height 1 through `tip`
+    /// (the node holds the full chain; `pruned` then follows `-prune` only).
+    /// Returns `Some(tip)` when even the tip has no local body.
+    pub fn first_complete_body_height(&self, tip: u32) -> Result<Option<u32>, StorageError> {
+        if tip == 0 {
+            return Ok(None);
+        }
+        if !self.height_has_body(tip)? {
+            return Ok(Some(tip));
+        }
+        // Height 1 missing ⇒ a prefix hole (plus an optional genesis island).
+        // Binary-searching `[1, tip]` is safe: genesis is outside the range.
+        // Height 1 present ⇒ either the chain is complete, or a genesis-side
+        // backfill is in progress with a gap below the original snapshot floor.
+        let search_lo = if self.height_has_body(1)? {
+            match self.historical_backfill_floor()? {
+                Some(f) if f > 1 => f,
+                _ => return Ok(None),
+            }
+        } else {
+            1
+        };
+        self.first_body_in_indexed_suffix(search_lo, tip)
+    }
+
+    /// `tip` has a body. Lowest height in `search_lo..=tip` whose suffix to
+    /// tip is complete. The indexed tail is a single suffix (bodies may start
+    /// *above* `search_lo`, e.g. headers at 942157 and bodies at 944184).
+    fn first_body_in_indexed_suffix(
+        &self,
+        search_lo: u32,
+        tip: u32,
+    ) -> Result<Option<u32>, StorageError> {
+        if search_lo >= tip {
+            return Ok(Some(tip));
+        }
+        if self.height_has_body(search_lo)? {
+            return Ok(Some(search_lo));
+        }
+        let mut lo = search_lo;
+        let mut hi = tip;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.height_has_body(mid)? {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Ok(Some(hi))
+    }
+
+    /// Floor to report as `pruneheight`: the lowest height with complete
+    /// *block data*, not the height-index hole.
+    ///
+    /// Core (`rpc/blockchain.cpp` `GetPruneHeight` + 1): `pruneheight` is the
+    /// first unpruned block of the active-chain suffix. rustoshi's
+    /// `--load-snapshot` path previously reported the first *indexed* height
+    /// (942157 on mainnet) even when local bodies only start later (944184)
+    /// — or, conversely, when bodies existed below the index floor.
+    ///
+    /// If the height index has a snapshot hole, attempt to rebuild it from
+    /// stored bodies first. `None` means bodies are complete from height 1
+    /// (report `pruned: false` unless `-prune` is on).
+    pub fn prune_report_floor(&self, tip: u32) -> Result<Option<u32>, StorageError> {
+        if self.snapshot_index_floor(tip)?.is_some() {
+            self.rebuild_height_index_from_bodies()?;
+        }
+        self.first_complete_body_height(tip)
     }
 
     // ---------------- CHAIN METADATA ----------------
 
     /// Set the best (tip) block hash and height.
     pub fn set_best_block(&self, hash: &Hash256, height: u32) -> Result<(), StorageError> {
-        self.db.put_cf(CF_META, META_BEST_BLOCK_HASH, hash.as_bytes())?;
+        self.db
+            .put_cf(CF_META, META_BEST_BLOCK_HASH, hash.as_bytes())?;
         self.db
             .put_cf(CF_META, META_BEST_HEIGHT, &height.to_le_bytes())?;
         Ok(())
@@ -871,7 +972,10 @@ impl<'a> BlockStore<'a> {
     ///
     /// This is idempotent - calling it on an already-initialized database
     /// has no effect.
-    pub fn init_genesis(&self, params: &rustoshi_consensus::ChainParams) -> Result<(), StorageError> {
+    pub fn init_genesis(
+        &self,
+        params: &rustoshi_consensus::ChainParams,
+    ) -> Result<(), StorageError> {
         // Check if already initialized
         if self.get_best_block_hash()?.is_some() {
             return Ok(());
@@ -1701,11 +1805,7 @@ impl<'a> BlockStoreUtxoView<'a> {
     /// The caller is responsible for ensuring `(hash, height)` is the tip
     /// AT OR BELOW which every cached coin mutation belongs (i.e. flush
     /// only on a block boundary after `process_block` succeeded).
-    pub fn flush_with_tip(
-        &mut self,
-        hash: &Hash256,
-        height: u32,
-    ) -> Result<(), StorageError> {
+    pub fn flush_with_tip(&mut self, hash: &Hash256, height: u32) -> Result<(), StorageError> {
         let mut batch = self.store.db.new_batch();
         // Stage all cached UTXO mutations (drains the cache, resets mem).
         self.flush_into_batch(&mut batch)?;
@@ -1798,11 +1898,7 @@ impl<'a> BlockStoreUtxoView<'a> {
     }
 
     fn estimate_entry_size(coin: &Option<CoinEntry>) -> usize {
-        CACHE_ENTRY_OVERHEAD
-            + coin
-                .as_ref()
-                .map(|c| c.script_pubkey.len())
-                .unwrap_or(0)
+        CACHE_ENTRY_OVERHEAD + coin.as_ref().map(|c| c.script_pubkey.len()).unwrap_or(0)
     }
 }
 
@@ -1813,12 +1909,14 @@ impl<'a> rustoshi_consensus::validation::UtxoView for BlockStoreUtxoView<'a> {
     fn get_utxo(&self, outpoint: &OutPoint) -> Option<rustoshi_consensus::validation::CoinEntry> {
         // First check the cache
         if let Some(cached) = self.cache.get(outpoint) {
-            return cached.as_ref().map(|c| rustoshi_consensus::validation::CoinEntry {
-                height: c.height,
-                is_coinbase: c.is_coinbase,
-                value: c.value,
-                script_pubkey: c.script_pubkey.clone(),
-            });
+            return cached
+                .as_ref()
+                .map(|c| rustoshi_consensus::validation::CoinEntry {
+                    height: c.height,
+                    is_coinbase: c.is_coinbase,
+                    value: c.value,
+                    script_pubkey: c.script_pubkey.clone(),
+                });
         }
 
         // Fall back to database
@@ -1891,7 +1989,10 @@ mod flush_with_tip_tests {
     }
 
     fn outpoint_n(n: u8) -> OutPoint {
-        OutPoint { txid: hash_n(n), vout: 1 }
+        OutPoint {
+            txid: hash_n(n),
+            vout: 1,
+        }
     }
 
     fn coin(value: u64, height: u32) -> ConsCoinEntry {
@@ -1924,7 +2025,10 @@ mod flush_with_tip_tests {
         }
 
         // UTXO is durable in the DB.
-        let got = store.get_utxo(&op).expect("get_utxo").expect("utxo present");
+        let got = store
+            .get_utxo(&op)
+            .expect("get_utxo")
+            .expect("utxo present");
         assert_eq!(got.value, 500_000);
         // Tip pointer is durable in the DB.
         assert_eq!(store.get_best_block_hash().unwrap(), Some(tip));
@@ -1966,11 +2070,16 @@ mod flush_with_tip_tests {
         view.add_utxo(&b, coin(5_000_000_001, 111));
         // Mid-connect the block sees its own mutations.
         assert!(view.get_utxo(&u).is_none(), "U spent within the block");
-        assert!(view.get_utxo(&b).is_some(), "B output visible within the block");
+        assert!(
+            view.get_utxo(&b).is_some(),
+            "B output visible within the block"
+        );
         view.rollback_savepoint();
 
         // Poison prevented: U is spendable again.
-        let restored = view.get_utxo(&u).expect("U must be restored after rollback");
+        let restored = view
+            .get_utxo(&u)
+            .expect("U must be restored after rollback");
         assert_eq!(restored.value, 5_000_000_000);
         // The failed block's output is gone.
         assert!(view.get_utxo(&b).is_none(), "B_bad output must not persist");
@@ -2098,7 +2207,15 @@ mod flush_with_tip_tests {
         let op = outpoint_n(5);
         // Pre-seed a coin directly into the DB.
         store
-            .put_utxo(&op, &CoinEntry { height: 1, is_coinbase: false, value: 10, script_pubkey: vec![] })
+            .put_utxo(
+                &op,
+                &CoinEntry {
+                    height: 1,
+                    is_coinbase: false,
+                    value: 10,
+                    script_pubkey: vec![],
+                },
+            )
             .unwrap();
         assert!(store.get_utxo(&op).unwrap().is_some());
 
@@ -2280,7 +2397,10 @@ mod flush_with_tip_tests {
         let target_ok = (CAP * 8) / 10;
         let mut n: u32 = 0;
         while view.estimated_memory() < target_ok {
-            let op = OutPoint { txid: hash_n((n & 0xff) as u8), vout: n };
+            let op = OutPoint {
+                txid: hash_n((n & 0xff) as u8),
+                vout: n,
+            };
             view.add_utxo(&op, coin(1, 0));
             n += 1;
         }
@@ -2289,7 +2409,10 @@ mod flush_with_tip_tests {
         // Fill into the 90 %-100 % band → Large.
         let target_large = view.large_threshold_bytes() + 4096;
         while view.estimated_memory() < target_large {
-            let op = OutPoint { txid: hash_n((n & 0xff) as u8), vout: n };
+            let op = OutPoint {
+                txid: hash_n((n & 0xff) as u8),
+                vout: n,
+            };
             view.add_utxo(&op, coin(1, 0));
             n += 1;
         }
@@ -2299,7 +2422,10 @@ mod flush_with_tip_tests {
 
         // Push past the cap → Critical.
         while view.estimated_memory() <= CAP {
-            let op = OutPoint { txid: hash_n((n & 0xff) as u8), vout: n };
+            let op = OutPoint {
+                txid: hash_n((n & 0xff) as u8),
+                vout: n,
+            };
             view.add_utxo(&op, coin(1, 0));
             n += 1;
         }
@@ -2511,6 +2637,114 @@ mod snapshot_index_floor_tests {
         }
         assert_eq!(store.snapshot_index_floor(tip).unwrap(), Some(floor));
     }
+
+    fn dummy_block() -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                timestamp: 1,
+                bits: 0x207f_ffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+        }
+    }
+
+    fn put_indexed_body(store: &BlockStore<'_>, height: u32) {
+        let hash = h(height);
+        let mut status = BlockStatus::new();
+        status.set(BlockStatus::VALID_HEADER);
+        status.set(BlockStatus::HAVE_DATA);
+        store.put_height_index(height, &hash).unwrap();
+        store.put_block(&hash, &dummy_block()).unwrap();
+        store
+            .put_block_index(
+                &hash,
+                &BlockIndexEntry {
+                    height,
+                    status,
+                    n_tx: 0,
+                    timestamp: 1,
+                    bits: 0x207f_ffff,
+                    nonce: 0,
+                    version: 1,
+                    prev_hash: Hash256::ZERO,
+                    chain_work: [0u8; 32],
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn first_complete_body_height_follows_bodies_not_index() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        put_indexed_body(&store, 0);
+        // Height index from 10, bodies only from 15.
+        for n in 10..=20 {
+            store.put_height_index(n, &h(n)).unwrap();
+        }
+        for n in 15..=20 {
+            put_indexed_body(&store, n);
+        }
+        assert_eq!(store.first_complete_body_height(20).unwrap(), Some(15));
+        assert_eq!(store.snapshot_index_floor(20).unwrap(), Some(10));
+        assert_eq!(store.prune_report_floor(20).unwrap(), Some(15));
+    }
+
+    #[test]
+    fn first_complete_body_height_none_when_bodies_from_one() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        for n in 0..=10 {
+            put_indexed_body(&store, n);
+        }
+        assert_eq!(store.first_complete_body_height(10).unwrap(), None);
+        assert_eq!(store.prune_report_floor(10).unwrap(), None);
+    }
+
+    #[test]
+    fn rebuild_height_index_from_bodies_fills_snapshot_hole() {
+        let (_dir, db) = temp_db();
+        let store = BlockStore::new(&db);
+        put_indexed_body(&store, 0);
+        for n in 10..=20 {
+            put_indexed_body(&store, n);
+        }
+        // Bodies + block-index in the hole, no height-index rows.
+        for n in 1..10u32 {
+            let hash = h(n);
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::HAVE_DATA);
+            store.put_block(&hash, &dummy_block()).unwrap();
+            store
+                .put_block_index(
+                    &hash,
+                    &BlockIndexEntry {
+                        height: n,
+                        status,
+                        n_tx: 0,
+                        timestamp: 1,
+                        bits: 0x207f_ffff,
+                        nonce: 0,
+                        version: 1,
+                        prev_hash: Hash256::ZERO,
+                        chain_work: [0u8; 32],
+                    },
+                )
+                .unwrap();
+            assert_eq!(store.get_hash_by_height(n).unwrap(), None);
+        }
+        let filled = store.rebuild_height_index_from_bodies().unwrap();
+        assert_eq!(filled, 9);
+        for n in 1..10u32 {
+            assert_eq!(store.get_hash_by_height(n).unwrap(), Some(h(n)));
+        }
+        assert_eq!(store.snapshot_index_floor(20).unwrap(), None);
+        assert_eq!(store.first_complete_body_height(20).unwrap(), None);
+    }
 }
 
 // ============================================================
@@ -2592,7 +2826,8 @@ mod format_v2_tests {
         // 0x7B include bit 1, bit 3, bit 4, bit 5, bit 6 — all undefined
         // in our flag byte. The decoder MUST refuse rather than misread
         // a JSON byte as the height field.
-        let v1_blob = br#"{"height":12345,"is_coinbase":false,"value":50000000,"script_pubkey":[81]}"#;
+        let v1_blob =
+            br#"{"height":12345,"is_coinbase":false,"value":50000000,"script_pubkey":[81]}"#;
         // First 4 bytes get interpreted as a u32 height (junk but legal).
         // Byte 5 is `:` = 0x3A which has unknown flag bits set → rejected.
         let res = format_v2::decode_coin_entry(v1_blob);
@@ -2673,7 +2908,9 @@ mod format_v2_tests {
 
     #[test]
     fn undo_data_roundtrip_empty() {
-        let undo = UndoData { spent_coins: Vec::new() };
+        let undo = UndoData {
+            spent_coins: Vec::new(),
+        };
         let bytes = format_v2::encode_undo_data(&undo);
         assert_eq!(bytes, vec![0x00]); // compact_size(0)
         let decoded = format_v2::decode_undo_data(&bytes).expect("roundtrip");
@@ -2697,7 +2934,7 @@ mod format_v2_tests {
     #[test]
     fn undo_data_rejects_implausible_length() {
         // compact_size 0xFE = u32-prefix, with value 20_000_000 (>10M cap)
-        let bytes = [0xFE, 0x00, 0x2D, 0x31, 0x01, /* truncated rest */];
+        let bytes = [0xFE, 0x00, 0x2D, 0x31, 0x01 /* truncated rest */];
         let res = format_v2::decode_undo_data(&bytes);
         assert!(res.is_err(), "implausible length must be rejected");
     }
@@ -2745,8 +2982,8 @@ mod format_v2_tests {
         let coin = make_coin(
             50_000_000,
             vec![
-                0x76, 0xa9, 0x14, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
-                0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x88, 0xac,
+                0x76, 0xa9, 0x14, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+                0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x88, 0xac,
             ],
             false,
         );

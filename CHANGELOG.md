@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-12
 
+- fix(rpc): `pruneheight` is the lowest height with a local block body, not the height-index floor; rebuild height→hash from stored bodies; `getblockhash` names a missing index instead of claiming pruned data
 - feat: background backfill of genesis→snapshot-base after `--load-snapshot` (headers+bodies into the height index; `getblockhash(1)` / `pruned:false` once the hole closes). Not deployed.
 - feat(rpc): script-verification counter on getchainstates (`script_checks`)
 - feat(net): single `--connect` peer defaults to 128 in-flight; refill on receipt

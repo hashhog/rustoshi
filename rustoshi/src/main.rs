@@ -3611,6 +3611,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let mut invalid_block_hashes: std::collections::HashSet<Hash256> =
         std::collections::HashSet::new();
 
+    // AssumeUTXO hole: genesis + tail band, nothing in 1..floor-1. If
+    // bodies for those heights are already in CF_BLOCKS (index rebuild,
+    // not a 600 G download), restore the height→hash rows first so
+    // getblockhash / pruneheight see them before we arm P2P backfill.
+    match block_store.rebuild_height_index_from_bodies() {
+        Ok(n) if n > 0 => tracing::info!(
+            "rebuilt {n} height-index rows from stored block bodies"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("height-index rebuild from bodies failed: {e}"),
+    }
+
     // AssumeUTXO hole: genesis + tail band, nothing in 1..floor-1. Arm a
     // background header/body backfill that talks to the same peers as
     // forward sync but NEVER feeds those headers into HeaderSync (that
