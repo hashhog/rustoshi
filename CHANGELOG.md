@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-12
 
+- feat: `--no-historical-backfill` / `HASHHOG_DISABLE_HISTORICAL_BACKFILL=1` skip genesis→snapshot-base P2P backfill so `--load-snapshot` forward sync owns the peer
 - fix(net): historical backfill after `--load-snapshot` yields to forward header-sync and block download (no more 0-getdata stall at the snapshot base)
 - feat(consensus): `--par` sizes the script-check pool like Core (`-par=0` auto, `=1` serial, cap 15 extra workers); 128-item batches; 1-vs-N accept/reject identity
 - fix(rpc): `pruneheight` is the lowest height with a local block body, not the height-index floor; rebuild height→hash from stored bodies; `getblockhash` names a missing index instead of claiming pruned data

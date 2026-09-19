@@ -38,6 +38,11 @@
 //! the only peer. Observed 2026-09-19: 66,069 backfill iterations, zero
 //! block requests, tip frozen at the snapshot base.
 //!
+//! Operator kill-switch: [`historical_backfill_is_enabled`] /
+//! `--no-historical-backfill` / [`HISTORICAL_BACKFILL_DISABLE_ENV`]. Campaign
+//! slices that only need the snapshot tip can disable this path so forward
+//! header-sync and getdata own the single feeder peer. Default remains on.
+//!
 //! UTXO re-derivation of genesis→base (Core's in-memory/disk background
 //! coins view) is a separate concern: `ChainstateManager` already does it
 //! for small chains. Replaying ~942k mainnet blocks into a RAM `HashMap`
@@ -56,6 +61,26 @@ use crate::header_context::{expected_bits_for_child, HeaderCache};
 /// Maximum bodies requested in one getdata burst. Matches Core's default
 /// per-peer in-flight cap so historical download cannot starve tip sync.
 pub const BACKFILL_BODIES_PER_REQUEST: usize = 16;
+
+/// Env var an operator or campaign launcher sets to skip genesis→base P2P
+/// backfill after `--load-snapshot`. Same effect as `--no-historical-backfill`.
+pub const HISTORICAL_BACKFILL_DISABLE_ENV: &str = "HASHHOG_DISABLE_HISTORICAL_BACKFILL";
+
+/// True unless the operator kill-switch is set.
+///
+/// `cli_disabled` is `--no-historical-backfill`. `env` is the raw value of
+/// [`HISTORICAL_BACKFILL_DISABLE_ENV`] (`None` if unset). Either one disables:
+/// campaign `--load-snapshot` slices can then run forward-only without the
+/// 2026-09-19 stall (66,069 stored-0 getheaders, zero getdata).
+pub fn historical_backfill_is_enabled(cli_disabled: bool, env: Option<&str>) -> bool {
+    if cli_disabled {
+        return false;
+    }
+    match env.map(str::trim) {
+        None | Some("") => true,
+        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+    }
+}
 
 /// Error from applying a historical-backfill header or block batch.
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +202,23 @@ impl HistoricalBackfill {
             in_flight_bodies: HashSet::new(),
             getheaders_cooldown: false,
         }))
+    }
+
+    /// Like [`detect`], but returns `None` without reading or writing the
+    /// store when the operator kill-switch is set. A `--load-snapshot` boot
+    /// with the switch on therefore neither persists
+    /// `META_HISTORICAL_BACKFILL_FLOOR` nor sends genesis-side getheaders.
+    pub fn detect_unless_disabled(
+        store: &BlockStore<'_>,
+        genesis_hash: Hash256,
+        tip: u32,
+        cli_disabled: bool,
+        env: Option<&str>,
+    ) -> Result<Option<Self>, StorageError> {
+        if !historical_backfill_is_enabled(cli_disabled, env) {
+            return Ok(None);
+        }
+        Self::detect(store, genesis_hash, tip)
     }
 
     /// Whether historical backfill may send getheaders/getdata on the shared
@@ -931,5 +973,82 @@ mod tests {
             bf.should_request_headers(),
             "maintenance tick clears cooldown so backfill can retry"
         );
+    }
+
+    /// Operator kill-switch (QUEUES 2026-09-19): `--no-historical-backfill` /
+    /// `HASHHOG_DISABLE_HISTORICAL_BACKFILL` must default to enabled, and
+    /// either CLI or a truthy env value must disable. Campaign slices that
+    /// boot via `--load-snapshot` need this to skip genesis getheaders so
+    /// forward sync owns the only peer.
+    #[test]
+    fn historical_backfill_kill_switch_defaults_enabled() {
+        assert!(historical_backfill_is_enabled(false, None));
+        assert!(historical_backfill_is_enabled(false, Some("")));
+        assert!(historical_backfill_is_enabled(false, Some("0")));
+        assert!(historical_backfill_is_enabled(false, Some("false")));
+        assert!(historical_backfill_is_enabled(false, Some("no")));
+        assert!(historical_backfill_is_enabled(false, Some("off")));
+        assert!(historical_backfill_is_enabled(false, Some("garbage")));
+    }
+
+    #[test]
+    fn historical_backfill_kill_switch_cli_or_env_disables() {
+        assert!(!historical_backfill_is_enabled(true, None));
+        assert!(
+            !historical_backfill_is_enabled(true, Some("0")),
+            "CLI flag disables even if env is a falsey string"
+        );
+        for v in ["1", "true", "TRUE", "yes", "on", " Yes "] {
+            assert!(
+                !historical_backfill_is_enabled(false, Some(v)),
+                "env={v:?} must disable"
+            );
+        }
+    }
+
+    /// Disabled detect must not persist META_HISTORICAL_BACKFILL_FLOOR.
+    /// A "detect then drop" implementation would still write the resume
+    /// marker and is not a kill-switch.
+    #[test]
+    fn historical_backfill_disabled_skips_detect_and_does_not_persist_floor() {
+        let (_dir, db) = temp_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let blocks = build_regtest_chain(&params, 20);
+        seed_snapshot_hole(&store, &blocks, 10, 20);
+        assert_eq!(store.snapshot_index_floor(20).unwrap(), Some(10));
+        assert!(store.historical_backfill_floor().unwrap().is_none());
+
+        let armed =
+            HistoricalBackfill::detect_unless_disabled(&store, params.genesis_hash, 20, true, None)
+                .unwrap();
+        assert!(armed.is_none(), "CLI kill-switch must not arm P2P backfill");
+        assert!(
+            store.historical_backfill_floor().unwrap().is_none(),
+            "disabled detect must not persist META_HISTORICAL_BACKFILL_FLOOR"
+        );
+
+        let armed = HistoricalBackfill::detect_unless_disabled(
+            &store,
+            params.genesis_hash,
+            20,
+            false,
+            Some("1"),
+        )
+        .unwrap();
+        assert!(armed.is_none(), "env kill-switch must not arm P2P backfill");
+        assert!(store.historical_backfill_floor().unwrap().is_none());
+
+        // Default still arms and persists so turning the switch off later resumes.
+        let armed = HistoricalBackfill::detect_unless_disabled(
+            &store,
+            params.genesis_hash,
+            20,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(armed.is_some());
+        assert_eq!(store.historical_backfill_floor().unwrap(), Some(10));
     }
 }

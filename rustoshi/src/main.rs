@@ -44,7 +44,8 @@ use rustoshi_storage::{
     coinstats_compute_next_entry, coinstats_genesis_entry,
     indexes::BlockFilterIndex,
     BlockStore, ChainDb, CoinStatsIndex, HistoricalBackfill, UtxoCacheState,
-    BACKFILL_BODIES_PER_REQUEST,
+    BACKFILL_BODIES_PER_REQUEST, HISTORICAL_BACKFILL_DISABLE_ENV,
+    historical_backfill_is_enabled,
 };
 
 // ============================================================
@@ -287,6 +288,17 @@ struct Cli {
     /// rejected and the node continues a normal genesis IBD.
     #[arg(long = "load-snapshot", value_name = "PATH")]
     load_snapshot: Option<String>,
+
+    /// Skip genesis→snapshot-base P2P backfill after `--load-snapshot`.
+    ///
+    /// rustoshi has one P2P pipeline; background backfill shares it with
+    /// forward sync. Campaign slices that only need the snapshot tip can
+    /// disable backfill so header-sync and getdata are not starved (observed
+    /// 2026-09-19: 66,069 stored-0 iterations, zero block requests). Also
+    /// honoured via `HASHHOG_DISABLE_HISTORICAL_BACKFILL=1`. Default off
+    /// (backfill remains armed when a snapshot hole exists).
+    #[arg(long = "no-historical-backfill", default_value = "false")]
+    no_historical_backfill: bool,
 
     /// Enable the unauthenticated REST HTTP server.
     /// Mirrors Bitcoin Core's `-rest` (default off; see
@@ -2240,6 +2252,7 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
         }
     }
     merge_bool!(daemon, "daemon");
+    merge_bool!(no_historical_backfill, "no-historical-backfill");
     merge_opt_str!(pidfile, "pidfile");
     merge_opt_str!(debug_categories, "debug");
     merge_bool!(printtoconsole, "printtoconsole");
@@ -3291,14 +3304,26 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         best_hash = blockhash;
         best_height = assume.height;
 
+        let backfill_env = std::env::var(HISTORICAL_BACKFILL_DISABLE_ENV).ok();
+        let backfill_note = if historical_backfill_is_enabled(
+            cli.no_historical_backfill,
+            backfill_env.as_deref(),
+        ) {
+            format!(
+                "background backfill will download genesis→{} headers/bodies",
+                assume.height
+            )
+        } else {
+            "historical backfill disabled; forward sync owns the peer".to_string()
+        };
         tracing::info!(
             "Snapshot loaded + activated: {} coins, tip {} at height {} \
              (chain_work=minimum_chain_work; foreground IBD extends past this \
-             point; background backfill will download genesis→{} headers/bodies)",
+             point; {})",
             loaded,
             blockhash.to_hex(),
             assume.height,
-            assume.height,
+            backfill_note,
         );
         rpc_state_inner.chainstate_manager.activate_snapshot_with_commitment(
             blockhash,
@@ -3679,11 +3704,23 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // background header/body backfill that talks to the same peers as
     // forward sync but NEVER feeds those headers into HeaderSync (that
     // would rewind the snapshot tip to genesis). Resumes across restart
-    // via META_HISTORICAL_BACKFILL_FLOOR.
-    let mut historical_backfill = match HistoricalBackfill::detect(
+    // via META_HISTORICAL_BACKFILL_FLOOR. Operator kill-switch:
+    // `--no-historical-backfill` or HASHHOG_DISABLE_HISTORICAL_BACKFILL=1
+    // skips detect entirely so a campaign `--load-snapshot` boot does not
+    // persist the floor or send genesis getheaders on the shared peer.
+    let backfill_env = std::env::var(HISTORICAL_BACKFILL_DISABLE_ENV).ok();
+    if !historical_backfill_is_enabled(cli.no_historical_backfill, backfill_env.as_deref()) {
+        tracing::info!(
+            "historical backfill disabled (--no-historical-backfill / {HISTORICAL_BACKFILL_DISABLE_ENV}); \
+             snapshot hole is left in place so forward sync owns the peer"
+        );
+    }
+    let mut historical_backfill = match HistoricalBackfill::detect_unless_disabled(
         &block_store,
         params.genesis_hash,
         best_height,
+        cli.no_historical_backfill,
+        backfill_env.as_deref(),
     ) {
         Ok(bf) => bf,
         Err(e) => {
@@ -8087,6 +8124,42 @@ mod tests {
     fn test_cli_conf_flag() {
         let cli = Cli::try_parse_from(["rustoshi", "--conf", "/etc/rustoshi/rustoshi.conf"]).unwrap();
         assert_eq!(cli.conf.as_deref(), Some("/etc/rustoshi/rustoshi.conf"));
+    }
+
+    #[test]
+    fn test_cli_no_historical_backfill_flag() {
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert!(!cli.no_historical_backfill);
+        let cli = Cli::try_parse_from(["rustoshi", "--no-historical-backfill"]).unwrap();
+        assert!(cli.no_historical_backfill);
+        let cli = Cli::try_parse_from([
+            "rustoshi",
+            "--load-snapshot",
+            "/tmp/snap",
+            "--no-historical-backfill",
+        ])
+        .unwrap();
+        assert!(cli.no_historical_backfill);
+        assert_eq!(cli.load_snapshot.as_deref(), Some("/tmp/snap"));
+    }
+
+    #[test]
+    fn test_apply_conf_no_historical_backfill() {
+        let mut cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        let conf = ConfFile::parse("no-historical-backfill=1\n");
+        let raw_argv: Vec<String> = vec!["rustoshi".to_string()];
+        apply_conf_to_cli(&mut cli, &conf, &raw_argv);
+        assert!(cli.no_historical_backfill);
+
+        // CLI wins over conf.
+        let mut cli = Cli::try_parse_from(["rustoshi", "--no-historical-backfill"]).unwrap();
+        let conf = ConfFile::parse("no-historical-backfill=0\n");
+        let raw_argv: Vec<String> = ["rustoshi", "--no-historical-backfill"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        apply_conf_to_cli(&mut cli, &conf, &raw_argv);
+        assert!(cli.no_historical_backfill);
     }
 
     #[test]
