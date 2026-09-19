@@ -26,8 +26,10 @@
 //! - P4      : Non-critical / polish
 
 use rustoshi_consensus::{
-    ChainParams, SigCache, DEFAULT_MAX_ENTRIES,
+    ChainParams, SigCache, DEFAULT_MAX_ENTRIES, DEFAULT_SCRIPTCHECK_THREADS,
+    MAX_SCRIPTCHECK_THREADS, SCRIPT_CHECK_BATCH_SIZE, resolve_script_check_threads,
     script_flags_for_height, validate_scripts_parallel_with_cache,
+    validate_scripts_parallel_with_n_workers,
 };
 use rustoshi_consensus::validation::connect_block_with_sequence_locks;
 // validation module items used only in ignored tests (documented structural gaps)
@@ -123,20 +125,20 @@ use rustoshi_primitives::Encodable;
 // ============================================================
 
 #[test]
-#[ignore = "BUG G1 (P2): rustoshi has no --par flag; rayon uses all logical cores with no cap; Core default is GetNumCores()-1 worker threads capped at MAX_SCRIPTCHECK_THREADS=15"]
-fn g1_par_flag_absent() {
-    // The absence is structural — no flag in Cli::parse() means the
-    // rayon global pool is unconfigured. Confirm that the rayon
-    // default >= 1 (deadlock-free) but note lack of -par control.
-    let pool_threads = rayon::current_num_threads();
-    // Core would cap at 15 workers; rayon may use 32+ on high-core servers.
-    assert!(pool_threads >= 1, "rayon must have ≥1 thread");
-    // The test assertion below is the BUG: there is no mechanism to
-    // cap at MAX_SCRIPTCHECK_THREADS (15) via user config.
+fn g1_par_flag_resolve_matches_core() {
+    // `--par` is now a CLI flag (rustoshi/src/main.rs) and the pool is
+    // sized by resolve_script_check_threads, which is Core's formula:
+    // workers = clamp(par-1, 0, 15), total threads = workers+1.
+    assert_eq!(resolve_script_check_threads(1), 1);
+    assert_eq!(resolve_script_check_threads(4), 4);
+    let auto = resolve_script_check_threads(0);
     assert!(
-        pool_threads <= 15,
-        "rustoshi has no --par cap: rayon uses {} threads, Core caps at 15",
-        pool_threads
+        (1..=MAX_SCRIPTCHECK_THREADS + 1).contains(&auto),
+        "auto --par=0 must cap at 16 threads, got {auto}"
+    );
+    assert_eq!(
+        resolve_script_check_threads(100),
+        MAX_SCRIPTCHECK_THREADS + 1
     );
 }
 
@@ -183,18 +185,11 @@ fn g3_min_one_thread() {
 // ============================================================
 
 #[test]
-#[ignore = "BUG G4 (P2): MAX_SCRIPTCHECK_THREADS=15 constant and cap are absent; rayon pool is unbounded"]
 fn g4_max_scriptcheck_threads_cap() {
-    // rustoshi exports no MAX_SCRIPTCHECK_THREADS constant
-    // (search: grep -r MAX_SCRIPTCHECK /home/work/hashhog/rustoshi/crates --include=*.rs)
-    // This test would succeed once the constant is added and rayon is capped.
-    const MAX_SCRIPTCHECK_THREADS: usize = 15;
-    let actual = rayon::current_num_threads();
+    assert_eq!(MAX_SCRIPTCHECK_THREADS, 15);
     assert!(
-        actual <= MAX_SCRIPTCHECK_THREADS,
-        "rayon uses {} threads; Core caps at {}",
-        actual,
-        MAX_SCRIPTCHECK_THREADS
+        resolve_script_check_threads(i32::MAX) <= MAX_SCRIPTCHECK_THREADS + 1,
+        "even --par=i32::MAX must clamp extra workers at 15"
     );
 }
 
@@ -209,14 +204,10 @@ fn g4_max_scriptcheck_threads_cap() {
 // ============================================================
 
 #[test]
-#[ignore = "BUG G5 (P3): DEFAULT_SCRIPTCHECK_THREADS=0 constant absent; no auto-detection logic mirroring Core"]
-fn g5_default_scriptcheck_threads_constant_absent() {
-    // rustoshi has no DEFAULT_SCRIPTCHECK_THREADS exported from any crate.
-    // Once added this test becomes a compile-time pin.
-    // Expected constant: rustoshi_consensus::DEFAULT_SCRIPTCHECK_THREADS = 0
-    // (or equivalent rayon default-auto semantics).
-    let _: () = (); // placeholder — structural absence cannot be asserted
-    panic!("DEFAULT_SCRIPTCHECK_THREADS constant is absent in rustoshi_consensus");
+fn g5_default_scriptcheck_threads_is_auto() {
+    assert_eq!(DEFAULT_SCRIPTCHECK_THREADS, 0);
+    let auto = resolve_script_check_threads(DEFAULT_SCRIPTCHECK_THREADS);
+    assert!(auto >= 1 && auto <= MAX_SCRIPTCHECK_THREADS + 1);
 }
 
 // ============================================================
@@ -232,14 +223,13 @@ fn g5_default_scriptcheck_threads_constant_absent() {
 // ============================================================
 
 #[test]
-#[ignore = "BUG G6 (P3): nBatchSize=128 constant absent; rayon uses adaptive scheduling instead of fixed 128-item batches"]
 fn g6_nbatch_size_constant() {
-    // Core checkqueue.h:66 — const unsigned int nBatchSize = 128.
-    // Rustoshi has no equivalent. rayon's adaptive partitioner may
-    // use larger or smaller chunks, affecting cache locality.
-    const CORE_NBATCH_SIZE: usize = 128;
-    let _ = CORE_NBATCH_SIZE; // would reference rustoshi constant once added
-    panic!("nBatchSize=128 constant not exported by rustoshi_consensus");
+    assert_eq!(SCRIPT_CHECK_BATCH_SIZE, 128);
+    let src = include_str!("../src/validation.rs");
+    assert!(
+        src.contains("with_max_len(SCRIPT_CHECK_BATCH_SIZE)"),
+        "rayon jobs must be capped at nBatchSize=128"
+    );
 }
 
 // ============================================================
@@ -317,19 +307,31 @@ fn g10_workers_continue_after_batch() {
 // ============================================================
 
 #[test]
-#[ignore = "BUG G11 (P1): no first-failure cancellation; validate_scripts_parallel_with_cache collects all results before checking — O(N) work even when first check fails (DoS amplifier)"]
-fn g11_first_failure_cancellation_missing() {
-    // Demonstrates that validate_scripts_parallel_with_cache runs ALL
-    // checks regardless of early failure — no short-circuit.
-    // A real test would need a block with many expensive-but-valid
-    // scripts after an invalid one; here we just document the structural
-    // absence: the `results.iter().find(|r| r.is_err())` scan happens
-    // AFTER the full `.collect()`, not interleaved with execution.
-    //
-    // Core's CCheckQueue::Loop sets do_work=false as soon as
-    // m_result.has_value() — workers stop executing new checks.
-    // rustoshi's par_iter().map(...).collect() has no such mechanism.
-    panic!("first-failure short-circuit is absent in validate_scripts_parallel_with_cache");
+fn g11_first_failure_cancellation() {
+    // Structural pin: the parallel helper must short-circuit on the first
+    // Err (try_for_each + failed AtomicBool), matching Core's
+    // `do_work = !m_result.has_value()`. Behavioural identity is covered
+    // by parallel_script_verify::decision_identity_and_failure_propagation_1_vs_n.
+    let src = include_str!("../src/validation.rs");
+    let body = {
+        let sig = "fn validate_scripts_on_pool";
+        let start = src.find(sig).expect("validate_scripts_on_pool");
+        let rest = &src[start..];
+        let end = rest[sig.len()..]
+            .find("\npub fn ")
+            .or_else(|| rest[sig.len()..].find("\nfn "))
+            .map(|i| sig.len() + i)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    };
+    assert!(
+        body.contains("try_for_each"),
+        "must use try_for_each so the first Err stops new work"
+    );
+    assert!(
+        body.contains("failed.load") && body.contains("failed.store"),
+        "must skip remaining checks after the first failure (Core do_work)"
+    );
 }
 
 // ============================================================
@@ -914,11 +916,20 @@ fn g27_mandatory_vs_standard_flags_separated() {
 // ============================================================
 
 #[test]
-#[ignore = "BUG G28 (P2): no --par=1 single-thread mode; rayon global pool cannot be forced to 1 thread via CLI; needed for test determinism and debugging"]
 fn g28_par_1_single_threaded_mode() {
-    // Core allows -par=1 to force serial script checking.
-    // rustoshi has no equivalent. rayon pool is shared/global.
-    panic!("--par=1 single-thread mode absent; rayon global pool cannot be CLI-constrained to 1 thread");
+    assert_eq!(
+        resolve_script_check_threads(1),
+        1,
+        "--par=1 must be exactly one verification thread (serial)"
+    );
+    // The n-worker helper is how tests force serial vs N without racing
+    // the process-wide OnceLock pool.
+    let params = ChainParams::mainnet();
+    let block = make_coinbase_block(1, params.genesis_hash, &params);
+    let coins: Vec<Vec<CoinEntry>> = Vec::new();
+    let flags = rustoshi_consensus::ScriptFlags::default();
+    validate_scripts_parallel_with_n_workers(1, &block, &coins, &flags, None)
+        .expect("coinbase-only block must verify on a 1-thread pool");
 }
 
 // ============================================================

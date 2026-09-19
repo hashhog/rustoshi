@@ -26,8 +26,9 @@ use ops::{
 };
 
 use rustoshi_consensus::{
-    dump_mempool, get_block_proof, load_mempool, read_script_checks_total, should_skip_scripts,
-    ChainParams, ChainState, ChainWork, FeeEstimator, NetworkId, ValidationError,
+    dump_mempool, get_block_proof, init_script_check_threads, load_mempool,
+    read_script_checks_total, should_skip_scripts, ChainParams, ChainState, ChainWork,
+    FeeEstimator, NetworkId, ValidationError,
 };
 use rustoshi_network::{
     asmap as asmap_mod, resolve_blocks_in_flight_per_peer, BlockDownloader, CFCheckptMessage,
@@ -360,6 +361,23 @@ struct Cli {
     /// Example: `--assumevalid=0`
     #[arg(long = "assumevalid", value_name = "HEX|0")]
     assumevalid: Option<String>,
+
+    /// Number of script-verification threads. Mirrors Bitcoin Core's `-par=<n>`
+    /// (`init.cpp:513`, `chainstatemanager_args.cpp:53-60`):
+    ///
+    /// - `0` (default) = auto (`GetNumCores()` total, then extra workers =
+    ///   that minus 1, capped at 15)
+    /// - `>0` = that many total verification threads (`1` = serial)
+    /// - `<0` = leave that many cores free
+    ///
+    /// Worker count must not change any accept/reject decision.
+    #[arg(
+        long = "par",
+        value_name = "N",
+        default_value_t = 0,
+        allow_hyphen_values = true
+    )]
+    par: i32,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -2217,6 +2235,13 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
     merge_opt_str!(onion, "onion");
     merge_opt_str!(i2psam, "i2psam");
     merge_bool!(cjdnsreachable, "cjdnsreachable");
+    if !was_set(raw_argv, "par") {
+        if let Some(v) = conf.get("par") {
+            if let Ok(n) = v.parse::<i32>() {
+                cli.par = n;
+            }
+        }
+    }
 }
 
 /// Locate a config file path: explicit `--conf`, then `<datadir>/rustoshi.conf`,
@@ -2539,6 +2564,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     tracing::info!("Network: {:?}", params.network_id);
     tracing::info!("Genesis: {}", params.genesis_hash);
+
+    // `--par=<n>`: size the process-wide script-check pool before any
+    // ConnectBlock. Core logs extra workers (`worker_threads_num`); we do the
+    // same (total threads minus the master/caller slot).
+    let script_threads = init_script_check_threads(cli.par);
+    tracing::info!(
+        "Script verification uses {} additional threads (--par={})",
+        script_threads.saturating_sub(1),
+        cli.par
+    );
 
     // ---------- SCRIPTS-ON EVIDENCE BANNER ----------
     //
@@ -7975,6 +8010,41 @@ mod tests {
     fn test_cli_conf_flag() {
         let cli = Cli::try_parse_from(["rustoshi", "--conf", "/etc/rustoshi/rustoshi.conf"]).unwrap();
         assert_eq!(cli.conf.as_deref(), Some("/etc/rustoshi/rustoshi.conf"));
+    }
+
+    #[test]
+    fn test_cli_par_flag() {
+        // Core default: -par=0 (auto).
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert_eq!(cli.par, 0);
+        let cli = Cli::try_parse_from(["rustoshi", "--par", "4"]).unwrap();
+        assert_eq!(cli.par, 4);
+        let cli = Cli::try_parse_from(["rustoshi", "--par=1"]).unwrap();
+        assert_eq!(cli.par, 1);
+        // Negative = leave N cores free; needs --par=-1 (hyphen value).
+        let cli = Cli::try_parse_from(["rustoshi", "--par=-1"]).unwrap();
+        assert_eq!(cli.par, -1);
+        let cli = Cli::try_parse_from(["rustoshi", "--par", "16"]).unwrap();
+        assert_eq!(cli.par, 16);
+    }
+
+    #[test]
+    fn test_apply_conf_par() {
+        let mut cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        let conf = ConfFile::parse("par=8\n");
+        let raw_argv: Vec<String> = vec!["rustoshi".to_string()];
+        apply_conf_to_cli(&mut cli, &conf, &raw_argv);
+        assert_eq!(cli.par, 8);
+
+        // CLI wins over conf.
+        let mut cli = Cli::try_parse_from(["rustoshi", "--par", "1"]).unwrap();
+        let conf = ConfFile::parse("par=8\n");
+        let raw_argv: Vec<String> = ["rustoshi", "--par", "1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        apply_conf_to_cli(&mut cli, &conf, &raw_argv);
+        assert_eq!(cli.par, 1);
     }
 
     #[test]

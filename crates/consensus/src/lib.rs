@@ -70,11 +70,13 @@ pub use validation::{
     accept_block_header_chain_work,
     calculate_sequence_locks, check_block, check_block_with_pow, check_sequence_locks, check_transaction,
     connect_block_with_sequence_locks, contextual_check_block, contextual_check_block_header,
-    disconnect_block, read_script_checks_total, script_flags_for_height, should_skip_scripts,
-    validate_scripts_parallel_with_cache,
-    BlockIndexEntry, ChainContext, CoinEntry, DisconnectResult, SequenceLockContext,
-    SequenceLocks, StubChainContext, TransactionSignatureChecker, TxValidationError,
-    UndoData, UtxoView, ValidationError,
+    disconnect_block, init_script_check_threads, read_script_checks_total,
+    resolve_script_check_threads, script_check_thread_count, script_flags_for_height,
+    should_skip_scripts, validate_scripts_parallel_with_cache,
+    validate_scripts_parallel_with_n_workers, BlockIndexEntry, ChainContext, CoinEntry,
+    DisconnectResult, SequenceLockContext, SequenceLocks, StubChainContext,
+    TransactionSignatureChecker, TxValidationError, UndoData, UtxoView, ValidationError,
+    DEFAULT_SCRIPTCHECK_THREADS, MAX_SCRIPTCHECK_THREADS, SCRIPT_CHECK_BATCH_SIZE,
 };
 pub use chain_state::{current_time_secs, ChainState, CompressedScript, UtxoCache};
 pub use fee_estimator::{FeeEstimator, RawBucketStats};

@@ -40,33 +40,85 @@ use rayon::prelude::*;
 use rustoshi_crypto::sha256d;
 use rustoshi_primitives::{compact_size_len, Block, BlockHeader, Hash256, OutPoint, Transaction};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use thiserror::Error;
 
-/// Core's `MAX_SCRIPTCHECK_THREADS` (validation.h:90): hard cap on the
-/// number of parallel script-verification worker threads, regardless of
-/// how many cores the machine has.
-const MAX_SCRIPTCHECK_THREADS: usize = 15;
+/// Core's `MAX_SCRIPTCHECK_THREADS` (`validation.h:90`): hard cap on extra
+/// script-check worker threads. Combined with the calling/master thread this
+/// is at most 16 verification threads.
+pub const MAX_SCRIPTCHECK_THREADS: usize = 15;
+
+/// Core's `DEFAULT_SCRIPTCHECK_THREADS` (`chainstatemanager_args.h:14`):
+/// `0` means auto-detect (`GetNumCores()`).
+pub const DEFAULT_SCRIPTCHECK_THREADS: i32 = 0;
+
+/// Core's `CCheckQueue` batch size (`validation.cpp:6136`, `nBatchSize=128`).
+/// Each worker pulls at most this many checks at a time so per-worker
+/// buffers stay O(batch), not O(inputs × workers).
+pub const SCRIPT_CHECK_BATCH_SIZE: usize = 128;
+
+/// `--par` value consumed by the process-wide pool. Written by
+/// [`init_script_check_threads`] before the first ConnectBlock; default 0
+/// (auto) matches Core.
+static REQUESTED_PAR: AtomicI32 = AtomicI32::new(DEFAULT_SCRIPTCHECK_THREADS);
+
+/// Resolve `--par=<n>` to the number of script-verification threads.
+///
+/// Mirrors Bitcoin Core `ApplyArgsManOptions` (`chainstatemanager_args.cpp:53-60`)
+/// plus the `CCheckQueue` constructor clamp (`validation.cpp:6136`):
+///
+/// ```text
+/// script_threads = par
+/// if script_threads <= 0: script_threads += GetNumCores()  // 0=auto, -n=leave n free
+/// worker_threads_num = clamp(script_threads - 1, 0, MAX_SCRIPTCHECK_THREADS)
+/// ```
+///
+/// Core then runs `worker_threads_num` extra threads plus the calling
+/// (master) thread. Rayon's `ThreadPool::install` does *not* add the caller
+/// as a worker, so we size the pool at `worker_threads_num + 1` (always ≥ 1)
+/// to keep the same total. `--par=1` is therefore serial (one thread).
+pub fn resolve_script_check_threads(par: i32) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(1);
+    let mut script_threads = par;
+    if script_threads <= 0 {
+        script_threads = script_threads.saturating_add(cores);
+    }
+    let workers = (script_threads - 1).clamp(0, MAX_SCRIPTCHECK_THREADS as i32);
+    (workers + 1) as usize
+}
+
+/// Set `--par` and initialize the process-wide script-check pool.
+///
+/// Must be called once at startup, before the first ConnectBlock. Later
+/// calls cannot resize an already-built pool (OnceLock); they still return
+/// the live thread count.
+pub fn init_script_check_threads(par: i32) -> usize {
+    REQUESTED_PAR.store(par, Ordering::SeqCst);
+    script_check_thread_count()
+}
+
+/// Live size of the process-wide script-check pool (1 = serial).
+pub fn script_check_thread_count() -> usize {
+    script_check_pool().current_num_threads()
+}
 
 /// Lazily-initialized, process-wide rayon pool dedicated to parallel
 /// script verification in `validate_scripts_parallel_with_cache`.
 ///
-/// Sized like Core's script-check queue: `min(available_parallelism()-1,
-/// MAX_SCRIPTCHECK_THREADS)`, leaving one core for block download / I/O and
-/// never exceeding Core's 15-worker cap.  Using a dedicated capped pool
-/// (rather than rayon's unbounded global pool) keeps script verification
-/// from monopolizing every logical core during IBD.  See W105 G1/G4.
+/// Sized from `--par` via [`resolve_script_check_threads`]: never more than
+/// `MAX_SCRIPTCHECK_THREADS + 1` threads, and `--par=1` is a single thread.
+/// Using a dedicated capped pool (rather than rayon's unbounded global pool)
+/// keeps script verification from monopolizing every logical core during IBD.
+/// See W105 G1/G4/G28.
 fn script_check_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        // Leave one core for I/O; floor at 1 so the pool never has 0 threads.
-        let workers = cores.saturating_sub(1).clamp(1, MAX_SCRIPTCHECK_THREADS);
+        let n = resolve_script_check_threads(REQUESTED_PAR.load(Ordering::SeqCst));
         rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
+            .num_threads(n)
             .thread_name(|i| format!("script-check-{i}"))
             .build()
             .expect("script-check rayon pool must build")
@@ -2597,6 +2649,38 @@ pub fn validate_scripts_parallel_with_cache(
     flags: &ScriptFlags,
     sig_cache: Option<&crate::sig_cache::SigCache>,
 ) -> Result<(), TxValidationError> {
+    validate_scripts_on_pool(script_check_pool(), block, coins, flags, sig_cache)
+}
+
+/// Same as [`validate_scripts_parallel_with_cache`] but on a fresh pool of
+/// exactly `n_workers` threads (clamped to ≥ 1).
+///
+/// Used by the 1-vs-N identity / scaling controls so worker count is an
+/// input, not a process-wide OnceLock. Production ConnectBlock keeps using
+/// the `--par`-sized pool.
+pub fn validate_scripts_parallel_with_n_workers(
+    n_workers: usize,
+    block: &Block,
+    coins: &[Vec<CoinEntry>],
+    flags: &ScriptFlags,
+    sig_cache: Option<&crate::sig_cache::SigCache>,
+) -> Result<(), TxValidationError> {
+    let n = n_workers.max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .thread_name(move |i| format!("script-check-n{n}-{i}"))
+        .build()
+        .expect("script-check test pool must build");
+    validate_scripts_on_pool(&pool, block, coins, flags, sig_cache)
+}
+
+fn validate_scripts_on_pool(
+    pool: &rayon::ThreadPool,
+    block: &Block,
+    coins: &[Vec<CoinEntry>],
+    flags: &ScriptFlags,
+    sig_cache: Option<&crate::sig_cache::SigCache>,
+) -> Result<(), TxValidationError> {
     // Convert flags to u32 for cache key
     let flags_bits = flags.to_bits();
 
@@ -2645,19 +2729,21 @@ pub fn validate_scripts_parallel_with_cache(
     // never reaches this helper, so skip_scripts=true does not increment.
     record_script_checks(script_checks.len() as u64);
 
-    // Validate all scripts in parallel on the dedicated, core-capped pool
-    // (W105 G1/G4) with first-failure short-circuit (W105 G11).
+    // Validate all scripts in parallel on the supplied pool with
+    // first-failure short-circuit (W105 G11) and Core's 128-item batch
+    // bound (`with_max_len(SCRIPT_CHECK_BATCH_SIZE)`).
     //
-    // `try_for_each` mirrors Core's `CCheckQueue` `do_work = !m_result`
-    // behaviour: as soon as one check returns `Err`, rayon stops handing out
-    // new work and propagates that first error — so an attacker who places a
-    // bad script before thousands of expensive-but-valid scripts no longer
-    // forces O(N) wasted verification.  Any single failure → `Err` (block
-    // rejected); all pass → `Ok(())`.  Same `ScriptFailed` error type as the
-    // old collect-then-scan path.
-    script_check_pool().install(|| {
+    // `try_for_each` + `failed` mirrors Core's `CCheckQueue`
+    // `do_work = !m_result.has_value()`: as soon as one check returns
+    // `Err`, remaining workers skip new work and that error rejects the
+    // block.  Worker count does not change the accept/reject decision;
+    // with a single failing input the reject reason is identical at 1
+    // and at N (the 1-vs-N identity control).
+    let failed = AtomicBool::new(false);
+    pool.install(|| {
         script_checks
             .par_iter()
+            .with_max_len(SCRIPT_CHECK_BATCH_SIZE)
             .try_for_each(|(tx, input_idx, coin, tx_coin_idx)| {
                 // Capture script material for cache key derivation.
                 let script_sig = &tx.inputs[*input_idx].script_sig;
@@ -2665,6 +2751,13 @@ pub fn validate_scripts_parallel_with_cache(
                 let script_pubkey = &coin.script_pubkey;
                 let wtxid = &per_tx_wtxids[*tx_coin_idx];
                 let input_idx_u32 = *input_idx as u32;
+
+                // Core `do_work = !m_result`: skip remaining checks once
+                // any worker has failed. Returning Ok here lets the original
+                // Err propagate from the failing worker.
+                if failed.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
 
                 // Check cache first.  Keyed on (wtxid, input_idx, material,
                 // flags) so a hit guarantees that the same spending
@@ -2713,6 +2806,8 @@ pub fn validate_scripts_parallel_with_cache(
                             flags_bits,
                         );
                     }
+                } else {
+                    failed.store(true, Ordering::Relaxed);
                 }
 
                 result
