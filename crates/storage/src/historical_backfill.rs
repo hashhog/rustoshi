@@ -29,6 +29,15 @@
 //! would look like a rewind to height 0 and overwrite the snapshot tail.
 //! The P2P loop classifies a batch as backfill iff [`HistoricalBackfill::is_backfill_batch`].
 //!
+//! Peer isolation: rustoshi has one P2P pipeline. Core keeps the snapshot
+//! chainstate independent of background IBD. We approximate that with
+//! [`HistoricalBackfill::may_use_peer`]: backfill getheaders/getdata are
+//! forbidden while forward header-sync is in progress or the validated tip
+//! is behind the header tip. A stored-0 overlapping resend cools getheaders
+//! ([`HistoricalBackfill::should_request_headers`]) so it cannot tight-loop
+//! the only peer. Observed 2026-09-19: 66,069 backfill iterations, zero
+//! block requests, tip frozen at the snapshot base.
+//!
 //! UTXO re-derivation of genesis→base (Core's in-memory/disk background
 //! coins view) is a separate concern: `ChainstateManager` already does it
 //! for small chains. Replaying ~942k mainnet blocks into a RAM `HashMap`
@@ -94,6 +103,10 @@ pub struct HistoricalBackfill {
     next_body_height: u32,
     /// Hashes we have asked a peer for and not yet received.
     in_flight_bodies: HashSet<Hash256>,
+    /// Set when a headers batch stored 0 (overlapping resend). Cleared by
+    /// [`Self::clear_getheaders_cooldown`] (maintenance tick). Prevents the
+    /// tight loop that starved forward getheaders after `--load-snapshot`.
+    getheaders_cooldown: bool,
 }
 
 impl HistoricalBackfill {
@@ -162,7 +175,35 @@ impl HistoricalBackfill {
             floor_hash,
             next_body_height,
             in_flight_bodies: HashSet::new(),
+            getheaders_cooldown: false,
         }))
+    }
+
+    /// Whether historical backfill may send getheaders/getdata on the shared
+    /// peer. False while forward header-sync is occupying getheaders, or
+    /// while the validated tip is behind the header tip (forward block
+    /// download still needs the connection).
+    ///
+    /// rustoshi has one P2P pipeline; Core's snapshot chainstate does not
+    /// share that constraint. Yielding is how we keep `--load-snapshot`
+    /// boot able to request blocks past the base.
+    pub fn may_use_peer(
+        forward_header_sync_idle: bool,
+        validated_tip: u32,
+        header_tip: u32,
+    ) -> bool {
+        forward_header_sync_idle && validated_tip >= header_tip
+    }
+
+    /// True when the P2P loop should send a genesis-side getheaders.
+    /// False once the header hole is closed, or during the stored-0 cooldown.
+    pub fn should_request_headers(&self) -> bool {
+        !self.headers_complete() && !self.getheaders_cooldown
+    }
+
+    /// Allow getheaders again (maintenance tick / peer reconnect).
+    pub fn clear_getheaders_cooldown(&mut self) {
+        self.getheaders_cooldown = false;
     }
 
     /// Genesis-side locator for `getheaders`. Newest-first: the last
@@ -239,6 +280,9 @@ impl HistoricalBackfill {
         params: &ChainParams,
     ) -> Result<usize, BackfillError> {
         if headers.is_empty() || self.headers_complete() {
+            if !self.headers_complete() {
+                self.getheaders_cooldown = true;
+            }
             return Ok(0);
         }
 
@@ -249,6 +293,7 @@ impl HistoricalBackfill {
             }
             if start == headers.len() {
                 if self.is_historical_hash(store, &headers[0].prev_block_hash) {
+                    self.getheaders_cooldown = true;
                     return Ok(0);
                 }
                 return Err(BackfillError::Unconnecting {
@@ -350,6 +395,14 @@ impl HistoricalBackfill {
         }
         if self.is_complete() {
             store.clear_historical_backfill_floor()?;
+        }
+        // Overlapping resend (stored 0) must not immediately re-request: that
+        // is the 66,069-iteration stall after `--load-snapshot`. Progress
+        // (stored > 0) clears the cooldown so the next batch can be fetched.
+        if stored == 0 && !self.headers_complete() {
+            self.getheaders_cooldown = true;
+        } else if stored > 0 {
+            self.getheaders_cooldown = false;
         }
         Ok(stored)
     }
@@ -797,5 +850,86 @@ mod tests {
         assert!(!loc.contains(&blocks[20].header.block_hash()));
         assert_eq!(bf.hash_stop(), blocks[10].header.block_hash());
         assert_ne!(bf.hash_stop(), Hash256::ZERO);
+    }
+
+    /// Control for the 2026-09-19 snapshot-boot stall: after `--load-snapshot`
+    /// the background backfill must not occupy the shared peer while forward
+    /// header-sync is in progress or the validated tip is behind the header
+    /// tip. Observed: 66,069 backfill getheaders, zero block requests, tip
+    /// frozen at the snapshot base.
+    #[test]
+    fn historical_backfill_yields_to_forward_sync() {
+        assert!(
+            !HistoricalBackfill::may_use_peer(false, 900_000, 900_000),
+            "DownloadingHeaders must not share the getheaders slot with backfill"
+        );
+        assert!(
+            !HistoricalBackfill::may_use_peer(true, 900_000, 906_000),
+            "validated tip behind header tip: forward block download needs the peer"
+        );
+        assert!(
+            HistoricalBackfill::may_use_peer(true, 906_000, 906_000),
+            "caught up: backfill may use the peer"
+        );
+        assert!(
+            HistoricalBackfill::may_use_peer(true, 910_000, 906_000),
+            "validated tip ahead of header tip is still idle-forward"
+        );
+    }
+
+    /// Post-snapshot headers (connecting at the assumeutxo tail) must never be
+    /// classified as historical. If they were, HeaderSync would not see them
+    /// and would never enqueue bodies past the snapshot base.
+    #[test]
+    fn historical_backfill_post_snapshot_headers_are_forward() {
+        let (_dir, db) = temp_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let blocks = build_regtest_chain(&params, 20);
+        seed_snapshot_hole(&store, &blocks, 10, 20);
+        let bf = HistoricalBackfill::detect(&store, params.genesis_hash, 20)
+            .unwrap()
+            .unwrap();
+        let post: Vec<BlockHeader> = (11..16)
+            .map(|h| blocks[h as usize].header.clone())
+            .collect();
+        assert!(
+            !bf.is_backfill_batch(&store, &post),
+            "headers connecting past the snapshot floor are forward-sync, not backfill"
+        );
+        let hole: Vec<BlockHeader> = (1..5).map(|h| blocks[h as usize].header.clone()).collect();
+        assert!(bf.is_backfill_batch(&store, &hole));
+    }
+
+    /// A stored-0 overlapping resend must cool getheaders. The live stall was
+    /// 66,069 iterations of `stored 0 headers, genesis_tip=16000/897973` with
+    /// an immediate re-request after every one.
+    #[test]
+    fn historical_backfill_zero_store_cools_getheaders() {
+        let (_dir, db) = temp_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let blocks = build_regtest_chain(&params, 20);
+        seed_snapshot_hole(&store, &blocks, 10, 20);
+        let mut bf = HistoricalBackfill::detect(&store, params.genesis_hash, 20)
+            .unwrap()
+            .unwrap();
+        assert!(
+            bf.should_request_headers(),
+            "fresh hole must request genesis-side headers"
+        );
+        let first: Vec<BlockHeader> = (1..5).map(|h| blocks[h as usize].header.clone()).collect();
+        assert_eq!(bf.accept_headers(&first, &store, &params).unwrap(), 4);
+        assert!(bf.should_request_headers(), "progress must keep requesting");
+        assert_eq!(bf.accept_headers(&first, &store, &params).unwrap(), 0);
+        assert!(
+            !bf.should_request_headers(),
+            "stored-0 overlapping resend must not tight-loop getheaders"
+        );
+        bf.clear_getheaders_cooldown();
+        assert!(
+            bf.should_request_headers(),
+            "maintenance tick clears cooldown so backfill can retry"
+        );
     }
 }

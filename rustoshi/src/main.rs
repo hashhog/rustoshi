@@ -1277,6 +1277,11 @@ async fn send_download_requests(
 /// genesis-side locator and getdata for missing bodies. Historical batches
 /// must never enter the forward HeaderSync (that would rewind the snapshot
 /// tip to genesis).
+///
+/// Callers must have already checked [`HistoricalBackfill::may_use_peer`]:
+/// this node has one P2P pipeline, so backfill getheaders on a shared peer
+/// starves forward header-sync and block download (2026-09-19 snapshot-boot
+/// stall: 66,069 backfill lines, zero block requests).
 async fn drive_historical_backfill(
     backfill: &mut Option<HistoricalBackfill>,
     store: &BlockStore<'_>,
@@ -1293,7 +1298,7 @@ async fn drive_historical_backfill(
     let Some(ref pm) = ps.peer_manager else {
         return;
     };
-    if !bf.headers_complete() {
+    if bf.should_request_headers() {
         let msg = NetworkMessage::GetHeaders(GetHeadersMessage {
             version: PROTOCOL_VERSION as u32,
             locator_hashes: bf.locator(),
@@ -1327,6 +1332,18 @@ fn finish_historical_backfill_if_done(backfill: &mut Option<HistoricalBackfill>)
     if backfill.as_ref().is_some_and(|b| b.is_complete()) {
         *backfill = None;
     }
+}
+
+/// True when historical backfill may occupy the shared peer. False while
+/// HeaderSync is downloading headers or the validated tip is behind the
+/// header tip — those are the forward-sync states the 2026-09-19
+/// `--load-snapshot` stall starved.
+fn historical_backfill_may_drive(header_sync: &HeaderSync, validated_tip: u32) -> bool {
+    HistoricalBackfill::may_use_peer(
+        matches!(header_sync.state(), rustoshi_network::SyncState::Idle),
+        validated_tip,
+        header_sync.best_header_height(),
+    )
 }
 
 /// rustoshi's `InvalidBlockFound` equivalent (issue #5).
@@ -3677,7 +3694,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     if let Some(ref bf) = historical_backfill {
         tracing::info!(
             "historical backfill armed: genesis-side tip {} → floor {} \
-             (P2P headers+bodies; forward HeaderSync stays at the snapshot tip)",
+             (P2P headers+bodies; yields while forward header-sync or block \
+             download needs the peer; HeaderSync stays at the snapshot tip)",
             bf.genesis_tip(),
             bf.target_floor()
         );
@@ -4665,14 +4683,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             }
                         }
                         if historical_backfill.is_some() {
-                            drive_historical_backfill(
-                                &mut historical_backfill,
-                                &block_store,
-                                Some(peer_id),
-                                &peer_state,
-                            )
-                            .await;
-                            finish_historical_backfill_if_done(&mut historical_backfill);
+                            let chain_tip = {
+                                let cs = chain_state.read().await;
+                                cs.tip_height()
+                            };
+                            if historical_backfill_may_drive(&header_sync, chain_tip) {
+                                drive_historical_backfill(
+                                    &mut historical_backfill,
+                                    &block_store,
+                                    Some(peer_id),
+                                    &peer_state,
+                                )
+                                .await;
+                                finish_historical_backfill_if_done(&mut historical_backfill);
+                            }
                         }
                     }
 
@@ -4717,14 +4741,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             ),
                                         }
                                     }
-                                    drive_historical_backfill(
-                                        &mut historical_backfill,
-                                        &block_store,
-                                        Some(peer_id),
-                                        &peer_state,
-                                    )
-                                    .await;
-                                    finish_historical_backfill_if_done(&mut historical_backfill);
+                                    let chain_tip = {
+                                        let cs = chain_state.read().await;
+                                        cs.tip_height()
+                                    };
+                                    if historical_backfill_may_drive(&header_sync, chain_tip) {
+                                        drive_historical_backfill(
+                                            &mut historical_backfill,
+                                            &block_store,
+                                            Some(peer_id),
+                                            &peer_state,
+                                        )
+                                        .await;
+                                        finish_historical_backfill_if_done(&mut historical_backfill);
+                                    }
                                 } else {
                                 let header_count = headers.len();
                                 let current_header_height = header_sync.best_header_height();
@@ -4920,11 +4950,49 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 match need_more {
                                     Ok(true) => {
                                         // Update RPC header height during ongoing sync
+                                        let hh = header_sync.best_header_height();
                                         {
-                                            let hh = header_sync.best_header_height();
                                             let mut rpc = rpc_state.write().await;
                                             if hh > rpc.header_height {
                                                 rpc.header_height = hh;
+                                            }
+                                        }
+                                        // Advance the downloader's header tip on every full
+                                        // batch, not only on Ok(false) (caught up). Waiting
+                                        // for caught-up left best_header_height stuck at the
+                                        // snapshot base after 3×2000 headers, so the 10s
+                                        // gap-fill saw no gap and never issued getdata —
+                                        // the 2026-09-19 `--load-snapshot` stall.
+                                        block_downloader.set_best_header_height(hh);
+                                        block_downloader.clear_stalling();
+                                        if hh > current_header_height {
+                                            let mut blocks_to_download = Vec::new();
+                                            for h in (current_header_height + 1)..=hh {
+                                                if let Ok(Some(hash)) =
+                                                    block_store.get_hash_by_height(h)
+                                                {
+                                                    blocks_to_download.push((hash, h));
+                                                }
+                                            }
+                                            if !blocks_to_download.is_empty() {
+                                                tracing::info!(
+                                                    "Enqueueing {} blocks for download during header sync (heights {}..={})",
+                                                    blocks_to_download.len(),
+                                                    current_header_height + 1,
+                                                    hh
+                                                );
+                                                block_downloader.enqueue_blocks(blocks_to_download);
+                                                let requests = block_downloader.assign_requests();
+                                                if !requests.is_empty() {
+                                                    let ps = peer_state.read().await;
+                                                    if let Some(ref pm) = ps.peer_manager {
+                                                        for (peer, msg) in &requests {
+                                                            if !pm.send_to_peer(*peer, msg.clone()).await {
+                                                                block_downloader.remove_peer(*peer);
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         // Request more headers
@@ -5206,14 +5274,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             ),
                                         }
                                     }
-                                    drive_historical_backfill(
-                                        &mut historical_backfill,
-                                        &block_store,
-                                        Some(peer_id),
-                                        &peer_state,
-                                    )
-                                    .await;
-                                    finish_historical_backfill_if_done(&mut historical_backfill);
+                                    let chain_tip = {
+                                        let cs = chain_state.read().await;
+                                        cs.tip_height()
+                                    };
+                                    if historical_backfill_may_drive(&header_sync, chain_tip) {
+                                        drive_historical_backfill(
+                                            &mut historical_backfill,
+                                            &block_store,
+                                            Some(peer_id),
+                                            &peer_state,
+                                        )
+                                        .await;
+                                        finish_historical_backfill_if_done(&mut historical_backfill);
+                                    }
                                 } else {
                                 block_downloader.block_received(peer_id, block);
                                 // Refill in-flight now — do not wait for the 10s retry
@@ -7381,17 +7455,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     }
                 }
                 if historical_backfill.is_some() {
-                    historical_backfill
-                        .as_mut()
-                        .map(|bf| bf.clear_in_flight());
-                    drive_historical_backfill(
-                        &mut historical_backfill,
-                        &block_store,
-                        header_sync.some_peer(),
-                        &peer_state,
-                    )
-                    .await;
-                    finish_historical_backfill_if_done(&mut historical_backfill);
+                    if let Some(bf) = historical_backfill.as_mut() {
+                        bf.clear_in_flight();
+                        bf.clear_getheaders_cooldown();
+                    }
+                    if historical_backfill_may_drive(&header_sync, validated_tip) {
+                        drive_historical_backfill(
+                            &mut historical_backfill,
+                            &block_store,
+                            header_sync.some_peer(),
+                            &peer_state,
+                        )
+                        .await;
+                        finish_historical_backfill_if_done(&mut historical_backfill);
+                    }
                 }
             }
 
