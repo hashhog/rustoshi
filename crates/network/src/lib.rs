@@ -36,6 +36,9 @@ mod w104_addrman_tests;
 #[cfg(test)]
 mod w115_asmap_tests;
 
+#[cfg(test)]
+mod peer_loop_liveness_tests;
+
 pub use addr::*;
 pub use asmap::*;
 pub use block_download::*;

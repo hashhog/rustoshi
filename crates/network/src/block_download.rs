@@ -166,6 +166,12 @@ pub struct BlockDownloader {
     /// without waiting for the 10s retry tick (or the post-validation
     /// `assign_requests` call, which runs only after up to 8 slow connects).
     pending_refill: Vec<(PeerId, NetworkMessage)>,
+    /// Blocks whose request timed out, mapped to the peer that failed to
+    /// deliver. The re-request goes to a different peer when one has
+    /// capacity (Core reaches the same end by disconnecting the peer on a
+    /// block-download timeout). Entries are consumed on reassignment and
+    /// dropped on receipt.
+    timed_out_from: HashMap<Hash256, PeerId>,
 }
 
 /// Outcome of a level-triggered gap-fill reconciliation.
@@ -446,6 +452,7 @@ impl BlockDownloader {
             pending_set: std::collections::HashSet::new(),
             max_per_peer: per_peer.clamp(1, MAX_BLOCKS_IN_FLIGHT),
             pending_refill: Vec::new(),
+            timed_out_from: HashMap::new(),
         }
     }
 
@@ -601,8 +608,19 @@ impl BlockDownloader {
                 continue;
             }
 
-            let peer_id = available_peers[peer_idx % available_peers.len()];
+            let mut peer_id = available_peers[peer_idx % available_peers.len()];
             peer_idx += 1;
+            // A timed-out block goes to someone other than the peer that
+            // sat on it, whenever such a peer has capacity. Otherwise a
+            // silent peer can keep the one block we need at the tip for
+            // timeout after timeout.
+            if let Some(avoid) = self.timed_out_from.remove(&hash) {
+                if peer_id == avoid {
+                    if let Some(alt) = available_peers.iter().copied().find(|p| *p != avoid) {
+                        peer_id = alt;
+                    }
+                }
+            }
 
             // Get the peer's current timeout
             let timeout = self
@@ -671,6 +689,7 @@ impl BlockDownloader {
             let _ = in_flight;
         }
 
+        self.timed_out_from.remove(&hash);
         self.received_blocks.insert(hash, block);
 
         // Refill on receipt. `assign_requests` drains `pending_refill` first,
@@ -746,6 +765,7 @@ impl BlockDownloader {
                     state.increase_timeout();
                 }
                 // Re-queue the block for download from another peer
+                self.timed_out_from.insert(block.hash, block.peer);
                 self.download_queue.push_front((block.hash, block.height));
             }
         }
@@ -1360,6 +1380,65 @@ mod tests {
         assert_eq!(dl.blocks_in_flight(), 0);
         assert_eq!(dl.blocks_queued(), 1);
         assert!(dl.peer_states.get(&peer).unwrap().stalling);
+    }
+
+    /// The tip-sync case: ONE block, in flight to a peer that never answers
+    /// (dead task, silent peer). After its timeout it must be re-requested
+    /// from a DIFFERENT peer — re-asking the silent one just burns another
+    /// timeout. Core gets this for free by disconnecting a peer whose block
+    /// request times out (net_processing.cpp "Timeout downloading block"),
+    /// which forces the re-request elsewhere. Repeated with fresh downloaders
+    /// because `peer_states` is a HashMap: a round-robin that happens to pick
+    /// the other peer half the time would otherwise pass by luck.
+    #[test]
+    fn test_timed_out_block_rerequested_from_another_peer() {
+        for trial in 0..32 {
+            let mut dl = BlockDownloader::new(0, 100);
+            let silent = PeerId(1);
+            let healthy = PeerId(2);
+            dl.add_peer(silent);
+            dl.add_peer(healthy);
+
+            let hash = Hash256([9; 32]);
+            dl.enqueue_blocks(vec![(hash, 1)]);
+            // Force the first request onto the silent peer.
+            dl.peer_states.get_mut(&healthy).unwrap().blocks_in_flight = dl.max_per_peer;
+            let first = dl.assign_requests();
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].0, silent);
+            dl.peer_states.get_mut(&healthy).unwrap().blocks_in_flight = 0;
+
+            let b = dl.in_flight.get_mut(&hash).unwrap();
+            b.requested_at = Instant::now() - Duration::from_secs(100);
+            b.timeout = Duration::from_secs(1);
+            let _ = dl.check_timeouts();
+
+            let retry = dl.assign_requests();
+            assert_eq!(retry.len(), 1, "trial {trial}: block was not re-requested");
+            assert_eq!(
+                retry[0].0, healthy,
+                "trial {trial}: timed-out block re-requested from the same silent peer"
+            );
+        }
+    }
+
+    /// With no alternative peer, the timed-out block still goes back to the
+    /// only peer we have (never strand a block with zero requests out).
+    #[test]
+    fn test_timed_out_block_retries_same_peer_when_it_is_the_only_one() {
+        let mut dl = BlockDownloader::new(0, 100);
+        let only = PeerId(1);
+        dl.add_peer(only);
+        let hash = Hash256([9; 32]);
+        dl.enqueue_blocks(vec![(hash, 1)]);
+        let _ = dl.assign_requests();
+        let b = dl.in_flight.get_mut(&hash).unwrap();
+        b.requested_at = Instant::now() - Duration::from_secs(100);
+        b.timeout = Duration::from_secs(1);
+        let _ = dl.check_timeouts();
+        let retry = dl.assign_requests();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].0, only);
     }
 
     #[test]

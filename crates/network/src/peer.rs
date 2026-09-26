@@ -26,7 +26,7 @@ use crate::v2_transport::{
     Bip324Cipher, EllSwiftPubKey,
 };
 use rustoshi_crypto::sha256d;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -2042,66 +2042,127 @@ pub(crate) async fn v2_send_message_tracked<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Like [`v2_recv_message`] but updates `stats` with the ciphertext
-/// length consumed (length cipher + AEAD packet) before returning the
-/// decrypted message.
-pub(crate) async fn v2_recv_message_tracked<R: tokio::io::AsyncRead + Unpin>(
+/// Decrypt a BIP-324 length field and bound it. Advances the length cipher,
+/// so it must run exactly once per packet.
+fn v2_decode_length(cipher: &mut Bip324Cipher, enc_len: &[u8]) -> std::io::Result<usize> {
+    let mut len3 = [0u8; LENGTH_LEN];
+    len3.copy_from_slice(enc_len);
+    let plain_len = cipher.decrypt_length(&len3).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("v2 length decrypt: {}", e),
+        )
+    })? as usize;
+    if plain_len > MAX_MESSAGE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("v2 packet too large: {}", plain_len),
+        ));
+    }
+    Ok(plain_len)
+}
+
+/// Decrypt one BIP-324 AEAD packet (header + contents + tag) and decode the
+/// v2 envelope. Returns `Ok(None)` for a decoy (ignore-flag) packet.
+fn v2_decode_packet(
     cipher: &mut Bip324Cipher,
-    reader: &mut R,
+    aead_buf: &[u8],
+    plain_len: usize,
     stats: &Arc<PeerStats>,
-) -> std::io::Result<NetworkMessage> {
-    loop {
-        // Step 1: 3-byte length cipher → plain length.
-        let mut enc_len = [0u8; LENGTH_LEN];
-        reader.read_exact(&mut enc_len).await?;
-        let plain_len = cipher.decrypt_length(&enc_len).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("v2 length decrypt: {}", e),
-            )
-        })? as usize;
+) -> std::io::Result<Option<NetworkMessage>> {
+    // Account: total ciphertext bytes = LENGTH_LEN + aead_len (matches
+    // what hits the TCP recv buffer for this packet).
+    let bytes_total = (LENGTH_LEN + aead_buf.len()) as u64;
 
-        if plain_len > MAX_MESSAGE_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("v2 packet too large: {}", plain_len),
-            ));
+    let mut contents = vec![0u8; plain_len];
+    let ignore = cipher.decrypt(aead_buf, &[], &mut contents).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("v2 AEAD decrypt: {}", e),
+        )
+    })?;
+
+    if ignore {
+        // Decoy: still account the bytes (peer did make us read
+        // them), but use a synthetic histogram bucket.
+        stats.record_recv("<decoy>", bytes_total);
+        return Ok(None);
+    }
+
+    // Decode v2 envelope (short id / 12-byte command + payload).
+    let (command, payload) = decode_message_type_and_payload(&contents).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("v2 envelope: {}", e),
+        )
+    })?;
+
+    stats.record_recv(command_static_str(&command), bytes_total);
+    NetworkMessage::deserialize(&command, &payload).map(Some)
+}
+
+/// Cancel-safe incremental reader for BIP-324 packets, the v2 counterpart
+/// of the v1 loop's `PendingRead`.
+///
+/// A `read_exact`-based receive (like `v2_recv_message`, which the loop
+/// used to call via a `_tracked` twin) is NOT cancel-safe: it reads into
+/// buffers local to its future, and it advances the length cipher before the
+/// body arrives. Dropped by `select!` mid-packet (a command or the ping timer
+/// winning the race), it loses the bytes it had consumed and the length it
+/// had decrypted; the next call reads the middle of the packet as a length
+/// and the peer is dropped with "v2 packet too large: <random>" (1,616 such
+/// disconnects in the mainnet log for 2026-09-23..26; any block that peer
+/// was delivering went with it). Here all progress lives in the
+/// struct, and the only await is a single `read`, which is cancel-safe.
+struct V2PacketReader {
+    buf: Vec<u8>,
+    filled: usize,
+    /// `None` while reading the 3-byte length; `Some(plain_len)` once the
+    /// length has been decrypted and the AEAD body is being read.
+    body_len: Option<usize>,
+}
+
+impl V2PacketReader {
+    fn new() -> Self {
+        Self {
+            buf: vec![0u8; LENGTH_LEN],
+            filled: 0,
+            body_len: None,
         }
+    }
 
-        // Step 2: AEAD ciphertext (header + contents + tag).
-        let aead_len = HEADER_LEN + plain_len + TAG_LEN;
-        let mut aead_buf = vec![0u8; aead_len];
-        reader.read_exact(&mut aead_buf).await?;
+    /// The unfilled tail to read into.
+    fn spare(&mut self) -> &mut [u8] {
+        &mut self.buf[self.filled..]
+    }
 
-        // Account: total ciphertext bytes = LENGTH_LEN + aead_len (matches
-        // what hits the TCP recv buffer for this packet).
-        let bytes_total = (LENGTH_LEN + aead_len) as u64;
-
-        let mut contents = vec![0u8; plain_len];
-        let ignore = cipher.decrypt(&aead_buf, &[], &mut contents).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("v2 AEAD decrypt: {}", e),
-            )
-        })?;
-
-        if ignore {
-            // Decoy: still account the bytes (peer did make us read
-            // them), but use a synthetic histogram bucket.
-            stats.record_recv("<decoy>", bytes_total);
-            continue;
+    /// Account for `n` freshly-read bytes. Returns a message when one is
+    /// complete (decoys are consumed silently).
+    fn advance(
+        &mut self,
+        n: usize,
+        cipher: &mut Bip324Cipher,
+        stats: &Arc<PeerStats>,
+    ) -> std::io::Result<Option<NetworkMessage>> {
+        self.filled += n;
+        if self.filled < self.buf.len() {
+            return Ok(None);
         }
-
-        // Step 3: decode v2 envelope (short id / 12-byte command + payload).
-        let (command, payload) = decode_message_type_and_payload(&contents).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("v2 envelope: {}", e),
-            )
-        })?;
-
-        stats.record_recv(command_static_str(&command), bytes_total);
-        return NetworkMessage::deserialize(&command, &payload);
+        match self.body_len {
+            None => {
+                let plain_len = v2_decode_length(cipher, &self.buf)?;
+                self.buf = vec![0u8; HEADER_LEN + plain_len + TAG_LEN];
+                self.filled = 0;
+                self.body_len = Some(plain_len);
+                Ok(None)
+            }
+            Some(plain_len) => {
+                let body = std::mem::replace(&mut self.buf, vec![0u8; LENGTH_LEN]);
+                self.filled = 0;
+                self.body_len = None;
+                v2_decode_packet(cipher, &body, plain_len, stats)
+            }
+        }
     }
 }
 
@@ -2492,12 +2553,71 @@ pub async fn run_message_loop(
 pub async fn run_message_loop_tracked(
     peer_id: PeerId,
     magic: &[u8; 4],
-    mut reader: BufReader<OwnedReadHalf>,
-    mut writer: BufWriter<OwnedWriteHalf>,
+    reader: BufReader<OwnedReadHalf>,
+    writer: BufWriter<OwnedWriteHalf>,
     event_tx: mpsc::Sender<PeerEvent>,
     mut command_rx: mpsc::Receiver<PeerCommand>,
     stats: Arc<PeerStats>,
 ) {
+    let mut outbox = VecDeque::new();
+    let terminal = message_loop_v1(
+        peer_id,
+        magic,
+        reader,
+        writer,
+        &event_tx,
+        &mut command_rx,
+        &mut outbox,
+        &stats,
+    )
+    .await;
+    finish_peer_task(command_rx, &event_tx, outbox, terminal).await;
+}
+
+/// Hand a finished peer task's last events to the main loop.
+///
+/// The command receiver is dropped FIRST. Delivering these events can block
+/// (the event channel is bounded and the main loop may be behind), and a task
+/// that blocks while still owning its command receiver is the other half of
+/// the 2026-09-26 deadlock: the main loop, which has not yet seen
+/// `Disconnected`, blocks in `send_to_peer` on this peer's full command
+/// channel and never drains the event channel this task is waiting on.
+/// With the receiver gone, `send_to_peer` fails fast ("command channel
+/// closed"), and its callers requeue whatever they were requesting.
+async fn finish_peer_task(
+    command_rx: mpsc::Receiver<PeerCommand>,
+    event_tx: &mpsc::Sender<PeerEvent>,
+    outbox: VecDeque<PeerEvent>,
+    terminal: Vec<PeerEvent>,
+) {
+    drop(command_rx);
+    for ev in outbox.into_iter().chain(terminal) {
+        if event_tx.send(ev).await.is_err() {
+            return; // main loop gone (shutdown)
+        }
+    }
+}
+
+/// Body of [`run_message_loop_tracked`]. Returns the terminal events
+/// (Misbehaving / Disconnected) for [`finish_peer_task`] to deliver.
+///
+/// Inbound messages are staged in `outbox` and delivered through a
+/// `reserve()` arm of the same `select!` that services commands, so the task
+/// keeps draining its command channel while the event channel is full, and
+/// stops READING from the socket until the staged event is delivered (the
+/// equivalent of Core's fPauseRecv: back-pressure lands on the remote peer,
+/// never on our main loop).
+#[allow(clippy::too_many_arguments)]
+async fn message_loop_v1(
+    peer_id: PeerId,
+    magic: &[u8; 4],
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: BufWriter<OwnedWriteHalf>,
+    event_tx: &mpsc::Sender<PeerEvent>,
+    command_rx: &mut mpsc::Receiver<PeerCommand>,
+    outbox: &mut VecDeque<PeerEvent>,
+    stats: &Arc<PeerStats>,
+) -> Vec<PeerEvent> {
     let mut last_ping = Instant::now();
     let mut ping_nonce_pending: Option<(u64, Instant)> = None;
 
@@ -2529,42 +2649,47 @@ pub async fn run_message_loop_tracked(
                         }).await {
                             Ok(Ok(())) => {}
                             Ok(Err(_)) => {
-                                let _ = event_tx.send(PeerEvent::Disconnected(
+                                return vec![PeerEvent::Disconnected(
                                     peer_id, DisconnectReason::IoError("write failed".to_string())
-                                )).await;
-                                return;
+                                )];
                             }
                             Err(_elapsed) => {
-                                let _ = event_tx.send(PeerEvent::Disconnected(
+                                return vec![PeerEvent::Disconnected(
                                     peer_id,
                                     DisconnectReason::IoError(format!(
                                         "v1 send timed out after {}s (peer not draining)",
                                         PEER_SEND_TIMEOUT.as_secs()
                                     )),
-                                )).await;
-                                return;
+                                )];
                             }
                         }
                         stats.record_send(command_static_str(msg.command()), data.len() as u64);
                     }
                     Some(PeerCommand::Disconnect) | None => {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id, DisconnectReason::PeerRequested
-                        )).await;
-                        return;
+                        )];
                     }
                 }
             }
 
-            // Read next chunk of data
-            result = reader.read(&mut read_state.buffer[read_state.bytes_read..]) => {
+            // Deliver a staged inbound message. Never a blocking
+            // `event_tx.send().await` in the loop body: see message_loop_v1.
+            permit = event_tx.reserve(), if !outbox.is_empty() => {
+                match permit {
+                    Ok(permit) => permit.send(outbox.pop_front().expect("guarded non-empty")),
+                    Err(_) => return Vec::new(), // main loop gone (shutdown)
+                }
+            }
+
+            // Read next chunk of data — paused while an event is staged.
+            result = reader.read(&mut read_state.buffer[read_state.bytes_read..]), if outbox.is_empty() => {
                 match result {
                     Ok(0) => {
                         // EOF - connection closed
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id, DisconnectReason::ConnectionClosed
-                        )).await;
-                        return;
+                        )];
                     }
                     Ok(n) => {
                         read_state.bytes_read += n;
@@ -2579,44 +2704,38 @@ pub async fn run_message_loop_tracked(
 
                                     // Validate magic
                                     if magic_bytes != *magic {
-                                        let _ = event_tx.send(PeerEvent::Misbehaving(
+                                        return vec![PeerEvent::Misbehaving(
                                             peer_id,
                                             crate::misbehavior::MisbehaviorReason::ProtocolViolation(
                                                 "bad magic".to_string(),
                                             ),
-                                        )).await;
-                                        let _ = event_tx.send(PeerEvent::Disconnected(
+                                        ), PeerEvent::Disconnected(
                                             peer_id, DisconnectReason::ProtocolError("bad magic".to_string())
-                                        )).await;
-                                        return;
+                                        )];
                                     }
 
                                     // Validate length
                                     if length as usize > MAX_MESSAGE_SIZE {
-                                        let _ = event_tx.send(PeerEvent::Misbehaving(
+                                        return vec![PeerEvent::Misbehaving(
                                             peer_id,
                                             crate::misbehavior::MisbehaviorReason::MessageTooLarge,
-                                        )).await;
-                                        let _ = event_tx.send(PeerEvent::Disconnected(
+                                        ), PeerEvent::Disconnected(
                                             peer_id, DisconnectReason::ProtocolError("message too large".to_string())
-                                        )).await;
-                                        return;
+                                        )];
                                     }
 
                                     if length == 0 {
                                         // Empty payload, process immediately
                                         let computed = sha256d(&[]);
                                         if checksum != computed.0[..4] {
-                                            let _ = event_tx.send(PeerEvent::Misbehaving(
+                                            return vec![PeerEvent::Misbehaving(
                                                 peer_id,
                                                 crate::misbehavior::MisbehaviorReason::ProtocolViolation(
                                                     "checksum mismatch".to_string(),
                                                 ),
-                                            )).await;
-                                            let _ = event_tx.send(PeerEvent::Disconnected(
+                                            ), PeerEvent::Disconnected(
                                                 peer_id, DisconnectReason::ProtocolError("checksum mismatch".to_string())
-                                            )).await;
-                                            return;
+                                            )];
                                         }
 
                                         // Account: header bytes only (no payload).
@@ -2625,19 +2744,17 @@ pub async fn run_message_loop_tracked(
                                             MESSAGE_HEADER_SIZE as u64,
                                         );
 
-                                        match handle_message_tracked(peer_id, &command, &[], &mut writer, magic, &mut ping_nonce_pending, &event_tx, &stats).await {
+                                        match handle_message_tracked(peer_id, &command, &[], &mut writer, magic, &mut ping_nonce_pending, outbox, stats).await {
                                             Ok(()) => {}
                                             Err(e) => {
-                                                let _ = event_tx.send(PeerEvent::Misbehaving(
+                                                return vec![PeerEvent::Misbehaving(
                                                     peer_id,
                                                     crate::misbehavior::MisbehaviorReason::ProtocolViolation(
                                                         e.to_string(),
                                                     ),
-                                                )).await;
-                                                let _ = event_tx.send(PeerEvent::Disconnected(
+                                                ), PeerEvent::Disconnected(
                                                     peer_id, DisconnectReason::ProtocolError(e.to_string())
-                                                )).await;
-                                                return;
+                                                )];
                                             }
                                         }
                                         pending_read = Some(PendingRead::new_header());
@@ -2654,16 +2771,14 @@ pub async fn run_message_loop_tracked(
                                     // Validate checksum
                                     let computed = sha256d(payload);
                                     if checksum != computed.0[..4] {
-                                        let _ = event_tx.send(PeerEvent::Misbehaving(
+                                        return vec![PeerEvent::Misbehaving(
                                             peer_id,
                                             crate::misbehavior::MisbehaviorReason::ProtocolViolation(
                                                 "checksum mismatch".to_string(),
                                             ),
-                                        )).await;
-                                        let _ = event_tx.send(PeerEvent::Disconnected(
+                                        ), PeerEvent::Disconnected(
                                             peer_id, DisconnectReason::ProtocolError("checksum mismatch".to_string())
-                                        )).await;
-                                        return;
+                                        )];
                                     }
 
                                     // Account: header + payload bytes for this frame.
@@ -2672,19 +2787,17 @@ pub async fn run_message_loop_tracked(
                                         (MESSAGE_HEADER_SIZE + payload.len()) as u64,
                                     );
 
-                                    match handle_message_tracked(peer_id, &command, payload, &mut writer, magic, &mut ping_nonce_pending, &event_tx, &stats).await {
+                                    match handle_message_tracked(peer_id, &command, payload, &mut writer, magic, &mut ping_nonce_pending, outbox, stats).await {
                                         Ok(()) => {}
                                         Err(e) => {
-                                            let _ = event_tx.send(PeerEvent::Misbehaving(
+                                            return vec![PeerEvent::Misbehaving(
                                                 peer_id,
                                                 crate::misbehavior::MisbehaviorReason::ProtocolViolation(
                                                     e.to_string(),
                                                 ),
-                                            )).await;
-                                            let _ = event_tx.send(PeerEvent::Disconnected(
+                                            ), PeerEvent::Disconnected(
                                                 peer_id, DisconnectReason::ProtocolError(e.to_string())
-                                            )).await;
-                                            return;
+                                            )];
                                         }
                                     }
 
@@ -2694,10 +2807,9 @@ pub async fn run_message_loop_tracked(
                         }
                     }
                     Err(e) => {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id, DisconnectReason::IoError(e.to_string())
-                        )).await;
-                        return;
+                        )];
                     }
                 }
             }
@@ -2706,25 +2818,22 @@ pub async fn run_message_loop_tracked(
             _ = tokio::time::sleep(PING_INTERVAL.saturating_sub(last_ping.elapsed())) => {
                 if let Some((_, sent_at)) = &ping_nonce_pending {
                     if sent_at.elapsed() > PING_TIMEOUT {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id, DisconnectReason::Timeout
-                        )).await;
-                        return;
+                        )];
                     }
                 } else {
                     let nonce: u64 = rand::random();
                     let ping = serialize_message(magic, &NetworkMessage::Ping(nonce));
                     if writer.write_all(&ping).await.is_err() {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id, DisconnectReason::IoError("ping write failed".to_string())
-                        )).await;
-                        return;
+                        )];
                     }
                     if writer.flush().await.is_err() {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id, DisconnectReason::IoError("ping flush failed".to_string())
-                        )).await;
-                        return;
+                        )];
                     }
                     stats.record_send("ping", ping.len() as u64);
                     ping_nonce_pending = Some((nonce, Instant::now()));
@@ -2745,21 +2854,12 @@ pub async fn run_message_loop_tracked(
 /// BIP-324; both sides advance in lockstep because every successful
 /// encrypt on one side is matched by a successful decrypt on the other.
 ///
-/// Cancellation note: unlike the v1 path, v2 reads are not split into a
-/// chunk-buffered state machine.  `tokio::select!` cancels the in-flight
-/// `read_exact` cleanly only at AsyncRead poll boundaries; the BufReader
-/// holds any in-flight bytes so we can resume on the next iteration.
-/// The current implementation issues one `v2_recv_message` future per
-/// loop iteration and lets cancellation drop it; on the v2 path this is
-/// safe because the only competing branches (command and ping) write
-/// rather than read, and we always re-enter `v2_recv_message` from the
-/// top — any partial packet in BufReader's internal buffer survives.
-///
-/// (If select! cancellation is later proven to corrupt v2 stream state
-/// in practice, we'll add a `PendingV2Read` state machine analogous to
-/// `PendingRead` for the v1 path.  For initial wiring we follow the
-/// same straight-line read pattern that haskoin's `receiveMessage` uses
-/// post-`cfa04bd`.)
+/// Cancellation: reads go through [`V2PacketReader`], which keeps all
+/// packet progress (bytes read, decrypted length) outside the `select!`
+/// futures. The earlier version assumed a dropped `v2_recv_message` future
+/// left partial bytes in the BufReader; it does not (`read_exact` copies them
+/// into a future-local buffer), and every command that arrived mid-packet
+/// desynchronised the stream ("v2 packet too large").
 pub async fn run_message_loop_v2(
     peer_id: PeerId,
     magic: &[u8; 4],
@@ -2781,16 +2881,46 @@ pub async fn run_message_loop_v2(
 pub async fn run_message_loop_v2_tracked(
     peer_id: PeerId,
     magic: &[u8; 4],
-    mut cipher: Bip324Cipher,
-    mut reader: BufReader<OwnedReadHalf>,
-    mut writer: BufWriter<OwnedWriteHalf>,
+    cipher: Bip324Cipher,
+    reader: BufReader<OwnedReadHalf>,
+    writer: BufWriter<OwnedWriteHalf>,
     event_tx: mpsc::Sender<PeerEvent>,
     mut command_rx: mpsc::Receiver<PeerCommand>,
     stats: Arc<PeerStats>,
 ) {
     let _ = magic; // kept for parity with v1 signature; v2 doesn't use network magic post-handshake
+    let mut outbox = VecDeque::new();
+    let terminal = message_loop_v2(
+        peer_id,
+        cipher,
+        reader,
+        writer,
+        &event_tx,
+        &mut command_rx,
+        &mut outbox,
+        &stats,
+    )
+    .await;
+    finish_peer_task(command_rx, &event_tx, outbox, terminal).await;
+}
+
+/// Body of [`run_message_loop_v2_tracked`]; same event-staging contract as
+/// [`message_loop_v1`], plus a cancel-safe packet reader
+/// ([`V2PacketReader`]).
+#[allow(clippy::too_many_arguments)]
+async fn message_loop_v2(
+    peer_id: PeerId,
+    mut cipher: Bip324Cipher,
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: BufWriter<OwnedWriteHalf>,
+    event_tx: &mpsc::Sender<PeerEvent>,
+    command_rx: &mut mpsc::Receiver<PeerCommand>,
+    outbox: &mut VecDeque<PeerEvent>,
+    stats: &Arc<PeerStats>,
+) -> Vec<PeerEvent> {
     let mut last_ping = Instant::now();
     let mut ping_nonce_pending: Option<(u64, Instant)> = None;
+    let mut packet = V2PacketReader::new();
 
     loop {
         tokio::select! {
@@ -2805,72 +2935,81 @@ pub async fn run_message_loop_v2_tracked(
                         // full command channel. See PEER_SEND_TIMEOUT.
                         match tokio::time::timeout(
                             PEER_SEND_TIMEOUT,
-                            v2_send_message_tracked(&mut cipher, &mut writer, &msg, &stats),
+                            v2_send_message_tracked(&mut cipher, &mut writer, &msg, stats),
                         ).await {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
-                                let _ = event_tx.send(PeerEvent::Disconnected(
+                                return vec![PeerEvent::Disconnected(
                                     peer_id,
                                     DisconnectReason::IoError(format!("v2 send: {}", e)),
-                                )).await;
-                                return;
+                                )];
                             }
                             Err(_elapsed) => {
-                                let _ = event_tx.send(PeerEvent::Disconnected(
+                                return vec![PeerEvent::Disconnected(
                                     peer_id,
                                     DisconnectReason::IoError(format!(
                                         "v2 send timed out after {}s (peer not draining)",
                                         PEER_SEND_TIMEOUT.as_secs()
                                     )),
-                                )).await;
-                                return;
+                                )];
                             }
                         }
                     }
                     Some(PeerCommand::Disconnect) | None => {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id,
                             DisconnectReason::PeerRequested,
-                        )).await;
-                        return;
+                        )];
                     }
                 }
             }
 
-            // Read next encrypted packet → NetworkMessage.
-            recv = v2_recv_message_tracked(&mut cipher, &mut reader, &stats) => {
+            // Deliver a staged inbound message (see message_loop_v1).
+            permit = event_tx.reserve(), if !outbox.is_empty() => {
+                match permit {
+                    Ok(permit) => permit.send(outbox.pop_front().expect("guarded non-empty")),
+                    Err(_) => return Vec::new(), // main loop gone (shutdown)
+                }
+            }
+
+            // Read more of the current encrypted packet — paused while an
+            // event is staged. A single cancel-safe `read`; all packet
+            // progress lives in `packet`, so losing this race is harmless.
+            recv = reader.read(packet.spare()), if outbox.is_empty() => {
+                let recv = match recv {
+                    Ok(0) => Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+                    Ok(n) => packet.advance(n, &mut cipher, stats),
+                    Err(e) => Err(e),
+                };
                 match recv {
-                    Ok(msg) => {
+                    Ok(None) => {}
+                    Ok(Some(msg)) => {
                         if let Err(e) = handle_message_v2_tracked(
                             peer_id, &msg, &mut cipher, &mut writer,
-                            &mut ping_nonce_pending, &event_tx, &stats,
+                            &mut ping_nonce_pending, outbox, stats,
                         ).await {
-                            let _ = event_tx.send(PeerEvent::Misbehaving(
+                            return vec![PeerEvent::Misbehaving(
                                 peer_id,
                                 crate::misbehavior::MisbehaviorReason::ProtocolViolation(
                                     e.to_string(),
                                 ),
-                            )).await;
-                            let _ = event_tx.send(PeerEvent::Disconnected(
+                            ), PeerEvent::Disconnected(
                                 peer_id,
                                 DisconnectReason::ProtocolError(e.to_string()),
-                            )).await;
-                            return;
+                            )];
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id,
                             DisconnectReason::ConnectionClosed,
-                        )).await;
-                        return;
+                        )];
                     }
                     Err(e) => {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id,
                             DisconnectReason::IoError(e.to_string()),
-                        )).await;
-                        return;
+                        )];
                     }
                 }
             }
@@ -2879,21 +3018,19 @@ pub async fn run_message_loop_v2_tracked(
             _ = tokio::time::sleep(PING_INTERVAL.saturating_sub(last_ping.elapsed())) => {
                 if let Some((_, sent_at)) = &ping_nonce_pending {
                     if sent_at.elapsed() > PING_TIMEOUT {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id, DisconnectReason::Timeout,
-                        )).await;
-                        return;
+                        )];
                     }
                 } else {
                     let nonce: u64 = rand::random();
                     if let Err(e) = v2_send_message_tracked(
-                        &mut cipher, &mut writer, &NetworkMessage::Ping(nonce), &stats,
+                        &mut cipher, &mut writer, &NetworkMessage::Ping(nonce), stats,
                     ).await {
-                        let _ = event_tx.send(PeerEvent::Disconnected(
+                        return vec![PeerEvent::Disconnected(
                             peer_id,
                             DisconnectReason::IoError(format!("v2 ping send: {}", e)),
-                        )).await;
-                        return;
+                        )];
                     }
                     ping_nonce_pending = Some((nonce, Instant::now()));
                     last_ping = Instant::now();
@@ -2903,34 +3040,9 @@ pub async fn run_message_loop_v2_tracked(
     }
 }
 
-/// v2 sibling of `handle_message` — auto-pong on ping, pong RTT tracking,
-/// and forward to the main event loop.  Unlike the v1 path the inbound
-/// message is already deserialized (`v2_recv_message` does that), so we
-/// match on the variant directly.
-#[allow(dead_code)]
-async fn handle_message_v2(
-    peer_id: PeerId,
-    msg: &NetworkMessage,
-    cipher: &mut Bip324Cipher,
-    writer: &mut BufWriter<OwnedWriteHalf>,
-    ping_nonce_pending: &mut Option<(u64, Instant)>,
-    event_tx: &mpsc::Sender<PeerEvent>,
-) -> std::io::Result<()> {
-    let dummy = Arc::new(PeerStats::new());
-    handle_message_v2_tracked(
-        peer_id,
-        msg,
-        cipher,
-        writer,
-        ping_nonce_pending,
-        event_tx,
-        &dummy,
-    )
-    .await
-}
-
-/// Like [`handle_message_v2`] but updates `stats` for any pong written
-/// in response to an inbound ping.
+/// v2 per-message handling: auto-pong on ping, pong RTT tracking, and
+/// staging the message in `outbox` for the main event loop. Writes `stats`
+/// for any pong sent.
 #[allow(clippy::too_many_arguments)]
 async fn handle_message_v2_tracked(
     peer_id: PeerId,
@@ -2938,7 +3050,7 @@ async fn handle_message_v2_tracked(
     cipher: &mut Bip324Cipher,
     writer: &mut BufWriter<OwnedWriteHalf>,
     ping_nonce_pending: &mut Option<(u64, Instant)>,
-    event_tx: &mpsc::Sender<PeerEvent>,
+    outbox: &mut VecDeque<PeerEvent>,
     stats: &Arc<PeerStats>,
 ) -> std::io::Result<()> {
     match msg {
@@ -2962,39 +3074,13 @@ async fn handle_message_v2_tracked(
         msg.command(),
         peer_id.0
     );
-    let _ = event_tx
-        .send(PeerEvent::Message(peer_id, msg.clone()))
-        .await;
+    outbox.push_back(PeerEvent::Message(peer_id, msg.clone()));
     Ok(())
 }
 
-/// Handle a received message, sending pong for ping and tracking pong RTT.
-#[allow(dead_code)]
-async fn handle_message(
-    peer_id: PeerId,
-    command: &str,
-    payload: &[u8],
-    writer: &mut BufWriter<OwnedWriteHalf>,
-    magic: &[u8; 4],
-    ping_nonce_pending: &mut Option<(u64, Instant)>,
-    event_tx: &mpsc::Sender<PeerEvent>,
-) -> std::io::Result<()> {
-    let dummy = Arc::new(PeerStats::new());
-    handle_message_tracked(
-        peer_id,
-        command,
-        payload,
-        writer,
-        magic,
-        ping_nonce_pending,
-        event_tx,
-        &dummy,
-    )
-    .await
-}
-
-/// Like [`handle_message`] but updates `stats` for any pong written in
-/// response to a ping.
+/// v1 per-message handling: deserialize, auto-pong on ping, pong RTT
+/// tracking, and staging the message in `outbox` for the main event loop.
+/// Writes `stats` for any pong sent.
 #[allow(clippy::too_many_arguments)]
 async fn handle_message_tracked(
     peer_id: PeerId,
@@ -3003,7 +3089,7 @@ async fn handle_message_tracked(
     writer: &mut BufWriter<OwnedWriteHalf>,
     magic: &[u8; 4],
     ping_nonce_pending: &mut Option<(u64, Instant)>,
-    event_tx: &mpsc::Sender<PeerEvent>,
+    outbox: &mut VecDeque<PeerEvent>,
     stats: &Arc<PeerStats>,
 ) -> std::io::Result<()> {
     let msg = NetworkMessage::deserialize(command, payload)?;
@@ -3035,7 +3121,7 @@ async fn handle_message_tracked(
         msg.command(),
         peer_id.0
     );
-    let _ = event_tx.send(PeerEvent::Message(peer_id, msg)).await;
+    outbox.push_back(PeerEvent::Message(peer_id, msg));
 
     Ok(())
 }
