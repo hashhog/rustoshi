@@ -225,6 +225,12 @@ pub struct PeerManagerConfig {
     /// mirrors Core's `add_fixed_seeds = gArgs.GetBoolArg("-fixedseeds", ...)`
     /// gate (net.cpp:2568). See `maybe_add_fixed_seeds`.
     pub no_fixed_seeds: bool,
+    /// Bitcoin Core `-discover`: learn our public address from what outbound
+    /// peers report in VERSION `addr_recv` (default on; the CLI turns it off
+    /// when `--externalip` is given unless `--discover` is passed explicitly,
+    /// Core init.cpp:815). `--externalip` entries are added through
+    /// [`PeerManager::add_external_ip`].
+    pub discover: bool,
 }
 
 impl PeerManagerConfig {
@@ -312,6 +318,8 @@ impl Default for PeerManagerConfig {
             no_dns_seed: false,
             // Core DEFAULT_FIXEDSEEDS = true → fallback enabled by default.
             no_fixed_seeds: false,
+            // Core DEFAULT_DISCOVER = true.
+            discover: true,
         }
     }
 }
@@ -2450,6 +2458,10 @@ struct PeerHandle {
     addr_token_bucket: f64,
     /// Timestamp of the last addr-bucket refill (Core `m_addr_token_timestamp`).
     addr_token_timestamp: Instant,
+    /// When our own address is next announced to this peer (Core
+    /// `Peer::m_next_local_addr_send`); `None` = never sent yet, so the first
+    /// send happens as soon as we are listening and out of IBD.
+    next_local_addr_send: Option<Instant>,
 }
 
 /// The peer manager coordinates all peer connections.
@@ -2541,6 +2553,8 @@ pub struct PeerManager {
     /// DNS/fixed-seed re-seeding plus the `--connect` pinned-reconnect loop are
     /// held off. Default `true`; not persisted (resets to enabled on restart).
     network_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Our own address table (Core `mapLocalHost`); see `localaddr.rs`.
+    local_addrs: crate::localaddr::LocalAddrTable,
 }
 
 /// Minimum interval between reconnect attempts to a single pinned `-connect`
@@ -2589,6 +2603,7 @@ impl PeerManager {
             start_instant: None,
             added_nodes: Vec::new(),
             network_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            local_addrs: crate::localaddr::LocalAddrTable::new(),
         }
     }
 
@@ -2646,6 +2661,7 @@ impl PeerManager {
             start_instant: None,
             added_nodes: Vec::new(),
             network_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            local_addrs: crate::localaddr::LocalAddrTable::new(),
         }
     }
 
@@ -2692,6 +2708,150 @@ impl PeerManager {
     pub fn network_active(&self) -> bool {
         self.network_active
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    // ------------------------------------------------------------------
+    // Self-address advertisement (Core mapLocalHost / MaybeSendAddr).
+    // Table + per-peer choice live in `localaddr.rs`.
+    // ------------------------------------------------------------------
+
+    /// Whether we accept inbound connections (Core `fListen`). Advertising
+    /// our address is pointless otherwise.
+    pub fn listening(&self) -> bool {
+        self.config.listen && self.config.listen_port != 0 && !self.config.offline
+    }
+
+    /// Record an `--externalip` address at score LOCAL_MANUAL. `port` `None`
+    /// means our P2P listen port. Returns false when the address is not
+    /// publicly routable or we are not listening (Core `AddLocal` refuses the
+    /// former; the latter would advertise a port nobody can reach).
+    pub fn add_external_ip(&mut self, ip: std::net::IpAddr, port: Option<u16>) -> bool {
+        if !self.listening() {
+            return false;
+        }
+        let port = port.unwrap_or(self.config.listen_port);
+        self.local_addrs.add_manual(ip, port, Instant::now())
+    }
+
+    /// Our local address table, highest score first (getnetworkinfo
+    /// `localaddresses`).
+    pub fn local_addresses(&self) -> Vec<crate::localaddr::LocalAddress> {
+        self.local_addrs.list(Instant::now())
+    }
+
+    /// Handle a peer's VERSION `addr_recv` (Core ProcessMessage VERSION:
+    /// `SeenLocal` / `SetAddrLocal`). An OUTBOUND peer's view of us is a
+    /// discovery (only with `-discover`, only when both ends are routable,
+    /// Core `IsPeerAddrLocalGood`) and is stored with OUR listen port; an
+    /// inbound peer's view only scores an address we already know.
+    fn note_version_addr_recv(
+        &mut self,
+        id: PeerId,
+        info: &PeerInfo,
+        conn_type: ConnectionType,
+        now: Instant,
+    ) -> bool {
+        if !self.config.discover || !self.listening() {
+            return false;
+        }
+        let Some(seen) = info.addr_local else {
+            return false;
+        };
+        let peer_ip = crate::localaddr::canonical_ip(info.addr.ip());
+        if !crate::localaddr::is_routable_ip(&peer_ip)
+            || !crate::localaddr::is_routable_ip(&seen.ip())
+        {
+            return false;
+        }
+        let create = conn_type != ConnectionType::Inbound;
+        let group = self.netgroup_manager.get_group(&peer_ip).as_bytes().to_vec();
+        let port = self.config.listen_port;
+        let recorded = self.local_addrs.confirm(seen.ip(), port, group, create, now);
+        if recorded {
+            tracing::debug!(
+                "localaddr: peer {} ({}) sees us at {}",
+                id.0,
+                info.addr,
+                seen.ip()
+            );
+        }
+        recorded
+    }
+
+    /// Core `MaybeSendAddr` self-announcement block for one peer: if the peer
+    /// is due, send it ONE addr/addrv2 carrying our address, our VERSION
+    /// services, time now and the LISTEN port. Never to block-relay-only or
+    /// feeler connections; nothing while not listening or in IBD — and in
+    /// that case the per-peer timer is left untouched so the first send goes
+    /// out on the first tick after IBD ends. Returns true when a message was
+    /// queued.
+    pub async fn maybe_send_local_addr(&mut self, id: PeerId, now: Instant, is_ibd: bool) -> bool {
+        if !self.listening() || is_ibd {
+            return false;
+        }
+        let (peer_ip, addr_local, inbound, addrv2) = {
+            let Some(peer) = self.peers.get_mut(&id) else {
+                return false;
+            };
+            if matches!(
+                peer.conn_type,
+                ConnectionType::BlockRelayOnly | ConnectionType::Feeler
+            ) || peer.info.state != PeerState::Established
+            {
+                return false;
+            }
+            let due = peer.next_local_addr_send.map(|t| now >= t).unwrap_or(true);
+            if !due {
+                return false;
+            }
+            peer.next_local_addr_send = Some(now + crate::localaddr::next_local_addr_delay());
+            (
+                crate::localaddr::canonical_ip(peer.info.addr.ip()),
+                peer.info.addr_local,
+                peer.conn_type == ConnectionType::Inbound,
+                peer.info.supports_addrv2,
+            )
+        };
+        let best = self.local_addrs.best(Some(peer_ip), now);
+        let chosen = crate::localaddr::local_addr_for_peer(
+            best.as_ref(),
+            self.config.listen_port,
+            peer_ip,
+            addr_local,
+            inbound,
+            self.config.discover,
+            |bits| rand::random::<u32>() & ((1u32 << bits) - 1) == 0,
+        );
+        let Some(ours) = chosen else {
+            return false;
+        };
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let msg =
+            crate::localaddr::build_self_announcement(ours, self.local_services(), time, addrv2);
+        tracing::debug!("Advertising address {} to peer={}", ours, id.0);
+        self.send_to_peer(id, msg).await
+    }
+
+    /// Periodic self-announcement pass over every connected peer (Core
+    /// `MaybeSendAddr` timer; called from the maintenance tick). Returns the
+    /// number of peers a self-announcement was queued to.
+    pub async fn maybe_send_local_addrs(&mut self, is_ibd: bool) -> usize {
+        self.in_ibd = is_ibd;
+        if !self.listening() || is_ibd {
+            return 0;
+        }
+        let now = Instant::now();
+        let ids: Vec<PeerId> = self.peers.keys().copied().collect();
+        let mut sent = 0;
+        for id in ids {
+            if self.maybe_send_local_addr(id, now, is_ibd).await {
+                sent += 1;
+            }
+        }
+        sent
     }
 
     /// Service flags advertised by this node (NODE_NETWORK | NODE_WITNESS |
@@ -3636,6 +3796,7 @@ impl PeerManager {
                     supports_wtxid_relay: false,
                     supports_addrv2: false,
                     feefilter: 0,
+                    addr_local: None,
                 },
                 command_tx: cmd_tx,
                 conn_type,
@@ -3650,6 +3811,7 @@ impl PeerManager {
                 getaddr_recvd: false,
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: Instant::now(),
+                next_local_addr_send: None,
             },
         );
     }
@@ -3755,6 +3917,7 @@ impl PeerManager {
                     supports_wtxid_relay: false,
                     supports_addrv2: false,
                     feefilter: 0,
+                    addr_local: None,
                 },
                 command_tx: cmd_tx,
                 conn_type,
@@ -3768,6 +3931,7 @@ impl PeerManager {
                 getaddr_recvd: false,
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: Instant::now(),
+                next_local_addr_send: None,
             },
         );
     }
@@ -4246,10 +4410,23 @@ impl PeerManager {
                                 getaddr_recvd: false,
                                 addr_token_bucket: 1.0,
                                 addr_token_timestamp: Instant::now(),
+                                next_local_addr_send: None,
                             },
                         );
                         self.addr_manager.mark_inbound_success(&info.addr);
                     }
+                }
+
+                // Self-address discovery from the peer's VERSION addr_recv
+                // (Core SeenLocal / SetAddrLocal). Runs for every handshaked
+                // peer, feelers included, before the feeler early-return.
+                {
+                    let conn_type = self
+                        .peers
+                        .get(id)
+                        .map(|p| p.conn_type)
+                        .unwrap_or(ConnectionType::Inbound);
+                    self.note_version_addr_recv(*id, info, conn_type, Instant::now());
                 }
 
                 // Feeler: a successful handshake promotes the probed address
@@ -4335,6 +4512,14 @@ impl PeerManager {
                             .await;
                     }
                 }
+
+                // Initial self-announcement (Core MaybeSendAddr on the first
+                // SendMessages pass). Gated on listening + out of IBD (last
+                // maintenance-tick value) + not block-relay-only/feeler; if
+                // IBD suppresses it, the per-peer timer stays unset and the
+                // maintenance tick sends it once IBD ends.
+                let in_ibd = self.in_ibd;
+                self.maybe_send_local_addr(*id, Instant::now(), in_ibd).await;
             }
             PeerEvent::Disconnected(id, reason) => {
                 tracing::info!("Peer {} disconnected: {:?}", id.0, reason);
@@ -5110,6 +5295,7 @@ impl PeerManager {
                     supports_wtxid_relay: false,
                     supports_addrv2: false,
                     feefilter: 0,
+                    addr_local: None,
                 },
                 command_tx: cmd_tx,
                 conn_type: ConnectionType::FullRelay,
@@ -5123,6 +5309,7 @@ impl PeerManager {
                 getaddr_recvd: false,
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: Instant::now(),
+                next_local_addr_send: None,
             },
         );
         cmd_rx
@@ -5172,6 +5359,7 @@ impl PeerManager {
                     supports_wtxid_relay: false,
                     supports_addrv2: false,
                     feefilter: 0,
+                    addr_local: None,
                 },
                 command_tx: cmd_tx,
                 conn_type: ConnectionType::Inbound,
@@ -5185,6 +5373,7 @@ impl PeerManager {
                 getaddr_recvd: false,
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: Instant::now(),
+                next_local_addr_send: None,
             },
         );
         cmd_rx
@@ -5229,6 +5418,7 @@ impl PeerManager {
                     supports_wtxid_relay: false,
                     supports_addrv2: false,
                     feefilter: 0,
+                    addr_local: None,
                 },
                 command_tx: cmd_tx,
                 conn_type: ConnectionType::FullRelay,
@@ -5242,6 +5432,7 @@ impl PeerManager {
                 getaddr_recvd: false,
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: Instant::now(),
+                next_local_addr_send: None,
             },
         );
         cmd_rx
@@ -5280,6 +5471,7 @@ impl PeerManager {
             supports_wtxid_relay: false,
             supports_addrv2: false,
             feefilter: 0,
+            addr_local: None,
         };
         self.peers.insert(
             peer_id,
@@ -5297,6 +5489,7 @@ impl PeerManager {
                 getaddr_recvd: false,
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: Instant::now(),
+                next_local_addr_send: None,
             },
         );
         (info, cmd_rx)
@@ -5338,6 +5531,7 @@ impl PeerManager {
                     supports_wtxid_relay: false,
                     supports_addrv2: false,
                     feefilter: 0,
+                    addr_local: None,
                 },
                 command_tx: cmd_tx,
                 conn_type,
@@ -5351,6 +5545,7 @@ impl PeerManager {
                 getaddr_recvd: false,
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: Instant::now(),
+                next_local_addr_send: None,
             },
         );
         cmd_rx
@@ -5837,6 +6032,8 @@ pub async fn run_inbound_peer(
         supports_wtxid_relay: false,
         supports_addrv2: wants_addrv2,
         feefilter: 0,
+        // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
+        addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
     };
 
     // Per-peer atomic counters; populated for the entire post-handshake
@@ -6224,6 +6421,8 @@ async fn run_inbound_v2_peer(
         supports_wtxid_relay: app_hs.wants_wtxid_relay,
         supports_addrv2: app_hs.wants_addrv2,
         feefilter: 0,
+        // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
+        addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
     };
 
     let stats = std::sync::Arc::new(crate::peer::PeerStats::new());
@@ -8463,6 +8662,7 @@ mod tests {
             supports_wtxid_relay: false,
             supports_addrv2: false,
             feefilter: 0,
+            addr_local: None,
         };
         let stats = std::sync::Arc::new(crate::peer::PeerStats::new());
         mgr.handle_event(PeerEvent::Connected(peer_id, info, stats))
@@ -8605,5 +8805,253 @@ mod tests {
                 "a protected existing peer must NOT be disconnected"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Self-address advertisement (Core MaybeSendAddr / GetLocalAddrForPeer)
+    // ------------------------------------------------------------------
+
+    fn selfadv_mgr(listen_port: u16) -> PeerManager {
+        let config = PeerManagerConfig {
+            listen_port,
+            listen: true,
+            ..PeerManagerConfig::testnet4()
+        };
+        PeerManager::new(config, ChainParams::testnet4())
+    }
+
+    fn drain_msgs(rx: &mut mpsc::Receiver<PeerCommand>) -> Vec<NetworkMessage> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let PeerCommand::SendMessage(m) = cmd {
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    fn connected_event(id: PeerId, addr: SocketAddr, seen: Option<SocketAddr>, inbound: bool) -> PeerEvent {
+        // A handshake-complete PeerInfo, shaped like peer.rs builds it.
+        let info = PeerInfo {
+                addr,
+                version: PROTOCOL_VERSION,
+                services: 0,
+                user_agent: "/test/".to_string(),
+                start_height: 0,
+                relay: true,
+                inbound,
+                state: PeerState::Established,
+                last_send: Instant::now(),
+                last_recv: Instant::now(),
+                ping_nonce: None,
+                ping_time: None,
+                bytes_sent: 0,
+                bytes_recv: 0,
+                time_offset: 0,
+                supports_witness: true,
+                supports_sendheaders: false,
+                supports_wtxid_relay: false,
+                supports_addrv2: false,
+                feefilter: 0,
+                addr_local: seen,
+            };
+        PeerEvent::Connected(id, info, std::sync::Arc::new(crate::peer::PeerStats::new()))
+    }
+
+    /// Discovery: an OUTBOUND peer's VERSION addr_recv creates an entry at
+    /// OUR listen port (not the port the peer reported); a second distinct
+    /// netgroup makes it usable; inbound peers only bump; unroutable peer or
+    /// unroutable addr_recv is ignored.
+    #[tokio::test]
+    async fn selfadv_discovery_from_addr_recv() {
+        let mut mgr = selfadv_mgr(8334);
+        let us: SocketAddr = "76.38.7.169:51000".parse().unwrap();
+
+        // Inbound first: must NOT create.
+        let _rx_in = mgr.insert_test_peer(PeerId(1), "9.9.9.9:40000".parse().unwrap(), false, true);
+        mgr.handle_event(connected_event(PeerId(1), "9.9.9.9:40000".parse().unwrap(), Some(us), true))
+            .await;
+        assert!(mgr.local_addresses().is_empty(), "inbound must not create an entry");
+
+        // Loopback peer (regtest shape): ignored even though outbound.
+        let _rx_lo = mgr.insert_test_outbound_peer_old(PeerId(2), "127.0.0.1:18444".parse().unwrap());
+        mgr.handle_event(connected_event(PeerId(2), "127.0.0.1:18444".parse().unwrap(), Some(us), false))
+            .await;
+        assert!(mgr.local_addresses().is_empty(), "unroutable peer must be ignored");
+
+        // Outbound routable peer reporting an unroutable view: ignored.
+        let _rx_p = mgr.insert_test_outbound_peer_old(PeerId(3), "8.8.8.8:8333".parse().unwrap());
+        mgr.handle_event(connected_event(
+            PeerId(3),
+            "8.8.8.8:8333".parse().unwrap(),
+            Some("192.168.1.128:51000".parse().unwrap()),
+            false,
+        ))
+        .await;
+        assert!(mgr.local_addresses().is_empty(), "unroutable addr_recv must be ignored");
+
+        // Outbound routable peer, routable view: created at OUR listen port.
+        let _rx_a = mgr.insert_test_outbound_peer_old(PeerId(4), "8.8.4.4:8333".parse().unwrap());
+        mgr.handle_event(connected_event(PeerId(4), "8.8.4.4:8333".parse().unwrap(), Some(us), false))
+            .await;
+        let l = mgr.local_addresses();
+        assert_eq!(l.len(), 1);
+        assert_eq!((l[0].ip, l[0].port, l[0].score), (us.ip(), 8334, 1));
+        assert!(mgr.local_addrs.best(None, Instant::now()).is_none(), "score 1 is not advertisable");
+
+        // Second outbound peer in the SAME /16 netgroup: no new confirmer.
+        let _rx_b = mgr.insert_test_outbound_peer_old(PeerId(5), "8.8.9.9:8333".parse().unwrap());
+        mgr.handle_event(connected_event(PeerId(5), "8.8.9.9:8333".parse().unwrap(), Some(us), false))
+            .await;
+        assert_eq!(mgr.local_addresses()[0].score, 1);
+
+        // Inbound peer from a different netgroup: bumps the existing entry.
+        let _rx_c = mgr.insert_test_peer(PeerId(6), "1.1.1.1:40001".parse().unwrap(), false, true);
+        mgr.handle_event(connected_event(PeerId(6), "1.1.1.1:40001".parse().unwrap(), Some(us), true))
+            .await;
+        let l = mgr.local_addresses();
+        assert_eq!((l[0].port, l[0].score), (8334, 2));
+        let best = mgr.local_addrs.best(None, Instant::now()).unwrap();
+        assert_eq!(best.ip, us.ip());
+    }
+
+    /// --discover=false: no discovery at all.
+    #[tokio::test]
+    async fn selfadv_discover_off_learns_nothing() {
+        let config = PeerManagerConfig {
+            listen_port: 8334,
+            discover: false,
+            ..PeerManagerConfig::testnet4()
+        };
+        let mut mgr = PeerManager::new(config, ChainParams::testnet4());
+        let _rx = mgr.insert_test_outbound_peer_old(PeerId(1), "8.8.4.4:8333".parse().unwrap());
+        mgr.handle_event(connected_event(
+            PeerId(1),
+            "8.8.4.4:8333".parse().unwrap(),
+            Some("76.38.7.169:1".parse().unwrap()),
+            false,
+        ))
+        .await;
+        assert!(mgr.local_addresses().is_empty());
+    }
+
+    /// IBD gate + message contents: nothing during IBD and the timer is left
+    /// unset; once out of IBD exactly ONE addr with our services, time now and
+    /// the LISTEN port; not re-sent until the Poisson timer fires.
+    #[tokio::test]
+    async fn selfadv_ibd_gate_and_addr_contents() {
+        let mut mgr = selfadv_mgr(39777);
+        assert!(mgr.add_external_ip("1.2.3.4".parse().unwrap(), None));
+        let la = mgr.local_addresses();
+        assert_eq!((la[0].port, la[0].score), (39777, crate::localaddr::LOCAL_MANUAL));
+        let mut rx = mgr.insert_test_outbound_peer_old(PeerId(1), "127.0.0.1:18444".parse().unwrap());
+
+        // In IBD: nothing, and timer untouched.
+        assert!(!mgr.maybe_send_local_addr(PeerId(1), Instant::now(), true).await);
+        assert_eq!(mgr.maybe_send_local_addrs(true).await, 0);
+        assert!(drain_msgs(&mut rx).is_empty());
+        assert!(mgr.peers.get(&PeerId(1)).unwrap().next_local_addr_send.is_none());
+
+        // Out of IBD (first tick): one addr.
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        assert_eq!(mgr.maybe_send_local_addrs(false).await, 1);
+        let msgs = drain_msgs(&mut rx);
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            NetworkMessage::Addr(v) => {
+                assert_eq!(v.len(), 1);
+                let sa = net_address_to_socket_addr(&v[0].address).unwrap();
+                assert_eq!(sa, "1.2.3.4:39777".parse::<SocketAddr>().unwrap());
+                assert_eq!(v[0].address.services, mgr.local_services());
+                assert!(v[0].timestamp >= before && v[0].timestamp <= before + 5);
+            }
+            other => panic!("expected addr, got {:?}", other),
+        }
+        assert!(mgr.peers.get(&PeerId(1)).unwrap().next_local_addr_send.is_some());
+
+        // Not due again immediately.
+        assert_eq!(mgr.maybe_send_local_addrs(false).await, 0);
+        assert!(drain_msgs(&mut rx).is_empty());
+
+        // Force the timer due: re-sent.
+        mgr.peers.get_mut(&PeerId(1)).unwrap().next_local_addr_send =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(mgr.maybe_send_local_addrs(false).await, 1);
+        assert_eq!(drain_msgs(&mut rx).len(), 1);
+    }
+
+    /// addrv2 peers get addrv2; block-relay-only and feeler get nothing; not
+    /// listening -> nothing; no local address -> nothing.
+    #[tokio::test]
+    async fn selfadv_addrv2_and_conn_type_gates() {
+        let mut mgr = selfadv_mgr(8334);
+        let mut rx_none = mgr.insert_test_outbound_peer_old(PeerId(9), "8.8.8.8:8333".parse().unwrap());
+        // No local address known and no peer view: nothing to advertise.
+        assert!(!mgr.maybe_send_local_addr(PeerId(9), Instant::now(), false).await);
+        assert!(drain_msgs(&mut rx_none).is_empty());
+
+        assert!(mgr.add_external_ip("1.2.3.4".parse().unwrap(), Some(9999)));
+        let mut rx = mgr.insert_test_outbound_peer_old(PeerId(1), "8.8.8.8:8333".parse().unwrap());
+        mgr.peers.get_mut(&PeerId(1)).unwrap().info.supports_addrv2 = true;
+        assert!(mgr.maybe_send_local_addr(PeerId(1), Instant::now(), false).await);
+        match drain_msgs(&mut rx).as_slice() {
+            [NetworkMessage::AddrV2(v)] => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].addr, crate::addr::NetworkAddr::Ipv4("1.2.3.4".parse().unwrap()));
+                assert_eq!(v[0].port, 9999);
+                assert_eq!(v[0].services, mgr.local_services());
+            }
+            other => panic!("expected one addrv2, got {:?}", other),
+        }
+
+        for (id, ct) in [(2u64, ConnectionType::BlockRelayOnly), (3, ConnectionType::Feeler)] {
+            let mut rx = mgr.insert_test_outbound_peer_old(PeerId(id), "8.8.8.8:8333".parse().unwrap());
+            mgr.peers.get_mut(&PeerId(id)).unwrap().conn_type = ct;
+            assert!(!mgr.maybe_send_local_addr(PeerId(id), Instant::now(), false).await);
+            assert!(drain_msgs(&mut rx).is_empty(), "{:?} must not get our address", ct);
+        }
+
+        // Not listening: nothing, and --externalip is refused.
+        let config = PeerManagerConfig {
+            listen: false,
+            ..PeerManagerConfig::testnet4()
+        };
+        let mut off = PeerManager::new(config, ChainParams::testnet4());
+        assert!(!off.add_external_ip("1.2.3.4".parse().unwrap(), None));
+        let mut rx = off.insert_test_outbound_peer_old(PeerId(1), "8.8.8.8:8333".parse().unwrap());
+        assert_eq!(off.maybe_send_local_addrs(false).await, 0);
+        assert!(drain_msgs(&mut rx).is_empty());
+
+        // Unroutable --externalip refused.
+        assert!(!mgr.add_external_ip("192.168.1.128".parse().unwrap(), None));
+    }
+
+    /// Initial send happens from the Connected handler itself when out of IBD.
+    #[tokio::test]
+    async fn selfadv_initial_send_on_connected() {
+        let mut mgr = selfadv_mgr(39777);
+        mgr.add_external_ip("1.2.3.4".parse().unwrap(), None);
+        mgr.set_in_ibd(false);
+        let mut rx = mgr.insert_test_outbound_peer_old(PeerId(1), "127.0.0.1:18444".parse().unwrap());
+        mgr.handle_event(connected_event(PeerId(1), "127.0.0.1:18444".parse().unwrap(), None, false))
+            .await;
+        let addrs: Vec<_> = drain_msgs(&mut rx)
+            .into_iter()
+            .filter(|m| matches!(m, NetworkMessage::Addr(_) | NetworkMessage::AddrV2(_)))
+            .collect();
+        assert_eq!(addrs.len(), 1);
+
+        // Same, but in IBD: none.
+        let mut mgr = selfadv_mgr(39777);
+        mgr.add_external_ip("1.2.3.4".parse().unwrap(), None);
+        let mut rx = mgr.insert_test_outbound_peer_old(PeerId(1), "127.0.0.1:18444".parse().unwrap());
+        mgr.handle_event(connected_event(PeerId(1), "127.0.0.1:18444".parse().unwrap(), None, false))
+            .await;
+        assert!(drain_msgs(&mut rx)
+            .iter()
+            .all(|m| !matches!(m, NetworkMessage::Addr(_) | NetworkMessage::AddrV2(_))));
     }
 }

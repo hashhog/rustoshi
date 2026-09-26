@@ -9858,6 +9858,24 @@ impl RustoshiRpcServer for RpcServerImpl {
             )
         };
 
+        // localaddresses: our own advertised addresses (--externalip +
+        // discovered), Core rpc/net.cpp GetNetworkInfo mapLocalHost walk:
+        // [{address, port, score}]. Always an array.
+        let localaddresses: Vec<LocalAddress> = peer_state
+            .peer_manager
+            .as_ref()
+            .map(|pm| {
+                pm.local_addresses()
+                    .into_iter()
+                    .map(|la| LocalAddress {
+                        address: la.ip.to_string(),
+                        port: la.port,
+                        score: la.score,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let (connections, connections_in, connections_out, local_services, network_active) =
             if let Some(ref pm) = peer_state.peer_manager {
                 (
@@ -9944,7 +9962,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             ],
             relayfee: BtcAmount::from_sats(relay_fee_kvb),
             incrementalfee: BtcAmount::from_sats(incremental_fee_kvb),
-            localaddresses: vec![],
+            localaddresses,
             warnings: Vec::new(),
         })
     }

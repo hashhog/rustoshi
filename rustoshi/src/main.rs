@@ -166,6 +166,19 @@ struct Cli {
     #[arg(long = "nofixedseeds", default_value = "false")]
     nofixedseeds: bool,
 
+    /// Specify your own public address `<ip>[:port]` to advertise to peers
+    /// (Bitcoin Core `-externalip`; repeatable and/or comma-separated). A
+    /// bare IP uses the P2P listen port. Implies `--discover=false` unless
+    /// `--discover` is given explicitly (Core init.cpp:815).
+    #[arg(long = "externalip", value_delimiter = ',')]
+    externalip: Vec<String>,
+
+    /// Discover own public address from what outbound peers report in their
+    /// VERSION (Bitcoin Core `-discover`; default: true unless `--externalip`
+    /// is set). `--discover` alone means true.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    discover: Option<bool>,
+
     /// Enable transaction indexing
     #[arg(long)]
     txindex: bool,
@@ -1223,6 +1236,20 @@ async fn start_metrics_server(
 }
 
 /// Get the appropriate RPC port for a network.
+/// Parse an `--externalip` value: `<ip>`, `<ip>:<port>` or `[<ipv6>]:<port>`.
+/// `None` port means "use the P2P listen port" (Core -externalip semantics).
+fn parse_external_ip(v: &str) -> Result<(std::net::IpAddr, Option<u16>), String> {
+    let v = v.trim();
+    if let Ok(ip) = v.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>() {
+        return Ok((ip, None));
+    }
+    match v.parse::<std::net::SocketAddr>() {
+        Ok(sa) if sa.port() != 0 => Ok((sa.ip(), Some(sa.port()))),
+        Ok(_) => Err("port must be non-zero".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn default_rpc_port(network_id: NetworkId) -> u16 {
     match network_id {
         NetworkId::Mainnet => 8332,
@@ -2204,6 +2231,17 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
             if let Ok(p) = v.parse::<u16>() {
                 cli.port = Some(p);
             }
+        }
+    }
+    // Core -externalip / -discover from the conf file (CLI wins).
+    if !was_set(raw_argv, "externalip") {
+        if let Some(v) = conf.get("externalip") {
+            cli.externalip = v.split(',').map(|s| s.trim().to_string()).collect();
+        }
+    }
+    if !was_set(raw_argv, "discover") {
+        if let Some(v) = conf.get("discover") {
+            cli.discover = Some(!matches!(v.trim(), "0" | "false" | "no" | "off"));
         }
     }
     if !was_set(raw_argv, "maxconnections") {
@@ -3616,9 +3654,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         // Bitcoin Core `-fixedseeds=0`: disable the fixed-seed bootstrap
         // fallback. Default false = enabled (Core DEFAULT_FIXEDSEEDS=true).
         no_fixed_seeds: cli.nofixedseeds,
+        // Core -discover: default on, soft-set off by -externalip (init.cpp:815).
+        discover: cli.discover.unwrap_or(cli.externalip.is_empty()),
         ..Default::default()
     };
     let mut peer_manager = PeerManager::new_with_netgroup(peer_config, params.clone(), netgroup_manager);
+    // Core -externalip: our own address(es) at LOCAL_MANUAL score.
+    for s in cli.externalip.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let (ip, port) = parse_external_ip(s)
+            .unwrap_or_else(|e| panic!("Invalid --externalip {s:?}: {e}"));
+        if peer_manager.add_external_ip(ip, port) {
+            tracing::info!("externalip: advertising {}", s);
+        } else {
+            tracing::warn!(
+                "--externalip={} is not publicly routable or we are not listening; ignored",
+                s
+            );
+        }
+    }
     peer_manager.set_start_height(best_height as i32);
 
     // ASMap startup health check — log cardinality summary when an asmap is loaded.
@@ -7457,6 +7510,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // 5-min snap-forward on significant change, per-peer
                         // timer, skip block-relay-only / pre-70013 peers).
                         pm.maybe_send_feefilters(mempool_min_fee, is_ibd).await;
+                        // Self-address advertisement (Core MaybeSendAddr):
+                        // per-peer Poisson re-announce (24h mean), and the
+                        // deferred first send once IBD has ended.
+                        pm.maybe_send_local_addrs(is_ibd).await;
                         (stale, pm.peer_count())
                     } else {
                         (Default::default(), 0)
@@ -7962,6 +8019,52 @@ mod tests {
     #[test]
     fn test_default_rpc_port_regtest() {
         assert_eq!(default_rpc_port(NetworkId::Regtest), 18443);
+    }
+
+    /// Core -externalip / -discover parsing: bare IP -> listen port (None),
+    /// ip:port, [v6]:port, comma-separated + repeatable, and -discover soft
+    /// default (off when -externalip is set, unless given explicitly).
+    #[test]
+    fn test_externalip_and_discover_flags() {
+        use std::net::IpAddr;
+        assert_eq!(
+            parse_external_ip("1.2.3.4").unwrap(),
+            ("1.2.3.4".parse::<IpAddr>().unwrap(), None)
+        );
+        assert_eq!(
+            parse_external_ip("1.2.3.4:8334").unwrap(),
+            ("1.2.3.4".parse::<IpAddr>().unwrap(), Some(8334))
+        );
+        assert_eq!(
+            parse_external_ip("[2a01:4f8::1]:8334").unwrap(),
+            ("2a01:4f8::1".parse::<IpAddr>().unwrap(), Some(8334))
+        );
+        assert_eq!(
+            parse_external_ip("2a01:4f8::1").unwrap(),
+            ("2a01:4f8::1".parse::<IpAddr>().unwrap(), None)
+        );
+        assert!(parse_external_ip("not-an-ip").is_err());
+        assert!(parse_external_ip("1.2.3.4:0").is_err());
+
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert!(cli.externalip.is_empty());
+        assert_eq!(cli.discover.unwrap_or(cli.externalip.is_empty()), true);
+
+        let cli = Cli::try_parse_from([
+            "rustoshi",
+            "--externalip=1.2.3.4,5.6.7.8:9",
+            "--externalip",
+            "9.9.9.9",
+        ])
+        .unwrap();
+        assert_eq!(cli.externalip, vec!["1.2.3.4", "5.6.7.8:9", "9.9.9.9"]);
+        assert_eq!(cli.discover.unwrap_or(cli.externalip.is_empty()), false);
+
+        let cli =
+            Cli::try_parse_from(["rustoshi", "--externalip=1.2.3.4", "--discover"]).unwrap();
+        assert_eq!(cli.discover, Some(true));
+        let cli = Cli::try_parse_from(["rustoshi", "--discover=false"]).unwrap();
+        assert_eq!(cli.discover, Some(false));
     }
 
     #[test]

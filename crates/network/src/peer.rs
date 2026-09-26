@@ -308,6 +308,11 @@ pub struct PeerInfo {
     pub supports_addrv2: bool,
     /// Minimum fee rate filter (BIP 133).
     pub feefilter: u64,
+    /// The address the peer told us it sees us at (its VERSION `addr_recv`;
+    /// Core `CNode::GetAddrLocal`). Feeds self-address discovery and the
+    /// per-peer advertised-address choice (see `localaddr.rs`). `None`
+    /// before the handshake.
+    pub addr_local: Option<SocketAddr>,
 }
 
 /// Unique identifier for a peer connection.
@@ -995,6 +1000,8 @@ async fn run_v1_outbound_flow(
         supports_wtxid_relay: hs_result.wants_wtxid_relay,
         supports_addrv2: hs_result.wants_addrv2,
         feefilter: 0,
+        // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
+        addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
     };
 
     stats.mark_connected();
@@ -1215,6 +1222,8 @@ pub async fn run_outbound_peer(
         supports_wtxid_relay: hs_result.wants_wtxid_relay,
         supports_addrv2: hs_result.wants_addrv2,
         feefilter: 0,
+        // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
+        addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
     };
 
     // Stamp connection-established time before publishing the event so
@@ -1913,6 +1922,8 @@ async fn run_outbound_v2_peer(
         supports_wtxid_relay: hs_result.wants_wtxid_relay,
         supports_addrv2: hs_result.wants_addrv2,
         feefilter: 0,
+        // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
+        addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
     };
 
     stats.mark_connected();
@@ -3019,6 +3030,7 @@ mod tests {
             supports_wtxid_relay: false,
             supports_addrv2: false,
             feefilter: 0,
+            addr_local: None,
         };
 
         assert_eq!(info.version, 70016);
@@ -3268,6 +3280,7 @@ mod tests {
             supports_wtxid_relay: false,
             supports_addrv2: false,
             feefilter: 0,
+            addr_local: None,
         };
 
         let events = [

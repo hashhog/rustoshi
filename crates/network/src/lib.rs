@@ -10,6 +10,7 @@ pub mod erlay;
 pub mod eviction;
 pub mod header_sync;
 pub mod headers_presync;
+pub mod localaddr;
 pub mod message;
 pub mod misbehavior;
 pub mod netgroup;
