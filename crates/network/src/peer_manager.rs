@@ -18,7 +18,7 @@ use crate::eviction::{select_node_to_evict, EvictionCandidate, EvictionCandidate
 use crate::message::{
     parse_message_header, serialize_message, NetAddress, NetworkMessage, TimestampedNetAddress,
     VersionMessage, FEEFILTER_VERSION, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
-    MIN_WITNESS_PROTO_VERSION, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK,
+    MIN_PEER_PROTO_VERSION, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK,
     NODE_NETWORK_LIMITED, NODE_P2P_V2, NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
 };
 use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
@@ -5583,10 +5583,11 @@ pub fn bip324_v2_inbound_enabled() -> bool {
 /// Similar to run_outbound_peer but for connections initiated by remote peers.
 /// Enforces pre-handshake message validation:
 /// - First message must be version
-/// - Minimum protocol version (70015 for witness)
+/// - Minimum protocol version (Core MIN_PEER_PROTO_VERSION = 31800; no
+///   service requirement for inbound peers)
 /// - Self-connection detection via nonce
 /// - Duplicate version rejection
-/// - Pre-handshake message rejection
+/// - Unsupported messages between VERSION and VERACK are ignored (Core)
 #[allow(clippy::too_many_arguments)]
 pub async fn run_inbound_peer(
     peer_id: PeerId,
@@ -5812,8 +5813,12 @@ pub async fn run_inbound_peer(
         }
     };
 
-    // Check minimum protocol version (70015 for witness support)
-    if their_version.version < MIN_WITNESS_PROTO_VERSION {
+    // Protocol-version floor: Core MIN_PEER_PROTO_VERSION (31800).  An
+    // inbound peer is NOT held to the witness version/services — Core only
+    // applies HasAllDesirableServiceFlags to outbound connections
+    // (ExpectServicesFromConn is false for INBOUND); a pre-segwit inbound
+    // peer simply never gets witness-only features.
+    if their_version.version < MIN_PEER_PROTO_VERSION {
         let _ = event_tx
             .send(PeerEvent::Disconnected(
                 peer_id,
@@ -5887,10 +5892,16 @@ pub async fn run_inbound_peer(
     let mut version_received = true;
     let mut handshake_complete = false;
     let mut wants_addrv2 = false;
+    let mut pre_verack_prefs = crate::peer::PreVerackPrefs::default();
 
-    // Wait for their verack (with pre-handshake message validation)
+    // Wait for their verack.  The whole wait is bounded by ONE deadline
+    // (Core m_peer_connect_timeout: a peer that has not completed the
+    // handshake within the timeout is dropped), so ignoring unsupported
+    // pre-verack messages cannot hold the slot open indefinitely.
+    let verack_deadline = tokio::time::Instant::now() + handshake_timeout;
     while !handshake_complete {
-        let read_result = timeout(handshake_timeout, reader.read_exact(&mut header_buf)).await;
+        let read_result =
+            tokio::time::timeout_at(verack_deadline, reader.read_exact(&mut header_buf)).await;
 
         match read_result {
             Ok(Ok(_)) => {}
@@ -5913,10 +5924,28 @@ pub async fn run_inbound_peer(
 
         let (_, cmd, len, chk) = parse_message_header(&header_buf);
 
+        // Bound the allocation before reading: pre-verack messages are now
+        // ignored rather than fatal, so an unbounded `len` must not be able
+        // to drive a multi-GB allocation (Core rejects > MAX_SIZE frames).
+        if len as usize > MAX_MESSAGE_SIZE {
+            let _ = event_tx
+                .send(PeerEvent::Misbehaving(peer_id, MisbehaviorReason::MessageTooLarge))
+                .await;
+            let _ = event_tx
+                .send(PeerEvent::Disconnected(
+                    peer_id,
+                    DisconnectReason::ProtocolError("message too large".to_string()),
+                ))
+                .await;
+            return;
+        }
+
         // Read payload if any
         let mut msg_payload = vec![0u8; len as usize];
         if !msg_payload.is_empty() {
-            match timeout(handshake_timeout, reader.read_exact(&mut msg_payload)).await {
+            match tokio::time::timeout_at(verack_deadline, reader.read_exact(&mut msg_payload))
+                .await
+            {
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) => {
                     let _ = event_tx
@@ -5984,24 +6013,27 @@ pub async fn run_inbound_peer(
                 }
                 continue;
             }
-            // Any other message before handshake is complete is a protocol violation
+            // Core net_processing.cpp: "Unsupported message prior to
+            // verack" is logged and IGNORED — not a disconnect, not
+            // misbehavior (e.g. peers that send sendheaders/ping early).
+            // SENDHEADERS / SENDCMPCT are the exception: Core's handlers
+            // for them run before that guard, so they are recorded and
+            // replayed after Connected.  A payload that fails to decode is
+            // logged and ignored (Core catches the deserialization
+            // exception in ProcessMessages; no disconnect).
             _ => {
-                let _ = event_tx
-                    .send(PeerEvent::Misbehaving(
-                        peer_id,
-                        MisbehaviorReason::ProtocolViolation(format!(
-                            "pre-handshake message after version: {}",
-                            cmd
-                        )),
-                    ))
-                    .await;
-                let _ = event_tx
-                    .send(PeerEvent::Disconnected(
-                        peer_id,
-                        DisconnectReason::PreHandshakeMessage(cmd),
-                    ))
-                    .await;
-                return;
+                let recorded = match cmd.as_str() {
+                    "sendheaders" | "sendcmpct" => {
+                        match NetworkMessage::deserialize(&cmd, &msg_payload) {
+                            Ok(m) => pre_verack_prefs.record(&m),
+                            Err(_) => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if !recorded {
+                    crate::peer::log_ignored_pre_verack(&cmd);
+                }
             }
         }
     }
@@ -6049,6 +6081,7 @@ pub async fn run_inbound_peer(
             std::sync::Arc::clone(&stats),
         ))
         .await;
+    crate::peer::replay_pre_verack_prefs(peer_id, pre_verack_prefs, &event_tx).await;
 
     // BIP 130: sendheaders - request headers announcements instead of inv
     if their_version.version >= SENDHEADERS_VERSION {
@@ -6435,6 +6468,7 @@ async fn run_inbound_v2_peer(
             std::sync::Arc::clone(&stats),
         ))
         .await;
+    crate::peer::replay_pre_verack_prefs(peer_id, app_hs.pre_verack_prefs, &event_tx).await;
 
     tracing::info!(
         "peer {:?} ({}): BIP-324 v2 application handshake COMPLETE \

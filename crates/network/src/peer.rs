@@ -12,8 +12,9 @@
 use crate::addr::NetworkAddr;
 use crate::message::{
     parse_message_header, serialize_message, NetworkMessage, SendCmpctMessage, VersionMessage,
-    MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE, MIN_WITNESS_PROTO_VERSION, NODE_WITNESS,
-    SENDCMPCT_VERSION, SENDHEADERS_VERSION, WTXID_RELAY_VERSION,
+    MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE, MIN_PEER_PROTO_VERSION, NODE_NETWORK,
+    NODE_NETWORK_LIMITED, NODE_WITNESS, SENDADDRV2_VERSION, SENDCMPCT_VERSION,
+    SENDHEADERS_VERSION, WTXID_RELAY_VERSION,
 };
 use crate::proxy::{I2pSession, ProxyConfig, ProxyError, Socks5Proxy};
 use crate::v2_transport::{
@@ -1009,6 +1010,7 @@ async fn run_v1_outbound_flow(
     let _ = event_tx
         .send(PeerEvent::Connected(peer_id, peer_info, Arc::clone(&stats)))
         .await;
+    replay_pre_verack_prefs(peer_id, hs_result.pre_verack_prefs.clone(), &event_tx).await;
 
     if their_version.version >= SENDHEADERS_VERSION {
         let msg = serialize_message(&magic, &NetworkMessage::SendHeaders);
@@ -1233,6 +1235,7 @@ pub async fn run_outbound_peer(
     let _ = event_tx
         .send(PeerEvent::Connected(peer_id, peer_info, Arc::clone(&stats)))
         .await;
+    replay_pre_verack_prefs(peer_id, hs_result.pre_verack_prefs.clone(), &event_tx).await;
 
     // 5. Send post-handshake feature negotiation messages
     // Note: BIP 155 (sendaddrv2) and BIP 339 (wtxidrelay) are sent BEFORE verack
@@ -1670,21 +1673,23 @@ pub(crate) async fn perform_v2_handshake_outbound(
     if their_version.nonce == our_version.nonce && our_version.nonce != 0 {
         return Err(HandshakeError::SelfConnection);
     }
-    if their_version.version < MIN_WITNESS_PROTO_VERSION {
-        return Err(HandshakeError::ObsoleteVersion(their_version.version));
-    }
+    check_outbound_version(&their_version)?;
 
-    // Send pre-verack BIP negotiation messages.
+    // Send pre-verack BIP negotiation messages (gated on their version,
+    // as Core gates on the common version).
     if their_version.version >= WTXID_RELAY_VERSION {
         v2_send_message(cipher, writer, &NetworkMessage::WtxidRelay).await?;
     }
-    v2_send_message(cipher, writer, &NetworkMessage::SendAddrV2).await?;
+    if their_version.version >= SENDADDRV2_VERSION {
+        v2_send_message(cipher, writer, &NetworkMessage::SendAddrV2).await?;
+    }
     v2_send_message(cipher, writer, &NetworkMessage::Verack).await?;
 
     // Read until VERACK; track BIP negotiation flags along the way.
     let mut version_received = true; // we already got it above
     let mut wants_wtxid_relay = false;
     let mut wants_addrv2 = false;
+    let mut pre_verack_prefs = PreVerackPrefs::default();
     loop {
         let msg = v2_recv_message(cipher, reader).await?;
         match msg {
@@ -1695,12 +1700,14 @@ pub(crate) async fn perform_v2_handshake_outbound(
                 }
                 version_received = true;
             }
-            NetworkMessage::WtxidRelay => wants_wtxid_relay = true,
+            NetworkMessage::WtxidRelay => {
+                wants_wtxid_relay = their_version.version >= WTXID_RELAY_VERSION
+            }
             NetworkMessage::SendAddrV2 => wants_addrv2 = true,
             other => {
-                return Err(HandshakeError::PreHandshakeMessage(
-                    other.command().to_string(),
-                ));
+                if !pre_verack_prefs.record(&other) {
+                    log_ignored_pre_verack(other.command());
+                }
             }
         }
     }
@@ -1709,6 +1716,7 @@ pub(crate) async fn perform_v2_handshake_outbound(
         version: their_version,
         wants_wtxid_relay,
         wants_addrv2,
+        pre_verack_prefs,
     })
 }
 
@@ -1754,8 +1762,10 @@ pub(crate) async fn perform_v2_handshake_inbound(
     if their_version.nonce == our_nonce && our_nonce != 0 {
         return Err(DisconnectReason::SelfConnection);
     }
-    // Protocol-version floor.
-    if their_version.version < MIN_WITNESS_PROTO_VERSION {
+    // Protocol-version floor (Core MIN_PEER_PROTO_VERSION).  Inbound peers
+    // are never disconnected for their services (Core ExpectServicesFromConn
+    // is false for INBOUND).
+    if their_version.version < MIN_PEER_PROTO_VERSION {
         return Err(DisconnectReason::ObsoleteVersion(their_version.version));
     }
 
@@ -1806,9 +1816,11 @@ pub(crate) async fn perform_v2_handshake_inbound(
             .await
             .map_err(|e| DisconnectReason::IoError(format!("v2 send wtxidrelay: {}", e)))?;
     }
-    v2_send_message(cipher, writer, &NetworkMessage::SendAddrV2)
-        .await
-        .map_err(|e| DisconnectReason::IoError(format!("v2 send sendaddrv2: {}", e)))?;
+    if their_version.version >= SENDADDRV2_VERSION {
+        v2_send_message(cipher, writer, &NetworkMessage::SendAddrV2)
+            .await
+            .map_err(|e| DisconnectReason::IoError(format!("v2 send sendaddrv2: {}", e)))?;
+    }
     v2_send_message(cipher, writer, &NetworkMessage::Verack)
         .await
         .map_err(|e| DisconnectReason::IoError(format!("v2 send verack: {}", e)))?;
@@ -1817,6 +1829,7 @@ pub(crate) async fn perform_v2_handshake_inbound(
     let mut version_received = true;
     let mut wants_wtxid_relay = false;
     let mut wants_addrv2 = false;
+    let mut pre_verack_prefs = PreVerackPrefs::default();
     loop {
         let msg = v2_recv_message(cipher, reader)
             .await
@@ -1829,12 +1842,14 @@ pub(crate) async fn perform_v2_handshake_inbound(
                 }
                 version_received = true;
             }
-            NetworkMessage::WtxidRelay => wants_wtxid_relay = true,
+            NetworkMessage::WtxidRelay => {
+                wants_wtxid_relay = their_version.version >= WTXID_RELAY_VERSION
+            }
             NetworkMessage::SendAddrV2 => wants_addrv2 = true,
             other => {
-                return Err(DisconnectReason::PreHandshakeMessage(
-                    other.command().to_string(),
-                ));
+                if !pre_verack_prefs.record(&other) {
+                    log_ignored_pre_verack(other.command());
+                }
             }
         }
     }
@@ -1843,6 +1858,7 @@ pub(crate) async fn perform_v2_handshake_inbound(
         version: their_version,
         wants_wtxid_relay,
         wants_addrv2,
+        pre_verack_prefs,
     })
 }
 
@@ -1931,6 +1947,7 @@ async fn run_outbound_v2_peer(
     let _ = event_tx
         .send(PeerEvent::Connected(peer_id, peer_info, Arc::clone(&stats)))
         .await;
+    replay_pre_verack_prefs(peer_id, hs_result.pre_verack_prefs.clone(), &event_tx).await;
 
     tracing::info!(
         "peer {:?} ({}): BIP-324 v2 application handshake COMPLETE \
@@ -2088,6 +2105,103 @@ pub(crate) async fn v2_recv_message_tracked<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// Core `HasAllDesirableServiceFlags` for an OUTBOUND peer: it must serve
+/// witness blocks (NODE_WITNESS) and blocks at all (NODE_NETWORK, or
+/// NODE_NETWORK_LIMITED).  Core additionally only counts NETWORK_LIMITED as
+/// desirable when near the tip; the peer task has no view of our tip depth,
+/// so either block-serving bit is accepted here.
+///
+/// Inbound peers are never subjected to this check (Core
+/// `CNode::ExpectServicesFromConn` is false for INBOUND).
+pub fn has_desirable_outbound_services(services: u64) -> bool {
+    services & NODE_WITNESS != 0 && services & (NODE_NETWORK | NODE_NETWORK_LIMITED) != 0
+}
+
+/// Outbound VERSION acceptance, in Core's order (net_processing.cpp VERSION
+/// handler): desirable services first, then `MIN_PEER_PROTO_VERSION`.
+fn check_outbound_version(their_version: &VersionMessage) -> Result<(), HandshakeError> {
+    if !has_desirable_outbound_services(their_version.services) {
+        return Err(HandshakeError::MissingServices(their_version.services));
+    }
+    if their_version.version < MIN_PEER_PROTO_VERSION {
+        return Err(HandshakeError::ObsoleteVersion(their_version.version));
+    }
+    Ok(())
+}
+
+/// Core net_processing.cpp: a message other than version / verack /
+/// wtxidrelay / sendaddrv2 / sendtxrcncl received before VERACK is
+/// "Unsupported message prior to verack" — logged and ignored, never a
+/// disconnect.  (The overall handshake timeout still bounds how long a peer
+/// can stall in this state.)
+pub(crate) fn log_ignored_pre_verack(command: &str) {
+    tracing::debug!("Unsupported message \"{}\" prior to verack, ignoring", command);
+}
+
+/// Peer preferences Core honors even when they arrive BEFORE verack.
+///
+/// In Core's `ProcessMessage`, the SENDHEADERS and SENDCMPCT handlers sit
+/// above the `if (!pfrom.fSuccessfullyConnected)` "Unsupported message prior
+/// to verack" guard, so a peer that sends them between VERSION and VERACK
+/// has them applied (`m_prefers_headers = true`; `m_provides_cmpctblocks` /
+/// `m_requested_hb_cmpctblocks`).  Our preference state lives behind
+/// `PeerEvent::Message`, which only exists once the peer is registered, so
+/// the handshake records the latest of each here and the caller replays
+/// them right after `PeerEvent::Connected` via [`replay_pre_verack_prefs`] —
+/// the same effect as if they had been sent just after verack.  Only the
+/// latest of each is kept (Core's handlers overwrite state), so a flood of
+/// pre-verack preferences cannot grow memory.
+#[derive(Debug, Default, Clone)]
+pub struct PreVerackPrefs {
+    /// Peer sent SENDHEADERS before verack.
+    pub sendheaders: bool,
+    /// Latest SENDCMPCT the peer sent before verack.
+    pub sendcmpct: Option<SendCmpctMessage>,
+}
+
+impl PreVerackPrefs {
+    /// Record `msg` if it is a pre-verack preference Core processes;
+    /// returns `false` (caller logs + ignores) for anything else.
+    pub fn record(&mut self, msg: &NetworkMessage) -> bool {
+        match msg {
+            NetworkMessage::SendHeaders => {
+                self.sendheaders = true;
+                true
+            }
+            NetworkMessage::SendCmpct(sc) => {
+                self.sendcmpct = Some(sc.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Messages to replay after `PeerEvent::Connected`, in a fixed order.
+    pub fn into_messages(self) -> Vec<NetworkMessage> {
+        let mut out = Vec::new();
+        if self.sendheaders {
+            out.push(NetworkMessage::SendHeaders);
+        }
+        if let Some(sc) = self.sendcmpct {
+            out.push(NetworkMessage::SendCmpct(sc));
+        }
+        out
+    }
+}
+
+/// Replay pre-verack SENDHEADERS / SENDCMPCT (see [`PreVerackPrefs`]) as
+/// ordinary `PeerEvent::Message`s.  Must be called AFTER the
+/// `PeerEvent::Connected` send so the dispatcher has registered the peer.
+pub(crate) async fn replay_pre_verack_prefs(
+    peer_id: PeerId,
+    prefs: PreVerackPrefs,
+    event_tx: &mpsc::Sender<PeerEvent>,
+) {
+    for msg in prefs.into_messages() {
+        let _ = event_tx.send(PeerEvent::Message(peer_id, msg)).await;
+    }
+}
+
 /// Result of handshake validation.
 #[derive(Debug)]
 pub enum HandshakeError {
@@ -2099,6 +2213,9 @@ pub enum HandshakeError {
     SelfConnection,
     /// Protocol version too old.
     ObsoleteVersion(i32),
+    /// Outbound peer lacks the desirable services (Core
+    /// `HasAllDesirableServiceFlags`); carries the services it offered.
+    MissingServices(u64),
     /// Pre-handshake message received (not version/verack).
     PreHandshakeMessage(String),
     /// I/O error during handshake.
@@ -2114,6 +2231,11 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::DuplicateVersion => write!(f, "duplicate version message"),
             HandshakeError::SelfConnection => write!(f, "self-connection detected"),
             HandshakeError::ObsoleteVersion(v) => write!(f, "obsolete protocol version: {}", v),
+            HandshakeError::MissingServices(s) => write!(
+                f,
+                "peer does not offer the expected services ({:#010x} offered, NODE_WITNESS + NODE_NETWORK[_LIMITED] expected)",
+                s
+            ),
             HandshakeError::PreHandshakeMessage(cmd) => {
                 write!(f, "pre-handshake message: {}", cmd)
             }
@@ -2145,6 +2267,9 @@ pub struct HandshakeResult {
     pub wants_wtxid_relay: bool,
     /// Whether the peer signaled addrv2 support (BIP 155).
     pub wants_addrv2: bool,
+    /// SENDHEADERS / SENDCMPCT received before verack, to be replayed
+    /// after `PeerEvent::Connected` (Core processes them pre-verack).
+    pub pre_verack_prefs: PreVerackPrefs,
 }
 
 /// Perform the version/verack handshake with full validation.
@@ -2153,8 +2278,11 @@ pub struct HandshakeResult {
 /// - First message must be version
 /// - No duplicate version messages
 /// - Self-connection detection via nonce
-/// - Minimum protocol version (70015 for witness support)
-/// - Only version/verack/wtxidrelay/sendaddrv2/sendtxrcncl allowed before handshake complete
+/// - Outbound desirable services (NODE_WITNESS + NODE_NETWORK[_LIMITED])
+///   and minimum protocol version (Core MIN_PEER_PROTO_VERSION = 31800)
+/// - version/verack/wtxidrelay/sendaddrv2/sendtxrcncl are the negotiation
+///   messages before VERACK; anything else is ignored (Core
+///   "Unsupported message prior to verack"), not a disconnect
 ///
 /// The BIP negotiation flow is:
 /// 1. Send/receive VERSION
@@ -2204,10 +2332,9 @@ async fn perform_handshake_tracked(
         return Err(HandshakeError::SelfConnection);
     }
 
-    // Check minimum protocol version (70015 for witness support)
-    if their_version.version < MIN_WITNESS_PROTO_VERSION {
-        return Err(HandshakeError::ObsoleteVersion(their_version.version));
-    }
+    // Core VERSION-handler gates for an outbound peer: desirable services
+    // (NODE_WITNESS + NETWORK/NETWORK_LIMITED), then MIN_PEER_PROTO_VERSION.
+    check_outbound_version(&their_version)?;
 
     // Send BIP negotiation messages BEFORE verack (per BIP 155, BIP 339)
     // BIP 339: wtxidrelay - announce transactions by wtxid
@@ -2216,11 +2343,14 @@ async fn perform_handshake_tracked(
         writer.write_all(&wtxid_msg).await?;
         stats.record_send("wtxidrelay", wtxid_msg.len() as u64);
     }
-    // BIP 155: sendaddrv2 - signal support for addrv2 messages
-    // Send to all peers (protocol version >= 70016 is a courtesy, not a requirement)
-    let addrv2_msg = serialize_message(magic, &NetworkMessage::SendAddrV2);
-    writer.write_all(&addrv2_msg).await?;
-    stats.record_send("sendaddrv2", addrv2_msg.len() as u64);
+    // BIP 155: sendaddrv2 - signal support for addrv2 messages.  Core only
+    // sends it at common version >= 70016 ("some implementations reject
+    // messages they don't know"), so we match that courtesy.
+    if their_version.version >= SENDADDRV2_VERSION {
+        let addrv2_msg = serialize_message(magic, &NetworkMessage::SendAddrV2);
+        writer.write_all(&addrv2_msg).await?;
+        stats.record_send("sendaddrv2", addrv2_msg.len() as u64);
+    }
 
     // Send verack
     let verack_data = serialize_message(magic, &NetworkMessage::Verack);
@@ -2234,6 +2364,7 @@ async fn perform_handshake_tracked(
     // Track BIP negotiation messages received before verack
     let mut wants_wtxid_relay = false;
     let mut wants_addrv2 = false;
+    let mut pre_verack_prefs = PreVerackPrefs::default();
 
     // Read messages until we get verack
     // Only certain messages are allowed before handshake is complete:
@@ -2250,19 +2381,22 @@ async fn perform_handshake_tracked(
                 }
                 version_received = true;
             }
-            // BIP 339: wtxid relay negotiation
+            // BIP 339: wtxid relay negotiation (Core ignores it when the
+            // common version is below WTXID_RELAY_VERSION).
             NetworkMessage::WtxidRelay => {
-                wants_wtxid_relay = true;
+                wants_wtxid_relay = their_version.version >= WTXID_RELAY_VERSION;
             }
             // BIP 155: addrv2 negotiation
             NetworkMessage::SendAddrV2 => {
                 wants_addrv2 = true;
             }
-            // Any other message before handshake is complete is a protocol violation
+            // Core applies SENDHEADERS / SENDCMPCT even before verack;
+            // anything else is "Unsupported message prior to verack" —
+            // logged and ignored, NOT a disconnect (net_processing.cpp).
             other => {
-                return Err(HandshakeError::PreHandshakeMessage(
-                    other.command().to_string(),
-                ));
+                if !pre_verack_prefs.record(&other) {
+                    log_ignored_pre_verack(other.command());
+                }
             }
         }
     }
@@ -2271,6 +2405,7 @@ async fn perform_handshake_tracked(
         version: their_version,
         wants_wtxid_relay,
         wants_addrv2,
+        pre_verack_prefs,
     })
 }
 
@@ -3657,7 +3792,9 @@ mod tests {
     #[tokio::test]
     async fn test_handshake_rejects_obsolete_protocol_version() {
         let _g = global_v2_test_lock();
-        // Test that protocol version < 70015 is rejected
+        // Test that protocol version < MIN_PEER_PROTO_VERSION (31800) is
+        // rejected (the peer offers the desirable services, so the version
+        // floor is what fires).
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         mark_v1_only(addr); // mock speaks v1; skip v2 probe (default-ON)
@@ -3684,8 +3821,8 @@ mod tests {
 
             // Send version with obsolete protocol version (pre-witness)
             let old_version = VersionMessage {
-                version: 70010, // Pre-SegWit version
-                services: NODE_NETWORK,
+                version: 31799, // below Core MIN_PEER_PROTO_VERSION
+                services: NODE_NETWORK | NODE_WITNESS,
                 timestamp: 1234567890,
                 addr_recv: NetAddress::from_ipv4([127, 0, 0, 1], 48333, 0),
                 addr_from: NetAddress::from_ipv4([127, 0, 0, 1], 48333, NODE_NETWORK),
@@ -3716,10 +3853,7 @@ mod tests {
                 assert_eq!(id, peer_id);
                 match reason {
                     DisconnectReason::ObsoleteVersion(v) => {
-                        assert_eq!(v, 70010);
-                    }
-                    DisconnectReason::HandshakeFailed(msg) => {
-                        assert!(msg.contains("70010") || msg.contains("obsolete"));
+                        assert_eq!(v, 31799);
                     }
                     _ => panic!("expected ObsoleteVersion, got {:?}", reason),
                 }

@@ -4745,7 +4745,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             peer_id.0, info.addr, info.user_agent
                         );
                         header_sync.register_peer(peer_id, info.start_height);
-                        block_downloader.add_peer(peer_id);
+                        // Only witness-capable peers may serve blocks (Core
+                        // CanServeWitnesses): inbound peers are now accepted
+                        // down to MIN_PEER_PROTO_VERSION (31800) with any
+                        // services, and a non-witness peer would hand back
+                        // witness-stripped blocks.
+                        if info.supports_witness {
+                            block_downloader.add_peer(peer_id);
+                        }
                         // Keep the watchdog's lock-free connected-peer mirror in
                         // sync (== getpeerinfo view) so its >=1 anti-restart-loop
                         // gate is accurate.
