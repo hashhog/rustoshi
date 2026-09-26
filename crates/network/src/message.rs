@@ -297,8 +297,18 @@ pub struct VersionMessage {
 /// Current protocol version.
 pub const PROTOCOL_VERSION: i32 = 70016;
 /// Minimum protocol version for witness support (post-SegWit).
-/// We require SegWit support for all connections.
+///
+/// NOTE: this is NOT a peer-acceptance floor.  Core accepts any peer at
+/// or above [`MIN_PEER_PROTO_VERSION`]; witness capability is decided by
+/// the NODE_WITNESS service bit (outbound: `HasAllDesirableServiceFlags`).
 pub const MIN_WITNESS_PROTO_VERSION: i32 = 70015;
+/// Oldest protocol version we will talk to at all (Core
+/// `node/protocol_version.h` `MIN_PEER_PROTO_VERSION`).  Peers below this
+/// are disconnected ("peer using obsolete version").
+pub const MIN_PEER_PROTO_VERSION: i32 = 31800;
+/// BIP-155: Core only sends SENDADDRV2 when the common version is at
+/// least 70016 (net_processing.cpp VERSION handler, "As a courtesy").
+pub const SENDADDRV2_VERSION: i32 = 70016;
 /// Protocol version that added wtxidrelay.
 pub const WTXID_RELAY_VERSION: i32 = 70016;
 /// Protocol version that added sendheaders.
