@@ -148,20 +148,50 @@ fn g5_announce_block_branches_on_sendheaders() {
 
 // ─── G6: announce_block called from chain-advance path ──────────────────────
 
-/// G6 BUG-11 (P1) — `announce_block` is **never called** from the P2P
-/// chain-advance path in `rustoshi/src/main.rs`. A grep for `announce_block`
-/// across `rustoshi/src/main.rs` returns ZERO hits. The only production
-/// caller is `crates/rpc/src/server.rs:9624` from the `generateblock` RPC.
-/// Every block received via P2P (main.rs:2874 process_block success → undo
-/// applied → best_block updated at line 2963) is silently added without
-/// any block-announcement to other connected peers.  Pattern:
-/// **engineered-helper-with-unwired-call-site**.
+/// G6 BUG-11 (P1) — FIXED 2026-09-26. `announce_block` used to be reached
+/// only from the mining RPCs, so a block received via P2P was connected but
+/// never relayed (regtest: two Cores linked only through rustoshi never
+/// converged). Both P2P connect-tip paths in `rustoshi/src/main.rs` (the
+/// foreground/IBD loop and the post-IBD sync loop) now call
+/// `announce_connected_tip`, which forwards to `announce_block` unless the tip
+/// is older than Core's DEFAULT_MAX_TIP_AGE (UpdatedBlockTip's IBD guard).
+/// Source-level pin: both call sites must stay wired.
 #[test]
-#[ignore = "BUG-11 P1: announce_block never called from P2P connect-tip path in main.rs — only from generateblock RPC"]
 fn g6_announce_block_called_from_chain_advance() {
+    let main_rs = include_str!("../../../rustoshi/src/main.rs");
+    let sites = main_rs
+        .matches("announce_connected_tip(&peer_state, &block.header, block_hash)")
+        .count();
+    assert_eq!(
+        sites, 2,
+        "BUG-11: both P2P connect-tip paths in main.rs must announce the new tip"
+    );
     assert!(
-        false,
-        "BUG-11 P1: announce_block has no caller in rustoshi/src/main.rs P2P chain-advance path"
+        main_rs.contains("pm.announce_block(header.clone(), block_hash)"),
+        "BUG-11: announce_connected_tip must forward to PeerManager::announce_block"
+    );
+}
+
+/// G6b (2026-09-26) — once blocks are announced, peers fetch them at once.
+/// A block connected since the last durable flush exists only in
+/// `pending_blocks`; getdata must serve it from there (it used to be dropped
+/// silently, and Core then waits out its block-download timeout). Also
+/// MSG_CMPCT_BLOCK is answered with the full block, and getheaders is always
+/// answered (empty when the peer has our tip) as in Core.
+#[test]
+fn g6b_getdata_and_getheaders_serving_after_announce() {
+    let main_rs = include_str!("../../../rustoshi/src/main.rs");
+    assert!(
+        main_rs.contains("InvType::MsgBlock | InvType::MsgWitnessBlock | InvType::MsgCmpctBlock =>"),
+        "getdata must serve MSG_CMPCT_BLOCK"
+    );
+    assert!(
+        main_rs.contains(".find(|(h, _, _)| *h == item.hash)"),
+        "getdata must fall back to not-yet-flushed pending_blocks"
+    );
+    assert!(
+        !main_rs.contains("if best_header > our_height + 1000 || best_header == 0 {"),
+        "getheaders must not be skipped just because our header chain is at genesis"
     );
 }
 

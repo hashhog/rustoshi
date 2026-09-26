@@ -4094,7 +4094,10 @@ impl PeerManager {
                 }])
             };
 
-            let _ = peer.command_tx.send(PeerCommand::SendMessage(msg)).await;
+            // Non-blocking (Core queues per-peer and never stalls validation on a
+            // slow peer): now that the P2P connect path calls this, an awaited
+            // send on a full peer queue would stall block processing.
+            let _ = peer.command_tx.try_send(PeerCommand::SendMessage(msg));
         }
     }
 

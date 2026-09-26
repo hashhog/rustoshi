@@ -919,6 +919,39 @@ fn write_tx_index_entries(
     }
 }
 
+/// Core's `DEFAULT_MAX_TIP_AGE` (kernel/chainstatemanager_opts.h:24): a tip
+/// older than this means the node is still in initial block download.
+const ANNOUNCE_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Whether a freshly connected tip with header time `tip_time` should be
+/// relayed. Core `PeerManagerImpl::UpdatedBlockTip` (net_processing.cpp:2162)
+/// returns early while `fInitialDownload`; the IBD test that matters on a
+/// synced node is the tip-age clause of `IsInitialBlockDownload`.
+fn should_announce_tip(tip_time: u32, now_secs: u64) -> bool {
+    (tip_time as u64).saturating_add(ANNOUNCE_MAX_TIP_AGE_SECS) >= now_secs
+}
+
+/// BUG-11 (test_w136_relay_flags.rs G6): announce a block that became the
+/// active tip via P2P to every established peer — `headers` to peers that sent
+/// `sendheaders`, `inv` otherwise (Core `SendMessages`, net_processing.cpp
+/// ~5838-5960). Before this, `announce_block` was only reached from the mining
+/// RPCs, so rustoshi downloaded and connected blocks but never relayed them:
+/// two Core peers that could only reach each other through rustoshi never
+/// converged. Skipped during IBD, like Core.
+async fn announce_connected_tip(
+    peer_state: &Arc<RwLock<PeerState>>,
+    header: &rustoshi_primitives::BlockHeader,
+    block_hash: Hash256,
+) {
+    if !should_announce_tip(header.timestamp, rustoshi_consensus::current_time_secs()) {
+        return;
+    }
+    let ps = peer_state.read().await;
+    if let Some(ref pm) = ps.peer_manager {
+        pm.announce_block(header.clone(), block_hash).await;
+    }
+}
+
 /// Fan a freshly connected block into every loaded wallet's UTXO ledger and
 /// advance each wallet's persisted rescan watermark.
 ///
@@ -4600,6 +4633,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             }
                         }
 
+                        let mut tip_advanced = false;
                         {
                             let mut rpc = rpc_state.write().await;
                             if height > rpc.best_height {
@@ -4608,6 +4642,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // Wake the wait-family RPCs on this IBD/foreground
                                 // block-connect tip advance (Core blockTip).
                                 rpc.notify_tip_changed();
+                                tip_advanced = true;
                             }
 
                             // Drop confirmed/conflicting txs from the mempool,
@@ -4644,6 +4679,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 .map(|tx| tx.txid())
                                 .collect();
                             rpc.fee_estimator.process_block(height, &confirmed_txids);
+                        }
+
+                        // BUG-11: relay the new tip to peers (Core
+                        // PeerManagerImpl::UpdatedBlockTip -> SendMessages).
+                        if tip_advanced {
+                            announce_connected_tip(&peer_state, &block.header, block_hash).await;
                         }
 
                         // Wallet UTXO ledger: fan this connected block into
@@ -5890,6 +5931,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }
 
                                         // Update RPC state and clean mempool
+                                        let mut tip_advanced = false;
                                         {
                                             let mut rpc = rpc_state.write().await;
                                             if height > rpc.best_height {
@@ -5899,6 +5941,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 // post-IBD P2P block-connect tip
                                                 // advance (Core blockTip).
                                                 rpc.notify_tip_changed();
+                                                tip_advanced = true;
                                             }
 
                                             // Remove confirmed transactions from mempool
@@ -5959,6 +6002,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             // Clear recently-rejected filter -- rejection reasons
                                             // may no longer apply after a new block
                                             rpc.recently_rejected.clear();
+                                        }
+
+                                        // BUG-11: relay the new tip to peers (Core
+                                        // PeerManagerImpl::UpdatedBlockTip ->
+                                        // SendMessages block-announcement loop).
+                                        if tip_advanced {
+                                            announce_connected_tip(&peer_state, &block.header, block_hash).await;
                                         }
 
                                         // Wallet UTXO ledger: fan this connected
@@ -6297,7 +6347,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // Also rate-limit at startup before our own headers
                                 // are synced (best_header == 0 means we haven't
                                 // finished our own header sync yet).
-                                if best_header > our_height + 1000 || best_header == 0 {
+                                // (Not when best_header == 0: that skipped 9 of 10
+                                // getheaders from a peer on a fresh chain, and the
+                                // answer there is an empty/one-header reply that
+                                // costs nothing — see the always-reply note below.)
+                                if best_header > our_height + 1000 {
                                     // Only serve headers occasionally during IBD
                                     // Skip most getheaders to free bandwidth for blocks
                                     static IBD_HEADER_COUNTER: std::sync::atomic::AtomicU64
@@ -6361,6 +6415,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         start_height + headers.len() as u32,
                                         peer_id.0
                                     );
+                                }
+                                // Always answer — with an EMPTY headers message when
+                                // the peer already has our tip. Core's GETHEADERS
+                                // handler (net_processing.cpp:4306-4385) always pushes
+                                // HEADERS. Silence is not neutral: the requester only
+                                // clears m_last_getheaders_timestamp on a HEADERS
+                                // reply, so MaybeSendGetHeaders (:2829) refuses its
+                                // next getheaders for HEADERS_RESPONSE_TIME (2 min)
+                                // and every inv announcement in that window is lost.
+                                {
                                     let ps = peer_state.read().await;
                                     if let Some(ref pm) = ps.peer_manager {
                                         // Use try_send for header serving — it's bulk
@@ -6378,10 +6442,32 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // Serve requested blocks/transactions to peers
                                 for item in &items {
                                     match item.inv_type {
-                                        InvType::MsgBlock | InvType::MsgWitnessBlock => {
-                                            // Look up block from storage and send it
-                                            match block_store.get_block(&item.hash) {
-                                                Ok(Some(block)) => {
+                                        // MSG_CMPCT_BLOCK: a Core peer that chose us as a
+                                        // BIP-152 high-bandwidth peer fetches an announced
+                                        // tip this way. Serve the full block — what Core
+                                        // itself sends for MSG_CMPCT_BLOCK outside
+                                        // MAX_CMPCTBLOCK_DEPTH (ProcessGetBlockData,
+                                        // IsMsgCmpctBlk arm); it satisfies the in-flight
+                                        // request. It used to be dropped silently.
+                                        InvType::MsgBlock | InvType::MsgWitnessBlock | InvType::MsgCmpctBlock => {
+                                            // Look up block from storage and send it. A block
+                                            // connected since the last durable flush lives only
+                                            // in `pending_blocks` until the atomic batch lands;
+                                            // it is already our tip and already announced
+                                            // (announce_connected_tip), so a peer WILL ask for
+                                            // it — serve it from there instead of dropping the
+                                            // request (Core writes the body before ConnectTip,
+                                            // so it never has this gap).
+                                            let found = match block_store.get_block(&item.hash) {
+                                                Ok(Some(block)) => Some(block),
+                                                _ => pending_blocks
+                                                    .iter()
+                                                    .rev()
+                                                    .find(|(h, _, _)| *h == item.hash)
+                                                    .map(|(_, b, _)| b.clone()),
+                                            };
+                                            match found {
+                                                Some(block) => {
                                                     tracing::debug!(
                                                         "Serving block {} to peer {}",
                                                         item.hash, peer_id.0
@@ -7762,6 +7848,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bug11_should_announce_tip_follows_core_max_tip_age() {
+        let now = 1_800_000_000u64;
+        // Fresh tip (just mined): relay.
+        assert!(super::should_announce_tip(now as u32, now));
+        // Exactly at the 24h boundary: still relay (Core: IBD iff age > max).
+        assert!(super::should_announce_tip((now - 24 * 3600) as u32, now));
+        // Older than DEFAULT_MAX_TIP_AGE: node is in IBD, Core does not relay.
+        assert!(!super::should_announce_tip((now - 24 * 3600 - 1) as u32, now));
+        // Header time slightly in the future (allowed up to 2h): relay.
+        assert!(super::should_announce_tip((now + 600) as u32, now));
+    }
+
     use super::*;
 
     /// The backfill must be RETROACTIVE but never inventive.
