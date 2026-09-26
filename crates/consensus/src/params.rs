@@ -863,7 +863,10 @@ impl ChainParams {
                         "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8",
                     )
                     .expect("valid hash"),
-                    chain_tx_count: 1_334_000_000,
+                    // Core getchaintxstats txcount at this hash. Was the
+                    // 1_334_000_000 progress-display placeholder, 1,914,531
+                    // short — getchaintxstats now seeds from this value.
+                    chain_tx_count: 1_335_914_531,
                     // MTP of block 944,183 = median of the 11 block
                     // timestamps for heights 944,173..=944,183. Verified
                     // against Bitcoin Core `getblockheader` `mediantime`

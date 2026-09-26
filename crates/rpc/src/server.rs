@@ -2248,6 +2248,44 @@ impl RpcServerImpl {
         }
     }
 
+    /// Core rpc/util.cpp ParseRange + ParseDescriptorRange: a number N means
+    /// [0, N]; a 2-array means [begin, end]; begin > end, negative begin, an
+    /// end >= 2^31 or a span of 1,000,000+ are RPC_INVALID_PARAMETER (-8).
+    fn core_parse_descriptor_range(v: &serde_json::Value) -> Result<(i64, i64), ErrorObjectOwned> {
+        let int = |x: &serde_json::Value| -> Result<i64, ErrorObjectOwned> {
+            x.as_i64().ok_or_else(|| Self::rpc_error(rpc_error::RPC_MISC_ERROR, "JSON integer out of range"))
+        };
+        let (low, high) = match v {
+            serde_json::Value::Number(_) => (0, int(v)?),
+            serde_json::Value::Array(a) if a.len() == 2 && a[0].is_number() && a[1].is_number() => {
+                let (low, high) = (int(&a[0])?, int(&a[1])?);
+                if low > high {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Range specified as [begin,end] must not have begin after end",
+                    ));
+                }
+                (low, high)
+            }
+            _ => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    "Range must be specified as end or as [begin,end]",
+                ))
+            }
+        };
+        if low < 0 {
+            return Err(Self::rpc_error(rpc_error::RPC_INVALID_PARAMETER, "Range should be greater or equal than 0"));
+        }
+        if (high >> 31) != 0 {
+            return Err(Self::rpc_error(rpc_error::RPC_INVALID_PARAMETER, "End of range is too high"));
+        }
+        if high >= low + 1_000_000 {
+            return Err(Self::rpc_error(rpc_error::RPC_INVALID_PARAMETER, "Range is too large"));
+        }
+        Ok((low, high))
+    }
+
     /// `getInt<int>()` — the 32-bit signed destination.
     fn core_get_i32(v: &serde_json::Value) -> Result<i32, ErrorObjectOwned> {
         let i = Self::core_get_i64(v)?;
@@ -4738,125 +4776,6 @@ async fn core_fallback_block_info(block_hash_hex: &str) -> Option<(u32, String)>
     None
 }
 
-/// Call Bitcoin Core's `getblock <hash> <verbosity>` and return the raw
-/// JSON string of the `result` field, or `None` on any error.
-///
-/// Used as a fallback in `get_block` when the local CF_BLOCKS column family
-/// does not contain the block (e.g. assumeUTXO snapshot path, or after a
-/// `drop_blocks_cf` compaction).  Returns the raw bytes of the `result`
-/// JSON object without going through serde_json's number parser, so that
-/// values like `"value":0.00000000` (8 decimal places) are preserved
-/// byte-for-byte — matching Bitcoin Core 31.99's `ValueFromAmount` format
-/// and allowing `jq -Sc` normalization to produce `0E-8` correctly.
-///
-/// Tries the mainnet Bitcoin Core cookie first, then testnet4.
-async fn core_fallback_getblock(
-    block_hash_hex: &str,
-    verbosity: u8,
-) -> Option<String> {
-    struct Endpoint {
-        host: &'static str,
-        port: u16,
-        cookie_path: &'static str,
-    }
-    let endpoints = [
-        Endpoint {
-            host: "127.0.0.1",
-            port: 8332,
-            cookie_path: "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
-        },
-        Endpoint {
-            host: "127.0.0.1",
-            port: 48343,
-            cookie_path: "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie",
-        },
-    ];
-
-    for ep in &endpoints {
-        let cookie = match std::fs::read_to_string(ep.cookie_path) {
-            Ok(c) => c.trim().to_string(),
-            Err(_) => continue,
-        };
-        let parts: Vec<&str> = cookie.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let credentials = format!("{}:{}", parts[0], parts[1]);
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &credentials);
-
-        let json_body = format!(
-            r#"{{"jsonrpc":"1.0","method":"getblock","params":[{:?},{}],"id":1}}"#,
-            block_hash_hex, verbosity
-        );
-
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
-
-        let addr = format!("{}:{}", ep.host, ep.port);
-        let mut stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => continue,
-        };
-
-        let request = format!(
-            "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAuthorization: Basic {b64}\r\nConnection: close\r\n\r\n{body}",
-            host = ep.host,
-            port = ep.port,
-            len = json_body.len(),
-            b64 = b64,
-            body = json_body,
-        );
-
-        if stream.write_all(request.as_bytes()).await.is_err() {
-            continue;
-        }
-
-        let mut response = Vec::new();
-        if tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            stream.read_to_end(&mut response),
-        )
-        .await
-        .is_err()
-        {
-            continue;
-        }
-
-        // Find the JSON body after the HTTP headers (\r\n\r\n separator).
-        let body_start = match response.windows(4).position(|w| w == b"\r\n\r\n") {
-            Some(pos) => pos + 4,
-            None => continue,
-        };
-        let body_bytes = &response[body_start..];
-
-        // Parse the envelope with RawValue for `result` so that number fields
-        // (e.g. "value":0.00000000) are NOT converted to f64 — preserving
-        // Bitcoin Core's exact decimal representation.
-        #[derive(serde::Deserialize)]
-        struct CoreResp<'a> {
-            #[serde(borrow)]
-            result: Option<&'a serde_json::value::RawValue>,
-            error: Option<serde_json::Value>,
-        }
-
-        if let Ok(resp) = serde_json::from_slice::<CoreResp<'_>>(body_bytes) {
-            if resp.error.is_none() {
-                if let Some(raw_result) = resp.result {
-                    // raw_result.get() returns the exact JSON text of the result field.
-                    return Some(raw_result.get().to_owned());
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Call Bitcoin Core's `getrawtransaction <txid> <verbosity> <blockhash>` and
 /// return the raw JSON string of the `result` field, or `None` on any error.
 ///
@@ -5528,20 +5447,33 @@ impl RustoshiRpcServer for RpcServerImpl {
         };
 
         if local_block.is_none() {
-            // ── Phase 2: Core fallback ───────────────────────────────────────
-            // rustoshi may not have block bodies in CF_BLOCKS (dropped after
-            // assume-UTXO snapshot load, or not yet written during IBD).
-            // Proxy the request to a locally-running Bitcoin Core node, which
-            // is the authoritative reference for getblock verbosity=2 output.
-            // The raw JSON string is returned without re-encoding through serde's
-            // number serialiser, so `"value":0.00000000` is preserved byte-for-byte.
-            // The harness normalizes with `del(.confirmations)` before hashing so
-            // using Core's confirmations value is harmless.
-            let core_result = core_fallback_getblock(&block_hash.to_hex(), verbosity).await;
-            return match core_result {
-                Some(json_str) => Ok(raw(json_str)),
-                None => Err(Self::rpc_error(rpc_error::RPC_BLOCK_NOT_FOUND, "Block not found")),
-            };
+            // Core getblock (rpc/blockchain.cpp:855 + CheckBlockDataAvailability
+            // :671-684): an unknown hash is -5 "Block not found"; a block in
+            // the index whose data is absent is -1 "Block not available
+            // (pruned data)" / "(not fully downloaded)". Answer ONLY from
+            // local data. This used to proxy the call to a Bitcoin Core on
+            // 127.0.0.1:8332, so getblock "served" blocks rustoshi does not
+            // have (block 100000 on a snapshot-booted, pruned mainnet node)
+            // while getblockheader / verifytxoutproof correctly said -5.
+            let state = self.state.read().await;
+            let store = BlockStore::new(&state.db);
+            let in_index = store
+                .get_block_index(&block_hash)
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                .is_some();
+            if !in_index {
+                return Err(Self::rpc_error(rpc_error::RPC_BLOCK_NOT_FOUND, "Block not found"));
+            }
+            let pruned = state.prune_mode
+                || matches!(store.prune_report_floor(state.best_height), Ok(Some(_)));
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                if pruned {
+                    "Block not available (pruned data)"
+                } else {
+                    "Block not available (not fully downloaded)"
+                },
+            ));
         }
 
         let block = local_block.unwrap();
@@ -5552,9 +5484,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             return Ok(raw(serde_json::to_string(&hex_data).unwrap()));
         }
 
-        // ── Phase 3: build verbose response from local block data ────────────
-        // (Used when CF_BLOCKS is populated; the Core fallback is the primary
-        // production path for the current live fleet.)
+        // ── Phase 2: build verbose response from local block data ────────────
         let (height, next_hash, chainwork_hex, mediantime, best_height, in_active_chain) = {
             let state = self.state.read().await;
             let store = BlockStore::new(&state.db);
@@ -6552,37 +6482,43 @@ impl RustoshiRpcServer for RpcServerImpl {
         };
 
         // ── helpers over the active chain (by height) ──────────────────────
-        // Cumulative tx count genesis..=h  (Core's m_chain_tx_count). Walks
-        // the height index summing per-block n_tx. rustoshi has no persisted
-        // running counter (W109/G10 gap), so we sum on demand; this read-only
-        // diagnostic RPC tolerates the O(height) walk.
-        let chain_tx_count = |h: i64| -> Result<u64, ErrorObjectOwned> {
+        // Cumulative tx count genesis..=h — Core's CBlockIndex::m_chain_tx_count
+        // (chain.h:129), which is KNOWN only when every block back to an anchor
+        // has a known nTx: genesis, or an assumeutxo base whose count is
+        // hard-coded in chainparams (node/blockstorage.cpp:440-487 seeds
+        // `base->m_chain_tx_count = au_data.m_chain_tx_count` and derives the
+        // rest as pprev + nTx; anything below an un-downloaded base stays 0).
+        // Walk DOWN from `h` to the nearest anchor; a missing height-index
+        // row, block-index entry or nTx means UNKNOWN (None) — getchaintxstats
+        // then omits txcount / window_tx_count exactly as Core does
+        // (blockchain.cpp:1878,1886). The old walk UP from height 0 failed
+        // every snapshot-booted datadir with -32603 "missing height index at
+        // 1" (live mainnet) and cost O(height) on the rest.
+        let chain_tx_count = |h: i64| -> Result<Option<u64>, ErrorObjectOwned> {
             if h < 0 {
-                return Ok(0);
+                return Ok(None);
             }
-            let mut total: u64 = 0;
-            for height in 0..=(h as u32) {
-                let hash = store
-                    .get_hash_by_height(height)
-                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
-                    .ok_or_else(|| {
-                        Self::rpc_error(
-                            rpc_error::RPC_INTERNAL_ERROR,
-                            format!("missing height index at {height}"),
-                        )
-                    })?;
-                let entry = store
-                    .get_block_index(&hash)
-                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
-                    .ok_or_else(|| {
-                        Self::rpc_error(
-                            rpc_error::RPC_INTERNAL_ERROR,
-                            format!("missing block index for {hash}"),
-                        )
-                    })?;
-                total += entry.n_tx as u64;
-            }
-            Ok(total)
+            chain_tx_count_walk(
+                h as u32,
+                |height| {
+                    store
+                        .get_hash_by_height(height)
+                        .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))
+                },
+                |hash| {
+                    store
+                        .get_block_index(hash)
+                        .map(|e| e.map(|e| e.n_tx))
+                        .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))
+                },
+                |height, hash| {
+                    state
+                        .params
+                        .assumeutxo_for_height(height)
+                        .filter(|au| &au.blockhash == hash && au.chain_tx_count != 0)
+                        .map(|au| au.chain_tx_count)
+                },
+            )
         };
 
         // Median-time-past of the active-chain block at height `h`: median of
@@ -6639,8 +6575,8 @@ impl RustoshiRpcServer for RpcServerImpl {
         // txcount = cumulative tx count genesis..pindex (only emitted when
         // non-zero, matching Core's `if (pindex->m_chain_tx_count)`).
         let final_chain_tx = chain_tx_count(height_i)?;
-        if final_chain_tx != 0 {
-            ret.insert("txcount".to_string(), serde_json::json!(final_chain_tx));
+        if let Some(n) = final_chain_tx {
+            ret.insert("txcount".to_string(), serde_json::json!(n));
         }
 
         ret.insert(
@@ -6659,7 +6595,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         if blockcount > 0 {
             ret.insert("window_interval".to_string(), serde_json::json!(time_diff));
             let past_chain_tx = chain_tx_count(past_height)?;
-            if final_chain_tx != 0 && past_chain_tx != 0 {
+            if let (Some(final_chain_tx), Some(past_chain_tx)) = (final_chain_tx, past_chain_tx) {
                 let window_tx_count = final_chain_tx - past_chain_tx;
                 ret.insert(
                     "window_tx_count".to_string(),
@@ -10859,15 +10795,39 @@ impl RustoshiRpcServer for RpcServerImpl {
         range: Option<serde_json::Value>,
     ) -> RpcResult<Vec<String>> {
         use rustoshi_crypto::address::Network;
-        use rustoshi_wallet::descriptor::parse_descriptor;
+        use rustoshi_wallet::descriptor::{parse_descriptor, verify_checksum, DescriptorError};
 
-        // Parse the descriptor
-        let parsed = parse_descriptor(&descriptor).map_err(|e| {
-            Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                format!("Invalid descriptor: {}", e),
-            )
-        })?;
+        // Core output_script.cpp deriveaddresses, in Core's order:
+        //   1. ParseDescriptorRange(params[1]) when given (-8 / -1),
+        //   2. Parse(desc, ..., require_checksum = true) -> -5 on ANY parse
+        //      error, including "Missing checksum",
+        //   3. un-ranged + range given -> -8; ranged + no range -> -8.
+        // This accepted a checksum-less descriptor and silently ignored a
+        // range on an un-ranged one, returning addresses Core refuses to.
+        let parsed_range: Option<(i64, i64)> = match &range {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(Self::core_parse_descriptor_range(v)?),
+        };
+        let invalid_key = |msg: String| Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, msg);
+        if let Err(e) = verify_checksum(descriptor.trim()) {
+            return Err(invalid_key(match e {
+                DescriptorError::MissingChecksum => "Missing checksum".to_string(),
+                other => other.to_string(),
+            }));
+        }
+        let parsed = parse_descriptor(&descriptor).map_err(|e| invalid_key(e.to_string()))?;
+        if !parsed.is_range() && parsed_range.is_some() {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Range should not be specified for an un-ranged descriptor",
+            ));
+        }
+        if parsed.is_range() && parsed_range.is_none() {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Range must be specified for a ranged descriptor",
+            ));
+        }
 
         // Determine network from state
         let state = self.state.read().await;
@@ -10877,42 +10837,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             NetworkId::Regtest => Network::Regtest,
         };
 
-        // Parse range if provided
-        let (start, end) = if parsed.is_range() {
-            match &range {
-                Some(serde_json::Value::Array(arr)) if arr.len() == 2 => {
-                    let start = arr[0].as_u64().ok_or_else(|| {
-                        Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid range start")
-                    })? as u32;
-                    let end = arr[1].as_u64().ok_or_else(|| {
-                        Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid range end")
-                    })? as u32;
-                    (start, end)
-                }
-                Some(serde_json::Value::Number(n)) => {
-                    let end = n.as_u64().ok_or_else(|| {
-                        Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid range")
-                    })? as u32;
-                    (0, end)
-                }
-                None => {
-                    return Err(Self::rpc_error(
-                        rpc_error::RPC_INVALID_PARAMS,
-                        "Range required for ranged descriptor",
-                    ));
-                }
-                _ => {
-                    return Err(Self::rpc_error(
-                        rpc_error::RPC_INVALID_PARAMS,
-                        "Invalid range format",
-                    ));
-                }
-            }
-        } else {
+        // Validated above: in u32 range and non-negative (ParseDescriptorRange).
+        let (start, end) = match parsed_range {
+            Some((lo, hi)) => (lo as u32, hi as u32),
             // Non-ranged descriptor, derive a single address. The loop below
             // is inclusive (`start..=end`, matching Core `i <= range_end`),
             // so a singleton is (0, 0) not (0, 1).
-            (0, 0)
+            None => (0, 0),
         };
 
         // Derive addresses. Range is INCLUSIVE of `end` — Core's
@@ -15504,26 +15435,47 @@ impl RustoshiRpcServer for RpcServerImpl {
         block_hash.copy_from_slice(&block_hash_raw);
         // block_hash is little-endian (internal)
 
-        let state = self.state.read().await;
-        let store = BlockStore::new(&state.db);
-
-        // Confirm block is in our chain.
-        let block = store.get_block(&Hash256(block_hash))
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
-            .ok_or_else(|| Self::rpc_error(rpc_error::RPC_BLOCK_NOT_FOUND, "Block not in chain"))?;
-
-        // The merkle root in the header (bytes 36..68) is little-endian.
-        let merkle_root_in_header = &header_bytes[36..68];
-
+        // Core txoutproof.cpp verifytxoutproof: a proof whose partial tree
+        // does not hash to the header's merkle root is not an error — the
+        // answer is the EMPTY array.
         let (matched, computed_root) = parse_partial_merkle_tree(&proof_bytes[80..])
             .map_err(|e| Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, e))?;
-
-        if computed_root != merkle_root_in_header {
-            return Err(Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Merkle root mismatch"));
+        if computed_root.as_slice() != &header_bytes[36..68] {
+            return Ok(Vec::new());
         }
+        let proof_n_tx = u32::from_le_bytes([
+            proof_bytes[80],
+            proof_bytes[81],
+            proof_bytes[82],
+            proof_bytes[83],
+        ]);
 
-        // Suppress unused variable warning
-        let _ = block;
+        // Core: LookupBlockIndex(hash); !pindex || !ActiveChain().Contains(pindex)
+        // || pindex->nTx == 0 -> -5 "Block not found in chain". The BLOCK INDEX
+        // decides, not the presence of a body: the old body lookup accepted a
+        // proof for a STALE block whose body is still stored, and refused a
+        // pruned block that is on the active chain.
+        let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+        let hash = Hash256(block_hash);
+        let not_found =
+            || Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain");
+        let entry = store
+            .get_block_index(&hash)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+            .ok_or_else(not_found)?;
+        let on_active = entry.height <= state.best_height
+            && store
+                .get_hash_by_height(entry.height)
+                .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
+                == Some(hash);
+        if !on_active || entry.n_tx == 0 {
+            return Err(not_found());
+        }
+        // "Check if proof is valid, only add results if so".
+        if entry.n_tx != proof_n_tx {
+            return Ok(Vec::new());
+        }
 
         // Return txids in display order (big-endian hex).
         let result: Vec<String> = matched
@@ -16380,6 +16332,38 @@ fn read_varint(data: &[u8], offset: usize) -> Result<(usize, usize), String> {
             if offset + 9 > data.len() { return Err("short varint".into()); }
             Ok((u64::from_le_bytes(data[offset+1..offset+9].try_into().unwrap()) as usize, offset + 9))
         }
+    }
+}
+
+/// Core `CBlockIndex::m_chain_tx_count` for the active-chain block at
+/// `height`, or `None` when it is unknown (Core's 0 sentinel).
+///
+/// Walks down from `height` summing each block's nTx until it reaches an
+/// anchor: `anchor(h, hash)` (an assumeutxo base carrying a chainparams
+/// count, which INCLUDES that block) or genesis. Any gap — no height-index
+/// row, no block-index entry, or an nTx of 0 — is unknown; nothing is ever
+/// counted as zero or guessed.
+pub(crate) fn chain_tx_count_walk<E>(
+    height: u32,
+    mut hash_at: impl FnMut(u32) -> Result<Option<Hash256>, E>,
+    mut n_tx_of: impl FnMut(&Hash256) -> Result<Option<u32>, E>,
+    anchor: impl Fn(u32, &Hash256) -> Option<u64>,
+) -> Result<Option<u64>, E> {
+    let mut total: u64 = 0;
+    let mut h = height;
+    loop {
+        let Some(hash) = hash_at(h)? else { return Ok(None) };
+        if let Some(base) = anchor(h, &hash) {
+            return Ok(Some(total + base));
+        }
+        match n_tx_of(&hash)? {
+            Some(n) if n != 0 => total += u64::from(n),
+            _ => return Ok(None),
+        }
+        if h == 0 {
+            return Ok(Some(total));
+        }
+        h -= 1;
     }
 }
 
@@ -24637,6 +24621,220 @@ mod tests {
             "wire must omit pruneheight: {}",
             json
         );
+    }
+
+    // ── R5 DATA-INTEGRITY (QUEUES.md rustoshi item 0, 2026-09-25) ──────────
+    // Wrong answers, each checked against the Bitcoin Core source it cites.
+
+    fn r5di_server(
+        db: Arc<rustoshi_storage::ChainDb>,
+        params: rustoshi_consensus::ChainParams,
+        blocks: &[rustoshi_primitives::Block],
+        tip: u32,
+    ) -> RpcServerImpl {
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.best_height = tip;
+        rpc_state.best_hash = blocks[tip as usize].header.block_hash();
+        rpc_state.header_height = tip;
+        rpc_state.is_ibd = false;
+        RpcServerImpl::new(
+            Arc::new(RwLock::new(rpc_state)),
+            Arc::new(RwLock::new(PeerState::default())),
+        )
+    }
+
+    /// Serialized CMerkleBlock for a ONE-tx block: header ‖ nTx=1 ‖ [txid] ‖ flags 0x01.
+    fn r5di_single_tx_proof(block: &rustoshi_primitives::Block) -> String {
+        use rustoshi_primitives::Encodable;
+        let mut v = Vec::new();
+        block.header.encode(&mut v).unwrap();
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.push(1);
+        v.extend_from_slice(&block.transactions[0].txid().0);
+        v.push(1);
+        v.push(0x01);
+        hex::encode(v)
+    }
+
+    #[test]
+    fn r5di_chain_tx_count_walk_anchors_and_gaps() {
+        let h = |n: u32| Hash256([n as u8; 32]);
+        // heights 0..=9 present; nTx = 1 each; anchor at 5 carrying 500.
+        let present = |n: u32| -> Result<Option<Hash256>, ()> { Ok(if n <= 9 { Some(h(n)) } else { None }) };
+        let ntx = |_: &Hash256| -> Result<Option<u32>, ()> { Ok(Some(1)) };
+        let none = |_: u32, _: &Hash256| None;
+        let at5 = |n: u32, x: &Hash256| if n == 5 && *x == h(5) { Some(500) } else { None };
+        assert_eq!(chain_tx_count_walk(9, present, ntx, none), Ok(Some(10)));
+        assert_eq!(chain_tx_count_walk(9, present, ntx, at5), Ok(Some(504)));
+        assert_eq!(chain_tx_count_walk(5, present, ntx, at5), Ok(Some(500)));
+        // A hole (height 3 missing) with no anchor above it: unknown, never partial.
+        let holed = |n: u32| -> Result<Option<Hash256>, ()> { Ok(if n != 3 && n <= 9 { Some(h(n)) } else { None }) };
+        assert_eq!(chain_tx_count_walk(9, holed, ntx, none), Ok(None));
+        assert_eq!(chain_tx_count_walk(9, holed, ntx, at5), Ok(Some(504)));
+        // nTx 0 (unknown) is a gap, not a zero.
+        let zero_at_7 = |x: &Hash256| -> Result<Option<u32>, ()> { Ok(Some(if *x == h(7) { 0 } else { 1 })) };
+        assert_eq!(chain_tx_count_walk(9, present, zero_at_7, none), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn r5di_getchaintxstats_snapshot_hole_is_unknown_not_an_error() {
+        use rustoshi_storage::ChainDb;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (params, blocks) = seed_backfill_chain(&db, 10, 40); // heights 1..9 absent
+        let rpc = r5di_server(db, params, &blocks, 40);
+        // Core blockchain.cpp:1878/1886: unknown m_chain_tx_count -> txcount and
+        // window_tx_count omitted, never an error. Live mainnet answered
+        // -32603 "missing height index at 1".
+        let stats = rpc.get_chain_tx_stats(Some(5), None).await.expect("getchaintxstats");
+        assert!(stats.get("txcount").is_none(), "txcount must be omitted: {stats}");
+        assert!(stats.get("window_tx_count").is_none(), "{stats}");
+        assert_eq!(stats["window_final_block_height"], 40);
+        assert_eq!(stats["window_block_count"], 5);
+    }
+
+    #[tokio::test]
+    async fn r5di_getchaintxstats_seeds_from_the_assumeutxo_base_count() {
+        use rustoshi_consensus::params::{AssumeutxoData, AssumeutxoHash};
+        use rustoshi_storage::ChainDb;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (mut params, blocks) = seed_backfill_chain(&db, 10, 40);
+        // Core node/blockstorage.cpp:443: base->m_chain_tx_count = au_data.m_chain_tx_count.
+        params.assumeutxo_data.push(AssumeutxoData {
+            height: 10,
+            blockhash: blocks[10].header.block_hash(),
+            hash_serialized: AssumeutxoHash(Hash256::ZERO),
+            chain_tx_count: 1_000,
+            base_mtp: None,
+            base_tail_headers: vec![],
+        });
+        let rpc = r5di_server(db, params, &blocks, 40);
+        let stats = rpc.get_chain_tx_stats(Some(5), None).await.expect("getchaintxstats");
+        // base 1,000 (includes block 10) + one coinbase per block 11..=40.
+        assert_eq!(stats["txcount"], 1_030, "{stats}");
+        assert_eq!(stats["window_tx_count"], 5, "{stats}");
+    }
+
+    #[test]
+    fn r5di_mainnet_944183_count_is_cores_not_the_placeholder() {
+        let p = rustoshi_consensus::ChainParams::mainnet();
+        let au = p.assumeutxo_for_height(944_183).expect("944183 entry");
+        // Core getchaintxstats txcount at 0000…ced817 (2026-09-25).
+        assert_eq!(au.chain_tx_count, 1_335_914_531);
+    }
+
+    #[tokio::test]
+    async fn r5di_getblock_answers_only_from_local_data() {
+        use rustoshi_storage::ChainDb;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (params, blocks) = seed_backfill_chain(&db, 10, 20);
+        let store = BlockStore::new(&db);
+        // Height 12 on the active chain, body gone (pruned).
+        store.prune_block(&blocks[12].header.block_hash()).unwrap();
+        let rpc = r5di_server(db.clone(), params, &blocks, 20);
+
+        // Mainnet block 100000 — Core has it; this node does not. The old
+        // handler proxied the call to Core on 127.0.0.1:8332 and returned
+        // Core's block (confirmations 868603 on live mainnet).
+        let b100k = "000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506";
+        let e = rpc.get_block(b100k.into(), Some(serde_json::json!(1))).await.expect_err("unknown block");
+        assert_eq!(e.code(), -5, "{}", e.message());
+        assert_eq!(e.message(), "Block not found");
+
+        let h12 = blocks[12].header.block_hash().to_hex();
+        let e = rpc.get_block(h12, Some(serde_json::json!(0))).await.expect_err("no body");
+        assert_eq!(e.code(), -1, "{}", e.message());
+        assert!(e.message().starts_with("Block not available"), "{}", e.message());
+    }
+
+    #[tokio::test]
+    async fn r5di_verifytxoutproof_uses_the_active_chain_index() {
+        use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+        use rustoshi_storage::ChainDb;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (params, blocks) = seed_backfill_chain(&db, 10, 20);
+        let store = BlockStore::new(&db);
+
+        // A STALE block at height 15 (same parent as the active one), body and
+        // index entry stored, NOT on the active chain.
+        let mut stale = blocks[15].clone();
+        stale.header.timestamp += 1;
+        while !stale.header.validate_pow_against_declared_target() {
+            stale.header.nonce = stale.header.nonce.wrapping_add(1);
+        }
+        let stale_hash = stale.header.block_hash();
+        store.put_header(&stale_hash, &stale.header).unwrap();
+        store.put_block(&stale_hash, &stale).unwrap();
+        let mut st = BlockStatus::new();
+        st.set(BlockStatus::VALID_HEADER);
+        st.set(BlockStatus::HAVE_DATA);
+        store
+            .put_block_index(
+                &stale_hash,
+                &BlockIndexEntry {
+                    height: 15,
+                    status: st,
+                    n_tx: 1,
+                    timestamp: stale.header.timestamp,
+                    bits: stale.header.bits,
+                    nonce: stale.header.nonce,
+                    version: stale.header.version,
+                    prev_hash: stale.header.prev_block_hash,
+                    chain_work: [0u8; 32],
+                },
+            )
+            .unwrap();
+        // Height 12: active, body pruned.
+        store.prune_block(&blocks[12].header.block_hash()).unwrap();
+        let rpc = r5di_server(db.clone(), params, &blocks, 20);
+
+        let txid = |b: &rustoshi_primitives::Block| {
+            let mut d = b.transactions[0].txid().0;
+            d.reverse();
+            hex::encode(d)
+        };
+        // Active block with a body: the proven txid.
+        let got = rpc.verify_tx_out_proof(r5di_single_tx_proof(&blocks[14])).await.expect("active");
+        assert_eq!(got, vec![txid(&blocks[14])]);
+        // Active block whose body is pruned: Core needs only the index.
+        let got = rpc.verify_tx_out_proof(r5di_single_tx_proof(&blocks[12])).await.expect("pruned active");
+        assert_eq!(got, vec![txid(&blocks[12])]);
+        // Stale block: Core -5 "Block not found in chain" (ActiveChain().Contains).
+        let e = rpc.verify_tx_out_proof(r5di_single_tx_proof(&stale)).await.expect_err("stale");
+        assert_eq!(e.code(), -5, "{}", e.message());
+        // Root mismatch: Core returns the EMPTY array, not an error.
+        let mut bad = hex::decode(r5di_single_tx_proof(&blocks[14])).unwrap();
+        let n = bad.len();
+        bad[n - 3] ^= 0xff; // corrupt the single hash
+        let got = rpc.verify_tx_out_proof(hex::encode(bad)).await.expect("mismatch is not an error");
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn r5di_deriveaddresses_requires_checksum_and_range_rules() {
+        let (_db, _state, rpc) = make_test_server(rustoshi_consensus::ChainParams::mainnet());
+        let nocs = "wpkh(03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd)";
+        let cs = "wpkh(03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd)#e72f49hy";
+        // Core output_script.cpp:315 Parse(..., require_checksum = true) -> -5.
+        let e = rpc.derive_addresses(nocs.into(), None).await.expect_err("missing checksum");
+        assert_eq!(e.code(), -5, "{}", e.message());
+        assert_eq!(e.message(), "Missing checksum");
+        // :320 un-ranged descriptor + range -> -8.
+        let e = rpc.derive_addresses(cs.into(), Some(serde_json::json!([0, 2]))).await.expect_err("range");
+        assert_eq!(e.code(), -8, "{}", e.message());
+        // :324 ranged descriptor without range -> -8.
+        let ranged = "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*)#wvk84d79";
+        let e = rpc.derive_addresses(ranged.into(), None).await.expect_err("no range");
+        assert_eq!(e.code(), -8, "{}", e.message());
+        // The valid calls still answer (Core-exact values, r5 probe vectors).
+        assert_eq!(
+            rpc.derive_addresses(cs.into(), None).await.expect("single"),
+            vec!["bc1qgp3v3thdf7qu94ellp2299tsyyv3ug9kkau5q5".to_string()]
+        );
+        assert_eq!(rpc.derive_addresses(ranged.into(), Some(serde_json::json!([0, 2]))).await.expect("ranged").len(), 3);
     }
 
     #[tokio::test]
