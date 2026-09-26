@@ -125,6 +125,25 @@ pub enum StorageError {
 // DATABASE HANDLE
 // ============================================================
 
+/// Per-thread count of point reads (`get_cf` / `contains_key`) for tests
+/// that bound how much RocksDB work a single call does (e.g. the
+/// historical-backfill body scan that wedged the mainnet main task,
+/// 2026-09-26). Thread-local so parallel tests do not see each other.
+#[cfg(test)]
+pub(crate) mod test_read_counter {
+    use std::cell::Cell;
+    thread_local! {
+        static READS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn bump() {
+        READS.with(|r| r.set(r.get() + 1));
+    }
+    /// Reads observed on this thread since it started.
+    pub(crate) fn get() -> u64 {
+        READS.with(|r| r.get())
+    }
+}
+
 /// The main database handle wrapping RocksDB.
 ///
 /// Provides methods for reading and writing data across column families,
@@ -217,6 +236,8 @@ impl ChainDb {
     ///
     /// Returns `None` if the key doesn't exist.
     pub fn get_cf(&self, cf_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        #[cfg(test)]
+        test_read_counter::bump();
         let cf = self
             .db
             .cf_handle(cf_name)

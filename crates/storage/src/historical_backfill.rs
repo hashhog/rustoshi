@@ -62,6 +62,15 @@ use crate::header_context::{expected_bits_for_child, HeaderCache};
 /// per-peer in-flight cap so historical download cannot starve tip sync.
 pub const BACKFILL_BODIES_PER_REQUEST: usize = 16;
 
+/// Maximum heights one [`HistoricalBackfill::next_body_hashes`] call (and one
+/// body-cursor advance) examines. Each height costs up to two RocksDB point
+/// reads (height index + block presence), and the caller runs on the
+/// node's main async task, so per-call work must not grow with the hole.
+/// 2026-09-26 mainnet wedge: an unbounded walk of ~118k heights per call
+/// stalled block connect and inbound P2P for ~15 min until the P2P watchdog
+/// restarted the node.
+pub const BACKFILL_BODY_SCAN_MAX_HEIGHTS: u32 = 1024;
+
 /// Env var an operator or campaign launcher sets to skip genesis→base P2P
 /// backfill after `--load-snapshot`. Same effect as `--no-historical-backfill`.
 pub const HISTORICAL_BACKFILL_DISABLE_ENV: &str = "HASHHOG_DISABLE_HISTORICAL_BACKFILL";
@@ -126,6 +135,14 @@ pub struct HistoricalBackfill {
     floor_hash: Hash256,
     /// First height in `1..floor-1` whose body is still missing.
     next_body_height: u32,
+    /// Resume point of the missing-body scan. Heights in
+    /// `next_body_height..body_scan_height` have already been examined: each
+    /// was held, in flight, or has just been requested. Such a height can
+    /// only become wanted again when its in-flight marker is dropped without
+    /// the body being stored, and every place that does that rewinds this
+    /// cursor. Without it, a single missing/in-flight body at
+    /// `next_body_height` made every call re-walk the whole hole.
+    body_scan_height: u32,
     /// Hashes we have asked a peer for and not yet received.
     in_flight_bodies: HashSet<Hash256>,
     /// Set when a headers batch stored 0 (overlapping resend). Cleared by
@@ -199,6 +216,7 @@ impl HistoricalBackfill {
             target_floor,
             floor_hash,
             next_body_height,
+            body_scan_height: next_body_height,
             in_flight_bodies: HashSet::new(),
             getheaders_cooldown: false,
         }))
@@ -468,20 +486,31 @@ impl HistoricalBackfill {
             self.advance_body_cursor(store)?;
             return Ok(false);
         }
-        store.put_block(&hash, block)?;
-        let mut entry = entry;
-        entry.n_tx = block.transactions.len() as u32;
-        entry.status.set(BlockStatus::HAVE_DATA);
-        store.put_block_index(&hash, &entry)?;
-        self.advance_body_cursor(store)?;
-        if self.is_complete() {
-            store.clear_historical_backfill_floor()?;
+        let height = entry.height;
+        let stored = store.put_block(&hash, block).and_then(|()| {
+            let mut entry = entry;
+            entry.n_tx = block.transactions.len() as u32;
+            entry.status.set(BlockStatus::HAVE_DATA);
+            store.put_block_index(&hash, &entry)
+        });
+        if let Err(e) = stored {
+            // In-flight marker is gone but the body may not be stored: make
+            // sure the scan revisits this height.
+            self.body_scan_height = self.body_scan_height.min(height);
+            return Err(e.into());
         }
+        self.advance_body_cursor(store)?;
         Ok(true)
     }
 
     /// Next historical bodies to request, up to `limit`. Records them as
     /// in-flight so a subsequent call does not re-request the same hashes.
+    ///
+    /// Work per call is bounded by [`BACKFILL_BODY_SCAN_MAX_HEIGHTS`] (for the
+    /// completion-cursor advance and for the scan, each): the scan resumes at
+    /// `body_scan_height` instead of re-walking from `next_body_height`.
+    /// A call may therefore return fewer than `limit` hashes (even none)
+    /// while bodies are still missing further up; the next call continues.
     pub fn next_body_hashes(
         &mut self,
         store: &BlockStore<'_>,
@@ -490,24 +519,48 @@ impl HistoricalBackfill {
         if self.bodies_complete() || limit == 0 {
             return Ok(Vec::new());
         }
+        // Bodies may have landed out of band (or a previous advance hit its
+        // cap): move the completion cursor, bounded.
+        self.advance_body_cursor(store)?;
+        if self.bodies_complete() {
+            return Ok(Vec::new());
+        }
+
+        // Last height that can currently have a header: min(genesis_tip, floor-1).
+        let end = self.genesis_tip.min(self.target_floor - 1);
+        if self.body_scan_height < self.next_body_height {
+            self.body_scan_height = self.next_body_height;
+        }
+        if self.body_scan_height > end && self.in_flight_bodies.is_empty() {
+            // Everything up to `end` was examined, nothing is outstanding,
+            // yet the body at `next_body_height` is still absent: some marker
+            // was lost without a rewind. Rescan rather than stall forever.
+            self.body_scan_height = self.next_body_height;
+        }
+
         let mut out = Vec::with_capacity(limit);
-        let mut h = self.next_body_height;
-        while out.len() < limit && h < self.target_floor && h <= self.genesis_tip {
+        let mut h = self.body_scan_height;
+        let mut scanned = 0u32;
+        while out.len() < limit && h <= end && scanned < BACKFILL_BODY_SCAN_MAX_HEIGHTS {
+            scanned += 1;
             if let Some(hash) = store.get_hash_by_height(h)? {
-                if !store.has_block(&hash)? && !self.in_flight_bodies.contains(&hash) {
+                if !self.in_flight_bodies.contains(&hash) && !store.has_block(&hash)? {
                     self.in_flight_bodies.insert(hash);
                     out.push((h, hash));
                 }
             }
             h += 1;
         }
+        self.body_scan_height = h;
         Ok(out)
     }
 
-    /// Drop in-flight markers (peer gone / timeout). Next `next_body_hashes`
-    /// will re-request.
+    /// Drop in-flight markers (peer gone / timeout). Subsequent
+    /// `next_body_hashes` calls rescan from `next_body_height` and
+    /// re-request anything still undelivered.
     pub fn clear_in_flight(&mut self) {
         self.in_flight_bodies.clear();
+        self.body_scan_height = self.next_body_height;
     }
 
     fn is_historical_hash(&self, store: &BlockStore<'_>, hash: &Hash256) -> bool {
@@ -533,12 +586,22 @@ impl HistoricalBackfill {
         Ok(())
     }
 
+    /// Move `next_body_height` across a contiguous run of held bodies, at
+    /// most [`BACKFILL_BODY_SCAN_MAX_HEIGHTS`] heights per call (a late body
+    /// at the cursor can unblock a run of ~100k held bodies; that walk is
+    /// spread over later calls instead of done at once). Clears the persisted
+    /// floor when headers and bodies are both complete.
     fn advance_body_cursor(&mut self, store: &BlockStore<'_>) -> Result<(), StorageError> {
-        while self.next_body_height < self.target_floor {
+        let mut steps = 0u32;
+        while self.next_body_height < self.target_floor && steps < BACKFILL_BODY_SCAN_MAX_HEIGHTS {
+            steps += 1;
             match store.get_hash_by_height(self.next_body_height)? {
                 Some(h) if store.has_block(&h)? => self.next_body_height += 1,
                 _ => break,
             }
+        }
+        if self.is_complete() {
+            store.clear_historical_backfill_floor()?;
         }
         Ok(())
     }
@@ -1050,5 +1113,126 @@ mod tests {
         .unwrap();
         assert!(armed.is_some());
         assert_eq!(store.historical_backfill_floor().unwrap(), Some(10));
+    }
+
+    fn fake_hash(height: u32) -> Hash256 {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&height.to_be_bytes());
+        b[31] = 0xbf;
+        Hash256(b)
+    }
+
+    /// 2026-09-26 mainnet wedge (gdb: main thread in `next_body_hashes` ->
+    /// `ChainDb::contains_key` -> pread for ~15 min, every tokio worker idle,
+    /// P2P watchdog exit). With the body at the cursor missing or in flight,
+    /// `advance_body_cursor` cannot move, and every call re-walked every
+    /// height from the cursor to `genesis_tip` (~118k on mainnet): two
+    /// RocksDB point reads per height, synchronously on async_main.
+    ///
+    /// Shape here: hole `1..=50_000`, every body held except height 1 (at the
+    /// cursor) and height 40_000. Asserts each call's point reads are bounded
+    /// by a constant independent of `genesis_tip`, AND that correctness
+    /// holds: every missing body is eventually requested, nothing in flight
+    /// is re-requested, `clear_in_flight` makes undelivered bodies eligible
+    /// again, and once bodies land the cursor still reaches completion.
+    #[test]
+    fn historical_backfill_body_scan_is_bounded_per_call() {
+        const N: u32 = 50_000;
+        const FAR: u32 = 40_000;
+        // Generous fixed ceiling: a few thousand reads, vs ~2*N unbounded.
+        const MAX_READS_PER_CALL: u64 = 5_000;
+        const MAX_CALLS: usize = 1_000;
+
+        let (_dir, db) = temp_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        store.init_genesis(&params).unwrap();
+        let body = params.genesis_block.clone();
+        for h in 1..=N + 1 {
+            store.put_height_index(h, &fake_hash(h)).unwrap();
+            if h != 1 && h != FAR && h <= N {
+                store.put_block(&fake_hash(h), &body).unwrap();
+            }
+        }
+        store.set_historical_backfill_floor(N + 1).unwrap();
+        let mut bf = HistoricalBackfill::detect(&store, params.genesis_hash, N + 1)
+            .unwrap()
+            .expect("hole");
+        assert_eq!(bf.genesis_tip(), N);
+        assert!(bf.headers_complete());
+        assert!(!bf.bodies_complete());
+
+        let call = |bf: &mut HistoricalBackfill| {
+            let before = crate::db::test_read_counter::get();
+            let out = bf
+                .next_body_hashes(&store, BACKFILL_BODIES_PER_REQUEST)
+                .unwrap();
+            let reads = crate::db::test_read_counter::get() - before;
+            assert!(
+                reads <= MAX_READS_PER_CALL,
+                "next_body_hashes did {reads} RocksDB reads in one call \
+                 (bound {MAX_READS_PER_CALL}); genesis_tip={N}"
+            );
+            out
+        };
+
+        // Phase 1: both missing bodies get requested, each exactly once.
+        let mut requested: Vec<u32> = Vec::new();
+        for _ in 0..MAX_CALLS {
+            for (h, hash) in call(&mut bf) {
+                assert_eq!(hash, fake_hash(h));
+                assert!(
+                    !requested.contains(&h),
+                    "height {h} double-requested while in flight"
+                );
+                requested.push(h);
+            }
+            if requested.contains(&1) && requested.contains(&FAR) {
+                break;
+            }
+        }
+        requested.sort_unstable();
+        assert_eq!(
+            requested,
+            vec![1, FAR],
+            "every missing body must be requested"
+        );
+
+        // Phase 2: both in flight, nothing else missing -> empty, still bounded.
+        for _ in 0..50 {
+            assert!(
+                call(&mut bf).is_empty(),
+                "in-flight bodies must not be re-requested"
+            );
+        }
+
+        // Phase 3: peer gone -> clear_in_flight -> both eligible again.
+        bf.clear_in_flight();
+        let mut again: Vec<u32> = Vec::new();
+        for _ in 0..MAX_CALLS {
+            again.extend(call(&mut bf).into_iter().map(|(h, _)| h));
+            if again.contains(&1) && again.contains(&FAR) {
+                break;
+            }
+        }
+        again.sort_unstable();
+        assert_eq!(
+            again,
+            vec![1, FAR],
+            "undelivered bodies must be re-requested after clear_in_flight"
+        );
+
+        // Phase 4: bodies land; cursor must still reach completion and clear the floor.
+        store.put_block(&fake_hash(1), &body).unwrap();
+        store.put_block(&fake_hash(FAR), &body).unwrap();
+        for _ in 0..MAX_CALLS {
+            if bf.bodies_complete() {
+                break;
+            }
+            assert!(call(&mut bf).is_empty());
+        }
+        assert!(bf.bodies_complete(), "cursor must advance to the floor");
+        assert!(bf.is_complete());
+        assert_eq!(store.historical_backfill_floor().unwrap(), None);
     }
 }
