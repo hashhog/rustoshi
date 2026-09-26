@@ -53,14 +53,18 @@
 //!
 //! # Thread Safety
 //!
-//! The cache uses `DashMap` for lock-free concurrent reads, which matches
-//! well with rayon's parallel iteration during script validation.
+//! The cache is split into up to 64 independently locked shards (a salted
+//! key selects one); `lookup` takes one shard read lock and `insert` one
+//! shard write lock.  No operation on the hot path touches more than one
+//! shard, so rayon's script-check threads do not serialize on the cache.
 //!
 //! # Eviction
 //!
-//! When the cache reaches capacity, random eviction is used to make room
-//! for new entries. This is simple and effective for a cache that will
-//! typically have high hit rates during normal operation.
+//! Every shard has a fixed capacity (the capacities sum to exactly
+//! `max_entries`) and a FIFO ring: inserting into a full shard overwrites
+//! its oldest entry in O(1).  There is no global scan, no `len()` walk, and
+//! no batch eviction on the insert path (see `SigCache` for the eviction
+//! storm this replaced — QUEUES.md rustoshi item 0).
 //!
 //! # Usage
 //!
@@ -82,8 +86,11 @@
 //! cache.clear();
 //! ```
 
-use dashmap::DashMap;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Force sha2's lazy CPU-feature detection (CPUID probe) to run at crate
 /// load time rather than on the first `Sha256::digest` call.  Without this,
@@ -106,6 +113,112 @@ fn ensure_sha2_initialized() {
 /// which provides a good balance between memory usage and cache hit rate.
 pub const DEFAULT_MAX_ENTRIES: usize = 50_000;
 
+/// Upper bound on the number of shards.
+const MAX_SHARDS: usize = 64;
+/// Target minimum entries per shard (keeps small caches single-sharded so
+/// their capacity is exact and not fragmented across many tiny shards).
+const MIN_ENTRIES_PER_SHARD: usize = 1024;
+
+/// A cache key: `SHA256(nonce || material)`.
+///
+/// Because the key is already the output of a salted cryptographic hash
+/// (the salt is a per-session secret from the OS CSPRNG), its bytes are
+/// uniformly distributed and not attacker-steerable, so the hash table can
+/// use 8 of those bytes directly as its hash instead of re-hashing with
+/// SipHash.  Bytes 0..8 pick the shard, bytes 8..16 are the in-shard hash,
+/// so the two are independent.  This is the same trick Core's CuckooCache
+/// uses (`SignatureCacheHasher` reads the salted entry's words directly).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Key([u8; 32]);
+
+impl Hash for Key {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&self.0[8..16]);
+        state.write_u64(u64::from_le_bytes(b));
+    }
+}
+
+/// Pass-through hasher for [`Key`] (see there for why this is safe).
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Not reached for `Key` (which only calls write_u64); fold anything
+        // else in so the hasher is still correct if reused.
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+}
+
+type KeySet = HashSet<Key, BuildHasherDefault<KeyHasher>>;
+
+/// One shard: a hash set for O(1) membership plus a fixed-capacity FIFO
+/// ring of the same keys for O(1) eviction.
+///
+/// Invariant: `set` and `ring` hold exactly the same keys and
+/// `ring.len() <= cap`.
+struct Shard {
+    set: KeySet,
+    ring: Vec<Key>,
+    /// Next ring slot to overwrite once the ring is full (oldest entry).
+    hand: usize,
+    cap: usize,
+}
+
+impl Shard {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: KeySet::with_capacity_and_hasher(cap, Default::default()),
+            ring: Vec::with_capacity(cap),
+            hand: 0,
+            cap,
+        }
+    }
+
+    /// Insert `key`; returns `true` if the shard grew by one entry.
+    ///
+    /// When the shard is full exactly one entry — the oldest — is evicted.
+    /// O(1), never scans.
+    #[inline]
+    fn insert(&mut self, key: Key) -> bool {
+        if self.cap == 0 || self.set.contains(&key) {
+            return false;
+        }
+        if self.ring.len() < self.cap {
+            self.ring.push(key);
+            self.set.insert(key);
+            true
+        } else {
+            let victim = std::mem::replace(&mut self.ring[self.hand], key);
+            self.set.remove(&victim);
+            self.set.insert(key);
+            self.hand += 1;
+            if self.hand == self.cap {
+                self.hand = 0;
+            }
+            false
+        }
+    }
+}
+
+/// Cache-line-aligned shard lock, so neighbouring shard locks taken by
+/// different script-check threads do not false-share.
+#[repr(align(64))]
+struct PaddedShard(RwLock<Shard>);
+
 /// Thread-safe signature/script verification cache.
 ///
 /// This cache stores successful script verification results to avoid
@@ -116,24 +229,39 @@ pub const DEFAULT_MAX_ENTRIES: usize = 50_000;
 /// # Cache Key Design
 ///
 /// Keys are derived from the actual cryptographic material:
-/// `SHA256(nonce || script_sig || script_pubkey || witness || flags)`.
-/// A 256-bit per-session nonce prevents cross-session cache poisoning.
+/// `SHA256(nonce || wtxid || input_idx || script_sig || script_pubkey ||
+/// witness || flags)`.  A 256-bit per-session nonce prevents cross-session
+/// cache poisoning.  A hit therefore means that exact material verified.
 ///
-/// # Thread Safety
+/// # Bounded, O(1) insert (QUEUES.md rustoshi item 0)
 ///
-/// Uses `DashMap` for lock-free concurrent access, making it suitable
-/// for use with rayon's parallel iteration.
+/// The previous implementation (a `DashMap`) called `len()` on every insert
+/// — which read-locks every shard — and, when full, had EVERY inserting
+/// thread run a whole-map `retain` that evicted ~10% under shard write
+/// locks.  With 16+ script-check threads on a full cache that became an
+/// eviction storm (N concurrent full-map scans, each blocking the others'
+/// `len()`), captured by gdb on mainnet 2026-09-26 as a ~15-minute
+/// block-connection stall.
 ///
-/// # Eviction Strategy
+/// Following the design intent of Core's `CuckooCache`
+/// (`bitcoin-core/src/cuckoocache.h`: fixed-size table, `insert` bounded by
+/// `depth_limit`, no global scan on the hot path), this cache is:
 ///
-/// When the cache reaches capacity, random eviction is used. This is
-/// implemented by picking an arbitrary entry from the map and removing it.
-/// While not optimal, this approach is simple and performs well in practice.
+/// * **Sharded, each shard with a fixed capacity** summing to exactly
+///   `max_entries`, so the size can never exceed the cap — no
+///   check-then-insert race.
+/// * **O(1) eviction:** a full shard overwrites its oldest entry (FIFO ring).
+///   Eviction happens under the one shard write lock the inserter already
+///   holds, so there is at most one evictor per shard, each doing O(1) work.
+///   Nothing on the insert or lookup path touches more than one shard.
+/// * **O(1) `len()`:** an `AtomicUsize` maintained on insert/clear.
 pub struct SigCache {
-    /// The underlying concurrent hash map.
-    /// Key: 32-byte SHA256 hash of (nonce||material); value: ()
-    cache: DashMap<[u8; 32], ()>,
-    /// Maximum number of entries before eviction.
+    shards: Box<[PaddedShard]>,
+    /// `shards.len() - 1`; `shards.len()` is a power of two.
+    shard_mask: usize,
+    /// Current number of entries (O(1); maintained on insert and clear).
+    count: AtomicUsize,
+    /// Maximum number of entries (sum of shard capacities).
     max_entries: usize,
     /// Per-session 256-bit random nonce.
     ///
@@ -141,6 +269,10 @@ pub struct SigCache {
     /// attacker who can predict input material from poisoning cache entries
     /// across process restarts or between validation contexts.
     nonce: [u8; 32],
+    /// Test instrumentation: number of operations that visited every shard.
+    /// Only `clear()` does so; the insert/lookup path must never.
+    #[cfg(test)]
+    full_scans: AtomicUsize,
 }
 
 impl SigCache {
@@ -150,8 +282,8 @@ impl SigCache {
     ///
     /// # Arguments
     ///
-    /// * `max_entries` - Maximum number of entries before eviction kicks in.
-    ///   Use `DEFAULT_MAX_ENTRIES` for the recommended default (50,000).
+    /// * `max_entries` - Maximum number of entries; the cache never holds
+    ///   more.  Use `DEFAULT_MAX_ENTRIES` for the recommended default (50,000).
     ///
     /// # Example
     ///
@@ -167,11 +299,48 @@ impl SigCache {
         ensure_sha2_initialized();
         let mut nonce = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+        // Largest power of two <= max_entries / MIN_ENTRIES_PER_SHARD,
+        // clamped to [1, MAX_SHARDS].
+        let target = (max_entries / MIN_ENTRIES_PER_SHARD).max(1);
+        let n_shards = (1usize << (usize::BITS - 1 - target.leading_zeros())).min(MAX_SHARDS);
+        let base = max_entries / n_shards;
+        let extra = max_entries % n_shards;
+        let shards: Box<[PaddedShard]> = (0..n_shards)
+            .map(|i| PaddedShard(RwLock::new(Shard::new(base + usize::from(i < extra)))))
+            .collect();
+
         Self {
-            cache: DashMap::with_capacity(max_entries),
+            shards,
+            shard_mask: n_shards - 1,
+            count: AtomicUsize::new(0),
             max_entries,
             nonce,
+            #[cfg(test)]
+            full_scans: AtomicUsize::new(0),
         }
+    }
+
+    #[inline]
+    fn shard_of(&self, key: &Key) -> &RwLock<Shard> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&key.0[..8]);
+        let idx = (u64::from_le_bytes(b) as usize) & self.shard_mask;
+        &self.shards[idx].0
+    }
+
+    // A panic while holding a shard lock cannot leave the shard in a state
+    // that yields a false positive (the set/ring update order only risks a
+    // stale key being dropped early), so recover from poisoning rather than
+    // cascading panics into every script-check thread.
+    #[inline]
+    fn read(lock: &RwLock<Shard>) -> RwLockReadGuard<'_, Shard> {
+        lock.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[inline]
+    fn write(lock: &RwLock<Shard>) -> RwLockWriteGuard<'_, Shard> {
+        lock.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Derive the cache key for the given script material and flags.
@@ -237,13 +406,13 @@ impl SigCache {
         witness: &[Vec<u8>],
         flags: u32,
     ) -> bool {
-        let key = self.derive_key(wtxid, input_idx, script_sig, script_pubkey, witness, flags);
-        self.cache.contains_key(&key)
+        let key = Key(self.derive_key(wtxid, input_idx, script_sig, script_pubkey, witness, flags));
+        Self::read(self.shard_of(&key)).set.contains(&key)
     }
 
     /// Insert a successful verification result into the cache.
     ///
-    /// If the cache is at capacity, entries will be evicted to make room.
+    /// If the key's shard is full, its oldest entry is evicted (O(1)).
     /// Only call this after a script verification succeeds.
     ///
     /// # Arguments
@@ -263,73 +432,57 @@ impl SigCache {
         witness: &[Vec<u8>],
         flags: u32,
     ) {
-        // Check if we need to evict (with some slack for concurrent inserts)
-        if self.cache.len() >= self.max_entries {
-            self.evict_batch();
+        // Hash outside the lock.
+        let key = Key(self.derive_key(wtxid, input_idx, script_sig, script_pubkey, witness, flags));
+        let mut shard = Self::write(self.shard_of(&key));
+        if shard.insert(key) {
+            // Bumped under the shard lock so it pairs with clear()'s
+            // per-shard decrement (the counter can never transiently wrap).
+            self.count.fetch_add(1, Ordering::Relaxed);
         }
-
-        let key = self.derive_key(wtxid, input_idx, script_sig, script_pubkey, witness, flags);
-        self.cache.insert(key, ());
     }
 
     /// Clear all entries from the cache.
     ///
     /// This should be called during chain reorganizations to invalidate
     /// cached results that may no longer be valid on the new chain.
+    /// (Visits every shard — off the hot path.)
     pub fn clear(&self) {
-        self.cache.clear();
+        #[cfg(test)]
+        self.full_scans.fetch_add(1, Ordering::Relaxed);
+        for shard in self.shards.iter() {
+            let mut s = Self::write(&shard.0);
+            let removed = s.ring.len();
+            s.set.clear();
+            s.ring.clear();
+            s.hand = 0;
+            // Decrement while still holding the shard lock so `count` never
+            // under-flows relative to a concurrent insert into this shard.
+            self.count.fetch_sub(removed, Ordering::Relaxed);
+        }
     }
 
-    /// Get the current number of entries in the cache.
+    /// Get the current number of entries in the cache.  O(1).
     #[inline]
     pub fn len(&self) -> usize {
-        self.cache.len()
+        self.count.load(Ordering::Relaxed)
     }
 
-    /// Check if the cache is empty.
+    /// Maximum number of entries the cache will hold.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Check if the cache is empty.  O(1).
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.cache.is_empty()
+        self.len() == 0
     }
 
-    /// Evict a batch of entries from the cache.
-    ///
-    /// Removes at least 1 entry and approximately 10% of entries overall to
-    /// avoid frequent eviction overhead. Guaranteeing at least 1 removal
-    /// prevents the cache from growing without bound when the probabilistic
-    /// retain would otherwise evict nothing (which has ~35% probability for
-    /// a cache of 10 entries).
-    fn evict_batch(&self) {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let mut evicted = 0usize;
-        // Keep approximately 90% of entries (evict ~10%), but always evict at least 1.
-        self.cache.retain(|_, _| {
-            if !rng.gen_bool(0.9) {
-                evicted += 1;
-                false
-            } else {
-                true
-            }
-        });
-        // If probabilistic eviction removed nothing, forcibly remove one entry.
-        //
-        // NOTE: the victim key MUST be copied out into a local `let` binding
-        // *before* calling `remove`.  Writing this as
-        // `if let Some(k) = self.cache.iter().next().map(|e| *e.key()) { remove(k) }`
-        // extends the lifetime of the temporary `Iter` (which holds a
-        // shard *read* guard) across the whole `if let` block, so the
-        // subsequent `remove` — which needs a *write* guard on that same
-        // shard — self-deadlocks the calling thread.  Binding to a local
-        // drops the `Iter` (and its read guard) at the `;`, releasing the
-        // shard before `remove` runs.  This deadlock is what hung the
-        // `eviction_when_full` test for 50+ minutes.
-        if evicted == 0 {
-            let victim = self.cache.iter().next().map(|e| *e.key());
-            if let Some(key) = victim {
-                self.cache.remove(&key);
-            }
-        }
+    #[cfg(test)]
+    fn full_scan_count(&self) -> usize {
+        self.full_scans.load(Ordering::Relaxed)
     }
 }
 
@@ -641,5 +794,235 @@ mod tests {
 
         // All 400 entries should be present (1000 > 400)
         assert_eq!(cache.len(), 400);
+    }
+
+    /// Unique per-(tag, i) wtxid so every insert is a distinct key.
+    fn uniq_wtxid(tag: u8, i: u64) -> [u8; 32] {
+        let mut w = [0u8; 32];
+        w[..8].copy_from_slice(&i.to_le_bytes());
+        w[8] = tag;
+        w
+    }
+
+    /// QUEUES.md rustoshi item 0 (gdb wedge3 2026-09-26): with the cache
+    /// full, every script-verify thread's insert ran `evict_batch()` — a
+    /// whole-map `retain` under shard write locks — so N threads did N
+    /// full-map scans at once (an eviction storm) and block connection
+    /// stalled for ~15 min.  Invariants pinned here, on a full cache with
+    /// 16 concurrent inserters:
+    ///   * the insert path performs ZERO whole-map scans;
+    ///   * the size never exceeds `max_entries` (observed during AND after);
+    ///   * the cache stays full (eviction does not collapse occupancy);
+    ///   * wall time is bounded (very generous: the box may be loaded).
+    #[test]
+    fn concurrent_full_cache_insert_no_eviction_storm() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        const CAP: usize = 100_000;
+        const THREADS: usize = 16;
+        const PER_THREAD: u64 = 20_000;
+
+        let cache = Arc::new(SigCache::new(CAP));
+        let spk = vec![0x76u8; 25];
+        for i in 0..CAP as u64 {
+            cache.insert(&uniq_wtxid(0, i), 0, &[], &spk, &[], 0);
+        }
+        assert!(
+            cache.len() <= CAP,
+            "fill overshot: {} > {}",
+            cache.len(),
+            CAP
+        );
+
+        let scans_before = cache.full_scan_count();
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let start = Instant::now();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let cache = Arc::clone(&cache);
+                let max_seen = Arc::clone(&max_seen);
+                let barrier = Arc::clone(&barrier);
+                let spk = spk.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..PER_THREAD {
+                        let wt = uniq_wtxid(t as u8 + 1, i);
+                        cache.insert(&wt, 0, &[], &spk, &[], 0);
+                        if i % 64 == 0 {
+                            max_seen.fetch_max(cache.len(), Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let elapsed = start.elapsed();
+        let scans = cache.full_scan_count() - scans_before;
+        let max_seen = max_seen.load(Ordering::Relaxed).max(cache.len());
+        eprintln!(
+            "eviction-storm test: {} inserts by {} threads in {:?}; whole-map scans={}, \
+             max observed len={}, final len={}, cap={}",
+            THREADS as u64 * PER_THREAD,
+            THREADS,
+            elapsed,
+            scans,
+            max_seen,
+            cache.len(),
+            CAP
+        );
+
+        assert_eq!(
+            scans, 0,
+            "insert path performed {scans} whole-map scans on a full cache (eviction storm)"
+        );
+        assert!(max_seen <= CAP, "cache size {max_seen} exceeded cap {CAP}");
+        assert!(
+            cache.len() >= CAP * 9 / 10,
+            "occupancy collapsed to {} of {} (over-eviction)",
+            cache.len(),
+            CAP
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "16-thread insert took {elapsed:?}"
+        );
+    }
+
+    /// Microbenchmark (not a gate): 16 threads insert 2M distinct entries
+    /// into a 100k-cap cache.  Run with:
+    ///   cargo test --release -p rustoshi-consensus --lib \
+    ///     sig_cache::tests::bench_16_threads_2m_inserts_100k_cap -- --ignored --nocapture
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_16_threads_2m_inserts_100k_cap() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Instant;
+
+        const CAP: usize = 100_000;
+        const THREADS: usize = 16;
+        const TOTAL: u64 = 2_000_000;
+        let per_thread = TOTAL / THREADS as u64;
+        let spk = vec![0x76u8; 25];
+
+        for round in 0..3 {
+            let cache = Arc::new(SigCache::new(CAP));
+            let barrier = Arc::new(Barrier::new(THREADS + 1));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let cache = Arc::clone(&cache);
+                    let barrier = Arc::clone(&barrier);
+                    let spk = spk.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for i in 0..per_thread {
+                            cache.insert(&uniq_wtxid(t as u8 + 1, i), 0, &[], &spk, &[], 0);
+                        }
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let start = Instant::now();
+            for h in handles {
+                h.join().unwrap();
+            }
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!(
+                "BENCH round {round}: {TOTAL} inserts / {THREADS} threads / cap {CAP}: \
+                 {secs:.3}s = {:.0} inserts/s; whole-map scans={}; final len={}",
+                TOTAL as f64 / secs,
+                cache.full_scan_count(),
+                cache.len()
+            );
+        }
+    }
+
+    /// Shard capacities sum to exactly `max_entries` (so the hard cap is
+    /// exact), and the shard count is a power of two in [1, 64].
+    #[test]
+    fn shard_capacities_sum_to_max() {
+        for &cap in &[
+            0usize, 1, 10, 1000, 2047, 50_000, 100_000, 100_003, 10_000_000,
+        ] {
+            let c = SigCache::new(cap);
+            let n = c.shards.len();
+            assert!(
+                n.is_power_of_two() && n <= MAX_SHARDS,
+                "cap {cap}: {n} shards"
+            );
+            assert_eq!(c.shard_mask, n - 1);
+            let sum: usize = c.shards.iter().map(|s| s.0.read().unwrap().cap).sum();
+            assert_eq!(sum, cap, "shard caps must sum to max_entries");
+        }
+    }
+
+    /// Below capacity nothing is evicted, even across many shards; at and
+    /// beyond capacity the size is exactly the cap and the newest entries
+    /// are retained (FIFO evicts the oldest).
+    #[test]
+    fn sharded_fifo_keeps_recent_and_exact_cap() {
+        const CAP: usize = 100_000;
+        let cache = SigCache::new(CAP);
+        assert!(cache.shards.len() > 1);
+        let spk = vec![0x76u8; 25];
+        for i in 0..(CAP / 2) as u64 {
+            cache.insert(&uniq_wtxid(1, i), 0, &[], &spk, &[], 0);
+        }
+        assert_eq!(cache.len(), CAP / 2);
+        for i in 0..(CAP / 2) as u64 {
+            assert!(cache.lookup(&uniq_wtxid(1, i), 0, &[], &spk, &[], 0));
+        }
+        // Re-inserting an existing key does not grow the cache.
+        cache.insert(&uniq_wtxid(1, 0), 0, &[], &spk, &[], 0);
+        assert_eq!(cache.len(), CAP / 2);
+        // Overfill 3x.
+        for i in 0..(3 * CAP) as u64 {
+            cache.insert(&uniq_wtxid(2, i), 0, &[], &spk, &[], 0);
+            assert!(cache.len() <= CAP);
+        }
+        assert_eq!(cache.len(), CAP);
+        let per_shard: usize = cache
+            .shards
+            .iter()
+            .map(|s| s.0.read().unwrap().set.len())
+            .sum();
+        assert_eq!(per_shard, CAP, "atomic count must match the real contents");
+        // The very last insert is always present; the very first are gone.
+        assert!(cache.lookup(&uniq_wtxid(2, 3 * CAP as u64 - 1), 0, &[], &spk, &[], 0));
+        let old_hits = (0..(CAP / 2) as u64)
+            .filter(|&i| cache.lookup(&uniq_wtxid(1, i), 0, &[], &spk, &[], 0))
+            .count();
+        assert_eq!(old_hits, 0, "oldest entries must have been evicted");
+        cache.clear();
+        assert!(cache.is_empty());
+        for i in 0..100u64 {
+            assert!(!cache.lookup(&uniq_wtxid(2, 3 * CAP as u64 - 1 - i), 0, &[], &spk, &[], 0));
+        }
+    }
+
+    /// Zero-capacity cache never caches (and never panics).
+    #[test]
+    fn zero_capacity_never_caches() {
+        let cache = SigCache::new(0);
+        cache.insert(&wtxid(1), 0, &[1], &[2], &[], 0);
+        assert!(!cache.lookup(&wtxid(1), 0, &[1], &[2], &[], 0));
+        assert!(cache.is_empty());
+    }
+
+    /// Instrument check for `concurrent_full_cache_insert_no_eviction_storm`:
+    /// the scan counter DOES move when an all-shard operation runs, so a
+    /// zero reading in that test is a measurement, not a dead counter.
+    #[test]
+    fn full_scan_counter_sees_all_shard_ops() {
+        let cache = SigCache::new(100_000);
+        assert_eq!(cache.full_scan_count(), 0);
+        cache.insert(&wtxid(1), 0, &[], &[], &[], 0);
+        assert_eq!(cache.full_scan_count(), 0);
+        cache.clear();
+        assert_eq!(cache.full_scan_count(), 1);
     }
 }
