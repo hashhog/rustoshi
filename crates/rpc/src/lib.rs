@@ -43,6 +43,9 @@ pub mod wallet;
 pub mod wallet_route;
 pub mod zmq;
 
+#[cfg(test)]
+mod r5_errcode_tests;
+
 pub use payjoin_sender::{
     post_original_psbt, trim_to_base64 as payjoin_trim_to_base64, SenderHttpError, SenderRequest,
 };

@@ -1247,6 +1247,10 @@ pub struct CreateMultisigResult {
     pub redeem_script: String,
     /// The descriptor string with BIP-380 checksum.
     pub descriptor: String,
+    /// Core `PushWarnings`: present only when the chosen address type could
+    /// not be produced (an uncompressed key forces legacy P2SH).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub warnings: Option<Vec<String>>,
 }
 
 /// Request for `importdescriptors` RPC.

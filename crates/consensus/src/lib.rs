@@ -86,7 +86,8 @@ pub use orphanage::{
     MAX_ORPHAN_TX_SIZE, ORPHAN_TX_EXPIRE_TIME,
 };
 pub use mempool_persist::{
-    dump_mempool, dump_mempool_with_key, header_size, load_mempool, DumpStats, LoadStats,
+    dump_mempool, dump_mempool_with_key, header_size, load_mempool, load_mempool_with_options,
+    DumpStats, ImportMempoolOptions, LoadStats,
     MEMPOOL_DUMP_VERSION, MEMPOOL_DUMP_VERSION_NO_XOR_KEY, OBFUSCATION_KEY_LEN,
 };
 pub use block_template::{

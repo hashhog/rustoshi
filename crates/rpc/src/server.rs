@@ -163,7 +163,67 @@ pub mod rpc_error {
     pub const RPC_CLIENT_INVALID_IP_OR_SUBNET: i32 = -30;
     /// Block not found.
     pub const RPC_BLOCK_NOT_FOUND: i32 = -5;
+    /// Still downloading initial blocks
+    /// (`bitcoin-core/src/rpc/protocol.h::RPC_CLIENT_IN_INITIAL_DOWNLOAD = -10`;
+    /// `importmempool` refuses with it during IBD, rpc/mempool.cpp).
+    pub const RPC_CLIENT_IN_INITIAL_DOWNLOAD: i32 = -10;
 }
+
+/// One scriptPubKey the descriptor signing provider of `utxoupdatepsbt` /
+/// `descriptorprocesspsbt` knows about (single-key families only).
+#[derive(Clone, Debug)]
+pub(crate) struct DescProvEntry {
+    /// The (compressed) public key the script commits to.
+    pub(crate) pubkey: [u8; 33],
+    /// Core's KeyOriginInfo for that key.
+    pub(crate) origin: rustoshi_wallet::KeyOrigin,
+    /// The private key, when the descriptor carried one and it was expanded.
+    pub(crate) secret: Option<rustoshi_crypto::SecretKey>,
+    /// The P2WPKH redeem script, for a P2SH-P2WPKH scriptPubKey.
+    pub(crate) redeem_script: Option<Vec<u8>>,
+}
+
+/// The JSON types Core's `RPCHelpMan` type gate distinguishes
+/// (`bitcoin-core/src/rpc/util.cpp::ExpectedType(RPCArg::Type)`): STR and
+/// STR_HEX expect a string, NUM a number, BOOL a bool, OBJ* an object, ARR an
+/// array. AMOUNT and RANGE have no gate (checked inside their own parsers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoreArgType {
+    Str,
+    Num,
+    Bool,
+    Obj,
+    Arr,
+}
+
+impl CoreArgType {
+    /// Core's `uvTypeName` for the EXPECTED side of the message.
+    fn uv_name(self) -> &'static str {
+        match self {
+            CoreArgType::Str => "string",
+            CoreArgType::Num => "number",
+            CoreArgType::Bool => "bool",
+            CoreArgType::Obj => "object",
+            CoreArgType::Arr => "array",
+        }
+    }
+
+    fn matches(self, v: &serde_json::Value) -> bool {
+        matches!(
+            (self, v),
+            (CoreArgType::Str, serde_json::Value::String(_))
+                | (CoreArgType::Num, serde_json::Value::Number(_))
+                | (CoreArgType::Bool, serde_json::Value::Bool(_))
+                | (CoreArgType::Obj, serde_json::Value::Object(_))
+                | (CoreArgType::Arr, serde_json::Value::Array(_))
+        )
+    }
+}
+
+/// One positional argument as Core's `RPCHelpMan` declares it, for
+/// [`RpcServerImpl::core_type_gate`]: `(name, supplied value, expected type,
+/// optional)`. `None` = not supplied by the caller.
+pub(crate) type CoreArgSpec<'a> = (&'a str, Option<&'a serde_json::Value>, CoreArgType, bool);
 
 /// Help text thrown as `RPC_MISC_ERROR` (-1) when `addnode` is given a
 /// command other than add/remove/onetry. Bitcoin Core raises
@@ -773,7 +833,7 @@ pub trait RustoshiRpc {
 
     /// Decode a raw transaction without broadcasting.
     #[method(name = "decoderawtransaction")]
-    async fn decode_raw_transaction(&self, hex: String) -> RpcResult<Box<serde_json::value::RawValue>>;
+    async fn decode_raw_transaction(&self, hexstring: serde_json::Value) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Combine multiple partially-signed versions of the SAME transaction into
     /// one carrying the union of their signature data.
@@ -860,6 +920,18 @@ pub trait RustoshiRpc {
     /// jsonrpsee surfaces that arg instead of dropping it.
     #[method(name = "savemempool")]
     async fn save_mempool(&self, extra: Option<serde_json::Value>) -> RpcResult<serde_json::Value>;
+
+    /// Import a Core-format mempool.dat into the running mempool. Mirrors
+    /// Bitcoin Core `importmempool "filepath" ( options )`
+    /// (rpc/mempool.cpp): refused during IBD (-10); an unreadable or corrupt
+    /// file is -1 "Unable to import mempool file, see debug log for details.";
+    /// success returns `{}`.
+    #[method(name = "importmempool")]
+    async fn import_mempool(
+        &self,
+        filepath: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value>;
 
     /// Get a block template for mining.
     #[method(name = "getblocktemplate")]
@@ -1157,7 +1229,7 @@ pub trait RustoshiRpc {
     /// Parameters:
     /// - height: The block height to prune up to (blocks at this height and below will be pruned)
     #[method(name = "pruneblockchain")]
-    async fn prune_blockchain(&self, height: u32) -> RpcResult<u32>;
+    async fn prune_blockchain(&self, height: serde_json::Value) -> RpcResult<u32>;
 
     /// Submit a package of raw transactions to the mempool.
     ///
@@ -1171,16 +1243,16 @@ pub trait RustoshiRpc {
     #[method(name = "submitpackage")]
     async fn submit_package(
         &self,
-        rawtxs: Vec<String>,
-        maxfeerate: Option<f64>,
-        maxburnamount: Option<f64>,
+        package: serde_json::Value,
+        maxfeerate: Option<serde_json::Value>,
+        maxburnamount: Option<serde_json::Value>,
     ) -> RpcResult<SubmitPackageResult>;
 
     /// Get information about a descriptor.
     ///
     /// Analyzes a descriptor string and returns information including the checksum.
     #[method(name = "getdescriptorinfo")]
-    async fn get_descriptor_info(&self, descriptor: String) -> RpcResult<DescriptorInfoResult>;
+    async fn get_descriptor_info(&self, descriptor: serde_json::Value) -> RpcResult<DescriptorInfoResult>;
 
     /// Derive addresses from a descriptor.
     ///
@@ -1300,10 +1372,10 @@ pub trait RustoshiRpc {
     #[method(name = "createpsbt")]
     async fn createpsbt(
         &self,
-        inputs: Vec<CreatePsbtInput>,
-        outputs: Vec<serde_json::Value>,
+        inputs: serde_json::Value,
+        outputs: serde_json::Value,
         locktime: Option<serde_json::Value>,
-        replaceable: Option<bool>,
+        replaceable: Option<serde_json::Value>,
         // Core builds createpsbt and createrawtransaction from the SAME
         // routine (ConstructTransaction), so it takes the same 5th `version`
         // argument (rpc/rawtransaction.cpp:1642).  It was missing here too.
@@ -1328,7 +1400,37 @@ pub trait RustoshiRpc {
     ///
     /// All PSBTs must have the same underlying transaction.
     #[method(name = "combinepsbt")]
-    async fn combinepsbt(&self, psbts: Vec<String>) -> RpcResult<String>;
+    async fn combinepsbt(&self, txs: serde_json::Value) -> RpcResult<String>;
+
+    /// Updates the inputs and outputs of a PSBT with data from output
+    /// descriptors, the UTXO set, txindex and the mempool (Updater role only;
+    /// never signs). Mirrors Core `utxoupdatepsbt "psbt" ( descriptors )`
+    /// (rpc/rawtransaction.cpp + ProcessPSBT). Returns the base64 PSBT.
+    #[method(name = "utxoupdatepsbt")]
+    async fn utxoupdatepsbt(
+        &self,
+        psbt: serde_json::Value,
+        descriptors: Option<serde_json::Value>,
+    ) -> RpcResult<String>;
+
+    /// Updates a PSBT from descriptors / UTXO set / mempool, then signs the
+    /// inputs the descriptors' private keys control. Mirrors Core
+    /// `descriptorprocesspsbt "psbt" descriptors ( "sighashtype" bip32derivs
+    /// finalize )`. Returns `{psbt, complete}` (+ `hex` when complete).
+    ///
+    /// Scope: single-key descriptor families (`pk`, `pkh`, `wpkh`,
+    /// `sh(wpkh)`, `combo`) plus `addr`/`raw` (which carry no keys). Any other
+    /// descriptor type, and signing with a sighash other than ALL/DEFAULT, is
+    /// refused with an explicit error rather than answered partially.
+    #[method(name = "descriptorprocesspsbt")]
+    async fn descriptorprocesspsbt(
+        &self,
+        psbt: serde_json::Value,
+        descriptors: serde_json::Value,
+        sighashtype: Option<serde_json::Value>,
+        bip32derivs: Option<serde_json::Value>,
+        finalize: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value>;
 
     /// Finalize a PSBT and optionally extract the raw transaction.
     ///
@@ -1374,9 +1476,9 @@ pub trait RustoshiRpc {
     #[method(name = "converttopsbt")]
     async fn converttopsbt(
         &self,
-        hexstring: String,
-        permitsigdata: Option<bool>,
-        iswitness: Option<bool>,
+        hexstring: serde_json::Value,
+        permitsigdata: Option<serde_json::Value>,
+        iswitness: Option<serde_json::Value>,
     ) -> RpcResult<String>;
 
     /// Join multiple distinct PSBTs (disjoint inputs/outputs) into one.
@@ -1407,7 +1509,7 @@ pub trait RustoshiRpc {
     #[method(name = "createrawtransaction")]
     async fn create_raw_transaction(
         &self,
-        inputs: Vec<serde_json::Value>,
+        inputs: serde_json::Value,
         // Core's ConstructTransaction (rawtransaction_util.cpp::NormalizeOutputs)
         // accepts the `outputs` argument as EITHER a JSON object
         // `{address:amount,...,"data":hex}` OR a JSON array of single-key objects
@@ -1426,7 +1528,7 @@ pub trait RustoshiRpc {
         // range" (rawtransaction_util.cpp ConstructTransaction:151-155), which
         // the handler can only produce if it sees the raw value.
         locktime: Option<serde_json::Value>,
-        replaceable: Option<bool>,
+        replaceable: Option<serde_json::Value>,
         // Core's 5th argument (rpc/rawtransaction.cpp:122), read as
         // `self.Arg<uint32_t>("version")`.  Typed as a raw Value for the same
         // reason as `locktime` above: a narrow type makes the jsonrpsee
@@ -1437,7 +1539,7 @@ pub trait RustoshiRpc {
 
     /// Decode a hex-encoded script.
     #[method(name = "decodescript")]
-    async fn decode_script(&self, hex: String) -> RpcResult<serde_json::Value>;
+    async fn decode_script(&self, hexstring: serde_json::Value) -> RpcResult<serde_json::Value>;
 
     /// Return information about all known chain tips.
     #[method(name = "getchaintips")]
@@ -1610,8 +1712,8 @@ pub trait RustoshiRpc {
     async fn create_multisig(
         &self,
         nrequired: serde_json::Value,
-        keys: Vec<String>,
-        address_type: Option<String>,
+        keys: serde_json::Value,
+        address_type: Option<serde_json::Value>,
     ) -> RpcResult<CreateMultisigResult>;
 
     /// Get the server uptime in seconds.
@@ -1708,7 +1810,7 @@ pub trait RustoshiRpc {
     #[method(name = "scantxoutset")]
     async fn scan_tx_out_set(
         &self,
-        action: String,
+        action: serde_json::Value,
         scanobjects: Option<Vec<String>>,
     ) -> RpcResult<serde_json::Value>;
 
@@ -1748,7 +1850,7 @@ pub trait RustoshiRpc {
     #[method(name = "scanblocks")]
     async fn scan_blocks(
         &self,
-        action: String,
+        action: serde_json::Value,
         scanobjects: Option<Vec<String>>,
         start_height: Option<i64>,
         stop_height: Option<i64>,
@@ -1815,7 +1917,7 @@ pub trait RustoshiRpc {
     /// Verify a merkle proof produced by gettxoutproof.
     /// Returns the list of proven txids. Mirrors Bitcoin Core rpc/blockchain.cpp verifytxoutproof.
     #[method(name = "verifytxoutproof")]
-    async fn verify_tx_out_proof(&self, proof: String) -> RpcResult<Vec<String>>;
+    async fn verify_tx_out_proof(&self, proof: serde_json::Value) -> RpcResult<Vec<String>>;
 
     /// Return operational RPC server information.
     /// Mirrors Bitcoin Core rpc/server.cpp getrpcinfo.
@@ -1866,7 +1968,7 @@ pub trait RustoshiRpc {
     #[method(name = "getindexinfo")]
     async fn get_index_info(
         &self,
-        index_name: Option<String>,
+        index_name: Option<serde_json::Value>,
     ) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Scan the mempool (and the txospenderindex, if available) to find
@@ -2246,6 +2348,949 @@ impl RpcServerImpl {
                 ),
             )),
         }
+    }
+
+    /// Core's `RPCHelpMan::HandleRequest` argument type gate
+    /// (`bitcoin-core/src/rpc/util.cpp:647-657` + `RPCArg::MatchesType`).
+    ///
+    /// Core checks EVERY declared positional argument against its declared
+    /// type BEFORE the method body runs, collects every mismatch, and throws
+    /// one `RPC_TYPE_ERROR` (-3):
+    ///
+    /// ```text
+    /// Wrong type passed:
+    /// {
+    ///     "Position 1 (height)": "JSON value of type string is not of expected type number"
+    /// }
+    /// ```
+    ///
+    /// An optional argument that is omitted or JSON null passes; a REQUIRED
+    /// argument passed as null does not. jsonrpsee's typed parameters used to
+    /// fail these calls first with the transport code -32602 "Invalid params";
+    /// handlers that take `serde_json::Value` call this instead so the answer
+    /// is Core's, code AND message. Positions are 1-based in slice order, so
+    /// the slice must list the method's arguments from the first one.
+    fn core_type_gate(args: &[CoreArgSpec<'_>]) -> Result<(), ErrorObjectOwned> {
+        let mut mismatches: Vec<String> = Vec::new();
+        for (i, (name, value, expected, optional)) in args.iter().enumerate() {
+            let Some(v) = value else { continue };
+            if *optional && v.is_null() {
+                continue;
+            }
+            if !expected.matches(v) {
+                mismatches.push(format!(
+                    "    \"Position {} ({})\": \"JSON value of type {} is not of expected type {}\"",
+                    i + 1,
+                    name,
+                    Self::json_uvtype(v),
+                    expected.uv_name()
+                ));
+            }
+        }
+        if mismatches.is_empty() {
+            return Ok(());
+        }
+        Err(Self::rpc_error(
+            rpc_error::RPC_TYPE_ERROR,
+            format!("Wrong type passed:\n{{\n{}\n}}", mismatches.join(",\n")),
+        ))
+    }
+
+    /// A descriptor that fails `Parse` is `RPC_INVALID_ADDRESS_OR_KEY` (-5) in
+    /// every Core RPC that takes one (getdescriptorinfo, deriveaddresses,
+    /// generatetodescriptor, descriptorprocesspsbt, ...), carrying the parser's
+    /// error string. The checksum arm is reproduced verbatim from Core's
+    /// `CheckChecksum` ("Provided checksum '<x>' does not match computed
+    /// checksum '<y>'"); other messages are rustoshi's own parser wording.
+    fn core_descriptor_error(
+        desc: &str,
+        e: &rustoshi_wallet::descriptor::DescriptorError,
+    ) -> ErrorObjectOwned {
+        if let Some((body, provided)) = desc.rsplit_once('#') {
+            if let Some(computed) = rustoshi_wallet::descriptor::descriptor_checksum(body) {
+                if provided.len() != 8 {
+                    return Self::rpc_error(
+                        rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                        format!(
+                            "Expected 8 character checksum, not {} characters",
+                            provided.len()
+                        ),
+                    );
+                }
+                if computed != provided {
+                    return Self::rpc_error(
+                        rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                        format!(
+                            "Provided checksum '{}' does not match computed checksum '{}'",
+                            provided, computed
+                        ),
+                    );
+                }
+            }
+        }
+        Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, e.to_string())
+    }
+
+    /// Core's `ConstructTransaction` (rpc/rawtransaction_util.cpp), shared by
+    /// `createrawtransaction` and `createpsbt` exactly as in Core -- the two
+    /// used to be separate implementations, and createpsbt's (typed
+    /// `Vec<CreatePsbtInput>` / `Vec<Value>` params) refused Core's canonical
+    /// object-form outputs and a malformed txid with the transport code
+    /// -32602. Runs the RPCHelpMan type gate for the five arguments first.
+    fn core_construct_transaction(
+        params: &ChainParams,
+        inputs: &serde_json::Value,
+        outputs: &serde_json::Value,
+        locktime: Option<&serde_json::Value>,
+        replaceable: Option<&serde_json::Value>,
+        version: Option<&serde_json::Value>,
+    ) -> Result<Transaction, ErrorObjectOwned> {
+        // `outputs` is declared with skip_type_check in Core (it takes an
+        // object OR an array), so it is not gated here.
+        Self::core_type_gate(&[
+            ("inputs", Some(inputs), CoreArgType::Arr, false),
+            ("outputs", None, CoreArgType::Arr, false),
+            ("locktime", locktime, CoreArgType::Num, true),
+            ("replaceable", replaceable, CoreArgType::Bool, true),
+            ("version", version, CoreArgType::Num, true),
+        ])?;
+        let replaceable: Option<bool> = replaceable.and_then(|v| v.as_bool());
+        let locktime = Self::parse_createraw_locktime(locktime)?;
+        let tx_version = Self::parse_createraw_version(version)?;
+        // FIX-70 / W120 BUG-3: Core's `createrawtransaction` defaults `rbf` to
+        // TRUE (see bitcoin-core/src/rpc/rawtransaction.cpp::createrawtransaction
+        // — `std::optional<bool> rbf` is unset when the param is null, then
+        // `rbf.value_or(true)` is applied inside `ConstructTransaction`). Was
+        // `unwrap_or(false)` → API divergence + non-signaling tx by default.
+        //
+        // Keep the ABSENT-vs-EXPLICIT distinction alive. Core carries `rbf` as a
+        // `std::optional<bool>` all the way to the END of `ConstructTransaction`
+        // precisely because its two consumers read it DIFFERENTLY: choosing the
+        // default sequence uses `rbf.value_or(true)` (absent == true), while the
+        // contradiction check at the bottom of this handler uses
+        // `rbf.has_value() && rbf.value()` (absent == no check at all). Folding
+        // the option into a bool here and throwing the original away would
+        // destroy the second reading, so capture it before the shadowing.
+        let rbf_explicit = replaceable;
+        let replaceable = replaceable.unwrap_or(true);
+
+        // Parse inputs (Core AddInputs): a null `inputs` is an empty list;
+        // each element must be an object (get_obj, -3) whose `txid` is a
+        // string (ParseHashO -> get_str, -3) of 64 hex (-8).
+        let empty: Vec<serde_json::Value> = Vec::new();
+        let inputs: &Vec<serde_json::Value> = inputs.as_array().unwrap_or(&empty);
+        let mut tx_inputs = Vec::new();
+        for input in inputs {
+            if !input.is_object() {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type object",
+                        Self::json_uvtype(input)
+                    ),
+                ));
+            }
+            let txid_v = input.get("txid").unwrap_or(&serde_json::Value::Null);
+            let txid_str = txid_v.as_str().ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type string",
+                        Self::json_uvtype(txid_v)
+                    ),
+                )
+            })?;
+            // Core names the ARGUMENT in ParseHashV's message; for this RPC it
+            // is "txid", not the generic "hash" `parse_hash` emits.
+            let txid = Self::parse_hash_named("txid", txid_str)?;
+            // `as_u64() ... as u32` accepted anything non-negative and then
+            // TRUNCATED it: vout 2^32 and vout 2^33 both silently became vout
+            // 0, i.e. a request to spend one outpoint quietly became a request
+            // to spend a DIFFERENT, probably real one. A negative vout took the
+            // ok_or_else arm and reported "Missing vout" at RPC_INVALID_PARAMS,
+            // which is both the wrong code and a false statement -- the key was
+            // present, its value was out of domain.
+            let vout = Self::parse_createraw_vout(input.get("vout"))?;
+            // FIX-70 / W120 BUG-2: mirror Core's `ConstructTransaction` mapping
+            // (bitcoin-core/src/rpc/rawtransaction_util.cpp:47-55):
+            //   replaceable → MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD)
+            //   !replaceable && locktime != 0 → MAX_SEQUENCE_NONFINAL (0xFFFFFFFE)
+            //   !replaceable && locktime == 0 → SEQUENCE_FINAL (0xFFFFFFFF)
+            // Explicit per-input `sequence` always wins. Was emitting 0xFFFFFFFE
+            // unconditionally when explicit-replaceable=false; the locktime
+            // case was correct but the !locktime case was wrong.
+            let default_sequence = if replaceable {
+                MAX_BIP125_RBF_SEQUENCE
+            } else if locktime != 0 {
+                MAX_SEQUENCE_NONFINAL
+            } else {
+                SEQUENCE_FINAL
+            };
+            // The old expression was wrong in two directions at once.
+            // `as_u64() ... as u32` TRUNCATED an out-of-range sequence -- 2^32
+            // became 0, which CLEARS the BIP-68 disable bit and signals BIP-125
+            // replaceability, the opposite of what was asked for. And
+            // `unwrap_or(SEQUENCE_FINAL)` fired for any NON-numeric sequence,
+            // which Core simply ignores (`if (sequenceObj.isNum())`), applying
+            // the default -- so `"sequence": "nope"` produced a NON-replaceable
+            // transaction here and a replaceable one from Core, with no bad
+            // input involved at all.
+            let sequence =
+                Self::parse_createraw_sequence(input.get("sequence"), default_sequence)?;
+            tx_inputs.push(TxIn {
+                previous_output: OutPoint { txid, vout },
+                script_sig: vec![],
+                sequence,
+                witness: vec![],
+            });
+        }
+
+        // Parse outputs.
+        //
+        // Core's NormalizeOutputs (rawtransaction_util.cpp:74-99) accepts the
+        // `outputs` argument as EITHER:
+        //   - a JSON object `{address:amount,...,"data":hex}`, or
+        //   - a JSON array of single-key objects
+        //     `[{address:amount},{"data":hex}]`
+        // translating the array form into an ordered (key,value) list. We
+        // normalize both into `norm_outputs` so the downstream ParseOutputs
+        // logic (duplicate detection, OP_RETURN, address→spk) is identical for
+        // both shapes. Previously this handler only accepted the array form
+        // (the param was typed `Vec<serde_json::Value>`), so the object form was
+        // rejected by the deserializer before reaching here.
+        let mut norm_outputs: Vec<(String, serde_json::Value)> = Vec::new();
+        match outputs {
+            serde_json::Value::Object(map) => {
+                // serde_json's Map preserves insertion order (preserve_order /
+                // default IndexMap), so this matches Core's UniValue key order.
+                for (key, val) in map {
+                    norm_outputs.push((key.clone(), val.clone()));
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for entry in arr {
+                    let obj = entry.as_object().ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_INVALID_PARAMETER,
+                            "Invalid parameter, key-value pair not an object as expected",
+                        )
+                    })?;
+                    if obj.len() != 1 {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_INVALID_PARAMETER,
+                            "Invalid parameter, key-value pair must contain exactly one key",
+                        ));
+                    }
+                    for (key, val) in obj {
+                        norm_outputs.push((key.clone(), val.clone()));
+                    }
+                }
+            }
+            // Core NormalizeOutputs: null is -8; anything else that is not
+            // an object goes through get_array() -> -3.
+            serde_json::Value::Null => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    "Invalid parameter, output argument must be non-null",
+                ));
+            }
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type array",
+                        Self::json_uvtype(other)
+                    ),
+                ));
+            }
+        }
+
+        let mut tx_outputs = Vec::new();
+        let mut seen_data = false;
+        let mut seen_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (key, val) in &norm_outputs {
+            if key == "data" {
+                // OP_RETURN output. Core ParseOutputs rejects a duplicate
+                // "data" key (rawtransaction_util.cpp:109-111).
+                if seen_data {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Invalid parameter, duplicate key: data",
+                    ));
+                }
+                seen_data = true;
+                // Core: ParseHexV(outputs[name_].getValStr(), "Data") -- the
+                // value's TEXT (getValStr); non-hex is -8.
+                let data_text = match val {
+                    serde_json::Value::String(t) => t.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(bv) => bv.to_string(),
+                    _ => String::new(),
+                };
+                let data = Self::core_parse_hex_v(&data_text, "Data")?;
+                // OP_RETURN <push data>. Match Core's CScript << OP_RETURN << data
+                // minimal-push encoding (direct push ≤75, OP_PUSHDATA1 ≤255,
+                // OP_PUSHDATA2 otherwise — LE length).
+                let mut script = vec![0x6a]; // OP_RETURN
+                if data.len() <= 75 {
+                    script.push(data.len() as u8);
+                } else if data.len() <= 255 {
+                    script.push(0x4c); // OP_PUSHDATA1
+                    script.push(data.len() as u8);
+                } else {
+                    script.push(0x4d); // OP_PUSHDATA2
+                    script.extend_from_slice(&(data.len() as u16).to_le_bytes());
+                }
+                script.extend_from_slice(&data);
+                tx_outputs.push(TxOut {
+                    value: 0,
+                    script_pubkey: script,
+                });
+            } else {
+                // Address output: key is address, val is amount in BTC.
+                // Core ParseOutputs: AmountFromValue (-3; a NEGATIVE amount is
+                // "Amount out of range" -- it used to be silently accepted as
+                // a zero-value output), then IsValidDestination for THIS
+                // network (-5 "Invalid Bitcoin address: <name>"; a wrong-
+                // network address used to be accepted), then the duplicate
+                // check (-8).
+                let amount_sat = Self::core_amount_from_value(val)?;
+                let script = address_to_script_pubkey(key, params).map_err(|_| {
+                    Self::rpc_error(
+                        rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                        format!("Invalid Bitcoin address: {}", key),
+                    )
+                })?;
+                // Core ParseOutputs rejects a duplicated DESTINATION
+                // (rawtransaction_util.cpp:124-126).
+                if !seen_addrs.insert(hex::encode(&script)) {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        format!("Invalid parameter, duplicated address: {}", key),
+                    ));
+                }
+                tx_outputs.push(TxOut {
+                    value: amount_sat,
+                    script_pubkey: script,
+                });
+            }
+        }
+
+        // Core: `ConstructTransaction` (rawtransaction_util.cpp:166-168), run
+        // AFTER both AddInputs AND AddOutputs:
+        //
+        //   if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+        //       !SignalsOptInRBF(CTransaction(rawTx))) {
+        //       throw JSONRPCError(RPC_INVALID_PARAMETER,
+        //           "Invalid parameter combination: Sequence number(s) contradict replaceable option");
+        //   }
+        //
+        // with `SignalsOptInRBF` (util/rbf.cpp:9-17) true iff ANY input has
+        // `nSequence <= MAX_BIP125_RBF_SEQUENCE` (util/rbf.h:12, 0xfffffffd).
+        //
+        // WHY THIS MATTERS: nine of the ten nodes in this repo silently ACCEPT
+        // the contradiction today. A caller who explicitly asks for
+        // `replaceable=true` and ALSO pins a final sequence (0xFFFFFFFF, or the
+        // 0xFFFFFFFE that a non-final-locktime workflow hands you) gets back a
+        // perfectly well-formed transaction that CANNOT be fee-bumped, with no
+        // error and no warning: the explicit per-input sequence wins, the
+        // `replaceable` flag is quietly discarded, and the caller only finds out
+        // when `bumpfee` refuses it (BIP-125 Rule 1) with the fee already stuck.
+        // Core refuses to guess which half of the request was meant and errors
+        // out; so do we.
+        //
+        // The three conditions, and why each is exactly as narrow as Core's:
+        //   1. `rbf_explicit == Some(true)` — the flag was SUPPLIED as true.
+        //      An ABSENT (or JSON-null) `replaceable` does NOT arm this check
+        //      even though it still DEFAULTS to true for picking the sequence
+        //      above. That asymmetry is real and deliberate in Core
+        //      (`rbf.value_or(true)` for the default vs
+        //      `rbf.has_value() && rbf.value()` here): omitting the argument is
+        //      not a request, so a caller who only sets `sequence` has not
+        //      contradicted anything and must not be rejected.
+        //   2. at least one input — a no-input skeleton (the PSBT/funding
+        //      workflow's starting point) has no sequence to contradict.
+        //   3. NO input signals — one signaling input is enough to make the
+        //      transaction replaceable, so a mixed set is legal. Rejecting on
+        //      "not ALL inputs signal" would break multi-input RBF.
+        //
+        // Placed here, after outputs are parsed, so an output error still wins —
+        // same ordering as Core.
+        let signals_opt_in_rbf = tx_inputs
+            .iter()
+            .any(|txin| txin.sequence <= MAX_BIP125_RBF_SEQUENCE);
+        if rbf_explicit == Some(true) && !tx_inputs.is_empty() && !signals_opt_in_rbf {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Invalid parameter combination: Sequence number(s) contradict replaceable option",
+            ));
+        }
+
+        let tx = Transaction {
+            // Was hardcoded 2, which silently discarded the caller's
+            // `version` and returned a v2 transaction with a success reply.
+            // The cast is safe by construction: parse_createraw_version has
+            // already bounded the value to [1, 3].
+            version: tx_version as i32,
+            inputs: tx_inputs,
+            outputs: tx_outputs,
+            lock_time: locktime,
+        };
+
+        Ok(tx)
+    }
+
+    /// The address-network of the node's chain params.
+    fn addr_network(params: &ChainParams) -> rustoshi_crypto::address::Network {
+        use rustoshi_crypto::address::Network;
+        match params.network_id {
+            NetworkId::Mainnet => Network::Mainnet,
+            NetworkId::Testnet3 | NetworkId::Testnet4 | NetworkId::Signet => Network::Testnet,
+            NetworkId::Regtest => Network::Regtest,
+        }
+    }
+
+    /// Core `SighashFromStr` via `ParseSighashString` (-8 "'<s>' is not a valid
+    /// sighash parameter.").
+    fn core_sighash_from_str(s: &str) -> Result<u32, ErrorObjectOwned> {
+        Ok(match s {
+            "DEFAULT" => 0x00,
+            "ALL" => 0x01,
+            "NONE" => 0x02,
+            "SINGLE" => 0x03,
+            "ALL|ANYONECANPAY" => 0x81,
+            "NONE|ANYONECANPAY" => 0x82,
+            "SINGLE|ANYONECANPAY" => 0x83,
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    format!("'{}' is not a valid sighash parameter.", other),
+                ))
+            }
+        })
+    }
+
+    /// The key-origin Core's descriptor key providers report for a derived
+    /// key (`GetPubKey(..., KeyOriginInfo&)` in script/descriptor.cpp):
+    /// a bare constant key reports its own HASH160 prefix and an empty path;
+    /// an xpub/xprv reports its root key's fingerprint and the derivation
+    /// path; an explicit `[fp/path]` origin prefixes the inner path.
+    fn descriptor_key_origin(
+        key: &rustoshi_wallet::KeyProvider,
+        pos: u32,
+        pubkey33: &[u8; 33],
+    ) -> rustoshi_wallet::KeyOrigin {
+        use rustoshi_wallet::{KeyProvider, HARDENED_FLAG};
+        use rustoshi_wallet::descriptor::DeriveType;
+        fn fp_of(pk: &[u8]) -> [u8; 4] {
+            let h = rustoshi_crypto::hash160(pk);
+            [h.0[0], h.0[1], h.0[2], h.0[3]]
+        }
+        fn inner_path(k: &KeyProvider, pos: u32) -> Vec<u32> {
+            match k {
+                KeyProvider::Xpub { path, derive_type, .. }
+                | KeyProvider::Xprv { path, derive_type, .. } => {
+                    let mut p = path.clone();
+                    match derive_type {
+                        DeriveType::NonRanged => {}
+                        DeriveType::UnhardenedRanged => p.push(pos),
+                        DeriveType::HardenedRanged => p.push(pos | HARDENED_FLAG),
+                    }
+                    p
+                }
+                KeyProvider::WithOrigin { inner, .. } => inner_path(inner, pos),
+                _ => Vec::new(),
+            }
+        }
+        match key {
+            KeyProvider::WithOrigin { origin, inner, .. } => {
+                let mut path = origin.path.clone();
+                path.extend(inner_path(inner, pos));
+                rustoshi_wallet::KeyOrigin::new(origin.fingerprint, path)
+            }
+            KeyProvider::Xpub { xpub, .. } => rustoshi_wallet::KeyOrigin::new(
+                fp_of(&xpub.public_key.serialize()),
+                inner_path(key, pos),
+            ),
+            KeyProvider::Xprv { xprv, .. } => rustoshi_wallet::KeyOrigin::new(
+                fp_of(&xprv.to_public().public_key.serialize()),
+                inner_path(key, pos),
+            ),
+            _ => rustoshi_wallet::KeyOrigin::new(fp_of(pubkey33), Vec::new()),
+        }
+    }
+
+    /// Core `EvalDescriptorStringOrObject` over a `descriptors` array, into the
+    /// flat signing provider [`ProcessPsbt`] consults. Keyed by scriptPubKey.
+    fn descriptor_provider(
+        descriptors: Option<&serde_json::Value>,
+        network: rustoshi_crypto::address::Network,
+        expand_priv: bool,
+    ) -> Result<std::collections::HashMap<Vec<u8>, DescProvEntry>, ErrorObjectOwned> {
+        use rustoshi_wallet::descriptor::{parse_descriptor, Descriptor};
+        let mut provider: std::collections::HashMap<Vec<u8>, DescProvEntry> =
+            std::collections::HashMap::new();
+        let Some(descs) = descriptors.and_then(|v| v.as_array()) else {
+            return Ok(provider);
+        };
+        for scanobject in descs {
+            let mut range: (i64, i64) = (0, 1000);
+            let desc_str: String = match scanobject {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Object(o) => {
+                    let d = o.get("desc").unwrap_or(&serde_json::Value::Null);
+                    if d.is_null() {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_INVALID_PARAMETER,
+                            "Descriptor needs to be provided in scan object",
+                        ));
+                    }
+                    let d = d.as_str().ok_or_else(|| {
+                        Self::rpc_error(
+                            rpc_error::RPC_TYPE_ERROR,
+                            format!(
+                                "JSON value of type {} is not of expected type string",
+                                Self::json_uvtype(d)
+                            ),
+                        )
+                    })?;
+                    if let Some(r) = o.get("range") {
+                        if !r.is_null() {
+                            range = Self::core_parse_descriptor_range(r)?;
+                        }
+                    }
+                    d.to_string()
+                }
+                _ => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Scan object needs to be either a string or an object",
+                    ))
+                }
+            };
+            let desc = parse_descriptor(&desc_str)
+                .map_err(|e| Self::core_descriptor_error(&desc_str, &e))?;
+            if !desc.is_range() {
+                range = (0, 0);
+            }
+            // The single-key families this provider models. Anything else is
+            // refused honestly: answering without its scripts/keys would be a
+            // silently different PSBT from Core's.
+            let key = match &desc {
+                Descriptor::Pk(k)
+                | Descriptor::Pkh(k)
+                | Descriptor::Wpkh(k)
+                | Descriptor::Combo(k) => Some(k.clone()),
+                Descriptor::Sh(inner) => match inner.as_ref() {
+                    Descriptor::Wpkh(k) => Some(k.clone()),
+                    _ => None,
+                },
+                // addr()/raw() expand to scripts but carry no keys: Core's
+                // provider learns nothing it can update or sign with.
+                Descriptor::Addr(_) | Descriptor::Raw(_) => continue,
+                _ => None,
+            };
+            let Some(key) = key else {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    format!(
+                        "descriptor type not supported by this rustoshi build for PSBT \
+                         processing (single-key pk/pkh/wpkh/sh(wpkh)/combo only): '{}'",
+                        desc_str
+                    ),
+                ));
+            };
+            if !key.is_compressed() {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    format!(
+                        "uncompressed keys are not supported by this rustoshi build for PSBT \
+                         processing: '{}'",
+                        desc_str
+                    ),
+                ));
+            }
+            for pos in range.0..=range.1 {
+                let pos = pos as u32;
+                let cannot_derive = || {
+                    Self::rpc_error(
+                        rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                        format!("Cannot derive script without private keys: '{}'", desc_str),
+                    )
+                };
+                let pubkey = key.get_pubkey(pos).map_err(|_| cannot_derive())?;
+                let pubkey33: [u8; 33] = pubkey.serialize();
+                let origin = Self::descriptor_key_origin(&key, pos, &pubkey33);
+                let secret = if expand_priv {
+                    key.get_secret_key(pos).ok().flatten()
+                } else {
+                    None
+                };
+                let spks = desc.derive_scripts(pos, network).map_err(|_| cannot_derive())?;
+                let h = rustoshi_crypto::hash160(&pubkey33);
+                let mut p2wpkh = vec![0x00, 0x14];
+                p2wpkh.extend_from_slice(&h.0);
+                for spk in spks {
+                    let is_p2sh = spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87;
+                    provider.insert(
+                        spk,
+                        DescProvEntry {
+                            pubkey: pubkey33,
+                            origin: origin.clone(),
+                            secret,
+                            redeem_script: if is_p2sh { Some(p2wpkh.clone()) } else { None },
+                        },
+                    );
+                }
+            }
+        }
+        Ok(provider)
+    }
+
+    /// Core's `ProcessPSBT` (rpc/rawtransaction.cpp) for the single-key
+    /// provider above: fill UTXOs (txindex/mempool full tx, else the UTXO set
+    /// for segwit outputs), then per input the updater (+ signer when `sign`)
+    /// half of `SignPSBTInput`, then `UpdatePSBTOutput` for every output and
+    /// `RemoveUnnecessaryTransactions`. Returns the PSBT and whether every
+    /// input is finalized.
+    #[allow(clippy::too_many_arguments)]
+    fn process_psbt(
+        &self,
+        state: &RpcState,
+        psbt_str: &str,
+        provider: &std::collections::HashMap<Vec<u8>, DescProvEntry>,
+        network: rustoshi_crypto::address::Network,
+        sighash: Option<u32>,
+        bip32derivs: bool,
+        finalize: bool,
+        sign: bool,
+    ) -> Result<(Psbt, bool), ErrorObjectOwned> {
+        let mut psbt = Psbt::from_base64(psbt_str).map_err(|e| {
+            Self::rpc_error(
+                rpc_error::RPC_DESERIALIZATION_ERROR,
+                format!("TX decode failed {}", e),
+            )
+        })?;
+        let n_in = psbt.unsigned_tx.inputs.len();
+        let store = BlockStore::new(&state.db);
+
+        let is_p2pkh = |s: &[u8]| s.len() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac;
+        let is_p2wpkh = |s: &[u8]| s.len() == 22 && s[0] == 0x00 && s[1] == 0x14;
+        let is_p2sh = |s: &[u8]| s.len() == 23 && s[0] == 0xa9 && s[1] == 0x14 && s[22] == 0x87;
+        let is_p2tr = |s: &[u8]| s.len() == 34 && s[0] == 0x51 && s[1] == 0x20;
+        let is_witness_program = |s: &[u8]| {
+            s.len() >= 4
+                && s.len() <= 42
+                && (s[0] == 0x00 || (0x51..=0x60).contains(&s[0]))
+                && s[1] as usize + 2 == s.len()
+        };
+
+        // ---- 1. UTXO fill ----
+        let mut missing: Vec<usize> = Vec::new();
+        for i in 0..n_in {
+            if psbt.inputs[i].non_witness_utxo.is_some() {
+                continue;
+            }
+            let prev_txid = psbt.unsigned_tx.inputs[i].previous_output.txid;
+            let mut found: Option<Transaction> = None;
+            if let Ok(Some(entry)) = store.get_tx_index(&prev_txid) {
+                if let Ok(Some(block)) = store.get_block(&entry.block_hash) {
+                    found = block.transactions.into_iter().find(|t| t.txid() == prev_txid);
+                }
+            }
+            if found.is_none() {
+                found = state.mempool.get(&prev_txid).map(|e| e.tx.clone());
+            }
+            match found {
+                Some(tx) => psbt.inputs[i].non_witness_utxo = Some(tx),
+                None => missing.push(i),
+            }
+        }
+        for i in missing {
+            let prevout = psbt.unsigned_tx.inputs[i].previous_output.clone();
+            if let Ok(Some(coin)) = store.get_utxo(&prevout) {
+                // Core IsSegWitOutput(provider, spk): a witness program, or a
+                // P2SH whose redeem script the provider knows is one.
+                let spk = &coin.script_pubkey;
+                let segwit = is_witness_program(spk)
+                    || (is_p2sh(spk)
+                        && provider
+                            .get(spk)
+                            .and_then(|e| e.redeem_script.as_ref())
+                            .map(|r| is_witness_program(r))
+                            .unwrap_or(false));
+                if segwit {
+                    psbt.inputs[i].witness_utxo = Some(TxOut {
+                        value: coin.value,
+                        script_pubkey: coin.script_pubkey.clone(),
+                    });
+                }
+            }
+        }
+
+        // Keystore for the signer (private material only when `sign`).
+        let secrets: Vec<rustoshi_crypto::SecretKey> = if sign {
+            provider.values().filter_map(|e| e.secret).collect()
+        } else {
+            Vec::new()
+        };
+        let key_signer = if secrets.is_empty() {
+            None
+        } else {
+            Some(
+                rustoshi_wallet::KeySigner::from_secret_keys(&secrets, network).map_err(|e| {
+                    Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("signer: {}", e))
+                })?,
+            )
+        };
+
+        // Every input's spent output (for the signer's prevout list).
+        let utxo_of = |psbt: &Psbt, i: usize| -> Option<(TxOut, bool)> {
+            let input = &psbt.inputs[i];
+            let prevout = &psbt.unsigned_tx.inputs[i].previous_output;
+            if let Some(nw) = &input.non_witness_utxo {
+                if nw.txid() != prevout.txid {
+                    return None;
+                }
+                return nw.outputs.get(prevout.vout as usize).cloned().map(|o| (o, false));
+            }
+            input.witness_utxo.clone().map(|o| (o, true))
+        };
+        let all_prevouts: Vec<rustoshi_wallet::WalletUtxo> = (0..n_in)
+            .map(|i| {
+                let (o, _) = utxo_of(&psbt, i).unwrap_or((
+                    TxOut { value: 0, script_pubkey: Vec::new() },
+                    false,
+                ));
+                rustoshi_wallet::WalletUtxo {
+                    outpoint: psbt.unsigned_tx.inputs[i].previous_output.clone(),
+                    value: o.value,
+                    script_pubkey: o.script_pubkey,
+                    derivation_path: vec![],
+                    confirmations: 0,
+                    is_change: false,
+                    is_coinbase: false,
+                    height: None,
+                }
+            })
+            .collect();
+
+        // ---- 2. per-input SignPSBTInput ----
+        for i in 0..n_in {
+            let signed = psbt.inputs[i].final_script_sig.is_some()
+                || psbt.inputs[i].final_script_witness.is_some();
+            if signed {
+                continue;
+            }
+            let Some((utxo, require_witness_sig)) = utxo_of(&psbt, i) else {
+                continue; // MISSING_INPUTS
+            };
+            let spk = utxo.script_pubkey.clone();
+            let taproot = is_p2tr(&spk);
+            let want = sighash.unwrap_or(if taproot { 0x00 } else { 0x01 });
+            if let Some(t) = psbt.inputs[i].sighash_type {
+                if t != want {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_DESERIALIZATION_ERROR,
+                        "Specified sighash value does not match value stored in PSBT",
+                    ));
+                }
+            }
+            let set_field = if taproot { want != 0x00 } else { want != 0x00 && want != 0x01 };
+            if set_field {
+                psbt.inputs[i].sighash_type = Some(want);
+            }
+            if want != 0x00 && psbt.inputs[i].partial_sigs.values().any(|sig| sig.last() != Some(&(want as u8))) {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DESERIALIZATION_ERROR,
+                    "Specified sighash value does not match value stored in PSBT",
+                ));
+            }
+
+            let entry = provider.get(&spk);
+            // ProduceSignature's `witness` flag: P2WPKH is solved structurally
+            // (keys or not); P2SH only when the provider knows its redeem
+            // script and that is P2WPKH; taproot always sets it.
+            let witness = is_p2wpkh(&spk)
+                || taproot
+                || (is_p2sh(&spk)
+                    && entry
+                        .and_then(|e| e.redeem_script.as_ref())
+                        .map(|r| is_p2wpkh(r))
+                        .unwrap_or(false));
+            if require_witness_sig && !witness {
+                continue; // INCOMPLETE before FromSignatureData: nothing written.
+            }
+
+            let mut completed = false;
+            if let Some(e) = entry {
+                // Signer half.
+                if let (Some(_sk), Some(ks)) = (e.secret, key_signer.as_ref()) {
+                    if !ks.can_sign(&spk) || is_p2pkh(&spk) && require_witness_sig {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_MISC_ERROR,
+                            "signing this input type is not supported by this rustoshi build \
+                             (single-key P2PKH / P2WPKH / P2SH-P2WPKH only)",
+                        ));
+                    }
+                    if want != 0x00 && want != 0x01 {
+                        return Err(Self::rpc_error(
+                            rpc_error::RPC_MISC_ERROR,
+                            "sighash types other than ALL/DEFAULT are not supported for signing by this rustoshi build",
+                        ));
+                    }
+                    let mut scratch = psbt.unsigned_tx.clone();
+                    if ks.sign_input(&mut scratch, i, &all_prevouts[i], &all_prevouts).is_ok() {
+                        let signed_in = &scratch.inputs[i];
+                        if finalize {
+                            let inp = &mut psbt.inputs[i];
+                            inp.partial_sigs.clear();
+                            inp.bip32_derivation.clear();
+                            inp.redeem_script = None;
+                            inp.witness_script = None;
+                            if !signed_in.script_sig.is_empty() {
+                                inp.final_script_sig = Some(signed_in.script_sig.clone());
+                            }
+                            if !signed_in.witness.is_empty() {
+                                inp.final_script_witness = Some(signed_in.witness.clone());
+                            }
+                            completed = true;
+                        } else if let Some((pk, sig)) =
+                            crate::wallet::extract_single_partial_sig(signed_in)
+                        {
+                            psbt.inputs[i].partial_sigs.insert(pk, sig);
+                        }
+                    }
+                }
+                // Updater half (PSBTInput::FromSignatureData, incomplete case).
+                if !completed {
+                    let inp = &mut psbt.inputs[i];
+                    if inp.redeem_script.is_none() {
+                        if let Some(r) = &e.redeem_script {
+                            inp.redeem_script = Some(r.clone());
+                        }
+                    }
+                    if bip32derivs {
+                        inp.bip32_derivation
+                            .entry(e.pubkey)
+                            .or_insert_with(|| e.origin.clone());
+                    }
+                }
+            }
+            if witness {
+                psbt.inputs[i].witness_utxo = Some(utxo.clone());
+            }
+        }
+
+        // ---- 3. UpdatePSBTOutput ----
+        for o in 0..psbt.unsigned_tx.outputs.len() {
+            let spk = psbt.unsigned_tx.outputs[o].script_pubkey.clone();
+            if let Some(e) = provider.get(&spk) {
+                let out = &mut psbt.outputs[o];
+                if out.redeem_script.is_none() {
+                    if let Some(r) = &e.redeem_script {
+                        out.redeem_script = Some(r.clone());
+                    }
+                }
+                if bip32derivs {
+                    out.bip32_derivation
+                        .entry(e.pubkey)
+                        .or_insert_with(|| e.origin.clone());
+                }
+            }
+        }
+
+        // ---- 4. RemoveUnnecessaryTransactions ----
+        let mut to_drop: Vec<usize> = Vec::new();
+        let mut can_drop = true;
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            let Some(wu) = &input.witness_utxo else { can_drop = false; break };
+            let s = &wu.script_pubkey;
+            if !is_witness_program(s) || s[0] == 0x00 {
+                can_drop = false;
+                break;
+            }
+            if input.sighash_type.map(|t| t & 0x80 == 0x80).unwrap_or(false) {
+                can_drop = false;
+                break;
+            }
+            if input.non_witness_utxo.is_some() {
+                to_drop.push(i);
+            }
+        }
+        if can_drop {
+            for i in to_drop {
+                psbt.inputs[i].non_witness_utxo = None;
+            }
+        }
+
+        let complete = psbt
+            .inputs
+            .iter()
+            .all(|i| i.final_script_sig.is_some() || i.final_script_witness.is_some());
+        Ok((psbt, complete))
+    }
+
+    /// Core's `IsHex` (util/strencodings.cpp): non-empty, EVEN length, every
+    /// character a hex digit.
+    fn core_is_hex(s: &str) -> bool {
+        !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// Core's `ParseHexV(v, name)` (rpc/util.cpp:130-137): a string that is
+    /// not `IsHex` is `RPC_INVALID_PARAMETER` (-8)
+    /// "<name> must be hexadecimal string (not '<s>')". -22 is reserved for a
+    /// hex string whose DECODED bytes are not a valid object.
+    fn core_parse_hex_v(s: &str, name: &str) -> Result<Vec<u8>, ErrorObjectOwned> {
+        if !Self::core_is_hex(s) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                format!("{} must be hexadecimal string (not '{}')", name, s),
+            ));
+        }
+        hex::decode(s).map_err(|_| {
+            Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                format!("{} must be hexadecimal string (not '{}')", name, s),
+            )
+        })
+    }
+
+    /// Core's `DecodeHexTx` (core_io.cpp) boundary: a non-hex string or bytes
+    /// that do not decode to a transaction both return `false`, and every RPC
+    /// caller turns that into `RPC_DESERIALIZATION_ERROR` (-22). Returns `None`
+    /// on either failure; the caller supplies Core's per-method message.
+    fn core_decode_hex_tx(s: &str) -> Option<Transaction> {
+        if !Self::core_is_hex(s) {
+            return None;
+        }
+        let bytes = hex::decode(s).ok()?;
+        Transaction::deserialize(&bytes).ok()
+    }
+
+    /// Core's `AmountFromValue` (rpc/util.cpp): the value must be a JSON number
+    /// or string (else -3 "Amount is not a number or string"), must parse as a
+    /// fixed-point decimal with at most 8 fractional digits (else -3
+    /// "Invalid amount"), and must be within MoneyRange (else -3 "Amount out of
+    /// range"). Parsed from the value's TEXT, as Core does, so no float
+    /// rounding is involved.
+    fn core_amount_from_value(v: &serde_json::Value) -> Result<u64, ErrorObjectOwned> {
+        let text = match v {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            _ => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    "Amount is not a number or string",
+                ))
+            }
+        };
+        let amount = parse_fixed_point_8(&text)
+            .ok_or_else(|| Self::rpc_error(rpc_error::RPC_TYPE_ERROR, "Invalid amount"))?;
+        if amount < 0 || amount > (21_000_000i64 * COIN as i64) {
+            return Err(Self::rpc_error(rpc_error::RPC_TYPE_ERROR, "Amount out of range"));
+        }
+        Ok(amount as u64)
     }
 
     /// Core rpc/util.cpp ParseRange + ParseDescriptorRange: a number N means
@@ -4457,6 +5502,121 @@ pub fn try_attach_and_reorg(
 
 /// Convert compact bits to a floating-point target approximation.
 #[allow(dead_code)]
+/// Port of Core's `ParseFixedPoint(val, 8, &amount)`
+/// (`bitcoin-core/src/util/strencodings.cpp:272`), the parser inside
+/// `AmountFromValue`. Accepts `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`
+/// and returns the value scaled by 10^8, or `None` when it has more than 8
+/// fractional digits, overflows, or is malformed -- all of which Core reports
+/// as "Invalid amount".
+fn parse_fixed_point_8(val: &str) -> Option<i64> {
+    const UPPER_BOUND: i64 = 1_000_000_000_000_000_000 - 1;
+    let b = val.as_bytes();
+    let end = b.len();
+    let mut ptr = 0usize;
+    let mut mantissa: i64 = 0;
+    let mut exponent: i64 = 0;
+    let mut mantissa_tzeros: i64 = 0;
+    let mut mantissa_sign = false;
+    let mut exponent_sign = false;
+    let mut point_ofs: i64 = 0;
+
+    fn process_digit(ch: u8, mantissa: &mut i64, tzeros: &mut i64) -> bool {
+        const UPPER_BOUND: i64 = 1_000_000_000_000_000_000 - 1;
+        if ch == b'0' {
+            *tzeros += 1;
+        } else {
+            for _ in 0..=*tzeros {
+                if *mantissa > UPPER_BOUND / 10 {
+                    return false;
+                }
+                *mantissa *= 10;
+            }
+            *mantissa += i64::from(ch - b'0');
+            *tzeros = 0;
+        }
+        true
+    }
+
+    if ptr < end && b[ptr] == b'-' {
+        mantissa_sign = true;
+        ptr += 1;
+    }
+    if ptr < end {
+        if b[ptr] == b'0' {
+            ptr += 1;
+        } else if b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if !process_digit(b[ptr], &mut mantissa, &mut mantissa_tzeros) {
+                    return None;
+                }
+                ptr += 1;
+            }
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    }
+    if ptr < end && b[ptr] == b'.' {
+        ptr += 1;
+        if ptr < end && b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if !process_digit(b[ptr], &mut mantissa, &mut mantissa_tzeros) {
+                    return None;
+                }
+                ptr += 1;
+                point_ofs += 1;
+            }
+        } else {
+            return None;
+        }
+    }
+    if ptr < end && (b[ptr] == b'e' || b[ptr] == b'E') {
+        ptr += 1;
+        if ptr < end && b[ptr] == b'+' {
+            ptr += 1;
+        } else if ptr < end && b[ptr] == b'-' {
+            exponent_sign = true;
+            ptr += 1;
+        }
+        if ptr < end && b[ptr].is_ascii_digit() {
+            while ptr < end && b[ptr].is_ascii_digit() {
+                if exponent > UPPER_BOUND / 10 {
+                    return None;
+                }
+                exponent = exponent * 10 + i64::from(b[ptr] - b'0');
+                ptr += 1;
+            }
+        } else {
+            return None;
+        }
+    }
+    if ptr != end {
+        return None;
+    }
+    if exponent_sign {
+        exponent = -exponent;
+    }
+    exponent = exponent - point_ofs + mantissa_tzeros;
+    if mantissa_sign {
+        mantissa = -mantissa;
+    }
+    exponent += 8;
+    if exponent < 0 || exponent >= 18 {
+        return None;
+    }
+    for _ in 0..exponent {
+        if mantissa > UPPER_BOUND / 10 || mantissa < -(UPPER_BOUND / 10) {
+            return None;
+        }
+        mantissa *= 10;
+    }
+    if mantissa > UPPER_BOUND || mantissa < -UPPER_BOUND {
+        return None;
+    }
+    Some(mantissa)
+}
+
 fn compact_to_target_f64(bits: u32) -> f64 {
     let exponent = (bits >> 24) as i32;
     let mantissa = (bits & 0x007FFFFF) as f64;
@@ -7471,14 +8631,17 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
-    async fn decode_raw_transaction(&self, hex: String) -> RpcResult<Box<serde_json::value::RawValue>> {
-        let tx_bytes = Self::parse_hex(&hex)?;
-
-        let tx = Transaction::deserialize(&tx_bytes).map_err(|_| {
-            Self::rpc_error(
-                rpc_error::RPC_DESERIALIZATION_ERROR,
-                "Invalid transaction",
-            )
+    async fn decode_raw_transaction(&self, hexstring: serde_json::Value) -> RpcResult<Box<serde_json::value::RawValue>> {
+        // Core rawtransaction.cpp decoderawtransaction: the RPCHelpMan gate
+        // (-3 on a non-string), then `if (!DecodeHexTx(...)) throw
+        // JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed")`. A
+        // non-hex string and undecodable bytes are the SAME failure there --
+        // DecodeHexTx returns false for both -- so both are -22, not the
+        // transport code -32602 the shared parse_hex used to answer.
+        Self::core_type_gate(&[("hexstring", Some(&hexstring), CoreArgType::Str, false)])?;
+        let hex = hexstring.as_str().unwrap_or_default();
+        let tx = Self::core_decode_hex_tx(hex).ok_or_else(|| {
+            Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "TX decode failed")
         })?;
 
         let state = self.state.read().await;
@@ -7794,6 +8957,93 @@ impl RustoshiRpcServer for RpcServerImpl {
                 rpc_error::RPC_MISC_ERROR,
                 format!("dumpmempool failed: {}", e),
             )),
+        }
+    }
+
+    async fn import_mempool(
+        &self,
+        filepath: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value> {
+        // Core rpc/mempool.cpp importmempool, in order: RPCHelpMan gate (-3),
+        // IBD refusal (-10), option bools (get_bool, -3), then LoadMempool,
+        // whose failure is -1. The method did not exist here before (-32601).
+        Self::core_type_gate(&[
+            ("filepath", Some(&filepath), CoreArgType::Str, false),
+            ("options", options.as_ref(), CoreArgType::Obj, true),
+        ])?;
+        let mut state = self.state.write().await;
+        if state.is_ibd {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                "Can only import the mempool after the block download and sync is done.",
+            ));
+        }
+        let path = std::path::PathBuf::from(filepath.as_str().unwrap_or_default());
+        let opt_bool = |key: &str, default: bool| -> Result<bool, ErrorObjectOwned> {
+            match options.as_ref().and_then(|o| o.get(key)) {
+                None | Some(serde_json::Value::Null) => Ok(default),
+                Some(serde_json::Value::Bool(b)) => Ok(*b),
+                Some(other) => Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type bool",
+                        Self::json_uvtype(other)
+                    ),
+                )),
+            }
+        };
+        let opts = rustoshi_consensus::ImportMempoolOptions {
+            use_current_time: opt_bool("use_current_time", true)?,
+            apply_fee_delta_priority: opt_bool("apply_fee_delta_priority", false)?,
+        };
+        // Accepted for Core parity; rustoshi keeps no unbroadcast set, so
+        // there is nothing to apply it to (the loader reads past the block).
+        let _apply_unbroadcast_set = opt_bool("apply_unbroadcast_set", false)?;
+
+        let db = Arc::clone(&state.db);
+        {
+            let tip_height = state.best_height;
+            let store = BlockStore::new(&db);
+            let mtp = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+            state.mempool.notify_new_tip(tip_height, mtp);
+        }
+        let utxo_lookup = |outpoint: &OutPoint| {
+            let store = BlockStore::new(&db);
+            store
+                .get_utxo(outpoint)
+                .ok()
+                .flatten()
+                .map(|c| rustoshi_consensus::validation::CoinEntry {
+                    height: c.height,
+                    is_coinbase: c.is_coinbase,
+                    value: c.value,
+                    script_pubkey: c.script_pubkey,
+                })
+        };
+        match rustoshi_consensus::load_mempool_with_options(
+            &mut state.mempool,
+            &path,
+            &utxo_lookup,
+            &opts,
+        ) {
+            Ok(stats) => {
+                tracing::info!(
+                    "importmempool {}: {} accepted, {} failed (of {})",
+                    path.display(),
+                    stats.accepted,
+                    stats.failed,
+                    stats.total
+                );
+                Ok(serde_json::json!({}))
+            }
+            Err(e) => {
+                tracing::warn!("importmempool {}: {}", path.display(), e);
+                Err(Self::rpc_error(
+                    rpc_error::RPC_MISC_ERROR,
+                    "Unable to import mempool file, see debug log for details.",
+                ))
+            }
         }
     }
 
@@ -10485,7 +11735,19 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
-    async fn prune_blockchain(&self, height: u32) -> RpcResult<u32> {
+    async fn prune_blockchain(&self, height: serde_json::Value) -> RpcResult<u32> {
+        // Core rpc/blockchain.cpp::pruneblockchain, in Core's order:
+        //   1. RPCHelpMan type gate: a non-number `height` is -3 "Wrong type
+        //      passed" (typing this `u32` made serde answer -32602 first);
+        //   2. not in prune mode -> -1;
+        //   3. getInt<int> conversion -> -1 "JSON integer out of range";
+        //   4. negative -> -8 "Negative block height.";
+        //   5. a value > 1e9 is a TIMESTAMP -> earliest block with
+        //      nTimeMax >= ts - TIMESTAMP_WINDOW, else -8;
+        //   6. chain shorter than PruneAfterHeight -> -1; height > tip -> -8;
+        //      height within MIN_BLOCKS_TO_KEEP of the tip is CLAMPED, not an
+        //      error (it used to be -32602 here).
+        Self::core_type_gate(&[("height", Some(&height), CoreArgType::Num, false)])?;
         let state = self.state.read().await;
 
         // Check if pruning is enabled — covers both `-prune=N` (auto)
@@ -10494,22 +11756,73 @@ impl RustoshiRpcServer for RpcServerImpl {
         if !state.prune_mode {
             return Err(Self::rpc_error(
                 rpc_error::RPC_MISC_ERROR,
-                "Cannot prune blocks because node is not in prune mode",
+                "Cannot prune blocks because node is not in prune mode.",
             ));
         }
 
-        // Cannot prune past the tip minus MIN_BLOCKS_TO_KEEP
-        let min_blocks_to_keep = rustoshi_storage::MIN_BLOCKS_TO_KEEP;
-        let max_prune_height = state.best_height.saturating_sub(min_blocks_to_keep);
-
-        if height > max_prune_height {
+        let mut height_param = i64::from(Self::core_get_i32(&height)?);
+        if height_param < 0 {
             return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                format!(
-                    "Cannot prune to height {} (must keep at least {} blocks from tip {})",
-                    height, min_blocks_to_keep, state.best_height
-                ),
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Negative block height.",
             ));
+        }
+
+        // Core: a height above 1e9 is a unix time (TIMESTAMP_WINDOW = 7200),
+        // resolved with CChain::FindEarliestAtLeast -- the first block whose
+        // running max header time reaches the threshold.
+        if height_param > 1_000_000_000 {
+            let threshold = height_param - 7200;
+            let store = BlockStore::new(&state.db);
+            let mut time_max: i64 = 0;
+            let mut found: Option<u32> = None;
+            for h in 0..=state.best_height {
+                let hdr = store
+                    .get_hash_by_height(h)
+                    .ok()
+                    .flatten()
+                    .and_then(|hash| store.get_header(&hash).ok().flatten());
+                let Some(hdr) = hdr else { break };
+                time_max = time_max.max(i64::from(hdr.timestamp));
+                if time_max >= threshold {
+                    found = Some(h);
+                    break;
+                }
+            }
+            match found {
+                Some(h) => height_param = i64::from(h),
+                None => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_INVALID_PARAMETER,
+                        "Could not find block with at least the specified timestamp.",
+                    ))
+                }
+            }
+        }
+
+        // Core chainparams nPruneAfterHeight: 100000 on mainnet, 1000 on the
+        // test networks and regtest.
+        let prune_after_height: u32 = match state.params.network_id {
+            NetworkId::Mainnet => 100_000,
+            _ => 1_000,
+        };
+        let chain_height = state.best_height;
+        let min_blocks_to_keep = rustoshi_storage::MIN_BLOCKS_TO_KEEP;
+        let mut height = height_param as u32;
+        if chain_height < prune_after_height {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "Blockchain is too short for pruning.",
+            ));
+        } else if height > chain_height {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Blockchain is shorter than the attempted prune height.",
+            ));
+        } else if height > chain_height.saturating_sub(min_blocks_to_keep) {
+            // Core: "Attempt to prune blocks close to the tip. Retaining the
+            // minimum number of blocks." -- clamp, do not fail.
+            height = chain_height.saturating_sub(min_blocks_to_keep);
         }
 
         // Drive the prune coordinator synchronously. Mirrors Core's
@@ -10558,38 +11871,70 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn submit_package(
         &self,
-        rawtxs: Vec<String>,
-        maxfeerate: Option<f64>,
-        maxburnamount: Option<f64>,
+        package: serde_json::Value,
+        maxfeerate: Option<serde_json::Value>,
+        maxburnamount: Option<serde_json::Value>,
     ) -> RpcResult<SubmitPackageResult> {
         use std::collections::HashMap;
 
-        // Default maxfeerate: 0.10 BTC/kvB
-        let max_fee_rate_btc_kvb = maxfeerate.unwrap_or(0.10);
-
-        // Reject fee rates > 1 BTC/kvB as clearly erroneous
-        if max_fee_rate_btc_kvb > 1.0 {
+        // Core rpc/mempool.cpp submitpackage, in Core's order:
+        //   RPCHelpMan gate (-3 non-array) -> size outside [1, 25] is -8
+        //   "Array must contain between 1 and 25 transactions." -> maxfeerate
+        //   ParseFeeRate (AmountFromValue -3; >= 1 BTC/kvB -8) -> maxburnamount
+        //   AmountFromValue -> per tx get_str (-3) + DecodeHexTx, whose failure
+        //   (non-hex OR undecodable) is -22 "TX decode failed: <hex> Make sure
+        //   the tx has at least one input.".
+        // Every one of those used to be the transport code -32602.
+        Self::core_type_gate(&[("package", Some(&package), CoreArgType::Arr, false)])?;
+        let rawtxs = package.as_array().cloned().unwrap_or_default();
+        if rawtxs.is_empty() || rawtxs.len() > 25 {
             return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                "maxfeerate cannot exceed 1 BTC/kvB",
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Array must contain between 1 and 25 transactions.",
             ));
         }
+
+        // Default maxfeerate: 0.10 BTC/kvB
+        let max_fee_rate_sats_kvb: u64 = match maxfeerate.as_ref() {
+            None | Some(serde_json::Value::Null) => COIN / 10,
+            Some(v) => Self::core_amount_from_value(v)?,
+        };
+        if max_fee_rate_sats_kvb >= COIN {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Fee rates larger than or equal to 1BTC/kvB are not accepted",
+            ));
+        }
+        let max_fee_rate_btc_kvb = max_fee_rate_sats_kvb as f64 / COIN as f64;
 
         // Convert BTC/kvB to sat/vB
         let max_fee_rate_sat_vb = max_fee_rate_btc_kvb * (COIN as f64) / 1000.0;
 
         // Default maxburnamount: 0 BTC
-        let max_burn_btc = maxburnamount.unwrap_or(0.0);
-        let max_burn_sats = (max_burn_btc * COIN as f64) as u64;
+        let max_burn_sats: u64 = match maxburnamount.as_ref() {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(v) => Self::core_amount_from_value(v)?,
+        };
 
         // Parse all transactions
         let mut txs = Vec::with_capacity(rawtxs.len());
-        for (i, hex) in rawtxs.iter().enumerate() {
-            let tx_bytes = Self::parse_hex(hex)?;
-            let tx = Transaction::deserialize(&tx_bytes).map_err(|_| {
+        for (i, raw) in rawtxs.iter().enumerate() {
+            let hex = raw.as_str().ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type string",
+                        Self::json_uvtype(raw)
+                    ),
+                )
+            })?;
+            let tx = Self::core_decode_hex_tx(hex).ok_or_else(|| {
                 Self::rpc_error(
                     rpc_error::RPC_DESERIALIZATION_ERROR,
-                    format!("TX decode failed for transaction {}", i),
+                    format!(
+                        "TX decode failed: {} Make sure the tx has at least one input.",
+                        hex
+                    ),
                 )
             })?;
 
@@ -10611,9 +11956,10 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         if txs.is_empty() {
+            // Unreachable: the size gate above already refused an empty array.
             return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                "Package must contain at least one transaction",
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Array must contain between 1 and 25 transactions.",
             ));
         }
 
@@ -10772,18 +12118,19 @@ impl RustoshiRpcServer for RpcServerImpl {
         })
     }
 
-    async fn get_descriptor_info(&self, descriptor: String) -> RpcResult<DescriptorInfoResult> {
+    async fn get_descriptor_info(&self, descriptor: serde_json::Value) -> RpcResult<DescriptorInfoResult> {
         use rustoshi_wallet::descriptor::{
             parse_descriptor, DescriptorInfo,
         };
+        // Core output_script.cpp getdescriptorinfo: RPCHelpMan gate (-3), then
+        // `if (!desc) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error)` --
+        // an unparseable descriptor or a bad checksum is -5 (was -32602).
+        Self::core_type_gate(&[("descriptor", Some(&descriptor), CoreArgType::Str, false)])?;
+        let descriptor = descriptor.as_str().unwrap_or_default().to_string();
 
         // Try to parse the descriptor (with or without checksum)
-        let parsed = parse_descriptor(&descriptor).map_err(|e| {
-            Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                format!("Invalid descriptor: {}", e),
-            )
-        })?;
+        let parsed = parse_descriptor(&descriptor)
+            .map_err(|e| Self::core_descriptor_error(&descriptor, &e))?;
 
         let info = DescriptorInfo::from_descriptor(&parsed);
 
@@ -11001,12 +12348,8 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         // Parse the descriptor
-        let parsed = parse_descriptor(&descriptor).map_err(|e| {
-            Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                format!("Invalid descriptor: {}", e),
-            )
-        })?;
+        let parsed = parse_descriptor(&descriptor)
+            .map_err(|e| Self::core_descriptor_error(&descriptor, &e))?;
 
         // Derive the first address from the descriptor
         let addrs = parsed.derive_addresses(0, AddrNetwork::Regtest).map_err(|e| {
@@ -11325,149 +12668,32 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn createpsbt(
         &self,
-        inputs: Vec<CreatePsbtInput>,
-        outputs: Vec<serde_json::Value>,
+        inputs: serde_json::Value,
+        outputs: serde_json::Value,
         locktime: Option<serde_json::Value>,
-        replaceable: Option<bool>,
+        replaceable: Option<serde_json::Value>,
         version: Option<serde_json::Value>,
     ) -> RpcResult<String> {
-        let tx_version = Self::parse_createraw_version(version.as_ref())?;
+        // Core rawtransaction.cpp createpsbt: the SAME ConstructTransaction as
+        // createrawtransaction, then wrap the unsigned tx in an empty PSBT.
+        // (This used to be a second, drifted copy with typed params: Core's
+        // canonical object-form outputs `{"addr": amt}` and a malformed txid
+        // were both refused by serde as -32602.)
         let state = self.state.read().await;
+        let tx = Self::core_construct_transaction(
+            &state.params,
+            &inputs,
+            &outputs,
+            locktime.as_ref(),
+            replaceable.as_ref(),
+            version.as_ref(),
+        )?;
+        drop(state);
 
-        // Build the unsigned transaction
-        // Core reads locktime with getInt<int64_t> and then bounds it:
-        //   if (nLockTime < 0 || nLockTime > LOCKTIME_MAX) throw -8
-        //     "Invalid parameter, locktime out of range"
-        // (rawtransaction_util.cpp ConstructTransaction). All four hostile
-        // widths are valid int64 and therefore reach that -8 -- but typing
-        // this `u32` made serde refuse the call with -32602 first.
-        let lock_time: u32 = match locktime {
-            None | Some(serde_json::Value::Null) => 0,
-            Some(ref v) => {
-                let n = Self::core_get_i64(v)?;
-                if n < 0 || n > i64::from(u32::MAX) {
-                    return Err(Self::rpc_error(
-                        rpc_error::RPC_INVALID_PARAMETER,
-                        "Invalid parameter, locktime out of range",
-                    ));
-                }
-                n as u32
-            }
-        };
-        // FIX-70 / W120 BUG-2: Core's `createpsbt` defaults `rbf` to TRUE (see
-        // bitcoin-core/src/rpc/rawtransaction.cpp::createpsbt — std::optional<bool>
-        // rbf is unset when param is null and then `rbf.value_or(true)` is applied
-        // inside ConstructTransaction). Was `unwrap_or(false)`.
-        let replaceable = replaceable.unwrap_or(true);
-
-        // FIX-70 / W120 BUG-2: Core's `ConstructTransaction`
-        // (bitcoin-core/src/rpc/rawtransaction_util.cpp:47-55):
-        //   if (rbf.value_or(true))             → MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD)
-        //   else if (rawTx.nLockTime)           → MAX_SEQUENCE_NONFINAL    (0xFFFFFFFE)
-        //   else                                → SEQUENCE_FINAL           (0xFFFFFFFF)
-        // Was unconditionally 0xFFFFFFFE for replaceable=true → non-signaling tx
-        // (one above the BIP-125 threshold). Now matches Core exactly.
-        let default_sequence: u32 = if replaceable {
-            MAX_BIP125_RBF_SEQUENCE
-        } else if lock_time != 0 {
-            MAX_SEQUENCE_NONFINAL
-        } else {
-            SEQUENCE_FINAL
-        };
-
-        // Parse inputs
-        let mut tx_inputs = Vec::with_capacity(inputs.len());
-        for input in &inputs {
-            let txid = Self::parse_hash(&input.txid)?;
-            let sequence = input.sequence.unwrap_or(default_sequence);
-            tx_inputs.push(TxIn {
-                previous_output: OutPoint {
-                    txid,
-                    vout: input.vout,
-                },
-                script_sig: vec![],
-                sequence,
-                witness: vec![],
-            });
-        }
-
-        // Parse outputs
-        let mut tx_outputs = Vec::new();
-        for output in &outputs {
-            let obj = output.as_object().ok_or_else(|| {
-                Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Output must be an object")
-            })?;
-
-            for (key, value) in obj {
-                if key == "data" {
-                    // OP_RETURN output
-                    let data_hex = value.as_str().ok_or_else(|| {
-                        Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "data must be a hex string")
-                    })?;
-                    let data = Self::parse_hex(data_hex)?;
-
-                    // Build OP_RETURN script: OP_RETURN <push data>
-                    let mut script = vec![0x6a]; // OP_RETURN
-                    if data.len() <= 75 {
-                        script.push(data.len() as u8);
-                    } else if data.len() <= 255 {
-                        script.push(0x4c); // OP_PUSHDATA1
-                        script.push(data.len() as u8);
-                    } else {
-                        script.push(0x4d); // OP_PUSHDATA2
-                        script.extend_from_slice(&(data.len() as u16).to_le_bytes());
-                    }
-                    script.extend_from_slice(&data);
-
-                    tx_outputs.push(TxOut {
-                        value: 0,
-                        script_pubkey: script,
-                    });
-                } else {
-                    // Address -> amount output
-                    let amount_btc = value.as_f64().ok_or_else(|| {
-                        Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Amount must be a number")
-                    })?;
-
-                    if amount_btc < 0.0 {
-                        return Err(Self::rpc_error(
-                            rpc_error::RPC_INVALID_PARAMS,
-                            "Amount cannot be negative",
-                        ));
-                    }
-
-                    let amount_sats = (amount_btc * COIN as f64).round() as u64;
-
-                    // Decode address to scriptPubKey
-                    let script_pubkey = address_to_script_pubkey(key, &state.params)?;
-
-                    tx_outputs.push(TxOut {
-                        value: amount_sats,
-                        script_pubkey,
-                    });
-                }
-            }
-        }
-
-        // NO empty-inputs rejection. Core's createpsbt builds through
-        // ConstructTransaction (rpc/rawtransaction_util.cpp), which has no such
-        // check — `createpsbt [] [] 1 true 1` returns a PSBT with zero inputs.
-        // The invented -32602 here was a SPURIOUS-REJECT: the differential's
-        // CONTROL (an in-range call both sides must accept) failed on it, which
-        // is exactly what controls are for.
-
-        // Create the unsigned transaction
-        let tx = Transaction {
-            // Was hardcoded 2, discarding the caller's `version`.
-            version: tx_version as i32,
-            inputs: tx_inputs,
-            outputs: tx_outputs,
-            lock_time,
-        };
-
-        // Create PSBT from unsigned transaction
+        // An unsigned tx always makes a valid empty PSBT; a failure here is an
+        // internal inconsistency, not a caller error.
         let psbt = Psbt::from_unsigned_tx(tx).map_err(|e| {
-            Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, format!("Failed to create PSBT: {}", e))
+            Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("Failed to create PSBT: {}", e))
         })?;
 
         Ok(psbt.to_base64())
@@ -11834,28 +13060,129 @@ impl RustoshiRpcServer for RpcServerImpl {
         })
     }
 
-    async fn combinepsbt(&self, psbts: Vec<String>) -> RpcResult<String> {
-        if psbts.is_empty() {
+    async fn utxoupdatepsbt(
+        &self,
+        psbt: serde_json::Value,
+        descriptors: Option<serde_json::Value>,
+    ) -> RpcResult<String> {
+        // Core: RPCHelpMan gate, then EvalDescriptorStringOrObject for each
+        // descriptor, then ProcessPSBT with secrets hidden, no sighash, no
+        // finalize. The method did not exist here before (-32601).
+        Self::core_type_gate(&[
+            ("psbt", Some(&psbt), CoreArgType::Str, false),
+            ("descriptors", descriptors.as_ref(), CoreArgType::Arr, true),
+        ])?;
+        let state = self.state.read().await;
+        let network = Self::addr_network(&state.params);
+        let provider = Self::descriptor_provider(descriptors.as_ref(), network, false)?;
+        let (psbt, _complete) = self.process_psbt(
+            &state,
+            psbt.as_str().unwrap_or_default(),
+            &provider,
+            network,
+            None,
+            true,
+            false,
+            false,
+        )?;
+        Ok(psbt.to_base64())
+    }
+
+    async fn descriptorprocesspsbt(
+        &self,
+        psbt: serde_json::Value,
+        descriptors: serde_json::Value,
+        sighashtype: Option<serde_json::Value>,
+        bip32derivs: Option<serde_json::Value>,
+        finalize: Option<serde_json::Value>,
+    ) -> RpcResult<serde_json::Value> {
+        // Core rawtransaction.cpp descriptorprocesspsbt, in order: RPCHelpMan
+        // gate (-3); descriptors (-8 / -5); ParseSighashString (-8);
+        // bip32derivs / finalize; ProcessPSBT (decode -22, sighash mismatch
+        // -22). The method did not exist here before (-32601).
+        Self::core_type_gate(&[
+            ("psbt", Some(&psbt), CoreArgType::Str, false),
+            ("descriptors", Some(&descriptors), CoreArgType::Arr, false),
+            ("sighashtype", sighashtype.as_ref(), CoreArgType::Str, true),
+            ("bip32derivs", bip32derivs.as_ref(), CoreArgType::Bool, true),
+            ("finalize", finalize.as_ref(), CoreArgType::Bool, true),
+        ])?;
+        let state = self.state.read().await;
+        let network = Self::addr_network(&state.params);
+        let provider = Self::descriptor_provider(Some(&descriptors), network, true)?;
+        let sighash = match sighashtype.as_ref().and_then(|v| v.as_str()) {
+            None => None,
+            Some(s) => Some(Self::core_sighash_from_str(s)?),
+        };
+        let bip32derivs = bip32derivs.and_then(|v| v.as_bool()).unwrap_or(true);
+        let finalize = finalize.and_then(|v| v.as_bool()).unwrap_or(true);
+        let (psbt, complete) = self.process_psbt(
+            &state,
+            psbt.as_str().unwrap_or_default(),
+            &provider,
+            network,
+            sighash,
+            bip32derivs,
+            finalize,
+            true,
+        )?;
+        let mut result = serde_json::Map::new();
+        result.insert("psbt".to_string(), serde_json::Value::String(psbt.to_base64()));
+        result.insert("complete".to_string(), serde_json::Value::Bool(complete));
+        if complete {
+            let tx = psbt.extract_tx().map_err(|e| {
+                Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("extract failed: {}", e))
+            })?;
+            result.insert(
+                "hex".to_string(),
+                serde_json::Value::String(hex::encode(tx.serialize())),
+            );
+        }
+        Ok(serde_json::Value::Object(result))
+    }
+
+    async fn combinepsbt(&self, txs: serde_json::Value) -> RpcResult<String> {
+        // Core rawtransaction.cpp combinepsbt, in order:
+        //   RPCHelpMan gate (-3 non-array) -> empty array -8 "Parameter 'txs'
+        //   cannot be empty" -> per element get_str (-3) + DecodeBase64PSBT
+        //   (-22 "TX decode failed <err>") -> CombinePSBTs failure -8 "PSBTs
+        //   not compatible (different transactions)".
+        // The empty-array and combine arms used to be the transport code -32602.
+        Self::core_type_gate(&[("txs", Some(&txs), CoreArgType::Arr, false)])?;
+        let arr = txs.as_array().cloned().unwrap_or_default();
+        if arr.is_empty() {
             return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                "PSBTs array is empty",
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Parameter 'txs' cannot be empty",
             ));
         }
 
-        // Decode all PSBTs
-        let decoded_psbts: Result<Vec<Psbt>, _> = psbts
-            .iter()
-            .map(|s| {
-                Psbt::from_base64(s).map_err(|e| {
-                    Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, format!("Invalid PSBT: {}", e))
-                })
-            })
-            .collect();
-        let decoded_psbts = decoded_psbts?;
+        let mut decoded_psbts: Vec<Psbt> = Vec::with_capacity(arr.len());
+        for v in &arr {
+            let s = v.as_str().ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type string",
+                        Self::json_uvtype(v)
+                    ),
+                )
+            })?;
+            let p = Psbt::from_base64(s).map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_DESERIALIZATION_ERROR,
+                    format!("TX decode failed {}", e),
+                )
+            })?;
+            decoded_psbts.push(p);
+        }
 
         // Combine them
-        let combined = Psbt::combine(&decoded_psbts).map_err(|e| {
-            Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, format!("Failed to combine PSBTs: {}", e))
+        let combined = Psbt::combine(&decoded_psbts).map_err(|_| {
+            Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "PSBTs not compatible (different transactions)",
+            )
         })?;
 
         Ok(combined.to_base64())
@@ -11952,15 +13279,34 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn converttopsbt(
         &self,
-        hexstring: String,
-        permitsigdata: Option<bool>,
-        iswitness: Option<bool>,
+        hexstring: serde_json::Value,
+        permitsigdata: Option<serde_json::Value>,
+        iswitness: Option<serde_json::Value>,
     ) -> RpcResult<String> {
         // Mirrors `bitcoin-core/src/rpc/rawtransaction.cpp::converttopsbt`.
-        let permitsigdata = permitsigdata.unwrap_or(false);
+        // RPCHelpMan gate first (-3), exactly as Core -- typed params used to
+        // answer the transport code -32602 for any of these.
+        Self::core_type_gate(&[
+            ("hexstring", Some(&hexstring), CoreArgType::Str, false),
+            ("permitsigdata", permitsigdata.as_ref(), CoreArgType::Bool, true),
+            ("iswitness", iswitness.as_ref(), CoreArgType::Bool, true),
+        ])?;
+        let permitsigdata = permitsigdata.and_then(|v| v.as_bool()).unwrap_or(false);
+        let iswitness = iswitness.and_then(|v| v.as_bool());
 
-        // Decode the raw hex first; same error code Core uses on bad hex.
-        let raw = Self::parse_hex(&hexstring)?;
+        // Core: `if (!DecodeHexTx(tx, request.params[0].get_str(), ...)) throw
+        // JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed")` -- a
+        // non-hex string is the same -22 as undecodable bytes.
+        let hexstring = hexstring.as_str().unwrap_or_default();
+        if !Self::core_is_hex(hexstring) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_DESERIALIZATION_ERROR,
+                "TX decode failed",
+            ));
+        }
+        let raw = hex::decode(hexstring).map_err(|_| {
+            Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "TX decode failed")
+        })?;
 
         // Core `DecodeTx` dual-decode strategy
         // (`bitcoin-core/src/core_io.cpp::DecodeTx`):
@@ -12356,266 +13702,31 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn create_raw_transaction(
         &self,
-        inputs: Vec<serde_json::Value>,
+        inputs: serde_json::Value,
         outputs: serde_json::Value,
         locktime: Option<serde_json::Value>,
-        replaceable: Option<bool>,
+        replaceable: Option<serde_json::Value>,
         version: Option<serde_json::Value>,
     ) -> RpcResult<String> {
-        let locktime = Self::parse_createraw_locktime(locktime.as_ref())?;
-        let tx_version = Self::parse_createraw_version(version.as_ref())?;
-        // FIX-70 / W120 BUG-3: Core's `createrawtransaction` defaults `rbf` to
-        // TRUE (see bitcoin-core/src/rpc/rawtransaction.cpp::createrawtransaction
-        // — `std::optional<bool> rbf` is unset when the param is null, then
-        // `rbf.value_or(true)` is applied inside `ConstructTransaction`). Was
-        // `unwrap_or(false)` → API divergence + non-signaling tx by default.
-        //
-        // Keep the ABSENT-vs-EXPLICIT distinction alive. Core carries `rbf` as a
-        // `std::optional<bool>` all the way to the END of `ConstructTransaction`
-        // precisely because its two consumers read it DIFFERENTLY: choosing the
-        // default sequence uses `rbf.value_or(true)` (absent == true), while the
-        // contradiction check at the bottom of this handler uses
-        // `rbf.has_value() && rbf.value()` (absent == no check at all). Folding
-        // the option into a bool here and throwing the original away would
-        // destroy the second reading, so capture it before the shadowing.
-        let rbf_explicit = replaceable;
-        let replaceable = replaceable.unwrap_or(true);
-
-        // Parse inputs
-        let mut tx_inputs = Vec::new();
-        for input in &inputs {
-            let txid_str = input["txid"].as_str().ok_or_else(|| {
-                Self::rpc_error(
-                    rpc_error::RPC_MISC_ERROR,
-                    "JSON value is not a string as expected",
-                )
-            })?;
-            // Core names the ARGUMENT in ParseHashV's message; for this RPC it
-            // is "txid", not the generic "hash" `parse_hash` emits.
-            let txid = Self::parse_hash_named("txid", txid_str)?;
-            // `as_u64() ... as u32` accepted anything non-negative and then
-            // TRUNCATED it: vout 2^32 and vout 2^33 both silently became vout
-            // 0, i.e. a request to spend one outpoint quietly became a request
-            // to spend a DIFFERENT, probably real one. A negative vout took the
-            // ok_or_else arm and reported "Missing vout" at RPC_INVALID_PARAMS,
-            // which is both the wrong code and a false statement -- the key was
-            // present, its value was out of domain.
-            let vout = Self::parse_createraw_vout(input.get("vout"))?;
-            // FIX-70 / W120 BUG-2: mirror Core's `ConstructTransaction` mapping
-            // (bitcoin-core/src/rpc/rawtransaction_util.cpp:47-55):
-            //   replaceable → MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD)
-            //   !replaceable && locktime != 0 → MAX_SEQUENCE_NONFINAL (0xFFFFFFFE)
-            //   !replaceable && locktime == 0 → SEQUENCE_FINAL (0xFFFFFFFF)
-            // Explicit per-input `sequence` always wins. Was emitting 0xFFFFFFFE
-            // unconditionally when explicit-replaceable=false; the locktime
-            // case was correct but the !locktime case was wrong.
-            let default_sequence = if replaceable {
-                MAX_BIP125_RBF_SEQUENCE
-            } else if locktime != 0 {
-                MAX_SEQUENCE_NONFINAL
-            } else {
-                SEQUENCE_FINAL
-            };
-            // The old expression was wrong in two directions at once.
-            // `as_u64() ... as u32` TRUNCATED an out-of-range sequence -- 2^32
-            // became 0, which CLEARS the BIP-68 disable bit and signals BIP-125
-            // replaceability, the opposite of what was asked for. And
-            // `unwrap_or(SEQUENCE_FINAL)` fired for any NON-numeric sequence,
-            // which Core simply ignores (`if (sequenceObj.isNum())`), applying
-            // the default -- so `"sequence": "nope"` produced a NON-replaceable
-            // transaction here and a replaceable one from Core, with no bad
-            // input involved at all.
-            let sequence =
-                Self::parse_createraw_sequence(input.get("sequence"), default_sequence)?;
-            tx_inputs.push(TxIn {
-                previous_output: OutPoint { txid, vout },
-                script_sig: vec![],
-                sequence,
-                witness: vec![],
-            });
-        }
-
-        // Parse outputs.
-        //
-        // Core's NormalizeOutputs (rawtransaction_util.cpp:74-99) accepts the
-        // `outputs` argument as EITHER:
-        //   - a JSON object `{address:amount,...,"data":hex}`, or
-        //   - a JSON array of single-key objects
-        //     `[{address:amount},{"data":hex}]`
-        // translating the array form into an ordered (key,value) list. We
-        // normalize both into `norm_outputs` so the downstream ParseOutputs
-        // logic (duplicate detection, OP_RETURN, address→spk) is identical for
-        // both shapes. Previously this handler only accepted the array form
-        // (the param was typed `Vec<serde_json::Value>`), so the object form was
-        // rejected by the deserializer before reaching here.
-        let mut norm_outputs: Vec<(String, serde_json::Value)> = Vec::new();
-        match &outputs {
-            serde_json::Value::Object(map) => {
-                // serde_json's Map preserves insertion order (preserve_order /
-                // default IndexMap), so this matches Core's UniValue key order.
-                for (key, val) in map {
-                    norm_outputs.push((key.clone(), val.clone()));
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                for entry in arr {
-                    let obj = entry.as_object().ok_or_else(|| {
-                        Self::rpc_error(
-                            rpc_error::RPC_INVALID_PARAMS,
-                            "Invalid parameter, key-value pair not an object as expected",
-                        )
-                    })?;
-                    if obj.len() != 1 {
-                        return Err(Self::rpc_error(
-                            rpc_error::RPC_INVALID_PARAMS,
-                            "Invalid parameter, key-value pair must contain exactly one key",
-                        ));
-                    }
-                    for (key, val) in obj {
-                        norm_outputs.push((key.clone(), val.clone()));
-                    }
-                }
-            }
-            _ => {
-                return Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
-                    "Expected type object or array for outputs",
-                ));
-            }
-        }
-
-        let mut tx_outputs = Vec::new();
-        let mut seen_data = false;
-        let mut seen_addrs: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (key, val) in &norm_outputs {
-            if key == "data" {
-                // OP_RETURN output. Core ParseOutputs rejects a duplicate
-                // "data" key (rawtransaction_util.cpp:109-111).
-                if seen_data {
-                    return Err(Self::rpc_error(
-                        rpc_error::RPC_INVALID_PARAMS,
-                        "Invalid parameter, duplicate key: data",
-                    ));
-                }
-                seen_data = true;
-                let data_hex = val.as_str().ok_or_else(|| {
-                    Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Data must be hexadecimal string")
-                })?;
-                let data = hex::decode(data_hex).map_err(|_| {
-                    Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid data hex")
-                })?;
-                // OP_RETURN <push data>. Match Core's CScript << OP_RETURN << data
-                // minimal-push encoding (direct push ≤75, OP_PUSHDATA1 ≤255,
-                // OP_PUSHDATA2 otherwise — LE length).
-                let mut script = vec![0x6a]; // OP_RETURN
-                if data.len() <= 75 {
-                    script.push(data.len() as u8);
-                } else if data.len() <= 255 {
-                    script.push(0x4c); // OP_PUSHDATA1
-                    script.push(data.len() as u8);
-                } else {
-                    script.push(0x4d); // OP_PUSHDATA2
-                    script.extend_from_slice(&(data.len() as u16).to_le_bytes());
-                }
-                script.extend_from_slice(&data);
-                tx_outputs.push(TxOut {
-                    value: 0,
-                    script_pubkey: script,
-                });
-            } else {
-                // Address output: key is address, val is amount in BTC.
-                let amount_btc = val.as_f64().ok_or_else(|| {
-                    Self::rpc_error(rpc_error::RPC_INVALID_PARAMS, "Invalid amount")
-                })?;
-                let amount_sat = (amount_btc * COIN as f64).round() as u64;
-                let address = rustoshi_crypto::address::Address::from_string(key, None)
-                    .map_err(|e| {
-                        Self::rpc_error(
-                            rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
-                            format!("Invalid address: {}", e),
-                        )
-                    })?;
-                // Core ParseOutputs rejects a duplicated address
-                // (rawtransaction_util.cpp:124-126).
-                if !seen_addrs.insert(key.clone()) {
-                    return Err(Self::rpc_error(
-                        rpc_error::RPC_INVALID_PARAMS,
-                        format!("Invalid parameter, duplicated address: {}", key),
-                    ));
-                }
-                let script = address.to_script_pubkey();
-                tx_outputs.push(TxOut {
-                    value: amount_sat,
-                    script_pubkey: script,
-                });
-            }
-        }
-
-        // Core: `ConstructTransaction` (rawtransaction_util.cpp:166-168), run
-        // AFTER both AddInputs AND AddOutputs:
-        //
-        //   if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
-        //       !SignalsOptInRBF(CTransaction(rawTx))) {
-        //       throw JSONRPCError(RPC_INVALID_PARAMETER,
-        //           "Invalid parameter combination: Sequence number(s) contradict replaceable option");
-        //   }
-        //
-        // with `SignalsOptInRBF` (util/rbf.cpp:9-17) true iff ANY input has
-        // `nSequence <= MAX_BIP125_RBF_SEQUENCE` (util/rbf.h:12, 0xfffffffd).
-        //
-        // WHY THIS MATTERS: nine of the ten nodes in this repo silently ACCEPT
-        // the contradiction today. A caller who explicitly asks for
-        // `replaceable=true` and ALSO pins a final sequence (0xFFFFFFFF, or the
-        // 0xFFFFFFFE that a non-final-locktime workflow hands you) gets back a
-        // perfectly well-formed transaction that CANNOT be fee-bumped, with no
-        // error and no warning: the explicit per-input sequence wins, the
-        // `replaceable` flag is quietly discarded, and the caller only finds out
-        // when `bumpfee` refuses it (BIP-125 Rule 1) with the fee already stuck.
-        // Core refuses to guess which half of the request was meant and errors
-        // out; so do we.
-        //
-        // The three conditions, and why each is exactly as narrow as Core's:
-        //   1. `rbf_explicit == Some(true)` — the flag was SUPPLIED as true.
-        //      An ABSENT (or JSON-null) `replaceable` does NOT arm this check
-        //      even though it still DEFAULTS to true for picking the sequence
-        //      above. That asymmetry is real and deliberate in Core
-        //      (`rbf.value_or(true)` for the default vs
-        //      `rbf.has_value() && rbf.value()` here): omitting the argument is
-        //      not a request, so a caller who only sets `sequence` has not
-        //      contradicted anything and must not be rejected.
-        //   2. at least one input — a no-input skeleton (the PSBT/funding
-        //      workflow's starting point) has no sequence to contradict.
-        //   3. NO input signals — one signaling input is enough to make the
-        //      transaction replaceable, so a mixed set is legal. Rejecting on
-        //      "not ALL inputs signal" would break multi-input RBF.
-        //
-        // Placed here, after outputs are parsed, so an output error still wins —
-        // same ordering as Core.
-        let signals_opt_in_rbf = tx_inputs
-            .iter()
-            .any(|txin| txin.sequence <= MAX_BIP125_RBF_SEQUENCE);
-        if rbf_explicit == Some(true) && !tx_inputs.is_empty() && !signals_opt_in_rbf {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMETER,
-                "Invalid parameter combination: Sequence number(s) contradict replaceable option",
-            ));
-        }
-
-        let tx = Transaction {
-            // Was hardcoded 2, which silently discarded the caller's
-            // `version` and returned a v2 transaction with a success reply.
-            // The cast is safe by construction: parse_createraw_version has
-            // already bounded the value to [1, 3].
-            version: tx_version as i32,
-            inputs: tx_inputs,
-            outputs: tx_outputs,
-            lock_time: locktime,
-        };
-
+        let state = self.state.read().await;
+        let tx = Self::core_construct_transaction(
+            &state.params,
+            &inputs,
+            &outputs,
+            locktime.as_ref(),
+            replaceable.as_ref(),
+            version.as_ref(),
+        )?;
         Ok(hex::encode(tx.serialize()))
     }
 
-    async fn decode_script(&self, hex_str: String) -> RpcResult<serde_json::Value> {
+    async fn decode_script(&self, hexstring: serde_json::Value) -> RpcResult<serde_json::Value> {
+        // Core: RPCHelpMan gate (-3 on non-string), then
+        // `ParseHexV(request.params[0], "argument")` for a NON-EMPTY string:
+        // non-hex is RPC_INVALID_PARAMETER (-8) "argument must be hexadecimal
+        // string (not '<s>')" (was the transport code -32602).
+        Self::core_type_gate(&[("hexstring", Some(&hexstring), CoreArgType::Str, false)])?;
+        let hex_str = hexstring.as_str().unwrap_or_default().to_string();
         // Reference: bitcoin-core/src/rpc/rawtransaction.cpp `decodescript` handler.
         //
         // Shape mirrors ScriptToUniv(script, /*include_hex=*/false) for top level:
@@ -12647,7 +13758,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         let bytes = if hex_str.is_empty() {
             Vec::new()
         } else {
-            Self::parse_hex(&hex_str)?
+            Self::core_parse_hex_v(&hex_str, "argument")?
         };
 
         let params = {
@@ -13440,6 +14551,14 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getrpcinfo" => "getrpcinfo\nReturns details of the RPC server.",
                 "submitheader" => "submitheader \"hexdata\"\nDecode the given hexdata as a header and submit it as a candidate chain tip if valid.",
                 "analyzepsbt" => "analyzepsbt \"psbt\"\nAnalyzes and provides information about the current status of a PSBT and its inputs.",
+                "gettxoutsetinfo" => "gettxoutsetinfo ( \"hash_type\" hash_or_height use_index )\nReturns statistics about the unspent transaction output set.",
+                "getnetworkhashps" => "getnetworkhashps ( nblocks height )\nReturns the estimated network hashes per second based on the last n blocks.",
+                "scantxoutset" => "scantxoutset \"action\" ( [scanobjects,...] )\nScans the unspent transaction output set for entries that match certain output descriptors.",
+                "submitpackage" => "submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )\nSubmit a package of raw transactions (serialized, hex-encoded) to local node.",
+                "verifytxoutproof" => "verifytxoutproof \"proof\"\nVerifies that a proof points to a transaction in a block, returning the transaction it commits to\nand throwing an RPC error if the block is not in our best chain.",
+                "importmempool" => "importmempool \"filepath\" ( options )\nImport a mempool.dat file and attempt to add its contents to the mempool.",
+                "utxoupdatepsbt" => "utxoupdatepsbt \"psbt\" ( [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] )\nUpdates all segwit inputs and outputs in a PSBT with data from output descriptors, the UTXO set, txindex, or the mempool.",
+                "descriptorprocesspsbt" => "descriptorprocesspsbt \"psbt\" [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] ( \"sighashtype\" bip32derivs finalize )\nUpdate all segwit inputs in a PSBT with information from output descriptors, the UTXO set or the mempool.\nThen, sign the inputs we are able to with information from the output descriptors.",
                 "signrawtransactionwithkey" => "signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\",\"witnessScript\":\"hex\",\"amount\":amount},...] \"sighashtype\" )\nSign inputs for raw transaction (serialized, hex-encoded).",
                 _ => "Unknown command. Use \"help\" for a list of all commands.",
             };
@@ -13451,17 +14570,18 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "getblockfilter", "getblockfrompeer", "getblockhash", "getblockheader",
                 "getblockstats", "getchainstates", "getchaintips",
                 "getchaintxstats", "getdeploymentinfo", "getdifficulty", "gettxout",
-                "gettxoutproof", "gettxspendingprevout",
-                "invalidateblock", "preciousblock", "pruneblockchain", "reconsiderblock",
+                "gettxoutproof", "gettxoutsetinfo", "gettxspendingprevout",
+                "importmempool", "invalidateblock", "preciousblock", "pruneblockchain",
+                "reconsiderblock", "scanblocks", "scantxoutset", "verifytxoutproof",
                 "verifychain", "waitforblock", "waitforblockheight", "waitfornewblock",
                 "",
                 "== Mempool ==",
                 "dumpmempool", "getmempoolancestors", "getmempooldescendants",
                 "getmempoolentry", "getmempoolinfo", "getorphantxs", "getrawmempool", "loadmempool",
-                "savemempool", "testmempoolaccept",
+                "savemempool", "submitpackage", "testmempoolaccept",
                 "",
                 "== Mining ==",
-                "getblocktemplate", "getmininginfo", "getprioritisedtransactions",
+                "getblocktemplate", "getmininginfo", "getnetworkhashps", "getprioritisedtransactions",
                 "prioritisetransaction", "submitblock", "submitheader",
                 "",
                 "== Network ==",
@@ -13487,7 +14607,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "",
                 "== PSBT ==",
                 "analyzepsbt", "combinepsbt", "converttopsbt", "createpsbt", "decodepsbt",
-                "finalizepsbt", "joinpsbts", "walletprocesspsbt",
+                "descriptorprocesspsbt", "finalizepsbt", "joinpsbts", "utxoupdatepsbt",
+                "walletprocesspsbt",
                 "",
                 "== Util ==",
                 "estimaterawfee", "estimatesmartfee", "getindexinfo", "getnettotals", "help",
@@ -13534,20 +14655,14 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
-        // Decode the base64-encoded compact-recoverable signature.
-        let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(signature.trim()) {
-            Ok(b) => b,
-            Err(_) => {
-                return Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
-                    "Malformed base64 encoding",
-                ))
-            }
-        };
-
-        // Parse the address up-front; we need its hash to compare against the
-        // recovered pubkey hash. Rejecting bech32 (segwit/taproot) addresses
-        // matches Core, which restricts `verifymessage` to legacy P2PKH.
+        // Core common/signmessage.cpp MessageVerify checks, IN THIS ORDER:
+        // address validity (-5 "Invalid address"), address is P2PKH (-3
+        // "Address does not refer to key"), THEN the base64 signature (-3
+        // "Malformed base64 encoding", rpc/signmessage.cpp). The base64 arm
+        // used to run first and answer the transport code -32602.
+        //
+        // Rejecting bech32 (segwit/taproot) addresses matches Core, which
+        // restricts `verifymessage` to legacy P2PKH.
         let parsed = Address::from_string(&address, None).map_err(|_| {
             Self::rpc_error(rpc_error::RPC_INVALID_ADDRESS_OR_KEY, "Invalid address")
         })?;
@@ -13556,7 +14671,18 @@ impl RustoshiRpcServer for RpcServerImpl {
             _ => {
                 return Err(Self::rpc_error(
                     rpc_error::RPC_TYPE_ERROR,
-                    "Address does not refer to a P2PKH key",
+                    "Address does not refer to key",
+                ))
+            }
+        };
+
+        // Decode the base64-encoded compact-recoverable signature.
+        let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(signature.trim()) {
+            Ok(b) => b,
+            Err(_) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    "Malformed base64 encoding",
                 ))
             }
         };
@@ -13638,11 +14764,28 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn create_multisig(
         &self,
         nrequired: serde_json::Value,
-        keys: Vec<String>,
-        address_type: Option<String>,
+        keys: serde_json::Value,
+        address_type: Option<serde_json::Value>,
     ) -> RpcResult<CreateMultisigResult> {
-        // The conversion runs before the key-count checks: Core answers -1 for
-        // an out-of-int32 nrequired even when pubkeys is ALSO empty.
+        // Core rpc/output_script.cpp createmultisig + rpc/util.cpp
+        // (HexToPubKey, AddAndGetMultisigDestination), in Core's ORDER:
+        //   1. RPCHelpMan gate (-3);
+        //   2. nrequired getInt<int> (-1 out of int32);
+        //   3. EVERY key: get_str (-3), then HexToPubKey (-5: not hex / not
+        //      33-or-65 bytes / not on the curve);
+        //   4. address_type (-5 unknown, -5 bech32m);
+        //   5. only now the count checks (-8): nrequired < 1, fewer keys than
+        //      nrequired, more than 20 keys; then the 520-byte P2SH limit (-8).
+        // So createmultisig(3, ["deadbeef","deadbeef"]) is -5, not -8. Every
+        // arm here used to be the transport code -32602, and uncompressed keys
+        // and 17-20 key sets (both valid in Core) were refused outright.
+        Self::core_type_gate(&[
+            ("nrequired", Some(&nrequired), CoreArgType::Num, false),
+            ("keys", Some(&keys), CoreArgType::Arr, false),
+            ("address_type", address_type.as_ref(), CoreArgType::Str, true),
+        ])?;
+        // The conversion runs before the key checks: Core answers -1 for an
+        // out-of-int32 nrequired even when the keys are ALSO bad.
         let nrequired = Self::core_get_i32(&nrequired)?;
         use rustoshi_crypto::{
             address::{Address, Network},
@@ -13651,77 +14794,139 @@ impl RustoshiRpcServer for RpcServerImpl {
         };
         use rustoshi_wallet::descriptor::add_checksum;
 
-        let addr_type = address_type.as_deref().unwrap_or("legacy");
-
-        // Validate address_type
-        match addr_type {
-            "legacy" | "bech32" | "p2sh-segwit" => {}
-            other => {
-                return Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
-                    format!("Unknown address_type '{}'", other),
-                ));
-            }
-        }
-
-        let n_keys = keys.len();
-
-        // Validate key count (1..=16)
-        if n_keys < 1 || n_keys > 16 {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                format!("Number of keys {} is not in range [1..16]", n_keys),
-            ));
-        }
-
-        // Validate nrequired (1..=n_keys)
-        let n_required = nrequired as usize;
-        if n_required < 1 || n_required > n_keys {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                format!(
-                    "Multisig threshold {} is not in range [1..{}]",
-                    n_required, n_keys
-                ),
-            ));
-        }
-
-        // Parse and validate each pubkey (must be 33-byte compressed secp256k1)
-        let mut pubkey_bytes: Vec<Vec<u8>> = Vec::with_capacity(n_keys);
-        for (i, pk_hex) in keys.iter().enumerate() {
-            let pk_raw = hex::decode(pk_hex).map_err(|_| {
+        let key_values = keys.as_array().cloned().unwrap_or_default();
+        let mut keys: Vec<String> = Vec::with_capacity(key_values.len());
+        let mut pubkey_bytes: Vec<Vec<u8>> = Vec::with_capacity(key_values.len());
+        for v in &key_values {
+            let pk_hex = v.as_str().ok_or_else(|| {
                 Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
-                    format!("Pubkey {} is not valid hex", i),
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type string",
+                        Self::json_uvtype(v)
+                    ),
                 )
             })?;
-            if pk_raw.len() != 33 {
+            if !Self::core_is_hex(pk_hex) {
                 return Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
-                    format!("Pubkey {} is not compressed (must be 33 bytes)", i),
+                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                    format!("Pubkey \"{}\" must be a hex string", pk_hex),
                 ));
             }
-            // Verify the point is on the secp256k1 curve
-            parse_public_key(&pk_raw).map_err(|_| {
-                Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
-                    format!("Pubkey {} is not a valid secp256k1 public key", i),
-                )
-            })?;
+            if pk_hex.len() != 66 && pk_hex.len() != 130 {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                    format!(
+                        "Pubkey \"{}\" must have a length of either 33 or 65 bytes",
+                        pk_hex
+                    ),
+                ));
+            }
+            let pk_raw = hex::decode(pk_hex).unwrap_or_default();
+            // CPubKey::IsFullyValid: the right header byte for the length
+            // (0x02/0x03 for 33, 0x04 for 65) AND a point on the curve.
+            let header_ok = match pk_raw.len() {
+                33 => pk_raw[0] == 0x02 || pk_raw[0] == 0x03,
+                65 => pk_raw[0] == 0x04 || pk_raw[0] == 0x06 || pk_raw[0] == 0x07,
+                _ => false,
+            };
+            if !header_ok || parse_public_key(&pk_raw).is_err() {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                    format!("Pubkey \"{}\" must be cryptographically valid.", pk_hex),
+                ));
+            }
+            // InferDescriptor prints the key as lowercase HexStr.
+            keys.push(hex::encode(&pk_raw));
             pubkey_bytes.push(pk_raw);
         }
 
-        // Build redeemScript: OP_M || (0x21 || pk)*N || OP_N || OP_CHECKMULTISIG
-        // OP_1..OP_16 = 0x51..0x60
-        let rs_capacity = 1 + n_keys * (1 + 33) + 1 + 1;
-        let mut rs: Vec<u8> = Vec::with_capacity(rs_capacity);
-        rs.push(0x50u8 + n_required as u8); // OP_M
+        // Core: self.Arg<std::string_view>("address_type") (default "legacy")
+        // through ParseOutputType, which knows exactly these four names.
+        let requested_type = address_type
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("legacy")
+            .to_string();
+        match requested_type.as_str() {
+            "legacy" | "bech32" | "p2sh-segwit" => {}
+            "bech32m" => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                    "createmultisig cannot create bech32m multisig addresses",
+                ));
+            }
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
+                    format!("Unknown address type '{}'", other),
+                ));
+            }
+        }
+
+        let n_keys = pubkey_bytes.len();
+        if nrequired < 1 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "a multisignature address must require at least one key to redeem",
+            ));
+        }
+        if (n_keys as i64) < i64::from(nrequired) {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                format!(
+                    "not enough keys supplied (got {} keys, but need at least {} to redeem)",
+                    n_keys, nrequired
+                ),
+            ));
+        }
+        if n_keys > 20 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Number of keys involved in the multisignature address creation > 20\nReduce the number",
+            ));
+        }
+        let n_required = nrequired as usize;
+
+        // Core GetScriptForMultisig: CScript() << nRequired << keys... << n
+        // << OP_CHECKMULTISIG. A small int 1..16 is OP_1..OP_16; 17..20 is a
+        // one-byte minimal push (CScriptNum).
+        let push_small_int = |rs: &mut Vec<u8>, n: usize| {
+            if (1..=16).contains(&n) {
+                rs.push(0x50u8 + n as u8);
+            } else {
+                rs.push(0x01);
+                rs.push(n as u8);
+            }
+        };
+        let mut rs: Vec<u8> = Vec::with_capacity(3 + n_keys * 66);
+        push_small_int(&mut rs, n_required);
         for pk in &pubkey_bytes {
-            rs.push(0x21); // push 33 bytes
+            rs.push(pk.len() as u8); // 0x21 or 0x41: direct push
             rs.extend_from_slice(pk);
         }
-        rs.push(0x50u8 + n_keys as u8); // OP_N
+        push_small_int(&mut rs, n_keys);
         rs.push(0xae); // OP_CHECKMULTISIG
+
+        // Core: any uncompressed key forces LEGACY; the 520-byte limit is
+        // checked only for LEGACY (P2SH redeemScript push limit).
+        let has_uncompressed = pubkey_bytes.iter().any(|pk| pk.len() != 33);
+        let effective_type: &str = if has_uncompressed { "legacy" } else { requested_type.as_str() };
+        if effective_type == "legacy" && rs.len() > 520 {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                format!("redeemScript exceeds size limit: {} > 520", rs.len()),
+            ));
+        }
+        let addr_type = effective_type;
+        let warnings = if effective_type != requested_type {
+            Some(vec![
+                "Unable to make chosen address type, please ensure no uncompressed public keys are present."
+                    .to_string(),
+            ])
+        } else {
+            None
+        };
 
         let rs_hex = hex::encode(&rs);
 
@@ -13794,6 +14999,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             address: addr_str,
             redeem_script: rs_hex,
             descriptor,
+            warnings,
         })
     }
 
@@ -14989,9 +16195,11 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn scan_tx_out_set(
         &self,
-        action: String,
+        action: serde_json::Value,
         scanobjects: Option<Vec<String>>,
     ) -> RpcResult<serde_json::Value> {
+        Self::core_type_gate(&[("action", Some(&action), CoreArgType::Str, false)])?;
+        let action = action.as_str().unwrap_or_default().to_string();
         // Mirrors Bitcoin Core rpc/blockchain.cpp::scantxoutset.
         //
         // rustoshi runs the scan synchronously within this RPC call, so
@@ -15004,8 +16212,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             "abort" => return Ok(serde_json::Value::Bool(false)),
             "start" => {}
             other => {
+                // Core blockchain.cpp:2471 -- RPC_INVALID_PARAMETER (-8).
                 return Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
+                    rpc_error::RPC_INVALID_PARAMETER,
                     format!("Invalid action '{}'", other),
                 ));
             }
@@ -15434,17 +16643,24 @@ impl RustoshiRpcServer for RpcServerImpl {
         Ok(hex::encode(proof))
     }
 
-    async fn verify_tx_out_proof(&self, proof: String) -> RpcResult<Vec<String>> {
+    async fn verify_tx_out_proof(&self, proof: serde_json::Value) -> RpcResult<Vec<String>> {
         // Native-only: verify the partial merkle tree against rustoshi's own
         // block store. No Bitcoin Core proxy — an independent node must not
         // delegate proof verification to (or leak credentials to) an external
         // Core instance. The native verifier below is authoritative.
         use sha2::Digest;
-        let proof_bytes = hex::decode(&proof).map_err(|_| {
-            Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Invalid hex")
-        })?;
+        // Core txoutproof.cpp: `DataStream ssMB{ParseHexV(request.params[0],
+        // "proof")}` -- a non-hex proof is RPC_INVALID_PARAMETER (-8)
+        // "proof must be hexadecimal string (not '<s>')", not -22.
+        Self::core_type_gate(&[("proof", Some(&proof), CoreArgType::Str, false)])?;
+        let proof_bytes = Self::core_parse_hex_v(proof.as_str().unwrap_or_default(), "proof")?;
         if proof_bytes.len() < 84 {
-            return Err(Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "Proof too short"));
+            // Core's `ssMB >> merkleBlock` runs off the end of the stream and
+            // the std::ios_base::failure surfaces as RPC_MISC_ERROR (-1).
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "SpanReader::read(): end of data: iostream error",
+            ));
         }
 
         let header_bytes = &proof_bytes[..80];
@@ -15626,7 +16842,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     /// index; no consensus surface.
     async fn scan_blocks(
         &self,
-        action: String,
+        action: serde_json::Value,
         scanobjects: Option<Vec<String>>,
         start_height: Option<i64>,
         stop_height: Option<i64>,
@@ -15634,6 +16850,8 @@ impl RustoshiRpcServer for RpcServerImpl {
         options: Option<serde_json::Value>,
     ) -> RpcResult<serde_json::Value> {
         use rustoshi_storage::indexes::blockfilterindex::BlockFilterType;
+        Self::core_type_gate(&[("action", Some(&action), CoreArgType::Str, false)])?;
+        let action = action.as_str().unwrap_or_default().to_string();
 
         // (1) Action dispatch (Core 2578-2596). rustoshi scans synchronously,
         // so there is never an in-progress scan: "status" -> null (Core's
@@ -15644,12 +16862,10 @@ impl RustoshiRpcServer for RpcServerImpl {
             "abort" => return Ok(serde_json::Value::Bool(false)),
             "start" => {}
             other => {
-                // Core throws RPC_INVALID_PARAMETER (-8) here; rustoshi uses
-                // RPC_INVALID_PARAMS (-32602) for the unknown top-level action,
-                // consistent with scan_tx_out_set. (Differential gates on
-                // "is an error", not the exact code, for the action case.)
+                // Core blockchain.cpp:2713 -- RPC_INVALID_PARAMETER (-8). This
+                // used to answer the transport code -32602.
                 return Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMS,
+                    rpc_error::RPC_INVALID_PARAMETER,
                     format!("Invalid action '{}'", other),
                 ));
             }
@@ -15831,8 +17047,13 @@ impl RustoshiRpcServer for RpcServerImpl {
     /// at the tip the moment connect_tip returns).
     async fn get_index_info(
         &self,
-        index_name: Option<String>,
+        index_name: Option<serde_json::Value>,
     ) -> RpcResult<Box<serde_json::value::RawValue>> {
+        // Core RPCHelpMan gate: `index_name` is an optional STR, so
+        // getindexinfo(123) is -3 "Wrong type passed" (was serde's -32602).
+        Self::core_type_gate(&[("index_name", index_name.as_ref(), CoreArgType::Str, true)])?;
+        let index_name: Option<String> =
+            index_name.as_ref().and_then(|v| v.as_str()).map(str::to_string);
         // FIX (W121 G27 wire key-order): Bitcoin Core builds each per-index
         // entry with UniValue `pushKV("synced", ...)` then
         // `pushKV("best_block_height", ...)` (rpc/node.cpp::SummaryToJSON,
@@ -24149,7 +25370,7 @@ mod tests {
         let peer_state = Arc::new(RwLock::new(PeerState::default()));
         let rpc = RpcServerImpl::new(state, peer_state);
 
-        let err = rpc.prune_blockchain(0).await.expect_err("should reject");
+        let err = rpc.prune_blockchain(serde_json::json!(0)).await.expect_err("should reject");
         let msg = format!("{}", err);
         assert!(
             msg.contains("not in prune mode"),
@@ -24172,9 +25393,12 @@ mod tests {
         let params = rustoshi_consensus::ChainParams::regtest();
 
         // Build a synthetic chain so manual prune has something to drop.
+        // Core refuses to prune a chain shorter than nPruneAfterHeight (1000
+        // on regtest: "Blockchain is too short for pruning."), so the chain
+        // must reach past it.
         {
             let store = BlockStore::new(&db);
-            let tip = MIN_BLOCKS_TO_KEEP + 50;
+            let tip = 1000 + MIN_BLOCKS_TO_KEEP + 50;
             for h in 1..=tip {
                 let header = BlockHeader {
                     version: 1,
@@ -24242,7 +25466,7 @@ mod tests {
         let rpc = RpcServerImpl::new(state, peer_state);
 
         // Manual prune to height 5.
-        let returned = rpc.prune_blockchain(5).await.expect("prune");
+        let returned = rpc.prune_blockchain(serde_json::json!(5)).await.expect("prune");
         assert_eq!(returned, 5);
 
         // Verify low blocks dropped, high blocks intact.
@@ -24815,19 +26039,19 @@ mod tests {
             hex::encode(d)
         };
         // Active block with a body: the proven txid.
-        let got = rpc.verify_tx_out_proof(r5di_single_tx_proof(&blocks[14])).await.expect("active");
+        let got = rpc.verify_tx_out_proof(serde_json::Value::String(r5di_single_tx_proof(&blocks[14]))).await.expect("active");
         assert_eq!(got, vec![txid(&blocks[14])]);
         // Active block whose body is pruned: Core needs only the index.
-        let got = rpc.verify_tx_out_proof(r5di_single_tx_proof(&blocks[12])).await.expect("pruned active");
+        let got = rpc.verify_tx_out_proof(serde_json::Value::String(r5di_single_tx_proof(&blocks[12]))).await.expect("pruned active");
         assert_eq!(got, vec![txid(&blocks[12])]);
         // Stale block: Core -5 "Block not found in chain" (ActiveChain().Contains).
-        let e = rpc.verify_tx_out_proof(r5di_single_tx_proof(&stale)).await.expect_err("stale");
+        let e = rpc.verify_tx_out_proof(serde_json::Value::String(r5di_single_tx_proof(&stale))).await.expect_err("stale");
         assert_eq!(e.code(), -5, "{}", e.message());
         // Root mismatch: Core returns the EMPTY array, not an error.
         let mut bad = hex::decode(r5di_single_tx_proof(&blocks[14])).unwrap();
         let n = bad.len();
         bad[n - 3] ^= 0xff; // corrupt the single hash
-        let got = rpc.verify_tx_out_proof(hex::encode(bad)).await.expect("mismatch is not an error");
+        let got = rpc.verify_tx_out_proof(serde_json::Value::String(hex::encode(bad))).await.expect("mismatch is not an error");
         assert!(got.is_empty(), "{got:?}");
     }
 
@@ -25382,16 +26606,12 @@ mod tests {
     #[tokio::test]
     async fn fix70_createpsbt_default_replaceable_is_rbf_sequence() {
         let server = setup_test_server();
-        let inputs = vec![CreatePsbtInput {
-            txid: "00".repeat(32),
-            vout: 0,
-            sequence: None,
-        }];
+        let inputs = serde_json::json!([{"txid": "00".repeat(32), "vout": 0}]);
         let outputs = vec![serde_json::json!({
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, None, None, None)
+            .createpsbt(inputs, serde_json::Value::Array(outputs), None, None, None)
             .await
             .expect("createpsbt must succeed with valid inputs/outputs");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -25410,16 +26630,12 @@ mod tests {
     #[tokio::test]
     async fn fix70_createpsbt_explicit_replaceable_true_is_rbf_sequence() {
         let server = setup_test_server();
-        let inputs = vec![CreatePsbtInput {
-            txid: "00".repeat(32),
-            vout: 0,
-            sequence: None,
-        }];
+        let inputs = serde_json::json!([{"txid": "00".repeat(32), "vout": 0}]);
         let outputs = vec![serde_json::json!({
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, Some(serde_json::json!(0)), Some(true), None)
+            .createpsbt(inputs, serde_json::Value::Array(outputs), Some(serde_json::json!(0)), Some(serde_json::json!(true)), None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -25434,16 +26650,12 @@ mod tests {
     #[tokio::test]
     async fn fix70_createpsbt_no_rbf_no_locktime_is_sequence_final() {
         let server = setup_test_server();
-        let inputs = vec![CreatePsbtInput {
-            txid: "00".repeat(32),
-            vout: 0,
-            sequence: None,
-        }];
+        let inputs = serde_json::json!([{"txid": "00".repeat(32), "vout": 0}]);
         let outputs = vec![serde_json::json!({
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, Some(serde_json::json!(0)), Some(false), None)
+            .createpsbt(inputs, serde_json::Value::Array(outputs), Some(serde_json::json!(0)), Some(serde_json::json!(false)), None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -25458,16 +26670,12 @@ mod tests {
     #[tokio::test]
     async fn fix70_createpsbt_no_rbf_with_locktime_is_sequence_nonfinal() {
         let server = setup_test_server();
-        let inputs = vec![CreatePsbtInput {
-            txid: "00".repeat(32),
-            vout: 0,
-            sequence: None,
-        }];
+        let inputs = serde_json::json!([{"txid": "00".repeat(32), "vout": 0}]);
         let outputs = vec![serde_json::json!({
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, Some(serde_json::json!(500_000)), Some(false), None)
+            .createpsbt(inputs, serde_json::Value::Array(outputs), Some(serde_json::json!(500_000)), Some(serde_json::json!(false)), None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -25481,16 +26689,12 @@ mod tests {
     #[tokio::test]
     async fn fix70_createpsbt_explicit_input_sequence_wins() {
         let server = setup_test_server();
-        let inputs = vec![CreatePsbtInput {
-            txid: "00".repeat(32),
-            vout: 0,
-            sequence: Some(42),
-        }];
+        let inputs = serde_json::json!([{"txid": "00".repeat(32), "vout": 0, "sequence": 42}]);
         let outputs = vec![serde_json::json!({
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         })];
         let psbt_b64 = server
-            .createpsbt(inputs, outputs, None, None, None)
+            .createpsbt(inputs, serde_json::Value::Array(outputs), None, None, None)
             .await
             .expect("createpsbt must succeed");
         let seq = decode_psbt_first_input_sequence(&psbt_b64);
@@ -25542,7 +26746,7 @@ mod tests {
         let server = setup_test_server();
         let outputs = serde_json::json!({});
         match server
-            .create_raw_transaction(vec![input], outputs, locktime, None, None)
+            .create_raw_transaction(serde_json::json!([input]), outputs, locktime, None, None)
             .await
         {
             Ok(hex) => panic!("expected an error, got a transaction: {hex}"),
@@ -25592,7 +26796,7 @@ mod tests {
         let input = serde_json::json!({"txid": "aa".repeat(32), "vout": 0});
         let outputs = serde_json::json!({"data": "deadbeef"});
         server
-            .create_raw_transaction(vec![input], outputs, None, None, v)
+            .create_raw_transaction(serde_json::json!([input]), outputs, None, None, v)
             .await
             .map_err(|e| (e.code(), e.message().to_string()))
     }
@@ -25758,7 +26962,7 @@ mod tests {
             "txid": "aa".repeat(32), "vout": 0, "sequence": "nope",
         })];
         let hex = server
-            .create_raw_transaction(inputs, serde_json::json!({}), None, None, None)
+            .create_raw_transaction(serde_json::Value::Array(inputs), serde_json::json!({}), None, None, None)
             .await
             .expect("createrawtransaction must succeed");
         let (_vout, seq) = decode_first_input(&hex);
@@ -25779,7 +26983,7 @@ mod tests {
         })];
         let hex = server
             .create_raw_transaction(
-                inputs,
+                serde_json::Value::Array(inputs),
                 serde_json::json!({}),
                 Some(serde_json::json!(4294967295u64)),
                 None,
@@ -25808,7 +27012,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         });
         let hex = server
-            .create_raw_transaction(inputs, outputs, None, None, None)
+            .create_raw_transaction(serde_json::Value::Array(inputs), outputs, None, None, None)
             .await
             .expect("createrawtransaction must succeed");
         let bytes = hex::decode(&hex).expect("hex");
@@ -25835,7 +27039,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         }]);
         let hex = server
-            .create_raw_transaction(inputs, outputs, Some(serde_json::json!(500_000)), Some(false), None)
+            .create_raw_transaction(serde_json::Value::Array(inputs), outputs, Some(serde_json::json!(500_000)), Some(serde_json::json!(false)), None)
             .await
             .expect("createrawtransaction must succeed");
         let bytes = hex::decode(&hex).expect("hex");
@@ -25861,7 +27065,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         }]);
         let hex = server
-            .create_raw_transaction(inputs, outputs, Some(serde_json::json!(0)), Some(false), None)
+            .create_raw_transaction(serde_json::Value::Array(inputs), outputs, Some(serde_json::json!(0)), Some(serde_json::json!(false)), None)
             .await
             .expect("createrawtransaction must succeed");
         let bytes = hex::decode(&hex).expect("hex");
@@ -25953,7 +27157,7 @@ mod tests {
             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": 0.01
         });
         server
-            .create_raw_transaction(inputs, outputs, None, replaceable, None)
+            .create_raw_transaction(serde_json::Value::Array(inputs), outputs, None, replaceable.map(serde_json::Value::Bool), None)
             .await
             .map_err(|e| (e.code(), e.message().to_string()))
     }
@@ -26558,7 +27762,7 @@ mod tests {
         let (_db, _state, server) = make_test_server(params);
         let result = RustoshiRpcServer::scan_blocks(
             &server,
-            "status".to_string(),
+            serde_json::json!("status"),
             None,
             None,
             None,
@@ -26579,7 +27783,7 @@ mod tests {
         let (_db, _state, server) = make_test_server(params);
         let result = RustoshiRpcServer::scan_blocks(
             &server,
-            "abort".to_string(),
+            serde_json::json!("abort"),
             None,
             None,
             None,
@@ -26599,7 +27803,7 @@ mod tests {
         let (_db, _state, server) = make_test_server(params);
         let err = RustoshiRpcServer::scan_blocks(
             &server,
-            "bogus".to_string(),
+            serde_json::json!("bogus"),
             None,
             None,
             None,
@@ -26608,7 +27812,9 @@ mod tests {
         )
         .await
         .expect_err("bogus action must error");
-        assert_eq!(err.code(), rpc_error::RPC_INVALID_PARAMS);
+        // Core blockchain.cpp:2713 -- RPC_INVALID_PARAMETER (-8). This pin
+        // used to assert the transport code -32602, i.e. it locked the bug in.
+        assert_eq!(err.code(), rpc_error::RPC_INVALID_PARAMETER);
     }
 
     /// `scanblocks start ... bogustype` returns RPC_INVALID_ADDRESS_OR_KEY (-5)
@@ -26621,7 +27827,7 @@ mod tests {
         let (_db, _state, server) = make_test_server(params);
         let err = RustoshiRpcServer::scan_blocks(
             &server,
-            "start".to_string(),
+            serde_json::json!("start"),
             Some(vec!["raw(0014000000000000000000000000000000000000dead)".to_string()]),
             Some(0),
             None,
@@ -26648,7 +27854,7 @@ mod tests {
         let (_db, _state, server) = make_test_server(params);
         let err = RustoshiRpcServer::scan_blocks(
             &server,
-            "start".to_string(),
+            serde_json::json!("start"),
             Some(vec!["raw(0014000000000000000000000000000000000000dead)".to_string()]),
             Some(0),
             None,
@@ -26687,7 +27893,7 @@ mod tests {
         // start_height past the tip -> Invalid start_height.
         let err = RustoshiRpcServer::scan_blocks(
             &server,
-            "start".to_string(),
+            serde_json::json!("start"),
             Some(needle.clone()),
             Some(999),
             None,
@@ -26706,7 +27912,7 @@ mod tests {
         // stop_height < start_height -> Invalid stop_height.
         let err2 = RustoshiRpcServer::scan_blocks(
             &server,
-            "start".to_string(),
+            serde_json::json!("start"),
             Some(needle),
             Some(0),
             Some(-1),
@@ -26743,7 +27949,7 @@ mod tests {
 
         let result = RustoshiRpcServer::scan_blocks(
             &server,
-            "start".to_string(),
+            serde_json::json!("start"),
             Some(vec!["raw(0014000000000000000000000000000000000000dead)".to_string()]),
             Some(0),
             Some(tip),
@@ -26935,7 +28141,7 @@ mod tests {
 
         let only_txindex_raw = RustoshiRpcServer::get_index_info(
             &server,
-            Some("txindex".to_string()),
+            Some(serde_json::json!("txindex")),
         )
         .await
         .expect("getindexinfo must succeed");
@@ -26948,7 +28154,7 @@ mod tests {
 
         let only_filters_raw = RustoshiRpcServer::get_index_info(
             &server,
-            Some("basic block filter index".to_string()),
+            Some(serde_json::json!("basic block filter index")),
         )
         .await
         .expect("getindexinfo must succeed");

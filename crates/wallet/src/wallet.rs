@@ -2873,6 +2873,25 @@ impl KeySigner {
         Ok(Self { keystore, signer })
     }
 
+    /// Build the temporary keystore from already-decoded secret keys (the
+    /// private material a descriptor carries: WIF leaves and xprv-derived
+    /// keys). Same keystore shape as [`Self::from_wifs`]; used by
+    /// `descriptorprocesspsbt`, whose keys arrive inside descriptors rather
+    /// than as WIF strings.
+    pub fn from_secret_keys(
+        keys: &[secp256k1::SecretKey],
+        network: Network,
+    ) -> Result<Self, WalletError> {
+        let mut keystore: HashMap<Vec<u8>, secp256k1::SecretKey> = HashMap::new();
+        for sk in keys {
+            for spk in Wallet::script_pubkeys_for_key(sk, network) {
+                keystore.insert(spk, *sk);
+            }
+        }
+        let signer = Wallet::from_seed(&[0u8; 32], network, AddressType::P2WPKH)?;
+        Ok(Self { keystore, signer })
+    }
+
     /// Whether a provided key controls this scriptPubKey (i.e. the input is
     /// signable by this keystore).
     pub fn can_sign(&self, script_pubkey: &[u8]) -> bool {

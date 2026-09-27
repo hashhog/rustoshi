@@ -77,7 +77,7 @@ async fn converttopsbt_rejects_inputs_with_scriptsig() {
     let hex_tx = hex::encode(tx.serialize());
 
     let err = srv
-        .converttopsbt(hex_tx.clone(), None, None)
+        .converttopsbt(serde_json::json!(hex_tx.clone()), None, None)
         .await
         .expect_err("inputs with scriptSig must be rejected when permitsigdata=false");
     assert_eq!(
@@ -94,7 +94,7 @@ async fn converttopsbt_rejects_inputs_with_scriptsig() {
 
     // permitsigdata=true: conversion proceeds and the scriptSig is CLEARED.
     let b64 = srv
-        .converttopsbt(hex_tx, Some(true), None)
+        .converttopsbt(serde_json::json!(hex_tx), Some(serde_json::json!(true)), None)
         .await
         .expect("permitsigdata=true must allow conversion");
     let psbt = Psbt::from_base64(&b64).expect("valid PSBT base64");
@@ -132,7 +132,7 @@ async fn converttopsbt_produces_blank_per_input_and_per_output_maps() {
     let hex_tx = hex::encode(tx.serialize());
 
     let b64 = srv
-        .converttopsbt(hex_tx, None, None)
+        .converttopsbt(serde_json::json!(hex_tx), None, None)
         .await
         .expect("clean tx must convert");
     let psbt = Psbt::from_base64(&b64).expect("valid PSBT base64");
@@ -169,7 +169,7 @@ async fn converttopsbt_empty_vin_heuristic_keeps_op_return_output() {
     let srv = server();
 
     let b64 = srv
-        .converttopsbt(EMPTY_VIN_HEX.to_string(), None, None)
+        .converttopsbt(serde_json::json!(EMPTY_VIN_HEX), None, None)
         .await
         .expect("heuristic decode must succeed via legacy fallback");
 
@@ -243,7 +243,7 @@ async fn converttopsbt_empty_vin_iswitness_true_fails_22() {
     // iswitness=true forces the witness decode only; it does NOT fully consume
     // the bytes for this legacy tx, so the conversion must fail with -22.
     let err = srv
-        .converttopsbt(EMPTY_VIN_HEX.to_string(), None, Some(true))
+        .converttopsbt(serde_json::json!(EMPTY_VIN_HEX), None, Some(serde_json::json!(true)))
         .await
         .expect_err("iswitness=true must fail to decode this legacy tx");
     assert_eq!(
@@ -265,7 +265,7 @@ async fn converttopsbt_empty_vin_iswitness_false_succeeds() {
     // iswitness=false forces legacy decode only; it fully consumes the bytes,
     // yielding the same 0-input/1-OP_RETURN PSBT as the heuristic path.
     let b64 = srv
-        .converttopsbt(EMPTY_VIN_HEX.to_string(), None, Some(false))
+        .converttopsbt(serde_json::json!(EMPTY_VIN_HEX), None, Some(serde_json::json!(false)))
         .await
         .expect("iswitness=false legacy decode must succeed");
     assert_eq!(

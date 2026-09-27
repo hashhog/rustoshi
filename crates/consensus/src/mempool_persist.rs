@@ -291,6 +291,46 @@ pub fn load_mempool<F>(
 where
     F: Fn(&OutPoint) -> Option<CoinEntry>,
 {
+    load_mempool_with_options(mempool, path, utxo_lookup, &ImportMempoolOptions::default())
+}
+
+/// Knobs of Core's `node::ImportMempoolOptions` (node/mempool_persist.h) that
+/// this loader honours. `Default` is the STARTUP load (keep the file's entry
+/// times, apply fee deltas); the `importmempool` RPC passes its own
+/// (use_current_time=true, apply_fee_delta_priority=false by default).
+#[derive(Debug, Clone, Copy)]
+pub struct ImportMempoolOptions {
+    /// Stamp every loaded entry with the current time instead of the time
+    /// recorded in the file.
+    pub use_current_time: bool,
+    /// Apply the per-entry fee deltas and the standalone `mapDeltas` block.
+    pub apply_fee_delta_priority: bool,
+}
+
+impl Default for ImportMempoolOptions {
+    fn default() -> Self {
+        Self {
+            use_current_time: false,
+            apply_fee_delta_priority: true,
+        }
+    }
+}
+
+/// [`load_mempool`] with explicit [`ImportMempoolOptions`] (Core `LoadMempool`
+/// with `opts`). Used by the `importmempool` RPC.
+pub fn load_mempool_with_options<F>(
+    mempool: &mut Mempool,
+    path: &Path,
+    utxo_lookup: &F,
+    opts: &ImportMempoolOptions,
+) -> io::Result<LoadStats>
+where
+    F: Fn(&OutPoint) -> Option<CoinEntry>,
+{
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
@@ -344,10 +384,18 @@ where
         let tx = Transaction::decode(&mut xor)?;
         let mut time_buf = [0u8; 8];
         xor.read_exact(&mut time_buf)?;
-        let time_seconds = i64::from_le_bytes(time_buf);
+        let time_seconds = if opts.use_current_time {
+            now_secs
+        } else {
+            i64::from_le_bytes(time_buf)
+        };
         let mut fee_delta_buf = [0u8; 8];
         xor.read_exact(&mut fee_delta_buf)?;
-        let fee_delta = i64::from_le_bytes(fee_delta_buf);
+        let fee_delta = if opts.apply_fee_delta_priority {
+            i64::from_le_bytes(fee_delta_buf)
+        } else {
+            0
+        };
 
         let txid = tx.txid();
         match mempool.add_transaction(tx, utxo_lookup) {
@@ -401,8 +449,11 @@ where
         let delta = i64::from_le_bytes(delta_buf);
         let txid = Hash256::from_bytes(txid_bytes);
         // Stack delta into mempool.map_deltas (and into any matching
-        // in-mempool entry's `fee_delta`). Matches Core exactly.
-        mempool.prioritise_transaction(&txid, delta);
+        // in-mempool entry's `fee_delta`). Matches Core exactly -- and, as in
+        // Core, only when the caller asked for fee deltas to be applied.
+        if opts.apply_fee_delta_priority {
+            mempool.prioritise_transaction(&txid, delta);
+        }
     }
 
     // ---- unbroadcast txids ----

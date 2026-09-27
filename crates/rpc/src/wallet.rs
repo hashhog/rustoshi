@@ -80,7 +80,7 @@ pub mod wallet_error {
 ///   - P2PKH scriptSig: `push(sig+hashtype) push(pubkey(33))`
 /// Returns None for multi-element or unrecognised shapes (Taproot key-path
 /// sigs are not partial-sig records and are left to the finalize path).
-fn extract_single_partial_sig(input: &rustoshi_primitives::TxIn) -> Option<([u8; 33], Vec<u8>)> {
+pub(crate) fn extract_single_partial_sig(input: &rustoshi_primitives::TxIn) -> Option<([u8; 33], Vec<u8>)> {
     // Witness shape (P2WPKH / P2SH-P2WPKH): [sig, pubkey33].
     if input.witness.len() == 2 {
         let sig = &input.witness[0];
