@@ -5824,366 +5824,6 @@ fn strip_trailing_fraction_zeros(s: String) -> String {
     }
 }
 
-/// Query a locally-running Bitcoin Core node for the `nTx` and `chainwork`
-/// fields of a given block.  Used as a best-effort fallback in
-/// `getblockheader` when rustoshi's stored block index entry is absent or
-/// wrong (e.g. genesis chain_work accumulation bug or assumeUTXO snapshot).
-///
-/// Tries the mainnet cookie path first, then the testnet4 path.
-/// Makes a raw HTTP/1.1 POST over a tokio `TcpStream` (no extra deps).
-/// Returns `None` silently on any I/O or parse error.
-async fn core_fallback_block_info(block_hash_hex: &str) -> Option<(u32, String)> {
-    struct Endpoint {
-        host: &'static str,
-        port: u16,
-        cookie_path: &'static str,
-    }
-    let endpoints = [
-        Endpoint {
-            host: "127.0.0.1",
-            port: 8332,
-            cookie_path: "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
-        },
-        Endpoint {
-            host: "127.0.0.1",
-            port: 48343,
-            cookie_path: "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie",
-        },
-    ];
-
-    for ep in &endpoints {
-        let cookie = match std::fs::read_to_string(ep.cookie_path) {
-            Ok(c) => c.trim().to_string(),
-            Err(_) => continue,
-        };
-        let parts: Vec<&str> = cookie.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let credentials = format!("{}:{}", parts[0], parts[1]);
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &credentials);
-
-        let json_body = format!(
-            r#"{{"jsonrpc":"1.0","method":"getblockheader","params":[{:?},true],"id":1}}"#,
-            block_hash_hex
-        );
-
-        // Raw HTTP/1.1 POST over tokio TcpStream — no extra crate needed.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
-
-        let addr = format!("{}:{}", ep.host, ep.port);
-        let mut stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => continue,
-        };
-
-        let request = format!(
-            "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAuthorization: Basic {b64}\r\nConnection: close\r\n\r\n{body}",
-            host = ep.host,
-            port = ep.port,
-            len = json_body.len(),
-            b64 = b64,
-            body = json_body,
-        );
-
-        if stream.write_all(request.as_bytes()).await.is_err() {
-            continue;
-        }
-
-        let mut response = Vec::new();
-        if let Err(_) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            stream.read_to_end(&mut response),
-        )
-        .await
-        {
-            continue;
-        }
-
-        // Find the JSON body after the HTTP headers (\r\n\r\n separator).
-        let body_start = match response.windows(4).position(|w| w == b"\r\n\r\n") {
-            Some(pos) => pos + 4,
-            None => continue,
-        };
-        let body_bytes = &response[body_start..];
-
-        #[derive(serde::Deserialize)]
-        struct CoreResp {
-            result: Option<CoreResult>,
-        }
-        #[derive(serde::Deserialize)]
-        struct CoreResult {
-            #[serde(rename = "nTx")]
-            n_tx: Option<u32>,
-            chainwork: Option<String>,
-        }
-
-        if let Ok(resp) = serde_json::from_slice::<CoreResp>(body_bytes) {
-            if let Some(result) = resp.result {
-                let n_tx = result.n_tx.unwrap_or(0);
-                let chainwork = result.chainwork.unwrap_or_else(|| "0".repeat(64));
-                return Some((n_tx, chainwork));
-            }
-        }
-    }
-    None
-}
-
-/// Call Bitcoin Core's `getrawtransaction <txid> <verbosity> <blockhash>` and
-/// return the raw JSON string of the `result` field, or `None` on any error.
-///
-/// Used as a fallback in `get_raw_transaction` when verbosity=2 is requested.
-/// Returns the raw bytes of the `result` JSON object without going through
-/// serde_json's number parser, so that values like `"value":0.00000000`
-/// (8 decimal places) are preserved byte-for-byte — matching Bitcoin Core
-/// 31.99's `ValueFromAmount` format.
-///
-/// Tries the mainnet Bitcoin Core cookie first, then testnet4.
-async fn core_fallback_getrawtransaction(
-    txid_hex: &str,
-    verbosity: u8,
-    blockhash_hex: Option<&str>,
-) -> Option<String> {
-    struct Endpoint {
-        host: &'static str,
-        port: u16,
-        cookie_path: &'static str,
-    }
-    let endpoints = [
-        Endpoint {
-            host: "127.0.0.1",
-            port: 8332,
-            cookie_path: "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
-        },
-        Endpoint {
-            host: "127.0.0.1",
-            port: 48343,
-            cookie_path: "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie",
-        },
-    ];
-
-    for ep in &endpoints {
-        let cookie = match std::fs::read_to_string(ep.cookie_path) {
-            Ok(c) => c.trim().to_string(),
-            Err(_) => continue,
-        };
-        let parts: Vec<&str> = cookie.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let credentials = format!("{}:{}", parts[0], parts[1]);
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &credentials);
-
-        // Build params array: [txid, verbosity] or [txid, verbosity, blockhash].
-        let json_body = if let Some(bh) = blockhash_hex {
-            format!(
-                r#"{{"jsonrpc":"1.0","method":"getrawtransaction","params":[{:?},{},{}],"id":1}}"#,
-                txid_hex,
-                verbosity,
-                serde_json::to_string(bh).unwrap_or_else(|_| format!("{:?}", bh))
-            )
-        } else {
-            format!(
-                r#"{{"jsonrpc":"1.0","method":"getrawtransaction","params":[{:?},{}],"id":1}}"#,
-                txid_hex, verbosity
-            )
-        };
-
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
-
-        let addr = format!("{}:{}", ep.host, ep.port);
-        let mut stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => continue,
-        };
-
-        let request = format!(
-            "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAuthorization: Basic {b64}\r\nConnection: close\r\n\r\n{body}",
-            host = ep.host,
-            port = ep.port,
-            len = json_body.len(),
-            b64 = b64,
-            body = json_body,
-        );
-
-        if stream.write_all(request.as_bytes()).await.is_err() {
-            continue;
-        }
-
-        let mut response = Vec::new();
-        if tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            stream.read_to_end(&mut response),
-        )
-        .await
-        .is_err()
-        {
-            continue;
-        }
-
-        // Find the JSON body after the HTTP headers (\r\n\r\n separator).
-        let body_start = match response.windows(4).position(|w| w == b"\r\n\r\n") {
-            Some(pos) => pos + 4,
-            None => continue,
-        };
-        let body_bytes = &response[body_start..];
-
-        // Parse the envelope with RawValue for `result` so that number fields
-        // (e.g. "value":0.00000000) are NOT converted to f64 — preserving
-        // Bitcoin Core's exact decimal representation.
-        #[derive(serde::Deserialize)]
-        struct CoreResp<'a> {
-            #[serde(borrow)]
-            result: Option<&'a serde_json::value::RawValue>,
-            error: Option<serde_json::Value>,
-        }
-
-        if let Ok(resp) = serde_json::from_slice::<CoreResp<'_>>(body_bytes) {
-            if resp.error.is_none() {
-                if let Some(raw_result) = resp.result {
-                    // raw_result.get() returns the exact JSON text of the result field.
-                    return Some(raw_result.get().to_owned());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Call Bitcoin Core's `gettxout <txid> <vout>` and return the raw JSON string
-/// of the `result` field, or `None` on any error or when the UTXO is spent.
-///
-/// Used as a fallback in `get_tx_out` when rustoshi's chainstate does not
-/// contain the UTXO (e.g. UTXOs created after the assumeUTXO snapshot height
-/// but before rustoshi has synced to chain tip).  Returns the raw JSON bytes
-/// of the `result` field without going through serde_json's f64 re-serialiser,
-/// preserving Bitcoin Core's exact `ValueFromAmount` decimal representation.
-///
-/// Tries the mainnet Bitcoin Core cookie first, then testnet4.
-async fn core_fallback_gettxout(txid_hex: &str, vout: u32) -> Option<String> {
-    struct Endpoint {
-        host: &'static str,
-        port: u16,
-        cookie_path: &'static str,
-    }
-    let endpoints = [
-        Endpoint {
-            host: "127.0.0.1",
-            port: 8332,
-            cookie_path: "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
-        },
-        Endpoint {
-            host: "127.0.0.1",
-            port: 48343,
-            cookie_path: "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie",
-        },
-    ];
-
-    for ep in &endpoints {
-        let cookie = match std::fs::read_to_string(ep.cookie_path) {
-            Ok(c) => c.trim().to_string(),
-            Err(_) => continue,
-        };
-        let parts: Vec<&str> = cookie.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let credentials = format!("{}:{}", parts[0], parts[1]);
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &credentials);
-
-        let json_body = format!(
-            r#"{{"jsonrpc":"1.0","method":"gettxout","params":[{:?},{}],"id":1}}"#,
-            txid_hex, vout
-        );
-
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
-
-        let addr = format!("{}:{}", ep.host, ep.port);
-        let mut stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => continue,
-        };
-
-        let request = format!(
-            "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nAuthorization: Basic {b64}\r\nConnection: close\r\n\r\n{body}",
-            host = ep.host,
-            port = ep.port,
-            len = json_body.len(),
-            b64 = b64,
-            body = json_body,
-        );
-
-        if stream.write_all(request.as_bytes()).await.is_err() {
-            continue;
-        }
-
-        let mut response = Vec::new();
-        if tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            stream.read_to_end(&mut response),
-        )
-        .await
-        .is_err()
-        {
-            continue;
-        }
-
-        // Find the JSON body after the HTTP headers (\r\n\r\n separator).
-        let body_start = match response.windows(4).position(|w| w == b"\r\n\r\n") {
-            Some(pos) => pos + 4,
-            None => continue,
-        };
-        let body_bytes = &response[body_start..];
-
-        // Parse the envelope with RawValue for `result` so that number fields
-        // (e.g. "value":0.00000000) are NOT converted to f64 — preserving
-        // Bitcoin Core's exact decimal representation.
-        #[derive(serde::Deserialize)]
-        struct CoreResp<'a> {
-            #[serde(borrow)]
-            result: Option<&'a serde_json::value::RawValue>,
-            error: Option<serde_json::Value>,
-        }
-
-        if let Ok(resp) = serde_json::from_slice::<CoreResp<'_>>(body_bytes) {
-            if resp.error.is_none() {
-                if let Some(raw_result) = resp.result {
-                    // "null" means the UTXO is spent — propagate as None.
-                    let s = raw_result.get();
-                    if s == "null" {
-                        return None;
-                    }
-                    return Some(s.to_owned());
-                }
-                // result field present but missing → spent → None
-                return None;
-            }
-        }
-    }
-    None
-}
-
 // ============================================================
 // SHARED DEPLOYMENT STATE HELPER
 // ============================================================
@@ -6909,8 +6549,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         let block_hash = Self::parse_hash(&hash)?;
         let verbose = verbose.unwrap_or(true);
 
-        // Collect everything we need while holding the read-lock, then drop it
-        // before any async I/O (e.g. the Bitcoin Core fallback HTTP call).
+        // Collect everything we need while holding the read-lock.
         struct HeaderSnapshot {
             header_bits: u32,
             header_version: i32,
@@ -6922,8 +6561,8 @@ impl RustoshiRpcServer for RpcServerImpl {
             best_height: u32,
             in_active_chain: bool,
             next_hash: Option<String>,
-            chainwork_hex: Option<String>, // None means fallback needed
-            n_tx: Option<u32>,             // None means fallback needed
+            chainwork_hex: Option<String>, // None: no block index entry
+            n_tx: Option<u32>,             // None: no block index entry
             mediantime: u64,
         }
 
@@ -6992,12 +6631,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                 None
             };
 
-            // Chainwork and nTx: read from index entry if present; signal None
-            // so the caller can do the async Core fallback after releasing the lock.
+            // Chainwork and nTx from the node's own index entry (None when the
+            // header has no index entry).
             let (chainwork_hex, n_tx) = if let Some(ref e) = entry {
                 (Some(hex::encode(e.chain_work)), Some(e.n_tx))
             } else {
-                (None, None) // will be resolved via Core fallback below
+                (None, None)
             };
 
             // Median-time-past: median of the 11 block timestamps ending here.
@@ -7036,36 +6675,22 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         }; // state read-lock dropped here
 
-        // Resolve chainwork and nTx.
+        // chainwork and nTx come from rustoshi's OWN block index, exactly as
+        // Core's blockheaderToJSON reads `blockindex.nChainWork` and
+        // `blockindex.nTx` (rpc/blockchain.cpp:174-175). nTx is 0 for a
+        // header whose block data was never received (Core: nTx is set only
+        // in ReceivedBlockTransactions, validation.cpp:3768).
         //
-        // For byte-identity with Bitcoin Core we query a locally-running
-        // Bitcoin Core instance (mainnet port 8332, testnet4 port 48343) and
-        // prefer its values.  This is necessary because rustoshi's local block
-        // index entries are missing for all blocks that were never downloaded
-        // (assumeUTXO snapshot path) and are subtly wrong for early blocks
-        // (genesis chain_work is stored as 0, so block 1's accumulated work
-        // is off by one block-proof).
-        //
-        // Fallback order:
-        //   1. Bitcoin Core RPC (authoritative).
-        //   2. Locally-stored block index entry (present for blocks synced
-        //      after the snapshot tip; wrong for genesis-era blocks).
-        //   3. Zeros (last resort, only if no Core + no local entry).
-        //
-        // The Core query has a 5-second timeout and is best-effort.
-        let stored_chainwork = snap.chainwork_hex;
-        let stored_n_tx = snap.n_tx;
-
-        let (chainwork_hex, n_tx) = {
-            let core_result = core_fallback_block_info(&block_hash.to_hex()).await;
-            match core_result {
-                Some((fb_n_tx, fb_chainwork)) => (fb_chainwork, fb_n_tx),
-                None => (
-                    stored_chainwork.unwrap_or_else(|| "0".repeat(64)),
-                    stored_n_tx.unwrap_or(0),
-                ),
-            }
-        };
+        // R3: this used to ask a live Bitcoin Core on 127.0.0.1:8332 for both
+        // fields and prefer its answer. That made the node's output depend on
+        // another node running on the same box, and it hid a real accounting
+        // gap (snapshot-based chainwork), which is now reconciled from the
+        // node's own header chain at startup (`reconcile_chain_work`).
+        // A header with no index entry (only possible for the assumeutxo
+        // base-tail band before the historical header backfill completes)
+        // has no chainwork the node can compute yet; it reports zero work.
+        let chainwork_hex = snap.chainwork_hex.unwrap_or_else(|| "0".repeat(64));
+        let n_tx = snap.n_tx.unwrap_or(0);
 
         // Confirmations: Core (ComputeNextBlockAndDepth) returns
         // tipHeight - height + 1 for a block on the active chain, and -1 for a
@@ -8269,30 +7894,11 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         }
 
-        // ── verbosity=2: always proxy to Bitcoin Core ────────────────────────
-        // verbosity=2 requires per-vin prevout enrichment (spent coin height,
-        // value, scriptPubKey) and a top-level fee field.  rustoshi's undo data
-        // uses a flat CoinEntry vec with no per-tx boundaries, and many blocks
-        // pre-snapshot are not in CF_BLOCKS at all.  The cleanest solution —
-        // and the W59 getblock precedent — is to proxy the entire request to a
-        // locally-running Bitcoin Core node, which returns byte-identical output.
-        // The harness normalises with `del(.confirmations)` before hashing so
-        // Core's live confirmations value is not compared.
-        if verbosity_int >= 2 {
-            let core_result = core_fallback_getrawtransaction(
-                &txid,
-                verbosity_int,
-                blockhash.as_deref(),
-            )
-            .await;
-            return match core_result {
-                Some(json_str) => Ok(raw(json_str)),
-                None => Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
-                    "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
-                )),
-            };
-        }
+        // verbosity=2 is answered from the node's own block + undo data
+        // (Core rawtransaction.cpp:348-370: TxToJSON with the tx's CTxUndo,
+        // TxVerbosity::SHOW_DETAILS_AND_PREVOUT). R3: this used to forward
+        // every verbosity>=2 request to a live Bitcoin Core on 127.0.0.1:8332
+        // and return Core's JSON verbatim.
 
         let state = self.state.read().await;
         let store = BlockStore::new(&state.db);
@@ -8391,6 +7997,16 @@ impl RustoshiRpcServer for RpcServerImpl {
                         &store,
                     );
                     info.in_active_chain = in_active_chain;
+                    if verbosity_int >= 2 {
+                        attach_undo_prevouts(
+                            &mut info,
+                            &block,
+                            tx,
+                            &target_block_hash,
+                            &store,
+                            &state.params,
+                        )?;
+                    }
                     return Ok(raw(serde_json::to_string(&info).unwrap()));
                 }
             }
@@ -8401,8 +8017,17 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
-        // 3. If txindex is enabled, look up the transaction in the transaction index
-        if let Ok(Some(tx_entry)) = store.get_tx_index(&tx_hash) {
+        // 3. If txindex is enabled, look up the transaction in the transaction
+        //    index. Core consults the index only when -txindex is on
+        //    (`g_txindex`, rawtransaction.cpp:307-313 + GetTransaction);
+        //    rustoshi writes CF_TX_INDEX regardless of the flag, so gate on the
+        //    startup flag exactly as Core gates on `g_txindex`.
+        let tx_index_hit = if state.txindex_enabled {
+            store.get_tx_index(&tx_hash).ok().flatten()
+        } else {
+            None
+        };
+        if let Some(tx_entry) = tx_index_hit {
             // Load the block to get the transaction
             if let Ok(Some(block)) = store.get_block(&tx_entry.block_hash) {
                 // Find the transaction in the block
@@ -8422,7 +8047,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                         });
                         let blocktime = block_index.as_ref().map(|e| e.timestamp);
 
-                        let info = build_tx_info_verbose(
+                        let mut info = build_tx_info_verbose(
                             tx,
                             Some(&tx_entry.block_hash),
                             confirmations,
@@ -8430,15 +8055,35 @@ impl RustoshiRpcServer for RpcServerImpl {
                             &state,
                             &store,
                         );
+                        // Core: prevouts only when the containing block is in
+                        // the block index (rawtransaction.cpp:343-352).
+                        if verbosity_int >= 2 && block_index.is_some() {
+                            attach_undo_prevouts(
+                                &mut info,
+                                &block,
+                                tx,
+                                &tx_entry.block_hash,
+                                &store,
+                                &state.params,
+                            )?;
+                        }
                         return Ok(raw(serde_json::to_string(&info).unwrap()));
                     }
                 }
             }
         }
 
+        // Core's not-found message depends on whether a txindex exists
+        // (rawtransaction.cpp:314-329). rustoshi's txindex is written
+        // synchronously on connect, so it is never "still being indexed".
+        let errmsg = if state.txindex_enabled {
+            "No such mempool or blockchain transaction"
+        } else {
+            "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries"
+        };
         Err(Self::rpc_error(
             rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
-            "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
+            format!("{errmsg}. Use gettransaction for wallet transactions."),
         ))
     }
 
@@ -11537,7 +11182,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             vout,
         };
 
-        // Check mempool if requested
+        // Check mempool if requested. Core (rpc/blockchain.cpp gettxout)
+        // answers null for an outpoint already spent by a mempool tx when
+        // include_mempool is set: `if (!view.GetCoin(out, coin) ||
+        // mempool.isSpent(out)) return UniValue::VNULL;`.
+        if include_mempool && state.mempool.is_spent(&outpoint) {
+            return Ok(None);
+        }
         if include_mempool {
             if let Some(entry) = state.mempool.get(&tx_hash) {
                 if let Some(output) = entry.tx.outputs.get(vout as usize) {
@@ -11595,16 +11246,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             return Ok(Some(raw(json_str)));
         }
 
-        // UTXO not found locally — rustoshi may be behind tip (e.g. UTXOs
-        // created after the assumeUTXO snapshot but before sync reaches their
-        // block).  Fall back to Bitcoin Core to preserve byte-identity with
-        // Core's output.  If Core also returns null, the UTXO is spent.
-        drop(store);
-        drop(state);
-        if let Some(json_str) = core_fallback_gettxout(&txid, vout).await {
-            return Ok(Some(raw(json_str)));
-        }
-
+        // Not in the mempool and not in the node's own UTXO set: Core returns
+        // JSON null (rpc/blockchain.cpp gettxout: `if (!view.GetCoin(out))
+        // return UniValue::VNULL`). R3: this used to forward the query to a
+        // live Bitcoin Core on 127.0.0.1:8332 and return ITS answer, so a node
+        // that had never seen the coin (behind tip, or genesis-isolated)
+        // reported real mainnet data as its own.
         Ok(None)
     }
 
@@ -18746,6 +18393,7 @@ fn build_tx_info(
                         } else {
                             Some(input.witness.iter().map(hex::encode).collect())
                         },
+                        prevout: None,
                         sequence: input.sequence,
                     }
                 } else {
@@ -18762,6 +18410,7 @@ fn build_tx_info(
                         } else {
                             Some(input.witness.iter().map(hex::encode).collect())
                         },
+                        prevout: None,
                         sequence: input.sequence,
                     }
                 }
@@ -18788,12 +18437,89 @@ fn build_tx_info(
                 }
             })
             .collect(),
+        fee: None,
         hex: hex::encode(tx.serialize()),
         blockhash: block_hash.map(|h| h.to_hex()),
         confirmations,
         blocktime: None,
         time: None,
     }
+}
+
+/// Add Core's `getrawtransaction` verbosity-2 detail to `info`: each input's
+/// spent coin (`prevout`) and the tx `fee`, read from the containing block's
+/// undo data. Mirrors bitcoin-core/src/rpc/rawtransaction.cpp:348-370 +
+/// core_io.cpp::TxToUniv(SHOW_DETAILS_AND_PREVOUT):
+///   * coinbase → nothing added (Core: `tx->IsCoinBase()` → plain TxToJSON);
+///   * block data present but undo unreadable → RPC_INTERNAL_ERROR with
+///     Core's exact message;
+///   * otherwise per-input `prevout` {generated, height, value, scriptPubKey}
+///     and `fee` = sum(prevout values) - sum(output values).
+///
+/// rustoshi stores a block's undo as one flat `spent_coins` vector covering
+/// every non-coinbase input in block order, so the tx's slice starts after the
+/// inputs of all earlier non-coinbase txs.
+fn attach_undo_prevouts(
+    info: &mut TransactionInfo,
+    block: &Block,
+    tx: &Transaction,
+    block_hash: &Hash256,
+    store: &BlockStore,
+    params: &ChainParams,
+) -> Result<(), jsonrpsee::types::ErrorObjectOwned> {
+    if tx.is_coinbase() {
+        return Ok(());
+    }
+    let undo_err = || {
+        jsonrpsee::types::ErrorObjectOwned::owned(
+            rpc_error::RPC_INTERNAL_ERROR,
+            "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event.",
+            None::<()>,
+        )
+    };
+    let txid = tx.txid();
+    let Some(pos) = block.transactions.iter().position(|t| t.txid() == txid) else {
+        return Ok(());
+    };
+    let undo = store
+        .get_undo(block_hash)
+        .map_err(|_| undo_err())?
+        .ok_or_else(undo_err)?;
+    let start: usize = block.transactions[..pos]
+        .iter()
+        .filter(|t| !t.is_coinbase())
+        .map(|t| t.inputs.len())
+        .sum();
+    let end = start + tx.inputs.len();
+    let total: usize = block
+        .transactions
+        .iter()
+        .filter(|t| !t.is_coinbase())
+        .map(|t| t.inputs.len())
+        .sum();
+    if undo.spent_coins.len() != total || end > undo.spent_coins.len() {
+        return Err(undo_err());
+    }
+    let coins = &undo.spent_coins[start..end];
+    let mut total_in: i64 = 0;
+    for (vin, coin) in info.vin.iter_mut().zip(coins.iter()) {
+        total_in += coin.value as i64;
+        vin.prevout = Some(PrevoutInfo {
+            generated: coin.is_coinbase,
+            height: coin.height,
+            value: BtcAmount::from_sats(coin.value),
+            script_pubkey: ScriptPubKeyInfo {
+                asm: disassemble_script(&coin.script_pubkey),
+                desc: infer_descriptor(&coin.script_pubkey, params),
+                hex: hex::encode(&coin.script_pubkey),
+                address: script_to_address(&coin.script_pubkey, params),
+                script_type: classify_script(&coin.script_pubkey),
+            },
+        });
+    }
+    let total_out: i64 = tx.outputs.iter().map(|o| o.value as i64).sum();
+    info.fee = Some(BtcAmount(total_in - total_out));
+    Ok(())
 }
 
 /// Build verbose transaction info with all details.
@@ -18842,6 +18568,7 @@ fn build_tx_info_verbose(
                         } else {
                             Some(input.witness.iter().map(hex::encode).collect())
                         },
+                        prevout: None,
                         sequence: input.sequence,
                     }
                 } else {
@@ -18859,6 +18586,7 @@ fn build_tx_info_verbose(
                         } else {
                             Some(input.witness.iter().map(hex::encode).collect())
                         },
+                        prevout: None,
                         sequence: input.sequence,
                     }
                 }
@@ -18885,6 +18613,7 @@ fn build_tx_info_verbose(
                 }
             })
             .collect(),
+        fee: None,
         hex: hex::encode(tx.serialize()),
         blockhash: block_hash.map(|h| h.to_hex()),
         confirmations,
@@ -19641,6 +19370,7 @@ fn build_decoded_raw_transaction(
                     } else {
                         Some(input.witness.iter().map(hex::encode).collect())
                     },
+                    prevout: None,
                     sequence: input.sequence,
                 }
             } else {
@@ -19659,6 +19389,7 @@ fn build_decoded_raw_transaction(
                     } else {
                         Some(input.witness.iter().map(hex::encode).collect())
                     },
+                    prevout: None,
                     sequence: input.sequence,
                 }
             }

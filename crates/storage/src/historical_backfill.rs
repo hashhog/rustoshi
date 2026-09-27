@@ -452,6 +452,12 @@ impl HistoricalBackfill {
 
         if self.headers_complete() {
             self.verify_floor_link(store)?;
+            if stored > 0 {
+                tracing::info!(
+                    "historical backfill: genesis→floor headers complete; chain work \
+                     above the snapshot base is recomputed from them at next startup"
+                );
+            }
         }
         if self.is_complete() {
             store.clear_historical_backfill_floor()?;

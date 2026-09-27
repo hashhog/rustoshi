@@ -2817,6 +2817,42 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // we leave it alone.
     backfill_assumeutxo_base_tails(&block_store, &params);
 
+    // Chain work is a pure function of the header chain (Core:
+    // nChainWork = pprev->nChainWork + GetBlockProof). A snapshot activation
+    // seeds the base with `minimum_chain_work` because the genesis→base
+    // headers are not there yet; once the historical backfill has stored
+    // them, recompute the base and every entry above it from the node's own
+    // headers. Runs before any chain state is built in memory. (This gap used
+    // to be papered over by asking a live Bitcoin Core for `chainwork`.)
+    {
+        let snapshot_base = rustoshi_storage::read_snapshot_blockhash(&datadir)
+            .ok()
+            .flatten();
+        match rustoshi_storage::reconcile_chain_work(&block_store, snapshot_base) {
+            Ok(rustoshi_storage::ChainWorkReconcile::Clean) => {}
+            Ok(rustoshi_storage::ChainWorkReconcile::NotReady { gap_above }) => tracing::info!(
+                "chain work above the snapshot base is still seeded from minimum_chain_work: \
+                 no header below height {} yet (historical backfill incomplete); \
+                 it is recomputed from the header chain on the first restart after the backfill completes",
+                gap_above + 1
+            ),
+            Ok(rustoshi_storage::ChainWorkReconcile::Reconciled {
+                from_height,
+                rewritten,
+                created,
+                orphaned,
+            }) => tracing::info!(
+                "chain work reconciled from own header chain above height {}: \
+                 {} entries rewritten, {} tail-band entries created, {} orphaned entries skipped",
+                from_height.saturating_sub(1),
+                rewritten,
+                created,
+                orphaned
+            ),
+            Err(e) => tracing::warn!("chain work reconcile failed: {e}"),
+        }
+    }
+
     // BIP-157/158: index the GENESIS block's basic filter + filter header at
     // startup. Bitcoin Core's `BlockFilterIndex` indexes every connected block
     // INCLUDING genesis (`BaseIndex` walks from height 0), so the genesis

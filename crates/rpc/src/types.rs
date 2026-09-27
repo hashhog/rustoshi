@@ -531,6 +531,11 @@ pub struct TransactionInfo {
     pub vin: Vec<TxInputInfo>,
     /// Transaction outputs.
     pub vout: Vec<TxOutputInfo>,
+    /// Fee in BTC. Core's `TxToUniv` (core_io.cpp) pushes `fee` after `vout`
+    /// and before `hex` only when the tx's undo data is available
+    /// (`getrawtransaction` verbosity 2 on a confirmed non-coinbase tx).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<BtcAmount>,
     /// Raw hex of the transaction.
     pub hex: String,
     /// Block hash containing this transaction (omitted when unconfirmed).
@@ -570,8 +575,28 @@ pub struct TxInputInfo {
     /// Witness data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub txinwitness: Option<Vec<String>>,
+    /// Spent output (`getrawtransaction` verbosity 2, from undo data).
+    /// Core's `TxToUniv` pushes it after `txinwitness` and before `sequence`
+    /// (core_io.cpp, `TxVerbosity::SHOW_DETAILS_AND_PREVOUT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prevout: Option<PrevoutInfo>,
     /// Sequence number.
     pub sequence: u32,
+}
+
+/// The spent coin of a transaction input, as Core's `TxToUniv` emits it for
+/// `getrawtransaction` verbosity 2: generated, height, value, scriptPubKey.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrevoutInfo {
+    /// Whether the spent coin was created by a coinbase transaction.
+    pub generated: bool,
+    /// Height of the block that created the spent coin.
+    pub height: u32,
+    /// Value of the spent coin in BTC.
+    pub value: BtcAmount,
+    /// The spent coin's scriptPubKey (with address when one exists).
+    #[serde(rename = "scriptPubKey")]
+    pub script_pubkey: ScriptPubKeyInfo,
 }
 
 /// ScriptSig information.

@@ -41,6 +41,7 @@
 //! ```
 
 pub mod block_store;
+pub mod chain_work_reconcile;
 pub mod blockstore;
 pub mod columns;
 pub mod db;
@@ -94,6 +95,7 @@ pub use snapshot::{
     SNAPSHOT_BLOCKHASH_FILENAME, SNAPSHOT_CACHE_PERCENT, SNAPSHOT_CHAINSTATE_SUFFIX,
     SNAPSHOT_MAGIC_BYTES, SNAPSHOT_VERSION,
 };
+pub use chain_work_reconcile::{reconcile_chain_work, ChainWorkReconcile};
 pub use historical_backfill::{
     historical_backfill_is_enabled, BackfillError, HistoricalBackfill,
     BACKFILL_BODIES_PER_REQUEST, HISTORICAL_BACKFILL_DISABLE_ENV,

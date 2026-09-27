@@ -131,6 +131,7 @@ fn rawtx_verbose_key_order_matches_core() {
         locktime: 0,
         vin: vec![],
         vout: vec![],
+        fee: None,
         hex: "".into(),
         blockhash: Some("00".into()),
         confirmations: Some(1),
