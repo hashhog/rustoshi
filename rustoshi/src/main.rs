@@ -4839,6 +4839,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     }
 
                     Some(PeerEvent::Message(peer_id, msg)) => {
+                        // Bulk (tx/addr) events travel on their own lane, so a
+                        // peer's Disconnected (priority lane) can overtake them.
+                        // Once a peer is gone its leftover tx relay is noise:
+                        // relaying on its behalf, getdata to a dead task, orphans
+                        // charged to a peer whose orphans were already erased.
+                        if !header_sync.has_peer(peer_id)
+                            && rustoshi_network::is_bulk_message(&msg)
+                        {
+                            continue;
+                        }
                         match msg {
                             NetworkMessage::Headers(headers) => {
                                 // Issue #5: drop any header whose block already
@@ -5300,6 +5310,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     }
                                                 }
                                                 if !blocks_to_download.is_empty() {
+                                                    // A small batch is a new-tip
+                                                    // announcement: ask the peer that
+                                                    // sent it (Core HeadersDirectFetchBlocks).
+                                                    if total as usize == blocks_to_download.len() {
+                                                        block_downloader.note_announcer(peer_id, &blocks_to_download);
+                                                    }
                                                     block_downloader.enqueue_blocks(blocks_to_download);
                                                 }
 
@@ -6089,6 +6105,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // normal noise and the headers pipeline already drives
                                 // download) isn't disrupted.
                                 let mut block_discovery_peer = None;
+                                // LAG-4: an unknown-block inv that arrives while
+                                // header sync is NOT idle (DownloadingHeaders
+                                // from some other — possibly dead — peer) used to
+                                // be dropped on the floor. Core answers every
+                                // unknown-block inv with a getheaders to THAT
+                                // peer (net_processing.cpp INV handler ->
+                                // MaybeSendGetHeaders), whatever it is syncing
+                                // from. The reply connects to our header tip and
+                                // is processed as an unsolicited announcement.
+                                let mut block_announce_peer = None;
                                 for item in &inv_items {
                                     match item.inv_type {
                                         InvType::MsgBlock | InvType::MsgWitnessBlock => {
@@ -6097,13 +6123,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 .ok()
                                                 .flatten()
                                                 .is_some();
-                                            if !have_header
-                                                && matches!(
+                                            if !have_header {
+                                                if matches!(
                                                     header_sync.state(),
                                                     rustoshi_network::SyncState::Idle
-                                                )
-                                            {
-                                                block_discovery_peer = Some(peer_id);
+                                                ) {
+                                                    block_discovery_peer = Some(peer_id);
+                                                } else {
+                                                    block_announce_peer = Some(peer_id);
+                                                }
                                             }
                                             tracing::debug!(
                                                 "Block announced by peer {}: {} (have_header={})",
@@ -6165,6 +6193,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     let ps = peer_state.read().await;
                                     if let Some(ref pm) = ps.peer_manager {
                                         let _ = pm.send_to_peer(disc_peer, gh).await;
+                                    }
+                                } else if let Some(ann_peer) = block_announce_peer {
+                                    // Plain getheaders from our header tip; does
+                                    // not move the active sync peer.
+                                    let gh = NetworkMessage::GetHeaders(header_sync.make_getheaders(
+                                        |h| block_store.get_hash_by_height(h).ok().flatten(),
+                                    ));
+                                    tracing::info!(
+                                        "Peer {} inv'd an unknown block while header sync is {:?}; sending getheaders",
+                                        ann_peer.0, header_sync.state()
+                                    );
+                                    let ps = peer_state.read().await;
+                                    if let Some(ref pm) = ps.peer_manager {
+                                        pm.try_send_to_peer(ann_peer, gh);
                                     }
                                 }
                             }
@@ -6364,28 +6406,44 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     }
                                 }
 
-                                // Find fork point from locator (use hash index, not linear scan)
+                                // Find the fork point from the locator — Core's
+                                // FindForkInGlobalIndex: the highest locator entry
+                                // that is on OUR active chain (at or below our
+                                // connected tip). Walk our chain down from the tip
+                                // and stop at the first height whose hash the
+                                // locator names.
+                                //
+                                // The old code took the FIRST locator entry whose
+                                // HEADER we had, scanned 2000 heights for it, and
+                                // on a miss gave up with height 0. A peer's tip is
+                                // routinely a header we have but have not yet
+                                // CONNECTED (exactly when we are behind), so the
+                                // scan missed and we served headers 1..=2000 from
+                                // genesis — and a Core peer answers a full batch of
+                                // 2000 with a continuation getheaders, which hit
+                                // the same miss: 48 genesis batches in 30 minutes
+                                // on mainnet 2026-09-26 23:30-00:00, each a few
+                                // thousand cold RocksDB reads on the event loop.
                                 let start_height = {
+                                    let wanted: std::collections::HashSet<_> =
+                                        gh_msg.locator_hashes.iter().copied().collect();
+                                    let floor = our_height.saturating_sub(2000);
                                     let mut found_height = 0u32;
-                                    for locator_hash in &gh_msg.locator_hashes {
-                                        // Try to find the height for this hash via the height index
-                                        if let Ok(Some(_)) = block_store.get_header(locator_hash) {
-                                            // Find height by checking the block index
-                                            for h in (0..=our_height).rev() {
-                                                if let Ok(Some(hh)) = block_store.get_hash_by_height(h) {
-                                                    if &hh == locator_hash {
-                                                        found_height = h;
-                                                        break;
-                                                    }
-                                                }
-                                                // Locator hashes use exponential backoff, so
-                                                // the matching hash should be close to the tip.
-                                                // Bail early if we've searched 2000+ heights.
-                                                if our_height.saturating_sub(h) > 2000 && h < our_height.saturating_sub(2000) {
+                                    if !wanted.is_empty() {
+                                        let mut h = our_height;
+                                        loop {
+                                            match block_store.get_hash_by_height(h) {
+                                                Ok(Some(hh)) if wanted.contains(&hh) => {
+                                                    found_height = h;
                                                     break;
                                                 }
+                                                Ok(Some(_)) => {}
+                                                _ => break,
                                             }
-                                            break;
+                                            if h == floor || h == 0 {
+                                                break;
+                                            }
+                                            h -= 1;
                                         }
                                     }
                                     found_height
@@ -7340,12 +7398,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 // blocks_in_flight slots so assign_requests can use them.
                 let timed_out = block_downloader.check_timeouts();
 
-                // Score misbehavior for peers with stalled block downloads
+                // Disconnect peers that are stalling the block download —
+                // Core's "Peer is stalling block download" path sets
+                // fDisconnect and nothing else (net_processing.cpp
+                // SendMessages). It does NOT discourage/ban: a slow or
+                // briefly congested peer is not misbehaving. This used to call
+                // misbehaving(BlockDownloadStall), which put ~57 honest
+                // mainnet nodes on the 24h ban list on 2026-09-26 (combined
+                // with a stall detector that fired on a leaked counter; see
+                // BlockDownloader::check_timeouts). `check_timeouts` already
+                // re-queued the peer's blocks and stopped assigning to it.
                 if !timed_out.is_empty() {
-                    let mut ps = peer_state.write().await;
-                    if let Some(ref mut pm) = ps.peer_manager {
+                    let ps = peer_state.read().await;
+                    if let Some(ref pm) = ps.peer_manager {
                         for stalled_peer in &timed_out {
-                            pm.misbehaving(*stalled_peer, MisbehaviorReason::BlockDownloadStall).await;
+                            tracing::info!(
+                                "Peer {} is stalling block download, disconnecting",
+                                stalled_peer.0
+                            );
+                            pm.try_disconnect_peer(*stalled_peer);
                         }
                     }
                 }

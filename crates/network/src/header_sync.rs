@@ -142,6 +142,12 @@ impl HeaderSync {
         }
     }
 
+    /// Whether `peer_id` is currently registered (connected and not yet
+    /// removed).
+    pub fn has_peer(&self, peer_id: PeerId) -> bool {
+        self.peer_heights.contains_key(&peer_id)
+    }
+
     /// Number of registered peers.
     pub fn peer_count(&self) -> usize {
         self.peer_heights.len()

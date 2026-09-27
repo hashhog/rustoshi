@@ -14,6 +14,7 @@
 //! The peer manager coordinates outbound connection attempts, accepts inbound
 //! connections, and routes messages between peers and the node's message handler.
 
+use crate::event_lane::{event_channel, EventReceiver, EventSender, EVENT_LANE_CAPACITY};
 use crate::eviction::{select_node_to_evict, EvictionCandidate, EvictionCandidateBuilder};
 use crate::message::{
     parse_message_header, serialize_message, NetAddress, NetworkMessage, TimestampedNetAddress,
@@ -2503,9 +2504,9 @@ pub struct PeerManager {
     /// Next peer ID to assign.
     next_peer_id: u64,
     /// Channel for receiving events from peer tasks.
-    event_tx: mpsc::Sender<PeerEvent>,
+    event_tx: EventSender,
     /// Receiver for peer events (Option so it can be taken for independent polling).
-    event_rx: Option<mpsc::Receiver<PeerEvent>>,
+    event_rx: Option<EventReceiver>,
     /// Our current best block height (for version messages).
     start_height: i32,
     /// Anchor connections loaded from disk.
@@ -2567,7 +2568,7 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 impl PeerManager {
     /// Create a new peer manager with the given configuration and chain parameters.
     pub fn new(config: PeerManagerConfig, params: ChainParams) -> Self {
-        let (event_tx, event_rx) = mpsc::channel(1024);
+        let (event_tx, event_rx) = event_channel(EVENT_LANE_CAPACITY);
         let ban_manager = BanManager::with_duration(config.data_dir.clone(), config.ban_duration);
 
         // Load anchor connections from disk
@@ -2619,7 +2620,7 @@ impl PeerManager {
         params: ChainParams,
         netgroup_manager: NetGroupManager,
     ) -> Self {
-        let (event_tx, event_rx) = mpsc::channel(1024);
+        let (event_tx, event_rx) = event_channel(EVENT_LANE_CAPACITY);
         let ban_manager = BanManager::with_duration(config.data_dir.clone(), config.ban_duration);
 
         let anchors = read_anchors(&config.data_dir);
@@ -2934,7 +2935,7 @@ impl PeerManager {
     ///
     /// This allows the caller to poll events independently (e.g., in a `tokio::select!`)
     /// without holding a lock on the peer manager itself. Returns `None` if already taken.
-    pub fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<PeerEvent>> {
+    pub fn take_event_receiver(&mut self) -> Option<EventReceiver> {
         self.event_rx.take()
     }
 
@@ -4315,7 +4316,7 @@ impl PeerManager {
     }
 
     /// Get the event sender for spawning new peer tasks.
-    pub fn event_sender(&self) -> mpsc::Sender<PeerEvent> {
+    pub fn event_sender(&self) -> EventSender {
         self.event_tx.clone()
     }
 
@@ -5599,9 +5600,10 @@ pub async fn run_inbound_peer(
     magic: [u8; 4],
     our_services: u64,
     our_start_height: i32,
-    event_tx: mpsc::Sender<PeerEvent>,
+    event_tx: impl Into<EventSender>,
     command_rx: mpsc::Receiver<PeerCommand>,
 ) {
+    let event_tx: EventSender = event_tx.into();
     use tokio::time::timeout;
 
     // Split the stream
@@ -6148,9 +6150,10 @@ async fn run_inbound_v2_peer(
     _our_nonce: u64,
     prefix: [u8; V1_PREFIX_LEN],
     handshake_timeout: Duration,
-    event_tx: mpsc::Sender<PeerEvent>,
+    event_tx: impl Into<EventSender>,
     _command_rx: mpsc::Receiver<PeerCommand>,
 ) {
+    let event_tx: EventSender = event_tx.into();
     use tokio::time::timeout;
     // ----- Step 1: complete the peer's 64-byte ellswift pubkey. -----
     let mut their_pubkey_bytes = [0u8; ELLSWIFT_PUBKEY_LEN];

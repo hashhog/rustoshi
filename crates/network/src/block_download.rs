@@ -172,7 +172,20 @@ pub struct BlockDownloader {
     /// block-download timeout). Entries are consumed on reassignment and
     /// dropped on receipt.
     timed_out_from: HashMap<Hash256, PeerId>,
+    /// Tip blocks mapped to the peer that announced them. That peer
+    /// demonstrably has the block, so it is asked first — Core's
+    /// HeadersDirectFetchBlocks requests an announced tip block from the
+    /// announcing peer (`pfrom`), never from an arbitrary peer that may not
+    /// have it yet. Round-robin used to hand a fresh tip block to whichever
+    /// peer came next — a peer that might not have it, or (mainnet
+    /// 2026-09-26) a dead peer task — and the block then waited out a 30s+
+    /// request timeout. Consumed on assignment, dropped on receipt.
+    announced_by: HashMap<Hash256, PeerId>,
 }
+
+/// Most tip blocks a single announcement may pin to its announcer. Larger
+/// batches are header sync, where spreading across peers is what we want.
+const MAX_ANNOUNCER_PINNED: usize = 16;
 
 /// Outcome of a level-triggered gap-fill reconciliation.
 #[derive(Debug, PartialEq, Eq)]
@@ -453,6 +466,7 @@ impl BlockDownloader {
             max_per_peer: per_peer.clamp(1, MAX_BLOCKS_IN_FLIGHT),
             pending_refill: Vec::new(),
             timed_out_from: HashMap::new(),
+            announced_by: HashMap::new(),
         }
     }
 
@@ -485,6 +499,22 @@ impl BlockDownloader {
             self.pending_set.insert(item.0);
             self.pending_hashes.push_back(item.0);
             self.download_queue.push_back(item);
+        }
+    }
+
+    /// Record that `peer` announced `blocks` (a new-tip announcement), so
+    /// [`Self::assign_requests`] asks that peer for them first. Ignored for
+    /// batches larger than [`MAX_ANNOUNCER_PINNED`] (header sync, not an
+    /// announcement).
+    pub fn note_announcer(&mut self, peer: PeerId, blocks: &[(Hash256, u32)]) {
+        if blocks.len() > MAX_ANNOUNCER_PINNED {
+            return;
+        }
+        if self.announced_by.len() > 4 * MAX_ANNOUNCER_PINNED {
+            self.announced_by.clear(); // stale hints only; never a correctness input
+        }
+        for (hash, _) in blocks {
+            self.announced_by.insert(*hash, peer);
         }
     }
 
@@ -610,6 +640,11 @@ impl BlockDownloader {
 
             let mut peer_id = available_peers[peer_idx % available_peers.len()];
             peer_idx += 1;
+            if let Some(announcer) = self.announced_by.remove(&hash) {
+                if available_peers.contains(&announcer) {
+                    peer_id = announcer;
+                }
+            }
             // A timed-out block goes to someone other than the peer that
             // sat on it, whenever such a peer has capacity. Otherwise a
             // silent peer can keep the one block we need at the tip for
@@ -676,20 +711,28 @@ impl BlockDownloader {
         let hash = block.block_hash();
 
         if let Some(in_flight) = self.in_flight.remove(&hash) {
-            if let Some(state) = self.peer_states.get_mut(&peer_id) {
+            // Free the slot of the peer the block was REQUESTED from. It used
+            // to decrement the DELIVERING peer's counter instead, so a block
+            // requested from A but delivered by B (a compact block, an
+            // unsolicited block, a re-request after timeout) leaked one slot
+            // on A forever and saturating-subtracted nothing on B. A's leaked
+            // `blocks_in_flight > 0` then made `check_timeouts` report A as
+            // stalling on EVERY retry tick with nothing in flight at all —
+            // mainnet 2026-09-26 23:40-23:48: peer 308 scored +50 every ~10s
+            // up to 1950 with `in_flight=0`.
+            if let Some(state) = self.peer_states.get_mut(&in_flight.peer) {
                 state.blocks_in_flight = state.blocks_in_flight.saturating_sub(1);
+            }
+            if let Some(state) = self.peer_states.get_mut(&peer_id) {
                 state.last_block_received = Instant::now();
                 state.stalling = false;
                 // Decay timeout on success
                 state.decay_timeout();
             }
-
-            // Even if peer_id doesn't match in_flight.peer, we still accept the block
-            // (peer might have forwarded it)
-            let _ = in_flight;
         }
 
         self.timed_out_from.remove(&hash);
+        self.announced_by.remove(&hash);
         self.received_blocks.insert(hash, block);
 
         // Refill on receipt. `assign_requests` drains `pending_refill` first,
@@ -739,13 +782,47 @@ impl BlockDownloader {
         let now = Instant::now();
         let mut disconnect = Vec::new();
 
-        // Check per-peer stall (no block received for BLOCK_STALL_TIMEOUT)
-        for (peer_id, state) in &self.peer_states {
-            if state.blocks_in_flight > 0
-                && now.duration_since(state.last_block_received) > BLOCK_STALL_TIMEOUT
-            {
-                disconnect.push(*peer_id);
+        // Re-derive every peer's in-flight count from `in_flight` itself — the
+        // map is the ground truth; the per-peer counter is a cache of it for
+        // `assign_requests`. Any drift (see `block_received`) is healed here
+        // every retry tick instead of turning into a phantom stall.
+        let mut outstanding: HashMap<PeerId, usize> = HashMap::new();
+        for b in self.in_flight.values() {
+            *outstanding.entry(b.peer).or_insert(0) += 1;
+        }
+        for (peer_id, state) in self.peer_states.iter_mut() {
+            state.blocks_in_flight = outstanding.get(peer_id).copied().unwrap_or(0);
+        }
+
+        // Stall — Core's rule (net_processing.cpp, m_stalling_since), not a
+        // counter: the ONLY candidate is the peer holding the block the
+        // download window is blocked on (the next block we need to connect,
+        // `pending_hashes.front()`), and only while that request is actually
+        // outstanding and older than BLOCK_STALL_TIMEOUT with nothing
+        // delivered by that peer since. A peer with nothing in flight, or
+        // holding only blocks further up the window, is never a staller.
+        //
+        // The old rule — "counter > 0 and nothing received for 120s" — fired
+        // on a leaked counter with the in-flight map empty, and on any peer
+        // that sat idle for two minutes (normal at tip) the moment it was
+        // handed the new tip block. It put ~57 honest mainnet nodes on the
+        // 24h ban list on 2026-09-26 (listbanned: "block download stalling").
+        if let Some(front) = self.pending_hashes.front() {
+            if let Some(b) = self.in_flight.get(front) {
+                let since = self
+                    .peer_states
+                    .get(&b.peer)
+                    .map_or(b.requested_at, |st| b.requested_at.max(st.last_block_received));
+                if now.duration_since(since) > BLOCK_STALL_TIMEOUT {
+                    disconnect.push(b.peer);
+                }
             }
+        }
+        // Hand a stalled peer's blocks to someone else now and stop assigning
+        // to it, so it is reported ONCE (Core sets fDisconnect once) rather
+        // than on every tick until its disconnect is processed.
+        for peer_id in &disconnect {
+            self.remove_peer(*peer_id);
         }
 
         // Check individual block timeouts (adaptive per-peer timeout)
@@ -1380,6 +1457,175 @@ mod tests {
         assert_eq!(dl.blocks_in_flight(), 0);
         assert_eq!(dl.blocks_queued(), 1);
         assert!(dl.peer_states.get(&peer).unwrap().stalling);
+    }
+
+    /// LAG-4 (mainnet 2026-09-26 23:40Z): a block requested from A and
+    /// delivered by B must free A's slot. Before the fix A kept a phantom
+    /// `blocks_in_flight = 1`, and once its `last_block_received` aged past
+    /// BLOCK_STALL_TIMEOUT `check_timeouts` reported A as stalling on every
+    /// tick with the in-flight map EMPTY.
+    #[test]
+    fn stall_detector_never_flags_a_peer_with_zero_in_flight() {
+        let mut dl = BlockDownloader::new(0, 100);
+        let a = PeerId(1);
+        let b = PeerId(2);
+        dl.add_peer(a);
+        dl.add_peer(b);
+        let block = make_test_block(7);
+        let hash = block.block_hash();
+        dl.enqueue_blocks(vec![(hash, 1)]);
+        // Force the request onto A.
+        dl.peer_states.get_mut(&b).unwrap().blocks_in_flight = dl.max_per_peer;
+        let reqs = dl.assign_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].0, a);
+        dl.peer_states.get_mut(&b).unwrap().blocks_in_flight = 0;
+
+        // B delivers it (compact block / unsolicited / re-request).
+        assert_eq!(dl.block_received(b, block), Some(hash));
+        assert_eq!(dl.in_flight_count(), 0);
+        assert_eq!(
+            dl.peer_states[&a].blocks_in_flight, 0,
+            "A's slot leaked although its block was delivered by B"
+        );
+
+        // A has been quiet for a long time — irrelevant: it holds nothing.
+        dl.peer_states.get_mut(&a).unwrap().last_block_received =
+            Instant::now() - BLOCK_STALL_TIMEOUT * 3;
+        for tick in 0..5 {
+            assert!(
+                dl.check_timeouts().is_empty(),
+                "tick {tick}: a peer with nothing in flight was reported as stalling"
+            );
+        }
+    }
+
+    /// A drifted counter (however it got there) must not be read as a stall:
+    /// with the in-flight map empty, nobody is stalling.
+    #[test]
+    fn stall_detector_heals_a_drifted_counter() {
+        let mut dl = BlockDownloader::new(0, 100);
+        let a = PeerId(1);
+        dl.add_peer(a);
+        {
+            let st = dl.peer_states.get_mut(&a).unwrap();
+            st.blocks_in_flight = 3;
+            st.last_block_received = Instant::now() - BLOCK_STALL_TIMEOUT * 3;
+        }
+        assert!(dl.check_timeouts().is_empty());
+        assert_eq!(dl.peer_states[&a].blocks_in_flight, 0);
+    }
+
+    /// Core starts the stall clock when the window-blocking request is
+    /// outstanding (m_stalling_since), not when the peer last delivered. A
+    /// peer that was idle for minutes (normal at tip: one block per ~10 min)
+    /// and was JUST handed the new tip block is not stalling. Before the fix
+    /// it was flagged at the next retry tick — mainnet 23:38:32Z, peer 294
+    /// scored 3s after the getdata went out.
+    #[test]
+    fn stall_detector_does_not_flag_an_idle_peer_just_given_a_request() {
+        let mut dl = BlockDownloader::new(0, 100);
+        let a = PeerId(1);
+        dl.add_peer(a);
+        dl.peer_states.get_mut(&a).unwrap().last_block_received =
+            Instant::now() - BLOCK_STALL_TIMEOUT * 5;
+        dl.enqueue_blocks(vec![(Hash256([3; 32]), 1)]);
+        assert_eq!(dl.assign_requests().len(), 1);
+        assert!(
+            dl.check_timeouts().is_empty(),
+            "a request made just now was reported as a stall"
+        );
+    }
+
+    /// A peer that really holds an outstanding request past the stall timeout
+    /// is reported ONCE, and its block goes back to the queue for someone else.
+    #[test]
+    fn stall_detector_reports_a_real_staller_once_and_requeues_its_block() {
+        let mut dl = BlockDownloader::new(0, 100);
+        let a = PeerId(1);
+        dl.add_peer(a);
+        let hash = Hash256([4; 32]);
+        dl.enqueue_blocks(vec![(hash, 1)]);
+        assert_eq!(dl.assign_requests().len(), 1);
+        {
+            let b = dl.in_flight.get_mut(&hash).unwrap();
+            b.requested_at = Instant::now() - BLOCK_STALL_TIMEOUT * 2;
+            // Keep the per-block timeout out of the way.
+            b.timeout = BLOCK_STALL_TIMEOUT * 10;
+        }
+        dl.peer_states.get_mut(&a).unwrap().last_block_received =
+            Instant::now() - BLOCK_STALL_TIMEOUT * 3;
+        assert_eq!(dl.check_timeouts(), vec![a]);
+        assert_eq!(dl.in_flight_count(), 0);
+        assert_eq!(dl.download_queue_len(), 1);
+        assert!(dl.check_timeouts().is_empty(), "staller reported twice");
+    }
+
+    /// Only the holder of the window-blocking block (the next one to
+    /// connect) can be a staller — Core's m_stalling_since rule. A peer
+    /// sitting on a block further up the window is left to the per-block
+    /// timeout (re-request elsewhere), not disconnected.
+    #[test]
+    fn stall_detector_only_considers_the_window_blocking_block() {
+        let mut dl = BlockDownloader::new(0, 100);
+        let a = PeerId(1);
+        let b = PeerId(2);
+        dl.add_peer(a);
+        dl.add_peer(b);
+        let front = Hash256([1; 32]);
+        let later = Hash256([2; 32]);
+        dl.enqueue_blocks(vec![(front, 1), (later, 2)]);
+        // front -> a, later -> b
+        dl.peer_states.get_mut(&b).unwrap().blocks_in_flight = dl.max_per_peer;
+        dl.download_queue.truncate(1);
+        assert_eq!(dl.assign_requests()[0].0, a);
+        dl.peer_states.get_mut(&b).unwrap().blocks_in_flight = 0;
+        dl.peer_states.get_mut(&a).unwrap().blocks_in_flight = dl.max_per_peer;
+        dl.download_queue.push_back((later, 2));
+        assert_eq!(dl.assign_requests()[0].0, b);
+        dl.peer_states.get_mut(&a).unwrap().blocks_in_flight = 1;
+        let old = Instant::now() - BLOCK_STALL_TIMEOUT * 2;
+        for h in [front, later] {
+            let f = dl.in_flight.get_mut(&h).unwrap();
+            f.requested_at = old;
+            f.timeout = BLOCK_STALL_TIMEOUT * 10;
+        }
+        for p in [a, b] {
+            dl.peer_states.get_mut(&p).unwrap().last_block_received = old;
+        }
+        assert_eq!(dl.check_timeouts(), vec![a], "only the front-block holder stalls");
+    }
+
+    /// A new tip block goes to the peer that announced it (Core
+    /// HeadersDirectFetchBlocks), not to whichever peer round-robin lands on.
+    #[test]
+    fn announced_tip_block_is_requested_from_the_announcer() {
+        for trial in 0..32u8 {
+            let mut dl = BlockDownloader::new(0, 100);
+            for p in 1..=5 {
+                dl.add_peer(PeerId(p));
+            }
+            let announcer = PeerId(1 + (trial as u64 % 5));
+            let blocks = vec![(Hash256([trial; 32]), 1)];
+            dl.note_announcer(announcer, &blocks);
+            dl.enqueue_blocks(blocks);
+            let reqs = dl.assign_requests();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].0, announcer, "trial {trial}");
+        }
+    }
+
+    /// A large header-sync batch is NOT pinned to one peer.
+    #[test]
+    fn header_sync_batch_is_not_pinned_to_the_sender() {
+        let mut dl = BlockDownloader::new(0, 100);
+        dl.add_peer(PeerId(1));
+        dl.add_peer(PeerId(2));
+        let blocks: Vec<(Hash256, u32)> = (1..=32u32).map(|i| (Hash256([i as u8; 32]), i)).collect();
+        dl.note_announcer(PeerId(1), &blocks);
+        dl.enqueue_blocks(blocks);
+        let reqs = dl.assign_requests();
+        assert!(reqs.iter().any(|(p, _)| *p == PeerId(2)));
     }
 
     /// The tip-sync case: ONE block, in flight to a peer that never answers
