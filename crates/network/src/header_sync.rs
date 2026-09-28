@@ -135,10 +135,17 @@ impl HeaderSync {
     /// lowered. We keep the same monotonic semantics here: a peer's tracked
     /// height only goes up, so a transient lower observation can't drop a peer
     /// out of the sync-candidate set.
+    ///
+    /// Only a REGISTERED peer is updated. A `headers` message can be processed
+    /// after that peer's `Disconnected` event; inserting here would resurrect
+    /// it, and `some_peer` would then hand historical backfill a dead peer
+    /// forever (mainnet 2026-09-28: every backfill request dropped for 50+
+    /// min, "command channel closed for peer PeerId(37)").
     pub fn note_peer_height(&mut self, peer_id: PeerId, height: i32) {
-        let entry = self.peer_heights.entry(peer_id).or_insert(height);
-        if height > *entry {
-            *entry = height;
+        if let Some(entry) = self.peer_heights.get_mut(&peer_id) {
+            if height > *entry {
+                *entry = height;
+            }
         }
     }
 
@@ -1207,7 +1214,7 @@ mod tests {
         let mut sync = HeaderSync::new(genesis_hash);
         let peer = PeerId(7);
 
-        sync.note_peer_height(peer, 500);
+        sync.register_peer(peer, 500);
         assert_eq!(sync.peer_height(peer), Some(500));
 
         // Higher observation raises it.
@@ -1217,6 +1224,21 @@ mod tests {
         // Lower observation is ignored.
         sync.note_peer_height(peer, 100);
         assert_eq!(sync.peer_height(peer), Some(900));
+    }
+
+    /// A height observation for a peer that was removed (its `headers` was
+    /// processed after its `Disconnected` event) must not re-register it:
+    /// `some_peer` would otherwise return the dead peer indefinitely.
+    #[test]
+    fn test_note_peer_height_does_not_resurrect_removed_peer() {
+        let mut sync = HeaderSync::new(Hash256([0; 32]));
+        let dead = PeerId(37);
+        sync.register_peer(dead, 900);
+        sync.remove_peer(dead);
+        sync.note_peer_height(dead, 950);
+        assert!(!sync.has_peer(dead));
+        assert_eq!(sync.some_peer(), None);
+        assert_eq!(sync.peer_count(), 0);
     }
 
     /// Regression guard for the stale-height symptom directly: a peer whose
