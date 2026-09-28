@@ -110,12 +110,22 @@ pub fn reconcile_chain_work(
         return Ok(ChainWorkReconcile::Clean);
     }
 
+    // The base entry's parent link must match its header. A base activated
+    // before its header was stored carries prev_hash = ZERO; recompute_above
+    // then cannot find its parent, skips it as orphaned, and every descendant
+    // inherits the seeded placeholder (mainnet 2026-09-28: headers complete,
+    // work exact to 944182, wrong from the base 944183 to the tip).
+    let mut base = base;
+    if let Some(h) = store.get_header(&base_hash)? {
+        if base.prev_hash != h.prev_block_hash {
+            base.prev_hash = h.prev_block_hash;
+            store.put_block_index(&base_hash, &base)?;
+        }
+    }
+
     // Walk down from the base's parent through entry-less headers.
     let mut band: Vec<(Hash256, u32, u32)> = Vec::new(); // (hash, height, bits), descending
-    let mut cursor = match store.get_header(&base_hash)? {
-        Some(h) => h.prev_block_hash,
-        None => base.prev_hash,
-    };
+    let mut cursor = base.prev_hash;
     let mut height = base.height - 1;
     let anchor = loop {
         if let Some(e) = store.get_block_index(&cursor)? {
@@ -205,16 +215,35 @@ fn recompute_above(store: &BlockStore<'_>, floor: u32) -> Result<(u64, u64), Sto
     let mut rewritten = 0u64;
     let mut orphaned = 0u64;
     for (_, hash, mut entry) in above {
-        let parent_work = match settled.get(&entry.prev_hash) {
+        let mut parent_work = match settled.get(&entry.prev_hash) {
             Some(w) => Some(*w),
             None => store.get_block_index(&entry.prev_hash)?.map(|p| p.chain_work),
         };
+        if parent_work.is_none() {
+            // A stale/zero parent link in the index: trust the stored header.
+            if let Some(hdr) = store.get_header(&hash)? {
+                if hdr.prev_block_hash != entry.prev_hash {
+                    let pw = match settled.get(&hdr.prev_block_hash) {
+                        Some(w) => Some(*w),
+                        None => store
+                            .get_block_index(&hdr.prev_block_hash)?
+                            .map(|p| p.chain_work),
+                    };
+                    if pw.is_some() {
+                        entry.prev_hash = hdr.prev_block_hash;
+                        parent_work = pw;
+                    }
+                }
+            }
+        }
         let Some(parent_work) = parent_work else {
             orphaned += 1;
             continue;
         };
         let work = ChainWork(parent_work).saturating_add(&get_block_proof(entry.bits));
-        if entry.chain_work != work.0 {
+        let stored = store.get_block_index(&hash)?;
+        let link_repaired = stored.as_ref().is_some_and(|e| e.prev_hash != entry.prev_hash);
+        if entry.chain_work != work.0 || link_repaired {
             entry.chain_work = work.0;
             store.put_block_index(&hash, &entry)?;
             rewritten += 1;
@@ -354,6 +383,41 @@ mod tests {
             assert_eq!(e.height, h);
         }
         // Idempotent.
+        assert_eq!(
+            reconcile_chain_work(&store, Some(base_hash)).unwrap(),
+            ChainWorkReconcile::Clean
+        );
+    }
+
+    /// Mainnet 2026-09-28: the snapshot base entry carried prev_hash = ZERO
+    /// (activated before its header was stored). The reconcile fixed the tail
+    /// band but skipped the base as orphaned, so base..tip kept the seeded
+    /// placeholder. The base link must be repaired from its header.
+    #[test]
+    fn snapshot_base_with_zero_prev_link_is_reconciled_to_tip() {
+        let (_d, db) = temp_db();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::mainnet();
+        let hdrs = headers(params.genesis_hash, 60);
+        let (floor, base, tip) = (20u32, 40u32, 60u32);
+        snapshot_layout(&store, &params, &hdrs, floor, base, tip, true);
+        let base_hash = hdrs[base as usize - 1].block_hash();
+        let mut b = store.get_block_index(&base_hash).unwrap().unwrap();
+        b.prev_hash = Hash256::ZERO;
+        store.put_block_index(&base_hash, &b).unwrap();
+
+        let out = reconcile_chain_work(&store, Some(base_hash)).unwrap();
+        match out {
+            ChainWorkReconcile::Reconciled { orphaned, .. } => assert_eq!(orphaned, 0),
+            other => panic!("expected Reconciled, got {other:?}"),
+        }
+        for h in 1..=tip {
+            let hash = hdrs[h as usize - 1].block_hash();
+            let e = store.get_block_index(&hash).unwrap().unwrap();
+            assert_eq!(e.chain_work, core_work(&params, &hdrs, h), "height {h}");
+        }
+        let b = store.get_block_index(&base_hash).unwrap().unwrap();
+        assert_eq!(b.prev_hash, hdrs[base as usize - 2].block_hash());
         assert_eq!(
             reconcile_chain_work(&store, Some(base_hash)).unwrap(),
             ChainWorkReconcile::Clean
