@@ -115,10 +115,22 @@ pub fn reconcile_chain_work(
     // then cannot find its parent, skips it as orphaned, and every descendant
     // inherits the seeded placeholder (mainnet 2026-09-28: headers complete,
     // work exact to 944182, wrong from the base 944183 to the tip).
+    // The same activation path defaulted bits/timestamp/nonce/version to 0,
+    // and bits = 0 contributes zero proof: after the link repair the tip was
+    // still exactly one block's work (the base's) below Core.
     let mut base = base;
     if let Some(h) = store.get_header(&base_hash)? {
-        if base.prev_hash != h.prev_block_hash {
+        if base.prev_hash != h.prev_block_hash
+            || base.bits != h.bits
+            || base.timestamp != h.timestamp
+            || base.nonce != h.nonce
+            || base.version != h.version
+        {
             base.prev_hash = h.prev_block_hash;
+            base.bits = h.bits;
+            base.timestamp = h.timestamp;
+            base.nonce = h.nonce;
+            base.version = h.version;
             store.put_block_index(&base_hash, &base)?;
         }
     }
@@ -404,6 +416,10 @@ mod tests {
         let base_hash = hdrs[base as usize - 1].block_hash();
         let mut b = store.get_block_index(&base_hash).unwrap().unwrap();
         b.prev_hash = Hash256::ZERO;
+        b.bits = 0;
+        b.timestamp = 0;
+        b.nonce = 0;
+        b.version = 0;
         store.put_block_index(&base_hash, &b).unwrap();
 
         let out = reconcile_chain_work(&store, Some(base_hash)).unwrap();
@@ -418,6 +434,7 @@ mod tests {
         }
         let b = store.get_block_index(&base_hash).unwrap().unwrap();
         assert_eq!(b.prev_hash, hdrs[base as usize - 2].block_hash());
+        assert_eq!(b.bits, hdrs[base as usize - 1].bits);
         assert_eq!(
             reconcile_chain_work(&store, Some(base_hash)).unwrap(),
             ChainWorkReconcile::Clean
