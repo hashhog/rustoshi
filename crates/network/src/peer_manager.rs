@@ -3988,6 +3988,17 @@ impl PeerManager {
         }
     }
 
+    /// True while `peer_id` is in the table AND its task still holds the
+    /// command receiver. A peer task can exit minutes before its
+    /// `Disconnected` event is drained by the main loop (priority-lane
+    /// backlog); during that window this is false while the peer is still
+    /// registered everywhere else.
+    pub fn peer_channel_open(&self, peer_id: PeerId) -> bool {
+        self.peers
+            .get(&peer_id)
+            .is_some_and(|p| !p.command_tx.is_closed())
+    }
+
     /// Try to send a message without blocking. Drops the message if the
     /// peer's send buffer is full. Use for non-critical bulk responses.
     pub fn try_send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> bool {

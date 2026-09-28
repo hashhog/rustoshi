@@ -7754,10 +7754,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         bf.clear_getheaders_cooldown();
                     }
                     if historical_backfill_may_drive(&header_sync, validated_tip) {
+                        // Only a peer whose task is still alive: a dead one
+                        // stays registered until its Disconnected is drained.
+                        let bf_peer = {
+                            let ps = peer_state.read().await;
+                            ps.peer_manager.as_ref().and_then(|pm| {
+                                header_sync.first_peer_where(|p| pm.peer_channel_open(p))
+                            })
+                        };
                         drive_historical_backfill(
                             &mut historical_backfill,
                             &block_store,
-                            header_sync.some_peer(),
+                            bf_peer,
                             &peer_state,
                         )
                         .await;

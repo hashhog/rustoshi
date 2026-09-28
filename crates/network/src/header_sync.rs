@@ -167,6 +167,15 @@ impl HeaderSync {
         self.peer_heights.keys().next().copied()
     }
 
+    /// First registered peer satisfying `usable` (e.g. its command channel is
+    /// still open). Historical backfill uses this instead of `some_peer`: a
+    /// peer whose task has exited stays registered until its `Disconnected`
+    /// is drained, which on mainnet took 3-8 min, and `some_peer` (HashMap
+    /// first key) kept choosing it, so every request in that window dropped.
+    pub fn first_peer_where(&self, mut usable: impl FnMut(PeerId) -> bool) -> Option<PeerId> {
+        self.peer_heights.keys().copied().find(|p| usable(*p))
+    }
+
     /// Remove a disconnected peer.
     ///
     /// If we were syncing from this peer, reset state to Idle so we can
@@ -1239,6 +1248,19 @@ mod tests {
         assert!(!sync.has_peer(dead));
         assert_eq!(sync.some_peer(), None);
         assert_eq!(sync.peer_count(), 0);
+    }
+
+    /// `first_peer_where` skips peers the caller reports unusable, and is
+    /// `None` when none qualifies.
+    #[test]
+    fn test_first_peer_where_skips_dead_channels() {
+        let mut sync = HeaderSync::new(Hash256([0; 32]));
+        for id in [1u64, 2, 3] {
+            sync.register_peer(PeerId(id), 100);
+        }
+        let dead = |p: PeerId| p.0 != 2;
+        assert_eq!(sync.first_peer_where(|p| !dead(p)), Some(PeerId(2)));
+        assert_eq!(sync.first_peer_where(|_| false), None);
     }
 
     /// Regression guard for the stale-height symptom directly: a peer whose
