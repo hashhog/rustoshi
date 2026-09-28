@@ -38,6 +38,14 @@
 //! the only peer. Observed 2026-09-19: 66,069 backfill iterations, zero
 //! block requests, tip frozen at the snapshot base.
 //!
+//! Main-loop isolation (2026-09-28): the P2P loop is single-threaded, so
+//! backfill work there delays everything else it handles, including peer
+//! lifecycle events and new-tip headers. Three bounds keep it cheap:
+//! a global window of [`BACKFILL_MAX_BODIES_OUTSTANDING`] bodies (Core draws
+//! background-chainstate blocks from the same 16-per-peer in-transit budget,
+//! after the active chain), a single outstanding genesis-side getheaders, and
+//! body writes on the [`BodyWriter`] thread instead of the loop.
+//!
 //! Operator kill-switch: [`historical_backfill_is_enabled`] /
 //! `--no-historical-backfill` / [`HISTORICAL_BACKFILL_DISABLE_ENV`]. Campaign
 //! slices that only need the snapshot tip can disable this path so forward
@@ -48,19 +56,36 @@
 //! for small chains. Replaying ~942k mainnet blocks into a RAM `HashMap`
 //! would OOM; this backfill is the operator-visible historical index.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::Arc;
 
 use rustoshi_consensus::params::ChainParams;
 use rustoshi_consensus::pow::{get_block_proof, ChainWork};
 use rustoshi_primitives::{Block, BlockHeader, Hash256};
 
 use crate::block_store::{BlockIndexEntry, BlockStatus, BlockStore};
-use crate::db::StorageError;
+use crate::db::{ChainDb, StorageError};
 use crate::header_context::{expected_bits_for_child, HeaderCache};
 
 /// Maximum bodies requested in one getdata burst. Matches Core's default
 /// per-peer in-flight cap so historical download cannot starve tip sync.
 pub const BACKFILL_BODIES_PER_REQUEST: usize = 16;
+
+/// Hard cap on historical bodies outstanding at once, across ALL peers:
+/// requested-and-not-yet-received plus received-and-not-yet-written.
+///
+/// Core's background-chainstate download (`TryDownloadingHistoricalBlocks`,
+/// `net_processing.cpp`) draws from the same per-peer
+/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16` budget as the active chain, after
+/// the active chain has taken its share. rustoshi had no such window: every
+/// received body re-ran the scan and asked for up to 16 MORE, so the number
+/// of bodies in flight grew by ~15 per body received. On an I/O-bound box
+/// (2026-09-28, iowait ~68%) those bodies filled the priority event lane
+/// ahead of lifecycle events and new-tip headers: a `Connected` was handled
+/// 875 s after the handshake, a `Disconnected` 16 min after the task died,
+/// and the node sat 5 blocks behind the tip for 20 min.
+pub const BACKFILL_MAX_BODIES_OUTSTANDING: usize = 16;
 
 /// Maximum heights one [`HistoricalBackfill::next_body_hashes`] call (and one
 /// body-cursor advance) examines. Each height costs up to two RocksDB point
@@ -121,6 +146,84 @@ pub enum BackfillError {
     UnexpectedBlock(Hash256),
 }
 
+/// Outcome of [`HistoricalBackfill::admit_body`].
+#[derive(Debug)]
+pub enum BodyAdmission {
+    /// Already stored or already being written; nothing to do.
+    Duplicate,
+    /// Write this body with this (pre-write) index entry, then report back.
+    Store(BlockIndexEntry),
+}
+
+/// A historical body to persist off the P2P loop.
+pub struct BodyWriteJob {
+    pub hash: Hash256,
+    pub block: Block,
+    pub entry: BlockIndexEntry,
+    /// Opaque caller data returned in [`BodyWriteDone`] (the P2P loop passes
+    /// the delivering peer id so it can top the window back up there).
+    pub tag: u64,
+}
+
+/// Result of a [`BodyWriteJob`].
+#[derive(Debug)]
+pub struct BodyWriteDone {
+    pub hash: Hash256,
+    pub height: u32,
+    pub tag: u64,
+    pub result: Result<(), String>,
+}
+
+/// Dedicated OS thread that performs historical body writes
+/// ([`HistoricalBackfill::write_body`]) so the node's single-threaded P2P
+/// loop never blocks on them. The P2P loop only does bookkeeping
+/// ([`HistoricalBackfill::admit_body`] / [`HistoricalBackfill::body_written`]).
+///
+/// The job queue is bounded to [`BACKFILL_MAX_BODIES_OUTSTANDING`]; the
+/// window guarantees it cannot fill in normal operation, and
+/// [`BodyWriter::try_submit`] never blocks if it somehow does. The thread
+/// exits when the `BodyWriter` is dropped.
+pub struct BodyWriter {
+    tx: SyncSender<BodyWriteJob>,
+}
+
+impl BodyWriter {
+    /// Spawn the writer thread. `on_done` runs on that thread after every job.
+    pub fn spawn<F>(db: Arc<ChainDb>, mut on_done: F) -> std::io::Result<Self>
+    where
+        F: FnMut(BodyWriteDone) + Send + 'static,
+    {
+        let (tx, rx) = sync_channel::<BodyWriteJob>(BACKFILL_MAX_BODIES_OUTSTANDING);
+        std::thread::Builder::new()
+            .name("backfill-writer".into())
+            .spawn(move || {
+                let store = BlockStore::new(&db);
+                while let Ok(job) = rx.recv() {
+                    let height = job.entry.height;
+                    let result =
+                        HistoricalBackfill::write_body(&store, &job.hash, &job.block, job.entry)
+                            .map_err(|e| e.to_string());
+                    on_done(BodyWriteDone {
+                        hash: job.hash,
+                        height,
+                        tag: job.tag,
+                        result,
+                    });
+                }
+            })?;
+        Ok(BodyWriter { tx })
+    }
+
+    /// Queue a job without blocking. Returns the job if the queue is full or
+    /// the thread is gone; the caller then reports the write as failed so
+    /// the height is re-requested.
+    pub fn try_submit(&self, job: BodyWriteJob) -> Result<(), BodyWriteJob> {
+        self.tx.try_send(job).map_err(|e| match e {
+            TrySendError::Full(j) | TrySendError::Disconnected(j) => j,
+        })
+    }
+}
+
 /// Background backfill of the assumeutxo height-index hole.
 pub struct HistoricalBackfill {
     genesis_hash: Hash256,
@@ -143,8 +246,17 @@ pub struct HistoricalBackfill {
     /// cursor. Without it, a single missing/in-flight body at
     /// `next_body_height` made every call re-walk the whole hole.
     body_scan_height: u32,
-    /// Hashes we have asked a peer for and not yet received.
-    in_flight_bodies: HashSet<Hash256>,
+    /// Hashes we have asked a peer for and not yet received, with the
+    /// [`Self::expire_in_flight`] generation they were requested in.
+    in_flight_bodies: HashMap<Hash256, u64>,
+    /// Current request generation (advanced by [`Self::expire_in_flight`]).
+    body_generation: u64,
+    /// Bodies received and handed to the writer, not yet confirmed stored
+    /// (hash -> height). Count against [`BACKFILL_MAX_BODIES_OUTSTANDING`].
+    pending_writes: HashMap<Hash256, u32>,
+    /// A genesis-side getheaders is outstanding. Cleared by the next
+    /// historical headers batch or by the maintenance tick.
+    headers_in_flight: bool,
     /// Set when a headers batch stored 0 (overlapping resend). Cleared by
     /// [`Self::clear_getheaders_cooldown`] (maintenance tick). Prevents the
     /// tight loop that starved forward getheaders after `--load-snapshot`.
@@ -217,7 +329,10 @@ impl HistoricalBackfill {
             floor_hash,
             next_body_height,
             body_scan_height: next_body_height,
-            in_flight_bodies: HashSet::new(),
+            in_flight_bodies: HashMap::new(),
+            body_generation: 0,
+            pending_writes: HashMap::new(),
+            headers_in_flight: false,
             getheaders_cooldown: false,
         }))
     }
@@ -247,23 +362,45 @@ impl HistoricalBackfill {
     /// rustoshi has one P2P pipeline; Core's snapshot chainstate does not
     /// share that constraint. Yielding is how we keep `--load-snapshot`
     /// boot able to request blocks past the base.
+    ///
+    /// `forward_download_idle` is the forward block downloader having nothing
+    /// queued and nothing in flight: a tip block announced but not yet
+    /// fetched must not queue behind historical bodies on the same peer.
     pub fn may_use_peer(
         forward_header_sync_idle: bool,
+        forward_download_idle: bool,
         validated_tip: u32,
         header_tip: u32,
     ) -> bool {
-        forward_header_sync_idle && validated_tip >= header_tip
+        forward_header_sync_idle && forward_download_idle && validated_tip >= header_tip
     }
 
     /// True when the P2P loop should send a genesis-side getheaders.
-    /// False once the header hole is closed, or during the stored-0 cooldown.
+    /// False once the header hole is closed, during the stored-0 cooldown,
+    /// or while a previous getheaders is still unanswered (one outstanding
+    /// request, like Core's single headers-sync request per peer).
     pub fn should_request_headers(&self) -> bool {
-        !self.headers_complete() && !self.getheaders_cooldown
+        !self.headers_complete() && !self.getheaders_cooldown && !self.headers_in_flight
     }
 
-    /// Allow getheaders again (maintenance tick / peer reconnect).
+    /// Record that a genesis-side getheaders was sent.
+    pub fn note_headers_requested(&mut self) {
+        self.headers_in_flight = true;
+    }
+
+    /// Allow getheaders again (maintenance tick / peer reconnect). Also
+    /// forgets an unanswered getheaders, so a peer that never replied cannot
+    /// stall the header backfill beyond one tick.
     pub fn clear_getheaders_cooldown(&mut self) {
         self.getheaders_cooldown = false;
+        self.headers_in_flight = false;
+    }
+
+    /// Historical bodies requested-not-received plus received-not-written.
+    /// Never exceeds [`BACKFILL_MAX_BODIES_OUTSTANDING`] through
+    /// [`Self::next_body_hashes`].
+    pub fn bodies_outstanding(&self) -> usize {
+        self.in_flight_bodies.len() + self.pending_writes.len()
     }
 
     /// Genesis-side locator for `getheaders`. Newest-first: the last
@@ -339,6 +476,8 @@ impl HistoricalBackfill {
         store: &BlockStore<'_>,
         params: &ChainParams,
     ) -> Result<usize, BackfillError> {
+        // Whatever this batch is, it answers (or overlaps) our getheaders.
+        self.headers_in_flight = false;
         if headers.is_empty() || self.headers_complete() {
             if !self.headers_complete() {
                 self.getheaders_cooldown = true;
@@ -473,40 +612,88 @@ impl HistoricalBackfill {
         Ok(stored)
     }
 
-    /// Store a historical block body. Does not connect UTXO / does not move
-    /// the active tip. Updates `n_tx` and `HAVE_DATA` on the index entry.
+    /// Store a historical block body synchronously. Does not connect UTXO /
+    /// does not move the active tip. Updates `n_tx` and `HAVE_DATA` on the
+    /// index entry. Equivalent to [`Self::admit_body`] +
+    /// [`Self::write_body`] + [`Self::body_written`]; the P2P loop uses the
+    /// split form so the disk write runs on the [`BodyWriter`] thread.
     pub fn accept_block(
         &mut self,
         block: &Block,
         store: &BlockStore<'_>,
     ) -> Result<bool, BackfillError> {
         let hash = block.block_hash();
-        self.in_flight_bodies.remove(&hash);
-        let Some(entry) = store.get_block_index(&hash)? else {
-            return Err(BackfillError::UnexpectedBlock(hash));
+        match self.admit_body(&hash, store)? {
+            BodyAdmission::Duplicate => Ok(false),
+            BodyAdmission::Store(entry) => {
+                let res = Self::write_body(store, &hash, block, entry.clone());
+                let ok = res.is_ok();
+                self.body_written(&hash, entry.height, ok, store)?;
+                res.map(|()| true).map_err(BackfillError::from)
+            }
+        }
+    }
+
+    /// Main-loop half of storing a received historical body: cheap checks
+    /// (two point reads) and bookkeeping, no body write. On
+    /// [`BodyAdmission::Store`] the hash moves from in-flight to
+    /// pending-write (it still counts against
+    /// [`BACKFILL_MAX_BODIES_OUTSTANDING`]) and the caller must eventually
+    /// report the write via [`Self::body_written`].
+    pub fn admit_body(
+        &mut self,
+        hash: &Hash256,
+        store: &BlockStore<'_>,
+    ) -> Result<BodyAdmission, BackfillError> {
+        self.in_flight_bodies.remove(hash);
+        if self.pending_writes.contains_key(hash) {
+            // A second copy (re-request after expiry) of a body being written.
+            return Ok(BodyAdmission::Duplicate);
+        }
+        let Some(entry) = store.get_block_index(hash)? else {
+            return Err(BackfillError::UnexpectedBlock(*hash));
         };
         if entry.height == 0 || entry.height >= self.target_floor {
-            return Err(BackfillError::UnexpectedBlock(hash));
+            return Err(BackfillError::UnexpectedBlock(*hash));
         }
-        if store.has_block(&hash)? {
+        if store.has_block(hash)? {
             self.advance_body_cursor(store)?;
-            return Ok(false);
+            return Ok(BodyAdmission::Duplicate);
         }
-        let height = entry.height;
-        let stored = store.put_block(&hash, block).and_then(|()| {
-            let mut entry = entry;
-            entry.n_tx = block.transactions.len() as u32;
-            entry.status.set(BlockStatus::HAVE_DATA);
-            store.put_block_index(&hash, &entry)
-        });
-        if let Err(e) = stored {
-            // In-flight marker is gone but the body may not be stored: make
-            // sure the scan revisits this height.
+        self.pending_writes.insert(*hash, entry.height);
+        Ok(BodyAdmission::Store(entry))
+    }
+
+    /// Disk half: write the body and mark its index entry `HAVE_DATA`. Takes
+    /// no `&self`, so it can run on the [`BodyWriter`] thread.
+    pub fn write_body(
+        store: &BlockStore<'_>,
+        hash: &Hash256,
+        block: &Block,
+        mut entry: BlockIndexEntry,
+    ) -> Result<(), StorageError> {
+        store.put_block(hash, block)?;
+        entry.n_tx = block.transactions.len() as u32;
+        entry.status.set(BlockStatus::HAVE_DATA);
+        store.put_block_index(hash, &entry)
+    }
+
+    /// Main-loop completion of [`Self::admit_body`]. On failure the height is
+    /// rescanned (and so re-requested); on success the completion cursor
+    /// advances (bounded).
+    pub fn body_written(
+        &mut self,
+        hash: &Hash256,
+        height: u32,
+        ok: bool,
+        store: &BlockStore<'_>,
+    ) -> Result<(), StorageError> {
+        self.pending_writes.remove(hash);
+        if !ok {
             self.body_scan_height = self.body_scan_height.min(height);
-            return Err(e.into());
+            return Ok(());
         }
-        self.advance_body_cursor(store)?;
-        Ok(true)
+        self.advance_body_cursor(store)
     }
 
     /// Next historical bodies to request, up to `limit`. Records them as
@@ -522,6 +709,9 @@ impl HistoricalBackfill {
         store: &BlockStore<'_>,
         limit: usize,
     ) -> Result<Vec<(u32, Hash256)>, StorageError> {
+        // Global window first, before any store read: when the window is
+        // full this call costs nothing, however often the P2P loop calls it.
+        let limit = limit.min(BACKFILL_MAX_BODIES_OUTSTANDING.saturating_sub(self.bodies_outstanding()));
         if self.bodies_complete() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -537,7 +727,7 @@ impl HistoricalBackfill {
         if self.body_scan_height < self.next_body_height {
             self.body_scan_height = self.next_body_height;
         }
-        if self.body_scan_height > end && self.in_flight_bodies.is_empty() {
+        if self.body_scan_height > end && self.bodies_outstanding() == 0 {
             // Everything up to `end` was examined, nothing is outstanding,
             // yet the body at `next_body_height` is still absent: some marker
             // was lost without a rewind. Rescan rather than stall forever.
@@ -550,8 +740,11 @@ impl HistoricalBackfill {
         while out.len() < limit && h <= end && scanned < BACKFILL_BODY_SCAN_MAX_HEIGHTS {
             scanned += 1;
             if let Some(hash) = store.get_hash_by_height(h)? {
-                if !self.in_flight_bodies.contains(&hash) && !store.has_block(&hash)? {
-                    self.in_flight_bodies.insert(hash);
+                if !self.in_flight_bodies.contains_key(&hash)
+                    && !self.pending_writes.contains_key(&hash)
+                    && !store.has_block(&hash)?
+                {
+                    self.in_flight_bodies.insert(hash, self.body_generation);
                     out.push((h, hash));
                 }
             }
@@ -567,6 +760,25 @@ impl HistoricalBackfill {
     pub fn clear_in_flight(&mut self) {
         self.in_flight_bodies.clear();
         self.body_scan_height = self.next_body_height;
+    }
+
+    /// Drop body requests that have survived a full tick (requested before
+    /// the previous call), then start a new generation. Called from the P2P
+    /// maintenance tick (45 s), so an unanswered request is retried after
+    /// 45-90 s. Unlike [`Self::clear_in_flight`] this does not forget
+    /// requests that are merely recent, which would re-request them while
+    /// the first copies are still on the wire and defeat the window.
+    /// Returns the number of requests dropped.
+    pub fn expire_in_flight(&mut self) -> usize {
+        let gen = self.body_generation;
+        let before = self.in_flight_bodies.len();
+        self.in_flight_bodies.retain(|_, g| *g >= gen);
+        self.body_generation += 1;
+        let dropped = before - self.in_flight_bodies.len();
+        if dropped > 0 {
+            self.body_scan_height = self.next_body_height;
+        }
+        dropped
     }
 
     fn is_historical_hash(&self, store: &BlockStore<'_>, hash: &Hash256) -> bool {
@@ -971,19 +1183,23 @@ mod tests {
     #[test]
     fn historical_backfill_yields_to_forward_sync() {
         assert!(
-            !HistoricalBackfill::may_use_peer(false, 900_000, 900_000),
+            !HistoricalBackfill::may_use_peer(false, true, 900_000, 900_000),
             "DownloadingHeaders must not share the getheaders slot with backfill"
         );
         assert!(
-            !HistoricalBackfill::may_use_peer(true, 900_000, 906_000),
+            !HistoricalBackfill::may_use_peer(true, true, 900_000, 906_000),
             "validated tip behind header tip: forward block download needs the peer"
         );
         assert!(
-            HistoricalBackfill::may_use_peer(true, 906_000, 906_000),
+            !HistoricalBackfill::may_use_peer(true, false, 906_000, 906_000),
+            "forward downloader has blocks queued/in flight: it owns the peer"
+        );
+        assert!(
+            HistoricalBackfill::may_use_peer(true, true, 906_000, 906_000),
             "caught up: backfill may use the peer"
         );
         assert!(
-            HistoricalBackfill::may_use_peer(true, 910_000, 906_000),
+            HistoricalBackfill::may_use_peer(true, true, 910_000, 906_000),
             "validated tip ahead of header tip is still idle-forward"
         );
     }
@@ -1240,5 +1456,201 @@ mod tests {
         assert!(bf.bodies_complete(), "cursor must advance to the floor");
         assert!(bf.is_complete());
         assert_eq!(store.historical_backfill_floor().unwrap(), None);
+    }
+
+    /// Hole 1..=59 with all headers stored, no bodies. Returns (store dir, db, blocks, bf).
+    fn body_hole(n: u32) -> (TempDir, ChainDb, Vec<Block>) {
+        let (dir, db) = temp_store();
+        let params = ChainParams::regtest();
+        let blocks = build_regtest_chain(&params, n + 10);
+        {
+            let store = BlockStore::new(&db);
+            seed_snapshot_hole(&store, &blocks, n, n + 10);
+        }
+        (dir, db, blocks)
+    }
+
+    fn armed(store: &BlockStore<'_>, blocks: &[Block], n: u32) -> HistoricalBackfill {
+        let params = ChainParams::regtest();
+        let mut bf = HistoricalBackfill::detect(store, params.genesis_hash, n + 10)
+            .unwrap()
+            .unwrap();
+        let hole: Vec<BlockHeader> = (1..n as usize).map(|h| blocks[h].header.clone()).collect();
+        bf.accept_headers(&hole, store, &params).unwrap();
+        assert!(bf.headers_complete());
+        bf
+    }
+
+    /// 2026-09-28 main-loop starvation: every received body re-ran the scan
+    /// and asked for up to 16 MORE, so outstanding bodies grew ~15 per body
+    /// received and flooded the priority event lane. The window is global:
+    /// however often the P2P loop drives (every Connected, every block,
+    /// every tick), at most BACKFILL_MAX_BODIES_OUTSTANDING are outstanding,
+    /// and each delivered body frees exactly one slot.
+    #[test]
+    fn historical_backfill_body_window_is_global_and_bounded() {
+        const N: u32 = 60;
+        let (_dir, db, blocks) = body_hole(N);
+        let store = BlockStore::new(&db);
+        let mut bf = armed(&store, &blocks, N);
+
+        let mut requested: Vec<u32> = Vec::new();
+        for _ in 0..50 {
+            requested.extend(
+                bf.next_body_hashes(&store, BACKFILL_BODIES_PER_REQUEST)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(h, _)| h),
+            );
+        }
+        assert_eq!(
+            requested.len(),
+            BACKFILL_MAX_BODIES_OUTSTANDING,
+            "50 drives must not put more than the window in flight"
+        );
+        assert_eq!(bf.bodies_outstanding(), BACKFILL_MAX_BODIES_OUTSTANDING);
+
+        // The old amplification: deliver one body, drive again. Exactly one
+        // slot is free, so exactly one new request -- not 16.
+        let mut next_expected = BACKFILL_MAX_BODIES_OUTSTANDING as u32 + 1;
+        for h in 1..=30u32 {
+            assert!(bf.accept_block(&blocks[h as usize], &store).unwrap());
+            let more = bf.next_body_hashes(&store, BACKFILL_BODIES_PER_REQUEST).unwrap();
+            assert!(more.len() <= 1, "one body in, at most one request out; got {}", more.len());
+            if next_expected < N {
+                assert_eq!(more.len(), 1);
+                assert_eq!(more[0].0, next_expected);
+                next_expected += 1;
+            }
+            assert!(bf.bodies_outstanding() <= BACKFILL_MAX_BODIES_OUTSTANDING);
+        }
+
+        // Drain: the window still completes the hole.
+        for h in 31..N {
+            bf.accept_block(&blocks[h as usize], &store).unwrap();
+            bf.next_body_hashes(&store, BACKFILL_BODIES_PER_REQUEST).unwrap();
+        }
+        assert!(bf.is_complete());
+        assert_eq!(bf.bodies_outstanding(), 0);
+    }
+
+    /// The P2P loop's split path: admit (bookkeeping) -> write (writer
+    /// thread) -> body_written (bookkeeping). A body being written keeps its
+    /// slot and is neither re-requested nor written twice; a failed write is
+    /// re-requested.
+    #[test]
+    fn historical_backfill_split_write_keeps_window_and_retries_failures() {
+        const N: u32 = 30;
+        let (_dir, db, blocks) = body_hole(N);
+        let store = BlockStore::new(&db);
+        let mut bf = armed(&store, &blocks, N);
+        let first = bf.next_body_hashes(&store, BACKFILL_BODIES_PER_REQUEST).unwrap();
+        assert_eq!(first.len(), BACKFILL_MAX_BODIES_OUTSTANDING);
+
+        let b1 = &blocks[1];
+        let h1 = b1.block_hash();
+        let entry = match bf.admit_body(&h1, &store).unwrap() {
+            BodyAdmission::Store(e) => e,
+            other => panic!("expected Store, got {other:?}"),
+        };
+        assert_eq!(entry.height, 1);
+        // Pending write still holds its slot: nothing new requested.
+        assert_eq!(bf.bodies_outstanding(), BACKFILL_MAX_BODIES_OUTSTANDING);
+        assert!(bf.next_body_hashes(&store, 16).unwrap().is_empty());
+        // A second copy while the first is being written is a duplicate.
+        assert!(matches!(bf.admit_body(&h1, &store).unwrap(), BodyAdmission::Duplicate));
+
+        // Write fails: the slot frees and height 1 is asked for again.
+        bf.body_written(&h1, 1, false, &store).unwrap();
+        bf.expire_in_flight();
+        bf.expire_in_flight(); // drop the other 15 so the rescan starts at 1
+        let again = bf.next_body_hashes(&store, 16).unwrap();
+        assert!(again.iter().any(|(h, _)| *h == 1), "failed write must be re-requested");
+
+        // Write succeeds: stored with HAVE_DATA, cursor advances.
+        let entry = match bf.admit_body(&h1, &store).unwrap() {
+            BodyAdmission::Store(e) => e,
+            other => panic!("expected Store, got {other:?}"),
+        };
+        HistoricalBackfill::write_body(&store, &h1, b1, entry).unwrap();
+        bf.body_written(&h1, 1, true, &store).unwrap();
+        assert!(store.has_block(&h1).unwrap());
+        let e = store.get_block_index(&h1).unwrap().unwrap();
+        assert!(e.status.has(BlockStatus::HAVE_DATA));
+        assert_eq!(e.n_tx, 1);
+        assert!(matches!(bf.admit_body(&h1, &store).unwrap(), BodyAdmission::Duplicate));
+    }
+
+    /// Requests survive one maintenance tick and expire on the second, so a
+    /// request is retried after 45-90 s instead of being duplicated while
+    /// the first copy is still on the wire.
+    #[test]
+    fn historical_backfill_expire_in_flight_is_two_generation() {
+        const N: u32 = 20;
+        let (_dir, db, blocks) = body_hole(N);
+        let store = BlockStore::new(&db);
+        let mut bf = armed(&store, &blocks, N);
+        let n = bf.next_body_hashes(&store, 16).unwrap().len();
+        assert_eq!(n, BACKFILL_MAX_BODIES_OUTSTANDING, "window-capped");
+        assert_eq!(bf.expire_in_flight(), 0, "fresh requests survive the first tick");
+        assert!(bf.next_body_hashes(&store, 16).unwrap().is_empty());
+        assert_eq!(bf.expire_in_flight(), n, "unanswered after a full tick: dropped");
+        assert_eq!(bf.next_body_hashes(&store, 16).unwrap().len(), n);
+    }
+
+    /// One genesis-side getheaders outstanding at a time.
+    #[test]
+    fn historical_backfill_one_getheaders_outstanding() {
+        const N: u32 = 20;
+        let (_dir, db, blocks) = body_hole(N);
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let mut bf = HistoricalBackfill::detect(&store, params.genesis_hash, N + 10)
+            .unwrap()
+            .unwrap();
+        assert!(bf.should_request_headers());
+        bf.note_headers_requested();
+        assert!(!bf.should_request_headers(), "unanswered getheaders blocks another");
+        let part: Vec<BlockHeader> = (1..5).map(|h| blocks[h].header.clone()).collect();
+        assert_eq!(bf.accept_headers(&part, &store, &params).unwrap(), 4);
+        assert!(bf.should_request_headers(), "the reply re-opens the slot");
+        bf.note_headers_requested();
+        bf.clear_getheaders_cooldown();
+        assert!(bf.should_request_headers(), "the tick forgets an unanswered request");
+    }
+
+    /// The writer thread persists bodies and reports back.
+    #[test]
+    fn body_writer_thread_stores_and_reports() {
+        const N: u32 = 10;
+        let (_dir, db, blocks) = body_hole(N);
+        let db = Arc::new(db);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = BodyWriter::spawn(Arc::clone(&db), move |d| {
+            let _ = done_tx.send(d);
+        })
+        .unwrap();
+        let store = BlockStore::new(&db);
+        let mut bf = armed(&store, &blocks, N);
+        bf.next_body_hashes(&store, 16).unwrap();
+        for h in 1..N as usize {
+            let hash = blocks[h].block_hash();
+            let BodyAdmission::Store(entry) = bf.admit_body(&hash, &store).unwrap() else {
+                panic!("height {h} should be admitted");
+            };
+            writer
+                .try_submit(BodyWriteJob { hash, block: blocks[h].clone(), entry, tag: 7 })
+                .map_err(|_| ())
+                .expect("queue has room for the window");
+        }
+        for _ in 1..N {
+            let d = done_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            assert_eq!(d.tag, 7);
+            assert!(d.result.is_ok());
+            bf.body_written(&d.hash, d.height, true, &store).unwrap();
+        }
+        assert!(bf.is_complete());
+        assert_eq!(bf.bodies_outstanding(), 0);
+        drop(writer);
     }
 }

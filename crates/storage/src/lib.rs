@@ -97,8 +97,9 @@ pub use snapshot::{
 };
 pub use chain_work_reconcile::{reconcile_chain_work, ChainWorkReconcile};
 pub use historical_backfill::{
-    historical_backfill_is_enabled, BackfillError, HistoricalBackfill,
-    BACKFILL_BODIES_PER_REQUEST, HISTORICAL_BACKFILL_DISABLE_ENV,
+    historical_backfill_is_enabled, BackfillError, BodyAdmission, BodyWriteDone, BodyWriteJob,
+    BodyWriter, HistoricalBackfill, BACKFILL_BODIES_PER_REQUEST,
+    BACKFILL_MAX_BODIES_OUTSTANDING, HISTORICAL_BACKFILL_DISABLE_ENV,
 };
 
 #[cfg(test)]

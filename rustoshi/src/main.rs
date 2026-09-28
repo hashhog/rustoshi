@@ -43,7 +43,8 @@ use rustoshi_storage::{
     block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry},
     coinstats_compute_next_entry, coinstats_genesis_entry,
     indexes::BlockFilterIndex,
-    BlockStore, ChainDb, CoinStatsIndex, HistoricalBackfill, UtxoCacheState,
+    BlockStore, BodyAdmission, BodyWriteDone, BodyWriteJob, BodyWriter, ChainDb,
+    CoinStatsIndex, HistoricalBackfill, UtxoCacheState,
     BACKFILL_BODIES_PER_REQUEST, HISTORICAL_BACKFILL_DISABLE_ENV,
     historical_backfill_is_enabled,
 };
@@ -1376,7 +1377,9 @@ async fn drive_historical_backfill(
             locator_hashes: bf.locator(),
             hash_stop: bf.hash_stop(),
         });
-        let _ = pm.send_to_peer(peer, msg).await;
+        if pm.send_to_peer(peer, msg).await {
+            bf.note_headers_requested();
+        }
     }
     match bf.next_body_hashes(store, BACKFILL_BODIES_PER_REQUEST) {
         Ok(hashes) if !hashes.is_empty() => {
@@ -1387,6 +1390,13 @@ async fn drive_historical_backfill(
                     hash: *h,
                 })
                 .collect();
+            tracing::debug!(
+                "historical backfill: getdata {} bodies from height {} to peer {} ({} outstanding)",
+                hashes.len(),
+                hashes[0].0,
+                peer.0,
+                bf.bodies_outstanding()
+            );
             let _ = pm.send_to_peer(peer, NetworkMessage::GetData(inv)).await;
         }
         Ok(_) => {}
@@ -1410,12 +1420,44 @@ fn finish_historical_backfill_if_done(backfill: &mut Option<HistoricalBackfill>)
 /// HeaderSync is downloading headers or the validated tip is behind the
 /// header tip — those are the forward-sync states the 2026-09-19
 /// `--load-snapshot` stall starved.
-fn historical_backfill_may_drive(header_sync: &HeaderSync, validated_tip: u32) -> bool {
+fn historical_backfill_may_drive(
+    header_sync: &HeaderSync,
+    block_downloader: &BlockDownloader,
+    validated_tip: u32,
+) -> bool {
     HistoricalBackfill::may_use_peer(
         matches!(header_sync.state(), rustoshi_network::SyncState::Idle),
+        block_downloader.download_queue_empty() && block_downloader.blocks_in_flight() == 0,
         validated_tip,
         header_sync.best_header_height(),
     )
+}
+
+/// Times one main-loop peer event from dequeue to the end of its handler
+/// (including `continue` paths, via `Drop`) and feeds
+/// [`rustoshi_network::LoopLatency`], which WARNs (rate-limited) when an
+/// event waited >= 30 s in the event lane or took >= 5 s to handle.
+struct EventTiming<'a> {
+    latency: &'a mut rustoshi_network::LoopLatency,
+    start: std::time::Instant,
+    kind: &'static str,
+    wait: std::time::Duration,
+    prio_backlog: usize,
+}
+
+impl Drop for EventTiming<'_> {
+    fn drop(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(line) = self.latency.record(
+            now,
+            self.kind,
+            self.wait,
+            now.saturating_duration_since(self.start),
+            self.prio_backlog,
+        ) {
+            tracing::warn!("{line}");
+        }
+    }
 }
 
 /// rustoshi's `InvalidBlockFound` equivalent (issue #5).
@@ -3877,6 +3919,32 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // Historical body writes run on their own OS thread (bounded queue) so
+    // the P2P loop below never blocks on backfill disk I/O. Completions come
+    // back on `backfill_done_rx`. `_backfill_done_keepalive` keeps that
+    // channel open when no writer exists, so its select! arm just stays
+    // pending.
+    let (backfill_done_tx, mut backfill_done_rx) =
+        tokio::sync::mpsc::unbounded_channel::<BodyWriteDone>();
+    let _backfill_done_keepalive = backfill_done_tx.clone();
+    let backfill_writer: Option<BodyWriter> = if historical_backfill.is_some() {
+        match BodyWriter::spawn(Arc::clone(&db), move |done| {
+            let _ = backfill_done_tx.send(done);
+        }) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::warn!(
+                    "historical backfill: writer thread spawn failed ({e}); writing bodies inline"
+                );
+                None
+            }
+        }
+    } else {
+        drop(backfill_done_tx);
+        None
+    };
+    let mut loop_latency = rustoshi_network::LoopLatency::default();
+
     // Start peer connections (including TCP listener for inbound)
     peer_manager.start().await;
 
@@ -4803,6 +4871,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 if event.is_some() {
                     p2p_heartbeat.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                let _event_timing = event.as_ref().map(|ev| EventTiming {
+                    kind: rustoshi_network::event_kind(ev),
+                    wait: event_rx.last_wait(),
+                    prio_backlog: event_rx.priority_backlog(),
+                    start: std::time::Instant::now(),
+                    latency: &mut loop_latency,
+                });
                 match event {
                     Some(PeerEvent::Connected(peer_id, info, stats)) => {
                         // Register inbound peer handle in PeerManager
@@ -4861,7 +4936,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 let cs = chain_state.read().await;
                                 cs.tip_height()
                             };
-                            if historical_backfill_may_drive(&header_sync, chain_tip) {
+                            if historical_backfill_may_drive(&header_sync, &block_downloader, chain_tip) {
                                 drive_historical_backfill(
                                     &mut historical_backfill,
                                     &block_store,
@@ -4929,7 +5004,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         let cs = chain_state.read().await;
                                         cs.tip_height()
                                     };
-                                    if historical_backfill_may_drive(&header_sync, chain_tip) {
+                                    if historical_backfill_may_drive(&header_sync, &block_downloader, chain_tip) {
                                         drive_historical_backfill(
                                             &mut historical_backfill,
                                             &block_store,
@@ -5453,13 +5528,41 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     .unwrap_or(false);
                                 if is_historical_block {
                                     if let Some(ref mut bf) = historical_backfill {
-                                        match bf.accept_block(&block, &block_store) {
-                                            Ok(true) => tracing::debug!(
-                                                "historical backfill: stored body {}",
-                                                hist_hash
-                                            ),
-                                            Ok(false) => {}
-                                            Err(e) => tracing::warn!(
+                                        // Bookkeeping here; the body write runs on
+                                        // the backfill-writer thread so this loop
+                                        // (lifecycle events, tip headers) never
+                                        // waits on historical disk I/O.
+                                        match (bf.admit_body(&hist_hash, &block_store), &backfill_writer) {
+                                            (Ok(BodyAdmission::Store(entry)), Some(w)) => {
+                                                let height = entry.height;
+                                                let job = BodyWriteJob {
+                                                    hash: hist_hash,
+                                                    block,
+                                                    entry,
+                                                    tag: peer_id.0,
+                                                };
+                                                if w.try_submit(job).is_err() {
+                                                    tracing::warn!(
+                                                        "historical backfill: writer queue unavailable; \
+                                                         body {hist_hash} will be re-requested"
+                                                    );
+                                                    if let Err(e) = bf.body_written(&hist_hash, height, false, &block_store) {
+                                                        tracing::warn!("historical backfill: {e}");
+                                                    }
+                                                }
+                                            }
+                                            (Ok(BodyAdmission::Store(entry)), None) => {
+                                                // No writer thread (spawn failed): write inline.
+                                                let height = entry.height;
+                                                let ok = HistoricalBackfill::write_body(&block_store, &hist_hash, &block, entry)
+                                                    .map_err(|e| tracing::warn!("historical backfill: body write failed: {e}"))
+                                                    .is_ok();
+                                                if let Err(e) = bf.body_written(&hist_hash, height, ok, &block_store) {
+                                                    tracing::warn!("historical backfill: {e}");
+                                                }
+                                            }
+                                            (Ok(BodyAdmission::Duplicate), _) => {}
+                                            (Err(e), _) => tracing::warn!(
                                                 "historical backfill: body rejected: {e}"
                                             ),
                                         }
@@ -5468,7 +5571,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         let cs = chain_state.read().await;
                                         cs.tip_height()
                                     };
-                                    if historical_backfill_may_drive(&header_sync, chain_tip) {
+                                    if historical_backfill_may_drive(&header_sync, &block_downloader, chain_tip) {
                                         drive_historical_backfill(
                                             &mut historical_backfill,
                                             &block_store,
@@ -7429,6 +7532,54 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             // Periodic block download retry — picks up enqueued blocks that
             // couldn't be assigned on the first try (e.g. no peers available yet).
+            // Historical body persisted by the backfill-writer thread:
+            // bookkeeping only, then top the window back up on the peer
+            // that delivered it (if still usable).
+            Some(done) = backfill_done_rx.recv() => {
+                if let Some(bf) = historical_backfill.as_mut() {
+                    let ok = match &done.result {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                "historical backfill: body write failed for {} (height {}): {e}",
+                                done.hash, done.height
+                            );
+                            false
+                        }
+                    };
+                    if let Err(e) = bf.body_written(&done.hash, done.height, ok, &block_store) {
+                        tracing::warn!("historical backfill: body cursor advance failed: {e}");
+                    }
+                }
+                if historical_backfill.is_some() {
+                    let chain_tip = {
+                        let cs = chain_state.read().await;
+                        cs.tip_height()
+                    };
+                    if historical_backfill_may_drive(&header_sync, &block_downloader, chain_tip) {
+                        let bf_peer = {
+                            let ps = peer_state.read().await;
+                            ps.peer_manager.as_ref().and_then(|pm| {
+                                let tagged = rustoshi_network::PeerId(done.tag);
+                                if header_sync.has_peer(tagged) && pm.peer_channel_open(tagged) {
+                                    Some(tagged)
+                                } else {
+                                    header_sync.first_peer_where(|p| pm.peer_channel_open(p))
+                                }
+                            })
+                        };
+                        drive_historical_backfill(
+                            &mut historical_backfill,
+                            &block_store,
+                            bf_peer,
+                            &peer_state,
+                        )
+                        .await;
+                        finish_historical_backfill_if_done(&mut historical_backfill);
+                    }
+                }
+            }
+
             _ = block_retry_interval.tick() => {
                 // Check for timed-out block requests FIRST — this frees
                 // blocks_in_flight slots so assign_requests can use them.
@@ -7750,10 +7901,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 }
                 if historical_backfill.is_some() {
                     if let Some(bf) = historical_backfill.as_mut() {
-                        bf.clear_in_flight();
+                        // Retry only requests unanswered for a full tick;
+                        // clearing every marker here re-requested bodies
+                        // still on the wire and defeated the window.
+                        let expired = bf.expire_in_flight();
+                        if expired > 0 {
+                            tracing::info!(
+                                "historical backfill: {expired} body request(s) unanswered for a tick; \
+                                 re-requesting ({} outstanding)",
+                                bf.bodies_outstanding()
+                            );
+                        }
                         bf.clear_getheaders_cooldown();
                     }
-                    if historical_backfill_may_drive(&header_sync, validated_tip) {
+                    if historical_backfill_may_drive(&header_sync, &block_downloader, validated_tip) {
                         // Only a peer whose task is still alive: a dead one
                         // stays registered until its Disconnected is drained.
                         let bf_peer = {

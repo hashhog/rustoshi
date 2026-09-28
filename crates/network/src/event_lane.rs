@@ -56,6 +56,7 @@ use crate::peer::PeerEvent;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Capacity of each lane between the peer tasks and the main loop.
@@ -98,19 +99,91 @@ pub enum BulkOffer {
     Closed,
 }
 
+/// An event plus the instant it entered its lane, so the main loop can
+/// measure how long it waited (enqueue -> handle). Internal to the two-lane
+/// channel; callers see plain [`PeerEvent`]s.
+#[derive(Debug)]
+pub struct Stamped {
+    at: Instant,
+    ev: PeerEvent,
+}
+
+impl Stamped {
+    fn now(ev: PeerEvent) -> Self {
+        Stamped { at: Instant::now(), ev }
+    }
+}
+
+/// One lane's sending half. [`event_channel`] builds stamped lanes; a plain
+/// `mpsc::Sender<PeerEvent>` (tests, single-channel callers) stays plain.
+#[derive(Clone, Debug)]
+enum LaneTx {
+    Plain(mpsc::Sender<PeerEvent>),
+    Stamped(mpsc::Sender<Stamped>),
+}
+
+fn unstamp_try(e: mpsc::error::TrySendError<Stamped>) -> mpsc::error::TrySendError<PeerEvent> {
+    match e {
+        mpsc::error::TrySendError::Full(s) => mpsc::error::TrySendError::Full(s.ev),
+        mpsc::error::TrySendError::Closed(s) => mpsc::error::TrySendError::Closed(s.ev),
+    }
+}
+
+impl LaneTx {
+    async fn send(&self, ev: PeerEvent) -> Result<(), mpsc::error::SendError<PeerEvent>> {
+        match self {
+            LaneTx::Plain(tx) => tx.send(ev).await,
+            LaneTx::Stamped(tx) => tx
+                .send(Stamped::now(ev))
+                .await
+                .map_err(|e| mpsc::error::SendError(e.0.ev)),
+        }
+    }
+
+    fn try_send(&self, ev: PeerEvent) -> Result<(), mpsc::error::TrySendError<PeerEvent>> {
+        match self {
+            LaneTx::Plain(tx) => tx.try_send(ev),
+            LaneTx::Stamped(tx) => tx.try_send(Stamped::now(ev)).map_err(unstamp_try),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            LaneTx::Plain(tx) => tx.is_closed(),
+            LaneTx::Stamped(tx) => tx.is_closed(),
+        }
+    }
+}
+
+/// A reserved priority-lane slot (see [`EventSender::reserve_priority`]).
+/// `send` stamps the event with the instant it enters the lane.
+pub enum PriorityPermit<'a> {
+    Plain(mpsc::Permit<'a, PeerEvent>),
+    Stamped(mpsc::Permit<'a, Stamped>),
+}
+
+impl PriorityPermit<'_> {
+    pub fn send(self, ev: PeerEvent) {
+        match self {
+            PriorityPermit::Plain(p) => p.send(ev),
+            PriorityPermit::Stamped(p) => p.send(Stamped::now(ev)),
+        }
+    }
+}
+
 /// Sending half: routes each event to its lane.
 #[derive(Clone, Debug)]
 pub struct EventSender {
-    prio: mpsc::Sender<PeerEvent>,
-    bulk: mpsc::Sender<PeerEvent>,
+    prio: LaneTx,
+    bulk: LaneTx,
     dropped: Arc<AtomicU64>,
 }
 
 impl From<mpsc::Sender<PeerEvent>> for EventSender {
     fn from(tx: mpsc::Sender<PeerEvent>) -> Self {
         EventSender {
-            prio: tx.clone(),
-            bulk: tx,
+            prio: LaneTx::Plain(tx.clone()),
+            bulk: LaneTx::Plain(tx),
             dropped: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -161,10 +234,11 @@ impl EventSender {
     }
 
     /// Reserve a slot on the priority lane (cancel-safe; for `select!`).
-    pub async fn reserve_priority(
-        &self,
-    ) -> Result<mpsc::Permit<'_, PeerEvent>, mpsc::error::SendError<()>> {
-        self.prio.reserve().await
+    pub async fn reserve_priority(&self) -> Result<PriorityPermit<'_>, mpsc::error::SendError<()>> {
+        match &self.prio {
+            LaneTx::Plain(tx) => tx.reserve().await.map(PriorityPermit::Plain),
+            LaneTx::Stamped(tx) => tx.reserve().await.map(PriorityPermit::Stamped),
+        }
     }
 
     /// Hand every BULK event at the front of `outbox` to the bulk lane
@@ -193,28 +267,54 @@ impl EventSender {
 /// Receiving half: priority lane first.
 #[derive(Debug)]
 pub struct EventReceiver {
-    prio: mpsc::Receiver<PeerEvent>,
-    bulk: mpsc::Receiver<PeerEvent>,
+    prio: mpsc::Receiver<Stamped>,
+    bulk: mpsc::Receiver<Stamped>,
+    /// Enqueue -> dequeue wait of the event most recently returned.
+    last_wait: Duration,
 }
 
 impl EventReceiver {
     /// Next event, priority lane first. Cancel-safe (both arms are
     /// `mpsc::Receiver::recv`). `None` once both lanes are closed and empty.
+    /// Records the event's lane wait, readable via [`Self::last_wait`].
     pub async fn recv(&mut self) -> Option<PeerEvent> {
-        tokio::select! {
+        let s = tokio::select! {
             biased;
-            Some(ev) = self.prio.recv() => Some(ev),
-            Some(ev) = self.bulk.recv() => Some(ev),
-            else => None,
-        }
+            Some(s) = self.prio.recv() => s,
+            Some(s) = self.bulk.recv() => s,
+            else => return None,
+        };
+        self.last_wait = s.at.elapsed();
+        Some(s.ev)
     }
 
     /// Non-blocking receive, priority lane first.
     pub fn try_recv(&mut self) -> Result<PeerEvent, mpsc::error::TryRecvError> {
-        match self.prio.try_recv() {
-            Ok(ev) => Ok(ev),
-            Err(_) => self.bulk.try_recv(),
-        }
+        let s = match self.prio.try_recv() {
+            Ok(s) => s,
+            Err(_) => self.bulk.try_recv()?,
+        };
+        self.last_wait = s.at.elapsed();
+        Ok(s.ev)
+    }
+
+    /// How long the most recently returned event sat in its lane between the
+    /// peer task handing it over and the main loop taking it. This is the
+    /// main loop's backlog as a peer experiences it (2026-09-28: a
+    /// `Connected` was handled 875 s after the handshake, inferred from log
+    /// timestamps because nothing measured it).
+    pub fn last_wait(&self) -> Duration {
+        self.last_wait
+    }
+
+    /// Events currently queued on the priority lane.
+    pub fn priority_backlog(&self) -> usize {
+        self.prio.len()
+    }
+
+    /// Events currently queued on the bulk lane.
+    pub fn bulk_backlog(&self) -> usize {
+        self.bulk.len()
     }
 }
 
@@ -224,15 +324,134 @@ pub fn event_channel(capacity: usize) -> (EventSender, EventReceiver) {
     let (btx, brx) = mpsc::channel(capacity);
     (
         EventSender {
-            prio: ptx,
-            bulk: btx,
+            prio: LaneTx::Stamped(ptx),
+            bulk: LaneTx::Stamped(btx),
             dropped: Arc::new(AtomicU64::new(0)),
         },
         EventReceiver {
             prio: prx,
             bulk: brx,
+            last_wait: Duration::ZERO,
         },
     )
+}
+
+/// Main-loop latency accounting: how long events waited in the lanes and how
+/// long the loop spent handling each one. Cheap (two `Instant` reads per
+/// event); emits at most one WARN per [`LoopLatency::WARN_EVERY`] so a long
+/// backlog is visible without flooding the log.
+#[derive(Debug)]
+pub struct LoopLatency {
+    window_start: Instant,
+    last_warn: Option<Instant>,
+    events: u64,
+    max_wait: Duration,
+    max_handle: Duration,
+    max_handle_kind: &'static str,
+    slow_waits: u64,
+    slow_handles: u64,
+}
+
+/// Classification of an event for the latency log.
+pub fn event_kind(ev: &PeerEvent) -> &'static str {
+    match ev {
+        PeerEvent::Connected(..) => "connected",
+        PeerEvent::Disconnected(..) => "disconnected",
+        PeerEvent::Message(_, m) => match m {
+            NetworkMessage::Headers(_) => "headers",
+            NetworkMessage::Block(_) => "block",
+            NetworkMessage::CmpctBlock(_) => "cmpctblock",
+            NetworkMessage::BlockTxn(_) => "blocktxn",
+            NetworkMessage::Inv(_) => "inv",
+            NetworkMessage::GetData(_) => "getdata",
+            NetworkMessage::GetHeaders(_) => "getheaders",
+            NetworkMessage::Tx(_) => "tx",
+            NetworkMessage::Ping(_) => "ping",
+            NetworkMessage::Pong(_) => "pong",
+            _ => "message",
+        },
+        PeerEvent::Misbehaving(..) => "misbehaving",
+    }
+}
+
+impl Default for LoopLatency {
+    fn default() -> Self {
+        Self::new(Instant::now())
+    }
+}
+
+impl LoopLatency {
+    /// An event that waited at least this long in its lane is logged.
+    pub const SLOW_WAIT: Duration = Duration::from_secs(30);
+    /// A single event whose handling took at least this long is logged.
+    pub const SLOW_HANDLE: Duration = Duration::from_secs(5);
+    /// Minimum spacing of WARN lines.
+    pub const WARN_EVERY: Duration = Duration::from_secs(60);
+
+    pub fn new(now: Instant) -> Self {
+        LoopLatency {
+            window_start: now,
+            last_warn: None,
+            events: 0,
+            max_wait: Duration::ZERO,
+            max_handle: Duration::ZERO,
+            max_handle_kind: "",
+            slow_waits: 0,
+            slow_handles: 0,
+        }
+    }
+
+    /// Record one handled event. Returns the WARN line to emit, if any (the
+    /// caller logs it so the rate limit is testable without a subscriber).
+    pub fn record(
+        &mut self,
+        now: Instant,
+        kind: &'static str,
+        wait: Duration,
+        handle: Duration,
+        prio_backlog: usize,
+    ) -> Option<String> {
+        self.events += 1;
+        self.max_wait = self.max_wait.max(wait);
+        if handle > self.max_handle {
+            self.max_handle = handle;
+            self.max_handle_kind = kind;
+        }
+        let slow_wait = wait >= Self::SLOW_WAIT;
+        let slow_handle = handle >= Self::SLOW_HANDLE;
+        self.slow_waits += slow_wait as u64;
+        self.slow_handles += slow_handle as u64;
+        if !(slow_wait || slow_handle) {
+            return None;
+        }
+        if self
+            .last_warn
+            .is_some_and(|t| now.saturating_duration_since(t) < Self::WARN_EVERY)
+        {
+            return None;
+        }
+        let line = format!(
+            "main loop behind: `{kind}` waited {:.1}s in the event lane and took {:.1}s to handle \
+             (priority backlog {prio_backlog}); last {:.0}s: {} events, max wait {:.1}s, \
+             max handle {:.1}s (`{}`), {} waits >= {}s, {} handles >= {}s",
+            wait.as_secs_f64(),
+            handle.as_secs_f64(),
+            now.saturating_duration_since(self.window_start).as_secs_f64(),
+            self.events,
+            self.max_wait.as_secs_f64(),
+            self.max_handle.as_secs_f64(),
+            self.max_handle_kind,
+            self.slow_waits,
+            Self::SLOW_WAIT.as_secs(),
+            self.slow_handles,
+            Self::SLOW_HANDLE.as_secs(),
+        );
+        *self = LoopLatency {
+            last_warn: Some(now),
+            ..LoopLatency::new(now)
+        };
+        Some(line)
+    }
 }
 
 #[cfg(test)]
@@ -333,5 +552,61 @@ mod tests {
         assert_eq!(outbox.len(), 2);
         assert!(!is_bulk_event(outbox.front().unwrap()));
         assert_eq!(tx.dropped_bulk(), 1, "third bulk event overflowed the 2-slot lane");
+    }
+
+    /// (d) The lane measures how long an event waited, so a main-loop
+    /// backlog is observed rather than inferred from log timestamps.
+    #[tokio::test]
+    async fn receiver_reports_enqueue_to_dequeue_wait() {
+        let (tx, mut rx) = event_channel(8);
+        tx.send(headers_msg(1)).await.unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        tx.send(PeerEvent::Disconnected(PeerId(2), DisconnectReason::Timeout))
+            .await
+            .unwrap();
+        assert_eq!(rx.priority_backlog(), 2);
+        rx.recv().await.unwrap();
+        assert!(
+            rx.last_wait() >= Duration::from_millis(60),
+            "the first event sat in the lane >= 60 ms, got {:?}",
+            rx.last_wait()
+        );
+        rx.recv().await.unwrap();
+        assert!(
+            rx.last_wait() < Duration::from_millis(60),
+            "the second event was enqueued just before recv, got {:?}",
+            rx.last_wait()
+        );
+        // A reserved permit stamps too.
+        let permit = tx.reserve_priority().await.unwrap();
+        permit.send(headers_msg(3));
+        assert!(matches!(rx.try_recv(), Ok(PeerEvent::Message(PeerId(3), _))));
+    }
+
+    #[test]
+    fn loop_latency_warns_on_slow_wait_or_handle_and_rate_limits() {
+        let t0 = Instant::now();
+        let mut l = LoopLatency::new(t0);
+        let fast = Duration::from_millis(5);
+        assert!(l.record(t0, "headers", fast, fast, 0).is_none());
+        // Just under both thresholds: silent.
+        assert!(l
+            .record(t0, "block", LoopLatency::SLOW_WAIT - fast, LoopLatency::SLOW_HANDLE - fast, 3)
+            .is_none());
+        // Slow wait warns, and names the event kind and the backlog.
+        let w = l
+            .record(t0, "connected", Duration::from_secs(875), fast, 900)
+            .expect("an 875 s lane wait must warn");
+        assert!(w.contains("`connected` waited 875.0s"), "{w}");
+        assert!(w.contains("priority backlog 900"), "{w}");
+        // Rate limited inside WARN_EVERY...
+        assert!(l
+            .record(t0 + Duration::from_secs(1), "block", fast, Duration::from_secs(9), 0)
+            .is_none());
+        // ...but the window keeps the worst handle for the next line.
+        let w = l
+            .record(t0 + LoopLatency::WARN_EVERY, "block", fast, LoopLatency::SLOW_HANDLE, 0)
+            .expect("slow handle after the rate-limit window must warn");
+        assert!(w.contains("max handle 9.0s (`block`)"), "{w}");
     }
 }
