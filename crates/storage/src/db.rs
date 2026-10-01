@@ -321,6 +321,54 @@ impl ChainDb {
             .filter_map(|result| result.ok()))
     }
 
+    /// Take a point-in-time snapshot of the whole database (every column
+    /// family). Reads through [`Self::get_cf_at`] / [`Self::iter_cf_at`] see
+    /// exactly the state at this instant, however many batches commit after.
+    ///
+    /// `gettxoutsetinfo` uses this so the coin walk and the best-block
+    /// pointer it reports come from ONE state (Core's `ComputeUTXOStats`
+    /// reads `pcursor->GetBestBlock()` off the cursor it then iterates), and
+    /// so the walk can run with no lock held while blocks keep connecting.
+    pub fn snapshot(&self) -> rocksdb::Snapshot<'_> {
+        self.db.snapshot()
+    }
+
+    /// Point read of `key` in `cf_name` as of `snap`.
+    pub fn get_cf_at(
+        &self,
+        snap: &rocksdb::Snapshot<'_>,
+        cf_name: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
+        Ok(snap.get_cf(&cf, key)?)
+    }
+
+    /// Forward iteration over `cf_name` as of `snap`. Unlike [`Self::iter_cf`]
+    /// a read error is yielded, not silently skipped, and the walk does not
+    /// populate the block cache (a full-set scan must not evict the working
+    /// set validation reads).
+    #[allow(clippy::type_complexity)]
+    pub fn iter_cf_at<'a>(
+        &'a self,
+        snap: &'a rocksdb::Snapshot<'a>,
+        cf_name: &str,
+    ) -> Result<impl Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), StorageError>> + 'a, StorageError>
+    {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.fill_cache(false);
+        Ok(snap
+            .iterator_cf_opt(&cf, ro, rocksdb::IteratorMode::Start)
+            .map(|r| r.map_err(StorageError::from)))
+    }
+
     /// Open the database with optimized performance settings for IBD.
     ///
     /// This configuration is tuned for maximum throughput during initial block

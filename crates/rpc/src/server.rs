@@ -56,6 +56,26 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, RwLock};
 
+/// Test-only pause point inside the `gettxoutsetinfo` walk, right after the
+/// snapshot cursor is open: lets a test prove the walk holds no state lock
+/// and that writes landing mid-walk are not counted.
+/// Keyed by the `ChainDb` address so parallel tests on other databases never
+/// hit it.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static TXOUTSET_WALK_HOOK: std::sync::Mutex<Option<(usize, Box<dyn Fn() + Send>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn txoutset_walk_test_hook(db: &ChainDb) {
+    let key = db as *const ChainDb as usize;
+    if let Some((k, f)) = TXOUTSET_WALK_HOOK.lock().unwrap().as_ref() {
+        if *k == key {
+            f();
+        }
+    }
+}
+
 /// Total on-disk byte usage of the block/chain storage under `data_dir`.
 ///
 /// Mirrors Bitcoin Core's `getblockchaininfo` `size_on_disk`
@@ -2174,6 +2194,217 @@ impl RpcServerImpl {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// The `gettxoutsetinfo` full scan over ONE RocksDB snapshot.
+    ///
+    /// The coins-DB best block (`META_BEST_BLOCK_HASH`/`META_BEST_HEIGHT`) is
+    /// written in the same batch as the coins (`flush_with_tip`), so reading it
+    /// from the snapshot the walk iterates gives a label that always describes
+    /// the hashed set — Core's `ComputeUTXOStats` seeds `nHeight`/`hashBlock`
+    /// from `pcursor->GetBestBlock()` (`kernel/coinstats.cpp:147-157`).
+    ///
+    /// Runs on a blocking thread with NO `RpcState` lock: it used to run
+    /// inline on a tokio worker while holding the state READ guard for the
+    /// whole walk. The connect loop and P2P handler take the WRITE lock per
+    /// block, and tokio's RwLock queues later readers behind a waiting writer,
+    /// so a 35+ minute mainnet walk stopped block connection, then every RPC
+    /// and P2P task, until the 900 s P2P watchdog exited the node
+    /// (2026-10-01).
+    fn txoutset_full_scan(
+        db: &ChainDb,
+        ht: &str,
+        fallback: (Hash256, u32),
+    ) -> RpcResult<serde_json::Value> {
+        let snap = db.snapshot();
+        let read_meta = |key: &[u8]| -> RpcResult<Option<Vec<u8>>> {
+            db.get_cf_at(&snap, rustoshi_storage::columns::CF_META, key).map_err(|e| {
+                Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("coins db tip: {e}"))
+            })
+        };
+        let snap_hash = read_meta(rustoshi_storage::db::META_BEST_BLOCK_HASH)?
+            .filter(|v| v.len() == 32)
+            .map(|v| {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&v);
+                Hash256(h)
+            });
+        let snap_height = read_meta(rustoshi_storage::db::META_BEST_HEIGHT)?
+            .filter(|v| v.len() == 4)
+            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+        // Same fallback rule as `coins_db_tip`: an absent or all-zero pointer
+        // (fresh datadir) names no block.
+        let (scanned_hash, scanned_height) = match (snap_hash, snap_height) {
+            (Some(h), Some(n)) if h != Hash256::ZERO => (h, n),
+            _ => fallback,
+        };
+
+        use sha2::{Digest, Sha256};
+        use rustoshi_primitives::serialize::write_compact_size;
+
+        let mut hash_ser_state: Option<Sha256> = None;
+        let mut muhash_state: Option<rustoshi_storage::MuHash3072> = None;
+
+        match ht {
+            "hash_serialized_3" | "hash_serialized_2" | "hash_serialized" => {
+                hash_ser_state = Some(Sha256::new());
+            }
+            "muhash" => {
+                muhash_state = Some(rustoshi_storage::MuHash3072::new());
+            }
+            "none" => {} // counters only, no hash
+            other => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INVALID_PARAMETER,
+                    format!("'{other}' is not a valid hash_type"),
+                ));
+            }
+        }
+
+        let mut txouts: u64 = 0;
+        let mut bogosize: u64 = 0;
+        let mut total_amount_sats: u64 = 0;
+        // Count of distinct transactions with at least one unspent output —
+        // Core's `stats.nTransactions`, emitted as the `transactions` field
+        // (kernel/coinstats.cpp::ApplyStats increments once per txid group).
+        // The CF_UTXO iterator is keyed by `txid(32) || vout(4 BE)`, so it is
+        // txid-grouped; we count each txid the first time it appears.
+        let mut transactions: u64 = 0;
+        let mut prev_txid: Option<[u8; 32]> = None;
+
+        {
+            let iter = db.iter_cf_at(&snap, CF_UTXO).map_err(|e| {
+                Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("utxo cursor: {e}"))
+            })?;
+            #[cfg(test)]
+            txoutset_walk_test_hook(db);
+            for item in iter {
+                let (k, v) = item.map_err(|e| {
+                    Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("utxo cursor: {e}"))
+                })?;
+                if k.len() < 36 {
+                    continue;
+                }
+                let coin: CoinEntry = match rustoshi_storage::decode_utxo_value(&v) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                let this_txid: [u8; 32] = k[..32].try_into().unwrap_or([0u8; 32]);
+                if prev_txid != Some(this_txid) {
+                    transactions += 1;
+                    prev_txid = Some(this_txid);
+                }
+
+                txouts += 1;
+                total_amount_sats = total_amount_sats.saturating_add(coin.value);
+                // Bogosize matches Core's `GetBogoSize` formula:
+                // 32 (txid) + 4 (vout) + 4 (height) + 8 (amount) + 2 (spk len) + spk.len()
+                bogosize += 32 + 4 + 4 + 8 + 2 + coin.script_pubkey.len() as u64;
+
+                // Decode vout (BE encoded by `outpoint_key`).
+                let vout = u32::from_be_bytes([k[32], k[33], k[34], k[35]]);
+                let txid_bytes: [u8; 32] = k[..32].try_into().unwrap_or([0u8; 32]);
+
+                if let Some(ref mut h) = hash_ser_state {
+                    // Build TxOutSer in a small reusable buffer.
+                    let mut buf = Vec::with_capacity(36 + 4 + 8 + 9 + coin.script_pubkey.len());
+                    buf.extend_from_slice(&txid_bytes);
+                    buf.extend_from_slice(&vout.to_le_bytes());
+                    let code = (coin.height as u32) << 1
+                        | if coin.is_coinbase { 1u32 } else { 0u32 };
+                    buf.extend_from_slice(&code.to_le_bytes());
+                    buf.extend_from_slice(&coin.value.to_le_bytes());
+                    write_compact_size(&mut buf, coin.script_pubkey.len() as u64)
+                        .map_err(|e| Self::rpc_error(
+                            rpc_error::RPC_INTERNAL_ERROR,
+                            format!("write_compact_size: {}", e),
+                        ))?;
+                    buf.extend_from_slice(&coin.script_pubkey);
+                    h.update(&buf);
+                }
+
+                if let Some(ref mut mh) = muhash_state {
+                    use rustoshi_storage::indexes::coinstatsindex::serialize_coin_for_muhash;
+                    let txid = Hash256(txid_bytes);
+                    let bytes = serialize_coin_for_muhash(
+                        &txid, vout, coin.height, coin.is_coinbase,
+                        coin.value, &coin.script_pubkey,
+                    );
+                    mh.insert(&bytes);
+                }
+            }
+        }
+
+        // Compute the hash field (if any) BEFORE building the result so it can
+        // be inserted in Core's position — right after `bogosize` and before
+        // `total_amount` — rather than appended at the end.
+        let hash_serialized_hex: Option<String> = hash_ser_state.map(|h| {
+            // Double-SHA256: feed the first SHA into a new SHA, take that.
+            let first = h.finalize();
+            let second = Sha256::digest(first);
+            // Core emits this as `GetHex()` → reverse-byte hex (uint256
+            // little-endian internal, displayed big-endian). Match that.
+            let mut display = second.to_vec();
+            display.reverse();
+            hex::encode(display)
+        });
+        let muhash_hex: Option<String> = muhash_state.map(|mut mh| mh.finalize().to_hex());
+
+        // WIRE KEY ORDER — Bitcoin Core `gettxoutsetinfo`
+        // (rpc/blockchain.cpp:1115-1129), non-index path:
+        //   height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
+        //   total_amount, transactions, disk_size.
+        // The hash field is pushed immediately after `bogosize` and BEFORE
+        // `total_amount`; `transactions`/`disk_size` come AFTER `total_amount`.
+        // Previously these were built with one `json!` (which alphabetised
+        // under the BTreeMap-backed Value) followed by appended `result[..]=`
+        // assignments, putting the hash at the very end and `transactions`
+        // ahead of `total_amount`. With `preserve_order` the Map insertion
+        // order is the wire order, so we insert in Core's exact sequence.
+        // `height` / `bestblock` must describe the set that was just hashed, so
+        // they come from the COINS DB's own best block. Core seeds `CCoinsStats`
+        // from the cursor it is about to iterate —
+        //   `pindex = blockman.LookupBlockIndex(pcursor->GetBestBlock());`
+        //   `CCoinsStats stats{pindex->nHeight, pindex->GetBlockHash()};`
+        // (`kernel/coinstats.cpp:147-157`) — never from the in-memory tip.
+        // The force-flush at the top of this method normally makes the two
+        // equal; taking them from the coins DB is what keeps the triple
+        // coherent when it could not (a block connecting between the flush and
+        // this scan, or no connect loop armed to service the flush at all).
+        // Reporting the live tip over an older set is the failure mode that
+        // reads as a consensus divergence.
+        let mut result = serde_json::Map::new();
+        result.insert("height".to_string(), serde_json::json!(scanned_height));
+        result.insert(
+            "bestblock".to_string(),
+            serde_json::json!(scanned_hash.to_hex()),
+        );
+        result.insert("txouts".to_string(), serde_json::json!(txouts));
+        result.insert("bogosize".to_string(), serde_json::json!(bogosize));
+        if let Some(hex_str) = hash_serialized_hex {
+            result.insert(
+                "hash_serialized_3".to_string(),
+                serde_json::Value::String(hex_str.clone()),
+            );
+            // Back-compat alias for older clients / diff-test tolerance (not a
+            // Core field; kept adjacent to the canonical key).
+            result.insert(
+                "hash_serialized_2".to_string(),
+                serde_json::Value::String(hex_str),
+            );
+        }
+        if let Some(mh) = muhash_hex {
+            result.insert("muhash".to_string(), serde_json::Value::String(mh));
+        }
+        result.insert(
+            "total_amount".to_string(),
+            serde_json::json!(total_amount_sats as f64 / 1e8),
+        );
+        result.insert("transactions".to_string(), serde_json::json!(transactions));
+        result.insert("disk_size".to_string(), serde_json::json!(0u64));
+
+        Ok(serde_json::Value::Object(result))
     }
 
     /// The best block of the COINS DB — the block whose UTXO set is actually
@@ -15677,167 +15908,18 @@ impl RustoshiRpcServer for RpcServerImpl {
         // a stable but Core-incompatible value.  This commit switches
         // the decode to BE for both hash types; a separate audit can
         // re-verify any pre-W11 muhash values against Core.
-        use sha2::{Digest, Sha256};
-        use rustoshi_primitives::serialize::write_compact_size;
-
-        let mut hash_ser_state: Option<Sha256> = None;
-        let mut muhash_state: Option<rustoshi_storage::MuHash3072> = None;
-
-        match ht {
-            "hash_serialized_3" | "hash_serialized_2" | "hash_serialized" => {
-                hash_ser_state = Some(Sha256::new());
-            }
-            "muhash" => {
-                muhash_state = Some(rustoshi_storage::MuHash3072::new());
-            }
-            "none" => {} // counters only, no hash
-            other => {
-                return Err(Self::rpc_error(
-                    rpc_error::RPC_INVALID_PARAMETER,
-                    format!("'{other}' is not a valid hash_type"),
-                ));
-            }
-        }
-
-        let mut txouts: u64 = 0;
-        let mut bogosize: u64 = 0;
-        let mut total_amount_sats: u64 = 0;
-        // Count of distinct transactions with at least one unspent output —
-        // Core's `stats.nTransactions`, emitted as the `transactions` field
-        // (kernel/coinstats.cpp::ApplyStats increments once per txid group).
-        // The CF_UTXO iterator is keyed by `txid(32) || vout(4 BE)`, so it is
-        // txid-grouped; we count each txid the first time it appears.
-        let mut transactions: u64 = 0;
-        let mut prev_txid: Option<[u8; 32]> = None;
-
-        if let Ok(iter) = state.db.iter_cf(CF_UTXO) {
-            for (k, v) in iter {
-                if k.len() < 36 {
-                    continue;
-                }
-                let coin: CoinEntry = match rustoshi_storage::decode_utxo_value(&v) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-
-                let this_txid: [u8; 32] = k[..32].try_into().unwrap_or([0u8; 32]);
-                if prev_txid != Some(this_txid) {
-                    transactions += 1;
-                    prev_txid = Some(this_txid);
-                }
-
-                txouts += 1;
-                total_amount_sats = total_amount_sats.saturating_add(coin.value);
-                // Bogosize matches Core's `GetBogoSize` formula:
-                // 32 (txid) + 4 (vout) + 4 (height) + 8 (amount) + 2 (spk len) + spk.len()
-                bogosize += 32 + 4 + 4 + 8 + 2 + coin.script_pubkey.len() as u64;
-
-                // Decode vout (BE encoded by `outpoint_key`).
-                let vout = u32::from_be_bytes([k[32], k[33], k[34], k[35]]);
-                let txid_bytes: [u8; 32] = k[..32].try_into().unwrap_or([0u8; 32]);
-
-                if let Some(ref mut h) = hash_ser_state {
-                    // Build TxOutSer in a small reusable buffer.
-                    let mut buf = Vec::with_capacity(36 + 4 + 8 + 9 + coin.script_pubkey.len());
-                    buf.extend_from_slice(&txid_bytes);
-                    buf.extend_from_slice(&vout.to_le_bytes());
-                    let code = (coin.height as u32) << 1
-                        | if coin.is_coinbase { 1u32 } else { 0u32 };
-                    buf.extend_from_slice(&code.to_le_bytes());
-                    buf.extend_from_slice(&coin.value.to_le_bytes());
-                    write_compact_size(&mut buf, coin.script_pubkey.len() as u64)
-                        .map_err(|e| Self::rpc_error(
-                            rpc_error::RPC_INTERNAL_ERROR,
-                            format!("write_compact_size: {}", e),
-                        ))?;
-                    buf.extend_from_slice(&coin.script_pubkey);
-                    h.update(&buf);
-                }
-
-                if let Some(ref mut mh) = muhash_state {
-                    use rustoshi_storage::indexes::coinstatsindex::serialize_coin_for_muhash;
-                    let txid = Hash256(txid_bytes);
-                    let bytes = serialize_coin_for_muhash(
-                        &txid, vout, coin.height, coin.is_coinbase,
-                        coin.value, &coin.script_pubkey,
-                    );
-                    mh.insert(&bytes);
-                }
-            }
-        }
-
-        // Compute the hash field (if any) BEFORE building the result so it can
-        // be inserted in Core's position — right after `bogosize` and before
-        // `total_amount` — rather than appended at the end.
-        let hash_serialized_hex: Option<String> = hash_ser_state.map(|h| {
-            // Double-SHA256: feed the first SHA into a new SHA, take that.
-            let first = h.finalize();
-            let second = Sha256::digest(first);
-            // Core emits this as `GetHex()` → reverse-byte hex (uint256
-            // little-endian internal, displayed big-endian). Match that.
-            let mut display = second.to_vec();
-            display.reverse();
-            hex::encode(display)
-        });
-        let muhash_hex: Option<String> = muhash_state.map(|mut mh| mh.finalize().to_hex());
-
-        // WIRE KEY ORDER — Bitcoin Core `gettxoutsetinfo`
-        // (rpc/blockchain.cpp:1115-1129), non-index path:
-        //   height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
-        //   total_amount, transactions, disk_size.
-        // The hash field is pushed immediately after `bogosize` and BEFORE
-        // `total_amount`; `transactions`/`disk_size` come AFTER `total_amount`.
-        // Previously these were built with one `json!` (which alphabetised
-        // under the BTreeMap-backed Value) followed by appended `result[..]=`
-        // assignments, putting the hash at the very end and `transactions`
-        // ahead of `total_amount`. With `preserve_order` the Map insertion
-        // order is the wire order, so we insert in Core's exact sequence.
-        // `height` / `bestblock` must describe the set that was just hashed, so
-        // they come from the COINS DB's own best block. Core seeds `CCoinsStats`
-        // from the cursor it is about to iterate —
-        //   `pindex = blockman.LookupBlockIndex(pcursor->GetBestBlock());`
-        //   `CCoinsStats stats{pindex->nHeight, pindex->GetBlockHash()};`
-        // (`kernel/coinstats.cpp:147-157`) — never from the in-memory tip.
-        // The force-flush at the top of this method normally makes the two
-        // equal; taking them from the coins DB is what keeps the triple
-        // coherent when it could not (a block connecting between the flush and
-        // this scan, or no connect loop armed to service the flush at all).
-        // Reporting the live tip over an older set is the failure mode that
-        // reads as a consensus divergence.
-        let (scanned_hash, scanned_height) =
-            Self::coins_db_tip(&BlockStore::new(&state.db))
-                .unwrap_or((best_hash_at_entry, height));
-        let mut result = serde_json::Map::new();
-        result.insert("height".to_string(), serde_json::json!(scanned_height));
-        result.insert(
-            "bestblock".to_string(),
-            serde_json::json!(scanned_hash.to_hex()),
-        );
-        result.insert("txouts".to_string(), serde_json::json!(txouts));
-        result.insert("bogosize".to_string(), serde_json::json!(bogosize));
-        if let Some(hex_str) = hash_serialized_hex {
-            result.insert(
-                "hash_serialized_3".to_string(),
-                serde_json::Value::String(hex_str.clone()),
-            );
-            // Back-compat alias for older clients / diff-test tolerance (not a
-            // Core field; kept adjacent to the canonical key).
-            result.insert(
-                "hash_serialized_2".to_string(),
-                serde_json::Value::String(hex_str),
-            );
-        }
-        if let Some(mh) = muhash_hex {
-            result.insert("muhash".to_string(), serde_json::Value::String(mh));
-        }
-        result.insert(
-            "total_amount".to_string(),
-            serde_json::json!(total_amount_sats as f64 / 1e8),
-        );
-        result.insert("transactions".to_string(), serde_json::json!(transactions));
-        result.insert("disk_size".to_string(), serde_json::json!(0u64));
-
-        Ok(serde_json::Value::Object(result))
+        // Full scan: hand the DB handle to a blocking thread and RELEASE the
+        // state lock first (see `txoutset_full_scan`).
+        let db = Arc::clone(&state.db);
+        drop(stats_index);
+        drop(state);
+        let ht_owned = ht.to_string();
+        let fallback = (best_hash_at_entry, height);
+        tokio::task::spawn_blocking(move || Self::txoutset_full_scan(&db, &ht_owned, fallback))
+            .await
+            .map_err(|e| {
+                Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("gettxoutsetinfo walk: {e}"))
+            })?
     }
 
     async fn scan_tx_out_set(
@@ -28599,6 +28681,83 @@ mod tests {
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_i64())
             .unwrap_or_else(|| panic!("expected error object, got {resp}"))
+    }
+
+    /// Release gate 3a: the gettxoutsetinfo walk must not freeze the node.
+    ///
+    /// The walk is paused after its cursor opens. While it is paused:
+    ///   1. the `RpcState` WRITE lock (what the connect loop and P2P take per
+    ///      block) must be acquirable — the old walk held the READ guard for
+    ///      the whole scan, which on mainnet starved block connection and then
+    ///      every RPC/P2P task until the 900 s watchdog exited (2026-10-01);
+    ///   2. a block lands (new coin + new coins-DB best block). The paused
+    ///      walk must still report the state it started on — height AND hash —
+    ///      the old walk read the best-block pointer AFTER iterating, so a
+    ///      flush mid-walk relabelled the old set with the new height.
+    /// Negative control: a fresh walk afterwards does see the new block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gettxoutsetinfo_walks_one_snapshot_without_the_state_lock() {
+        use std::time::Duration;
+        let server = setup_test_server();
+        let coin = |v: u64, tag: u8| CoinEntry {
+            height: 1,
+            is_coinbase: false,
+            value: v,
+            script_pubkey: vec![0x51, tag],
+        };
+        let op = |b: u8, n: u32| OutPoint { txid: Hash256([b; 32]), vout: n };
+        let db_key = {
+            let st = server.state.read().await;
+            let store = BlockStore::new(&st.db);
+            store.put_utxo(&op(1, 0), &coin(1000, 1)).unwrap();
+            store.put_utxo(&op(2, 1), &coin(2000, 2)).unwrap();
+            store.set_best_block(&Hash256([0xaa; 32]), 1).unwrap();
+            &*st.db as *const ChainDb as usize
+        };
+        let hs3 = || Some("hash_serialized_3".to_string());
+        let before = server.get_tx_out_set_info(hs3(), None, None).await.unwrap();
+        assert_eq!(before["height"], 1);
+        assert_eq!(before["txouts"], 2);
+
+        let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        *TXOUTSET_WALK_HOOK.lock().unwrap() = Some((
+            db_key,
+            Box::new(move || {
+                let _ = open_tx.send(());
+                let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
+            }),
+        ));
+        let walker = RpcServerImpl::new(server.state.clone(), server.peer_state.clone());
+        let walk = tokio::spawn(async move { walker.get_tx_out_set_info(hs3(), None, None).await });
+        tokio::task::spawn_blocking(move || open_rx.recv_timeout(Duration::from_secs(60)))
+            .await
+            .unwrap()
+            .expect("walk never opened its cursor");
+
+        // 1. No state lock is held while the walk runs.
+        let w = tokio::time::timeout(Duration::from_secs(2), server.state.write()).await;
+        assert!(w.is_ok(), "gettxoutsetinfo walk holds the RpcState lock");
+        drop(w);
+
+        // 2. A block connects mid-walk.
+        {
+            let st = server.state.read().await;
+            let store = BlockStore::new(&st.db);
+            store.put_utxo(&op(3, 0), &coin(3000, 3)).unwrap();
+            store.set_best_block(&Hash256([0xbb; 32]), 2).unwrap();
+        }
+        go_tx.send(()).unwrap();
+        let mid = walk.await.unwrap().unwrap();
+        *TXOUTSET_WALK_HOOK.lock().unwrap() = None;
+        assert_eq!(mid, before, "mid-walk result must describe the snapshot it walked");
+
+        // Negative control: the block is visible to a new walk.
+        let after = server.get_tx_out_set_info(hs3(), None, None).await.unwrap();
+        assert_eq!(after["height"], 2);
+        assert_eq!(after["txouts"], 3);
+        assert_ne!(after["hash_serialized_3"], before["hash_serialized_3"]);
     }
 
     #[tokio::test]
