@@ -259,7 +259,8 @@ pub fn load_from_path(
             })?;
 
         // Refuse collisions with a built-in (production) entry: same height
-        // OR same block hash with a DIFFERENT commitment. Campaign data may
+        // OR same block hash with a DIFFERENT commitment (blockhash,
+        // hash_serialized or m_chain_tx_count). Campaign data may
         // never override a production hash.
         //
         // An entry that is byte-identical to a built-in is not an override;
@@ -274,9 +275,14 @@ pub fn load_from_path(
             .iter()
             .find(|b| b.height == r.height || b.blockhash == blockhash)
         {
+            // The WHOLE commitment must match -- m_chain_tx_count included
+            // (Core pins it in the same m_assumeutxo_data row). A differing
+            // count at a built-in height is an override and refuses; before
+            // this it was silently skipped and the built-in count used.
             let identical = b.height == r.height
                 && b.blockhash == blockhash
-                && b.hash_serialized == hash_serialized;
+                && b.hash_serialized == hash_serialized
+                && b.chain_tx_count == r.m_chain_tx_count;
             if !identical {
                 return Err(CampaignAssumeutxoError::CollidesWithBuiltin {
                     index,
@@ -501,6 +507,69 @@ mod tests {
         }];
         let staged = load_from_path(&path, &builtin).expect("identical entry is a confirmation");
         assert!(staged.is_empty(), "the built-in already covers it; nothing staged");
+    }
+
+    #[test]
+    fn accepts_the_real_910000_anchor_against_the_mainnet_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_json(
+            tmp.path(),
+            "campaign.json",
+            r#"[ { "height": 910000,
+                   "blockhash": "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+                   "hash_serialized": "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+                   "m_chain_tx_count": 1226586151 } ]"#,
+        );
+        let params = ChainParams::mainnet();
+        let staged = load_from_path(&path, &params.assumeutxo_data)
+            .expect("identical to the built-in 910000 row");
+        assert!(staged.is_empty());
+    }
+
+    #[test]
+    fn refuses_different_hash_serialized_at_builtin_910000() {
+        // Same height + blockhash as the built-in, one nibble of the UTXO
+        // commitment changed: an override, not a confirmation.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_json(
+            tmp.path(),
+            "campaign.json",
+            r#"[ { "height": 910000,
+                   "blockhash": "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+                   "hash_serialized": "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1569",
+                   "m_chain_tx_count": 1226586151 } ]"#,
+        );
+        let params = ChainParams::mainnet();
+        let err = load_from_path(&path, &params.assumeutxo_data)
+            .expect_err("different hash_serialized at a built-in height must refuse");
+        assert!(matches!(
+            err,
+            CampaignAssumeutxoError::CollidesWithBuiltin { height: 910_000, .. }
+        ));
+    }
+
+    #[test]
+    fn refuses_different_chain_tx_count_at_builtin_910000() {
+        // Same height, blockhash AND hash_serialized, different
+        // m_chain_tx_count: the whole commitment is not identical, so it is
+        // an override (Core's m_assumeutxo_data row carries m_chain_tx_count
+        // as part of the pinned data). Previously skipped silently.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_json(
+            tmp.path(),
+            "campaign.json",
+            r#"[ { "height": 910000,
+                   "blockhash": "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+                   "hash_serialized": "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+                   "m_chain_tx_count": 1226586152 } ]"#,
+        );
+        let params = ChainParams::mainnet();
+        let err = load_from_path(&path, &params.assumeutxo_data)
+            .expect_err("different m_chain_tx_count at a built-in height must refuse");
+        assert!(matches!(
+            err,
+            CampaignAssumeutxoError::CollidesWithBuiltin { height: 910_000, .. }
+        ));
     }
 
     #[test]
