@@ -3538,6 +3538,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let flush_signal = Arc::new(rustoshi_storage::ChainstateFlushSignal::new());
     rpc_state_inner.chainstate_flush = flush_signal.clone();
 
+    // RPC `stop` (Core `rpc/server.cpp` stop -> StartShutdown()). The handler
+    // takes this sender and fires it; the main event loop below breaks on the
+    // receiver exactly as it does on SIGTERM, so `stop` and SIGTERM run the
+    // same graceful-shutdown path. The field existed but was never installed,
+    // so `stop` answered "stopping" and the node kept running.
+    let (rpc_stop_tx, mut rpc_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    rpc_state_inner.shutdown_tx = Some(rpc_stop_tx);
+
     let rpc_state = Arc::new(RwLock::new(rpc_state_inner));
 
     // Build the prune coordinator config once. Re-used by every
@@ -7974,6 +7982,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
             _ = sigterm.recv() => {
                 tracing::info!("Received shutdown signal (SIGTERM)");
+                break;
+            }
+            // RPC `stop`: same exit as SIGTERM. `Ok(())` only — if the sender
+            // were ever dropped unsent, the branch disables instead of
+            // shutting the node down.
+            Ok(()) = &mut rpc_stop_rx => {
+                tracing::info!("Received shutdown request (RPC stop)");
+                // Let the handler's "stopping" reply reach the client before
+                // the RPC server is torn down (Core answers before exiting).
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 break;
             }
         }

@@ -28,7 +28,7 @@
 //!
 //! Bug summary (see audit/w124_operator_experience.md for full text):
 //!
-//!   BUG-1  (P0)        RPC `stop` returns success but does NOT shut down.
+//!   BUG-1  (P0)        RPC `stop` returned success but did NOT shut down. FIXED (gate 5).
 //!                      `RpcState::shutdown_tx` field exists (server.rs:137)
 //!                      but is NEVER assigned in `main.rs`; `.take()` always
 //!                      yields `None`. `bitcoin-cli stop` is canonical fleet
@@ -277,37 +277,32 @@
 // Gates 1-10: Startup sequence, signal handling, lifecycle
 // ============================================================
 
-/// G1 (PARTIAL — BUG-1): RPC `stop` end-to-end shutdown path.
+/// G1 (FIXED, gate 5): RPC `stop` end-to-end shutdown path.
 ///
-/// Core: `bitcoin-cli stop` triggers `StartShutdown()` which sets the
-/// `g_shutdown_mutex` cv and unblocks the main loop. Rustoshi: `stop`
-/// RPC method exists (server.rs:4887) and tries to take a
-/// `shutdown_tx` oneshot, but `main.rs` never installs the sender, so
-/// the oneshot fires into the void and the daemon keeps running.
-///
-/// This is a static-source assertion — exercising it for real requires
-/// spinning a full node, which we don't do in unit tests.
+/// Core: `bitcoin-cli stop` triggers `StartShutdown()` which unblocks the
+/// main loop. Rustoshi's `stop` handler takes `RpcState::shutdown_tx` and
+/// fires it; main.rs must install that sender and break its event loop on
+/// the receiver (the same exit SIGTERM takes). Before gate 5 the sender was
+/// never installed, so `stop` answered "stopping" and the daemon kept
+/// running. The handler half is unit-tested in the rpc crate
+/// (`test_rpc_stop_fires_shutdown_signal`); the end-to-end proof is
+/// tools/crash-restart-harness.py reporting `rpc-stop` (not
+/// `rpc-stop-ignored`). This is the static guard on main.rs's half.
 #[test]
-fn g1_rpc_stop_does_not_actually_shutdown() {
-    // Read main.rs and confirm the absence of any `shutdown_tx = Some(...)`
-    // assignment that connects RpcState::shutdown_tx to the main loop's
-    // select! break.
+fn g1_rpc_stop_is_wired_to_main_loop() {
     let main_rs = include_str!("../src/main.rs");
-    // The Cli loop already terminates on Ctrl+C / SIGTERM, but the RPC
-    // `stop` route is silent.
     assert!(
-        !main_rs.contains("shutdown_tx = Some"),
-        "BUG-1: main.rs unexpectedly wires shutdown_tx — re-verify the audit"
+        main_rs.contains("rpc_state_inner.shutdown_tx = Some(rpc_stop_tx)"),
+        "main.rs must install RpcState::shutdown_tx before the RPC server starts"
     );
     assert!(
-        !main_rs.contains("shutdown_tx: Some"),
-        "BUG-1: main.rs unexpectedly wires shutdown_tx — re-verify the audit"
+        main_rs.contains("Ok(()) = &mut rpc_stop_rx =>"),
+        "main.rs event loop must break on the RPC stop receiver"
     );
-    // Sanity: server.rs declared the field, so the wiring gap is on main.rs.
     let server_rs = include_str!("../../crates/rpc/src/server.rs");
     assert!(
         server_rs.contains("pub shutdown_tx: Option<oneshot::Sender<()>>"),
-        "RpcState::shutdown_tx field MUST exist — audit reflects rustoshi as of FIX-88"
+        "RpcState::shutdown_tx field MUST exist"
     );
 }
 

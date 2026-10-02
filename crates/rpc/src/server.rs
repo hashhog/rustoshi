@@ -20248,6 +20248,32 @@ mod tests {
         (rpc, state, peer_state, tmp)
     }
 
+    /// Gate 5: RPC `stop` must actually request shutdown (Core
+    /// `rpc/server.cpp` stop -> StartShutdown()). The handler fires the
+    /// `shutdown_tx` oneshot that main.rs's event loop selects on — the same
+    /// break SIGTERM takes. A type error on `wait` must NOT fire it.
+    #[tokio::test]
+    async fn test_rpc_stop_fires_shutdown_signal() {
+        let (rpc, state, _ps, _tmp) = gbfp_fixture().await;
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        state.write().await.shutdown_tx = Some(tx);
+
+        // Bad `wait` type: RPC_TYPE_ERROR and the node stays up.
+        let err = RustoshiRpcServer::stop(&rpc, Some(serde_json::json!("x")))
+            .await
+            .expect_err("string wait must be a type error");
+        assert_eq!(err.code(), rpc_error::RPC_TYPE_ERROR);
+        assert!(rx.try_recv().is_err(), "a rejected stop must not request shutdown");
+
+        let reply = RustoshiRpcServer::stop(&rpc, None).await.expect("stop ok");
+        assert!(reply.contains("stopping"), "reply: {reply}");
+        assert!(rx.try_recv().is_ok(), "stop must fire the shutdown signal");
+        assert!(state.read().await.shutdown_tx.is_none(), "sender consumed");
+
+        // A second stop is harmless (sender already taken).
+        RustoshiRpcServer::stop(&rpc, None).await.expect("second stop ok");
+    }
+
     /// Construct a distinct regtest header, persist it (header only, NO block
     /// body), and return its hash. This is the "we have the CBlockIndex but not
     /// the block data" state `getblockfrompeer` is meant to act on.
