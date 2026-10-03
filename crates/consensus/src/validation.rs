@@ -276,6 +276,19 @@ pub enum ValidationError {
     #[error("previous block not found: {0}")]
     PrevBlockNotFound(String),
 
+    /// A consensus value needed an ancestor header this node does not hold
+    /// (e.g. the BIP-68 coin median-time-past window of a coin created below
+    /// an assumeUTXO snapshot's header band). The payload is the missing
+    /// height.
+    ///
+    /// This is NOT a verdict on the block. Bitcoin Core cannot reach this
+    /// state (it holds the full header chain before activating a snapshot,
+    /// validation.cpp ActivateSnapshot), so the only Core-equivalent answer is
+    /// "cannot decide yet": callers MUST NOT mark the block invalid, cache it
+    /// as invalid, or punish the peer that served it.
+    #[error("missing ancestor header at height {0}: cannot evaluate consensus rule")]
+    MissingAncestorHeader(u32),
+
     #[error("block connects to invalid chain")]
     InvalidChain,
 
@@ -542,6 +555,9 @@ impl ValidationError {
             // Decision is unchanged — the block is rejected either way — this
             // is R2 reason-code parity.
             ValidationError::PrevBlockNotFound(_) => "prev-blk-not-found".to_string(),
+            // Not a Core reject reason: Core never lacks an ancestor header.
+            // Distinct token so it can never be read as an invalid-block verdict.
+            ValidationError::MissingAncestorHeader(_) => "missing-ancestor-header".to_string(),
             // Catch-all: covers remaining structural/chain errors
             _ => "rejected".to_string(),
         }
@@ -1626,6 +1642,24 @@ pub trait SequenceLockContext {
     /// For sequence lock calculation, we need the MTP of the block prior
     /// to when the UTXO was mined (i.e., height - 1).
     fn get_mtp_at_height(&self, height: u32) -> u32;
+
+    /// Fallible form of [`Self::get_mtp_at_height`]: `Err(h)` when the
+    /// 11-header MTP window ending at `height` is not fully available
+    /// (`h` = the first missing height). Block connection uses this so that
+    /// a partial window or an absent header fails CLOSED with
+    /// [`ValidationError::MissingAncestorHeader`] instead of silently
+    /// computing a wrong median (partial window) or treating the coin as
+    /// created at time 0 (fail-open).
+    ///
+    /// Bitcoin Core: `CalculateSequenceLocks` uses
+    /// `block.GetAncestor(std::max(nCoinHeight - 1, 0))->GetMedianTimePast()`,
+    /// which always has the full window because Core holds every header.
+    ///
+    /// The default delegates to the infallible lookup, which is right for
+    /// contexts that by construction always have the data (tests, mempool).
+    fn try_get_mtp_at_height(&self, height: u32) -> Result<u32, u32> {
+        Ok(self.get_mtp_at_height(height))
+    }
 }
 
 /// BIP-68 applies only when `tx.version >= 2`. Bitcoin Core stores the version as
@@ -1661,6 +1695,38 @@ pub fn calculate_sequence_locks<C: SequenceLockContext>(
     context: &C,
     enforce_bip68: bool,
 ) -> SequenceLocks {
+    match calculate_sequence_locks_impl(tx, spent_heights, enforce_bip68, |h| {
+        Ok::<u32, u32>(context.get_mtp_at_height(h))
+    }) {
+        Ok(l) => l,
+        Err(_) => unreachable!("infallible lookup"),
+    }
+}
+
+/// Fail-closed form of [`calculate_sequence_locks`] used on block connection.
+///
+/// Uses [`SequenceLockContext::try_get_mtp_at_height`]; when the coin's
+/// 11-header MTP window is not fully available it returns
+/// [`ValidationError::MissingAncestorHeader`] (not an invalid-block verdict)
+/// rather than a partial-window median or a zero coin time.
+pub fn try_calculate_sequence_locks<C: SequenceLockContext>(
+    tx: &Transaction,
+    spent_heights: &[u32],
+    context: &C,
+    enforce_bip68: bool,
+) -> Result<SequenceLocks, ValidationError> {
+    calculate_sequence_locks_impl(tx, spent_heights, enforce_bip68, |h| {
+        context.try_get_mtp_at_height(h)
+    })
+    .map_err(ValidationError::MissingAncestorHeader)
+}
+
+fn calculate_sequence_locks_impl<F: FnMut(u32) -> Result<u32, u32>>(
+    tx: &Transaction,
+    spent_heights: &[u32],
+    enforce_bip68: bool,
+    mut mtp_at: F,
+) -> Result<SequenceLocks, u32> {
     assert_eq!(spent_heights.len(), tx.inputs.len());
 
     // Will be set to the equivalent height- and time-based nLockTime
@@ -1673,10 +1739,10 @@ pub fn calculate_sequence_locks<C: SequenceLockContext>(
     // Do not enforce sequence numbers as a relative lock time
     // unless we have been instructed to
     if !enforce_bip68 {
-        return SequenceLocks {
+        return Ok(SequenceLocks {
             min_height,
             min_time,
-        };
+        });
     }
 
     for (idx, input) in tx.inputs.iter().enumerate() {
@@ -1697,9 +1763,9 @@ pub fn calculate_sequence_locks<C: SequenceLockContext>(
             //
             // For the first block (height 0), use height 0's MTP as a fallback.
             let coin_time = if coin_height > 0 {
-                context.get_mtp_at_height(coin_height - 1) as i64
+                mtp_at(coin_height - 1)? as i64
             } else {
-                context.get_mtp_at_height(0) as i64
+                mtp_at(0)? as i64
             };
 
             // NOTE: Subtract 1 to maintain nLockTime semantics.
@@ -1725,10 +1791,10 @@ pub fn calculate_sequence_locks<C: SequenceLockContext>(
         }
     }
 
-    SequenceLocks {
+    Ok(SequenceLocks {
         min_height,
         min_time,
-    }
+    })
 }
 
 /// Check if sequence locks are satisfied for a block at the given height.
@@ -2454,7 +2520,9 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
         // entirely — that was BUG-1/G16 (P0-CDIV chain split).
         let enforce_bip68 = bip68_version_active(tx.version) && csv_active;
         if enforce_bip68 {
-            let locks = calculate_sequence_locks(tx, &spent_heights, seq_context, true);
+            // Fail-closed lookup: a missing/partial coin-MTP window returns
+            // MissingAncestorHeader (no verdict) instead of a wrong median.
+            let locks = try_calculate_sequence_locks(tx, &spent_heights, seq_context, true)?;
             // Enforce BOTH height and time components (EvaluateSequenceLocks,
             // consensus/tx_verify.cpp:97-104).
             if !check_sequence_locks(&locks, height, prev_block_mtp as i64) {

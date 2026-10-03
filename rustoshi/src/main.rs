@@ -1316,6 +1316,10 @@ fn misbehavior_for_block_error(e: &ValidationError) -> Option<MisbehaviorReason>
     match e {
         // Honest competing-branch / unknown-parent block: NOT misbehavior.
         ValidationError::PrevBlockNotFound(_) => None,
+        // We lack an ancestor header needed to evaluate a rule (snapshot
+        // boot below the header band). Our gap, not the peer's fault, and
+        // not a verdict on the block: Core never reaches this state.
+        ValidationError::MissingAncestorHeader(_) => None,
         // BLOCK_MUTATED: merkle / witness-commitment corruption.
         ValidationError::BadMerkleRoot
         | ValidationError::BadWitnessCommitment
@@ -1961,7 +1965,8 @@ fn run_import_from_blk_files(
 
         // Validate and process (f_requested=true: import-from-Core-datadir is
         // a requested/trusted path — no fTooFarAhead guard needed).
-        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
+        let seq_ctx = rustoshi_storage::StoreSeqLockCtx::new(&block_store);
+        let undo = match chain_state.process_block_with_seq_ctx(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &seq_ctx, skip_scripts, prev_timestamp) {
             Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", height, e);
@@ -2184,7 +2189,8 @@ fn run_import_from_stdin(
 
         // Validate and process (f_requested=true: snapshot-import is a
         // requested/trusted path — no fTooFarAhead guard needed).
-        let undo = match chain_state.process_block(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp) {
+        let seq_ctx = rustoshi_storage::StoreSeqLockCtx::new(&block_store);
+        let undo = match chain_state.process_block_with_seq_ctx(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &seq_ctx, skip_scripts, prev_timestamp) {
             Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", frame_height, e);
@@ -4510,7 +4516,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             Ok(()) => {
                                 // f_requested=true: blocks from the IBD block downloader
                                 // are actively requested via getdata — no fTooFarAhead guard.
-                                cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp)
+                                cs.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &rustoshi_storage::StoreSeqLockCtx::new(&block_store), skip_scripts, prev_timestamp)
                             }
                             Err(reason) => {
                                 tracing::error!(
@@ -4591,9 +4597,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // is a fork/side-branch candidate, not an invalid
                                 // block, so it is excluded (IBD is sequential, so
                                 // it should not arise here, but stay conservative).
+                                // MissingAncestorHeader is "cannot decide yet"
+                                // (fail closed), never an invalid verdict.
                                 if !matches!(
                                     e,
                                     rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)
+                                        | rustoshi_consensus::validation::ValidationError::MissingAncestorHeader(_)
                                 ) {
                                     connect_invalid = true;
                                 }
@@ -5760,7 +5769,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             Ok(()) => {
                                                 // f_requested=true: blocks from the P2P block downloader
                                                 // are actively requested via getdata — no fTooFarAhead guard.
-                                                cs.process_block(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), skip_scripts, prev_timestamp)
+                                                cs.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &rustoshi_storage::StoreSeqLockCtx::new(&block_store), skip_scripts, prev_timestamp)
                                             }
                                             Err(reason) => {
                                                 tracing::error!(
@@ -5812,6 +5821,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)
                                                 ) {
                                                     reorg_candidate = true;
+                                                } else if matches!(
+                                                    e,
+                                                    rustoshi_consensus::validation::ValidationError::MissingAncestorHeader(_)
+                                                ) {
+                                                    // Fail closed: we lack the ancestor
+                                                    // header a consensus rule needs (a
+                                                    // coin below the snapshot header band).
+                                                    // No invalid mark, no peer punishment;
+                                                    // the block stays unconnected.
+                                                    tracing::error!(
+                                                        "block {} at height {} NOT connected: {} — this node \
+                                                         lacks pre-base headers (assumeUTXO snapshot boot); \
+                                                         the tip cannot advance past it until the full header \
+                                                         chain is present",
+                                                        block_hash, height, e
+                                                    );
                                                 } else {
                                                     connect_invalid = true;
                                                 }

@@ -50,6 +50,7 @@ pub mod header_context;
 pub mod historical_backfill;
 pub mod indexes;
 pub mod prune;
+pub mod seq_lock_ctx;
 pub mod snapshot;
 pub mod undo;
 pub mod w102_assumeutxo_gates;
@@ -65,6 +66,7 @@ pub use blockstore::{
     BLOCKFILE_CHUNK_SIZE, MAX_BLOCKFILE_SIZE, MIN_BLOCKS_TO_KEEP, MIN_DISK_SPACE_FOR_BLOCK_FILES,
     MIN_PRUNE_TARGET_MIB, STORAGE_HEADER_BYTES, UNDOFILE_CHUNK_SIZE,
 };
+pub use seq_lock_ctx::StoreSeqLockCtx;
 pub use prune::{auto_prune, manual_prune_to_height, PruneCoordConfig, PruneOutcome, PRUNE_MANUAL_SENTINEL};
 pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;

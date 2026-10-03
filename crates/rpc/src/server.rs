@@ -4291,68 +4291,24 @@ fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> u32 {
 
 /// A `SequenceLockContext` backed by the persistent block/header store.
 ///
-/// For each height h, `get_mtp_at_height(h)` returns the median-time-past
-/// of the active-chain block at height h — i.e., the median of the timestamps
-/// of blocks at heights h, h-1, …, max(h-10, 0), looked up via
-/// `get_hash_by_height` + `get_header`.
-///
-/// Uses Core's "use what you have" semantics (chain.h:233-245): if fewer than
-/// 11 ancestors are available (genesis-adjacent or partial store), the median
-/// is computed from however many ARE available.  Never returns 0 on a short
-/// walk — only returns 0 when the block at height h itself is not found in
-/// the store (which should not happen during normal block validation, since
-/// we only call this for coins whose UTXO height is confirmed in the store).
-///
-/// This is the fix for BUG-2/G17 (P0-CDIV): the old `ChainStateNullSeqContext`
-/// returned 0 for every height, making every time-based BIP-68 relative lock
-/// trivially satisfied.
+/// Thin alias over `rustoshi_storage::StoreSeqLockCtx`, which is FAIL-CLOSED:
+/// a partial 11-header window or an absent height yields
+/// `ValidationError::MissingAncestorHeader` on the connect path (no verdict),
+/// never a partial-window median (false reject: hotbuns 942168 / camlcoin
+/// 932256 on snapshot-booted nodes) or a 0 coin time (false accept). The
+/// previous in-file impl did both ("use what you have" + `return 0`); Core
+/// never faces the question because it holds every header.
 struct BlockStoreSeqLockCtx<'a> {
     block_store: &'a BlockStore<'a>,
 }
 
 impl<'a> SequenceLockContext for BlockStoreSeqLockCtx<'a> {
     fn get_mtp_at_height(&self, height: u32) -> u32 {
-        use rustoshi_consensus::params::MEDIAN_TIME_PAST_WINDOW;
-        // Look up the active-chain block hash at this height.
-        let hash = match self.block_store.get_hash_by_height(height) {
-            Ok(Some(h)) => h,
-            // Height not in the active chain index — should not happen during
-            // block validation (we only call this for UTXOs whose coin height
-            // is confirmed). Return 0 so the caller sees coin_time=0, which
-            // makes time-based locks trivially satisfied (conservative fallback,
-            // same as the null context we replaced).
-            _ => return 0,
-        };
-        // Walk back up to 11 ancestors collecting timestamps.
-        // Core's "use what you have" semantics: stop on the first header miss
-        // rather than aborting the whole walk (mirrors CBlockIndex::GetMedianTimePast,
-        // chain.h:233-245 `for (... && pindex; ..., pindex = pindex->pprev)`).
-        let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
-        let mut current = hash;
-        for _ in 0..MEDIAN_TIME_PAST_WINDOW {
-            match self.block_store.get_header(&current) {
-                Ok(Some(header)) => {
-                    timestamps.push(header.timestamp);
-                    if header.prev_block_hash == Hash256::ZERO {
-                        break; // reached the genesis sentinel
-                    }
-                    current = header.prev_block_hash;
-                }
-                // Partial walk — use whatever was collected rather than 0.
-                // This is the BUG-5/G20 fix: Core never aborts to 0 on a
-                // missing ancestor; it computes the median of what it got.
-                _ => break,
-            }
-        }
-        if timestamps.is_empty() {
-            // We got a valid hash_by_height but could not read its header.
-            // Extremely unlikely in normal operation; 0 is the safe fallback
-            // (same behavior as the null context, conservatively false-accepts
-            // rather than false-rejects or panics).
-            return 0;
-        }
-        timestamps.sort_unstable();
-        timestamps[timestamps.len() / 2]
+        rustoshi_storage::StoreSeqLockCtx::new(self.block_store).get_mtp_at_height(height)
+    }
+
+    fn try_get_mtp_at_height(&self, height: u32) -> Result<u32, u32> {
+        rustoshi_storage::StoreSeqLockCtx::new(self.block_store).try_get_mtp_at_height(height)
     }
 }
 

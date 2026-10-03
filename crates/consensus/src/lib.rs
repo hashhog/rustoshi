@@ -68,7 +68,7 @@ pub use script::{
 };
 pub use validation::{
     accept_block_header_chain_work,
-    calculate_sequence_locks, check_block, check_block_with_pow, check_sequence_locks, check_transaction,
+    calculate_sequence_locks, try_calculate_sequence_locks, check_block, check_block_with_pow, check_sequence_locks, check_transaction,
     connect_block_with_sequence_locks, contextual_check_block, contextual_check_block_header,
     disconnect_block, init_script_check_threads, read_script_checks_total,
     resolve_script_check_threads, script_check_thread_count, script_flags_for_height,

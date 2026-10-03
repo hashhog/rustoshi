@@ -842,8 +842,17 @@ impl ChainState {
             // Reference: bitcoin-core/src/validation.cpp ConnectBlock
             // (~line 2486) which feeds `pindex->pprev->GetMedianTimePast()`
             // into the IsFinalTx call.
-            let prev_block_mtp =
-                compute_mtp_via_get_block(&self.tip_hash, get_block);
+            //
+            // A missing ancestor body (e.g. the new branch forks within 11
+            // blocks of an assumeUTXO base whose pre-base bodies are absent)
+            // used to return 0 here, which SKIPPED time-too-old and set the
+            // BIP-113 cutoff to 0. Fail closed instead: no verdict.
+            let prev_block_mtp = compute_mtp_via_get_block(&self.tip_hash, get_block)
+                .map_err(|collected| {
+                    ValidationError::MissingAncestorHeader(
+                        self.tip_height.saturating_sub(collected as u32),
+                    )
+                })?;
             // BIP-113 / Core ContextualCheckBlockHeader: block timestamp must
             // be strictly greater than MTP of parent.
             // Reference: bitcoin-core/src/validation.cpp:4092
@@ -1014,7 +1023,10 @@ impl ChainState {
 /// `CBlockIndex::GetMedianTimePast` for short chains.
 ///
 /// Reference: bitcoin-core/src/chain.h CBlockIndex::GetMedianTimePast.
-fn compute_mtp_via_get_block<FB>(tip_hash: &Hash256, get_block: &FB) -> u32
+/// Returns `Err(n)` when the walk hits a missing block after collecting `n`
+/// timestamps (and before reaching genesis): the window is partial, so no
+/// Core-equivalent MTP exists here. Callers fail closed on that.
+fn compute_mtp_via_get_block<FB>(tip_hash: &Hash256, get_block: &FB) -> Result<u32, usize>
 where
     FB: Fn(&Hash256) -> Option<Block>,
 {
@@ -1029,14 +1041,14 @@ where
                 }
                 current = block.header.prev_block_hash;
             }
-            None => return 0,
+            None => return Err(timestamps.len()),
         }
     }
     if timestamps.is_empty() {
-        return 0;
+        return Err(0);
     }
     timestamps.sort_unstable();
-    timestamps[timestamps.len() / 2]
+    Ok(timestamps[timestamps.len() / 2])
 }
 
 /// Test-only wrapper around `compute_mtp_via_get_block` that takes a slice of
@@ -1091,7 +1103,7 @@ pub(crate) fn compute_mtp_via_get_block_test(timestamps: &[u32]) -> u32 {
         b[0] = 1u8;
         b
     });
-    compute_mtp_via_get_block(&tip_hash, &|h| blocks.get(h).cloned())
+    compute_mtp_via_get_block(&tip_hash, &|h| blocks.get(h).cloned()).unwrap_or(0)
 }
 
 /// `SequenceLockContext` impl used by `process_block` for the time-based
