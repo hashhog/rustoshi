@@ -8260,6 +8260,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // RocksDB close joins background compactions (`DBImpl::CloseHelper`).
+    // A scratch stop stayed in that join for 60s+ after the log below
+    // (2026-10-03) and the stop grace SIGKILL'd it. The shutdown batch is
+    // already in the WAL; cancel the jobs and do not wait. The next open
+    // recovers an abandoned compaction the same way it recovers a crash.
+    if let Err(e) = block_store.db().cancel_background_compactions() {
+        tracing::error!(
+            "Failed to fsync WAL before skipping the compaction join: {}",
+            e
+        );
+    }
+
     // Remove PID file so a subsequent supervisor restart sees a clean state.
     remove_pid_file(&pid_path);
 

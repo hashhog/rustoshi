@@ -5,8 +5,9 @@
 
 use crate::columns::*;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use std::mem::ManuallyDrop;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ============================================================
 // METADATA KEYS
@@ -161,17 +162,53 @@ pub(crate) mod test_read_counter {
     }
 }
 
+/// Test gate: a compaction filter blocks in `block_in_filter` until
+/// `release`, so close's join of that compaction is observable.
+#[cfg(test)]
+struct CompactionStall {
+    started: AtomicBool,
+    release: AtomicBool,
+}
+
+#[cfg(test)]
+impl CompactionStall {
+    fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        }
+    }
+
+    fn block_in_filter(&self) {
+        self.started.store(true, Ordering::Release);
+        while !self.release.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn release(&self) {
+        self.release.store(true, Ordering::Release);
+    }
+}
+
 /// The main database handle wrapping RocksDB.
 ///
 /// Provides methods for reading and writing data across column families,
 /// with support for atomic batch writes.
 pub struct ChainDb {
-    db: DB,
+    /// `ManuallyDrop` so shutdown can skip `rocksdb_close`. That close
+    /// joins every background compaction (`DBImpl::CloseHelper`); on a
+    /// scratch datadir the join ran 60s+ after "Shutdown complete"
+    /// (2026-10-03).
+    db: ManuallyDrop<DB>,
     /// Counter for the number of `write_batch` calls. Used by tests to
     /// assert the multi-block-atomicity invariant: a multi-block reorg
     /// must commit exactly one RocksDB batch (Pattern D fleet-wide
     /// closure, 2026-05-07).
     write_batch_count: AtomicU64,
+    /// Set by [`ChainDb::cancel_background_compactions`]. Drop then does
+    /// not call `rocksdb_close`.
+    skip_close_wait: AtomicBool,
 }
 
 impl ChainDb {
@@ -228,8 +265,9 @@ impl ChainDb {
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
         let handle = Self {
-            db,
+            db: ManuallyDrop::new(db),
             write_batch_count: AtomicU64::new(0),
+            skip_close_wait: AtomicBool::new(false),
         };
         handle.check_and_init_version()?;
         Ok(handle)
@@ -500,11 +538,97 @@ impl ChainDb {
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
         let handle = Self {
-            db,
+            db: ManuallyDrop::new(db),
             write_batch_count: AtomicU64::new(0),
+            skip_close_wait: AtomicBool::new(false),
         };
         handle.check_and_init_version()?;
         Ok(handle)
+    }
+
+    /// Fsync the WAL, stop scheduling compactions, and make [`Drop`] skip
+    /// `rocksdb_close`'s join of in-flight ones.
+    ///
+    /// `cancel_all_background_work(false)` only sets `shutting_down_`.
+    /// The destructor still waits until every running compaction returns
+    /// (`DBImpl::CloseHelper`). A compaction blocked in `fdatasync` does
+    /// not notice the flag, so the wait is the compaction's remaining
+    /// I/O — 60s+ on a scratch datadir after "Shutdown complete"
+    /// (2026-10-03), past the stop grace. The shutdown batch is already
+    /// in the WAL; abandoning the compaction is the same recovery as a
+    /// crash (the output SST is not in the MANIFEST until the job
+    /// commits). Process exit reclaims the leaked handle and its threads.
+    pub fn cancel_background_compactions(&self) -> Result<(), StorageError> {
+        // WAL first, while the DB is still accepting writes. With the
+        // default WAL, memtables are recoverable from it; `has_unpersisted_data_`
+        // is set only for WAL-disabled writes, which this node does not issue.
+        let wal = self.db.flush_wal(true);
+        for name in ALL_COLUMN_FAMILIES {
+            if let Some(cf) = self.db.cf_handle(name) {
+                // Mutable CF option. Failure is non-fatal: cancel below
+                // still sets `shutting_down_`.
+                let _ = self
+                    .db
+                    .set_options_cf(&cf, &[("disable_auto_compactions", "true")]);
+            }
+        }
+        // wait=false sets shutting_down and returns. It does not join.
+        self.db.cancel_all_background_work(false);
+        self.skip_close_wait.store(true, Ordering::Release);
+        wal?;
+        Ok(())
+    }
+
+    /// Block in a compaction filter until `stall` is released, so a test
+    /// can measure that `rocksdb_close` waits for that compaction.
+    #[cfg(test)]
+    fn open_with_compaction_stall(
+        path: &Path,
+        stall: std::sync::Arc<CompactionStall>,
+    ) -> Result<Self, StorageError> {
+        let mut db_opts = Options::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+        db_opts.set_max_background_jobs(2);
+        // A stalled compaction must not stop the flushes that create the
+        // L0 files which trigger it.
+        db_opts.set_level_zero_stop_writes_trigger(64);
+        db_opts.set_level_zero_slowdown_writes_trigger(32);
+
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_COLUMN_FAMILIES
+            .iter()
+            .map(|name| {
+                let mut cf_opts = Options::default();
+                cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
+                cf_opts.set_level_zero_file_num_compaction_trigger(2);
+                cf_opts.set_write_buffer_size(8 * 1024 * 1024);
+                let gate = std::sync::Arc::clone(&stall);
+                cf_opts.set_compaction_filter("stall-compaction", move |_level, _key, _value| {
+                    gate.block_in_filter();
+                    rocksdb::CompactionDecision::Keep
+                });
+                ColumnFamilyDescriptor::new(*name, cf_opts)
+            })
+            .collect();
+
+        let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
+        let handle = Self {
+            db: ManuallyDrop::new(db),
+            write_batch_count: AtomicU64::new(0),
+            skip_close_wait: AtomicBool::new(false),
+        };
+        handle.check_and_init_version()?;
+        Ok(handle)
+    }
+
+    #[cfg(test)]
+    fn flush_cf(&self, cf_name: &str) -> Result<(), StorageError> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::Corruption(format!("missing column family: {cf_name}")))?;
+        self.db.flush_cf(&cf)?;
+        Ok(())
     }
 
     /// Check the on-disk chainstate format version and either:
@@ -644,5 +768,141 @@ mod version_check_tests {
             Err(other) => panic!("expected VersionMismatch, got {:?}", other),
             Ok(_) => panic!("expected error, got success"),
         }
+    }
+}
+
+impl Drop for ChainDb {
+    fn drop(&mut self) {
+        if self.skip_close_wait.load(Ordering::Acquire) {
+            // Leave the DB allocated. `rocksdb_close` would join the
+            // compaction threads; process exit reclaims them instead.
+            return;
+        }
+        // SAFETY: `db` was set at open and this is the only drop of it.
+        unsafe { ManuallyDrop::drop(&mut self.db) }
+    }
+}
+
+#[cfg(test)]
+mod close_wait_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    /// Write overlapping L0 files until the compaction filter blocks.
+    fn drive_until_compaction_starts(db: &ChainDb, stall: &CompactionStall) {
+        let value = vec![0x5Au8; 2048];
+        for _round in 0..8 {
+            for k in 0..40u32 {
+                db.put_cf(CF_META, &k.to_be_bytes(), &value)
+                    .expect("put");
+            }
+            db.flush_cf(CF_META).expect("flush");
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < deadline {
+                if stall.started.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        panic!("compaction filter never ran; the close-wait instrument is blind");
+    }
+
+    /// Gate 5: `rocksdb_close` joins background compactions, so a process
+    /// that has already logged "Shutdown complete" stays alive until they
+    /// finish (scratch stops 60s+, 2026-10-03).
+    ///
+    /// The plain drop must wait out a stalled compaction — otherwise this
+    /// test cannot see the bug. `cancel_background_compactions` then drop
+    /// must return while that compaction is still stalled.
+    #[test]
+    fn close_skips_background_compaction() {
+        // --- instrument: a normal close waits for the stalled compaction ---
+        {
+            let dir = TempDir::new().expect("tempdir");
+            let stall = Arc::new(CompactionStall::new());
+            let db =
+                ChainDb::open_with_compaction_stall(dir.path(), Arc::clone(&stall)).expect("open");
+            db.put_cf(CF_META, b"persist-key", b"persist-val")
+                .expect("seed");
+            drive_until_compaction_starts(&db, &stall);
+            let gate = Arc::clone(&stall);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1500));
+                gate.release();
+            });
+            let started = Instant::now();
+            drop(db);
+            let waited = started.elapsed();
+            eprintln!(
+                "plain drop waited {} ms while a compaction was stalled",
+                waited.as_millis()
+            );
+            assert!(
+                waited >= Duration::from_millis(1200),
+                "instrument blind: plain drop returned in {} ms; rocksdb_close must wait for the stalled compaction",
+                waited.as_millis()
+            );
+            let reopened = ChainDb::open(dir.path()).expect("reopen after normal close");
+            assert_eq!(
+                reopened
+                    .get_cf(CF_META, b"persist-key")
+                    .expect("get")
+                    .as_deref(),
+                Some(b"persist-val".as_slice())
+            );
+        }
+
+        // --- fix: cancel, then drop, returns while the compaction is stalled ---
+        {
+            let dir = TempDir::new().expect("tempdir");
+            let stall = Arc::new(CompactionStall::new());
+            let db =
+                ChainDb::open_with_compaction_stall(dir.path(), Arc::clone(&stall)).expect("open");
+            drive_until_compaction_starts(&db, &stall);
+            // Backstop so a close that still joins fails the assertion
+            // instead of hanging the suite.
+            let gate = Arc::clone(&stall);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(3000));
+                gate.release();
+            });
+            let started = Instant::now();
+            db.cancel_background_compactions()
+                .expect("cancel background compactions");
+            drop(db);
+            let waited = started.elapsed();
+            eprintln!(
+                "cancel_background_compactions + drop waited {} ms",
+                waited.as_millis()
+            );
+            // Unblock the compaction thread now that we have the measurement,
+            // so it does not sit in the filter until the backstop fires.
+            stall.release();
+            assert!(
+                waited < Duration::from_millis(1000),
+                "close waited {} ms for a stalled compaction (bound 1000 ms)",
+                waited.as_millis()
+            );
+            // The handle was leaked on purpose; do not delete the dir out
+            // from under a compaction that may still be finishing.
+            std::mem::forget(dir);
+        }
+
+        let main_rs = include_str!("../../../rustoshi/src/main.rs");
+        let shutdown = main_rs
+            .find("// GRACEFUL SHUTDOWN")
+            .expect("shutdown section missing");
+        let complete = main_rs
+            .find("tracing::info!(\"Shutdown complete\");")
+            .expect("Shutdown complete log missing");
+        assert!(shutdown < complete);
+        let window = &main_rs[shutdown..complete];
+        assert!(
+            window.contains("cancel_background_compactions()"),
+            "shutdown must cancel RocksDB compactions before logging Shutdown complete"
+        );
     }
 }
