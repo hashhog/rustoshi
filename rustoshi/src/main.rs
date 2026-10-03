@@ -1346,6 +1346,83 @@ async fn send_download_requests(
     }
 }
 
+/// [`HistoricalBackfill::detect`] running on its own thread after P2P is up.
+///
+/// The P2P loop polls [`Self::recv`] in its `select!` and arms the backfill
+/// when the result arrives. Until then the node runs exactly as with
+/// `--no-historical-backfill`. Dropping this (node shutdown) cancels a walk
+/// that is still running, so a stop never waits on it. A plain OS thread, not
+/// `spawn_blocking`: the tokio runtime waits for blocking tasks when it shuts
+/// down.
+struct HistoricalBackfillArming {
+    rx: Option<tokio::sync::oneshot::Receiver<Result<Option<HistoricalBackfill>, String>>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    started: std::time::Instant,
+}
+
+impl HistoricalBackfillArming {
+    fn disabled() -> Self {
+        Self {
+            rx: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn spawn(db: Arc<ChainDb>, genesis_hash: Hash256, tip: u32) -> Self {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_t = Arc::clone(&cancel);
+        let spawned = std::thread::Builder::new()
+            .name("backfill-detect".into())
+            .spawn(move || {
+                let store = BlockStore::new(&db);
+                let res = HistoricalBackfill::detect_cancellable(&store, genesis_hash, tip, &cancel_t)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(res);
+            });
+        let rx = match spawned {
+            Ok(_) => Some(rx),
+            Err(e) => {
+                tracing::warn!("historical backfill: detect thread spawn failed ({e}); backfill stays off");
+                None
+            }
+        };
+        Self {
+            rx,
+            cancel,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.rx.is_some()
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    /// Cancel-safe: a `select!` that drops this future leaves the receiver
+    /// in place for the next poll.
+    async fn recv(&mut self) -> Result<Option<HistoricalBackfill>, String> {
+        let Some(rx) = self.rx.as_mut() else {
+            return std::future::pending().await;
+        };
+        let res = rx
+            .await
+            .unwrap_or_else(|_| Err("detect thread ended without a result".into()));
+        self.rx = None;
+        res
+    }
+}
+
+impl Drop for HistoricalBackfillArming {
+    fn drop(&mut self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Drive one round of assumeUTXO historical backfill: getheaders from the
 /// genesis-side locator and getdata for missing bodies. Historical batches
 /// must never enter the forward HeaderSync (that would rewind the snapshot
@@ -3864,12 +3941,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // bodies for those heights are already in CF_BLOCKS (index rebuild,
     // not a 600 G download), restore the height→hash rows first so
     // getblockhash / pruneheight see them before we arm P2P backfill.
-    match block_store.rebuild_height_index_from_bodies() {
-        Ok(n) if n > 0 => tracing::info!(
-            "rebuilt {n} height-index rows from stored block bodies"
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::warn!("height-index rebuild from bodies failed: {e}"),
+    //
+    // Only when the hole is actually there (height 1 unindexed; O(log n) to
+    // tell). The rebuild walks the whole block index, ~970k entries on
+    // mainnet, and once the hole is indexed it can never find anything:
+    // running it on every boot put another O(history) pass in front of P2P.
+    // `prune_report_floor` gates its own call the same way.
+    match block_store.snapshot_index_floor(best_height) {
+        Ok(Some(_)) => match block_store.rebuild_height_index_from_bodies() {
+            Ok(n) if n > 0 => tracing::info!(
+                "rebuilt {n} height-index rows from stored block bodies"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("height-index rebuild from bodies failed: {e}"),
+        },
+        Ok(None) => {}
+        Err(e) => tracing::warn!("snapshot index floor check failed: {e}"),
     }
 
     // AssumeUTXO hole: genesis + tail band, nothing in 1..floor-1. Arm a
@@ -3887,70 +3974,29 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
              snapshot hole is left in place so forward sync owns the peer"
         );
     }
-    let mut historical_backfill = match HistoricalBackfill::detect_unless_disabled(
-        &block_store,
-        params.genesis_hash,
-        best_height,
-        cli.no_historical_backfill,
-        backfill_env.as_deref(),
-    ) {
-        Ok(bf) => bf,
-        Err(e) => {
-            tracing::warn!("historical backfill detect failed: {e}");
-            None
-        }
-    };
-    if let Some(ref bf) = historical_backfill {
-        tracing::info!(
-            "historical backfill armed: genesis-side tip {} → floor {} \
-             (P2P headers+bodies; yields while forward header-sync or block \
-             download needs the peer; HeaderSync stays at the snapshot tip)",
-            bf.genesis_tip(),
-            bf.target_floor()
-        );
-        let mut rpc = rpc_state.write().await;
-        if !rpc.chainstate_manager.is_snapshot_active() {
-            if let Ok(Some(base)) = rustoshi_storage::read_snapshot_blockhash(&datadir) {
-                let (height, commitment) = match params.assumeutxo_for_blockhash(&base) {
-                    Some(au) => (au.height, au.hash_serialized),
-                    None => (
-                        bf.target_floor(),
-                        rustoshi_consensus::AssumeutxoHash(Hash256::ZERO),
-                    ),
-                };
-                rpc.chainstate_manager.activate_snapshot_with_commitment(
-                    base, height, commitment,
-                );
-                rpc.chainstate_manager
-                    .start_background_validation(std::sync::Arc::as_ptr(&db) as usize);
-            }
-        }
-    }
+    //
+    // `detect` is NOT run here. It can walk the stored history (the first
+    // time on a datadir without progress markers, or after a crash that
+    // lost them), and it used to run right here, on the main task, before
+    // P2P started: 2026-10-01 mainnet, 20+ min off-network after a restart
+    // (gdb: main thread in HistoricalBackfill::detect -> rocksdb pread).
+    // Bitcoin Core never makes startup wait on history: availability is
+    // the per-entry nStatus BLOCK_HAVE_DATA bit, and background-chainstate
+    // download starts after the network is up. So detect runs on a
+    // blocking thread once P2P is started, and the backfill stays unarmed
+    // (exactly the `--no-historical-backfill` state) until its result
+    // reaches the select! loop below. See `HistoricalBackfillArming`.
+    let mut historical_backfill: Option<HistoricalBackfill> = None;
 
     // Historical body writes run on their own OS thread (bounded queue) so
     // the P2P loop below never blocks on backfill disk I/O. Completions come
     // back on `backfill_done_rx`. `_backfill_done_keepalive` keeps that
     // channel open when no writer exists, so its select! arm just stays
-    // pending.
+    // pending. The writer is spawned when the backfill is armed.
     let (backfill_done_tx, mut backfill_done_rx) =
         tokio::sync::mpsc::unbounded_channel::<BodyWriteDone>();
     let _backfill_done_keepalive = backfill_done_tx.clone();
-    let backfill_writer: Option<BodyWriter> = if historical_backfill.is_some() {
-        match BodyWriter::spawn(Arc::clone(&db), move |done| {
-            let _ = backfill_done_tx.send(done);
-        }) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                tracing::warn!(
-                    "historical backfill: writer thread spawn failed ({e}); writing bodies inline"
-                );
-                None
-            }
-        }
-    } else {
-        drop(backfill_done_tx);
-        None
-    };
+    let mut backfill_writer: Option<BodyWriter> = None;
     let mut loop_latency = rustoshi_network::LoopLatency::default();
 
     // Start peer connections (including TCP listener for inbound)
@@ -3963,6 +4009,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
 
     tracing::info!("Node started. Waiting for peers...");
+
+    // Historical backfill detect, off the boot critical path (see above).
+    let mut backfill_arming = if historical_backfill_is_enabled(
+        cli.no_historical_backfill,
+        backfill_env.as_deref(),
+    ) {
+        HistoricalBackfillArming::spawn(Arc::clone(&db), params.genesis_hash, best_height)
+    } else {
+        HistoricalBackfillArming::disabled()
+    };
 
     // ---------- SIGHUP HANDLER (log reopen for logrotate) ----------
     // Bitcoin Core reopens the debug log on SIGHUP so logrotate can move
@@ -5562,7 +5618,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             (Ok(BodyAdmission::Store(entry)), None) => {
                                                 // No writer thread (spawn failed): write inline.
                                                 let height = entry.height;
-                                                let ok = HistoricalBackfill::write_body(&block_store, &hist_hash, &block, entry)
+                                                let res = HistoricalBackfill::write_body(&block_store, &hist_hash, &block, entry, &params);
+                                                if let Err(rustoshi_storage::historical_backfill::BackfillError::InvalidBody { err, .. }) = &res {
+                                                    if let Some(reason) = misbehavior_for_block_error(err) {
+                                                        let mut ps = peer_state.write().await;
+                                                        if let Some(ref mut pm) = ps.peer_manager {
+                                                            pm.misbehaving(peer_id, reason).await;
+                                                        }
+                                                    }
+                                                }
+                                                let ok = res
                                                     .map_err(|e| tracing::warn!("historical backfill: body write failed: {e}"))
                                                     .is_ok();
                                                 if let Err(e) = bf.body_written(&hist_hash, height, ok, &block_store) {
@@ -7543,7 +7608,71 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             // Historical body persisted by the backfill-writer thread:
             // bookkeeping only, then top the window back up on the peer
             // that delivered it (if still usable).
+            // Background `HistoricalBackfill::detect` finished: arm the
+            // backfill now (it was deliberately kept off the boot path).
+            res = backfill_arming.recv(), if backfill_arming.pending() => {
+                let secs = backfill_arming.elapsed_secs();
+                match res {
+                    Ok(Some(bf)) => {
+                        tracing::info!(
+                            "historical backfill armed after {secs:.1}s background detect: \
+                             genesis-side tip {} → floor {}, first missing body at {} \
+                             (P2P headers+bodies; yields while forward header-sync or block \
+                             download needs the peer; HeaderSync stays at the snapshot tip)",
+                            bf.genesis_tip(),
+                            bf.target_floor(),
+                            bf.next_body_height()
+                        );
+                        {
+                            let mut rpc = rpc_state.write().await;
+                            if !rpc.chainstate_manager.is_snapshot_active() {
+                                if let Ok(Some(base)) = rustoshi_storage::read_snapshot_blockhash(&datadir) {
+                                    let (height, commitment) = match params.assumeutxo_for_blockhash(&base) {
+                                        Some(au) => (au.height, au.hash_serialized),
+                                        None => (
+                                            bf.target_floor(),
+                                            rustoshi_consensus::AssumeutxoHash(Hash256::ZERO),
+                                        ),
+                                    };
+                                    rpc.chainstate_manager.activate_snapshot_with_commitment(
+                                        base, height, commitment,
+                                    );
+                                    rpc.chainstate_manager
+                                        .start_background_validation(std::sync::Arc::as_ptr(&db) as usize);
+                                }
+                            }
+                        }
+                        if backfill_writer.is_none() {
+                            let tx = backfill_done_tx.clone();
+                            match BodyWriter::spawn(Arc::clone(&db), params.clone(), move |done| {
+                                let _ = tx.send(done);
+                            }) {
+                                Ok(w) => backfill_writer = Some(w),
+                                Err(e) => tracing::warn!(
+                                    "historical backfill: writer thread spawn failed ({e}); writing bodies inline"
+                                ),
+                            }
+                        }
+                        historical_backfill = Some(bf);
+                    }
+                    Ok(None) => tracing::info!(
+                        "historical backfill: no snapshot hole to fill (detect {secs:.1}s)"
+                    ),
+                    Err(e) => tracing::warn!("historical backfill detect failed after {secs:.1}s: {e}"),
+                }
+            }
+
             Some(done) = backfill_done_rx.recv() => {
+                if let Some(invalid) = done.invalid.as_ref() {
+                    // A mutated/invalid historical body: Core's
+                    // MaybePunishNodeForBlock, same as the forward path.
+                    if let Some(reason) = misbehavior_for_block_error(invalid) {
+                        let mut ps = peer_state.write().await;
+                        if let Some(ref mut pm) = ps.peer_manager {
+                            pm.misbehaving(rustoshi_network::PeerId(done.tag), reason).await;
+                        }
+                    }
+                }
                 if let Some(bf) = historical_backfill.as_mut() {
                     let ok = match &done.result {
                         Ok(()) => true,
@@ -8001,6 +8130,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // GRACEFUL SHUTDOWN
     // ============================================================
     tracing::info!("Shutting down...");
+    // Stop a background detect walk that is still running (it only reads,
+    // plus progress-marker writes that are safe to cut off at any point).
+    drop(backfill_arming);
 
     // Stop RPC server
     rpc_handle.stop()?;
@@ -8142,6 +8274,44 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The boot path hands `detect` to `HistoricalBackfillArming`, which runs
+    /// it on its own thread and delivers the result to the P2P loop later
+    /// (2026-10-01: detect on the boot path kept mainnet off P2P 20+ min).
+    #[tokio::test]
+    async fn historical_backfill_arming_delivers_detect_off_the_boot_path() {
+        use super::{Arc, ChainDb, Hash256, HistoricalBackfillArming};
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::BlockStore;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(dir.path()).unwrap());
+        let params = ChainParams::regtest();
+        {
+            let store = BlockStore::new(&db);
+            store.init_genesis(&params).unwrap();
+            for h in 10..=20u32 {
+                store.put_height_index(h, &Hash256([h as u8; 32])).unwrap();
+            }
+        }
+        let mut arming = HistoricalBackfillArming::spawn(Arc::clone(&db), params.genesis_hash, 20);
+        assert!(arming.pending());
+        let bf = tokio::time::timeout(std::time::Duration::from_secs(30), arming.recv())
+            .await
+            .expect("detect result arrives")
+            .expect("detect ok")
+            .expect("snapshot hole found");
+        assert_eq!(bf.target_floor(), 10);
+        assert!(!arming.pending(), "one result, then the select! arm is disabled");
+
+        // Kill-switch: never resolves, so its select! arm stays idle.
+        let mut off = HistoricalBackfillArming::disabled();
+        assert!(!off.pending());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), off.recv())
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn bug11_should_announce_tip_follows_core_max_tip_age() {
         let now = 1_800_000_000u64;

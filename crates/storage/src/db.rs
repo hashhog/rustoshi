@@ -48,6 +48,23 @@ pub const META_REORG_PRUNE_HEIGHT: &[u8] = b"reorg_prune_height";
 /// a datadir without the key is "no backfill in progress".
 pub const META_HISTORICAL_BACKFILL_FLOOR: &[u8] = b"historical_backfill_floor";
 
+/// Metadata key: progress marker of the historical backfill's header hole
+/// (u32 LE). Every height in `1..=marker` has a `CF_HEIGHT_INDEX` row.
+///
+/// Written after the rows it vouches for, so after a crash it can only be
+/// behind the truth, never ahead. [`crate::historical_backfill::HistoricalBackfill::detect`]
+/// resumes its contiguity walk here instead of at height 1: without it every
+/// boot re-read ~942k height rows (2026-10-01 mainnet, 20+ min before P2P).
+/// Additive, no format bump: an absent key means "walk from height 1 once".
+pub const META_HISTORICAL_BACKFILL_HEADER_TIP: &[u8] = b"historical_backfill_header_tip";
+
+/// Metadata key: progress marker of the historical backfill's body fill
+/// (u32 LE). Every height in `1..marker` has a stored body (the marker is the
+/// first height that may still be missing). Same write-after rule and the
+/// same purpose as [`META_HISTORICAL_BACKFILL_HEADER_TIP`]: without it every
+/// boot re-read every stored historical body (multi-GB) to find the first gap.
+pub const META_HISTORICAL_BACKFILL_NEXT_BODY: &[u8] = b"historical_backfill_next_body";
+
 /// Metadata key for the database version.
 pub const META_DB_VERSION: &[u8] = b"db_version";
 
@@ -298,8 +315,56 @@ impl ChainDb {
     }
 
     /// Check if a key exists in a column family.
+    ///
+    /// Uses a pinned read, so a multi-MB value (a block body) is not copied
+    /// into a fresh `Vec` just to be dropped.
     pub fn contains_key(&self, cf_name: &str, key: &[u8]) -> Result<bool, StorageError> {
-        Ok(self.get_cf(cf_name, key)?.is_some())
+        #[cfg(test)]
+        test_read_counter::bump();
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
+        Ok(self.db.get_pinned_cf(&cf, key)?.is_some())
+    }
+
+    /// [`Self::contains_key`] that does not populate the block cache. For
+    /// one-shot background walks over cold history, which must not evict the
+    /// working set that validation reads.
+    pub fn contains_key_uncached(&self, cf_name: &str, key: &[u8]) -> Result<bool, StorageError> {
+        #[cfg(test)]
+        test_read_counter::bump();
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.fill_cache(false);
+        Ok(self.db.get_pinned_cf_opt(&cf, key, &ro)?.is_some())
+    }
+
+    /// Forward iteration over `cf_name` starting at the first key `>= from`.
+    /// Read errors are yielded. Each yielded item counts as one read for the
+    /// test read counter.
+    #[allow(clippy::type_complexity)]
+    pub fn iter_cf_from<'a>(
+        &'a self,
+        cf_name: &str,
+        from: &[u8],
+    ) -> Result<impl Iterator<Item = Result<(Box<[u8]>, Box<[u8]>), StorageError>> + 'a, StorageError>
+    {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
+        Ok(self
+            .db
+            .iterator_cf(&cf, rocksdb::IteratorMode::From(from, rocksdb::Direction::Forward))
+            .map(|r| {
+                #[cfg(test)]
+                test_read_counter::bump();
+                r.map_err(StorageError::from)
+            }))
     }
 
     /// Iterate over all key-value pairs in a column family.

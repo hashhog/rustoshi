@@ -6,7 +6,8 @@
 use crate::columns::*;
 use crate::db::{
     ChainDb, StorageError, META_BEST_BLOCK_HASH, META_BEST_HEIGHT, META_HISTORICAL_BACKFILL_FLOOR,
-    META_PRUNE_HEIGHT, META_REORG_PRUNE_HEIGHT,
+    META_HISTORICAL_BACKFILL_HEADER_TIP, META_HISTORICAL_BACKFILL_NEXT_BODY, META_PRUNE_HEIGHT,
+    META_REORG_PRUNE_HEIGHT,
 };
 use rocksdb::WriteBatch;
 use rustoshi_primitives::{Block, BlockHeader, Decodable, Encodable, Hash256, OutPoint};
@@ -400,8 +401,11 @@ impl<'a> BlockStore<'a> {
     }
 
     /// Persist the backfill target floor so a restart can resume after
-    /// height 1 is already indexed.
+    /// height 1 is already indexed. A new floor starts a new backfill, so
+    /// any progress markers from an earlier one are dropped.
     pub fn set_historical_backfill_floor(&self, floor: u32) -> Result<(), StorageError> {
+        self.db.delete_cf(CF_META, META_HISTORICAL_BACKFILL_HEADER_TIP)?;
+        self.db.delete_cf(CF_META, META_HISTORICAL_BACKFILL_NEXT_BODY)?;
         self.db.put_cf(
             CF_META,
             META_HISTORICAL_BACKFILL_FLOOR,
@@ -409,9 +413,86 @@ impl<'a> BlockStore<'a> {
         )
     }
 
-    /// Clear the backfill-floor marker. Called when genesis→floor is dense.
+    /// Clear the backfill-floor marker (and its progress markers). Called
+    /// when genesis→floor is dense.
     pub fn clear_historical_backfill_floor(&self) -> Result<(), StorageError> {
-        self.db.delete_cf(CF_META, META_HISTORICAL_BACKFILL_FLOOR)
+        self.db.delete_cf(CF_META, META_HISTORICAL_BACKFILL_FLOOR)?;
+        self.db.delete_cf(CF_META, META_HISTORICAL_BACKFILL_HEADER_TIP)?;
+        self.db.delete_cf(CF_META, META_HISTORICAL_BACKFILL_NEXT_BODY)
+    }
+
+    fn get_meta_u32(&self, key: &[u8]) -> Result<Option<u32>, StorageError> {
+        match self.db.get_cf(CF_META, key)? {
+            Some(bytes) if bytes.len() == 4 => {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&bytes);
+                Ok(Some(u32::from_le_bytes(b)))
+            }
+            Some(_) => Err(StorageError::Corruption(format!(
+                "{} is not 4 bytes",
+                String::from_utf8_lossy(key)
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Persisted lower bound on the historical backfill's contiguous header
+    /// tip: every height in `1..=h` has a height-index row. See
+    /// [`META_HISTORICAL_BACKFILL_HEADER_TIP`].
+    pub fn historical_backfill_header_tip(&self) -> Result<Option<u32>, StorageError> {
+        self.get_meta_u32(META_HISTORICAL_BACKFILL_HEADER_TIP)
+    }
+
+    /// Record header-hole progress. Call only after the rows it vouches for
+    /// have been written.
+    pub fn set_historical_backfill_header_tip(&self, height: u32) -> Result<(), StorageError> {
+        self.db
+            .put_cf(CF_META, META_HISTORICAL_BACKFILL_HEADER_TIP, &height.to_le_bytes())
+    }
+
+    /// Persisted lower bound on the historical backfill's body cursor: every
+    /// height in `1..h` has a stored body. See
+    /// [`META_HISTORICAL_BACKFILL_NEXT_BODY`].
+    pub fn historical_backfill_next_body(&self) -> Result<Option<u32>, StorageError> {
+        self.get_meta_u32(META_HISTORICAL_BACKFILL_NEXT_BODY)
+    }
+
+    /// Record body-fill progress. Call only after the bodies it vouches for
+    /// have been written.
+    pub fn set_historical_backfill_next_body(&self, height: u32) -> Result<(), StorageError> {
+        self.db
+            .put_cf(CF_META, META_HISTORICAL_BACKFILL_NEXT_BODY, &height.to_le_bytes())
+    }
+
+    /// First height in `from..end` without a height-index row, or `end` if
+    /// every height in the range has one. One sequential iterator pass, not a
+    /// point read per height: the rows are keyed by big-endian height, so a
+    /// dense run is read as contiguous SST blocks.
+    pub fn first_missing_height_index(&self, from: u32, end: u32) -> Result<u32, StorageError> {
+        if from >= end {
+            return Ok(end);
+        }
+        let mut expect = from;
+        for item in self.db.iter_cf_from(CF_HEIGHT_INDEX, &from.to_be_bytes())? {
+            let (key, _) = item?;
+            if key.len() != 4 {
+                break;
+            }
+            let h = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
+            if h != expect {
+                return Ok(expect);
+            }
+            expect += 1;
+            if expect >= end {
+                return Ok(end);
+            }
+        }
+        Ok(expect.min(end))
+    }
+
+    /// [`Self::has_block`] without populating the block cache (cold walks).
+    pub fn has_block_uncached(&self, hash: &Hash256) -> Result<bool, StorageError> {
+        self.db.contains_key_uncached(CF_BLOCKS, hash.as_bytes())
     }
 
     /// Whether the active-chain block at `height` has a local body in `CF_BLOCKS`.

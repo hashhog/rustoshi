@@ -25524,12 +25524,28 @@ mod tests {
                 version: 1,
                 inputs: vec![TxIn {
                     previous_output: OutPoint::null(),
-                    script_sig: vec![
-                        0x03,
-                        (h & 0xff) as u8,
-                        ((h >> 8) & 0xff) as u8,
-                        ((h >> 16) & 0xff) as u8,
-                    ],
+                    script_sig: {
+                        // BIP-34 height push (OP_N for 1..=16, else a minimal
+                        // CScriptNum push) + one pad byte (scriptSig 2..=100).
+                        let mut sig = if h <= 16 {
+                            vec![0x50 + h as u8]
+                        } else {
+                            let mut le = Vec::new();
+                            let mut x = h;
+                            while x > 0 {
+                                le.push((x & 0xff) as u8);
+                                x >>= 8;
+                            }
+                            if le.last().is_some_and(|b| b & 0x80 != 0) {
+                                le.push(0);
+                            }
+                            let mut v = vec![le.len() as u8];
+                            v.extend(le);
+                            v
+                        };
+                        sig.push(0x00);
+                        sig
+                    },
                     sequence: 0xffffffff,
                     witness: vec![],
                 }],
@@ -25629,7 +25645,7 @@ mod tests {
         let hole: Vec<_> = (1..10).map(|h| blocks[h].header.clone()).collect();
         bf.accept_headers(&hole, &store, &params).unwrap();
         for h in 1..10 {
-            bf.accept_block(&blocks[h], &store).unwrap();
+            bf.accept_block(&blocks[h], &store, &params).unwrap();
         }
 
         let mut rpc_state = RpcState::new(db, params);
@@ -25685,7 +25701,7 @@ mod tests {
         let hole: Vec<_> = (1..10).map(|h| blocks[h].header.clone()).collect();
         bf.accept_headers(&hole, &store, &params).unwrap();
         for h in 1..10 {
-            bf.accept_block(&blocks[h], &store).unwrap();
+            bf.accept_block(&blocks[h], &store, &params).unwrap();
         }
 
         let after = rpc.get_blockchain_info().await.expect("info after");
@@ -25932,7 +25948,7 @@ mod tests {
         let hole: Vec<_> = (1..10).map(|h| blocks[h].header.clone()).collect();
         bf.accept_headers(&hole, &store, &params).unwrap();
         for h in 1..10 {
-            bf.accept_block(&blocks[h], &store).unwrap();
+            bf.accept_block(&blocks[h], &store, &params).unwrap();
         }
 
         let mut rpc_state = RpcState::new(db, params);

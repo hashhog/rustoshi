@@ -57,11 +57,13 @@
 //! would OOM; this backfill is the operator-visible historical index.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 
 use rustoshi_consensus::params::ChainParams;
 use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+use rustoshi_consensus::{check_block, contextual_check_block, StubChainContext, ValidationError};
 use rustoshi_primitives::{Block, BlockHeader, Hash256};
 
 use crate::block_store::{BlockIndexEntry, BlockStatus, BlockStore};
@@ -95,6 +97,11 @@ pub const BACKFILL_MAX_BODIES_OUTSTANDING: usize = 16;
 /// stalled block connect and inbound P2P for ~15 min until the P2P watchdog
 /// restarted the node.
 pub const BACKFILL_BODY_SCAN_MAX_HEIGHTS: u32 = 1024;
+
+/// While [`HistoricalBackfill::detect`] walks a datadir that has no body
+/// progress marker yet, it persists the marker every this many heights so a
+/// restart in the middle of that one-time walk does not start it over.
+pub const DETECT_PERSIST_EVERY: u32 = 4096;
 
 /// Env var an operator or campaign launcher sets to skip genesis→base P2P
 /// backfill after `--load-snapshot`. Same effect as `--no-historical-backfill`.
@@ -144,6 +151,14 @@ pub enum BackfillError {
     /// Block body does not match a stored historical header.
     #[error("unexpected historical block {0}")]
     UnexpectedBlock(Hash256),
+    /// Body fails Core's CheckBlock / ContextualCheckBlock (merkle root,
+    /// witness commitment, BIP-34 coinbase height, ...). Not stored.
+    #[error("invalid historical block {hash} at height {height}: {err}")]
+    InvalidBody {
+        hash: Hash256,
+        height: u32,
+        err: ValidationError,
+    },
 }
 
 /// Outcome of [`HistoricalBackfill::admit_body`].
@@ -172,6 +187,10 @@ pub struct BodyWriteDone {
     pub height: u32,
     pub tag: u64,
     pub result: Result<(), String>,
+    /// Set when the body was refused by [`HistoricalBackfill::check_body`]
+    /// (the delivering peer sent a mutated/invalid block), as opposed to a
+    /// local storage failure. The caller punishes the peer on this.
+    pub invalid: Option<ValidationError>,
 }
 
 /// Dedicated OS thread that performs historical body writes
@@ -189,7 +208,9 @@ pub struct BodyWriter {
 
 impl BodyWriter {
     /// Spawn the writer thread. `on_done` runs on that thread after every job.
-    pub fn spawn<F>(db: Arc<ChainDb>, mut on_done: F) -> std::io::Result<Self>
+    /// Each body is checked ([`HistoricalBackfill::check_body`]) before it is
+    /// written; the check runs here, off the P2P loop.
+    pub fn spawn<F>(db: Arc<ChainDb>, params: ChainParams, mut on_done: F) -> std::io::Result<Self>
     where
         F: FnMut(BodyWriteDone) + Send + 'static,
     {
@@ -200,14 +221,19 @@ impl BodyWriter {
                 let store = BlockStore::new(&db);
                 while let Ok(job) = rx.recv() {
                     let height = job.entry.height;
-                    let result =
-                        HistoricalBackfill::write_body(&store, &job.hash, &job.block, job.entry)
-                            .map_err(|e| e.to_string());
+                    let res = HistoricalBackfill::write_body(
+                        &store, &job.hash, &job.block, job.entry, &params,
+                    );
+                    let invalid = match &res {
+                        Err(BackfillError::InvalidBody { err, .. }) => Some(err.clone()),
+                        _ => None,
+                    };
                     on_done(BodyWriteDone {
                         hash: job.hash,
                         height,
                         tag: job.tag,
-                        result,
+                        result: res.map_err(|e| e.to_string()),
+                        invalid,
                     });
                 }
             })?;
@@ -268,10 +294,36 @@ impl HistoricalBackfill {
     ///
     /// `tip` is the active chain tip height (snapshot tip). `genesis_hash`
     /// is the network genesis; height 0 must already be indexed.
+    ///
+    /// Cost: O(log n) plus the distance from the persisted progress markers
+    /// ([`BlockStore::historical_backfill_header_tip`] /
+    /// [`BlockStore::historical_backfill_next_body`]) to the real frontier,
+    /// which the running backfill keeps current. Without markers (a datadir
+    /// from before they existed) the first call walks the hole once, writing
+    /// the markers as it goes, so an interrupted walk resumes. Bitcoin Core
+    /// never makes startup wait on this: block availability is a per-entry
+    /// `nStatus` bit, and background-chainstate download starts from the
+    /// in-memory index. rustoshi used to run this walk on the main task
+    /// before P2P started: 2026-10-01 mainnet, 942k height reads plus every
+    /// stored historical body (multi-GB) on every boot, 20+ min off-network
+    /// under load. The node now calls it on a blocking thread after P2P is up.
     pub fn detect(
         store: &BlockStore<'_>,
         genesis_hash: Hash256,
         tip: u32,
+    ) -> Result<Option<Self>, StorageError> {
+        Self::detect_cancellable(store, genesis_hash, tip, &AtomicBool::new(false))
+    }
+
+    /// [`Self::detect`] that gives up (returning `Ok(None)`, progress
+    /// markers saved) as soon as `cancel` is set. The node runs detect on a
+    /// background thread and sets `cancel` at shutdown so a stop never waits
+    /// for a one-time walk to finish.
+    pub fn detect_cancellable(
+        store: &BlockStore<'_>,
+        genesis_hash: Hash256,
+        tip: u32,
+        cancel: &AtomicBool,
     ) -> Result<Option<Self>, StorageError> {
         // Resume from the persisted floor if a backfill was already running
         // (height 1 may already be indexed, which makes snapshot_index_floor
@@ -301,24 +353,65 @@ impl HistoricalBackfill {
             return Ok(None);
         };
 
-        let mut genesis_tip = 0u32;
-        let mut genesis_tip_hash = genesis_hash;
-        while genesis_tip + 1 < target_floor {
-            match store.get_hash_by_height(genesis_tip + 1)? {
-                Some(h) => {
-                    genesis_tip += 1;
-                    genesis_tip_hash = h;
+        // Header hole: heights 1..=genesis_tip are contiguous. Start at the
+        // marker when its row is there (rows below the floor are only ever
+        // added, contiguously, by accept_headers), then find the first gap
+        // with one sequential iterator pass.
+        let header_marker = store.historical_backfill_header_tip()?;
+        let header_start = match header_marker {
+            Some(m) if m >= 1 && m < target_floor && store.get_hash_by_height(m)?.is_some() => m,
+            _ => 0,
+        };
+        let first_gap = store.first_missing_height_index(header_start + 1, target_floor)?;
+        let genesis_tip = first_gap - 1;
+        let genesis_tip_hash = if genesis_tip == 0 {
+            genesis_hash
+        } else {
+            match store.get_hash_by_height(genesis_tip)? {
+                Some(h) => h,
+                None => {
+                    return Err(StorageError::Corruption(format!(
+                        "historical backfill: height row {genesis_tip} vanished during detect"
+                    )))
                 }
-                None => break,
             }
+        };
+        if genesis_tip > 0 && header_marker != Some(genesis_tip) {
+            store.set_historical_backfill_header_tip(genesis_tip)?;
         }
 
-        let mut next_body_height = 1u32;
-        while next_body_height <= genesis_tip && next_body_height < target_floor {
-            match store.get_hash_by_height(next_body_height)? {
-                Some(h) if store.has_block(&h)? => next_body_height += 1,
-                _ => break,
+        // Body fill: every height in 1..next_body_height has a body. Start
+        // at the marker when the body just below it is still there.
+        let body_marker = store.historical_backfill_next_body()?;
+        let mut next_body_height = match body_marker {
+            Some(m)
+                if m >= 2
+                    && m <= genesis_tip + 1
+                    && m <= target_floor
+                    && Self::height_has_body_cold(store, m - 1)? =>
+            {
+                m
             }
+            _ => 1,
+        };
+        let mut since_persist = 0u32;
+        while next_body_height <= genesis_tip && next_body_height < target_floor {
+            if cancel.load(Ordering::Relaxed) {
+                store.set_historical_backfill_next_body(next_body_height)?;
+                return Ok(None);
+            }
+            if !Self::height_has_body_cold(store, next_body_height)? {
+                break;
+            }
+            next_body_height += 1;
+            since_persist += 1;
+            if since_persist >= DETECT_PERSIST_EVERY {
+                store.set_historical_backfill_next_body(next_body_height)?;
+                since_persist = 0;
+            }
+        }
+        if body_marker != Some(next_body_height) {
+            store.set_historical_backfill_next_body(next_body_height)?;
         }
 
         Ok(Some(Self {
@@ -335,6 +428,14 @@ impl HistoricalBackfill {
             headers_in_flight: false,
             getheaders_cooldown: false,
         }))
+    }
+
+    /// Body presence at `height` without polluting the block cache.
+    fn height_has_body_cold(store: &BlockStore<'_>, height: u32) -> Result<bool, StorageError> {
+        match store.get_hash_by_height(height)? {
+            Some(h) => store.has_block_uncached(&h),
+            None => Ok(false),
+        }
     }
 
     /// Like [`detect`], but returns `None` without reading or writing the
@@ -422,6 +523,11 @@ impl HistoricalBackfill {
     /// Last contiguous genesis-side height we have a header for.
     pub fn genesis_tip(&self) -> u32 {
         self.genesis_tip
+    }
+
+    /// First height in `1..floor` whose body may still be missing.
+    pub fn next_body_height(&self) -> u32 {
+        self.next_body_height
     }
 
     /// Snapshot-index floor this backfill is filling toward (exclusive).
@@ -589,6 +695,10 @@ impl HistoricalBackfill {
             stored += 1;
         }
 
+        if stored > 0 {
+            // After the rows: the marker may lag the truth, never lead it.
+            store.set_historical_backfill_header_tip(self.genesis_tip)?;
+        }
         if self.headers_complete() {
             self.verify_floor_link(store)?;
             if stored > 0 {
@@ -621,17 +731,33 @@ impl HistoricalBackfill {
         &mut self,
         block: &Block,
         store: &BlockStore<'_>,
+        params: &ChainParams,
     ) -> Result<bool, BackfillError> {
         let hash = block.block_hash();
         match self.admit_body(&hash, store)? {
             BodyAdmission::Duplicate => Ok(false),
             BodyAdmission::Store(entry) => {
-                let res = Self::write_body(store, &hash, block, entry.clone());
+                let res = Self::write_body(store, &hash, block, entry.clone(), params);
                 let ok = res.is_ok();
                 self.body_written(&hash, entry.height, ok, store)?;
-                res.map(|()| true).map_err(BackfillError::from)
+                res.map(|()| true)
             }
         }
+    }
+
+    /// Context-free and height-contextual body checks before a historical
+    /// body is stored: Core's `CheckBlock` (merkle root incl. CVE-2012-2459
+    /// mutation, coinbase rules, per-tx checks, weight, legacy sigops) and
+    /// `ContextualCheckBlock` (BIP-34 coinbase height, BIP-141 witness
+    /// commitment / unexpected witness). Core runs both in `AcceptBlock`
+    /// before `WriteBlock`, for background-chainstate blocks too. The header
+    /// itself was already checked (PoW, nBits, MTP) when it was stored, and
+    /// the body's hash is the stored header's hash, so this binds the
+    /// transactions to that header. Script and UTXO checks are not done
+    /// here: the backfill does not connect blocks (see the module docs).
+    pub fn check_body(block: &Block, height: u32, params: &ChainParams) -> Result<(), ValidationError> {
+        check_block(block, params)?;
+        contextual_check_block(block, height, &StubChainContext, params)
     }
 
     /// Main-loop half of storing a received historical body: cheap checks
@@ -664,18 +790,29 @@ impl HistoricalBackfill {
         Ok(BodyAdmission::Store(entry))
     }
 
-    /// Disk half: write the body and mark its index entry `HAVE_DATA`. Takes
-    /// no `&self`, so it can run on the [`BodyWriter`] thread.
+    /// Disk half: check the body ([`Self::check_body`]), then write it and
+    /// mark its index entry `HAVE_DATA`. Takes no `&self`, so it can run on
+    /// the [`BodyWriter`] thread. A body that fails the check is not written.
     pub fn write_body(
         store: &BlockStore<'_>,
         hash: &Hash256,
         block: &Block,
         mut entry: BlockIndexEntry,
-    ) -> Result<(), StorageError> {
+        params: &ChainParams,
+    ) -> Result<(), BackfillError> {
+        if block.block_hash() != *hash {
+            return Err(BackfillError::UnexpectedBlock(*hash));
+        }
+        Self::check_body(block, entry.height, params).map_err(|err| BackfillError::InvalidBody {
+            hash: *hash,
+            height: entry.height,
+            err,
+        })?;
         store.put_block(hash, block)?;
         entry.n_tx = block.transactions.len() as u32;
         entry.status.set(BlockStatus::HAVE_DATA);
-        store.put_block_index(hash, &entry)
+        store.put_block_index(hash, &entry)?;
+        Ok(())
     }
 
     /// Main-loop completion of [`Self::admit_body`]. On failure the height is
@@ -810,6 +947,7 @@ impl HistoricalBackfill {
     /// spread over later calls instead of done at once). Clears the persisted
     /// floor when headers and bodies are both complete.
     fn advance_body_cursor(&mut self, store: &BlockStore<'_>) -> Result<(), StorageError> {
+        let before = self.next_body_height;
         let mut steps = 0u32;
         while self.next_body_height < self.target_floor && steps < BACKFILL_BODY_SCAN_MAX_HEIGHTS {
             steps += 1;
@@ -820,6 +958,10 @@ impl HistoricalBackfill {
         }
         if self.is_complete() {
             store.clear_historical_backfill_floor()?;
+        } else if self.next_body_height != before {
+            // The bodies below the cursor were read back just now, so they
+            // are stored: the marker never leads the truth.
+            store.set_historical_backfill_next_body(self.next_body_height)?;
         }
         Ok(())
     }
@@ -866,12 +1008,28 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 previous_output: OutPoint::null(),
-                script_sig: vec![
-                    0x03,
-                    (height & 0xff) as u8,
-                    ((height >> 8) & 0xff) as u8,
-                    ((height >> 16) & 0xff) as u8,
-                ],
+                script_sig: {
+                        // BIP-34 height push (OP_N for 1..=16, else a minimal
+                        // CScriptNum push) + one pad byte (scriptSig 2..=100).
+                        let mut sig = if height <= 16 {
+                            vec![0x50 + height as u8]
+                        } else {
+                            let mut le = Vec::new();
+                            let mut x = height;
+                            while x > 0 {
+                                le.push((x & 0xff) as u8);
+                                x >>= 8;
+                            }
+                            if le.last().is_some_and(|b| b & 0x80 != 0) {
+                                le.push(0);
+                            }
+                            let mut v = vec![le.len() as u8];
+                            v.extend(le);
+                            v
+                        };
+                        sig.push(0x00);
+                        sig
+                    },
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
@@ -1117,7 +1275,7 @@ mod tests {
         assert_eq!(want[0].0, 1);
 
         for h in 1..10 {
-            assert!(bf.accept_block(&blocks[h], &store).unwrap());
+            assert!(bf.accept_block(&blocks[h], &store, &params).unwrap());
         }
         assert!(bf.bodies_complete());
         assert!(bf.is_complete());
@@ -1490,6 +1648,7 @@ mod tests {
     #[test]
     fn historical_backfill_body_window_is_global_and_bounded() {
         const N: u32 = 60;
+        let params = ChainParams::regtest();
         let (_dir, db, blocks) = body_hole(N);
         let store = BlockStore::new(&db);
         let mut bf = armed(&store, &blocks, N);
@@ -1514,7 +1673,7 @@ mod tests {
         // slot is free, so exactly one new request -- not 16.
         let mut next_expected = BACKFILL_MAX_BODIES_OUTSTANDING as u32 + 1;
         for h in 1..=30u32 {
-            assert!(bf.accept_block(&blocks[h as usize], &store).unwrap());
+            assert!(bf.accept_block(&blocks[h as usize], &store, &params).unwrap());
             let more = bf.next_body_hashes(&store, BACKFILL_BODIES_PER_REQUEST).unwrap();
             assert!(more.len() <= 1, "one body in, at most one request out; got {}", more.len());
             if next_expected < N {
@@ -1527,7 +1686,7 @@ mod tests {
 
         // Drain: the window still completes the hole.
         for h in 31..N {
-            bf.accept_block(&blocks[h as usize], &store).unwrap();
+            bf.accept_block(&blocks[h as usize], &store, &params).unwrap();
             bf.next_body_hashes(&store, BACKFILL_BODIES_PER_REQUEST).unwrap();
         }
         assert!(bf.is_complete());
@@ -1572,7 +1731,7 @@ mod tests {
             BodyAdmission::Store(e) => e,
             other => panic!("expected Store, got {other:?}"),
         };
-        HistoricalBackfill::write_body(&store, &h1, b1, entry).unwrap();
+        HistoricalBackfill::write_body(&store, &h1, b1, entry, &ChainParams::regtest()).unwrap();
         bf.body_written(&h1, 1, true, &store).unwrap();
         assert!(store.has_block(&h1).unwrap());
         let e = store.get_block_index(&h1).unwrap().unwrap();
@@ -1626,7 +1785,7 @@ mod tests {
         let (_dir, db, blocks) = body_hole(N);
         let db = Arc::new(db);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let writer = BodyWriter::spawn(Arc::clone(&db), move |d| {
+        let writer = BodyWriter::spawn(Arc::clone(&db), ChainParams::regtest(), move |d| {
             let _ = done_tx.send(d);
         })
         .unwrap();
@@ -1652,5 +1811,204 @@ mod tests {
         assert!(bf.is_complete());
         assert_eq!(bf.bodies_outstanding(), 0);
         drop(writer);
+    }
+
+    /// Store shaped like live mainnet mid-backfill (2026-10-01): header hole
+    /// closed (rows 1..floor-1), bodies 1..=bodies_top, floor marker set, NO
+    /// progress markers (a datadir from before they existed).
+    fn legacy_mid_backfill_store(n: u32, bodies_top: u32) -> (TempDir, ChainDb) {
+        let (dir, db) = temp_store();
+        {
+            let store = BlockStore::new(&db);
+            let params = ChainParams::regtest();
+            store.init_genesis(&params).unwrap();
+            let body = params.genesis_block.clone();
+            for h in 1..=n + 1 {
+                store.put_height_index(h, &fake_hash(h)).unwrap();
+                if h <= bodies_top {
+                    store.put_block(&fake_hash(h), &body).unwrap();
+                }
+            }
+            store.set_historical_backfill_floor(n + 1).unwrap();
+            assert_eq!(store.historical_backfill_header_tip().unwrap(), None);
+            assert_eq!(store.historical_backfill_next_body().unwrap(), None);
+        }
+        (dir, db)
+    }
+
+    fn detect_reads(store: &BlockStore<'_>, tip: u32) -> (HistoricalBackfill, u64) {
+        let params = ChainParams::regtest();
+        let before = crate::db::test_read_counter::get();
+        let bf = HistoricalBackfill::detect(store, params.genesis_hash, tip)
+            .unwrap()
+            .expect("hole");
+        (bf, crate::db::test_read_counter::get() - before)
+    }
+
+    /// 2026-10-01 mainnet: every boot spent 20+ min in `detect` before P2P
+    /// started, because detect re-derived the backfill frontier from scratch
+    /// (one read per indexed height, then one full-body read per stored
+    /// body). With the persisted progress markers, the walk is done once;
+    /// every later detect costs a constant number of reads, however large
+    /// the history. On master (no markers) the second detect below does
+    /// ~N + M reads again and this test fails.
+    #[test]
+    fn historical_backfill_detect_is_constant_reads_once_markers_exist() {
+        const N: u32 = 60_000;
+        const M: u32 = 25_000;
+        const MAX_READS: u64 = 32;
+        let (_dir, db) = legacy_mid_backfill_store(N, M);
+        let store = BlockStore::new(&db);
+
+        // First detect on a legacy datadir: the one-time walk. It must agree
+        // with the frontier, and it leaves the markers behind.
+        let (bf, first_reads) = detect_reads(&store, N + 1);
+        assert_eq!(bf.genesis_tip(), N);
+        assert_eq!(bf.next_body_height(), M + 1);
+        assert!(first_reads > M as u64, "legacy walk reads the bodies once ({first_reads})");
+        assert_eq!(store.historical_backfill_header_tip().unwrap(), Some(N));
+        assert_eq!(store.historical_backfill_next_body().unwrap(), Some(M + 1));
+
+        // Every later boot: constant.
+        for _ in 0..3 {
+            let (bf, reads) = detect_reads(&store, N + 1);
+            assert_eq!(bf.genesis_tip(), N);
+            assert_eq!(bf.next_body_height(), M + 1);
+            assert!(
+                reads <= MAX_READS,
+                "detect did {reads} reads with markers present (bound {MAX_READS}); \
+                 history is {N} heights / {M} bodies"
+            );
+        }
+    }
+
+    /// The markers are lower bounds, never trusted past what is stored: a
+    /// marker that lags (crash before it was rewritten) is walked forward to
+    /// the true frontier, and a marker whose vouching body is gone falls
+    /// back to the full walk instead of skipping a hole.
+    #[test]
+    fn historical_backfill_detect_markers_are_verified_lower_bounds() {
+        const N: u32 = 5_000;
+        const M: u32 = 3_000;
+        let (_dir, db) = legacy_mid_backfill_store(N, M);
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+
+        // Lagging markers: walked forward.
+        store.set_historical_backfill_header_tip(100).unwrap();
+        store.set_historical_backfill_next_body(200).unwrap();
+        let bf = HistoricalBackfill::detect(&store, params.genesis_hash, N + 1).unwrap().unwrap();
+        assert_eq!((bf.genesis_tip(), bf.next_body_height()), (N, M + 1));
+        assert_eq!(store.historical_backfill_next_body().unwrap(), Some(M + 1));
+
+        // A body below the marker disappeared (e.g. pruned): the marker's
+        // vouching body (marker-1) is missing -> full walk -> real gap found.
+        db.delete_cf(crate::columns::CF_BLOCKS, fake_hash(M).as_bytes()).unwrap();
+        let bf = HistoricalBackfill::detect(&store, params.genesis_hash, N + 1).unwrap().unwrap();
+        assert_eq!(bf.next_body_height(), M);
+
+        // Overstated marker past the stored rows/bodies: rejected, not trusted.
+        store.set_historical_backfill_next_body(N).unwrap();
+        let bf = HistoricalBackfill::detect(&store, params.genesis_hash, N + 1).unwrap().unwrap();
+        assert_eq!(bf.next_body_height(), M);
+        store.set_historical_backfill_header_tip(N + 5).unwrap();
+        let bf = HistoricalBackfill::detect(&store, params.genesis_hash, N + 1).unwrap().unwrap();
+        assert_eq!(bf.genesis_tip(), N);
+    }
+
+    /// The running backfill keeps the markers current: accept_headers after
+    /// its rows, the body cursor after the bodies it read back.
+    #[test]
+    fn historical_backfill_progress_markers_follow_the_backfill() {
+        const N: u32 = 30;
+        let (_dir, db, blocks) = body_hole(N);
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let mut bf = HistoricalBackfill::detect(&store, params.genesis_hash, N + 10)
+            .unwrap()
+            .unwrap();
+        let part: Vec<BlockHeader> = (1..12).map(|h| blocks[h].header.clone()).collect();
+        assert_eq!(bf.accept_headers(&part, &store, &params).unwrap(), 11);
+        assert_eq!(store.historical_backfill_header_tip().unwrap(), Some(11));
+        let rest: Vec<BlockHeader> = (12..N as usize).map(|h| blocks[h].header.clone()).collect();
+        bf.accept_headers(&rest, &store, &params).unwrap();
+        assert_eq!(store.historical_backfill_header_tip().unwrap(), Some(N - 1));
+
+        bf.next_body_hashes(&store, 16).unwrap();
+        for h in 1..=5 {
+            assert!(bf.accept_block(&blocks[h], &store, &params).unwrap());
+        }
+        assert_eq!(store.historical_backfill_next_body().unwrap(), Some(6));
+
+        // Restart: resumes at the markers.
+        let bf2 = HistoricalBackfill::detect(&store, params.genesis_hash, N + 10).unwrap().unwrap();
+        assert_eq!((bf2.genesis_tip(), bf2.next_body_height()), (N - 1, 6));
+
+        // Completion clears the floor and both markers.
+        for h in 6..N as usize {
+            bf.accept_block(&blocks[h], &store, &params).unwrap();
+        }
+        assert!(bf.is_complete());
+        assert_eq!(store.historical_backfill_floor().unwrap(), None);
+        assert_eq!(store.historical_backfill_header_tip().unwrap(), None);
+        assert_eq!(store.historical_backfill_next_body().unwrap(), None);
+    }
+
+    /// Shutdown during the one-time legacy walk: detect gives up at once and
+    /// keeps its progress, so the next boot resumes rather than restarts.
+    #[test]
+    fn historical_backfill_detect_cancel_keeps_progress() {
+        let (_dir, db) = legacy_mid_backfill_store(1_000, 800);
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let cancel = AtomicBool::new(true);
+        let r = HistoricalBackfill::detect_cancellable(&store, params.genesis_hash, 1_001, &cancel)
+            .unwrap();
+        assert!(r.is_none(), "cancelled detect arms nothing");
+        assert!(store.historical_backfill_next_body().unwrap().is_some());
+        let bf = HistoricalBackfill::detect(&store, params.genesis_hash, 1_001).unwrap().unwrap();
+        assert_eq!(bf.next_body_height(), 801);
+    }
+
+    /// Q:91: a historical body whose transactions do not match its header
+    /// (same block hash, different txs) was stored and then served. Core's
+    /// AcceptBlock runs CheckBlock + ContextualCheckBlock before WriteBlock.
+    #[test]
+    fn historical_backfill_refuses_mutated_bodies() {
+        const N: u32 = 10;
+        let (_dir, db, blocks) = body_hole(N);
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let mut bf = armed(&store, &blocks, N);
+        bf.next_body_hashes(&store, 16).unwrap();
+
+        // Merkle mismatch: change a tx, keep the header (so the hash).
+        let mut bad = blocks[1].clone();
+        bad.transactions[0].outputs[0].value -= 1;
+        let h1 = blocks[1].block_hash();
+        assert_eq!(bad.block_hash(), h1);
+        let err = bf.accept_block(&bad, &store, &params).unwrap_err();
+        assert!(
+            matches!(err, BackfillError::InvalidBody { err: ValidationError::BadMerkleRoot, .. }),
+            "{err:?}"
+        );
+        assert!(!store.has_block(&h1).unwrap(), "mutated body must not be stored");
+
+        // Witness malleation: witness data does not change the txid, so the
+        // merkle root still matches; there is no commitment.
+        let mut bad = blocks[2].clone();
+        bad.transactions[0].inputs[0].witness = vec![vec![0u8; 32]];
+        let h2 = blocks[2].block_hash();
+        assert_eq!(bad.block_hash(), h2);
+        let err = bf.accept_block(&bad, &store, &params).unwrap_err();
+        assert!(
+            matches!(err, BackfillError::InvalidBody { err: ValidationError::UnexpectedWitness, .. }),
+            "{err:?}"
+        );
+        assert!(!store.has_block(&h2).unwrap());
+
+        // The honest bodies are still accepted afterwards.
+        assert!(bf.accept_block(&blocks[1], &store, &params).unwrap());
+        assert!(bf.accept_block(&blocks[2], &store, &params).unwrap());
     }
 }
