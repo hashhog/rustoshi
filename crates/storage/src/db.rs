@@ -546,36 +546,32 @@ impl ChainDb {
         Ok(handle)
     }
 
-    /// Fsync the WAL, stop scheduling compactions, and make [`Drop`] skip
+    /// Stop background compactions, fsync the WAL, and make [`Drop`] skip
     /// `rocksdb_close`'s join of in-flight ones.
     ///
-    /// `cancel_all_background_work(false)` only sets `shutting_down_`.
-    /// The destructor still waits until every running compaction returns
-    /// (`DBImpl::CloseHelper`). A compaction blocked in `fdatasync` does
-    /// not notice the flag, so the wait is the compaction's remaining
-    /// I/O — 60s+ on a scratch datadir after "Shutdown complete"
-    /// (2026-10-03), past the stop grace. The shutdown batch is already
-    /// in the WAL; abandoning the compaction is the same recovery as a
-    /// crash (the output SST is not in the MANIFEST until the job
-    /// commits). Process exit reclaims the leaked handle and its threads.
+    /// `cancel_all_background_work(false)` sets `shutting_down_` and returns.
+    /// A running compaction sees the flag in its iterator loop and aborts
+    /// after the write or `fdatasync` it is in; its output SST is not in the
+    /// MANIFEST, so the next open drops it — the same recovery as a crash.
+    /// Without the flag, nothing stops it: on a scratch copy of mainnet
+    /// (2026-10-03) the process sat in `PosixEnv::JoinThreadsOnExit` at exit
+    /// for 320 s+ after "Shutdown complete", joining an L0 compaction of the
+    /// blocks CF that ran to completion.
+    ///
+    /// Cancel FIRST, then fsync the WAL: the compaction's writeback is what
+    /// makes an fsync slow on this box. Do NOT flip `disable_auto_compactions`
+    /// here: every `SetOptions` call writes and fsyncs a new OPTIONS file, and
+    /// one per column family cost 67-75 s under I/O load (gdb: `SetOptions ->
+    /// WriteOptionsFile -> fsync`). `shutting_down_` already stops new
+    /// compactions from being scheduled.
     pub fn cancel_background_compactions(&self) -> Result<(), StorageError> {
-        // WAL first, while the DB is still accepting writes. With the
-        // default WAL, memtables are recoverable from it; `has_unpersisted_data_`
-        // is set only for WAL-disabled writes, which this node does not issue.
-        let wal = self.db.flush_wal(true);
-        for name in ALL_COLUMN_FAMILIES {
-            if let Some(cf) = self.db.cf_handle(name) {
-                // Mutable CF option. Failure is non-fatal: cancel below
-                // still sets `shutting_down_`.
-                let _ = self
-                    .db
-                    .set_options_cf(&cf, &[("disable_auto_compactions", "true")]);
-            }
-        }
         // wait=false sets shutting_down and returns. It does not join.
         self.db.cancel_all_background_work(false);
         self.skip_close_wait.store(true, Ordering::Release);
-        wal?;
+        // With the default WAL, memtables are recoverable from it;
+        // `has_unpersisted_data_` is set only for WAL-disabled writes, which
+        // this node does not issue. FlushWAL does not check shutting_down_.
+        self.db.flush_wal(true)?;
         Ok(())
     }
 

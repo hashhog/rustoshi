@@ -8260,10 +8260,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // RocksDB close joins background compactions (`DBImpl::CloseHelper`).
-    // A scratch stop stayed in that join for 60s+ after the log below
-    // (2026-10-03) and the stop grace SIGKILL'd it. The shutdown batch is
-    // already in the WAL; cancel the jobs and do not wait. The next open
+    // A background compaction outlives "Shutdown complete" unless RocksDB is
+    // told to stop: on a scratch copy of mainnet (2026-10-03) the process sat
+    // in `PosixEnv::JoinThreadsOnExit` at exit for 320 s+ while an L0
+    // compaction of the blocks CF ran to completion, and the stop grace
+    // SIGKILL'd it. Set shutting_down (running compactions abort at their next
+    // key), fsync the WAL, and skip `rocksdb_close`'s join. The next open
     // recovers an abandoned compaction the same way it recovers a crash.
     if let Err(e) = block_store.db().cancel_background_compactions() {
         tracing::error!(
