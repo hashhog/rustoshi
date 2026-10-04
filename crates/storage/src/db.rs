@@ -7,7 +7,7 @@ use crate::columns::*;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::mem::ManuallyDrop;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 // ============================================================
 // METADATA KEYS
@@ -209,6 +209,43 @@ pub struct ChainDb {
     /// Set by [`ChainDb::cancel_background_compactions`]. Drop then does
     /// not call `rocksdb_close`.
     skip_close_wait: AtomicBool,
+    /// Gate-6 fault injection (disk full / EIO). Inert unless a test arms it;
+    /// the production cost is one relaxed atomic load per read/write.
+    faults: FaultInjection,
+}
+
+/// Gate-6 fault injection: makes the next N writes (or reads of one column
+/// family) fail with an I/O error, exactly as a full disk or a failing device
+/// would, so tests can prove a system fault never becomes a verdict.
+#[derive(Default)]
+struct FaultInjection {
+    /// Remaining writes (`write_batch` / `put_cf` / `delete_cf`) to fail.
+    writes: AtomicU32,
+    /// Remaining reads (`get_cf` / `contains_key`) to fail.
+    reads: AtomicU32,
+    /// When `Some`, only reads of this column family fail.
+    read_cf: std::sync::Mutex<Option<String>>,
+}
+
+/// The error an injected fault returns: what the kernel hands RocksDB on a
+/// full disk.
+fn injected_fault(op: &str) -> StorageError {
+    StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::StorageFull,
+        format!("injected fault: {} failed (No space left on device)", op),
+    ))
+}
+
+/// Decrement `ctr` if it is non-zero; true when this call consumed a fault.
+fn take_fault(ctr: &AtomicU32) -> bool {
+    let mut cur = ctr.load(Ordering::SeqCst);
+    while cur > 0 {
+        match ctr.compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+    false
 }
 
 impl ChainDb {
@@ -268,6 +305,7 @@ impl ChainDb {
             db: ManuallyDrop::new(db),
             write_batch_count: AtomicU64::new(0),
             skip_close_wait: AtomicBool::new(false),
+            faults: FaultInjection::default(),
         };
         handle.check_and_init_version()?;
         Ok(handle)
@@ -297,7 +335,13 @@ impl ChainDb {
             .db
             .cf_handle(cf_name)
             .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
-        Ok(self.db.get_cf(&cf, key)?)
+        // Gate 6: a read error is retried once, then latches AbortNode (Core:
+        // CCoinsViewErrorCatcher aborts on a coins-DB read error) and is
+        // returned as an error -- never as "absent".
+        match self.read_once(cf_name, || self.db.get_cf(&cf, key)) {
+            Ok(v) => Ok(v),
+            Err(_) => self.read_retry_or_abort(cf_name, || self.db.get_cf(&cf, key)),
+        }
     }
 
     /// Put a value into a column family.
@@ -306,7 +350,12 @@ impl ChainDb {
             .db
             .cf_handle(cf_name)
             .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
-        self.db.put_cf(&cf, key, value)?;
+        if take_fault(&self.faults.writes) {
+            return Err(self.write_failed("put_cf", injected_fault("put_cf")));
+        }
+        self.db
+            .put_cf(&cf, key, value)
+            .map_err(|e| self.write_failed("put_cf", e.into()))?;
         Ok(())
     }
 
@@ -316,7 +365,12 @@ impl ChainDb {
             .db
             .cf_handle(cf_name)
             .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
-        self.db.delete_cf(&cf, key)?;
+        if take_fault(&self.faults.writes) {
+            return Err(self.write_failed("delete_cf", injected_fault("delete_cf")));
+        }
+        self.db
+            .delete_cf(&cf, key)
+            .map_err(|e| self.write_failed("delete_cf", e.into()))?;
         Ok(())
     }
 
@@ -324,10 +378,97 @@ impl ChainDb {
     ///
     /// All writes in the batch are applied together or not at all,
     /// ensuring consistency even across multiple column families.
+    ///
+    /// Gate 6: a failed write latches AbortNode
+    /// ([`rustoshi_consensus::fatal::abort_node`]) before the error is
+    /// returned. Callers that can safely retry (the UTXO flush, whose cache is
+    /// left intact on failure) use [`Self::try_write_batch`] for the first
+    /// attempt.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.try_write_batch(batch)
+            .map_err(|e| self.write_failed("write_batch", e))
+    }
+
+    /// [`Self::write_batch`] WITHOUT latching AbortNode on failure. Only for a
+    /// caller that keeps everything needed to rebuild and retry the batch and
+    /// goes through [`Self::write_batch`] (which latches) on the retry.
+    pub fn try_write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        if take_fault(&self.faults.writes) {
+            return Err(injected_fault("write_batch"));
+        }
         self.db.write(batch)?;
         self.write_batch_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Latch AbortNode for a failed write and hand the error back.
+    fn write_failed(&self, op: &str, e: StorageError) -> StorageError {
+        rustoshi_consensus::fatal::abort_node(&format!(
+            "chainstate database write failed ({}): {}",
+            op, e
+        ));
+        e
+    }
+
+    /// First attempt of a read, honouring injected read faults.
+    fn read_once<T>(
+        &self,
+        cf_name: &str,
+        f: impl Fn() -> Result<T, rocksdb::Error>,
+    ) -> Result<T, StorageError> {
+        if self.read_fault_armed_for(cf_name) {
+            return Err(injected_fault("read"));
+        }
+        Ok(f()?)
+    }
+
+    /// Second (last) attempt of a read: on failure latch AbortNode and return
+    /// the error.
+    fn read_retry_or_abort<T>(
+        &self,
+        cf_name: &str,
+        f: impl Fn() -> Result<T, rocksdb::Error>,
+    ) -> Result<T, StorageError> {
+        match self.read_once(cf_name, f) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                rustoshi_consensus::fatal::abort_node(&format!(
+                    "chainstate database read failed twice (column family {}): {}",
+                    cf_name, e
+                ));
+                Err(e)
+            }
+        }
+    }
+
+    fn read_fault_armed_for(&self, cf_name: &str) -> bool {
+        if self.faults.reads.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let matches = match self.faults.read_cf.lock() {
+            Ok(g) => g.as_deref().map(|c| c == cf_name).unwrap_or(true),
+            Err(_) => true,
+        };
+        matches && take_fault(&self.faults.reads)
+    }
+
+    /// Gate-6 fault injection: the next `n` writes (`write_batch`, `put_cf`,
+    /// `delete_cf`) fail with an I/O "No space left on device" error and
+    /// write nothing. Test-only by contract; inert in production.
+    #[doc(hidden)]
+    pub fn inject_write_faults(&self, n: u32) {
+        self.faults.writes.store(n, Ordering::SeqCst);
+    }
+
+    /// Gate-6 fault injection: the next `n` reads (`get_cf`,
+    /// `contains_key`) of `cf_name` (or of any column family when `None`)
+    /// fail with an I/O error. Test-only by contract; inert in production.
+    #[doc(hidden)]
+    pub fn inject_read_faults(&self, cf_name: Option<&str>, n: u32) {
+        if let Ok(mut g) = self.faults.read_cf.lock() {
+            *g = cf_name.map(|s| s.to_string());
+        }
+        self.faults.reads.store(n, Ordering::SeqCst);
     }
 
     /// Number of `write_batch` calls observed by this handle.
@@ -363,7 +504,11 @@ impl ChainDb {
             .db
             .cf_handle(cf_name)
             .ok_or_else(|| StorageError::Corruption(format!("missing column family: {}", cf_name)))?;
-        Ok(self.db.get_pinned_cf(&cf, key)?.is_some())
+        let probe = || self.db.get_pinned_cf(&cf, key).map(|v| v.is_some());
+        match self.read_once(cf_name, probe) {
+            Ok(v) => Ok(v),
+            Err(_) => self.read_retry_or_abort(cf_name, probe),
+        }
     }
 
     /// [`Self::contains_key`] that does not populate the block cache. For
@@ -541,6 +686,7 @@ impl ChainDb {
             db: ManuallyDrop::new(db),
             write_batch_count: AtomicU64::new(0),
             skip_close_wait: AtomicBool::new(false),
+            faults: FaultInjection::default(),
         };
         handle.check_and_init_version()?;
         Ok(handle)
@@ -612,6 +758,7 @@ impl ChainDb {
             db: ManuallyDrop::new(db),
             write_batch_count: AtomicU64::new(0),
             skip_close_wait: AtomicBool::new(false),
+            faults: FaultInjection::default(),
         };
         handle.check_and_init_version()?;
         Ok(handle)

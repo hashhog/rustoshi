@@ -313,6 +313,15 @@ pub enum ValidationError {
     /// burning CPU/memory without the early reject gate.
     #[error("too-little-chainwork: header chain work below minimum")]
     TooLittleChainwork,
+
+    /// A LOCAL system fault stopped validation: a coins/header DB read
+    /// failed, a write failed, the disk is full. Gate 6: this is NEVER a
+    /// verdict on the block -- callers must not mark it invalid, cache it as
+    /// invalid, or punish the peer that served it; they retry or halt.
+    /// Core: `state.Error(..)` / `FatalError` (validation.cpp:2136), which
+    /// `ConnectTip` does not pass to `InvalidBlockFound`.
+    #[error("system fault (not a verdict): {0}")]
+    SystemFault(String),
 }
 
 /// Errors that can occur during transaction validation.
@@ -381,19 +390,53 @@ impl ValidationError {
     /// - `BlockTooFarAhead` (anti-DoS refusal, not a validity check);
     /// - `InvalidChain` (only produced by disconnect / chain-walk failures,
     ///   i.e. local state, never by a block's own content).
+    /// - `SystemFault` (gate 6: a local I/O / disk / DB failure).
+    ///
+    /// EXHAUSTIVE (no wildcard): a new variant does not compile until someone
+    /// decides whether it is a verdict. The old `!matches!(..)` deny-list made
+    /// every unlisted error a verdict by default.
     pub fn is_invalid_block_verdict(&self) -> bool {
-        !matches!(
-            self,
+        match self {
+            // Not verdicts.
             ValidationError::BadMerkleRoot
-                | ValidationError::BadTxnsDuplicate
-                | ValidationError::BadWitnessCommitment
-                | ValidationError::BadWitnessNonceSize
-                | ValidationError::UnexpectedWitness
-                | ValidationError::PrevBlockNotFound(_)
-                | ValidationError::MissingAncestorHeader(_)
-                | ValidationError::BlockTooFarAhead(_, _)
-                | ValidationError::InvalidChain
-        )
+            | ValidationError::BadTxnsDuplicate
+            | ValidationError::BadWitnessCommitment
+            | ValidationError::BadWitnessNonceSize
+            | ValidationError::UnexpectedWitness
+            | ValidationError::PrevBlockNotFound(_)
+            | ValidationError::MissingAncestorHeader(_)
+            | ValidationError::BlockTooFarAhead(_, _)
+            | ValidationError::InvalidChain
+            | ValidationError::SystemFault(_) => false,
+            // Verdicts: properties of the block's own content.
+            ValidationError::BlockTooLarge(_)
+            | ValidationError::BlockLengthTooLarge(_)
+            | ValidationError::NoTransactions
+            | ValidationError::NoCoinbase
+            | ValidationError::MultipleCoinbase
+            | ValidationError::BadProofOfWork
+            | ValidationError::BadDifficulty
+            | ValidationError::TimeTooOld
+            | ValidationError::TimeTooNew
+            | ValidationError::BadVersion(_)
+            | ValidationError::TimeTimewarpAttack
+            | ValidationError::DuplicateTx(_)
+            | ValidationError::TxValidation(_)
+            | ValidationError::BadCoinbaseHeight
+            | ValidationError::SigopsLimitExceeded(_)
+            | ValidationError::BadSubsidy(_, _)
+            | ValidationError::FeesOutOfRange(_)
+            | ValidationError::WeightExceeded(_)
+            | ValidationError::NonFinalTx
+            | ValidationError::Bip30DuplicateOutput
+            | ValidationError::TooLittleChainwork => true,
+        }
+    }
+
+    /// Whether this error is a local system fault (gate 6), i.e. the caller
+    /// must retry or halt and must neither mark nor punish.
+    pub fn is_system_fault(&self) -> bool {
+        matches!(self, ValidationError::SystemFault(_))
     }
 
     /// Map this error to the canonical BIP-22 result string.
@@ -1886,7 +1929,22 @@ pub struct UndoData {
 /// (in-memory cache, database, etc.).
 pub trait UtxoView {
     /// Get a UTXO by outpoint.
+    ///
+    /// `None` means "absent". A backend that can fail (a database) must not
+    /// report a failed read through this method as `None` on any path that
+    /// reaches a verdict: `connect_block` reads through [`Self::try_get_utxo`].
     fn get_utxo(&self, outpoint: &OutPoint) -> Option<CoinEntry>;
+
+    /// Fallible coin lookup (gate 6). `Ok(None)` = the coin is absent (a
+    /// consensus fact: missing-inputs); `Err` = the backend could not answer
+    /// (a local system fault: never a verdict, never a ban). Mirrors Core's
+    /// `CCoinsViewErrorCatcher` (coins.cpp:415-427), which turns a coins-DB
+    /// read error into an abort instead of a "missing" coin.
+    ///
+    /// The default is infallible (in-memory views).
+    fn try_get_utxo(&self, outpoint: &OutPoint) -> Result<Option<CoinEntry>, String> {
+        Ok(self.get_utxo(outpoint))
+    }
 
     /// Add a new UTXO.
     fn add_utxo(&mut self, outpoint: &OutPoint, coin: CoinEntry);
@@ -2411,8 +2469,17 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
             let txid = tx.txid();
             for vout in 0..tx.outputs.len() {
                 let outpoint = OutPoint { txid, vout: vout as u32 };
-                if utxo_view.get_utxo(&outpoint).is_some() {
-                    return Err(ValidationError::Bip30DuplicateOutput);
+                // Gate 6: a failed lookup is a system fault, never "no
+                // conflict" (fail-open) -- audit F7b.
+                match utxo_view.try_get_utxo(&outpoint) {
+                    Ok(Some(_)) => return Err(ValidationError::Bip30DuplicateOutput),
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(ValidationError::SystemFault(format!(
+                            "BIP30 coin lookup {}:{} failed: {}",
+                            outpoint.txid, outpoint.vout, e
+                        )))
+                    }
                 }
             }
         }
@@ -2476,12 +2543,25 @@ pub fn connect_block_with_sequence_locks<C: SequenceLockContext>(
         let mut input_sum: u64 = 0;
         for input in &tx.inputs {
             // Get the coin being spent
-            let coin = utxo_view.get_utxo(&input.previous_output).ok_or(
-                TxValidationError::MissingInput(
-                    input.previous_output.txid,
-                    input.previous_output.vout,
-                ),
-            )?;
+            // Gate 6 (audit F9): a coins-DB read error is NOT a missing input.
+            // `Ok(None)` is the consensus verdict (bad-txns-inputs-missingorspent);
+            // `Err` is a local system fault -- no mark, no ban.
+            let coin = match utxo_view.try_get_utxo(&input.previous_output) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    return Err(TxValidationError::MissingInput(
+                        input.previous_output.txid,
+                        input.previous_output.vout,
+                    )
+                    .into())
+                }
+                Err(e) => {
+                    return Err(ValidationError::SystemFault(format!(
+                        "coin lookup {}:{} failed: {}",
+                        input.previous_output.txid, input.previous_output.vout, e
+                    )))
+                }
+            };
 
             // Check coinbase maturity
             if coin.is_coinbase && height - coin.height < COINBASE_MATURITY {

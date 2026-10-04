@@ -1796,21 +1796,80 @@ impl<'a> BlockStoreUtxoView<'a> {
     }
 
     /// Flush all cached changes to the database using a WriteBatch.
+    ///
+    /// Gate 6 (audit F2): the cache is cleared only AFTER the batch is
+    /// durable. See [`Self::commit_staged`].
     pub fn flush(&mut self) -> Result<(), StorageError> {
         if self.cache.is_empty() {
             return Ok(());
         }
+        self.commit_staged("flush", |view, batch| view.flush_into_batch(batch))
+    }
+
+    /// Build a batch with `stage`, write it, and only then clear the cache.
+    ///
+    /// Core's order (`CCoinsViewCache::Flush` -> `CCoinsViewDB::BatchWrite`,
+    /// coins.cpp / txdb.cpp; `FlushStateToDisk`, validation.cpp:2779-2836):
+    /// the in-memory coins are discarded only after the database write has
+    /// returned success. The old order drained the cache INTO the batch
+    /// before the write, so a failed write (ENOSPC, EIO) lost every pending
+    /// spend and every pending create: a spent coin came back (a later
+    /// double-spend ACCEPTED) and a created coin vanished (the next valid
+    /// block rejected as missing-inputs, marked FAILED_VALIDITY, its peer
+    /// banned).
+    ///
+    /// On failure the batch is rebuilt from the still-intact cache and
+    /// written once more; if that also fails, `ChainDb::write_batch` latches
+    /// AbortNode (`rustoshi_consensus::fatal`) and the error is returned with
+    /// the cache unchanged. Rebuilding is cheap relative to the write and
+    /// avoids holding a second copy of a multi-GB batch on the success path.
+    fn commit_staged(
+        &mut self,
+        what: &str,
+        stage: impl Fn(&Self, &mut WriteBatch) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
         let mut batch = self.store.db.new_batch();
-        self.flush_into_batch(&mut batch)?;
-        self.store.db.write_batch(batch)?;
-        Ok(())
+        stage(self, &mut batch)?;
+        match self.store.db.try_write_batch(batch) {
+            Ok(()) => {
+                self.mark_flushed();
+                Ok(())
+            }
+            Err(first) => {
+                tracing::error!(
+                    "UTXO {} write failed ({}); cache kept intact, retrying once",
+                    what, first
+                );
+                let mut batch = self.store.db.new_batch();
+                stage(self, &mut batch)?;
+                // `write_batch` latches AbortNode on failure.
+                self.store.db.write_batch(batch)?;
+                self.mark_flushed();
+                Ok(())
+            }
+        }
+    }
+
+    /// Discard the cached UTXO changes after the caller has DURABLY committed
+    /// a batch built by [`Self::flush_into_batch`]. Never call it before the
+    /// write returned `Ok` -- that is the gate-6 F2 bug.
+    pub fn mark_flushed(&mut self) {
+        self.cache.clear();
+        self.estimated_mem = 0;
+        // Anything journaled refers to slots that are now on disk.
+        if self.journal.is_some() {
+            self.journal = Some(std::collections::HashMap::new());
+            self.savepoint_mem = 0;
+        }
     }
 
     /// Stage all cached UTXO changes into the caller-provided WriteBatch.
     ///
-    /// Drains the cache (resetting `estimated_mem`) but does NOT execute
-    /// the batch — the caller is responsible for committing it via
-    /// [`ChainDb::write_batch`] (or [`BlockStore::write_batch`]). This is
+    /// Does NOT modify the cache and does NOT execute the batch. The caller
+    /// commits it via [`ChainDb::write_batch`] (or [`BlockStore::write_batch`])
+    /// and, only once that returned `Ok`, calls [`Self::mark_flushed`]
+    /// (gate 6, audit F2: this used to `drain()` the cache here, before the
+    /// write, so a failed write lost the changes). This is
     /// the building block for atomic cross-CF commits in the disconnect
     /// and reorg paths, where height-index updates + new tip pointer
     /// must land in the same RocksDB write as the UTXO mutations to
@@ -1820,7 +1879,7 @@ impl<'a> BlockStoreUtxoView<'a> {
     /// Mirrors `bitcoin-core/src/validation.cpp::DisconnectTip` —
     /// Core flushes its `CCoinsViewCache` into a single `CDBBatch` that
     /// also carries the `BlockTreeDB` index updates, then commits once.
-    pub fn flush_into_batch(&mut self, batch: &mut WriteBatch) -> Result<(), StorageError> {
+    pub fn flush_into_batch(&self, batch: &mut WriteBatch) -> Result<(), StorageError> {
         if self.cache.is_empty() {
             return Ok(());
         }
@@ -1829,11 +1888,11 @@ impl<'a> BlockStoreUtxoView<'a> {
             .db
             .cf_handle(CF_UTXO)
             .ok_or_else(|| StorageError::Corruption("missing UTXO column family".into()))?;
-        for (outpoint, coin) in self.cache.drain() {
-            let key = outpoint_key(&outpoint);
+        for (outpoint, coin) in self.cache.iter() {
+            let key = outpoint_key(outpoint);
             match coin {
                 Some(c) => {
-                    let data = format_v2::encode_coin_entry(&c);
+                    let data = format_v2::encode_coin_entry(c);
                     batch.put_cf(cf, &key, &data);
                 }
                 None => {
@@ -1841,7 +1900,6 @@ impl<'a> BlockStoreUtxoView<'a> {
                 }
             }
         }
-        self.estimated_mem = 0;
         Ok(())
     }
 
@@ -1887,14 +1945,14 @@ impl<'a> BlockStoreUtxoView<'a> {
     /// AT OR BELOW which every cached coin mutation belongs (i.e. flush
     /// only on a block boundary after `process_block` succeeded).
     pub fn flush_with_tip(&mut self, hash: &Hash256, height: u32) -> Result<(), StorageError> {
-        let mut batch = self.store.db.new_batch();
-        // Stage all cached UTXO mutations (drains the cache, resets mem).
-        self.flush_into_batch(&mut batch)?;
-        // Stage the tip pointer into the SAME batch so it can never be
-        // durable without its coins.
-        self.store.batch_set_best_block(&mut batch, hash, height)?;
-        self.store.db.write_batch(batch)?;
-        Ok(())
+        let (hash, height) = (*hash, height);
+        self.commit_staged("flush_with_tip", move |view, batch| {
+            // Stage all cached UTXO mutations (cache untouched until commit).
+            view.flush_into_batch(batch)?;
+            // Stage the tip pointer into the SAME batch so it can never be
+            // durable without its coins.
+            view.store.batch_set_best_block(batch, &hash, height)
+        })
     }
 
     /// Atomic UTXO + tip flush that ALSO persists the block bodies + undo
@@ -1950,17 +2008,39 @@ impl<'a> BlockStoreUtxoView<'a> {
         prune_targets: &[(u32, Hash256)],
         prune_watermark: Option<u32>,
     ) -> Result<(), StorageError> {
-        let mut batch = self.store.db.new_batch();
-        // 1. Cached UTXO mutations (drains cache, resets mem).
-        self.flush_into_batch(&mut batch)?;
+        self.commit_staged("flush_with_tip_and_blocks", |view, batch| {
+            view.stage_tip_and_blocks(
+                batch,
+                tip_hash,
+                tip_height,
+                pending,
+                prune_targets,
+                prune_watermark,
+            )
+        })
+    }
+
+    /// Stage everything [`Self::flush_with_tip_and_blocks`] commits. Leaves
+    /// the cache untouched (gate 6).
+    fn stage_tip_and_blocks(
+        &self,
+        batch: &mut WriteBatch,
+        tip_hash: &Hash256,
+        tip_height: u32,
+        pending: &[(Hash256, Block, UndoData)],
+        prune_targets: &[(u32, Hash256)],
+        prune_watermark: Option<u32>,
+    ) -> Result<(), StorageError> {
+        // 1. Cached UTXO mutations (cache untouched until commit).
+        self.flush_into_batch(batch)?;
         // 2. Block bodies + undo for every block connected since last flush.
         for (hash, block, undo) in pending {
-            self.store.batch_put_block(&mut batch, hash, block)?;
-            self.store.batch_put_undo(&mut batch, hash, undo)?;
+            self.store.batch_put_block(batch, hash, block)?;
+            self.store.batch_put_undo(batch, hash, undo)?;
         }
         // 3. Retention prune: drop bodies/undo that fell out of the window.
         for (_height, hash) in prune_targets {
-            self.store.batch_prune_block_body(&mut batch, hash)?;
+            self.store.batch_prune_block_body(batch, hash)?;
         }
         // 3b. Advance the reorg-retention prune watermark in the SAME batch
         //     so the contiguous sweep resumes exactly where it left off on
@@ -1969,12 +2049,11 @@ impl<'a> BlockStoreUtxoView<'a> {
         //     it, and a crash that loses the watermark only re-deletes
         //     already-gone bodies, an idempotent no-op).
         if let Some(wm) = prune_watermark {
-            self.store.batch_set_reorg_prune_height(&mut batch, wm)?;
+            self.store.batch_set_reorg_prune_height(batch, wm)?;
         }
         // 4. Tip pointer LAST so it can never be durable without (1)-(2).
         self.store
-            .batch_set_best_block(&mut batch, tip_hash, tip_height)?;
-        self.store.db.write_batch(batch)?;
+            .batch_set_best_block(batch, tip_hash, tip_height)?;
         Ok(())
     }
 
@@ -2000,15 +2079,37 @@ impl<'a> rustoshi_consensus::validation::UtxoView for BlockStoreUtxoView<'a> {
                 });
         }
 
-        // Fall back to database
-        self.store.get_utxo(outpoint).ok().flatten().map(|c| {
-            rustoshi_consensus::validation::CoinEntry {
+        // Fall back to database. A read error is NOT "absent": ChainDb has
+        // already retried once and latched AbortNode, so the node is halting;
+        // `None` here is only ever seen by non-verdict callers (RPC, mempool,
+        // disconnect), all of which check the latch. `connect_block` reads
+        // through `try_get_utxo`, which surfaces the error (gate 6, audit F9).
+        self.try_get_utxo(outpoint).ok().flatten()
+    }
+
+    fn try_get_utxo(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<rustoshi_consensus::validation::CoinEntry>, String> {
+        if let Some(cached) = self.cache.get(outpoint) {
+            return Ok(cached
+                .as_ref()
+                .map(|c| rustoshi_consensus::validation::CoinEntry {
+                    height: c.height,
+                    is_coinbase: c.is_coinbase,
+                    value: c.value,
+                    script_pubkey: c.script_pubkey.clone(),
+                }));
+        }
+        match self.store.get_utxo(outpoint) {
+            Ok(c) => Ok(c.map(|c| rustoshi_consensus::validation::CoinEntry {
                 height: c.height,
                 is_coinbase: c.is_coinbase,
                 value: c.value,
                 script_pubkey: c.script_pubkey,
-            }
-        })
+            })),
+            Err(e) => Err(format!("{}: coins database read: {}", rustoshi_consensus::fatal::SYSTEM_FAULT_TAG, e)),
+        }
     }
 
     fn add_utxo(&mut self, outpoint: &OutPoint, coin: rustoshi_consensus::validation::CoinEntry) {

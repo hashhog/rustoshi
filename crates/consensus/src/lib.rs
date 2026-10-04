@@ -37,6 +37,7 @@ pub mod block_template;
 pub mod campaign_assumeutxo;
 pub mod chain_manager;
 pub mod chain_state;
+pub mod fatal;
 pub mod fee_estimator;
 pub mod mempool;
 pub mod mempool_persist;

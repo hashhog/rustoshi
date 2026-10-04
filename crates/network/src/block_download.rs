@@ -137,6 +137,10 @@ impl PeerDownloadState {
     }
 }
 
+/// Cap on [`BlockDownloader`]'s delivering-peer map (it is cleared when full;
+/// losing an entry only means a later invalid block goes unpunished).
+const MAX_BLOCK_SOURCES: usize = 4096;
+
 /// Manages block downloading during IBD and steady-state.
 pub struct BlockDownloader {
     /// Blocks waiting to be requested, in order.
@@ -162,6 +166,11 @@ pub struct BlockDownloader {
     /// Per-peer in-flight cap for this downloader. 16 matches Core; 128 is
     /// the single-`--connect` feeder default.
     max_per_peer: usize,
+    /// The peer that DELIVERED each buffered block (Core `mapBlockSource`,
+    /// net_processing.cpp). A block that fails validation is blamed on its
+    /// deliverer, not on whichever peer's message happened to trigger the
+    /// connect loop (gate-6 audit D1). Bounded by [`MAX_BLOCK_SOURCES`].
+    block_source: HashMap<Hash256, PeerId>,
     /// Getdata produced by refill-on-receipt. The event loop must send these
     /// without waiting for the 10s retry tick (or the post-validation
     /// `assign_requests` call, which runs only after up to 8 slow connects).
@@ -467,7 +476,15 @@ impl BlockDownloader {
             pending_refill: Vec::new(),
             timed_out_from: HashMap::new(),
             announced_by: HashMap::new(),
+            block_source: HashMap::new(),
         }
+    }
+
+    /// The peer that delivered `hash`, removing the record (Core erases its
+    /// `mapBlockSource` entry in `BlockChecked`). `None` when unknown, in
+    /// which case nobody is punished -- as in Core.
+    pub fn take_block_source(&mut self, hash: &Hash256) -> Option<PeerId> {
+        self.block_source.remove(hash)
     }
 
     /// Per-peer in-flight cap this downloader was constructed with.
@@ -734,6 +751,10 @@ impl BlockDownloader {
         self.timed_out_from.remove(&hash);
         self.announced_by.remove(&hash);
         self.received_blocks.insert(hash, block);
+        if self.block_source.len() >= MAX_BLOCK_SOURCES {
+            self.block_source.clear();
+        }
+        self.block_source.insert(hash, peer_id);
 
         // Refill on receipt. `assign_requests` drains `pending_refill` first,
         // so stash the newly assigned getdata for the event loop to send
@@ -793,6 +814,19 @@ impl BlockDownloader {
             // Next block in sequence hasn't arrived yet
             None
         }
+    }
+
+    /// Put a block that [`Self::next_block_to_validate`] just handed out back
+    /// at the FRONT of the validation queue, undoing that call (gate 6: a
+    /// block whose connect hit a local system fault is retried, never dropped
+    /// or marked). The block's body is kept, so no re-download is needed.
+    pub fn requeue_block_for_validation(&mut self, block: Block) {
+        let h = block.block_hash();
+        if self.pending_set.insert(h) {
+            self.pending_hashes.push_front(h);
+        }
+        self.received_blocks.insert(h, block);
+        self.validated_tip_height = self.validated_tip_height.saturating_sub(1);
     }
 
     /// Returns true if the next block in chain order is available for

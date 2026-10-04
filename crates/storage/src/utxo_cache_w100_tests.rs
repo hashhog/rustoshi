@@ -684,15 +684,30 @@ mod tests {
         assert_eq!(cache.cache_size(), 0);
     }
 
-    /// G19 ERROR PATH (documented bug B5): if flush fails mid-drain, entries
-    /// that were drained but not written are silently discarded.
+    /// G19 ERROR PATH (B5, fixed under gate 6): a flush that fails must not
+    /// discard the dirty entries it did not write. `ChainDb::inject_write_faults`
+    /// makes the coin write fail as a full disk would.
     #[test]
-    #[ignore = "G19 / B5: flush_to_db drain() removes entries before write; partial I/O error silently discards dirty entries"]
     fn g19_flush_error_must_not_lose_dirty_entries() {
-        // Requires ability to inject a DB write error mid-flush.
-        // Without that, we document the design flaw: drain() is destructive
-        // before the write completes, so a partial error loses data.
-        panic!("flush_to_db uses drain() before write — error path loses dirty entries");
+        let _g = rustoshi_consensus::fatal::test_serial_guard();
+        let (_dir, db) = temp_db();
+        let db_view = CoinsViewDB::new(&db);
+        let mut cache = CoinsViewCache::new(&db_view);
+
+        let op = make_outpoint(0);
+        cache.add_coin(op.clone(), make_coin(100, 1, false), false).unwrap();
+        assert_eq!(cache.dirty_count(), 1);
+
+        db.inject_write_faults(1);
+        assert!(cache.flush_to_db(&db_view).is_err(), "write failure must surface");
+        assert_eq!(cache.dirty_count(), 1, "dirty entry discarded by a failed flush");
+        assert_eq!(cache.cache_size(), 1, "entry discarded by a failed flush");
+
+        cache.flush_to_db(&db_view).expect("flush after recovery");
+        assert_eq!(cache.dirty_count(), 0);
+        let fresh = CoinsViewCache::new(&db_view);
+        assert!(fresh.get_coin(&op).unwrap().is_some(), "coin durable after recovery");
+        rustoshi_consensus::fatal::reset_for_tests();
     }
 
     // -----------------------------------------------------------------------

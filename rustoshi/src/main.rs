@@ -472,10 +472,17 @@ fn median_time_past(timestamps: &mut [u32]) -> Option<u32> {
 /// blocks past a snapshot base must use [`mtp_for_connect`] instead, which
 /// falls back to the trusted `AssumeutxoData::base_mtp` chainparams
 /// constant in that case.
+///
+/// Gate 6 (audit F5): a header READ ERROR is `Err`, never a shorter window.
+/// It used to `break` on any `Err` exactly as on a missing header, so a
+/// failing disk produced a partial-window median or `None` -> MTP 0, which
+/// waived time-too-old and turned every time-locked transaction into a
+/// `bad-txns-nonfinal` VERDICT. The error carries
+/// [`rustoshi_consensus::fatal::SYSTEM_FAULT_TAG`].
 fn compute_mtp_via_store(
     block_store: &BlockStore,
     tip_hash: &rustoshi_primitives::Hash256,
-) -> Option<u32> {
+) -> Result<Option<u32>, String> {
     use rustoshi_consensus::params::MEDIAN_TIME_PAST_WINDOW;
     let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
     let mut current = *tip_hash;
@@ -492,10 +499,123 @@ fn compute_mtp_via_store(
             // Header not stored (e.g. the parent is below an assumeUTXO
             // snapshot base): stop the walk here and median what we have,
             // exactly as Core stops at a null `pprev`.
-            _ => break,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(format!(
+                    "{}: MTP header read {} failed: {}",
+                    rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                    current,
+                    e
+                ))
+            }
         }
     }
-    median_time_past(&mut timestamps)
+    Ok(median_time_past(&mut timestamps))
+}
+
+/// Timestamp of `parent_hash` for the BIP-94 timewarp gate. `Ok(0)` when the
+/// header is not stored (unchanged behaviour); `Err` (tagged system fault) on
+/// a read error, which used to collapse to 0 as well (gate 6).
+fn parent_timestamp_for_connect(
+    block_store: &BlockStore,
+    parent_hash: &rustoshi_primitives::Hash256,
+) -> Result<u32, String> {
+    match block_store.get_header(parent_hash) {
+        Ok(h) => Ok(h.map(|h| h.timestamp).unwrap_or(0)),
+        Err(e) => Err(format!(
+            "{}: parent header read {} failed: {}",
+            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+            parent_hash,
+            e
+        )),
+    }
+}
+
+/// Store a header that passed the header-validation gates (the last step of
+/// the `process_headers` closure).
+///
+/// Gate 6 (audit F12): a failed WRITE (disk full) is our fault, not the
+/// peer's. It used to come back as a bare `e.to_string()` and land in the
+/// "genuinely invalid content" branch, banning EVERY peer that sent headers
+/// while the disk was full. The error is tagged as a system fault (and
+/// `ChainDb` has latched AbortNode).
+fn store_validated_header(
+    block_store: &BlockStore,
+    header: &rustoshi_primitives::BlockHeader,
+    height: u32,
+) -> Result<(), String> {
+    block_store
+        .put_header(&header.block_hash(), header)
+        .map_err(|e| {
+            format!(
+                "{}: put_header failed: {}",
+                rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                e
+            )
+        })?;
+    block_store
+        .put_height_index(height, &header.block_hash())
+        .map_err(|e| {
+            format!(
+                "{}: put_height_index failed: {}",
+                rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                e
+            )
+        })?;
+    Ok(())
+}
+
+/// What the headers handler does with a `process_headers` error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderErrorAction {
+    /// Local disk / DB failure (or AbortNode latched): never punish.
+    SystemFault,
+    /// Headers that do not connect: Core's tolerated-unconnecting path.
+    Unconnecting,
+    /// Invalid header content: punish (`bad-header`).
+    Invalid,
+}
+
+/// Classify a header-sync error (gate 6: system faults first, so a tagged
+/// I/O error can never be read as invalid content).
+fn header_error_action(e: &str) -> HeaderErrorAction {
+    if rustoshi_consensus::fatal::is_system_fault_str(e) || rustoshi_consensus::fatal::is_aborted() {
+        HeaderErrorAction::SystemFault
+    } else if e.contains("not connected") || e.contains("not in our chain") {
+        HeaderErrorAction::Unconnecting
+    } else {
+        HeaderErrorAction::Invalid
+    }
+}
+
+/// Gate 6 "retry once, then halt": remembers the last block whose connect hit
+/// a system fault. A second fault on the same block latches AbortNode.
+#[derive(Default)]
+struct SystemFaultRetry {
+    last: Option<rustoshi_primitives::Hash256>,
+}
+
+impl SystemFaultRetry {
+    /// True if this is the first system fault for `hash` (retry allowed);
+    /// false if it already faulted once (halt).
+    fn note(&mut self, hash: rustoshi_primitives::Hash256) -> bool {
+        if self.last == Some(hash) {
+            false
+        } else {
+            self.last = Some(hash);
+            true
+        }
+    }
+}
+
+/// Outcome of a pre-connect gate that can fail for two very different
+/// reasons (gate 6).
+#[derive(Debug)]
+enum ConnectGateError {
+    /// The block's own content is invalid: a verdict.
+    Invalid(String),
+    /// A local read failed: NOT a verdict; no mark, no ban.
+    System(String),
 }
 
 /// Connect-time backstop for Core's FIRST contextual header gate,
@@ -523,7 +643,7 @@ fn check_connect_diffbits(
     block_store: &BlockStore,
     header: &rustoshi_primitives::BlockHeader,
     params: &rustoshi_consensus::ChainParams,
-) -> Result<(), String> {
+) -> Result<(), ConnectGateError> {
     let parent_height = match block_store.get_block_index(&header.prev_block_hash) {
         Ok(Some(entry)) => entry.height,
         // The parent is not in the block index, so this block does not extend
@@ -531,10 +651,19 @@ fn check_connect_diffbits(
         // `PrevBlockNotFound` (and the reorg path re-validates it against its
         // real parent); there is no height to gate against here.
         Ok(None) => return Ok(()),
-        Err(e) => return Err(format!("bad-diffbits: block index read failed: {}", e)),
+        // Gate 6 (audit B2): a block-index READ error is ours, not the
+        // block's. It used to become `BadDifficulty` -> persisted
+        // FAILED_VALIDITY + a 100-point ban.
+        Err(e) => {
+            return Err(ConnectGateError::System(format!(
+                "{}: block index read failed: {}",
+                rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                e
+            )))
+        }
     };
     let mut cache = rustoshi_storage::HeaderCache::new(256);
-    match rustoshi_storage::diffbits_gate_for_header(
+    let gate = rustoshi_storage::diffbits_gate_for_header(
         block_store,
         &mut cache,
         &header.prev_block_hash,
@@ -543,13 +672,21 @@ fn check_connect_diffbits(
         parent_height.saturating_add(1),
         None,
         params,
-    )? {
+    )
+    .map_err(|reason| {
+        if rustoshi_consensus::fatal::is_system_fault_str(&reason) {
+            ConnectGateError::System(reason)
+        } else {
+            ConnectGateError::Invalid(reason)
+        }
+    })?;
+    match gate {
         rustoshi_storage::DiffBitsGate::Required(expected) => {
             if header.bits != expected {
-                Err(format!(
+                Err(ConnectGateError::Invalid(format!(
                     "bad-diffbits: nBits {:#010x} != required {:#010x} (parent {} at height {})",
                     header.bits, expected, header.prev_block_hash, parent_height
-                ))
+                )))
             } else {
                 Ok(())
             }
@@ -588,16 +725,69 @@ fn mtp_for_connect(
     block_store: &BlockStore,
     parent_hash: &rustoshi_primitives::Hash256,
     params: &rustoshi_consensus::ChainParams,
-) -> Option<u32> {
-    if let Some(mtp) = compute_mtp_via_store(block_store, parent_hash) {
-        return Some(mtp);
+) -> Result<Option<u32>, String> {
+    if let Some(mtp) = compute_mtp_via_store(block_store, parent_hash)? {
+        return Ok(Some(mtp));
     }
     // No ancestor headers reachable. If the parent is a trusted assumeUTXO
     // snapshot base, use its pinned MTP so the first post-snapshot block
     // validates `IsFinalTx` correctly.
-    params
+    Ok(params
         .assumeutxo_for_blockhash(parent_hash)
-        .and_then(|d| d.base_mtp)
+        .and_then(|d| d.base_mtp))
+}
+
+/// The two inputs `process_block` needs from the parent's header chain, read
+/// fallibly (gate 6). `Err` is a `ValidationError::SystemFault`: the caller
+/// must not connect, mark or punish.
+fn connect_time_inputs(
+    block_store: &BlockStore,
+    tip_hash: &rustoshi_primitives::Hash256,
+    parent_hash: &rustoshi_primitives::Hash256,
+    params: &rustoshi_consensus::ChainParams,
+) -> Result<(u32, u32), ValidationError> {
+    let mtp = mtp_for_connect(block_store, tip_hash, params)
+        .map_err(ValidationError::SystemFault)?
+        .unwrap_or(0);
+    let prev_timestamp =
+        parent_timestamp_for_connect(block_store, parent_hash).map_err(ValidationError::SystemFault)?;
+    Ok((mtp, prev_timestamp))
+}
+
+/// Run the connect-path bad-diffbits backstop and then `process_block`,
+/// mapping a gate system fault to `ValidationError::SystemFault` (no verdict)
+/// and a gate content failure to `BadDifficulty` (verdict).
+fn diffbits_gate_to_validation(
+    gate: Result<(), ConnectGateError>,
+    block_hash: &rustoshi_primitives::Hash256,
+    height: u32,
+) -> Result<(), ValidationError> {
+    match gate {
+        Ok(()) => Ok(()),
+        Err(ConnectGateError::Invalid(reason)) => {
+            tracing::error!(
+                "connect-path bad-diffbits backstop rejected block {} at height {}: {}",
+                block_hash, height, reason
+            );
+            Err(ValidationError::BadDifficulty)
+        }
+        Err(ConnectGateError::System(reason)) => {
+            tracing::error!(
+                "connect-path bad-diffbits backstop could not run for block {} at height {}: {} \
+                 (system fault, NOT a verdict)",
+                block_hash, height, reason
+            );
+            Err(ValidationError::SystemFault(reason))
+        }
+    }
+}
+
+/// Gate 6: whether a connect failure may be acted on as a verdict (persisted
+/// FAILED_VALIDITY mark) at all. False for a system fault, and false for
+/// ANY error once AbortNode has latched: state read after a failed write or
+/// read is not trusted, and Core records nothing after AbortNode.
+fn connect_error_is_verdict(e: &ValidationError) -> bool {
+    !rustoshi_consensus::fatal::is_aborted() && e.is_invalid_block_verdict()
 }
 
 /// Apply a `--assumevalid=<hex|0>` CLI override onto the chain params.
@@ -1312,7 +1502,15 @@ fn default_rpc_port(network_id: NetworkId) -> u16 {
 /// headers-first sync is not the fork blocks we would want to reorg onto. So
 /// `PrevBlockNotFound` returns `None` (no punishment). Routing the dropped fork
 /// block into the attach/reorg path is Units B+C, not done here.
+///
+/// Gate 6: EXHAUSTIVE (no wildcard), so a new error variant cannot default to
+/// a ban; a `SystemFault` (our disk / DB) never punishes; and nothing is
+/// punished once AbortNode has latched (Core's `MaybePunishNodeForBlock` acts
+/// only on a `BlockValidationResult`, never on `state.Error`).
 fn misbehavior_for_block_error(e: &ValidationError) -> Option<MisbehaviorReason> {
+    if rustoshi_consensus::fatal::is_aborted() {
+        return None;
+    }
     match e {
         // Honest competing-branch / unknown-parent block: NOT misbehavior.
         ValidationError::PrevBlockNotFound(_) => None,
@@ -1320,13 +1518,38 @@ fn misbehavior_for_block_error(e: &ValidationError) -> Option<MisbehaviorReason>
         // boot below the header band). Our gap, not the peer's fault, and
         // not a verdict on the block: Core never reaches this state.
         ValidationError::MissingAncestorHeader(_) => None,
+        // Gate 6: a local I/O / disk / DB failure is never the peer's fault.
+        ValidationError::SystemFault(_) => None,
         // BLOCK_MUTATED: merkle / witness-commitment corruption.
         ValidationError::BadMerkleRoot
         | ValidationError::BadWitnessCommitment
         | ValidationError::BadWitnessNonceSize
         | ValidationError::UnexpectedWitness => Some(MisbehaviorReason::MutatedBlock),
-        // Any other consensus failure: generic invalid block.
-        _ => Some(MisbehaviorReason::InvalidBlock),
+        // Consensus failures of the block's own content: generic invalid block.
+        ValidationError::BlockTooLarge(_)
+        | ValidationError::BlockLengthTooLarge(_)
+        | ValidationError::NoTransactions
+        | ValidationError::NoCoinbase
+        | ValidationError::MultipleCoinbase
+        | ValidationError::BadTxnsDuplicate
+        | ValidationError::BadProofOfWork
+        | ValidationError::BadDifficulty
+        | ValidationError::TimeTooOld
+        | ValidationError::TimeTooNew
+        | ValidationError::BadVersion(_)
+        | ValidationError::TimeTimewarpAttack
+        | ValidationError::DuplicateTx(_)
+        | ValidationError::TxValidation(_)
+        | ValidationError::BadCoinbaseHeight
+        | ValidationError::SigopsLimitExceeded(_)
+        | ValidationError::BadSubsidy(_, _)
+        | ValidationError::FeesOutOfRange(_)
+        | ValidationError::WeightExceeded(_)
+        | ValidationError::BlockTooFarAhead(_, _)
+        | ValidationError::InvalidChain
+        | ValidationError::NonFinalTx
+        | ValidationError::Bip30DuplicateOutput
+        | ValidationError::TooLittleChainwork => Some(MisbehaviorReason::InvalidBlock),
     }
 }
 
@@ -2050,15 +2273,14 @@ fn run_import_from_blk_files(
         // for `lock_time_cutoff` in `is_final_tx`.  Returns 0 near genesis
         // (fewer than 11 ancestors), which matches Core's behaviour.
         let prev_block_mtp =
-            compute_mtp_via_store(block_store, &chain_state.tip_hash()).unwrap_or(0);
+            compute_mtp_via_store(block_store, &chain_state.tip_hash())
+                .map_err(|e| anyhow::anyhow!("import aborted (gate 6): {}", e))?
+                .unwrap_or(0);
 
         // Finding 16 (BIP-94 timewarp): real parent timestamp for the gate.
-        let prev_timestamp = block_store
-            .get_header(&block.header.prev_block_hash)
-            .ok()
-            .flatten()
-            .map(|h| h.timestamp)
-            .unwrap_or(0);
+        let prev_timestamp =
+            parent_timestamp_for_connect(block_store, &block.header.prev_block_hash)
+                .map_err(|e| anyhow::anyhow!("import aborted (gate 6): {}", e))?;
 
         // Finding 4 (assumevalid): import path has no live header_sync, so
         // we conservatively verify all scripts (correct; faster paths use
@@ -2148,7 +2370,9 @@ fn run_import_from_blk_files(
             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
             let entries = utxo_view.cache_len();
             if let Err(e) = utxo_view.flush() {
-                tracing::error!("UTXO cache flush failed: {}", e);
+                // Gate 6: AbortNode has latched; stop instead of importing on
+                // top of a chainstate whose last flush did not land.
+                anyhow::bail!("import aborted (gate 6): UTXO cache flush failed: {}", e);
             } else {
                 tracing::info!(
                     "UTXO cache flushed: {} entries, ~{} MiB at height {}",
@@ -2275,15 +2499,14 @@ fn run_import_from_stdin(
         // so `is_final_tx` uses the right `lock_time_cutoff` once CSV is
         // active.  Returns 0 near genesis (matches Core).
         let prev_block_mtp =
-            compute_mtp_via_store(block_store, &chain_state.tip_hash()).unwrap_or(0);
+            compute_mtp_via_store(block_store, &chain_state.tip_hash())
+                .map_err(|e| anyhow::anyhow!("import aborted (gate 6): {}", e))?
+                .unwrap_or(0);
 
         // Finding 16 (BIP-94 timewarp): real parent timestamp for the gate.
-        let prev_timestamp = block_store
-            .get_header(&block.header.prev_block_hash)
-            .ok()
-            .flatten()
-            .map(|h| h.timestamp)
-            .unwrap_or(0);
+        let prev_timestamp =
+            parent_timestamp_for_connect(block_store, &block.header.prev_block_hash)
+                .map_err(|e| anyhow::anyhow!("import aborted (gate 6): {}", e))?;
 
         // Finding 4 (assumevalid): import path has no live header_sync, so
         // we conservatively verify all scripts.
@@ -2367,7 +2590,9 @@ fn run_import_from_stdin(
             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
             let entries = utxo_view.cache_len();
             if let Err(e) = utxo_view.flush() {
-                tracing::error!("UTXO cache flush failed: {}", e);
+                // Gate 6: AbortNode has latched; stop instead of importing on
+                // top of a chainstate whose last flush did not land.
+                anyhow::bail!("import aborted (gate 6): UTXO cache flush failed: {}", e);
             } else {
                 tracing::info!(
                     "UTXO cache flushed: {} entries, ~{} MiB at height {}",
@@ -3236,7 +3461,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let mem_mb = utxo_view.estimated_memory() / (1024 * 1024);
             match utxo_view.flush() {
                 Ok(()) => tracing::info!("Final UTXO flush: {} entries, ~{} MiB", entries, mem_mb),
-                Err(e) => tracing::error!("Final UTXO flush failed: {}", e),
+                // Gate 6: never advance the tip pointer over coins that did
+                // not land.
+                Err(e) => anyhow::bail!("Final UTXO flush failed (gate 6 abort): {}", e),
             }
         }
 
@@ -4459,7 +4686,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| anyhow::anyhow!("failed to install SIGINT handler: {e}"))?;
 
+    // Gate 6: one retry per block for a system fault, then AbortNode.
+    let mut system_fault_retry = SystemFaultRetry::default();
+
     loop {
+        // Gate 6 (AbortNode): a failed chainstate write/read latched the
+        // process-wide fatal flag. Stop here: no more connects, no verdicts,
+        // and (below) no shutdown flush of a possibly-torn cache.
+        if rustoshi_consensus::fatal::is_aborted() {
+            tracing::error!(
+                "AbortNode latched ({}); leaving the main loop to shut down",
+                rustoshi_consensus::fatal::abort_reason().unwrap_or_default()
+            );
+            break;
+        }
         tokio::select! {
             // Fast validation tick — process buffered blocks frequently.
             // Checked with equal priority to peer events via random select.
@@ -4548,6 +4788,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 let mut blocks_validated = 0usize;
 
                 while blocks_validated < MAX_BLOCKS_VALIDATE {
+                    // Gate 6: nothing is connected after AbortNode.
+                    if rustoshi_consensus::fatal::is_aborted() {
+                        break;
+                    }
                     let block = match block_downloader.next_block_to_validate() {
                         Some(b) => b,
                         None => break,
@@ -4575,6 +4819,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     // and (if it was the header tip) rewind so an honest sibling
                     // can connect. See `mark_connect_failed_block_invalid`.
                     let mut connect_invalid = false;
+                    // Gate 6: set when the connect hit a local system fault;
+                    // the block was requeued and this tick stops validating.
+                    let mut system_fault_hit = false;
                     let connected_undo: Option<rustoshi_consensus::validation::UndoData> = {
                         let mut cs = chain_state.write().await;
                         // BIP-113: compute parent MTP for `is_final_tx`'s
@@ -4591,16 +4838,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // and rejecting every time-locked tx as
                         // `bad-txns-nonfinal` (mainnet wedge 2026-05-20:
                         // block 944,184).
-                        let prev_block_mtp =
-                            mtp_for_connect(&block_store, &cs.tip_hash(), &params)
-                                .unwrap_or(0);
+                        //
+                        // Gate 6 (audit F5): a header READ ERROR is a
+                        // SystemFault, never MTP 0 (which waived time-too-old
+                        // and made time-locked txs a nonfinal verdict).
                         // Finding 16 (BIP-94 timewarp): real parent timestamp.
-                        let prev_timestamp = block_store
-                            .get_header(&block.header.prev_block_hash)
-                            .ok()
-                            .flatten()
-                            .map(|h| h.timestamp)
-                            .unwrap_or(0);
+                        let time_inputs = connect_time_inputs(
+                            &block_store,
+                            &cs.tip_hash(),
+                            &block.header.prev_block_hash,
+                            &params,
+                        );
+                        let (prev_block_mtp, prev_timestamp) =
+                            time_inputs.as_ref().map(|t| *t).unwrap_or((0, 0));
                         // Finding 4 (assumevalid): faithful 5-condition gate.
                         let skip_scripts = compute_skip_scripts(
                             &block_hash,
@@ -4623,20 +4873,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // header chain), so without this the nBits-equals-required
                         // comparison never runs on the connect path. See
                         // `check_connect_diffbits`.
-                        let connect_res = match check_connect_diffbits(&block_store, &block.header, &params) {
-                            Ok(()) => {
+                        let connect_res = time_inputs
+                            .map(|_| ())
+                            .and_then(|()| {
+                                diffbits_gate_to_validation(
+                                    check_connect_diffbits(&block_store, &block.header, &params),
+                                    &block_hash,
+                                    height,
+                                )
+                            })
+                            .and_then(|()| {
                                 // f_requested=true: blocks from the IBD block downloader
                                 // are actively requested via getdata — no fTooFarAhead guard.
                                 cs.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &rustoshi_storage::StoreSeqLockCtx::new(&block_store), skip_scripts, prev_timestamp)
-                            }
-                            Err(reason) => {
-                                tracing::error!(
-                                    "connect-path bad-diffbits backstop rejected block {} at height {}: {}",
-                                    block_hash, height, reason
-                                );
-                                Err(rustoshi_consensus::validation::ValidationError::BadDifficulty)
-                            }
-                        };
+                            });
                         match connect_res {
                             Ok((undo, _fees)) => {
                                 utxo_view.commit_savepoint();
@@ -4712,7 +4962,27 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // (fail closed), never an invalid verdict.
                                 // BLOCK_MUTATED results are not verdicts
                                 // either (Core InvalidBlockFound skips them).
-                                if e.is_invalid_block_verdict() {
+                                if e.is_system_fault() || rustoshi_consensus::fatal::is_aborted() {
+                                    // Gate 6: a local system fault (or any
+                                    // result after AbortNode latched) is NOT
+                                    // a verdict -- no mark, no ban. Retry the
+                                    // block once on the next tick; a second
+                                    // fault halts (the storage layer latches
+                                    // AbortNode on a failed read/write).
+                                    tracing::error!(
+                                        "block {} at height {} NOT connected: {} \
+                                         (system fault, not a verdict)",
+                                        block_hash, height, e
+                                    );
+                                    if !system_fault_retry.note(block_hash) {
+                                        rustoshi_consensus::fatal::abort_node(&format!(
+                                            "block {} at height {} failed twice on a system fault: {}",
+                                            block_hash, height, e
+                                        ));
+                                    }
+                                    block_downloader.requeue_block_for_validation(block.clone());
+                                    system_fault_hit = true;
+                                } else if connect_error_is_verdict(&e) {
                                     connect_invalid = true;
                                 } else if !matches!(
                                     e,
@@ -4728,6 +4998,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             }
                         }
                     };
+
+                    if system_fault_hit {
+                        break;
+                    }
 
                     // Issue #5: InvalidBlockFound-equivalent. Mark the failed
                     // block invalid and (if it was the header tip) rewind so an
@@ -5352,10 +5626,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // blocks. Walks ancestors via block_store.
                                         // Skipped for the very first connection (genesis-
                                         // adjacent) where MTP=0 by convention.
+                                        // Gate 6: a header READ error is a tagged
+                                        // system fault (`?`), never "skip the check".
                                         if let Some(mtp) = compute_mtp_via_store(
                                             &block_store,
                                             &header.prev_block_hash,
-                                        ) {
+                                        )? {
                                             if header.timestamp <= mtp {
                                                 return Err(format!(
                                                     "time-too-old: header timestamp {} <= MTP {}",
@@ -5363,13 +5639,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 ));
                                             }
                                         }
-                                        block_store
-                                            .put_header(&header.block_hash(), header)
-                                            .map_err(|e| e.to_string())?;
-                                        block_store
-                                            .put_height_index(height, &header.block_hash())
-                                            .map_err(|e| e.to_string())?;
-                                        Ok(())
+                                        // Gate 6 (audit F12): a failed header WRITE
+                                        // (disk full) is our fault, not the peer's.
+                                        // It used to come back as a bare string and
+                                        // land in the "genuinely invalid content"
+                                        // branch below, banning EVERY peer that sent
+                                        // headers while the disk was full. Tagged as a
+                                        // system fault (ChainDb has latched AbortNode).
+                                        store_validated_header(&block_store, header, height)
                                     },
                                     &|hash| {
                                         // Walk back through the height index to find this hash.
@@ -5654,10 +5931,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                                         // Classify the error: unconnecting-headers vs
                                         // genuinely-invalid-content (PoW, bad version, etc.).
-                                        let is_unconnecting =
-                                            e.contains("not connected") || e.contains("not in our chain");
+                                        // Gate 6 (audit F12): a local system fault
+                                        // (disk full, DB read/write error) while
+                                        // validating/storing the headers -- or anything
+                                        // after AbortNode latched -- is never the
+                                        // peer's fault. Core's MaybePunishNodeForBlock
+                                        // only acts on a BlockValidationResult.
+                                        let action = header_error_action(&e);
+                                        let is_unconnecting = action == HeaderErrorAction::Unconnecting;
 
-                                        if is_unconnecting {
+                                        if action == HeaderErrorAction::SystemFault {
+                                            tracing::error!(
+                                                "headers from peer {} not processed: local system fault \
+                                                 (NOT the peer's fault, not punished): {}",
+                                                peer_id.0, e
+                                            );
+                                        } else if is_unconnecting {
                                             // Core (net_processing.cpp::ProcessHeadersMessage)
                                             // tolerates up to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10
                                             // unconnecting-headers messages from a single peer
@@ -5811,6 +6100,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 let mut blocks_validated = 0usize;
 
                                 while blocks_validated < MAX_BLOCKS_PER_ITERATION {
+                                    // Gate 6: nothing is connected after AbortNode.
+                                    if rustoshi_consensus::fatal::is_aborted() {
+                                        break;
+                                    }
                                     let block = match block_downloader.next_block_to_validate() {
                                         Some(b) => b,
                                         None => break,
@@ -5846,6 +6139,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     // invalid + rewind the header tip so an honest
                                     // sibling can connect (InvalidBlockFound).
                                     let mut connect_invalid = false;
+                                    // Gate 6: the connect hit a local system
+                                    // fault; the block was requeued.
+                                    let mut system_fault_hit = false;
                                     let connected_undo: Option<rustoshi_consensus::validation::UndoData> = {
                                         let mut cs = chain_state.write().await;
                                         // BIP-113: compute parent MTP for
@@ -5854,16 +6150,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // above for full rationale, including
                                         // the assumeUTXO snapshot-base case
                                         // that `mtp_for_connect` handles.
-                                        let prev_block_mtp =
-                                            mtp_for_connect(&block_store, &cs.tip_hash(), &params)
-                                                .unwrap_or(0);
-                                        // Finding 16 (BIP-94 timewarp): real parent timestamp.
-                                        let prev_timestamp = block_store
-                                            .get_header(&block.header.prev_block_hash)
-                                            .ok()
-                                            .flatten()
-                                            .map(|h| h.timestamp)
-                                            .unwrap_or(0);
+                                        // Gate 6: read errors are SystemFault, not MTP 0.
+                                        let time_inputs = connect_time_inputs(
+                                            &block_store,
+                                            &cs.tip_hash(),
+                                            &block.header.prev_block_hash,
+                                            &params,
+                                        );
+                                        let (prev_block_mtp, prev_timestamp) =
+                                            time_inputs.as_ref().map(|t| *t).unwrap_or((0, 0));
                                         // Finding 4 (assumevalid): faithful 5-condition gate.
                                         let skip_scripts = compute_skip_scripts(
                                             &block_hash,
@@ -5883,20 +6178,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // bad-diffbits backstop (Core validation.cpp:4088) —
                                         // see the matching site in the validation_interval
                                         // branch above and `check_connect_diffbits`.
-                                        let connect_res = match check_connect_diffbits(&block_store, &block.header, &params) {
-                                            Ok(()) => {
+                                        let connect_res = time_inputs
+                                            .map(|_| ())
+                                            .and_then(|()| {
+                                                diffbits_gate_to_validation(
+                                                    check_connect_diffbits(&block_store, &block.header, &params),
+                                                    &block_hash,
+                                                    height,
+                                                )
+                                            })
+                                            .and_then(|()| {
                                                 // f_requested=true: blocks from the P2P block downloader
                                                 // are actively requested via getdata — no fTooFarAhead guard.
                                                 cs.process_block_with_seq_ctx(&block, &mut utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &rustoshi_storage::StoreSeqLockCtx::new(&block_store), skip_scripts, prev_timestamp)
-                                            }
-                                            Err(reason) => {
-                                                tracing::error!(
-                                                    "connect-path bad-diffbits backstop rejected block {} at height {}: {}",
-                                                    block_hash, height, reason
-                                                );
-                                                Err(rustoshi_consensus::validation::ValidationError::BadDifficulty)
-                                            }
-                                        };
+                                            });
                                         match connect_res {
                                             Ok((undo, _fees)) => {
                                                 utxo_view.commit_savepoint();
@@ -5922,10 +6217,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 // / fork block, which Core never bans (Unit A). See
                                                 // that fn for the full Core reference. A None reason
                                                 // means do NOT punish the serving peer.
-                                                if let Some(reason) = misbehavior_for_block_error(&e) {
+                                                //
+                                                // Gate-6 audit D1: punish the peer that
+                                                // DELIVERED this block (Core mapBlockSource),
+                                                // not the sender of the message that happened
+                                                // to run this loop. Unknown deliverer: nobody.
+                                                let punish = misbehavior_for_block_error(&e).and_then(|r| {
+                                                    block_downloader.take_block_source(&block_hash).map(|p| (p, r))
+                                                });
+                                                if let Some((culprit, reason)) = punish {
                                                     let mut ps = peer_state.write().await;
                                                     if let Some(ref mut pm) = ps.peer_manager {
-                                                        pm.misbehaving(peer_id, reason).await;
+                                                        pm.misbehaving(culprit, reason).await;
                                                     }
                                                 }
                                                 // Unit C: a `PrevBlockNotFound` block is a
@@ -5934,7 +6237,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 // Any OTHER error means the block extends our tip
                                                 // but is invalid (issue #5) — mark it so the
                                                 // downloader adopts the honest sibling.
-                                                if matches!(
+                                                if e.is_system_fault() || rustoshi_consensus::fatal::is_aborted() {
+                                                    // Gate 6: our disk / DB failed, not the
+                                                    // block. No mark, no ban (misbehavior_for_
+                                                    // block_error returned None above). Requeue
+                                                    // and retry once; a second fault halts.
+                                                    tracing::error!(
+                                                        "block {} at height {} NOT connected: {} \
+                                                         (system fault, not a verdict)",
+                                                        block_hash, height, e
+                                                    );
+                                                    if !system_fault_retry.note(block_hash) {
+                                                        rustoshi_consensus::fatal::abort_node(&format!(
+                                                            "block {} at height {} failed twice on a system fault: {}",
+                                                            block_hash, height, e
+                                                        ));
+                                                    }
+                                                    block_downloader.requeue_block_for_validation(block.clone());
+                                                    system_fault_hit = true;
+                                                } else if matches!(
                                                     e,
                                                     rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)
                                                 ) {
@@ -5955,7 +6276,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                          chain is present",
                                                         block_hash, height, e
                                                     );
-                                                } else if e.is_invalid_block_verdict() {
+                                                } else if connect_error_is_verdict(&e) {
                                                     connect_invalid = true;
                                                 } else {
                                                     // BLOCK_MUTATED (bad merkle / witness
@@ -5974,6 +6295,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             }
                                         }
                                     };
+
+                                    if system_fault_hit {
+                                        break;
+                                    }
 
                                     // Issue #5: InvalidBlockFound-equivalent
                                     // (Core validation.cpp:3043). Mark the failed
@@ -6065,8 +6390,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 "Unit C: pre-reorg UTXO flush failed: {}", e
                                             );
                                         }
+                                        // Gate 6 (audit F2 tail): a failed pre-reorg flush
+                                        // used to fall through and run the reorg against a
+                                        // stale on-disk UTXO set. The flush failure has
+                                        // latched AbortNode; do not reorg, stop validating.
+                                        if rustoshi_consensus::fatal::is_aborted() {
+                                            break;
+                                        }
 
                                         let block_hash_for_reorg = block_hash;
+                                        // Gate-6 audit D1: the deliverer, not the
+                                        // current message's sender.
+                                        let deliverer = block_downloader
+                                            .take_block_source(&block_hash_for_reorg)
+                                            .unwrap_or(peer_id);
                                         let reorg_result = {
                                             let mut rpc = rpc_state.write().await;
                                             rustoshi_rpc::server::try_attach_and_reorg_detailed(
@@ -6123,7 +6460,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 if side_branch_source.len() >= 1024 {
                                                     side_branch_source.clear();
                                                 }
-                                                side_branch_source.insert(block_hash_for_reorg, peer_id);
+                                                side_branch_source.insert(block_hash_for_reorg, deliverer);
                                                 // next_block_to_validate bumped the validated-tip
                                                 // counter for this block although it did not
                                                 // connect. Left stale it labels the NEXT connected
@@ -6154,7 +6491,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     //     block — this peer if it is this block,
                                                     //     else the recorded side-branch source.
                                                     let source = if inv.failed == block_hash_for_reorg {
-                                                        Some(peer_id)
+                                                        Some(deliverer)
                                                     } else {
                                                         side_branch_source.get(&inv.failed).copied()
                                                     };
@@ -6662,10 +6999,30 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 };
                                 let mut rpc = rpc_state.write().await;
                                 // Refresh tip snapshot for IsFinalTx / coinbase-maturity checks.
-                                {
+                                //
+                                // Gate 6 (audit tier 3): a header read error used to
+                                // become MTP 0, so every time-locked tx was "non-final"
+                                // and landed in recently_rejected. Now the tx is simply
+                                // not processed (not rejected, not cached, sender not
+                                // scored); the read error has latched AbortNode.
+                                let tip_mtp = {
                                     let h = rpc.best_height;
-                                    let mtp = compute_mtp_via_store(&block_store, &rpc.best_hash).unwrap_or(0) as i64;
-                                    rpc.mempool.notify_new_tip(h, mtp);
+                                    match compute_mtp_via_store(&block_store, &rpc.best_hash) {
+                                        Ok(m) => {
+                                            rpc.mempool.notify_new_tip(h, m.unwrap_or(0) as i64);
+                                            true
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "tx {} from peer {} not processed: {} (system fault)",
+                                                txid, peer_id.0, e
+                                            );
+                                            false
+                                        }
+                                    }
+                                };
+                                if !tip_mtp || rustoshi_consensus::fatal::is_aborted() {
+                                    continue;
                                 }
                                 let result = rpc.mempool.add_transaction(tx.clone(), &|outpoint| {
                                     // Look up UTXO from storage
@@ -6801,6 +7158,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 ),
                                             }
                                         }
+                                    }
+                                    Err(e) if rustoshi_consensus::fatal::is_aborted() => {
+                                        // Gate 6: a coin read failed during admission
+                                        // (AbortNode latched). Not a reject: no cache.
+                                        tracing::error!(
+                                            "tx {} not judged (system fault after AbortNode): {}",
+                                            txid, e
+                                        );
                                     }
                                     Err(e) => {
                                         tracing::debug!("Rejected tx {}: {}", txid, e);
@@ -8458,6 +8823,21 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
         let entries = utxo_view.cache_len();
         let mem_mb = utxo_view.estimated_memory() / (1024 * 1024);
+        // Gate 6 (AbortNode): after a failed chainstate write or read the
+        // in-memory view is not trusted to be what the disk should hold, so
+        // it is NOT flushed (Core does not write the chainstate after
+        // AbortNode). The durable state is the last successful atomic batch;
+        // the restart replays from there.
+        let skip_flush = rustoshi_consensus::fatal::is_aborted();
+        if skip_flush {
+            tracing::error!(
+                "shutdown flush SKIPPED: AbortNode latched ({}); {} cached UTXO entries + {} \
+                 un-persisted blocks discarded, restart resumes from the last durable tip",
+                rustoshi_consensus::fatal::abort_reason().unwrap_or_default(),
+                entries,
+                pending_blocks.len()
+            );
+        }
         // Unit B: the connect loop may hold un-persisted block bodies + undo
         // in `pending_blocks` (connected since the last flush boundary).
         // Persist them in the SAME atomic batch as the final UTXO + tip
@@ -8467,13 +8847,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         // the exit path minimal; the next connect-loop flush prunes (and
         // `None` leaves the prune watermark untouched so the contiguous
         // sweep resumes correctly on restart).
-        match utxo_view.flush_with_tip_and_blocks(
-            &tip_hash,
-            tip_height,
-            &pending_blocks,
-            &[],
-            None,
-        ) {
+        match if skip_flush {
+            Ok(())
+        } else {
+            utxo_view.flush_with_tip_and_blocks(
+                &tip_hash,
+                tip_height,
+                &pending_blocks,
+                &[],
+                None,
+            )
+        } {
+            Ok(()) if skip_flush => {}
             Ok(()) => {
                 tracing::info!(
                     "UTXO+tip+{}blk flushed atomically on shutdown: {} entries, ~{} MiB, tip {} at height {}",
@@ -8503,6 +8888,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     remove_pid_file(&pid_path);
 
     tracing::info!("Shutdown complete");
+
+    // Gate 6: exit NON-ZERO after AbortNode so the supervisor
+    // (systemd Restart=on-failure) restarts the node on its durable state.
+    if rustoshi_consensus::fatal::is_aborted() {
+        anyhow::bail!(
+            "aborted: {}",
+            rustoshi_consensus::fatal::abort_reason().unwrap_or_default()
+        );
+    }
 
     Ok(())
 }
@@ -9252,7 +9646,7 @@ mod tests {
         // Partial median of {1_775_651_930, 1_775_653_126}.
         assert_eq!(
             compute_mtp_via_store(&store, &h2_hash),
-            Some(1_775_653_126)
+            Ok(Some(1_775_653_126))
         );
     }
 
@@ -9263,7 +9657,224 @@ mod tests {
         // `mtp_for_connect` can fall back to `base_mtp`.
         let (_dir, db) = mtp_test_store();
         let store = BlockStore::new(&db);
-        assert_eq!(compute_mtp_via_store(&store, &Hash256([9u8; 32])), None);
+        assert_eq!(compute_mtp_via_store(&store, &Hash256([9u8; 32])), Ok(None));
+    }
+
+    // =================================================================
+    // GATE 6 — a system fault is never a verdict and never a ban
+    // (receipts/gate6-resource-limit-audit-2026-10-04.md, rustoshi F5,
+    // B2 diffbits, F12 header closure, F9 via the P2P classifier)
+    // =================================================================
+
+    /// Two stored, linked headers (parent `p` -> tip `t`).
+    fn gate6_two_headers(store: &BlockStore) -> (Hash256, Hash256) {
+        let p = hdr(Hash256([3u8; 32]), 1_775_651_930);
+        let p_hash = p.block_hash();
+        let t = hdr(p_hash, 1_775_653_126);
+        let t_hash = t.block_hash();
+        store.put_header(&p_hash, &p).unwrap();
+        store.put_header(&t_hash, &t).unwrap();
+        (p_hash, t_hash)
+    }
+
+    /// F5: a header READ ERROR while computing the connect-time MTP / parent
+    /// timestamp is a non-verdict error. Pre-fix it collapsed to MTP 0, which
+    /// waived time-too-old and made every time-locked tx a nonfinal VERDICT.
+    #[test]
+    fn gate6_mtp_read_error_is_not_mtp_zero() {
+        let _g = rustoshi_consensus::fatal::test_serial_guard();
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let (_p, t) = gate6_two_headers(&store);
+        let params = ChainParams::regtest();
+        db.inject_read_faults(Some(rustoshi_storage::columns::CF_HEADERS), 1000);
+        let r = connect_time_inputs(&store, &t, &t, &params);
+        db.inject_read_faults(None, 0);
+        let e = r.expect_err("a failed header read must not yield an MTP");
+        assert!(!e.is_invalid_block_verdict(), "{e:?}");
+        assert!(misbehavior_for_block_error(&e).is_none(), "{e:?}");
+        rustoshi_consensus::fatal::reset_for_tests();
+    }
+
+    /// Control: with no fault the same inputs are the real MTP and parent time.
+    #[test]
+    fn gate6_control_mtp_without_fault() {
+        let _g = rustoshi_consensus::fatal::test_serial_guard();
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let (_p, t) = gate6_two_headers(&store);
+        let params = ChainParams::regtest();
+        let (mtp, ts) = connect_time_inputs(&store, &t, &t, &params).expect("no fault");
+        assert_eq!(mtp, 1_775_653_126);
+        assert_eq!(ts, 1_775_653_126);
+    }
+
+    /// B2: a block-index READ error in the connect-path diffbits backstop is
+    /// not `BadDifficulty`. Pre-fix it was: persisted FAILED_VALIDITY + ban.
+    #[test]
+    fn gate6_diffbits_index_read_error_is_not_bad_difficulty() {
+        let _g = rustoshi_consensus::fatal::test_serial_guard();
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let child = hdr(params.genesis_hash, params.genesis_block.header.timestamp + 600);
+        db.inject_read_faults(Some(rustoshi_storage::columns::CF_BLOCK_INDEX), 1000);
+        let gate = check_connect_diffbits(&store, &child, &params);
+        db.inject_read_faults(None, 0);
+        let e = diffbits_gate_to_validation(gate, &child.block_hash(), 1)
+            .expect_err("the gate could not run: the block must not connect");
+        assert!(!e.is_invalid_block_verdict(), "{e:?}");
+        assert!(misbehavior_for_block_error(&e).is_none(), "{e:?}");
+        rustoshi_consensus::fatal::reset_for_tests();
+    }
+
+    /// Control: a genuinely wrong nBits is still `bad-diffbits` (a verdict).
+    #[test]
+    fn gate6_control_wrong_nbits_is_bad_difficulty() {
+        let _g = rustoshi_consensus::fatal::test_serial_guard();
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let g = &params.genesis_block.header;
+        store.put_header(&params.genesis_hash, g).unwrap();
+        let mut status = rustoshi_storage::block_store::BlockStatus::new();
+        status.set(rustoshi_storage::block_store::BlockStatus::HAVE_DATA);
+        store
+            .put_block_index(
+                &params.genesis_hash,
+                &rustoshi_storage::block_store::BlockIndexEntry {
+                    height: 0,
+                    status,
+                    n_tx: 1,
+                    timestamp: g.timestamp,
+                    bits: g.bits,
+                    nonce: g.nonce,
+                    version: g.version,
+                    prev_hash: Hash256::ZERO,
+                    chain_work: [0u8; 32],
+                },
+            )
+            .unwrap();
+        // regtest requires the parent's (pow-limit) bits; 0x1d00ffff is wrong.
+        let mut child = hdr(params.genesis_hash, g.timestamp + 600);
+        child.bits = 0x1d00_ffff;
+        let e = diffbits_gate_to_validation(
+            check_connect_diffbits(&store, &child, &params),
+            &child.block_hash(),
+            1,
+        )
+        .expect_err("wrong nBits");
+        assert_eq!(e, ValidationError::BadDifficulty);
+        assert!(e.is_invalid_block_verdict());
+        assert!(misbehavior_for_block_error(&e).is_some());
+    }
+
+    /// F12: a header WRITE failure (disk full) is never classified as invalid
+    /// header content. Pre-fix every header-sending peer was banned
+    /// (`InvalidBlockHeader`) while the disk was full.
+    #[test]
+    fn gate6_header_write_failure_does_not_punish() {
+        let _g = rustoshi_consensus::fatal::test_serial_guard();
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let header = hdr(Hash256([4u8; 32]), 1_775_653_126);
+        db.inject_write_faults(1000);
+        let r = store_validated_header(&store, &header, 10);
+        db.inject_write_faults(0);
+        let e = r.expect_err("the header write failed");
+        assert_ne!(header_error_action(&e), HeaderErrorAction::Invalid, "{e}");
+        rustoshi_consensus::fatal::reset_for_tests();
+    }
+
+    /// Control: invalid header content is still punished; unconnecting
+    /// headers keep Core's tolerance path.
+    #[test]
+    fn gate6_control_invalid_header_still_punished() {
+        let _g = rustoshi_consensus::fatal::test_serial_guard();
+        assert_eq!(header_error_action("high-hash"), HeaderErrorAction::Invalid);
+        assert_eq!(
+            header_error_action("time-too-old: header timestamp 1 <= MTP 2"),
+            HeaderErrorAction::Invalid
+        );
+        assert_eq!(
+            header_error_action("headers not connected to our chain"),
+            HeaderErrorAction::Unconnecting
+        );
+    }
+
+    /// F9 through the P2P classifier: a block whose coin read fails is neither
+    /// marked nor punished. Pre-fix: MissingInput -> FAILED_VALIDITY + ban.
+    #[test]
+    fn gate6_coin_read_error_not_punished_control_missing_coin_is() {
+        let _g = rustoshi_consensus::fatal::test_serial_guard();
+        use rustoshi_consensus::validation::{connect_block_with_sequence_locks, CoinEntry, UtxoView};
+        use rustoshi_primitives::{Block, OutPoint, Transaction, TxIn, TxOut};
+        struct NoSeq;
+        impl rustoshi_consensus::validation::SequenceLockContext for NoSeq {
+            fn get_mtp_at_height(&self, _h: u32) -> u32 {
+                0
+            }
+        }
+        let params = ChainParams::regtest();
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let funded = OutPoint { txid: Hash256([0x31; 32]), vout: 0 };
+        {
+            let mut v = store.utxo_view();
+            v.add_utxo(
+                &funded,
+                CoinEntry { height: 1, is_coinbase: false, value: 50_000, script_pubkey: vec![0x51] },
+            );
+            v.flush().unwrap();
+        }
+        let mk = |prev: OutPoint| Block {
+            header: hdr(Hash256([0x32; 32]), 1_775_653_126),
+            transactions: vec![
+                Transaction {
+                    version: 1,
+                    inputs: vec![TxIn {
+                        previous_output: OutPoint { txid: Hash256::ZERO, vout: 0xFFFF_FFFF },
+                        script_sig: vec![0x02, 0xc8, 0x00],
+                        sequence: 0xFFFF_FFFF,
+                        witness: vec![],
+                    }],
+                    outputs: vec![TxOut { value: 1_000, script_pubkey: vec![0x51] }],
+                    lock_time: 0,
+                },
+                Transaction {
+                    version: 1,
+                    inputs: vec![TxIn {
+                        previous_output: prev,
+                        script_sig: vec![],
+                        sequence: 0xFFFF_FFFF,
+                        witness: vec![],
+                    }],
+                    outputs: vec![TxOut { value: 40_000, script_pubkey: vec![0x51] }],
+                    lock_time: 0,
+                },
+            ],
+        };
+        // Fault: the coin exists but cannot be read.
+        let mut view = store.utxo_view();
+        db.inject_read_faults(Some(rustoshi_storage::columns::CF_UTXO), 1000);
+        let r = connect_block_with_sequence_locks(
+            &mk(funded.clone()), 200, &mut view as &mut dyn UtxoView, &params, &NoSeq, 0, true, None,
+        );
+        db.inject_read_faults(None, 0);
+        let e = r.expect_err("unreadable coin: must not connect");
+        assert!(!e.is_invalid_block_verdict(), "{e:?}");
+        assert!(misbehavior_for_block_error(&e).is_none(), "{e:?}");
+        rustoshi_consensus::fatal::reset_for_tests();
+
+        // Control: a coin that does not exist is a verdict and is punished.
+        let mut view = store.utxo_view();
+        let e = connect_block_with_sequence_locks(
+            &mk(OutPoint { txid: Hash256([0x33; 32]), vout: 0 }),
+            200, &mut view as &mut dyn UtxoView, &params, &NoSeq, 0, true, None,
+        )
+        .expect_err("missing coin");
+        assert!(e.is_invalid_block_verdict(), "{e:?}");
+        assert_eq!(misbehavior_for_block_error(&e), Some(MisbehaviorReason::InvalidBlock));
     }
 
     // =================================================================
@@ -9555,10 +10166,11 @@ mod tests {
         let base_hash = snapshot_base.blockhash;
 
         // Pre-fix behaviour: bare `compute_mtp_via_store` -> None -> 0.
-        assert_eq!(compute_mtp_via_store(&store, &base_hash), None);
+        assert_eq!(compute_mtp_via_store(&store, &base_hash), Ok(None));
 
         // Post-fix behaviour: `mtp_for_connect` recovers the real MTP.
         let mtp = mtp_for_connect(&store, &base_hash, &params)
+            .expect("no read error")
             .expect("snapshot-base MTP must resolve via base_mtp");
         assert_eq!(mtp, 1_775_650_208);
         assert_eq!(Some(mtp), snapshot_base.base_mtp);
@@ -9594,7 +10206,7 @@ mod tests {
         };
 
         // Buggy cutoff (compute_mtp_via_store alone -> unwrap_or(0)).
-        let buggy_cutoff = compute_mtp_via_store(&store, &base_hash).unwrap_or(0);
+        let buggy_cutoff = compute_mtp_via_store(&store, &base_hash).unwrap().unwrap_or(0);
         assert_eq!(buggy_cutoff, 0);
         assert!(
             !is_final_tx(&tx, 944_184, buggy_cutoff),
@@ -9602,7 +10214,7 @@ mod tests {
         );
 
         // Fixed cutoff (mtp_for_connect -> base_mtp).
-        let fixed_cutoff = mtp_for_connect(&store, &base_hash, &params).unwrap_or(0);
+        let fixed_cutoff = mtp_for_connect(&store, &base_hash, &params).unwrap().unwrap_or(0);
         assert_eq!(fixed_cutoff, 1_775_650_208);
         assert!(
             is_final_tx(&tx, 944_184, fixed_cutoff),
@@ -9621,7 +10233,7 @@ mod tests {
         let params = ChainParams::mainnet();
         assert_eq!(
             mtp_for_connect(&store, &Hash256([0x5a; 32]), &params),
-            None
+            Ok(None)
         );
     }
 

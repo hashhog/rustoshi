@@ -634,7 +634,13 @@ pub fn diffbits_gate_for_header<P: HeaderProvider + ?Sized>(
             // have real parent bits for the downgraded check.
             let parent_bits = cache
                 .get(provider, parent_hash)
-                .map_err(|e| format!("bad-diffbits: storage error: {}", e))?
+                .map_err(|e| {
+                    format!(
+                        "{}: bad-diffbits gate storage read failed: {}",
+                        rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                        e
+                    )
+                })?
                 .map(|m| m.bits);
             degrade_at_snapshot_base(
                 parent_bits,
@@ -655,12 +661,27 @@ pub fn diffbits_gate_for_header<P: HeaderProvider + ?Sized>(
             // still carry real bits when a tail band was supplied.
             let parent_bits = provider
                 .indexed_block(&h)
-                .map_err(|e| format!("bad-diffbits: storage error: {}", e))?
+                .map_err(|e| {
+                    format!(
+                        "{}: bad-diffbits gate storage read failed: {}",
+                        rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                        e
+                    )
+                })?
                 .map(|i| i.bits)
                 .filter(|b| *b != 0);
             degrade_at_snapshot_base(parent_bits, header_bits, height, &h, height, params)
         }
 
+        // Gate 6: a storage READ error is a local system fault, never a
+        // `bad-diffbits` verdict (it used to become one: persisted
+        // FAILED_VALIDITY + a ban on the connect path, a ban of every header
+        // sender on the header path). Tagged so string-typed callers can tell.
+        Err(ExpectedBitsError::Storage(e)) => Err(format!(
+            "{}: bad-diffbits gate storage read failed: {}",
+            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+            e
+        )),
         Err(e) => Err(format!("bad-diffbits: {}", e.describe())),
     }
 }

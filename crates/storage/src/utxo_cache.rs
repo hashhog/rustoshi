@@ -533,8 +533,13 @@ impl<'a> CoinsViewCache<'a> {
     /// Flush all dirty entries to a database-backed view.
     ///
     /// This writes all modifications to the backing store and clears the cache.
+    ///
+    /// Gate 6 (G19/B5): entries are cleared only after every write returned
+    /// `Ok`. On an error the cache is left intact (writes are idempotent, so
+    /// the next flush simply redoes them); it used to `drain()` first and
+    /// lose every entry not yet written.
     pub fn flush_to_db(&mut self, db: &CoinsViewDB) -> Result<(), StorageError> {
-        for (outpoint, entry) in self.cache.drain() {
+        for (outpoint, entry) in self.cache.iter() {
             if !entry.is_dirty() {
                 continue;
             }
@@ -542,19 +547,21 @@ impl<'a> CoinsViewCache<'a> {
             if entry.coin.is_spent() {
                 // FRESH + spent = never existed in DB, nothing to delete
                 if !entry.is_fresh() {
-                    db.delete_coin(&outpoint)?;
+                    db.delete_coin(outpoint)?;
                 }
             } else {
-                db.put_coin(&outpoint, &entry.coin)?;
+                db.put_coin(outpoint, &entry.coin)?;
             }
         }
 
         // Update best block if set
-        if let Some(hash) = self.hash_block.take() {
+        if let Some(hash) = self.hash_block {
             use crate::columns::CF_META;
             use crate::db::META_BEST_BLOCK_HASH;
             db.db().put_cf(CF_META, META_BEST_BLOCK_HASH, hash.as_bytes())?;
         }
+        self.hash_block = None;
+        self.cache.clear();
 
         self.cached_coins_usage = 0;
         self.dirty_count = 0;

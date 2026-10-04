@@ -556,7 +556,15 @@ fn g17_persistence_failure_silent_in_exit_code() {
     let shutdown = main_rs
         .find("tracing::info!(\"Shutdown complete\");")
         .expect("G17: shutdown complete log changed — re-verify");
-    let after = &main_rs[shutdown..shutdown.saturating_add(80)];
+    // Gate 6 (2026-10-04): after AbortNode (a failed chainstate write/read)
+    // the process now exits NON-ZERO so the supervisor restarts it; every
+    // other shutdown still returns Ok(()) (mempool / fee-estimate save
+    // failures remain log-only -- the rest of BUG-17).
+    let after = &main_rs[shutdown..shutdown.saturating_add(600)];
+    assert!(
+        after.contains("fatal::is_aborted()") && after.contains("anyhow::bail!"),
+        "gate 6: an aborted node must exit non-zero after shutdown"
+    );
     assert!(
         after.contains("Ok(())"),
         "G17: shutdown return path changed — re-verify"

@@ -145,6 +145,11 @@ pub mod rpc_error {
     pub const RPC_DESERIALIZATION_ERROR: i32 = -22;
     /// Transaction error (generic).
     pub const RPC_TRANSACTION_ERROR: i32 = -25;
+    /// General error during transaction or block submission
+    /// (`bitcoin-core/src/rpc/protocol.h::RPC_VERIFY_ERROR = -25`). Core's
+    /// `BIP22ValidationResult` throws it when `state.IsError()` -- a system
+    /// failure, as opposed to a block that is invalid (gate 6).
+    pub const RPC_VERIFY_ERROR: i32 = -25;
     /// Transaction rejected by mempool.
     pub const RPC_VERIFY_REJECTED: i32 = -26;
     /// Transaction rejected by mempool (alias for clarity).
@@ -4266,7 +4271,10 @@ impl RpcServerImpl {
 /// crate-local helper here to avoid pulling the binary's helper into the
 /// RPC crate.  Drift between the two should stay limited (both walk the
 /// same `BlockStore::get_header` chain).
-fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> u32 {
+///
+/// Gate 6 (audit F5): a header READ ERROR is `Err` (tagged system fault),
+/// never a shorter window or 0.
+fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> Result<u32, String> {
     use rustoshi_consensus::params::MEDIAN_TIME_PAST_WINDOW;
     let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
     let mut current = *tip_hash;
@@ -4279,14 +4287,33 @@ fn compute_prev_block_mtp(block_store: &BlockStore, tip_hash: &Hash256) -> u32 {
                 }
                 current = header.prev_block_hash;
             }
-            _ => break,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(format!(
+                    "{}: MTP header read {} failed: {}",
+                    rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                    current,
+                    e
+                ))
+            }
         }
     }
     if timestamps.is_empty() {
-        return 0;
+        return Ok(0);
     }
     timestamps.sort_unstable();
-    timestamps[timestamps.len() / 2]
+    Ok(timestamps[timestamps.len() / 2])
+}
+
+/// Gate 6: the JSON-RPC error a submission gets when the node, not the block,
+/// failed (Core `BIP22ValidationResult`: `state.IsError()` ->
+/// `JSONRPCError(RPC_VERIFY_ERROR, ..)`). Never a BIP-22 reject token.
+fn submit_system_fault_error(what: &str) -> jsonrpsee::types::ErrorObjectOwned {
+    jsonrpsee::types::ErrorObjectOwned::owned(
+        rpc_error::RPC_VERIFY_ERROR,
+        format!("system error, block not judged: {}", what),
+        None::<()>,
+    )
 }
 
 /// A `SequenceLockContext` backed by the persistent block/header store.
@@ -4435,8 +4462,16 @@ pub fn broadcast_signed_tx(
     // Refresh tip snapshot for IsFinalTx / coinbase-maturity checks.
     {
         let tip_height = state.best_height;
-        let mtp = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+        // Gate 6: a header read error is a system fault (refuse, no reject
+        // cache), never MTP 0 (every time-locked tx "non-final").
+        let mtp = compute_prev_block_mtp(&store, &state.best_hash)? as i64;
         state.mempool.notify_new_tip(tip_height, mtp);
+    }
+    if rustoshi_consensus::fatal::is_aborted() {
+        return Err(format!(
+            "{}: node is shutting down after a fatal error",
+            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG
+        ));
     }
 
     let utxo_lookup = |outpoint: &OutPoint| {
@@ -4461,6 +4496,13 @@ pub fn broadcast_signed_tx(
             }
             Ok(txid)
         }
+        // Gate 6: a coin read failed during admission (AbortNode latched):
+        // a system error, not a reject token.
+        Err(e) if rustoshi_consensus::fatal::is_aborted() => Err(format!(
+            "{}: transaction not judged: {}",
+            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+            e
+        )),
         Err(e) => {
             use rustoshi_consensus::mempool::MempoolError;
             match &e {
@@ -4866,6 +4908,8 @@ fn disconnect_to(
     store
         .write_batch(batch)
         .map_err(|e| format!("write_batch (disconnect_to): {}", e))?;
+    // Gate 6: the staged coins are durable only now; drop them from the view.
+    utxo_view.mark_flushed();
 
     // Coinstatsindex: drop per-height snapshots for the disconnected range so
     // a query for a not-yet-reconnected height never returns the orphaned
@@ -4921,7 +4965,8 @@ fn disconnect_to(
         // Sync mempool's tip-snapshot to the new tip so that IsFinalTx
         // (BIP-113) + coinbase-maturity checks during refill use the
         // post-rewind height + MTP rather than the pre-rewind values.
-        let mtp = compute_prev_block_mtp(&store, &target_hash) as i64;
+        // Mempool refill only (no verdict); a read error has latched AbortNode.
+        let mtp = compute_prev_block_mtp(&store, &target_hash).unwrap_or(0) as i64;
         state.mempool.notify_new_tip(target_height, mtp);
 
         let refill_view = store.utxo_view();
@@ -5248,7 +5293,10 @@ pub fn try_attach_and_reorg_detailed(
         // BIP-113 MTP gate (time-too-old): the real check; StubChainContext
         // returns MTP=0. Walks the parent's 11 ancestors via the store, exactly
         // like submitheader / the header-sync path.
-        let mtp = compute_prev_block_mtp(&store, &block.header.prev_block_hash);
+        // Gate 6: a read error is a non-verdict refusal (no sentinel, no
+        // `invalid`), never MTP 0 (which skipped this check).
+        let mtp = compute_prev_block_mtp(&store, &block.header.prev_block_hash)
+            .map_err(AttachReorgError::from)?;
         if mtp > 0 && block.header.timestamp <= mtp {
             tracing::warn!(
                 "try_attach_and_reorg: side-branch block {} rejected at store: time-too-old (ts {} <= parent MTP {})",
@@ -5426,6 +5474,23 @@ pub fn try_attach_and_reorg_detailed(
                 // canonical BIP-22 code (via the sentinel) so submitblock
                 // reports the same reason Core does on the reorg arm (e.g.
                 // `bad-cb-amount`) instead of the free-form Display string.
+                // Gate 6: a system fault (or anything after AbortNode) is not
+                // a consensus failure -- no sentinel, nothing marked below.
+                let system_fault = failure.error.is_system_fault()
+                    || rustoshi_consensus::fatal::is_aborted();
+                if system_fault {
+                    tracing::error!(
+                        "reorg onto {} not attempted to completion: {} (system fault, NOT a verdict)",
+                        block_hash,
+                        failure.error
+                    );
+                    return Err(AttachReorgError::from(format!(
+                        "{}: reorg onto {}: {}",
+                        rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                        block_hash,
+                        failure.error
+                    )));
+                }
                 let reason = format!(
                     "{}{}",
                     REORG_CONSENSUS_REJECT_SENTINEL,
@@ -5656,9 +5721,15 @@ pub fn try_attach_and_reorg_detailed(
     // (delete for disconnected branch + put for new branch) + new-branch
     // block undo all flip together.
     // Pattern D fleet-wide closure: an N+M block reorg lands in one batch.
-    store
-        .write_batch(batch)
-        .map_err(|e| format!("write_batch (try_attach_and_reorg): {}", e))?;
+    store.write_batch(batch).map_err(|e| {
+        format!(
+            "{}: write_batch (try_attach_and_reorg): {}",
+            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+            e
+        )
+    })?;
+    // Gate 6: the staged coins are durable only now; drop them from the view.
+    utxo_view.mark_flushed();
 
     state.best_hash = new_tip_hash;
     state.best_height = new_tip_height;
@@ -5808,7 +5879,8 @@ pub fn try_attach_and_reorg_detailed(
     if !disconnected_blocks.is_empty() {
         // Sync mempool's tip-snapshot to the new tip before refill — see
         // disconnect_to() for the same rationale.
-        let mtp = compute_prev_block_mtp(&store, &new_tip_hash) as i64;
+        // Mempool refill only (no verdict); a read error has latched AbortNode.
+        let mtp = compute_prev_block_mtp(&store, &new_tip_hash).unwrap_or(0) as i64;
         state.mempool.notify_new_tip(new_tip_height, mtp);
 
         let refill_view = store.utxo_view();
@@ -6294,7 +6366,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             // if the helper can't reach a full window (returns 0) so we never
             // surface a zero mediantime on genesis-adjacent chains.
             let mediantime_val = {
-                let mtp = compute_prev_block_mtp(&store, &state.best_hash);
+                let mtp = compute_prev_block_mtp(&store, &state.best_hash).unwrap_or(0);
                 if mtp != 0 { mtp as u64 } else { tip_time_val }
             };
 
@@ -7395,14 +7467,15 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // BIP-113 lock_time_cutoff: MTP of the parent block, computed
                 // from the on-disk header chain (same helper the connect path
                 // uses). The parent is the previous block in the active chain.
+                // Gate 6: a read error is an RPC error, not a failed check.
                 let prev_block_mtp =
-                    compute_prev_block_mtp(&store, &block.header.prev_block_hash);
+                    compute_prev_block_mtp(&store, &block.header.prev_block_hash)
+                        .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e))?;
 
                 // Finding 16 (BIP-94 timewarp): real parent timestamp for gate.
                 let prev_timestamp = store
                     .get_header(&block.header.prev_block_hash)
-                    .ok()
-                    .flatten()
+                    .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
                     .map(|h| h.timestamp)
                     .unwrap_or(0);
                 let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
@@ -8507,7 +8580,14 @@ impl RustoshiRpcServer for RpcServerImpl {
         {
             let tip_height = state.best_height;
             let store = BlockStore::new(&db);
-            let mtp = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+            // Gate 6: a header read error refuses the request as a system
+            // error (no reject cache), never MTP 0 (time-locked txs
+            // "non-final").
+            let mtp = compute_prev_block_mtp(&store, &state.best_hash)
+                .map_err(|e| submit_system_fault_error(&e))? as i64;
+            if rustoshi_consensus::fatal::is_aborted() {
+                return Err(submit_system_fault_error("node is shutting down after a fatal error"));
+            }
             state.mempool.notify_new_tip(tip_height, mtp);
         }
 
@@ -8579,6 +8659,11 @@ impl RustoshiRpcServer for RpcServerImpl {
                 }
 
                 Ok(txid.to_hex())
+            }
+            // Gate 6: a coin read failed during admission (AbortNode
+            // latched): RPC_VERIFY_ERROR, never a reject token.
+            Err(e) if rustoshi_consensus::fatal::is_aborted() => {
+                Err(submit_system_fault_error(&e.to_string()))
             }
             Err(e) => {
                 // Map mempool errors to appropriate RPC errors
@@ -8976,7 +9061,14 @@ impl RustoshiRpcServer for RpcServerImpl {
         {
             let tip_height = state.best_height;
             let store = BlockStore::new(&db);
-            let mtp = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+            // Gate 6: a header read error refuses the request as a system
+            // error (no reject cache), never MTP 0 (time-locked txs
+            // "non-final").
+            let mtp = compute_prev_block_mtp(&store, &state.best_hash)
+                .map_err(|e| submit_system_fault_error(&e))? as i64;
+            if rustoshi_consensus::fatal::is_aborted() {
+                return Err(submit_system_fault_error("node is shutting down after a fatal error"));
+            }
             state.mempool.notify_new_tip(tip_height, mtp);
         }
         let utxo_lookup = |outpoint: &OutPoint| {
@@ -9245,7 +9337,8 @@ impl RustoshiRpcServer for RpcServerImpl {
         // miner.cpp:148 `m_lock_time_cutoff = pindexPrev->GetMedianTimePast()`.
         // The old code used tip.timestamp as an approximation — wrong for the
         // IsFinalTx lock_time_cutoff and for the mintime RPC field.
-        let median_time_past = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+        let median_time_past = compute_prev_block_mtp(&store, &state.best_hash)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e))? as i64;
 
         // Compute the next block's nBits via GetNextWorkRequired.  The old
         // code returned prev_block.bits unchanged, which is wrong at retarget
@@ -9564,6 +9657,15 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         }
 
+        // Gate 6 (AbortNode): after a fatal chainstate fault nothing is
+        // connected or judged.
+        if rustoshi_consensus::fatal::is_aborted() {
+            return Err(submit_system_fault_error(&format!(
+                "node is shutting down after a fatal error: {}",
+                rustoshi_consensus::fatal::abort_reason().unwrap_or_default()
+            )));
+        }
+
         let block_bytes = Self::parse_hex(&hex)?;
 
         // Defense in depth: catch any panics during deserialization so a malformed
@@ -9640,13 +9742,15 @@ impl RustoshiRpcServer for RpcServerImpl {
         // once CSV is active.  Returns 0 if the chain is genesis-adjacent
         // (matches Core's `CBlockIndex::GetMedianTimePast` semantics for
         // chains with < 11 ancestors).
-        let prev_block_mtp = compute_prev_block_mtp(&store, &state.best_hash);
+        //
+        // Gate 6 (audit F5): a header read error is RPC_VERIFY_ERROR, never 0.
+        let prev_block_mtp = compute_prev_block_mtp(&store, &state.best_hash)
+            .map_err(|e| submit_system_fault_error(&e))?;
 
         // Finding 16 (BIP-94 timewarp): real parent timestamp for the gate.
         let prev_timestamp = store
             .get_header(&block.header.prev_block_hash)
-            .ok()
-            .flatten()
+            .map_err(|e| submit_system_fault_error(&e.to_string()))?
             .map(|h| h.timestamp)
             .unwrap_or(0);
 
@@ -9726,6 +9830,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                 }
             }
             Ok(None) => {}
+            Err(reason) if rustoshi_consensus::fatal::is_system_fault_str(&reason) => {
+                // Gate 6: the gate could not READ the ancestors -- ours, not
+                // the block's.
+                tracing::error!("submitblock: block {} not judged: {}", block_hash, reason);
+                return Err(submit_system_fault_error(&reason));
+            }
             Err(reason) => {
                 tracing::warn!("submitblock: block {} rejected: {}", block_hash, reason);
                 return Ok(Some("bad-diffbits".to_string()));
@@ -9750,18 +9860,18 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Store header and block data
                 if let Err(e) = store.put_header(&block_hash, &block.header) {
                     tracing::error!("submitblock: failed to store header: {}", e);
-                    return Ok(Some(format!("database-error: {}", e)));
+                    return Err(submit_system_fault_error(&format!("database error: {}", e)));
                 }
                 if let Err(e) = store.put_block(&block_hash, &block) {
                     tracing::error!("submitblock: failed to store block: {}", e);
-                    return Ok(Some(format!("database-error: {}", e)));
+                    return Err(submit_system_fault_error(&format!("database error: {}", e)));
                 }
 
                 // Populate height-to-hash index
                 let new_height = state.best_height + 1;
                 if let Err(e) = store.put_height_index(new_height, &block_hash) {
                     tracing::error!("submitblock: failed to store height index: {}", e);
-                    return Ok(Some(format!("database-error: {}", e)));
+                    return Err(submit_system_fault_error(&format!("database error: {}", e)));
                 }
 
                 // Persist undo data so future reorgs / `invalidateblock` calls
@@ -9773,7 +9883,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 let storage_undo = validation_undo_to_storage(&undo_data);
                 if let Err(e) = store.put_undo(&block_hash, &storage_undo) {
                     tracing::error!("submitblock: failed to store undo data: {}", e);
-                    return Ok(Some(format!("database-error: {}", e)));
+                    return Err(submit_system_fault_error(&format!("database error: {}", e)));
                 }
 
                 // Persist a `BlockIndexEntry` (with cumulative chain_work)
@@ -9835,7 +9945,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                             "submitblock: failed to store block index: {}",
                             e
                         );
-                        return Ok(Some(format!("database-error: {}", e)));
+                        return Err(submit_system_fault_error(&format!("database error: {}", e)));
                     }
                 }
 
@@ -9870,7 +9980,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                                 "submitblock: failed to store tx index: {}",
                                 e
                             );
-                            return Ok(Some(format!("database-error: {}", e)));
+                            return Err(submit_system_fault_error(&format!("database error: {}", e)));
                         }
                     }
                 }
@@ -9936,13 +10046,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Flush UTXO changes to disk
                 if let Err(e) = utxo_view.flush() {
                     tracing::error!("submitblock: UTXO flush failed: {}", e);
-                    return Ok(Some(format!("database-error: {}", e)));
+                    return Err(submit_system_fault_error(&format!("database error: {}", e)));
                 }
 
                 // Update best block pointer
                 if let Err(e) = store.set_best_block(&block_hash, new_height) {
                     tracing::error!("submitblock: failed to update best block: {}", e);
-                    return Ok(Some(format!("database-error: {}", e)));
+                    return Err(submit_system_fault_error(&format!("database error: {}", e)));
                 }
 
                 // Update RPC state
@@ -10132,12 +10242,24 @@ impl RustoshiRpcServer for RpcServerImpl {
                             // Decision is unchanged — the block is rejected either
                             // way. R2 reason-code parity only.
                             Ok(Some("prev-blk-not-found".to_string()))
+                        } else if rustoshi_consensus::fatal::is_system_fault_str(&e)
+                            || rustoshi_consensus::fatal::is_aborted()
+                        {
+                            // Gate 6: our disk / DB failed during the reorg --
+                            // RPC_VERIFY_ERROR, not a BIP-22 reject.
+                            Err(submit_system_fault_error(&e))
                         } else {
                             // Structural / IO / depth-cap errors: unchanged.
                             Ok(Some(format!("rejected: {}", e)))
                         }
                     }
                 }
+            }
+            Err(e) if e.is_system_fault() || rustoshi_consensus::fatal::is_aborted() => {
+                // Gate 6: Core BIP22ValidationResult -- state.IsError() throws
+                // RPC_VERIFY_ERROR; it is never reported as a reject reason.
+                tracing::error!("submitblock: block {} not judged (system fault): {}", block_hash, e);
+                Err(submit_system_fault_error(&e.to_string()))
             }
             Err(e) => {
                 tracing::warn!("submitblock: block {} rejected: {}", block_hash, e);
@@ -10340,7 +10462,9 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // BIP-113 MTP gate (the real check; StubChainContext returns MTP=0).
         // Walks ancestors via the store, same as the header-sync path.
-        let mtp = compute_prev_block_mtp(&store, &header.prev_block_hash);
+        // Gate 6: a read error is RPC_VERIFY_ERROR, never "skip the check".
+        let mtp = compute_prev_block_mtp(&store, &header.prev_block_hash)
+            .map_err(|e| submit_system_fault_error(&e))?;
         if mtp > 0 && header.timestamp <= mtp {
             return Err(Self::rpc_error(
                 rpc_error::RPC_TRANSACTION_ERROR,
@@ -13561,7 +13685,14 @@ impl RustoshiRpcServer for RpcServerImpl {
         {
             let tip_height = state.best_height;
             let store = BlockStore::new(&db);
-            let mtp = compute_prev_block_mtp(&store, &state.best_hash) as i64;
+            // Gate 6: a header read error refuses the request as a system
+            // error (no reject cache), never MTP 0 (time-locked txs
+            // "non-final").
+            let mtp = compute_prev_block_mtp(&store, &state.best_hash)
+                .map_err(|e| submit_system_fault_error(&e))? as i64;
+            if rustoshi_consensus::fatal::is_aborted() {
+                return Err(submit_system_fault_error("node is shutting down after a fatal error"));
+            }
             state.mempool.notify_new_tip(tip_height, mtp);
         }
 
@@ -18114,13 +18245,13 @@ impl RpcServerImpl {
 
         // BIP-113: compute prev-block MTP for the IsFinalTx lock_time_cutoff
         // (reuses the same module-level helper as submit_block).
-        let prev_block_mtp = compute_prev_block_mtp(&store, &prev_hash);
+        let prev_block_mtp = compute_prev_block_mtp(&store, &prev_hash)
+            .map_err(|e| submit_system_fault_error(&e))?;
 
         // Finding 16 (BIP-94 timewarp): real parent timestamp for the gate.
         let prev_timestamp = store
             .get_header(&prev_hash)
-            .ok()
-            .flatten()
+            .map_err(|e| submit_system_fault_error(&e.to_string()))?
             .map(|h| h.timestamp)
             .unwrap_or(0);
 

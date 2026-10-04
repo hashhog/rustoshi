@@ -105,6 +105,9 @@ pub use historical_backfill::{
 };
 
 #[cfg(test)]
+mod gate6_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rustoshi_consensus::ChainParams;
@@ -839,8 +842,8 @@ mod tests {
 
     /// `flush_into_batch` MUST not touch RocksDB — observable state only
     /// changes when the caller commits the batch. Inversely, before the
-    /// commit, the cache MUST be drained (so a second commit attempt can
-    /// not double-write).
+    /// commit the cache is still intact (gate 6: a failed write must not lose
+    /// it), and `mark_flushed` after a successful commit releases it.
     #[test]
     fn test_flush_into_batch_defers_disk_writes_until_commit() {
         use rustoshi_consensus::validation::UtxoView;
@@ -878,11 +881,15 @@ mod tests {
             store.get_utxo(&outpoint).unwrap().is_none(),
             "flush_into_batch alone must not commit anything to disk"
         );
-        // Cache has been drained.
-        assert_eq!(view.cache_len(), 0);
+        // Gate 6 (audit F2): the cache is NOT drained by staging -- it is the
+        // only copy of these changes until the write succeeds.
+        assert_eq!(view.cache_len(), 1);
 
-        // Commit the batch — now the UTXO is visible.
+        // Commit the batch — now the UTXO is visible; only then is the cache
+        // released (re-staging after this commits nothing new).
         store.write_batch(batch).unwrap();
+        view.mark_flushed();
+        assert_eq!(view.cache_len(), 0);
         let on_disk = store.get_utxo(&outpoint).unwrap().unwrap();
         assert_eq!(on_disk.value, 12345);
     }
