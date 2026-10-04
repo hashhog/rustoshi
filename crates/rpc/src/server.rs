@@ -18133,6 +18133,16 @@ impl RpcServerImpl {
         use rustoshi_consensus::params::compact_to_target;
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        // Gate 6 (AbortNode): after a fatal chainstate fault nothing is mined,
+        // connected or judged (a disk-full run showed the next generate
+        // answering a BIP30 "verdict" built on a half-written block).
+        if rustoshi_consensus::fatal::is_aborted() {
+            return Err(submit_system_fault_error(&format!(
+                "node is shutting down after a fatal error: {}",
+                rustoshi_consensus::fatal::abort_reason().unwrap_or_default()
+            )));
+        }
+
         let mut state = self.state.write().await;
         let store = BlockStore::new(&state.db);
 
