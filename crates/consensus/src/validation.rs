@@ -365,6 +365,37 @@ pub enum TxValidationError {
 }
 
 impl ValidationError {
+    /// Whether this error is a VERDICT that the block itself is invalid, i.e.
+    /// one Bitcoin Core's `Chainstate::InvalidBlockFound` (validation.cpp)
+    /// would record as `BLOCK_FAILED_VALID` (descendants `BLOCK_FAILED_CHILD`).
+    ///
+    /// `false` for everything that says nothing about the block's validity:
+    /// - `BLOCK_MUTATED` (bad merkle root, duplicate-tx merkle malleation,
+    ///   witness commitment / nonce / unexpected witness): Core never marks a
+    ///   mutated block failed, because the honest block with the same header
+    ///   may still arrive (InvalidBlockFound's `state.GetResult() !=
+    ///   BLOCK_MUTATED` guard);
+    /// - `PrevBlockNotFound` (missing parent / body: a side-branch candidate
+    ///   or a local gap);
+    /// - `MissingAncestorHeader` ("cannot decide yet" on a snapshot boot);
+    /// - `BlockTooFarAhead` (anti-DoS refusal, not a validity check);
+    /// - `InvalidChain` (only produced by disconnect / chain-walk failures,
+    ///   i.e. local state, never by a block's own content).
+    pub fn is_invalid_block_verdict(&self) -> bool {
+        !matches!(
+            self,
+            ValidationError::BadMerkleRoot
+                | ValidationError::BadTxnsDuplicate
+                | ValidationError::BadWitnessCommitment
+                | ValidationError::BadWitnessNonceSize
+                | ValidationError::UnexpectedWitness
+                | ValidationError::PrevBlockNotFound(_)
+                | ValidationError::MissingAncestorHeader(_)
+                | ValidationError::BlockTooFarAhead(_, _)
+                | ValidationError::InvalidChain
+        )
+    }
+
     /// Map this error to the canonical BIP-22 result string.
     ///
     /// Per BIP-22 and Bitcoin Core `BIP22ValidationResult` in

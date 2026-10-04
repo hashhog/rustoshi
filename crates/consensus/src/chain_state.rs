@@ -299,6 +299,23 @@ where
 // CHAIN STATE
 // ============================================================
 
+/// Failure of [`ChainState::reorganize_with_seq_ctx_detailed`].
+///
+/// `failed_block` names the new-branch block that failed validation when
+/// (and only when) `error` is an invalid-block verdict — the analog of the
+/// `pindexNew` Bitcoin Core's `ConnectTip` passes to `InvalidBlockFound`.
+#[derive(Debug)]
+pub struct ReorgFailure {
+    pub error: ValidationError,
+    pub failed_block: Option<Hash256>,
+}
+
+impl From<ValidationError> for ReorgFailure {
+    fn from(error: ValidationError) -> Self {
+        ReorgFailure { error, failed_block: None }
+    }
+}
+
 /// The active chain state, tracking the best chain and managing reorganizations.
 ///
 /// ChainState manages:
@@ -720,6 +737,47 @@ impl ChainState {
         FI: Fn(&Hash256) -> Option<BlockIndexEntry>,
         C: SequenceLockContext,
     {
+        self.reorganize_with_seq_ctx_detailed(
+            new_tip_hash,
+            get_block,
+            get_undo,
+            get_block_index,
+            utxo_cache,
+            seq_ctx,
+        )
+        .map_err(|f| f.error)
+    }
+
+    /// `reorganize_with_seq_ctx`, but a failure also names the new-branch
+    /// block that FAILED VALIDATION, when there is one.
+    ///
+    /// Bitcoin Core's `ActivateBestChainStep` hands a `ConnectTip` failure to
+    /// `InvalidBlockFound(pindexNew)` — it knows exactly which block on the
+    /// candidate branch was bad, marks it `BLOCK_FAILED_VALID` and its
+    /// descendants `BLOCK_FAILED_CHILD`, and `BlockChecked` punishes the peer
+    /// that delivered THAT block (validation.cpp ConnectTip / InvalidChainFound,
+    /// net_processing.cpp BlockChecked). A plain `ValidationError` loses the
+    /// "which block" half, so the caller could neither mark the branch nor stop
+    /// re-selecting it. `failed_block` is `Some` only when the error is an
+    /// invalid-block verdict ([`ValidationError::is_invalid_block_verdict`]);
+    /// disconnect failures, missing bodies/undo, a missing ancestor header and
+    /// BLOCK_MUTATED results leave it `None` (no verdict, nothing to mark).
+    pub fn reorganize_with_seq_ctx_detailed<U, FB, FU, FI, C>(
+        &mut self,
+        new_tip_hash: Hash256,
+        get_block: &FB,
+        get_undo: &FU,
+        get_block_index: &FI,
+        utxo_cache: &mut U,
+        seq_ctx: &C,
+    ) -> Result<(usize, Vec<(Hash256, u32, UndoData)>), ReorgFailure>
+    where
+        U: UtxoView,
+        FB: Fn(&Hash256) -> Option<Block>,
+        FU: Fn(&Hash256) -> Option<UndoData>,
+        FI: Fn(&Hash256) -> Option<BlockIndexEntry>,
+        C: SequenceLockContext,
+    {
         // Find the fork point
         let mut old_chain: Vec<Hash256> = Vec::new();
         let mut new_chain: Vec<Hash256> = Vec::new();
@@ -749,15 +807,15 @@ impl ChainState {
                 }
                 (Some(_old_e), None) => {
                     // New chain block not found — error
-                    return Err(ValidationError::PrevBlockNotFound(new_hash.to_hex()));
+                    return Err(ValidationError::PrevBlockNotFound(new_hash.to_hex()).into());
                 }
                 (None, Some(_)) => {
                     // Old chain block not found — error
-                    return Err(ValidationError::PrevBlockNotFound(old_hash.to_hex()));
+                    return Err(ValidationError::PrevBlockNotFound(old_hash.to_hex()).into());
                 }
                 (None, None) => {
                     // Both blocks not found — error
-                    return Err(ValidationError::InvalidChain);
+                    return Err(ValidationError::InvalidChain.into());
                 }
             }
         }
@@ -796,7 +854,7 @@ impl ChainState {
             )?;
             match result {
                 DisconnectResult::Failed => {
-                    return Err(ValidationError::InvalidChain);
+                    return Err(ValidationError::InvalidChain.into());
                 }
                 DisconnectResult::Unclean => {
                     tracing::warn!(
@@ -821,57 +879,67 @@ impl ChainState {
                 ValidationError::PrevBlockNotFound(format!("missing block for connect: {}", hash))
             })?;
             let new_height = self.tip_height + 1;
-            check_block(&block, &self.params)?;
-            // Contextual checks (BIP-34 + SegWit commitment) — must run on
-            // every block connected via reorg too.  See process_block for
-            // the full rationale.
-            contextual_check_block(&block, new_height, &StubChainContext, &self.params)?;
-            // BIP-113: compute the parent's median-time-past so that
-            // `is_final_tx` (called from `connect_block_with_sequence_locks`)
-            // uses the correct `lock_time_cutoff` once CSV is active.
-            // Walks 11 ancestors via the `get_block` closure.  Returns 0
-            // when fewer than 11 ancestors are reachable (genesis-adjacent),
-            // matching `process_block`'s null-context behaviour.
-            //
-            // Without this, the reorg path mirrors the pre-fix
-            // `process_block` bug: every tx with a timestamp-based
-            // `nLockTime > 0` is rejected as `bad-txns-nonfinal` once
-            // CSV activates (mainnet h>=419,328) — wedge described in
-            // CORE-PARITY-AUDIT/_OVERNIGHT-STATUS-MORNING.md.
-            //
-            // Reference: bitcoin-core/src/validation.cpp ConnectBlock
-            // (~line 2486) which feeds `pindex->pprev->GetMedianTimePast()`
-            // into the IsFinalTx call.
-            //
-            // A missing ancestor body (e.g. the new branch forks within 11
-            // blocks of an assumeUTXO base whose pre-base bodies are absent)
-            // used to return 0 here, which SKIPPED time-too-old and set the
-            // BIP-113 cutoff to 0. Fail closed instead: no verdict.
-            let prev_block_mtp = compute_mtp_via_get_block(&self.tip_hash, get_block)
-                .map_err(|collected| {
-                    ValidationError::MissingAncestorHeader(
-                        self.tip_height.saturating_sub(collected as u32),
-                    )
-                })?;
-            // BIP-113 / Core ContextualCheckBlockHeader: block timestamp must
-            // be strictly greater than MTP of parent.
-            // Reference: bitcoin-core/src/validation.cpp:4092
-            if prev_block_mtp > 0 && block.header.timestamp <= prev_block_mtp {
-                return Err(ValidationError::TimeTooOld);
-            }
-            let (undo, _fees) = connect_block_with_sequence_locks(
-                &block,
-                new_height,
-                utxo_cache,
-                &self.params,
-                seq_ctx,
-                prev_block_mtp,
-                false, // reorg blocks always verify scripts (condition 5 would fail: < 2 weeks burial)
-                // W3 fix: conservatively pass None here as well.  Reorg blocks are
-                // already required to verify scripts (skip=false above) so the BIP-30
-                // check runs every time, which is the safe direction.
-                None,
-            )?;
+            // Every check below is a verdict on THIS block (or a non-verdict
+            // the predicate filters out); tag a verdict with the block's hash
+            // so the caller can run its InvalidBlockFound equivalent.
+            let step = (|| -> Result<UndoData, ValidationError> {
+                check_block(&block, &self.params)?;
+                // Contextual checks (BIP-34 + SegWit commitment) — must run on
+                // every block connected via reorg too.  See process_block for
+                // the full rationale.
+                contextual_check_block(&block, new_height, &StubChainContext, &self.params)?;
+                // BIP-113: compute the parent's median-time-past so that
+                // `is_final_tx` (called from `connect_block_with_sequence_locks`)
+                // uses the correct `lock_time_cutoff` once CSV is active.
+                // Walks 11 ancestors via the `get_block` closure.  Returns 0
+                // when fewer than 11 ancestors are reachable (genesis-adjacent),
+                // matching `process_block`'s null-context behaviour.
+                //
+                // Without this, the reorg path mirrors the pre-fix
+                // `process_block` bug: every tx with a timestamp-based
+                // `nLockTime > 0` is rejected as `bad-txns-nonfinal` once
+                // CSV activates (mainnet h>=419,328) — wedge described in
+                // CORE-PARITY-AUDIT/_OVERNIGHT-STATUS-MORNING.md.
+                //
+                // Reference: bitcoin-core/src/validation.cpp ConnectBlock
+                // (~line 2486) which feeds `pindex->pprev->GetMedianTimePast()`
+                // into the IsFinalTx call.
+                //
+                // A missing ancestor body (e.g. the new branch forks within 11
+                // blocks of an assumeUTXO base whose pre-base bodies are absent)
+                // used to return 0 here, which SKIPPED time-too-old and set the
+                // BIP-113 cutoff to 0. Fail closed instead: no verdict.
+                let prev_block_mtp = compute_mtp_via_get_block(&self.tip_hash, get_block)
+                    .map_err(|collected| {
+                        ValidationError::MissingAncestorHeader(
+                            self.tip_height.saturating_sub(collected as u32),
+                        )
+                    })?;
+                // BIP-113 / Core ContextualCheckBlockHeader: block timestamp must
+                // be strictly greater than MTP of parent.
+                // Reference: bitcoin-core/src/validation.cpp:4092
+                if prev_block_mtp > 0 && block.header.timestamp <= prev_block_mtp {
+                    return Err(ValidationError::TimeTooOld);
+                }
+                let (undo, _fees) = connect_block_with_sequence_locks(
+                    &block,
+                    new_height,
+                    utxo_cache,
+                    &self.params,
+                    seq_ctx,
+                    prev_block_mtp,
+                    false, // reorg blocks always verify scripts (condition 5 would fail: < 2 weeks burial)
+                    // W3 fix: conservatively pass None here as well.  Reorg blocks are
+                    // already required to verify scripts (skip=false above) so the BIP-30
+                    // check runs every time, which is the safe direction.
+                    None,
+                )?;
+                Ok(undo)
+            })();
+            let undo = step.map_err(|error| ReorgFailure {
+                failed_block: error.is_invalid_block_verdict().then_some(*hash),
+                error,
+            })?;
             self.tip_hash = *hash;
             self.tip_height = new_height;
             connected.push((*hash, new_height, undo));

@@ -745,6 +745,39 @@ impl BlockDownloader {
         Some(hash)
     }
 
+    /// Drop every trace of `hashes` from the download pipeline (queue,
+    /// pending order, received buffer, in-flight slots, peer hints).
+    ///
+    /// Used for blocks proven invalid (Core never requests a
+    /// `BLOCK_FAILED_*` block again): a stale queued / in-flight / buffered
+    /// copy would otherwise be fetched again or handed back to the connect
+    /// loop. Frees the in-flight slot of the peer each block was requested
+    /// from. Returns how many entries were removed.
+    pub fn forget_blocks(&mut self, hashes: &std::collections::HashSet<Hash256>) -> usize {
+        let mut removed = 0usize;
+        let before = self.download_queue.len();
+        self.download_queue.retain(|(h, _)| !hashes.contains(h));
+        removed += before - self.download_queue.len();
+        let before = self.pending_hashes.len();
+        self.pending_hashes.retain(|h| !hashes.contains(h));
+        removed += before - self.pending_hashes.len();
+        for h in hashes {
+            self.pending_set.remove(h);
+            if self.received_blocks.remove(h).is_some() {
+                removed += 1;
+            }
+            if let Some(f) = self.in_flight.remove(h) {
+                if let Some(state) = self.peer_states.get_mut(&f.peer) {
+                    state.blocks_in_flight = state.blocks_in_flight.saturating_sub(1);
+                }
+                removed += 1;
+            }
+            self.timed_out_from.remove(h);
+            self.announced_by.remove(h);
+        }
+        removed
+    }
+
     /// Get the next block ready to be validated (in chain order).
     ///
     /// Blocks must be validated in sequential order because each block's

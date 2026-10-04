@@ -5030,6 +5030,63 @@ pub fn try_attach_and_reorg(
     block: &Block,
     block_hash: &Hash256,
 ) -> Result<bool, String> {
+    try_attach_and_reorg_detailed(state, block, block_hash).map_err(|e| e.reason)
+}
+
+/// The side branch an attach-and-reorg attempt proved invalid.
+///
+/// `failed` is the block that failed validation (Core: the `pindexNew` handed
+/// to `InvalidBlockFound`, now `BLOCK_FAILED_VALID`), or — for a block whose
+/// parent was already known-invalid — the block itself (`BLOCK_FAILED_CHILD`,
+/// Core `AcceptBlockHeader`'s "bad-prevblk"). `invalidated` lists every hash
+/// this call marked failed, `failed` first, then its descendants up to the
+/// attached block (Core `InvalidChainFound` / `SetBlockFailureFlags`). The
+/// P2P caller drops them from its header chain, never fetches them again,
+/// and punishes the peer that delivered `failed` (Core `BlockChecked` ->
+/// `MaybePunishNodeForBlock`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidBranch {
+    pub failed: Hash256,
+    pub invalidated: Vec<Hash256>,
+}
+
+/// Error of [`try_attach_and_reorg_detailed`]: the same `reason` string
+/// `try_attach_and_reorg` returns, plus the invalid branch when the failure
+/// was an invalid-block VERDICT. `invalid` is `None` for every non-verdict
+/// (unknown parent, storage error, depth cap, missing body/undo, a missing
+/// ancestor header, a BLOCK_MUTATED result) — nothing is marked for those.
+#[derive(Debug, Clone)]
+pub struct AttachReorgError {
+    pub reason: String,
+    pub invalid: Option<InvalidBranch>,
+}
+
+impl From<String> for AttachReorgError {
+    fn from(reason: String) -> Self {
+        AttachReorgError { reason, invalid: None }
+    }
+}
+
+/// Set `flag` on an existing block-index entry (no-op when absent).
+fn set_block_index_flag(store: &BlockStore, hash: &Hash256, flag: u32) {
+    match store.get_block_index(hash) {
+        Ok(Some(mut e)) => {
+            e.status.set(flag);
+            if let Err(err) = store.put_block_index(hash, &e) {
+                tracing::error!("failed to persist failure flag on {}: {}", hash, err);
+            }
+        }
+        Ok(None) => {}
+        Err(err) => tracing::error!("get_block_index({}) while marking failed: {}", hash, err),
+    }
+}
+
+/// [`try_attach_and_reorg`] with the invalid-branch outcome surfaced.
+pub fn try_attach_and_reorg_detailed(
+    state: &mut RpcState,
+    block: &Block,
+    block_hash: &Hash256,
+) -> Result<bool, AttachReorgError> {
     use rustoshi_consensus::pow::{get_block_proof, ChainWork};
     use rustoshi_consensus::validation;
     use rustoshi_storage::block_store::{
@@ -5052,6 +5109,44 @@ pub fn try_attach_and_reorg(
         })?;
 
     let new_height = parent_entry.height + 1;
+
+    // Core AcceptBlock / AcceptBlockHeader: a block already marked failed is
+    // never re-stored or re-tried ("duplicate-invalid"), and a block whose
+    // parent is failed is itself invalid ("bad-prevblk", BLOCK_FAILED_CHILD).
+    // Without the first check the HAVE_DATA store below would OVERWRITE the
+    // failure flag and a peer could make us re-attempt the same bad reorg.
+    {
+        let failed_mask = |st: BlockStatus| {
+            st.has(BlockStatus::FAILED_VALIDITY) || st.has(BlockStatus::FAILED_CHILD)
+        };
+        if let Ok(Some(existing)) = store.get_block_index(block_hash) {
+            if failed_mask(existing.status) {
+                return Err(format!("{}duplicate-invalid", REORG_CONSENSUS_REJECT_SENTINEL).into());
+            }
+        }
+        if failed_mask(parent_entry.status) {
+            let _ = store.put_header(block_hash, &block.header);
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::FAILED_CHILD);
+            let parent_work = ChainWork::from_be_bytes(parent_entry.chain_work);
+            let entry = StorageBlockIndexEntry {
+                height: new_height,
+                status,
+                n_tx: block.transactions.len() as u32,
+                timestamp: block.header.timestamp,
+                bits: block.header.bits,
+                nonce: block.header.nonce,
+                version: block.header.version,
+                prev_hash: block.header.prev_block_hash,
+                chain_work: parent_work.saturating_add(&get_block_proof(block.header.bits)).0,
+            };
+            let _ = store.put_block_index(block_hash, &entry);
+            return Err(AttachReorgError {
+                reason: format!("{}bad-prevblk", REORG_CONSENSUS_REJECT_SENTINEL),
+                invalid: Some(InvalidBranch { failed: *block_hash, invalidated: vec![*block_hash] }),
+            });
+        }
+    }
 
     // Compute new branch chainwork.
     let parent_work = ChainWork::from_be_bytes(parent_entry.chain_work);
@@ -5116,7 +5211,7 @@ pub fn try_attach_and_reorg(
                 );
                 // Canonical BIP-22 reject string on the wire; the detail is in
                 // the log line above.
-                return Err("bad-diffbits".to_string());
+                return Err(AttachReorgError::from("bad-diffbits".to_string()));
             }
         };
         // prev_entry placeholder: contextual_check_block_header reads only
@@ -5147,7 +5242,7 @@ pub fn try_attach_and_reorg(
                 block_hash,
                 e.bip22_string()
             );
-            return Err(e.bip22_string());
+            return Err(AttachReorgError::from(e.bip22_string()));
         }
 
         // BIP-113 MTP gate (time-too-old): the real check; StubChainContext
@@ -5159,7 +5254,7 @@ pub fn try_attach_and_reorg(
                 "try_attach_and_reorg: side-branch block {} rejected at store: time-too-old (ts {} <= parent MTP {})",
                 block_hash, block.header.timestamp, mtp
             );
-            return Err("time-too-old".to_string());
+            return Err(AttachReorgError::from("time-too-old".to_string()));
         }
     }
 
@@ -5168,10 +5263,10 @@ pub fn try_attach_and_reorg(
     // HAVE_DATA but not VALID_SCRIPTS - that flag is set by the connect
     // path on the new chain after `reorganize` re-runs validation.
     if let Err(e) = store.put_header(block_hash, &block.header) {
-        return Err(format!("put_header: {}", e));
+        return Err(AttachReorgError::from(format!("put_header: {}", e)));
     }
     if let Err(e) = store.put_block(block_hash, block) {
-        return Err(format!("put_block: {}", e));
+        return Err(AttachReorgError::from(format!("put_block: {}", e)));
     }
     {
         let mut status = BlockStatus::new();
@@ -5188,7 +5283,7 @@ pub fn try_attach_and_reorg(
             chain_work: this_work.0,
         };
         if let Err(e) = store.put_block_index(block_hash, &entry) {
-            return Err(format!("put_block_index: {}", e));
+            return Err(AttachReorgError::from(format!("put_block_index: {}", e)));
         }
     }
 
@@ -5297,12 +5392,12 @@ pub fn try_attach_and_reorg(
     // reorg to a higher-work chain has the undo it needs and we follow it to
     // any depth like Core rather than staying on a lower-work minority chain.
     if state.prune_mode && total > MAX_REORG_DEPTH {
-        return Err(format!(
+        return Err(AttachReorgError::from(format!(
             "reorg span {} (disconnect={} + connect={}) exceeds \
              MAX_REORG_DEPTH ({}) in prune mode; refusing reorg past the \
              undo-retention window",
             total, approx_disconnect, approx_connect, MAX_REORG_DEPTH
-        ));
+        )));
     }
 
     // `reorganize_with_seq_ctx` surfaces the per-block undo data for every
@@ -5314,22 +5409,66 @@ pub fn try_attach_and_reorg(
     // so that time-based BIP-68 relative lock-times are enforced on reorg-
     // connected blocks, exactly as on the main process_block path.
     let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
+    let reorg_res = chain_state.reorganize_with_seq_ctx_detailed(
+        *block_hash,
+        &get_block,
+        &get_undo,
+        &get_block_index,
+        &mut utxo_view,
+        &seq_ctx,
+    );
     let (_disconnected_count, connected_blocks): (usize, Vec<(Hash256, u32, validation::UndoData)>) =
-        chain_state
-            .reorganize_with_seq_ctx(
-                *block_hash,
-                &get_block,
-                &get_undo,
-                &get_block_index,
-                &mut utxo_view,
-                &seq_ctx,
-            )
-            // A consensus failure while CONNECTING the heavier branch is a real
-            // block rejection, not an internal error: preserve its canonical
-            // BIP-22 code (via the sentinel) so submitblock reports the same
-            // reason Core does on the reorg arm (e.g. `bad-cb-amount`) instead
-            // of the free-form "reorganize: bad subsidy: …" Display string.
-            .map_err(|e| format!("{}{}", REORG_CONSENSUS_REJECT_SENTINEL, e.bip22_string()))?;
+        match reorg_res {
+            Ok(v) => v,
+            Err(failure) => {
+                // A consensus failure while CONNECTING the heavier branch is a
+                // real block rejection, not an internal error: preserve its
+                // canonical BIP-22 code (via the sentinel) so submitblock
+                // reports the same reason Core does on the reorg arm (e.g.
+                // `bad-cb-amount`) instead of the free-form Display string.
+                let reason = format!(
+                    "{}{}",
+                    REORG_CONSENSUS_REJECT_SENTINEL,
+                    failure.error.bip22_string()
+                );
+                // Core InvalidBlockFound + InvalidChainFound: the failing block
+                // becomes BLOCK_FAILED_VALID and every descendant on the branch
+                // we tried (up to the attached block) BLOCK_FAILED_CHILD. Nothing
+                // was committed (the reorg batch below is never written), so the
+                // active tip and UTXO set are exactly what they were: the node
+                // stays on the most-work VALID chain, as ActivateBestChain does
+                // after a ConnectTip failure. Non-verdicts mark nothing.
+                let invalid = failure.failed_block.map(|failed| {
+                    set_block_index_flag(&store, &failed, BlockStatus::FAILED_VALIDITY);
+                    let mut descendants = Vec::new();
+                    let mut walk = *block_hash;
+                    let mut guard = new_height + 16;
+                    while walk != failed && walk != Hash256::ZERO && guard > 0 {
+                        guard -= 1;
+                        set_block_index_flag(&store, &walk, BlockStatus::FAILED_CHILD);
+                        descendants.push(walk);
+                        match get_block_index(&walk) {
+                            Some(e) => walk = e.prev_hash,
+                            None => break,
+                        }
+                    }
+                    descendants.reverse();
+                    let mut invalidated = vec![failed];
+                    invalidated.extend(descendants);
+                    tracing::warn!(
+                        "reorg onto {} failed: block {} is invalid ({}); marked it failed + {} \
+                         descendant(s) failed-child, staying on tip {}",
+                        block_hash,
+                        failed,
+                        failure.error.bip22_string(),
+                        invalidated.len() - 1,
+                        state.best_hash
+                    );
+                    InvalidBranch { failed, invalidated }
+                });
+                return Err(AttachReorgError { reason, invalid });
+            }
+        };
 
     // Pattern D (post-reorg-consistency, 2026-05-05):
     // The reorg commit must be ALL-OR-NOTHING on disk. Build a single

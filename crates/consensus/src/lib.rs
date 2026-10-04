@@ -78,7 +78,7 @@ pub use validation::{
     TransactionSignatureChecker, TxValidationError, UndoData, UtxoView, ValidationError,
     DEFAULT_SCRIPTCHECK_THREADS, MAX_SCRIPTCHECK_THREADS, SCRIPT_CHECK_BATCH_SIZE,
 };
-pub use chain_state::{current_time_secs, ChainState, CompressedScript, UtxoCache};
+pub use chain_state::{current_time_secs, ChainState, CompressedScript, ReorgFailure, UtxoCache};
 pub use fee_estimator::{FeeEstimator, RawBucketStats};
 pub use mempool::{AtmpOptions, Mempool, MempoolConfig, MempoolEntry, MempoolError};
 pub use orphanage::{

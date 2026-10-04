@@ -1637,6 +1637,108 @@ fn mark_connect_failed_block_invalid(
     None
 }
 
+/// After an attach-and-reorg attempt proved a side branch invalid, take the
+/// header chain OFF that branch — rustoshi's analog of Core's
+/// `InvalidChainFound` -> `RecalculateBestHeader` plus `ActivateBestChain`
+/// settling on the most-work VALID chain.
+///
+/// rustoshi tracks ONE linear header chain (HeaderSync + the height index,
+/// which `validate_and_store` overwrites for every accepted header). When a
+/// heavier fork was announced, the header tip and the height index were moved
+/// onto it; when the reorg onto it then failed, nothing moved them back. The
+/// node was left with (a) a best header ON the invalid branch, so an honest
+/// sibling of equal work (B2' vs B2x) was "not heavier" and ignored, (b) the
+/// height index naming the invalid blocks at heights the active chain owns, so
+/// the header-arrival enqueue kept re-fetching the invalid tip, and (c) block
+/// locators built from that index, which made the honest peer's reply look like
+/// a lighter/equal fork — the observed wedge (stays on B1', never fetches B2').
+///
+/// If the current header tip descends from (or is) any block in `invalid`, this
+/// restores the height index along the ACTIVE chain, deletes the entries above
+/// the active tip that named the invalid branch, re-seats the header tip on the
+/// active tip, and realigns the downloader. The active tip is valid by
+/// construction and is the most-work valid header rustoshi still knows about;
+/// the honest chain re-announces (or extends) on top of it. Also drops the
+/// invalid blocks from the download pipeline. Returns the new header height
+/// when it rewound.
+fn rewind_headers_off_invalid_branch(
+    block_store: &BlockStore,
+    header_sync: &mut HeaderSync,
+    block_downloader: &mut BlockDownloader,
+    invalid: &std::collections::HashSet<Hash256>,
+    active_tip: (Hash256, u32),
+) -> Option<u32> {
+    const MAX_WALK: u32 = 2000;
+    block_downloader.forget_blocks(invalid);
+
+    let (active_hash, active_height) = active_tip;
+    let old_header_height = header_sync.best_header_height();
+    let min_invalid_height = invalid
+        .iter()
+        .filter_map(|h| block_store.get_block_index(h).ok().flatten().map(|e| e.height))
+        .min()
+        .unwrap_or(0);
+
+    // (1) Does the header tip sit on the invalid branch?
+    let mut tainted = false;
+    let (mut walk, mut walk_h) = (header_sync.best_header_hash(), old_header_height);
+    for _ in 0..MAX_WALK {
+        if invalid.contains(&walk) {
+            tainted = true;
+            break;
+        }
+        if walk == Hash256::ZERO || walk_h == 0 || walk_h <= min_invalid_height {
+            break;
+        }
+        match block_store.get_header(&walk).ok().flatten() {
+            Some(h) => {
+                walk = h.prev_block_hash;
+                walk_h -= 1;
+            }
+            None => break,
+        }
+    }
+    if !tainted {
+        return None;
+    }
+
+    // (2) Height index back onto the active chain at and below its tip.
+    let (mut walk, mut walk_h) = (active_hash, active_height);
+    for _ in 0..MAX_WALK {
+        if block_store.get_hash_by_height(walk_h).ok().flatten() == Some(walk) {
+            break; // joined the shared prefix
+        }
+        if let Err(e) = block_store.put_height_index(walk_h, &walk) {
+            tracing::error!("restore height index {} -> {}: {}", walk_h, walk, e);
+        }
+        if walk_h == 0 {
+            break;
+        }
+        match block_store.get_header(&walk).ok().flatten() {
+            Some(h) => {
+                walk = h.prev_block_hash;
+                walk_h -= 1;
+            }
+            None => break,
+        }
+    }
+    // (3) Above the active tip the index named only the invalid branch.
+    for h in (active_height + 1)..=old_header_height {
+        let _ = block_store.delete_height_index(h);
+    }
+
+    // (4) Header tip + downloader counters back to the active tip.
+    header_sync.set_best_header(active_height, active_hash);
+    block_downloader.set_best_header_height(active_height);
+    block_downloader.set_validated_tip_height(active_height);
+    tracing::warn!(
+        "invalid side branch: header tip was on it (height {}); re-seated the header chain on \
+         the active tip {} at height {} (Core InvalidChainFound / RecalculateBestHeader)",
+        old_header_height, active_hash, active_height
+    );
+    Some(active_height)
+}
+
 // ============================================================
 // COOKIE AUTH HELPERS
 // ============================================================
@@ -3942,6 +4044,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // source of truth is the FAILED_VALIDITY flag; this is an O(1) fast-path.
     let mut invalid_block_hashes: std::collections::HashSet<Hash256> =
         std::collections::HashSet::new();
+    // Peer that delivered each side-branch block stored without a reorg
+    // (try_attach_and_reorg -> Ok(false)). Core keeps `mapBlockSource` for a
+    // stored-but-not-connected block until it is checked, so when a LATER
+    // block makes that branch heavier and the reorg fails on the stored block,
+    // `BlockChecked` punishes the peer that delivered the INVALID block, not
+    // the one that delivered the trigger. Bounded: cleared past 1024 entries
+    // (a lost entry only forgoes a punishment, never a validity decision).
+    let mut side_branch_source: std::collections::HashMap<Hash256, rustoshi_network::PeerId> =
+        std::collections::HashMap::new();
 
     // AssumeUTXO hole: genesis + tail band, nothing in 1..floor-1. If
     // bodies for those heights are already in CF_BLOCKS (index rebuild,
@@ -4599,12 +4710,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // it should not arise here, but stay conservative).
                                 // MissingAncestorHeader is "cannot decide yet"
                                 // (fail closed), never an invalid verdict.
-                                if !matches!(
+                                // BLOCK_MUTATED results are not verdicts
+                                // either (Core InvalidBlockFound skips them).
+                                if e.is_invalid_block_verdict() {
+                                    connect_invalid = true;
+                                } else if !matches!(
                                     e,
                                     rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)
                                         | rustoshi_consensus::validation::ValidationError::MissingAncestorHeader(_)
                                 ) {
-                                    connect_invalid = true;
+                                    // BLOCK_MUTATED: not marked; realign the
+                                    // validated-tip counter next_block_to_validate
+                                    // bumped for a block that did not connect.
+                                    block_downloader.set_validated_tip_height(cs.tip_height());
                                 }
                                 None
                             }
@@ -5837,8 +5955,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                          chain is present",
                                                         block_hash, height, e
                                                     );
-                                                } else {
+                                                } else if e.is_invalid_block_verdict() {
                                                     connect_invalid = true;
+                                                } else {
+                                                    // BLOCK_MUTATED (bad merkle / witness
+                                                    // malleation): the peer was punished
+                                                    // above, but the block is NOT marked
+                                                    // failed — the honest block with this
+                                                    // header may still arrive (Core
+                                                    // InvalidBlockFound's BLOCK_MUTATED
+                                                    // guard). Realign the downloader's
+                                                    // validated-tip counter, which
+                                                    // next_block_to_validate bumped for a
+                                                    // block that did not connect.
+                                                    block_downloader.set_validated_tip_height(cs.tip_height());
                                                 }
                                                 None
                                             }
@@ -5939,7 +6069,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         let block_hash_for_reorg = block_hash;
                                         let reorg_result = {
                                             let mut rpc = rpc_state.write().await;
-                                            rustoshi_rpc::server::try_attach_and_reorg(
+                                            rustoshi_rpc::server::try_attach_and_reorg_detailed(
                                                 &mut rpc,
                                                 &block,
                                                 &block_hash_for_reorg,
@@ -5990,16 +6120,86 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     "Unit C: stored side-branch block {} (not best work)",
                                                     block_hash_for_reorg
                                                 );
+                                                if side_branch_source.len() >= 1024 {
+                                                    side_branch_source.clear();
+                                                }
+                                                side_branch_source.insert(block_hash_for_reorg, peer_id);
+                                                // next_block_to_validate bumped the validated-tip
+                                                // counter for this block although it did not
+                                                // connect. Left stale it labels the NEXT connected
+                                                // block with a too-high height (index entry,
+                                                // filter index, and the diffbits window walk,
+                                                // which then rejects an honest block as
+                                                // bad-diffbits and bans its sender — observed in
+                                                // the invalid-block-over-P2P 'after' run).
+                                                let tip_h = chain_state.read().await.tip_height();
+                                                block_downloader.set_validated_tip_height(tip_h);
                                             }
                                             Err(e) => {
-                                                // Unknown parent, MAX_REORG_DEPTH exceeded, or a
-                                                // storage error. Drop the block (same outcome as
-                                                // pre-Unit-C) — do NOT ban the peer (Unit A). Our
-                                                // tip + UTXO view are untouched.
+                                                // Same counter realign as the Ok(false) arm.
+                                                let tip_h = chain_state.read().await.tip_height();
+                                                block_downloader.set_validated_tip_height(tip_h);
+                                                // Our tip + UTXO view are untouched: the
+                                                // reorg batch is only written on success.
                                                 tracing::warn!(
                                                     "Unit C: attach-and-reorg declined block {}: {}",
-                                                    block_hash_for_reorg, e
+                                                    block_hash_for_reorg, e.reason
                                                 );
+                                                if let Some(inv) = e.invalid {
+                                                    // An invalid-block VERDICT on the branch
+                                                    // (Core InvalidBlockFound/InvalidChainFound;
+                                                    // the index flags were set by the callee).
+                                                    // (1) BlockChecked -> MaybePunishNodeForBlock:
+                                                    //     punish whoever delivered the FAILED
+                                                    //     block — this peer if it is this block,
+                                                    //     else the recorded side-branch source.
+                                                    let source = if inv.failed == block_hash_for_reorg {
+                                                        Some(peer_id)
+                                                    } else {
+                                                        side_branch_source.get(&inv.failed).copied()
+                                                    };
+                                                    let new_invalid: std::collections::HashSet<Hash256> =
+                                                        inv.invalidated.iter().copied().collect();
+                                                    for h in &inv.invalidated {
+                                                        side_branch_source.remove(h);
+                                                        invalid_block_hashes.insert(*h);
+                                                    }
+                                                    if let Some(src) = source {
+                                                        let mut ps = peer_state.write().await;
+                                                        if let Some(ref mut pm) = ps.peer_manager {
+                                                            pm.misbehaving(src, MisbehaviorReason::InvalidBlock).await;
+                                                        }
+                                                    }
+                                                    // (2) Never fetch them again, and take the
+                                                    //     header chain off the branch so the
+                                                    //     valid competitor is followed.
+                                                    let active = {
+                                                        let cs = chain_state.read().await;
+                                                        (cs.tip_hash(), cs.tip_height())
+                                                    };
+                                                    if let Some(hh) = rewind_headers_off_invalid_branch(
+                                                        &block_store,
+                                                        &mut header_sync,
+                                                        &mut block_downloader,
+                                                        &new_invalid,
+                                                        active,
+                                                    ) {
+                                                        let mut rpc = rpc_state.write().await;
+                                                        if rpc.header_height > hh {
+                                                            rpc.header_height = hh;
+                                                        }
+                                                    } else {
+                                                        // Header tip not on the branch: still
+                                                        // realign the counter that
+                                                        // next_block_to_validate bumped.
+                                                        block_downloader.set_validated_tip_height(active.1);
+                                                    }
+                                                } else {
+                                                    // Non-verdict (unknown parent, depth cap,
+                                                    // storage error, missing ancestor header,
+                                                    // BLOCK_MUTATED): nothing marked, nobody
+                                                    // punished (Unit A).
+                                                }
                                             }
                                         }
                                     }
@@ -9511,5 +9711,140 @@ mod tests {
             );
             assert_eq!(reason.score(), 100, "MutatedBlock is a 100-pt instant ban");
         }
+    }
+
+    // ---- invalid-block-over-P2P: header chain off a failed reorg branch ----
+
+    fn rt_header(prev: Hash256, ts: u32) -> BlockHeader {
+        let mut h = BlockHeader {
+            version: 4,
+            prev_block_hash: prev,
+            merkle_root: Hash256::ZERO,
+            timestamp: ts,
+            bits: 0x207f_ffff,
+            nonce: 0,
+        };
+        while !h.validate_pow_against_declared_target() {
+            h.nonce += 1;
+        }
+        h
+    }
+
+    fn index_entry(store: &BlockStore, h: &BlockHeader, height: u32) {
+        store.put_header(&h.block_hash(), h).unwrap();
+        store
+            .put_block_index(
+                &h.block_hash(),
+                &BlockIndexEntry {
+                    height,
+                    status: BlockStatus::new(),
+                    n_tx: 1,
+                    timestamp: h.timestamp,
+                    bits: h.bits,
+                    nonce: h.nonce,
+                    version: h.version,
+                    prev_hash: h.prev_block_hash,
+                    chain_work: [0u8; 32],
+                },
+            )
+            .unwrap();
+    }
+
+    /// The observed wedge (tools/p2p-invalid-block-feed.py `after`, live
+    /// mainnet code b6827aba): active G -> A1; the heavier fork B1 -> B2 moved
+    /// the header tip + height index onto B, then the reorg failed on B1. The
+    /// header chain must come back to A1 so the honest A2 (equal work to B2)
+    /// EXTENDS it instead of being ignored as a "lighter/equal fork".
+    #[test]
+    fn failed_reorg_branch_rewinds_header_chain_to_active_tip() {
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let g = rt_header(Hash256::ZERO, 1_700_000_000);
+        let a1 = rt_header(g.block_hash(), 1_700_000_100);
+        let b1 = rt_header(g.block_hash(), 1_700_000_200);
+        let b2 = rt_header(b1.block_hash(), 1_700_000_300);
+        for (h, ht) in [(&g, 0), (&a1, 1), (&b1, 1), (&b2, 2)] {
+            index_entry(&store, h, ht);
+        }
+        // What header sync left behind after the heavier-fork rewind.
+        store.put_height_index(0, &g.block_hash()).unwrap();
+        store.put_height_index(1, &b1.block_hash()).unwrap();
+        store.put_height_index(2, &b2.block_hash()).unwrap();
+        let mut hs = HeaderSync::new(g.block_hash());
+        hs.set_best_header(2, b2.block_hash());
+        let mut dl = BlockDownloader::new(3, 2); // counter drifted past the tip
+        dl.enqueue_blocks(vec![(b2.block_hash(), 2)]);
+
+        let invalid: std::collections::HashSet<Hash256> =
+            [b1.block_hash(), b2.block_hash()].into_iter().collect();
+        let r = rewind_headers_off_invalid_branch(
+            &store,
+            &mut hs,
+            &mut dl,
+            &invalid,
+            (a1.block_hash(), 1),
+        );
+        assert_eq!(r, Some(1));
+        assert_eq!((hs.best_header_height(), hs.best_header_hash()), (1, a1.block_hash()));
+        assert_eq!(store.get_hash_by_height(1).unwrap(), Some(a1.block_hash()));
+        assert_eq!(store.get_hash_by_height(2).unwrap(), None);
+        assert_eq!(dl.best_header_height(), 1);
+        assert_eq!(dl.validated_tip_height(), 1);
+        assert_eq!(dl.download_queue_len(), 0, "invalid block must not stay queued");
+        assert_eq!(dl.pending_hashes_count(), 0);
+
+        // The honest sibling now extends the header chain (a normal unsolicited
+        // announcement), instead of being dropped as an equal-work fork.
+        let a2 = rt_header(a1.block_hash(), 1_700_000_400);
+        let res = hs.process_headers(
+            rustoshi_network::PeerId(7),
+            vec![a2.clone()],
+            &mut |_, _| Ok(()),
+            &|_| None,
+            &|_| None,
+        );
+        assert!(res.is_ok());
+        assert_eq!((hs.best_header_height(), hs.best_header_hash()), (2, a2.block_hash()));
+    }
+
+    /// A header tip that is NOT on the invalid branch is left alone.
+    #[test]
+    fn failed_reorg_branch_off_header_chain_is_a_noop() {
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let g = rt_header(Hash256::ZERO, 1_700_000_000);
+        let a1 = rt_header(g.block_hash(), 1_700_000_100);
+        let a2 = rt_header(a1.block_hash(), 1_700_000_150);
+        let b1 = rt_header(g.block_hash(), 1_700_000_200);
+        for (h, ht) in [(&g, 0), (&a1, 1), (&a2, 2), (&b1, 1)] {
+            index_entry(&store, h, ht);
+        }
+        store.put_height_index(0, &g.block_hash()).unwrap();
+        store.put_height_index(1, &a1.block_hash()).unwrap();
+        store.put_height_index(2, &a2.block_hash()).unwrap();
+        let mut hs = HeaderSync::new(g.block_hash());
+        hs.set_best_header(2, a2.block_hash());
+        let mut dl = BlockDownloader::new(1, 2);
+        let invalid: std::collections::HashSet<Hash256> = [b1.block_hash()].into_iter().collect();
+        let r = rewind_headers_off_invalid_branch(&store, &mut hs, &mut dl, &invalid, (a1.block_hash(), 1));
+        assert_eq!(r, None);
+        assert_eq!((hs.best_header_height(), hs.best_header_hash()), (2, a2.block_hash()));
+        assert_eq!(store.get_hash_by_height(2).unwrap(), Some(a2.block_hash()));
+    }
+
+    /// MissingAncestorHeader stays a non-verdict; BLOCK_MUTATED results are
+    /// not verdicts either (Core InvalidBlockFound's BLOCK_MUTATED guard);
+    /// genuine consensus failures are.
+    #[test]
+    fn invalid_block_verdict_classification() {
+        use rustoshi_consensus::validation::ValidationError as V;
+        assert!(!V::MissingAncestorHeader(927_973).is_invalid_block_verdict());
+        assert!(!V::PrevBlockNotFound("x".into()).is_invalid_block_verdict());
+        assert!(!V::BadMerkleRoot.is_invalid_block_verdict());
+        assert!(!V::BadTxnsDuplicate.is_invalid_block_verdict());
+        assert!(!V::BadWitnessCommitment.is_invalid_block_verdict());
+        assert!(V::BadSubsidy(1, 0).is_invalid_block_verdict());
+        assert!(V::NonFinalTx.is_invalid_block_verdict());
+        assert!(V::BadDifficulty.is_invalid_block_verdict());
     }
 }
