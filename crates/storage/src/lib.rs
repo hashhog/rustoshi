@@ -48,6 +48,7 @@ pub mod db;
 pub mod flush_signal;
 pub mod header_context;
 pub mod historical_backfill;
+pub mod index_tip;
 pub mod indexes;
 pub mod prune;
 pub mod seq_lock_ctx;
@@ -67,6 +68,7 @@ pub use blockstore::{
     MIN_PRUNE_TARGET_MIB, STORAGE_HEADER_BYTES, UNDOFILE_CHUNK_SIZE,
 };
 pub use seq_lock_ctx::StoreSeqLockCtx;
+pub use index_tip::{index_tip_advances, IndexTip, OptionalIndex, META_INDEX_TIP_BLOCKFILTER, META_INDEX_TIP_TX};
 pub use prune::{auto_prune, manual_prune_to_height, PruneCoordConfig, PruneOutcome, PRUNE_MANUAL_SENTINEL};
 pub use undo::{BlockUndo, TxUndo};
 pub use columns::*;

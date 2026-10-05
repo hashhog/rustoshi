@@ -3229,7 +3229,14 @@ impl RpcServerImpl {
             }
             let prev_txid = psbt.unsigned_tx.inputs[i].previous_output.txid;
             let mut found: Option<Transaction> = None;
-            if let Ok(Some(entry)) = store.get_tx_index(&prev_txid) {
+            // Core rawtransaction.cpp:155-159: the txindex only when it exists
+            // (g_txindex), then the mempool.
+            let indexed = if state.txindex_enabled {
+                store.get_tx_index(&prev_txid).ok().flatten()
+            } else {
+                None
+            };
+            if let Some(entry) = indexed {
                 if let Ok(Some(block)) = store.get_block(&entry.block_hash) {
                     found = block.transactions.into_iter().find(|t| t.txid() == prev_txid);
                 }
@@ -4430,6 +4437,29 @@ fn diffbits_expected_for_header(
     }
 }
 
+/// Core `BroadcastTransaction` (`node/transaction.cpp:54-60`): a transaction
+/// any of whose outputs is in the UTXO set is already confirmed, and is
+/// answered `ALREADY_IN_UTXO_SET` ("Transaction outputs already in utxo set",
+/// RPC -27) — a probe of the coins view, not of an index, so it works the
+/// same with `-txindex` off (ARCH-2 R-1). A fully spent confirmed tx is not
+/// caught here in Core either; it falls through to mempool admission and
+/// fails there on its missing inputs.
+pub(crate) fn tx_outputs_in_utxo_set(
+    store: &BlockStore,
+    tx: &Transaction,
+) -> Result<bool, rustoshi_storage::StorageError> {
+    let txid = tx.txid();
+    for vout in 0..tx.outputs.len() as u32 {
+        if store.get_utxo(&OutPoint { txid, vout })?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Core's message for [`tx_outputs_in_utxo_set`] (`common/messages.cpp:133`).
+pub(crate) const ALREADY_IN_UTXO_SET_MSG: &str = "Transaction outputs already in utxo set";
+
 /// Admit an already-signed transaction into the node mempool.
 ///
 /// The wallet-native `sendtoaddress` path builds + signs a transaction inside
@@ -4455,8 +4485,16 @@ pub fn broadcast_signed_tx(
 
     let db = Arc::clone(&state.db);
     let store = BlockStore::new(&db);
-    if let Ok(Some(_)) = store.get_tx_index(&txid) {
-        return Err("Transaction already in block chain".to_string());
+    match tx_outputs_in_utxo_set(&store, &tx) {
+        Ok(true) => return Err(ALREADY_IN_UTXO_SET_MSG.to_string()),
+        Ok(false) => {}
+        Err(e) => {
+            return Err(format!(
+                "{}: coins read failed: {}",
+                rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                e
+            ))
+        }
     }
 
     // Refresh tip snapshot for IsFinalTx / coinbase-maturity checks.
@@ -4897,6 +4935,14 @@ fn disconnect_to(
     store
         .batch_set_best_block(&mut batch, &target_hash, target_height)
         .map_err(|e| format!("batch_set_best_block: {}", e))?;
+
+    // ARCH-2 R-1: a built-through marker above the target on the chain being
+    // disconnected comes back to the target with its rows (deleted above).
+    for kind in [rustoshi_storage::OptionalIndex::Tx, rustoshi_storage::OptionalIndex::BlockFilter] {
+        store
+            .batch_rewind_index_tip(&mut batch, kind, target_height, target_hash)
+            .map_err(|e| format!("batch_rewind_index_tip: {}", e))?;
+    }
 
     // Stage the height-index deletes for the disconnected range.
     for h in target_height + 1..=original_height {
@@ -5664,8 +5710,11 @@ pub fn try_attach_and_reorg_detailed(
         let mut walk = new_tip_hash;
         let mut walk_h = new_tip_height;
         let mut guard = new_tip_height + 16;
+        // ARCH-2 R-1: the new branch's rows are written only with -txindex
+        // (the deletes above stay unconditional: they keep rows below a
+        // frozen marker truthful).
         loop {
-            if walk == Hash256::ZERO || walk_h < stop_height || guard == 0 {
+            if !state.txindex_enabled || walk == Hash256::ZERO || walk_h < stop_height || guard == 0 {
                 break;
             }
             guard -= 1;
@@ -5695,6 +5744,46 @@ pub fn try_attach_and_reorg_detailed(
             }
             walk = prev;
             walk_h -= 1;
+        }
+    }
+
+    // ARCH-2 R-1: built-through markers across the reorg (same batch).
+    // A marker above the fork on the old active chain is rewound to the
+    // fork (its rows above were just deleted / are about to be replaced);
+    // an enabled, contiguous txindex then moves to the new tip, whose rows
+    // are staged above. The filter marker advances per block after the
+    // filters are written below. A marker below the fork, or already off
+    // the chain, is a gap and is left alone.
+    {
+        use rustoshi_storage::{IndexTip, OptionalIndex};
+        let fork_height = connected_blocks
+            .iter()
+            .map(|(_, h, _)| *h)
+            .min()
+            .map(|min_h| min_h.saturating_sub(1))
+            .unwrap_or(new_tip_height.saturating_sub(1));
+        if let Ok(Some(fork_hash)) = store.get_hash_by_height(fork_height) {
+            let tx_contiguous = match store.get_index_tip(OptionalIndex::Tx) {
+                Ok(Some(IndexTip::At { height, hash })) => {
+                    height >= fork_height
+                        && store.get_hash_by_height(height).ok().flatten() == Some(hash)
+                }
+                _ => false,
+            };
+            for kind in [OptionalIndex::Tx, OptionalIndex::BlockFilter] {
+                if let Err(e) = store.batch_rewind_index_tip(&mut batch, kind, fork_height, fork_hash) {
+                    tracing::error!("try_attach_and_reorg: {} marker rewind failed: {}", kind.name(), e);
+                }
+            }
+            if state.txindex_enabled && tx_contiguous {
+                if let Err(e) = store.batch_set_index_tip(
+                    &mut batch,
+                    OptionalIndex::Tx,
+                    IndexTip::At { height: new_tip_height, hash: new_tip_hash },
+                ) {
+                    tracing::error!("try_attach_and_reorg: txindex marker stage failed: {}", e);
+                }
+            }
         }
     }
 
@@ -5761,7 +5850,8 @@ pub fn try_attach_and_reorg_detailed(
     // matching Core, whose index is likewise keyed by block hash and
     // overwrites on reconnect. The undo data (spent-prevout scriptPubKeys)
     // feeds BIP-158's spent-script set exactly as Core requires.
-    {
+    // ARCH-2 R-1: only with -blockfilterindex.
+    if state.blockfilterindex_enabled {
         let filter_index = BlockFilterIndex::new(&state.db);
         for (h, height, v_undo) in &connected_blocks {
             let block = match store.get_block(h).ok().flatten() {
@@ -5784,6 +5874,13 @@ pub fn try_attach_and_reorg_detailed(
                     "try_attach_and_reorg: block filter index update failed for {} \
                      at height {}: {}",
                     h, height, e
+                );
+            } else {
+                let _ = store.advance_index_tip(
+                    rustoshi_storage::OptionalIndex::BlockFilter,
+                    *height,
+                    *h,
+                    block.header.prev_block_hash,
                 );
             }
         }
@@ -8472,13 +8569,26 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         }
 
-        // Core's not-found message depends on whether a txindex exists
-        // (rawtransaction.cpp:314-329). rustoshi's txindex is written
-        // synchronously on connect, so it is never "still being indexed".
-        let errmsg = if state.txindex_enabled {
-            "No such mempool or blockchain transaction"
-        } else {
+        // Core's not-found message depends on whether a txindex exists and
+        // has synced (rawtransaction.cpp:308-326). rustoshi's txindex is
+        // written synchronously on connect, but it has a built-through marker
+        // (ARCH-2 R-1): an index switched on after running without it, or on
+        // a snapshot chain, has a gap below the tip and is not synced.
+        let txindex_ready = state.txindex_enabled
+            && store
+                .index_sync_state(
+                    rustoshi_storage::OptionalIndex::Tx,
+                    state.best_height,
+                    &state.best_hash,
+                )
+                .map(|(synced, _)| synced)
+                .unwrap_or(false);
+        let errmsg = if !state.txindex_enabled {
             "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries"
+        } else if !txindex_ready {
+            "No such mempool transaction. Blockchain transactions are still in the process of being indexed"
+        } else {
+            "No such mempool or blockchain transaction"
         };
         Err(Self::rpc_error(
             rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
@@ -8548,14 +8658,25 @@ impl RustoshiRpcServer for RpcServerImpl {
             return Ok(txid.to_hex());
         }
 
-        // Check if transaction is already confirmed (in UTXO set / tx index)
+        // Already confirmed? Core probes the UTXO set for the tx's outputs
+        // (node/transaction.cpp:54-60) — never the txindex, which may be
+        // off (ARCH-2 R-1). -27 RPC_VERIFY_ALREADY_IN_UTXO_SET.
         let db = Arc::clone(&state.db);
         let store = BlockStore::new(&db);
-        if let Ok(Some(_)) = store.get_tx_index(&txid) {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_TRANSACTION_ALREADY_IN_CHAIN,
-                "Transaction already in block chain",
-            ));
+        match tx_outputs_in_utxo_set(&store, &tx) {
+            Ok(true) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_TRANSACTION_ALREADY_IN_CHAIN,
+                    ALREADY_IN_UTXO_SET_MSG,
+                ))
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DATABASE_ERROR,
+                    format!("coins read failed: {}", e),
+                ))
+            }
         }
 
         // UTXO lookup closure
@@ -9967,21 +10088,17 @@ impl RustoshiRpcServer for RpcServerImpl {
                 //   - `bitcoin-core/src/index/txindex.cpp::CustomAppend`
                 //   - CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
                 //     (rustoshi C0 finding — server.rs:2738 was unwired)
-                {
-                    use rustoshi_storage::block_store::TxIndexEntry;
-                    for tx in &block.transactions {
-                        let entry = TxIndexEntry {
-                            block_hash,
-                            tx_offset: 0,
-                            tx_length: 0,
-                        };
-                        if let Err(e) = store.put_tx_index(&tx.txid(), &entry) {
-                            tracing::error!(
-                                "submitblock: failed to store tx index: {}",
-                                e
-                            );
-                            return Err(submit_system_fault_error(&format!("database error: {}", e)));
-                        }
+                //
+                // ARCH-2 R-1: only with `-txindex` (Core DEFAULT_TXINDEX=false,
+                // no index instance when off). Rows + built-through marker in
+                // one batch (rustoshi_storage::index_tip).
+                if state.txindex_enabled {
+                    if let Err(e) = store.write_tx_index_block(&block, block_hash, new_height) {
+                        tracing::error!(
+                            "submitblock: failed to store tx index: {}",
+                            e
+                        );
+                        return Err(submit_system_fault_error(&format!("database error: {}", e)));
                     }
                 }
 
@@ -9998,7 +10115,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // arrived (P2P, RPC submitblock, or generate). Uses the
                 // `undo_data` returned by `process_block` for the spent-prevout
                 // scriptPubKeys, exactly as BIP-158 requires.
-                {
+                // ARCH-2 R-1: only with `-blockfilterindex` (Core default "0").
+                if state.blockfilterindex_enabled {
                     let filter_index = BlockFilterIndex::new(&state.db);
                     if let Err(e) =
                         filter_index.connect_block(new_height, &block, &undo_data)
@@ -10013,6 +10131,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                             "submitblock: block filter index update failed for {} at height {}: {}",
                             block_hash, new_height, e
                         );
+                    } else if let Err(e) = store.advance_index_tip(
+                        rustoshi_storage::OptionalIndex::BlockFilter,
+                        new_height,
+                        block_hash,
+                        block.header.prev_block_hash,
+                    ) {
+                        tracing::warn!("submitblock: blockfilterindex marker update failed: {}", e);
                     }
                 }
 
@@ -16722,6 +16847,16 @@ impl RustoshiRpcServer for RpcServerImpl {
         })?;
 
         let state = self.state.read().await;
+        // Core rpc/blockchain.cpp:2985-2988: no filter index for this type ->
+        // RPC_MISC_ERROR "Index is not enabled for filtertype <name>".
+        // ARCH-2 R-1: rustoshi no longer writes filters with the flag off, so
+        // the flag (not a CF probe) decides, like Core's GetBlockFilterIndex.
+        if !state.blockfilterindex_enabled {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                format!("Index is not enabled for filtertype {}", ftype_name),
+            ));
+        }
         let store = BlockStore::new(&state.db);
         let index = BlockFilterIndex::new(&state.db);
 
@@ -16759,6 +16894,19 @@ impl RustoshiRpcServer for RpcServerImpl {
             )
         })?;
 
+        // ARCH-2 R-1: a filter past the index's built-through marker was
+        // written after a gap, so its header chains from ZERO — never serve
+        // it; Core's index would still be syncing there.
+        let covered = store
+            .index_covers(
+                rustoshi_storage::OptionalIndex::BlockFilter,
+                entry.height,
+                &block_hash,
+            )
+            .unwrap_or(false);
+        let (filter_opt, header_opt) = if covered { (filter_opt, header_opt) } else { (None, None) };
+        let index_behind = !covered && on_active_chain;
+
         match (filter_opt, header_opt) {
             (Some(filter), Some(header_entry)) => {
                 // Mirror Core: encode the encoded_filter (which is the
@@ -16777,7 +16925,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                         rpc_error::RPC_INVALID_ADDRESS_OR_KEY,
                         "Filter not found. Block was not connected to active chain.",
                     ))
-                } else if state.best_height < entry.height {
+                } else if state.best_height < entry.height || index_behind {
                     Err(Self::rpc_error(
                         rpc_error::RPC_MISC_ERROR,
                         "Filter not found. Block filters are still in the process of being indexed.",
@@ -16861,7 +17009,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         // the same probe getindexinfo uses: a filter row for the best block.
         // (At genesis-only chains best_height==0; the genesis filter is still
         // written when -blockfilterindex is on, so the probe holds.)
-        let index_enabled = index.has_filter(&state.best_hash).unwrap_or(false);
+        // ARCH-2 R-1: the flag, not a CF probe (filters are no longer written
+        // with the flag off, and rows from an older binary must not count).
+        let index_enabled = state.blockfilterindex_enabled;
         if !index_enabled {
             return Err(Self::rpc_error(
                 rpc_error::RPC_MISC_ERROR,
@@ -17051,6 +17201,15 @@ impl RustoshiRpcServer for RpcServerImpl {
             state.chainstate_manager.is_snapshot_active(),
             state.chainstate_manager.is_snapshot_validated(),
         );
+        // ARCH-2 R-1: each optional index reports its OWN built-through
+        // marker (Core BaseIndex::GetSummary: best_block_height is the index's
+        // locator, synced is m_synced), not the chain tip.
+        let marker_state = |kind: rustoshi_storage::OptionalIndex| -> (bool, u32) {
+            let store = BlockStore::new(&state.db);
+            store
+                .index_sync_state(kind, state.best_height, &state.best_hash)
+                .unwrap_or((false, 0))
+        };
 
         // txindex active iff -txindex was enabled at startup.  Mirrors Core's
         // `g_txindex != nullptr` (the global is set iff -txindex was passed at
@@ -17102,11 +17261,12 @@ impl RustoshiRpcServer for RpcServerImpl {
         if blockfilter_active
             && (want.is_empty() || want == "basic block filter index")
         {
+            let (synced, h) = marker_state(rustoshi_storage::OptionalIndex::BlockFilter);
             entries.push((
                 "basic block filter index",
                 IndexSummary {
-                    synced: fully_validated,
-                    best_block_height: state.best_height,
+                    synced: synced && fully_validated,
+                    best_block_height: h,
                 },
             ));
         }
@@ -17120,11 +17280,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
         if txindex_active && (want.is_empty() || want == "txindex") {
+            let (synced, h) = marker_state(rustoshi_storage::OptionalIndex::Tx);
             entries.push((
                 "txindex",
                 IndexSummary {
-                    synced: fully_validated,
-                    best_block_height: state.best_height,
+                    synced: synced && fully_validated,
+                    best_block_height: h,
                 },
             ));
         }
@@ -18355,21 +18516,33 @@ impl RpcServerImpl {
                     })?;
                 }
 
-                // Store transaction index entries for all transactions in the block
-                {
-                    use rustoshi_storage::block_store::TxIndexEntry;
-                    for tx in &block.transactions {
-                        let entry = TxIndexEntry {
-                            block_hash,
-                            tx_offset: 0,
-                            tx_length: 0,
-                        };
-                        store.put_tx_index(&tx.txid(), &entry).map_err(|e| {
-                            Self::rpc_error(
-                                rpc_error::RPC_DATABASE_ERROR,
-                                format!("Failed to store tx index: {}", e),
-                            )
-                        })?;
+                // Optional indexes (ARCH-2 R-1): written only when enabled,
+                // like every other connect path — Core's generate goes through
+                // ProcessNewBlock, so BaseIndex::BlockConnected fires for the
+                // enabled indexes and nothing is written for the others.
+                if state.txindex_enabled {
+                    store.write_tx_index_block(&block, block_hash, height).map_err(|e| {
+                        Self::rpc_error(
+                            rpc_error::RPC_DATABASE_ERROR,
+                            format!("Failed to store tx index: {}", e),
+                        )
+                    })?;
+                }
+                if state.blockfilterindex_enabled {
+                    let filter_index = BlockFilterIndex::new(&state.db);
+                    match filter_index.connect_block(height, &block, &_undo_data) {
+                        Ok(_) => {
+                            let _ = store.advance_index_tip(
+                                rustoshi_storage::OptionalIndex::BlockFilter,
+                                height,
+                                block_hash,
+                                block.header.prev_block_hash,
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            "generate: block filter index update failed for {} at height {}: {}",
+                            block_hash, height, e
+                        ),
                     }
                 }
 
@@ -24899,7 +25072,15 @@ mod tests {
     #[tokio::test]
     async fn submit_block_writes_tx_index_entries_for_accepted_block() {
         let params = mainnet_params_for_synth_blocks();
-        let (db, _state, server) = make_test_server(params.clone());
+        let (db, state, server) = make_test_server(params.clone());
+        // ARCH-2 R-1: rows are written only with -txindex.
+        state.write().await.txindex_enabled = true;
+        BlockStore::new(&db)
+            .set_index_tip(
+                rustoshi_storage::OptionalIndex::Tx,
+                rustoshi_storage::IndexTip::At { height: 0, hash: params.genesis_hash },
+            )
+            .unwrap();
 
         let genesis_hash = params.genesis_hash;
         let block_a1 = mine_synth_block(1, genesis_hash, 0xA1);
@@ -24928,6 +25109,59 @@ mod tests {
             entry.block_hash, hash_a1,
             "tx_index entry must point at the connecting block"
         );
+        // ...and the built-through marker advanced contiguously with it.
+        assert_eq!(
+            store.get_index_tip(rustoshi_storage::OptionalIndex::Tx).unwrap(),
+            Some(rustoshi_storage::IndexTip::At { height: 1, hash: hash_a1 })
+        );
+    }
+
+    /// ARCH-2 R-1: with -txindex and -blockfilterindex OFF (the default, as
+    /// Core's DEFAULT_TXINDEX / DEFAULT_BLOCKFILTERINDEX), submitblock writes
+    /// NO tx_index row and NO filter row — counted, not inferred from the
+    /// absence of an error — and the markers do not move.
+    #[tokio::test]
+    async fn arch2_r1_submit_block_writes_no_optional_index_when_off() {
+        use rustoshi_storage::{BlockFilterIndex, IndexTip, OptionalIndex};
+        let params = mainnet_params_for_synth_blocks();
+        let (db, _state, server) = make_test_server(params.clone());
+        let store = BlockStore::new(&db);
+        let g = IndexTip::At { height: 0, hash: params.genesis_hash };
+        store.set_index_tip(OptionalIndex::Tx, g).unwrap();
+        store.set_index_tip(OptionalIndex::BlockFilter, g).unwrap();
+        let count = |cf: &str| db.iter_cf(cf).map(|it| it.count()).unwrap_or(0);
+        let (tx0, bf0, bfh0) = (
+            count(rustoshi_storage::CF_TX_INDEX),
+            count(rustoshi_storage::CF_BLOCKFILTER),
+            count(rustoshi_storage::CF_BLOCKFILTER_HEADER),
+        );
+        let block_a1 = mine_synth_block(1, params.genesis_hash, 0xA1);
+        let res = drive_submit_block(&server, &block_a1).await;
+        assert!(res.is_none(), "expected accept (None), got {:?}", res);
+        assert_eq!(count(rustoshi_storage::CF_TX_INDEX), tx0, "tx_index rows written with -txindex off");
+        assert_eq!(count(rustoshi_storage::CF_BLOCKFILTER), bf0, "filter rows written with -blockfilterindex off");
+        assert_eq!(count(rustoshi_storage::CF_BLOCKFILTER_HEADER), bfh0);
+        assert!(BlockFilterIndex::new(&db).get_filter(&block_a1.block_hash()).unwrap().is_none());
+        assert_eq!(store.get_index_tip(OptionalIndex::Tx).unwrap(), Some(g));
+        assert_eq!(store.get_index_tip(OptionalIndex::BlockFilter).unwrap(), Some(g));
+    }
+
+    /// ARCH-2 R-1: sendrawtransaction of an already-confirmed transaction is
+    /// caught by Core's UTXO-set probe (node/transaction.cpp:54-60), -27
+    /// "Transaction outputs already in utxo set" — with -txindex OFF, where
+    /// the old tx_index lookup could not see it.
+    #[tokio::test]
+    async fn arch2_r1_sendrawtransaction_confirmed_tx_is_already_in_utxo_set() {
+        let params = mainnet_params_for_synth_blocks();
+        let (_db, _state, server) = make_test_server(params.clone());
+        let block_a1 = mine_synth_block(1, params.genesis_hash, 0xA1);
+        assert!(drive_submit_block(&server, &block_a1).await.is_none());
+        let hex_tx = hex::encode(block_a1.transactions[0].serialize());
+        let err = RustoshiRpcServer::send_raw_transaction(&server, hex_tx, None, None)
+            .await
+            .expect_err("confirmed tx must be refused");
+        assert_eq!(err.code(), rpc_error::RPC_TRANSACTION_ALREADY_IN_CHAIN);
+        assert_eq!(err.message(), "Transaction outputs already in utxo set");
     }
 
     /// Test: try_attach_and_reorg on a heavier side-branch deletes
@@ -24942,6 +25176,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
         let mut rpc_state = RpcState::new(db.clone(), mainnet_params_for_synth_blocks());
+        // ARCH-2 R-1: the new branch's rows are written only with -txindex.
+        rpc_state.txindex_enabled = true;
 
         // G -> A1 -> A2 (active, height 2).
         let (hash_g, _block_g, work_g) = {
@@ -26450,6 +26686,14 @@ mod tests {
             state.txindex_enabled = true;
             state.best_height = 1234;
             let store = BlockStore::new(&state.db);
+            // ARCH-2 R-1: synced/best_block_height come from the txindex's
+            // built-through marker; put it at the pinned tip.
+            store
+                .set_index_tip(
+                    rustoshi_storage::OptionalIndex::Tx,
+                    rustoshi_storage::IndexTip::At { height: 1234, hash: state.best_hash },
+                )
+                .expect("marker");
             store
                 .put_tx_index(
                     &Hash256::from_bytes([0xabu8; 32]),
@@ -27801,7 +28045,10 @@ mod tests {
     async fn fix_88_getblockfilter_unknown_block_returns_invalid_address_or_key() {
         use rustoshi_consensus::ChainParams;
         let params = ChainParams::regtest();
-        let (_db, _state, server) = make_test_server(params);
+        let (_db, state, server) = make_test_server(params);
+        // Core checks the index exists BEFORE the block lookup
+        // (blockchain.cpp:2985-2997), so enable it to reach "Block not found".
+        state.write().await.blockfilterindex_enabled = true;
         // 32-byte hex string that is not in the block index.
         let bogus = "0".repeat(64);
         let err = RustoshiRpcServer::get_block_filter(&server, bogus, None)
@@ -27837,6 +28084,61 @@ mod tests {
             err.message().contains("Unknown filtertype"),
             "expected 'Unknown filtertype' message"
         );
+    }
+
+    /// ARCH-2 R-1: with `-blockfilterindex` off there is no filter index, so
+    /// getblockfilter answers Core's RPC_MISC_ERROR "Index is not enabled for
+    /// filtertype basic" (blockchain.cpp:2985-2988) — even when filter rows
+    /// written by an older binary are on disk — not "Filter not found ...
+    /// index corruption".
+    #[tokio::test]
+    async fn arch2_r1_getblockfilter_index_off_is_core_error() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::{BlockFilter, BlockFilterIndex};
+        let params = ChainParams::regtest();
+        let (db, state, server) = make_test_server(params);
+        let best = state.read().await.best_hash;
+        let filter = BlockFilter::build_basic(best, std::iter::empty(), std::iter::empty());
+        BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
+        let err = RustoshiRpcServer::get_block_filter(&server, best.to_hex(), None)
+            .await
+            .expect_err("index off must error");
+        assert_eq!(err.code(), rpc_error::RPC_MISC_ERROR);
+        assert_eq!(err.message(), "Index is not enabled for filtertype basic");
+    }
+
+    /// ARCH-2 R-1: an enabled filter index whose built-through marker is
+    /// behind a block does not serve that block's filter (its header would
+    /// chain from ZERO after a gap); Core's still-syncing message instead.
+    #[tokio::test]
+    async fn arch2_r1_getblockfilter_past_marker_is_still_indexing() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::{BlockFilter, BlockFilterIndex, IndexTip, OptionalIndex};
+        let params = ChainParams::regtest();
+        let (db, state, server) = make_test_server(params);
+        state.write().await.blockfilterindex_enabled = true;
+        let best = state.read().await.best_hash;
+        let idx = BlockFilterIndex::new(&db);
+        let genesis = state.read().await.params.genesis_block.clone();
+        idx.connect_block(0, &genesis, &rustoshi_consensus::validation::UndoData { spent_coins: vec![] })
+            .unwrap();
+        let _ = BlockFilter::build_basic(best, std::iter::empty(), std::iter::empty());
+        let store = BlockStore::new(&db);
+        // marker Empty: nothing vouched for -> still indexing
+        store.set_index_tip(OptionalIndex::BlockFilter, IndexTip::Empty).unwrap();
+        let err = RustoshiRpcServer::get_block_filter(&server, best.to_hex(), None)
+            .await
+            .expect_err("uncovered filter must not be served");
+        assert_eq!(err.code(), rpc_error::RPC_MISC_ERROR);
+        assert!(err.message().contains("still in the process of being indexed"), "{}", err.message());
+        // marker at genesis: served
+        store
+            .set_index_tip(OptionalIndex::BlockFilter, IndexTip::At { height: 0, hash: best })
+            .unwrap();
+        let ok = RustoshiRpcServer::get_block_filter(&server, best.to_hex(), None)
+            .await
+            .expect("covered filter is served");
+        assert!(ok.get("filter").is_some() && ok.get("header").is_some());
     }
 
     // ============================================================
@@ -27972,7 +28274,9 @@ mod tests {
 
         let params = ChainParams::regtest();
         let (db, state, server) = make_test_server(params);
-        // Enable the index by writing a filter row for the best block.
+        // Enable the index (ARCH-2 R-1: the -blockfilterindex flag decides,
+        // as Core's GetBlockFilterIndex) and write a filter row for the best block.
+        state.write().await.blockfilterindex_enabled = true;
         let st = state.read().await;
         let best = st.best_hash;
         drop(st);
@@ -28030,7 +28334,9 @@ mod tests {
 
         let params = ChainParams::regtest();
         let (db, state, server) = make_test_server(params);
-        // Enable the index by writing a filter row for the genesis/best block.
+        // Enable the index (flag, ARCH-2 R-1) and write a filter row for the
+        // genesis/best block.
+        state.write().await.blockfilterindex_enabled = true;
         let st = state.read().await;
         let best = st.best_hash;
         let tip = st.best_height as i64;
@@ -28191,6 +28497,13 @@ mod tests {
             std::iter::empty(),
         );
         BlockFilterIndex::new(&db).put_filter(&filter).unwrap();
+        // ARCH-2 R-1: synced comes from the index's built-through marker.
+        BlockStore::new(&db)
+            .set_index_tip(
+                rustoshi_storage::OptionalIndex::BlockFilter,
+                rustoshi_storage::IndexTip::At { height: 0, hash: best },
+            )
+            .unwrap();
 
         let raw = RustoshiRpcServer::get_index_info(&server, None)
             .await

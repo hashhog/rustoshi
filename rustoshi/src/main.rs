@@ -40,7 +40,7 @@ use rustoshi_network::{
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
 use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
 use rustoshi_storage::{
-    block_store::{BlockIndexEntry, BlockStatus, TxIndexEntry},
+    block_store::{BlockIndexEntry, BlockStatus},
     coinstats_compute_next_entry, coinstats_genesis_entry,
     indexes::BlockFilterIndex,
     BlockStore, BodyAdmission, BodyWriteDone, BodyWriteJob, BodyWriter, ChainDb,
@@ -1090,23 +1090,26 @@ fn reorg_retention_prune_targets(
     }
 }
 
+/// ARCH-2 R-1: writes NOTHING unless `-txindex` is on (Core
+/// `DEFAULT_TXINDEX{false}`, `index/txindex.h:19` — with the flag off Core has
+/// no txindex instance at all). When on, the block's rows go in one batch
+/// together with the `idx_tip/tx` built-through marker
+/// (`rustoshi_storage::index_tip`), which advances only contiguously.
 fn write_tx_index_entries(
     block_store: &BlockStore,
+    enabled: bool,
     block: &rustoshi_primitives::Block,
     block_hash: rustoshi_primitives::Hash256,
+    height: u32,
 ) {
-    for tx in &block.transactions {
-        let entry = TxIndexEntry {
-            block_hash,
-            tx_offset: 0,
-            tx_length: 0,
-        };
-        if let Err(e) = block_store.put_tx_index(&tx.txid(), &entry) {
-            tracing::warn!(
-                "tx_index write failed for {} in block {}: {}",
-                tx.txid(), block_hash, e
-            );
-        }
+    if !enabled {
+        return;
+    }
+    if let Err(e) = block_store.write_tx_index_block(block, block_hash, height) {
+        tracing::warn!(
+            "tx_index write failed for block {} at height {}: {}",
+            block_hash, height, e
+        );
     }
 }
 
@@ -1207,15 +1210,34 @@ async fn connect_block_into_wallets(
 /// GCS + index + REST stack in `rustoshi-storage::indexes` was DEAD CODE
 /// because no production code path ever called `BlockFilterIndex::index_block`.
 /// Light clients querying /rest/blockfilter would get 404 after a full IBD.
+///
+/// ARCH-2 R-1: writes NOTHING unless `-blockfilterindex` is on (Core
+/// `DEFAULT_BLOCKFILTERINDEX "0"`, `index/blockfilterindex.h:28`). When on,
+/// the `idx_tip/blockfilter` marker advances after a successful write, only
+/// contiguously — a filter written after a gap chains its header from ZERO,
+/// so the marker must not vouch for it.
 fn write_block_filter_index(
     block_store: &BlockStore,
+    enabled: bool,
     block: &rustoshi_primitives::Block,
     height: u32,
     undo: &rustoshi_consensus::validation::UndoData,
 ) {
+    if !enabled {
+        return;
+    }
     let idx = BlockFilterIndex::new(block_store.db());
     match idx.connect_block(height, block, undo) {
-        Ok(_) => {}
+        Ok(_) => {
+            if let Err(e) = block_store.advance_index_tip(
+                rustoshi_storage::OptionalIndex::BlockFilter,
+                height,
+                block.block_hash(),
+                block.header.prev_block_hash,
+            ) {
+                tracing::warn!("blockfilterindex marker update failed at height {}: {}", height, e);
+            }
+        }
         Err(e) => {
             tracing::warn!(
                 "BlockFilterIndex update failed for {} at height {}: {}",
@@ -2226,6 +2248,8 @@ fn run_import_from_blk_files(
     start_height: u32,
     coinstatsindex_enabled: bool,
     txospenderindex_enabled: bool,
+    txindex_enabled: bool,
+    blockfilterindex_enabled: bool,
 ) -> anyhow::Result<u32> {
     let magic = params.network_magic.0;
     tracing::info!("Scanning blk*.dat files in {} ...", blocks_dir.display());
@@ -2333,14 +2357,14 @@ fn run_import_from_blk_files(
         // Pattern C0 (txindex-on-connect): persist tx_index for every tx so
         // that getrawtransaction works post-IBD. See write_tx_index_entries
         // for the Core reference + audit-doc citation.
-        write_tx_index_entries(block_store, &block, hash);
+        write_tx_index_entries(block_store, txindex_enabled, &block, hash, height);
 
         // BIP-157/158 block filter index — FIX-69 W121 BUG-16.  Build and
         // persist the basic GCS filter + filter header for this block so
         // that /rest/blockfilter, /rest/blockfilterheaders, and (when wired
         // upstream) BIP-157 P2P serving can respond. Mirrors Core
         // `BlockFilterIndex::CustomAppend` fired from BaseIndex::BlockConnected.
-        write_block_filter_index(block_store, &block, height, &undo);
+        write_block_filter_index(block_store, blockfilterindex_enabled, &block, height, &undo);
 
         // Coinstatsindex — maintain the per-height running MuHash + UTXO-set
         // counts on the PRIMARY connect path (same as txindex/blockfilterindex)
@@ -2431,6 +2455,8 @@ fn run_import_from_stdin(
     start_height: u32,
     coinstatsindex_enabled: bool,
     txospenderindex_enabled: bool,
+    txindex_enabled: bool,
+    blockfilterindex_enabled: bool,
 ) -> anyhow::Result<u32> {
     use rustoshi_primitives::{Block, Decodable};
     use std::io::Read;
@@ -2558,11 +2584,11 @@ fn run_import_from_stdin(
         // Pattern C0 (txindex-on-connect): persist tx_index for every tx in
         // this block so getrawtransaction works post-IBD. See
         // `write_tx_index_entries` for the Core reference + audit-doc citation.
-        write_tx_index_entries(block_store, &block, hash);
+        write_tx_index_entries(block_store, txindex_enabled, &block, hash, frame_height);
 
         // BIP-157/158 block filter index — FIX-69 W121 BUG-16.
         // See `write_block_filter_index` for the Core reference.
-        write_block_filter_index(block_store, &block, frame_height, &undo);
+        write_block_filter_index(block_store, blockfilterindex_enabled, &block, frame_height, &undo);
 
         // Coinstatsindex — PRIMARY connect path (same as txindex/blockfilterindex).
         // See `write_coinstats_index` for the Core reference.
@@ -3317,11 +3343,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // has only a coinbase (no spent inputs), so its undo is empty. Idempotent:
     // `connect_block` overwrites the same key, and `init_genesis` itself is a
     // no-op on restart, so re-running this is harmless.
+    //
+    // ARCH-2 R-1: only when `-blockfilterindex` is on — with the flag off Core
+    // has no filter index and writes nothing (`DEFAULT_BLOCKFILTERINDEX "0"`).
+    let blockfilterindex_on = !matches!(
+        cli.blockfilterindex.to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "off" | "no"
+    );
     {
         let genesis_filter_index = BlockFilterIndex::new(block_store.db());
-        if !genesis_filter_index
-            .has_filter(&params.genesis_hash)
-            .unwrap_or(false)
+        if blockfilterindex_on
+            && !genesis_filter_index
+                .has_filter(&params.genesis_hash)
+                .unwrap_or(false)
         {
             let empty_undo = rustoshi_consensus::validation::UndoData {
                 spent_coins: Vec::new(),
@@ -3333,6 +3367,54 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     "BlockFilterIndex: failed to index genesis filter for {}: {} \
                      (BIP-157 header chain will be off by the genesis link until reindex)",
                     params.genesis_hash, e
+                );
+            }
+        }
+    }
+
+    // ARCH-2 R-1: per-index built-through markers (`idx_tip/tx`,
+    // `idx_tip/blockfilter`, rustoshi_storage::index_tip). One-time migration
+    // for a datadir written before the markers existed: every earlier binary
+    // indexed unconditionally, so it is indexed through its stored tip. Then
+    // say where each index stands, loudly when an enabled one has a gap —
+    // Core's BaseIndex would sync it from its locator; rustoshi does not yet
+    // backfill, so the gap stays visible in getindexinfo (synced:false) and
+    // the "still being indexed" RPC errors until a reindex.
+    {
+        let genesis_filter_indexed = BlockFilterIndex::new(block_store.db())
+            .has_filter(&params.genesis_hash)
+            .unwrap_or(false);
+        let snapshot_based = rustoshi_storage::read_snapshot_blockhash(&datadir)
+            .ok()
+            .flatten()
+            .is_some();
+        match block_store.migrate_index_tips(params.genesis_hash, genesis_filter_indexed, snapshot_based) {
+            Ok(written) => {
+                for (kind, tip) in written {
+                    tracing::info!("index marker migration: {} built-through set to {:?}", kind.name(), tip);
+                }
+            }
+            Err(e) => tracing::warn!("index marker migration failed: {}", e),
+        }
+        let stored_tip = block_store.get_best_height().ok().flatten().unwrap_or(0);
+        for (kind, on) in [
+            (rustoshi_storage::OptionalIndex::Tx, cli.txindex),
+            (rustoshi_storage::OptionalIndex::BlockFilter, blockfilterindex_on),
+        ] {
+            let tip = block_store.get_index_tip(kind).ok().flatten();
+            let marker_h = tip.and_then(|t| t.height());
+            if !on {
+                tracing::info!(
+                    "{} disabled: not written on connect (built through {:?})",
+                    kind.name(), marker_h
+                );
+            } else if marker_h.map(|h| h < stored_tip).unwrap_or(true) {
+                tracing::warn!(
+                    "{} ENABLED but built only through {:?} of stored tip {}: the index has a gap \
+                     (it was off, or the chain came from a snapshot). rustoshi does not backfill \
+                     an index yet (Core's BaseIndex would sync it from its locator), so it stays \
+                     synced:false; only a datadir synced with the flag on has a complete index.",
+                    kind.name(), marker_h, stored_tip
                 );
             }
         }
@@ -3443,11 +3525,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let mut utxo_view = block_store.utxo_view_with_cache(dbcache_bytes);
 
         let imported = if import_path == "-" {
-            run_import_from_stdin(&params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex, cli.txospenderindex)?
+            run_import_from_stdin(&params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex, cli.txospenderindex, cli.txindex, blockfilterindex_on)?
         } else {
             let path = std::path::PathBuf::from(import_path);
             if path.is_dir() {
-                run_import_from_blk_files(&path, &params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex, cli.txospenderindex)?
+                run_import_from_blk_files(&path, &params, &block_store, &mut chain_state, &mut utxo_view, best_height, cli.coinstatsindex, cli.txospenderindex, cli.txindex, blockfilterindex_on)?
             } else {
                 anyhow::bail!(
                     "--import-blocks path must be a directory containing blk*.dat files, or \"-\" for stdin"
@@ -5060,11 +5142,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // Pattern C0 (txindex-on-connect): persist tx_index for
                         // every tx in this block so getrawtransaction works
                         // post-IBD. See `write_tx_index_entries`.
-                        write_tx_index_entries(&block_store, &block, block_hash);
+                        write_tx_index_entries(&block_store, cli.txindex, &block, block_hash, height);
 
                         // BIP-157/158 block filter index — FIX-69 W121 BUG-16.
                         // See `write_block_filter_index` for the Core reference.
-                        write_block_filter_index(&block_store, &block, height, &undo);
+                        write_block_filter_index(&block_store, blockfilterindex_enabled, &block, height, &undo);
 
                         // Coinstatsindex — PRIMARY P2P/IBD connect path (same as
                         // txindex/blockfilterindex). See `write_coinstats_index`
@@ -6577,11 +6659,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // Pattern C0 (txindex-on-connect): persist tx_index for
                                         // every tx in this block so getrawtransaction works
                                         // post-IBD. See `write_tx_index_entries`.
-                                        write_tx_index_entries(&block_store, &block, block_hash);
+                                        write_tx_index_entries(&block_store, cli.txindex, &block, block_hash, height);
 
                                         // BIP-157/158 block filter index — FIX-69 W121 BUG-16.
                                         // See `write_block_filter_index` for the Core reference.
-                                        write_block_filter_index(&block_store, &block, height, &undo);
+                                        write_block_filter_index(&block_store, blockfilterindex_enabled, &block, height, &undo);
 
                                         // Coinstatsindex — PRIMARY P2P sync-loop
                                         // connect path (same as txindex/
@@ -9376,6 +9458,45 @@ mod tests {
     fn test_cli_txindex_flag() {
         let cli = Cli::try_parse_from(["rustoshi", "--txindex"]).unwrap();
         assert!(cli.txindex);
+        // Core DEFAULT_TXINDEX{false}
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert!(!cli.txindex);
+    }
+
+    /// ARCH-2 R-1: the connect-path index writers (shared by blk import,
+    /// framed import, foreground IBD and the P2P loop) write NOTHING with the
+    /// flag off — counted rows, not absence of an error — and write rows +
+    /// advance the built-through marker contiguously with the flag on.
+    #[test]
+    fn arch2_r1_connect_path_index_writers_respect_flags() {
+        use rustoshi_storage::{IndexTip, OptionalIndex, CF_BLOCKFILTER, CF_BLOCKFILTER_HEADER, CF_TX_INDEX};
+        let dir = tempfile::tempdir().unwrap();
+        let db = ChainDb::open(dir.path()).unwrap();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::regtest();
+        let genesis = params.genesis_block.clone();
+        let gh = genesis.block_hash();
+        let undo = rustoshi_consensus::validation::UndoData { spent_coins: Vec::new() };
+        let count = |cf: &str| db.iter_cf(cf).map(|it| it.count()).unwrap();
+        let g = IndexTip::At { height: 0, hash: gh };
+        store.set_index_tip(OptionalIndex::Tx, IndexTip::Empty).unwrap();
+        store.set_index_tip(OptionalIndex::BlockFilter, IndexTip::Empty).unwrap();
+
+        write_tx_index_entries(&store, false, &genesis, gh, 0);
+        write_block_filter_index(&store, false, &genesis, 0, &undo);
+        assert_eq!(count(CF_TX_INDEX), 0);
+        assert_eq!(count(CF_BLOCKFILTER), 0);
+        assert_eq!(count(CF_BLOCKFILTER_HEADER), 0);
+        assert_eq!(store.get_index_tip(OptionalIndex::Tx).unwrap(), Some(IndexTip::Empty));
+        assert_eq!(store.get_index_tip(OptionalIndex::BlockFilter).unwrap(), Some(IndexTip::Empty));
+
+        write_tx_index_entries(&store, true, &genesis, gh, 0);
+        write_block_filter_index(&store, true, &genesis, 0, &undo);
+        assert_eq!(count(CF_TX_INDEX), genesis.transactions.len());
+        assert_eq!(count(CF_BLOCKFILTER), 1);
+        assert_eq!(count(CF_BLOCKFILTER_HEADER), 1);
+        assert_eq!(store.get_index_tip(OptionalIndex::Tx).unwrap(), Some(g));
+        assert_eq!(store.get_index_tip(OptionalIndex::BlockFilter).unwrap(), Some(g));
     }
 
     #[test]

@@ -165,6 +165,8 @@ pub enum RestError {
     UnknownFilterType,
     /// BIP-157 filter not found for the given block.
     FilterNotFound,
+    /// `-blockfilterindex` is off (Core rest.cpp:543/647, HTTP 400).
+    FilterIndexNotEnabled,
 }
 
 impl IntoResponse for RestError {
@@ -190,6 +192,9 @@ impl IntoResponse for RestError {
             RestError::EmptyRequest => (StatusCode::BAD_REQUEST, "Empty request"),
             RestError::UnknownFilterType => (StatusCode::BAD_REQUEST, "Unknown filtertype"),
             RestError::FilterNotFound => (StatusCode::NOT_FOUND, "Filter not found"),
+            RestError::FilterIndexNotEnabled => {
+                (StatusCode::BAD_REQUEST, "Index is not enabled for filtertype basic")
+            }
         };
 
         Response::builder()
@@ -531,8 +536,14 @@ async fn rest_tx(
         return format_transaction(&entry.tx, format, None, None);
     }
 
-    // Check transaction index
-    if let Ok(Some(tx_entry)) = store.get_tx_index(&txid) {
+    // Check transaction index — only when -txindex is on (Core rest_tx ->
+    // GetTransaction consults g_txindex only when it exists). ARCH-2 R-1.
+    let indexed = if rpc_state.txindex_enabled {
+        store.get_tx_index(&txid).ok().flatten()
+    } else {
+        None
+    };
+    if let Some(tx_entry) = indexed {
         // Load the block and find the transaction
         if let Ok(Some(block)) = store.get_block(&tx_entry.block_hash) {
             for tx in &block.transactions {
@@ -1449,7 +1460,24 @@ async fn rest_blockfilter(
     let (block_hash, format) = parse_hash_and_format(parts[1])?;
 
     let rpc_state = state.rpc_state.read().await;
+    // ARCH-2 R-1: no filter index when the flag is off (Core rest.cpp:543);
+    // never serve a filter past the index's built-through marker.
+    if !rpc_state.blockfilterindex_enabled {
+        return Err(RestError::FilterIndexNotEnabled);
+    }
     let index = BlockFilterIndex::new(&rpc_state.db);
+    let store = BlockStore::new(&rpc_state.db);
+    let height = store
+        .get_block_index(&block_hash)
+        .map_err(|e| RestError::DatabaseError(e.to_string()))?
+        .ok_or(RestError::BlockNotFound)?
+        .height;
+    if !store
+        .index_covers(rustoshi_storage::OptionalIndex::BlockFilter, height, &block_hash)
+        .map_err(|e| RestError::DatabaseError(e.to_string()))?
+    {
+        return Err(RestError::FilterNotFound);
+    }
 
     let filter = index
         .get_filter(&block_hash)
@@ -1524,8 +1552,19 @@ async fn rest_blockfilterheaders(
     // commit mid-response.  This mirrors Core's `cs_main` lock held by
     // `rest_filter_header` (bitcoin-core/src/rest.cpp).
     let rpc_state = state.rpc_state.read().await;
+    if !rpc_state.blockfilterindex_enabled {
+        return Err(RestError::FilterIndexNotEnabled);
+    }
     let store = BlockStore::new(&rpc_state.db);
     let index = BlockFilterIndex::new(&rpc_state.db);
+    // ARCH-2 R-1: headers past the built-through marker chain from ZERO.
+    let marker_height = match store
+        .get_index_tip(rustoshi_storage::OptionalIndex::BlockFilter)
+        .map_err(|e| RestError::DatabaseError(e.to_string()))?
+    {
+        Some(rustoshi_storage::IndexTip::At { height, .. }) => Some(height),
+        _ => None,
+    };
 
     let start_entry = store
         .get_block_index(&start_hash)
@@ -1560,6 +1599,12 @@ async fn rest_blockfilterheaders(
             return Err(RestError::BlockNotFound);
         }
 
+        if marker_height.map(|m| height > m).unwrap_or(true) {
+            if headers.is_empty() {
+                return Err(RestError::FilterNotFound);
+            }
+            break;
+        }
         match index.get_filter_header(height) {
             Ok(Some(entry)) => headers.push(entry.filter_header),
             Ok(None) => return Err(RestError::FilterNotFound),
@@ -2354,9 +2399,40 @@ mod tests {
         let encoded = vec![0xde, 0xad, 0xbe, 0xef, 0x42];
         let filter = BlockFilter::new(BlockFilterType::Basic, block_hash, encoded.clone());
         BlockFilterIndex::new(&db).put_filter(&filter).expect("put_filter");
+        // ARCH-2 R-1: the block must be known and on the active chain, and the
+        // filter index's built-through marker must cover it.
+        {
+            use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+            let store = BlockStore::new(&db);
+            store
+                .put_block_index(
+                    &block_hash,
+                    &BlockIndexEntry {
+                        height: 0,
+                        status: BlockStatus::default(),
+                        n_tx: 1,
+                        timestamp: 0,
+                        bits: 0,
+                        nonce: 0,
+                        version: 1,
+                        prev_hash: Hash256::ZERO,
+                        chain_work: [0u8; 32],
+                    },
+                )
+                .unwrap();
+            store.put_height_index(0, &block_hash).unwrap();
+            store
+                .set_index_tip(
+                    rustoshi_storage::OptionalIndex::BlockFilter,
+                    rustoshi_storage::IndexTip::At { height: 0, hash: block_hash },
+                )
+                .unwrap();
+        }
 
         let params = ChainParams::regtest();
-        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        let mut rs = RpcState::new(db, params);
+        rs.blockfilterindex_enabled = true;
+        let state = Arc::new(RwLock::new(rs));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let bound = listener.local_addr().expect("local_addr");
@@ -2408,6 +2484,47 @@ mod tests {
         assert_eq!(body_bytes, expected, "binary blockfilter body mismatch");
     }
 
+    #[tokio::test]
+    async fn arch2_r1_rest_blockfilter_index_off_400() {
+        // ARCH-2 R-1: with -blockfilterindex off there is no index; Core answers
+        // HTTP 400 "Index is not enabled for filtertype basic" (rest.cpp:543),
+        // even when filter rows from an older binary exist on disk.
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::indexes::blockfilterindex::{BlockFilter, BlockFilterIndex};
+        use rustoshi_storage::ChainDb;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let h = Hash256::from_hex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f").unwrap();
+        BlockFilterIndex::new(&db)
+            .put_filter(&BlockFilter::new(BlockFilterType::Basic, h, vec![1, 2, 3]))
+            .unwrap();
+        let state = Arc::new(RwLock::new(RpcState::new(db, ChainParams::regtest())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let bound = listener.local_addr().expect("local_addr");
+        let router = rest_router(state);
+        let _server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let mut sock = TcpStream::connect(bound).await.expect("connect");
+        sock.write_all(
+            format!(
+                "GET /rest/blockfilter/basic/{}.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                h.to_hex()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write");
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.expect("read");
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 400"), "expected 400, got:\n{}", resp);
+        assert!(resp.contains("Index is not enabled for filtertype basic"), "{}", resp);
+    }
+
     /// 404 on unknown block hash (filter index has no entry).
     #[tokio::test]
     async fn test_rest_blockfilter_unknown_hash_404() {
@@ -2419,7 +2536,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
         let params = ChainParams::regtest();
-        let state = Arc::new(RwLock::new(RpcState::new(db, params)));
+        // Core checks the filter index exists (400 when off) before looking
+        // the block up (404) — rest.cpp:543 then :550. Enable it.
+        let mut rs = RpcState::new(db, params);
+        rs.blockfilterindex_enabled = true;
+        let state = Arc::new(RwLock::new(rs));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let bound = listener.local_addr().expect("local_addr");
