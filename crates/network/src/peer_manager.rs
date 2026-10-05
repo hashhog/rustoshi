@@ -4961,9 +4961,19 @@ impl PeerManager {
     ///
     /// `tx_fee_rate` is the transaction's feerate in sat/kvB, to match the u64
     /// feefilter units exactly.
+    ///
+    /// The inv entry is chosen PER PEER (BIP-339, Core net_processing.cpp
+    /// SendMessages: `peer->m_wtxid_relay ? MSG_WTX/wtxid : MSG_TX/txid`), the
+    /// same selection the P2P relay path uses (`relay_tx_to_peers`). This used
+    /// to take a caller-built inv, and both RPC callers (sendrawtransaction,
+    /// submitpackage) built `MsgWitnessTx`/wtxid — 0x40000001 is a GETDATA-only
+    /// flag (BIP-144), not an inv type: Core's INV handler acts only on
+    /// MSG_TX/MSG_WTX (`IsGenTxMsg`) and blocks, so every RPC-submitted tx was
+    /// announced in a form no peer would request.
     pub async fn relay_tx_inv(
         &self,
-        inv: Vec<crate::message::InvVector>,
+        txid: rustoshi_primitives::Hash256,
+        wtxid: rustoshi_primitives::Hash256,
         tx_fee_rate: u64,
     ) -> FanoutOutcome {
         let mut out = FanoutOutcome::default();
@@ -4984,9 +4994,11 @@ impl PeerManager {
             // `peer_state.read()`, and tokio's RwLock is write-preferring, so
             // an awaited send into one stuck peer's full queue also stalled
             // the P2P main loop behind any queued writer.
+            let inv =
+                crate::relay::build_tx_inv_entry(peer.info.supports_wtxid_relay, txid, wtxid);
             out.record(
                 peer.command_tx
-                    .try_send(PeerCommand::SendMessage(NetworkMessage::Inv(inv.clone()))),
+                    .try_send(PeerCommand::SendMessage(NetworkMessage::Inv(vec![inv]))),
             );
         }
         out
@@ -9243,12 +9255,46 @@ mod nonblocking_fanout_tests {
     #[tokio::test]
     async fn relay_tx_inv_does_not_block_on_full_peer() {
         let (mgr, _rx1, mut rx2, mut rx3) = mgr_with_stuck_peer();
-        let inv = vec![InvVector { inv_type: InvType::MsgWtx, hash: Hash256::from_bytes([7; 32]) }];
-        tokio::time::timeout(LIMIT, mgr.relay_tx_inv(inv, 0))
+        tokio::time::timeout(
+            LIMIT,
+            mgr.relay_tx_inv(Hash256::from_bytes([6; 32]), Hash256::from_bytes([7; 32]), 0),
+        )
             .await
             .expect("relay_tx_inv blocked on a peer whose send queue is full");
         assert!(drain(&mut rx2).iter().any(|m| matches!(m, NetworkMessage::Inv(_))));
         assert!(drain(&mut rx3).iter().any(|m| matches!(m, NetworkMessage::Inv(_))));
+    }
+
+    /// RPC relay (sendrawtransaction / submitpackage → relay_tx_inv) must
+    /// announce MSG_WTX+wtxid to wtxidrelay peers and MSG_TX+txid to the rest
+    /// (BIP-339; Core SendMessages), never MSG_WITNESS_TX (0x40000001, a
+    /// getdata-only type that Core's INV handler ignores). On a79ff94f the
+    /// callers built a MsgWitnessTx inv and relay_tx_inv forwarded it verbatim.
+    #[tokio::test]
+    async fn relay_tx_inv_selects_inv_type_per_peer() {
+        let (mgr, _rx1, mut rx2, mut rx3) = mgr_with_stuck_peer();
+        let txid = Hash256::from_bytes([0x11; 32]);
+        let wtxid = Hash256::from_bytes([0x22; 32]);
+        mgr.relay_tx_inv(txid, wtxid, 0).await;
+        let invs = |msgs: Vec<NetworkMessage>| -> Vec<InvVector> {
+            msgs.into_iter()
+                .filter_map(|m| match m {
+                    NetworkMessage::Inv(v) => Some(v),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+        // peer 2: wtxidrelay
+        let got2 = invs(drain(&mut rx2));
+        assert_eq!(got2.len(), 1, "{got2:?}");
+        assert_eq!(got2[0].inv_type, InvType::MsgWtx);
+        assert_eq!(got2[0].hash, wtxid);
+        // peer 3: legacy
+        let got3 = invs(drain(&mut rx3));
+        assert_eq!(got3.len(), 1, "{got3:?}");
+        assert_eq!(got3[0].inv_type, InvType::MsgTx);
+        assert_eq!(got3[0].hash, txid);
     }
 
     #[tokio::test]

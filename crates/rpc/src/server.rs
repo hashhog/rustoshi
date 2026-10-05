@@ -8801,12 +8801,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Drop the state lock before broadcasting
                 drop(state);
 
-                // Relay to connected peers via inv message
-                // Use WitnessTx type since we support SegWit
-                let inv = vec![InvVector {
-                    inv_type: InvType::MsgWitnessTx,
-                    hash: wtxid,
-                }];
+                // Relay to connected peers via inv message. relay_tx_inv picks
+                // MSG_WTX/wtxid or MSG_TX/txid per peer (BIP-339); never
+                // MSG_WITNESS_TX, which is a getdata-only type.
 
                 // BIP-133 outbound tx-INV gate: feerate in sat/kvB (= fee *
                 // 1000 / vsize) to match the u64 feefilter units. relay_tx_inv
@@ -8821,7 +8818,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Relay, consulting each peer's received feefilter.
                 let peer_state = self.peer_state.read().await;
                 if let Some(ref peer_manager) = peer_state.peer_manager {
-                    peer_manager.relay_tx_inv(inv, tx_fee_rate_sat_kvb).await;
+                    peer_manager.relay_tx_inv(txid, wtxid, tx_fee_rate_sat_kvb).await;
                     tracing::debug!("Relayed transaction {} to peers", txid.to_hex());
                 }
 
@@ -12351,11 +12348,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             let peer_state = self.peer_state.read().await;
             if let Some(ref peer_manager) = peer_state.peer_manager {
                 for (i, tx) in txs.iter().enumerate() {
+                    // Per-peer MSG_WTX/MSG_TX selection happens in relay_tx_inv.
+                    let txid = tx.txid();
                     let wtxid = tx.wtxid();
-                    let inv = vec![InvVector {
-                        inv_type: InvType::MsgWitnessTx,
-                        hash: wtxid,
-                    }];
                     // BIP-133 outbound tx-INV gate: per-tx feerate in sat/kvB
                     // (= fee * 1000 / vsize), derived from this tx's package
                     // result, to match the u64 feefilter units. Drops the INV
@@ -12371,7 +12366,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                             }
                         })
                         .unwrap_or(0);
-                    peer_manager.relay_tx_inv(inv, tx_fee_rate_sat_kvb).await;
+                    peer_manager.relay_tx_inv(txid, wtxid, tx_fee_rate_sat_kvb).await;
                 }
             }
         }
