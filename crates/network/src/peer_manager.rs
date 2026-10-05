@@ -2465,6 +2465,28 @@ struct PeerHandle {
     next_local_addr_send: Option<Instant>,
 }
 
+/// Result of a non-blocking fan-out (tx relay, broadcast).
+///
+/// Fan-outs never await a peer's command channel: `queued` peers got the
+/// message, `dropped_full` peers had a full queue (not reading; skipped),
+/// `closed` peers' tasks had already exited.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FanoutOutcome {
+    pub queued: usize,
+    pub dropped_full: usize,
+    pub closed: usize,
+}
+
+impl FanoutOutcome {
+    fn record(&mut self, r: Result<(), mpsc::error::TrySendError<PeerCommand>>) {
+        match r {
+            Ok(()) => self.queued += 1,
+            Err(mpsc::error::TrySendError::Full(_)) => self.dropped_full += 1,
+            Err(mpsc::error::TrySendError::Closed(_)) => self.closed += 1,
+        }
+    }
+}
+
 /// The peer manager coordinates all peer connections.
 pub struct PeerManager {
     /// Configuration.
@@ -4012,15 +4034,63 @@ impl PeerManager {
     }
 
     /// Broadcast a message to all established peers.
-    pub async fn broadcast(&self, msg: NetworkMessage) {
+    ///
+    /// Non-blocking per peer (see [`FanoutOutcome`]): a peer whose command
+    /// queue is full is skipped, never awaited.
+    pub async fn broadcast(&self, msg: NetworkMessage) -> FanoutOutcome {
+        let mut out = FanoutOutcome::default();
         for peer in self.peers.values() {
             if peer.info.state == PeerState::Established {
-                let _ = peer
-                    .command_tx
-                    .send(PeerCommand::SendMessage(msg.clone()))
-                    .await;
+                out.record(
+                    peer.command_tx
+                        .try_send(PeerCommand::SendMessage(msg.clone())),
+                );
             }
         }
+        out
+    }
+
+    /// Relay a newly accepted transaction to every established peer except
+    /// `source` (the peer it came from), announcing by wtxid (`MSG_WTX`) to
+    /// BIP-339 wtxidrelay peers and by txid (`MSG_TX`) to everyone else.
+    ///
+    /// NEVER awaits a peer. This runs on the P2P main loop while it holds
+    /// `peer_state.read()`; the previous inline loop awaited each peer's
+    /// 32-slot command channel in turn, so one peer that stopped reading
+    /// (writer parked until `PEER_SEND_TIMEOUT`, 120 s) stalled relay to
+    /// every later peer AND the whole main loop for up to 120 s per tx.
+    ///
+    /// Core (net.cpp `PushMessage` → per-peer `vSendMsg` queue, paused
+    /// receive past `nSendBufferMaxSize`; net_processing `m_tx_inventory_to_send`)
+    /// never blocks one peer's relay on another's socket. Core queues rather
+    /// than drops; rustoshi has no per-peer inventory set, so a peer whose
+    /// command queue is already full (≥32 undelivered messages — it is not
+    /// reading) simply misses this announcement. That is safe: an inv is an
+    /// advisory hint, the peer can still learn the tx from any other peer or
+    /// via `mempool`, and a peer that stays this far behind is dropped by the
+    /// writer's send timeout anyway.
+    pub fn relay_tx_to_peers(
+        &self,
+        source: PeerId,
+        txid: rustoshi_primitives::Hash256,
+        wtxid: rustoshi_primitives::Hash256,
+    ) -> FanoutOutcome {
+        let mut out = FanoutOutcome::default();
+        for (&pid, peer) in self.peers.iter() {
+            if pid == source || peer.info.state != PeerState::Established {
+                continue;
+            }
+            // Canonical per-peer selection (BIP-339): MsgWtx+wtxid for
+            // wtxidrelay peers, else MsgTx+txid. MsgWitnessTx is a
+            // getdata-only flag, never a valid inv type.
+            let inv =
+                crate::relay::build_tx_inv_entry(peer.info.supports_wtxid_relay, txid, wtxid);
+            out.record(
+                peer.command_tx
+                    .try_send(PeerCommand::SendMessage(NetworkMessage::Inv(vec![inv]))),
+            );
+        }
+        out
     }
 
     /// Send a BIP-31 `ping` (with a fresh nonce) to every established peer.
@@ -4049,13 +4119,17 @@ impl PeerManager {
             // Fresh per-peer nonce (Core picks a random nonce per PING).
             let nonce: u64 = rand::random();
 
-            // Queue the PING on the peer's command channel. A send error means
-            // the peer task is gone; skip it without recording a pending ping
-            // (so it is not later mistaken for a ping-timeout candidate).
+            // Queue the PING on the peer's command channel WITHOUT awaiting:
+            // the caller holds the peer-state write lock, and an awaited send
+            // into a non-reading peer's full queue would park every other
+            // peer (and the P2P main loop) until that peer's 120 s writer
+            // timeout. Core's `ping` RPC only sets `m_ping_queued`. A closed
+            // channel (peer task gone) or a full one (peer not reading — its
+            // writer timeout will drop it) skips the peer without recording a
+            // pending ping.
             if peer
                 .command_tx
-                .send(PeerCommand::SendMessage(NetworkMessage::Ping(nonce)))
-                .await
+                .try_send(PeerCommand::SendMessage(NetworkMessage::Ping(nonce)))
                 .is_err()
             {
                 continue;
@@ -4804,9 +4878,8 @@ impl PeerManager {
             if target_supports_addrv2 {
                 let entries = self.addr_manager.get_addrv2_for_sharing(10);
                 if !entries.is_empty() {
-                    let _ = self
-                        .send_to_peer(target_id, NetworkMessage::AddrV2(entries))
-                        .await;
+                    // Best-effort addr relay; never await a stuck peer.
+                    let _ = self.try_send_to_peer(target_id, NetworkMessage::AddrV2(entries));
                 }
             } else {
                 let addrs = self.addr_manager.get_addresses_for_sharing(10);
@@ -4818,9 +4891,8 @@ impl PeerManager {
                     })
                     .collect();
                 if !timestamped.is_empty() {
-                    let _ = self
-                        .send_to_peer(target_id, NetworkMessage::Addr(timestamped))
-                        .await;
+                    // Best-effort addr relay; never await a stuck peer.
+                    let _ = self.try_send_to_peer(target_id, NetworkMessage::Addr(timestamped));
                 }
             }
         }
@@ -4868,10 +4940,13 @@ impl PeerManager {
         let pending = self
             .feefilter_manager
             .get_pending_feefilters(mempool_min_fee, is_ibd);
+        // Non-blocking: this runs on the maintenance tick under the
+        // peer-state WRITE lock, so an awaited send into one non-reading
+        // peer's full queue froze the P2P main loop for up to the 120 s
+        // writer timeout. A dropped feefilter is re-sent on the peer's next
+        // scheduled broadcast (Core MaybeSendFeefilter is likewise periodic).
         for (peer_id, fee_rate) in pending {
-            let _ = self
-                .send_to_peer(peer_id, NetworkMessage::FeeFilter(fee_rate))
-                .await;
+            let _ = self.try_send_to_peer(peer_id, NetworkMessage::FeeFilter(fee_rate));
         }
     }
 
@@ -4886,7 +4961,12 @@ impl PeerManager {
     ///
     /// `tx_fee_rate` is the transaction's feerate in sat/kvB, to match the u64
     /// feefilter units exactly.
-    pub async fn relay_tx_inv(&self, inv: Vec<crate::message::InvVector>, tx_fee_rate: u64) {
+    pub async fn relay_tx_inv(
+        &self,
+        inv: Vec<crate::message::InvVector>,
+        tx_fee_rate: u64,
+    ) -> FanoutOutcome {
+        let mut out = FanoutOutcome::default();
         for (&peer_id, peer) in self.peers.iter() {
             if peer.info.state != PeerState::Established {
                 continue;
@@ -4900,11 +4980,16 @@ impl PeerManager {
             {
                 continue;
             }
-            let _ = peer
-                .command_tx
-                .send(PeerCommand::SendMessage(NetworkMessage::Inv(inv.clone())))
-                .await;
+            // Non-blocking (see `relay_tx_to_peers`): the RPC caller holds
+            // `peer_state.read()`, and tokio's RwLock is write-preferring, so
+            // an awaited send into one stuck peer's full queue also stalled
+            // the P2P main loop behind any queued writer.
+            out.record(
+                peer.command_tx
+                    .try_send(PeerCommand::SendMessage(NetworkMessage::Inv(inv.clone()))),
+            );
         }
+        out
     }
 
     /// Update our tip height for stale peer detection.
@@ -9104,5 +9189,131 @@ mod tests {
         assert!(drain_msgs(&mut rx)
             .iter()
             .all(|m| !matches!(m, NetworkMessage::Addr(_) | NetworkMessage::AddrV2(_))));
+    }
+}
+
+/// R-a (2026-10-05 fleet sweep, QUEUES 11:30Z item 4): a peer whose command
+/// queue is full (it stopped reading; its writer is parked until the 120 s
+/// `PEER_SEND_TIMEOUT`) must not delay relay to any other peer, nor the caller
+/// (the P2P main loop / an RPC holding the peer-state lock). Core: net.cpp
+/// `PushMessage` appends to a per-peer `vSendMsg` queue and never blocks one
+/// peer's sends on another's socket.
+///
+/// Every fan-out runs under a 2 s timeout. On 32d20827 `relay_tx_inv`,
+/// `send_pings` and `maybe_send_feefilters` awaited the stuck peer's channel
+/// forever (no writer drains it here) → timeout → FAIL.
+#[cfg(test)]
+mod nonblocking_fanout_tests {
+    use super::*;
+    use crate::message::{InvType, InvVector};
+    use rustoshi_primitives::Hash256;
+
+    const STUCK: PeerId = PeerId(1);
+    const LIMIT: Duration = Duration::from_secs(2);
+
+    /// Manager with one stuck peer (queue filled, receiver alive, never
+    /// drained) and two healthy peers (2 = wtxidrelay, 3 = legacy).
+    fn mgr_with_stuck_peer() -> (
+        PeerManager,
+        mpsc::Receiver<PeerCommand>,
+        mpsc::Receiver<PeerCommand>,
+        mpsc::Receiver<PeerCommand>,
+    ) {
+        let mut mgr = PeerManager::new(PeerManagerConfig::testnet4(), ChainParams::testnet4());
+        let rx1 = mgr.insert_test_peer(STUCK, "192.0.2.1:8333".parse().unwrap(), false, true);
+        let rx2 = mgr.insert_test_peer(PeerId(2), "192.0.2.2:8333".parse().unwrap(), false, true);
+        let rx3 = mgr.insert_test_peer(PeerId(3), "192.0.2.3:8333".parse().unwrap(), false, true);
+        mgr.peers.get_mut(&PeerId(2)).unwrap().info.supports_wtxid_relay = true;
+        let mut filled = 0;
+        while mgr.try_send_to_peer(STUCK, NetworkMessage::Verack) {
+            filled += 1;
+        }
+        assert!(filled > 0, "stuck peer's queue must be full");
+        (mgr, rx1, rx2, rx3)
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<PeerCommand>) -> Vec<NetworkMessage> {
+        let mut v = Vec::new();
+        while let Ok(PeerCommand::SendMessage(m)) = rx.try_recv() {
+            v.push(m);
+        }
+        v
+    }
+
+    #[tokio::test]
+    async fn relay_tx_inv_does_not_block_on_full_peer() {
+        let (mgr, _rx1, mut rx2, mut rx3) = mgr_with_stuck_peer();
+        let inv = vec![InvVector { inv_type: InvType::MsgWtx, hash: Hash256::from_bytes([7; 32]) }];
+        tokio::time::timeout(LIMIT, mgr.relay_tx_inv(inv, 0))
+            .await
+            .expect("relay_tx_inv blocked on a peer whose send queue is full");
+        assert!(drain(&mut rx2).iter().any(|m| matches!(m, NetworkMessage::Inv(_))));
+        assert!(drain(&mut rx3).iter().any(|m| matches!(m, NetworkMessage::Inv(_))));
+    }
+
+    #[tokio::test]
+    async fn send_pings_does_not_block_on_full_peer() {
+        let (mut mgr, _rx1, mut rx2, mut rx3) = mgr_with_stuck_peer();
+        tokio::time::timeout(LIMIT, mgr.send_pings())
+            .await
+            .expect("send_pings blocked on a peer whose send queue is full");
+        assert!(drain(&mut rx2).iter().any(|m| matches!(m, NetworkMessage::Ping(_))));
+        assert!(drain(&mut rx3).iter().any(|m| matches!(m, NetworkMessage::Ping(_))));
+        // A ping that never left must not be recorded as outstanding.
+        assert!(mgr.peers[&STUCK].info.ping_nonce.is_none());
+        assert!(mgr.peers[&PeerId(2)].info.ping_nonce.is_some());
+    }
+
+    #[tokio::test]
+    async fn feefilter_tick_does_not_block_on_full_peer() {
+        let (mut mgr, _rx1, mut rx2, mut rx3) = mgr_with_stuck_peer();
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        for id in [STUCK, PeerId(2), PeerId(3)] {
+            mgr.feefilter_manager.add_peer(id, true, false);
+            assert!(mgr.feefilter_manager.set_next_send_for_test(id, past));
+        }
+        tokio::time::timeout(LIMIT, mgr.maybe_send_feefilters(1000, false))
+            .await
+            .expect("maybe_send_feefilters blocked on a peer whose send queue is full");
+        assert!(drain(&mut rx2).iter().any(|m| matches!(m, NetworkMessage::FeeFilter(_))));
+        assert!(drain(&mut rx3).iter().any(|m| matches!(m, NetworkMessage::FeeFilter(_))));
+    }
+
+    /// The P2P main loop's per-tx relay (main.rs, was an inline awaited loop).
+    #[tokio::test]
+    async fn relay_tx_to_peers_skips_full_peer_and_source() {
+        let (mgr, mut rx1, mut rx2, mut rx3) = mgr_with_stuck_peer();
+        let txid = Hash256::from_bytes([1; 32]);
+        let wtxid = Hash256::from_bytes([2; 32]);
+        // Source = peer 3: it must not be told about its own tx.
+        let out = mgr.relay_tx_to_peers(PeerId(3), txid, wtxid);
+        assert_eq!(out, FanoutOutcome { queued: 1, dropped_full: 1, closed: 0 });
+        let m2 = drain(&mut rx2);
+        assert!(
+            m2.iter().any(|m| matches!(m, NetworkMessage::Inv(v)
+                if v.len() == 1 && v[0].inv_type == InvType::MsgWtx && v[0].hash == wtxid)),
+            "wtxidrelay peer gets MSG_WTX(wtxid): {m2:?}"
+        );
+        assert!(drain(&mut rx3).is_empty(), "source peer must not be relayed to");
+        // Stuck peer: only the filler messages, no inv was waited for.
+        assert!(drain(&mut rx1).iter().all(|m| matches!(m, NetworkMessage::Verack)));
+
+        // Legacy peer gets MSG_TX(txid) when it is not the source.
+        let (mgr, _rx1, _rx2, mut rx3) = mgr_with_stuck_peer();
+        let out = mgr.relay_tx_to_peers(PeerId(2), txid, wtxid);
+        assert_eq!(out.queued, 1);
+        let m3 = drain(&mut rx3);
+        assert!(m3.iter().any(|m| matches!(m, NetworkMessage::Inv(v)
+            if v[0].inv_type == InvType::MsgTx && v[0].hash == txid)), "{m3:?}");
+    }
+
+    #[tokio::test]
+    async fn broadcast_does_not_block_on_full_peer() {
+        let (mgr, _rx1, mut rx2, _rx3) = mgr_with_stuck_peer();
+        let out = tokio::time::timeout(LIMIT, mgr.broadcast(NetworkMessage::SendHeaders))
+            .await
+            .expect("broadcast blocked");
+        assert_eq!(out, FanoutOutcome { queued: 2, dropped_full: 1, closed: 0 });
+        assert!(drain(&mut rx2).iter().any(|m| matches!(m, NetworkMessage::SendHeaders)));
     }
 }

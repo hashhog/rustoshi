@@ -7181,37 +7181,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         drop(rpc);
                                         // Relay to all peers except the source.
                                         // BIP 339: announce by wtxid+MsgWtx to peers that
-                                        // negotiated wtxidrelay, else by txid+MsgWitnessTx
-                                        // (legacy). Select per peer using the peer's
-                                        // supports_wtxid_relay flag — mirrors the RPC/mempool
-                                        // relay path's per-peer type selection.
+                                        // negotiated wtxidrelay, else by txid+MsgTx.
+                                        // Non-blocking per peer (relay_tx_to_peers): the
+                                        // old inline loop awaited each peer's 32-slot
+                                        // command channel while holding peer_state.read(),
+                                        // so one non-reading peer stalled relay to every
+                                        // later peer and this whole loop for up to the
+                                        // 120 s writer timeout per tx (Core never blocks
+                                        // one peer on another's socket, net.cpp).
                                         let ps = peer_state.read().await;
                                         if let Some(ref pm) = ps.peer_manager {
-                                            // Snapshot (peer_id, wants_wtxid) so we don't
-                                            // hold the borrow across the async sends.
-                                            let peers: Vec<(rustoshi_network::PeerId, bool)> = pm
-                                                .connected_peers()
-                                                .iter()
-                                                .map(|(id, info)| (*id, info.supports_wtxid_relay))
-                                                .collect();
-                                            for (pid, wants_wtxid) in peers {
-                                                if pid == peer_id {
-                                                    continue;
-                                                }
-                                                // Canonical per-peer selection (BIP-339):
-                                                // MsgWtx+wtxid for wtxidrelay peers, else
-                                                // MsgTx+txid. MsgWitnessTx is a getdata-only
-                                                // flag, never a valid inv type.
-                                                let inv = rustoshi_network::build_tx_inv_entry(
-                                                    wants_wtxid,
-                                                    txid,
-                                                    wtxid,
+                                            let out = pm.relay_tx_to_peers(peer_id, txid, wtxid);
+                                            if out.dropped_full > 0 {
+                                                tracing::debug!(
+                                                    "tx {} relay: {} peer(s) skipped (send queue full), {} queued",
+                                                    txid, out.dropped_full, out.queued
                                                 );
-                                                let _ = pm.send_to_peer(
-                                                    pid,
-                                                    NetworkMessage::Inv(vec![inv]),
-                                                )
-                                                .await;
                                             }
                                         }
                                     }
