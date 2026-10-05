@@ -38,7 +38,7 @@ use crate::params::{
 use crate::params::MAX_MONEY;
 use crate::script::{is_p2a, is_p2sh, parse_witness_program, verify_script, ScriptFlags};
 use crate::validation::{
-    calculate_sequence_locks, check_sequence_locks, check_transaction, CoinEntry,
+    check_sequence_locks, check_transaction, CoinEntry,
     count_script_sigops, get_transaction_sigop_cost, SequenceLockContext,
     TransactionSignatureChecker, TxValidationError,
 };
@@ -48,28 +48,54 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+/// Per-height median-time-past lookup for BIP68 coin times: `Some(mtp)` of
+/// the 11-header window ending at `height` on the active chain, `None` when
+/// that window is not fully available (fail closed).
+pub type CoinMtpProvider = Arc<dyn Fn(u32) -> Option<u32> + Send + Sync>;
+
 /// SequenceLockContext for mempool acceptance checks (BIP-68).
 ///
-/// Mempool does not have direct DB access, so we use a conservative
-/// approximation: return the current tip's MTP for all coin heights.
-/// For time-based relative locks, using the tip MTP as the "coin time"
-/// makes the check STRICTER (it adds more to the lock_time value), which
-/// may produce false-rejects but never false-admits — safe for mempool.
-struct MempoolSeqLockCtx {
+/// Core `CalculateLockPointsAtTip` (validation.cpp): a coin's time is the MTP
+/// of its block's PARENT (`GetAncestor(max(nCoinHeight - 1, 0))`); a mempool
+/// coin counts at height tip+1, so its time is the tip's MTP. Heights at or
+/// above the tip therefore answer the mempool's own tip MTP; lower heights go
+/// to the store-backed [`CoinMtpProvider`].
+///
+/// Previously every height answered the TIP MTP, so a confirmed coin "was
+/// created" at the tip's MTP and any time-based relative lock with a value of
+/// at least 1 (512 s) could never be satisfied: valid txs were refused.
+/// Without a provider (unit-test mempools) the old stricter behaviour remains.
+struct MempoolSeqLockCtx<'a> {
+    tip_height: u32,
     tip_mtp: u32,
+    provider: Option<&'a CoinMtpProvider>,
 }
 
-impl MempoolSeqLockCtx {
-    fn new(tip_mtp_i64: i64) -> Self {
+impl<'a> MempoolSeqLockCtx<'a> {
+    fn new(tip_height: u32, tip_mtp_i64: i64, provider: Option<&'a CoinMtpProvider>) -> Self {
         Self {
+            tip_height,
             tip_mtp: tip_mtp_i64.max(0) as u32,
+            provider,
         }
     }
 }
 
-impl SequenceLockContext for MempoolSeqLockCtx {
-    fn get_mtp_at_height(&self, _height: u32) -> u32 {
-        self.tip_mtp
+impl SequenceLockContext for MempoolSeqLockCtx<'_> {
+    fn get_mtp_at_height(&self, height: u32) -> u32 {
+        // Infallible form: an unresolvable window makes time locks
+        // unsatisfiable (fail closed), never satisfied.
+        self.try_get_mtp_at_height(height).unwrap_or(u32::MAX)
+    }
+
+    fn try_get_mtp_at_height(&self, height: u32) -> Result<u32, u32> {
+        if height >= self.tip_height {
+            return Ok(self.tip_mtp);
+        }
+        match self.provider {
+            Some(p) => p(height).ok_or(height),
+            None => Ok(self.tip_mtp),
+        }
     }
 }
 
@@ -1523,9 +1549,64 @@ pub struct Mempool {
     /// write + :125-132 load). W120 BUG-9 + BUG-10 (FIX-72); FIX-76
     /// closure of the standalone-tail persistence gap.
     map_deltas: HashMap<Hash256, i64>,
+    /// BIP68 coin-time lookup (see [`MempoolSeqLockCtx`]); set by the node
+    /// from its header store.
+    coin_mtp_provider: Option<CoinMtpProvider>,
 }
 
 impl Mempool {
+    /// Install the per-height MTP lookup used for BIP68 time-based relative
+    /// locks (Core CalculateLockPointsAtTip: coin time = MTP of the coin's
+    /// block's parent).
+    pub fn set_coin_mtp_provider(&mut self, provider: CoinMtpProvider) {
+        self.coin_mtp_provider = Some(provider);
+    }
+
+    /// BIP68 at the next block for `tx`, resolving coin heights the way
+    /// admission does: a mempool parent's output at tip+1, a confirmed coin
+    /// at its own height. A missing input or an unresolvable MTP window is
+    /// NOT final (fail closed). Core `CheckSequenceLocksAtTip`.
+    pub fn sequence_locks_ok_at_tip<F>(&self, tx: &Transaction, utxo_lookup: &F) -> bool
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
+        if !crate::validation::bip68_version_active(tx.version) {
+            return true;
+        }
+        let mut heights = Vec::with_capacity(tx.inputs.len());
+        for input in &tx.inputs {
+            if self.created_utxos.contains_key(&input.previous_output) {
+                heights.push(self.tip_height + 1);
+            } else if let Some(c) = utxo_lookup(&input.previous_output) {
+                heights.push(c.height);
+            } else {
+                return false;
+            }
+        }
+        let ctx = MempoolSeqLockCtx::new(
+            self.tip_height,
+            self.median_time_past,
+            self.coin_mtp_provider.as_ref(),
+        );
+        match crate::validation::try_calculate_sequence_locks(tx, &heights, &ctx, true) {
+            Ok(locks) => check_sequence_locks(&locks, self.tip_height + 1, self.median_time_past),
+            Err(_) => false,
+        }
+    }
+
+    /// Txids whose BIP68 relative locks are not satisfied at the next block
+    /// (reorg eviction; Core removeForReorg re-checks lock points).
+    pub fn txids_failing_sequence_locks<F>(&self, utxo_lookup: &F) -> HashSet<Hash256>
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
+        self.transactions
+            .values()
+            .filter(|e| !self.sequence_locks_ok_at_tip(&e.tx, utxo_lookup))
+            .map(|e| e.txid)
+            .collect()
+    }
+
     /// Create a new mempool with the given configuration.
     pub fn new(config: MempoolConfig) -> Self {
         Self {
@@ -1550,6 +1631,7 @@ impl Mempool {
             // First admitted tx gets sequence 1 (Core uses 1-indexed).
             next_sequence: 1,
             map_deltas: HashMap::new(),
+            coin_mtp_provider: None,
         }
     }
 
@@ -1931,11 +2013,23 @@ impl Mempool {
         // we skip the BIP-68 check for those inputs since they're being replaced;
         // the full BIP-68 check will be re-evaluated after conflicts are removed.
         if spent_heights.len() == tx.inputs.len() {
-            let seq_ctx = MempoolSeqLockCtx::new(self.median_time_past);
+            let seq_ctx = MempoolSeqLockCtx::new(
+                self.tip_height,
+                self.median_time_past,
+                self.coin_mtp_provider.as_ref(),
+            );
             // Core compares version unsigned (uint32_t, tx_verify.cpp:51); a high-bit
             // version (0x80000002) still enforces BIP68. Shared with validation.rs.
             let enforce_bip68 = crate::validation::bip68_version_active(tx.version);
-            let locks = calculate_sequence_locks(&tx, &spent_heights, &seq_ctx, enforce_bip68);
+            // An unresolvable coin MTP window refuses the tx (fail closed;
+            // Core always has the header).
+            let locks = crate::validation::try_calculate_sequence_locks(
+                &tx,
+                &spent_heights,
+                &seq_ctx,
+                enforce_bip68,
+            )
+            .map_err(|_| MempoolError::SequenceLockNotSatisfied)?;
             if !check_sequence_locks(&locks, next_height, self.median_time_past) {
                 return Err(MempoolError::SequenceLockNotSatisfied);
             }
@@ -7140,6 +7234,93 @@ mod tests {
         assert!(!mempool.contains(&txid1));
         assert!(mempool.contains(&txid2));
         assert_eq!(mempool.size(), 1);
+    }
+
+    /// R-d: BIP68 coin times. Fixture: tip 1000 with MTP T; a confirmed coin
+    /// at height 500 whose parent block (499) has MTP T - 100_000.
+    const RD_T: u32 = 1_700_000_000;
+    fn rd_mempool(provider: Option<CoinMtpProvider>) -> (Mempool, HashMap<OutPoint, CoinEntry>, Hash256) {
+        let mut m = Mempool::new(MempoolConfig::default());
+        m.notify_new_tip(1000, RD_T as i64);
+        if let Some(p) = provider {
+            m.set_coin_mtp_provider(p);
+        }
+        let c = Hash256::from_hex("00000000000000000000000000000000000000000000000000000000000000d7").unwrap();
+        let mut u = mock_utxo_set(vec![(OutPoint { txid: c, vout: 0 }, 100_000)]);
+        u.get_mut(&OutPoint { txid: c, vout: 0 }).unwrap().height = 500;
+        (m, u, c)
+    }
+    fn rd_provider() -> CoinMtpProvider {
+        Arc::new(|h: u32| if h == 499 { Some(RD_T - 100_000) } else { None })
+    }
+    fn rd_tx(prev: Hash256, sequence: u32, lock_time: u32) -> Transaction {
+        let mut t = make_tx(vec![(prev, 0)], vec![90_000], 2);
+        t.inputs[0].sequence = sequence;
+        t.lock_time = lock_time;
+        t
+    }
+    const TYPE_FLAG: u32 = 1 << 22;
+
+    /// A matured time-type relative lock (10 x 512 s, coin ~27 h old) is
+    /// valid at the next block. 32d20827 used the TIP MTP as every coin's
+    /// time, so any time lock >= 1 unit was refused.
+    #[test]
+    fn test_bip68_time_lock_matured_accepted() {
+        let (mut m, u, c) = rd_mempool(Some(rd_provider()));
+        let r = m.add_transaction(rd_tx(c, TYPE_FLAG | 10, 0), &|o| u.get(o).cloned());
+        assert!(r.is_ok(), "matured time-type relative lock must be accepted: {r:?}");
+    }
+
+    /// Controls: a time lock NOT yet matured is refused (coin time T-100000,
+    /// lock 196 x 512 = 100_352 s > 100_000); an unresolvable coin window
+    /// refuses (fail closed); a height lock on the same coin is unaffected.
+    #[test]
+    fn test_bip68_time_lock_controls() {
+        let (mut m, u, c) = rd_mempool(Some(rd_provider()));
+        assert!(matches!(
+            m.add_transaction(rd_tx(c, TYPE_FLAG | 196, 0), &|o| u.get(o).cloned()),
+            Err(MempoolError::SequenceLockNotSatisfied)
+        ));
+        let (mut m, u, c) = rd_mempool(Some(Arc::new(|_| None)));
+        assert!(matches!(
+            m.add_transaction(rd_tx(c, TYPE_FLAG | 1, 0), &|o| u.get(o).cloned()),
+            Err(MempoolError::SequenceLockNotSatisfied)
+        ), "no MTP window for the coin: fail closed");
+        let (mut m, u, c) = rd_mempool(Some(Arc::new(|_| None)));
+        assert!(m.add_transaction(rd_tx(c, 500, 0), &|o| u.get(o).cloned()).is_ok(),
+            "height lock 500 on a coin 500 deep: satisfied, needs no MTP");
+    }
+
+    /// Child of an UNCONFIRMED parent with a relative height lock of 1: the
+    /// parent's coin counts at tip+1, so the child is not final at tip+1
+    /// (Core CalculateLockPointsAtTip). Also: an anti-fee-sniping nLockTime
+    /// = tip height is final at tip+1.
+    #[test]
+    fn test_bip68_mempool_parent_height_lock_and_anti_fee_sniping() {
+        let (mut m, u, c) = rd_mempool(Some(rd_provider()));
+        let parent = rd_tx(c, 0xFFFF_FFFE, 1000); // anti-fee-sniping locktime = tip
+        let pid = parent.txid();
+        assert!(m.add_transaction(parent, &|o| u.get(o).cloned()).is_ok(),
+            "nLockTime = tip height is final at tip+1");
+        let mut child = make_tx(vec![(pid, 0)], vec![80_000], 2);
+        child.inputs[0].sequence = 1;
+        assert!(matches!(
+            m.add_transaction(child, &|o| u.get(o).cloned()),
+            Err(MempoolError::SequenceLockNotSatisfied)
+        ), "height lock 1 on a mempool parent is non-BIP68-final at tip+1");
+    }
+
+    /// Reorg eviction re-checks BIP68 (Core removeForReorg): a tx whose
+    /// height lock was met at tip 1000 is not final after a reorg to 900.
+    #[test]
+    fn test_bip68_reorg_recheck() {
+        let (mut m, u, c) = rd_mempool(Some(rd_provider()));
+        let tx = rd_tx(c, 450, 0); // coin at 500: final from height 950
+        let id = tx.txid();
+        m.add_transaction(tx, &|o| u.get(o).cloned()).unwrap();
+        assert!(m.txids_failing_sequence_locks(&|o| u.get(o).cloned()).is_empty());
+        m.notify_new_tip(900, RD_T as i64 - 60_000);
+        assert!(m.txids_failing_sequence_locks(&|o| u.get(o).cloned()).contains(&id));
     }
 
     /// R-c (2026-10-05 fleet sweep, QUEUES 11:30Z item 6): fee-bumping the

@@ -493,13 +493,102 @@ fn chain_fully_validated(snapshot_active: bool, snapshot_validated: bool) -> boo
     !snapshot_active || snapshot_validated
 }
 
+/// Evict mempool entries invalid at a post-reorg tip: non-final, spending a
+/// now-immature coinbase, or (3) BIP68 relative locks not met at tip+1.
+/// Core `MaybeUpdateMempoolForReorg` -> `removeForReorg` (validation.cpp),
+/// run after every reorg. Returns the number of entries removed.
+fn evict_mempool_after_reorg(
+    mempool: &mut Mempool,
+    store: &BlockStore<'_>,
+    tip_height: u32,
+    mtp: i64,
+) -> usize {
+    let refill_view = store.utxo_view();
+    let utxo_lookup = |op: &rustoshi_primitives::OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
+        use rustoshi_consensus::validation::UtxoView;
+        refill_view.get_utxo(op)
+    };
+    // DoS-vector parity (audit w14z8m3zc, finding 4): evict mempool entries
+    // that became invalid at the NEW (shorter) tip. After a reorg, txs that
+    // were valid against the old chain can be:
+    //   - no longer FINAL (nLockTime height/time not yet reached at the new
+    //     tip), or
+    //   - spending a coinbase output that is no longer mature (the
+    //     confirming block was rolled off, so the coinbase has fewer
+    //     confirmations than COINBASE_MATURITY at new-tip+1).
+    // Mirrors Core's `CTxMemPool::removeForReorg` driven from
+    // `Chainstate::MaybeUpdateMempoolForReorg` (validation.cpp:334-385),
+    // which runs AFTER the disconnected-block re-add above.
+    //
+    // Scope: finality, coinbase maturity and (3, below) BIP68 sequence
+    // locks. Core caches LockPoints per entry; rustoshi recomputes them.
+    let next_height = tip_height + 1;
+    // 3) BIP68 at the new tip (Core removeForReorg re-validates each
+    //    entry's LockPoints, validation.cpp MaybeUpdateMempoolForReorg).
+    //    Computed before the &mut borrow: a mempool parent's output counts
+    //    at new-tip+1, a confirmed coin at its height, its time the MTP of
+    //    its block's parent; unresolvable or missing -> evicted.
+    let bip68_fail = mempool.txids_failing_sequence_locks(&utxo_lookup);
+    let removed = mempool.remove_for_reorg(|entry| {
+        // 1) Finality at the new tip (BIP-113 uses MTP for time locks).
+        if !rustoshi_consensus::block_template::is_final_tx(&entry.tx, next_height, mtp) {
+            return true;
+        }
+        if bip68_fail.contains(&entry.txid) {
+            return true;
+        }
+        // 2) Coinbase maturity at the new tip. Only entries flagged as
+        //    spending a coinbase need the (cheap) per-input re-scan.
+        if entry.spends_coinbase {
+            use rustoshi_consensus::validation::UtxoView;
+            for input in &entry.tx.inputs {
+                if let Some(coin) = refill_view.get_utxo(&input.previous_output) {
+                    if coin.is_coinbase
+                        && next_height.saturating_sub(coin.height)
+                            < rustoshi_consensus::COINBASE_MATURITY
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    });
+    if removed > 0 {
+        tracing::info!(
+            "Reorg to height {}: evicted {} now-invalid mempool tx(s) (non-final / non-BIP68-final / immature-coinbase)",
+            tip_height, removed
+        );
+    }
+    removed
+}
+
+/// BIP68 coin-time lookup for the mempool, backed by the header store (the
+/// same fail-closed 11-header walk block connection uses). Core
+/// CalculateLockPointsAtTip: a coin's time is the MTP of its block's parent.
+fn store_coin_mtp_provider(db: Arc<ChainDb>) -> rustoshi_consensus::mempool::CoinMtpProvider {
+    Arc::new(move |height: u32| {
+        let store = BlockStore::new(&db);
+        rustoshi_storage::StoreSeqLockCtx::new(&store)
+            .try_get_mtp_at_height(height)
+            .ok()
+    })
+}
+
+/// A mempool for this node, wired to the header store for BIP68 coin times.
+fn node_mempool(db: &Arc<ChainDb>, config: rustoshi_consensus::MempoolConfig) -> Mempool {
+    let mut m = Mempool::new(config);
+    m.set_coin_mtp_provider(store_coin_mtp_provider(Arc::clone(db)));
+    m
+}
+
 impl RpcState {
     /// Create a new RPC state.
     pub fn new(db: Arc<ChainDb>, params: ChainParams) -> Self {
         let mempool_config = mempool_config_for_network(params.network_id);
         Self {
+            mempool: node_mempool(&db, mempool_config),
             db,
-            mempool: Mempool::new(mempool_config),
             fee_estimator: FeeEstimator::new(),
             params,
             best_height: 0,
@@ -534,8 +623,8 @@ impl RpcState {
     pub fn with_prune_config(db: Arc<ChainDb>, params: ChainParams, prune_target: u64) -> Self {
         let mempool_config = mempool_config_for_network(params.network_id);
         Self {
+            mempool: node_mempool(&db, mempool_config),
             db,
-            mempool: Mempool::new(mempool_config),
             fee_estimator: FeeEstimator::new(),
             params,
             best_height: 0,
@@ -5026,53 +5115,7 @@ fn disconnect_to(
                 .block_disconnected(&block.transactions, &utxo_lookup);
         }
 
-        // DoS-vector parity (audit w14z8m3zc, finding 4): evict mempool entries
-        // that became invalid at the NEW (shorter) tip. After a reorg, txs that
-        // were valid against the old chain can be:
-        //   - no longer FINAL (nLockTime height/time not yet reached at the new
-        //     tip), or
-        //   - spending a coinbase output that is no longer mature (the
-        //     confirming block was rolled off, so the coinbase has fewer
-        //     confirmations than COINBASE_MATURITY at new-tip+1).
-        // Mirrors Core's `CTxMemPool::removeForReorg` driven from
-        // `Chainstate::MaybeUpdateMempoolForReorg` (validation.cpp:334-385),
-        // which runs AFTER the disconnected-block re-add above.
-        //
-        // Scope: this mirrors the two cases named in `remove_for_reorg`'s own
-        // doc-comment (finality + coinbase maturity). Core additionally
-        // re-checks BIP-68 sequence-locks via cached LockPoints; rustoshi's
-        // `MempoolEntry` does not cache LockPoints, so that nuance is left to
-        // whatever `add_transaction` re-enforces on the next admission (the
-        // re-added disconnected txs already pass `is_final_tx`).
-        let next_height = target_height + 1;
-        let removed = state.mempool.remove_for_reorg(|entry| {
-            // 1) Finality at the new tip (BIP-113 uses MTP for time locks).
-            if !rustoshi_consensus::block_template::is_final_tx(&entry.tx, next_height, mtp) {
-                return true;
-            }
-            // 2) Coinbase maturity at the new tip. Only entries flagged as
-            //    spending a coinbase need the (cheap) per-input re-scan.
-            if entry.spends_coinbase {
-                use rustoshi_consensus::validation::UtxoView;
-                for input in &entry.tx.inputs {
-                    if let Some(coin) = refill_view.get_utxo(&input.previous_output) {
-                        if coin.is_coinbase
-                            && next_height.saturating_sub(coin.height)
-                                < rustoshi_consensus::COINBASE_MATURITY
-                        {
-                            return true;
-                        }
-                    }
-                }
-            }
-            false
-        });
-        if removed > 0 {
-            tracing::info!(
-                "Reorg to height {}: evicted {} now-invalid mempool tx(s) (non-final / immature-coinbase)",
-                target_height, removed
-            );
-        }
+        evict_mempool_after_reorg(&mut state.mempool, &store, target_height, mtp);
     }
 
     Ok(())
@@ -5990,6 +6033,9 @@ pub fn try_attach_and_reorg_detailed(
                 .mempool
                 .block_disconnected(&blk.transactions, &utxo_lookup);
         }
+        // Core MaybeUpdateMempoolForReorg runs removeForReorg after EVERY
+        // reorg; this path refilled the mempool but never evicted.
+        evict_mempool_after_reorg(&mut state.mempool, &store, new_tip_height, mtp);
     }
 
     Ok(true)
