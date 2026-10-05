@@ -2108,9 +2108,24 @@ impl Mempool {
         // This may indicate sibling eviction is possible
         let sibling_to_evict = self.check_truc_policy(&tx, txid, vsize, &mempool_parents, &direct_conflicts)?;
 
-        // Handle conflicts via RBF
+        // Handle conflicts via RBF.
+        //
+        // STAGED, not applied. Core builds the eviction set into a
+        // CTxMemPool::ChangeSet (validation.cpp ReplacementChecks →
+        // m_subpackage.m_changeset->StageRemoval) and only REMOVES it in
+        // FinalizeSubpackage → ChangeSet::Apply(), after PolicyScriptChecks and
+        // ConsensusScriptChecks passed; with m_test_accept it never applies at
+        // all (AcceptSingleTransactionInternal returns before Finalize).
+        // rustoshi used to call remove_single() right here, so (a) a
+        // replacement that later failed its cluster gates or its SCRIPT checks
+        // had already evicted the original — a free mempool-eviction DoS with
+        // an invalid signature — and (b) testmempoolaccept of a valid
+        // replacement evicted live transactions. Everything below now runs
+        // against the unmodified pool; `staged_removals` is committed only
+        // after every check passed and only when !test_accept.
+        let mut staged_removals: Vec<Hash256> = Vec::new();
         if !direct_conflicts.is_empty() {
-            // Check RBF rules and get the set of transactions to remove
+            // Check RBF rules (read-only).
             self.check_rbf_rules(&tx, fee, fee_rate, vsize, &direct_conflicts, &mempool_parents)?;
 
             // Collect all transactions to remove (direct conflicts + their descendants)
@@ -2121,11 +2136,7 @@ impl Mempool {
                     all_to_remove.insert(desc);
                 }
             }
-
-            // Remove all conflicting transactions and their descendants
-            for txid_to_remove in &all_to_remove {
-                self.remove_single(txid_to_remove);
-            }
+            staged_removals.extend(all_to_remove);
         }
 
         // Handle TRUC sibling eviction (Rule 6)
@@ -2157,8 +2168,10 @@ impl Mempool {
                     ));
                 }
 
-                // Remove the sibling
-                self.remove_single(&sibling_txid);
+                // Stage the sibling (removed at commit, below).
+                if !staged_removals.contains(&sibling_txid) {
+                    staged_removals.push(sibling_txid);
+                }
             }
         }
 
@@ -2177,7 +2190,30 @@ impl Mempool {
         //     total_count > m_max_cluster_count || total_size > m_max_cluster_size
         // Both comparisons are STRICTLY greater: 64 members accept / 65 reject,
         // 404_000 weight accepts / 404_001 rejects.
-        let new_cluster_size = self.calculate_new_cluster_size(&mempool_parents);
+        //
+        // The staged removals are not applied yet, so the gates are evaluated
+        // on the pool AS IT WILL BE after the change set commits (Core runs
+        // CheckMemPoolPolicyLimits on the changeset, which already excludes
+        // the staged removals). With nothing staged this is the original
+        // cluster-id computation, unchanged.
+        let new_tx_adjusted_weight = crate::params::get_sigops_adjusted_weight(
+            tx.weight() as u64,
+            tx_sigop_cost,
+            crate::params::DEFAULT_BYTES_PER_SIGOP,
+        );
+        let (new_cluster_size, new_cluster_weight) = if staged_removals.is_empty() {
+            (
+                self.calculate_new_cluster_size(&mempool_parents),
+                self.calculate_new_cluster_weight(&mempool_parents, new_tx_adjusted_weight),
+            )
+        } else {
+            let excluded: HashSet<Hash256> = staged_removals.iter().copied().collect();
+            self.calculate_new_cluster_stats_excluding(
+                &mempool_parents,
+                &excluded,
+                new_tx_adjusted_weight,
+            )
+        };
         if new_cluster_size > MAX_CLUSTER_SIZE {
             return Err(MempoolError::ClusterSizeLimitExceeded(
                 new_cluster_size,
@@ -2187,13 +2223,6 @@ impl Mempool {
 
         // Cluster total size in WEIGHT units. Each member contributes
         // max(weight, sigop_cost * 20); no per-tx division, no per-tx rounding.
-        let new_tx_adjusted_weight = crate::params::get_sigops_adjusted_weight(
-            tx.weight() as u64,
-            tx_sigop_cost,
-            crate::params::DEFAULT_BYTES_PER_SIGOP,
-        );
-        let new_cluster_weight =
-            self.calculate_new_cluster_weight(&mempool_parents, new_tx_adjusted_weight);
         if new_cluster_weight > MAX_CLUSTER_SIZE_WEIGHT {
             return Err(MempoolError::ClusterWeightLimitExceeded(
                 new_cluster_weight,
@@ -2323,7 +2352,15 @@ impl Mempool {
         // When `opts.test_accept` is true (testmempoolaccept RPC), return after
         // validation without inserting.
         if opts.test_accept {
+            // Dry run: the staged removals are dropped, never applied (Core
+            // validation.cpp: m_test_accept returns before FinalizeSubpackage).
             return Ok(txid);
+        }
+
+        // Every check passed: commit the change set (Core ChangeSet::Apply —
+        // conflicts and the TRUC sibling leave the pool only now).
+        for txid_to_remove in &staged_removals {
+            self.remove_single(txid_to_remove);
         }
 
         // Evict if mempool is full, updating the rolling minimum fee rate on each eviction.
@@ -4368,6 +4405,48 @@ impl Mempool {
         }
 
         total_weight
+    }
+
+    /// Count and total sigop-adjusted weight of the cluster a new transaction
+    /// with `mempool_parents` would join, evaluated as if every txid in
+    /// `excluded` had already been removed (the staged RBF / TRUC-sibling
+    /// change set). Clusters are connected components of the parent/child
+    /// graph (`remove_from_clusters` splits them), so a walk over that graph
+    /// that skips `excluded` yields exactly the post-removal merged cluster.
+    /// The new transaction itself is counted (1, `new_tx_adjusted_weight`).
+    ///
+    /// POLICY, not consensus.
+    fn calculate_new_cluster_stats_excluding(
+        &self,
+        mempool_parents: &HashSet<Hash256>,
+        excluded: &HashSet<Hash256>,
+        new_tx_adjusted_weight: u64,
+    ) -> (usize, u64) {
+        let mut visited: HashSet<Hash256> = HashSet::new();
+        let mut queue: Vec<Hash256> = mempool_parents
+            .iter()
+            .filter(|t| !excluded.contains(*t))
+            .copied()
+            .collect();
+        let mut count = 1usize;
+        let mut weight = new_tx_adjusted_weight;
+        while let Some(cur) = queue.pop() {
+            if excluded.contains(&cur) || !visited.insert(cur) {
+                continue;
+            }
+            let Some(entry) = self.transactions.get(&cur) else {
+                continue;
+            };
+            count += 1;
+            weight = weight.saturating_add(entry.sigop_adjusted_weight);
+            if let Some(ps) = self.parents.get(&cur) {
+                queue.extend(ps.iter().filter(|t| !excluded.contains(*t)).copied());
+            }
+            if let Some(cs) = self.children.get(&cur) {
+                queue.extend(cs.iter().filter(|t| !excluded.contains(*t)).copied());
+            }
+        }
+        (count, weight)
     }
 
     /// Evict the transaction with the lowest mining score.
