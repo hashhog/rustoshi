@@ -1727,43 +1727,19 @@ impl Mempool {
                     return Err(MempoolError::ReplacementDisallowed);
                 }
                 direct_conflicts.insert(conflicting);
-                // Still need to look up the value from UTXO set since we're replacing
-                if let Some(coin) = utxo_lookup(&input.previous_output) {
-                    // Coinbase maturity even for conflicting inputs (belt+suspenders).
-                    if coin.is_coinbase {
-                        spends_coinbase = true;
-                        let age = self.tip_height.saturating_sub(coin.height);
-                        if age < COINBASE_MATURITY {
-                            return Err(MempoolError::CoinbaseNotMature {
-                                age,
-                                required: COINBASE_MATURITY,
-                            });
-                        }
-                    }
-                    spent_heights.push(coin.height);
-                    prevout_scripts.push(coin.script_pubkey);
-                    // W96 (gate 11): MoneyRange per-input + accumulated.
-                    // Mirrors Core consensus/tx_verify.cpp::CheckTxInputs:
-                    //   if (!MoneyRange(coin.out.nValue))
-                    //   nValueIn += coin.out.nValue;
-                    //   if (!MoneyRange(nValueIn))
-                    if coin.value > MAX_MONEY {
-                        return Err(MempoolError::InputValueOutOfRange(coin.value));
-                    }
-                    input_sum = input_sum
-                        .checked_add(coin.value)
-                        .filter(|&v| v <= MAX_MONEY)
-                        .ok_or(MempoolError::InputValueOutOfRange(
-                            input_sum.saturating_add(coin.value),
-                        ))?;
-                } else {
-                    // The input must be in the UTXO set (not in mempool) for replacement
-                    return Err(MempoolError::MissingInput(
-                        input.previous_output.txid,
-                        input.previous_output.vout,
-                    ));
-                }
-                continue;
+                // Fall through to the SAME coin lookup as a non-conflicting
+                // input. The prevout may be an output of an unconfirmed
+                // mempool parent (fee-bumping a child of an unconfirmed tx):
+                // Core resolves every input through m_view backed by
+                // CCoinsViewMemPool (validation.cpp:845, txmempool.cpp
+                // CCoinsViewMemPool::GetCoin), conflicts included. A
+                // replacement that spends an output of a tx it replaces is
+                // refused later by check_rbf_rules' ancestors-vs-conflicts
+                // test (bad-txns-spends-conflicting-tx, Core
+                // EntriesAndTxidsDisjoint, validation.cpp:1356), which needs
+                // that parent in `mempool_parents`. Previously this branch
+                // read the chain UTXO set only and returned MissingInput, so
+                // the replacement was orphaned and never promoted.
             }
 
             // Try mempool UTXOs first (for chained unconfirmed transactions).
@@ -4712,6 +4688,14 @@ impl Mempool {
             // Check for conflicts (double-spends)
             if let Some(&conflicting) = self.spent_outpoints.get(&input.previous_output) {
                 direct_conflicts.insert(conflicting);
+                // Deliberately chain-UTXO only (unlike add_transaction): a
+                // package member that replaces a mempool tx while spending a
+                // mempool parent's output is refused by Core too — package
+                // RBF requires no in-mempool ancestors (validation.cpp:1065,
+                // "package RBF failed: new transaction cannot have mempool
+                // ancestors"). rustoshi has no package-RBF rules yet, so this
+                // lookup is what keeps that case rejected (with the
+                // missing-inputs token rather than Core's package one).
                 if let Some(coin) = utxo_lookup(&input.previous_output) {
                     prevout_scripts.push(coin.script_pubkey.clone());
                     input_sum += coin.value;
@@ -7156,6 +7140,79 @@ mod tests {
         assert!(!mempool.contains(&txid1));
         assert!(mempool.contains(&txid2));
         assert_eq!(mempool.size(), 1);
+    }
+
+    /// R-c (2026-10-05 fleet sweep, QUEUES 11:30Z item 6): fee-bumping the
+    /// CHILD of an unconfirmed parent. The replacement's conflicting input is
+    /// an output of a mempool tx, so it is only visible through a mempool-
+    /// backed view (Core m_view → CCoinsViewMemPool, validation.cpp:845).
+    /// 32d20827 resolved conflicting inputs from the chain UTXO set only →
+    /// MissingInput → orphaned, never promoted (the parent is already here).
+    #[test]
+    fn test_rbf_fee_bump_child_of_unconfirmed_parent() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let coin =
+            Hash256::from_hex("00000000000000000000000000000000000000000000000000000000000000c1")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: coin, vout: 0 }, 1_000_000)]);
+        let look = |op: &OutPoint| utxos.get(op).cloned();
+
+        // Unconfirmed parent P (two outputs), then child C1 spending P:0.
+        let p = make_tx(vec![(coin, 0)], vec![490_000, 490_000], 2);
+        let p_id = p.txid();
+        mempool.add_transaction(p, &look).unwrap();
+        let c1 = make_tx(vec![(p_id, 0)], vec![480_000], 2);
+        let c1_id = c1.txid();
+        mempool.add_transaction(c1, &look).unwrap();
+
+        // Fee bump of the child: same input P:0, higher fee.
+        let c2 = make_tx(vec![(p_id, 0)], vec![470_000], 2);
+        let c2_id = c2.txid();
+        let r = mempool.add_transaction(c2, &look);
+        assert!(r.is_ok(), "fee bump of a child of an unconfirmed tx must replace, got {r:?}");
+        assert!(mempool.contains(&p_id), "parent stays");
+        assert!(!mempool.contains(&c1_id), "replaced child evicted");
+        assert!(mempool.contains(&c2_id));
+        let e = mempool.get(&c2_id).unwrap();
+        assert_eq!(e.fee, 20_000, "fee computed from the mempool parent's output value");
+        assert_eq!(mempool.get_ancestors_of(&c2_id), vec![p_id], "P is the replacement's ancestor");
+    }
+
+    /// Same view, mixed inputs: the replacement conflicts on a mempool-parent
+    /// output AND adds a confirmed input; and an overspending bump is still
+    /// refused on value (the parent's output is the real input amount, not 0
+    /// and not "missing").
+    #[test]
+    fn test_rbf_fee_bump_child_of_unconfirmed_parent_values() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let a =
+            Hash256::from_hex("00000000000000000000000000000000000000000000000000000000000000a1")
+                .unwrap();
+        let b =
+            Hash256::from_hex("00000000000000000000000000000000000000000000000000000000000000b1")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: a, vout: 0 }, 1_000_000),
+            (OutPoint { txid: b, vout: 0 }, 50_000),
+        ]);
+        let look = |op: &OutPoint| utxos.get(op).cloned();
+        let p = make_tx(vec![(a, 0)], vec![990_000], 2);
+        let p_id = p.txid();
+        mempool.add_transaction(p, &look).unwrap();
+        let c1 = make_tx(vec![(p_id, 0)], vec![980_000], 2);
+        mempool.add_transaction(c1, &look).unwrap();
+
+        let over = make_tx(vec![(p_id, 0)], vec![990_001], 2);
+        assert!(
+            matches!(mempool.add_transaction(over, &look), Err(MempoolError::InsufficientFunds)),
+            "overspending bump must fail on value, not as missing inputs"
+        );
+        let c2 = make_tx(vec![(p_id, 0), (b, 0)], vec![1_000_000], 2);
+        let c2_id = c2.txid();
+        let r = mempool.add_transaction(c2, &look);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(mempool.get(&c2_id).unwrap().fee, 40_000);
+        assert_eq!(mempool.size(), 2);
     }
 
     #[test]
