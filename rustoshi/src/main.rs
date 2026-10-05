@@ -608,6 +608,105 @@ impl SystemFaultRetry {
     }
 }
 
+/// A forward block whose connect needs a header this node does not have yet.
+///
+/// Since gate 6 a block whose consensus rules need a pre-snapshot header —
+/// in practice the BIP68 time lock of an input whose coin's block is below
+/// the snapshot's header band (Core `CalculateSequenceLocks`:
+/// `GetAncestor(max(nCoinHeight - 1, 0))->GetMedianTimePast()`) — fails
+/// closed with `MissingAncestorHeader(h)`: no verdict. Core never meets this
+/// (assumeUTXO activation requires the full header chain). Here the header
+/// arrives only through the historical backfill.
+///
+/// Two things wedged a snapshot-started node at that block (R4 slices on
+/// rung 940000: block 940004 needs header 935419, the ladder entry carries
+/// 2,027 headers; every arm stuck at 940003):
+///
+/// * the block was DROPPED (handed out by `next_block_to_validate`, never
+///   requeued, the downloader's validated-tip counter left one ahead), so
+///   every later buffered block failed `PrevBlockNotFound` and was dropped
+///   too;
+/// * the backfill yields to the forward download
+///   ([`historical_backfill_may_drive`]), which was now waiting on it.
+///
+/// Now the block is parked: put back at the front of the validation queue
+/// (body kept), connects pause until the header window at `h` is present,
+/// and while parked the backfill may fetch HEADERS (never bodies) even
+/// though the forward download is busy.
+#[derive(Default)]
+struct AncestorHeaderWait {
+    parked: Option<(rustoshi_primitives::Hash256, u32)>,
+}
+
+impl AncestorHeaderWait {
+    /// Park `block` until the header at `need` (and its MTP window) is
+    /// stored. Returns true the first time this block/height is parked (log
+    /// once, not every tick).
+    fn park(&mut self, block: rustoshi_primitives::Hash256, need: u32) -> bool {
+        let first = self.parked != Some((block, need));
+        self.parked = Some((block, need));
+        first
+    }
+
+    /// The missing header height a parked block waits on.
+    fn waiting_on(&self) -> Option<u32> {
+        self.parked.map(|(_, h)| h)
+    }
+
+    /// True when forward connects may run: nothing parked, or the missing
+    /// header window has arrived (then the wait is cleared). Fails closed: a
+    /// read error keeps the block parked (the retry would only re-park it).
+    fn ready(&mut self, store: &BlockStore<'_>) -> bool {
+        use rustoshi_consensus::SequenceLockContext;
+        let Some((block, need)) = self.parked else {
+            return true;
+        };
+        if rustoshi_storage::StoreSeqLockCtx::new(store)
+            .try_get_mtp_at_height(need)
+            .is_ok()
+        {
+            tracing::info!(
+                "ancestor header {} is now stored; retrying parked block {}",
+                need, block
+            );
+            self.parked = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Park a forward block on a missing ancestor header and say so once.
+fn park_on_missing_ancestor(
+    wait: &mut AncestorHeaderWait,
+    backfill_armed: bool,
+    block: rustoshi_primitives::Hash256,
+    height: u32,
+    need: u32,
+) {
+    if !wait.park(block, need) {
+        return;
+    }
+    if backfill_armed {
+        tracing::warn!(
+            "block {} at height {} parked: its consensus checks need ancestor header {} \
+             (below the assumeUTXO header band; no verdict). The historical backfill is \
+             fetching headers ahead of the forward download; the block is retried as soon \
+             as that header window is stored",
+            block, height, need
+        );
+    } else {
+        tracing::error!(
+            "block {} at height {} parked: its consensus checks need ancestor header {} \
+             and this node has no historical backfill running (--no-historical-backfill / \
+             HASHHOG_DISABLE_HISTORICAL_BACKFILL, or not armed yet) — the tip cannot \
+             advance past it until the full header chain is present",
+            block, height, need
+        );
+    }
+}
+
 /// Outcome of a pre-connect gate that can fail for two very different
 /// reasons (gate 6).
 #[derive(Debug)]
@@ -1686,6 +1785,7 @@ async fn drive_historical_backfill(
     store: &BlockStore<'_>,
     peer: Option<rustoshi_network::PeerId>,
     peer_state: &RwLock<PeerState>,
+    headers_only: bool,
 ) {
     let Some(bf) = backfill.as_mut() else {
         return;
@@ -1707,7 +1807,14 @@ async fn drive_historical_backfill(
             bf.note_headers_requested();
         }
     }
-    match bf.next_body_hashes(store, BACKFILL_BODIES_PER_REQUEST) {
+    // Headers-only while a forward connect is parked on a missing ancestor
+    // header (see `AncestorHeaderWait`): historical BODIES still yield.
+    let bodies = if headers_only {
+        Ok(Vec::new())
+    } else {
+        bf.next_body_hashes(store, BACKFILL_BODIES_PER_REQUEST)
+    };
+    match bodies {
         Ok(hashes) if !hashes.is_empty() => {
             let inv: Vec<InvVector> = hashes
                 .iter()
@@ -1757,6 +1864,30 @@ fn historical_backfill_may_drive(
         validated_tip,
         header_sync.best_header_height(),
     )
+}
+
+/// What the historical backfill may do on the shared peer now: `None` =
+/// nothing, `Some(false)` = headers and bodies, `Some(true)` = headers only.
+///
+/// Headers-only overrides the forward-sync yield while a forward block is
+/// parked on a missing pre-snapshot header ([`AncestorHeaderWait`]): the
+/// forward download is then waiting on the backfill, so yielding to it is a
+/// deadlock (R4 rung 940000, wedged at 940003). One getheaders is
+/// outstanding at a time (`should_request_headers`), the cost the 2026-09-19
+/// tight-loop fix already bounds.
+fn historical_backfill_drive_mode(
+    header_sync: &HeaderSync,
+    block_downloader: &BlockDownloader,
+    validated_tip: u32,
+    ancestor_wait: &AncestorHeaderWait,
+) -> Option<bool> {
+    if historical_backfill_may_drive(header_sync, block_downloader, validated_tip) {
+        Some(false)
+    } else if ancestor_wait.waiting_on().is_some() {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Times one main-loop peer event from dequeue to the end of its handler
@@ -4770,6 +4901,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     // Gate 6: one retry per block for a system fault, then AbortNode.
     let mut system_fault_retry = SystemFaultRetry::default();
+    // A forward block parked on a missing pre-snapshot ancestor header.
+    let mut ancestor_wait = AncestorHeaderWait::default();
 
     loop {
         // Gate 6 (AbortNode): a failed chainstate write/read latched the
@@ -4874,6 +5007,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     if rustoshi_consensus::fatal::is_aborted() {
                         break;
                     }
+                    // A parked block waits for its ancestor header window.
+                    if !ancestor_wait.ready(&block_store) {
+                        break;
+                    }
                     let block = match block_downloader.next_block_to_validate() {
                         Some(b) => b,
                         None => break,
@@ -4904,6 +5041,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     // Gate 6: set when the connect hit a local system fault;
                     // the block was requeued and this tick stops validating.
                     let mut system_fault_hit = false;
+                    // Set when the block was parked on a missing ancestor
+                    // header (requeued; connects pause until it arrives).
+                    let mut ancestor_parked = false;
                     let connected_undo: Option<rustoshi_consensus::validation::UndoData> = {
                         let mut cs = chain_state.write().await;
                         // BIP-113: compute parent MTP for `is_final_tx`'s
@@ -5064,12 +5204,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     }
                                     block_downloader.requeue_block_for_validation(block.clone());
                                     system_fault_hit = true;
+                                } else if let rustoshi_consensus::validation::ValidationError::MissingAncestorHeader(need) = e {
+                                    // No verdict, no mark, no ban: park the
+                                    // block (body kept) until the backfill
+                                    // stores the header window it needs.
+                                    // Dropping it wedged R4 slices at 940003.
+                                    block_downloader.requeue_block_for_validation(block.clone());
+                                    park_on_missing_ancestor(
+                                        &mut ancestor_wait,
+                                        historical_backfill.is_some(),
+                                        block_hash,
+                                        height,
+                                        need,
+                                    );
+                                    ancestor_parked = true;
                                 } else if connect_error_is_verdict(&e) {
                                     connect_invalid = true;
                                 } else if !matches!(
                                     e,
                                     rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)
-                                        | rustoshi_consensus::validation::ValidationError::MissingAncestorHeader(_)
                                 ) {
                                     // BLOCK_MUTATED: not marked; realign the
                                     // validated-tip counter next_block_to_validate
@@ -5081,7 +5234,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         }
                     };
 
-                    if system_fault_hit {
+                    if system_fault_hit || ancestor_parked {
                         break;
                     }
 
@@ -5483,12 +5636,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 let cs = chain_state.read().await;
                                 cs.tip_height()
                             };
-                            if historical_backfill_may_drive(&header_sync, &block_downloader, chain_tip) {
+                            if let Some(bf_headers_only) = historical_backfill_drive_mode(&header_sync, &block_downloader, chain_tip, &ancestor_wait) {
                                 drive_historical_backfill(
                                     &mut historical_backfill,
                                     &block_store,
                                     Some(peer_id),
                                     &peer_state,
+                                    bf_headers_only,
                                 )
                                 .await;
                                 finish_historical_backfill_if_done(&mut historical_backfill);
@@ -5551,12 +5705,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         let cs = chain_state.read().await;
                                         cs.tip_height()
                                     };
-                                    if historical_backfill_may_drive(&header_sync, &block_downloader, chain_tip) {
+                                    if let Some(bf_headers_only) = historical_backfill_drive_mode(&header_sync, &block_downloader, chain_tip, &ancestor_wait) {
                                         drive_historical_backfill(
                                             &mut historical_backfill,
                                             &block_store,
                                             Some(peer_id),
                                             &peer_state,
+                                            bf_headers_only,
                                         )
                                         .await;
                                         finish_historical_backfill_if_done(&mut historical_backfill);
@@ -6142,12 +6297,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         let cs = chain_state.read().await;
                                         cs.tip_height()
                                     };
-                                    if historical_backfill_may_drive(&header_sync, &block_downloader, chain_tip) {
+                                    if let Some(bf_headers_only) = historical_backfill_drive_mode(&header_sync, &block_downloader, chain_tip, &ancestor_wait) {
                                         drive_historical_backfill(
                                             &mut historical_backfill,
                                             &block_store,
                                             Some(peer_id),
                                             &peer_state,
+                                            bf_headers_only,
                                         )
                                         .await;
                                         finish_historical_backfill_if_done(&mut historical_backfill);
@@ -6184,6 +6340,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 while blocks_validated < MAX_BLOCKS_PER_ITERATION {
                                     // Gate 6: nothing is connected after AbortNode.
                                     if rustoshi_consensus::fatal::is_aborted() {
+                                        break;
+                                    }
+                                    // A parked block waits for its ancestor header window.
+                                    if !ancestor_wait.ready(&block_store) {
                                         break;
                                     }
                                     let block = match block_downloader.next_block_to_validate() {
@@ -6224,6 +6384,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     // Gate 6: the connect hit a local system
                                     // fault; the block was requeued.
                                     let mut system_fault_hit = false;
+                                    // Parked on a missing ancestor header.
+                                    let mut ancestor_parked = false;
                                     let connected_undo: Option<rustoshi_consensus::validation::UndoData> = {
                                         let mut cs = chain_state.write().await;
                                         // BIP-113: compute parent MTP for
@@ -6342,22 +6504,23 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                     rustoshi_consensus::validation::ValidationError::PrevBlockNotFound(_)
                                                 ) {
                                                     reorg_candidate = true;
-                                                } else if matches!(
-                                                    e,
-                                                    rustoshi_consensus::validation::ValidationError::MissingAncestorHeader(_)
-                                                ) {
+                                                } else if let rustoshi_consensus::validation::ValidationError::MissingAncestorHeader(need) = e {
                                                     // Fail closed: we lack the ancestor
                                                     // header a consensus rule needs (a
                                                     // coin below the snapshot header band).
-                                                    // No invalid mark, no peer punishment;
-                                                    // the block stays unconnected.
-                                                    tracing::error!(
-                                                        "block {} at height {} NOT connected: {} — this node \
-                                                         lacks pre-base headers (assumeUTXO snapshot boot); \
-                                                         the tip cannot advance past it until the full header \
-                                                         chain is present",
-                                                        block_hash, height, e
+                                                    // No invalid mark, no peer punishment.
+                                                    // Park the block (body kept) until the
+                                                    // backfill stores that header window —
+                                                    // dropping it wedged R4 slices at 940003.
+                                                    block_downloader.requeue_block_for_validation(block.clone());
+                                                    park_on_missing_ancestor(
+                                                        &mut ancestor_wait,
+                                                        historical_backfill.is_some(),
+                                                        block_hash,
+                                                        height,
+                                                        need,
                                                     );
+                                                    ancestor_parked = true;
                                                 } else if connect_error_is_verdict(&e) {
                                                     connect_invalid = true;
                                                 } else {
@@ -6378,7 +6541,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }
                                     };
 
-                                    if system_fault_hit {
+                                    if system_fault_hit || ancestor_parked {
                                         break;
                                     }
 
@@ -8350,7 +8513,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         let cs = chain_state.read().await;
                         cs.tip_height()
                     };
-                    if historical_backfill_may_drive(&header_sync, &block_downloader, chain_tip) {
+                    if let Some(bf_headers_only) = historical_backfill_drive_mode(&header_sync, &block_downloader, chain_tip, &ancestor_wait) {
                         let bf_peer = {
                             let ps = peer_state.read().await;
                             ps.peer_manager.as_ref().and_then(|pm| {
@@ -8367,6 +8530,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             &block_store,
                             bf_peer,
                             &peer_state,
+                            bf_headers_only,
                         )
                         .await;
                         finish_historical_backfill_if_done(&mut historical_backfill);
@@ -8708,7 +8872,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         }
                         bf.clear_getheaders_cooldown();
                     }
-                    if historical_backfill_may_drive(&header_sync, &block_downloader, validated_tip) {
+                    if let Some(bf_headers_only) = historical_backfill_drive_mode(&header_sync, &block_downloader, validated_tip, &ancestor_wait) {
                         // Only a peer whose task is still alive: a dead one
                         // stays registered until its Disconnected is drained.
                         let bf_peer = {
@@ -8722,6 +8886,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             &block_store,
                             bf_peer,
                             &peer_state,
+                            bf_headers_only,
                         )
                         .await;
                         finish_historical_backfill_if_done(&mut historical_backfill);
@@ -10564,5 +10729,76 @@ mod tests {
         assert!(V::BadSubsidy(1, 0).is_invalid_block_verdict());
         assert!(V::NonFinalTx.is_invalid_block_verdict());
         assert!(V::BadDifficulty.is_invalid_block_verdict());
+    }
+
+    /// R-b: a block parked on a missing pre-snapshot header stays parked
+    /// until that header's whole MTP window is stored (a short window fails
+    /// closed), and is released exactly then.
+    #[test]
+    fn ancestor_header_wait_parks_until_window_stored() {
+        use rustoshi_primitives::{BlockHeader, Hash256};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = std::sync::Arc::new(rustoshi_storage::ChainDb::open(dir.path()).expect("db"));
+        let store = rustoshi_storage::BlockStore::new(&db);
+        // Linked headers at heights 100..=119; the first has a non-zero
+        // (unknown) parent so it is not mistaken for genesis.
+        let mut prev = Hash256::from_bytes([9; 32]);
+        let mut chain = Vec::new();
+        for h in 100u32..=119 {
+            let hdr = BlockHeader {
+                version: 4,
+                prev_block_hash: prev,
+                merkle_root: Hash256::from_bytes([h as u8; 32]),
+                timestamp: 1_600_000_000 + h * 600,
+                bits: 0x1d00ffff,
+                nonce: h,
+            };
+            prev = hdr.block_hash();
+            chain.push((h, hdr));
+        }
+        let put = |lo: u32, hi: u32| {
+            for (h, hdr) in &chain {
+                if (lo..=hi).contains(h) {
+                    store.put_header(&hdr.block_hash(), hdr).unwrap();
+                    store.put_height_index(*h, &hdr.block_hash()).unwrap();
+                }
+            }
+        };
+        put(115, 119); // the "snapshot band"
+        let blk = Hash256::from_bytes([7; 32]);
+        let mut w = AncestorHeaderWait::default();
+        assert!(w.ready(&store), "nothing parked: connects run");
+        assert!(w.park(blk, 114), "first park is reported");
+        assert!(!w.park(blk, 114), "re-park of the same block/height is not re-logged");
+        assert_eq!(w.waiting_on(), Some(114));
+        assert!(!w.ready(&store), "header 114 absent: stays parked");
+        put(108, 114); // header present but its 11-header window is short
+        assert!(!w.ready(&store), "short MTP window fails closed: stays parked");
+        put(104, 107);
+        assert!(w.ready(&store), "window 104..=114 stored: released");
+        assert_eq!(w.waiting_on(), None);
+    }
+
+    /// R-b: while a forward block is parked on a missing ancestor header, the
+    /// historical backfill may fetch headers (never bodies) even though the
+    /// forward download is busy; otherwise it still yields.
+    #[test]
+    fn backfill_fetches_headers_for_a_parked_forward_block() {
+        use rustoshi_primitives::Hash256;
+        let g = Hash256::from_bytes([1; 32]);
+        let hs = HeaderSync::new(g);
+        let mut busy = BlockDownloader::new(0, 10);
+        busy.enqueue_blocks(vec![(Hash256::from_bytes([2; 32]), 1)]);
+        let idle = BlockDownloader::new(0, 0);
+        let mut w = AncestorHeaderWait::default();
+        assert_eq!(historical_backfill_drive_mode(&hs, &busy, 0, &w), None, "yields to forward");
+        assert_eq!(historical_backfill_drive_mode(&hs, &idle, 0, &w), Some(false), "idle: full");
+        w.park(Hash256::from_bytes([3; 32]), 935_419);
+        assert_eq!(
+            historical_backfill_drive_mode(&hs, &busy, 0, &w),
+            Some(true),
+            "forward waits on the backfill: headers only, never yield"
+        );
+        assert_eq!(historical_backfill_drive_mode(&hs, &idle, 0, &w), Some(false));
     }
 }
