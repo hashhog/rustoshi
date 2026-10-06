@@ -2525,7 +2525,10 @@ impl WalletRpcServer for WalletRpcImpl {
             )
         })?;
         {
-            let mut node_state = node.write().await;
+            // F0: admit against the coins of the published tip.
+            let mut node_state = crate::coins_coherence::write_coherent(&node)
+                .await
+                .map_err(|m| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, m))?;
             crate::server::broadcast_signed_tx(&mut node_state, tx)
                 .map_err(|msg| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg))?;
         }
@@ -2650,7 +2653,10 @@ impl WalletRpcServer for WalletRpcImpl {
             )
         })?;
         {
-            let mut node_state = node.write().await;
+            // F0: admit against the coins of the published tip.
+            let mut node_state = crate::coins_coherence::write_coherent(&node)
+                .await
+                .map_err(|m| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, m))?;
             crate::server::broadcast_signed_tx(&mut node_state, tx)
                 .map_err(|msg| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg))?;
         }

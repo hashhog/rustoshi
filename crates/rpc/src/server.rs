@@ -2259,35 +2259,12 @@ impl RpcServerImpl {
     /// alongside its coin set (see [`Self::coins_db_tip`]), so the answer
     /// stays internally consistent rather than mislabelled.
     async fn force_flush_chainstate_to_disk(&self) {
-        /// How long to wait for the connect loop to service the request. It
-        /// services between blocks on a 100 ms tick, so this is orders of
-        /// magnitude of headroom; it exists only so a wedged loop cannot
-        /// hang an RPC forever.
-        const FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
-
         // Clone the handle out from under the lock and DROP the guard before
         // awaiting: the connect loop takes the `RpcState` WRITE lock on every
         // block-connect, so holding a read guard across this wait would
         // deadlock against the very loop we are waiting on.
         let signal = { self.state.read().await.chainstate_flush.clone() };
-        if !signal.is_armed() {
-            return;
-        }
-        let ticket = signal.request();
-        let started = std::time::Instant::now();
-        let mut backoff = std::time::Duration::from_millis(2);
-        while !signal.is_satisfied(ticket) {
-            if started.elapsed() >= FLUSH_WAIT {
-                tracing::warn!(
-                    "force-flush of the chainstate was not serviced within {:?}; \
-                     reporting the UTXO set at the coins DB's own best block",
-                    FLUSH_WAIT
-                );
-                return;
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
-        }
+        crate::coins_coherence::force_flush(&signal).await;
     }
 
     /// The `gettxoutsetinfo` full scan over ONE RocksDB snapshot.
@@ -2553,6 +2530,12 @@ impl RpcServerImpl {
     /// Helper to create an RPC error.
     fn rpc_error(code: i32, message: impl Into<String>) -> ErrorObjectOwned {
         ErrorObjectOwned::owned(code, message.into(), None::<()>)
+    }
+
+    /// A coin reader whose coins DB never caught up with the published tip
+    /// (see [`crate::coins_coherence`]). Not an answer about the coin.
+    fn coins_incoherent_error(msg: &str) -> ErrorObjectOwned {
+        Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, msg)
     }
 
     /// Helper to parse a hex-encoded txid/blockhash argument.
@@ -8696,7 +8679,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         }
 
-        let mut state = self.state.write().await;
+        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
 
         // Check if transaction already exists in mempool
         if state.mempool.contains(&txid) {
@@ -9192,7 +9175,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             ("filepath", Some(&filepath), CoreArgType::Str, false),
             ("options", options.as_ref(), CoreArgType::Obj, true),
         ])?;
-        let mut state = self.state.write().await;
+        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         if state.is_ibd {
             return Err(Self::rpc_error(
                 rpc_error::RPC_CLIENT_IN_INITIAL_DOWNLOAD,
@@ -9308,7 +9291,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn load_mempool(&self) -> RpcResult<serde_json::Value> {
-        let mut state = self.state.write().await;
+        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let path = match state.mempool_dat_path.clone() {
             Some(p) => p,
             None => {
@@ -9856,7 +9839,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         let block_hash = block.block_hash();
 
-        let mut state = self.state.write().await;
+        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(submit_system_fault_error)?;
 
         // Check for duplicate — but key on the BLOCK INDEX entry, not the bare
         // header (P1.6 fix, 2026-07-21). `put_block_index` is written only
@@ -11792,7 +11775,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         let tx_hash = Self::parse_hash(&txid)?;
         let include_mempool = include_mempool.unwrap_or(true);
 
-        let state = self.state.read().await;
+        let state = crate::coins_coherence::read_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         let outpoint = OutPoint {
@@ -12228,7 +12211,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
-        let mut state = self.state.write().await;
+        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
 
         // UTXO lookup closure
         let db = Arc::clone(&state.db);
@@ -12638,7 +12621,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn invalidate_block(&self, blockhash: String) -> RpcResult<()> {
         let hash = Self::parse_hash(&blockhash)?;
 
-        let mut state = self.state.write().await;
+        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         // Get block index entry
@@ -12780,7 +12763,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn reconsider_block(&self, blockhash: String) -> RpcResult<()> {
         let hash = Self::parse_hash(&blockhash)?;
 
-        let state = self.state.write().await;
+        let state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         // Verify the block exists and get its metadata
@@ -12879,7 +12862,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn precious_block(&self, blockhash: String) -> RpcResult<()> {
         let hash = Self::parse_hash(&blockhash)?;
 
-        let mut state = self.state.write().await;
+        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         // Get block index entry
@@ -13842,7 +13825,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Need a write lock: add_transaction_with_options takes &mut self even
         // in test_accept mode (dry-run; it returns before inserting).
-        let mut state = self.state.write().await;
+        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let db = Arc::clone(&state.db);
 
         // Refresh the mempool's tip snapshot so IsFinalTx (BIP-113) and
@@ -18345,7 +18328,7 @@ impl RpcServerImpl {
             )));
         }
 
-        let mut state = self.state.write().await;
+        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         let height = state.best_height + 1;

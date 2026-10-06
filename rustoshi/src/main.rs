@@ -4944,6 +4944,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 // whole chain, so the header tip stayed ~866k blocks ahead —
                 // and the RPC answered with the 91,795 coin set under a 91,825
                 // tip.
+                // F0 (crates/rpc/src/coins_coherence.rs): coin readers outside
+                // this loop request a flush whenever the coins DB lags the
+                // published tip, then re-check under the RpcState lock. After a
+                // flush that actually wrote something, connect nothing more this
+                // tick, so that re-check finds the tip it just made durable
+                // instead of chasing blocks connected a moment later.
+                let mut flush_serviced_with_work = false;
                 if let Some(flush_seq) = flush_signal.pending() {
                     let (mut tip_hash, mut tip_height) = {
                         let cs = chain_state.read().await;
@@ -4965,44 +4972,53 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     }
                     let entries = utxo_view.cache_len();
                     let had_work = entries > 0 || !pending_blocks.is_empty();
-                    // No retention prune on this path: it is demand-driven and
-                    // must stay cheap and predictable. `None` leaves the prune
-                    // watermark untouched so the contiguous sweep resumes
-                    // correctly on the next scheduled flush.
-                    match utxo_view.flush_with_tip_and_blocks(
-                        &tip_hash,
-                        tip_height,
-                        &pending_blocks,
-                        &[],
-                        None,
-                    ) {
-                        Ok(()) => {
-                            if had_work {
-                                tracing::info!(
-                                    "force-flush (RPC request): {} entries + {} blocks committed atomically with tip {} at height {}",
-                                    entries, pending_blocks.len(), tip_hash, tip_height
-                                );
+                    // Nothing buffered: the coins DB already holds everything
+                    // this loop connected, so there is nothing to write -- and
+                    // rewriting the tip pointer could only clobber one that the
+                    // RPC path (submitblock / generate* / reorg) set since.
+                    if !had_work {
+                        flush_signal.complete(flush_seq);
+                    } else {
+                        flush_serviced_with_work = true;
+                        // No retention prune on this path: it is demand-driven and
+                        // must stay cheap and predictable. `None` leaves the prune
+                        // watermark untouched so the contiguous sweep resumes
+                        // correctly on the next scheduled flush.
+                        match utxo_view.flush_with_tip_and_blocks(
+                            &tip_hash,
+                            tip_height,
+                            &pending_blocks,
+                            &[],
+                            None,
+                        ) {
+                            Ok(()) => {
+                                if had_work {
+                                    tracing::info!(
+                                        "force-flush (RPC request): {} entries + {} blocks committed atomically with tip {} at height {}",
+                                        entries, pending_blocks.len(), tip_hash, tip_height
+                                    );
+                                }
+                                pending_blocks.clear();
+                                blocks_since_flush = 0;
+                                last_flush_instant = std::time::Instant::now();
                             }
-                            pending_blocks.clear();
-                            blocks_since_flush = 0;
-                            last_flush_instant = std::time::Instant::now();
+                            Err(e) => {
+                                // Do NOT clear `pending_blocks` / reset the flush
+                                // accounting — the scheduled path retries.
+                                tracing::error!("force-flush (RPC request) failed: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            // Do NOT clear `pending_blocks` / reset the flush
-                            // accounting — the scheduled path retries.
-                            tracing::error!("force-flush (RPC request) failed: {}", e);
-                        }
+                        // Complete even on error: the caller labels its answer with
+                        // the coins DB's own best block, so it reports a coherent
+                        // (older) triple rather than hanging until its timeout.
+                        flush_signal.complete(flush_seq);
                     }
-                    // Complete even on error: the caller labels its answer with
-                    // the coins DB's own best block, so it reports a coherent
-                    // (older) triple rather than hanging until its timeout.
-                    flush_signal.complete(flush_seq);
                 }
 
                 const MAX_BLOCKS_VALIDATE: usize = 8;
                 let mut blocks_validated = 0usize;
 
-                while blocks_validated < MAX_BLOCKS_VALIDATE {
+                while !flush_serviced_with_work && blocks_validated < MAX_BLOCKS_VALIDATE {
                     // Gate 6: nothing is connected after AbortNode.
                     if rustoshi_consensus::fatal::is_aborted() {
                         break;
@@ -7269,16 +7285,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 if !tip_mtp || rustoshi_consensus::fatal::is_aborted() {
                                     continue;
                                 }
+                                // F0: resolve prevouts through THIS loop's coin view
+                                // (write-back cache, then disk) -- Core's
+                                // CCoinsViewMemPool over CoinsTip(). The bare store
+                                // lags every block connected since the last flush,
+                                // so a coin those blocks spent read as UNSPENT and
+                                // a tx re-spending it was admitted.
                                 let result = rpc.mempool.add_transaction(tx.clone(), &|outpoint| {
-                                    // Look up UTXO from storage
-                                    block_store.get_utxo(outpoint).ok().flatten().map(|coin| {
-                                        rustoshi_consensus::CoinEntry {
-                                            height: coin.height,
-                                            is_coinbase: coin.is_coinbase,
-                                            value: coin.value,
-                                            script_pubkey: coin.script_pubkey,
-                                        }
-                                    })
+                                    rustoshi_consensus::validation::UtxoView::get_utxo(
+                                        &utxo_view, outpoint,
+                                    )
                                 });
                                 match result {
                                     Ok(_) => {
@@ -7310,18 +7326,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             let admit = rpc.mempool.add_transaction(
                                                 (*entry.tx).clone(),
                                                 &|outpoint| {
-                                                    block_store
-                                                        .get_utxo(outpoint)
-                                                        .ok()
-                                                        .flatten()
-                                                        .map(|coin| {
-                                                            rustoshi_consensus::CoinEntry {
-                                                                height: coin.height,
-                                                                is_coinbase: coin.is_coinbase,
-                                                                value: coin.value,
-                                                                script_pubkey: coin.script_pubkey,
-                                                            }
-                                                        })
+                                                    // F0: same coin view as above.
+                                                    rustoshi_consensus::validation::UtxoView::get_utxo(
+                                                        &utxo_view, outpoint,
+                                                    )
                                                 },
                                             );
                                             match admit {

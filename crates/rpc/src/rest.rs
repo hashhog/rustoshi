@@ -628,7 +628,11 @@ async fn rest_getutxos(
         return Err(RestError::TooManyOutpoints);
     }
 
-    let rpc_state = state.rpc_state.read().await;
+    // F0: read only while the coins DB describes the published tip (see
+    // `crate::coins_coherence`).
+    let rpc_state = crate::coins_coherence::read_coherent(&state.rpc_state)
+        .await
+        .map_err(|m| RestError::DatabaseError(m.to_string()))?;
     let store = BlockStore::new(&rpc_state.db);
 
     // Check each outpoint
