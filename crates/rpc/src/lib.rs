@@ -46,6 +46,8 @@ pub mod zmq;
 
 #[cfg(test)]
 mod r5_errcode_tests;
+#[cfg(test)]
+mod f0_coin_view_tests;
 
 pub use payjoin_sender::{
     post_original_psbt, trim_to_base64 as payjoin_trim_to_base64, SenderHttpError, SenderRequest,
