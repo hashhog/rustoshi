@@ -3069,8 +3069,10 @@ fn apply_tx_in_undo(
 ///
 /// Unspendable outputs are intentionally NEVER added to the UTXO set
 /// during `ConnectBlock`, so `DisconnectBlock` must skip them when
-/// reversing — attempting to spend them would always fail.
-fn is_unspendable(script: &[u8]) -> bool {
+/// reversing — attempting to spend them would always fail. Every other
+/// writer that re-applies outputs (the `dumptxoutset` rollback replay) must
+/// use this same predicate (Core `AddCoin`, coins.cpp:84-91).
+pub fn is_unspendable(script: &[u8]) -> bool {
     if script.is_empty() {
         return false;
     }

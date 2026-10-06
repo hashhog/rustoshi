@@ -18044,20 +18044,16 @@ impl RpcServerImpl {
                         }
                     }
                     for (vout, output) in tx.outputs.iter().enumerate() {
-                        // Skip provably-unspendable OP_RETURN outputs to
-                        // match what `connect_block`/`connect_block_parallel`
-                        // store in the UTXO set.
-                        if !output.script_pubkey.is_empty()
-                            && output.script_pubkey[0] == 0x6a
-                        {
-                            continue;
-                        }
-                        // Skip the magic null-witness-commitment placeholder
-                        // (empty script + zero value) used by witness coinbase.
-                        if tx.is_coinbase()
-                            && output.script_pubkey.is_empty()
-                            && output.value == 0
-                        {
+                        // Exactly the rule connect_block applies (Core
+                        // `AddCoin`, coins.cpp:84-91: `if (IsUnspendable())
+                        // return;` -- OP_RETURN OR size > MAX_SCRIPT_SIZE),
+                        // nothing more and nothing less. The old ad-hoc
+                        // filter (OP_RETURN only, plus a skip of empty-script
+                        // zero-value coinbase outputs) re-added >10,000-byte
+                        // outputs as phantom coins and dropped empty-script
+                        // coinbase coins that connect had created, leaving
+                        // the live set different from the one rolled back.
+                        if rustoshi_consensus::validation::is_unspendable(&output.script_pubkey) {
                             continue;
                         }
                         let outpoint = OutPoint { txid, vout: vout as u32 };
