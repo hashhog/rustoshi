@@ -20,6 +20,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tokio::io::AsyncWriteExt;
 
 mod ops;
+mod swiftsync;
 use ops::{
     daemonize, debug_categories_to_directives, notify_ready, remove_pid_file, write_pid_file,
     ConfFile, ReopenableLogFile,
@@ -415,6 +416,9 @@ enum Commands {
     Reindex,
     /// Wipe and resync the blockchain
     Resync,
+    /// SwiftSync batch pass: fully validate a height range against Core undo
+    /// data + unspent-hints, no UTXO set (hashhog SwiftSync design, BIP 457).
+    SwiftsyncPass(swiftsync::PassArgs),
 }
 
 // ============================================================
@@ -3132,6 +3136,13 @@ fn main() -> anyhow::Result<()> {
     let raw_argv: Vec<String> = std::env::args().collect();
     let mut cli = Cli::parse();
 
+    // SwiftSync batch pass: a self-contained offline command. It touches no
+    // datadir, config file, network or RPC, so it dispatches before any of
+    // that is set up.
+    if let Some(Commands::SwiftsyncPass(args)) = &cli.command {
+        std::process::exit(swiftsync::run(args.clone()));
+    }
+
     // Merge config-file values BEFORE we daemonize / start the runtime, so
     // `-daemon=1` in the conf file works the same as on the CLI.
     if let Some(conf_path) = find_conf_file(&cli) {
@@ -3502,6 +3513,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 remove_pid_file(&pid_path);
                 return Ok(());
             }
+            // Dispatched (and exited) at the top of `main`.
+            Commands::SwiftsyncPass(_) => unreachable!("swiftsync-pass dispatches in main"),
         }
     }
 

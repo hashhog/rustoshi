@@ -125,6 +125,19 @@ fn script_check_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// Run `op` on the process-wide script-check pool.
+///
+/// Hashhog SwiftSync batch driver (`rustoshi swiftsync-pass`): it validates
+/// many blocks concurrently and runs its per-block workers ON this pool, so the
+/// nested `pool.install` inside `validate_scripts_parallel_with_cache` executes
+/// inline and script checks work-steal across the same `--par`-sized pool
+/// instead of a second, oversubscribed one. Changes no validation decision:
+/// the pool, the script checks and their order of first failure are the ones
+/// ConnectBlock already uses.
+pub fn install_on_script_check_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    script_check_pool().install(op)
+}
+
 /// Process-wide count of input scripts actually dispatched for verification
 /// (not skipped via assumevalid). Range-runner / getchainstates read this
 /// instead of grepping a log banner. Not persisted; resets on process start.

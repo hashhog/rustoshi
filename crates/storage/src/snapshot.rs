@@ -1156,6 +1156,35 @@ fn write_compressed_script<W: Write>(writer: &mut W, script: &[u8]) -> Result<()
     Ok(())
 }
 
+/// Decode one spent coin in Bitcoin Core's block-undo encoding
+/// (`TxInUndoFormatter`, bitcoin-core/src/undo.h:25-45):
+/// `VARINT(nHeight*2 + fCoinBase)`, a dummy `VARINT` version when
+/// `nHeight > 0`, then `TxOutCompression` (`VARINT(CompressAmount(value))`
+/// + `ScriptCompression`) -- the same coin encoding the snapshot loader reads
+/// via [`SnapshotReader::read_coin`], decoded by the same helpers.
+///
+/// Returns `(height, is_coinbase, value, script_pubkey)`. Used by the
+/// SwiftSync batch driver (`rustoshi swiftsync-pass`) to read Core undo data.
+pub fn read_core_txin_undo<R: Read>(
+    reader: &mut R,
+) -> Result<(u32, bool, u64, Vec<u8>), SnapshotError> {
+    let code = read_varint(reader)?;
+    if code >> 1 > u32::MAX as u64 {
+        return Err(SnapshotError::MalformedCoin(format!(
+            "undo coin height out of range: code {code}"
+        )));
+    }
+    let height = (code >> 1) as u32;
+    let is_coinbase = (code & 1) == 1;
+    if height > 0 {
+        // Core: `if (txout.nHeight > 0) { unsigned int nVersionDummy; ::Unserialize(s, VARINT(nVersionDummy)); }`
+        let _version_dummy = read_varint(reader)?;
+    }
+    let value = decompress_amount(read_varint(reader)?);
+    let script_pubkey = read_compressed_script(reader)?;
+    Ok((height, is_coinbase, value, script_pubkey))
+}
+
 /// Read a scriptPubKey using Core's `ScriptCompression` formatter.
 fn read_compressed_script<R: Read>(reader: &mut R) -> Result<Vec<u8>, SnapshotError> {
     let n_size = read_varint(reader)?;
