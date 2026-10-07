@@ -504,19 +504,58 @@ impl BlockDownloader {
     /// Deduplicates against blocks already queued, in-flight, or received.
     pub fn enqueue_blocks(&mut self, blocks: Vec<(Hash256, u32)>) {
         for item in blocks {
-            // Skip blocks already in the pipeline.
-            // Uses the persistent pending_set for O(1) dedup instead of
-            // rebuilding a HashSet from pending_hashes on every call.
-            if self.in_flight.contains_key(&item.0)
-                || self.received_blocks.contains_key(&item.0)
-                || self.pending_set.contains(&item.0)
-            {
+            // Already in the validation order: nothing to do. Uses the
+            // persistent pending_set for O(1) dedup instead of rebuilding a
+            // HashSet from pending_hashes on every call.
+            if self.pending_set.contains(&item.0) {
+                continue;
+            }
+            // Already downloaded (a block that arrived before its header --
+            // unsolicited, or announced by a second peer) or already on the
+            // wire: it must still take its place in the validation order, it
+            // just must not be requested again. `next_block_to_validate` only
+            // ever pops `pending_hashes.front()`, so a received block that
+            // was skipped here sat in `received_blocks` forever, the next
+            // height failed PrevBlockNotFound, and the level-triggered gap
+            // fill re-enqueued the same hash into this same skip every 10 s:
+            // a permanent wedge (2026-10-07 audit RU-5). Core's
+            // FindNextBlocksToDownload / ProcessNewBlock never let a stored
+            // body block the next connect.
+            if self.received_blocks.contains_key(&item.0) || self.in_flight.contains_key(&item.0) {
+                self.pending_set.insert(item.0);
+                self.pending_hashes.push_back(item.0);
                 continue;
             }
             self.pending_set.insert(item.0);
             self.pending_hashes.push_back(item.0);
             self.download_queue.push_back(item);
         }
+    }
+
+    /// Drop the whole download pipeline (queue, validation order, buffered
+    /// bodies, in-flight requests) and re-seat both counters at `tip`.
+    ///
+    /// For when the active chain was moved by something other than the
+    /// connect loop -- an RPC `invalidateblock`, `reconsiderblock` or rollback
+    /// (Core's ActivateBestChain recomputes the download set from the new tip
+    /// on the next SendMessages). Everything queued was ordered against the
+    /// OLD tip; the header-arrival enqueue and the retry tick's level-triggered
+    /// gap fill rebuild the set from the header chain.
+    pub fn reset_to_tip(&mut self, tip: u32) {
+        self.download_queue.clear();
+        self.pending_hashes.clear();
+        self.pending_set.clear();
+        self.received_blocks.clear();
+        for (_, f) in self.in_flight.drain() {
+            if let Some(state) = self.peer_states.get_mut(&f.peer) {
+                state.blocks_in_flight = state.blocks_in_flight.saturating_sub(1);
+            }
+        }
+        self.timed_out_from.clear();
+        self.announced_by.clear();
+        self.pending_refill.clear();
+        self.validated_tip_height = tip;
+        self.best_header_height = tip;
     }
 
     /// Record that `peer` announced `blocks` (a new-tip announcement), so
@@ -1995,6 +2034,70 @@ mod tests {
         // Should not assign it (already received)
         let requests = dl.assign_requests();
         assert!(requests.is_empty() || dl.blocks_in_flight() == 0);
+    }
+
+    /// RU-5 (2026-10-07 audit): a block that arrived BEFORE its header was
+    /// enqueued must still reach `next_block_to_validate` once the header
+    /// enqueues it -- without being requested a second time.
+    #[test]
+    fn block_received_before_enqueue_reaches_validation() {
+        let mut dl = BlockDownloader::new(0, 0);
+        let peer = PeerId(1);
+        dl.add_peer(peer);
+        let b1 = make_test_block(1);
+        let h1 = b1.block_hash();
+        // Unsolicited delivery: nothing queued, nothing in flight.
+        dl.block_received(peer, b1);
+        assert!(dl.next_block_to_validate().is_none(), "no header yet");
+        // Its header arrives and enqueues it.
+        dl.set_best_header_height(1);
+        dl.enqueue_blocks(vec![(h1, 1)]);
+        assert_eq!(dl.download_queue_len(), 0, "a received body is never re-requested");
+        let got = dl.next_block_to_validate().expect("the buffered body must be handed to the connect loop");
+        assert_eq!(got.block_hash(), h1);
+        assert_eq!(dl.validated_tip_height(), 1);
+        // Re-enqueueing (gap fill) after it was consumed queues it afresh.
+        assert_eq!(dl.pending_hashes_len(), 0);
+    }
+
+    /// RU-5 control: the ordinary header-first path is unchanged.
+    #[test]
+    fn enqueue_then_receive_still_validates_in_order() {
+        let mut dl = BlockDownloader::new(0, 2);
+        let peer = PeerId(1);
+        dl.add_peer(peer);
+        let b1 = make_test_block(1);
+        let b2 = make_test_block(2);
+        dl.enqueue_blocks(vec![(b1.block_hash(), 1), (b2.block_hash(), 2)]);
+        assert_eq!(dl.download_queue_len(), 2);
+        let _ = dl.assign_requests();
+        dl.block_received(peer, b2.clone());
+        assert!(dl.next_block_to_validate().is_none(), "1 not here yet");
+        dl.block_received(peer, b1.clone());
+        assert_eq!(dl.next_block_to_validate().unwrap().block_hash(), b1.block_hash());
+        assert_eq!(dl.next_block_to_validate().unwrap().block_hash(), b2.block_hash());
+    }
+
+    #[test]
+    fn reset_to_tip_empties_pipeline_and_frees_slots() {
+        let mut dl = BlockDownloader::new(0, 3);
+        let peer = PeerId(1);
+        dl.add_peer(peer);
+        let blocks: Vec<_> = (1..=3).map(make_test_block).collect();
+        dl.enqueue_blocks(blocks.iter().enumerate().map(|(i, b)| (b.block_hash(), i as u32 + 1)).collect());
+        let _ = dl.assign_requests();
+        assert!(dl.in_flight_count() > 0);
+        dl.block_received(peer, blocks[1].clone());
+        dl.reset_to_tip(7);
+        assert_eq!(dl.in_flight_count(), 0);
+        assert_eq!(dl.pending_hashes_len(), 0);
+        assert_eq!(dl.received_blocks_count(), 0);
+        assert_eq!(dl.download_queue_len(), 0);
+        assert_eq!(dl.validated_tip_height(), 7);
+        assert_eq!(dl.best_header_height(), 7);
+        // The peer's slots were returned: a fresh enqueue is requested again.
+        dl.enqueue_blocks(vec![(blocks[0].block_hash(), 8)]);
+        assert_eq!(dl.assign_requests().len(), 1);
     }
 
     #[test]
