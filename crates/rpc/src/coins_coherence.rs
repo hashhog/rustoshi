@@ -48,6 +48,26 @@
 //! [`ChainstateFlushSignal`] handshake that `gettxoutsetinfo` and
 //! `dumptxoutset` already use — Core's `ForceFlushStateToDisk`) and re-checks.
 //!
+//! For that to hold, the coins DB itself must not move while the lock is
+//! held either: EVERY write of the coins DB happens under the `RpcState`
+//! WRITE lock. The connect loop takes it before each flush and publishes the
+//! new tip under the same guard (2026-10-07 audit RU-2: it used to flush
+//! first and lock afterwards, so a reader that had passed the check could
+//! read block N+1's coins under published tip N).
+//!
+//! # Writers
+//!
+//! A chainstate WRITER (`submitblock`, `generate*`, `invalidateblock`,
+//! `reconsiderblock`, `preciousblock`, `loadtxoutset`, the rollback dance)
+//! also holds the [`ChainLock`] — `cs_main` — for its whole write, via
+//! [`chain_write_coherent`]. The connect loop holds the same lock across each
+//! block's connect → flush → publish, so a writer can never act between the
+//! loop reading the coins and writing them back, and the loop learns about
+//! every writer (see [`crate::chain_lock`]). Lock order: chain lock, then
+//! `RpcState`.
+//!
+//! [`ChainLock`]: crate::chain_lock::ChainLock
+//!
 //! With no connect loop behind the state (an UNARMED signal: unit tests,
 //! RPC-only rigs) there is no write-back cache, so there is nothing to be
 //! stale against and the check is skipped.
@@ -62,6 +82,7 @@ use rustoshi_primitives::Hash256;
 use rustoshi_storage::{BlockStore, ChainstateFlushSignal};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::chain_lock::{ChainEvent, ChainHeld};
 use crate::server::RpcState;
 
 /// How many flush-and-recheck rounds a reader makes before giving up. Each
@@ -156,5 +177,71 @@ pub async fn read_coherent(
         force_flush(&signal).await;
     }
     tracing::warn!("coin reader refused: {}", INCOHERENT_MSG);
+    Err(INCOHERENT_MSG)
+}
+
+/// The `RpcState` write lock of a chainstate WRITER, taken while it also
+/// holds the chain lock (`cs_main`) and while the coins DB describes the
+/// published tip. Releasing it tells the connect loop to re-read the
+/// chainstate (see [`crate::chain_lock`]).
+pub struct ChainWriteGuard<'a> {
+    // Field order: the `RpcState` guard is released before the chain lock.
+    state: RwLockWriteGuard<'a, RpcState>,
+    held: ChainHeld,
+}
+
+impl<'a> ChainWriteGuard<'a> {
+    /// Record a change the connect loop must act on (invalidated /
+    /// reconsidered blocks).
+    pub fn push_event(&self, ev: ChainEvent) {
+        self.held.push_event(ev);
+    }
+
+    /// Split into the `RpcState` guard and the chain-lock hold, so a long
+    /// writer (the rollback dance) can release `RpcState` for a phase that
+    /// does not need it while still excluding every other chain writer.
+    pub fn into_parts(self) -> (RwLockWriteGuard<'a, RpcState>, ChainHeld) {
+        (self.state, self.held)
+    }
+}
+
+impl std::ops::Deref for ChainWriteGuard<'_> {
+    type Target = RpcState;
+    fn deref(&self) -> &RpcState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for ChainWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut RpcState {
+        &mut self.state
+    }
+}
+
+/// [`write_coherent`] for chainstate WRITERS: also holds the chain lock
+/// (`cs_main`) for as long as the returned guard lives. Core takes `cs_main`
+/// (and `m_chainstate_mutex`) around `ProcessNewBlock`, `InvalidateBlock`,
+/// `ActivateBestChain` (validation.cpp 3337, 3533, 4409).
+pub async fn chain_write_coherent(
+    state: &RwLock<RpcState>,
+) -> Result<ChainWriteGuard<'_>, &'static str> {
+    let chain = state.read().await.chain_lock.clone();
+    for _ in 0..COHERENCE_ATTEMPTS {
+        // Chain lock FIRST, then RpcState (the loop's order too).
+        let cs = chain.lock().await;
+        let guard = state.write().await;
+        if coins_db_matches_tip(&guard) {
+            return Ok(ChainWriteGuard {
+                state: guard,
+                held: ChainHeld::new(chain, cs),
+            });
+        }
+        let signal = guard.chainstate_flush.clone();
+        drop(guard);
+        // The loop needs the chain lock to service the flush.
+        drop(cs);
+        force_flush(&signal).await;
+    }
+    tracing::warn!("chain writer refused: {}", INCOHERENT_MSG);
     Err(INCOHERENT_MSG)
 }

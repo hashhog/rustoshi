@@ -470,6 +470,7 @@ pub fn watchdog_should_fire(
 pub fn spawn_p2p_watchdog<F>(
     heartbeat: Arc<AtomicU64>,
     peer_count: Arc<AtomicUsize>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
     window_secs: u64,
     frozen_height: F,
 ) -> std::thread::JoinHandle<()>
@@ -492,6 +493,15 @@ where
                 std::thread::sleep(poll);
                 let now = Instant::now();
                 let hb = heartbeat.load(Ordering::Relaxed);
+                // An operator-requested chainstate pause (`dumptxoutset
+                // rollback`, Core's NetworkDisable) is not a wedge: the loop
+                // deliberately connects nothing for its length. Count it as
+                // activity so a long mainnet rollback is not killed mid-replay.
+                if paused.load(Ordering::SeqCst) {
+                    last_hb = hb;
+                    last_change = now;
+                    continue;
+                }
                 if hb != last_hb {
                     // Activity observed -> reset the flat-for clock.
                     last_hb = hb;

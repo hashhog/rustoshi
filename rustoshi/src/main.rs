@@ -2115,6 +2115,157 @@ fn rewind_headers_off_invalid_branch(
     Some(active_height)
 }
 
+/// The connect loop's half of `cs_main` (`rustoshi_rpc::chain_lock`): adopt
+/// whatever RPC chainstate writers did since the loop last held the lock.
+///
+/// Must be called with the chain lock held. The loop owns its own copy of the
+/// chainstate -- `ChainState`'s tip, the write-back coin view, the header
+/// chain, the downloader -- and an RPC writer (`submitblock`, `generate*`,
+/// `invalidateblock`, `reconsiderblock`, `loadtxoutset`, the rollback dance)
+/// changes only the coins DB and the block index. Before the 2026-10-07 audit
+/// (RU-1) nothing told the loop: after `invalidateblock N` its tip still said
+/// N, so the next P2P block N+1 passed `prev == tip` and was connected over
+/// the N-1 coins (N's spends resurrected, N's outputs gone) and flushed as tip
+/// N+1. Core has one chainstate, so there is nothing to adopt; this is the
+/// equivalent: re-read the tip from the coins DB (written atomically with the
+/// coins), start a fresh coin view, and realign headers and downloads.
+///
+/// A writer only runs while the coins DB describes the published tip (it took
+/// the lock through `chain_write_coherent`), and the loop publishes only under
+/// the chain lock after flushing, so the view being dropped holds no
+/// unflushed block. Returns true when anything was adopted.
+#[allow(clippy::too_many_arguments)]
+async fn adopt_rpc_chain_writes<'s>(
+    chain_lock: &rustoshi_rpc::chain_lock::ChainLock,
+    seen_epoch: &mut u64,
+    block_store: &'s BlockStore<'_>,
+    chain_state: &RwLock<ChainState>,
+    utxo_view: &mut rustoshi_storage::BlockStoreUtxoView<'s>,
+    dbcache_bytes: usize,
+    pending_blocks: &mut Vec<(
+        Hash256,
+        rustoshi_primitives::Block,
+        rustoshi_storage::block_store::UndoData,
+    )>,
+    blocks_since_flush: &mut u32,
+    header_sync: &mut HeaderSync,
+    block_downloader: &mut BlockDownloader,
+    invalid_block_hashes: &mut std::collections::HashSet<Hash256>,
+    rpc_state: &RwLock<RpcState>,
+) -> bool {
+    use rustoshi_rpc::chain_lock::ChainEvent;
+    let Some(events) = chain_lock.take_changes(seen_epoch) else {
+        return false;
+    };
+    let mut invalidated: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
+    let mut reconsidered: Vec<Hash256> = Vec::new();
+    for ev in events {
+        match ev {
+            ChainEvent::Invalidated(v) => invalidated.extend(v),
+            ChainEvent::Reconsidered(v) => reconsidered.extend(v),
+        }
+    }
+    let (old_hash, old_height) = {
+        let cs = chain_state.read().await;
+        (cs.tip_hash(), cs.tip_height())
+    };
+    let db_tip = match (block_store.get_best_block_hash(), block_store.get_best_height()) {
+        (Ok(Some(h)), Ok(Some(n))) if h != Hash256::ZERO => Some((h, n)),
+        _ => None,
+    };
+    let (new_hash, new_height) = db_tip.unwrap_or((old_hash, old_height));
+    let tip_moved = (new_hash, new_height) != (old_hash, old_height);
+
+    if tip_moved || !invalidated.is_empty() {
+        if !pending_blocks.is_empty() {
+            // Cannot happen: a writer needs the coins DB at the published
+            // tip, which the loop reaches only by flushing these. Say so
+            // loudly rather than write them over the writer's chainstate.
+            tracing::error!(
+                "chain lock: {} unflushed connected block(s) in the sync loop while an RPC \
+                 writer moved the chainstate; discarding them (they are re-downloaded)",
+                pending_blocks.len()
+            );
+            pending_blocks.clear();
+        }
+        *blocks_since_flush = 0;
+        chain_state.write().await.set_tip(new_hash, new_height);
+        // Every coin the old view cached describes the pre-write chainstate.
+        *utxo_view = block_store.utxo_view_with_cache(dbcache_bytes);
+
+        // Did the writer simply extend our tip (submitblock / generate*)?
+        // Then only the blocks it connected leave the download pipeline.
+        // Anything else (invalidate, rollback, a reorg) re-orders every
+        // queued block against a different tip: start the pipeline over.
+        let mut extended: Option<std::collections::HashSet<Hash256>> = None;
+        if new_height > old_height && new_height - old_height <= 2000 {
+            let mut connected = std::collections::HashSet::new();
+            let (mut walk, mut h) = (new_hash, new_height);
+            while h > old_height {
+                connected.insert(walk);
+                match block_store.get_header(&walk).ok().flatten() {
+                    Some(hdr) => walk = hdr.prev_block_hash,
+                    None => break,
+                }
+                h -= 1;
+            }
+            if h == old_height && walk == old_hash {
+                extended = Some(connected);
+            }
+        }
+        match extended {
+            Some(connected) => {
+                block_downloader.forget_blocks(&connected);
+                block_downloader.set_validated_tip_height(new_height);
+            }
+            None => {
+                let header_h = header_sync.best_header_height();
+                block_downloader.reset_to_tip(new_height);
+                block_downloader.set_best_header_height(header_h.max(new_height));
+            }
+        }
+        if header_sync.best_header_height() < new_height {
+            header_sync.set_best_header(new_height, new_hash);
+            block_downloader.set_best_header_height(new_height);
+        }
+    }
+
+    if !invalidated.is_empty() {
+        // Core InvalidateBlock -> InvalidChainFound / RecalculateBestHeader:
+        // never fetch or follow these again, and take the header chain off
+        // them if it runs through them.
+        invalid_block_hashes.extend(invalidated.iter().copied());
+        if let Some(hh) = rewind_headers_off_invalid_branch(
+            block_store,
+            header_sync,
+            block_downloader,
+            &invalidated,
+            (new_hash, new_height),
+        ) {
+            let mut rpc = rpc_state.write().await;
+            if rpc.header_height > hh {
+                rpc.header_height = hh;
+            }
+        }
+    }
+    for h in &reconsidered {
+        // Core ReconsiderBlock clears the failure flags and lets the headers
+        // be followed again; the next getheaders round re-learns them.
+        invalid_block_hashes.remove(h);
+    }
+
+    if !tip_moved && invalidated.is_empty() && reconsidered.is_empty() {
+        return false;
+    }
+    tracing::info!(
+        "sync loop adopted RPC chainstate write(s): tip {} at {} -> {} at {} \
+         (invalidated {}, reconsidered {}, header tip {})",
+        old_hash, old_height, new_hash, new_height,
+        invalidated.len(), reconsidered.len(), header_sync.best_header_height()
+    );
+    true
+}
+
 // ============================================================
 // COOKIE AUTH HELPERS
 // ============================================================
@@ -4846,7 +4997,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let hb = Arc::clone(&p2p_heartbeat);
         let pc = Arc::clone(&watchdog_peer_count);
         let db_wd = Arc::clone(&db);
-        ops::spawn_p2p_watchdog(hb, pc, cli.p2p_watchdog_secs, move || {
+        let paused = rpc_state.read().await.block_submission_paused.clone();
+        ops::spawn_p2p_watchdog(hb, pc, paused, cli.p2p_watchdog_secs, move || {
             BlockStore::new(&db_wd).get_best_height().ok().flatten()
         });
         tracing::info!(
@@ -4871,6 +5023,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // signal unarmed, and the RPC-side wait degrades to a no-op instead of
     // blocking for its full timeout.
     flush_signal.arm();
+
+    // cs_main (crates/rpc/src/chain_lock.rs). The loop takes it with
+    // `try_lock` only -- around each block's connect -> flush -> publish and
+    // around the force-flush service -- so an RPC chainstate writer (a long
+    // rollback included) defers block connection instead of freezing this
+    // event loop. `chain_epoch_seen` is how it notices that a writer ran.
+    let chain_lock = rpc_state.read().await.chain_lock.clone();
+    let submission_paused = rpc_state.read().await.block_submission_paused.clone();
+    let mut chain_epoch_seen = chain_lock.epoch();
+    // The maintenance tick's last mempool min-fee reading (see there).
+    let mut last_mempool_min_fee: u64 = 0;
 
     // Shutdown signal streams are created ONCE, here, and only `.recv()`ed
     // inside the select! below.
@@ -4951,7 +5114,28 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 // tick, so that re-check finds the tip it just made durable
                 // instead of chasing blocks connected a moment later.
                 let mut flush_serviced_with_work = false;
-                if let Some(flush_seq) = flush_signal.pending() {
+                // cs_main for the flush service, and the point where RPC
+                // chainstate writes are adopted between blocks. A writer that
+                // holds the lock right now defers both to a later tick.
+                let cs_main_tick = chain_lock.try_lock();
+                if cs_main_tick.is_some() {
+                    adopt_rpc_chain_writes(
+                        &chain_lock,
+                        &mut chain_epoch_seen,
+                        &block_store,
+                        &chain_state,
+                        &mut utxo_view,
+                        dbcache_bytes,
+                        &mut pending_blocks,
+                        &mut blocks_since_flush,
+                        &mut header_sync,
+                        &mut block_downloader,
+                        &mut invalid_block_hashes,
+                        &rpc_state,
+                    )
+                    .await;
+                }
+                if let Some(flush_seq) = flush_signal.pending().filter(|_| cs_main_tick.is_some()) {
                     let (mut tip_hash, mut tip_height) = {
                         let cs = chain_state.read().await;
                         (cs.tip_hash(), cs.tip_height())
@@ -4984,13 +5168,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         // must stay cheap and predictable. `None` leaves the prune
                         // watermark untouched so the contiguous sweep resumes
                         // correctly on the next scheduled flush.
-                        match utxo_view.flush_with_tip_and_blocks(
+                        // Every coins-DB write happens under the RpcState
+                        // write lock, so a coherent reader that holds the lock
+                        // never sees the DB move under it (audit RU-2).
+                        let flush_rpc_guard = rpc_state.write().await;
+                        let flush_res = utxo_view.flush_with_tip_and_blocks(
                             &tip_hash,
                             tip_height,
                             &pending_blocks,
                             &[],
                             None,
-                        ) {
+                        );
+                        drop(flush_rpc_guard);
+                        match flush_res {
                             Ok(()) => {
                                 if had_work {
                                     tracing::info!(
@@ -5014,6 +5204,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         flush_signal.complete(flush_seq);
                     }
                 }
+                drop(cs_main_tick);
 
                 const MAX_BLOCKS_VALIDATE: usize = 8;
                 let mut blocks_validated = 0usize;
@@ -5023,6 +5214,30 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     if rustoshi_consensus::fatal::is_aborted() {
                         break;
                     }
+                    // cs_main across this block's connect -> flush -> publish
+                    // (audit RU-1/RU-2). Held by an RPC writer: connect later.
+                    let Some(_cs_main) = chain_lock.try_lock() else {
+                        break;
+                    };
+                    // dumptxoutset rollback in progress (Core NetworkDisable).
+                    if submission_paused.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    adopt_rpc_chain_writes(
+                        &chain_lock,
+                        &mut chain_epoch_seen,
+                        &block_store,
+                        &chain_state,
+                        &mut utxo_view,
+                        dbcache_bytes,
+                        &mut pending_blocks,
+                        &mut blocks_since_flush,
+                        &mut header_sync,
+                        &mut block_downloader,
+                        &mut invalid_block_hashes,
+                        &rpc_state,
+                    )
+                    .await;
                     // A parked block waits for its ancestor header window.
                     if !ancestor_wait.ready(&block_store) {
                         break;
@@ -5394,6 +5609,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             || at_header_tip
                             || (time_since_flush.as_secs() >= UTXO_FLUSH_INTERVAL_SECS
                                 && utxo_view.cache_len() > 0);
+                        // The flush and the tip publish below happen under ONE RpcState
+                        // write guard (and under cs_main): a coherent coin reader holds
+                        // that lock, so it can never see this block's coins on disk under
+                        // the previous published tip (2026-10-07 audit RU-2 -- the flush
+                        // used to run before the lock was taken).
+                        let publish_guard = rpc_state.write().await;
                         if should_flush {
                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                             let entries = utxo_view.cache_len();
@@ -5456,7 +5677,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                         let mut tip_advanced = false;
                         {
-                            let mut rpc = rpc_state.write().await;
+                            let mut rpc = publish_guard;
                             if height > rpc.best_height {
                                 rpc.best_height = height;
                                 rpc.best_hash = block_hash;
@@ -5692,13 +5913,29 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // this is the linear-index analog. The honest
                                 // sibling (a DIFFERENT hash) is never filtered,
                                 // so it still connects and advances the tip.
+                                //
+                                // A header whose PARENT failed is dropped (and
+                                // remembered) too -- Core AcceptBlockHeader's
+                                // BLOCK_FAILED_MASK parent check ("bad-prevblk",
+                                // BLOCK_FAILED_CHILD). Without it, after an
+                                // `invalidateblock N` the peers' N+1, N+2 headers
+                                // were taken on as the header chain again.
                                 let headers: Vec<_> = if invalid_block_hashes.is_empty() {
                                     headers
                                 } else {
-                                    headers
-                                        .into_iter()
-                                        .filter(|h| !invalid_block_hashes.contains(&h.block_hash()))
-                                        .collect()
+                                    let mut kept = Vec::with_capacity(headers.len());
+                                    for h in headers {
+                                        let hh = h.block_hash();
+                                        if invalid_block_hashes.contains(&hh) {
+                                            continue;
+                                        }
+                                        if invalid_block_hashes.contains(&h.prev_block_hash) {
+                                            invalid_block_hashes.insert(hh);
+                                            continue;
+                                        }
+                                        kept.push(h);
+                                    }
+                                    kept
                                 };
                                 let is_historical = historical_backfill
                                     .as_ref()
@@ -6359,6 +6596,35 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     if rustoshi_consensus::fatal::is_aborted() {
                                         break;
                                     }
+                                    // cs_main across this block's connect -> flush
+                                    // -> publish, the attach-and-reorg path included
+                                    // (audit RU-1/RU-2). Held by an RPC writer: the
+                                    // body stays buffered and the validation tick
+                                    // connects it once the writer is done.
+                                    let Some(_cs_main) = chain_lock.try_lock() else {
+                                        break;
+                                    };
+                                    // dumptxoutset rollback in progress (Core
+                                    // NetworkDisable): connect nothing over the
+                                    // rewound coins.
+                                    if submission_paused.load(std::sync::atomic::Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    adopt_rpc_chain_writes(
+                                        &chain_lock,
+                                        &mut chain_epoch_seen,
+                                        &block_store,
+                                        &chain_state,
+                                        &mut utxo_view,
+                                        dbcache_bytes,
+                                        &mut pending_blocks,
+                                        &mut blocks_since_flush,
+                                        &mut header_sync,
+                                        &mut block_downloader,
+                                        &mut invalid_block_hashes,
+                                        &rpc_state,
+                                    )
+                                    .await;
                                     // A parked block waits for its ancestor header window.
                                     if !ancestor_wait.ready(&block_store) {
                                         break;
@@ -6628,6 +6894,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // before we hand off. Mirrors the connect loop's atomic
                                         // flush_with_tip_and_blocks, minus the tip advance (the
                                         // dropped block did NOT connect).
+                                        // Coins-DB writes only under the RpcState
+                                        // write lock (audit RU-2).
+                                        let pre_reorg_guard = rpc_state.write().await;
                                         if !pending_blocks.is_empty() {
                                             let (prev_view_tip, prev_view_h) = {
                                                 let cs = chain_state.read().await;
@@ -6653,6 +6922,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 "Unit C: pre-reorg UTXO flush failed: {}", e
                                             );
                                         }
+                                        drop(pre_reorg_guard);
                                         // Gate 6 (audit F2 tail): a failed pre-reorg flush
                                         // used to fall through and run the reorg against a
                                         // stale on-disk UTXO set. The flush failure has
@@ -6931,6 +7201,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             || at_header_tip
                                             || (time_since_flush.as_secs() >= UTXO_FLUSH_INTERVAL_SECS
                                                 && utxo_view.cache_len() > 0);
+                                        // The flush and the tip publish below happen under ONE RpcState
+                                        // write guard (and under cs_main): a coherent coin reader holds
+                                        // that lock, so it can never see this block's coins on disk under
+                                        // the previous published tip (2026-10-07 audit RU-2 -- the flush
+                                        // used to run before the lock was taken).
+                                        let publish_guard = rpc_state.write().await;
                                         if should_flush {
                                             let cache_mb = utxo_view.estimated_memory() / (1024 * 1024);
                                             let entries = utxo_view.cache_len();
@@ -6986,7 +7262,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // Update RPC state and clean mempool
                                         let mut tip_advanced = false;
                                         {
-                                            let mut rpc = rpc_state.write().await;
+                                            let mut rpc = publish_guard;
                                             if height > rpc.best_height {
                                                 rpc.best_height = height;
                                                 rpc.best_hash = block_hash;
@@ -7248,6 +7524,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 }
                             }
 
+                            NetworkMessage::Tx(tx)
+                                if submission_paused.load(std::sync::atomic::Ordering::SeqCst) =>
+                            {
+                                // dumptxoutset rollback in progress: the coins DB
+                                // is rewound, so admitting against it would let a
+                                // tx spending coins the real tip already spent into
+                                // the mempool. Core's NetworkDisable stops relay
+                                // outright; drop it (the peer re-announces).
+                                tracing::debug!(
+                                    "tx {} from peer {} ignored: chainstate rollback in progress",
+                                    tx.txid(), peer_id.0
+                                );
+                            }
                             NetworkMessage::Tx(tx) => {
                                 let txid = tx.txid();
                                 let wtxid = tx.wtxid();
@@ -8770,8 +9059,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 // periodic `TxOrphanage::LimitOrphans` time sweep. The 45s
                 // maintenance cadence is well under the 20-min ORPHAN_TX
                 // expiry, satisfying the "~1 min" sweep requested by the audit.
-                {
-                    let mut rpc = rpc_state.write().await;
+                // try_write: this tick must never park the event loop behind a
+                // long RpcState holder (audit RU-3 -- a waiting writer also
+                // queues every later reader, and the P2P watchdog then fired).
+                // A busy lock just defers the sweep one tick.
+                if let Ok(mut rpc) = rpc_state.try_write() {
                     let evicted = rpc.orphanage.expire_orphans(std::time::Instant::now());
                     if evicted > 0 {
                         tracing::debug!("Orphan TTL sweep evicted {} stale orphan(s)", evicted);
@@ -8796,9 +9088,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 // Core's m_mempool.GetMinFee().GetFeePerK(). get_min_fee takes
                 // &mut self (it decays the rolling minimum), so grab it under the
                 // rpc_state write lock.
-                let mempool_min_fee = {
-                    let mut rpc = rpc_state.write().await;
-                    rpc.mempool.get_min_fee()
+                let mempool_min_fee = match rpc_state.try_write() {
+                    Ok(mut rpc) => {
+                        let f = rpc.mempool.get_min_fee();
+                        last_mempool_min_fee = f;
+                        f
+                    }
+                    // Busy (see the orphan sweep above): reuse last tick's.
+                    Err(_) => last_mempool_min_fee,
                 };
 
                 // FEELER gate: at most one short-lived NEW-table probe per
@@ -9025,6 +9322,28 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // flushes atomically every UTXO_FLUSH_INTERVAL_BLOCKS blocks. This
     // shutdown flush is the best-effort fast path for clean exits.
     {
+        // cs_main, then adopt any RPC chainstate write the loop has not seen
+        // yet: after an `invalidateblock` the loop's tip is ABOVE the coins
+        // DB's, and the never-regress guard below would otherwise write that
+        // stale tip over the rewound coins (audit RU-1).
+        let _cs_main = chain_lock.lock().await;
+        adopt_rpc_chain_writes(
+            &chain_lock,
+            &mut chain_epoch_seen,
+            &block_store,
+            &chain_state,
+            &mut utxo_view,
+            dbcache_bytes,
+            &mut pending_blocks,
+            &mut blocks_since_flush,
+            &mut header_sync,
+            &mut block_downloader,
+            &mut invalid_block_hashes,
+            &rpc_state,
+        )
+        .await;
+        // Coins-DB writes only under the RpcState write lock (audit RU-2).
+        let _shutdown_rpc_guard = rpc_state.write().await;
         let cs = chain_state.read().await;
         let mut tip_hash = cs.tip_hash();
         let mut tip_height = cs.tip_height();

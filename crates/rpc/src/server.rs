@@ -447,6 +447,10 @@ pub struct RpcState {
     /// boundary. Unarmed by default, which makes the wait a no-op on nodes
     /// that have no connect loop (unit tests, RPC-only harnesses).
     pub chainstate_flush: Arc<rustoshi_storage::ChainstateFlushSignal>,
+    /// `cs_main`: held by the connect loop across each block's
+    /// connect/flush/publish and by every RPC chainstate writer (see
+    /// [`crate::chain_lock`]). Lock order: chain lock BEFORE this `RpcState`.
+    pub chain_lock: Arc<crate::chain_lock::ChainLock>,
 }
 
 /// Select the mempool configuration appropriate for `network`.
@@ -616,6 +620,7 @@ impl RpcState {
             chainstate_manager: ChainstateManager::new(),
             tip_notifier: crate::tip_notifier::TipNotifier::shared(),
             chainstate_flush: Arc::new(rustoshi_storage::ChainstateFlushSignal::new()),
+            chain_lock: crate::chain_lock::ChainLock::new(),
         }
     }
 
@@ -652,6 +657,7 @@ impl RpcState {
             chainstate_manager: ChainstateManager::new(),
             tip_notifier: crate::tip_notifier::TipNotifier::shared(),
             chainstate_flush: Arc::new(rustoshi_storage::ChainstateFlushSignal::new()),
+            chain_lock: crate::chain_lock::ChainLock::new(),
         }
     }
 
@@ -2479,36 +2485,6 @@ impl RpcServerImpl {
         Ok(serde_json::Value::Object(result))
     }
 
-    /// The best block of the COINS DB — the block whose UTXO set is actually
-    /// on disk — or `None` when the pointer is absent or unset.
-    ///
-    /// This is what Core reports, and it is deliberately NOT the in-memory
-    /// tip. `ComputeUTXOStats` seeds its result from the cursor it is about
-    /// to iterate:
-    ///
-    /// ```text
-    ///   pcursor = view->Cursor();
-    ///   pindex  = blockman.LookupBlockIndex(pcursor->GetBestBlock());
-    ///   CCoinsStats stats{pindex->nHeight, pindex->GetBlockHash()};
-    /// ```
-    /// (`kernel/coinstats.cpp:147-157`)
-    ///
-    /// so `height`/`bestblock` always describe the very set being hashed.
-    /// Reading them from the in-memory tip instead is what turns a
-    /// not-yet-flushed cache into a mismatching-but-plausible pair. The
-    /// force-flush above normally makes the two equal; this keeps the answer
-    /// honest in the window where a block connects between the flush and the
-    /// scan, and when no connect loop is there to service the flush at all.
-    fn coins_db_tip(store: &BlockStore<'_>) -> Option<(Hash256, u32)> {
-        let hash = store.get_best_block_hash().ok().flatten()?;
-        // A fresh datadir seeds META_BEST_BLOCK_HASH with 32 zero bytes
-        // (`db.rs`), which names no block; fall back to the caller's tip.
-        if hash == Hash256::ZERO {
-            return None;
-        }
-        let height = store.get_best_height().ok().flatten()?;
-        Some((hash, height))
-    }
 
     /// Create a new RPC server implementation with ZMQ notifications.
     pub fn with_zmq(
@@ -9840,7 +9816,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         let block_hash = block.block_hash();
 
-        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(submit_system_fault_error)?;
+        let mut state = crate::coins_coherence::chain_write_coherent(&self.state).await.map_err(submit_system_fault_error)?;
 
         // Check for duplicate — but key on the BLOCK INDEX entry, not the bare
         // header (P1.6 fix, 2026-07-21). `put_block_index` is written only
@@ -12622,7 +12598,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn invalidate_block(&self, blockhash: String) -> RpcResult<()> {
         let hash = Self::parse_hash(&blockhash)?;
 
-        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
+        let mut state = crate::coins_coherence::chain_write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         // Get block index entry
@@ -12698,6 +12674,16 @@ impl RustoshiRpcServer for RpcServerImpl {
             block_entry.height,
             descendants.len()
         );
+        // Tell the connect loop which blocks are now invalid: it must drop
+        // them from its download pipeline and take its header chain off them,
+        // or the next P2P block on that branch would be connected over the
+        // rewound coins (2026-10-07 audit RU-1).
+        {
+            let mut inv: Vec<Hash256> = Vec::with_capacity(descendants.len() + 1);
+            inv.push(hash);
+            inv.extend(descendants.iter().copied());
+            state.push_event(crate::chain_lock::ChainEvent::Invalidated(inv));
+        }
 
         // If the invalidated block is in the active chain, we need to reorg
         // Find the new best valid chain tip by walking back from the current tip
@@ -12764,7 +12750,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn reconsider_block(&self, blockhash: String) -> RpcResult<()> {
         let hash = Self::parse_hash(&blockhash)?;
 
-        let state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
+        let state = crate::coins_coherence::chain_write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         // Verify the block exists and get its metadata
@@ -12799,6 +12785,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         };
 
         let mut reconsidered_count = 0;
+        let mut reconsidered: Vec<Hash256> = Vec::new();
 
         // Clear invalid flags from this block and all related blocks
         // (both ancestors and descendants)
@@ -12831,6 +12818,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     )
                 })?;
                 reconsidered_count += 1;
+                reconsidered.push(*block_hash);
             }
         }
 
@@ -12839,6 +12827,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             hash,
             reconsidered_count
         );
+        if !reconsidered.is_empty() {
+            state.push_event(crate::chain_lock::ChainEvent::Reconsidered(reconsidered));
+        }
 
         // Check if we should switch to the reconsidered chain
         // Compare chain work of the reconsidered block vs current tip
@@ -12863,7 +12854,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn precious_block(&self, blockhash: String) -> RpcResult<()> {
         let hash = Self::parse_hash(&blockhash)?;
 
-        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
+        let mut state = crate::coins_coherence::chain_write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         // Get block index entry
@@ -15588,154 +15579,21 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
-        // Tip metadata. `tip_height` was bound at the top of the method so the
-        // rollback-target resolver could see it; rebinding the hash + index
-        // here keeps the rest of the body unchanged.
+        // The base reported for the dump is the COINS DB's own best block as
+        // recorded in the snapshot the walk reads — Core takes it from the
+        // cursor it iterates (`WriteUTXOSnapshot`'s `tip` comes from
+        // `pcursor->GetBestBlock()`), so the metadata can never name a height
+        // whose coins are not in the file. The force-flush at the top of this
+        // method normally makes it the published tip.
         //
-        // The base reported for the dump is the COINS DB's own best block, not
-        // the in-memory tip — Core takes it from the cursor it is about to
-        // iterate (`WriteUTXOSnapshot`'s `tip` comes from
-        // `maybe_stats->hashBlock`, itself `pcursor->GetBestBlock()`), so the
-        // metadata can never name a height whose coins are not in the file.
-        // The force-flush at the top of this method normally makes the two
-        // equal; this is what keeps them equal when it could not run.
-        let store = BlockStore::new(&state.db);
-        let (tip_hash, tip_height) = match Self::coins_db_tip(&store) {
-            Some(pair) => pair,
-            None => (state.best_hash, tip_height),
-        };
-        let tip_index = store
-            .get_block_index(&tip_hash)
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
-
-        // Iterate the UTXO column family. RocksDB returns keys in lex order;
-        // our `outpoint_key` is `txid (32) || vout (4 BE)`, so iteration is
-        // already in `(txid, vout)` ascending order — the same ordering Core
-        // requires for `dumptxoutset`.
-        let mut coins_count: u64 = 0;
-        for (key, _) in state
-            .db
-            .iter_cf(CF_UTXO)
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
-        {
-            if key.len() == 36 {
-                coins_count += 1;
-            }
-        }
-
-        // Write to a temp path and rename on success, mirroring Core's
-        // `temppath = path + ".incomplete"` flow in
-        // `bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset`. The
-        // sync_all() before rename is the durability barrier — without
-        // it a power loss between rename and dirty-page flush could
-        // leave `<path>` visible with zero-length / torn contents.
-        let temp_path = {
-            let mut p = abs_path.clone().into_os_string();
-            p.push(".incomplete");
-            std::path::PathBuf::from(p)
-        };
-
-        // Best-effort cleanup helper used on every error path past
-        // `File::create` so a failed dump leaves at most one
-        // .incomplete artifact, never a torn `<path>`.
-        let cleanup_temp = |tp: &std::path::Path| {
-            let _ = std::fs::remove_file(tp);
-        };
-
-        let file = std::fs::File::create(&temp_path)
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
-
-        let metadata = SnapshotMetadata::new(tip_hash, coins_count, state.params.network_magic);
-        let mut writer = SnapshotWriter::new(file, &metadata).map_err(|e| {
-            cleanup_temp(&temp_path);
-            Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
-        })?;
-
-        let mut written: u64 = 0;
-        for entry_iter in state
-            .db
-            .iter_cf(CF_UTXO)
-            .map_err(|e| {
-                cleanup_temp(&temp_path);
-                Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
-            })?
-        {
-            let (key, value) = entry_iter;
-            if key.len() != 36 {
-                continue;
-            }
-            let mut txid_bytes = [0u8; 32];
-            txid_bytes.copy_from_slice(&key[..32]);
-            let txid = Hash256(txid_bytes);
-            let mut vout_bytes = [0u8; 4];
-            vout_bytes.copy_from_slice(&key[32..]);
-            let vout = u32::from_be_bytes(vout_bytes);
-
-            let entry: CoinEntry =
-                rustoshi_storage::decode_utxo_value(&value).map_err(|e| {
-                    cleanup_temp(&temp_path);
-                    Self::rpc_error(
-                        rpc_error::RPC_DATABASE_ERROR,
-                        format!("UTXO deserialization failed: {}", e),
-                    )
-                })?;
-            let coin = Coin::from_entry(&entry);
-            writer
-                .write_coin(&OutPoint { txid, vout }, &coin)
-                .map_err(|e| {
-                    cleanup_temp(&temp_path);
-                    Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
-                })?;
-            written += 1;
-        }
-
-        let (file, txoutset_hash, core_hash_serialized, muhash) = writer
-            .finish_with_hashes()
-            .map_err(|e| {
-                cleanup_temp(&temp_path);
-                Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
-            })?;
-
-        // Durability barrier: fsync the temp file before the atomic
-        // rename. Mirrors Core's `Fdatasync`/`fclose` flush before
-        // `rename(temppath, path)` in `dumptxoutset`. We then drop the
-        // handle (closing the fd) and hand the rename to the OS.
-        if let Err(e) = file.sync_all() {
-            cleanup_temp(&temp_path);
-            return Err(Self::rpc_error(
-                rpc_error::RPC_MISC_ERROR,
-                format!("fsync failed: {}", e),
-            ));
-        }
-        drop(file);
-
-        std::fs::rename(&temp_path, &abs_path).map_err(|e| {
-            cleanup_temp(&temp_path);
-            Self::rpc_error(rpc_error::RPC_MISC_ERROR, format!("rename failed: {}", e))
-        })?;
-
-        let nchaintx: u64 = tip_index
-            .as_ref()
-            .map(|e| e.n_tx as u64)
-            .unwrap_or(0);
-
-        Ok(serde_json::json!({
-            "coins_written": written,
-            "base_hash": tip_hash.to_hex(),
-            "base_height": tip_height,
-            "path": abs_path.display().to_string(),
-            // Legacy rustoshi `compute_utxo_hash` form — preserved so old
-            // tooling keeps working.  Does NOT match Core.
-            "txoutset_hash": txoutset_hash.0.to_hex(),
-            // Core HASH_SERIALIZED form (sha256d of TxOutSer bytes,
-            // grouped by txid).  This is what
-            // `AssumeutxoData::hash_serialized` is anchored to.
-            "hash_serialized": core_hash_serialized.0.to_hex(),
-            // Core MuHash3072 form (matches `gettxoutsetinfo`'s `muhash`
-            // field; order-independent in the prime field).
-            "muhash": muhash.0.to_hex(),
-            "nchaintx": nchaintx,
-        }))
+        // The walk runs on a blocking thread over one RocksDB snapshot with
+        // the `RpcState` lock RELEASED (audit RU-3: holding it for a mainnet
+        // walk stopped the connect loop until the P2P watchdog exited).
+        let db = Arc::clone(&state.db);
+        let fallback = (state.best_hash, tip_height);
+        let magic = state.params.network_magic;
+        drop(state);
+        Self::dump_utxo_snapshot_blocking(db, fallback, magic, abs_path).await
     }
 
     async fn load_tx_outset(&self, path: String) -> RpcResult<serde_json::Value> {
@@ -15935,6 +15793,14 @@ impl RustoshiRpcServer for RpcServerImpl {
             Arc::as_ptr(&st.db) as usize
         };
 
+        // cs_main (2026-10-07 audit RU-1): the activation replaces the coins
+        // and the tip; the connect loop must not be mid-connect, and must
+        // re-read its chainstate afterwards (the hold bumps the write epoch).
+        let _chain_held = {
+            let chain = self.state.read().await.chain_lock.clone();
+            let g = chain.lock().await;
+            crate::chain_lock::ChainHeld::new(chain, g)
+        };
         let mut state = self.state.write().await;
 
         // Persist the real pre-base header band (if the matched campaign
@@ -16332,8 +16198,17 @@ impl RustoshiRpcServer for RpcServerImpl {
             )
         })?;
 
-        let state = self.state.read().await;
+        // Core scantxoutset (rpc/blockchain.cpp:2430-2441): take cs_main only
+        // to ForceFlushStateToDisk and open a cursor, then walk with no lock.
+        // This used to walk CF_UTXO inline while holding the `RpcState` read
+        // guard: the connect loop's next `RpcState` write (the 45 s
+        // maintenance tick, any publish) queued behind it, tokio's RwLock
+        // then queued every later reader behind that writer, and the P2P
+        // watchdog exit(1)'d the node at 900 s (2026-10-07 audit RU-3). It
+        // also scanned only what had been flushed, under the in-memory tip.
+        self.force_flush_chainstate_to_disk().await;
 
+        let state = self.state.read().await;
         // Build the set of target scriptPubKeys ("needles") from the scan
         // objects, remembering the descriptor string for each so the result
         // can echo it back like Core does.
@@ -16342,102 +16217,15 @@ impl RustoshiRpcServer for RpcServerImpl {
             let script = Self::scanobject_to_script(obj, &state.params)?;
             needles.push((script, obj.clone()));
         }
+        let db = Arc::clone(&state.db);
+        let fallback = (state.best_hash, state.best_height);
+        drop(state);
 
-        let height = state.best_height;
-        let best_hash = state.best_hash;
-
-        // Block-hash-by-height lookup, exactly as the getblockhash RPC does
-        // (CF_HEIGHT_INDEX keyed by height.to_be_bytes()). Used to emit
-        // `blockhash` per unspent, mirroring Core's
-        // coinb_block.GetBlockHash().GetHex().
-        let store = BlockStore::new(&state.db);
-
-        // Walk the current UTXO set, exactly as gettxoutsetinfo /
-        // dumptxoutset do (CF_UTXO key = txid(32 internal) || vout(4 BE),
-        // value decoded via decode_utxo_value).
-        let mut txouts: u64 = 0;
-        let mut total_amount_sats: u64 = 0;
-        let mut unspents: Vec<serde_json::Value> = Vec::new();
-
-        crate::test_hooks::txoutset_walk_sleep("scantxoutset");
-        for (key, value) in state
-            .db
-            .iter_cf(CF_UTXO)
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
-        {
-            if key.len() != 36 {
-                continue;
-            }
-            let coin: CoinEntry = match rustoshi_storage::decode_utxo_value(&value) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            txouts += 1;
-
-            // Match the output script against every needle. Core dedups
-            // scripts in a std::set; here we just stop at the first match
-            // (an output script matches at most one descriptor's bytes
-            // anyway, and the descriptor string echoed is that needle's).
-            let matched = needles
-                .iter()
-                .find(|(spk, _)| spk.as_slice() == coin.script_pubkey.as_slice());
-            let Some((_, desc)) = matched else {
-                continue;
-            };
-
-            let mut txid_bytes = [0u8; 32];
-            txid_bytes.copy_from_slice(&key[..32]);
-            let txid = Hash256(txid_bytes);
-            let vout = u32::from_be_bytes([key[32], key[33], key[34], key[35]]);
-
-            total_amount_sats = total_amount_sats.saturating_add(coin.value);
-
-            let confirmations = if height >= coin.height {
-                height - coin.height + 1
-            } else {
-                0
-            };
-
-            // blockhash = hash of the block at the coin's height, big-endian
-            // DISPLAY hex, mirroring Core's coinb_block.GetBlockHash().GetHex()
-            // (blockchain.cpp:2451,2463).
-            let blockhash = match store.get_hash_by_height(coin.height) {
-                Ok(Some(hash)) => hash.to_hex(),
-                Ok(None) => {
-                    return Err(Self::rpc_error(
-                        rpc_error::RPC_DATABASE_ERROR,
-                        format!("Block hash not found for height {}", coin.height),
-                    ))
-                }
-                Err(e) => {
-                    return Err(Self::rpc_error(
-                        rpc_error::RPC_DATABASE_ERROR,
-                        format!("Database error: {}", e),
-                    ))
-                }
-            };
-
-            unspents.push(serde_json::json!({
-                "txid": txid.to_hex(),
-                "vout": vout,
-                "scriptPubKey": hex::encode(&coin.script_pubkey),
-                "desc": desc,
-                "amount": coin.value as f64 / 1e8,
-                "coinbase": coin.is_coinbase,
-                "height": coin.height,
-                "blockhash": blockhash,
-                "confirmations": confirmations,
-            }));
-        }
-
-        Ok(serde_json::json!({
-            "success": true,
-            "txouts": txouts,
-            "height": height,
-            "bestblock": best_hash.to_hex(),
-            "unspents": unspents,
-            "total_amount": total_amount_sats as f64 / 1e8,
-        }))
+        tokio::task::spawn_blocking(move || Self::scantxoutset_walk(&db, &needles, fallback))
+            .await
+            .map_err(|e| {
+                Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("scantxoutset walk: {e}"))
+            })?
     }
 
     async fn rescan_blockchain(
@@ -16477,7 +16265,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         };
 
-        let store = BlockStore::new(&state.db);
+        // Walk the blocks with the `RpcState` lock RELEASED (audit RU-3): a
+        // long rescan held it for the whole walk and froze the connect loop's
+        // next `RpcState` write, then every RPC, until the P2P watchdog fired.
+        // Blocks are immutable once stored; the height index is read per step.
+        let db = Arc::clone(&state.db);
+        drop(state);
+        let store = BlockStore::new(&db);
         let ws_guard = ws.read().await;
 
         // Walk the active chain over [start, stop] in height order, feeding
@@ -17851,7 +17645,14 @@ impl RpcServerImpl {
     ) -> RpcResult<serde_json::Value> {
         use rustoshi_consensus::validation::UtxoView as _;
 
-        let mut state = self.state.write().await;
+        // cs_main for the whole rewind -> dump -> replay (Core holds it
+        // across TemporaryRollback's InvalidateBlock / ReconsiderBlock): the
+        // connect loop cannot connect a P2P block over the rewound coins, and
+        // re-reads its chainstate when this hold is released (audit RU-1).
+        let (mut state, _chain_held) = crate::coins_coherence::chain_write_coherent(&self.state)
+            .await
+            .map_err(Self::coins_incoherent_error)?
+            .into_parts();
 
         // NetworkDisable RAII: pause inbound block acceptance for the
         // duration of the rewind→dump→replay dance. Peers stay connected,
@@ -18018,7 +17819,21 @@ impl RpcServerImpl {
         crate::test_hooks::rollback_pause().await;
 
         // -------- 3. Dump the snapshot at the rolled-back tip --------
-        let dump_result = Self::dump_tx_outset_at_current_tip(&state, &abs_path);
+        // The walk needs no `RpcState`: release it (the chain lock stays
+        // held, so nothing moves the chainstate) so RPC and the connect
+        // loop's other work keep running for the length of a mainnet dump
+        // (audit RU-3), then retake it for the replay.
+        let db = Arc::clone(&state.db);
+        let magic = state.params.network_magic;
+        drop(state);
+        let dump_result = Self::dump_utxo_snapshot_blocking(
+            db,
+            (target_hash, target_height),
+            magic,
+            abs_path.clone(),
+        )
+        .await;
+        let mut state = self.state.write().await;
 
         // -------- 4. Reconnect target+1..tip --------
         // Independent of whether the dump succeeded, we always try to
@@ -18151,29 +17966,165 @@ impl RpcServerImpl {
         Ok(serde_json::Value::Object(obj))
     }
 
-    /// Dump the UTXO set at the current `state.best_*` to `abs_path`.
+    /// The `scantxoutset start` walk over ONE RocksDB snapshot, on a blocking
+    /// thread with no lock held. `height` / `bestblock` are the coins DB's own
+    /// best block as recorded in that snapshot (Core reports the cursor's
+    /// block), so the answer always describes the set it scanned.
+    fn scantxoutset_walk(
+        db: &ChainDb,
+        needles: &[(Vec<u8>, String)],
+        fallback: (Hash256, u32),
+    ) -> RpcResult<serde_json::Value> {
+        crate::test_hooks::txoutset_walk_sleep("scantxoutset");
+        let snap = db.snapshot();
+        let (best_hash, height) = Self::coins_db_tip_at(|k| {
+            db.get_cf_at(&snap, rustoshi_storage::columns::CF_META, k).ok().flatten()
+        })
+        .unwrap_or(fallback);
+        let db_err = |e: rustoshi_storage::StorageError| {
+            Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+        };
+
+        let mut txouts: u64 = 0;
+        let mut total_amount_sats: u64 = 0;
+        let mut unspents: Vec<serde_json::Value> = Vec::new();
+
+        for item in db.iter_cf_at(&snap, CF_UTXO).map_err(db_err)? {
+            let (key, value) = item.map_err(db_err)?;
+            if key.len() != 36 {
+                continue;
+            }
+            let coin: CoinEntry = match rustoshi_storage::decode_utxo_value(&value) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            txouts += 1;
+
+            // Match the output script against every needle. Core dedups
+            // scripts in a std::set; here we just stop at the first match
+            // (an output script matches at most one descriptor's bytes
+            // anyway, and the descriptor string echoed is that needle's).
+            let matched = needles
+                .iter()
+                .find(|(spk, _)| spk.as_slice() == coin.script_pubkey.as_slice());
+            let Some((_, desc)) = matched else {
+                continue;
+            };
+
+            let mut txid_bytes = [0u8; 32];
+            txid_bytes.copy_from_slice(&key[..32]);
+            let txid = Hash256(txid_bytes);
+            let vout = u32::from_be_bytes([key[32], key[33], key[34], key[35]]);
+
+            total_amount_sats = total_amount_sats.saturating_add(coin.value);
+
+            let confirmations = if height >= coin.height {
+                height - coin.height + 1
+            } else {
+                0
+            };
+
+            // blockhash = hash of the block at the coin's height, big-endian
+            // DISPLAY hex, mirroring Core's coinb_block.GetBlockHash().GetHex()
+            // (blockchain.cpp:2451,2463). Read from the same snapshot.
+            let blockhash = match db
+                .get_cf_at(
+                    &snap,
+                    rustoshi_storage::columns::CF_HEIGHT_INDEX,
+                    &coin.height.to_be_bytes(),
+                )
+                .map_err(db_err)?
+            {
+                Some(v) if v.len() == 32 => {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&v);
+                    Hash256(h).to_hex()
+                }
+                _ => {
+                    return Err(Self::rpc_error(
+                        rpc_error::RPC_DATABASE_ERROR,
+                        format!("Block hash not found for height {}", coin.height),
+                    ))
+                }
+            };
+
+            unspents.push(serde_json::json!({
+                "txid": txid.to_hex(),
+                "vout": vout,
+                "scriptPubKey": hex::encode(&coin.script_pubkey),
+                "desc": desc,
+                "amount": coin.value as f64 / 1e8,
+                "coinbase": coin.is_coinbase,
+                "height": coin.height,
+                "blockhash": blockhash,
+                "confirmations": confirmations,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "success": true,
+            "txouts": txouts,
+            "height": height,
+            "bestblock": best_hash.to_hex(),
+            "unspents": unspents,
+            "total_amount": total_amount_sats as f64 / 1e8,
+        }))
+    }
+
+    /// The coins-DB best block as recorded in `snap` (written in the same
+    /// batch as the coins, so it labels exactly the set the snapshot holds).
+    /// `None` for an absent / all-zero pointer (fresh datadir).
+    /// `read_meta` reads a `CF_META` key from that snapshot.
+    fn coins_db_tip_at(read: impl Fn(&[u8]) -> Option<Vec<u8>>) -> Option<(Hash256, u32)> {
+        let hash = read(rustoshi_storage::db::META_BEST_BLOCK_HASH)
+            .filter(|v| v.len() == 32)
+            .map(|v| {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&v);
+                Hash256(h)
+            })?;
+        if hash == Hash256::ZERO {
+            return None;
+        }
+        let height = read(rustoshi_storage::db::META_BEST_HEIGHT)
+            .filter(|v| v.len() == 4)
+            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))?;
+        Some((hash, height))
+    }
+
+    /// Write the UTXO set to `abs_path` from ONE RocksDB snapshot.
     ///
-    /// Factored out so the rollback path can call into the same writer
-    /// the "latest" path uses, after rewinding the chainstate. Pure
-    /// snapshot-of-current-state — no chain mutation here.
-    fn dump_tx_outset_at_current_tip(
-        state: &RpcState,
+    /// Core takes the coins cursor once (`PrepareUTXOSnapshot`,
+    /// rpc/blockchain.cpp:3238-3264) and labels the file with that cursor's
+    /// best block. This used to make two passes over the LIVE column family
+    /// (count, then write) while holding the `RpcState` lock: a flush between
+    /// them made the header's coin count disagree with the body (audit
+    /// RU-11), and the lock held for the whole walk froze the connect loop
+    /// until the P2P watchdog killed the node (RU-3). Both passes now read the
+    /// same snapshot and the caller runs this on a blocking thread with no
+    /// lock held. `fallback` labels the dump only when the snapshot carries
+    /// no best-block pointer.
+    fn dump_utxo_snapshot_at(
+        db: &ChainDb,
+        fallback: (Hash256, u32),
+        network_magic: rustoshi_consensus::params::NetworkMagic,
         abs_path: &std::path::Path,
     ) -> RpcResult<serde_json::Value> {
-        let store = BlockStore::new(&state.db);
-        let tip_hash = state.best_hash;
-        let tip_height = state.best_height;
-        let tip_index = store
+        let snap = db.snapshot();
+        let (tip_hash, tip_height) = Self::coins_db_tip_at(|k| {
+            db.get_cf_at(&snap, rustoshi_storage::columns::CF_META, k).ok().flatten()
+        })
+        .unwrap_or(fallback);
+        let tip_index = BlockStore::new(db)
             .get_block_index(&tip_hash)
             .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?;
 
-        // Count coins.
+        let db_err = |e: rustoshi_storage::StorageError| {
+            Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
+        };
         let mut coins_count: u64 = 0;
-        for (key, _) in state
-            .db
-            .iter_cf(CF_UTXO)
-            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string()))?
-        {
+        for item in db.iter_cf_at(&snap, CF_UTXO).map_err(db_err)? {
+            let (key, _) = item.map_err(db_err)?;
             if key.len() == 36 {
                 coins_count += 1;
             }
@@ -18184,72 +18135,60 @@ impl RpcServerImpl {
             p.push(".incomplete");
             std::path::PathBuf::from(p)
         };
-
-        // Best-effort cleanup helper used on every error path past
-        // `File::create` so a failed dump leaves at most one
-        // .incomplete artifact, never a torn `<path>`. Mirrors Core's
-        // flow in rpc/blockchain.cpp::dumptxoutset.
+        // A failed dump leaves at most one .incomplete artifact, never a torn
+        // `<path>` (Core's temppath flow in dumptxoutset).
         let cleanup_temp = |tp: &std::path::Path| {
             let _ = std::fs::remove_file(tp);
         };
 
         let file = std::fs::File::create(&temp_path)
             .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string()))?;
-
-        let metadata = SnapshotMetadata::new(tip_hash, coins_count, state.params.network_magic);
+        let metadata = SnapshotMetadata::new(tip_hash, coins_count, network_magic);
         let mut writer = SnapshotWriter::new(file, &metadata).map_err(|e| {
             cleanup_temp(&temp_path);
             Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
         })?;
 
         let mut written: u64 = 0;
-        for entry_iter in state
-            .db
-            .iter_cf(CF_UTXO)
-            .map_err(|e| {
+        let iter = db.iter_cf_at(&snap, CF_UTXO).map_err(|e| {
+            cleanup_temp(&temp_path);
+            db_err(e)
+        })?;
+        for item in iter {
+            let (key, value) = item.map_err(|e| {
                 cleanup_temp(&temp_path);
-                Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e.to_string())
-            })?
-        {
-            let (key, value) = entry_iter;
+                db_err(e)
+            })?;
             if key.len() != 36 {
                 continue;
             }
             let mut txid_bytes = [0u8; 32];
             txid_bytes.copy_from_slice(&key[..32]);
             let txid = Hash256(txid_bytes);
-            let mut vout_bytes = [0u8; 4];
-            vout_bytes.copy_from_slice(&key[32..]);
-            let vout = u32::from_be_bytes(vout_bytes);
-
-            let entry: CoinEntry =
-                rustoshi_storage::decode_utxo_value(&value).map_err(|e| {
-                    cleanup_temp(&temp_path);
-                    Self::rpc_error(
-                        rpc_error::RPC_DATABASE_ERROR,
-                        format!("UTXO deserialization failed: {}", e),
-                    )
-                })?;
+            let vout = u32::from_be_bytes([key[32], key[33], key[34], key[35]]);
+            let entry: CoinEntry = rustoshi_storage::decode_utxo_value(&value).map_err(|e| {
+                cleanup_temp(&temp_path);
+                Self::rpc_error(
+                    rpc_error::RPC_DATABASE_ERROR,
+                    format!("UTXO deserialization failed: {}", e),
+                )
+            })?;
             let coin = Coin::from_entry(&entry);
-            writer
-                .write_coin(&OutPoint { txid, vout }, &coin)
-                .map_err(|e| {
-                    cleanup_temp(&temp_path);
-                    Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
-                })?;
-            written += 1;
-        }
-
-        let (file, txoutset_hash, core_hash_serialized, muhash) = writer
-            .finish_with_hashes()
-            .map_err(|e| {
+            writer.write_coin(&OutPoint { txid, vout }, &coin).map_err(|e| {
                 cleanup_temp(&temp_path);
                 Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
             })?;
+            written += 1;
+        }
+        drop(snap);
 
-        // Durability barrier: fsync the temp file before the atomic
-        // rename. Mirrors Core's `Fdatasync`/`fclose` flush before
-        // `rename(temppath, path)` in `dumptxoutset`.
+        let (file, txoutset_hash, core_hash_serialized, muhash) =
+            writer.finish_with_hashes().map_err(|e| {
+                cleanup_temp(&temp_path);
+                Self::rpc_error(rpc_error::RPC_MISC_ERROR, e.to_string())
+            })?;
+        // Durability barrier before the atomic rename (Core's Fdatasync +
+        // rename(temppath, path)).
         if let Err(e) = file.sync_all() {
             cleanup_temp(&temp_path);
             return Err(Self::rpc_error(
@@ -18258,24 +18197,42 @@ impl RpcServerImpl {
             ));
         }
         drop(file);
-
         std::fs::rename(&temp_path, abs_path).map_err(|e| {
             cleanup_temp(&temp_path);
             Self::rpc_error(rpc_error::RPC_MISC_ERROR, format!("rename failed: {}", e))
         })?;
 
         let nchaintx: u64 = tip_index.as_ref().map(|e| e.n_tx as u64).unwrap_or(0);
-
         Ok(serde_json::json!({
             "coins_written": written,
             "base_hash": tip_hash.to_hex(),
             "base_height": tip_height,
             "path": abs_path.display().to_string(),
+            // Legacy rustoshi `compute_utxo_hash` form — preserved so old
+            // tooling keeps working.  Does NOT match Core.
             "txoutset_hash": txoutset_hash.0.to_hex(),
+            // Core HASH_SERIALIZED form (what `AssumeutxoData::hash_serialized`
+            // is anchored to).
             "hash_serialized": core_hash_serialized.0.to_hex(),
+            // Core MuHash3072 form (matches `gettxoutsetinfo`'s `muhash`).
             "muhash": muhash.0.to_hex(),
             "nchaintx": nchaintx,
         }))
+    }
+
+    /// [`Self::dump_utxo_snapshot_at`] on a blocking thread, holding no lock.
+    async fn dump_utxo_snapshot_blocking(
+        db: Arc<ChainDb>,
+        fallback: (Hash256, u32),
+        network_magic: rustoshi_consensus::params::NetworkMagic,
+        abs_path: std::path::PathBuf,
+    ) -> RpcResult<serde_json::Value> {
+        tokio::task::spawn_blocking(move || {
+            crate::test_hooks::txoutset_walk_sleep("dumptxoutset");
+            Self::dump_utxo_snapshot_at(&db, fallback, network_magic, &abs_path)
+        })
+        .await
+        .map_err(|e| Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("dumptxoutset walk: {e}")))?
     }
 
     /// Mine blocks with coinbase reward going to the specified scriptPubKey.
@@ -18328,7 +18285,7 @@ impl RpcServerImpl {
             )));
         }
 
-        let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
+        let mut state = crate::coins_coherence::chain_write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         let height = state.best_height + 1;
