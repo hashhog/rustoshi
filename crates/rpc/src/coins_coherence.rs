@@ -148,6 +148,7 @@ pub async fn read_coherent(
     for _ in 0..COHERENCE_ATTEMPTS {
         let guard = state.read().await;
         if coins_db_matches_tip(&guard) {
+            crate::test_hooks::coherent_read_pause().await;
             return Ok(guard);
         }
         let signal = guard.chainstate_flush.clone();

@@ -5033,6 +5033,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     };
                     let block_hash = block.block_hash();
                     let height = block_downloader.validated_tip_height();
+                    rustoshi_rpc::test_hooks::pause_before_connect(height).await;
 
                     if let Err(e) = block_store.put_header(&block_hash, &block.header) {
                         tracing::error!("Failed to store header {}: {}", block_hash, e);
@@ -6368,6 +6369,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     };
                                     let block_hash = block.block_hash();
                                     let height = block_downloader.validated_tip_height();
+                                    rustoshi_rpc::test_hooks::pause_before_connect(height).await;
 
                                     // Skip storing full blocks in RocksDB during IBD —
                                     // they're enormous (~500GB for mainnet) and inflate

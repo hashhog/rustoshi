@@ -2287,6 +2287,7 @@ impl RpcServerImpl {
         ht: &str,
         fallback: (Hash256, u32),
     ) -> RpcResult<serde_json::Value> {
+        crate::test_hooks::txoutset_walk_sleep("gettxoutsetinfo");
         let snap = db.snapshot();
         let read_meta = |key: &[u8]| -> RpcResult<Option<Vec<u8>>> {
             db.get_cf_at(&snap, rustoshi_storage::columns::CF_META, key).map_err(|e| {
@@ -16358,6 +16359,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         let mut total_amount_sats: u64 = 0;
         let mut unspents: Vec<serde_json::Value> = Vec::new();
 
+        crate::test_hooks::txoutset_walk_sleep("scantxoutset");
         for (key, value) in state
             .db
             .iter_cf(CF_UTXO)
@@ -18012,6 +18014,8 @@ impl RpcServerImpl {
             original_tip_height,
             target_height
         );
+
+        crate::test_hooks::rollback_pause().await;
 
         // -------- 3. Dump the snapshot at the rolled-back tip --------
         let dump_result = Self::dump_tx_outset_at_current_tip(&state, &abs_path);

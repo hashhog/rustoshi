@@ -37,6 +37,7 @@ pub mod logging;
 pub mod payjoin_sender;
 pub mod rest;
 pub mod server;
+pub mod test_hooks;
 pub mod tip_notifier;
 pub mod tls;
 pub mod types;
