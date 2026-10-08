@@ -2617,12 +2617,27 @@ impl Mempool {
             self.created_utxos.insert(outpoint, txid);
         }
 
+        // Core UpdateTransactionsFromBlock (txmempool.cpp): a tx re-added
+        // from a disconnected block can already have in-mempool children --
+        // txs that spent its outputs while it was confirmed. They must become
+        // its descendants (ancestor/descendant state, clusters, recursive
+        // removal, template order). Outside a reorg refill this set is always
+        // empty: a tx spending a not-yet-known output is an orphan, never a
+        // mempool entry.
+        let existing_children: HashSet<Hash256> = (0..tx.outputs.len() as u32)
+            .filter_map(|vout| self.spent_outpoints.get(&OutPoint { txid, vout }).copied())
+            .collect();
+
         // Track parent/child relationships
         self.parents.insert(txid, mempool_parents.clone());
         for parent in &mempool_parents {
             self.children.entry(*parent).or_default().insert(txid);
         }
         self.children.entry(txid).or_default();
+        for child in &existing_children {
+            self.parents.entry(*child).or_default().insert(txid);
+            self.children.entry(txid).or_default().insert(*child);
+        }
 
         // Update all ancestors' descendant stats (once per ancestor, not per parent)
         self.update_all_ancestors_for_add(&mempool_parents, vsize, fee);
@@ -2646,8 +2661,17 @@ impl Mempool {
         // → ApplyDelta sequence (txmempool.cpp:1015).
         self.apply_pending_delta(&txid);
 
-        // Add to cluster structure and compute mining score
-        self.add_to_clusters(txid, fee, vsize, &mempool_parents);
+        if !existing_children.is_empty() {
+            // The new entry joins its pre-existing children's packages:
+            // recompute the cached aggregates of everything now related to it.
+            self.recompute_relative_stats(&txid);
+        }
+
+        // Add to cluster structure and compute mining score. Pre-existing
+        // children's clusters merge with the parents' (one connected component).
+        let mut cluster_neighbours = mempool_parents.clone();
+        cluster_neighbours.extend(existing_children.iter().copied());
+        self.add_to_clusters(txid, fee, vsize, &cluster_neighbours);
 
         // Core LimitMempoolSize runs AFTER addUnchecked. TrimToSize evicts the
         // worst chunk, which may be this transaction. W96: skipped on
@@ -2661,6 +2685,51 @@ impl Mempool {
         }
 
         Ok(txid)
+    }
+
+    /// Recompute the cached ancestor/descendant aggregates (count, vsize,
+    /// modified fees) of `txid`, every ancestor and every descendant of it,
+    /// from the parent/child graph. Used after a re-added tx is linked to
+    /// children that were already in the mempool (Core
+    /// `UpdateTransactionsFromBlock` -> `UpdateForDescendants`), where the
+    /// incremental add/remove bookkeeping cannot express the new edges.
+    fn recompute_relative_stats(&mut self, txid: &Hash256) {
+        let mut affected: Vec<Hash256> = vec![*txid];
+        affected.extend(self.get_ancestors_of(txid));
+        affected.extend(self.get_descendants_of(txid));
+        let mut seen = HashSet::new();
+        affected.retain(|t| seen.insert(*t));
+        let mut updates = Vec::with_capacity(affected.len());
+        for t in &affected {
+            let Some(me) = self.transactions.get(t) else { continue };
+            let (mut ac, mut asz, mut af) = (1usize, me.vsize, Self::get_modified_fee(me));
+            for a in self.get_ancestors_of(t) {
+                if let Some(e) = self.transactions.get(&a) {
+                    ac += 1;
+                    asz += e.vsize;
+                    af = af.saturating_add(Self::get_modified_fee(e));
+                }
+            }
+            let (mut dc, mut dsz, mut df) = (1usize, me.vsize, Self::get_modified_fee(me));
+            for d in self.get_descendants_of(t) {
+                if let Some(e) = self.transactions.get(&d) {
+                    dc += 1;
+                    dsz += e.vsize;
+                    df = df.saturating_add(Self::get_modified_fee(e));
+                }
+            }
+            updates.push((*t, ac, asz, af, dc, dsz, df));
+        }
+        for (t, ac, asz, af, dc, dsz, df) in updates {
+            if let Some(e) = self.transactions.get_mut(&t) {
+                e.ancestor_count = ac;
+                e.ancestor_size = asz;
+                e.ancestor_fees = af;
+                e.descendant_count = dc;
+                e.descendant_size = dsz;
+                e.descendant_fees = df;
+            }
+        }
     }
 
     /// Update all ancestors' descendant stats when adding a new transaction.
@@ -2991,32 +3060,79 @@ impl Mempool {
     where
         F: Fn(&OutPoint) -> Option<CoinEntry>,
     {
+        self.readd_disconnected_blocks(std::iter::once(block_transactions), utxo_lookup)
+    }
+
+    /// Core `MaybeUpdateMempoolForReorg`, re-add half (validation.cpp): put
+    /// the non-coinbase txs of the disconnected blocks back, EARLIEST
+    /// CONFIRMED FIRST. `blocks_earliest_first` must yield the blocks in
+    /// ascending height (Core iterates `DisconnectedBlockTransactions` in
+    /// reverse: the pool's front is the most recently confirmed tx).
+    ///
+    /// Order matters: a tx in block N+1 spending a tx in block N can only be
+    /// accepted once its parent is back in the pool; re-adding tip-first
+    /// rejected it as an orphan (mempool-reorg-sweep scenario a/d: C <- P:0).
+    ///
+    /// A re-added tx with children already in the mempool is linked to them
+    /// in `add_transaction_with_options` (Core `UpdateTransactionsFromBlock`).
+    /// A tx that fails re-admission is removed recursively: any in-mempool
+    /// spender of its outputs goes too (Core `removeRecursive`).
+    ///
+    /// The caller runs `remove_for_reorg` (finality / BIP68 / coinbase
+    /// maturity at the new tip) afterwards, then `limit_mempool_size`.
+    pub fn readd_disconnected_blocks<'a, I, F>(
+        &mut self,
+        blocks_earliest_first: I,
+        utxo_lookup: &F,
+    ) -> usize
+    where
+        I: IntoIterator<Item = &'a [Transaction]>,
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
         let mut readded = 0;
-        for tx in block_transactions {
-            if tx.is_coinbase() {
-                continue;
-            }
-            // Best-effort: a tx may legitimately fail re-admit (no longer
-            // final under new MTP, double-spent by a tx already in mempool,
-            // inputs no longer in the UTXO set, etc.). Drop quietly.
-            //
-            // W96: use `AtmpOptions::reorg_refill()` to (a) skip the fee
-            // gate (so low-fee txs that were already mined get a chance
-            // to re-enter), (b) skip mempool-full eviction during the
-            // re-admit burst, (c) skip script verification (already
-            // verified at original ConnectBlock time), and (d) tag the
-            // entry_sequence as 0 so reorged children sort before any
-            // existing children.  Mirrors Core's `MaybeUpdateMempoolForReorg`.
-            match self.add_transaction_with_options(
-                tx.clone(),
-                utxo_lookup,
-                AtmpOptions::reorg_refill(),
-            ) {
-                Ok(_) => readded += 1,
-                Err(_) => {}
+        for block_transactions in blocks_earliest_first {
+            for tx in block_transactions {
+                if tx.is_coinbase() {
+                    continue;
+                }
+                // `reorg_refill`: bypass_limits (no fee floor, no mempool-full
+                // eviction during the burst), entry_sequence 0. Every other
+                // admission check runs against the post-disconnect view.
+                match self.add_transaction_with_options(
+                    tx.clone(),
+                    utxo_lookup,
+                    AtmpOptions::reorg_refill(),
+                ) {
+                    Ok(_) => readded += 1,
+                    // Same txid already in the pool: it stays, with its children.
+                    Err(MempoolError::AlreadyExists)
+                    | Err(MempoolError::WtxidAlreadyInMempool)
+                    | Err(MempoolError::TxidSameNonwitnessData) => {}
+                    Err(_) => {
+                        // Core: `if (!accepted) removeRecursive(tx)`.
+                        let txid = tx.txid();
+                        for vout in 0..tx.outputs.len() as u32 {
+                            if let Some(spender) =
+                                self.spent_outpoints.get(&OutPoint { txid, vout }).copied()
+                            {
+                                self.remove_transaction(&spender, true);
+                            }
+                        }
+                    }
+                }
             }
         }
         readded
+    }
+
+    /// Core `LimitMempoolSize` after a reorg refill (which bypassed the size
+    /// limit): trim back to the configured maximum. Returns entries evicted.
+    pub fn limit_mempool_size(&mut self) -> usize {
+        if self.total_size > self.config.max_size_bytes {
+            self.trim_to_size(self.config.max_size_bytes)
+        } else {
+            0
+        }
     }
 
     /// Get transactions sorted by descendant fee rate for block building.

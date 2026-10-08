@@ -5246,8 +5246,16 @@ fn disconnect_to(
     // (commit 22667c2). Cross-impl audit:
     // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
     //
-    // Plan order is tip-down (highest height first); refill order doesn't
-    // matter — `add_transaction` resolves dependencies via the UTXO view.
+    // Plan order is tip-down (highest height first). Refill order DOES
+    // matter: Core re-adds earliest-confirmed first (InvalidateBlock runs
+    // MaybeUpdateMempoolForReorg after each DisconnectTip, tip-down, so a
+    // later block's tx is back before the earlier block's parent and is
+    // linked under it by UpdateTransactionsFromBlock). One batch, earliest
+    // first, reaches the same pool: a tx in block N+1 spending a tx of block
+    // N is accepted once its parent is back, never rejected as an orphan.
+    // Finality / maturity / BIP68 only get stricter as the tip drops, so the
+    // single removeForReorg at the final tip removes what the per-block
+    // passes would have.
     {
         // Sync mempool's tip-snapshot to the new tip so that IsFinalTx
         // (BIP-113) + coinbase-maturity checks during refill use the
@@ -5261,13 +5269,14 @@ fn disconnect_to(
             use rustoshi_consensus::validation::UtxoView;
             refill_view.get_utxo(op)
         };
-        for (_h, _hash, block, _undo) in plan.iter() {
-            state
-                .mempool
-                .block_disconnected(&block.transactions, &utxo_lookup);
-        }
+        state.mempool.readd_disconnected_blocks(
+            plan.iter().rev().map(|(_h, _hash, block, _undo)| block.transactions.as_slice()),
+            &utxo_lookup,
+        );
 
         evict_mempool_after_reorg(&mut state.mempool, &store, target_height, mtp);
+        // Core MaybeUpdateMempoolForReorg -> LimitMempoolSize.
+        state.mempool.limit_mempool_size();
     }
 
     Ok(())
@@ -6401,26 +6410,63 @@ pub fn try_attach_and_reorg_detailed(
     // Mirrors `bitcoin-core/src/validation.cpp::DisconnectTip` →
     // `MaybeUpdateMempoolForReorg`.  Cross-impl audit:
     // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
-    if !disconnected_blocks.is_empty() {
+    {
+        // Core ConnectTip -> mempool.removeForBlock(block.vtx) for EVERY
+        // block the reorg connected (confirmed txs out; conflicts out with
+        // their descendants), and disconnectpool.removeForBlock: a tx that is
+        // confirmed again on the new branch is not re-added.
+        let mut reconfirmed: std::collections::HashSet<Hash256> =
+            std::collections::HashSet::new();
+        for (h, _height, _undo) in &connected_blocks {
+            if let Some(blk) = get_block(h) {
+                let block_txids: Vec<Hash256> =
+                    blk.transactions.iter().map(|tx| tx.txid()).collect();
+                let block_spent: Vec<rustoshi_primitives::OutPoint> = blk
+                    .transactions
+                    .iter()
+                    .flat_map(|tx| tx.inputs.iter().map(|i| i.previous_output.clone()))
+                    .collect();
+                state.mempool.remove_for_block(&block_txids, &block_spent);
+                reconfirmed.extend(block_txids);
+            }
+        }
+
         // Sync mempool's tip-snapshot to the new tip before refill — see
-        // disconnect_to() for the same rationale.
+        // disconnect_to() for the same rationale (also on a pure extension:
+        // later admissions check finality / maturity against this tip).
         // Mempool refill only (no verdict); a read error has latched AbortNode.
         let mtp = compute_prev_block_mtp(&store, &new_tip_hash).unwrap_or(0) as i64;
         state.mempool.notify_new_tip(new_tip_height, mtp);
 
-        let refill_view = store.utxo_view();
-        let utxo_lookup = |op: &rustoshi_primitives::OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
-            use rustoshi_consensus::validation::UtxoView;
-            refill_view.get_utxo(op)
-        };
-        for blk in &disconnected_blocks {
+        if !disconnected_blocks.is_empty() {
+
+            let refill_view = store.utxo_view();
+            let utxo_lookup = |op: &rustoshi_primitives::OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
+                use rustoshi_consensus::validation::UtxoView;
+                refill_view.get_utxo(op)
+            };
+            // Core MaybeUpdateMempoolForReorg: earliest confirmed first.
+            // `disconnected_blocks` was collected tip-first, so walk it in
+            // reverse; drop the txs the new branch confirmed.
+            let refill: Vec<Vec<rustoshi_primitives::Transaction>> = disconnected_blocks
+                .iter()
+                .rev()
+                .map(|blk| {
+                    blk.transactions
+                        .iter()
+                        .filter(|tx| !reconfirmed.contains(&tx.txid()))
+                        .cloned()
+                        .collect()
+                })
+                .collect();
             state
                 .mempool
-                .block_disconnected(&blk.transactions, &utxo_lookup);
+                .readd_disconnected_blocks(refill.iter().map(|v| v.as_slice()), &utxo_lookup);
+            // Then removeForReorg (finality / BIP68 / immature coinbase at
+            // tip+1, with descendants) and LimitMempoolSize.
+            evict_mempool_after_reorg(&mut state.mempool, &store, new_tip_height, mtp);
+            state.mempool.limit_mempool_size();
         }
-        // Core MaybeUpdateMempoolForReorg runs removeForReorg after EVERY
-        // reorg; this path refilled the mempool but never evicted.
-        evict_mempool_after_reorg(&mut state.mempool, &store, new_tip_height, mtp);
     }
 
     // Core ConnectTip calls removeForBlock for every block the reorg connects,
@@ -24768,6 +24814,231 @@ mod tests {
         let store = BlockStore::new(&db);
         assert_eq!(store.get_best_block_hash().unwrap().unwrap(), hash_a);
         assert_eq!(store.get_best_height().unwrap().unwrap(), 1);
+    }
+
+    /// P2WSH(OP_TRUE): a standard output whose spend needs no signature
+    /// (witness = [OP_TRUE]), so the mempool's policy + consensus script
+    /// checks pass for the reorg-refill fixtures below.
+    fn p2wsh_true_spk() -> Vec<u8> {
+        let mut spk = vec![0x00, 0x20];
+        spk.extend_from_slice(&rustoshi_crypto::hashes::sha256(&[0x51]));
+        spk
+    }
+
+    fn spend_p2wsh_true(prev: OutPoint, value: u64) -> Transaction {
+        Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: prev,
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![vec![0x51]],
+            }],
+            outputs: vec![TxOut {
+                value,
+                script_pubkey: p2wsh_true_spk(),
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// Append an active-chain block carrying `extra` non-coinbase txs:
+    /// block + header + height + index + undo (`spent`, in input order) +
+    /// UTXO effects, so disconnect_to can roll it back cleanly.
+    fn synth_append_with_txs(
+        store: &BlockStore,
+        h: u32,
+        prev_hash: Hash256,
+        prev_work: [u8; 32],
+        marker: u8,
+        extra: Vec<Transaction>,
+        spent: Vec<(OutPoint, rustoshi_storage::block_store::CoinEntry)>,
+    ) -> (Hash256, [u8; 32]) {
+        use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+        let mut block = mine_synth_block(h, prev_hash, marker);
+        block.transactions.extend(extra);
+        let block_hash = block.block_hash();
+        let this_work =
+            ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(block.header.bits));
+        store.put_block(&block_hash, &block).unwrap();
+        store.put_header(&block_hash, &block.header).unwrap();
+        store.put_height_index(h, &block_hash).unwrap();
+        {
+            use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus};
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_SCRIPTS);
+            status.set(BlockStatus::HAVE_DATA);
+            store
+                .put_block_index(
+                    &block_hash,
+                    &BlockIndexEntry {
+                        height: h,
+                        status,
+                        n_tx: block.transactions.len() as u32,
+                        timestamp: block.header.timestamp,
+                        bits: block.header.bits,
+                        nonce: block.header.nonce,
+                        version: block.header.version,
+                        prev_hash,
+                        chain_work: this_work.0,
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .put_undo(
+                &block_hash,
+                &rustoshi_storage::block_store::UndoData {
+                    spent_coins: spent.iter().map(|(_, c)| c.clone()).collect(),
+                },
+            )
+            .unwrap();
+        for (op, _) in &spent {
+            store.delete_utxo(op).unwrap();
+        }
+        for (i, tx) in block.transactions.iter().enumerate() {
+            let txid = tx.txid();
+            for (vout, out) in tx.outputs.iter().enumerate() {
+                store
+                    .put_utxo(
+                        &OutPoint { txid, vout: vout as u32 },
+                        &rustoshi_storage::block_store::CoinEntry {
+                            height: h,
+                            is_coinbase: i == 0,
+                            value: out.value,
+                            script_pubkey: out.script_pubkey.clone(),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        store.set_best_block(&block_hash, h).unwrap();
+        (block_hash, this_work.0)
+    }
+
+    /// Regression (mempool-reorg-sweep scenario a/d): invalidating a block
+    /// whose child block spends one of its txs must put BOTH back, the child
+    /// linked under its parent, and keep a pre-existing mempool spender of
+    /// the child as its descendant. Core MaybeUpdateMempoolForReorg re-adds
+    /// earliest-confirmed first; UpdateTransactionsFromBlock links children.
+    ///
+    /// Chain G(0) - A(1) - B(2)[P <- U] - C(3)[CX <- P:0]; mempool [M <- CX:0].
+    /// disconnect_to(A) must leave {P, CX, M} with P -> CX -> M linked.
+    /// Pre-fix (tip-first refill) CX was rejected as an orphan (P not yet
+    /// back) and M was evicted for its missing input: pool = {P}.
+    #[tokio::test]
+    async fn disconnect_to_refills_earliest_first_and_links_children() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::block_store::CoinEntry as SCoin;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let store = BlockStore::new(&db);
+
+        let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xB1);
+        let (hash_a, _, work_a) = synth_append_with_work(&store, 1, hash_g, work_g, 0xB1);
+
+        // A confirmed, non-coinbase coin U the block-2 tx spends.
+        let u = OutPoint { txid: Hash256::from_bytes([0x77; 32]), vout: 0 };
+        let u_coin = SCoin { height: 1, is_coinbase: false, value: 1_000_000, script_pubkey: p2wsh_true_spk() };
+        store.put_utxo(&u, &u_coin).unwrap();
+
+        let tx_p = spend_p2wsh_true(u.clone(), 990_000);
+        let p0 = OutPoint { txid: tx_p.txid(), vout: 0 };
+        let (hash_b, work_b) = synth_append_with_txs(
+            &store, 2, hash_a, work_a, 0xB1, vec![tx_p.clone()], vec![(u.clone(), u_coin.clone())],
+        );
+        let tx_cx = spend_p2wsh_true(p0.clone(), 980_000);
+        let cx0 = OutPoint { txid: tx_cx.txid(), vout: 0 };
+        let p0_coin = SCoin { height: 2, is_coinbase: false, value: 990_000, script_pubkey: p2wsh_true_spk() };
+        let (hash_c, _) = synth_append_with_txs(
+            &store, 3, hash_b, work_b, 0xB1, vec![tx_cx.clone()], vec![(p0.clone(), p0_coin)],
+        );
+        rpc_state.best_hash = hash_c;
+        rpc_state.best_height = 3;
+
+        // M spends CX:0 while CX is confirmed (a mempool child of a block tx).
+        let tx_m = spend_p2wsh_true(cx0.clone(), 970_000);
+        {
+            let mtp = compute_prev_block_mtp(&store, &hash_c).unwrap_or(0) as i64;
+            rpc_state.mempool.notify_new_tip(3, mtp);
+            let view = store.utxo_view();
+            let lookup = |op: &OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
+                use rustoshi_consensus::validation::UtxoView;
+                view.get_utxo(op)
+            };
+            rpc_state.mempool.add_transaction(tx_m.clone(), &lookup).expect("M admitted at tip C");
+        }
+
+        disconnect_to(&mut rpc_state, hash_a, 1).expect("disconnect_to");
+        assert_eq!(rpc_state.best_height, 1);
+
+        let (p, cx, m) = (tx_p.txid(), tx_cx.txid(), tx_m.txid());
+        let pool: std::collections::HashSet<Hash256> =
+            rpc_state.mempool.get_sorted_for_mining().into_iter().collect();
+        let want: std::collections::HashSet<Hash256> = [p, cx, m].into_iter().collect();
+        assert_eq!(pool, want, "refill must restore P and CX (earliest first) and keep M");
+
+        // UpdateTransactionsFromBlock: CX's pre-existing child M is linked.
+        let mut desc_p = rpc_state.mempool.get_descendants_of(&p);
+        desc_p.sort();
+        let mut want_desc = vec![cx, m];
+        want_desc.sort();
+        assert_eq!(desc_p, want_desc, "P's descendants are CX and M");
+        let m_entry = rpc_state.mempool.get(&m).expect("M in pool");
+        assert_eq!(m_entry.ancestor_count, 3, "M's package now includes CX and P");
+        let p_entry = rpc_state.mempool.get(&p).expect("P in pool");
+        assert_eq!(p_entry.descendant_count, 3, "P's descendants: itself, CX, M");
+        assert_eq!(
+            rpc_state.mempool.get_cluster_id(&p),
+            rpc_state.mempool.get_cluster_id(&m),
+            "M joined the P/CX cluster"
+        );
+    }
+
+    /// Regression: reconsiderblock re-activates the reconsidered branch
+    /// inside the RPC, from the blocks on disk (Core ReconsiderBlock ->
+    /// ActivateBestChain). Pre-fix the RPC only cleared the failure flags
+    /// and the tip stayed at the invalidated block's parent until a peer
+    /// re-announced the branch (no peer here -> never).
+    #[tokio::test]
+    async fn reconsiderblock_reactivates_branch_without_a_peer() {
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut st = RpcState::new(db.clone(), mainnet_params_for_synth_blocks());
+        let store = BlockStore::new(&db);
+        let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xC1);
+        let (hash_a, _, work_a) = synth_append_with_work(&store, 1, hash_g, work_g, 0xC1);
+        let (hash_b, _, work_b) = synth_append_with_work(&store, 2, hash_a, work_a, 0xC1);
+        let (hash_c, _, _) = synth_append_with_work(&store, 3, hash_b, work_b, 0xC1);
+        drop(store);
+        st.best_hash = hash_c;
+        st.best_height = 3;
+        let state = Arc::new(RwLock::new(st));
+        let server = RpcServerImpl::new(state.clone(), Arc::new(RwLock::new(PeerState::default())));
+
+        RustoshiRpcServer::invalidate_block(&server, hash_b.to_hex())
+            .await
+            .expect("invalidateblock");
+        {
+            let s = state.read().await;
+            assert_eq!((s.best_hash, s.best_height), (hash_a, 1), "invalidate rolled back to A");
+        }
+        RustoshiRpcServer::reconsider_block(&server, hash_b.to_hex())
+            .await
+            .expect("reconsiderblock");
+        let s = state.read().await;
+        assert_eq!(
+            (s.best_hash, s.best_height),
+            (hash_c, 3),
+            "reconsiderblock must re-activate the most-work branch before it returns"
+        );
+        let store = BlockStore::new(&db);
+        assert_eq!(store.get_best_block_hash().unwrap().unwrap(), hash_c);
     }
 
     /// Test: disconnect_to refuses when undo data is missing — protects
