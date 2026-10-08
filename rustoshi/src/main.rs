@@ -2155,6 +2155,7 @@ async fn adopt_rpc_chain_writes<'s>(
     header_sync: &mut HeaderSync,
     block_downloader: &mut BlockDownloader,
     invalid_block_hashes: &mut std::collections::HashSet<Hash256>,
+    failed_child_parent: &mut std::collections::HashMap<Hash256, Hash256>,
     rpc_state: &RwLock<RpcState>,
 ) -> bool {
     use rustoshi_rpc::chain_lock::ChainEvent;
@@ -2252,10 +2253,34 @@ async fn adopt_rpc_chain_writes<'s>(
             }
         }
     }
-    for h in &reconsidered {
-        // Core ReconsiderBlock clears the failure flags and lets the headers
-        // be followed again; the next getheaders round re-learns them.
-        invalid_block_hashes.remove(h);
+    if !reconsidered.is_empty() {
+        // Core ReconsiderBlock (ResetBlockFailureFlags) clears the failure
+        // flags of the block AND every descendant in the block index --
+        // including header-only descendants, which Core stores with
+        // BLOCK_FAILED_CHILD. rustoshi drops such a header (its parent was
+        // failed) and remembers only its hash here, so walk the remembered
+        // child -> parent links from the reconsidered blocks and forget every
+        // descendant too. Before this, header N+1 (announced while N was
+        // invalidated) stayed refused after reconsiderblock, so a peer serving
+        // N+1, N+2 could never move the node past N (INV-RECONSIDER).
+        let mut cleared: std::collections::HashSet<Hash256> = reconsidered.iter().copied().collect();
+        loop {
+            let next: Vec<Hash256> = failed_child_parent
+                .iter()
+                .filter(|(_, p)| cleared.contains(*p))
+                .map(|(c, _)| *c)
+                .collect();
+            if next.is_empty() {
+                break;
+            }
+            for c in next {
+                failed_child_parent.remove(&c);
+                cleared.insert(c);
+            }
+        }
+        for h in &cleared {
+            invalid_block_hashes.remove(h);
+        }
     }
 
     if !tip_moved && invalidated.is_empty() && reconsidered.is_empty() {
@@ -4648,6 +4673,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // source of truth is the FAILED_VALIDITY flag; this is an O(1) fast-path.
     let mut invalid_block_hashes: std::collections::HashSet<Hash256> =
         std::collections::HashSet::new();
+    // child -> parent for every header dropped because its parent was failed
+    // (Core keeps those in the block index as BLOCK_FAILED_CHILD), so
+    // reconsiderblock can clear the descendants it never stored.
+    let mut failed_child_parent: std::collections::HashMap<Hash256, Hash256> =
+        std::collections::HashMap::new();
     // Peer that delivered each side-branch block stored without a reorg
     // (try_attach_and_reorg -> Ok(false)). Core keeps `mapBlockSource` for a
     // stored-but-not-connected block until it is checked, so when a LATER
@@ -5144,6 +5174,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         &mut header_sync,
                         &mut block_downloader,
                         &mut invalid_block_hashes,
+                        &mut failed_child_parent,
                         &rpc_state,
                     )
                     .await;
@@ -5248,6 +5279,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         &mut header_sync,
                         &mut block_downloader,
                         &mut invalid_block_hashes,
+                        &mut failed_child_parent,
                         &rpc_state,
                     )
                     .await;
@@ -5944,6 +5976,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         }
                                         if invalid_block_hashes.contains(&h.prev_block_hash) {
                                             invalid_block_hashes.insert(hh);
+                                            if failed_child_parent.len() < 100_000 {
+                                                failed_child_parent.insert(hh, h.prev_block_hash);
+                                            }
                                             continue;
                                         }
                                         kept.push(h);
@@ -6635,6 +6670,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         &mut header_sync,
                                         &mut block_downloader,
                                         &mut invalid_block_hashes,
+                                        &mut failed_child_parent,
                                         &rpc_state,
                                     )
                                     .await;
@@ -9352,6 +9388,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             &mut header_sync,
             &mut block_downloader,
             &mut invalid_block_hashes,
+            &mut failed_child_parent,
             &rpc_state,
         )
         .await;

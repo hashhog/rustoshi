@@ -5175,6 +5175,128 @@ fn set_block_index_flag(store: &BlockStore, hash: &Hash256, flag: u32) {
     }
 }
 
+/// Core `ActivateBestChain` after `ReconsiderBlock` (rpc/blockchain.cpp
+/// reconsiderblock -> validation.cpp ResetBlockFailureFlags, which re-adds the
+/// cleared blocks with data to `setBlockIndexCandidates`, then
+/// ActivateBestChain). The candidates are the blocks `reconsiderblock` just
+/// cleared; the most-work one whose whole branch down to the active chain has
+/// its body and no failure flag becomes the tip through the same
+/// attach-and-reorg path submitblock and P2P use (fast-forward when the active
+/// tip is its ancestor, a full reorg otherwise). A candidate that fails
+/// validation is marked failed there (Core InvalidBlockFound) and the next one
+/// is tried, as ActivateBestChain does; that is not an RPC error. Returns the
+/// hashes newly marked failed, for the connect loop.
+///
+/// Caller holds the chain lock (`chain_write_coherent`).
+pub fn activate_best_chain_after_reconsider(
+    state: &mut RpcState,
+    cleared: &[Hash256],
+) -> Result<Vec<Hash256>, String> {
+    use rustoshi_storage::block_store::BlockStatus;
+    let failed = |st: BlockStatus| {
+        st.has(BlockStatus::FAILED_VALIDITY) || st.has(BlockStatus::FAILED_CHILD)
+    };
+    let mut newly_invalid: Vec<Hash256> = Vec::new();
+    let mut tried: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
+    // Bounded: every iteration either moves the tip (then stops) or removes a
+    // candidate from consideration.
+    for _ in 0..=cleared.len() {
+        let db = state.db.clone();
+        let store = BlockStore::new(&db);
+        let tip_entry = store
+            .get_block_index(&state.best_hash)
+            .map_err(|e| format!("get_block_index(tip): {}", e))?
+            .ok_or_else(|| format!("tip {} missing from block index", state.best_hash))?;
+        // Most-work cleared block that beats the tip.
+        let mut cands: Vec<(Hash256, rustoshi_storage::block_store::BlockIndexEntry)> = cleared
+            .iter()
+            .filter(|h| !tried.contains(*h))
+            .filter_map(|h| store.get_block_index(h).ok().flatten().map(|e| (*h, e)))
+            .filter(|(_, e)| e.status.has(BlockStatus::HAVE_DATA) && !failed(e.status))
+            .filter(|(_, e)| compare_chain_work(&e.chain_work, &tip_entry.chain_work).is_gt())
+            .collect();
+        cands.sort_by(|a, b| compare_chain_work(&b.1.chain_work, &a.1.chain_work));
+        let mut chosen: Option<(Hash256, Block)> = None;
+        for (h, e) in cands {
+            tried.insert(h);
+            // The branch from `h` down to the fork with the active chain must
+            // be connectable: every block has its body and no failure flag.
+            let mut ok = true;
+            let (mut nw, mut nh) = (h, e.height);
+            let (mut ow, mut oh) = (state.best_hash, state.best_height);
+            let mut guard = e.height as u64 + state.best_height as u64 + 16;
+            while nw != ow && guard > 0 {
+                guard -= 1;
+                if nh >= oh {
+                    match store.get_block_index(&nw).ok().flatten() {
+                        Some(ne) if ne.status.has(BlockStatus::HAVE_DATA) && !failed(ne.status) => {
+                            nw = ne.prev_hash;
+                            nh = nh.saturating_sub(1);
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if oh > nh {
+                    match store.get_block_index(&ow).ok().flatten() {
+                        Some(oe) => {
+                            ow = oe.prev_hash;
+                            oh = oh.saturating_sub(1);
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !ok || nw != ow {
+                continue;
+            }
+            match store.get_block(&h) {
+                Ok(Some(b)) => {
+                    chosen = Some((h, b));
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        drop(store);
+        let Some((h, block)) = chosen else {
+            return Ok(newly_invalid);
+        };
+        match try_attach_and_reorg_detailed(state, &block, &h) {
+            Ok(true) => {
+                tracing::info!(
+                    "reconsiderblock: activated best chain, tip {} at height {}",
+                    state.best_hash,
+                    state.best_height
+                );
+                return Ok(newly_invalid);
+            }
+            Ok(false) => return Ok(newly_invalid),
+            Err(e) => {
+                if rustoshi_consensus::fatal::is_system_fault_str(&e.reason)
+                    || rustoshi_consensus::fatal::is_aborted()
+                {
+                    return Err(e.reason);
+                }
+                tracing::warn!(
+                    "reconsiderblock: candidate {} not activated: {}",
+                    h,
+                    e.reason.trim_start_matches(REORG_CONSENSUS_REJECT_SENTINEL)
+                );
+                if let Some(inv) = e.invalid {
+                    newly_invalid.extend(inv.invalidated);
+                }
+            }
+        }
+    }
+    Ok(newly_invalid)
+}
+
 /// [`try_attach_and_reorg`] with the invalid-branch outcome surfaced.
 pub fn try_attach_and_reorg_detailed(
     state: &mut RpcState,
@@ -9842,6 +9964,21 @@ impl RustoshiRpcServer for RpcServerImpl {
         {
             let store = BlockStore::new(&state.db);
             if let Ok(Some(idx)) = store.get_block_index(&block_hash) {
+                // Core: a block whose index entry is BLOCK_FAILED_* (it failed
+                // validation, or `invalidateblock` marked it / an ancestor) is
+                // never reconnected by a resubmission. AcceptBlockHeader finds
+                // the failed entry and returns BLOCK_CACHED_INVALID
+                // "duplicate-invalid" (validation.cpp AcceptBlockHeader;
+                // rpc/mining.cpp submitblock -> BIP22ValidationResult). Only
+                // `reconsiderblock` clears the flag. Before this check the
+                // invalidated block N (the direct child of tip N-1 after the
+                // rewind) matched `unconnected_tip_child` below and was
+                // re-processed -- i.e. reconnected -- answering null.
+                if idx.status.has(rustoshi_storage::block_store::BlockStatus::FAILED_VALIDITY)
+                    || idx.status.has(rustoshi_storage::block_store::BlockStatus::FAILED_CHILD)
+                {
+                    return Ok(Some("duplicate-invalid".to_string()));
+                }
                 let unconnected_tip_child = idx.height == state.best_height + 1
                     && idx.prev_hash == state.best_hash;
                 if !unconnected_tip_child {
@@ -12750,7 +12887,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn reconsider_block(&self, blockhash: String) -> RpcResult<()> {
         let hash = Self::parse_hash(&blockhash)?;
 
-        let state = crate::coins_coherence::chain_write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
+        let mut state = crate::coins_coherence::chain_write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         // Verify the block exists and get its metadata
@@ -12828,24 +12965,20 @@ impl RustoshiRpcServer for RpcServerImpl {
             reconsidered_count
         );
         if !reconsidered.is_empty() {
-            state.push_event(crate::chain_lock::ChainEvent::Reconsidered(reconsidered));
+            state.push_event(crate::chain_lock::ChainEvent::Reconsidered(reconsidered.clone()));
         }
 
-        // Check if we should switch to the reconsidered chain
-        // Compare chain work of the reconsidered block vs current tip
-        let current_tip_entry = store.get_block_index(&state.best_hash).ok().flatten();
-        let reconsidered_entry = store.get_block_index(&hash).ok().flatten();
-
-        if let (Some(current), Some(reconsidered)) = (current_tip_entry, reconsidered_entry) {
-            // If the reconsidered chain has more work, we might want to switch
-            if compare_chain_work(&reconsidered.chain_work, &current.chain_work).is_gt() {
-                tracing::info!(
-                    "Reconsidered block {} has more work than current tip, consider reorg",
-                    hash
-                );
-                // Note: A full implementation would trigger ActivateBestChain here
-                // For now, we just clear the flags and log
-            }
+        // Core ReconsiderBlock -> ResetBlockFailureFlags re-adds every cleared
+        // block with data to setBlockIndexCandidates, then the RPC calls
+        // ActivateBestChain (rpc/blockchain.cpp reconsiderblock), so the tip
+        // returns to the most-work valid chain before the call returns. Before
+        // this the flags were cleared and nothing else happened: the node sat
+        // on the invalidation point until a peer re-sent the bodies.
+        drop(store);
+        let newly_invalid = activate_best_chain_after_reconsider(&mut state, &reconsidered)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e))?;
+        if !newly_invalid.is_empty() {
+            state.push_event(crate::chain_lock::ChainEvent::Invalidated(newly_invalid));
         }
 
         Ok(())
