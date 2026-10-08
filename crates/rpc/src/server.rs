@@ -15592,8 +15592,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         let db = Arc::clone(&state.db);
         let fallback = (state.best_hash, tip_height);
         let magic = state.params.network_magic;
+        let anchors = Self::chain_tx_anchors(&state.params);
         drop(state);
-        Self::dump_utxo_snapshot_blocking(db, fallback, magic, abs_path).await
+        Self::dump_utxo_snapshot_blocking(db, fallback, magic, abs_path, anchors).await
     }
 
     async fn load_tx_outset(&self, path: String) -> RpcResult<serde_json::Value> {
@@ -17825,12 +17826,14 @@ impl RpcServerImpl {
         // (audit RU-3), then retake it for the replay.
         let db = Arc::clone(&state.db);
         let magic = state.params.network_magic;
+        let anchors = Self::chain_tx_anchors(&state.params);
         drop(state);
         let dump_result = Self::dump_utxo_snapshot_blocking(
             db,
             (target_hash, target_height),
             magic,
             abs_path.clone(),
+            anchors,
         )
         .await;
         let mut state = self.state.write().await;
@@ -18109,6 +18112,7 @@ impl RpcServerImpl {
         fallback: (Hash256, u32),
         network_magic: rustoshi_consensus::params::NetworkMagic,
         abs_path: &std::path::Path,
+        chain_tx_anchors: &[(u32, Hash256, u64)],
     ) -> RpcResult<serde_json::Value> {
         let snap = db.snapshot();
         let (tip_hash, tip_height) = Self::coins_db_tip_at(|k| {
@@ -18202,22 +18206,58 @@ impl RpcServerImpl {
             Self::rpc_error(rpc_error::RPC_MISC_ERROR, format!("rename failed: {}", e))
         })?;
 
-        let nchaintx: u64 = tip_index.as_ref().map(|e| e.n_tx as u64).unwrap_or(0);
+        // Core WriteUTXOSnapshot: `nchaintx` = tip->m_chain_tx_count, the
+        // CUMULATIVE tx count genesis..=base (0 when unknown) -- not the base
+        // block's own nTx. Same walk as getchaintxstats (anchored at genesis
+        // or an assumeutxo base carrying a chainparams count).
+        let _ = &tip_index;
+        let store = BlockStore::new(db);
+        let nchaintx: u64 = chain_tx_count_walk(
+            tip_height,
+            |h| store.get_hash_by_height(h),
+            |hash| store.get_block_index(hash).map(|e| e.map(|e| e.n_tx)),
+            |h, hash| {
+                chain_tx_anchors
+                    .iter()
+                    .find(|(ah, ahash, _)| *ah == h && ahash == hash)
+                    .map(|(_, _, n)| *n)
+            },
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(0);
         Ok(serde_json::json!({
             "coins_written": written,
             "base_hash": tip_hash.to_hex(),
             "base_height": tip_height,
             "path": abs_path.display().to_string(),
-            // Legacy rustoshi `compute_utxo_hash` form — preserved so old
-            // tooling keeps working.  Does NOT match Core.
-            "txoutset_hash": txoutset_hash.0.to_hex(),
-            // Core HASH_SERIALIZED form (what `AssumeutxoData::hash_serialized`
-            // is anchored to).
+            // Core WriteUTXOSnapshot: txoutset_hash = hashSerialized of the
+            // base (== gettxoutsetinfo hash_serialized_3). Tools
+            // (seed-chain-rider, build-rung-walk, boundary-snapshot) read it
+            // as exactly that.
+            "txoutset_hash": core_hash_serialized.0.to_hex(),
+            // Same value under rustoshi's older extra key.
             "hash_serialized": core_hash_serialized.0.to_hex(),
+            // rustoshi-only legacy `compute_utxo_hash` form (NOT Core's);
+            // kept under its own name for anything that compared against it.
+            "legacy_txoutset_hash": txoutset_hash.0.to_hex(),
             // Core MuHash3072 form (matches `gettxoutsetinfo`'s `muhash`).
             "muhash": muhash.0.to_hex(),
             "nchaintx": nchaintx,
         }))
+    }
+
+    /// assumeutxo bases with a chainparams m_chain_tx_count, as
+    /// (height, blockhash, count) anchors for [`chain_tx_count_walk`].
+    fn chain_tx_anchors(
+        params: &ChainParams,
+    ) -> Vec<(u32, Hash256, u64)> {
+        params
+            .assumeutxo_data
+            .iter()
+            .filter(|au| au.chain_tx_count != 0)
+            .map(|au| (au.height, au.blockhash, au.chain_tx_count))
+            .collect()
     }
 
     /// [`Self::dump_utxo_snapshot_at`] on a blocking thread, holding no lock.
@@ -18226,10 +18266,11 @@ impl RpcServerImpl {
         fallback: (Hash256, u32),
         network_magic: rustoshi_consensus::params::NetworkMagic,
         abs_path: std::path::PathBuf,
+        chain_tx_anchors: Vec<(u32, Hash256, u64)>,
     ) -> RpcResult<serde_json::Value> {
         tokio::task::spawn_blocking(move || {
             crate::test_hooks::txoutset_walk_sleep("dumptxoutset");
-            Self::dump_utxo_snapshot_at(&db, fallback, network_magic, &abs_path)
+            Self::dump_utxo_snapshot_at(&db, fallback, network_magic, &abs_path, &chain_tx_anchors)
         })
         .await
         .map_err(|e| Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("dumptxoutset walk: {e}")))?
@@ -23222,12 +23263,54 @@ mod tests {
         assert_eq!(resp["base_hash"].as_str().unwrap(), h1.to_hex());
         assert_eq!(resp["coins_written"].as_u64(), Some(1));
         assert_eq!(resp["rollback"]["blocks_rewound"].as_u64(), Some(2));
+        // Core WriteUTXOSnapshot: nchaintx = base->m_chain_tx_count, the
+        // cumulative tx count genesis..=base (genesis + block 1 = 2), not the
+        // base block's own nTx (1).
+        assert_eq!(resp["nchaintx"].as_u64(), Some(2));
+        // txoutset_hash = Core's hashSerialized (the legacy rustoshi form
+        // lives on only under its own key).
+        assert_eq!(resp["txoutset_hash"], resp["hash_serialized"]);
+        assert_ne!(resp["txoutset_hash"], resp["legacy_txoutset_hash"]);
 
         // Post-replay: original tip + UTXO set restored.
         assert_eq!(snapshot_utxo(&db), utxo_before);
         let st = state.read().await;
         assert_eq!(st.best_height, 3);
         assert_eq!(st.best_hash, h3);
+    }
+
+    #[tokio::test]
+    async fn dumptxoutset_latest_txoutset_hash_is_hash_serialized_3() {
+        // Core: dumptxoutset's txoutset_hash == gettxoutsetinfo
+        // hash_serialized_3 at the same base; nchaintx == m_chain_tx_count.
+        use rustoshi_storage::ChainDb;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let params = rustoshi_consensus::ChainParams::regtest();
+        let genesis_hash = params.genesis_hash;
+        {
+            let store = BlockStore::new(&db);
+            store.init_genesis(&params).unwrap();
+        }
+        let (h1, _) = synth_append_block(&BlockStore::new(&db), 1, genesis_hash, 50_000_000, 0xC1);
+        let (h2, _) = synth_append_block(&BlockStore::new(&db), 2, h1, 50_000_000, 0xC2);
+        let mut rpc_state = RpcState::new(db.clone(), params);
+        rpc_state.best_height = 2;
+        rpc_state.best_hash = h2;
+        rpc_state.data_dir = Some(tmp.path().to_path_buf());
+        let state = Arc::new(RwLock::new(rpc_state));
+        let server = RpcServerImpl::new(state, Arc::new(RwLock::new(PeerState::default())));
+        let info = server
+            .get_tx_out_set_info(Some("hash_serialized_3".to_string()), None, None)
+            .await
+            .expect("gettxoutsetinfo");
+        let resp = server
+            .dump_tx_outset("latest.dat".to_string(), Some("latest".to_string()), None)
+            .await
+            .expect("latest dump");
+        assert_eq!(resp["base_height"].as_u64(), Some(2));
+        assert_eq!(resp["txoutset_hash"], info["hash_serialized_3"]);
+        assert_eq!(resp["nchaintx"].as_u64(), Some(3));
     }
 
     #[tokio::test]
