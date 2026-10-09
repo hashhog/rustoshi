@@ -99,10 +99,15 @@ class CoreNode(Node):
         return r.stdout.strip()
 
     def cli_json(self, *args: str):
+        # bitcoin-cli prints a top-level string result bare (no JSON quotes)
+        # and everything else as JSON.
         out = self.cli(*args)
-        if out == "":
+        if out == "" or out == "null":
             return None
-        return json.loads(out, parse_float=Decimal)
+        try:
+            return json.loads(out, parse_float=Decimal)
+        except json.JSONDecodeError:
+            return out
 
     def rpc(self, method: str, params: list | None = None):
         raw_args = [method]
@@ -209,8 +214,6 @@ def start_rustoshi(datadir: Path, log_path: Path) -> subprocess.Popen:
         "0",
         "--nodnsseed",
         "--nofixedseeds",
-        "--listen",
-        "false",
         "--port",
         "18447",
     ]
@@ -264,7 +267,6 @@ def make_signed(
     prev_spk: str,
     fee_sats: int,
     dest: str,
-    priv: str,
 ) -> dict:
     out_sats = prev_sats - fee_sats
     if out_sats <= 0:
@@ -274,10 +276,13 @@ def make_signed(
         json.dumps([{"txid": prev_txid, "vout": prev_vout}]),
         json.dumps([{dest: btc(out_sats)}]),
     )
+    # Descriptor wallets in Core v31 have no dumpprivkey. The wallet holds
+    # the key for `dest`, including an output of a tx that is not yet
+    # broadcast, as long as the prevout is supplied.
     signed = core.cli_json(
-        "signrawtransactionwithkey",
+        "-rpcwallet=sweep",
+        "signrawtransactionwithwallet",
         raw,
-        json.dumps([priv]),
         json.dumps(
             [
                 {
@@ -290,7 +295,7 @@ def make_signed(
         ),
     )
     if not signed.get("complete"):
-        die(f"signrawtransactionwithkey incomplete: {signed}")
+        die(f"signrawtransactionwithwallet incomplete: {signed}")
     decoded = core.cli_json("decoderawtransaction", signed["hex"])
     witness = decoded["vin"][0].get("txinwitness") or []
     return {
@@ -432,7 +437,6 @@ def main() -> int:
     wait_rpc(core)
     core.cli("createwallet", "sweep")
     dest = core.cli_json("-rpcwallet=sweep", "getnewaddress", "", "bech32")
-    priv = core.cli_json("-rpcwallet=sweep", "dumpprivkey", dest)
     info = core.cli_json("-rpcwallet=sweep", "getaddressinfo", dest)
     spk = info["scriptPubKey"]
     log(f"mining {CHAIN_BLOCKS} regtest blocks to {dest}")
@@ -450,7 +454,11 @@ def main() -> int:
     for u in utxos:
         log(f"utxo {u['txid']}:{u['vout']} {u['amount']} conf={u['confirmations']}")
 
-    log("starting rustoshi (--maxconnections 0 --nodnsseed --nofixedseeds --listen false)")
+    log(
+        "starting rustoshi (--maxconnections 0 --nodnsseed --nofixedseeds, "
+        "--port 18447). --listen is a switch that cannot be set false "
+        "(default true); maxconnections 0 is the offline gate"
+    )
     rust_log = WORKDIR / "rustoshi.log"
     rust_proc = start_rustoshi(rust_dir, rust_log)
     cookie_path = rust_dir / ".cookie"
@@ -557,20 +565,20 @@ def main() -> int:
     # 1. CPFP. Parent fee 1 sat (below 100 sat/kvB). Child fee 20_000 sat.
     u = utxos[0]
     parent = make_signed(
-        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 1, dest, priv
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 1, dest
     )
     child = make_signed(
-        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 20_000, dest, priv
+        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 20_000, dest
     )
     run_case("valid-cpfp", parent["hex"], child["hex"], parent["txid"], child["txid"])
 
     # 2. Invalid-signature child. Parent fee 10_000 sat so it is individually valid.
     u = utxos[1]
     parent = make_signed(
-        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest, priv
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest
     )
     child = make_signed(
-        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 10_000, dest, priv
+        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 10_000, dest
     )
     bad_child_hex = corrupt_witness_sig(child["hex"], child["witness"][0])
     bad_child = core.cli_json("decoderawtransaction", bad_child_hex)
@@ -585,14 +593,14 @@ def main() -> int:
     # 3. Invalid-signature parent.
     u = utxos[2]
     parent = make_signed(
-        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest, priv
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest
     )
     bad_parent_hex = corrupt_witness_sig(parent["hex"], parent["witness"][0])
     bad_parent = core.cli_json("decoderawtransaction", bad_parent_hex)
     # Child spends the corrupted parent. txid is unchanged by a witness-only
     # mutation, so the signed child still refers to it.
     child = make_signed(
-        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 10_000, dest, priv
+        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 10_000, dest
     )
     run_case(
         "invalid-sig-parent",
