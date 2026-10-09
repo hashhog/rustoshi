@@ -826,3 +826,396 @@ async fn submitpackage_failed_package_does_not_keep_evictions() {
     assert!(!ids.contains(&r.parent.txid().to_hex()), "{ids:?} {res}");
     assert!(!ids.contains(&r.child.txid().to_hex()), "{ids:?} {res}");
 }
+
+const TOPOLOGY_MSG: &str = "package topology disallowed. not child-with-parents or parents depend on each other.";
+const TOO_MANY_MSG: &str = "Array must contain between 1 and 25 transactions.";
+
+fn rpc_err(resp: &serde_json::Value) -> (i64, String) {
+    let err = &resp["error"];
+    assert!(
+        !err.is_null(),
+        "expected JSON-RPC error, got result {}",
+        resp["result"]
+    );
+    (
+        err["code"].as_i64().unwrap_or(0),
+        err["message"].as_str().unwrap_or("").to_string(),
+    )
+}
+
+fn lone_spend(prev: OutPoint) -> Transaction {
+    spend(prev, 50_000, 1_000)
+}
+
+/// Parent weight plus a one-input child exceeds `MAX_PACKAGE_WEIGHT` (404_000).
+fn overweight_tree() -> (Transaction, Transaction) {
+    let prev = OutPoint {
+        txid: Hash256::from([0x41u8; 32]),
+        vout: 0,
+    };
+    let mut n = 12_000usize;
+    loop {
+        let parent = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: prev.clone(),
+                script_sig: vec![],
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 1_000,
+                    script_pubkey: vec![],
+                };
+                n
+            ],
+            lock_time: 0,
+        };
+        let child = spend(
+            OutPoint {
+                txid: parent.txid(),
+                vout: 0,
+            },
+            1_000,
+            100,
+        );
+        if parent.weight() + child.weight()
+            > rustoshi_consensus::mempool::MAX_PACKAGE_WEIGHT as usize
+        {
+            return (parent, child);
+        }
+        n += 500;
+        assert!(n < 20_000, "could not build an overweight package");
+    }
+}
+
+fn assert_package_not_validated(res: &serde_json::Value, msg: &str, txs: &[&Transaction]) {
+    assert_eq!(res["package_msg"], msg, "{res}");
+    assert_top(res);
+    assert_eq!(res["replaced-transactions"].as_array().unwrap().len(), 0);
+    // tx-results is an object keyed by wtxid. A repeated wtxid overwrites,
+    // the same way Core's UniValue object does.
+    let map = res["tx-results"].as_object().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for tx in txs {
+        let wtxid = tx.wtxid().to_hex();
+        let e = entry(res, &wtxid);
+        assert_keys(e, TX_REJECTED, msg);
+        assert_eq!(e["txid"], tx.txid().to_hex());
+        assert_eq!(e["error"], "package-not-validated", "{e}");
+        seen.insert(wtxid);
+    }
+    assert_eq!(map.len(), seen.len(), "{res}");
+}
+
+fn assert_tma_package_error(rows: &serde_json::Value, msg: &str, txs: &[&Transaction]) {
+    let arr = rows.as_array().expect("testmempoolaccept array");
+    assert_eq!(arr.len(), txs.len(), "{rows}");
+    for (row, tx) in arr.iter().zip(txs) {
+        assert_keys(row, &["txid", "wtxid", "package-error"], msg);
+        assert_eq!(row["txid"], tx.txid().to_hex());
+        assert_eq!(row["wtxid"], tx.wtxid().to_hex());
+        assert_eq!(row["package-error"], msg, "{row}");
+        assert!(row.get("allowed").is_none(), "no allowed with package-error: {row}");
+    }
+}
+
+/// Not child-with-parents is an RPC error, not a `package-error:` result.
+#[tokio::test]
+async fn submitpackage_unrelated_topology_is_rpc_error() {
+    let (state, _) = server();
+    let a = lone_spend(OutPoint {
+        txid: Hash256::from([0x11u8; 32]),
+        vout: 0,
+    });
+    let b = lone_spend(OutPoint {
+        txid: Hash256::from([0x22u8; 32]),
+        vout: 0,
+    });
+    let resp = call(
+        &state,
+        "submitpackage",
+        serde_json::json!([[hex_tx(&a), hex_tx(&b)]]),
+    )
+    .await;
+    let (code, message) = rpc_err(&resp);
+    assert_eq!(code, -25, "{resp}");
+    assert_eq!(message, TOPOLOGY_MSG, "{resp}");
+}
+
+/// Two copies of one tx are not a child-with-parents tree. Core's submitpackage
+/// rejects that in the RPC, before IsWellFormedPackage.
+#[tokio::test]
+async fn submitpackage_duplicate_txs_are_rpc_error() {
+    let (state, _) = server();
+    let a = lone_spend(OutPoint {
+        txid: Hash256::from([0x33u8; 32]),
+        vout: 0,
+    });
+    let resp = call(
+        &state,
+        "submitpackage",
+        serde_json::json!([[hex_tx(&a), hex_tx(&a)]]),
+    )
+    .await;
+    let (code, message) = rpc_err(&resp);
+    assert_eq!(code, -25, "{resp}");
+    assert_eq!(message, TOPOLOGY_MSG, "{resp}");
+}
+
+/// More than 25 txs is -8 on both RPCs, before any per-tx result.
+#[tokio::test]
+async fn submitpackage_too_many_txs_is_rpc_error() {
+    let (state, _) = server();
+    let a = lone_spend(OutPoint {
+        txid: Hash256::from([0x44u8; 32]),
+        vout: 0,
+    });
+    let hexes = vec![hex_tx(&a); 26];
+    let resp = call(&state, "submitpackage", serde_json::json!([hexes])).await;
+    let (code, message) = rpc_err(&resp);
+    assert_eq!(code, -8, "{resp}");
+    assert_eq!(message, TOO_MANY_MSG, "{resp}");
+}
+
+#[tokio::test]
+async fn testmempoolaccept_too_many_txs_is_rpc_error() {
+    let (state, _) = server();
+    let a = lone_spend(OutPoint {
+        txid: Hash256::from([0x55u8; 32]),
+        vout: 0,
+    });
+    let hexes = vec![hex_tx(&a); 26];
+    let resp = call(&state, "testmempoolaccept", serde_json::json!([hexes])).await;
+    let (code, message) = rpc_err(&resp);
+    assert_eq!(code, -8, "{resp}");
+    assert_eq!(message, TOO_MANY_MSG, "{resp}");
+}
+
+/// A child-with-parents package over `MAX_PACKAGE_WEIGHT` is a result:
+/// `package_msg` is the policy token and every tx is `package-not-validated`.
+#[tokio::test]
+async fn submitpackage_package_too_large_emits_package_not_validated() {
+    let (state, _) = server();
+    let (parent, child) = overweight_tree();
+    let res = result(
+        call(
+            &state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_package_not_validated(&res, "package-too-large", &[&parent, &child]);
+}
+
+#[tokio::test]
+async fn testmempoolaccept_package_too_large_has_package_error_only() {
+    let (state, _) = server();
+    let (parent, child) = overweight_tree();
+    let res = result(
+        call(
+            &state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_tma_package_error(&res, "package-too-large", &[&parent, &child]);
+}
+
+/// Duplicate txids that still form a child-with-parents tree pass the RPC
+/// topology gate and come back as `package-contains-duplicates`.
+#[tokio::test]
+async fn submitpackage_duplicate_parents_emit_package_not_validated() {
+    let (state, _) = server();
+    let parent = lone_spend(OutPoint {
+        txid: Hash256::from([0x66u8; 32]),
+        vout: 0,
+    });
+    let child = spend(
+        OutPoint {
+            txid: parent.txid(),
+            vout: 0,
+        },
+        49_000,
+        1_000,
+    );
+    let res = result(
+        call(
+            &state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_package_not_validated(
+        &res,
+        "package-contains-duplicates",
+        &[&parent, &parent, &child],
+    );
+}
+
+#[tokio::test]
+async fn testmempoolaccept_duplicate_txs_have_package_error_only() {
+    let (state, _) = server();
+    let a = lone_spend(OutPoint {
+        txid: Hash256::from([0x77u8; 32]),
+        vout: 0,
+    });
+    let res = result(
+        call(
+            &state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&a), hex_tx(&a)]]),
+        )
+        .await,
+    );
+    assert_tma_package_error(&res, "package-contains-duplicates", &[&a, &a]);
+}
+
+/// Child listed before its parent: testmempoolaccept reports `package-not-sorted`.
+/// submitpackage hits the topology RPC error because the last tx is not the child.
+#[tokio::test]
+async fn testmempoolaccept_unsorted_package_has_package_error_only() {
+    let (state, _) = server();
+    let parent = lone_spend(OutPoint {
+        txid: Hash256::from([0x88u8; 32]),
+        vout: 0,
+    });
+    let child = spend(
+        OutPoint {
+            txid: parent.txid(),
+            vout: 0,
+        },
+        49_000,
+        1_000,
+    );
+    let res = result(
+        call(
+            &state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&child), hex_tx(&parent)]]),
+        )
+        .await,
+    );
+    assert_tma_package_error(&res, "package-not-sorted", &[&child, &parent]);
+}
+
+#[tokio::test]
+async fn submitpackage_unsorted_is_topology_rpc_error() {
+    let (state, _) = server();
+    let parent = lone_spend(OutPoint {
+        txid: Hash256::from([0x99u8; 32]),
+        vout: 0,
+    });
+    let child = spend(
+        OutPoint {
+            txid: parent.txid(),
+            vout: 0,
+        },
+        49_000,
+        1_000,
+    );
+    let resp = call(
+        &state,
+        "submitpackage",
+        serde_json::json!([[hex_tx(&child), hex_tx(&parent)]]),
+    )
+    .await;
+    let (code, message) = rpc_err(&resp);
+    assert_eq!(code, -25, "{resp}");
+    assert_eq!(message, TOPOLOGY_MSG, "{resp}");
+}
+
+/// Two parents spending one prevout, child spending both: still a tree, so
+/// submitpackage returns `conflict-in-package` and `package-not-validated`.
+#[tokio::test]
+async fn submitpackage_conflict_emits_package_not_validated() {
+    let (state, _) = server();
+    let prev = OutPoint {
+        txid: Hash256::from([0xaau8; 32]),
+        vout: 0,
+    };
+    let p1 = lone_spend(prev.clone());
+    let p2 = spend(prev, 50_000, 2_000);
+    let child = Transaction {
+        version: 2,
+        inputs: vec![
+            TxIn {
+                previous_output: OutPoint {
+                    txid: p1.txid(),
+                    vout: 0,
+                },
+                script_sig: vec![0x01, 0x51],
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            },
+            TxIn {
+                previous_output: OutPoint {
+                    txid: p2.txid(),
+                    vout: 0,
+                },
+                script_sig: vec![0x01, 0x51],
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            },
+        ],
+        outputs: vec![TxOut {
+            value: 1_000,
+            script_pubkey: p2sh_true(),
+        }],
+        lock_time: 0,
+    };
+    let res = result(
+        call(
+            &state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&p1), hex_tx(&p2), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_package_not_validated(&res, "conflict-in-package", &[&p1, &p2, &child]);
+}
+
+/// Core `IsWellFormedPackage` rejects `package-too-large` before
+/// `package-contains-duplicates`. A repeated parent that is also overweight
+/// is still a child-with-parents tree, so this is a result, not an RPC error.
+#[tokio::test]
+async fn submitpackage_overweight_duplicate_is_package_too_large() {
+    let (state, _) = server();
+    let (parent, child) = overweight_tree();
+    let res = result(
+        call(
+            &state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_package_not_validated(
+        &res,
+        "package-too-large",
+        &[&parent, &parent, &child],
+    );
+}
+
+#[tokio::test]
+async fn testmempoolaccept_overweight_duplicate_is_package_too_large() {
+    let (state, _) = server();
+    let (parent, child) = overweight_tree();
+    let res = result(
+        call(
+            &state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_tma_package_error(
+        &res,
+        "package-too-large",
+        &[&parent, &parent, &child],
+    );
+}

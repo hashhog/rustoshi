@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -103,11 +104,52 @@ class CoreNode(Node):
         except json.JSONDecodeError:
             return out
 
+    def _post(self, method: str, params: list | None = None) -> dict:
+        # HTTP, not bitcoin-cli. A package over MAX_PACKAGE_WEIGHT is >128KiB
+        # of hex, which this environment rejects as E2BIG on exec.
+        cookie_path = self.datadir / "regtest" / ".cookie"
+        user, _, secret = cookie_path.read_text().strip().partition(":")
+        token = base64.b64encode(f"{user}:{secret}".encode()).decode()
+        body = json.dumps(
+            {"jsonrpc": "1.0", "id": "sweep", "method": method, "params": params or []}
+        ).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{CORE_RPC_PORT}/",
+            data=body,
+            headers={
+                "Authorization": f"Basic {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read().decode(), parse_float=Decimal)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            try:
+                return json.loads(detail, parse_float=Decimal)
+            except json.JSONDecodeError as err:
+                raise RuntimeError(
+                    f"bitcoind {method} HTTP {e.code}: {detail}"
+                ) from err
+
     def rpc(self, method: str, params: list | None = None):
-        raw_args = [method]
-        for p in params or []:
-            raw_args.append(p if isinstance(p, str) else json.dumps(p))
-        return self.cli_json(*raw_args)
+        payload = self._post(method, params)
+        if payload.get("error"):
+            raise RuntimeError(f"bitcoind {method}: {payload['error']}")
+        return payload.get("result")
+
+    def rpc_outcome(self, method: str, params: list | None = None):
+        """Result JSON, or Core's JSONRPCError code and message."""
+        payload = self._post(method, params)
+        if payload.get("error"):
+            err = payload["error"]
+            return {
+                "ok": False,
+                "code": err.get("code"),
+                "message": err.get("message"),
+            }
+        return {"ok": True, "result": payload.get("result")}
 
 
 class RustNode(Node):
@@ -137,8 +179,39 @@ class RustNode(Node):
             detail = e.read().decode(errors="replace")
             raise RuntimeError(f"rustoshi {method} HTTP {e.code}: {detail}") from e
         if payload.get("error"):
-            raise RuntimeError(f"rustoshi {method}: {payload['error']}")
+            err = payload["error"]
+            raise RuntimeError(f"rustoshi {method}: {err}")
         return payload.get("result")
+
+    def rpc_outcome(self, method: str, params: list | None = None):
+        body = json.dumps(
+            {"jsonrpc": "1.0", "id": "sweep", "method": method, "params": params or []}
+        ).encode()
+        req = urllib.request.Request(
+            self.url,
+            data=body,
+            headers={
+                "Authorization": self.auth,
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                payload = json.loads(resp.read().decode(), parse_float=Decimal)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            try:
+                payload = json.loads(detail)
+            except json.JSONDecodeError:
+                return {"ok": False, "code": None, "message": detail}
+        if payload.get("error"):
+            err = payload["error"]
+            return {
+                "ok": False,
+                "code": err.get("code"),
+                "message": err.get("message"),
+            }
+        return {"ok": True, "result": payload.get("result")}
 
 
 def wait_rpc(node: Node, seconds: int = 60) -> None:
@@ -361,6 +434,69 @@ def compare_json(core, rust, path: str) -> list[dict]:
 
 def compare_submit(core_res: dict, rust_res: dict) -> list[dict]:
     return compare_json(core_res, rust_res, "submitpackage")
+
+
+def compare_outcome(core_out: dict, rust_out: dict, path: str) -> list[dict]:
+    """RPC error (code + message) or the entire result JSON."""
+    if core_out.get("ok") != rust_out.get("ok"):
+        return [
+            {
+                "field": f"{path} ok",
+                "core": core_out,
+                "rustoshi": rust_out,
+                "justified": None,
+            }
+        ]
+    if not core_out.get("ok"):
+        c = {"code": core_out.get("code"), "message": core_out.get("message")}
+        r = {"code": rust_out.get("code"), "message": rust_out.get("message")}
+        if c != r:
+            return [
+                {
+                    "field": path,
+                    "core": c,
+                    "rustoshi": r,
+                    "justified": None,
+                }
+            ]
+        return []
+    return compare_json(core_out.get("result"), rust_out.get("result"), path)
+
+
+def _compact_size(n: int) -> bytes:
+    if n < 0xFD:
+        return bytes([n])
+    if n <= 0xFFFF:
+        return b"\xfd" + n.to_bytes(2, "little")
+    if n <= 0xFFFFFFFF:
+        return b"\xfe" + n.to_bytes(4, "little")
+    return b"\xff" + n.to_bytes(8, "little")
+
+
+def raw_tx(inputs: list[tuple[bytes, int, bytes]], outputs: list[tuple[int, bytes]]) -> bytes:
+    """Non-witness tx. `inputs` are (prevout txid in internal order, vout, scriptSig)."""
+    raw = (2).to_bytes(4, "little")
+    raw += _compact_size(len(inputs))
+    for txid_le, vout, script in inputs:
+        raw += txid_le
+        raw += int(vout).to_bytes(4, "little")
+        raw += _compact_size(len(script)) + script
+        raw += (0xFFFFFFFF).to_bytes(4, "little")
+    raw += _compact_size(len(outputs))
+    for value, spk in outputs:
+        raw += int(value).to_bytes(8, "little")
+        raw += _compact_size(len(spk)) + spk
+    raw += (0).to_bytes(4, "little")
+    return raw
+
+
+def txid_internal(raw: bytes) -> bytes:
+    return hashlib.sha256(hashlib.sha256(raw).digest()).digest()
+
+
+def fake_spend(prev_byte: int, script_sig: bytes = b"", n_outputs: int = 1, value: int = 1000) -> bytes:
+    prev = bytes([prev_byte]) * 32
+    return raw_tx([(prev, 0, script_sig)], [(value, b"")] * n_outputs)
 
 
 def mempool_txids(node: Node) -> list[str]:
@@ -907,6 +1043,120 @@ def main() -> int:
         core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest
     )
     run_solo("maxfeerate", hot["hex"], hot["txid"], "0.00001000")
+
+    def run_policy(name: str, hexes: list[str]):
+        """submitpackage and testmempoolaccept, including JSON-RPC errors.
+
+        Topology and the 1..=25 size gate are RPC errors (code + message).
+        IsWellFormedPackage failures are results. Neither path should admit a tx.
+        """
+        log(f"=== {name} ===")
+        before_c = mempool_txids(core)
+        before_r = mempool_txids(rust)
+        c_tma = core.rpc_outcome("testmempoolaccept", [hexes])
+        r_tma = rust.rpc_outcome("testmempoolaccept", [hexes])
+        log("core testmempoolaccept: " + json.dumps(c_tma, sort_keys=True, default=str))
+        log("rustoshi testmempoolaccept: " + json.dumps(r_tma, sort_keys=True, default=str))
+        mismatches = compare_outcome(c_tma, r_tma, "testmempoolaccept")
+        c_res = core.rpc_outcome("submitpackage", [hexes])
+        r_res = rust.rpc_outcome("submitpackage", [hexes])
+        log("core submitpackage: " + json.dumps(c_res, sort_keys=True, default=str))
+        log("rustoshi submitpackage: " + json.dumps(r_res, sort_keys=True, default=str))
+        mismatches.extend(compare_outcome(c_res, r_res, "submitpackage"))
+        after_c = mempool_txids(core)
+        after_r = mempool_txids(rust)
+        if after_c != before_c or after_r != before_r or after_c != after_r:
+            mismatches.append(
+                {
+                    "field": "mempool_changed",
+                    "core": after_c,
+                    "rustoshi": after_r,
+                    "justified": None,
+                }
+            )
+        for m in mismatches:
+            tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+            log(f"  {tag} {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
+        cases.append(
+            {
+                "name": name,
+                "core": c_res,
+                "rustoshi": r_res,
+                "mempool_core": after_c,
+                "mempool_rustoshi": after_r,
+                "mismatches": mismatches,
+            }
+        )
+
+    # Two individually valid spends are not a child-with-parents tree.
+    # submitpackage is the topology RPC error. testmempoolaccept has no tree
+    # gate and validates each tx (allowed, with fees).
+    free = [
+        u
+        for u in utxos
+        if core.rpc("gettxout", [u["txid"], int(u["vout"])]) is not None
+    ]
+    if len(free) < 2:
+        die(f"need 2 unspent coinbases for the topology case, have {len(free)}")
+    topo_a = make_signed(
+        core, free[0]["txid"], free[0]["vout"], sats_of(free[0]["amount"]), spk, 10_000, dest
+    )
+    topo_b = make_signed(
+        core, free[1]["txid"], free[1]["vout"], sats_of(free[1]["amount"]), spk, 10_000, dest
+    )
+    run_policy("topology-unrelated", [topo_a["hex"], topo_b["hex"]])
+
+    dup = fake_spend(0x33).hex()
+    run_policy("duplicate-tx", [dup, dup])
+
+    tiny = fake_spend(0x44).hex()
+    run_policy("too-many-txs", [tiny] * 26)
+    run_policy("empty-package", [])
+
+    # Child-with-parents whose total weight exceeds 404_000. Parent alone is
+    # already over the limit (non-witness weight = 4 * serialized size).
+    n_out = 12_000
+    parent_raw = fake_spend(0x55, n_outputs=n_out, value=1_000)
+    child_raw = raw_tx([(txid_internal(parent_raw), 0, b"")], [(100, b"")])
+    weight = 4 * (len(parent_raw) + len(child_raw))
+    if weight <= 404_000:
+        die(f"policy package weight {weight} did not exceed 404000")
+    log(f"overweight package bytes parent={len(parent_raw)} child={len(child_raw)} weight={weight}")
+    parent_hex = parent_raw.hex()
+    child_hex = child_raw.hex()
+    # Confirm Core can decode them. A decode failure would hide the policy token.
+    core.rpc("decoderawtransaction", [parent_hex])
+    core.rpc("decoderawtransaction", [child_hex])
+    run_policy("package-too-large", [parent_hex, child_hex])
+    run_policy("package-too-large-duplicate", [parent_hex, parent_hex, child_hex])
+
+    # Last tx is not the child, so submitpackage is the topology RPC error.
+    # testmempoolaccept has no tree gate and reports package-not-sorted.
+    # Use a small tree: the overweight pair would be package-too-large first.
+    sort_parent = fake_spend(0x88, value=50_000)
+    sort_child = raw_tx([(txid_internal(sort_parent), 0, b"")], [(1_000, b"")])
+    run_policy("unsorted", [sort_child.hex(), sort_parent.hex()])
+
+    # Two parents spend one prevout; the child spends both. Still a tree.
+    p1 = fake_spend(0x66, script_sig=b"", value=50_000)
+    p2 = fake_spend(0x66, script_sig=b"\x51", value=40_000)
+    conflict_child = raw_tx(
+        [
+            (txid_internal(p1), 0, b""),
+            (txid_internal(p2), 0, b""),
+        ],
+        [(1_000, b"")],
+    )
+    run_policy("conflict-in-package", [p1.hex(), p2.hex(), conflict_child.hex()])
+
+    # Duplicate parents that still form a tree: package-contains-duplicates,
+    # not the topology RPC error. Distinct from duplicate-tx ([tx, tx]).
+    tree_parent = fake_spend(0x77, value=50_000)
+    tree_child = raw_tx([(txid_internal(tree_parent), 0, b"")], [(1_000, b"")])
+    run_policy(
+        "duplicate-parents",
+        [tree_parent.hex(), tree_parent.hex(), tree_child.hex()],
+    )
 
     # invalidateblock / reconsiderblock of the current tip.
     log("=== invalidateblock / reconsiderblock ===")
