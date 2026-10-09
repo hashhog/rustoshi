@@ -3075,6 +3075,10 @@ impl Mempool {
     ///
     /// A re-added tx with children already in the mempool is linked to them
     /// in `add_transaction_with_options` (Core `UpdateTransactionsFromBlock`).
+    /// Linking merges those clusters after the per-tx cluster gate, which only
+    /// sees mempool parents, so the merged cluster can exceed 64 txs or
+    /// 404_000 WU. `trim_cluster_limits` is Core `TxGraphImpl::Trim`, called
+    /// at the end of `UpdateTransactionsFromBlock`.
     /// A tx that fails re-admission is removed recursively: any in-mempool
     /// spender of its outputs goes too (Core `removeRecursive`).
     ///
@@ -3122,7 +3126,110 @@ impl Mempool {
                 }
             }
         }
+        // Core CTxMemPool::UpdateTransactionsFromBlock ends with TxGraph::Trim
+        // once every re-added tx has been linked to in-pool children.
+        self.trim_cluster_limits();
         readded
+    }
+
+    /// Drop transactions from clusters that exceed [`MAX_CLUSTER_SIZE`] or
+    /// [`MAX_CLUSTER_SIZE_WEIGHT`] after a reorg linked in-pool children.
+    ///
+    /// Core `TxGraphImpl::Trim` (txgraph.cpp): walk the merged cluster in
+    /// decreasing chunk-feerate order (the linearization). A transaction whose
+    /// addition would exceed either limit is not included, and neither are its
+    /// descendants — their dependency stays unmet, so they are removed too.
+    /// 64 txs and 404_000 WU are within the limit (`>` comparison).
+    fn trim_cluster_limits(&mut self) -> usize {
+        let cluster_ids: Vec<ClusterId> = self.clusters.keys().copied().collect();
+        let mut removed = 0;
+        for id in cluster_ids {
+            let Some(drop_ids) = self.plan_cluster_trim(id) else {
+                continue;
+            };
+            for txid in drop_ids {
+                if self.transactions.contains_key(&txid) {
+                    self.remove_transaction(&txid, true);
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
+    /// Txids to remove so `id` satisfies the cluster limits, in an order where
+    /// each dropped tx is removed with its descendants. `None` when the
+    /// cluster already fits.
+    fn plan_cluster_trim(&self, id: ClusterId) -> Option<Vec<Hash256>> {
+        let cluster = self.clusters.get(&id)?;
+        let total_weight: u64 = cluster
+            .txids
+            .iter()
+            .map(|t| {
+                self.transactions
+                    .get(t)
+                    .map(|e| e.sigop_adjusted_weight)
+                    .unwrap_or(0)
+            })
+            .sum();
+        if cluster.txids.len() <= MAX_CLUSTER_SIZE && total_weight <= MAX_CLUSTER_SIZE_WEIGHT {
+            return None;
+        }
+        let members = cluster.txids.clone();
+        let mut order: Vec<Hash256> = cluster
+            .linearization
+            .iter()
+            .flat_map(|chunk| chunk.txids.iter().copied())
+            .collect();
+        let mut in_order: HashSet<Hash256> = order.iter().copied().collect();
+        for txid in &members {
+            if in_order.insert(*txid) {
+                order.push(*txid);
+            }
+        }
+        let mut dropped: HashSet<Hash256> = HashSet::new();
+        let mut roots: Vec<Hash256> = Vec::new();
+        let mut kept_count = 0usize;
+        let mut kept_weight = 0u64;
+        for txid in order {
+            let blocked = self.ancestor_was_dropped(&txid, &dropped);
+            let weight = self
+                .transactions
+                .get(&txid)
+                .map(|e| e.sigop_adjusted_weight)
+                .unwrap_or(0);
+            let fits = !blocked
+                && kept_count + 1 <= MAX_CLUSTER_SIZE
+                && kept_weight.saturating_add(weight) <= MAX_CLUSTER_SIZE_WEIGHT;
+            if fits {
+                kept_count += 1;
+                kept_weight += weight;
+            } else if dropped.insert(txid) {
+                roots.push(txid);
+            }
+        }
+        Some(roots)
+    }
+
+    fn ancestor_was_dropped(&self, txid: &Hash256, dropped: &HashSet<Hash256>) -> bool {
+        let mut stack: Vec<Hash256> = self
+            .parents
+            .get(txid)
+            .map(|ps| ps.iter().copied().collect())
+            .unwrap_or_default();
+        let mut seen: HashSet<Hash256> = HashSet::new();
+        while let Some(parent) = stack.pop() {
+            if !seen.insert(parent) {
+                continue;
+            }
+            if dropped.contains(&parent) {
+                return true;
+            }
+            if let Some(grandparents) = self.parents.get(&parent) {
+                stack.extend(grandparents.iter().copied());
+            }
+        }
+        false
     }
 
     /// Core `LimitMempoolSize` after a reorg refill (which bypassed the size

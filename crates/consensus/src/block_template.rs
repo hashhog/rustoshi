@@ -254,6 +254,7 @@ struct TxPriority {
     ancestor_fee_rate: f64,
     #[allow(dead_code)]
     fee: u64,
+    #[allow(dead_code)]
     weight: u64,
 }
 
@@ -401,42 +402,47 @@ pub fn build_block_template(
             break;
         }
 
-        // Check weight limit: strict >= mirrors Core's
-        // TestChunkBlockLimits (miner.cpp:241):
-        //   `if (nBlockWeight + chunk_feerate.size >= m_options.nBlockMaxWeight)`
-        // Note: MAX_BLOCK_WEIGHT is the absolute ceiling; max_weight =
-        // MAX_BLOCK_WEIGHT - block_reserved_weight, so the comparison below
-        // correctly treats max_weight as the usable ceiling.
-        let weight_fails = total_weight + priority.weight >= MAX_BLOCK_WEIGHT;
+        // Ancestor package, parents first. Selection ranks by ancestor
+        // feerate, so a high-feerate child is popped before its parent.
+        // Core `BlockAssembler::addPackageTxs` appends that package in
+        // ancestor-count order; `addChunks` (miner.cpp) appends each chunk
+        // already topologically sorted. BIP-22 `depends` (1-based, coinbase
+        // omitted) is derived from this order by getblocktemplate.
+        let mut package_ids = mempool.get_ancestors_of(&priority.txid);
+        package_ids.push(priority.txid);
+        package_ids.retain(|id| !selected_txids.contains(id));
+        package_ids.sort_by_key(|id| mempool.get(id).map(|e| e.ancestor_count).unwrap_or(usize::MAX));
 
-        // Compute the sigop cost of this transaction. We don't have UTXO
-        // context here so we use the inaccurate legacy sigop count (which
-        // also ignores P2SH and witness sigops) scaled by the witness
-        // factor — the same approximation `count_block_sigops` uses in
-        // `validation.rs`. Block consensus validation later applies the
-        // tighter accurate count; if we under-estimate here, the block
-        // would be rejected by validation, but in practice legacy sigops
-        // dominate the budget and the approximation is conservative
-        // enough for a budget gate.
-        let tx_sigops = if let Some(entry) = mempool.get(&priority.txid) {
-            get_legacy_sigop_count(&entry.tx) as u64 * WITNESS_SCALE_FACTOR
-        } else {
-            0
-        };
+        // (txid, tx, fee, weight, sigops), parents before children.
+        let mut picked: Vec<(Hash256, Transaction, u64, u64, u64)> = Vec::with_capacity(package_ids.len());
+        let mut package_ok = !package_ids.is_empty();
+        for id in &package_ids {
+            let Some(entry) = mempool.get(id) else {
+                package_ok = false;
+                break;
+            };
+            if !is_final_tx(&entry.tx, height, median_time_past) {
+                package_ok = false;
+                break;
+            }
+            // Legacy sigop count scaled by the witness factor — the same
+            // approximation `count_block_sigops` uses. Consensus validation
+            // applies the accurate count when the block is submitted.
+            let tx_sigops = get_legacy_sigop_count(&entry.tx) as u64 * WITNESS_SCALE_FACTOR;
+            picked.push((*id, entry.tx.clone(), entry.fee, entry.weight as u64, tx_sigops));
+        }
 
-        // Sigops limit: strict >= mirrors Core's TestChunkBlockLimits
-        // (miner.cpp:244): `if (nBlockSigOpsCost + chunk_sigops_cost >=
-        // MAX_BLOCK_SIGOPS_COST) { return false; }`
-        let sigops_fails = total_sigops + tx_sigops >= max_sigops;
+        let package_weight: u64 = picked.iter().map(|p| p.3).sum();
+        let package_sigops: u64 = picked.iter().map(|p| p.4).sum();
+        // Strict >= mirrors Core TestChunkBlockLimits (miner.cpp:241,244).
+        // max_weight is the usable ceiling (MAX_BLOCK_WEIGHT minus the
+        // reservation already counted in total_weight).
+        let weight_fails = total_weight + package_weight >= MAX_BLOCK_WEIGHT;
+        let sigops_fails = total_sigops + package_sigops >= max_sigops;
 
-        if weight_fails || sigops_fails {
-            // This tx doesn't fit; increment failure counter for the
-            // bail-out heuristic.
+        if !package_ok || weight_fails || sigops_fails {
             n_consecutive_failed += 1;
-
-            // MAX_CONSECUTIVE_FAILURES bail-out: if the block is close to
-            // full and we've been failing for a long time, give up.
-            // Bitcoin Core miner.cpp:314-318.
+            // MAX_CONSECUTIVE_FAILURES bail-out (miner.cpp:314-318).
             if n_consecutive_failed > MAX_CONSECUTIVE_FAILURES
                 && total_weight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > max_weight
             {
@@ -445,29 +451,17 @@ pub fn build_block_template(
             continue;
         }
 
-        // Add the transaction
-        if let Some(entry) = mempool.get(&priority.txid) {
-            // Double-check finality (in case mempool state changed)
-            if !is_final_tx(&entry.tx, height, median_time_past) {
-                n_consecutive_failed += 1;
-                continue;
-            }
-
-            selected_txs.push(entry.tx.clone());
-            selected_sigops.push(tx_sigops);
-            // Record the base fee for this tx (Core miner.cpp:265
-            // `vTxFees.push_back(entry.GetFee())`). Base fee fits in i64 on
-            // any real chain (max money is < 2^53 sats).
-            selected_fees.push(entry.fee as i64);
-            selected_txids.insert(priority.txid);
-            // FIX-72: total_fees uses the entry's actual base fee — the
-            // delta is a mining-selection knob, not an additional payment.
-            // Core BlockAssembler sums actual fees too (miner.cpp:172-176).
-            total_fees += entry.fee;
-            total_weight += entry.weight as u64;
-            total_sigops += tx_sigops;
-            n_consecutive_failed = 0; // reset on success
+        for (txid, tx, fee, weight, sigops) in picked {
+            selected_txs.push(tx);
+            selected_sigops.push(sigops);
+            // Base fee (Core miner.cpp:265 `vTxFees.push_back(entry.GetFee())`).
+            selected_fees.push(fee as i64);
+            selected_txids.insert(txid);
+            total_fees += fee;
+            total_weight += weight;
+            total_sigops += sigops;
         }
+        n_consecutive_failed = 0;
     }
 
     // Calculate coinbase value (subsidy + fees)
