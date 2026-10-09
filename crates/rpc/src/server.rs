@@ -198,7 +198,6 @@ pub(crate) fn guess_verification_progress(
 pub(crate) fn rpc_mempool_entry(
     mempool: &Mempool,
     entry: &rustoshi_consensus::mempool::MempoolEntry,
-    height: u32,
 ) -> MempoolEntry {
     let modified = Mempool::get_modified_fee(entry);
     let (chunk_fee, chunk_weight) = mempool
@@ -208,8 +207,9 @@ pub(crate) fn rpc_mempool_entry(
         vsize: entry.vsize as u32,
         weight: entry.weight as u32,
         // Core: count_seconds(e.GetTime()) — absolute Unix time, not age.
+        // `entryHeight` is the tip height at admission, not the live tip.
         time: entry.time_seconds as u64,
-        height,
+        height: entry.entry_height,
         descendantcount: entry.descendant_count as u32,
         descendantsize: entry.descendant_size as u32,
         ancestorcount: entry.ancestor_count as u32,
@@ -276,7 +276,7 @@ pub(crate) fn mempool_contents_json(state: &RpcState) -> String {
     let mut first = true;
     for txid in state.mempool.get_sorted_for_mining() {
         if let Some(entry) = state.mempool.get(&txid) {
-            let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
+            let mem_entry = rpc_mempool_entry(&state.mempool, entry);
             if !first {
                 json.push(',');
             }
@@ -9284,7 +9284,8 @@ impl RustoshiRpcServer for RpcServerImpl {
 
                 // Track for fee estimation
                 state.fee_estimator.track_transaction(txid, fee_rate);
-                // Core AddUnbroadcastTx: no peers, so the tx stays unbroadcast.
+                // Core AddUnbroadcastTx: no peers, so the tx stays unbroadcast
+                // until a getdata reply is queued.
                 state.mempool.add_unbroadcast(txid);
 
                 // Drop the state lock before broadcasting
@@ -9626,10 +9627,10 @@ impl RustoshiRpcServer for RpcServerImpl {
         let opts = rustoshi_consensus::ImportMempoolOptions {
             use_current_time: opt_bool("use_current_time", true)?,
             apply_fee_delta_priority: opt_bool("apply_fee_delta_priority", false)?,
+            // Core's importmempool RPC defaults this to false. Startup load
+            // uses ImportMempoolOptions::default(), which applies the set.
+            apply_unbroadcast_set: opt_bool("apply_unbroadcast_set", false)?,
         };
-        // Accepted for Core parity; rustoshi keeps no unbroadcast set, so
-        // there is nothing to apply it to (the loader reads past the block).
-        let _apply_unbroadcast_set = opt_bool("apply_unbroadcast_set", false)?;
 
         let db = Arc::clone(&state.db);
         {
@@ -12875,6 +12876,11 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Broadcast accepted transactions to peers
         if result.all_accepted() {
+            for tx_result in &result.tx_results {
+                if tx_result.error.is_none() && !tx_result.already_in_mempool {
+                    state.mempool.add_unbroadcast(tx_result.txid);
+                }
+            }
             drop(state);
             let peer_state = self.peer_state.read().await;
             if let Some(ref peer_manager) = peer_state.peer_manager {
@@ -15013,7 +15019,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Serialize via MempoolEntry + to_string so that BtcAmount's
                 // 8-decimal format is preserved.  serde_json::json! with f64 would
                 // emit "fee":1e-05 for small values instead of "fee":0.00001000.
-                let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
+                let mem_entry = rpc_mempool_entry(&state.mempool, entry);
                 let json_str = serde_json::to_string(&mem_entry).unwrap();
                 Ok(serde_json::value::RawValue::from_string(json_str).unwrap())
             }
@@ -15233,7 +15239,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 if let Some(entry) = state.mempool.get(ancestor_txid) {
                     if !first { json.push(','); }
                     first = false;
-                    let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
+                    let mem_entry = rpc_mempool_entry(&state.mempool, entry);
                     json.push('"');
                     json.push_str(&ancestor_txid.to_hex());
                     json.push_str("\":");
@@ -15279,7 +15285,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 if let Some(entry) = state.mempool.get(d) {
                     if !first { json.push(','); }
                     first = false;
-                    let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
+                    let mem_entry = rpc_mempool_entry(&state.mempool, entry);
                     json.push('"');
                     json.push_str(&d.to_hex());
                     json.push_str("\":");

@@ -109,10 +109,10 @@ pub struct BlockTemplate {
     pub total_weight: u64,
     /// Total sigops cost of all transactions (coinbase + selected txs).
     ///
-    /// This tracks legacy sigops (scriptSig + scriptPubKey) scaled by
-    /// `WITNESS_SCALE_FACTOR`, matching `count_block_sigops` in `validation.rs`.
-    /// P2SH and witness sigops require UTXO context and are not included here;
-    /// the selection loop is therefore conservative and may over-estimate.
+    /// Each selected transaction contributes the sigop cost stored at mempool
+    /// admission (`GetTransactionSigOpCost`: legacy×4 + P2SH×4 + witness
+    /// sigops). The coinbase is counted with legacy sigops ×
+    /// `WITNESS_SCALE_FACTOR`.
     pub total_sigops: u64,
     /// Per-transaction sigop cost, in the same order as `transactions`.
     ///
@@ -425,10 +425,9 @@ pub fn build_block_template(
                 package_ok = false;
                 break;
             }
-            // Legacy sigop count scaled by the witness factor — the same
-            // approximation `count_block_sigops` uses. Consensus validation
-            // applies the accurate count when the block is submitted.
-            let tx_sigops = get_legacy_sigop_count(&entry.tx) as u64 * WITNESS_SCALE_FACTOR;
+            // Same cost Core stores on the mempool entry and copies into
+            // `CBlockTemplate::vTxSigOpsCost` (miner.cpp AddToBlock).
+            let tx_sigops = entry.sigop_cost;
             picked.push((*id, entry.tx.clone(), entry.fee, entry.weight as u64, tx_sigops));
         }
 
