@@ -12707,6 +12707,17 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
+        // Core rpc/mempool.cpp submitpackage, after decode and before
+        // ProcessNewPackage. Not a result object.
+        if txs.len() > 1
+            && !rustoshi_consensus::mempool::Mempool::is_child_with_parents_tree(&txs)
+        {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_TRANSACTION_ERROR,
+                "package topology disallowed. not child-with-parents or parents depend on each other.",
+            ));
+        }
+
         let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
 
         // UTXO lookup closure
@@ -12762,6 +12773,24 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Build the RPC response in Core's pushKV order. tx-results is keyed
         // by the submitted wtxid, in package order.
         let mut tx_results_map = indexmap::IndexMap::new();
+
+        // IsWellFormedPackage (and any other abort before per-tx results)
+        // returns an empty map. Core then sets every submitted wtxid's error
+        // to "package-not-validated" (rpc/mempool.cpp submitpackage).
+        if result.tx_results.is_empty() && result.package_error.is_some() {
+            for tx in &txs {
+                tx_results_map.insert(
+                    tx.wtxid().to_hex(),
+                    PackageTxResultRpc {
+                        txid: tx.txid().to_hex(),
+                        other_wtxid: None,
+                        vsize: None,
+                        fees: None,
+                        error: Some("package-not-validated".to_string()),
+                    },
+                );
+            }
+        }
 
         for (i, tx_result) in result.tx_results.iter().enumerate() {
             let tx = &txs[i];
@@ -12825,13 +12854,11 @@ impl RustoshiRpcServer for RpcServerImpl {
             tx_results_map.insert(wtxid, rpc_result);
         }
 
-        // Core package_msg for PCKG_TX is "transaction failed"
-        // (AcceptPackage / rpc/mempool.cpp submitpackage). Other package-level
-        // failures keep the historical "package-error:" prefix.
-        let package_msg = if result.package_error.as_deref() == Some("transaction failed") {
-            "transaction failed".to_string()
-        } else if let Some(ref err) = result.package_error {
-            format!("package-error: {}", err)
+        // Core package_msg is PackageValidationState::ToString(): the reject
+        // reason when debug is empty ("transaction failed", "package-too-large",
+        // "package-contains-duplicates", ...). Never a "package-error:" prefix.
+        let package_msg = if let Some(ref err) = result.package_error {
+            err.clone()
         } else if result.all_accepted() {
             "success".to_string()
         } else {
@@ -14326,6 +14353,15 @@ impl RustoshiRpcServer for RpcServerImpl {
         let max_fee_rate_btc_kvb = maxfeerate.unwrap_or(0.10);
         let max_sat_kvb = (max_fee_rate_btc_kvb * COIN as f64).round() as u64;
 
+        // Core testmempoolaccept: the array length is an RPC -8, before decode
+        // and before any per-tx result. It is not `package-too-many-transactions`.
+        if rawtxs.is_empty() || rawtxs.len() > MAX_PACKAGE_COUNT {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Array must contain between 1 and 25 transactions.",
+            ));
+        }
+
         // Decode all transactions up front so we fail fast on malformed hex
         // before acquiring any lock.
         let mut txs: Vec<Transaction> = Vec::with_capacity(rawtxs.len());
@@ -14340,23 +14376,24 @@ impl RustoshiRpcServer for RpcServerImpl {
             txs.push(tx);
         }
 
-        // Bitcoin Core: testmempoolaccept rejects the whole array when it
-        // exceeds MAX_PACKAGE_COUNT (25) at the package-policy level and
-        // returns a per-tx result with "package-error" for every tx.
-        if txs.len() > MAX_PACKAGE_COUNT {
-            let pkg_err = "package-too-many-transactions";
-            let results: Vec<serde_json::Value> = txs
-                .iter()
-                .map(|tx| {
-                    serde_json::json!({
-                        "txid": tx.txid().to_hex(),
-                        "wtxid": tx.wtxid().to_hex(),
-                        "allowed": false,
-                        "package-error": pkg_err
+        // IsWellFormedPackage failures are PCKG_POLICY with an empty tx-result
+        // map. Each entry is txid, wtxid, package-error. No `allowed`.
+        {
+            let state = self.state.read().await;
+            if let Err(e) = state.mempool.check_package(&txs) {
+                let pkg_err = e.reject_token();
+                let results: Vec<serde_json::Value> = txs
+                    .iter()
+                    .map(|tx| {
+                        serde_json::json!({
+                            "txid": tx.txid().to_hex(),
+                            "wtxid": tx.wtxid().to_hex(),
+                            "package-error": pkg_err,
+                        })
                     })
-                })
-                .collect();
-            return Ok(serde_json::json!(results));
+                    .collect();
+                return Ok(serde_json::json!(results));
+            }
         }
 
         // Need a write lock: add_transaction_with_options takes &mut self even

@@ -1321,7 +1321,9 @@ impl MempoolError {
             // testmempoolaccept / sendrawtransaction paths this map serves). ----
             MempoolError::PackageTooManyTx(_, _) => "package-too-many-transactions".to_string(),
             MempoolError::PackageTooLarge(_, _) => "package-too-large".to_string(),
-            MempoolError::PackageDuplicateTx => "conflict-in-package".to_string(),
+            // Distinct from `conflict-in-package`. Core IsWellFormedPackage
+            // (policy/packages.cpp) reports this after the weight check.
+            MempoolError::PackageDuplicateTx => "package-contains-duplicates".to_string(),
             MempoolError::PackageNotSorted => "package-not-sorted".to_string(),
             MempoolError::PackageConflict => "conflict-in-package".to_string(),
             MempoolError::PackageInsufficientFee(_, _) => "min relay fee not met".to_string(),
@@ -4834,10 +4836,10 @@ impl Mempool {
 
     /// Check if a package is well-formed (context-free checks).
     ///
-    /// Validates:
+    /// Validates, in Core `IsWellFormedPackage` order:
     /// 1. Transaction count <= MAX_PACKAGE_COUNT (25)
-    /// 2. Total virtual size <= MAX_PACKAGE_SIZE (101 kvB)
-    /// 3. No duplicate transactions
+    /// 2. Multi-tx total weight <= MAX_PACKAGE_WEIGHT (404_000)
+    /// 3. No duplicate txids
     /// 4. Topologically sorted (parents before children)
     /// 5. No conflicting transactions within the package
     pub fn check_package(&self, txs: &[Transaction]) -> Result<(), MempoolError> {
@@ -4846,33 +4848,27 @@ impl Mempool {
             return Err(MempoolError::PackageTooManyTx(txs.len(), MAX_PACKAGE_COUNT));
         }
 
-        // Calculate total vsize and check for duplicates
-        let mut total_vsize = 0usize;
+        // Core IsWellFormedPackage (policy/packages.cpp): total weight, then
+        // duplicate txids (including same-txid-different-witness), then
+        // topological order, then conflicting inputs. A single tx reports its
+        // own weight policy, so only a multi-tx package is `package-too-large`.
         let mut seen_txids = HashSet::new();
-        let mut package_outputs = HashSet::new(); // outputs created by package txs
-
+        let mut total_weight: u64 = 0;
+        let mut duplicate = false;
         for tx in txs {
-            let txid = tx.txid();
-
-            // Check for duplicates
-            if !seen_txids.insert(txid) {
-                return Err(MempoolError::PackageDuplicateTx);
+            if !seen_txids.insert(tx.txid()) {
+                duplicate = true;
             }
-
-            total_vsize += tx.vsize();
-
-            // Track outputs created by this transaction
-            for vout in 0..tx.outputs.len() {
-                package_outputs.insert(OutPoint {
-                    txid,
-                    vout: vout as u32,
-                });
-            }
+            total_weight = total_weight.saturating_add(tx.weight() as u64);
         }
-
-        // Check total size
-        if total_vsize > MAX_PACKAGE_SIZE {
-            return Err(MempoolError::PackageTooLarge(total_vsize, MAX_PACKAGE_SIZE));
+        if txs.len() > 1 && total_weight > MAX_PACKAGE_WEIGHT {
+            return Err(MempoolError::PackageTooLarge(
+                total_weight as usize,
+                MAX_PACKAGE_WEIGHT as usize,
+            ));
+        }
+        if duplicate {
+            return Err(MempoolError::PackageDuplicateTx);
         }
 
         // Check topological order: for each transaction, all its parent txids
@@ -4894,22 +4890,55 @@ impl Mempool {
             seen_for_topo.insert(txid);
         }
 
-        // Check for conflicts within the package (double-spending same input)
+        // IsConsistentPackage: empty vin cannot be checked and is a conflict.
+        // Inputs of one tx are added together so an intra-tx duplicate is left
+        // to CheckTransaction (`bad-txns-inputs-duplicate`), not this gate.
         let mut spent_in_package = HashSet::new();
         for tx in txs {
+            if tx.inputs.is_empty() {
+                return Err(MempoolError::PackageConflict);
+            }
             for input in &tx.inputs {
-                // Skip if spending an output created within the package
-                if package_outputs.contains(&input.previous_output) {
-                    continue;
-                }
-                // Check for double-spend within package
-                if !spent_in_package.insert(input.previous_output.clone()) {
+                if spent_in_package.contains(&input.previous_output) {
                     return Err(MempoolError::PackageConflict);
                 }
+            }
+            for input in &tx.inputs {
+                spent_in_package.insert(input.previous_output.clone());
             }
         }
 
         Ok(())
+    }
+
+    /// Core `IsChildWithParentsTree` (`policy/packages.cpp`). Every tx except
+    /// the last is a parent of the last, and parents do not spend each other.
+    /// A single tx is not a tree; callers treat `len == 1` separately.
+    pub fn is_child_with_parents_tree(txs: &[Transaction]) -> bool {
+        if txs.len() < 2 {
+            return false;
+        }
+        let child = &txs[txs.len() - 1];
+        let parent_txids: HashSet<Hash256> =
+            txs.iter().take(txs.len() - 1).map(|tx| tx.txid()).collect();
+        let child_spends: HashSet<Hash256> = child
+            .inputs
+            .iter()
+            .map(|input| input.previous_output.txid)
+            .collect();
+        if txs
+            .iter()
+            .take(txs.len() - 1)
+            .any(|parent| !child_spends.contains(&parent.txid()))
+        {
+            return false;
+        }
+        txs.iter().take(txs.len() - 1).all(|parent| {
+            parent
+                .inputs
+                .iter()
+                .all(|input| !parent_txids.contains(&input.previous_output.txid))
+        })
     }
 
     /// Check if a package has the "child-with-parents" topology.
@@ -4989,14 +5018,23 @@ impl Mempool {
         F: Fn(&OutPoint) -> Option<CoinEntry>,
     {
         // Context-free package checks
-        if let Err(e) = self.check_package(&txs) {
-            return PackageAcceptResult::package_failure(e.to_string());
+        if txs.is_empty() {
+            return PackageAcceptResult::package_failure(
+                MempoolError::PackageInvalidTopology.reject_token(),
+            );
         }
 
-        // Check for child-with-parents topology
-        if !self.is_child_with_parents(&txs) {
+        if let Err(e) = self.check_package(&txs) {
+            // Core package_msg is the reject reason, not the Display string.
+            return PackageAcceptResult::package_failure(e.reject_token());
+        }
+
+        // Check for child-with-parents topology. submitpackage throws the RPC
+        // error for a non-tree before it gets here; this is AcceptPackage's
+        // `package-not-child-with-parents` for other callers.
+        if txs.len() > 1 && !Self::is_child_with_parents_tree(&txs) {
             return PackageAcceptResult::package_failure(
-                MempoolError::PackageInvalidTopology.to_string(),
+                MempoolError::PackageInvalidTopology.reject_token(),
             );
         }
 
