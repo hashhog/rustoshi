@@ -1445,6 +1445,10 @@ pub struct PackageTxResult {
     /// just this tx. Already-in-mempool entries leave both unset: Core's
     /// `MEMPOOL_ENTRY` result has `fees.base` only.
     pub effective_includes: Option<Vec<Hash256>>,
+    /// Mempool wtxid when this submission shares a txid with a different
+    /// witness already in the mempool (Core `DIFFERENT_WITNESS`). The RPC
+    /// emits it as `other-wtxid` and omits `vsize` / `fees` / `error`.
+    pub other_wtxid: Option<Hash256>,
 }
 
 /// Result of package acceptance.
@@ -4931,21 +4935,43 @@ impl Mempool {
         let _tx_map: HashMap<Hash256, &Transaction> =
             txs.iter().map(|tx| (tx.txid(), tx)).collect();
 
-        // First pass: check which transactions are already in mempool
+        // Exact wtxid already in the mempool vs same txid with a different
+        // witness. Core AcceptPackage: exists(wtxid) is MEMPOOL_ENTRY;
+        // exists(txid) is DIFFERENT_WITNESS and the submission is ignored.
         let mut already_in_mempool = HashSet::new();
+        let mut different_witness: HashMap<Hash256, Hash256> = HashMap::new();
         for tx in &txs {
             let txid = tx.txid();
-            if self.transactions.contains_key(&txid) {
-                already_in_mempool.insert(txid);
+            if let Some(entry) = self.transactions.get(&txid) {
+                let mem_wtxid = entry.tx.wtxid();
+                if mem_wtxid == tx.wtxid() {
+                    already_in_mempool.insert(txid);
+                } else {
+                    different_witness.insert(txid, mem_wtxid);
+                }
             }
         }
 
-        // If all transactions are already in mempool, return success
-        if already_in_mempool.len() == txs.len() {
+        // Nothing new to validate.
+        if already_in_mempool.len() + different_witness.len() == txs.len() {
             let tx_results: Vec<PackageTxResult> = txs
                 .iter()
                 .map(|tx| {
                     let txid = tx.txid();
+                    if let Some(other) = different_witness.get(&txid).copied() {
+                        return PackageTxResult {
+                            txid,
+                            wtxid: tx.wtxid(),
+                            vsize: 0,
+                            fee: 0,
+                            already_in_mempool: false,
+                            error: None,
+                            replaced_txids: Vec::new(),
+                            effective_fee_sat_per_kvb: None,
+                            effective_includes: None,
+                            other_wtxid: Some(other),
+                        };
+                    }
                     let entry = self.transactions.get(&txid).unwrap();
                     PackageTxResult {
                         txid,
@@ -4957,6 +4983,7 @@ impl Mempool {
                         replaced_txids: Vec::new(),
                         effective_fee_sat_per_kvb: None,
                         effective_includes: None,
+                        other_wtxid: None,
                     }
                 })
                 .collect();
@@ -4987,6 +5014,10 @@ impl Mempool {
         // Calculate fees for new transactions
         for tx in &txs {
             let txid = tx.txid();
+
+            if different_witness.contains_key(&txid) {
+                continue;
+            }
 
             if already_in_mempool.contains(&txid) {
                 // Use existing mempool entry data
@@ -5077,6 +5108,22 @@ impl Mempool {
             let vsize = tx.vsize();
             let fee = *tx_fees.get(&txid).unwrap_or(&0);
 
+            if let Some(other) = different_witness.get(&txid).copied() {
+                tx_results.push(PackageTxResult {
+                    txid,
+                    wtxid,
+                    vsize: 0,
+                    fee: 0,
+                    already_in_mempool: false,
+                    error: None,
+                    replaced_txids: Vec::new(),
+                    effective_fee_sat_per_kvb: None,
+                    effective_includes: None,
+                    other_wtxid: Some(other),
+                });
+                continue;
+            }
+
             if already_in_mempool.contains(&txid) {
                 tx_results.push(PackageTxResult {
                     txid,
@@ -5088,6 +5135,7 @@ impl Mempool {
                     replaced_txids: Vec::new(),
                     effective_fee_sat_per_kvb: None,
                     effective_includes: None,
+                    other_wtxid: None,
                 });
                 continue;
             }
@@ -5112,6 +5160,7 @@ impl Mempool {
                         replaced_txids: replaced,
                         effective_fee_sat_per_kvb: None,
                         effective_includes: None,
+                        other_wtxid: None,
                     });
                 }
                 Err(e) => {
@@ -5125,6 +5174,7 @@ impl Mempool {
                         replaced_txids: Vec::new(),
                         effective_fee_sat_per_kvb: None,
                         effective_includes: None,
+                        other_wtxid: None,
                     });
                     // Core AcceptPackage keeps txs that already passed alone
                     // and keeps walking. A parent admitted only because of the
@@ -5214,7 +5264,7 @@ impl Mempool {
     ) {
         let mut in_pkg = HashSet::new();
         for r in tx_results.iter() {
-            if r.already_in_mempool || r.error.is_some() {
+            if r.other_wtxid.is_some() || r.already_in_mempool || r.error.is_some() {
                 continue;
             }
             if self.individual_fee_reject_message(r.fee, r.vsize).is_some() {
@@ -5232,9 +5282,12 @@ impl Mempool {
                 if in_pkg.contains(&txid) {
                     continue;
                 }
-                let accepted = tx_results
-                    .iter()
-                    .any(|r| r.txid == txid && r.error.is_none() && !r.already_in_mempool);
+                let accepted = tx_results.iter().any(|r| {
+                    r.txid == txid
+                        && r.error.is_none()
+                        && !r.already_in_mempool
+                        && r.other_wtxid.is_none()
+                });
                 if !accepted {
                     continue;
                 }
@@ -5268,7 +5321,7 @@ impl Mempool {
             0
         };
         for r in tx_results.iter_mut() {
-            if in_pkg.contains(&r.txid) {
+            if in_pkg.contains(&r.txid) && r.other_wtxid.is_none() {
                 r.effective_fee_sat_per_kvb = Some(sat_kvb);
                 r.effective_includes = Some(wtxids.clone());
             }

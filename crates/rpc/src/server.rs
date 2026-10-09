@@ -12625,8 +12625,6 @@ impl RustoshiRpcServer for RpcServerImpl {
         maxfeerate: Option<serde_json::Value>,
         maxburnamount: Option<serde_json::Value>,
     ) -> RpcResult<SubmitPackageResult> {
-        use std::collections::HashMap;
-
         // Core rpc/mempool.cpp submitpackage, in Core's order:
         //   RPCHelpMan gate (-3 non-array) -> size outside [1, 25] is -8
         //   "Array must contain between 1 and 25 transactions." -> maxfeerate
@@ -12758,101 +12756,97 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
         let replaced_transactions: Vec<String> = replaced_set.into_iter().collect();
 
-        // Build the RPC response
-        let mut tx_results_map = HashMap::new();
+        // Build the RPC response in Core's pushKV order. tx-results is keyed
+        // by the submitted wtxid, in package order.
+        let mut tx_results_map = indexmap::IndexMap::new();
+        let mut maxfeerate_failed = false;
 
         for (i, tx_result) in result.tx_results.iter().enumerate() {
             let tx = &txs[i];
             let wtxid = tx.wtxid().to_hex();
 
-            // Check if fee rate exceeds maxfeerate
-            let fee_rate_sat_vb = if tx_result.vsize > 0 {
-                tx_result.fee as f64 / tx_result.vsize as f64
+            let rpc_result = if let Some(other) = tx_result.other_wtxid {
+                PackageTxResultRpc {
+                    txid: tx_result.txid.to_hex(),
+                    other_wtxid: Some(other.to_hex()),
+                    vsize: None,
+                    fees: None,
+                    error: None,
+                }
+            } else if let Some(err) = tx_result.error.clone() {
+                // INVALID: txid + error. No vsize, no fees.
+                PackageTxResultRpc {
+                    txid: tx_result.txid.to_hex(),
+                    other_wtxid: None,
+                    vsize: None,
+                    fees: None,
+                    error: Some(err),
+                }
             } else {
-                0.0
-            };
-
-            // Core INVALID results are txid + error only. The post-accept
-            // maxfeerate check is separate and still reports vsize/fees.
-            let validation_error = tx_result.error.clone();
-            let maxfeerate_reason = if validation_error.is_none()
-                && max_fee_rate_btc_kvb > 0.0
-                && fee_rate_sat_vb > max_fee_rate_sat_vb
-            {
-                Some(format!(
-                    "Fee rate too high: {:.8} BTC/kvB > {:.8} BTC/kvB (maxfeerate)",
-                    fee_rate_sat_vb * 1000.0 / (COIN as f64),
-                    max_fee_rate_btc_kvb
-                ))
-            } else {
-                None
-            };
-            let reject_reason = validation_error.clone().or(maxfeerate_reason);
-
-            let fees = if validation_error.is_some() {
-                None
-            } else if tx_result.already_in_mempool {
-                // MEMPOOL_ENTRY: base only. Package feerate at admission is unknown.
-                Some(PackageFees {
-                    base: BtcAmount::from_sats(tx_result.fee),
-                    effective_feerate: None,
-                    effective_includes: None,
-                })
-            } else {
-                let sat_kvb = tx_result.effective_fee_sat_per_kvb.unwrap_or_else(|| {
-                    if tx_result.vsize > 0 {
-                        tx_result.fee.saturating_mul(1000) / tx_result.vsize as u64
-                    } else {
-                        0
+                let fee_rate_sat_vb = if tx_result.vsize > 0 {
+                    tx_result.fee as f64 / tx_result.vsize as f64
+                } else {
+                    0.0
+                };
+                // Core PreChecks: modified feerate above client max is
+                // TX_MEMPOOL_POLICY "max feerate exceeded" (INVALID shape).
+                if max_fee_rate_btc_kvb > 0.0 && fee_rate_sat_vb > max_fee_rate_sat_vb {
+                    maxfeerate_failed = true;
+                    PackageTxResultRpc {
+                        txid: tx_result.txid.to_hex(),
+                        other_wtxid: None,
+                        vsize: None,
+                        fees: None,
+                        error: Some("max feerate exceeded".to_string()),
                     }
-                });
-                let includes = tx_result
-                    .effective_includes
-                    .clone()
-                    .unwrap_or_else(|| vec![tx_result.wtxid]);
-                Some(PackageFees {
-                    base: BtcAmount::from_sats(tx_result.fee),
-                    effective_feerate: Some(BtcAmount::from_sats(sat_kvb)),
-                    effective_includes: Some(includes.iter().map(|w| w.to_hex()).collect()),
-                })
-            };
-            let rpc_result = PackageTxResultRpc {
-                txid: tx_result.txid.to_hex(),
-                wtxid: wtxid.clone(),
-                vsize: if validation_error.is_some() {
-                    None
+                } else if tx_result.already_in_mempool {
+                    // MEMPOOL_ENTRY: vsize + fees.base. No effective-feerate.
+                    PackageTxResultRpc {
+                        txid: tx_result.txid.to_hex(),
+                        other_wtxid: None,
+                        vsize: Some(tx_result.vsize as u64),
+                        fees: Some(PackageFees {
+                            base: BtcAmount::from_sats(tx_result.fee),
+                            effective_feerate: None,
+                            effective_includes: None,
+                        }),
+                        error: None,
+                    }
                 } else {
-                    Some(tx_result.vsize as u64)
-                },
-                fees,
-                allowed: if reject_reason.is_none() {
-                    Some(true)
-                } else {
-                    Some(false)
-                },
-                error: validation_error,
-                reject_reason,
+                    let sat_kvb = tx_result.effective_fee_sat_per_kvb.unwrap_or_else(|| {
+                        if tx_result.vsize > 0 {
+                            tx_result.fee.saturating_mul(1000) / tx_result.vsize as u64
+                        } else {
+                            0
+                        }
+                    });
+                    let includes = tx_result
+                        .effective_includes
+                        .clone()
+                        .unwrap_or_else(|| vec![tx_result.wtxid]);
+                    PackageTxResultRpc {
+                        txid: tx_result.txid.to_hex(),
+                        other_wtxid: None,
+                        vsize: Some(tx_result.vsize as u64),
+                        fees: Some(PackageFees {
+                            base: BtcAmount::from_sats(tx_result.fee),
+                            effective_feerate: Some(BtcAmount::from_sats(sat_kvb)),
+                            effective_includes: Some(includes.iter().map(|w| w.to_hex()).collect()),
+                        }),
+                        error: None,
+                    }
+                }
             };
 
             tx_results_map.insert(wtxid, rpc_result);
         }
 
-        // Package fee rate: sat/vB * 1000 vB/kvB / COIN sat/BTC = BTC/kvB.
-        // Store as BtcAmount so the serialiser emits 8 decimal places.
-        // BtcAmount(sat/kvB) = sat/kvB / 1e8 BTC/kvB — same numeric value as BTC/kvB
-        // because BtcAmount(n).serialize() = n/1e8 and sat/kvB / 1e8 = BTC/kvB.
-        let package_feerate = if result.package_vsize > 0 {
-            let fee_sat_kvb = (result.package_fee as f64 / result.package_vsize as f64) * 1000.0;
-            Some(BtcAmount::from_sats(fee_sat_kvb.round() as u64))
-        } else {
-            None
-        };
-
-        // Build package message
         // Core package_msg for PCKG_TX is "transaction failed"
         // (AcceptPackage / rpc/mempool.cpp submitpackage). Other package-level
         // failures keep the historical "package-error:" prefix.
-        let package_msg = if result.package_error.as_deref() == Some("transaction failed") {
+        let package_msg = if result.package_error.as_deref() == Some("transaction failed")
+            || maxfeerate_failed
+        {
             "transaction failed".to_string()
         } else if let Some(ref err) = result.package_error {
             format!("package-error: {}", err)
@@ -12898,7 +12892,6 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         Ok(SubmitPackageResult {
-            package_feerate,
             package_msg,
             tx_results: tx_results_map,
             // FIX-73 (W120 BUG-5): populated above from per-tx
