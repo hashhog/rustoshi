@@ -1303,14 +1303,15 @@ mod tests {
             }
         }
 
-        // Both should be included
-        assert!(pos_tx1.is_some(), "tx1 should be in template");
-        assert!(pos_tx2.is_some(), "tx2 should be in template");
-
-        // Note: In our simplified implementation, we don't enforce strict topological
-        // order during selection. A more complete implementation would ensure
-        // parents come before children. For now, we just verify both are included.
-        // The actual block validation would catch ordering issues.
+        let pos_tx1 = pos_tx1.expect("tx1 should be in template");
+        let pos_tx2 = pos_tx2.expect("tx2 should be in template");
+        // tx2's fee is higher than tx1's, so ancestor-feerate selection pops the
+        // child first. The ancestor package must still be appended parents-first
+        // (Core BlockAssembler::addPackageTxs / addChunks).
+        assert!(
+            pos_tx1 < pos_tx2,
+            "parent tx1 must precede child tx2 in the template (got {pos_tx1} then {pos_tx2})"
+        );
     }
 
     #[test]

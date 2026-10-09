@@ -21243,6 +21243,115 @@ mod tests {
         );
     }
 
+    /// CPFP: the child feerate is higher than the parent's, so selection pops
+    /// the child first. The template must still list the parent first, and
+    /// BIP-22 `depends` (1-based, coinbase omitted) must name that index.
+    #[tokio::test]
+    async fn test_gbt_cpfp_child_depends_on_earlier_parent() {
+        use rustoshi_consensus::{mempool::AtmpOptions, CoinEntry};
+        use std::collections::HashMap as StdHashMap;
+
+        let (rpc, state, _peer_state, _tmp) = gbfp_fixture().await;
+
+        let p2pkh = {
+            let mut v = vec![0x76u8, 0xa9, 0x14];
+            v.extend_from_slice(&[0x42u8; 20]);
+            v.push(0x88);
+            v.push(0xac);
+            v
+        };
+        let coin = |value: u64| CoinEntry {
+            value,
+            script_pubkey: p2pkh.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let mk_tx = |prev: Hash256, vout: u32, out_value: u64| Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev, vout },
+                script_sig: vec![],
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: out_value,
+                script_pubkey: p2pkh.clone(),
+            }],
+            lock_time: 0,
+        };
+
+        let parent_prevout = OutPoint {
+            txid: Hash256([0xE2; 32]),
+            vout: 0,
+        };
+        let mut utxos: StdHashMap<OutPoint, CoinEntry> = StdHashMap::new();
+        utxos.insert(parent_prevout.clone(), coin(1_000_000));
+
+        let (parent_id, child_id) = {
+            let mut s = state.write().await;
+            let opts = AtmpOptions {
+                skip_script_checks: true,
+                ..Default::default()
+            };
+            // Low fee parent, high fee child (CPFP).
+            let parent_tx = mk_tx(Hash256([0xE2; 32]), 0, 999_000);
+            let parent_id = s
+                .mempool
+                .add_transaction_with_options(parent_tx, &|op| utxos.get(op).cloned(), opts.clone())
+                .expect("parent admitted");
+            utxos.insert(
+                OutPoint {
+                    txid: parent_id,
+                    vout: 0,
+                },
+                coin(999_000),
+            );
+            let child_tx = mk_tx(parent_id, 0, 900_000);
+            let child_id = s
+                .mempool
+                .add_transaction_with_options(child_tx, &|op| utxos.get(op).cloned(), opts)
+                .expect("child admitted");
+            (parent_id, child_id)
+        };
+
+        let result = rpc
+            .get_block_template(Some(serde_json::json!({"rules": ["segwit"]})))
+            .await
+            .expect("getblocktemplate must succeed");
+        let txs = result
+            .get("transactions")
+            .and_then(|v| v.as_array())
+            .expect("transactions array");
+
+        let find = |id: Hash256| -> (usize, &serde_json::Value) {
+            txs.iter()
+                .enumerate()
+                .find(|(_, t)| t.get("txid").and_then(|x| x.as_str()) == Some(id.to_hex().as_str()))
+                .map(|(i, t)| (i, t))
+                .expect("tx must be in template")
+        };
+        let (parent_pos, _) = find(parent_id);
+        let (child_pos, child_entry) = find(child_id);
+        assert!(
+            parent_pos < child_pos,
+            "CPFP parent must precede its higher-feerate child"
+        );
+        let parent_template_idx = (parent_pos + 1) as u64;
+        let child_depends: Vec<u64> = child_entry
+            .get("depends")
+            .and_then(|v| v.as_array())
+            .expect("child depends array")
+            .iter()
+            .map(|v| v.as_u64().expect("depends entry must be a number"))
+            .collect();
+        assert_eq!(
+            child_depends,
+            vec![parent_template_idx],
+            "BIP-22 depends is 1-based into transactions, coinbase omitted"
+        );
+    }
+
     // ── getblockfrompeer ──────────────────────────────────────────────────
     //
     // Thin port of Bitcoin Core's `getblockfrompeer` + `FetchBlock`. These
@@ -24996,6 +25105,272 @@ mod tests {
             rpc_state.mempool.get_cluster_id(&m),
             "M joined the P/CX cluster"
         );
+    }
+
+    /// Confirmed parent with `n` outputs and one in-mempool child per output.
+    /// `child_fees` is ascending. `op_return_len` pads every child (0 = none).
+    /// Disconnecting the parent's block is what `invalidateblock` does.
+    fn seed_parent_with_inpool_children(
+        n: usize,
+        child_fees: &[u64],
+        output_value: u64,
+        op_return_len: usize,
+    ) -> (
+        tempfile::TempDir,
+        RpcState,
+        Hash256,
+        Transaction,
+        Vec<Hash256>,
+    ) {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::block_store::CoinEntry as SCoin;
+        use rustoshi_storage::ChainDb;
+
+        assert_eq!(child_fees.len(), n);
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let store = BlockStore::new(&db);
+
+        let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xD1);
+        let (hash_a, _, work_a) = synth_append_with_work(&store, 1, hash_g, work_g, 0xD1);
+
+        let parent_fee = 500u64;
+        let u_value = output_value * n as u64 + parent_fee;
+        let u = OutPoint {
+            txid: Hash256::from_bytes([0x61; 32]),
+            vout: 0,
+        };
+        let u_coin = SCoin {
+            height: 1,
+            is_coinbase: false,
+            value: u_value,
+            script_pubkey: p2wsh_true_spk(),
+        };
+        store.put_utxo(&u, &u_coin).unwrap();
+
+        let parent = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: u.clone(),
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![vec![0x51]],
+            }],
+            outputs: (0..n)
+                .map(|_| TxOut {
+                    value: output_value,
+                    script_pubkey: p2wsh_true_spk(),
+                })
+                .collect(),
+            lock_time: 0,
+        };
+        let (_hash_b, _) = synth_append_with_txs(
+            &store,
+            2,
+            hash_a,
+            work_a,
+            0xD1,
+            vec![parent.clone()],
+            vec![(u, u_coin)],
+        );
+        rpc_state.best_hash = _hash_b;
+        rpc_state.best_height = 2;
+
+        let mut op_return = Vec::new();
+        if op_return_len > 0 {
+            op_return.push(0x6a);
+            op_return.push(0x4d);
+            op_return.extend_from_slice(&(op_return_len as u16).to_le_bytes());
+            op_return.resize(op_return.len() + op_return_len, 0x11);
+        }
+
+        let parent_txid = parent.txid();
+        let mut child_ids = Vec::with_capacity(n);
+        {
+            let mtp = compute_prev_block_mtp(&store, &_hash_b).unwrap_or(0) as i64;
+            rpc_state.mempool.notify_new_tip(2, mtp);
+            let view = store.utxo_view();
+            let lookup = |op: &OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
+                use rustoshi_consensus::validation::UtxoView;
+                view.get_utxo(op)
+            };
+            for (i, fee) in child_fees.iter().copied().enumerate() {
+                assert!(output_value > fee, "child output would underflow");
+                let mut outputs = vec![TxOut {
+                    value: output_value - fee,
+                    script_pubkey: p2wsh_true_spk(),
+                }];
+                if op_return_len > 0 {
+                    outputs.push(TxOut {
+                        value: 0,
+                        script_pubkey: op_return.clone(),
+                    });
+                }
+                let child = Transaction {
+                    version: 2,
+                    inputs: vec![TxIn {
+                        previous_output: OutPoint {
+                            txid: parent_txid,
+                            vout: i as u32,
+                        },
+                        script_sig: vec![],
+                        sequence: 0xFFFF_FFFF,
+                        witness: vec![vec![0x51]],
+                    }],
+                    outputs,
+                    lock_time: 0,
+                };
+                let id = rpc_state
+                    .mempool
+                    .add_transaction(child, &lookup)
+                    .unwrap_or_else(|e| panic!("child {i} fee {fee} admitted: {e}"));
+                child_ids.push(id);
+            }
+        }
+        assert_eq!(
+            rpc_state.mempool.size(),
+            n,
+            "every child is in the pool before disconnect"
+        );
+        (tmp, rpc_state, hash_a, parent, child_ids)
+    }
+
+    fn cluster_count_and_weight(
+        pool: &rustoshi_consensus::mempool::Mempool,
+        txid: &Hash256,
+    ) -> (usize, u64) {
+        let id = pool.get_cluster_id(txid).expect("txid in a cluster");
+        let cluster = pool.get_cluster(id).expect("cluster");
+        let weight = cluster
+            .txids
+            .iter()
+            .map(|t| pool.get(t).expect("member").sigop_adjusted_weight)
+            .sum();
+        (cluster.size(), weight)
+    }
+
+    /// Parent re-enters with 64 in-pool children (65 txs). Core
+    /// `TxGraphImpl::Trim` (`txgraph.cpp`, called from
+    /// `CTxMemPool::UpdateTransactionsFromBlock`) keeps 64 and drops the
+    /// lowest-chunk-feerate tx, which here is the lowest-fee child.
+    #[tokio::test]
+    async fn disconnect_trims_cluster_of_64_children() {
+        use rustoshi_consensus::mempool::{MAX_CLUSTER_SIZE, MAX_CLUSTER_SIZE_WEIGHT};
+
+        let n = 64usize;
+        let fees: Vec<u64> = (0..n).map(|i| 2_000 + (i as u64) * 100).collect();
+        let lowest = fees[0];
+        let (_tmp, mut rpc_state, hash_a, parent, child_ids) =
+            seed_parent_with_inpool_children(n, &fees, 50_000, 0);
+        let parent_id = parent.txid();
+        // Fees ascend with index, so child 0 is the lowest feerate.
+        let lowest_id = child_ids[0];
+        for id in &child_ids {
+            let e = rpc_state.mempool.get(id).unwrap();
+            assert_eq!(e.fee == lowest, *id == lowest_id);
+        }
+
+        disconnect_to(&mut rpc_state, hash_a, 1).expect("disconnect_to");
+
+        assert!(
+            rpc_state.mempool.get(&parent_id).is_some(),
+            "parent re-entered"
+        );
+        assert!(
+            rpc_state.mempool.get(&lowest_id).is_none(),
+            "lowest-feerate child must be trimmed"
+        );
+        let mut kept = 0usize;
+        for id in child_ids.iter().skip(1) {
+            assert!(
+                rpc_state.mempool.get(id).is_some(),
+                "higher-feerate child kept"
+            );
+            kept += 1;
+        }
+        assert_eq!(kept, 63);
+        let (count, weight) = cluster_count_and_weight(&rpc_state.mempool, &parent_id);
+        assert_eq!(count, MAX_CLUSTER_SIZE, "trimmed cluster is exactly 64 txs");
+        assert!(weight <= MAX_CLUSTER_SIZE_WEIGHT);
+        assert_eq!(rpc_state.mempool.size(), MAX_CLUSTER_SIZE);
+    }
+
+    /// 63 children + the re-added parent is exactly the cluster count limit.
+    /// Nothing is trimmed (Core compares with `>`).
+    #[tokio::test]
+    async fn disconnect_keeps_cluster_of_63_children() {
+        use rustoshi_consensus::mempool::MAX_CLUSTER_SIZE;
+
+        let n = 63usize;
+        let fees: Vec<u64> = (0..n).map(|i| 2_000 + (i as u64) * 100).collect();
+        let (_tmp, mut rpc_state, hash_a, parent, child_ids) =
+            seed_parent_with_inpool_children(n, &fees, 50_000, 0);
+        let parent_id = parent.txid();
+
+        disconnect_to(&mut rpc_state, hash_a, 1).expect("disconnect_to");
+
+        assert!(rpc_state.mempool.get(&parent_id).is_some());
+        for id in &child_ids {
+            assert!(
+                rpc_state.mempool.get(id).is_some(),
+                "63-child cluster is within the limit"
+            );
+        }
+        let (count, _) = cluster_count_and_weight(&rpc_state.mempool, &parent_id);
+        assert_eq!(count, MAX_CLUSTER_SIZE);
+        assert_eq!(rpc_state.mempool.size(), n + 1);
+    }
+
+    /// Count stays under 64, but parent + children exceed 404_000 WU.
+    /// Trim drops the lowest-feerate child; the other two stay with the parent.
+    #[tokio::test]
+    async fn disconnect_trims_cluster_over_weight_limit() {
+        use rustoshi_consensus::mempool::MAX_CLUSTER_SIZE_WEIGHT;
+
+        // ~35_000-byte OP_RETURN → ~140_000 WU per child. Three of them plus
+        // the parent exceed 404_000 WU; two plus the parent do not.
+        let op_return_len = 34_875usize;
+        let fees = [10_000u64, 20_000, 30_000];
+        let (_tmp, mut rpc_state, hash_a, parent, child_ids) =
+            seed_parent_with_inpool_children(3, &fees, 100_000, op_return_len);
+        let parent_id = parent.txid();
+        let child_weight: u64 = child_ids
+            .iter()
+            .map(|id| rpc_state.mempool.get(id).unwrap().sigop_adjusted_weight)
+            .sum();
+        let combined = parent.weight() as u64 + child_weight;
+        assert!(
+            combined > MAX_CLUSTER_SIZE_WEIGHT,
+            "fixture must exceed the weight limit before trim (combined {combined})"
+        );
+        let two_heaviest: u64 = child_ids
+            .iter()
+            .skip(1)
+            .map(|id| rpc_state.mempool.get(id).unwrap().sigop_adjusted_weight)
+            .sum();
+        assert!(
+            parent.weight() as u64 + two_heaviest <= MAX_CLUSTER_SIZE_WEIGHT,
+            "dropping only the lowest-feerate child must fit"
+        );
+        assert!(3 + 1 < 64, "count limit is not what binds");
+
+        disconnect_to(&mut rpc_state, hash_a, 1).expect("disconnect_to");
+
+        assert!(
+            rpc_state.mempool.get(&parent_id).is_some(),
+            "parent re-entered"
+        );
+        assert!(
+            rpc_state.mempool.get(&child_ids[0]).is_none(),
+            "lowest-feerate child dropped for cluster weight"
+        );
+        assert!(rpc_state.mempool.get(&child_ids[1]).is_some());
+        assert!(rpc_state.mempool.get(&child_ids[2]).is_some());
+        let (count, weight) = cluster_count_and_weight(&rpc_state.mempool, &parent_id);
+        assert_eq!(count, 3);
+        assert!(weight <= MAX_CLUSTER_SIZE_WEIGHT, "cluster weight {weight}");
+        assert_eq!(rpc_state.mempool.size(), 3);
     }
 
     /// Regression: reconsiderblock re-activates the reconsidered branch
