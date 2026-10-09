@@ -327,3 +327,187 @@ fn submitpackage_valid_cpfp_1p1c_still_accepted() {
     assert!(mp.contains(&parent_txid) && mp.contains(&child_txid));
     assert!(res.tx_results.iter().all(|r| r.error.is_none()));
 }
+
+/// Core `rpc_packages.py` `test_submitpackage`: a non-standard child
+/// (`version` out of range) does not undo a parent that was valid on its own.
+/// `package_msg` is `transaction failed`, the child error is `version`, and
+/// the parent stays in the mempool so `submitpackage` can relay it.
+#[test]
+fn submitpackage_bad_version_child_keeps_individually_valid_parent() {
+    let f = fixture();
+    let lookup = |op: &OutPoint| f.utxos.get(op).cloned();
+    let mut mp = production_pool();
+
+    let parent = signed_spend(f.prev.clone(), IN_VALUE, 10_000, &f.alice, &f.bob, false);
+    let parent_txid = parent.txid();
+    let mut child = signed_spend(
+        OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        },
+        IN_VALUE - 10_000,
+        10_000,
+        &f.bob,
+        &f.bob,
+        false,
+    );
+    // Core IsStandardTx: nVersion outside [1, 3] → "version" (policy.cpp).
+    child.version = 0x7fff_ffff;
+    let child_txid = child.txid();
+
+    let res = mp.accept_package(vec![parent, child], &lookup);
+    assert_eq!(res.package_error.as_deref(), Some("transaction failed"));
+    assert!(
+        mp.contains(&parent_txid),
+        "individually valid parent stays so submitpackage can relay it"
+    );
+    assert!(!mp.contains(&child_txid));
+    let parent_res = res.tx_results.iter().find(|r| r.txid == parent_txid).unwrap();
+    assert!(parent_res.error.is_none(), "parent error {:?}", parent_res.error);
+    let child_err = res
+        .tx_results
+        .iter()
+        .find(|r| r.txid == child_txid)
+        .and_then(|r| r.error.clone())
+        .unwrap_or_default();
+    assert_eq!(child_err, "version");
+}
+
+/// CPFP parent (below the relay floor) plus a bad-signature child.
+/// Core runs PolicyScriptChecks on the subpackage before SubmitPackage, so
+/// neither tx is inserted. The parent's result is its individual fee failure.
+#[test]
+fn submitpackage_cpfp_bad_signature_child_inserts_neither() {
+    let f = fixture();
+    let lookup = |op: &OutPoint| f.utxos.get(op).cloned();
+    let mut mp = production_pool();
+
+    let parent = signed_spend(f.prev.clone(), IN_VALUE, 1, &f.alice, &f.bob, false);
+    let parent_txid = parent.txid();
+    let child = signed_spend(
+        OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        },
+        IN_VALUE - 1,
+        20_000,
+        &f.bob,
+        &f.bob,
+        true,
+    );
+    let child_txid = child.txid();
+    let expected = core_script_error(&child, &parent_txid);
+
+    let res = mp.accept_package(vec![parent, child], &lookup);
+    assert_eq!(res.package_error.as_deref(), Some("transaction failed"));
+    assert!(
+        !mp.contains(&parent_txid) && !mp.contains(&child_txid),
+        "script failure aborts SubmitPackage; the below-min-fee parent must not stay"
+    );
+    let parent_err = res
+        .tx_results
+        .iter()
+        .find(|r| r.txid == parent_txid)
+        .and_then(|r| r.error.clone())
+        .unwrap_or_default();
+    assert!(
+        parent_err.starts_with("min relay fee not met"),
+        "parent individual failure, got {parent_err}"
+    );
+    let child_err = res
+        .tx_results
+        .iter()
+        .find(|r| r.txid == child_txid)
+        .and_then(|r| r.error.clone())
+        .unwrap_or_default();
+    assert_eq!(child_err, expected);
+}
+
+/// A package member that is already in the mempool is `MEMPOOL_ENTRY`:
+/// no error, `already_in_mempool`, and no package effective-feerate
+/// (Core omits `effective-feerate` / `effective-includes` for that result).
+#[test]
+fn submitpackage_already_in_mempool_member_is_success_without_package_feerate() {
+    let f = fixture();
+    let lookup = |op: &OutPoint| f.utxos.get(op).cloned();
+    let mut mp = production_pool();
+
+    let parent = signed_spend(f.prev.clone(), IN_VALUE, 10_000, &f.alice, &f.bob, false);
+    let parent_txid = parent.txid();
+    let child = signed_spend(
+        OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        },
+        IN_VALUE - 10_000,
+        10_000,
+        &f.bob,
+        &f.bob,
+        false,
+    );
+    let child_txid = child.txid();
+
+    let first = mp.accept_package(vec![parent.clone()], &lookup);
+    assert!(first.all_accepted(), "{:?}", first.package_error);
+    assert!(mp.contains(&parent_txid));
+
+    let res = mp.accept_package(vec![parent, child], &lookup);
+    assert!(res.all_accepted(), "{:?}", res.package_error);
+    assert!(mp.contains(&parent_txid) && mp.contains(&child_txid));
+    let parent_res = res.tx_results.iter().find(|r| r.txid == parent_txid).unwrap();
+    assert!(parent_res.already_in_mempool);
+    assert!(parent_res.error.is_none());
+    assert!(parent_res.effective_fee_sat_per_kvb.is_none());
+    assert!(parent_res.effective_includes.is_none());
+    let child_res = res.tx_results.iter().find(|r| r.txid == child_txid).unwrap();
+    assert!(!child_res.already_in_mempool);
+    assert!(child_res.error.is_none());
+    // Accepted on its own: effective-includes is just the child.
+    assert!(
+        child_res.effective_includes.is_none()
+            || child_res.effective_includes.as_ref().unwrap().len() == 1
+    );
+}
+
+/// Valid CPFP: both txs were package-evaluated, so both carry the package
+/// feerate and the same `effective-includes` list (parent wtxid, child wtxid).
+#[test]
+fn submitpackage_valid_cpfp_reports_package_effective_feerate() {
+    let f = fixture();
+    let lookup = |op: &OutPoint| f.utxos.get(op).cloned();
+    let mut mp = production_pool();
+
+    let parent = signed_spend(f.prev.clone(), IN_VALUE, 1, &f.alice, &f.bob, false);
+    let parent_txid = parent.txid();
+    let parent_wtxid = parent.wtxid();
+    let child = signed_spend(
+        OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        },
+        IN_VALUE - 1,
+        20_000,
+        &f.bob,
+        &f.bob,
+        false,
+    );
+    let child_txid = child.txid();
+    let child_wtxid = child.wtxid();
+
+    let res = mp.accept_package(vec![parent, child], &lookup);
+    assert!(res.all_accepted(), "{:?}", res.package_error);
+    let parent_res = res.tx_results.iter().find(|r| r.txid == parent_txid).unwrap();
+    let child_res = res.tx_results.iter().find(|r| r.txid == child_txid).unwrap();
+    let vsize = parent_res.vsize + child_res.vsize;
+    let sat_kvb = (parent_res.fee + child_res.fee).saturating_mul(1000) / vsize as u64;
+    assert_eq!(parent_res.effective_fee_sat_per_kvb, Some(sat_kvb));
+    assert_eq!(child_res.effective_fee_sat_per_kvb, Some(sat_kvb));
+    assert_eq!(
+        parent_res.effective_includes.as_deref(),
+        Some([parent_wtxid, child_wtxid].as_slice())
+    );
+    assert_eq!(
+        child_res.effective_includes.as_deref(),
+        Some([parent_wtxid, child_wtxid].as_slice())
+    );
+}

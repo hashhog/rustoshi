@@ -240,6 +240,12 @@ def sats_of(amount) -> int:
     return int((Decimal(str(amount)) * Decimal(100_000_000)).to_integral_value())
 
 
+def with_version(raw_hex: str, version: int) -> str:
+    raw = bytearray.fromhex(raw_hex)
+    raw[0:4] = (version & 0xFFFFFFFF).to_bytes(4, "little")
+    return raw.hex()
+
+
 def corrupt_witness_sig(raw_hex: str, sig_hex: str) -> str:
     """Flip the low bit of the last byte of DER r. Stays strict-DER so
     CHECKSIG fails and NULLFAIL fires (Core SCRIPT_ERR_SIG_NULLFAIL)."""
@@ -448,9 +454,9 @@ def main() -> int:
 
     utxos = core.cli_json("-rpcwallet=sweep", "listunspent", "100", "9999999")
     utxos = [u for u in utxos if u.get("spendable")]
-    if len(utxos) < 3:
-        die(f"need 3 mature coinbases, have {len(utxos)}")
-    utxos = utxos[:3]
+    if len(utxos) < 5:
+        die(f"need 5 mature coinbases, have {len(utxos)}")
+    utxos = utxos[:5]
     for u in utxos:
         log(f"utxo {u['txid']}:{u['vout']} {u['amount']} conf={u['confirmations']}")
 
@@ -535,6 +541,21 @@ def main() -> int:
                         "justified": None,
                     }
                 )
+            if c_in and r_in:
+                c_entry = core.rpc("getmempoolentry", [txid])
+                r_entry = rust.rpc("getmempoolentry", [txid])
+                c_unb = c_entry.get("unbroadcast") if isinstance(c_entry, dict) else None
+                r_unb = r_entry.get("unbroadcast") if isinstance(r_entry, dict) else None
+                log(f"  {label} unbroadcast core={c_unb} rustoshi={r_unb}")
+                if c_unb != r_unb:
+                    mismatches.append(
+                        {
+                            "field": f"unbroadcast_{label}",
+                            "core": c_unb,
+                            "rustoshi": r_unb,
+                            "justified": None,
+                        }
+                    )
         added_c = sorted(set(after_c) - before_c)
         added_r = sorted(set(after_r) - before_r)
         if added_c != added_r:
@@ -571,6 +592,14 @@ def main() -> int:
         core, parent["txid"], 0, parent["out_sats"], parent["spk"], 20_000, dest
     )
     run_case("valid-cpfp", parent["hex"], child["hex"], parent["txid"], child["txid"])
+    # Same package again: both members are already in the mempool (MEMPOOL_ENTRY).
+    run_case(
+        "already-in-mempool",
+        parent["hex"],
+        child["hex"],
+        parent["txid"],
+        child["txid"],
+    )
 
     # 2. Invalid-signature child. Parent fee 10_000 sat so it is individually valid.
     u = utxos[1]
@@ -608,6 +637,42 @@ def main() -> int:
         child["hex"],
         bad_parent["txid"],
         child["txid"],
+    )
+
+    # 4. CPFP parent + invalid-signature child. Core submits nothing.
+    u = utxos[3]
+    parent = make_signed(
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 1, dest
+    )
+    child = make_signed(
+        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 20_000, dest
+    )
+    bad_child_hex = corrupt_witness_sig(child["hex"], child["witness"][0])
+    bad_child = core.cli_json("decoderawtransaction", bad_child_hex)
+    run_case(
+        "cpfp-invalid-sig-child",
+        parent["hex"],
+        bad_child_hex,
+        parent["txid"],
+        bad_child["txid"],
+    )
+
+    # 5. Non-standard child version. Parent pays its own fee and is relayed.
+    u = utxos[4]
+    parent = make_signed(
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest
+    )
+    child = make_signed(
+        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 10_000, dest
+    )
+    bad_ver_hex = with_version(child["hex"], 0xFFFFFFFF)
+    bad_ver = core.cli_json("decoderawtransaction", bad_ver_hex)
+    run_case(
+        "bad-version-child",
+        parent["hex"],
+        bad_ver_hex,
+        parent["txid"],
+        bad_ver["txid"],
     )
 
     # invalidateblock / reconsiderblock of the current tip.

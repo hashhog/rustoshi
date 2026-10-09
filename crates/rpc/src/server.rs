@@ -12765,13 +12765,6 @@ impl RustoshiRpcServer for RpcServerImpl {
             let tx = &txs[i];
             let wtxid = tx.wtxid().to_hex();
 
-            // Calculate effective fee rate
-            let effective_feerate = if tx_result.vsize > 0 {
-                (tx_result.fee as f64 / tx_result.vsize as f64) * 1000.0 / (COIN as f64)
-            } else {
-                0.0
-            };
-
             // Check if fee rate exceeds maxfeerate
             let fee_rate_sat_vb = if tx_result.vsize > 0 {
                 tx_result.fee as f64 / tx_result.vsize as f64
@@ -12779,9 +12772,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                 0.0
             };
 
-            let reject_reason = if let Some(ref err) = tx_result.error {
-                Some(err.clone())
-            } else if max_fee_rate_btc_kvb > 0.0 && fee_rate_sat_vb > max_fee_rate_sat_vb {
+            // Core INVALID results are txid + error only. The post-accept
+            // maxfeerate check is separate and still reports vsize/fees.
+            let validation_error = tx_result.error.clone();
+            let maxfeerate_reason = if validation_error.is_none()
+                && max_fee_rate_btc_kvb > 0.0
+                && fee_rate_sat_vb > max_fee_rate_sat_vb
+            {
                 Some(format!(
                     "Fee rate too high: {:.8} BTC/kvB > {:.8} BTC/kvB (maxfeerate)",
                     fee_rate_sat_vb * 1000.0 / (COIN as f64),
@@ -12790,32 +12787,50 @@ impl RustoshiRpcServer for RpcServerImpl {
             } else {
                 None
             };
+            let reject_reason = validation_error.clone().or(maxfeerate_reason);
 
-            let rejected = reject_reason.is_some();
+            let fees = if validation_error.is_some() {
+                None
+            } else if tx_result.already_in_mempool {
+                // MEMPOOL_ENTRY: base only. Package feerate at admission is unknown.
+                Some(PackageFees {
+                    base: BtcAmount::from_sats(tx_result.fee),
+                    effective_feerate: None,
+                    effective_includes: None,
+                })
+            } else {
+                let sat_kvb = tx_result.effective_fee_sat_per_kvb.unwrap_or_else(|| {
+                    if tx_result.vsize > 0 {
+                        tx_result.fee.saturating_mul(1000) / tx_result.vsize as u64
+                    } else {
+                        0
+                    }
+                });
+                let includes = tx_result
+                    .effective_includes
+                    .clone()
+                    .unwrap_or_else(|| vec![tx_result.wtxid]);
+                Some(PackageFees {
+                    base: BtcAmount::from_sats(tx_result.fee),
+                    effective_feerate: Some(BtcAmount::from_sats(sat_kvb)),
+                    effective_includes: Some(includes.iter().map(|w| w.to_hex()).collect()),
+                })
+            };
             let rpc_result = PackageTxResultRpc {
                 txid: tx_result.txid.to_hex(),
                 wtxid: wtxid.clone(),
-                vsize: if rejected {
+                vsize: if validation_error.is_some() {
                     None
                 } else {
                     Some(tx_result.vsize as u64)
                 },
-                fees: if rejected {
-                    None
+                fees,
+                allowed: if reject_reason.is_none() {
+                    Some(true)
                 } else {
-                    Some(PackageFees {
-                        // base: absolute fee in BTC.
-                        base: BtcAmount::from_sats(tx_result.fee),
-                        // effective_feerate: BTC/kvB value; store as BtcAmount for 8-decimal output.
-                        // effective_feerate (BTC/kvB) * 1e8 sat/BTC = sat/kvB, stored as BtcAmount.
-                        effective_feerate: BtcAmount::from_sats(
-                            (effective_feerate * COIN as f64).round() as u64
-                        ),
-                        effective_includes: vec![tx_result.wtxid.to_hex()],
-                    })
+                    Some(false)
                 },
-                allowed: if rejected { Some(false) } else { Some(true) },
-                error: reject_reason.clone(),
+                error: validation_error,
                 reject_reason,
             };
 

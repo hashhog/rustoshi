@@ -708,13 +708,16 @@ fn test_g13_per_tx_result_map_populated() {
 }
 
 // ============================================================
-// G14: Atomic: all-or-nothing semantics
+// G14: Individually accepted parents stay when a later member fails
 // ============================================================
 
-/// G14 — if one tx in a package fails, all previously-added txs are rolled back.
-/// Status: PARTIAL — rollback is attempted via remove_transaction; but see BUG note.
+/// G14 — Core AcceptPackage keeps a parent that was valid on its own when a
+/// later member fails (`rpc/mempool.cpp` submitpackage: "If any transaction
+/// passes, it will be accepted to mempool"). A below-min-fee parent is not
+/// kept: that admission only exists for package feerate, and Core does not
+/// call SubmitPackage once a member fails.
 #[test]
-fn test_g14_package_atomic_rollback_on_failure() {
+fn test_g14_individually_valid_parent_stays_when_child_fails() {
     let mut mp = test_mempool();
 
     // Set up UTXO for parent only (child will have missing input)
@@ -755,23 +758,18 @@ fn test_g14_package_atomic_rollback_on_failure() {
         &|op| utxos.get(op).cloned(),
     );
 
-    // Package should fail
-    let success = result.all_accepted();
-
-    if !success {
-        // Verify rollback: parent must NOT be in mempool after failure
-        assert!(
-            mp.get(&parent_txid).is_none(),
-            "atomicity: parent must be rolled back when child fails (all-or-nothing)"
-        );
-    } else {
-        // If accepted (possible if invalid input is treated as missing and not fatal),
-        // at least verify parent is in mempool
-        assert!(
-            mp.get(&parent_txid).is_some(),
-            "if package accepted, parent must be in mempool"
-        );
-    }
+    assert!(!result.all_accepted(), "child spends a missing input");
+    assert!(
+        mp.get(&parent_txid).is_some(),
+        "parent pays its own fee and stays (Core AcceptPackage)"
+    );
+    let child_err = result
+        .tx_results
+        .iter()
+        .find(|r| r.txid != parent_txid)
+        .and_then(|r| r.error.clone())
+        .unwrap_or_default();
+    assert_eq!(child_err, "bad-txns-inputs-missingorspent");
 }
 
 // ============================================================

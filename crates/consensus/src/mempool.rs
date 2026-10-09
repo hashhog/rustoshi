@@ -1437,6 +1437,14 @@ pub struct PackageTxResult {
     /// (`validation.h:146`). Populated for txs admitted via RBF/TRUC; empty
     /// for non-replacement admissions and for `already_in_mempool` entries.
     pub replaced_txids: Vec<Hash256>,
+    /// Sat/kvB for `fees.effective-feerate` when this tx was accepted under
+    /// package feerate (Core `m_package_feerates`, `CFeeRate::GetFeePerK`).
+    /// `None` means the tx's own `fee * 1000 / vsize`.
+    pub effective_fee_sat_per_kvb: Option<u64>,
+    /// Wtxids for `fees.effective-includes`, in package order. `None` means
+    /// just this tx. Already-in-mempool entries leave both unset: Core's
+    /// `MEMPOOL_ENTRY` result has `fees.base` only.
+    pub effective_includes: Option<Vec<Hash256>>,
 }
 
 /// Result of package acceptance.
@@ -4947,6 +4955,8 @@ impl Mempool {
                         already_in_mempool: true,
                         error: None,
                         replaced_txids: Vec::new(),
+                        effective_fee_sat_per_kvb: None,
+                        effective_includes: None,
                     }
                 })
                 .collect();
@@ -5060,9 +5070,8 @@ impl Mempool {
         let mut tx_results = Vec::new();
         let mut added_txids = Vec::new();
         let mut failed = false;
-        let mut saw_script_failure = false;
 
-        for (idx, tx) in txs.iter().enumerate() {
+        for tx in txs.iter() {
             let txid = tx.txid();
             let wtxid = tx.wtxid();
             let vsize = tx.vsize();
@@ -5077,6 +5086,8 @@ impl Mempool {
                     already_in_mempool: true,
                     error: None,
                     replaced_txids: Vec::new(),
+                    effective_fee_sat_per_kvb: None,
+                    effective_includes: None,
                 });
                 continue;
             }
@@ -5099,14 +5110,11 @@ impl Mempool {
                         already_in_mempool: false,
                         error: None,
                         replaced_txids: replaced,
+                        effective_fee_sat_per_kvb: None,
+                        effective_includes: None,
                     });
                 }
                 Err(e) => {
-                    let script_failure = matches!(
-                        e,
-                        MempoolError::PolicyScriptCheckFailed(_, _)
-                            | MempoolError::ConsensusScriptCheckFailed(_, _)
-                    );
                     tx_results.push(PackageTxResult {
                         txid,
                         wtxid,
@@ -5115,41 +5123,21 @@ impl Mempool {
                         already_in_mempool: false,
                         error: Some(submitpackage_member_error(&e)),
                         replaced_txids: Vec::new(),
+                        effective_fee_sat_per_kvb: None,
+                        effective_includes: None,
                     });
-                    // Script failure is not reconsiderable (Core AcceptPackage).
-                    // A parent already admitted stays. Keep walking so a child
-                    // of the bad parent reports bad-txns-inputs-missingorspent.
-                    // Any other failure rolls the package back (test_g14).
-                    if script_failure {
-                        saw_script_failure = true;
-                    } else if !saw_script_failure {
-                        for added_txid in &added_txids {
-                            self.remove_transaction(added_txid, false);
-                        }
-                        for r in tx_results.iter_mut() {
-                            if added_txids.contains(&r.txid) {
-                                r.error = Some("transaction failed".to_string());
-                                r.replaced_txids.clear();
-                            }
-                        }
-                        for rest in txs.iter().skip(idx + 1) {
-                            let rest_txid = rest.txid();
-                            tx_results.push(PackageTxResult {
-                                txid: rest_txid,
-                                wtxid: rest.wtxid(),
-                                vsize: rest.vsize(),
-                                fee: *tx_fees.get(&rest_txid).unwrap_or(&0),
-                                already_in_mempool: false,
-                                error: Some("package-not-validated".to_string()),
-                                replaced_txids: Vec::new(),
-                            });
-                        }
-                        failed = true;
-                        break;
-                    }
+                    // Core AcceptPackage keeps txs that already passed alone
+                    // and keeps walking. A parent admitted only because of the
+                    // package feerate is not submitted when a later member
+                    // fails (SubmitPackage runs after every script check).
+                    self.rollback_package_only_admissions(&mut tx_results, &mut added_txids);
                     failed = true;
                 }
             }
+        }
+
+        if !failed {
+            self.stamp_package_effective_feerate(&txs, &mut tx_results);
         }
 
         if failed {
@@ -5165,6 +5153,126 @@ impl Mempool {
         }
 
         PackageAcceptResult::success(tx_results, package_fee, package_vsize)
+    }
+
+    /// Core `CheckFeeRate` for a tx evaluated by itself (validation.cpp:706).
+    /// `Some` is `TxValidationState::ToString()` (`reject_reason, debug`).
+    /// `None` means both the rolling mempool floor and the static relay floor pass.
+    fn individual_fee_reject_message(&mut self, fee: u64, vsize: usize) -> Option<String> {
+        if vsize == 0 {
+            return Some(format!("min relay fee not met, {fee} < 0"));
+        }
+        let tx_fee_rate_kvb = ((fee as f64 / vsize as f64) * 1000.0).floor() as u64;
+        let mempool_min_fee_kvb = self.get_min_fee();
+        if mempool_min_fee_kvb > 0 && tx_fee_rate_kvb < mempool_min_fee_kvb {
+            let required = (mempool_min_fee_kvb.saturating_mul(vsize as u64) + 999) / 1000;
+            return Some(format!("mempool min fee not met, {fee} < {required}"));
+        }
+        if tx_fee_rate_kvb < self.config.min_fee_rate {
+            let required = (self.config.min_fee_rate.saturating_mul(vsize as u64) + 999) / 1000;
+            return Some(format!("min relay fee not met, {fee} < {required}"));
+        }
+        None
+    }
+
+    /// Drop admissions that exist only because package feerate bypassed
+    /// `CheckFeeRate`. Individually valid admissions stay.
+    fn rollback_package_only_admissions(
+        &mut self,
+        tx_results: &mut [PackageTxResult],
+        added_txids: &mut Vec<Hash256>,
+    ) {
+        let mut keep = Vec::new();
+        for txid in added_txids.drain(..) {
+            let Some((fee, vsize)) = tx_results
+                .iter()
+                .find(|r| r.txid == txid)
+                .map(|r| (r.fee, r.vsize))
+            else {
+                continue;
+            };
+            if let Some(msg) = self.individual_fee_reject_message(fee, vsize) {
+                self.remove_transaction(&txid, false);
+                if let Some(r) = tx_results.iter_mut().find(|r| r.txid == txid) {
+                    r.error = Some(msg);
+                    r.replaced_txids.clear();
+                }
+            } else {
+                keep.push(txid);
+            }
+        }
+        *added_txids = keep;
+    }
+
+    /// Core `m_package_feerates`: txs that failed alone for fee or missing
+    /// inputs and were then accepted together share one feerate and one
+    /// `effective-includes` list (validation.cpp:1549).
+    fn stamp_package_effective_feerate(
+        &mut self,
+        txs: &[Transaction],
+        tx_results: &mut [PackageTxResult],
+    ) {
+        let mut in_pkg = HashSet::new();
+        for r in tx_results.iter() {
+            if r.already_in_mempool || r.error.is_some() {
+                continue;
+            }
+            if self.individual_fee_reject_message(r.fee, r.vsize).is_some() {
+                in_pkg.insert(r.txid);
+            }
+        }
+        if in_pkg.is_empty() {
+            return;
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for tx in txs {
+                let txid = tx.txid();
+                if in_pkg.contains(&txid) {
+                    continue;
+                }
+                let accepted = tx_results
+                    .iter()
+                    .any(|r| r.txid == txid && r.error.is_none() && !r.already_in_mempool);
+                if !accepted {
+                    continue;
+                }
+                if tx
+                    .inputs
+                    .iter()
+                    .any(|inp| in_pkg.contains(&inp.previous_output.txid))
+                {
+                    in_pkg.insert(txid);
+                    changed = true;
+                }
+            }
+        }
+        let mut fee = 0u64;
+        let mut vsize = 0usize;
+        let mut wtxids = Vec::new();
+        for tx in txs {
+            let txid = tx.txid();
+            if !in_pkg.contains(&txid) {
+                continue;
+            }
+            if let Some(r) = tx_results.iter().find(|r| r.txid == txid) {
+                fee += r.fee;
+                vsize += r.vsize;
+                wtxids.push(r.wtxid);
+            }
+        }
+        let sat_kvb = if vsize > 0 {
+            fee.saturating_mul(1000) / vsize as u64
+        } else {
+            0
+        };
+        for r in tx_results.iter_mut() {
+            if in_pkg.contains(&r.txid) {
+                r.effective_fee_sat_per_kvb = Some(sat_kvb);
+                r.effective_includes = Some(wtxids.clone());
+            }
+        }
     }
 
     /// Add a transaction as part of a package (allows lower individual fee rate).
