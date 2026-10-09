@@ -713,6 +713,10 @@ pub struct AtmpOptions {
     /// must never report an invalidly-signed tx as `allowed`.  Superseded by
     /// `skip_script_checks` when both are set (reorg-refill never forces).
     pub force_script_checks: bool,
+    /// Caller cap in sat/kvB. `None` (and `Some(0)`) disables the check.
+    /// Mirrors `ATMPArgs::m_client_maxfeerate`: `CFeeRate(fee, vsize) > cap`
+    /// is rejected before scripts and before `FinalizeSubpackage`.
+    pub client_max_feerate_sat_kvb: Option<u64>,
 }
 
 impl Default for AtmpOptions {
@@ -724,6 +728,7 @@ impl Default for AtmpOptions {
             test_accept: false,
             skip_script_checks: false,
             force_script_checks: false,
+            client_max_feerate_sat_kvb: None,
         }
     }
 }
@@ -739,6 +744,7 @@ impl AtmpOptions {
             test_accept: false,
             skip_script_checks: true,
             force_script_checks: false,
+            client_max_feerate_sat_kvb: None,
         }
     }
 
@@ -757,6 +763,7 @@ impl AtmpOptions {
             test_accept: true,
             skip_script_checks: false,
             force_script_checks: false,
+            client_max_feerate_sat_kvb: None,
         }
     }
 }
@@ -1003,6 +1010,12 @@ pub enum MempoolError {
     #[error("mempool min fee not met: {0} sat/kvB (minimum: {1} sat/kvB)")]
     MempoolMinFeeNotMet(u64, u64),
 
+    /// `CFeeRate(modified_fees, vsize) > client_maxfeerate`. Checked before
+    /// script verification and before any eviction is applied. The
+    /// submitpackage `error` is this reason with an empty debug string.
+    #[error("max feerate exceeded")]
+    MaxFeerateExceeded,
+
     #[error("mempool full")]
     MempoolFull,
 
@@ -1230,6 +1243,7 @@ impl MempoolError {
             MempoolError::InsufficientFee(_, _) => "min relay fee not met".to_string(),
             // Dynamic rolling mempool-min-fee floor.
             MempoolError::MempoolMinFeeNotMet(_, _) => "mempool min fee not met".to_string(),
+            MempoolError::MaxFeerateExceeded => "max feerate exceeded".to_string(),
 
             // ---- Mempool capacity / chain limits ----
             MempoolError::MempoolFull => "mempool full".to_string(),
@@ -2776,6 +2790,54 @@ impl Mempool {
             self.total_size = self.total_size.saturating_sub(entry.vsize);
             self.note_randomized_removed();
         }
+    }
+
+    /// Put an entry removed by a package RBF/TRUC eviction back. Used when a
+    /// later package member fails and the admission that evicted it is itself
+    /// rolled back. Ancestors are restored first by the caller.
+    fn restore_entry(&mut self, entry: MempoolEntry) {
+        let txid = entry.txid;
+        if self.transactions.contains_key(&txid) {
+            return;
+        }
+        let vsize = entry.vsize;
+        let fee = entry.fee;
+        let fee_rate = entry.fee_rate;
+        let wtxid = entry.tx.wtxid();
+        let mut mempool_parents = HashSet::new();
+        for input in &entry.tx.inputs {
+            if let Some(parent) = self.created_utxos.get(&input.previous_output).copied() {
+                mempool_parents.insert(parent);
+            }
+            self.spent_outpoints
+                .insert(input.previous_output.clone(), txid);
+        }
+        for vout in 0..entry.tx.outputs.len() {
+            self.created_utxos.insert(
+                OutPoint {
+                    txid,
+                    vout: vout as u32,
+                },
+                txid,
+            );
+        }
+        self.parents.insert(txid, mempool_parents.clone());
+        for parent in &mempool_parents {
+            self.children.entry(*parent).or_default().insert(txid);
+        }
+        self.children.entry(txid).or_default();
+        self.update_all_ancestors_for_add(&mempool_parents, vsize, fee);
+        self.total_size += vsize;
+        self.fee_rate_index.insert(
+            FeeRateKey {
+                fee_rate_millionths: (fee_rate * 1_000_000.0) as u64,
+                txid,
+            },
+            txid,
+        );
+        self.wtxid_index.insert(wtxid, txid);
+        self.transactions.insert(txid, entry);
+        self.add_to_clusters(txid, fee, vsize, &mempool_parents);
     }
 
     /// Update all ancestors' descendant stats when removing a transaction.
@@ -5107,8 +5169,18 @@ impl Mempool {
         // For package validation, we temporarily allow individual transactions
         // to have lower fee rates as long as the package rate is sufficient
         let mut tx_results = Vec::new();
-        let mut added_txids = Vec::new();
+        // Admissions this call inserted, with the entries they evicted.
+        // Package-only rollback restores those entries; individually valid
+        // admissions keep the eviction (Core try-alone FinalizeSubpackage).
+        let mut added_txids: Vec<(Hash256, Vec<MempoolEntry>)> = Vec::new();
         let mut failed = false;
+        let new_count = txs
+            .iter()
+            .filter(|tx| {
+                let txid = tx.txid();
+                !already_in_mempool.contains(&txid) && !different_witness.contains_key(&txid)
+            })
+            .count();
 
         for tx in txs.iter() {
             let txid = tx.txid();
@@ -5148,12 +5220,34 @@ impl Mempool {
                 continue;
             }
 
+            // A single new transaction is evaluated alone (Core
+            // `package.size() == 1` / `AcceptSubPackage` of one tx): CheckFeeRate
+            // applies and a failure is not retried at package feerate.
+            if new_count < 2 {
+                if let Some(msg) = self.individual_fee_reject_message(fee, vsize) {
+                    tx_results.push(PackageTxResult {
+                        txid,
+                        wtxid,
+                        vsize,
+                        fee,
+                        already_in_mempool: false,
+                        error: Some(msg),
+                        replaced_txids: Vec::new(),
+                        effective_fee_sat_per_kvb: None,
+                        effective_includes: None,
+                        other_wtxid: None,
+                    });
+                    failed = true;
+                    continue;
+                }
+            }
+
             // Try to add the transaction
             // For package validation, we use a special path that allows low fees
             match self.add_transaction_for_package(tx.clone(), utxo_lookup, package_fee_rate, &opts)
             {
-                Ok((_, replaced)) => {
-                    added_txids.push(txid);
+                Ok((_, replaced, evicted)) => {
+                    added_txids.push((txid, evicted));
                     // FIX-73 (W120 BUG-5): thread the per-tx evicted-txid set
                     // up to the package result so the RPC layer can build
                     // `submitpackage.replaced-transactions` (Core
@@ -5216,21 +5310,45 @@ impl Mempool {
     /// Core `CheckFeeRate` for a tx evaluated by itself (validation.cpp:706).
     /// `Some` is `TxValidationState::ToString()` (`reject_reason, debug`).
     /// `None` means both the rolling mempool floor and the static relay floor pass.
+    /// `CFeeRate::GetFee`: ceiling of `rate_sat_kvb * vsize / 1000`, with the
+    /// 1-sat floor when the rate is positive and the quotient truncates to 0.
+    /// `EvaluateFeeUp` already yields at least 1 for a positive rate and a
+    /// positive size only when `(rate * vsize + size - 1) / size` is used;
+    /// `(rate * vsize + 999) / 1000` is that formula for a per-kvB rate.
+    fn fee_for_kvb_rate(rate_sat_kvb: u64, vsize: usize) -> u64 {
+        if rate_sat_kvb == 0 || vsize == 0 {
+            return 0;
+        }
+        rate_sat_kvb.saturating_mul(vsize as u64).saturating_add(999) / 1000
+    }
+
     fn individual_fee_reject_message(&mut self, fee: u64, vsize: usize) -> Option<String> {
-        if vsize == 0 {
-            return Some(format!("min relay fee not met, {fee} < 0"));
-        }
-        let tx_fee_rate_kvb = ((fee as f64 / vsize as f64) * 1000.0).floor() as u64;
+        // Core CheckFeeRate (validation.cpp): absolute fee against
+        // `GetMinFee().GetFee(vsize)` then `min_relay_feerate.GetFee(vsize)`.
+        // ToString is `reason, {fee} < {required}`.
         let mempool_min_fee_kvb = self.get_min_fee();
-        if mempool_min_fee_kvb > 0 && tx_fee_rate_kvb < mempool_min_fee_kvb {
-            let required = (mempool_min_fee_kvb.saturating_mul(vsize as u64) + 999) / 1000;
-            return Some(format!("mempool min fee not met, {fee} < {required}"));
+        if mempool_min_fee_kvb > 0 {
+            let required = Self::fee_for_kvb_rate(mempool_min_fee_kvb, vsize);
+            if required > 0 && fee < required {
+                return Some(format!("mempool min fee not met, {fee} < {required}"));
+            }
         }
-        if tx_fee_rate_kvb < self.config.min_fee_rate {
-            let required = (self.config.min_fee_rate.saturating_mul(vsize as u64) + 999) / 1000;
+        let required = Self::fee_for_kvb_rate(self.config.min_fee_rate, vsize);
+        if fee < required {
             return Some(format!("min relay fee not met, {fee} < {required}"));
         }
         None
+    }
+
+    /// `CFeeRate(fee, vsize) > CFeeRate(max_sat_kvb)` via `FeeRateCompare`
+    /// (cross-multiply). `None` and `0` disable the cap.
+    fn exceeds_client_max_feerate(fee: u64, vsize: usize, max_sat_kvb: Option<u64>) -> bool {
+        match max_sat_kvb {
+            Some(max) if max > 0 && vsize > 0 => {
+                fee.saturating_mul(1000) > max.saturating_mul(vsize as u64)
+            }
+            _ => false,
+        }
     }
 
     /// Drop admissions that exist only because package feerate bypassed
@@ -5238,10 +5356,14 @@ impl Mempool {
     fn rollback_package_only_admissions(
         &mut self,
         tx_results: &mut [PackageTxResult],
-        added_txids: &mut Vec<Hash256>,
+        added_txids: &mut Vec<(Hash256, Vec<MempoolEntry>)>,
     ) {
         let mut keep = Vec::new();
-        for txid in added_txids.drain(..) {
+        // Children first, so a package-only parent is not removed out from
+        // under a child we are also dropping. Evicted originals are restored
+        // only for the admissions we drop, ancestor-first.
+        let mut restore: Vec<Vec<MempoolEntry>> = Vec::new();
+        for (txid, evicted) in added_txids.drain(..).rev() {
             let Some((fee, vsize)) = tx_results
                 .iter()
                 .find(|r| r.txid == txid)
@@ -5255,11 +5377,18 @@ impl Mempool {
                     r.error = Some(msg);
                     r.replaced_txids.clear();
                 }
+                restore.push(evicted);
             } else {
-                keep.push(txid);
+                keep.push((txid, evicted));
             }
         }
+        keep.reverse();
         *added_txids = keep;
+        for evicted in restore.into_iter().rev() {
+            for entry in evicted {
+                self.restore_entry(entry);
+            }
+        }
     }
 
     /// Core `m_package_feerates`: txs that failed alone for fee or missing
@@ -5446,7 +5575,7 @@ impl Mempool {
         utxo_lookup: &F,
         package_fee_rate: f64,
         opts: &AtmpOptions,
-    ) -> Result<(Hash256, Vec<Hash256>), MempoolError>
+    ) -> Result<(Hash256, Vec<Hash256>, Vec<MempoolEntry>), MempoolError>
     where
         F: Fn(&OutPoint) -> Option<CoinEntry>,
     {
@@ -5454,7 +5583,7 @@ impl Mempool {
 
         // Already in mempool?
         if self.transactions.contains_key(&txid) {
-            return Ok((txid, Vec::new())); // Not an error for package validation
+            return Ok((txid, Vec::new(), Vec::new())); // Not an error for package validation
         }
 
         // Context-free validation
@@ -5689,10 +5818,24 @@ impl Mempool {
         let (ancestor_count, ancestor_size, ancestor_fees) =
             self.calculate_ancestors(&mempool_parents);
 
+        // Core checks the caller cap after policy/RBF prechecks and before
+        // script checks and FinalizeSubpackage (validation.cpp:1462). Nothing
+        // has been removed yet.
+        if Self::exceeds_client_max_feerate(fee, vsize, opts.client_max_feerate_sat_kvb) {
+            return Err(MempoolError::MaxFeerateExceeded);
+        }
+
         // AcceptMultipleTransactionsInternal runs PolicyScriptChecks on each
         // package tx (validation.cpp:1542) before SubmitPackage inserts.
         self.enforce_script_checks(&tx, &prevout_scripts, utxo_lookup, opts)?;
 
+        // Snapshot first. A later package member can still fail; package-only
+        // rollback restores these entries. Core applies the ChangeSet only in
+        // FinalizeSubpackage, after every check in the subpackage has passed.
+        let evicted: Vec<MempoolEntry> = replaced_txids
+            .iter()
+            .filter_map(|id| self.transactions.get(id).cloned())
+            .collect();
         for txid_to_remove in &replaced_txids {
             self.remove_single(txid_to_remove);
         }
@@ -5787,7 +5930,7 @@ impl Mempool {
             return Err(MempoolError::MempoolFull);
         }
 
-        Ok((txid, replaced_txids))
+        Ok((txid, replaced_txids, evicted))
     }
 }
 

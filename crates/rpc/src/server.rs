@@ -12653,10 +12653,6 @@ impl RustoshiRpcServer for RpcServerImpl {
                 "Fee rates larger than or equal to 1BTC/kvB are not accepted",
             ));
         }
-        let max_fee_rate_btc_kvb = max_fee_rate_sats_kvb as f64 / COIN as f64;
-
-        // Convert BTC/kvB to sat/vB
-        let max_fee_rate_sat_vb = max_fee_rate_btc_kvb * (COIN as f64) / 1000.0;
 
         // Default maxburnamount: 0 BTC
         let max_burn_sats: u64 = match maxburnamount.as_ref() {
@@ -12737,6 +12733,13 @@ impl RustoshiRpcServer for RpcServerImpl {
             &utxo_lookup,
             rustoshi_consensus::mempool::AtmpOptions {
                 force_script_checks: true,
+                // Core: maxfeerate 0 disables the cap (`nullopt`). Otherwise
+                // the check runs inside acceptance, before the tx is inserted.
+                client_max_feerate_sat_kvb: if max_fee_rate_sats_kvb == 0 {
+                    None
+                } else {
+                    Some(max_fee_rate_sats_kvb)
+                },
                 ..Default::default()
             },
         );
@@ -12759,7 +12762,6 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Build the RPC response in Core's pushKV order. tx-results is keyed
         // by the submitted wtxid, in package order.
         let mut tx_results_map = indexmap::IndexMap::new();
-        let mut maxfeerate_failed = false;
 
         for (i, tx_result) in result.tx_results.iter().enumerate() {
             let tx = &txs[i];
@@ -12782,59 +12784,41 @@ impl RustoshiRpcServer for RpcServerImpl {
                     fees: None,
                     error: Some(err),
                 }
+            } else if tx_result.already_in_mempool {
+                // MEMPOOL_ENTRY: vsize + fees.base. No effective-feerate.
+                PackageTxResultRpc {
+                    txid: tx_result.txid.to_hex(),
+                    other_wtxid: None,
+                    vsize: Some(tx_result.vsize as u64),
+                    fees: Some(PackageFees {
+                        base: BtcAmount::from_sats(tx_result.fee),
+                        effective_feerate: None,
+                        effective_includes: None,
+                    }),
+                    error: None,
+                }
             } else {
-                let fee_rate_sat_vb = if tx_result.vsize > 0 {
-                    tx_result.fee as f64 / tx_result.vsize as f64
-                } else {
-                    0.0
-                };
-                // Core PreChecks: modified feerate above client max is
-                // TX_MEMPOOL_POLICY "max feerate exceeded" (INVALID shape).
-                if max_fee_rate_btc_kvb > 0.0 && fee_rate_sat_vb > max_fee_rate_sat_vb {
-                    maxfeerate_failed = true;
-                    PackageTxResultRpc {
-                        txid: tx_result.txid.to_hex(),
-                        other_wtxid: None,
-                        vsize: None,
-                        fees: None,
-                        error: Some("max feerate exceeded".to_string()),
+                let sat_kvb = tx_result.effective_fee_sat_per_kvb.unwrap_or_else(|| {
+                    if tx_result.vsize > 0 {
+                        tx_result.fee.saturating_mul(1000) / tx_result.vsize as u64
+                    } else {
+                        0
                     }
-                } else if tx_result.already_in_mempool {
-                    // MEMPOOL_ENTRY: vsize + fees.base. No effective-feerate.
-                    PackageTxResultRpc {
-                        txid: tx_result.txid.to_hex(),
-                        other_wtxid: None,
-                        vsize: Some(tx_result.vsize as u64),
-                        fees: Some(PackageFees {
-                            base: BtcAmount::from_sats(tx_result.fee),
-                            effective_feerate: None,
-                            effective_includes: None,
-                        }),
-                        error: None,
-                    }
-                } else {
-                    let sat_kvb = tx_result.effective_fee_sat_per_kvb.unwrap_or_else(|| {
-                        if tx_result.vsize > 0 {
-                            tx_result.fee.saturating_mul(1000) / tx_result.vsize as u64
-                        } else {
-                            0
-                        }
-                    });
-                    let includes = tx_result
-                        .effective_includes
-                        .clone()
-                        .unwrap_or_else(|| vec![tx_result.wtxid]);
-                    PackageTxResultRpc {
-                        txid: tx_result.txid.to_hex(),
-                        other_wtxid: None,
-                        vsize: Some(tx_result.vsize as u64),
-                        fees: Some(PackageFees {
-                            base: BtcAmount::from_sats(tx_result.fee),
-                            effective_feerate: Some(BtcAmount::from_sats(sat_kvb)),
-                            effective_includes: Some(includes.iter().map(|w| w.to_hex()).collect()),
-                        }),
-                        error: None,
-                    }
+                });
+                let includes = tx_result
+                    .effective_includes
+                    .clone()
+                    .unwrap_or_else(|| vec![tx_result.wtxid]);
+                PackageTxResultRpc {
+                    txid: tx_result.txid.to_hex(),
+                    other_wtxid: None,
+                    vsize: Some(tx_result.vsize as u64),
+                    fees: Some(PackageFees {
+                        base: BtcAmount::from_sats(tx_result.fee),
+                        effective_feerate: Some(BtcAmount::from_sats(sat_kvb)),
+                        effective_includes: Some(includes.iter().map(|w| w.to_hex()).collect()),
+                    }),
+                    error: None,
                 }
             };
 
@@ -12844,9 +12828,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Core package_msg for PCKG_TX is "transaction failed"
         // (AcceptPackage / rpc/mempool.cpp submitpackage). Other package-level
         // failures keep the historical "package-error:" prefix.
-        let package_msg = if result.package_error.as_deref() == Some("transaction failed")
-            || maxfeerate_failed
-        {
+        let package_msg = if result.package_error.as_deref() == Some("transaction failed") {
             "transaction failed".to_string()
         } else if let Some(ref err) = result.package_error {
             format!("package-error: {}", err)
@@ -14338,10 +14320,11 @@ impl RustoshiRpcServer for RpcServerImpl {
     ) -> RpcResult<serde_json::Value> {
         use rustoshi_consensus::mempool::{AtmpOptions, MAX_PACKAGE_COUNT};
 
-        // Default maxfeerate: 0.10 BTC/kvB (same as sendrawtransaction)
+        // Default maxfeerate: 0.10 BTC/kvB. 0 disables the post-ATMP cap.
+        // Core applies it as `fee > maxfeerate.GetFee(vsize)` after a VALID
+        // result and reports `reject-reason` `max-fee-exceeded` (no details).
         let max_fee_rate_btc_kvb = maxfeerate.unwrap_or(0.10);
-        // Convert BTC/kvB → sat/vB for comparisons
-        let max_fee_rate_sat_vb = max_fee_rate_btc_kvb * (COIN as f64) / 1000.0;
+        let max_sat_kvb = (max_fee_rate_btc_kvb * COIN as f64).round() as u64;
 
         // Decode all transactions up front so we fail fast on malformed hex
         // before acquiring any lock.
@@ -14412,104 +14395,215 @@ impl RustoshiRpcServer for RpcServerImpl {
                 })
         };
 
-        let mut results = Vec::with_capacity(txs.len());
+        // Core testmempoolaccept (rpc/mempool.cpp):
+        //   one tx  → ProcessTransaction(test_accept)
+        //   several → AcceptMultipleTransactions with package_feerates=false
+        //             and allow_replacement=false (PackageTestAccept).
+        // PreChecks run on every tx before any success is recorded. A precheck
+        // failure returns only that tx; earlier and later txs are unfinished
+        // (`txid` + `wtxid` only). Script failures keep earlier VALID results.
+        // maxfeerate is NOT an ATMP check here: after VALID, `fee > cap.GetFee(vsize)`
+        // is `reject-reason` `max-fee-exceeded` and later txs are unfinished.
+        use rustoshi_consensus::mempool::MempoolError;
+        use rustoshi_consensus::validation::CoinEntry;
+        use std::collections::HashMap;
 
-        // Bitcoin Core testmempoolaccept tests each tx independently (not as a
-        // package); the package path is only used by submitpackage.  We call
-        // add_transaction_with_options with test_accept=true for each tx.
-        for tx in &txs {
-            let txid = tx.txid();
-            let wtxid = tx.wtxid();
-            let vsize = tx.vsize();
-
-            // Pre-compute fee: Σ(input UTXOs) − Σ(outputs).  Needed for the
-            // successful-result payload and for the maxfeerate check.
-            // Missing inputs yield 0 (the ATMP call will reject them anyway).
+        let amount = |sats: u64| -> serde_json::Value {
+            let text = format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000);
+            serde_json::from_str(&text).unwrap_or(serde_json::json!(0))
+        };
+        let blank = |tx: &Transaction| {
+            serde_json::json!({
+                "txid": tx.txid().to_hex(),
+                "wtxid": tx.wtxid().to_hex(),
+            })
+        };
+        let fee_of = |tx: &Transaction,
+                      temp: &HashMap<OutPoint, (u64, Vec<u8>)>,
+                      pool: &rustoshi_consensus::mempool::Mempool|
+         -> u64 {
             let input_sum: u64 = tx
                 .inputs
                 .iter()
                 .map(|inp| {
-                    utxo_lookup(&inp.previous_output)
-                        .map(|c| c.value)
-                        .unwrap_or(0)
+                    if let Some((value, _)) = temp.get(&inp.previous_output) {
+                        return *value;
+                    }
+                    if let Some(out) = pool.get_utxo(&inp.previous_output) {
+                        return out.value;
+                    }
+                    utxo_lookup(&inp.previous_output).map(|c| c.value).unwrap_or(0)
                 })
                 .sum();
             let output_sum: u64 = tx.outputs.iter().map(|o| o.value).sum();
-            let fee_sats = input_sum.saturating_sub(output_sum);
-
-            match state.mempool.add_transaction_with_options(
-                tx.clone(),
-                &utxo_lookup,
-                // Force full script verification even on regtest (where the
-                // mempool runs with verify_scripts=false for the synthetic-tx
-                // fixtures). Core's testmempoolaccept verifies scripts on every
-                // network (validation.cpp:1382-1384); without this the RPC would
-                // report an invalidly-signed tx as `allowed`.
-                AtmpOptions {
-                    force_script_checks: true,
-                    ..AtmpOptions::test_accept()
-                },
-            ) {
-                Ok(_) => {
-                    // Enforce maxfeerate: reject if fee rate exceeds the cap.
-                    let fee_rate_sat_vb = if vsize > 0 {
-                        fee_sats as f64 / vsize as f64
-                    } else {
-                        0.0
-                    };
-                    if max_fee_rate_btc_kvb > 0.0 && fee_rate_sat_vb > max_fee_rate_sat_vb {
-                        let fee_rate_btc_kvb = fee_rate_sat_vb * 1000.0 / COIN as f64;
-                        results.push(serde_json::json!({
-                            "txid": txid.to_hex(),
-                            "wtxid": wtxid.to_hex(),
-                            "allowed": false,
-                            "reject-reason": format!(
-                                "Fee rate too high: {:.8} BTC/kvB > {:.8} BTC/kvB (maxfeerate)",
-                                fee_rate_btc_kvb, max_fee_rate_btc_kvb
-                            )
-                        }));
-                    } else {
-                        // Serialize fee as BTC with 8 decimal places, matching
-                        // Core's ValueFromAmount format ("0.00001000" etc.).
-                        let fee_num = |sats: u64| -> serde_json::Value {
-                            let text = format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000);
-                            serde_json::from_str(&text).unwrap_or(serde_json::json!(0))
-                        };
-                        // Core CFeeRate(fee, vsize).GetFeePerK(): integer sat/kvB.
-                        let effective = if vsize > 0 {
-                            fee_sats.saturating_mul(1000) / vsize as u64
-                        } else {
-                            0
-                        };
-                        results.push(serde_json::json!({
-                            "txid": txid.to_hex(),
-                            "wtxid": wtxid.to_hex(),
-                            "allowed": true,
-                            "vsize": vsize,
-                            "fees": {
-                                "base": fee_num(fee_sats),
-                                "effective-feerate": fee_num(effective),
-                                "effective-includes": [wtxid.to_hex()]
-                            }
-                        }));
-                    }
-                }
-                Err(e) => {
-                    let mut result = serde_json::json!({
-                        "txid": txid.to_hex(),
-                        "wtxid": wtxid.to_hex(),
-                        "allowed": false,
-                        // Bare token. TX_MISSING_INPUTS is remapped and has no
-                        // reject-details; every other rejection also carries
-                        // state.ToString() (reason, plus the debug message).
-                        "reject-reason": e.reject_token()
-                    });
-                    if e.reject_token() != "missing-inputs" {
-                        result["reject-details"] = serde_json::Value::String(e.reject_debug());
-                    }
-                    results.push(result);
-                }
+            input_sum.saturating_sub(output_sum)
+        };
+        let required_fee = |rate_sat_kvb: u64, vsize: usize| -> u64 {
+            if rate_sat_kvb == 0 || vsize == 0 {
+                0
+            } else {
+                rate_sat_kvb.saturating_mul(vsize as u64).saturating_add(999) / 1000
             }
+        };
+        let rejection = |tx: &Transaction, err: &MempoolError, fee: u64, vsize: usize| {
+            let (reason, details): (String, Option<String>) = match err {
+                MempoolError::MissingInput(_, _)
+                | MempoolError::Validation(
+                    rustoshi_consensus::validation::TxValidationError::MissingInput(_, _),
+                ) => ("missing-inputs".to_string(), None),
+                MempoolError::PolicyScriptCheckFailed(_, detail)
+                | MempoolError::ConsensusScriptCheckFailed(_, detail) => {
+                    // GetRejectReason is the flag string. The `, input N of …`
+                    // tail is the debug message, so ToString (reject-details)
+                    // is the whole line.
+                    let reason = match detail.find(", input ") {
+                        Some(i) => detail[..i].to_string(),
+                        None => detail.clone(),
+                    };
+                    (reason, Some(detail.clone()))
+                }
+                MempoolError::InsufficientFee(_, min_kvb) => {
+                    let required = required_fee(*min_kvb, vsize);
+                    (
+                        "min relay fee not met".to_string(),
+                        Some(format!("min relay fee not met, {fee} < {required}")),
+                    )
+                }
+                MempoolError::MempoolMinFeeNotMet(_, min_kvb) => {
+                    let required = required_fee(*min_kvb, vsize);
+                    (
+                        "mempool min fee not met".to_string(),
+                        Some(format!("mempool min fee not met, {fee} < {required}")),
+                    )
+                }
+                other => (other.reject_token(), Some(other.reject_debug())),
+            };
+            let mut obj = serde_json::json!({
+                "txid": tx.txid().to_hex(),
+                "wtxid": tx.wtxid().to_hex(),
+                "allowed": false,
+                "reject-reason": reason,
+            });
+            if let Some(details) = details {
+                obj.as_object_mut()
+                    .unwrap()
+                    .insert("reject-details".to_string(), serde_json::Value::String(details));
+            }
+            obj
+        };
+        let lookup_with = |temp: &HashMap<OutPoint, (u64, Vec<u8>)>, op: &OutPoint| -> Option<CoinEntry> {
+            if let Some((value, script)) = temp.get(op) {
+                return Some(CoinEntry {
+                    height: 0,
+                    is_coinbase: false,
+                    value: *value,
+                    script_pubkey: script.clone(),
+                });
+            }
+            utxo_lookup(op)
+        };
+        let remember = |temp: &mut HashMap<OutPoint, (u64, Vec<u8>)>, tx: &Transaction| {
+            let txid = tx.txid();
+            for (vout, output) in tx.outputs.iter().enumerate() {
+                temp.insert(
+                    OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    },
+                    (output.value, output.script_pubkey.clone()),
+                );
+            }
+        };
+
+        let mut temp: HashMap<OutPoint, (u64, Vec<u8>)> = HashMap::new();
+        let pre_opts = AtmpOptions {
+            test_accept: true,
+            allow_replacement: false,
+            skip_script_checks: true,
+            force_script_checks: false,
+            ..AtmpOptions::test_accept()
+        };
+        for (i, tx) in txs.iter().enumerate() {
+            let fee = fee_of(tx, &temp, &state.mempool);
+            let vsize = tx.vsize();
+            let err = {
+                let lookup = |op: &OutPoint| lookup_with(&temp, op);
+                state
+                    .mempool
+                    .add_transaction_with_options(tx.clone(), &lookup, pre_opts.clone())
+                    .err()
+            };
+            if let Some(err) = err {
+                let mut results = Vec::with_capacity(txs.len());
+                for prior in txs.iter().take(i) {
+                    results.push(blank(prior));
+                }
+                results.push(rejection(tx, &err, fee, vsize));
+                for later in txs.iter().skip(i + 1) {
+                    results.push(blank(later));
+                }
+                return Ok(serde_json::json!(results));
+            }
+            remember(&mut temp, tx);
+        }
+
+        temp.clear();
+        let script_opts = AtmpOptions {
+            test_accept: true,
+            allow_replacement: false,
+            skip_script_checks: false,
+            force_script_checks: true,
+            ..AtmpOptions::test_accept()
+        };
+        let mut results = Vec::with_capacity(txs.len());
+        let mut exit_early = false;
+        for tx in &txs {
+            if exit_early {
+                results.push(blank(tx));
+                continue;
+            }
+            let fee = fee_of(tx, &temp, &state.mempool);
+            let vsize = tx.vsize();
+            let err = {
+                let lookup = |op: &OutPoint| lookup_with(&temp, op);
+                state
+                    .mempool
+                    .add_transaction_with_options(tx.clone(), &lookup, script_opts.clone())
+                    .err()
+            };
+            if let Some(err) = err {
+                results.push(rejection(tx, &err, fee, vsize));
+                exit_early = true;
+                continue;
+            }
+            let cap = required_fee(max_sat_kvb, vsize);
+            if cap > 0 && fee > cap {
+                results.push(serde_json::json!({
+                    "txid": tx.txid().to_hex(),
+                    "wtxid": tx.wtxid().to_hex(),
+                    "allowed": false,
+                    "reject-reason": "max-fee-exceeded",
+                }));
+                exit_early = true;
+                continue;
+            }
+            let sat_kvb = if vsize > 0 {
+                fee.saturating_mul(1000) / vsize as u64
+            } else {
+                0
+            };
+            results.push(serde_json::json!({
+                "txid": tx.txid().to_hex(),
+                "wtxid": tx.wtxid().to_hex(),
+                "allowed": true,
+                "vsize": vsize,
+                "fees": {
+                    "base": amount(fee),
+                    "effective-feerate": amount(sat_kvb),
+                    "effective-includes": [tx.wtxid().to_hex()],
+                },
+            }));
+            remember(&mut temp, tx);
         }
 
         Ok(serde_json::json!(results))
