@@ -2865,6 +2865,22 @@ impl Mempool {
         self.remove_from_clusters(txid);
 
         self.unbroadcast.remove(txid);
+
+        // Drop this tx from each in-pool child's parent set before the entry
+        // itself goes away. remove_for_block confirms a parent while leaving
+        // its spenders; without this unlink their cached ancestor totals still
+        // include the confirmed tx (Core removeUnchecked updates the graph).
+        let child_ids: Vec<Hash256> = self
+            .children
+            .get(txid)
+            .map(|c| c.iter().copied().collect())
+            .unwrap_or_default();
+        for child in &child_ids {
+            if let Some(parents) = self.parents.get_mut(child) {
+                parents.remove(txid);
+            }
+        }
+
         if let Some(entry) = self.transactions.remove(txid) {
             // W96: keep the wtxid → txid index in sync with `transactions`.
             self.wtxid_index.remove(&entry.tx.wtxid());
@@ -2903,6 +2919,12 @@ impl Mempool {
             self.fee_rate_index.remove(&fee_key);
             self.total_size = self.total_size.saturating_sub(entry.vsize);
             self.note_randomized_removed();
+        }
+
+        for child in &child_ids {
+            if self.transactions.contains_key(child) {
+                self.recompute_relative_stats(child);
+            }
         }
     }
 
@@ -6998,6 +7020,43 @@ mod tests {
         // Verify ancestor stats
         let entry = mempool.get(&txid2).unwrap();
         assert_eq!(entry.ancestor_count, 2); // self + parent
+    }
+
+    /// Confirming a parent must drop it from in-pool children's ancestor totals.
+    /// `remove_for_block` removes the parent only (`remove_descendants` false);
+    /// the child stays, and its cached ancestor count/fees must not still
+    /// include the parent.
+    #[test]
+    fn remove_for_block_unlinks_parent_from_child_ancestors() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000)]);
+
+        let parent = make_tx(vec![(utxo_txid, 0)], vec![90_000], 1);
+        let parent_id = parent.txid();
+        mempool
+            .add_transaction(parent, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        let child = make_tx(vec![(parent_id, 0)], vec![80_000], 1);
+        let child_id = child.txid();
+        mempool
+            .add_transaction(child.clone(), &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        mempool.remove_for_block(&[parent_id], &[]);
+
+        assert!(mempool.get(&parent_id).is_none(), "confirmed parent leaves the pool");
+        let entry = mempool.get(&child_id).expect("child stays");
+        assert!(
+            mempool.parents.get(&child_id).map(|p| p.is_empty()).unwrap_or(true),
+            "child must not keep the confirmed parent as a mempool parent"
+        );
+        assert_eq!(entry.ancestor_count, 1);
+        assert_eq!(entry.ancestor_fees, entry.fee);
+        assert_eq!(entry.ancestor_size, entry.vsize);
     }
 
     /// `max_ancestor_count` is NO LONGER A GATE (Core v31 cluster mempool).
