@@ -1199,11 +1199,13 @@ pub struct PackageFees {
     /// Base fee in BTC — serialized as Core's ValueFromAmount `%d.%08d`.
     pub base: BtcAmount,
     /// Effective fee rate in BTC/kvB — serialized as `%d.%08d`.
-    #[serde(rename = "effective-feerate")]
-    pub effective_feerate: BtcAmount,
-    /// List of transaction IDs this effective fee rate applies to.
-    #[serde(rename = "effective-includes")]
-    pub effective_includes: Vec<String>,
+    /// Absent for `MEMPOOL_ENTRY` (Core rpc/mempool.cpp submitpackage).
+    #[serde(rename = "effective-feerate", skip_serializing_if = "Option::is_none", default)]
+    pub effective_feerate: Option<BtcAmount>,
+    /// Wtxids whose fees and vsizes make up `effective-feerate`.
+    /// Absent for `MEMPOOL_ENTRY`.
+    #[serde(rename = "effective-includes", skip_serializing_if = "Option::is_none", default)]
+    pub effective_includes: Option<Vec<String>>,
 }
 
 /// Response for `submitpackage` RPC.
