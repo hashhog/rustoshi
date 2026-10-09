@@ -3625,6 +3625,14 @@ impl Mempool {
         }
     }
 
+    /// Pin the rolling minimum (sat/kvB) and leave decay off until the next
+    /// block. This is the in-memory state `trackPackageRemoved` leaves when
+    /// `blockSinceLastRollingFeeBump` is still false.
+    pub fn set_rolling_min_fee_sat_kvb(&mut self, sat_kvb: u64) {
+        self.rolling_minimum_fee_rate = sat_kvb as f64;
+        self.block_since_last_rolling_fee_bump = false;
+    }
+
     /// Return the effective minimum fee rate that a new transaction must
     /// meet to enter the mempool (sat/kvB, as integer for integer comparison).
     ///
