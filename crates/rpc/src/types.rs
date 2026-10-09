@@ -1176,16 +1176,21 @@ pub struct PackageTxResultRpc {
     pub txid: String,
     /// Witness transaction ID.
     pub wtxid: String,
-    /// Virtual size in bytes.
-    pub vsize: u64,
-    /// Fee in BTC.
-    pub fees: PackageFees,
+    /// Virtual size in bytes. Omitted when the tx was rejected (Core omits it).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vsize: Option<u64>,
+    /// Fee in BTC. Omitted when the tx was rejected.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fees: Option<PackageFees>,
     /// Whether this transaction was already in the mempool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed: Option<bool>,
     /// Error message if validation failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<String>,
+    /// Core `submitpackage` `tx-results[].error` (`TxValidationState::ToString()`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
 }
 
 /// Fee information for a transaction in a package.
