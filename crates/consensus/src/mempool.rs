@@ -36,7 +36,7 @@ use crate::params::{
     TAPROOT_LEAF_MASK, TAPROOT_LEAF_TAPSCRIPT, WITNESS_SCALE_FACTOR,
 };
 use crate::params::MAX_MONEY;
-use crate::script::{is_p2a, is_p2sh, parse_witness_program, verify_script, ScriptFlags};
+use crate::script::{is_p2a, is_p2sh, parse_witness_program, verify_script, ScriptError, ScriptFlags};
 use crate::validation::{
     check_sequence_locks, check_transaction, CoinEntry,
     count_script_sigops, get_transaction_sigop_cost, SequenceLockContext,
@@ -1711,6 +1711,37 @@ fn txgraph_cluster_usage(n: usize) -> usize {
     }
 }
 
+/// Core `CheckInputScripts` reject (validation.cpp:2123) plus `CScriptCheck`'s
+/// debug string: `input i of <txid> (wtxid <wtxid>), spending <prev>:<n>`.
+fn core_script_reject(policy: bool, err: &ScriptError, tx: &Transaction, input_idx: usize) -> String {
+    let kind = if policy {
+        "mempool-script-verify-flag-failed"
+    } else {
+        "block-script-verify-flag-failed"
+    };
+    let prev = &tx.inputs[input_idx].previous_output;
+    format!(
+        "{kind} ({}), input {input_idx} of {} (wtxid {}), spending {}:{}",
+        err.core_message(),
+        tx.txid(),
+        tx.wtxid(),
+        prev.txid,
+        prev.vout,
+    )
+}
+
+/// `submitpackage` `tx-results[].error` is `TxValidationState::ToString()`.
+/// Missing inputs keep `bad-txns-inputs-missingorspent` (validation.cpp:873);
+/// the `missing-inputs` remap is testmempoolaccept only.
+fn submitpackage_member_error(e: &MempoolError) -> String {
+    match e {
+        MempoolError::PolicyScriptCheckFailed(_, detail)
+        | MempoolError::ConsensusScriptCheckFailed(_, detail) => detail.clone(),
+        MempoolError::MissingInput(_, _) => "bad-txns-inputs-missingorspent".to_string(),
+        other => other.reject_token(),
+    }
+}
+
 impl Mempool {
     /// Install the per-height MTP lookup used for BIP68 time-based relative
     /// locks (Core CalculateLockPointsAtTip: coin time = MTP of the coin's
@@ -2444,111 +2475,9 @@ impl Mempool {
         let (ancestor_count, ancestor_size, ancestor_fees) =
             self.calculate_ancestors(&mempool_parents);
 
-        // W96 (gates 27 + 28): script verification — done LAST so CPU-expensive
-        // signature checks only run after every cheap policy gate has passed.
-        // Mirrors Core's two-pass structure (validation.cpp:1135-1190):
-        //
-        //   PolicyScriptChecks    — STANDARD_SCRIPT_VERIFY_FLAGS (consensus +
-        //                          policy: NULLFAIL, LOW_S, MINIMALIF, …)
-        //                          failure → TX_NOT_STANDARD
-        //
-        //   ConsensusScriptChecks — MANDATORY_SCRIPT_VERIFY_FLAGS only
-        //                          (defense-in-depth re-check; failure here
-        //                          is a real consensus bug since
-        //                          STANDARD_FLAGS ⊇ MANDATORY_FLAGS)
-        //
-        // Pre-W96 the mempool admission path performed ZERO script
-        // verification.  That meant invalid-script txs entered the mempool
-        // and were only caught by miners during block assembly — wasted
-        // CPU + relay.
-        //
-        // Opt-out: `opts.skip_script_checks` for the reorg path where the
-        // tx's scripts were already verified when the block was originally
-        // connected.  Matches Core's `bypass_limits` script-cache hot path.
-        if (self.config.verify_scripts || opts.force_script_checks)
-            && !opts.skip_script_checks
-            && !tx.is_coinbase()
-            && prevout_scripts.len() == tx.inputs.len()
-        {
-            // Materialise per-input slices once so the Taproot checker can
-            // compute BIP-341 sha_amounts / sha_scriptpubkeys without
-            // re-walking on every call.  Mirrors validation.cpp:1711-1712.
-            let mut spent_amounts: Vec<u64> = Vec::with_capacity(tx.inputs.len());
-            for input in &tx.inputs {
-                let val = if let Some(parent_txid) = self.created_utxos.get(&input.previous_output) {
-                    self.transactions
-                        .get(parent_txid)
-                        .map(|e| e.tx.outputs[input.previous_output.vout as usize].value)
-                        .unwrap_or(0)
-                } else {
-                    utxo_lookup(&input.previous_output)
-                        .map(|c| c.value)
-                        .unwrap_or(0)
-                };
-                spent_amounts.push(val);
-            }
-
-            // Gate 27: PolicyScriptChecks with STANDARD flags.
-            let std_flags = ScriptFlags::standard_flags();
-            for (input_idx, input) in tx.inputs.iter().enumerate() {
-                let checker = TransactionSignatureChecker::new(
-                    &tx,
-                    input_idx,
-                    spent_amounts[input_idx],
-                    &spent_amounts,
-                    &prevout_scripts,
-                );
-                if let Err(e) = verify_script(
-                    &input.script_sig,
-                    &prevout_scripts[input_idx],
-                    &input.witness,
-                    &std_flags,
-                    &checker,
-                ) {
-                    return Err(MempoolError::PolicyScriptCheckFailed(
-                        input_idx,
-                        e.to_string(),
-                    ));
-                }
-            }
-
-            // Gate 28: ConsensusScriptChecks with MANDATORY-only flags.
-            // Defense-in-depth: re-verify with consensus-only flags.  If
-            // PolicyScriptChecks (a superset) passed but this fails, it's
-            // a real consensus bug (STANDARD_FLAGS over-relaxed something).
-            let consensus_flags = ScriptFlags {
-                verify_p2sh: true,
-                verify_dersig: true,
-                verify_checklocktimeverify: true,
-                verify_checksequenceverify: true,
-                verify_witness: true,
-                verify_nulldummy: true,
-                verify_taproot: true,
-                ..Default::default()
-            };
-            for (input_idx, input) in tx.inputs.iter().enumerate() {
-                let checker = TransactionSignatureChecker::new(
-                    &tx,
-                    input_idx,
-                    spent_amounts[input_idx],
-                    &spent_amounts,
-                    &prevout_scripts,
-                );
-                if let Err(e) = verify_script(
-                    &input.script_sig,
-                    &prevout_scripts[input_idx],
-                    &input.witness,
-                    &consensus_flags,
-                    &checker,
-                ) {
-                    // Real-consensus class: TX_CONSENSUS, not TX_NOT_STANDARD.
-                    return Err(MempoolError::ConsensusScriptCheckFailed(
-                        input_idx,
-                        e.to_string(),
-                    ));
-                }
-            }
-        }
+        // PolicyScriptChecks then ConsensusScriptChecks (Core v31.1
+        // validation.cpp:1139 and :1162). Shared with the package path.
+        self.enforce_script_checks(&tx, &prevout_scripts, utxo_lookup, &opts)?;
 
         // W96 (test_accept short-circuit): mirror Core validation.cpp:1388-1391.
         // When `opts.test_accept` is true (testmempoolaccept RPC), return after
@@ -4962,6 +4891,21 @@ impl Mempool {
     where
         F: Fn(&OutPoint) -> Option<CoinEntry>,
     {
+        self.accept_package_with_options(txs, utxo_lookup, AtmpOptions::default())
+    }
+
+    /// Accept a package. `opts.force_script_checks` makes `submitpackage` verify
+    /// scripts on regtest, where the mempool is built with `verify_scripts = false`.
+    /// Core `ProcessNewPackage` always runs the script checks.
+    pub fn accept_package_with_options<F>(
+        &mut self,
+        txs: Vec<Transaction>,
+        utxo_lookup: &F,
+        opts: AtmpOptions,
+    ) -> PackageAcceptResult
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
         // Context-free package checks
         if let Err(e) = self.check_package(&txs) {
             return PackageAcceptResult::package_failure(e.to_string());
@@ -5115,8 +5059,10 @@ impl Mempool {
         // to have lower fee rates as long as the package rate is sufficient
         let mut tx_results = Vec::new();
         let mut added_txids = Vec::new();
+        let mut failed = false;
+        let mut saw_script_failure = false;
 
-        for tx in &txs {
+        for (idx, tx) in txs.iter().enumerate() {
             let txid = tx.txid();
             let wtxid = tx.wtxid();
             let vsize = tx.vsize();
@@ -5137,7 +5083,8 @@ impl Mempool {
 
             // Try to add the transaction
             // For package validation, we use a special path that allows low fees
-            match self.add_transaction_for_package(tx.clone(), utxo_lookup, package_fee_rate) {
+            match self.add_transaction_for_package(tx.clone(), utxo_lookup, package_fee_rate, &opts)
+            {
                 Ok((_, replaced)) => {
                     added_txids.push(txid);
                     // FIX-73 (W120 BUG-5): thread the per-tx evicted-txid set
@@ -5155,15 +5102,66 @@ impl Mempool {
                     });
                 }
                 Err(e) => {
-                    // Transaction failed - roll back any transactions we added
-                    for added_txid in &added_txids {
-                        self.remove_transaction(added_txid, false);
-                    }
-                    return PackageAcceptResult::package_failure(
-                        MempoolError::PackageTxFailed(txid, e.to_string()).to_string(),
+                    let script_failure = matches!(
+                        e,
+                        MempoolError::PolicyScriptCheckFailed(_, _)
+                            | MempoolError::ConsensusScriptCheckFailed(_, _)
                     );
+                    tx_results.push(PackageTxResult {
+                        txid,
+                        wtxid,
+                        vsize,
+                        fee,
+                        already_in_mempool: false,
+                        error: Some(submitpackage_member_error(&e)),
+                        replaced_txids: Vec::new(),
+                    });
+                    // Script failure is not reconsiderable (Core AcceptPackage).
+                    // A parent already admitted stays. Keep walking so a child
+                    // of the bad parent reports bad-txns-inputs-missingorspent.
+                    // Any other failure rolls the package back (test_g14).
+                    if script_failure {
+                        saw_script_failure = true;
+                    } else if !saw_script_failure {
+                        for added_txid in &added_txids {
+                            self.remove_transaction(added_txid, false);
+                        }
+                        for r in tx_results.iter_mut() {
+                            if added_txids.contains(&r.txid) {
+                                r.error = Some("transaction failed".to_string());
+                                r.replaced_txids.clear();
+                            }
+                        }
+                        for rest in txs.iter().skip(idx + 1) {
+                            let rest_txid = rest.txid();
+                            tx_results.push(PackageTxResult {
+                                txid: rest_txid,
+                                wtxid: rest.wtxid(),
+                                vsize: rest.vsize(),
+                                fee: *tx_fees.get(&rest_txid).unwrap_or(&0),
+                                already_in_mempool: false,
+                                error: Some("package-not-validated".to_string()),
+                                replaced_txids: Vec::new(),
+                            });
+                        }
+                        failed = true;
+                        break;
+                    }
+                    failed = true;
                 }
             }
+        }
+
+        if failed {
+            let accepted_count = tx_results.iter().filter(|r| r.error.is_none()).count();
+            return PackageAcceptResult {
+                tx_results,
+                package_fee,
+                package_vsize,
+                package_fee_rate,
+                accepted_count,
+                package_error: Some("transaction failed".to_string()),
+            };
         }
 
         PackageAcceptResult::success(tx_results, package_fee, package_vsize)
@@ -5179,11 +5177,106 @@ impl Mempool {
     /// include direct RBF conflicts, their descendants, and any TRUC
     /// sibling-eviction target. Mirrors Core
     /// `MempoolAcceptResult::m_replaced_transactions`.
+    /// `PolicyScriptChecks` then `ConsensusScriptChecks` (Core v31.1
+    /// `MemPoolAccept::PolicyScriptChecks` validation.cpp:1139,
+    /// `ConsensusScriptChecks` :1162). Called from the single-tx path and from
+    /// `AcceptMultipleTransactionsInternal` (:1542) before insert.
+    fn enforce_script_checks<F>(
+        &self,
+        tx: &Transaction,
+        prevout_scripts: &[Vec<u8>],
+        utxo_lookup: &F,
+        opts: &AtmpOptions,
+    ) -> Result<(), MempoolError>
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
+        if !(self.config.verify_scripts || opts.force_script_checks)
+            || opts.skip_script_checks
+            || tx.is_coinbase()
+            || prevout_scripts.len() != tx.inputs.len()
+        {
+            return Ok(());
+        }
+
+        let mut spent_amounts: Vec<u64> = Vec::with_capacity(tx.inputs.len());
+        for input in &tx.inputs {
+            let val = if let Some(parent_txid) = self.created_utxos.get(&input.previous_output) {
+                self.transactions
+                    .get(parent_txid)
+                    .map(|e| e.tx.outputs[input.previous_output.vout as usize].value)
+                    .unwrap_or(0)
+            } else {
+                utxo_lookup(&input.previous_output)
+                    .map(|c| c.value)
+                    .unwrap_or(0)
+            };
+            spent_amounts.push(val);
+        }
+
+        let std_flags = ScriptFlags::standard_flags();
+        for (input_idx, input) in tx.inputs.iter().enumerate() {
+            let checker = TransactionSignatureChecker::new(
+                tx,
+                input_idx,
+                spent_amounts[input_idx],
+                &spent_amounts,
+                prevout_scripts,
+            );
+            if let Err(e) = verify_script(
+                &input.script_sig,
+                &prevout_scripts[input_idx],
+                &input.witness,
+                &std_flags,
+                &checker,
+            ) {
+                return Err(MempoolError::PolicyScriptCheckFailed(
+                    input_idx,
+                    core_script_reject(true, &e, tx, input_idx),
+                ));
+            }
+        }
+
+        let consensus_flags = ScriptFlags {
+            verify_p2sh: true,
+            verify_dersig: true,
+            verify_checklocktimeverify: true,
+            verify_checksequenceverify: true,
+            verify_witness: true,
+            verify_nulldummy: true,
+            verify_taproot: true,
+            ..Default::default()
+        };
+        for (input_idx, input) in tx.inputs.iter().enumerate() {
+            let checker = TransactionSignatureChecker::new(
+                tx,
+                input_idx,
+                spent_amounts[input_idx],
+                &spent_amounts,
+                prevout_scripts,
+            );
+            if let Err(e) = verify_script(
+                &input.script_sig,
+                &prevout_scripts[input_idx],
+                &input.witness,
+                &consensus_flags,
+                &checker,
+            ) {
+                return Err(MempoolError::ConsensusScriptCheckFailed(
+                    input_idx,
+                    core_script_reject(false, &e, tx, input_idx),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn add_transaction_for_package<F>(
         &mut self,
         tx: Transaction,
         utxo_lookup: &F,
         package_fee_rate: f64,
+        opts: &AtmpOptions,
     ) -> Result<(Hash256, Vec<Hash256>), MempoolError>
     where
         F: Fn(&OutPoint) -> Option<CoinEntry>,
@@ -5351,11 +5444,10 @@ impl Mempool {
             }
 
             for txid_to_remove in &all_to_remove {
-                // Capture for the RPC response BEFORE remove_single drops the
-                // entry — Core does the same via GetSharedTx() in
-                // validation.cpp:1236.
+                // Captured now; removed only after script checks pass.
+                // Core applies the ChangeSet in FinalizeSubpackage, after
+                // PolicyScriptChecks and ConsensusScriptChecks.
                 replaced_txids.push(*txid_to_remove);
-                self.remove_single(txid_to_remove);
             }
         }
 
@@ -5383,30 +5475,39 @@ impl Mempool {
                 // FIX-73: TRUC sibling counts as a replaced tx per Core
                 // (validation.cpp:639 — m_replaced_transactions includes
                 // sibling-eviction targets in addition to conflict-input txns).
+                // Removed only after script checks pass.
                 replaced_txids.push(sibling_txid);
-                self.remove_single(&sibling_txid);
             }
         }
 
         // ---- Cluster limits (Core v31 cluster mempool). POLICY, not consensus. ----
         // Package path — same two gates as add_transaction; see the commentary
-        // there. Strict `>` on both (txgraph.cpp:2059).
-        let new_cluster_size = self.calculate_new_cluster_size(&mempool_parents);
+        // there. Strict `>` on both (txgraph.cpp:2059). Replacements are not
+        // applied yet, so the gates see the pool as it will be after they commit.
+        let new_tx_adjusted_weight = crate::params::get_sigops_adjusted_weight(
+            tx.weight() as u64,
+            tx_sigop_cost,
+            crate::params::DEFAULT_BYTES_PER_SIGOP,
+        );
+        let (new_cluster_size, new_cluster_weight) = if replaced_txids.is_empty() {
+            (
+                self.calculate_new_cluster_size(&mempool_parents),
+                self.calculate_new_cluster_weight(&mempool_parents, new_tx_adjusted_weight),
+            )
+        } else {
+            let excluded: HashSet<Hash256> = replaced_txids.iter().copied().collect();
+            self.calculate_new_cluster_stats_excluding(
+                &mempool_parents,
+                &excluded,
+                new_tx_adjusted_weight,
+            )
+        };
         if new_cluster_size > MAX_CLUSTER_SIZE {
             return Err(MempoolError::ClusterSizeLimitExceeded(
                 new_cluster_size,
                 MAX_CLUSTER_SIZE,
             ));
         }
-
-        // Cluster total size in WEIGHT units: Σ max(weight, sigop_cost * 20).
-        let new_tx_adjusted_weight = crate::params::get_sigops_adjusted_weight(
-            tx.weight() as u64,
-            tx_sigop_cost,
-            crate::params::DEFAULT_BYTES_PER_SIGOP,
-        );
-        let new_cluster_weight =
-            self.calculate_new_cluster_weight(&mempool_parents, new_tx_adjusted_weight);
         if new_cluster_weight > MAX_CLUSTER_SIZE_WEIGHT {
             return Err(MempoolError::ClusterWeightLimitExceeded(
                 new_cluster_weight,
@@ -5418,6 +5519,14 @@ impl Mempool {
         // See the equivalent block in add_transaction for the rationale.
         let (ancestor_count, ancestor_size, ancestor_fees) =
             self.calculate_ancestors(&mempool_parents);
+
+        // AcceptMultipleTransactionsInternal runs PolicyScriptChecks on each
+        // package tx (validation.cpp:1542) before SubmitPackage inserts.
+        self.enforce_script_checks(&tx, &prevout_scripts, utxo_lookup, opts)?;
+
+        for txid_to_remove in &replaced_txids {
+            self.remove_single(txid_to_remove);
+        }
 
         // Build the entry (cluster_id and mining_score will be updated by add_to_clusters)
         let weight = tx.weight();

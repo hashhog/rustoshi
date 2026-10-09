@@ -12731,8 +12731,17 @@ impl RustoshiRpcServer for RpcServerImpl {
                 })
         };
 
-        // Accept the package
-        let result = state.mempool.accept_package(txs.clone(), &utxo_lookup);
+        // Accept the package. Core ProcessNewPackage always runs
+        // PolicyScriptChecks + ConsensusScriptChecks, including on regtest
+        // where this node's mempool is built with verify_scripts = false.
+        let result = state.mempool.accept_package_with_options(
+            txs.clone(),
+            &utxo_lookup,
+            rustoshi_consensus::mempool::AtmpOptions {
+                force_script_checks: true,
+                ..Default::default()
+            },
+        );
 
         // FIX-73 (W120 BUG-5): accumulate the deduped, sorted union of every
         // per-tx replaced txid. Mirrors Bitcoin Core `rpc/mempool.cpp:1460-1510`
@@ -12782,25 +12791,31 @@ impl RustoshiRpcServer for RpcServerImpl {
                 None
             };
 
+            let rejected = reject_reason.is_some();
             let rpc_result = PackageTxResultRpc {
                 txid: tx_result.txid.to_hex(),
                 wtxid: wtxid.clone(),
-                vsize: tx_result.vsize as u64,
-                fees: PackageFees {
-                    // base: absolute fee in BTC.
-                    base: BtcAmount::from_sats(tx_result.fee),
-                    // effective_feerate: BTC/kvB value; store as BtcAmount for 8-decimal output.
-                    // effective_feerate (BTC/kvB) * 1e8 sat/BTC = sat/kvB, stored as BtcAmount.
-                    effective_feerate: BtcAmount::from_sats(
-                        (effective_feerate * COIN as f64).round() as u64
-                    ),
-                    effective_includes: vec![tx_result.wtxid.to_hex()],
-                },
-                allowed: if reject_reason.is_none() {
-                    Some(true)
+                vsize: if rejected {
+                    None
                 } else {
-                    Some(false)
+                    Some(tx_result.vsize as u64)
                 },
+                fees: if rejected {
+                    None
+                } else {
+                    Some(PackageFees {
+                        // base: absolute fee in BTC.
+                        base: BtcAmount::from_sats(tx_result.fee),
+                        // effective_feerate: BTC/kvB value; store as BtcAmount for 8-decimal output.
+                        // effective_feerate (BTC/kvB) * 1e8 sat/BTC = sat/kvB, stored as BtcAmount.
+                        effective_feerate: BtcAmount::from_sats(
+                            (effective_feerate * COIN as f64).round() as u64
+                        ),
+                        effective_includes: vec![tx_result.wtxid.to_hex()],
+                    })
+                },
+                allowed: if rejected { Some(false) } else { Some(true) },
+                error: reject_reason.clone(),
                 reject_reason,
             };
 
@@ -12819,7 +12834,12 @@ impl RustoshiRpcServer for RpcServerImpl {
         };
 
         // Build package message
-        let package_msg = if let Some(ref err) = result.package_error {
+        // Core package_msg for PCKG_TX is "transaction failed"
+        // (AcceptPackage / rpc/mempool.cpp submitpackage). Other package-level
+        // failures keep the historical "package-error:" prefix.
+        let package_msg = if result.package_error.as_deref() == Some("transaction failed") {
+            "transaction failed".to_string()
+        } else if let Some(ref err) = result.package_error {
             format!("package-error: {}", err)
         } else if result.all_accepted() {
             "success".to_string()
@@ -12827,31 +12847,37 @@ impl RustoshiRpcServer for RpcServerImpl {
             "partial failure".to_string()
         };
 
-        // Broadcast accepted transactions to peers
-        if result.all_accepted() {
+        // Broadcast every package tx that is actually in the mempool. Core
+        // submitpackage does this even when a later package member was rejected.
+        let relay: Vec<(Transaction, u64)> = txs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tx)| {
+                if !state.mempool.contains(&tx.txid()) {
+                    return None;
+                }
+                let tx_fee_rate_sat_kvb = result
+                    .tx_results
+                    .get(i)
+                    .map(|r| {
+                        if r.vsize > 0 {
+                            r.fee.saturating_mul(1000) / r.vsize as u64
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0);
+                Some((tx.clone(), tx_fee_rate_sat_kvb))
+            })
+            .collect();
+        if !relay.is_empty() {
             drop(state);
             let peer_state = self.peer_state.read().await;
             if let Some(ref peer_manager) = peer_state.peer_manager {
-                for (i, tx) in txs.iter().enumerate() {
-                    // Per-peer MSG_WTX/MSG_TX selection happens in relay_tx_inv.
-                    let txid = tx.txid();
-                    let wtxid = tx.wtxid();
-                    // BIP-133 outbound tx-INV gate: per-tx feerate in sat/kvB
-                    // (= fee * 1000 / vsize), derived from this tx's package
-                    // result, to match the u64 feefilter units. Drops the INV
-                    // only for peers whose advertised feefilter exceeds it.
-                    let tx_fee_rate_sat_kvb = result
-                        .tx_results
-                        .get(i)
-                        .map(|r| {
-                            if r.vsize > 0 {
-                                r.fee.saturating_mul(1000) / r.vsize as u64
-                            } else {
-                                0
-                            }
-                        })
-                        .unwrap_or(0);
-                    peer_manager.relay_tx_inv(txid, wtxid, tx_fee_rate_sat_kvb).await;
+                for (tx, tx_fee_rate_sat_kvb) in &relay {
+                    peer_manager
+                        .relay_tx_inv(tx.txid(), tx.wtxid(), *tx_fee_rate_sat_kvb)
+                        .await;
                 }
             }
         }

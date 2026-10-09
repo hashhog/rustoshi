@@ -16,7 +16,7 @@
 //! calls those checks, so a structurally valid parent+child whose signature
 //! does not verify is admitted.
 
-use rustoshi_consensus::mempool::{Mempool, MempoolConfig};
+use rustoshi_consensus::mempool::{AtmpOptions, Mempool, MempoolConfig};
 use rustoshi_consensus::CoinEntry;
 use rustoshi_crypto::{hash160, sighash::segwit_v0_sighash};
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxIn, TxOut};
@@ -243,6 +243,56 @@ fn submitpackage_invalid_signature_parent_rejected_with_core_script_error() {
         .and_then(|r| r.error.clone())
         .unwrap_or_default();
     assert_eq!(child_err, "bad-txns-inputs-missingorspent");
+}
+
+/// Regtest builds the mempool with `verify_scripts = false`. `submitpackage`
+/// passes `force_script_checks` so the same bad child is still rejected.
+#[test]
+fn submitpackage_force_script_checks_rejects_when_verify_scripts_off() {
+    let f = fixture();
+    let lookup = |op: &OutPoint| f.utxos.get(op).cloned();
+    let mut mp = Mempool::new(MempoolConfig::default());
+    mp.notify_new_tip(1_000, 1_700_000_000);
+    assert!(!mp.verify_scripts());
+
+    let parent = signed_spend(f.prev.clone(), IN_VALUE, 10_000, &f.alice, &f.bob, false);
+    let parent_txid = parent.txid();
+    let child = signed_spend(
+        OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        },
+        IN_VALUE - 10_000,
+        10_000,
+        &f.bob,
+        &f.bob,
+        true,
+    );
+    let child_txid = child.txid();
+
+    let res = mp.accept_package_with_options(
+        vec![parent, child],
+        &lookup,
+        AtmpOptions {
+            force_script_checks: true,
+            ..AtmpOptions::default()
+        },
+    );
+    assert!(!res.all_accepted());
+    assert!(mp.contains(&parent_txid));
+    assert!(!mp.contains(&child_txid));
+    let child_err = res
+        .tx_results
+        .iter()
+        .find(|r| r.txid == child_txid)
+        .and_then(|r| r.error.clone())
+        .unwrap_or_default();
+    assert!(
+        child_err.starts_with(
+            "mempool-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)"
+        ),
+        "{child_err}"
+    );
 }
 
 /// Valid 1-parent-1-child CPFP: the parent is below the relay floor on its
