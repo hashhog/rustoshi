@@ -1142,6 +1142,7 @@ fn fix73_package_tx_result_replaced_txids_field_shape() {
         replaced_txids: Vec::<rustoshi_primitives::Hash256>::new(),
         effective_fee_sat_per_kvb: None,
         effective_includes: None,
+        other_wtxid: None,
     };
     // Iterator over the canonical Hash256 element type — pins the inner type.
     let _: Vec<rustoshi_primitives::Hash256> = r.replaced_txids.clone();

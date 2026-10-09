@@ -53,12 +53,6 @@ CORE_RPC_PORT = 18445
 RUST_RPC_PORT = 18443
 CHAIN_BLOCKS = 110
 
-# Fields Core v31.1 submitpackage does not return. A difference that is only
-# one of these being present on rustoshi is recorded, not treated as a
-# value mismatch.
-RUSTOSHI_EXTRA_TOP = {"package_feerate"}
-RUSTOSHI_EXTRA_TX = {"allowed", "reject_reason", "wtxid"}
-
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -314,106 +308,58 @@ def make_signed(
     }
 
 
-def norm_amount(v):
-    if v is None:
+def _num(v):
+    if isinstance(v, bool) or v is None:
         return None
-    return f"{Decimal(str(v)):.8f}"
+    if isinstance(v, (int, Decimal)):
+        return Decimal(v)
+    return None
+
+
+def compare_json(core, rust, path: str) -> list[dict]:
+    """Entire JSON value: key set, key order, and values. No ignored extras."""
+    mismatches = []
+
+    def add(field: str, c, r):
+        mismatches.append(
+            {"field": field, "core": c, "rustoshi": r, "justified": None}
+        )
+
+    cn, rn = _num(core), _num(rust)
+    if cn is not None and rn is not None:
+        if cn != rn:
+            add(path, core, rust)
+        return mismatches
+
+    if isinstance(core, dict) or isinstance(rust, dict):
+        if not isinstance(core, dict) or not isinstance(rust, dict):
+            add(path, core, rust)
+            return mismatches
+        ck, rk = list(core), list(rust)
+        if ck != rk:
+            add(f"{path} keys", ck, rk)
+        for key in ck:
+            if key in rust:
+                mismatches.extend(compare_json(core[key], rust[key], f"{path}.{key}"))
+        return mismatches
+
+    if isinstance(core, list) or isinstance(rust, list):
+        if not isinstance(core, list) or not isinstance(rust, list):
+            add(path, core, rust)
+            return mismatches
+        if len(core) != len(rust):
+            add(f"{path} len", len(core), len(rust))
+        for i, (c, r) in enumerate(zip(core, rust)):
+            mismatches.extend(compare_json(c, r, f"{path}[{i}]"))
+        return mismatches
+
+    if core != rust:
+        add(path, core, rust)
+    return mismatches
 
 
 def compare_submit(core_res: dict, rust_res: dict) -> list[dict]:
-    mismatches = []
-
-    def add(field: str, c, r, justified: str | None = None):
-        mismatches.append(
-            {
-                "field": field,
-                "core": c,
-                "rustoshi": r,
-                "justified": justified,
-            }
-        )
-
-    if core_res.get("package_msg") != rust_res.get("package_msg"):
-        add("package_msg", core_res.get("package_msg"), rust_res.get("package_msg"))
-
-    c_rep = core_res.get("replaced-transactions")
-    r_rep = rust_res.get("replaced-transactions")
-    if c_rep != r_rep:
-        add("replaced-transactions", c_rep, r_rep)
-
-    for key in sorted(set(rust_res) - set(core_res)):
-        if key in RUSTOSHI_EXTRA_TOP:
-            add(
-                key,
-                None,
-                rust_res.get(key),
-                "Core v31.1 submitpackage does not return this field",
-            )
-        else:
-            add(key, None, rust_res.get(key))
-    for key in sorted(set(core_res) - set(rust_res)):
-        if key in ("package_msg", "tx-results", "replaced-transactions"):
-            continue
-        add(key, core_res.get(key), None)
-
-    c_tx = core_res.get("tx-results") or {}
-    r_tx = rust_res.get("tx-results") or {}
-    for wtxid in sorted(set(c_tx) | set(r_tx)):
-        c = c_tx.get(wtxid)
-        r = r_tx.get(wtxid)
-        prefix = f"tx-results[{wtxid[:12]}]"
-        if c is None or r is None:
-            add(prefix, c, r)
-            continue
-        if c.get("txid") != r.get("txid"):
-            add(f"{prefix}.txid", c.get("txid"), r.get("txid"))
-        if c.get("error") != r.get("error"):
-            add(f"{prefix}.error", c.get("error"), r.get("error"))
-        if c.get("vsize") != r.get("vsize"):
-            add(f"{prefix}.vsize", c.get("vsize"), r.get("vsize"))
-        c_fees = c.get("fees") or {}
-        r_fees = r.get("fees") or {}
-        if (c.get("fees") is None) != (r.get("fees") is None):
-            add(f"{prefix}.fees", c.get("fees"), r.get("fees"))
-        else:
-            if norm_amount(c_fees.get("base")) != norm_amount(r_fees.get("base")):
-                add(f"{prefix}.fees.base", c_fees.get("base"), r_fees.get("base"))
-            c_eff = norm_amount(c_fees.get("effective-feerate"))
-            r_eff = norm_amount(r_fees.get("effective-feerate"))
-            if c_eff != r_eff:
-                add(
-                    f"{prefix}.fees.effective-feerate",
-                    c_fees.get("effective-feerate"),
-                    r_fees.get("effective-feerate"),
-                    "rustoshi reports this tx's own feerate; Core v31.1 "
-                    "AcceptPackage reports the package feerate "
-                    "(effective-feerate / effective-includes)",
-                )
-            c_inc = c_fees.get("effective-includes")
-            r_inc = r_fees.get("effective-includes")
-            if c_inc != r_inc:
-                add(
-                    f"{prefix}.fees.effective-includes",
-                    c_inc,
-                    r_inc,
-                    "Core lists every wtxid in the package fee calculation; "
-                    "rustoshi lists only this tx",
-                )
-        for key in sorted(set(r) - set(c)):
-            if key in RUSTOSHI_EXTRA_TX:
-                add(
-                    f"{prefix}.{key}",
-                    None,
-                    r.get(key),
-                    "Core v31.1 submitpackage tx-results omit this field",
-                )
-            else:
-                add(f"{prefix}.{key}", None, r.get(key))
-        for key in sorted(set(c) - set(r)):
-            if key in ("txid", "error", "vsize", "fees", "other-wtxid"):
-                continue
-            add(f"{prefix}.{key}", c.get(key), None)
-    return mismatches
+    return compare_json(core_res, rust_res, "submitpackage")
 
 
 def mempool_txids(node: Node) -> list[str]:
@@ -510,11 +456,18 @@ def main() -> int:
         log(f"=== {name} ===")
         before_c = set(mempool_txids(core))
         before_r = set(mempool_txids(rust))
+        c_tma = core.rpc("testmempoolaccept", [[parent_hex, child_hex]])
+        r_tma = rust.rpc("testmempoolaccept", [[parent_hex, child_hex]])
+        log("core testmempoolaccept: " + json.dumps(c_tma, sort_keys=True, default=str))
+        log("rustoshi testmempoolaccept: " + json.dumps(r_tma, sort_keys=True, default=str))
+        tma_mismatches = compare_json(c_tma, r_tma, "testmempoolaccept")
+        for m in tma_mismatches:
+            log(f"  MISMATCH {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
         c_res = core.rpc("submitpackage", [[parent_hex, child_hex]])
         r_res = rust.rpc("submitpackage", [[parent_hex, child_hex]])
         log("core submitpackage: " + json.dumps(c_res, sort_keys=True, default=str))
         log("rustoshi submitpackage: " + json.dumps(r_res, sort_keys=True, default=str))
-        mismatches = compare_submit(c_res, r_res)
+        mismatches = tma_mismatches + compare_submit(c_res, r_res)
         after_c = mempool_txids(core)
         after_r = mempool_txids(rust)
         if after_c != after_r:
@@ -591,6 +544,7 @@ def main() -> int:
     child = make_signed(
         core, parent["txid"], 0, parent["out_sats"], parent["spk"], 20_000, dest
     )
+    cpfp_parent = parent
     run_case("valid-cpfp", parent["hex"], child["hex"], parent["txid"], child["txid"])
     # Same package again: both members are already in the mempool (MEMPOOL_ENTRY).
     run_case(
@@ -599,6 +553,59 @@ def main() -> int:
         child["hex"],
         parent["txid"],
         child["txid"],
+    )
+
+    # Same txid as the CPFP parent, different witness. Core returns other-wtxid
+    # and leaves the mempool tx alone.
+    log("=== other-wtxid ===")
+    malleated_hex = corrupt_witness_sig(cpfp_parent["hex"], cpfp_parent["witness"][0])
+    malleated = core.cli_json("decoderawtransaction", malleated_hex)
+    if malleated["txid"] != cpfp_parent["txid"]:
+        die("witness malleation changed txid")
+    if malleated["hash"] == cpfp_parent["wtxid"]:
+        die("witness malleation did not change wtxid")
+    before_c = mempool_txids(core)
+    before_r = mempool_txids(rust)
+    c_tma = core.rpc("testmempoolaccept", [[malleated_hex]])
+    r_tma = rust.rpc("testmempoolaccept", [[malleated_hex]])
+    log("core testmempoolaccept: " + json.dumps(c_tma, sort_keys=True, default=str))
+    log("rustoshi testmempoolaccept: " + json.dumps(r_tma, sort_keys=True, default=str))
+    ow_mismatches = compare_json(c_tma, r_tma, "testmempoolaccept")
+    c_res = core.rpc("submitpackage", [[malleated_hex]])
+    r_res = rust.rpc("submitpackage", [[malleated_hex]])
+    log("core submitpackage: " + json.dumps(c_res, sort_keys=True, default=str))
+    log("rustoshi submitpackage: " + json.dumps(r_res, sort_keys=True, default=str))
+    ow_mismatches.extend(compare_submit(c_res, r_res))
+    if mempool_txids(core) != before_c or mempool_txids(rust) != before_r:
+        ow_mismatches.append(
+            {
+                "field": "mempool_changed",
+                "core": mempool_txids(core) != before_c,
+                "rustoshi": mempool_txids(rust) != before_r,
+                "justified": None,
+            }
+        )
+    if mempool_txids(core) != mempool_txids(rust):
+        ow_mismatches.append(
+            {
+                "field": "getrawmempool",
+                "core": mempool_txids(core),
+                "rustoshi": mempool_txids(rust),
+                "justified": None,
+            }
+        )
+    for m in ow_mismatches:
+        tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+        log(f"  {tag} {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
+    cases.append(
+        {
+            "name": "other-wtxid",
+            "core": c_res,
+            "rustoshi": r_res,
+            "mempool_core": mempool_txids(core),
+            "mempool_rustoshi": mempool_txids(rust),
+            "mismatches": ow_mismatches,
+        }
     )
 
     # 2. Invalid-signature child. Parent fee 10_000 sat so it is individually valid.

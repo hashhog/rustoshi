@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use indexmap::IndexMap;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 // ============================================================
@@ -1169,26 +1170,27 @@ pub struct BannedInfo {
 // PACKAGE RELAY
 // ============================================================
 
-/// Per-transaction result in a package submission.
+/// Per-transaction result in a `submitpackage` response.
+///
+/// Key order matches Bitcoin Core v31.1 `rpc/mempool.cpp` `submitpackage`
+/// (`txid`, optional `other-wtxid`, optional `vsize`, optional `fees`,
+/// optional `error`). The object is keyed by wtxid; the wtxid is not repeated
+/// inside the entry.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PackageTxResultRpc {
     /// Transaction ID.
     pub txid: String,
-    /// Witness transaction ID.
-    pub wtxid: String,
-    /// Virtual size in bytes. Omitted when the tx was rejected (Core omits it).
+    /// Wtxid of a different transaction with the same txid already in the mempool.
+    /// Present only for Core `DIFFERENT_WITNESS`.
+    #[serde(rename = "other-wtxid", skip_serializing_if = "Option::is_none", default)]
+    pub other_wtxid: Option<String>,
+    /// Sigops-adjusted virtual size. Absent for `INVALID` and `DIFFERENT_WITNESS`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub vsize: Option<u64>,
-    /// Fee in BTC. Omitted when the tx was rejected.
+    /// Fees. Absent for `INVALID` and `DIFFERENT_WITNESS`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fees: Option<PackageFees>,
-    /// Whether this transaction was already in the mempool.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed: Option<bool>,
-    /// Error message if validation failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reject_reason: Option<String>,
-    /// Core `submitpackage` `tx-results[].error` (`TxValidationState::ToString()`).
+    /// Core `tx-results[].error` (`TxValidationState::ToString()`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
 }
@@ -1209,16 +1211,16 @@ pub struct PackageFees {
 }
 
 /// Response for `submitpackage` RPC.
+///
+/// Key order matches Bitcoin Core v31.1 `rpc/mempool.cpp` `submitpackage`:
+/// `package_msg`, `tx-results`, `replaced-transactions`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SubmitPackageResult {
-    /// Aggregate package fee rate in BTC/kvB — serialized as `%d.%08d`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub package_feerate: Option<BtcAmount>,
     /// Message describing the result.
     pub package_msg: String,
-    /// Per-transaction results, keyed by wtxid.
+    /// Per-transaction results, keyed by wtxid, in package submission order.
     #[serde(rename = "tx-results")]
-    pub tx_results: std::collections::HashMap<String, PackageTxResultRpc>,
+    pub tx_results: IndexMap<String, PackageTxResultRpc>,
     /// List of txids that were replaced (RBF + TRUC sibling eviction).
     ///
     /// FIX-73 (W120 BUG-5): wire field is `replaced-transactions` (kebab-case)
@@ -2450,9 +2452,8 @@ mod tests {
     #[test]
     fn test_submit_package_result_replaced_transactions_shape_fix73() {
         let result = SubmitPackageResult {
-            package_feerate: None,
             package_msg: "success".to_string(),
-            tx_results: std::collections::HashMap::new(),
+            tx_results: IndexMap::new(),
             replaced_transactions: vec![
                 "aa".repeat(32),
                 "bb".repeat(32),
@@ -2478,9 +2479,8 @@ mod tests {
         // BIP-125 / package-RBF consumers rely on key presence to disambiguate
         // "no replacements" from "field not implemented".
         let empty = SubmitPackageResult {
-            package_feerate: None,
             package_msg: "success".to_string(),
-            tx_results: std::collections::HashMap::new(),
+            tx_results: IndexMap::new(),
             replaced_transactions: vec![],
         };
         let json_empty = serde_json::to_string(&empty).unwrap();
