@@ -302,6 +302,7 @@ def make_signed(
         "hex": signed["hex"],
         "txid": decoded["txid"],
         "wtxid": decoded["hash"],
+        "vsize": int(decoded["vsize"]),
         "witness": witness,
         "out_sats": out_sats,
         "spk": decoded["vout"][0]["scriptPubKey"]["hex"],
@@ -400,9 +401,9 @@ def main() -> int:
 
     utxos = core.cli_json("-rpcwallet=sweep", "listunspent", "100", "9999999")
     utxos = [u for u in utxos if u.get("spendable")]
-    if len(utxos) < 5:
-        die(f"need 5 mature coinbases, have {len(utxos)}")
-    utxos = utxos[:5]
+    if len(utxos) < 10:
+        die(f"need 10 mature coinbases, have {len(utxos)}")
+    utxos = utxos[:10]
     for u in utxos:
         log(f"utxo {u['txid']}:{u['vout']} {u['amount']} conf={u['confirmations']}")
 
@@ -681,6 +682,231 @@ def main() -> int:
         parent["txid"],
         bad_ver["txid"],
     )
+
+    def admit_both(name: str, hex_tx: str) -> None:
+        """submitpackage one tx on both nodes and require the results to match."""
+        log(f"=== admit {name} ===")
+        c_res = core.rpc("submitpackage", [[hex_tx]])
+        r_res = rust.rpc("submitpackage", [[hex_tx]])
+        log("core submitpackage: " + json.dumps(c_res, sort_keys=True, default=str))
+        log("rustoshi submitpackage: " + json.dumps(r_res, sort_keys=True, default=str))
+        mismatches = compare_submit(c_res, r_res)
+        if mempool_txids(core) != mempool_txids(rust):
+            mismatches.append(
+                {
+                    "field": "getrawmempool",
+                    "core": mempool_txids(core),
+                    "rustoshi": mempool_txids(rust),
+                    "justified": None,
+                }
+            )
+        for m in mismatches:
+            tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+            log(f"  {tag} {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
+        cases.append(
+            {
+                "name": name,
+                "core": c_res,
+                "rustoshi": r_res,
+                "mempool_core": mempool_txids(core),
+                "mempool_rustoshi": mempool_txids(rust),
+                "mismatches": mismatches,
+            }
+        )
+
+    # 6. Package RBF success. The replacement parent spends the same confirmed
+    # output as `original` and pays a higher fee; the child spends the parent.
+    # Core lists the replaced txid in replaced-transactions.
+    u = utxos[5]
+    original = make_signed(
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest
+    )
+    admit_both("package-rbf-original", original["hex"])
+    parent = make_signed(
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 50_000, dest
+    )
+    child = make_signed(
+        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 5_000, dest
+    )
+    run_case(
+        "package-rbf-success",
+        parent["hex"],
+        child["hex"],
+        parent["txid"],
+        child["txid"],
+    )
+    if original["txid"] in mempool_txids(core) or original["txid"] in mempool_txids(rust):
+        log(
+            f"MISMATCH package-rbf-success left original {original['txid']} in a mempool"
+        )
+        cases[-1]["mismatches"].append(
+            {
+                "field": "original_still_present",
+                "core": original["txid"] in mempool_txids(core),
+                "rustoshi": original["txid"] in mempool_txids(rust),
+                "justified": None,
+            }
+        )
+
+    # 7. The replacement itself fails script checks. Core never reaches
+    # FinalizeSubpackage, so the original stays and replaced-transactions is
+    # empty. A child of the rejected parent is missing-inputs.
+    u = utxos[6]
+    original = make_signed(
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest
+    )
+    admit_both("package-rbf-badsig-original", original["hex"])
+    parent = make_signed(
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 50_000, dest
+    )
+    bad_parent_hex = corrupt_witness_sig(parent["hex"], parent["witness"][0])
+    bad_parent = core.cli_json("decoderawtransaction", bad_parent_hex)
+    child = make_signed(
+        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 5_000, dest
+    )
+    run_case(
+        "package-rbf-badsig",
+        bad_parent_hex,
+        child["hex"],
+        bad_parent["txid"],
+        child["txid"],
+    )
+    orig_c = original["txid"] in mempool_txids(core)
+    orig_r = original["txid"] in mempool_txids(rust)
+    log(f"  original still in mempool core={orig_c} rustoshi={orig_r}")
+    if not orig_c or not orig_r:
+        cases[-1]["mismatches"].append(
+            {
+                "field": "original_evicted",
+                "core": orig_c,
+                "rustoshi": orig_r,
+                "justified": None,
+            }
+        )
+
+    # 8. Individually valid RBF parent, bad-sig child. Core finalizes the
+    # parent (and its eviction) before the child is script-checked, so the
+    # original is gone and replaced-transactions lists it.
+    u = utxos[7]
+    original = make_signed(
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest
+    )
+    admit_both("package-rbf-badchild-original", original["hex"])
+    parent = make_signed(
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 50_000, dest
+    )
+    child = make_signed(
+        core, parent["txid"], 0, parent["out_sats"], parent["spk"], 5_000, dest
+    )
+    bad_child_hex = corrupt_witness_sig(child["hex"], child["witness"][0])
+    bad_child = core.cli_json("decoderawtransaction", bad_child_hex)
+    run_case(
+        "package-rbf-bad-child",
+        parent["hex"],
+        bad_child_hex,
+        parent["txid"],
+        bad_child["txid"],
+    )
+
+    def run_solo(name: str, hex_tx: str, txid: str, maxfeerate: str | None = None):
+        """One-tx submitpackage (and testmempoolaccept). Optional maxfeerate."""
+        log(f"=== {name} ===")
+        before_c = set(mempool_txids(core))
+        before_r = set(mempool_txids(rust))
+        tma_params: list = [[hex_tx]]
+        sp_params: list = [[hex_tx]]
+        if maxfeerate is not None:
+            # testmempoolaccept takes a JSON number. submitpackage takes
+            # Core's amount string (8 decimal places).
+            tma_params.append(float(maxfeerate))
+            sp_params.append(maxfeerate)
+        c_tma = core.rpc("testmempoolaccept", tma_params)
+        r_tma = rust.rpc("testmempoolaccept", tma_params)
+        log("core testmempoolaccept: " + json.dumps(c_tma, sort_keys=True, default=str))
+        log("rustoshi testmempoolaccept: " + json.dumps(r_tma, sort_keys=True, default=str))
+        mismatches = compare_json(c_tma, r_tma, "testmempoolaccept")
+        c_res = core.rpc("submitpackage", sp_params)
+        r_res = rust.rpc("submitpackage", sp_params)
+        log("core submitpackage: " + json.dumps(c_res, sort_keys=True, default=str))
+        log("rustoshi submitpackage: " + json.dumps(r_res, sort_keys=True, default=str))
+        mismatches.extend(compare_submit(c_res, r_res))
+        after_c = mempool_txids(core)
+        after_r = mempool_txids(rust)
+        if after_c != after_r:
+            mismatches.append(
+                {
+                    "field": "getrawmempool",
+                    "core": after_c,
+                    "rustoshi": after_r,
+                    "justified": None,
+                }
+            )
+        c_in = txid in after_c
+        r_in = txid in after_r
+        log(f"  tx {txid} in mempool core={c_in} rustoshi={r_in}")
+        if c_in != r_in:
+            mismatches.append(
+                {
+                    "field": "mempool_contains",
+                    "core": c_in,
+                    "rustoshi": r_in,
+                    "justified": None,
+                }
+            )
+        added_c = sorted(set(after_c) - before_c)
+        added_r = sorted(set(after_r) - before_r)
+        if added_c != added_r:
+            mismatches.append(
+                {
+                    "field": "mempool_added",
+                    "core": added_c,
+                    "rustoshi": added_r,
+                    "justified": None,
+                }
+            )
+        for m in mismatches:
+            tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+            log(f"  {tag} {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
+        cases.append(
+            {
+                "name": name,
+                "core": c_res,
+                "rustoshi": r_res,
+                "mempool_core": after_c,
+                "mempool_rustoshi": after_r,
+                "mismatches": mismatches,
+            }
+        )
+
+    # 9. Solo effective-feerate. CFeeRate::GetFeePerK truncates
+    # (fee * 1000) / vsize. Pick a fee where that differs from rounding.
+    u = utxos[8]
+    fee = 10_000
+    solo = None
+    for _ in range(80):
+        solo = make_signed(
+            core, u["txid"], u["vout"], sats_of(u["amount"]), spk, fee, dest
+        )
+        vsize = solo["vsize"]
+        trunc = (fee * 1000) // vsize
+        rnd = (fee * 1000 + vsize // 2) // vsize
+        if trunc != rnd:
+            log(f"solo feerate fee={fee} vsize={vsize} trunc_sat_kvb={trunc} round_sat_kvb={rnd}")
+            break
+        fee += 1
+    else:
+        die("could not find a solo fee whose GetFeePerK truncates differently from rounding")
+    run_solo("solo-effective-feerate", solo["hex"], solo["txid"])
+
+    # 10. maxfeerate is checked before submission. 0.00001000 BTC/kvB is
+    # 1000 sat/kvB; this tx's fee is far above that. Core's error is
+    # "max feerate exceeded" (empty debug message), package_msg
+    # "transaction failed", and the tx is not admitted.
+    u = utxos[9]
+    hot = make_signed(
+        core, u["txid"], u["vout"], sats_of(u["amount"]), spk, 10_000, dest
+    )
+    run_solo("maxfeerate", hot["hex"], hot["txid"], "0.00001000")
 
     # invalidateblock / reconsiderblock of the current tip.
     log("=== invalidateblock / reconsiderblock ===")

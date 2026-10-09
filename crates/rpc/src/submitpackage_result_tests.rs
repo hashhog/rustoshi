@@ -575,3 +575,254 @@ async fn submitpackage_other_wtxid_result_keys_match_core() {
     assert_eq!(e["txid"], f.parent.txid().to_hex());
     assert_eq!(e["other-wtxid"], mem_wtxid);
 }
+
+fn mempool_txids(pool: &serde_json::Value) -> Vec<String> {
+    serde_json::from_value(pool.clone()).unwrap()
+}
+
+async fn mempool(state: &Arc<RwLock<RpcState>>) -> Vec<String> {
+    let pool = result(call(state, "getrawmempool", serde_json::json!([false])).await);
+    mempool_txids(&pool)
+}
+
+/// Core `CFeeRate(fee, vsize).GetFeePerK` is `EvaluateFeeDown(1000)`:
+/// `(fee * 1000) / vsize` (truncation toward zero). `ValueFromAmount` is that
+/// many satoshis printed as 8-decimal BTC.
+fn trunc_sat_per_kvb(fee: u64, vsize: usize) -> u64 {
+    fee.saturating_mul(1000) / vsize as u64
+}
+
+fn round_sat_per_kvb(fee: u64, vsize: usize) -> u64 {
+    fee.saturating_mul(1000).saturating_add(vsize as u64 / 2) / vsize as u64
+}
+
+/// Solo effective-feerate matches Core truncation, which differs from rounding
+/// whenever the remainder is at least half a sat/kvB.
+#[tokio::test]
+async fn submitpackage_solo_effective_feerate_truncates_like_core() {
+    let probe = signed_pkg(10_000, 1_000, false, false).await;
+    let vsize = probe.parent.vsize();
+    let mut fee = 10_000u64;
+    while trunc_sat_per_kvb(fee, vsize) == round_sat_per_kvb(fee, vsize) {
+        fee += 1;
+        assert!(fee < 20_000, "vsize {vsize} never separates trunc from round");
+    }
+    let s = signed_pkg(fee, 1_000, false, false).await;
+    let res = result(
+        call(
+            &s.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&s.parent)]]),
+        )
+        .await,
+    );
+    assert_eq!(res["package_msg"], "success");
+    let e = entry(&res, &s.parent.wtxid().to_hex());
+    assert_keys(e, TX_ACCEPTED, "solo");
+    let got = e["fees"]["effective-feerate"].as_f64().unwrap();
+    let trunc = trunc_sat_per_kvb(fee, s.parent.vsize()) as f64 / 100_000_000.0;
+    let round = round_sat_per_kvb(fee, s.parent.vsize()) as f64 / 100_000_000.0;
+    assert!(
+        (got - trunc).abs() < 1e-12,
+        "effective-feerate {got} != Core GetFeePerK {trunc} (round would be {round})"
+    );
+    assert!(
+        (got - round).abs() > 1e-12,
+        "effective-feerate collapsed to the rounded value {round}"
+    );
+    let includes = e["fees"]["effective-includes"].as_array().unwrap();
+    assert_eq!(includes.len(), 1);
+    assert_eq!(includes[0], s.parent.wtxid().to_hex());
+}
+
+/// Core checks maxfeerate before submission. The tx is not admitted, the
+/// entry is INVALID (`txid` + `error` = "max feerate exceeded"), and
+/// `package_msg` is "transaction failed".
+#[tokio::test]
+async fn submitpackage_maxfeerate_rejected_before_admission() {
+    let s = signed_pkg(10_000, 10_000, false, false).await;
+    let res = result(
+        call(
+            &s.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&s.parent)], "0.00001000"]),
+        )
+        .await,
+    );
+    assert_eq!(res["package_msg"], "transaction failed");
+    assert_top(&res);
+    assert_eq!(res["replaced-transactions"].as_array().unwrap().len(), 0);
+    let e = entry(&res, &s.parent.wtxid().to_hex());
+    assert_keys(e, TX_REJECTED, "maxfeerate");
+    assert_eq!(e["error"], "max feerate exceeded");
+    let ids = mempool(&s.state).await;
+    assert!(
+        !ids.contains(&s.parent.txid().to_hex()),
+        "maxfeerate reject must not admit the tx, mempool={ids:?}"
+    );
+}
+
+/// `tx-results[].error` is `TxValidationState::ToString()`:
+/// `mempool min fee not met, {fee} < {GetMinFee().GetFee(vsize)}`.
+#[tokio::test]
+async fn submitpackage_mempool_min_fee_error_matches_core() {
+    let fee = 10_000u64;
+    let s = signed_pkg(fee, 1_000, false, false).await;
+    let min_kvb = 5_000_000u64;
+    {
+        let mut st = s.state.write().await;
+        st.mempool.set_rolling_min_fee_sat_kvb(min_kvb);
+    }
+    let vsize = s.parent.vsize();
+    let required = (min_kvb * vsize as u64 + 999) / 1000;
+    let expect = format!("mempool min fee not met, {fee} < {required}");
+    let res = result(
+        call(
+            &s.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&s.parent)]]),
+        )
+        .await,
+    );
+    assert_eq!(res["package_msg"], "transaction failed");
+    assert_top(&res);
+    let e = entry(&res, &s.parent.wtxid().to_hex());
+    assert_keys(e, TX_REJECTED, "mempool min fee");
+    assert_eq!(e["error"], expect, "vsize={vsize} result={e}");
+    let ids = mempool(&s.state).await;
+    assert!(
+        !ids.contains(&s.parent.txid().to_hex()),
+        "below mempool min fee must not be admitted, mempool={ids:?}"
+    );
+}
+
+struct Replacement {
+    state: Arc<RwLock<RpcState>>,
+    original: Transaction,
+    parent: Transaction,
+    child: Transaction,
+}
+
+async fn replacement_pkg(orig_fee: u64, parent_fee: u64, child_fee: u64, corrupt_child: bool) -> Replacement {
+    let alice = signer(0x11);
+    let bob = signer(0x22);
+    let carol = signer(0x33);
+    let (state, _server) = server();
+    let prev = OutPoint {
+        txid: Hash256::from([0x77u8; 32]),
+        vout: 0,
+    };
+    {
+        let mut st = state.write().await;
+        BlockStore::new(&st.db)
+            .put_utxo(
+                &prev,
+                &rustoshi_storage::CoinEntry {
+                    height: 1,
+                    is_coinbase: false,
+                    value: IN_VALUE,
+                    script_pubkey: p2wpkh_spk(&alice),
+                },
+            )
+            .unwrap();
+        st.mempool.notify_new_tip(200, 1_700_000_000);
+    }
+    let original = signed_spend(prev.clone(), IN_VALUE, orig_fee, &alice, &bob, false);
+    let parent = signed_spend(prev, IN_VALUE, parent_fee, &alice, &carol, false);
+    let child = signed_spend(
+        OutPoint {
+            txid: parent.txid(),
+            vout: 0,
+        },
+        IN_VALUE - parent_fee,
+        child_fee,
+        &carol,
+        &carol,
+        corrupt_child,
+    );
+    Replacement {
+        state,
+        original,
+        parent,
+        child,
+    }
+}
+
+/// Package RBF success lists the replaced txid.
+#[tokio::test]
+async fn submitpackage_rbf_success_lists_replaced_txids() {
+    let r = replacement_pkg(10_000, 50_000, 5_000, false).await;
+    let first = result(
+        call(
+            &r.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&r.original)]]),
+        )
+        .await,
+    );
+    assert_eq!(first["package_msg"], "success", "{first}");
+    let res = result(
+        call(
+            &r.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&r.parent), hex_tx(&r.child)]]),
+        )
+        .await,
+    );
+    assert_eq!(res["package_msg"], "success", "{res}");
+    assert_top(&res);
+    let replaced = res["replaced-transactions"].as_array().unwrap();
+    assert_eq!(
+        replaced,
+        &vec![serde_json::Value::String(r.original.txid().to_hex())],
+        "{res}"
+    );
+    let ids = mempool(&r.state).await;
+    assert!(!ids.contains(&r.original.txid().to_hex()), "{ids:?}");
+    assert!(ids.contains(&r.parent.txid().to_hex()), "{ids:?}");
+    assert!(ids.contains(&r.child.txid().to_hex()), "{ids:?}");
+}
+
+/// A package that would evict and then fails must leave the original in
+/// place, with `replaced-transactions` empty. The parent clears RBF on its
+/// own fee but not the rolling mempool floor, so it is package-only; the
+/// child then fails script checks.
+#[tokio::test]
+async fn submitpackage_failed_package_does_not_keep_evictions() {
+    let r = replacement_pkg(10_000, 50_000, 20_000, true).await;
+    let first = result(
+        call(
+            &r.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&r.original)]]),
+        )
+        .await,
+    );
+    assert_eq!(first["package_msg"], "success", "{first}");
+    {
+        let mut st = r.state.write().await;
+        st.mempool.set_rolling_min_fee_sat_kvb(5_000_000);
+    }
+    let res = result(
+        call(
+            &r.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&r.parent), hex_tx(&r.child)]]),
+        )
+        .await,
+    );
+    assert_eq!(res["package_msg"], "transaction failed", "{res}");
+    assert_top(&res);
+    assert_eq!(
+        res["replaced-transactions"].as_array().unwrap().len(),
+        0,
+        "{res}"
+    );
+    let ids = mempool(&r.state).await;
+    assert!(
+        ids.contains(&r.original.txid().to_hex()),
+        "original must survive a failed package, mempool={ids:?} result={res}"
+    );
+    assert!(!ids.contains(&r.parent.txid().to_hex()), "{ids:?} {res}");
+    assert!(!ids.contains(&r.child.txid().to_hex()), "{ids:?} {res}");
+}
