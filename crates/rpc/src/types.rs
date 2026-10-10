@@ -684,13 +684,11 @@ pub struct MempoolInfo {
 
 /// Nested fee object for `getmempoolentry` / `getrawmempool` verbose entries.
 ///
-/// Bitcoin Core `entryToJSON` (rpc/mempool.cpp:527-532) builds a `fees`
-/// sub-object with four keys in this exact order: `base`, `modified`,
-/// `ancestor`, `descendant` (plus `chunk` for cluster-mempool, omitted here
-/// as a TODO until cluster mempool is implemented).  All values are BTC amounts
-/// (8 decimal places, matching `ValueFromAmount`).
-///
-/// Reference: bitcoin-core/src/rpc/mempool.cpp::entryToJSON (lines 527-533).
+/// Bitcoin Core `entryToJSON` (rpc/mempool.cpp) builds a `fees` sub-object
+/// with keys in this exact order: `base`, `modified`, `ancestor`,
+/// `descendant`, `chunk`. All values are BTC amounts (8 decimal places,
+/// matching `ValueFromAmount`). `chunk` is the modified fee of the cluster
+/// chunk this transaction mines in.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MempoolFees {
     /// Base fee (unmodified) in BTC — serialized as Core's `%d.%08d`.
@@ -701,9 +699,8 @@ pub struct MempoolFees {
     pub ancestor: BtcAmount,
     /// Total descendant fees (including this tx) in BTC.
     pub descendant: BtcAmount,
-    // TODO: `chunk` fee from cluster mempool (Bitcoin Core 31.99+ only);
-    // requires cluster-mempool tracking in consensus/mempool.rs before it
-    // can be populated.
+    /// Modified fee of this transaction's cluster chunk, in BTC.
+    pub chunk: BtcAmount,
 }
 
 /// Entry in mempool for `getrawmempool` verbose mode and `getmempoolentry`.
@@ -712,7 +709,7 @@ pub struct MempoolFees {
 /// (bitcoin-core/src/rpc/mempool.cpp:508-568):
 ///   vsize, weight, time, height,
 ///   descendantcount, descendantsize, ancestorcount, ancestorsize,
-///   wtxid, fees{base, modified, ancestor, descendant},
+///   wtxid, chunkweight, fees{base, modified, ancestor, descendant, chunk},
 ///   depends, spentby, bip125-replaceable, unbroadcast.
 ///
 /// The old flat fields (`fee`, `modifiedfee`, `descendantfees`, `ancestorfees`)
@@ -738,7 +735,9 @@ pub struct MempoolEntry {
     pub ancestorsize: u32,
     /// Witness transaction ID.
     pub wtxid: String,
-    /// Nested fee sub-object (base, modified, ancestor, descendant) in BTC.
+    /// Sigop-adjusted weight of the cluster chunk this transaction mines in.
+    pub chunkweight: u64,
+    /// Nested fee sub-object (base, modified, ancestor, descendant, chunk) in BTC.
     pub fees: MempoolFees,
     /// Transaction IDs this transaction depends on (unconfirmed parents).
     pub depends: Vec<String>,
@@ -2113,11 +2112,13 @@ mod tests {
             ancestorcount: 0,
             ancestorsize: 0,
             wtxid: "abcd".repeat(16),
+            chunkweight: 1000,
             fees: MempoolFees {
                 base: BtcAmount::from_btc(0.000025),
                 modified: BtcAmount::from_btc(0.000025),
                 ancestor: BtcAmount::from_sats(0),
                 descendant: BtcAmount::from_sats(2500),
+                chunk: BtcAmount::from_btc(0.000025),
             },
             depends: vec!["1234".repeat(16)],
             spentby: vec![],
@@ -2135,12 +2136,17 @@ mod tests {
         assert!(json.contains("\"descendantcount\":1"), "descendantcount: {}", json);
         assert!(json.contains("\"ancestorcount\":0"), "ancestorcount: {}", json);
         assert!(json.contains("\"wtxid\":"), "wtxid: {}", json);
+        assert!(json.contains("\"chunkweight\":1000"), "chunkweight: {}", json);
+        let chunk_pos = json.find("\"chunkweight\"").unwrap();
+        let fees_pos = json.find("\"fees\"").unwrap();
+        assert!(chunk_pos < fees_pos, "chunkweight precedes fees: {json}");
         // Nested fees object — Core shape (not flat fee/modifiedfee fields)
         assert!(json.contains("\"fees\":{"), "fees nested object: {}", json);
         assert!(json.contains("\"base\":0.00002500"), "fees.base precision: {}", json);
         assert!(json.contains("\"modified\":0.00002500"), "fees.modified precision: {}", json);
         assert!(json.contains("\"ancestor\":0.00000000"), "fees.ancestor: {}", json);
         assert!(json.contains("\"descendant\":0.00002500"), "fees.descendant: {}", json);
+        assert!(json.contains("\"chunk\":0.00002500"), "fees.chunk: {}", json);
         // Flat fee/modifiedfee must NOT appear at top level
         assert!(!json.contains("\"fee\":"), "flat fee field must be absent: {}", json);
         assert!(!json.contains("\"modifiedfee\":"), "flat modifiedfee must be absent: {}", json);

@@ -10,9 +10,12 @@ fresh Core node and a fresh rustoshi. Compared, field by field:
   * invalidateblock / reconsiderblock results
   * getchaintips (height, hash, branchlen, status)
   * getbestblockhash
-  * getblockchaininfo tip fields (blocks, headers, bestblockhash, bits,
-    target, difficulty, time, mediantime, chainwork)
-  * getrawmempool after invalidate and after reconsider
+  * getblockchaininfo, every field (headers, verificationprogress,
+    size_on_disk included)
+  * getrawmempool after invalidate and after reconsider, including time,
+    bip125-replaceable, fees.chunk, and chunkweight
+  * submitheader of a header whose parent was invalidated (bad-prevblk,
+    header not stored)
 
 Usage:
   invalidated_submit_sweep.py --bitcoind PATH --bitcoin-cli PATH --rustoshi PATH
@@ -35,19 +38,8 @@ import time
 import urllib.error
 import urllib.request
 
-TIP_FIELDS = (
-    "blocks",
-    "headers",
-    "bestblockhash",
-    "bits",
-    "target",
-    "difficulty",
-    "time",
-    "mediantime",
-    "chainwork",
-)
-# Local insertion time. The same tx is admitted independently on each node.
-MEMPOOL_TIME_KEYS = {"time"}
+# Floats Core emits with setFloat / setprecision. Compared as f64.
+INFO_FLOATS = {"difficulty", "verificationprogress"}
 
 
 def sha256d(b: bytes) -> bytes:
@@ -293,9 +285,17 @@ def build_chain(bitcoind: str, bitcoin_cli: str, work: str) -> dict:
         shutil.rmtree(datadir, ignore_errors=True)
 
 
-def snapshot(rpc: Rpc, blocks: list[str]) -> dict:
+def header_hash(header_hex: str) -> str:
+    return sha256d(bytes.fromhex(header_hex))[::-1].hex()
+
+
+def snapshot(rpc: Rpc, blocks: list[str], mock_time: int) -> dict:
     """One full pass. `blocks` is height 1..102; the last confirms a non-coinbase spend."""
     out: dict = {"steps": []}
+    # Same mock clock on both nodes so mempool `time` is not a race.
+    rec_clock = rpc.call("setmocktime", [mock_time])
+    if isinstance(rec_clock, dict) and "_rpc_error" in rec_clock:
+        raise RuntimeError(f"setmocktime failed: {rec_clock}")
 
     def rec(name: str, value) -> None:
         out["steps"].append({"name": name, "value": value})
@@ -327,6 +327,20 @@ def snapshot(rpc: Rpc, blocks: list[str]) -> dict:
     tip_hash = rpc.call("getbestblockhash")
     rec("invalidate-tip", rpc.call("invalidateblock", [tip_hash]))
     chain_view("after-invalidate-tip")
+    # Header whose parent is the invalidated tip. Core: RPC -25 bad-prevblk,
+    # and the header is not added to the index.
+    failed_parent = rpc.call("getblock", [tip_hash])
+    if not isinstance(failed_parent, dict) or "time" not in failed_parent:
+        raise RuntimeError(f"getblock {tip_hash} missing time: {failed_parent}")
+    failed_header_block = make_block(
+        tip_hash, 1, int(failed_parent["time"]) + 1, extra=b"\x31\xc5"
+    )
+    failed_header = failed_header_block[:160]
+    rec("submitheader-failed-parent", rpc.call("submitheader", [failed_header]))
+    rec(
+        "submitheader-failed-parent:getblockheader",
+        rpc.call("getblockheader", [header_hash(failed_header)]),
+    )
     submit("duplicate-invalid-tip", tip_hex)
     rec("reconsider-tip", rpc.call("reconsiderblock", [tip_hash]))
     chain_view("after-reconsider-tip")
@@ -383,14 +397,14 @@ def canonical_tips(tips):
 def canonical_mempool(pool):
     if not isinstance(pool, dict):
         return pool
-    out = {}
-    for txid, entry in sorted(pool.items()):
-        if isinstance(entry, dict):
-            e = {k: v for k, v in entry.items() if k not in MEMPOOL_TIME_KEYS}
-            out[txid] = e
-        else:
-            out[txid] = entry
-    return out
+    return {txid: pool[txid] for txid in sorted(pool)}
+
+
+def floats_close(a, b) -> bool:
+    fa, fb = norm_difficulty(a), norm_difficulty(b)
+    if isinstance(fa, float) and isinstance(fb, float):
+        return abs(fa - fb) <= max(1e-12, 1e-9 * max(abs(fa), abs(fb)))
+    return a == b
 
 
 def values_equal(name: str, a, b) -> bool:
@@ -401,14 +415,12 @@ def values_equal(name: str, a, b) -> bool:
     if name.endswith(":getblockchaininfo"):
         if not isinstance(a, dict) or not isinstance(b, dict):
             return a == b
-        for k in TIP_FIELDS:
-            av, bv = a.get(k), b.get(k)
-            if k == "difficulty":
-                fa, fb = norm_difficulty(av), norm_difficulty(bv)
-                if isinstance(fa, float) and isinstance(fb, float):
-                    if abs(fa - fb) > max(1e-18, 1e-9 * max(abs(fa), abs(fb))):
-                        return False
-                elif av != bv:
+        if set(a) != set(b):
+            return False
+        for k, av in a.items():
+            bv = b[k]
+            if k in INFO_FLOATS:
+                if not floats_close(av, bv):
                     return False
             elif av != bv:
                 return False
@@ -494,9 +506,10 @@ def main() -> int:
         rust = start_rustoshi(args.rustoshi, os.path.join(args.work, "rustoshi"), 18621, 18622)
         nodes.append(rust)
         print("replaying on core...")
-        core_obs = snapshot(core.rpc, built["blocks"])
+        mock_time = int(time.time())
+        core_obs = snapshot(core.rpc, built["blocks"], mock_time)
         print("replaying on rustoshi...")
-        rust_obs = snapshot(rust.rpc, built["blocks"])
+        rust_obs = snapshot(rust.rpc, built["blocks"], mock_time)
     finally:
         for n in nodes:
             n.stop()

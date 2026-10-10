@@ -1359,11 +1359,16 @@ async fn rest_chaininfo(
         (None, None) => (1.0, "0".repeat(64), 0),
     };
 
-    let progress = if rpc_state.header_height > 0 {
-        rpc_state.best_height as f64 / rpc_state.header_height as f64
-    } else {
-        1.0
-    };
+    let chain_tx = crate::server::active_chain_tx_count(&store, &rpc_state.best_hash);
+    let tip_time = header_opt.as_ref().map(|h| h.timestamp).unwrap_or(0);
+    let progress = crate::server::guess_verification_progress(
+        rpc_state.params.network_id,
+        chain_tx,
+        tip_time,
+        rpc_state.best_height,
+        rpc_state.header_height.max(rpc_state.best_height),
+        crate::server::unix_now_secs(),
+    );
 
     let chain_name = match rpc_state.params.network_id {
         rustoshi_consensus::params::NetworkId::Mainnet => "main",

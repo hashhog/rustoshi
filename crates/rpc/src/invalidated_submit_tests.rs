@@ -24,19 +24,50 @@ use tokio::sync::RwLock;
 
 const BASE_TIME: u32 = 1_700_000_000;
 
-fn coinbase(h: u32) -> Transaction {
-    // BIP34 height push (heights here are <= 16) + a marker byte.
+/// BIP34 height push. Heights 1..=16 are `OP_1`..`OP_16`; larger heights are
+/// a minimal little-endian script-num push.
+fn bip34_push(height: u32) -> Vec<u8> {
+    if height == 0 {
+        return vec![0x00];
+    }
+    if height <= 16 {
+        return vec![0x50 + height as u8];
+    }
+    let mut h = height;
+    let mut le = Vec::new();
+    while h > 0 {
+        le.push((h & 0xFF) as u8);
+        h >>= 8;
+    }
+    if le.last().is_some_and(|b| b & 0x80 != 0) {
+        le.push(0);
+    }
+    let mut out = vec![le.len() as u8];
+    out.extend(le);
+    out
+}
+
+fn coinbase_to(h: u32, outputs: Vec<TxOut>) -> Transaction {
+    let mut script_sig = bip34_push(h);
+    script_sig.extend_from_slice(&[0x01, 0xC5]);
     Transaction {
         version: 2,
         inputs: vec![TxIn {
             previous_output: OutPoint { txid: Hash256::ZERO, vout: u32::MAX },
-            script_sig: vec![0x50 + h as u8, 0x01, 0xC5],
+            script_sig,
             sequence: 0xFFFF_FFFF,
             witness: vec![],
         }],
-        outputs: vec![TxOut { value: 50 * 100_000_000, script_pubkey: vec![0x51] }],
+        outputs,
         lock_time: 0,
     }
+}
+
+fn coinbase(h: u32) -> Transaction {
+    coinbase_to(
+        h,
+        vec![TxOut { value: 50 * 100_000_000, script_pubkey: vec![0x51] }],
+    )
 }
 
 /// `cb_height` is the BIP-34 prefix (independent of the block's real height).
@@ -240,4 +271,470 @@ async fn submitblock_child_and_grandchild_of_invalidated_block_are_bad_prevblk()
     server.reconsider_block(b[8].block_hash().to_hex()).await.expect("reconsiderblock");
     assert_eq!(server.get_block_count().await.unwrap(), 11);
     assert_eq!(server.get_best_block_hash().await.unwrap(), child.block_hash().to_hex());
+}
+
+fn header_hex(block: &Block) -> String {
+    let mut buf = Vec::new();
+    block.header.encode(&mut buf).unwrap();
+    assert_eq!(buf.len(), 80);
+    hex::encode(buf)
+}
+
+fn mine_at(h: u32, prev: Hash256, timestamp: u32) -> Block {
+    mine_with_at(h, prev, timestamp, Vec::new())
+}
+
+fn mine_with_at(h: u32, prev: Hash256, timestamp: u32, extra: Vec<Transaction>) -> Block {
+    let mut transactions = vec![coinbase(h)];
+    transactions.extend(extra);
+    let mut block = Block {
+        header: BlockHeader {
+            version: 0x2000_0000,
+            prev_block_hash: prev,
+            merkle_root: Hash256::ZERO,
+            timestamp,
+            bits: 0x207f_ffff,
+            nonce: 0,
+        },
+        transactions,
+    };
+    block.header.merkle_root = block.compute_merkle_root();
+    while !block.header.validate_pow_against_declared_target() {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+    block
+}
+
+async fn chain_at(n: u32, time_of: impl Fn(u32) -> u32) -> (RpcServerImpl, Vec<Block>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let db = Arc::new(ChainDb::open(&path).unwrap());
+    let params = ChainParams::regtest();
+    BlockStore::new(&db).init_genesis(&params).unwrap();
+    let mut st = RpcState::new(db.clone(), params.clone());
+    st.best_hash = params.genesis_hash;
+    st.best_height = 0;
+    st.data_dir = Some(path);
+    let state = Arc::new(RwLock::new(st));
+    let server = RpcServerImpl::new(state, Arc::new(RwLock::new(PeerState::default())));
+    let mut blocks = vec![params.genesis_block.clone()];
+    let mut prev = params.genesis_hash;
+    for h in 1..=n {
+        let b = mine_at(h, prev, time_of(h));
+        let r = server.submit_block(hex_of(&b)).await.expect("submitblock rpc");
+        assert!(r.is_none(), "setup block {h} rejected: {r:?}");
+        prev = b.block_hash();
+        blocks.push(b);
+    }
+    (server, blocks)
+}
+
+/// Core `getchaintips` (rpc/blockchain.cpp): the active tip, plus every orphan
+/// that is not the parent of another orphan. Status is active / invalid /
+/// headers-only / valid-fork / valid-headers. branchlen is the distance back
+/// to the active chain.
+#[tokio::test]
+async fn getchaintips_lists_every_core_status() {
+    let (server, blocks) = chain(2).await;
+    let genesis = blocks[0].block_hash();
+    let a2 = blocks[2].block_hash();
+
+    // Heavier fork from genesis. S1 and S2 lose to A2; S3 overtakes it.
+    // A2 stays fully validated and becomes a valid-fork.
+    let s1 = mine_cb(1, genesis, 100);
+    assert_eq!(
+        server.submit_block(hex_of(&s1)).await.unwrap().as_deref(),
+        Some("inconclusive")
+    );
+    let s2 = mine_cb(2, s1.block_hash(), 101);
+    assert_eq!(
+        server.submit_block(hex_of(&s2)).await.unwrap().as_deref(),
+        Some("inconclusive")
+    );
+    let s3 = mine_cb(3, s2.block_hash(), 102);
+    assert!(
+        server.submit_block(hex_of(&s3)).await.unwrap().is_none(),
+        "heavier fork must become the tip"
+    );
+    assert_eq!(server.get_best_block_hash().await.unwrap(), s3.block_hash().to_hex());
+
+    // Sibling of block 1 that never connects: valid-headers.
+    let side = mine_cb(1, genesis, 200);
+    assert_eq!(
+        server.submit_block(hex_of(&side)).await.unwrap().as_deref(),
+        Some("inconclusive")
+    );
+
+    // Header-only competitor of S3, parent S2 (still valid).
+    let hdr = mine_cb(3, s2.block_hash(), 150);
+    server
+        .submit_header(header_hex(&hdr))
+        .await
+        .expect("header on a valid parent");
+
+    server
+        .invalidate_block(s3.block_hash().to_hex())
+        .await
+        .expect("invalidateblock");
+    assert_eq!(server.get_block_count().await.unwrap(), 2);
+    assert_eq!(server.get_best_block_hash().await.unwrap(), s2.block_hash().to_hex());
+
+    let tips = server.get_chain_tips().await.expect("getchaintips");
+    let mut got: Vec<(u64, String, u64, String)> = tips
+        .as_array()
+        .expect("getchaintips array")
+        .iter()
+        .map(|t| {
+            (
+                t["height"].as_u64().unwrap(),
+                t["hash"].as_str().unwrap().to_string(),
+                t["branchlen"].as_u64().unwrap(),
+                t["status"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    got.sort();
+
+    let mut expect = vec![
+        (2, s2.block_hash().to_hex(), 0, "active".to_string()),
+        (2, a2.to_hex(), 2, "valid-fork".to_string()),
+        (1, side.block_hash().to_hex(), 1, "valid-headers".to_string()),
+        (3, s3.block_hash().to_hex(), 1, "invalid".to_string()),
+        (3, hdr.block_hash().to_hex(), 1, "headers-only".to_string()),
+    ];
+    expect.sort();
+    assert_eq!(got, expect, "getchaintips must list every Core status");
+}
+
+/// Core `InvalidateBlock` resets `m_best_header` to the new valid tip (then
+/// any non-failed header with more work). `GuessVerificationProgress` on a
+/// regtest tip younger than two hours is 1 when headers == blocks, and
+/// `chain_tx / (chain_tx + 0.6)` when the header tip is one block ahead
+/// (`dTxRate` 0.001, spacing 600s).
+#[tokio::test]
+async fn invalidateblock_rewinds_headers_and_verificationprogress() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    // Every block time stays inside the 2h "recent header" window.
+    let base = now - 4 * 600;
+    let (server, blocks) = chain_at(3, |h| base + h * 600).await;
+
+    let ahead = mine_at(4, blocks[3].block_hash(), blocks[3].header.timestamp + 1);
+    server
+        .submit_header(header_hex(&ahead))
+        .await
+        .expect("header extends the tip");
+
+    let info = server.get_blockchain_info().await.unwrap();
+    assert_eq!(info.blocks, 3);
+    assert_eq!(info.headers, 4, "headers must follow the header tip");
+    // Four chain txs (genesis + 3), one header ahead → extra 0.6 tx.
+    let expected = 4.0 / 4.6;
+    assert!(
+        (info.verificationprogress - expected).abs() < 1e-12,
+        "verificationprogress {}, Core {}",
+        info.verificationprogress,
+        expected
+    );
+
+    server
+        .invalidate_block(blocks[3].block_hash().to_hex())
+        .await
+        .unwrap();
+    let info = server.get_blockchain_info().await.unwrap();
+    assert_eq!(info.blocks, 2);
+    assert_eq!(info.headers, 2, "invalidateblock must rewind the header tip");
+    assert_eq!(
+        info.verificationprogress, 1.0,
+        "synced recent tip is fully verified"
+    );
+
+    server
+        .reconsider_block(blocks[3].block_hash().to_hex())
+        .await
+        .unwrap();
+    let info = server.get_blockchain_info().await.unwrap();
+    assert_eq!(info.blocks, 3);
+    assert_eq!(info.headers, 4, "the non-failed header is ahead of the block tip again");
+    assert!(
+        (info.verificationprogress - expected).abs() < 1e-12,
+        "verificationprogress after reconsider {}, Core {}",
+        info.verificationprogress,
+        expected
+    );
+}
+
+fn block_file_bytes(block: &Block) -> u64 {
+    let mut buf = Vec::new();
+    block.encode(&mut buf).unwrap();
+    // Core blk*.dat record: 4-byte magic + 4-byte size + payload.
+    8 + buf.len() as u64
+}
+
+/// Coinbase-only undo record: compact-size 0 (1 byte) + 32-byte checksum,
+/// plus the 8-byte rev*.dat record header. Genesis has no undo record.
+const EMPTY_UNDO_RECORD: u64 = 41;
+
+/// Core `CalculateCurrentUsage`: logical blk*.dat + rev*.dat bytes of blocks
+/// that have data (and undo, once connected). Not the chainstate database.
+#[tokio::test]
+async fn size_on_disk_counts_block_and_undo_bytes() {
+    let (server, blocks) = chain(2).await;
+    let mut expected = 0u64;
+    for (i, block) in blocks.iter().take(3).enumerate() {
+        expected += block_file_bytes(block);
+        if i > 0 {
+            expected += EMPTY_UNDO_RECORD;
+        }
+    }
+    let info = server.get_blockchain_info().await.unwrap();
+    assert_eq!(info.size_on_disk, expected, "connected chain blk+rev bytes");
+
+    let side = mine_cb(1, blocks[0].block_hash(), 80);
+    assert_eq!(
+        server.submit_block(hex_of(&side)).await.unwrap().as_deref(),
+        Some("inconclusive")
+    );
+    expected += block_file_bytes(&side);
+    let info = server.get_blockchain_info().await.unwrap();
+    assert_eq!(info.size_on_disk, expected, "side block adds blk bytes, no undo");
+
+    server.invalidate_block(blocks[2].block_hash().to_hex()).await.unwrap();
+    let info = server.get_blockchain_info().await.unwrap();
+    assert_eq!(info.size_on_disk, expected, "invalidateblock does not shrink the files");
+}
+
+/// P2SH wrapping `OP_TRUE`: standard prevout, consensus-valid without a
+/// signature, no witness (so the confirming block needs no witness commitment).
+fn p2sh_op_true() -> (Vec<u8>, Vec<u8>) {
+    let redeem = vec![0x51u8];
+    let h = rustoshi_crypto::hash160(&redeem);
+    let mut script_pubkey = vec![0xa9, 0x14];
+    script_pubkey.extend_from_slice(&h.0);
+    script_pubkey.push(0x87);
+    (script_pubkey, vec![0x01, 0x51])
+}
+
+fn spend_p2sh(prev: Hash256, vout: u32, sequence: u32, value: u64, script_pubkey: Vec<u8>, script_sig: Vec<u8>) -> Transaction {
+    Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint { txid: prev, vout },
+            script_sig,
+            sequence,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut { value, script_pubkey }],
+        lock_time: 0,
+    }
+}
+
+/// Coinbase maturity is 100. Block 1 pays two P2SH(OP_TRUE) outputs so one
+/// spend can signal BIP125 and the other cannot.
+async fn mature_p2sh_chain() -> (RpcServerImpl, Vec<Block>, Transaction, Transaction) {
+    let (script_pubkey, script_sig) = p2sh_op_true();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let db = Arc::new(ChainDb::open(&path).unwrap());
+    let params = ChainParams::regtest();
+    BlockStore::new(&db).init_genesis(&params).unwrap();
+    let mut st = RpcState::new(db, params.clone());
+    st.best_hash = params.genesis_hash;
+    st.best_height = 0;
+    st.data_dir = Some(path);
+    let state = Arc::new(RwLock::new(st));
+    let server = RpcServerImpl::new(state, Arc::new(RwLock::new(PeerState::default())));
+
+    let half = 25 * 100_000_000;
+    let block1 = {
+        let cb = coinbase_to(
+            1,
+            vec![
+                TxOut { value: half, script_pubkey: script_pubkey.clone() },
+                TxOut { value: half, script_pubkey: script_pubkey.clone() },
+            ],
+        );
+        let mut block = Block {
+            header: BlockHeader {
+                version: 0x2000_0000,
+                prev_block_hash: params.genesis_hash,
+                merkle_root: Hash256::ZERO,
+                timestamp: BASE_TIME + 600,
+                bits: 0x207f_ffff,
+                nonce: 0,
+            },
+            transactions: vec![cb],
+        };
+        block.header.merkle_root = block.compute_merkle_root();
+        while !block.header.validate_pow_against_declared_target() {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        block
+    };
+    assert!(server.submit_block(hex_of(&block1)).await.unwrap().is_none());
+
+    let mut prev = block1.block_hash();
+    let mut blocks = vec![params.genesis_block.clone(), block1];
+    // Tip must be >= 101. Mempool maturity is `tip_height - coin_height`
+    // (mempool.rs), so a height-1 coinbase is spendable only once the tip
+    // is 101. The confirming block is then height 102.
+    for h in 2..=101 {
+        let b = mine(h, prev);
+        assert!(
+            server.submit_block(hex_of(&b)).await.unwrap().is_none(),
+            "setup block {h}"
+        );
+        prev = b.block_hash();
+        blocks.push(b);
+    }
+
+    let cb_txid = blocks[1].transactions[0].txid();
+    let signaling = spend_p2sh(
+        cb_txid,
+        0,
+        0xFFFF_FFFD,
+        half - 10_000,
+        script_pubkey.clone(),
+        script_sig.clone(),
+    );
+    let quiet = spend_p2sh(cb_txid, 1, 0xFFFF_FFFF, half - 10_000, script_pubkey, script_sig);
+    (server, blocks, signaling, quiet)
+}
+
+fn mempool_map(raw: &serde_json::value::RawValue) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_str(raw.get()).unwrap()
+}
+
+const MEMPOOL_KEYS: &[&str] = &[
+    "vsize",
+    "weight",
+    "time",
+    "height",
+    "descendantcount",
+    "descendantsize",
+    "ancestorcount",
+    "ancestorsize",
+    "wtxid",
+    "chunkweight",
+    "fees",
+    "depends",
+    "spentby",
+    "bip125-replaceable",
+    "unbroadcast",
+];
+
+fn assert_core_mempool_entry(entry: &serde_json::Value, bip125: bool, height: u64) {
+    let obj = entry.as_object().expect("mempool entry");
+    let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    assert_eq!(keys, MEMPOOL_KEYS, "entry keys must match Core entryToJSON");
+    assert_eq!(entry["bip125-replaceable"].as_bool(), Some(bip125));
+    assert_eq!(entry["height"].as_u64(), Some(height));
+    assert_eq!(entry["chunkweight"], entry["weight"]);
+    let fees = entry["fees"].as_object().unwrap();
+    let fee_keys: Vec<&str> = fees.keys().map(|k| k.as_str()).collect();
+    assert_eq!(
+        fee_keys,
+        ["base", "modified", "ancestor", "descendant", "chunk"]
+    );
+    assert_eq!(fees["chunk"], fees["base"]);
+    assert_eq!(fees["modified"], fees["base"]);
+    assert!(entry["depends"].as_array().unwrap().is_empty());
+    assert!(entry["spentby"].as_array().unwrap().is_empty());
+}
+
+/// Core `entryToJSON`: `bip125-replaceable` is BIP125 opt-in (sequence <=
+/// 0xFFFFFFFD, or an unconfirmed ancestor that signals), not "true because
+/// fullrbf". `chunkweight` / `fees.chunk` are the cluster chunk's
+/// sigop-adjusted weight and modified fee. A singleton's chunk is itself.
+#[tokio::test]
+async fn getrawmempool_verbose_bip125_and_chunk_match_core() {
+    let (server, _blocks, signaling, quiet) = mature_p2sh_chain().await;
+    let sig_txid = server
+        .send_raw_transaction(hex_of(&signaling), None, None)
+        .await
+        .expect("signaling spend");
+    let quiet_txid = server
+        .send_raw_transaction(hex_of(&quiet), None, None)
+        .await
+        .expect("non-signaling spend");
+    assert_eq!(sig_txid, signaling.txid().to_hex());
+
+    let pool = mempool_map(&server.get_raw_mempool(Some(true)).await.unwrap());
+    let height = server.get_block_count().await.unwrap() as u64;
+    assert_core_mempool_entry(pool.get(&sig_txid).expect("signaling tx"), true, height);
+    assert_core_mempool_entry(pool.get(&quiet_txid).expect("quiet tx"), false, height);
+}
+
+/// A reorg that reconnects a block must drop the txs that block confirms.
+/// Core's mempool is empty after `reconsiderblock` puts the confirming tip back.
+#[tokio::test]
+async fn reconsiderblock_drops_txs_confirmed_by_the_reconnected_blocks() {
+    let (server, blocks, signaling, _quiet) = mature_p2sh_chain().await;
+    let txid = server
+        .send_raw_transaction(hex_of(&signaling), None, None)
+        .await
+        .expect("spend");
+    let tip = blocks.last().unwrap().block_hash();
+    let confirming = mine_with_at(102, tip, BASE_TIME + 102 * 600, vec![signaling]);
+    assert!(
+        server.submit_block(hex_of(&confirming)).await.unwrap().is_none(),
+        "confirming block"
+    );
+    assert!(mempool_map(&server.get_raw_mempool(Some(true)).await.unwrap()).is_empty());
+
+    server
+        .invalidate_block(confirming.block_hash().to_hex())
+        .await
+        .unwrap();
+    let pool = mempool_map(&server.get_raw_mempool(Some(true)).await.unwrap());
+    assert!(pool.contains_key(&txid), "invalidateblock returns the spend to the mempool");
+
+    server
+        .reconsider_block(confirming.block_hash().to_hex())
+        .await
+        .unwrap();
+    assert_eq!(server.get_best_block_hash().await.unwrap(), confirming.block_hash().to_hex());
+    let pool = mempool_map(&server.get_raw_mempool(Some(true)).await.unwrap());
+    assert!(
+        pool.is_empty(),
+        "reconsiderblock must remove txs the reconnected block confirms, got {pool:?}"
+    );
+}
+
+/// Core `submitheader` → `AcceptBlockHeader`: a header whose parent is
+/// `BLOCK_FAILED_VALID` is an RPC error -25 "bad-prevblk", and the header is
+/// not stored.
+#[tokio::test]
+async fn submitheader_of_failed_parent_is_bad_prevblk_and_not_stored() {
+    let (server, blocks) = chain(2).await;
+    let tip = blocks[2].block_hash();
+    server.invalidate_block(tip.to_hex()).await.unwrap();
+
+    let child = mine_at(3, tip, blocks[2].header.timestamp + 1);
+    let err = server
+        .submit_header(header_hex(&child))
+        .await
+        .expect_err("child of an invalidated block");
+    assert_eq!(err.code(), -25, "{err:?}");
+    assert!(
+        err.message().contains("bad-prevblk"),
+        "message {:?}, want bad-prevblk",
+        err.message()
+    );
+
+    let missing = server
+        .get_block_header(child.block_hash().to_hex(), Some(true))
+        .await;
+    assert!(missing.is_err(), "failed-parent header must not be stored: {missing:?}");
+    let tips = server.get_chain_tips().await.unwrap();
+    let listed = tips
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["hash"].as_str() == Some(&child.block_hash().to_hex()));
+    assert!(!listed, "unstored header must not be a chain tip");
 }

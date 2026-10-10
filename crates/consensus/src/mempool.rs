@@ -99,10 +99,23 @@ impl SequenceLockContext for MempoolSeqLockCtx<'_> {
     }
 }
 
+/// `setmocktime` override. 0 means "use the system clock", matching Core.
+static MOCK_TIME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Pin `GetTime()` for mempool entry timestamps. `0` clears the pin.
+/// Header and consensus clocks are unchanged.
+pub fn set_mock_time(secs: i64) {
+    MOCK_TIME.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Helper: current wall-clock time as seconds since Unix epoch (i64).
 /// Used for the `time_seconds` field of `MempoolEntry`, which is
-/// persisted in the Core-format `mempool.dat` file.
+/// persisted in the Core-format `mempool.dat` file. Honors `set_mock_time`.
 fn now_unix_seconds() -> i64 {
+    let mock = MOCK_TIME.load(std::sync::atomic::Ordering::Relaxed);
+    if mock != 0 {
+        return mock;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -3173,6 +3186,49 @@ impl Mempool {
     /// <= MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD = SEQUENCE_FINAL - 2).
     fn signals_opt_in_rbf(tx: &Transaction) -> bool {
         tx.inputs.iter().any(|input| input.sequence <= MAX_BIP125_RBF_SEQUENCE)
+    }
+
+    /// Fee and sigop-adjusted weight of the cluster chunk this tx mines in.
+    ///
+    /// Core `CTxMemPool::GetMainChunkFeerate` (`entryToJSON`'s `chunkweight`
+    /// and `fees.chunk`): the chunk's modified fees and the sum of
+    /// `GetSigOpsAdjustedWeight` over the transactions in that chunk.
+    pub fn main_chunk_fee_and_weight(&self, txid: &Hash256) -> Option<(u64, u64)> {
+        let entry = self.transactions.get(txid)?;
+        let cluster = self.clusters.get(&entry.cluster_id)?;
+        let idx = *cluster.tx_to_chunk.get(txid)?;
+        let chunk = cluster.linearization.get(idx)?;
+        let mut fee = 0u64;
+        let mut weight = 0u64;
+        for tx in &chunk.txids {
+            if let Some(member) = self.transactions.get(tx) {
+                fee = fee.saturating_add(Self::get_modified_fee(member));
+                weight = weight.saturating_add(member.sigop_adjusted_weight);
+            }
+        }
+        Some((fee, weight))
+    }
+
+    /// In-mempool parents, as display hex, in Core's `std::set` order.
+    pub fn mempool_depends(&self, txid: &Hash256) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .parents
+            .get(txid)
+            .map(|set| set.iter().map(|h| h.to_hex()).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// In-mempool children, as display hex, in Core's `std::set` order.
+    pub fn mempool_spent_by(&self, txid: &Hash256) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .children
+            .get(txid)
+            .map(|set| set.iter().map(|h| h.to_hex()).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
     }
 
     /// Check if a mempool transaction is BIP-125 replaceable.
