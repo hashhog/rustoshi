@@ -291,13 +291,6 @@ pub(crate) fn mempool_contents_json(state: &RpcState) -> String {
     json
 }
 
-pub(crate) fn unix_now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 // ============================================================
 // RPC ERROR CODES
 // ============================================================
@@ -6983,7 +6976,8 @@ impl RustoshiRpcServer for RpcServerImpl {
                 tip_timestamp,
                 state.best_height,
                 header_height,
-                unix_now_secs(),
+                // Core NodeClock::now() honors setmocktime.
+                rustoshi_consensus::mempool::current_unix_seconds(),
             )
         };
 
@@ -7176,7 +7170,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 tip_time,
                 state.best_height,
                 state.header_height.max(state.best_height),
-                unix_now_secs(),
+                rustoshi_consensus::mempool::current_unix_seconds(),
             )
         };
 
@@ -14792,7 +14786,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             tip_time,
             state.best_height,
             header_height,
-            unix_now_secs(),
+            rustoshi_consensus::mempool::current_unix_seconds(),
         );
 
         // Coins-cache sizes: derive Core's coinsdb/coinstip split from the

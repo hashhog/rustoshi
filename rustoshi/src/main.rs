@@ -574,6 +574,50 @@ fn store_validated_header(
                 e
             )
         })?;
+    // Core AcceptBlockHeader inserts a CBlockIndex even when the body has
+    // not arrived: nTx 0, nChainWork = parent + GetBlockProof, VALID_TREE,
+    // no HAVE_DATA. getblockheader and getchaintips read that entry. A
+    // header that already has one (submitheader, or a connected block
+    // re-announced) keeps it — overwriting would zero nTx on a block that
+    // already has data.
+    let hash = header.block_hash();
+    let existing = block_store.get_block_index(&hash).map_err(|e| {
+        format!(
+            "{}: get_block_index failed: {}",
+            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+            e
+        )
+    })?;
+    if existing.is_none() {
+        let parent_work = block_store
+            .get_block_index(&header.prev_block_hash)
+            .ok()
+            .flatten()
+            .map(|e| ChainWork::from_be_bytes(e.chain_work))
+            .unwrap_or(ChainWork::ZERO);
+        let mut status = BlockStatus::new();
+        status.set(BlockStatus::VALID_TREE);
+        let entry = BlockIndexEntry {
+            height,
+            status,
+            n_tx: 0,
+            timestamp: header.timestamp,
+            bits: header.bits,
+            nonce: header.nonce,
+            version: header.version,
+            prev_hash: header.prev_block_hash,
+            chain_work: parent_work
+                .saturating_add(&get_block_proof(header.bits))
+                .0,
+        };
+        block_store.put_block_index(&hash, &entry).map_err(|e| {
+            format!(
+                "{}: put_block_index failed: {}",
+                rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                e
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -9568,6 +9612,62 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Core AcceptBlockHeader inserts a CBlockIndex for a headers-only block:
+    /// height, nChainWork = parent + proof, nTx 0, VALID_TREE, no HAVE_DATA.
+    /// Without that entry getblockheader reports height 0 and getchaintips
+    /// omits the tip. A block that already has an index entry is left alone.
+    #[test]
+    fn p2p_header_is_indexed_like_accept_block_header() {
+        use super::{store_validated_header, BlockStore, ChainDb, ChainParams};
+        use rustoshi_consensus::{get_block_proof, ChainWork};
+        use rustoshi_primitives::BlockHeader;
+        use rustoshi_storage::block_store::BlockStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = ChainDb::open(dir.path()).unwrap();
+        let params = ChainParams::regtest();
+        let store = BlockStore::new(&db);
+        store.init_genesis(&params).unwrap();
+        let parent = store
+            .get_block_index(&params.genesis_hash)
+            .unwrap()
+            .unwrap();
+        let header = BlockHeader {
+            version: 0x2000_0000,
+            prev_block_hash: params.genesis_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: parent.timestamp.saturating_add(1),
+            bits: 0x207f_ffff,
+            nonce: 1,
+        };
+        store_validated_header(&store, &header, 1).unwrap();
+        let entry = store
+            .get_block_index(&header.block_hash())
+            .unwrap()
+            .expect("P2P header must be in the block index");
+        assert_eq!(entry.height, 1);
+        assert_eq!(entry.n_tx, 0);
+        assert!(entry.status.has(BlockStatus::VALID_TREE));
+        assert!(!entry.status.has(BlockStatus::HAVE_DATA));
+        assert_eq!(entry.prev_hash, params.genesis_hash);
+        let expect = ChainWork::from_be_bytes(parent.chain_work)
+            .saturating_add(&get_block_proof(header.bits));
+        assert_eq!(entry.chain_work, expect.0);
+
+        let mut connected = entry.clone();
+        connected.n_tx = 7;
+        connected.status.set(BlockStatus::HAVE_DATA);
+        store
+            .put_block_index(&header.block_hash(), &connected)
+            .unwrap();
+        store_validated_header(&store, &header, 1).unwrap();
+        let kept = store
+            .get_block_index(&header.block_hash())
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.n_tx, 7, "a connected index entry must survive a re-announce");
     }
 
     #[test]

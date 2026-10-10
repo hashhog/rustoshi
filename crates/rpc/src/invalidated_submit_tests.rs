@@ -414,6 +414,7 @@ async fn getchaintips_lists_every_core_status() {
 /// (`dTxRate` 0.001, spacing 600s).
 #[tokio::test]
 async fn invalidateblock_rewinds_headers_and_verificationprogress() {
+    let _lock = mock_clock_lock();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -462,6 +463,64 @@ async fn invalidateblock_rewinds_headers_and_verificationprogress() {
     assert!(
         (info.verificationprogress - expected).abs() < 1e-12,
         "verificationprogress after reconsider {}, Core {}",
+        info.verificationprogress,
+        expected
+    );
+}
+
+fn mock_clock_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Core `GuessVerificationProgress` reads `NodeClock::now()`, which honors
+/// `setmocktime`. More than two hours ahead of the tip, the height-based
+/// shortcut does not apply and the denominator grows by `dTxRate` per second.
+struct ResetMockTime;
+impl Drop for ResetMockTime {
+    fn drop(&mut self) {
+        rustoshi_consensus::mempool::set_mock_time(0);
+    }
+}
+
+#[tokio::test]
+async fn verificationprogress_follows_setmocktime() {
+    let _lock = mock_clock_lock();
+    let _reset = ResetMockTime;
+    rustoshi_consensus::mempool::set_mock_time(0);
+
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let base = wall - 4 * 600;
+    let (server, blocks) = chain_at(3, |h| base + h * 600).await;
+    let ahead = mine_at(4, blocks[3].block_hash(), blocks[3].header.timestamp + 1);
+    server
+        .submit_header(header_hex(&ahead))
+        .await
+        .expect("header extends the tip");
+
+    let recent = server.get_blockchain_info().await.unwrap();
+    assert_eq!(recent.blocks, 3);
+    assert_eq!(recent.headers, 4);
+    let recent_expected = 4.0 / 4.6;
+    assert!(
+        (recent.verificationprogress - recent_expected).abs() < 1e-12,
+        "recent progress {}, Core {}",
+        recent.verificationprogress,
+        recent_expected
+    );
+
+    let tip_time = blocks[3].header.timestamp as i64;
+    let mocked = tip_time + 12 * 3600;
+    server.set_mock_time(mocked).await.unwrap();
+    let info = server.get_blockchain_info().await.unwrap();
+    // Not within 2h, so block_time is the tip time: +43.2 tx over 12h at 0.001.
+    let expected = 4.0 / (4.0 + 12.0 * 3600.0 * 0.001);
+    assert!(
+        (info.verificationprogress - expected).abs() < 1e-9,
+        "mocktime progress {}, Core {}",
         info.verificationprogress,
         expected
     );

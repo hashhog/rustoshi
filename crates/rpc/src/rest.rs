@@ -1303,7 +1303,7 @@ async fn rest_chaininfo(
         tip_time,
         rpc_state.best_height,
         rpc_state.header_height.max(rpc_state.best_height),
-        crate::server::unix_now_secs(),
+        rustoshi_consensus::mempool::current_unix_seconds(),
     );
 
     let chain_name = match rpc_state.params.network_id {
