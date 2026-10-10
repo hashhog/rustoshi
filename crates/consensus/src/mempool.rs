@@ -1635,6 +1635,9 @@ pub struct Mempool {
     /// enough to recover the number.
     txns_randomized_len: usize,
     txns_randomized_cap: usize,
+    /// Core `m_pool.m_opts.require_standard`. False when the node was started
+    /// with `-acceptnonstdtxn` (regtest/testnet/signet only).
+    require_standard: bool,
 }
 
 /// `CFeeRate(fee, size).GetFeePerK()`: integer satoshis per 1000 vbytes.
@@ -1765,7 +1768,10 @@ fn core_script_reject(policy: bool, err: &ScriptError, tx: &Transaction, input_i
 /// `submitpackage` `tx-results[].error` is `TxValidationState::ToString()`.
 /// Missing inputs keep `bad-txns-inputs-missingorspent` (validation.cpp:873);
 /// the `missing-inputs` remap is testmempoolaccept only.
-fn submitpackage_member_error(e: &MempoolError) -> String {
+fn submitpackage_member_error(pool: &Mempool, tx: &Transaction, e: &MempoolError) -> String {
+    if let Some(msg) = pool.truc_violation_tostring(tx, e) {
+        return msg;
+    }
     match e {
         MempoolError::PolicyScriptCheckFailed(_, detail)
         | MempoolError::ConsensusScriptCheckFailed(_, detail) => detail.clone(),
@@ -1872,6 +1878,7 @@ impl Mempool {
             unbroadcast: HashSet::new(),
             txns_randomized_len: 0,
             txns_randomized_cap: 0,
+            require_standard: true,
         }
     }
 
@@ -1913,6 +1920,15 @@ impl Mempool {
 
     pub fn unbroadcast_count(&self) -> usize {
         self.unbroadcast.len()
+    }
+
+    pub fn require_standard(&self) -> bool {
+        self.require_standard
+    }
+
+    /// `-acceptnonstdtxn` clears this. Mainnet must not call it.
+    pub fn set_require_standard(&mut self, require_standard: bool) {
+        self.require_standard = require_standard;
     }
 
     /// Allocate the next admission sequence number and advance the counter.
@@ -2324,7 +2340,12 @@ impl Mempool {
         // before CheckFeeRate. One dust output is standard; a nonzero fee on
         // it is TX_NOT_STANDARD "dust" / "tx with dust output must be 0-fee".
         if require_standard {
-            pre_check_ephemeral_tx(&tx, fee, self.config.dust_relay_fee)?;
+            pre_check_ephemeral_tx(
+                &tx,
+                fee,
+                self.modified_fee_of(&txid, fee),
+                self.config.dust_relay_fee,
+            )?;
         }
 
         // Sigop-adjusted vsize.  Mirrors Bitcoin Core's CTxMemPoolEntry::GetTxSize()
@@ -3201,8 +3222,7 @@ impl Mempool {
         // Core IsStandardTx (policy.cpp): only MAX_DUST_OUTPUTS_PER_TX dust
         // outputs are standard. One dust output is the ephemeral-dust allowance;
         // PreCheckEphemeralTx (0-fee) and CheckEphemeralSpends run later.
-        // OP_RETURN is not dust. P2A is exempt from IsDust here; a 0-value P2A
-        // still counts via is_ephemeral_dust.
+        // OP_RETURN is not dust. P2A below the threshold counts, including 0.
         if policy_dust_count(tx, self.config.dust_relay_fee) > MAX_DUST_OUTPUTS_PER_TX {
             return Err(MempoolError::NonStandard("dust".into()));
         }
@@ -5298,28 +5318,36 @@ impl Mempool {
             })
             .count();
 
-        // Aggregate package feerate is AcceptMultipleTransactions, after every
-        // PreChecks. A single tx (or a quit-early individual failure) must not
-        // be replaced by this Display string: IsStandard / the size floor /
-        // CheckFeeRate run per tx below. Two or more new txs still use it.
-        if new_count >= 2
-            && ((package_fee_rate * 1000.0).floor() as u64) < self.config.min_fee_rate
-        {
-            return PackageAcceptResult::package_failure(
-                MempoolError::PackageInsufficientFee(package_fee_rate, self.config.min_fee_rate)
-                    .to_string(),
-            );
+        // PackageTRUCChecks, aggregate CheckFeeRate, and the mempool-ancestor
+        // PackageRBFChecks rejection. A non-reconsiderable PreChecks failure
+        // (standardness, the 65-byte floor, dust) stays on the per-tx loop.
+        if new_count >= 2 {
+            if let Some(aborted) = self.multi_tx_policy_result(
+                &txs,
+                &tx_fees,
+                &already_in_mempool,
+                &different_witness,
+                utxo_lookup,
+                &opts,
+                package_fee,
+                package_vsize,
+                package_fee_rate,
+            ) {
+                return aborted;
+            }
         }
 
         // More than one dust output is IsStandard "dust", and a nonzero fee on
         // dust is PreCheckEphemeralTx. Both are non-reconsiderable, so Core
         // never reaches CheckEphemeralSpends (`unspent-dust`).
         let dust_relay = self.config.dust_relay_fee;
-        let blocks_ephemeral_package = txs.iter().any(|tx| {
-            let fee = *tx_fees.get(&tx.txid()).unwrap_or(&0);
-            policy_dust_count(tx, dust_relay) > MAX_DUST_OUTPUTS_PER_TX
-                || pre_check_ephemeral_tx(tx, fee, dust_relay).is_err()
-        });
+        let blocks_ephemeral_package = opts.require_standard
+            && txs.iter().any(|tx| {
+                let fee = *tx_fees.get(&tx.txid()).unwrap_or(&0);
+                policy_dust_count(tx, dust_relay) > MAX_DUST_OUTPUTS_PER_TX
+                    || pre_check_ephemeral_tx(tx, fee, self.modified_fee_of(&tx.txid(), fee), dust_relay)
+                        .is_err()
+            });
         if !blocks_ephemeral_package {
             if let Err(MempoolError::EphemeralDustNotFullySpent(child_txid, parent_txid)) =
                 check_ephemeral_spends(&txs, &self.transactions, dust_relay)
@@ -5391,15 +5419,17 @@ impl Mempool {
             // PreChecks order (validation.cpp): IsStandardTx, then the 65-byte
             // floor, then PreCheckEphemeralTx, then CheckFeeRate. Doing the fee
             // test first hides "scriptpubkey" on a tiny non-standard tx.
-            if let Err(e) = self.check_standard(tx) {
-                tx_results.push(rejected_package_tx(
-                    tx,
-                    fee,
-                    vsize,
-                    submitpackage_member_error(&e),
-                ));
-                failed = true;
-                continue;
+            if opts.require_standard {
+                if let Err(e) = self.check_standard(tx) {
+                    tx_results.push(rejected_package_tx(
+                        tx,
+                        fee,
+                        vsize,
+                        submitpackage_member_error(self, tx, &e),
+                    ));
+                    failed = true;
+                    continue;
+                }
             }
             if tx.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
                 tx_results.push(rejected_package_tx(
@@ -5411,7 +5441,10 @@ impl Mempool {
                 failed = true;
                 continue;
             }
-            if pre_check_ephemeral_tx(tx, fee, dust_relay).is_err() {
+            if opts.require_standard
+                && pre_check_ephemeral_tx(tx, fee, self.modified_fee_of(&txid, fee), dust_relay)
+                    .is_err()
+            {
                 tx_results.push(rejected_package_tx(
                     tx,
                     fee,
@@ -5474,7 +5507,7 @@ impl Mempool {
                         vsize,
                         fee,
                         already_in_mempool: false,
-                        error: Some(submitpackage_member_error(&e)),
+                        error: Some(submitpackage_member_error(self, tx, &e)),
                         replaced_txids: Vec::new(),
                         effective_fee_sat_per_kvb: None,
                         effective_includes: None,
@@ -5524,22 +5557,428 @@ impl Mempool {
         rate_sat_kvb.saturating_mul(vsize as u64).saturating_add(999) / 1000
     }
 
+    fn modified_fee_of(&self, txid: &Hash256, base_fee: u64) -> i64 {
+        let delta = self.map_deltas.get(txid).copied().unwrap_or(0);
+        (base_fee as i64).saturating_add(delta)
+    }
+
     fn individual_fee_reject_message(&mut self, fee: u64, vsize: usize) -> Option<String> {
-        // Core CheckFeeRate (validation.cpp): absolute fee against
-        // `GetMinFee().GetFee(vsize)` then `min_relay_feerate.GetFee(vsize)`.
-        // ToString is `reason, {fee} < {required}`.
+        self.check_fee_rate_message(fee as i64, vsize)
+    }
+
+    /// Core `CheckFeeRate` ToString. `modified_fee` is base + priority delta
+    /// and may be negative.
+    fn check_fee_rate_message(&mut self, modified_fee: i64, vsize: usize) -> Option<String> {
         let mempool_min_fee_kvb = self.get_min_fee();
         if mempool_min_fee_kvb > 0 {
-            let required = Self::fee_for_kvb_rate(mempool_min_fee_kvb, vsize);
-            if required > 0 && fee < required {
-                return Some(format!("mempool min fee not met, {fee} < {required}"));
+            let required = Self::fee_for_kvb_rate(mempool_min_fee_kvb, vsize) as i64;
+            if required > 0 && modified_fee < required {
+                return Some(format!("mempool min fee not met, {modified_fee} < {required}"));
             }
         }
-        let required = Self::fee_for_kvb_rate(self.config.min_fee_rate, vsize);
-        if fee < required {
-            return Some(format!("min relay fee not met, {fee} < {required}"));
+        let required = Self::fee_for_kvb_rate(self.config.min_fee_rate, vsize) as i64;
+        if modified_fee < required {
+            return Some(format!("min relay fee not met, {modified_fee} < {required}"));
         }
         None
+    }
+
+    fn parent_wtxid(&self, parent: &Hash256) -> Hash256 {
+        self.transactions
+            .get(parent)
+            .map(|entry| entry.tx.wtxid())
+            .unwrap_or(*parent)
+    }
+
+    /// `TRUC-violation, {debug}` for a single-tx SingleTRUCChecks failure.
+    fn truc_violation_tostring(&self, tx: &Transaction, err: &MempoolError) -> Option<String> {
+        let debug = match err {
+            MempoolError::TrucTxTooLarge(_, vsize, max) => format!(
+                "version=3 tx {} (wtxid={}) is too big: {vsize} > {max} virtual bytes",
+                tx.txid(),
+                tx.wtxid()
+            ),
+            MempoolError::TrucChildTooLarge(_, vsize, max) => format!(
+                "version=3 child tx {} (wtxid={}) is too big: {vsize} > {max} virtual bytes",
+                tx.txid(),
+                tx.wtxid()
+            ),
+            MempoolError::TrucTooManyAncestors(_, _, _) => format!(
+                "tx {} (wtxid={}) would have too many ancestors",
+                tx.txid(),
+                tx.wtxid()
+            ),
+            MempoolError::TrucTooManyDescendants(parent) => format!(
+                "tx {parent} (wtxid={}) would exceed descendant count limit",
+                self.parent_wtxid(parent)
+            ),
+            MempoolError::TrucSpendingNonTruc(_, parent) => format!(
+                "version=3 tx {} (wtxid={}) cannot spend from non-version=3 tx {parent} (wtxid={})",
+                tx.txid(),
+                tx.wtxid(),
+                self.parent_wtxid(parent)
+            ),
+            MempoolError::NonTrucSpendingTruc(_, parent) => format!(
+                "non-version=3 tx {} (wtxid={}) cannot spend from version=3 tx {parent} (wtxid={})",
+                tx.txid(),
+                tx.wtxid(),
+                self.parent_wtxid(parent)
+            ),
+            _ => return None,
+        };
+        Some(format!("TRUC-violation, {debug}"))
+    }
+
+    /// PackageTRUCChecks debug string, or the full `TRUC-violation, {debug}`
+    /// when `full` is asked via [`package_truc_violation`].
+    pub fn package_truc_violation(&self, txs: &[Transaction]) -> Option<String> {
+        let refs: Vec<&Transaction> = txs.iter().collect();
+        self.package_truc_debug(&refs)
+            .map(|debug| format!("TRUC-violation, {debug}"))
+    }
+
+    fn package_truc_debug(&self, txs: &[&Transaction]) -> Option<String> {
+        let index_of: HashMap<Hash256, usize> = txs
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| (tx.txid(), i))
+            .collect();
+        for tx in txs {
+            let mut in_pkg: Vec<usize> = Vec::new();
+            let mut mem_parents: Vec<Hash256> = Vec::new();
+            let mut seen = HashSet::new();
+            for input in &tx.inputs {
+                let pid = input.previous_output.txid;
+                if !seen.insert(pid) {
+                    continue;
+                }
+                if let Some(&idx) = index_of.get(&pid) {
+                    if txs[idx].txid() != tx.txid() {
+                        in_pkg.push(idx);
+                    }
+                } else if let Some(creator) = self.created_utxos.get(&input.previous_output) {
+                    mem_parents.push(*creator);
+                } else if self.spent_outpoints.contains_key(&input.previous_output)
+                    && self.transactions.contains_key(&pid)
+                {
+                    mem_parents.push(pid);
+                }
+            }
+            let vsize = tx.vsize();
+            if tx.version == TRUC_VERSION {
+                if vsize > TRUC_MAX_VSIZE {
+                    return Some(format!(
+                        "version=3 tx {} (wtxid={}) is too big: {vsize} > {TRUC_MAX_VSIZE} virtual bytes",
+                        tx.txid(),
+                        tx.wtxid()
+                    ));
+                }
+                if mem_parents.len() + in_pkg.len() + 1 > TRUC_ANCESTOR_LIMIT {
+                    return Some(format!(
+                        "tx {} (wtxid={}) would have too many ancestors",
+                        tx.txid(),
+                        tx.wtxid()
+                    ));
+                }
+                if !mem_parents.is_empty() || !in_pkg.is_empty() {
+                    if let Some(parent_id) = mem_parents.first() {
+                        if let Some(entry) = self.transactions.get(parent_id) {
+                            if entry.ancestor_count + in_pkg.len() + 1 > TRUC_ANCESTOR_LIMIT {
+                                return Some(format!(
+                                    "tx {} (wtxid={}) would have too many ancestors",
+                                    tx.txid(),
+                                    tx.wtxid()
+                                ));
+                            }
+                        }
+                    }
+                    if mem_parents.len() + in_pkg.len() == 1 {
+                        let (ptxid, pwtxid, pver, has_desc) = if let Some(parent_id) = mem_parents.first()
+                        {
+                            let entry = self.transactions.get(parent_id)?;
+                            (
+                                entry.tx.txid(),
+                                entry.tx.wtxid(),
+                                entry.tx.version,
+                                entry.descendant_count > 1,
+                            )
+                        } else {
+                            let parent = txs[in_pkg[0]];
+                            (parent.txid(), parent.wtxid(), parent.version, false)
+                        };
+                        if pver != TRUC_VERSION {
+                            return Some(format!(
+                                "version=3 tx {} (wtxid={}) cannot spend from non-version=3 tx {ptxid} (wtxid={pwtxid})",
+                                tx.txid(),
+                                tx.wtxid()
+                            ));
+                        }
+                        if vsize > TRUC_CHILD_MAX_VSIZE {
+                            return Some(format!(
+                                "version=3 child tx {} (wtxid={}) is too big: {vsize} > {TRUC_CHILD_MAX_VSIZE} virtual bytes",
+                                tx.txid(),
+                                tx.wtxid()
+                            ));
+                        }
+                        for other in txs {
+                            if other.txid() == tx.txid() {
+                                continue;
+                            }
+                            for input in &other.inputs {
+                                if input.previous_output.txid == ptxid {
+                                    return Some(format!(
+                                        "tx {ptxid} (wtxid={pwtxid}) would exceed descendant count limit"
+                                    ));
+                                }
+                                if input.previous_output.txid == tx.txid() {
+                                    return Some(format!(
+                                        "tx {} (wtxid={}) would have too many ancestors",
+                                        other.txid(),
+                                        other.wtxid()
+                                    ));
+                                }
+                            }
+                        }
+                        if has_desc {
+                            return Some(format!(
+                                "tx {ptxid} (wtxid={pwtxid}) would exceed descendant count limit"
+                            ));
+                        }
+                    }
+                }
+            } else {
+                for parent_id in &mem_parents {
+                    if let Some(entry) = self.transactions.get(parent_id) {
+                        if entry.tx.version == TRUC_VERSION {
+                            return Some(format!(
+                                "non-version=3 tx {} (wtxid={}) cannot spend from version=3 tx {} (wtxid={})",
+                                tx.txid(),
+                                tx.wtxid(),
+                                entry.tx.txid(),
+                                entry.tx.wtxid()
+                            ));
+                        }
+                    }
+                }
+                for idx in &in_pkg {
+                    let parent = txs[*idx];
+                    if parent.version == TRUC_VERSION {
+                        return Some(format!(
+                            "non-version=3 tx {} (wtxid={}) cannot spend from version=3 tx {} (wtxid={})",
+                            tx.txid(),
+                            tx.wtxid(),
+                            parent.txid(),
+                            parent.wtxid()
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn input_available_outside_package<F>(&self, op: &OutPoint, utxo_lookup: &F) -> bool
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
+        if self.created_utxos.contains_key(op) || utxo_lookup(op).is_some() {
+            return true;
+        }
+        self.spent_outpoints.contains_key(op) && self.transactions.contains_key(&op.txid)
+    }
+
+    fn package_rbf_blocked(&self, eval: &[&Transaction]) -> bool {
+        let mut conflict = false;
+        let mut mem_parent = false;
+        for tx in eval {
+            for input in &tx.inputs {
+                let op = &input.previous_output;
+                if self.spent_outpoints.contains_key(op) {
+                    conflict = true;
+                }
+                if self.created_utxos.contains_key(op)
+                    || (self.spent_outpoints.contains_key(op)
+                        && self.transactions.contains_key(&op.txid))
+                {
+                    mem_parent = true;
+                }
+            }
+        }
+        conflict && mem_parent
+    }
+
+    /// Multi-tx package eval for reconsiderable txs only.
+    /// `Some` replaces the whole package result and inserts nothing.
+    fn multi_tx_policy_result<F>(
+        &mut self,
+        txs: &[Transaction],
+        tx_fees: &HashMap<Hash256, u64>,
+        already_in_mempool: &HashSet<Hash256>,
+        different_witness: &HashMap<Hash256, Hash256>,
+        utxo_lookup: &F,
+        opts: &AtmpOptions,
+        package_fee: u64,
+        package_vsize: usize,
+        package_fee_rate: f64,
+    ) -> Option<PackageAcceptResult>
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
+        let dust_relay = self.config.dust_relay_fee;
+        let mut eval: Vec<&Transaction> = Vec::new();
+        let mut individual: HashMap<Hash256, String> = HashMap::new();
+        for tx in txs {
+            let txid = tx.txid();
+            if already_in_mempool.contains(&txid) || different_witness.contains_key(&txid) {
+                continue;
+            }
+            if opts.require_standard && self.check_standard(tx).is_err() {
+                return None;
+            }
+            if tx.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
+                return None;
+            }
+            let base = *tx_fees.get(&txid).unwrap_or(&0);
+            let mod_fee = self.modified_fee_of(&txid, base);
+            if opts.require_standard
+                && pre_check_ephemeral_tx(tx, base, mod_fee, dust_relay).is_err()
+            {
+                return None;
+            }
+            let inputs_outside = tx
+                .inputs
+                .iter()
+                .all(|input| self.input_available_outside_package(&input.previous_output, utxo_lookup));
+            if !inputs_outside {
+                eval.push(tx);
+                individual.insert(txid, "bad-txns-inputs-missingorspent".to_string());
+                continue;
+            }
+            if let Some(msg) = self.check_fee_rate_message(mod_fee, tx.vsize()) {
+                eval.push(tx);
+                individual.insert(txid, msg);
+                continue;
+            }
+            // Individually valid (including a single-tx RBF). Leave it to the
+            // add loop so a high-fee replacement is not package-rejected.
+            return None;
+        }
+        if eval.len() < 2 {
+            return None;
+        }
+        let package_msg = if let Some(debug) = self.package_truc_debug(&eval) {
+            format!("TRUC-violation, {debug}")
+        } else {
+            let mut mod_sum: i64 = 0;
+            let mut vsize_sum: usize = 0;
+            for tx in &eval {
+                let base = *tx_fees.get(&tx.txid()).unwrap_or(&0);
+                mod_sum = mod_sum.saturating_add(self.modified_fee_of(&tx.txid(), base));
+                vsize_sum += tx.vsize();
+            }
+            if let Some(msg) = self.check_fee_rate_message(mod_sum, vsize_sum) {
+                let last = eval.last().map(|tx| tx.txid());
+                if let Some(last) = last {
+                    individual.insert(last, msg);
+                }
+                "transaction failed".to_string()
+            } else if self.package_rbf_blocked(&eval) {
+                "package RBF failed: new transaction cannot have mempool ancestors".to_string()
+            } else {
+                return None;
+            }
+        };
+
+        let mut tx_results = Vec::with_capacity(txs.len());
+        for tx in txs {
+            let txid = tx.txid();
+            let wtxid = tx.wtxid();
+            if let Some(other) = different_witness.get(&txid).copied() {
+                tx_results.push(PackageTxResult {
+                    txid,
+                    wtxid,
+                    vsize: 0,
+                    fee: 0,
+                    already_in_mempool: false,
+                    error: None,
+                    replaced_txids: Vec::new(),
+                    effective_fee_sat_per_kvb: None,
+                    effective_includes: None,
+                    other_wtxid: Some(other),
+                });
+                continue;
+            }
+            if already_in_mempool.contains(&txid) {
+                let fee = *tx_fees.get(&txid).unwrap_or(&0);
+                tx_results.push(PackageTxResult {
+                    txid,
+                    wtxid,
+                    vsize: tx.vsize(),
+                    fee,
+                    already_in_mempool: true,
+                    error: None,
+                    replaced_txids: Vec::new(),
+                    effective_fee_sat_per_kvb: None,
+                    effective_includes: None,
+                    other_wtxid: None,
+                });
+                continue;
+            }
+            let fee = *tx_fees.get(&txid).unwrap_or(&0);
+            tx_results.push(rejected_package_tx(
+                tx,
+                fee,
+                tx.vsize(),
+                individual
+                    .get(&txid)
+                    .cloned()
+                    .unwrap_or_else(|| "bad-txns-inputs-missingorspent".to_string()),
+            ));
+        }
+        Some(PackageAcceptResult {
+            tx_results,
+            package_fee,
+            package_vsize,
+            package_fee_rate,
+            accepted_count: 0,
+            package_error: Some(package_msg),
+        })
+    }
+
+    /// sendrawtransaction message: Core `TxValidationState::ToString`.
+    pub fn atmp_reject_message(
+        &self,
+        tx: &Transaction,
+        err: &MempoolError,
+        base_fee: u64,
+        vsize: usize,
+    ) -> String {
+        if let Some(msg) = self.truc_violation_tostring(tx, err) {
+            return msg;
+        }
+        match err {
+            MempoolError::MissingInput(_, _)
+            | MempoolError::Validation(crate::validation::TxValidationError::MissingInput(_, _)) => {
+                "bad-txns-inputs-missingorspent".to_string()
+            }
+            MempoolError::EphemeralDustNonZeroFee => DUST_FEE_TOSTRING.to_string(),
+            MempoolError::InsufficientFee(_, _) => {
+                let shown = self.modified_fee_of(&tx.txid(), base_fee);
+                let required = Self::fee_for_kvb_rate(self.config.min_fee_rate, vsize);
+                format!("min relay fee not met, {shown} < {required}")
+            }
+            MempoolError::MempoolMinFeeNotMet(_, min_kvb) => {
+                let shown = self.modified_fee_of(&tx.txid(), base_fee);
+                let required = Self::fee_for_kvb_rate(*min_kvb, vsize);
+                format!("mempool min fee not met, {shown} < {required}")
+            }
+            MempoolError::PolicyScriptCheckFailed(_, detail)
+            | MempoolError::ConsensusScriptCheckFailed(_, detail) => detail.clone(),
+            MempoolError::EphemeralDustNotFullySpent(_, _) | MempoolError::EphemeralDustUnspent(_) => {
+                missing_ephemeral_spends_tostring(tx)
+            }
+            other => other.reject_debug(),
+        }
     }
 
     /// CheckEphemeralSpends failed. Core AcceptPackage keeps the parent's
@@ -5938,10 +6377,13 @@ impl Mempool {
         // Context-free validation
         check_transaction(&tx)?;
 
-        // Check standardness (IsStandardTx). The 65-byte floor is not part of
-        // IsStandardTx; Core applies it immediately afterwards, even when
-        // standardness is off (validation.cpp:819).
-        self.check_standard(&tx)?;
+        // Check standardness (IsStandardTx) only when require_standard. The
+        // 65-byte floor is not part of IsStandardTx; Core applies it
+        // immediately afterwards, even when standardness is off
+        // (validation.cpp:819).
+        if opts.require_standard {
+            self.check_standard(&tx)?;
+        }
         if tx.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
             return Err(MempoolError::NonStandard("tx-size-small".into()));
         }
@@ -6897,7 +7339,9 @@ fn is_standard_script(script: &[u8]) -> bool {
 ///
 /// An output whose value is below this threshold is "dust": it would cost
 /// more in fees to spend than it is worth. Unspendable outputs (OP_RETURN,
-/// P2A) return 0 — they can never be dust (Core: `IsUnspendable()` ⇒ 0).
+/// or a script larger than `MAX_SCRIPT_SIZE`) return 0. P2A is spendable
+/// and uses the witness-program cost (Core `IsUnspendable()` is only
+/// OP_RETURN or oversized).
 ///
 ///   nSize = GetSerializeSize(txout) + spending_cost
 ///         = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost
@@ -6915,10 +7359,6 @@ pub fn dust_threshold(output: &TxOut, dust_relay_fee: u64) -> u64 {
     // OP_RETURN and other unspendable scripts can never be dust (Core
     // `txout.scriptPubKey.IsUnspendable()` ⇒ return 0).
     if !output.script_pubkey.is_empty() && output.script_pubkey[0] == 0x6a {
-        return 0;
-    }
-    // P2A (Pay-to-Anchor) outputs are exempt from the dust threshold.
-    if is_p2a(&output.script_pubkey) {
         return 0;
     }
 
@@ -6971,11 +7411,8 @@ fn is_dust(output: &TxOut, dust_relay_fee: u64) -> bool {
 ///
 /// Per Bitcoin Core's ephemeral_policy.cpp, ephemeral dust is any output that:
 /// 1. Has value == 0
-/// 2. Would be considered dust (IsDust returns true, but we special-case P2A
-///    which is exempt from normal dust rules)
-///
-/// Note: P2A (Pay-to-Anchor) outputs with value == 0 ARE ephemeral dust because
-/// they must be spent by a child to bring fees.
+/// 2. Would be considered dust (`IsDust`). A 0-value P2A is dust because P2A
+///    is not unspendable.
 fn is_ephemeral_dust(output: &TxOut) -> bool {
     // Ephemeral dust must have zero value
     if output.value != 0 {
@@ -6993,20 +7430,12 @@ fn is_ephemeral_dust(output: &TxOut) -> bool {
         return false;
     }
 
-    // P2A (Pay-to-Anchor) with 0 value IS ephemeral dust
-    // Even though P2A is exempt from normal dust threshold, 0-value P2A
-    // must be spent by a child (that's the whole point of ephemeral anchors)
-    if is_p2a(&output.script_pubkey) {
-        return true;
-    }
-
-    // Any other 0-value output is ephemeral dust
+    // Any other 0-value spendable output, including P2A, is ephemeral dust.
     true
 }
 
-/// Core `IsDust` plus a 0-value anchor. `dust_threshold` exempts P2A, but
-/// Core's ephemeral rules still treat a 0-value anchor as dust. A positive
-/// P2A below the dust threshold stays exempt (existing tests).
+/// Core `IsDust`: value below `GetDustThreshold`. A 0-value spendable output
+/// is both ephemeral dust and policy dust.
 fn is_policy_dust(output: &TxOut, dust_relay_fee: u64) -> bool {
     is_dust(output, dust_relay_fee) || is_ephemeral_dust(output)
 }
@@ -7047,15 +7476,17 @@ fn missing_ephemeral_spends_tostring(tx: &Transaction) -> String {
 /// Mirrors Bitcoin Core `PreCheckEphemeralTx` (policy/ephemeral_policy.cpp).
 fn pre_check_ephemeral_tx(
     tx: &Transaction,
-    fee: u64,
+    base_fee: u64,
+    mod_fee: i64,
     dust_relay_fee: u64,
 ) -> Result<(), MempoolError> {
-    // If the transaction has no fee, it passes (ephemeral or not)
-    if fee == 0 {
+    // Core: reject when (base_fee != 0 || mod_fee != 0) && dust is nonempty.
+    // A prioritisetransaction delta makes mod_fee nonzero even if base_fee is 0.
+    // A negative delta that cancels a nonzero base fee still rejects.
+    if base_fee == 0 && mod_fee == 0 {
         return Ok(());
     }
 
-    // Nonzero base fee and any dust output: TX_NOT_STANDARD "dust".
     if policy_dust_count(tx, dust_relay_fee) > 0 {
         return Err(MempoolError::EphemeralDustNonZeroFee);
     }
@@ -7722,20 +8153,33 @@ mod tests {
         };
         assert!(!is_dust(&op_return, DUST_RELAY_TX_FEE));
 
-        // P2A (Pay-to-Anchor) is never dust
-        // Script: OP_1 PUSHBYTES_2 0x4e 0x73
+        // P2A is a spendable witness program. Core GetDustThreshold does not
+        // exempt it (only IsUnspendable: OP_RETURN or oversized scripts).
+        // Serialize size 13 + witness spend 67 = 80; 80 * 3000 / 1000 = 240.
+        let p2a_spk = vec![0x51, 0x02, 0x4e, 0x73];
         let p2a = TxOut {
             value: 0,
-            script_pubkey: vec![0x51, 0x02, 0x4e, 0x73],
+            script_pubkey: p2a_spk.clone(),
         };
-        assert!(!is_dust(&p2a, DUST_RELAY_TX_FEE));
-
-        // P2A with non-zero value is also not dust
+        assert_eq!(dust_threshold(&p2a, DUST_RELAY_TX_FEE), 240);
+        assert!(is_dust(&p2a, DUST_RELAY_TX_FEE));
+        assert!(is_ephemeral_dust(&p2a));
         let p2a_with_value = TxOut {
             value: 1,
-            script_pubkey: vec![0x51, 0x02, 0x4e, 0x73],
+            script_pubkey: p2a_spk.clone(),
         };
-        assert!(!is_dust(&p2a_with_value, DUST_RELAY_TX_FEE));
+        assert!(is_dust(&p2a_with_value, DUST_RELAY_TX_FEE));
+        assert!(!is_ephemeral_dust(&p2a_with_value));
+        let p2a_below = TxOut {
+            value: 239,
+            script_pubkey: p2a_spk.clone(),
+        };
+        assert!(is_dust(&p2a_below, DUST_RELAY_TX_FEE));
+        let p2a_at = TxOut {
+            value: 240,
+            script_pubkey: p2a_spk,
+        };
+        assert!(!is_dust(&p2a_at, DUST_RELAY_TX_FEE));
 
         // Configurable dust-relay feerate (the BUG-5 fix): a higher
         // -dustrelayfee raises the threshold, so an output that is NOT dust
@@ -13722,5 +14166,229 @@ mod tests {
             assert!(!tok.contains("transaction"), "token leaked Display prose: {tok}");
             assert!(!tok.contains(" at index "), "token leaked prose detail: {tok}");
         }
+    }
+
+    fn relay_required(vsize: usize) -> u64 {
+        Mempool::fee_for_kvb_rate(100, vsize)
+    }
+
+    /// Two below-min-relay txs. Core AcceptMultipleTransactions CheckFeeRate
+    /// sets package_msg to `transaction failed` and puts the package
+    /// ToString only on the last eval tx. The parent keeps its own fee.
+    #[test]
+    fn test_low_fee_package_last_tx_gets_checkfeerate_tostring() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let utxo = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000a1",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+        let parent = make_tx(vec![(utxo, 0)], vec![99_999], 2);
+        let child = make_tx(vec![(parent.txid(), 0)], vec![99_998], 2);
+        assert_eq!(100_000 - 99_999, 1);
+        assert_eq!(99_999 - 99_998, 1);
+        let parent_req = relay_required(parent.vsize());
+        let pkg_req = relay_required(parent.vsize() + child.vsize());
+        assert!(1 < parent_req && 2 < pkg_req, "fixture must be under the relay floor");
+
+        let result = mempool.accept_package(vec![parent.clone(), child.clone()], &|op| {
+            utxos.get(op).cloned()
+        });
+        assert_eq!(result.package_error.as_deref(), Some("transaction failed"));
+        assert_eq!(result.tx_results.len(), 2, "{:?}", result.tx_results);
+        assert_eq!(
+            result.tx_results[0].error.as_deref(),
+            Some(format!("min relay fee not met, 1 < {parent_req}").as_str())
+        );
+        assert_eq!(
+            result.tx_results[1].error.as_deref(),
+            Some(format!("min relay fee not met, 2 < {pkg_req}").as_str())
+        );
+        assert!(!mempool.contains(&parent.txid()));
+        assert!(!mempool.contains(&child.txid()));
+    }
+
+    /// A version=2 child of an in-package version=3 parent is
+    /// `TRUC-violation, {debug}`, not the bare token.
+    #[test]
+    fn test_truc_child_reject_includes_debug() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let utxo = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000a2",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+        let parent = make_tx(vec![(utxo, 0)], vec![90_000], TRUC_VERSION);
+        let child = make_tx(vec![(parent.txid(), 0)], vec![80_000], 2);
+        let result = mempool.accept_package(vec![parent.clone(), child.clone()], &|op| {
+            utxos.get(op).cloned()
+        });
+        assert_eq!(result.package_error.as_deref(), Some("transaction failed"));
+        let err = result.tx_results[1].error.clone().unwrap_or_default();
+        let debug = format!(
+            "non-version=3 tx {} (wtxid={}) cannot spend from version=3 tx {} (wtxid={})",
+            child.txid(),
+            child.wtxid(),
+            parent.txid(),
+            parent.wtxid()
+        );
+        assert_eq!(err, format!("TRUC-violation, {debug}"));
+        assert!(mempool.contains(&parent.txid()));
+        assert!(!mempool.contains(&child.txid()));
+    }
+
+    /// `add_transaction_for_package` skips IsStandardTx when require_standard
+    /// is false. The 65-byte floor still rejects.
+    #[test]
+    fn test_package_nonstandard_skipped_when_require_standard_false() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let utxo = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000a3",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+        let nonstd = vec![0x51u8; 10];
+        let mut parent = make_tx(vec![(utxo, 0)], vec![90_000], 2);
+        parent.outputs[0].script_pubkey = nonstd.clone();
+        assert!(parent.base_size() >= MIN_STANDARD_TX_NONWITNESS_SIZE);
+        let mut child = make_tx(vec![(parent.txid(), 0)], vec![80_000], 2);
+        child.outputs[0].script_pubkey = nonstd;
+        assert!(child.base_size() >= MIN_STANDARD_TX_NONWITNESS_SIZE);
+        let opts = AtmpOptions {
+            require_standard: false,
+            ..AtmpOptions::default()
+        };
+        let result = mempool.accept_package_with_options(
+            vec![parent.clone(), child.clone()],
+            &|op| utxos.get(op).cloned(),
+            opts,
+        );
+        assert!(result.package_error.is_none(), "{:?}", result.package_error);
+        assert!(result.tx_results.iter().all(|r| r.error.is_none()), "{:?}", result.tx_results);
+        assert!(mempool.contains(&parent.txid()));
+        assert!(mempool.contains(&child.txid()));
+
+        let prev = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000a4",
+        )
+        .unwrap();
+        let tiny = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev, vout: 0 },
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: vec![0x6a],
+            }],
+            lock_time: 0,
+        };
+        assert!(tiny.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE);
+        let utxos2 = mock_utxo_set(vec![(OutPoint { txid: prev, vout: 0 }, 100)]);
+        let tiny_opts = AtmpOptions {
+            require_standard: false,
+            ..AtmpOptions::default()
+        };
+        let rejected = mempool.add_transaction_for_package(
+            tiny,
+            &|op| utxos2.get(op).cloned(),
+            10.0,
+            &tiny_opts,
+        );
+        assert!(
+            matches!(rejected, Err(MempoolError::NonStandard(ref s)) if s.contains("tx-size-small")),
+            "{rejected:?}"
+        );
+    }
+
+    /// Replacing a mempool spend of an unconfirmed output, inside a package
+    /// whose other member is below min relay. Core PackageRBFChecks rejects
+    /// with no debug string.
+    #[test]
+    fn test_package_rbf_mempool_ancestor_reject() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let chain_p = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000b1",
+        )
+        .unwrap();
+        let chain_a = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000b2",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: chain_p, vout: 0 }, 100_000),
+            (OutPoint { txid: chain_a, vout: 0 }, 100_000),
+        ]);
+        let lookup = |op: &OutPoint| utxos.get(op).cloned();
+        let parent_p = make_tx(vec![(chain_p, 0)], vec![90_000], 2);
+        mempool.add_transaction(parent_p.clone(), &lookup).unwrap();
+        let spender = make_tx(vec![(parent_p.txid(), 0)], vec![80_000], 2);
+        mempool.add_transaction(spender, &lookup).unwrap();
+
+        let low = make_tx(vec![(chain_a, 0)], vec![99_999], 2);
+        let replacement = make_tx(
+            vec![(low.txid(), 0), (parent_p.txid(), 0)],
+            vec![50_000],
+            2,
+        );
+        let low_req = relay_required(low.vsize());
+        let result = mempool.accept_package(vec![low.clone(), replacement.clone()], &lookup);
+        assert_eq!(
+            result.package_error.as_deref(),
+            Some("package RBF failed: new transaction cannot have mempool ancestors")
+        );
+        assert_eq!(
+            result.tx_results[0].error.as_deref(),
+            Some(format!("min relay fee not met, 1 < {low_req}").as_str())
+        );
+        assert_eq!(
+            result.tx_results[1].error.as_deref(),
+            Some("bad-txns-inputs-missingorspent")
+        );
+        assert!(!mempool.contains(&low.txid()));
+        assert!(!mempool.contains(&replacement.txid()));
+        assert!(mempool.contains(&parent_p.txid()));
+    }
+
+    /// prioritisetransaction delta is mod_fee. A 0-base-fee dust tx with a
+    /// nonzero delta is PreCheckEphemeralTx, before CheckFeeRate.
+    #[test]
+    fn test_ephemeral_dust_rejects_nonzero_priority_delta() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let utxo = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000c1",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 100_000)]);
+        let tx = make_tx(vec![(utxo, 0)], vec![99_999, 1], 2);
+        // make_tx builds one output per value. Fee is 100_000 - 99_999 - 1 = 0.
+        assert_eq!(tx.outputs.iter().map(|o| o.value).sum::<u64>(), 100_000);
+        mempool.prioritise_transaction(&tx.txid(), 1_000);
+        let err = mempool
+            .add_transaction(tx, &|op| utxos.get(op).cloned())
+            .unwrap_err();
+        assert!(
+            matches!(err, MempoolError::EphemeralDustNonZeroFee),
+            "{err:?}"
+        );
+
+        let utxo2 = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000c2",
+        )
+        .unwrap();
+        let utxos2 = mock_utxo_set(vec![(OutPoint { txid: utxo2, vout: 0 }, 100_000)]);
+        let paid = make_tx(vec![(utxo2, 0)], vec![99_000, 1], 2);
+        // base fee 999. A cancelling delta still rejects because base_fee != 0.
+        mempool.prioritise_transaction(&paid.txid(), -999);
+        let err = mempool
+            .add_transaction(paid, &|op| utxos2.get(op).cloned())
+            .unwrap_err();
+        assert!(
+            matches!(err, MempoolError::EphemeralDustNonZeroFee),
+            "{err:?}"
+        );
     }
 }

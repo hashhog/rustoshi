@@ -1690,3 +1690,137 @@ async fn submitpackage_too_large_cluster_child_is_transaction_failed() {
     assert!(st.mempool.contains(&parent.txid()));
     assert!(!st.mempool.contains(&child.txid()));
 }
+
+fn relay_fee(vsize: usize) -> u64 {
+    100u64.saturating_mul(vsize as u64).saturating_add(999) / 1000
+}
+
+/// Aggregate CheckFeeRate: package_msg is `transaction failed`, and only the
+/// last tx carries the package fee/vsize ToString.
+#[tokio::test]
+async fn submitpackage_low_package_fee_last_tx_is_checkfeerate() {
+    let f = funded(1, 1).await;
+    let parent_req = relay_fee(f.parent.vsize());
+    let pkg_req = relay_fee(f.parent.vsize() + f.child.vsize());
+    assert!(1 < parent_req && 2 < pkg_req);
+    let res = result(
+        call(
+            &f.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&f.parent), hex_tx(&f.child)]]),
+        )
+        .await,
+    );
+    assert_eq!(res["package_msg"], "transaction failed", "{res}");
+    let parent_row = entry(&res, &f.parent.wtxid().to_hex());
+    let child_row = entry(&res, &f.child.wtxid().to_hex());
+    assert_eq!(
+        parent_row["error"],
+        format!("min relay fee not met, 1 < {parent_req}")
+    );
+    assert_eq!(
+        child_row["error"],
+        format!("min relay fee not met, 2 < {pkg_req}")
+    );
+}
+
+/// Fee-sufficient v3 parent + version=2 child. submitpackage admits the
+/// parent and the child's error is the SingleTRUCChecks ToString.
+#[tokio::test]
+async fn submitpackage_truc_child_error_includes_debug() {
+    let f = funded(10_000, 10_000).await;
+    let mut parent = f.parent.clone();
+    parent.version = 3;
+    let child = spend(
+        OutPoint {
+            txid: parent.txid(),
+            vout: 0,
+        },
+        1_000_000 - 10_000,
+        10_000,
+    );
+    let debug = format!(
+        "non-version=3 tx {} (wtxid={}) cannot spend from version=3 tx {} (wtxid={})",
+        child.txid(),
+        child.wtxid(),
+        parent.txid(),
+        parent.wtxid()
+    );
+    let res = result(
+        call(
+            &f.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_eq!(res["package_msg"], "transaction failed", "{res}");
+    assert_eq!(
+        entry(&res, &child.wtxid().to_hex())["error"],
+        format!("TRUC-violation, {debug}")
+    );
+    let st = f.state.read().await;
+    assert!(st.mempool.contains(&parent.txid()));
+}
+
+/// testmempoolaccept does not admit the parent, so PackageTRUCChecks is the
+/// package-error on every entry and `allowed` is omitted.
+#[tokio::test]
+async fn testmempoolaccept_truc_package_error_includes_debug() {
+    let f = funded(10_000, 10_000).await;
+    let mut parent = f.parent.clone();
+    parent.version = 3;
+    let child = spend(
+        OutPoint {
+            txid: parent.txid(),
+            vout: 0,
+        },
+        1_000_000 - 10_000,
+        10_000,
+    );
+    let debug = format!(
+        "non-version=3 tx {} (wtxid={}) cannot spend from version=3 tx {} (wtxid={})",
+        child.txid(),
+        child.wtxid(),
+        parent.txid(),
+        parent.wtxid()
+    );
+    let res = result(
+        call(
+            &f.state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    let rows = res.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row["package-error"], format!("TRUC-violation, {debug}"), "{row}");
+        assert!(row.get("allowed").is_none(), "{row}");
+    }
+}
+
+/// sendrawtransaction of a nonzero-fee dust tx is RPC -26 and Core's ToString,
+/// not the bare `dust` token.
+#[tokio::test]
+async fn sendrawtransaction_dust_returns_tostring_and_code() {
+    let f = funded(10_000, 10_000).await;
+    let parent = dust_parent(
+        OutPoint {
+            txid: Hash256::from([0x11u8; 32]),
+            vout: 0,
+        },
+        1_000_000,
+        5_000,
+    );
+    let resp = call(
+        &f.state,
+        "sendrawtransaction",
+        serde_json::json!([hex_tx(&parent)]),
+    )
+    .await;
+    let (code, message) = rpc_err(&resp);
+    assert_eq!(code, -26, "{resp}");
+    assert_eq!(message, DUST_FEE_MSG, "{resp}");
+}

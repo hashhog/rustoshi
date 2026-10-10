@@ -9199,8 +9199,33 @@ impl RustoshiRpcServer for RpcServerImpl {
             state.mempool.notify_new_tip(tip_height, mtp);
         }
 
+        let base_fee = {
+            let mut sum = 0u64;
+            let mut known = true;
+            for input in &tx.inputs {
+                if let Some(coin) = utxo_lookup(&input.previous_output) {
+                    sum = sum.saturating_add(coin.value);
+                } else if let Some(out) = state.mempool.get_utxo(&input.previous_output) {
+                    sum = sum.saturating_add(out.value);
+                } else {
+                    known = false;
+                    break;
+                }
+            }
+            if known {
+                let outputs: u64 = tx.outputs.iter().map(|o| o.value).sum();
+                sum.saturating_sub(outputs)
+            } else {
+                0
+            }
+        };
+        let admit_opts = rustoshi_consensus::mempool::AtmpOptions {
+            require_standard: state.mempool.require_standard(),
+            ..rustoshi_consensus::mempool::AtmpOptions::default()
+        };
+
         // Add to mempool
-        match state.mempool.add_transaction(tx, &utxo_lookup) {
+        match state.mempool.add_transaction_with_options(tx.clone(), &utxo_lookup, admit_opts) {
             Ok(_) => {
                 // Get fee info for validation and estimation
                 let entry = state.mempool.get(&txid);
@@ -9280,14 +9305,19 @@ impl RustoshiRpcServer for RpcServerImpl {
                         // Already in mempool - return txid without error
                         Ok(txid.to_hex())
                     }
-                    // Every other rejection surfaces Bitcoin Core's bare
-                    // canonical reject token (rpc/mempool.cpp reports the bare
-                    // state.GetRejectReason(); TX_MISSING_INPUTS remaps to
-                    // "missing-inputs"), not a Rust Display sentence. The
-                    // accept/reject decision is unchanged — only the string.
+                    // Core HandleATMPError uses state.ToString() (reason plus
+                    // debug) and RPC_TRANSACTION_ERROR (-25) for missing
+                    // inputs, RPC_TRANSACTION_REJECTED (-26) otherwise.
+                    MempoolError::MissingInput(_, _)
+                    | MempoolError::Validation(
+                        rustoshi_consensus::validation::TxValidationError::MissingInput(_, _),
+                    ) => Err(Self::rpc_error(
+                        rpc_error::RPC_TRANSACTION_ERROR,
+                        "bad-txns-inputs-missingorspent",
+                    )),
                     other => Err(Self::rpc_error(
                         rpc_error::RPC_TRANSACTION_REJECTED,
-                        other.reject_debug(),
+                        state.mempool.atmp_reject_message(&tx, other, base_fee, vsize),
                     )),
                 }
             }
@@ -12739,11 +12769,13 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Accept the package. Core ProcessNewPackage always runs
         // PolicyScriptChecks + ConsensusScriptChecks, including on regtest
         // where this node's mempool is built with verify_scripts = false.
+        let require_standard = state.mempool.require_standard();
         let result = state.mempool.accept_package_with_options(
             txs.clone(),
             &utxo_lookup,
             rustoshi_consensus::mempool::AtmpOptions {
                 force_script_checks: true,
+                require_standard,
                 // Core: maxfeerate 0 disables the cap (`nullopt`). Otherwise
                 // the check runs inside acceptance, before the tx is inserted.
                 client_max_feerate_sat_kvb: if max_fee_rate_sats_kvb == 0 {
@@ -14575,6 +14607,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             allow_replacement: false,
             skip_script_checks: true,
             force_script_checks: false,
+            require_standard: state.mempool.require_standard(),
             ..AtmpOptions::test_accept()
         };
         for (i, tx) in txs.iter().enumerate() {
@@ -14614,6 +14647,22 @@ impl RustoshiRpcServer for RpcServerImpl {
             remember(&mut temp, tx);
         }
 
+        if txs.len() > 1 {
+            if let Some(msg) = state.mempool.package_truc_violation(&txs) {
+                let results: Vec<serde_json::Value> = txs
+                    .iter()
+                    .map(|tx| {
+                        serde_json::json!({
+                            "txid": tx.txid().to_hex(),
+                            "wtxid": tx.wtxid().to_hex(),
+                            "package-error": msg,
+                        })
+                    })
+                    .collect();
+                return Ok(serde_json::json!(results));
+            }
+        }
+
         if txs.len() > 1 && state.mempool.package_exceeds_cluster_limits(&txs) {
             let results: Vec<serde_json::Value> = txs
                 .iter()
@@ -14634,6 +14683,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             allow_replacement: false,
             skip_script_checks: false,
             force_script_checks: true,
+            require_standard: state.mempool.require_standard(),
             ..AtmpOptions::test_accept()
         };
         let mut results = Vec::with_capacity(txs.len());
