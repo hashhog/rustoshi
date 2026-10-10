@@ -4701,14 +4701,24 @@ pub(crate) fn tx_outputs_in_utxo_set(
 /// Core's message for [`tx_outputs_in_utxo_set`] (`common/messages.cpp:133`).
 pub(crate) const ALREADY_IN_UTXO_SET_MSG: &str = "Transaction outputs already in utxo set";
 
+/// JSON-RPC reject from [`broadcast_signed_tx`], same codes as
+/// `sendrawtransaction`: -25 missing inputs, -26 mempool policy, -27
+/// already in the UTXO set.
+#[derive(Debug)]
+pub struct BroadcastError {
+    pub code: i32,
+    pub message: String,
+}
+
 /// Admit an already-signed transaction into the node mempool.
 ///
-/// The wallet-native `sendtoaddress` path builds + signs a transaction inside
-/// the wallet, then calls this to broadcast it the same way
+/// The wallet-native `sendtoaddress` / `send` paths build + sign a transaction
+/// inside the wallet, then call this to broadcast it the same way
 /// `sendrawtransaction` does: refresh the mempool tip snapshot (so BIP-113 /
 /// coinbase-maturity checks use the live tip), resolve prevouts against the
 /// chainstate UTXO set, and hand the tx to `Mempool::add_transaction`. Returns
-/// the internal-order txid on success, or a human-readable rejection string.
+/// the internal-order txid on success, or the same reject code and
+/// `TxValidationState::ToString` as `sendrawtransaction`.
 ///
 /// Peer relay is intentionally NOT done here (the wallet RPC has no peer-
 /// manager handle); on regtest the local mempool admission + the next
@@ -4717,7 +4727,7 @@ pub(crate) const ALREADY_IN_UTXO_SET_MSG: &str = "Transaction outputs already in
 pub fn broadcast_signed_tx(
     state: &mut RpcState,
     tx: Transaction,
-) -> Result<Hash256, String> {
+) -> Result<Hash256, BroadcastError> {
     let txid = tx.txid();
 
     if state.mempool.contains(&txid) {
@@ -4727,14 +4737,22 @@ pub fn broadcast_signed_tx(
     let db = Arc::clone(&state.db);
     let store = BlockStore::new(&db);
     match tx_outputs_in_utxo_set(&store, &tx) {
-        Ok(true) => return Err(ALREADY_IN_UTXO_SET_MSG.to_string()),
+        Ok(true) => {
+            return Err(BroadcastError {
+                code: rpc_error::RPC_TRANSACTION_ALREADY_IN_CHAIN,
+                message: ALREADY_IN_UTXO_SET_MSG.to_string(),
+            })
+        }
         Ok(false) => {}
         Err(e) => {
-            return Err(format!(
-                "{}: coins read failed: {}",
-                rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
-                e
-            ))
+            return Err(BroadcastError {
+                code: rpc_error::RPC_DATABASE_ERROR,
+                message: format!(
+                    "{}: coins read failed: {}",
+                    rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                    e
+                ),
+            })
         }
     }
 
@@ -4743,14 +4761,25 @@ pub fn broadcast_signed_tx(
         let tip_height = state.best_height;
         // Gate 6: a header read error is a system fault (refuse, no reject
         // cache), never MTP 0 (every time-locked tx "non-final").
-        let mtp = compute_prev_block_mtp(&store, &state.best_hash)? as i64;
+        let mtp = match compute_prev_block_mtp(&store, &state.best_hash) {
+            Ok(mtp) => mtp as i64,
+            Err(message) => {
+                return Err(BroadcastError {
+                    code: rpc_error::RPC_VERIFY_ERROR,
+                    message,
+                })
+            }
+        };
         state.mempool.notify_new_tip(tip_height, mtp);
     }
     if rustoshi_consensus::fatal::is_aborted() {
-        return Err(format!(
-            "{}: node is shutting down after a fatal error",
-            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG
-        ));
+        return Err(BroadcastError {
+            code: rpc_error::RPC_VERIFY_ERROR,
+            message: format!(
+                "{}: node is shutting down after a fatal error",
+                rustoshi_consensus::fatal::SYSTEM_FAULT_TAG
+            ),
+        });
     }
 
     let utxo_lookup = |outpoint: &OutPoint| {
@@ -4767,7 +4796,29 @@ pub fn broadcast_signed_tx(
             })
     };
 
-    match state.mempool.add_transaction(tx, &utxo_lookup) {
+    let base_fee = {
+        let mut sum = 0u64;
+        let mut known = true;
+        for input in &tx.inputs {
+            if let Some(coin) = utxo_lookup(&input.previous_output) {
+                sum = sum.saturating_add(coin.value);
+            } else if let Some(out) = state.mempool.get_utxo(&input.previous_output) {
+                sum = sum.saturating_add(out.value);
+            } else {
+                known = false;
+                break;
+            }
+        }
+        if known {
+            let outputs: u64 = tx.outputs.iter().map(|o| o.value).sum();
+            sum.saturating_sub(outputs)
+        } else {
+            0
+        }
+    };
+    let vsize = tx.vsize();
+
+    match state.mempool.add_transaction(tx.clone(), &utxo_lookup) {
         Ok(_) => {
             if let Some(entry) = state.mempool.get(&txid) {
                 let fee_rate = entry.fee_rate;
@@ -4777,18 +4828,33 @@ pub fn broadcast_signed_tx(
         }
         // Gate 6: a coin read failed during admission (AbortNode latched):
         // a system error, not a reject token.
-        Err(e) if rustoshi_consensus::fatal::is_aborted() => Err(format!(
-            "{}: transaction not judged: {}",
-            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
-            e
-        )),
+        Err(e) if rustoshi_consensus::fatal::is_aborted() => Err(BroadcastError {
+            code: rpc_error::RPC_VERIFY_ERROR,
+            message: format!(
+                "{}: transaction not judged: {}",
+                rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                e
+            ),
+        }),
         Err(e) => {
             use rustoshi_consensus::mempool::MempoolError;
             match &e {
                 MempoolError::AlreadyExists => Ok(txid),
-                // Bare canonical Core reject token, matching the
-                // sendrawtransaction / testmempoolaccept RPC paths.
-                other => Err(other.reject_token()),
+                // Core HandleATMPError: ToString, -25 for missing inputs,
+                // -26 otherwise. Same mapping as sendrawtransaction.
+                MempoolError::MissingInput(_, _)
+                | MempoolError::Validation(
+                    rustoshi_consensus::validation::TxValidationError::MissingInput(_, _),
+                ) => Err(BroadcastError {
+                    code: rpc_error::RPC_TRANSACTION_ERROR,
+                    message: "bad-txns-inputs-missingorspent".to_string(),
+                }),
+                other => Err(BroadcastError {
+                    code: rpc_error::RPC_TRANSACTION_REJECTED,
+                    message: state
+                        .mempool
+                        .atmp_reject_message(&tx, other, base_fee, vsize),
+                }),
             }
         }
     }

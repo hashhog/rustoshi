@@ -2382,28 +2382,31 @@ impl Mempool {
         // admitting and relaying the very low-fee txs it had just evicted,
         // defeating the rolling-minimum DoS backpressure entirely.
         //
-        // Units: `get_min_fee()` and the comparison are in sat/kvB; `fee_rate`
-        // is sat/vB, so we scale by 1000 (mirrors Core comparing absolute
-        // `package_fee` against `GetMinFee().GetFee(package_size)`).
+        // Core CheckFeeRate compares the modified fee to `CFeeRate::GetFee(vsize)`
+        // (`(rate * vsize + 999) / 1000`), not `(fee/vsize*1000).floor()`. The
+        // f64 floor is short by one sat/kvB on some sizes (1005 sat/kvB, vsize
+        // 200, fee 201 floors to 1004).
+        let modified_fee = self.modified_fee_of(&txid, fee);
         if !bypass_limits {
             let mempool_min_fee_kvb = self.get_min_fee();
             if mempool_min_fee_kvb > 0 {
-                let tx_fee_rate_kvb = (fee_rate * 1000.0).floor() as u64;
-                if tx_fee_rate_kvb < mempool_min_fee_kvb {
+                let required = Self::fee_for_kvb_rate(mempool_min_fee_kvb, vsize) as i64;
+                if required > 0 && modified_fee < required {
+                    let shown_kvb = if vsize == 0 {
+                        0
+                    } else {
+                        fee.saturating_mul(1000) / vsize as u64
+                    };
                     return Err(MempoolError::MempoolMinFeeNotMet(
-                        tx_fee_rate_kvb,
+                        shown_kvb,
                         mempool_min_fee_kvb,
                     ));
                 }
             }
         }
-        // Static relay floor (`min_fee_rate`) is sat/kvB; convert the tx feerate
-        // to sat/kvB before comparing so the floor can be a true sub-sat/vB
-        // value (100 sat/kvB = 0.1 sat/vB). Mirrors the dynamic-floor block above
-        // and Core comparing absolute fee against CFeeRate(min_relay).GetFee(vsize).
         if !bypass_limits {
-            let tx_fee_rate_kvb = (fee_rate * 1000.0).floor() as u64;
-            if tx_fee_rate_kvb < self.config.min_fee_rate {
+            let required = Self::fee_for_kvb_rate(self.config.min_fee_rate, vsize) as i64;
+            if modified_fee < required {
                 return Err(MempoolError::InsufficientFee(
                     fee_rate,
                     self.config.min_fee_rate,
@@ -3743,6 +3746,11 @@ impl Mempool {
     pub fn set_rolling_min_fee_sat_kvb(&mut self, sat_kvb: u64) {
         self.rolling_minimum_fee_rate = sat_kvb as f64;
         self.block_since_last_rolling_fee_bump = false;
+    }
+
+    /// `-minrelaytxfee` in sat/kvB. Core stores this on `min_relay_feerate`.
+    pub fn set_min_relay_feerate_kvb(&mut self, sat_kvb: u64) {
+        self.config.min_fee_rate = sat_kvb;
     }
 
     /// Return the effective minimum fee rate that a new transaction must
@@ -5479,7 +5487,13 @@ impl Mempool {
 
             // Try to add the transaction
             // For package validation, we use a special path that allows low fees
-            match self.add_transaction_for_package(tx.clone(), utxo_lookup, package_fee_rate, &opts)
+            match self.add_transaction_for_package(
+                tx.clone(),
+                utxo_lookup,
+                package_fee,
+                package_vsize,
+                &opts,
+            )
             {
                 Ok((_, replaced, evicted)) => {
                     added_txids.push((txid, evicted));
@@ -6037,7 +6051,8 @@ impl Mempool {
                 let _ = self.add_transaction_for_package(
                     tx.clone(),
                     utxo_lookup,
-                    package_fee_rate,
+                    package_fee,
+                    package_vsize,
                     opts,
                 );
             }
@@ -6361,7 +6376,8 @@ impl Mempool {
         &mut self,
         tx: Transaction,
         utxo_lookup: &F,
-        package_fee_rate: f64,
+        package_fee: u64,
+        package_vsize: usize,
         opts: &AtmpOptions,
     ) -> Result<(Hash256, Vec<Hash256>, Vec<MempoolEntry>), MempoolError>
     where
@@ -6506,12 +6522,34 @@ impl Mempool {
         ) as usize;
         let fee_rate = fee as f64 / vsize as f64;
 
-        // For package validation, use the PACKAGE fee rate for the minimum check
-        // Individual transactions can be below minimum as long as package rate is sufficient.
-        // `min_fee_rate` is sat/kvB; scale the package feerate (sat/vB) by 1000.
-        if ((package_fee_rate * 1000.0).floor() as u64) < self.config.min_fee_rate {
+        // Same absolute `CFeeRate::GetFee` comparison as single-tx CheckFeeRate,
+        // applied to the package fee and vsize. The f64 floor of the package
+        // rate rejects a fee that GetFee accepts (1005 sat/kvB, vsize 200, fee 201).
+        let package_modified = package_fee as i64;
+        let package_rate = if package_vsize > 0 {
+            package_fee as f64 / package_vsize as f64
+        } else {
+            0.0
+        };
+        let mempool_min_fee_kvb = self.get_min_fee();
+        if mempool_min_fee_kvb > 0 {
+            let required = Self::fee_for_kvb_rate(mempool_min_fee_kvb, package_vsize) as i64;
+            if required > 0 && package_modified < required {
+                let shown_kvb = if package_vsize == 0 {
+                    0
+                } else {
+                    package_fee.saturating_mul(1000) / package_vsize as u64
+                };
+                return Err(MempoolError::MempoolMinFeeNotMet(
+                    shown_kvb,
+                    mempool_min_fee_kvb,
+                ));
+            }
+        }
+        let required = Self::fee_for_kvb_rate(self.config.min_fee_rate, package_vsize) as i64;
+        if package_modified < required {
             return Err(MempoolError::InsufficientFee(
-                package_fee_rate,
+                package_rate,
                 self.config.min_fee_rate,
             ));
         }
@@ -7356,9 +7394,9 @@ fn is_standard_script(script: &[u8]) -> bool {
 /// `CeilDiv(nSize * fee, 1000)` (Core `CFeeRate::GetFee` →
 /// `FeePerVSize::EvaluateFeeUp` → `CeilDiv`, feefrac.h:212).
 pub fn dust_threshold(output: &TxOut, dust_relay_fee: u64) -> u64 {
-    // OP_RETURN and other unspendable scripts can never be dust (Core
-    // `txout.scriptPubKey.IsUnspendable()` ⇒ return 0).
-    if !output.script_pubkey.is_empty() && output.script_pubkey[0] == 0x6a {
+    // Core `IsUnspendable`: OP_RETURN, or larger than MAX_SCRIPT_SIZE.
+    // An empty script is spendable and falls through to the legacy size.
+    if crate::validation::is_unspendable(&output.script_pubkey) {
         return 0;
     }
 
@@ -7395,11 +7433,6 @@ pub fn dust_threshold(output: &TxOut, dust_relay_fee: u64) -> u64 {
 /// knob from the min-relay floor — Core's `IsDust(txout, dustRelayFeeIn)`
 /// never consults the min-relay feerate.
 fn is_dust(output: &TxOut, dust_relay_fee: u64) -> bool {
-    // Empty script with zero value is special (sometimes used).
-    if output.script_pubkey.is_empty() && output.value == 0 {
-        return false;
-    }
-
     output.value < dust_threshold(output, dust_relay_fee)
 }
 
@@ -7414,30 +7447,13 @@ fn is_dust(output: &TxOut, dust_relay_fee: u64) -> bool {
 /// 2. Would be considered dust (`IsDust`). A 0-value P2A is dust because P2A
 ///    is not unspendable.
 fn is_ephemeral_dust(output: &TxOut) -> bool {
-    // Ephemeral dust must have zero value
-    if output.value != 0 {
-        return false;
-    }
-
-    // OP_RETURN outputs are never dust (even with 0 value, they're unspendable)
-    if !output.script_pubkey.is_empty() && output.script_pubkey[0] == 0x6a {
-        return false;
-    }
-
-    // Empty script with zero value is not considered ephemeral dust
-    // (it's a special case that's handled differently)
-    if output.script_pubkey.is_empty() {
-        return false;
-    }
-
-    // Any other 0-value spendable output, including P2A, is ephemeral dust.
-    true
+    output.value == 0 && is_dust(output, DUST_RELAY_TX_FEE)
 }
 
 /// Core `IsDust`: value below `GetDustThreshold`. A 0-value spendable output
 /// is both ephemeral dust and policy dust.
 fn is_policy_dust(output: &TxOut, dust_relay_fee: u64) -> bool {
-    is_dust(output, dust_relay_fee) || is_ephemeral_dust(output)
+    is_dust(output, dust_relay_fee)
 }
 
 fn policy_dust_count(tx: &Transaction, dust_relay_fee: u64) -> usize {
@@ -7920,6 +7936,213 @@ mod tests {
         }
     }
 
+    /// `(fee/vsize*1000).floor()` and `CFeeRate::GetFee` disagree when f64
+    /// rounding drops the quotient under the rate while the absolute fee
+    /// still meets `ceil(rate * vsize / 1000)`. At 1005 sat/kvB and vsize
+    /// 200, fee 201 floors to 1004 (reject) but GetFee(200) is 201 (accept).
+    fn floor_sat_kvb(fee: u64, vsize: usize) -> u64 {
+        ((fee as f64 / vsize as f64) * 1000.0).floor() as u64
+    }
+
+    fn opreturn_pad(payload: usize) -> Vec<u8> {
+        let mut script = vec![0x6a];
+        if payload == 0 {
+            return script;
+        }
+        if payload <= 75 {
+            script.push(payload as u8);
+        } else {
+            script.push(0x4c);
+            script.push(payload as u8);
+        }
+        script.extend(std::iter::repeat(0u8).take(payload));
+        script
+    }
+
+    fn tx_with_pad(prev: Hash256, input_value: u64, fee: u64, pad: usize) -> Transaction {
+        let p2pkh = vec![
+            0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac,
+        ];
+        Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut {
+                    value: input_value - fee,
+                    script_pubkey: p2pkh,
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: opreturn_pad(pad),
+                },
+            ],
+            lock_time: 0,
+        }
+    }
+
+    /// First pad whose vsize makes `fee == GetFee(rate)` fail the f64 floor test.
+    fn padded_boundary(prev: Hash256, input_value: u64, rate: u64) -> (Transaction, usize, u64) {
+        for pad in 0..500 {
+            let probe = tx_with_pad(prev, input_value, 0, pad);
+            let vsize = probe.vsize();
+            if vsize == 0 {
+                continue;
+            }
+            let fee = Mempool::fee_for_kvb_rate(rate, vsize);
+            if fee == 0 || fee >= input_value {
+                continue;
+            }
+            if floor_sat_kvb(fee, vsize) < rate {
+                return (tx_with_pad(prev, input_value, fee, pad), vsize, fee);
+            }
+        }
+        panic!("no vsize where floor(fee*1000/vsize) disagrees with GetFee");
+    }
+
+    fn admit_config(rate: u64) -> MempoolConfig {
+        MempoolConfig {
+            min_fee_rate: rate,
+            ..MempoolConfig::default()
+        }
+    }
+
+    #[test]
+    fn single_tx_fee_gate_matches_getfee_not_floor() {
+        let rate = 1005u64;
+        let prev =
+            Hash256::from_hex("00000000000000000000000000000000000000000000000000000000000000a1")
+                .unwrap();
+        let input_value = 1_000_000u64;
+        let (tx, vsize, fee) = padded_boundary(prev, input_value, rate);
+        assert_eq!(tx.vsize(), vsize);
+        assert!(floor_sat_kvb(fee, vsize) < rate);
+        assert!(fee >= Mempool::fee_for_kvb_rate(rate, vsize));
+
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev, vout: 0 }, input_value)]);
+        let mut mempool = Mempool::new(admit_config(rate));
+        let res = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            res.is_ok(),
+            "fee {fee} vsize {vsize} meets GetFee and must be admitted, got {res:?}"
+        );
+
+        let low_fee = fee - 1;
+        let mut low = None;
+        for pad in 0..500 {
+            let candidate = tx_with_pad(prev, input_value, low_fee, pad);
+            if candidate.vsize() == vsize {
+                low = Some(candidate);
+                break;
+            }
+        }
+        let mut mempool = Mempool::new(admit_config(rate));
+        let res = mempool.add_transaction(low.expect("same vsize one sat under"), &|op| {
+            utxos.get(op).cloned()
+        });
+        assert!(
+            matches!(res, Err(MempoolError::InsufficientFee(_, _))),
+            "one sat under GetFee must be rejected, got {res:?}"
+        );
+    }
+
+    /// The rolling floor uses the same comparison as the static floor.
+    /// Rate 1005, vsize of the padded tx, fee == GetFee: the f64 floor is
+    /// short by 1 sat/kvB and rejects; absolute GetFee accepts. The static
+    /// floor stays at 100 sat/kvB so only the rolling gate can reject.
+    #[test]
+    fn rolling_fee_gate_matches_getfee_not_floor() {
+        let rate = 1005u64;
+        let prev =
+            Hash256::from_hex("00000000000000000000000000000000000000000000000000000000000000a2")
+                .unwrap();
+        let input_value = 1_000_000u64;
+        let (tx, vsize, fee) = padded_boundary(prev, input_value, rate);
+        assert!(floor_sat_kvb(fee, vsize) < rate);
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev, vout: 0 }, input_value)]);
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        mempool.set_rolling_min_fee_sat_kvb(rate);
+        assert_eq!(mempool.get_min_fee(), rate);
+        let res = mempool.add_transaction(tx, &|op| utxos.get(op).cloned());
+        assert!(
+            res.is_ok(),
+            "rolling GetFee({vsize}) = {fee} must admit, got {res:?}"
+        );
+    }
+
+    /// Package admission scales `package_fee_rate * 1000` with the same floor.
+    /// A parent+child whose combined fee equals GetFee(package vsize) at
+    /// 1005 sat/kvB must be admitted.
+    #[test]
+    fn package_fee_gate_matches_getfee_not_floor() {
+        let rate = 1005u64;
+        let prev =
+            Hash256::from_hex("00000000000000000000000000000000000000000000000000000000000000a3")
+                .unwrap();
+        let input_value = 1_000_000u64;
+        let p2pkh = vec![
+            0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac,
+        ];
+        let child_of = |parent: &Transaction, child_fee: u64| -> Transaction {
+            let value = parent.outputs[0].value;
+            Transaction {
+                version: 2,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: parent.txid(),
+                        vout: 0,
+                    },
+                    script_sig: vec![0x51],
+                    sequence: 0xffff_ffff,
+                    witness: vec![],
+                }],
+                outputs: vec![TxOut {
+                    value: value - child_fee,
+                    script_pubkey: p2pkh.clone(),
+                }],
+                lock_time: 0,
+            }
+        };
+        let mut chosen = None;
+        for pad in 0..500 {
+            let parent_probe = tx_with_pad(prev, input_value, 1, pad);
+            let child_probe = child_of(&parent_probe, 1);
+            let vsize = parent_probe.vsize() + child_probe.vsize();
+            let fee = Mempool::fee_for_kvb_rate(rate, vsize);
+            if fee <= 2 || floor_sat_kvb(fee, vsize) >= rate {
+                continue;
+            }
+            let parent = tx_with_pad(prev, input_value, 1, pad);
+            let child = child_of(&parent, fee - 1);
+            if parent.vsize() + child.vsize() == vsize {
+                chosen = Some((parent, child, vsize, fee));
+                break;
+            }
+        }
+        let (parent, child, vsize, fee) = chosen.expect("package vsize that disagrees");
+        assert!(floor_sat_kvb(fee, vsize) < rate);
+        assert!(fee >= Mempool::fee_for_kvb_rate(rate, vsize));
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: prev, vout: 0 }, input_value)]);
+        let mut mempool = Mempool::new(admit_config(rate));
+        let result = mempool.accept_package(vec![parent, child], &|op| utxos.get(op).cloned());
+        assert!(
+            result.package_error.is_none(),
+            "package fee {fee} vsize {vsize} meets GetFee, got {:?}",
+            result.package_error
+        );
+        assert!(
+            result.tx_results.iter().all(|row| row.error.is_none()),
+            "{:?}",
+            result.tx_results
+        );
+    }
+
     /// The public accessors expose the real sat/kvB floor so the RPC display
     /// can READ policy instead of hardcoding a literal (the recurrence guard
     /// for the fee-display lie). Production config must report 100 sat/kvB.
@@ -8189,6 +8412,64 @@ mod tests {
         // 6x-default threshold.
         assert!(!is_dust(&non_dust_output, DUST_RELAY_TX_FEE));
         assert!(is_dust(&non_dust_output, DUST_RELAY_TX_FEE * 6));
+    }
+
+    /// Core `IsDust` / `IsUnspendable` (`script.h:563`, `policy.cpp:42-67`).
+    /// An empty script is spendable, so GetDustThreshold sizes it as a legacy
+    /// output: serialize size 9 + spending cost 148 = 157, and
+    /// `CFeeRate(3000).GetFee(157)` is 471. Zero-value empty outputs are
+    /// dust (and therefore ephemeral dust). A script longer than
+    /// `MAX_SCRIPT_SIZE` is unspendable and has threshold 0.
+    #[test]
+    fn empty_and_unspendable_scripts_match_core_is_dust() {
+        let empty = TxOut {
+            value: 0,
+            script_pubkey: vec![],
+        };
+        assert_eq!(dust_threshold(&empty, DUST_RELAY_TX_FEE), 471);
+        assert!(is_dust(&empty, DUST_RELAY_TX_FEE));
+        assert!(is_ephemeral_dust(&empty));
+
+        let one = TxOut {
+            value: 1,
+            script_pubkey: vec![],
+        };
+        assert!(is_dust(&one, DUST_RELAY_TX_FEE));
+        assert!(!is_ephemeral_dust(&one));
+
+        let below = TxOut {
+            value: 470,
+            script_pubkey: vec![],
+        };
+        assert!(is_dust(&below, DUST_RELAY_TX_FEE));
+        let at = TxOut {
+            value: 471,
+            script_pubkey: vec![],
+        };
+        assert!(!is_dust(&at, DUST_RELAY_TX_FEE));
+
+        let op_return = TxOut {
+            value: 0,
+            script_pubkey: vec![0x6a],
+        };
+        assert_eq!(dust_threshold(&op_return, DUST_RELAY_TX_FEE), 0);
+        assert!(!is_dust(&op_return, DUST_RELAY_TX_FEE));
+        assert!(!is_ephemeral_dust(&op_return));
+
+        let max_spendable = TxOut {
+            value: 0,
+            script_pubkey: vec![0x51; crate::params::MAX_SCRIPT_SIZE],
+        };
+        assert!(dust_threshold(&max_spendable, DUST_RELAY_TX_FEE) > 0);
+        assert!(is_dust(&max_spendable, DUST_RELAY_TX_FEE));
+
+        let oversized = TxOut {
+            value: 50_000,
+            script_pubkey: vec![0x51; crate::params::MAX_SCRIPT_SIZE + 1],
+        };
+        assert_eq!(dust_threshold(&oversized, DUST_RELAY_TX_FEE), 0);
+        assert!(!is_dust(&oversized, DUST_RELAY_TX_FEE));
+        assert!(!is_ephemeral_dust(&oversized));
     }
 
     #[test]
@@ -14292,10 +14573,12 @@ mod tests {
             require_standard: false,
             ..AtmpOptions::default()
         };
+        let tiny_vsize = tiny.vsize().max(1);
         let rejected = mempool.add_transaction_for_package(
             tiny,
             &|op| utxos2.get(op).cloned(),
-            10.0,
+            10_000,
+            tiny_vsize,
             &tiny_opts,
         );
         assert!(
