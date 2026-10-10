@@ -81,6 +81,21 @@ pub enum WalletError {
         need: u64,
     },
 
+    /// CreateTransaction `IsDust` (spend.cpp). A 0-value spendable output is
+    /// dust. sendtoaddress maps this to RPC -6 and send maps it to RPC -4;
+    /// the string is Core's original error.
+    #[error("Transaction amount too small")]
+    AmountTooSmall,
+
+    /// SelectCoins failed because the balance covers the recipients but not
+    /// the fee. `{fee}` is Core `FormatMoney` of the no-input fee
+    /// (`selection_target - recipients_sum`).
+    #[error("The total exceeds your balance when the {fee} transaction fee is included.")]
+    FeeExceedsBalance {
+        /// Fee in BTC, trailing zeros stripped, matching Core `FormatMoney`.
+        fee: String,
+    },
+
     /// Invalid address format.
     #[error("invalid address: {0}")]
     InvalidAddress(String),

@@ -14584,7 +14584,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 rate_sat_kvb.saturating_mul(vsize as u64).saturating_add(999) / 1000
             }
         };
-        let rejection = |tx: &Transaction, err: &MempoolError, fee: u64, vsize: usize| {
+        let rejection = |tx: &Transaction, err: &MempoolError, shown_fee: i64, vsize: usize| {
             let (reason, details): (String, Option<String>) = match err {
                 MempoolError::MissingInput(_, _)
                 | MempoolError::Validation(
@@ -14605,14 +14605,14 @@ impl RustoshiRpcServer for RpcServerImpl {
                     let required = required_fee(*min_kvb, vsize);
                     (
                         "min relay fee not met".to_string(),
-                        Some(format!("min relay fee not met, {fee} < {required}")),
+                        Some(format!("min relay fee not met, {shown_fee} < {required}")),
                     )
                 }
                 MempoolError::MempoolMinFeeNotMet(_, min_kvb) => {
                     let required = required_fee(*min_kvb, vsize);
                     (
                         "mempool min fee not met".to_string(),
-                        Some(format!("mempool min fee not met, {fee} < {required}")),
+                        Some(format!("mempool min fee not met, {shown_fee} < {required}")),
                     )
                 }
                 MempoolError::EphemeralDustNonZeroFee => (
@@ -14679,6 +14679,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         for (i, tx) in txs.iter().enumerate() {
             let fee = fee_of(tx, &temp, &state.mempool);
             let vsize = tx.vsize();
+            // CheckFeeRate compares the modified fee. reject-details must show
+            // that sum, including a prioritisetransaction delta (validation.cpp).
+            let shown_fee = state.mempool.modified_fee_of(&tx.txid(), fee);
             let err = {
                 let lookup = |op: &OutPoint| lookup_with(&temp, op);
                 state
@@ -14703,7 +14706,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     for prior in txs.iter().take(i) {
                         results.push(blank(prior));
                     }
-                    results.push(rejection(tx, &err, fee, vsize));
+                    results.push(rejection(tx, &err, shown_fee, vsize));
                     for later in txs.iter().skip(i + 1) {
                         results.push(blank(later));
                     }
@@ -14761,6 +14764,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
             let fee = fee_of(tx, &temp, &state.mempool);
             let vsize = tx.vsize();
+            let shown_fee = state.mempool.modified_fee_of(&tx.txid(), fee);
             let err = {
                 let lookup = |op: &OutPoint| lookup_with(&temp, op);
                 state
@@ -14769,7 +14773,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     .err()
             };
             if let Some(err) = err {
-                results.push(rejection(tx, &err, fee, vsize));
+                results.push(rejection(tx, &err, shown_fee, vsize));
                 exit_early = true;
                 continue;
             }

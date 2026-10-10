@@ -2834,7 +2834,13 @@ impl Mempool {
 
             // Update ancestor descendant stats (once per ancestor, not per parent)
             if let Some(parents) = self.parents.get(txid).cloned() {
-                self.update_all_ancestors_for_remove(&parents, entry.vsize, entry.fee);
+                // Descendants were added at their modified fee. Subtract that,
+                // not the base fee, or a pre-admission delta sticks to ancestors.
+                self.update_all_ancestors_for_remove(
+                    &parents,
+                    entry.vsize,
+                    Self::get_modified_fee(&entry),
+                );
                 for parent in &parents {
                     if let Some(children) = self.children.get_mut(parent) {
                         children.remove(txid);
@@ -2865,6 +2871,7 @@ impl Mempool {
         }
         let vsize = entry.vsize;
         let fee = entry.fee;
+        let modified = Self::get_modified_fee(&entry);
         let fee_rate = entry.fee_rate;
         let wtxid = entry.tx.wtxid();
         let mut mempool_parents = HashSet::new();
@@ -2889,7 +2896,7 @@ impl Mempool {
             self.children.entry(*parent).or_default().insert(txid);
         }
         self.children.entry(txid).or_default();
-        self.update_all_ancestors_for_add(&mempool_parents, vsize, fee);
+        self.update_all_ancestors_for_add(&mempool_parents, vsize, modified);
         self.total_size += vsize;
         self.fee_rate_index.insert(
             FeeRateKey {
@@ -3374,7 +3381,9 @@ impl Mempool {
             }
             if let Some(entry) = self.transactions.get(&parent) {
                 total_size += entry.vsize;
-                total_fees += entry.fee;
+                // nModFeesWithAncestors sums modified fees (base + fee_delta),
+                // not the base fee (kernel/mempool_entry.h GetModifiedFee).
+                total_fees += Self::get_modified_fee(entry);
                 if let Some(grandparents) = self.parents.get(&parent) {
                     for gp in grandparents {
                         queue.push(*gp);
@@ -4293,11 +4302,23 @@ impl Mempool {
     /// (txmempool.cpp:1015).  Idempotent: callers may invoke at any time
     /// (no-op when there is no pending delta).
     fn apply_pending_delta(&mut self, txid: &Hash256) {
-        if let Some(&delta) = self.map_deltas.get(txid) {
-            if let Some(entry) = self.transactions.get_mut(txid) {
-                entry.fee_delta = delta;
+        let Some(delta) = self.map_deltas.get(txid).copied() else {
+            return;
+        };
+        let change = if let Some(entry) = self.transactions.get_mut(txid) {
+            let prev = entry.fee_delta;
+            if prev == delta {
+                return;
             }
-        }
+            entry.fee_delta = delta;
+            delta.saturating_sub(prev)
+        } else {
+            return;
+        };
+        // Insert stored ancestor/descendant fees from the base fee. Core's
+        // ApplyDelta (txmempool.cpp, called from addUnchecked) then folds a
+        // delta that was recorded before admission into those aggregates.
+        self.propagate_fee_delta(txid, change);
     }
 
     /// Drop a pending delta for `txid` without affecting any existing entry.
@@ -5347,32 +5368,42 @@ impl Mempool {
 
         // More than one dust output is IsStandard "dust", and a nonzero fee on
         // dust is PreCheckEphemeralTx. Both are non-reconsiderable, so Core
-        // never reaches CheckEphemeralSpends (`unspent-dust`).
+        // never reaches CheckEphemeralSpends (`unspent-dust`). CheckEphemeralSpends
+        // itself is skipped entirely when require_standard is false
+        // (validation.cpp:1530).
         let dust_relay = self.config.dust_relay_fee;
-        let blocks_ephemeral_package = opts.require_standard
-            && txs.iter().any(|tx| {
+        // Sum of modified fees (base + prioritisetransaction delta). Core's
+        // package CheckFeeRate compares this, not the raw package fee
+        // (validation.cpp:1503-1512). A zero delta keeps it equal to package_fee.
+        let package_modified: i64 = tx_fees.iter().fold(0i64, |acc, (txid, base)| {
+            acc.saturating_add(self.modified_fee_of(txid, *base))
+        });
+        if opts.require_standard {
+            let blocks_ephemeral_package = txs.iter().any(|tx| {
                 let fee = *tx_fees.get(&tx.txid()).unwrap_or(&0);
                 policy_dust_count(tx, dust_relay) > MAX_DUST_OUTPUTS_PER_TX
                     || pre_check_ephemeral_tx(tx, fee, self.modified_fee_of(&tx.txid(), fee), dust_relay)
                         .is_err()
             });
-        if !blocks_ephemeral_package {
-            if let Err(MempoolError::EphemeralDustNotFullySpent(child_txid, parent_txid)) =
-                check_ephemeral_spends(&txs, &self.transactions, dust_relay)
-            {
-                return self.unspent_dust_package_result(
-                    &txs,
-                    &tx_fees,
-                    &already_in_mempool,
-                    &different_witness,
-                    child_txid,
-                    parent_txid,
-                    utxo_lookup,
-                    package_fee_rate,
-                    &opts,
-                    package_fee,
-                    package_vsize,
-                );
+            if !blocks_ephemeral_package {
+                if let Err(MempoolError::EphemeralDustNotFullySpent(child_txid, parent_txid)) =
+                    check_ephemeral_spends(&txs, &self.transactions, dust_relay)
+                {
+                    return self.unspent_dust_package_result(
+                        &txs,
+                        &tx_fees,
+                        &already_in_mempool,
+                        &different_witness,
+                        child_txid,
+                        parent_txid,
+                        utxo_lookup,
+                        package_fee_rate,
+                        &opts,
+                        package_fee,
+                        package_vsize,
+                        package_modified,
+                    );
+                }
             }
         }
 
@@ -5492,6 +5523,7 @@ impl Mempool {
                 utxo_lookup,
                 package_fee,
                 package_vsize,
+                package_modified,
                 &opts,
             )
             {
@@ -5571,7 +5603,7 @@ impl Mempool {
         rate_sat_kvb.saturating_mul(vsize as u64).saturating_add(999) / 1000
     }
 
-    fn modified_fee_of(&self, txid: &Hash256, base_fee: u64) -> i64 {
+    pub fn modified_fee_of(&self, txid: &Hash256, base_fee: u64) -> i64 {
         let delta = self.map_deltas.get(txid).copied().unwrap_or(0);
         (base_fee as i64).saturating_add(delta)
     }
@@ -6013,6 +6045,7 @@ impl Mempool {
         opts: &AtmpOptions,
         package_fee: u64,
         package_vsize: usize,
+        package_modified: i64,
     ) -> PackageAcceptResult
     where
         F: Fn(&OutPoint) -> Option<CoinEntry>,
@@ -6053,6 +6086,7 @@ impl Mempool {
                     utxo_lookup,
                     package_fee,
                     package_vsize,
+                    package_modified,
                     opts,
                 );
             }
@@ -6241,7 +6275,7 @@ impl Mempool {
                 }
             }
         }
-        let mut fee = 0u64;
+        let mut fee: i64 = 0;
         let mut vsize = 0usize;
         let mut wtxids = Vec::new();
         for tx in txs {
@@ -6250,13 +6284,16 @@ impl Mempool {
                 continue;
             }
             if let Some(r) = tx_results.iter().find(|r| r.txid == txid) {
-                fee += r.fee;
+                // Core's package effective feerate is CFeeRate(total modified
+                // fees, total vsize). A prioritisetransaction delta is part of
+                // that total; a zero delta leaves the base fee.
+                fee = fee.saturating_add(self.modified_fee_of(&txid, r.fee));
                 vsize += r.vsize;
                 wtxids.push(r.wtxid);
             }
         }
-        let sat_kvb = if vsize > 0 {
-            fee.saturating_mul(1000) / vsize as u64
+        let sat_kvb = if vsize > 0 && fee > 0 {
+            (fee as u64).saturating_mul(1000) / vsize as u64
         } else {
             0
         };
@@ -6378,6 +6415,7 @@ impl Mempool {
         utxo_lookup: &F,
         package_fee: u64,
         package_vsize: usize,
+        package_modified: i64,
         opts: &AtmpOptions,
     ) -> Result<(Hash256, Vec<Hash256>, Vec<MempoolEntry>), MempoolError>
     where
@@ -6523,9 +6561,11 @@ impl Mempool {
         let fee_rate = fee as f64 / vsize as f64;
 
         // Same absolute `CFeeRate::GetFee` comparison as single-tx CheckFeeRate,
-        // applied to the package fee and vsize. The f64 floor of the package
+        // applied to the package's modified fee (base + prioritisetransaction
+        // deltas) and vsize. Core uses `m_total_modified_fees`
+        // (validation.cpp:1512), which can be negative. A zero delta leaves
+        // this equal to the base package fee. The f64 floor of the package
         // rate rejects a fee that GetFee accepts (1005 sat/kvB, vsize 200, fee 201).
-        let package_modified = package_fee as i64;
         let package_rate = if package_vsize > 0 {
             package_fee as f64 / package_vsize as f64
         } else {
@@ -14579,12 +14619,55 @@ mod tests {
             &|op| utxos2.get(op).cloned(),
             10_000,
             tiny_vsize,
+            10_000,
             &tiny_opts,
         );
         assert!(
             matches!(rejected, Err(MempoolError::NonStandard(ref s)) if s.contains("tx-size-small")),
             "{rejected:?}"
         );
+    }
+
+    /// Core skips CheckEphemeralSpends when `require_standard` is false
+    /// (validation.cpp:1530). A package that leaves a 0-value empty output
+    /// unspent is still admitted under -acceptnonstdtxn.
+    #[test]
+    fn test_package_ephemeral_skipped_when_require_standard_false() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let utxo = Hash256::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000c1",
+        )
+        .unwrap();
+        let input_value = 100_000u64;
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, input_value)]);
+        let mut parent = make_tx(vec![(utxo, 0)], vec![input_value - 10_000], 2);
+        parent.outputs.push(TxOut {
+            value: 0,
+            script_pubkey: Vec::new(),
+        });
+        assert!(parent.base_size() >= MIN_STANDARD_TX_NONWITNESS_SIZE);
+        assert!(is_policy_dust(&parent.outputs[1], DUST_RELAY_TX_FEE));
+        let child = make_tx(vec![(parent.txid(), 0)], vec![input_value - 20_000], 2);
+        let opts = AtmpOptions {
+            require_standard: false,
+            ..AtmpOptions::default()
+        };
+        let result = mempool.accept_package_with_options(
+            vec![parent.clone(), child.clone()],
+            &|op| utxos.get(op).cloned(),
+            opts,
+        );
+        assert!(
+            result.package_error.is_none(),
+            "require_standard false must skip CheckEphemeralSpends: {result:?}"
+        );
+        assert!(
+            result.tx_results.iter().all(|r| r.error.is_none()),
+            "{:?}",
+            result.tx_results
+        );
+        assert!(mempool.contains(&parent.txid()));
+        assert!(mempool.contains(&child.txid()));
     }
 
     /// Replacing a mempool spend of an unconfirmed output, inside a package
