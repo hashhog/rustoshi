@@ -436,7 +436,7 @@ def compare_json(core, rust, path: str) -> list[dict]:
 
     def add(field: str, c, r):
         mismatches.append(
-            {"field": field, "core": c, "rustoshi": r, "justified": None}
+            {"field": field, "core": c, "rustoshi": r, "out_of_scope": None}
         )
 
     cn, rn = _num(core), _num(rust)
@@ -484,7 +484,7 @@ def compare_outcome(core_out: dict, rust_out: dict, path: str) -> list[dict]:
                 "field": f"{path} ok",
                 "core": core_out,
                 "rustoshi": rust_out,
-                "justified": None,
+                "out_of_scope": None,
             }
         ]
     if not core_out.get("ok"):
@@ -496,7 +496,7 @@ def compare_outcome(core_out: dict, rust_out: dict, path: str) -> list[dict]:
                     "field": path,
                     "core": c,
                     "rustoshi": r,
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             ]
         return []
@@ -632,6 +632,10 @@ def main() -> int:
     )
 
     cases = []
+    # Full package RBF is not implemented in this run. This list records the
+    # one submitpackage the sweep sends specifically to measure it. It is not
+    # part of the exit code.
+    package_rbf_observed = []
 
     def run_case(name: str, parent_hex: str, child_hex: str, parent_txid: str, child_txid: str):
         log(f"=== {name} ===")
@@ -657,7 +661,7 @@ def main() -> int:
                     "field": "getrawmempool",
                     "core": after_c,
                     "rustoshi": after_r,
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             )
         # Membership of this package's txids, called out even when the full
@@ -672,7 +676,7 @@ def main() -> int:
                         "field": f"mempool_contains_{label}",
                         "core": c_in,
                         "rustoshi": r_in,
-                        "justified": None,
+                        "out_of_scope": None,
                     }
                 )
             if c_in and r_in:
@@ -687,7 +691,7 @@ def main() -> int:
                             "field": f"unbroadcast_{label}",
                             "core": c_unb,
                             "rustoshi": r_unb,
-                            "justified": None,
+                            "out_of_scope": None,
                         }
                     )
         added_c = sorted(set(after_c) - before_c)
@@ -698,14 +702,14 @@ def main() -> int:
                     "field": "mempool_added",
                     "core": added_c,
                     "rustoshi": added_r,
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             )
         for m in mismatches:
-            tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+            tag = "OUT_OF_SCOPE" if m["out_of_scope"] else "MISMATCH"
             log(f"  {tag} {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
-            if m["justified"]:
-                log(f"    why: {m['justified']}")
+            if m["out_of_scope"]:
+                log(f"    why: {m['out_of_scope']}")
         cases.append(
             {
                 "name": name,
@@ -763,7 +767,7 @@ def main() -> int:
                 "field": "mempool_changed",
                 "core": mempool_txids(core) != before_c,
                 "rustoshi": mempool_txids(rust) != before_r,
-                "justified": None,
+                "out_of_scope": None,
             }
         )
     if mempool_txids(core) != mempool_txids(rust):
@@ -772,11 +776,11 @@ def main() -> int:
                 "field": "getrawmempool",
                 "core": mempool_txids(core),
                 "rustoshi": mempool_txids(rust),
-                "justified": None,
+                "out_of_scope": None,
             }
         )
     for m in ow_mismatches:
-        tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+        tag = "OUT_OF_SCOPE" if m["out_of_scope"] else "MISMATCH"
         log(f"  {tag} {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
     cases.append(
         {
@@ -877,11 +881,11 @@ def main() -> int:
                     "field": "getrawmempool",
                     "core": mempool_txids(core),
                     "rustoshi": mempool_txids(rust),
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             )
         for m in mismatches:
-            tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+            tag = "OUT_OF_SCOPE" if m["out_of_scope"] else "MISMATCH"
             log(f"  {tag} {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
         cases.append(
             {
@@ -924,7 +928,7 @@ def main() -> int:
                 "field": "original_still_present",
                 "core": original["txid"] in mempool_txids(core),
                 "rustoshi": original["txid"] in mempool_txids(rust),
-                "justified": None,
+                "out_of_scope": None,
             }
         )
 
@@ -960,7 +964,7 @@ def main() -> int:
                 "field": "original_evicted",
                 "core": orig_c,
                 "rustoshi": orig_r,
-                "justified": None,
+                "out_of_scope": None,
             }
         )
 
@@ -1018,7 +1022,7 @@ def main() -> int:
                     "field": "getrawmempool",
                     "core": after_c,
                     "rustoshi": after_r,
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             )
         c_in = txid in after_c
@@ -1030,7 +1034,7 @@ def main() -> int:
                     "field": "mempool_contains",
                     "core": c_in,
                     "rustoshi": r_in,
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             )
         added_c = sorted(set(after_c) - before_c)
@@ -1041,11 +1045,11 @@ def main() -> int:
                     "field": "mempool_added",
                     "core": added_c,
                     "rustoshi": added_r,
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             )
         for m in mismatches:
-            tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+            tag = "OUT_OF_SCOPE" if m["out_of_scope"] else "MISMATCH"
             log(f"  {tag} {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
         cases.append(
             {
@@ -1118,7 +1122,7 @@ def main() -> int:
                         "field": "getrawmempool",
                         "core": after_c,
                         "rustoshi": after_r,
-                        "justified": None,
+                        "out_of_scope": None,
                     }
                 )
         elif after_c != before_c or after_r != before_r or after_c != after_r:
@@ -1127,11 +1131,11 @@ def main() -> int:
                     "field": "mempool_changed",
                     "core": after_c,
                     "rustoshi": after_r,
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             )
         for m in mismatches:
-            tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+            tag = "OUT_OF_SCOPE" if m["out_of_scope"] else "MISMATCH"
             log(f"  {tag} {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
         cases.append(
             {
@@ -1398,7 +1402,8 @@ def main() -> int:
     # Seven Core v31.1 paths. testmempoolaccept, sendrawtransaction, and
     # submitpackage are compared whole. getrawmempool verbose is compared for
     # the package txids that landed; time / chunkweight / fees.chunk / depends
-    # / spentby / bip125-replaceable are recorded as justified display gaps.
+    # / spentby / bip125-replaceable / unbroadcast / time are out of scope:
+    # they are fixed on PR #7 and are not compared into the exit code.
     spk_bytes = bytes.fromhex(spk)
     # OP_1 PUSH2 4e73. 0x02 is the push length; 0x20 would be a 32-byte push.
     p2a_script = bytes.fromhex("51024e73")
@@ -1512,7 +1517,7 @@ def main() -> int:
                     "field": "getrawmempool type",
                     "core": core_map,
                     "rustoshi": rust_map,
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             ]
         c_ids, r_ids = list(core_map), list(rust_map)
@@ -1522,7 +1527,7 @@ def main() -> int:
                     "field": "getrawmempool txids",
                     "core": sorted(set(c_ids) - set(r_ids)),
                     "rustoshi": sorted(set(r_ids) - set(c_ids)),
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             )
         if c_ids != r_ids and set(c_ids) == set(r_ids):
@@ -1531,7 +1536,7 @@ def main() -> int:
                     "field": "getrawmempool key order",
                     "core": len(c_ids),
                     "rustoshi": len(r_ids),
-                    "justified": (
+                    "out_of_scope": (
                         "Core MempoolToJSON walks entryAll (rpc/mempool.cpp:579); "
                         "rustoshi walks get_sorted_for_mining (crates/rpc/src/server.rs:9091)"
                     ),
@@ -1554,7 +1559,7 @@ def main() -> int:
                         "field": f"getrawmempool.{txid}",
                         "core": txid in core_map,
                         "rustoshi": txid in rust_map,
-                        "justified": None,
+                        "out_of_scope": None,
                     }
                 )
                 continue
@@ -1569,7 +1574,7 @@ def main() -> int:
                         "field": f"getrawmempool.{txid}.chunkweight",
                         "core": c_ent.get("chunkweight"),
                         "rustoshi": r_ent.get("chunkweight"),
-                        "justified": None,
+                        "out_of_scope": None,
                     }
                 )
             c_fees = c_ent.get("fees") if isinstance(c_ent.get("fees"), dict) else {}
@@ -1582,7 +1587,7 @@ def main() -> int:
                         "field": f"getrawmempool.{txid}.fees.chunk",
                         "core": c_fees.get("chunk"),
                         "rustoshi": r_fees.get("chunk"),
-                        "justified": None,
+                        "out_of_scope": None,
                     }
                 )
             for key in ("depends", "spentby", "bip125-replaceable", "unbroadcast"):
@@ -1602,7 +1607,7 @@ def main() -> int:
                     "field": "getrawmempool verbose residuals",
                     "core": hit,
                     "rustoshi": "differs on the focused entries",
-                    "justified": (
+                    "out_of_scope": (
                         "time is the local Unix second the tx entered; "
                         "chunkweight is Core entryToJSON (rpc/mempool.cpp:525), "
                         "omitted by rustoshi MempoolEntry (crates/rpc/src/types.rs:723); "
@@ -1656,7 +1661,7 @@ def main() -> int:
                     "field": "tip",
                     "core": c_tip,
                     "rustoshi": r_tip,
-                    "justified": None,
+                    "out_of_scope": None,
                 }
             )
         focus = package_txids(hexes)
@@ -1668,10 +1673,10 @@ def main() -> int:
             shown = m["core"]
             if isinstance(shown, (dict, list)) and len(json.dumps(shown, default=str)) > 400:
                 shown = json.dumps(shown, default=str)[:400] + "…"
-            tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+            tag = "OUT_OF_SCOPE" if m["out_of_scope"] else "MISMATCH"
             log(f"  {tag} {m['field']}: core={shown!r} rustoshi={m['rustoshi']!r}")
-            if m["justified"]:
-                log(f"    why: {m['justified']}")
+            if m["out_of_scope"]:
+                log(f"    why: {m['out_of_scope']}")
         cases.append(
             {
                 "name": name,
@@ -1906,10 +1911,11 @@ def main() -> int:
         sendraw=[anchor_parent["hex"]],
     )
 
-    # broadcast_signed_tx is sendtoaddress and send. No REST handler calls it.
-    # Core's wallet rejects 1 sat before BroadcastTransaction. rustoshi builds
-    # the tx and broadcast_signed_tx returns sendrawtransaction's -26 string.
-    log("=== sendtoaddress dust via broadcast_signed_tx ===")
+    # Wallet CreateTransaction pre-checks. Dust (including 0) is rejected
+    # before fee estimation, so it matches on a node with no -fallbackfee.
+    # `send` takes an explicit fee_rate, which is how insufficient funds and
+    # the no-input-fee sentence are reached on both nodes.
+    log("=== wallet CreateTransaction pre-checks ===")
     rust.rpc("createwallet", ["sweep"])
     rust_addr = rust.rpc("getnewaddress", ["", "bech32"])
     rust_info = rust.rpc("getaddressinfo", [rust_addr])
@@ -1928,42 +1934,88 @@ def main() -> int:
     log("rustoshi listunspent: " + json.dumps(rust_unspent, default=str)[:1500])
     if not rust_unspent:
         die("rustoshi wallet saw no coins after rescanblockchain")
-    core_dust_addr = core.cli_json("-rpcwallet=sweep", "getnewaddress", "", "bech32")
-    rust_dust_addr = rust.rpc("getnewaddress", ["", "bech32"])
-    c_send = core.wallet_outcome("sendtoaddress", [core_dust_addr, 0.00000001])
-    r_send = rust.rpc_outcome("sendtoaddress", [rust_dust_addr, 0.00000001])
-    log("core sendtoaddress: " + json.dumps(c_send, default=str))
-    log("rustoshi sendtoaddress: " + json.dumps(r_send, default=str))
-    send_mismatches = compare_outcome(c_send, r_send, "sendtoaddress")
-    dust_broadcast = (
-        c_send.get("code") == -6
-        and c_send.get("message") == "Transaction amount too small"
-        and r_send.get("code") == -26
-        and r_send.get("message") == "dust, tx with dust output must be 0-fee"
-    )
-    if send_mismatches and dust_broadcast:
-        for item in send_mismatches:
-            item["justified"] = (
-                "Core wallet CreateTransaction rejects a 1-sat output with "
-                "RPC_WALLET_INSUFFICIENT_FUNDS (-6) 'Transaction amount too small' "
-                "before BroadcastTransaction (spend.cpp). sendtoaddress and send "
-                "are the only callers of broadcast_signed_tx; no REST path uses it. "
-                "rustoshi sendtoaddress reaches broadcast_signed_tx and returns "
-                "sendrawtransaction's -26 ToString. Matching the wallet pre-check "
-                "would skip that path."
+    core_addr = core.cli_json("-rpcwallet=sweep", "getnewaddress", "", "bech32")
+    rust_addr = rust.rpc("getnewaddress", ["", "bech32"])
+
+    def record_wallet(name: str, method: str, core_params: list, rust_params: list) -> None:
+        log(f"=== {name} ===")
+        c_out = core.wallet_outcome(method, core_params)
+        r_out = rust.rpc_outcome(method, rust_params)
+        log("core: " + json.dumps(c_out, default=str))
+        log("rustoshi: " + json.dumps(r_out, default=str))
+        mismatches = compare_outcome(c_out, r_out, method)
+        for item in mismatches:
+            log(
+                f"  MISMATCH {item['field']}: "
+                f"core={item['core']!r} rustoshi={item['rustoshi']!r}"
             )
-    for item in send_mismatches:
-        tag = "JUSTIFIED" if item["justified"] else "MISMATCH"
-        log(f"  {tag} {item['field']}: core={item['core']!r} rustoshi={item['rustoshi']!r}")
-        if item["justified"]:
-            log(f"    why: {item['justified']}")
-    cases.append(
-        {
-            "name": "sendtoaddress-broadcast-dust",
-            "core": c_send,
-            "rustoshi": r_send,
-            "mismatches": send_mismatches,
-        }
+        cases.append(
+            {
+                "name": name,
+                "core": c_out,
+                "rustoshi": r_out,
+                "mismatches": mismatches,
+            }
+        )
+
+    record_wallet(
+        "sendtoaddress-1sat",
+        "sendtoaddress",
+        [core_addr, "0.00000001"],
+        [rust_addr, "0.00000001"],
+    )
+    record_wallet(
+        "sendtoaddress-zero",
+        "sendtoaddress",
+        [core_addr, "0"],
+        [rust_addr, "0"],
+    )
+    record_wallet(
+        "sendtoaddress-negative",
+        "sendtoaddress",
+        [core_addr, "-0.00000001"],
+        [rust_addr, "-0.00000001"],
+    )
+    record_wallet(
+        "send-1sat",
+        "send",
+        [[{core_addr: "0.00000001"}], None, "unset", 1],
+        [[{rust_addr: "0.00000001"}], None, "unset", 1],
+    )
+    record_wallet(
+        "send-zero",
+        "send",
+        [[{core_addr: "0"}], None, "unset", 1],
+        [[{rust_addr: "0"}], None, "unset", 1],
+    )
+    record_wallet(
+        "send-negative",
+        "send",
+        [[{core_addr: "-0.00000001"}], None, "unset", 1],
+        [[{rust_addr: "-0.00000001"}], None, "unset", 1],
+    )
+    record_wallet(
+        "send-insufficient",
+        "send",
+        [[{core_addr: "1000000"}], None, "unset", 1],
+        [[{rust_addr: "1000000"}], None, "unset", 1],
+    )
+    c_bal = core.wallet_outcome("getbalance", [])
+    r_bal = rust.rpc_outcome("getbalance", [])
+    log(f"wallet balance core={c_bal} rustoshi={r_bal}")
+    if not c_bal.get("ok") or not r_bal.get("ok"):
+        die(f"getbalance failed core={c_bal} rustoshi={r_bal}")
+    record_wallet(
+        "send-exact-balance-fee5",
+        "send",
+        [[{core_addr: str(c_bal["result"])}], None, "unset", 5],
+        [[{rust_addr: str(r_bal["result"])}], None, "unset", 5],
+    )
+    record_wallet(
+        "send-exact-balance-fee1",
+        "send",
+        [[{core_addr: str(c_bal["result"])}], None, "unset", 1],
+        [[{rust_addr: str(r_bal["result"])}], None, "unset", 1],
     )
 
     def restart_nodes(log_name: str, core_extra: list[str], rust_extra: list[str]) -> None:
@@ -2040,6 +2092,109 @@ def main() -> int:
             coin,
             [(sats - fee, spk_bytes), (0, null_data(pad))],
         )
+
+    # Package CheckFeeRate uses modified fees. Parent fee is 1 sat. A +1
+    # prioritisetransaction delta clears a package that is one sat under
+    # GetFee. A -1 delta rejects a package whose base fee meets GetFee.
+    def child_spending(parent: dict, fee: int) -> dict:
+        change = next(v for v in parent["decoded"]["vout"] if sats_of(v["value"]) > 0)
+        change_value = sats_of(change["value"])
+        if fee <= 0 or fee >= change_value:
+            die(f"child fee {fee} does not fit {change_value}")
+        return sign_raw(
+            raw_tx(
+                [(bytes.fromhex(parent["decoded"]["txid"])[::-1], change["n"], b"")],
+                [(change_value - fee, spk_bytes)],
+            ).hex(),
+            [
+                {
+                    "txid": parent["decoded"]["txid"],
+                    "vout": change["n"],
+                    "scriptPubKey": change["scriptPubKey"]["hex"],
+                    "amount": btc(change_value),
+                }
+            ],
+        )
+
+    def prioritise(txid: str, delta: int) -> None:
+        c_pri = core.rpc_outcome("prioritisetransaction", [txid, 0, delta])
+        r_pri = rust.rpc_outcome("prioritisetransaction", [txid, 0, delta])
+        log(f"prioritise {txid} {delta}: core={c_pri} rustoshi={r_pri}")
+        mismatches = compare_outcome(c_pri, r_pri, "prioritisetransaction")
+        if mismatches:
+            cases.append(
+                {
+                    "name": f"prioritisetransaction-{txid}-{delta}",
+                    "core": c_pri,
+                    "rustoshi": r_pri,
+                    "mismatches": mismatches,
+                }
+            )
+
+    def modified_fee_package(child_fee_below_req: int, delta: int, name: str) -> None:
+        coin = fresh_coin()
+        parent = signed_outputs(coin, [(sats_of(coin["amount"]) - 1, spk_bytes)])
+        parent_v = int(parent["decoded"]["vsize"])
+        change_value = sats_of(coin["amount"]) - 1
+        # A DER signature's length moves with the fee, so a probe at fee 1
+        # does not fix the child's vsize. Search for a fee that is exactly
+        # GetFee(package vsize) minus the requested shortfall at that vsize.
+        found = None
+        for fee in range(1, 80):
+            if fee >= change_value:
+                break
+            trial = child_spending(parent, fee)
+            pkg_v = parent_v + int(trial["decoded"]["vsize"])
+            pkg_req = get_fee(100, pkg_v)
+            if fee == pkg_req - child_fee_below_req:
+                found = (trial, pkg_v, pkg_req, fee)
+                break
+        if found is None:
+            die(f"{name} found no child fee whose vsize satisfies GetFee")
+        child, pkg_v, pkg_req, child_fee = found
+        log(
+            f"{name} parent_vsize={parent['decoded']['vsize']} "
+            f"pkg_vsize={pkg_v} pkg_req={pkg_req} child_fee={child_fee} "
+            f"base={1 + child_fee} delta={delta}"
+        )
+        prioritise(parent["decoded"]["txid"], delta)
+        run_reached(name, [parent["hex"], child["hex"]], sendraw=[parent["hex"]])
+
+    modified_fee_package(2, 1, "package-modified-fee-positive")
+    modified_fee_package(1, -1, "package-modified-fee-negative")
+
+    # Package RBF where the parent alone does not pay the incremental relay
+    # fee and the child does. Not scored: this run does not implement it.
+    rbf_coin = fresh_coin()
+    rbf_sats = sats_of(rbf_coin["amount"])
+    rbf_original = signed_outputs(rbf_coin, [(rbf_sats - 10_000, spk_bytes)])
+    admit_both("package-rbf-child-pays-original", rbf_original["hex"])
+    rbf_parent = signed_outputs(rbf_coin, [(rbf_sats - 10_001, spk_bytes)])
+    rbf_child = signed_child(rbf_parent, 50_000)
+    log("=== package-rbf-child-pays (not scored) ===")
+    rbf_hexes = [rbf_parent["hex"], rbf_child["hex"]]
+    rbf_core = core.rpc_outcome("submitpackage", [rbf_hexes])
+    rbf_rust = rust.rpc_outcome("submitpackage", [rbf_hexes])
+    log("core submitpackage: " + json.dumps(rbf_core, default=str)[:2500])
+    log("rustoshi submitpackage: " + json.dumps(rbf_rust, default=str)[:2500])
+    package_rbf_observed.append(
+        {
+            "name": "package-rbf-child-pays",
+            "inputs": {
+                "original_fee_sat": 10_000,
+                "parent_fee_sat": 10_001,
+                "child_fee_sat": 50_000,
+                "original_txid": rbf_original["decoded"]["txid"],
+                "parent_txid": rbf_parent["decoded"]["txid"],
+                "child_txid": rbf_child["decoded"]["txid"],
+                "parent_hex": rbf_parent["hex"],
+                "child_hex": rbf_child["hex"],
+            },
+            "core": rbf_core,
+            "rustoshi": rbf_rust,
+            "mismatches": compare_outcome(rbf_core, rbf_rust, "submitpackage"),
+        }
+    )
 
     # Rate 1005 sat/kvB is the smallest rate whose CFeeRate::GetFee(vsize)
     # disagrees with floor(fee/vsize*1000). vsize 200, fee 201 floors to 1004.
@@ -2229,6 +2384,43 @@ def main() -> int:
         sendraw=[paid_one["hex"]],
     )
 
+    # require_standard is off, so Core skips CheckEphemeralSpends. The child
+    # spends the value output and leaves the 0-value empty output unspent.
+    unspent_parent = empty_spk_tx(fresh_coin(), 0, 10_000)
+    unspent_change = next(
+        v for v in unspent_parent["decoded"]["vout"] if sats_of(v["value"]) > 0
+    )
+    unspent_empty = next(
+        v for v in unspent_parent["decoded"]["vout"] if sats_of(v["value"]) == 0
+    )
+    if unspent_empty["scriptPubKey"]["hex"] != "":
+        die(f"expected an empty scriptPubKey, got {unspent_empty}")
+    unspent_value = sats_of(unspent_change["value"])
+    unspent_child = sign_raw(
+        raw_tx(
+            [
+                (
+                    bytes.fromhex(unspent_parent["decoded"]["txid"])[::-1],
+                    unspent_change["n"],
+                    b"",
+                )
+            ],
+            [(unspent_value - 1_000, spk_bytes)],
+        ).hex(),
+        [
+            {
+                "txid": unspent_parent["decoded"]["txid"],
+                "vout": unspent_change["n"],
+                "scriptPubKey": unspent_change["scriptPubKey"]["hex"],
+                "amount": btc(unspent_value),
+            }
+        ],
+    )
+    run_reached(
+        "acceptnonstd-unspent-empty-output",
+        [unspent_parent["hex"], unspent_child["hex"]],
+    )
+
     # invalidateblock / reconsiderblock of the current tip.
     log("=== invalidateblock / reconsiderblock ===")
     tip = core.rpc("getbestblockhash")
@@ -2285,27 +2477,70 @@ def main() -> int:
             "activate_best_chain_after_reconsider. Not fixed on this branch."
         )
 
-    report = {"cases": cases, "reconsider": reconsider}
+    if c_after_re != r_after_re:
+        log(
+            "OUT_OF_SCOPE reconsiderblock tip: "
+            f"core={c_after_re} rustoshi={r_after_re}. "
+            "PR #7 invalidated-submit restores the tip. Not fixed on this branch."
+        )
+
+    report = {
+        "cases": cases,
+        "reconsider": reconsider,
+        "package_rbf_not_implemented": package_rbf_observed,
+    }
     out = WORKDIR / "report.json"
     out.write_text(json.dumps(report, indent=2, sort_keys=True, default=str))
     log(f"wrote {out}")
 
-    unjustified = []
+    in_scope = []
+    out_of_scope = []
     for case in cases:
         for m in case["mismatches"]:
-            if not m["justified"]:
-                unjustified.append((case["name"], m))
+            entry = (case["name"], m)
+            if m.get("out_of_scope"):
+                out_of_scope.append(entry)
+            else:
+                in_scope.append(entry)
     if c_after_inv != r_after_inv:
-        unjustified.append(("reconsider", {"field": "after_invalidate", "core": c_after_inv, "rustoshi": r_after_inv}))
-    # Tip not restored is the known B gap; count it separately so the script
-    # exit code reflects package mismatches only when B is the sole gap.
-    b_gap = c_after_re != r_after_re
-    log(f"unjustified package/invalidate mismatches: {len(unjustified)}")
-    log(f"reconsiderblock tip gap (known, PR #7): {b_gap}")
+        in_scope.append(
+            (
+                "invalidateblock",
+                {"field": "after_invalidate", "core": c_after_inv, "rustoshi": r_after_inv},
+            )
+        )
+    if c_after_re != r_after_re:
+        out_of_scope.append(
+            (
+                "reconsiderblock",
+                {
+                    "field": "after_reconsider",
+                    "core": c_after_re,
+                    "rustoshi": r_after_re,
+                    "out_of_scope": (
+                        "PR #7 invalidated-submit calls activate_best_chain_after_reconsider. "
+                        "This branch only clears FAILED flags."
+                    ),
+                },
+            )
+        )
+    log(f"in-scope mismatches: {len(in_scope)}")
+    for name, m in in_scope:
+        log(f"  {name} {m.get('field')}: core={m.get('core')!r} rustoshi={m.get('rustoshi')!r}")
+    log(f"out of scope (PR #7 verbose mempool / reconsiderblock): {len(out_of_scope)}")
+    for name, m in out_of_scope:
+        why = m.get("out_of_scope")
+        log(f"  {name} {m.get('field')}: {why}")
+    for note in package_rbf_observed:
+        n = len(note["mismatches"])
+        log(f"package RBF not implemented this run: {note['name']} differences={n}")
+        if n:
+            log("  core: " + json.dumps(note["core"], default=str)[:2000])
+            log("  rustoshi: " + json.dumps(note["rustoshi"], default=str)[:2000])
 
     stop_rustoshi(rust_proc)
     stop_core(core_dir)
-    return 1 if unjustified else 0
+    return 1 if in_scope else 0
 
 
 if __name__ == "__main__":
