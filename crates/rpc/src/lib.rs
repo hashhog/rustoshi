@@ -32,6 +32,7 @@
 //! ```
 
 pub mod auth;
+pub mod header_filter;
 pub mod chain_lock;
 pub mod coins_coherence;
 pub mod logging;
@@ -50,6 +51,8 @@ pub mod zmq;
 mod r5_errcode_tests;
 #[cfg(test)]
 mod f0_coin_view_tests;
+#[cfg(test)]
+mod invalidated_submit_tests;
 
 pub use payjoin_sender::{
     post_original_psbt, trim_to_base64 as payjoin_trim_to_base64, SenderHttpError, SenderRequest,
@@ -58,6 +61,7 @@ pub use rest::{
     rest_router, rest_router_with_wallet, start_rest_server, start_rest_server_with_wallet,
     RestConfig, RestServerHandle, RestState,
 };
+pub use header_filter::filter_incoming_headers;
 pub use server::{start_rpc_server, PeerState, RpcServerImpl, RpcState, RustoshiRpcServer};
 pub use tip_notifier::TipNotifier;
 pub use types::*;

@@ -1156,6 +1156,43 @@ fn write_compressed_script<W: Write>(writer: &mut W, script: &[u8]) -> Result<()
     Ok(())
 }
 
+/// Bitcoin Core `CBlockUndo` payload (no magic, size, or checksum).
+///
+/// `input_counts` is one entry per non-coinbase transaction: how many inputs
+/// that transaction has. `coins` is the flat spent-coin list in the same
+/// order (`TxInUndoFormatter` in `undo.h`): `VARINT(height*2 + coinbase)`,
+/// a dummy version `VARINT` when `height > 0`, then `TxOutCompression`.
+/// A coinbase-only block has an empty `input_counts` and encodes as a single
+/// `0x00` (compact-size 0). Core's rev*.dat record is this payload plus a
+/// 32-byte double-SHA256 checksum.
+pub fn core_block_undo_payload(
+    input_counts: &[usize],
+    coins: &[crate::block_store::CoinEntry],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = write_compact_size(&mut out, input_counts.len() as u64);
+    let mut cursor = 0usize;
+    for &n_inputs in input_counts {
+        let _ = write_compact_size(&mut out, n_inputs as u64);
+        for _ in 0..n_inputs {
+            if cursor >= coins.len() {
+                return out;
+            }
+            let coin = &coins[cursor];
+            cursor += 1;
+            let code = (u64::from(coin.height) << 1) | u64::from(coin.is_coinbase);
+            let _ = write_varint(&mut out, code);
+            if coin.height > 0 {
+                // TxInUndoFormatter writes a dummy version VARINT for height > 0.
+                let _ = write_varint(&mut out, 0);
+            }
+            let _ = write_varint(&mut out, compress_amount(coin.value));
+            let _ = write_compressed_script(&mut out, &coin.script_pubkey);
+        }
+    }
+    out
+}
+
 /// Decode one spent coin in Bitcoin Core's block-undo encoding
 /// (`TxInUndoFormatter`, bitcoin-core/src/undo.h:25-45):
 /// `VARINT(nHeight*2 + fCoinBase)`, a dummy `VARINT` version when

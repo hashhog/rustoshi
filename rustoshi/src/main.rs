@@ -39,7 +39,10 @@ use rustoshi_network::{
     PROTOCOL_VERSION,
 };
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
-use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
+use rustoshi_rpc::{
+    filter_incoming_headers, start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig,
+    RpcState,
+};
 use rustoshi_storage::{
     block_store::{BlockIndexEntry, BlockStatus},
     coinstats_compute_next_entry, coinstats_genesis_entry,
@@ -140,6 +143,11 @@ struct Cli {
     /// P2P listen port (overrides network default)
     #[arg(long)]
     port: Option<u16>,
+
+    /// Maximum mempool size in megabytes (Bitcoin Core `-maxmempool`).
+    /// The byte limit is `megabytes * 1_000_000`. Core rejects values below 5.
+    #[arg(long, default_value_t = 300)]
+    maxmempool: u64,
 
     /// Maximum number of outbound connections
     #[arg(long, default_value = "8")]
@@ -566,6 +574,50 @@ fn store_validated_header(
                 e
             )
         })?;
+    // Core AcceptBlockHeader inserts a CBlockIndex even when the body has
+    // not arrived: nTx 0, nChainWork = parent + GetBlockProof, VALID_TREE,
+    // no HAVE_DATA. getblockheader and getchaintips read that entry. A
+    // header that already has one (submitheader, or a connected block
+    // re-announced) keeps it — overwriting would zero nTx on a block that
+    // already has data.
+    let hash = header.block_hash();
+    let existing = block_store.get_block_index(&hash).map_err(|e| {
+        format!(
+            "{}: get_block_index failed: {}",
+            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+            e
+        )
+    })?;
+    if existing.is_none() {
+        let parent_work = block_store
+            .get_block_index(&header.prev_block_hash)
+            .ok()
+            .flatten()
+            .map(|e| ChainWork::from_be_bytes(e.chain_work))
+            .unwrap_or(ChainWork::ZERO);
+        let mut status = BlockStatus::new();
+        status.set(BlockStatus::VALID_TREE);
+        let entry = BlockIndexEntry {
+            height,
+            status,
+            n_tx: 0,
+            timestamp: header.timestamp,
+            bits: header.bits,
+            nonce: header.nonce,
+            version: header.version,
+            prev_hash: header.prev_block_hash,
+            chain_work: parent_work
+                .saturating_add(&get_block_proof(header.bits))
+                .0,
+        };
+        block_store.put_block_index(&hash, &entry).map_err(|e| {
+            format!(
+                "{}: put_block_index failed: {}",
+                rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+                e
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -2155,6 +2207,7 @@ async fn adopt_rpc_chain_writes<'s>(
     header_sync: &mut HeaderSync,
     block_downloader: &mut BlockDownloader,
     invalid_block_hashes: &mut std::collections::HashSet<Hash256>,
+    failed_child_parent: &mut std::collections::HashMap<Hash256, Hash256>,
     rpc_state: &RwLock<RpcState>,
 ) -> bool {
     use rustoshi_rpc::chain_lock::ChainEvent;
@@ -2252,10 +2305,34 @@ async fn adopt_rpc_chain_writes<'s>(
             }
         }
     }
-    for h in &reconsidered {
-        // Core ReconsiderBlock clears the failure flags and lets the headers
-        // be followed again; the next getheaders round re-learns them.
-        invalid_block_hashes.remove(h);
+    if !reconsidered.is_empty() {
+        // Core ReconsiderBlock (ResetBlockFailureFlags) clears the failure
+        // flags of the block AND every descendant in the block index --
+        // including header-only descendants, which Core stores with
+        // BLOCK_FAILED_CHILD. rustoshi drops such a header (its parent was
+        // failed) and remembers only its hash here, so walk the remembered
+        // child -> parent links from the reconsidered blocks and forget every
+        // descendant too. Before this, header N+1 (announced while N was
+        // invalidated) stayed refused after reconsiderblock, so a peer serving
+        // N+1, N+2 could never move the node past N (INV-RECONSIDER).
+        let mut cleared: std::collections::HashSet<Hash256> = reconsidered.iter().copied().collect();
+        loop {
+            let next: Vec<Hash256> = failed_child_parent
+                .iter()
+                .filter(|(_, p)| cleared.contains(*p))
+                .map(|(c, _)| *c)
+                .collect();
+            if next.is_empty() {
+                break;
+            }
+            for c in next {
+                failed_child_parent.remove(&c);
+                cleared.insert(c);
+            }
+        }
+        for h in &cleared {
+            invalid_block_hashes.remove(h);
+        }
     }
 
     if !tip_moved && invalidated.is_empty() && reconsidered.is_empty() {
@@ -3909,6 +3986,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     rpc_state_inner.txindex_enabled = cli.txindex;
     rpc_state_inner.blockfilterindex_enabled =
         !matches!(cli.blockfilterindex.to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no");
+    // Core init.cpp: `-maxmempool` is megabytes, minimum 5, stored as
+    // `max_size_bytes = megabytes * 1_000_000` and reported by getmempoolinfo.
+    if cli.maxmempool < 5 {
+        anyhow::bail!("Error: -maxmempool must be at least 5 MB");
+    }
+    rpc_state_inner
+        .mempool
+        .set_max_size_bytes((cli.maxmempool as usize).saturating_mul(1_000_000));
     rpc_state_inner.init_from_db().map_err(|e| anyhow::anyhow!(e))?;
 
     // If `--load-snapshot=<path>` was provided, ingest the Core-format UTXO
@@ -4646,8 +4731,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // header (Core drops BLOCK_FAILED_VALID blocks from the candidate set;
     // rustoshi's linear header index would otherwise re-pin it). The durable
     // source of truth is the FAILED_VALIDITY flag; this is an O(1) fast-path.
+    // Seed from the block index so a restart still rejects headers that
+    // descend from a BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD block. The
+    // session set alone is empty after process start.
     let mut invalid_block_hashes: std::collections::HashSet<Hash256> =
         std::collections::HashSet::new();
+    if let Ok(iter) = block_store.iter_block_index() {
+        for (hash, entry) in iter {
+            if entry.status.has(BlockStatus::FAILED_VALIDITY)
+                || entry.status.has(BlockStatus::FAILED_CHILD)
+            {
+                invalid_block_hashes.insert(hash);
+            }
+        }
+    }
+    // child -> parent for every header dropped because its parent was failed
+    // (Core keeps those in the block index as BLOCK_FAILED_CHILD), so
+    // reconsiderblock can clear the descendants it never stored.
+    let mut failed_child_parent: std::collections::HashMap<Hash256, Hash256> =
+        std::collections::HashMap::new();
     // Peer that delivered each side-branch block stored without a reorg
     // (try_attach_and_reorg -> Ok(false)). Core keeps `mapBlockSource` for a
     // stored-but-not-connected block until it is checked, so when a LATER
@@ -5144,6 +5246,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         &mut header_sync,
                         &mut block_downloader,
                         &mut invalid_block_hashes,
+                        &mut failed_child_parent,
                         &rpc_state,
                     )
                     .await;
@@ -5248,6 +5351,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         &mut header_sync,
                         &mut block_downloader,
                         &mut invalid_block_hashes,
+                        &mut failed_child_parent,
                         &rpc_state,
                     )
                     .await;
@@ -5720,7 +5824,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             // DoS-vector parity (audit w14z8m3zc, findings 2 + 3):
                             // arm the rolling-min-fee decay + expire stale txs.
                             rpc.mempool.on_block_connected(
-                                rustoshi_consensus::current_time_secs() as i64,
+                                rustoshi_consensus::mempool::current_unix_seconds(),
                             );
 
                             // Wire fee estimator: notify it of the newly connected
@@ -5933,23 +6037,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // BLOCK_FAILED_CHILD). Without it, after an
                                 // `invalidateblock N` the peers' N+1, N+2 headers
                                 // were taken on as the header chain again.
-                                let headers: Vec<_> = if invalid_block_hashes.is_empty() {
-                                    headers
-                                } else {
-                                    let mut kept = Vec::with_capacity(headers.len());
-                                    for h in headers {
-                                        let hh = h.block_hash();
-                                        if invalid_block_hashes.contains(&hh) {
-                                            continue;
-                                        }
-                                        if invalid_block_hashes.contains(&h.prev_block_hash) {
-                                            invalid_block_hashes.insert(hh);
-                                            continue;
-                                        }
-                                        kept.push(h);
-                                    }
-                                    kept
-                                };
+                                let headers = filter_incoming_headers(
+                                    headers,
+                                    &mut invalid_block_hashes,
+                                    &mut failed_child_parent,
+                                    |hash| block_store.is_block_invalid(hash).unwrap_or(false),
+                                );
                                 let is_historical = historical_backfill
                                     .as_ref()
                                     .map(|bf| bf.is_backfill_batch(&block_store, &headers))
@@ -6635,6 +6728,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         &mut header_sync,
                                         &mut block_downloader,
                                         &mut invalid_block_hashes,
+                                        &mut failed_child_parent,
                                         &rpc_state,
                                     )
                                     .await;
@@ -7312,7 +7406,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             let expired = rpc
                                                 .mempool
                                                 .on_block_connected(
-                                                    rustoshi_consensus::current_time_secs() as i64,
+                                                    rustoshi_consensus::mempool::current_unix_seconds(),
                                                 );
                                             if expired > 0 {
                                                 tracing::debug!(
@@ -9352,6 +9446,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             &mut header_sync,
             &mut block_downloader,
             &mut invalid_block_hashes,
+            &mut failed_child_parent,
             &rpc_state,
         )
         .await;
@@ -9517,6 +9612,62 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Core AcceptBlockHeader inserts a CBlockIndex for a headers-only block:
+    /// height, nChainWork = parent + proof, nTx 0, VALID_TREE, no HAVE_DATA.
+    /// Without that entry getblockheader reports height 0 and getchaintips
+    /// omits the tip. A block that already has an index entry is left alone.
+    #[test]
+    fn p2p_header_is_indexed_like_accept_block_header() {
+        use super::{store_validated_header, BlockStore, ChainDb, ChainParams};
+        use rustoshi_consensus::{get_block_proof, ChainWork};
+        use rustoshi_primitives::BlockHeader;
+        use rustoshi_storage::block_store::BlockStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = ChainDb::open(dir.path()).unwrap();
+        let params = ChainParams::regtest();
+        let store = BlockStore::new(&db);
+        store.init_genesis(&params).unwrap();
+        let parent = store
+            .get_block_index(&params.genesis_hash)
+            .unwrap()
+            .unwrap();
+        let header = BlockHeader {
+            version: 0x2000_0000,
+            prev_block_hash: params.genesis_hash,
+            merkle_root: Hash256::ZERO,
+            timestamp: parent.timestamp.saturating_add(1),
+            bits: 0x207f_ffff,
+            nonce: 1,
+        };
+        store_validated_header(&store, &header, 1).unwrap();
+        let entry = store
+            .get_block_index(&header.block_hash())
+            .unwrap()
+            .expect("P2P header must be in the block index");
+        assert_eq!(entry.height, 1);
+        assert_eq!(entry.n_tx, 0);
+        assert!(entry.status.has(BlockStatus::VALID_TREE));
+        assert!(!entry.status.has(BlockStatus::HAVE_DATA));
+        assert_eq!(entry.prev_hash, params.genesis_hash);
+        let expect = ChainWork::from_be_bytes(parent.chain_work)
+            .saturating_add(&get_block_proof(header.bits));
+        assert_eq!(entry.chain_work, expect.0);
+
+        let mut connected = entry.clone();
+        connected.n_tx = 7;
+        connected.status.set(BlockStatus::HAVE_DATA);
+        store
+            .put_block_index(&header.block_hash(), &connected)
+            .unwrap();
+        store_validated_header(&store, &header, 1).unwrap();
+        let kept = store
+            .get_block_index(&header.block_hash())
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.n_tx, 7, "a connected index entry must survive a re-announce");
     }
 
     #[test]

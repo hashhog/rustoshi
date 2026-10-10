@@ -95,7 +95,7 @@ pub use snapshot::{
     read_snapshot_blockhash, write_snapshot_blockhash, BackgroundChainstate,
     BackgroundValidationError, ChainstateManager, SnapshotActivation, SnapshotError,
     SnapshotMetadata, SnapshotReader, SnapshotState, SnapshotVerdict, SnapshotWriter,
-    read_core_txin_undo,
+    core_block_undo_payload, read_core_txin_undo,
     IBD_ACTIVE_CACHE_PERCENT, IBD_CACHE_PERCENT, SNAPSHOT_ACTIVE_CACHE_PERCENT,
     SNAPSHOT_BLOCKHASH_FILENAME, SNAPSHOT_CACHE_PERCENT, SNAPSHOT_CHAINSTATE_SUFFIX,
     SNAPSHOT_MAGIC_BYTES, SNAPSHOT_VERSION,

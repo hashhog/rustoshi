@@ -446,6 +446,32 @@ impl ValidationError {
         }
     }
 
+    /// Whether ConnectBlock (not CheckBlock / ContextualCheckBlockHeader)
+    /// produced this error. Core writes the block, then `InvalidBlockFound`
+    /// sets `BLOCK_FAILED_VALID` only after ConnectTip fails. Context-free
+    /// and header failures are refused before the block is stored, and
+    /// `BLOCK_MUTATED` results are not marked.
+    pub fn is_connect_block_failure(&self) -> bool {
+        match self {
+            ValidationError::BadSubsidy(_, _)
+            | ValidationError::FeesOutOfRange(_)
+            | ValidationError::SigopsLimitExceeded(_)
+            | ValidationError::WeightExceeded(_)
+            | ValidationError::NonFinalTx
+            | ValidationError::Bip30DuplicateOutput => true,
+            ValidationError::TxValidation(tx) => matches!(
+                tx,
+                TxValidationError::MissingInput(_, _)
+                    | TxValidationError::InsufficientFunds(_, _)
+                    | TxValidationError::ScriptFailed(_)
+                    | TxValidationError::PrematureCoinbaseSpend(_, _)
+                    | TxValidationError::InputValueOverflow
+                    | TxValidationError::SequenceLockNotMet
+            ),
+            _ => false,
+        }
+    }
+
     /// Whether this error is a local system fault (gate 6), i.e. the caller
     /// must retry or halt and must neither mark nor punish.
     pub fn is_system_fault(&self) -> bool {

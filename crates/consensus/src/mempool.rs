@@ -99,14 +99,33 @@ impl SequenceLockContext for MempoolSeqLockCtx<'_> {
     }
 }
 
+/// `setmocktime` override. 0 means "use the system clock", matching Core.
+static MOCK_TIME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Pin `GetTime()` for mempool entry timestamps. `0` clears the pin.
+/// Header and consensus clocks are unchanged.
+pub fn set_mock_time(secs: i64) {
+    MOCK_TIME.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Helper: current wall-clock time as seconds since Unix epoch (i64).
 /// Used for the `time_seconds` field of `MempoolEntry`, which is
-/// persisted in the Core-format `mempool.dat` file.
+/// persisted in the Core-format `mempool.dat` file. Honors `set_mock_time`.
 fn now_unix_seconds() -> i64 {
+    let mock = MOCK_TIME.load(std::sync::atomic::Ordering::Relaxed);
+    if mock != 0 {
+        return mock;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// `GetTime()` for mempool admission, expiry, and rolling-fee decay.
+/// Honors `set_mock_time`; `0` means the system clock.
+pub fn current_unix_seconds() -> i64 {
+    now_unix_seconds()
 }
 
 // ============================================================
@@ -352,6 +371,10 @@ pub struct Cluster {
     pub linearization: Vec<Chunk>,
     /// Map from txid to chunk index (for quick lookup).
     pub tx_to_chunk: HashMap<Hash256, usize>,
+    /// Core `QualityLevel::OPTIMAL`. False while this cluster still needs
+    /// linearization (`NEEDS_FIX` / `NEEDS_RELINEARIZE` / `ACCEPTABLE`).
+    /// `TxGraph::DoWork(0)` is false if any cluster is not known-optimal.
+    pub known_optimal: bool,
 }
 
 impl Cluster {
@@ -371,6 +394,8 @@ impl Cluster {
             total_vsize: vsize,
             linearization: vec![chunk],
             tx_to_chunk,
+            // Core inserts a singleton at QualityLevel::OPTIMAL.
+            known_optimal: true,
         }
     }
 
@@ -1358,6 +1383,19 @@ impl MempoolError {
             .unwrap_or(reason)
             .to_string()
     }
+
+    /// Core `TxValidationState::ToString`. `testmempoolaccept` stores this in
+    /// `reject-details`, and `sendrawtransaction` uses it as the RPC message.
+    /// A debug string is appended only when Core's check site sets one.
+    pub fn reject_debug(&self) -> String {
+        match self {
+            // tx_verify.cpp CheckTxInputs: "tried to spend coinbase at depth %d"
+            MempoolError::CoinbaseNotMature { age, .. } => format!(
+                "bad-txns-premature-spend-of-coinbase, tried to spend coinbase at depth {age}"
+            ),
+            other => other.reject_token(),
+        }
+    }
 }
 
 // ============================================================
@@ -1552,6 +1590,125 @@ pub struct Mempool {
     /// BIP68 coin-time lookup (see [`MempoolSeqLockCtx`]); set by the node
     /// from its header store.
     coin_mtp_provider: Option<CoinMtpProvider>,
+    /// Txids accepted by `sendrawtransaction` that have not been announced.
+    /// Core `CTxMemPool::m_unbroadcast_txids`. With no peers the set stays
+    /// populated, so `getrawmempool` reports `unbroadcast: true`.
+    unbroadcast: HashSet<Hash256>,
+    /// Length and capacity of Core's `txns_randomized`
+    /// (`vector<pair<Wtxid, txiter>>`, 40 bytes per element on x86_64).
+    ///
+    /// libstdc++ grows with `size + max(size, 1)` and the last-entry removal
+    /// calls `clear()`, which keeps capacity. `DynamicMemoryUsage` charges
+    /// `MallocUsage(capacity * 40)`, so the live transaction count is not
+    /// enough to recover the number.
+    txns_randomized_len: usize,
+    txns_randomized_cap: usize,
+}
+
+/// `CFeeRate(fee, size).GetFeePerK()`: integer satoshis per 1000 vbytes.
+fn chunk_sat_per_kvb(feefrac: &FeeFrac) -> i64 {
+    if feefrac.size <= 0 {
+        0
+    } else {
+        feefrac.fee.saturating_mul(1000) / feefrac.size
+    }
+}
+
+/// True when `a` has a strictly lower fee/size than `b`.
+fn fee_frac_is_worse(a: &FeeFrac, b: &FeeFrac) -> bool {
+    (a.fee as i128) * (b.size as i128) < (b.fee as i128) * (a.size as i128)
+}
+
+/// `memusage::MallocUsage` for glibc ≥ 2.19 on x86_64: round the request
+/// up to a multiple of 16, then add 16. An exact multiple of 16 is not a
+/// fixed point (`MallocUsage(64) == 80`). A zero-sized request allocates
+/// nothing.
+fn malloc_usage(alloc: usize) -> usize {
+    if alloc == 0 {
+        0
+    } else {
+        ((alloc + 31) >> 4) << 4
+    }
+}
+
+// x86_64 `sizeof` of the Core v31.1 objects that `DynamicMemoryUsage` charges.
+// CTxIn 112, CTxOut 48, CScript is prevector<36, uint8_t> (inline up to 36),
+// CTransaction 128, stl_shared_counter 24, CTxMemPoolEntry 136.
+const CTX_IN: usize = 112;
+const CTX_OUT: usize = 48;
+const CSCRIPT_DIRECT: usize = 36;
+const CTX: usize = 128;
+const SHARED_COUNTER: usize = 24;
+/// `sizeof(CTxMemPoolEntry) + 9 * sizeof(void*)` — the mapTx node Core multiplies by `mapTx.size()`.
+const MAPTX_ELEM: usize = 136 + 9 * 8;
+/// `stl_tree_node<pair<const COutPoint*, txiter>>`. txiter is one pointer
+/// (Boost.MultiIndex hashed-index iterator, safe mode off).
+const MAP_NEXT_NODE: usize = 48;
+/// `stl_tree_node<pair<const Txid, int64_t>>`.
+const MAP_DELTA_NODE: usize = 72;
+/// `sizeof(pair<Wtxid, txiter>)`.
+const RAND_PAIR: usize = 40;
+/// `sizeof(TxGraphImpl::Entry)`.
+const GRAPH_ENTRY: usize = 80;
+/// `stl_tree_node<ChunkData>`.
+const CHUNK_NODE: usize = 40;
+const SINGLETON_CLUSTER: usize = 48;
+const GENERIC_CLUSTER: usize = 104;
+const UNIQUE_PTR: usize = 8;
+/// `sizeof(DepGraph::Entry)` for `BitSet<64>`: FeeFrac 16 + two 8-byte sets.
+const DEP_ENTRY: usize = 32;
+/// `GraphIndex` / `DepGraphIndex` (`uint32_t`).
+const INDEX: usize = 4;
+
+/// Heap bytes of one `CScript` (`prevector<36>`). Unserialize from empty sets
+/// capacity equal to the length, so a spill is `MallocUsage(len)`.
+fn script_heap(len: usize) -> usize {
+    if len <= CSCRIPT_DIRECT {
+        0
+    } else {
+        malloc_usage(len)
+    }
+}
+
+/// `RecursiveDynamicUsage(CTransactionRef)`: the shared_ptr control block,
+/// the `CTransaction` object, and vin / vout / witness allocations.
+/// `CTxMemPoolEntry::DynamicMemoryUsage` returns this and nothing else;
+/// `cachedInnerUsage` is the sum over entries.
+fn tx_cached_inner_usage(tx: &Transaction) -> usize {
+    let mut mem = malloc_usage(tx.inputs.len() * CTX_IN) + malloc_usage(tx.outputs.len() * CTX_OUT);
+    for inp in &tx.inputs {
+        mem += script_heap(inp.script_sig.len());
+        // Witness stack vector capacity equals the item count (unserialize reserve).
+        mem += malloc_usage(inp.witness.len() * 24);
+        for item in &inp.witness {
+            // Each item is `vector<unsigned char>` resized to its length.
+            mem += malloc_usage(item.len());
+        }
+    }
+    for out in &tx.outputs {
+        mem += script_heap(out.script_pubkey.len());
+    }
+    // shared_ptr: MallocUsage(sizeof(CTransaction)) + MallocUsage(sizeof(stl_shared_counter)).
+    mem + malloc_usage(CTX) + malloc_usage(SHARED_COUNTER)
+}
+
+/// `Cluster::TotalMemoryUsage` after `Compact` (capacities equal the tx
+/// count). A singleton is constant-size. Two or more transactions live in a
+/// `GenericClusterImpl`; `GetMainMemoryUsage` keeps the post-compact cached
+/// value, so a later relinearize does not change it.
+fn txgraph_cluster_usage(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else if n == 1 {
+        malloc_usage(SINGLETON_CLUSTER) + UNIQUE_PTR
+    } else {
+        // mapping, linearization, depgraph entries, the cluster object, the unique_ptr slot.
+        malloc_usage(n * INDEX)
+            + malloc_usage(n * INDEX)
+            + malloc_usage(n * DEP_ENTRY)
+            + malloc_usage(GENERIC_CLUSTER)
+            + UNIQUE_PTR
+    }
 }
 
 impl Mempool {
@@ -1632,7 +1789,50 @@ impl Mempool {
             next_sequence: 1,
             map_deltas: HashMap::new(),
             coin_mtp_provider: None,
+            unbroadcast: HashSet::new(),
+            txns_randomized_len: 0,
+            txns_randomized_cap: 0,
         }
+    }
+
+    /// Core `txns_randomized.emplace_back` (txmempool.cpp addNewTransaction).
+    fn note_randomized_added(&mut self) {
+        let old = self.txns_randomized_len;
+        if old + 1 > self.txns_randomized_cap {
+            // libstdc++ `_M_check_len`: `size + max(size, n)` with n = 1.
+            self.txns_randomized_cap = old + old.max(1);
+        }
+        self.txns_randomized_len += 1;
+    }
+
+    /// Core `removeUnchecked` update of `txns_randomized`.
+    ///
+    /// While more than one entry remains, Core swaps with the back and
+    /// `pop_back`, then `shrink_to_fit` when `size * 2 < capacity`. The final
+    /// entry takes the `clear()` branch, which drops the size and keeps the
+    /// capacity.
+    fn note_randomized_removed(&mut self) {
+        if self.txns_randomized_len > 1 {
+            self.txns_randomized_len -= 1;
+            if self.txns_randomized_len * 2 < self.txns_randomized_cap {
+                self.txns_randomized_cap = self.txns_randomized_len;
+            }
+        } else {
+            self.txns_randomized_len = 0;
+        }
+    }
+
+    /// Record a tx accepted via `sendrawtransaction` as not yet announced.
+    pub fn add_unbroadcast(&mut self, txid: Hash256) {
+        self.unbroadcast.insert(txid);
+    }
+
+    pub fn is_unbroadcast(&self, txid: &Hash256) -> bool {
+        self.unbroadcast.contains(txid)
+    }
+
+    pub fn unbroadcast_count(&self) -> usize {
+        self.unbroadcast.len()
     }
 
     /// Allocate the next admission sequence number and advance the counter.
@@ -1859,7 +2059,9 @@ impl Mempool {
                 // Coinbase maturity check.
                 if coin.is_coinbase {
                     spends_coinbase = true;
-                    let age = self.tip_height.saturating_sub(coin.height);
+                    // Core CheckTxInputs: nSpendHeight = tip + 1 (the next
+                    // block). A height-1 coinbase is mature at tip 100.
+                    let age = self.tip_height.saturating_add(1).saturating_sub(coin.height);
                     if age < COINBASE_MATURITY {
                         return Err(MempoolError::CoinbaseNotMature {
                             age,
@@ -2363,18 +2565,6 @@ impl Mempool {
             self.remove_single(txid_to_remove);
         }
 
-        // Evict if mempool is full, updating the rolling minimum fee rate on each eviction.
-        // Mirrors CTxMemPool::TrimToSize (txmempool.cpp:861-911).
-        // W96: skipped on bypass_limits (reorg path) so disconnected-block
-        // txs are not immediately evicted before re-mining.
-        if !bypass_limits && self.total_size + vsize > self.config.max_size_bytes {
-            let target = self.config.max_size_bytes.saturating_sub(vsize);
-            self.trim_to_size(target);
-            if self.total_size + vsize > self.config.max_size_bytes {
-                return Err(MempoolError::MempoolFull);
-            }
-        }
-
         // Build the entry (cluster_id and mining_score will be updated by add_to_clusters)
         let weight = tx.weight();
         let has_ephemeral_dust = !get_ephemeral_dust_outputs(&tx).is_empty();
@@ -2443,7 +2633,9 @@ impl Mempool {
             txid,
         };
         self.fee_rate_index.insert(fee_key, txid);
-        self.transactions.insert(txid, entry);
+        let replaced = self.transactions.insert(txid, entry);
+        debug_assert!(replaced.is_none(), "mapTx insert replaced an existing entry");
+        self.note_randomized_added();
         // W96 (gates 6 + 7): keep wtxid → txid index in lockstep with
         // `transactions`.  Required for the txn-already-in-mempool /
         // txn-same-nonwitness-data-in-mempool error-class distinction.
@@ -2456,6 +2648,17 @@ impl Mempool {
 
         // Add to cluster structure and compute mining score
         self.add_to_clusters(txid, fee, vsize, &mempool_parents);
+
+        // Core LimitMempoolSize runs AFTER addUnchecked. TrimToSize evicts the
+        // worst chunk, which may be this transaction. W96: skipped on
+        // bypass_limits (reorg refill) so disconnected-block txs are not
+        // immediately evicted before re-mining.
+        if !bypass_limits {
+            self.trim_to_size(self.config.max_size_bytes);
+            if !self.transactions.contains_key(&txid) {
+                return Err(MempoolError::MempoolFull);
+            }
+        }
 
         Ok(txid)
     }
@@ -2592,6 +2795,7 @@ impl Mempool {
         // Remove from cluster structure first (before removing from transactions)
         self.remove_from_clusters(txid);
 
+        self.unbroadcast.remove(txid);
         if let Some(entry) = self.transactions.remove(txid) {
             // W96: keep the wtxid → txid index in sync with `transactions`.
             self.wtxid_index.remove(&entry.tx.wtxid());
@@ -2629,6 +2833,7 @@ impl Mempool {
             };
             self.fee_rate_index.remove(&fee_key);
             self.total_size = self.total_size.saturating_sub(entry.vsize);
+            self.note_randomized_removed();
         }
     }
 
@@ -3175,6 +3380,49 @@ impl Mempool {
         tx.inputs.iter().any(|input| input.sequence <= MAX_BIP125_RBF_SEQUENCE)
     }
 
+    /// Fee and sigop-adjusted weight of the cluster chunk this tx mines in.
+    ///
+    /// Core `CTxMemPool::GetMainChunkFeerate` (`entryToJSON`'s `chunkweight`
+    /// and `fees.chunk`): the chunk's modified fees and the sum of
+    /// `GetSigOpsAdjustedWeight` over the transactions in that chunk.
+    pub fn main_chunk_fee_and_weight(&self, txid: &Hash256) -> Option<(u64, u64)> {
+        let entry = self.transactions.get(txid)?;
+        let cluster = self.clusters.get(&entry.cluster_id)?;
+        let idx = *cluster.tx_to_chunk.get(txid)?;
+        let chunk = cluster.linearization.get(idx)?;
+        let mut fee = 0u64;
+        let mut weight = 0u64;
+        for tx in &chunk.txids {
+            if let Some(member) = self.transactions.get(tx) {
+                fee = fee.saturating_add(Self::get_modified_fee(member));
+                weight = weight.saturating_add(member.sigop_adjusted_weight);
+            }
+        }
+        Some((fee, weight))
+    }
+
+    /// In-mempool parents, as display hex, in Core's `std::set` order.
+    pub fn mempool_depends(&self, txid: &Hash256) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .parents
+            .get(txid)
+            .map(|set| set.iter().map(|h| h.to_hex()).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// In-mempool children, as display hex, in Core's `std::set` order.
+    pub fn mempool_spent_by(&self, txid: &Hash256) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .children
+            .get(txid)
+            .map(|set| set.iter().map(|h| h.to_hex()).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
     /// Check if a mempool transaction is BIP-125 replaceable.
     ///
     /// A transaction is replaceable if it signals RBF itself, or if any of
@@ -3458,23 +3706,22 @@ impl Mempool {
             return self.rolling_minimum_fee_rate.round() as u64;
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // Core GetTime(): mockable, same clock as entry timestamps.
+        let now = now_unix_seconds();
 
         // Only update every 10 seconds to avoid unnecessary churn.
         // Core: `if (time > lastRollingFeeUpdate + 10)`
-        if now <= self.last_rolling_fee_update + 10 {
+        if now <= self.last_rolling_fee_update as i64 + 10 {
             return std::cmp::max(
                 self.rolling_minimum_fee_rate.round() as u64,
                 self.config.incremental_relay_fee,
             );
         }
 
-        // Choose halflife based on current mempool usage.
+        // Choose halflife based on DynamicMemoryUsage, not virtual size.
+        // Core: `if (DynamicMemoryUsage() < sizelimit / 4)`.
         let sizelimit = self.config.max_size_bytes as f64;
-        let usage = self.total_size as f64;
+        let usage = self.dynamic_memory_usage() as f64;
         let mut halflife = ROLLING_FEE_HALFLIFE as f64;
         if usage < sizelimit / 4.0 {
             halflife /= 4.0;
@@ -3483,9 +3730,9 @@ impl Mempool {
         }
 
         // Exponential decay: rate /= 2^(elapsed / halflife)
-        let elapsed = (now - self.last_rolling_fee_update) as f64;
+        let elapsed = (now - self.last_rolling_fee_update as i64) as f64;
         self.rolling_minimum_fee_rate /= 2_f64.powf(elapsed / halflife);
-        self.last_rolling_fee_update = now;
+        self.last_rolling_fee_update = now.max(0) as u64;
 
         // Zero out when below incremental_relay_fee / 2.
         // Core: `if (rollingMinimumFeeRate < (double)m_opts.incremental_relay_feerate.GetFeePerK() / 2)`
@@ -3501,55 +3748,65 @@ impl Mempool {
         )
     }
 
-    /// Evict transactions until `total_size <= sizelimit`, updating the rolling
-    /// minimum fee rate after each eviction.
+    /// Evict whole chunks until `DynamicMemoryUsage() <= sizelimit`.
     ///
-    /// Mirrors `CTxMemPool::TrimToSize` (txmempool.cpp:861-911).
+    /// Mirrors `CTxMemPool::TrimToSize` (txmempool.cpp:861-911): the loop
+    /// condition is `!mapTx.empty() && DynamicMemoryUsage() > sizelimit`, and
+    /// each step removes `GetWorstMainChunk()` (not the worst transaction plus
+    /// every descendant). An empty pool stops even when the retained
+    /// `txns_randomized` capacity is still above `sizelimit`.
     ///
-    /// After eviction, calls `track_package_removed` with the worst chunk's
-    /// feerate + `incremental_relay_fee` so that the rolling minimum is bumped
-    /// and future transactions that would have been evicted are pre-rejected.
+    /// The removed chunk's feerate (sat/kvB, integer `CFeeRate`) plus
+    /// `incremental_relay_feerate` bumps the rolling minimum.
     ///
     /// Returns the number of transactions removed.
     pub fn trim_to_size(&mut self, sizelimit: usize) -> usize {
         let mut n_removed: usize = 0;
 
-        while self.total_size > sizelimit && !self.transactions.is_empty() {
-            // Find the lowest-mining-score entry to evict.
-            let worst_txid = match self.mining_score_index.iter().next() {
-                Some((&_key, &txid)) => txid,
-                None => match self.fee_rate_index.iter().next() {
-                    Some((key, _)) => key.txid,
-                    None => break,
-                },
+        while !self.transactions.is_empty() && self.dynamic_memory_usage() > sizelimit {
+            let Some(chunk) = self.worst_main_chunk() else {
+                break;
             };
+            if chunk.txids.is_empty() {
+                break;
+            }
 
-            let worst_entry = match self.transactions.get(&worst_txid) {
-                Some(e) => e,
-                None => break,
-            };
-
-            // Compute feerate of the worst entry (sat/kvB), then add
-            // incremental_relay_fee so the min-fee bumps past it.
-            // Core: `removed += m_opts.incremental_relay_feerate` then
-            // `trackPackageRemoved(removed)` (txmempool.cpp:877-878).
-            let removed_fee_rate = worst_entry.fee_rate * 1000.0 // sat/vB → sat/kvB
+            // Core: `CFeeRate removed{feerate.fee, feerate.size}` then
+            // `removed += incremental_relay_feerate`.
+            let removed_fee_rate = chunk_sat_per_kvb(&chunk.feefrac) as f64
                 + self.config.incremental_relay_fee as f64;
             self.track_package_removed(removed_fee_rate);
 
-            // Collect descendants to evict together with the worst entry.
-            let mut to_evict: Vec<Hash256> = Vec::new();
-            to_evict.push(worst_txid);
-            for desc in self.get_all_descendants(&worst_txid) {
-                to_evict.push(desc);
-            }
+            let to_evict = chunk.txids.clone();
+            let before = self.transactions.len();
             n_removed += to_evict.len();
             for txid in &to_evict {
                 self.remove_single(txid);
             }
+            if self.transactions.len() == before {
+                break;
+            }
         }
 
         n_removed
+    }
+
+    /// Lowest-feerate chunk of the main graph (`TxGraph::GetWorstMainChunk`).
+    fn worst_main_chunk(&self) -> Option<Chunk> {
+        let mut worst: Option<Chunk> = None;
+        for cluster in self.clusters.values() {
+            let Some(chunk) = cluster.linearization.last() else {
+                continue;
+            };
+            let replace = match &worst {
+                None => true,
+                Some(current) => fee_frac_is_worse(&chunk.feefrac, &current.feefrac),
+            };
+            if replace {
+                worst = Some(chunk.clone());
+            }
+        }
+        worst
     }
 
     /// Remove any mempool transactions that are no longer valid after a reorg:
@@ -3638,8 +3895,17 @@ impl Mempool {
     /// expiry_seconds`. Returns the number of transactions expired.
     pub fn on_block_connected(&mut self, now_secs: i64) -> usize {
         self.notify_block_connected();
+        // Core removeForBlock stamps lastRollingFeeUpdate = GetTime() in the
+        // same step that arms blockSinceLastRollingFeeBump. Decay then waits
+        // until more than 10 seconds have passed.
+        if now_secs >= 0 {
+            self.last_rolling_fee_update = now_secs as u64;
+        }
         let cutoff = now_secs.saturating_sub(self.config.expiry_seconds as i64);
-        self.expire(cutoff)
+        let expired = self.expire(cutoff);
+        // Core LimitMempoolSize: Expire, then TrimToSize(max_size_bytes).
+        self.trim_to_size(self.config.max_size_bytes);
+        expired
     }
 
     /// Evict the lowest fee rate transaction (and its descendants).
@@ -3766,6 +4032,58 @@ impl Mempool {
     /// Get the total virtual size of all transactions.
     pub fn total_bytes(&self) -> usize {
         self.total_size
+    }
+
+    /// Mempool `usage` reported by `getmempoolinfo` / REST info.
+    ///
+    /// Bitcoin Core v31.1 `CTxMemPool::DynamicMemoryUsage` (txmempool.cpp)
+    /// on x86_64 / libstdc++ / glibc, evaluated from this pool's own
+    /// transactions, clusters, and `map_deltas`. The sizes below are the
+    /// `sizeof` values of Core's types (probed against the v31.1 headers);
+    /// `malloc_usage` is `memusage::MallocUsage`.
+    pub fn dynamic_memory_usage(&self) -> usize {
+        debug_assert_eq!(self.txns_randomized_len, self.transactions.len());
+        let n = self.transactions.len();
+        let mut inner = 0usize;
+        let mut inputs = 0usize;
+        for entry in self.transactions.values() {
+            inner += tx_cached_inner_usage(&entry.tx);
+            inputs += entry.tx.inputs.len();
+        }
+
+        let mut clusters_mem = 0usize;
+        let mut chunks = 0usize;
+        let mut clustered = 0usize;
+        for cluster in self.clusters.values() {
+            let k = cluster.txids.len();
+            if k == 0 {
+                continue;
+            }
+            clusters_mem += txgraph_cluster_usage(k);
+            chunks += cluster.linearization.len();
+            clustered += k;
+        }
+        // A transaction that has not been attached to a cluster yet is a
+        // Core singleton (one chunk). Admission always clusters first.
+        debug_assert_eq!(clustered, n);
+        let orphans = n.saturating_sub(clustered);
+        if orphans > 0 {
+            clusters_mem += txgraph_cluster_usage(1) * orphans;
+            chunks += orphans;
+        }
+        // GetMainMemoryUsage: cached cluster usage + sizeof(Entry) * txcount
+        // + one std::set node per chunk. Discarded chunk nodes are not counted.
+        let graph = clusters_mem + GRAPH_ENTRY * n + malloc_usage(CHUNK_NODE) * chunks;
+
+        // mapTx multi_index node, per entry: MallocUsage(sizeof(CTxMemPoolEntry) + 9 pointers).
+        // mapNextTx: one indirectmap node per input. mapDeltas: one std::map node per delta.
+        // txns_randomized: one vector allocation, MallocUsage(capacity * sizeof(pair)).
+        malloc_usage(MAPTX_ELEM) * n
+            + malloc_usage(MAP_NEXT_NODE) * inputs
+            + malloc_usage(MAP_DELTA_NODE) * self.map_deltas.len()
+            + malloc_usage(self.txns_randomized_cap * RAND_PAIR)
+            + graph
+            + inner
     }
 
     /// Get a transaction by its txid.
@@ -3967,6 +4285,9 @@ impl Mempool {
         self.tx_to_cluster.clear();
         self.mining_score_index.clear();
         self.total_size = 0;
+        // `std::vector::clear` keeps capacity. One-by-one removal would
+        // shrink; this helper wipes the map in one shot.
+        self.txns_randomized_len = 0;
     }
 
     /// Get the total fees of all transactions in the mempool (in satoshis).
@@ -4008,6 +4329,32 @@ impl Mempool {
     /// Get the number of clusters in the mempool.
     pub fn cluster_count(&self) -> usize {
         self.clusters.len()
+    }
+
+    /// Core `TxGraph::DoWork(0)`: false while any cluster still needs
+    /// linearization work (`NEEDS_FIX` / `NEEDS_RELINEARIZE` / `ACCEPTABLE`).
+    ///
+    /// An empty graph has no pending work, so it is optimal.
+    pub fn txgraph_is_optimal(&self) -> bool {
+        self.clusters.values().all(|c| c.known_optimal)
+    }
+
+    /// Test hook: mark every cluster as not yet linearized.
+    #[cfg(test)]
+    pub fn mark_clusters_not_optimal_for_test(&mut self) {
+        for cluster in self.clusters.values_mut() {
+            cluster.known_optimal = false;
+        }
+    }
+
+    /// Configured `TrimToSize` / `-maxmempool` byte limit.
+    pub fn max_size_bytes(&self) -> usize {
+        self.config.max_size_bytes
+    }
+
+    /// Set the `TrimToSize` byte limit (`-maxmempool` megabytes × 1_000_000).
+    pub fn set_max_size_bytes(&mut self, bytes: usize) {
+        self.config.max_size_bytes = bytes;
     }
 
     /// Add a transaction to the cluster structure and compute its mining score.
@@ -4139,6 +4486,8 @@ impl Mempool {
             total_vsize,
             linearization: vec![],
             tx_to_chunk: HashMap::new(),
+            // ApplyDependencies starts at NEEDS_FIX; relinearize marks OPTIMAL.
+            known_optimal: false,
         };
 
         self.clusters.insert(merged_id, merged_cluster);
@@ -4173,6 +4522,10 @@ impl Mempool {
                 }
             }
             cluster.linearization = linearization;
+            // A completed linearization is OPTIMAL. Core may leave a hard
+            // cluster at ACCEPTABLE when the post-change budget runs out;
+            // this port finishes the linearization before returning.
+            cluster.known_optimal = !cluster.txids.is_empty() && !cluster.linearization.is_empty();
         }
 
         // Update mining scores for all transactions in cluster
@@ -4282,6 +4635,7 @@ impl Mempool {
                     total_vsize,
                     linearization: vec![],
                     tx_to_chunk: HashMap::new(),
+                    known_optimal: false,
                 };
 
                 self.clusters.insert(new_cluster_id, new_cluster);
@@ -4856,6 +5210,7 @@ impl Mempool {
         let mut mempool_parents = HashSet::new();
         let mut direct_conflicts = HashSet::new();
         let mut prevout_scripts: Vec<Vec<u8>> = Vec::with_capacity(tx.inputs.len());
+        let mut spends_coinbase = false;
 
         for input in &tx.inputs {
             // Check for conflicts (double-spends)
@@ -4870,6 +5225,16 @@ impl Mempool {
                 // lookup is what keeps that case rejected (with the
                 // missing-inputs token rather than Core's package one).
                 if let Some(coin) = utxo_lookup(&input.previous_output) {
+                    if coin.is_coinbase {
+                        spends_coinbase = true;
+                        let age = self.tip_height.saturating_add(1).saturating_sub(coin.height);
+                        if age < COINBASE_MATURITY {
+                            return Err(MempoolError::CoinbaseNotMature {
+                                age,
+                                required: COINBASE_MATURITY,
+                            });
+                        }
+                    }
                     prevout_scripts.push(coin.script_pubkey.clone());
                     input_sum += coin.value;
                 } else {
@@ -4898,6 +5263,16 @@ impl Mempool {
                 input_sum += parent.tx.outputs[vout].value;
                 mempool_parents.insert(*parent_txid);
             } else if let Some(coin) = utxo_lookup(&input.previous_output) {
+                if coin.is_coinbase {
+                    spends_coinbase = true;
+                    let age = self.tip_height.saturating_add(1).saturating_sub(coin.height);
+                    if age < COINBASE_MATURITY {
+                        return Err(MempoolError::CoinbaseNotMature {
+                            age,
+                            required: COINBASE_MATURITY,
+                        });
+                    }
+                }
                 prevout_scripts.push(coin.script_pubkey.clone());
                 input_sum += coin.value;
             } else {
@@ -5044,25 +5419,12 @@ impl Mempool {
         let (ancestor_count, ancestor_size, ancestor_fees) =
             self.calculate_ancestors(&mempool_parents);
 
-        // Evict if mempool is full, updating the rolling minimum fee rate on each eviction.
-        // Mirrors CTxMemPool::TrimToSize (txmempool.cpp:861-911).
-        if self.total_size + vsize > self.config.max_size_bytes {
-            let target = self.config.max_size_bytes.saturating_sub(vsize);
-            self.trim_to_size(target);
-            if self.total_size + vsize > self.config.max_size_bytes {
-                return Err(MempoolError::MempoolFull);
-            }
-        }
-
         // Build the entry (cluster_id and mining_score will be updated by add_to_clusters)
         let weight = tx.weight();
         let has_ephemeral_dust = !get_ephemeral_dust_outputs(&tx).is_empty();
-        // W96: package-path entry_sequence + spends_coinbase.
         // Package admissions get a fresh sequence number (no bypass_limits).
-        // spends_coinbase here is approximated as false because the
-        // package path does not yet track per-input coinbase status; this
-        // is safe because non-coinbase-spending entries are simply
-        // excluded from the reorg re-scan set.
+        // spends_coinbase is the same per-input flag add_transaction records,
+        // so remove_for_reorg can re-check maturity after a reorg.
         let entry_sequence_pkg = self.get_and_increment_sequence();
         let entry = MempoolEntry {
             tx: tx.clone(),
@@ -5091,7 +5453,7 @@ impl Mempool {
             descendant_size: vsize,
             descendant_fees: fee,
             has_ephemeral_dust,
-            spends_coinbase: false,
+            spends_coinbase,
             entry_sequence: entry_sequence_pkg,
         };
         let entry_wtxid = entry.tx.wtxid();
@@ -5127,7 +5489,9 @@ impl Mempool {
             txid,
         };
         self.fee_rate_index.insert(fee_key, txid);
-        self.transactions.insert(txid, entry);
+        let replaced = self.transactions.insert(txid, entry);
+        debug_assert!(replaced.is_none(), "mapTx insert replaced an existing entry");
+        self.note_randomized_added();
         // W96: maintain wtxid index in the package-admission path too.
         self.wtxid_index.insert(entry_wtxid, txid);
 
@@ -5137,6 +5501,13 @@ impl Mempool {
 
         // Add to cluster structure and compute mining score
         self.add_to_clusters(txid, fee, vsize, &mempool_parents);
+
+        // Same post-insert TrimToSize as the single-tx path. If this package
+        // tx was the worst chunk, Core reports "mempool full".
+        self.trim_to_size(self.config.max_size_bytes);
+        if !self.transactions.contains_key(&txid) {
+            return Err(MempoolError::MempoolFull);
+        }
 
         Ok((txid, replaced_txids))
     }
@@ -6479,7 +6850,8 @@ mod tests {
     #[test]
     fn test_eviction_when_full() {
         let config = MempoolConfig {
-            max_size_bytes: 500, // Very small
+            max_size_bytes: 10_000_000,
+            min_fee_rate: 0,
             ..Default::default()
         };
         let mut mempool = Mempool::new(config);
@@ -6496,19 +6868,25 @@ mod tests {
             (OutPoint { txid: utxo2, vout: 0 }, 100_000),
         ]);
 
-        // Add low fee transaction
+        // Add low fee transaction, then shrink the limit to just above its
+        // dynamic usage. The higher-fee tx is inserted and TrimToSize evicts
+        // the worse chunk (the first tx). A 500-byte limit is below one tx's
+        // DynamicMemoryUsage, so Core would reject that tx as mempool-full.
         let tx1 = make_tx(vec![(utxo1, 0)], vec![99_000], 1); // 1000 sat fee
+        let txid1 = tx1.txid();
         mempool
             .add_transaction(tx1, &|op| utxos.get(op).cloned())
             .unwrap();
+        let usage_one = mempool.dynamic_memory_usage();
+        mempool.set_max_size_bytes(usage_one + 64);
 
-        // Add higher fee transaction (should evict the first one)
         let tx2 = make_tx(vec![(utxo2, 0)], vec![90_000], 1); // 10000 sat fee
-        let result = mempool.add_transaction(tx2, &|op| utxos.get(op).cloned());
-
-        // Either succeeds (eviction worked) or fails (couldn't evict enough)
-        // With our small limit, it should evict tx1
-        assert!(result.is_ok() || matches!(result, Err(MempoolError::MempoolFull)));
+        let txid2 = tx2.txid();
+        mempool
+            .add_transaction(tx2, &|op| utxos.get(op).cloned())
+            .expect("higher-feerate tx fits once the worse chunk is evicted");
+        assert!(!mempool.contains(&txid1), "worse chunk is evicted");
+        assert!(mempool.contains(&txid2), "the new higher-feerate tx stays");
     }
 
     #[test]
@@ -11347,15 +11725,173 @@ mod tests {
         let txid_high = tx_high.txid();
         mempool.add_transaction(tx_high, &|op| utxos.get(op).cloned()).unwrap();
 
-        // Trim so only one tx can fit (set sizelimit to just below combined size).
-        let current = mempool.total_bytes();
-        let sizelimit = current / 2; // forces one eviction
-        let removed = mempool.trim_to_size(sizelimit);
+        // Trim so only one tx can fit. The limit is DynamicMemoryUsage, so a
+        // vsize/2 cutoff (below one tx's dynamic usage) would evict both.
+        let usage = mempool.dynamic_memory_usage();
+        assert!(mempool.total_bytes() < usage);
+        let removed = mempool.trim_to_size(usage - 1);
 
         assert_eq!(removed, 1, "exactly one tx should be evicted");
         // The low-fee-rate tx must be evicted, high-rate tx survives.
         assert!(!mempool.contains(&txid_low), "low-feerate tx must be evicted first");
         assert!(mempool.contains(&txid_high), "high-feerate tx must survive");
+    }
+
+    /// TrimToSize's limit is `DynamicMemoryUsage`, not virtual size.
+    ///
+    /// Two independent spends have a combined vsize far below one transaction's
+    /// dynamic usage. A limit just under the two-tx usage is therefore above
+    /// `total_size` (today's loop does nothing) and below `DynamicMemoryUsage`
+    /// (Core evicts the worst chunk).
+    #[test]
+    fn test_trim_to_size_compares_dynamic_memory_usage() {
+        let config = MempoolConfig {
+            max_size_bytes: 10_000_000,
+            min_fee_rate: 0,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo1 = Hash256::from_hex(
+            "c100000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let utxo2 = Hash256::from_hex(
+            "c100000000000000000000000000000000000000000000000000000000000002",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo1, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo2, vout: 0 }, 1_000_000),
+        ]);
+
+        let tx_low = make_tx(vec![(utxo1, 0)], vec![999_900], 1);
+        let txid_low = tx_low.txid();
+        mempool
+            .add_transaction(tx_low, &|op| utxos.get(op).cloned())
+            .unwrap();
+        let tx_high = make_tx(vec![(utxo2, 0)], vec![900_000], 1);
+        let txid_high = tx_high.txid();
+        mempool
+            .add_transaction(tx_high, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        let usage = mempool.dynamic_memory_usage();
+        let vsize = mempool.total_bytes();
+        assert!(
+            usage > vsize.saturating_mul(4),
+            "dynamic usage {usage} must sit well above vsize {vsize}"
+        );
+        // Above combined vsize, so a vsize comparison evicts nothing. Below
+        // dynamic usage, so Core's comparison evicts the cheaper chunk.
+        let limit = usage - 1;
+        assert!(vsize < limit);
+        let removed = mempool.trim_to_size(limit);
+        assert!(
+            removed >= 1,
+            "TrimToSize must evict when DynamicMemoryUsage ({usage}) exceeds {limit}"
+        );
+        assert!(!mempool.contains(&txid_low), "lowest-feerate chunk is evicted");
+        assert!(mempool.contains(&txid_high), "higher-feerate tx stays");
+    }
+
+    /// GetMinFee's halflife reads DynamicMemoryUsage, and the clock is GetTime()
+    /// (mockable). vsize under limit/4 would quarter the halflife; dynamic usage
+    /// at or above limit/2 keeps the full 12h. One halflife of mock time halves
+    /// the rate. Wall-clock elapsed from a small `lastRollingFeeUpdate` would
+    /// zero it.
+    #[test]
+    fn test_get_min_fee_halflife_follows_dynamic_usage_and_mock_time() {
+        let config = MempoolConfig {
+            max_size_bytes: 10_000_000,
+            min_fee_rate: 0,
+            incremental_relay_fee: 100,
+            ..Default::default()
+        };
+        let mut mempool = Mempool::new(config);
+
+        let utxo1 = Hash256::from_hex(
+            "c200000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let utxo2 = Hash256::from_hex(
+            "c200000000000000000000000000000000000000000000000000000000000002",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo1, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo2, vout: 0 }, 1_000_000),
+        ]);
+        mempool
+            .add_transaction(make_tx(vec![(utxo1, 0)], vec![900_000], 1), &|op| {
+                utxos.get(op).cloned()
+            })
+            .unwrap();
+        mempool
+            .add_transaction(make_tx(vec![(utxo2, 0)], vec![800_000], 1), &|op| {
+                utxos.get(op).cloned()
+            })
+            .unwrap();
+
+        let usage = mempool.dynamic_memory_usage() as f64;
+        let vsize = mempool.total_bytes() as f64;
+        // limit/2 <= usage and vsize < limit/4.
+        let limit = ((4.0 * vsize) + (2.0 * usage)) / 2.0;
+        assert!(vsize < limit / 4.0, "vsize {vsize} limit {limit}");
+        assert!(usage >= limit / 2.0, "usage {usage} limit {limit}");
+        mempool.config.max_size_bytes = limit as usize;
+
+        let bumped = 160_000.0;
+        mempool.rolling_minimum_fee_rate = bumped;
+        mempool.block_since_last_rolling_fee_bump = true;
+        let start = 1_700_000_000u64;
+        mempool.last_rolling_fee_update = start;
+        super::set_mock_time((start + ROLLING_FEE_HALFLIFE + 11) as i64);
+
+        let decayed = mempool.get_min_fee();
+        // Full halflife: 160000 / 2 = 80000. Quarter halflife (vsize path): /16 = 10000.
+        // A wall-clock read of lastRollingFeeUpdate=1700000000 zeros the rate.
+        assert!(
+            (79_000..=81_000).contains(&decayed),
+            "one full halflife must halve 160000 sat/kvB, got {decayed}"
+        );
+        super::set_mock_time(0);
+    }
+
+    /// `optimal` is false while any cluster is not known to be optimally
+    /// linearized, and true for an empty pool and after an ordinary admit
+    /// (singletons are inserted optimal, matching Core).
+    #[test]
+    fn test_txgraph_optimal_false_until_linearized() {
+        let mut mempool = Mempool::new(MempoolConfig {
+            min_fee_rate: 0,
+            ..Default::default()
+        });
+        assert!(
+            mempool.txgraph_is_optimal(),
+            "an empty graph has no pending linearization work"
+        );
+
+        let utxo = Hash256::from_hex(
+            "c300000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 1_000_000)]);
+        mempool
+            .add_transaction(make_tx(vec![(utxo, 0)], vec![900_000], 1), &|op| {
+                utxos.get(op).cloned()
+            })
+            .unwrap();
+        assert!(
+            mempool.txgraph_is_optimal(),
+            "a finished singleton cluster is optimal"
+        );
+
+        mempool.mark_clusters_not_optimal_for_test();
+        assert!(
+            !mempool.txgraph_is_optimal(),
+            "DoWork(0) is false while a cluster is not optimally linearized"
+        );
     }
 
     /// trim_to_size: rolling minimum fee rate is bumped after eviction.
@@ -12106,6 +12642,52 @@ mod tests {
         let entry = mempool.get(&txid).expect("entry must be in mempool");
         assert!(entry.spends_coinbase,
             "entry must mark spends_coinbase=true when any input prevout is_coinbase");
+    }
+
+    /// Core `CheckTxInputs` spends at `nSpendHeight = tip + 1`.
+    /// A height-1 coinbase is mature in the mempool at tip 100
+    /// (`101 - 1 = 100`) and immature at tip 99 (`100 - 1 = 99`).
+    #[test]
+    fn coinbase_maturity_spend_height_is_tip_plus_one() {
+        let prev = Hash256::from_bytes([0x61; 32]);
+        let p2pkh: Vec<u8> = {
+            let mut v = vec![0x76, 0xa9, 0x14];
+            v.extend_from_slice(&[0x42u8; 20]);
+            v.push(0x88);
+            v.push(0xac);
+            v
+        };
+        let utxos: HashMap<OutPoint, CoinEntry> = [(
+            OutPoint { txid: prev, vout: 0 },
+            CoinEntry {
+                height: 1,
+                is_coinbase: true,
+                value: 100_000,
+                script_pubkey: p2pkh,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let lookup = |op: &OutPoint| utxos.get(op).cloned();
+
+        let mut early = Mempool::new(MempoolConfig::default());
+        early.notify_new_tip(99, 0);
+        let rejected = early
+            .add_transaction(make_tx(vec![(prev, 0)], vec![90_000], 1), &lookup)
+            .unwrap_err();
+        assert!(
+            matches!(
+                rejected,
+                MempoolError::CoinbaseNotMature { age: 99, required: 100 }
+            ),
+            "tip 99 must reject with depth 99, got {rejected:?}"
+        );
+
+        let mut mature = Mempool::new(MempoolConfig::default());
+        mature.notify_new_tip(100, 0);
+        mature
+            .add_transaction(make_tx(vec![(prev, 0)], vec![90_000], 1), &lookup)
+            .expect("tip 100 must accept a height-1 coinbase (depth 100)");
     }
 
     /// W96 gate 16: entry_sequence advances per admission, and bypass_limits

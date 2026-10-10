@@ -87,30 +87,208 @@ fn txoutset_walk_test_hook(db: &ChainDb) {
 /// value is never consulted by any validation or fork-choice path.
 ///
 /// Best-effort: file/dir stat errors are skipped (a transient RocksDB compaction
-/// renaming an SST must not fail the RPC), and a missing directory yields 0.
-fn chainstate_size_on_disk(data_dir: &std::path::Path) -> u64 {
-    fn dir_bytes(path: &std::path::Path) -> u64 {
-        let entries = match std::fs::read_dir(path) {
-            Ok(e) => e,
-            Err(_) => return 0,
-        };
-        let mut total: u64 = 0;
-        for entry in entries.flatten() {
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => total = total.saturating_add(dir_bytes(&entry.path())),
-                Ok(ft) if ft.is_file() => {
-                    if let Ok(meta) = entry.metadata() {
-                        total = total.saturating_add(meta.len());
-                    }
+/// Core `BlockManager::CalculateCurrentUsage`: logical bytes of every
+/// `blk*.dat` record (magic + size + block) plus every `rev*.dat` record
+/// (magic + size + undo payload + 32-byte checksum). Genesis has no undo.
+/// Headers-only blocks are not in the block files. Invalidate does not
+/// delete the records, so a failed block still counts.
+fn core_size_on_disk(store: &BlockStore) -> u64 {
+    use rustoshi_storage::block_store::BlockStatus;
+    let Ok(iter) = store.iter_block_index() else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for (hash, entry) in iter {
+        if entry.status.has(BlockStatus::HAVE_DATA) {
+            if let Ok(Some(block)) = store.get_block(&hash) {
+                let mut buf = Vec::new();
+                if block.encode(&mut buf).is_ok() {
+                    total = total.saturating_add(8 + buf.len() as u64);
                 }
-                // Symlinks / errors: skip (RocksDB never stores block data behind
-                // a symlink; following one could double-count or escape the dir).
-                _ => {}
             }
         }
-        total
+        if entry.height > 0 && entry.status.has(BlockStatus::HAVE_UNDO) {
+            let input_counts = store
+                .get_block(&hash)
+                .ok()
+                .flatten()
+                .map(|block| {
+                    block
+                        .transactions
+                        .iter()
+                        .skip(1)
+                        .map(|tx| tx.inputs.len())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let coins = store
+                .get_undo(&hash)
+                .ok()
+                .flatten()
+                .map(|undo| undo.spent_coins)
+                .unwrap_or_default();
+            let payload = rustoshi_storage::core_block_undo_payload(&input_counts, &coins);
+            total = total.saturating_add(8 + payload.len() as u64 + 32);
+        }
     }
-    dir_bytes(&data_dir.join("chainstate"))
+    total
+}
+
+/// Chain-tx total of the active chain (Core `nChainTx` at the tip).
+pub(crate) fn active_chain_tx_count(store: &BlockStore, tip: &Hash256) -> u64 {
+    let mut total = 0u64;
+    let mut walk = *tip;
+    let mut guard = 1_000_000u32;
+    while walk != Hash256::ZERO && guard > 0 {
+        guard -= 1;
+        let Some(entry) = store.get_block_index(&walk).ok().flatten() else {
+            break;
+        };
+        total = total.saturating_add(u64::from(entry.n_tx));
+        if entry.height == 0 {
+            break;
+        }
+        walk = entry.prev_hash;
+    }
+    total
+}
+
+/// Bitcoin Core `ChainstateManager::GuessVerificationProgress` (validation.cpp).
+///
+/// Regtest `ChainTxData` is `(nTime=0, tx_count=0, dTxRate=0.001)`. A tip whose
+/// timestamp is within two hours, with `headers == blocks`, therefore reports
+/// exactly 1. One header ahead adds `600 * 0.001 = 0.6` to the denominator.
+pub(crate) fn guess_verification_progress(
+    network: NetworkId,
+    chain_tx: u64,
+    tip_time: u32,
+    tip_height: u32,
+    header_height: u32,
+    now: i64,
+) -> f64 {
+    if chain_tx == 0 {
+        return 0.0;
+    }
+    // chainparams.cpp ChainTxData for Bitcoin Core v31.1.
+    let (data_time, data_tx_count, d_tx_rate) = match network {
+        NetworkId::Mainnet => (1_772_055_173_i64, 1_315_805_869.0_f64, 5.40111006496122),
+        NetworkId::Testnet3 => (1_772_051_651, 536_108_416.0, 0.02691479016257117),
+        NetworkId::Testnet4 => (1_772_013_387, 14_191_421.0, 0.01848579579528412),
+        NetworkId::Signet => (1_772_055_248, 28_676_833.0, 0.06736623436338929),
+        NetworkId::Regtest => (0, 0.0, 0.001),
+    };
+    let spacing: i64 = 600;
+    let recent = (now - i64::from(tip_time)).abs() <= 2 * 60 * 60 && header_height >= tip_height;
+    let block_time = if recent {
+        now - (i64::from(header_height) - i64::from(tip_height)) * spacing
+    } else {
+        i64::from(tip_time)
+    };
+    let f_tx_total = if (chain_tx as f64) <= data_tx_count {
+        data_tx_count + (now - data_time) as f64 * d_tx_rate
+    } else {
+        chain_tx as f64 + (now - block_time) as f64 * d_tx_rate
+    };
+    if f_tx_total <= 0.0 {
+        return 0.0;
+    }
+    (chain_tx as f64 / f_tx_total).min(1.0)
+}
+
+pub(crate) fn rpc_mempool_entry(
+    mempool: &Mempool,
+    entry: &rustoshi_consensus::mempool::MempoolEntry,
+    height: u32,
+) -> MempoolEntry {
+    let modified = Mempool::get_modified_fee(entry);
+    let (chunk_fee, chunk_weight) = mempool
+        .main_chunk_fee_and_weight(&entry.txid)
+        .unwrap_or((modified, entry.sigop_adjusted_weight));
+    MempoolEntry {
+        vsize: entry.vsize as u32,
+        weight: entry.weight as u32,
+        // Core: count_seconds(e.GetTime()) — absolute Unix time, not age.
+        time: entry.time_seconds as u64,
+        height,
+        descendantcount: entry.descendant_count as u32,
+        descendantsize: entry.descendant_size as u32,
+        ancestorcount: entry.ancestor_count as u32,
+        ancestorsize: entry.ancestor_size as u32,
+        wtxid: entry.tx.wtxid().to_hex(),
+        chunkweight: chunk_weight,
+        fees: MempoolFees {
+            base: BtcAmount::from_sats(entry.fee),
+            modified: BtcAmount::from_sats(modified),
+            ancestor: BtcAmount::from_sats(entry.ancestor_fees),
+            descendant: BtcAmount::from_sats(entry.descendant_fees),
+            chunk: BtcAmount::from_sats(chunk_fee),
+        },
+        depends: mempool.mempool_depends(&entry.txid),
+        spentby: mempool.mempool_spent_by(&entry.txid),
+        // BIP125 opt-in (self or unconfirmed ancestor). Not full-RBF.
+        bip125_replaceable: mempool.is_bip125_replaceable(&entry.txid),
+        unbroadcast: mempool.is_unbroadcast(&entry.txid),
+    }
+}
+
+/// Core `MempoolInfoToJSON` — shared by `getmempoolinfo` and REST
+/// `/rest/mempool/info.json`.
+pub(crate) fn mempool_info(state: &RpcState) -> MempoolInfo {
+    let total_fee_sats: u64 = state
+        .mempool
+        .get_sorted_for_mining()
+        .iter()
+        .filter_map(|h| state.mempool.get(h))
+        .map(|e| e.fee)
+        .sum();
+    // Fee fields are the live admission floor, sat/kvB. BtcAmount serializes
+    // 100 sat/kvB as 0.00000100 BTC (Core ValueFromAmount).
+    let min_relay_kvb = state.mempool.min_relay_feerate_kvb();
+    let incremental_kvb = state.mempool.incremental_relay_feerate_kvb();
+    let mempool_min_kvb = std::cmp::max(state.mempool.mempool_min_feerate_kvb(), min_relay_kvb);
+    MempoolInfo {
+        loaded: true,
+        size: state.mempool.size(),
+        bytes: state.mempool.total_bytes(),
+        // Core `CTxMemPool::DynamicMemoryUsage` (map nodes, txgraph, cachedInnerUsage).
+        usage: state.mempool.dynamic_memory_usage(),
+        total_fee: BtcAmount::from_sats(total_fee_sats),
+        maxmempool: state.mempool.max_size_bytes(),
+        mempoolminfee: BtcAmount::from_sats(mempool_min_kvb),
+        minrelaytxfee: BtcAmount::from_sats(min_relay_kvb),
+        incrementalrelayfee: BtcAmount::from_sats(incremental_kvb),
+        unbroadcastcount: state.mempool.unbroadcast_count(),
+        fullrbf: true,
+        permitbaremultisig: true,
+        maxdatacarriersize: 100_000,
+        limitclustercount: 64,
+        limitclustersize: 101_000,
+        // Core `pool.m_txgraph->DoWork(0)`: false while any cluster is not
+        // known to be optimally linearized.
+        optimal: state.mempool.txgraph_is_optimal(),
+    }
+}
+
+/// Core `MempoolToJSON(..., verbose=true)` — shared by `getrawmempool` and
+/// REST `/rest/mempool/contents.json`.
+pub(crate) fn mempool_contents_json(state: &RpcState) -> String {
+    let mut json = String::from("{");
+    let mut first = true;
+    for txid in state.mempool.get_sorted_for_mining() {
+        if let Some(entry) = state.mempool.get(&txid) {
+            let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            json.push('"');
+            json.push_str(&txid.to_hex());
+            json.push_str("\":");
+            json.push_str(&serde_json::to_string(&mem_entry).unwrap());
+        }
+    }
+    json.push('}');
+    json
 }
 
 // ============================================================
@@ -680,46 +858,53 @@ impl RpcState {
 
     /// Initialize from database state.
     pub fn init_from_db(&mut self) -> Result<(), String> {
-        let store = BlockStore::new(&self.db);
-
-        if let Some(hash) = store
-            .get_best_block_hash()
-            .map_err(|e| format!("db error: {}", e))?
         {
-            self.best_hash = hash;
-        } else {
-            self.best_hash = self.params.genesis_hash;
-        }
+            let store = BlockStore::new(&self.db);
 
-        if let Some(height) = store
-            .get_best_height()
-            .map_err(|e| format!("db error: {}", e))?
-        {
-            self.best_height = height;
-            self.header_height = height;
-        }
+            if let Some(hash) = store
+                .get_best_block_hash()
+                .map_err(|e| format!("db error: {}", e))?
+            {
+                self.best_hash = hash;
+            } else {
+                self.best_hash = self.params.genesis_hash;
+            }
 
-        // Check if we should exit initial block download based on stored state
-        if self.best_height > 0 {
-            if let Ok(Some(entry)) = store.get_block_index(&self.best_hash) {
-                // Check if chain work >= minimum chain work
-                if compare_chain_work(&entry.chain_work, &self.params.minimum_chain_work)
-                    != std::cmp::Ordering::Less
-                {
-                    // Check if tip is recent (within 24h)
-                    let max_tip_age_secs = 24 * 60 * 60; // 24 hours in seconds
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let tip_age = now.saturating_sub(entry.timestamp as u64);
+            if let Some(height) = store
+                .get_best_height()
+                .map_err(|e| format!("db error: {}", e))?
+            {
+                self.best_height = height;
+                self.header_height = height;
+            }
 
-                    if tip_age < max_tip_age_secs {
-                        self.is_ibd = false;
+            // Check if we should exit initial block download based on stored state
+            if self.best_height > 0 {
+                if let Ok(Some(entry)) = store.get_block_index(&self.best_hash) {
+                    // Check if chain work >= minimum chain work
+                    if compare_chain_work(&entry.chain_work, &self.params.minimum_chain_work)
+                        != std::cmp::Ordering::Less
+                    {
+                        // Check if tip is recent (within 24h)
+                        let max_tip_age_secs = 24 * 60 * 60; // 24 hours in seconds
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let tip_age = now.saturating_sub(entry.timestamp as u64);
+
+                        if tip_age < max_tip_age_secs {
+                            self.is_ibd = false;
+                        }
                     }
                 }
             }
         }
+
+        // Core loads `m_best_header` from the index: the most-work header that
+        // is not BLOCK_FAILED_*. A headers-only chain heavier than the active
+        // tip must survive restart. Equal work does not replace the tip.
+        refresh_best_header_height(self);
 
         Ok(())
     }
@@ -774,6 +959,13 @@ pub trait RustoshiRpc {
     /// Spec: meta-repo `spec/getsyncstate.md`.
     #[method(name = "getsyncstate")]
     async fn get_sync_state(&self) -> RpcResult<SyncStateResult>;
+
+    /// Pin the clock used for mempool entry timestamps (`-regtest` only).
+    ///
+    /// `0` restores the system clock. Matches Core `setmocktime` for the
+    /// mempool `time` field the regtest replay compares.
+    #[method(name = "setmocktime")]
+    async fn set_mock_time(&self, timestamp: i64) -> RpcResult<()>;
 
     /// Get the hash of a block at a given height.
     #[method(name = "getblockhash")]
@@ -5161,6 +5353,98 @@ impl From<String> for AttachReorgError {
     }
 }
 
+/// Height of the most-work block-index entry that is not failed.
+///
+/// Core `m_best_header`: `InvalidateBlock` drops it back to the new tip, then
+/// any non-failed header with strictly more chainwork can raise it again.
+/// Equal work does not replace the active tip's height.
+fn refresh_best_header_height(state: &mut RpcState) {
+    use rustoshi_storage::block_store::BlockStatus;
+    let store = BlockStore::new(&state.db);
+    let Ok(iter) = store.iter_block_index() else {
+        return;
+    };
+    // Start from the active tip so an equal-work header does not replace it.
+    // A missing tip entry leaves the scan to take the first non-failed header.
+    let mut best_work: Option<[u8; 32]> = store
+        .get_block_index(&state.best_hash)
+        .ok()
+        .flatten()
+        .map(|entry| entry.chain_work);
+    let mut best_height = state.best_height;
+    for (_hash, entry) in iter {
+        if entry.status.has(BlockStatus::FAILED_VALIDITY)
+            || entry.status.has(BlockStatus::FAILED_CHILD)
+        {
+            continue;
+        }
+        let wins = match best_work {
+            None => true,
+            Some(work) => compare_chain_work(&entry.chain_work, &work).is_gt(),
+        };
+        if wins {
+            best_work = Some(entry.chain_work);
+            best_height = entry.height;
+        }
+    }
+    state.header_height = best_height;
+}
+
+/// Core `AcceptBlock` writes the block, then `ConnectTip` fails and
+/// `InvalidBlockFound` sets `BLOCK_FAILED_VALID`. The active tip, height
+/// index, and UTXO set stay where they were. A later submit of the same
+/// block is `duplicate-invalid`.
+fn persist_failed_connect(
+    store: &BlockStore,
+    state: &RpcState,
+    block: &Block,
+    block_hash: &Hash256,
+) -> Result<(), String> {
+    use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+    use rustoshi_storage::block_store::{BlockIndexEntry as StorageBlockIndexEntry, BlockStatus};
+
+    store
+        .put_header(block_hash, &block.header)
+        .map_err(|e| format!("put_header: {e}"))?;
+    store
+        .put_block(block_hash, block)
+        .map_err(|e| format!("put_block: {e}"))?;
+    let parent_work = if block.header.prev_block_hash != Hash256::ZERO {
+        store
+            .get_block_index(&block.header.prev_block_hash)
+            .ok()
+            .flatten()
+            .map(|e| ChainWork::from_be_bytes(e.chain_work))
+            .unwrap_or(ChainWork::ZERO)
+    } else {
+        ChainWork::ZERO
+    };
+    let this_work = parent_work.saturating_add(&get_block_proof(block.header.bits));
+    let mut status = store
+        .get_block_index(block_hash)
+        .ok()
+        .flatten()
+        .map(|e| e.status)
+        .unwrap_or_else(BlockStatus::new);
+    status.set(BlockStatus::HAVE_DATA);
+    status.set(BlockStatus::FAILED_VALIDITY);
+    let entry = StorageBlockIndexEntry {
+        height: state.best_height + 1,
+        status,
+        n_tx: block.transactions.len() as u32,
+        timestamp: block.header.timestamp,
+        bits: block.header.bits,
+        nonce: block.header.nonce,
+        version: block.header.version,
+        prev_hash: block.header.prev_block_hash,
+        chain_work: this_work.0,
+    };
+    store
+        .put_block_index(block_hash, &entry)
+        .map_err(|e| format!("put_block_index: {e}"))?;
+    Ok(())
+}
+
 /// Set `flag` on an existing block-index entry (no-op when absent).
 fn set_block_index_flag(store: &BlockStore, hash: &Hash256, flag: u32) {
     match store.get_block_index(hash) {
@@ -5173,6 +5457,128 @@ fn set_block_index_flag(store: &BlockStore, hash: &Hash256, flag: u32) {
         Ok(None) => {}
         Err(err) => tracing::error!("get_block_index({}) while marking failed: {}", hash, err),
     }
+}
+
+/// Core `ActivateBestChain` after `ReconsiderBlock` (rpc/blockchain.cpp
+/// reconsiderblock -> validation.cpp ResetBlockFailureFlags, which re-adds the
+/// cleared blocks with data to `setBlockIndexCandidates`, then
+/// ActivateBestChain). The candidates are the blocks `reconsiderblock` just
+/// cleared; the most-work one whose whole branch down to the active chain has
+/// its body and no failure flag becomes the tip through the same
+/// attach-and-reorg path submitblock and P2P use (fast-forward when the active
+/// tip is its ancestor, a full reorg otherwise). A candidate that fails
+/// validation is marked failed there (Core InvalidBlockFound) and the next one
+/// is tried, as ActivateBestChain does; that is not an RPC error. Returns the
+/// hashes newly marked failed, for the connect loop.
+///
+/// Caller holds the chain lock (`chain_write_coherent`).
+pub fn activate_best_chain_after_reconsider(
+    state: &mut RpcState,
+    cleared: &[Hash256],
+) -> Result<Vec<Hash256>, String> {
+    use rustoshi_storage::block_store::BlockStatus;
+    let failed = |st: BlockStatus| {
+        st.has(BlockStatus::FAILED_VALIDITY) || st.has(BlockStatus::FAILED_CHILD)
+    };
+    let mut newly_invalid: Vec<Hash256> = Vec::new();
+    let mut tried: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
+    // Bounded: every iteration either moves the tip (then stops) or removes a
+    // candidate from consideration.
+    for _ in 0..=cleared.len() {
+        let db = state.db.clone();
+        let store = BlockStore::new(&db);
+        let tip_entry = store
+            .get_block_index(&state.best_hash)
+            .map_err(|e| format!("get_block_index(tip): {}", e))?
+            .ok_or_else(|| format!("tip {} missing from block index", state.best_hash))?;
+        // Most-work cleared block that beats the tip.
+        let mut cands: Vec<(Hash256, rustoshi_storage::block_store::BlockIndexEntry)> = cleared
+            .iter()
+            .filter(|h| !tried.contains(*h))
+            .filter_map(|h| store.get_block_index(h).ok().flatten().map(|e| (*h, e)))
+            .filter(|(_, e)| e.status.has(BlockStatus::HAVE_DATA) && !failed(e.status))
+            .filter(|(_, e)| compare_chain_work(&e.chain_work, &tip_entry.chain_work).is_gt())
+            .collect();
+        cands.sort_by(|a, b| compare_chain_work(&b.1.chain_work, &a.1.chain_work));
+        let mut chosen: Option<(Hash256, Block)> = None;
+        for (h, e) in cands {
+            tried.insert(h);
+            // The branch from `h` down to the fork with the active chain must
+            // be connectable: every block has its body and no failure flag.
+            let mut ok = true;
+            let (mut nw, mut nh) = (h, e.height);
+            let (mut ow, mut oh) = (state.best_hash, state.best_height);
+            let mut guard = e.height as u64 + state.best_height as u64 + 16;
+            while nw != ow && guard > 0 {
+                guard -= 1;
+                if nh >= oh {
+                    match store.get_block_index(&nw).ok().flatten() {
+                        Some(ne) if ne.status.has(BlockStatus::HAVE_DATA) && !failed(ne.status) => {
+                            nw = ne.prev_hash;
+                            nh = nh.saturating_sub(1);
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if oh > nh {
+                    match store.get_block_index(&ow).ok().flatten() {
+                        Some(oe) => {
+                            ow = oe.prev_hash;
+                            oh = oh.saturating_sub(1);
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !ok || nw != ow {
+                continue;
+            }
+            match store.get_block(&h) {
+                Ok(Some(b)) => {
+                    chosen = Some((h, b));
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        drop(store);
+        let Some((h, block)) = chosen else {
+            return Ok(newly_invalid);
+        };
+        match try_attach_and_reorg_detailed(state, &block, &h) {
+            Ok(true) => {
+                tracing::info!(
+                    "reconsiderblock: activated best chain, tip {} at height {}",
+                    state.best_hash,
+                    state.best_height
+                );
+                return Ok(newly_invalid);
+            }
+            Ok(false) => return Ok(newly_invalid),
+            Err(e) => {
+                if rustoshi_consensus::fatal::is_system_fault_str(&e.reason)
+                    || rustoshi_consensus::fatal::is_aborted()
+                {
+                    return Err(e.reason);
+                }
+                tracing::warn!(
+                    "reconsiderblock: candidate {} not activated: {}",
+                    h,
+                    e.reason.trim_start_matches(REORG_CONSENSUS_REJECT_SENTINEL)
+                );
+                if let Some(inv) = e.invalid {
+                    newly_invalid.extend(inv.invalidated);
+                }
+            }
+        }
+    }
+    Ok(newly_invalid)
 }
 
 /// [`try_attach_and_reorg`] with the invalid-branch outcome surfaced.
@@ -5539,6 +5945,25 @@ pub fn try_attach_and_reorg_detailed(
                         block_hash,
                         failure.error
                     )));
+                }
+                // ConnectTip writes undo before a later block in the same step
+                // fails. Core's rev*.dat high-water mark keeps those bytes, so
+                // size_on_disk still counts them after the tip rolls back.
+                for (hash, _height, undo) in &failure.connected {
+                    let storage_undo = validation_undo_to_storage(undo);
+                    if let Err(err) = store.put_undo(hash, &storage_undo) {
+                        tracing::error!("failed reorg: undo for {} not stored: {}", hash, err);
+                        continue;
+                    }
+                    if let Ok(Some(mut entry)) = store.get_block_index(hash) {
+                        entry.status.set(BlockStatus::HAVE_UNDO);
+                        if let Err(err) = store.put_block_index(hash, &entry) {
+                            tracing::error!(
+                                "failed reorg: HAVE_UNDO on {} not stored: {}",
+                                hash, err
+                            );
+                        }
+                    }
                 }
                 let reason = format!(
                     "{}{}",
@@ -5996,6 +6421,35 @@ pub fn try_attach_and_reorg_detailed(
         // Core MaybeUpdateMempoolForReorg runs removeForReorg after EVERY
         // reorg; this path refilled the mempool but never evicted.
         evict_mempool_after_reorg(&mut state.mempool, &store, new_tip_height, mtp);
+    }
+
+    // Core ConnectTip calls removeForBlock for every block the reorg connects,
+    // including a fast-forward (empty `disconnected_blocks`) such as
+    // reconsiderblock putting a previously invalidated tip back. Txs that
+    // returned to the mempool on the disconnect must leave again once those
+    // blocks are active.
+    for (hash, _height, _undo) in &connected_blocks {
+        if let Some(block) = store.get_block(hash).ok().flatten() {
+            let txids: Vec<Hash256> = block.transactions.iter().map(|tx| tx.txid()).collect();
+            let spent: Vec<OutPoint> = block
+                .transactions
+                .iter()
+                .flat_map(|tx| tx.inputs.iter().map(|input| input.previous_output.clone()))
+                .collect();
+            state.mempool.remove_for_block(&txids, &spent);
+        }
+        if let Ok(Some(mut entry)) = store.get_block_index(hash) {
+            entry.status.set(BlockStatus::VALID_SCRIPTS);
+            entry.status.set(BlockStatus::HAVE_DATA);
+            entry.status.set(BlockStatus::HAVE_UNDO);
+            if let Err(e) = store.put_block_index(hash, &entry) {
+                tracing::error!(
+                    "try_attach_and_reorg: failed to mark {} connected: {}",
+                    hash,
+                    e
+                );
+            }
+        }
     }
 
     Ok(true)
@@ -6510,11 +6964,21 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         };
 
-        // Calculate verification progress
-        let progress = if state.header_height > 0 {
-            state.best_height as f64 / state.header_height as f64
-        } else {
-            1.0
+        // Core GuessVerificationProgress. header_height is the most-work
+        // non-failed header, refreshed on invalidate / reconsider / submitheader.
+        let progress = {
+            let store = BlockStore::new(&state.db);
+            let chain_tx = active_chain_tx_count(&store, &state.best_hash);
+            let header_height = state.header_height.max(state.best_height);
+            guess_verification_progress(
+                state.params.network_id,
+                chain_tx,
+                tip_timestamp,
+                state.best_height,
+                header_height,
+                // Core NodeClock::now() honors setmocktime.
+                rustoshi_consensus::mempool::current_unix_seconds(),
+            )
         };
 
         // Core GetChainTypeString (util/chaintype.cpp): testnet3 -> "test",
@@ -6602,17 +7066,8 @@ impl RustoshiRpcServer for RpcServerImpl {
             verificationprogress: progress,
             initialblockdownload: state.is_ibd,
             chainwork: chainwork_hex,
-            // Core parity: sum the on-disk bytes of the block/chain storage
-            // (Core's BlockManager::CalculateCurrentUsage). rustoshi stores
-            // blocks + chainstate in a single RocksDB under
-            // `<data_dir>/chainstate`, so we stat that directory. When no datadir
-            // was wired (in-memory / test harness) we report 0, matching Core's
-            // "nothing on disk" reading.
-            size_on_disk: state
-                .data_dir
-                .as_deref()
-                .map(chainstate_size_on_disk)
-                .unwrap_or(0),
+            // Core BlockManager::CalculateCurrentUsage: blk + rev logical bytes.
+            size_on_disk: core_size_on_disk(&store),
             pruned,
             pruneheight,
             prune_target_size,
@@ -6676,6 +7131,19 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
+    async fn set_mock_time(&self, timestamp: i64) -> RpcResult<()> {
+        let state = self.state.read().await;
+        if state.params.network_id != NetworkId::Regtest {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_MISC_ERROR,
+                "setmocktime for regression testing (-regtest mode) only",
+            ));
+        }
+        drop(state);
+        rustoshi_consensus::mempool::set_mock_time(timestamp);
+        Ok(())
+    }
+
     async fn get_sync_state(&self) -> RpcResult<SyncStateResult> {
         let state = self.state.read().await;
 
@@ -6687,10 +7155,23 @@ impl RustoshiRpcServer for RpcServerImpl {
             NetworkId::Regtest => "regtest",
         };
 
-        let progress = if state.header_height > 0 {
-            (state.best_height as f64 / state.header_height as f64).min(1.0)
-        } else {
-            0.0
+        let progress = {
+            let store = BlockStore::new(&state.db);
+            let chain_tx = active_chain_tx_count(&store, &state.best_hash);
+            let tip_time = store
+                .get_header(&state.best_hash)
+                .ok()
+                .flatten()
+                .map(|h| h.timestamp)
+                .unwrap_or(0);
+            guess_verification_progress(
+                state.params.network_id,
+                chain_tx,
+                tip_time,
+                state.best_height,
+                state.header_height.max(state.best_height),
+                rustoshi_consensus::mempool::current_unix_seconds(),
+            )
         };
 
         let num_peers = {
@@ -8757,6 +9238,8 @@ impl RustoshiRpcServer for RpcServerImpl {
 
                 // Track for fee estimation
                 state.fee_estimator.track_transaction(txid, fee_rate);
+                // Core AddUnbroadcastTx: no peers, so the tx stays unbroadcast.
+                state.mempool.add_unbroadcast(txid);
 
                 // Drop the state lock before broadcasting
                 drop(state);
@@ -8804,7 +9287,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     // accept/reject decision is unchanged — only the string.
                     other => Err(Self::rpc_error(
                         rpc_error::RPC_TRANSACTION_REJECTED,
-                        other.reject_token(),
+                        other.reject_debug(),
                     )),
                 }
             }
@@ -9011,45 +9494,11 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
-        let state = self.state.read().await;
-
-        // Total fees: iterate mempool for sum of all entry fees.
-        let total_fee_sats: u64 = state.mempool.get_sorted_for_mining()
-            .iter()
-            .filter_map(|h| state.mempool.get(h))
-            .map(|e| e.fee)
-            .sum();
-        // Couple the displayed fee fields to the REAL admission floor instead
-        // of a hardcoded literal (audit wx12re33x: the prior `let _ = 100;`
-        // understated the policy by 10x). All three are sat/kvB integers read
-        // from the live mempool config; BtcAmount serializes 100 sat/kvB to
-        // 0.00000100 BTC (Core ValueFromAmount(CFeeRate(100).GetFeePerK())).
-        //   minrelaytxfee      = static min-relay floor (config.min_fee_rate)
-        //   incrementalrelayfee = config.incremental_relay_fee
-        //   mempoolminfee      = max(rolling, floor) per Core CTxMemPool::GetMinFee
-        let min_relay_kvb = state.mempool.min_relay_feerate_kvb();
-        let incremental_kvb = state.mempool.incremental_relay_feerate_kvb();
-        let mempool_min_kvb =
-            std::cmp::max(state.mempool.mempool_min_feerate_kvb(), min_relay_kvb);
-
-        Ok(MempoolInfo {
-            loaded: true,
-            size: state.mempool.size(),
-            bytes: state.mempool.total_bytes(),
-            usage: state.mempool.total_bytes() * 2, // approximate memory usage
-            total_fee: BtcAmount::from_sats(total_fee_sats),
-            maxmempool: 300 * 1_000_000, // DEFAULT_MAX_MEMPOOL_SIZE_MB(300) * 1'000'000 = 300000000
-            mempoolminfee: BtcAmount::from_sats(mempool_min_kvb),
-            minrelaytxfee: BtcAmount::from_sats(min_relay_kvb),
-            incrementalrelayfee: BtcAmount::from_sats(incremental_kvb),
-            unbroadcastcount: 0,
-            fullrbf: true,
-            permitbaremultisig: true, // DEFAULT_PERMIT_BAREMULTISIG
-            maxdatacarriersize: 100_000, // MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT(400000)/WITNESS_SCALE_FACTOR(4)
-            limitclustercount: 64, // DEFAULT_CLUSTER_LIMIT
-            limitclustersize: 101_000, // DEFAULT_CLUSTER_SIZE_LIMIT_KVB(101) * 1000
-            optimal: true, // DoWork(0) on default/empty mempool reports known-optimal
-        })
+        let mut state = self.state.write().await;
+        // Core MempoolInfoToJSON calls GetMinFee, which decays the rolling
+        // minimum before the value is reported.
+        state.mempool.get_min_fee();
+        Ok(mempool_info(&state))
     }
 
     async fn get_raw_mempool(&self, verbose: Option<bool>) -> RpcResult<Box<serde_json::value::RawValue>> {
@@ -9065,54 +9514,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             return Ok(serde_json::value::RawValue::from_string(json_str).unwrap());
         }
 
-        // Verbose mode: map of txid -> entry details.
-        // Build JSON manually via to_string so that BtcAmount's 8-decimal
-        // serialiser is used and serde_json::to_value cannot collapse
-        // "0.00001000" to 1e-05 by routing through Value::Number (f64).
-        let mut json = String::from("{");
-        let mut first = true;
-        for txid in sorted {
-            if let Some(entry) = state.mempool.get(&txid) {
-                // FIX-72 (W120 BUG-9): modifiedfee = base + prioritise delta.
-                let modified_fee_sats = rustoshi_consensus::mempool::Mempool::get_modified_fee(entry);
-                let mem_entry = MempoolEntry {
-                    vsize: entry.vsize as u32,
-                    weight: entry.weight as u32,
-                    // Core: count_seconds(e.GetTime()) — the absolute Unix epoch
-                    // second the tx entered the pool, not its dwell time/age.
-                    time: entry.time_seconds as u64,
-                    height: state.best_height,
-                    descendantcount: entry.descendant_count as u32,
-                    descendantsize: entry.descendant_size as u32,
-                    ancestorcount: entry.ancestor_count as u32,
-                    ancestorsize: entry.ancestor_size as u32,
-                    wtxid: entry.tx.wtxid().to_hex(),
-                    // Nested fees object matching Bitcoin Core's entryToJSON shape
-                    // (rpc/mempool.cpp:527-532): base, modified, ancestor, descendant.
-                    fees: MempoolFees {
-                        base: BtcAmount::from_sats(entry.fee),
-                        modified: BtcAmount::from_sats(modified_fee_sats),
-                        ancestor: BtcAmount::from_sats(entry.ancestor_fees),
-                        descendant: BtcAmount::from_sats(entry.descendant_fees),
-                    },
-                    depends: vec![],
-                    spentby: vec![],
-                    bip125_replaceable: false,
-                    unbroadcast: false,
-                };
-                if !first {
-                    json.push(',');
-                }
-                first = false;
-                // Key
-                json.push('"');
-                json.push_str(&txid.to_hex());
-                json.push_str("\":");
-                // Value: serialize via to_string to preserve BtcAmount precision.
-                json.push_str(&serde_json::to_string(&mem_entry).unwrap());
-            }
-        }
-        json.push('}');
+        // Verbose mode: same object REST `/rest/mempool/contents.json` serves.
+        // Built via to_string so BtcAmount keeps 8 decimal places.
+        let json = mempool_contents_json(&state);
         Ok(serde_json::value::RawValue::from_string(json).unwrap())
     }
 
@@ -9842,6 +10246,21 @@ impl RustoshiRpcServer for RpcServerImpl {
         {
             let store = BlockStore::new(&state.db);
             if let Ok(Some(idx)) = store.get_block_index(&block_hash) {
+                // Core: a block whose index entry is BLOCK_FAILED_* (it failed
+                // validation, or `invalidateblock` marked it / an ancestor) is
+                // never reconnected by a resubmission. AcceptBlockHeader finds
+                // the failed entry and returns BLOCK_CACHED_INVALID
+                // "duplicate-invalid" (validation.cpp AcceptBlockHeader;
+                // rpc/mining.cpp submitblock -> BIP22ValidationResult). Only
+                // `reconsiderblock` clears the flag. Before this check the
+                // invalidated block N (the direct child of tip N-1 after the
+                // rewind) matched `unconnected_tip_child` below and was
+                // re-processed -- i.e. reconnected -- answering null.
+                if idx.status.has(rustoshi_storage::block_store::BlockStatus::FAILED_VALIDITY)
+                    || idx.status.has(rustoshi_storage::block_store::BlockStatus::FAILED_CHILD)
+                {
+                    return Ok(Some("duplicate-invalid".to_string()));
+                }
                 let unconnected_tip_child = idx.height == state.best_height + 1
                     && idx.prev_hash == state.best_hash;
                 if !unconnected_tip_child {
@@ -9925,11 +10344,44 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // The parent height comes from CF_BLOCK_INDEX — authoritative, and NOT
         // the attacker-poisonable height→hash index.
-        let submit_parent_height = store
+        let submit_parent = store
             .get_block_index(&block.header.prev_block_hash)
             .ok()
-            .flatten()
-            .map(|e| e.height);
+            .flatten();
+
+        // Core ProcessNewBlock: CheckBlock, then AcceptBlockHeader. A parent
+        // with BLOCK_FAILED_MASK is BLOCK_INVALID_PREV "bad-prevblk" before
+        // ContextualCheckBlockHeader and ContextualCheckBlock (validation.cpp
+        // AcceptBlockHeader; rpc/mining.cpp submitblock → BIP22ValidationResult).
+        // A coinbase-height mismatch on a child of an invalidated block must
+        // not surface as bad-cb-height. The block is not added to the index.
+        if let Some(ref parent_idx) = submit_parent {
+            if parent_idx
+                .status
+                .has(rustoshi_storage::block_store::BlockStatus::FAILED_VALIDITY)
+                || parent_idx
+                    .status
+                    .has(rustoshi_storage::block_store::BlockStatus::FAILED_CHILD)
+            {
+                if let Err(e) =
+                    rustoshi_consensus::validation::check_block(&block, &state.params)
+                {
+                    tracing::warn!(
+                        "submitblock: block {} rejected (context-free CheckBlock, failed parent): {}",
+                        block_hash,
+                        e.bip22_string()
+                    );
+                    return Ok(Some(e.bip22_string()));
+                }
+                tracing::warn!(
+                    "submitblock: block {} rejected: bad-prevblk (parent {} is failed)",
+                    block_hash,
+                    block.header.prev_block_hash
+                );
+                return Ok(Some("bad-prevblk".to_string()));
+            }
+        }
+        let submit_parent_height = submit_parent.as_ref().map(|e| e.height);
         let submit_height = submit_parent_height
             .map(|h| h.saturating_add(1))
             .unwrap_or_else(|| state.best_height.saturating_add(1));
@@ -10220,7 +10672,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     // same as the P2P / IBD block-connect paths in main.rs.
                     state
                         .mempool
-                        .on_block_connected(rustoshi_consensus::current_time_secs() as i64);
+                        .on_block_connected(rustoshi_consensus::mempool::current_unix_seconds());
                 }
 
                 // Wire fee estimator: notify it of the confirmed block.
@@ -10390,6 +10842,18 @@ impl RustoshiRpcServer for RpcServerImpl {
                 Err(submit_system_fault_error(&e.to_string()))
             }
             Err(e) => {
+                // ConnectBlock failed after the header and context-free checks
+                // passed. Core has already written the block; InvalidBlockFound
+                // marks BLOCK_FAILED_VALID and leaves the tip alone.
+                if e.is_connect_block_failure() {
+                    if let Err(err) = persist_failed_connect(&store, &state, &block, &block_hash) {
+                        tracing::error!(
+                            "submitblock: failed to persist invalid block {}: {}",
+                            block_hash, err
+                        );
+                        return Err(submit_system_fault_error(&err));
+                    }
+                }
                 tracing::warn!("submitblock: block {} rejected: {}", block_hash, e);
                 // Return canonical BIP-22 result string per BIP-22 and Bitcoin Core
                 // BIP22ValidationResult() in src/rpc/mining.cpp.
@@ -10473,8 +10937,24 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         // --- Step 3: idempotency --------------------------------------------
-        // Core's ProcessNewBlockHeaders is idempotent: an already-known header
-        // succeeds with state.IsValid() == true -> return null.
+        // Core AcceptBlockHeader: an index entry with BLOCK_FAILED_VALID is
+        // "duplicate-invalid" (RPC error), before PoW. A known valid header
+        // is a no-op (null).
+        if let Ok(Some(existing)) = store.get_block_index(&block_hash) {
+            if existing
+                .status
+                .has(rustoshi_storage::block_store::BlockStatus::FAILED_VALIDITY)
+                || existing
+                    .status
+                    .has(rustoshi_storage::block_store::BlockStatus::FAILED_CHILD)
+            {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_VERIFY_ERROR,
+                    "duplicate-invalid",
+                ));
+            }
+            return Ok(None);
+        }
         if let Ok(true) = store.has_header(&block_hash) {
             return Ok(None);
         }
@@ -10519,6 +10999,20 @@ impl RustoshiRpcServer for RpcServerImpl {
                 rpc_error::RPC_TRANSACTION_ERROR,
                 "high-hash",
             ));
+        }
+
+        // Core AcceptBlockHeader: prev BLOCK_FAILED_MASK is bad-prevblk before
+        // ContextualCheckBlockHeader, and the header is not added to the index.
+        if let Ok(Some(parent_idx)) = store.get_block_index(&header.prev_block_hash) {
+            if parent_idx
+                .status
+                .has(rustoshi_storage::block_store::BlockStatus::FAILED_VALIDITY)
+                || parent_idx
+                    .status
+                    .has(rustoshi_storage::block_store::BlockStatus::FAILED_CHILD)
+            {
+                return Err(Self::rpc_error(rpc_error::RPC_VERIFY_ERROR, "bad-prevblk"));
+            }
         }
 
         // --- Step 6: contextual header checks (Core ContextualCheckBlockHeader)
@@ -10618,9 +11112,40 @@ impl RustoshiRpcServer for RpcServerImpl {
                 format!("Database error: {}", e),
             ));
         }
-        if new_height > state.header_height {
-            state.header_height = new_height;
+        // Block-index entry with no HAVE_DATA so getchaintips reports
+        // "headers-only" and the header can win m_best_header on chainwork.
+        {
+            use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+            use rustoshi_storage::block_store::{
+                BlockIndexEntry as StorageBlockIndexEntry, BlockStatus,
+            };
+            let parent_work = store
+                .get_block_index(&header.prev_block_hash)
+                .ok()
+                .flatten()
+                .map(|e| ChainWork::from_be_bytes(e.chain_work))
+                .unwrap_or(ChainWork::ZERO);
+            let mut status = BlockStatus::new();
+            status.set(BlockStatus::VALID_TREE);
+            let entry = StorageBlockIndexEntry {
+                height: new_height,
+                status,
+                n_tx: 0,
+                timestamp: header.timestamp,
+                bits: header.bits,
+                nonce: header.nonce,
+                version: header.version,
+                prev_hash: header.prev_block_hash,
+                chain_work: parent_work.saturating_add(&get_block_proof(header.bits)).0,
+            };
+            if let Err(e) = store.put_block_index(&block_hash, &entry) {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_DATABASE_ERROR,
+                    format!("Database error: {}", e),
+                ));
+            }
         }
+        refresh_best_header_height(&mut state);
 
         // Success -> JSON null (Core: return UniValue::VNULL).
         Ok(None)
@@ -12744,13 +13269,16 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
 
         let _ = (new_tip_hash, new_tip_height);
+        // Descendants are already marked failed, so the most-work survivor
+        // is the new header tip (Core resets m_best_header here).
+        refresh_best_header_height(&mut state);
         Ok(())
     }
 
     async fn reconsider_block(&self, blockhash: String) -> RpcResult<()> {
         let hash = Self::parse_hash(&blockhash)?;
 
-        let state = crate::coins_coherence::chain_write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
+        let mut state = crate::coins_coherence::chain_write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
         let store = BlockStore::new(&state.db);
 
         // Verify the block exists and get its metadata
@@ -12828,26 +13356,25 @@ impl RustoshiRpcServer for RpcServerImpl {
             reconsidered_count
         );
         if !reconsidered.is_empty() {
-            state.push_event(crate::chain_lock::ChainEvent::Reconsidered(reconsidered));
+            state.push_event(crate::chain_lock::ChainEvent::Reconsidered(reconsidered.clone()));
         }
 
-        // Check if we should switch to the reconsidered chain
-        // Compare chain work of the reconsidered block vs current tip
-        let current_tip_entry = store.get_block_index(&state.best_hash).ok().flatten();
-        let reconsidered_entry = store.get_block_index(&hash).ok().flatten();
-
-        if let (Some(current), Some(reconsidered)) = (current_tip_entry, reconsidered_entry) {
-            // If the reconsidered chain has more work, we might want to switch
-            if compare_chain_work(&reconsidered.chain_work, &current.chain_work).is_gt() {
-                tracing::info!(
-                    "Reconsidered block {} has more work than current tip, consider reorg",
-                    hash
-                );
-                // Note: A full implementation would trigger ActivateBestChain here
-                // For now, we just clear the flags and log
-            }
+        // Core ReconsiderBlock -> ResetBlockFailureFlags re-adds every cleared
+        // block with data to setBlockIndexCandidates, then the RPC calls
+        // ActivateBestChain (rpc/blockchain.cpp reconsiderblock), so the tip
+        // returns to the most-work valid chain before the call returns. Before
+        // this the flags were cleared and nothing else happened: the node sat
+        // on the invalidation point until a peer re-sent the bodies.
+        drop(store);
+        let newly_invalid = activate_best_chain_after_reconsider(&mut state, &reconsidered)
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, e))?;
+        if !newly_invalid.is_empty() {
+            state.push_event(crate::chain_lock::ChainEvent::Invalidated(newly_invalid));
         }
 
+        // Failure flags are cleared and the best chain is active. A non-failed
+        // header with more work than the block tip becomes m_best_header.
+        refresh_best_header_height(&mut state);
         Ok(())
     }
 
@@ -13910,34 +14437,43 @@ impl RustoshiRpcServer for RpcServerImpl {
                     } else {
                         // Serialize fee as BTC with 8 decimal places, matching
                         // Core's ValueFromAmount format ("0.00001000" etc.).
-                        let base_fee_str = {
-                            let whole = fee_sats / 100_000_000;
-                            let frac  = fee_sats % 100_000_000;
-                            format!("{}.{:08}", whole, frac)
+                        let fee_num = |sats: u64| -> serde_json::Value {
+                            let text = format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000);
+                            serde_json::from_str(&text).unwrap_or(serde_json::json!(0))
                         };
-                        let base_fee_num: serde_json::Value =
-                            serde_json::from_str(&base_fee_str).unwrap_or(serde_json::json!(0));
+                        // Core CFeeRate(fee, vsize).GetFeePerK(): integer sat/kvB.
+                        let effective = if vsize > 0 {
+                            fee_sats.saturating_mul(1000) / vsize as u64
+                        } else {
+                            0
+                        };
                         results.push(serde_json::json!({
                             "txid": txid.to_hex(),
                             "wtxid": wtxid.to_hex(),
                             "allowed": true,
                             "vsize": vsize,
                             "fees": {
-                                "base": base_fee_num
+                                "base": fee_num(fee_sats),
+                                "effective-feerate": fee_num(effective),
+                                "effective-includes": [wtxid.to_hex()]
                             }
                         }));
                     }
                 }
                 Err(e) => {
-                    results.push(serde_json::json!({
+                    let mut result = serde_json::json!({
                         "txid": txid.to_hex(),
                         "wtxid": wtxid.to_hex(),
                         "allowed": false,
-                        // Emit Bitcoin Core's bare canonical reject token
-                        // (rpc/mempool.cpp surfaces state.GetRejectReason()),
-                        // not the Rust Display string.
+                        // Bare token. TX_MISSING_INPUTS is remapped and has no
+                        // reject-details; every other rejection also carries
+                        // state.ToString() (reason, plus the debug message).
                         "reject-reason": e.reject_token()
-                    }));
+                    });
+                    if e.reject_token() != "missing-inputs" {
+                        result["reject-details"] = serde_json::Value::String(e.reject_debug());
+                    }
+                    results.push(result);
                 }
             }
         }
@@ -14124,15 +14660,91 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn get_chain_tips(&self) -> RpcResult<serde_json::Value> {
+        use rustoshi_storage::block_store::BlockStatus;
         let state = self.state.read().await;
+        let store = BlockStore::new(&state.db);
+        let entries = store.iter_block_index().map_err(|e| {
+            Self::rpc_error(rpc_error::RPC_DATABASE_ERROR, format!("Database error: {}", e))
+        })?;
+        let by_hash: std::collections::HashMap<Hash256, rustoshi_storage::block_store::BlockIndexEntry> =
+            entries.into_iter().collect();
 
-        // The active tip is always present
-        let tips = vec![serde_json::json!({
-            "height": state.best_height,
-            "hash": state.best_hash.to_string(),
-            "branchlen": 0,
-            "status": "active"
-        })];
+        // Active chain, tip back to genesis.
+        let mut active: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
+        let mut walk = state.best_hash;
+        let mut guard = state.best_height.saturating_add(2);
+        while walk != Hash256::ZERO && guard > 0 {
+            active.insert(walk);
+            guard -= 1;
+            match by_hash.get(&walk) {
+                Some(entry) => walk = entry.prev_hash,
+                None => break,
+            }
+        }
+
+        // Orphan tips: orphans that are not the parent of another orphan,
+        // plus the active tip. Core rpc/blockchain.cpp getchaintips.
+        let mut orphan_prevs: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
+        let mut orphans: Vec<Hash256> = Vec::new();
+        for (hash, entry) in &by_hash {
+            if !active.contains(hash) {
+                orphans.push(*hash);
+                orphan_prevs.insert(entry.prev_hash);
+            }
+        }
+        let mut tip_hashes: Vec<Hash256> = orphans
+            .into_iter()
+            .filter(|hash| !orphan_prevs.contains(hash))
+            .collect();
+        if !tip_hashes.contains(&state.best_hash) {
+            tip_hashes.push(state.best_hash);
+        }
+
+        let mut tips = Vec::with_capacity(tip_hashes.len());
+        for hash in tip_hashes {
+            let Some(entry) = by_hash.get(&hash) else {
+                continue;
+            };
+            let fork_height = {
+                let mut cursor = hash;
+                let mut height = entry.height;
+                let mut steps = entry.height.saturating_add(2);
+                loop {
+                    if active.contains(&cursor) {
+                        break height;
+                    }
+                    let Some(node) = by_hash.get(&cursor) else {
+                        break 0;
+                    };
+                    if node.height == 0 || steps == 0 {
+                        break 0;
+                    }
+                    steps -= 1;
+                    cursor = node.prev_hash;
+                    height = height.saturating_sub(1);
+                }
+            };
+            let branchlen = entry.height.saturating_sub(fork_height);
+            let failed = entry.status.has(BlockStatus::FAILED_VALIDITY)
+                || entry.status.has(BlockStatus::FAILED_CHILD);
+            let status = if active.contains(&hash) {
+                "active"
+            } else if failed {
+                "invalid"
+            } else if !entry.status.has(BlockStatus::HAVE_DATA) {
+                "headers-only"
+            } else if entry.status.has(BlockStatus::VALID_SCRIPTS) {
+                "valid-fork"
+            } else {
+                "valid-headers"
+            };
+            tips.push(serde_json::json!({
+                "height": entry.height,
+                "hash": hash.to_string(),
+                "branchlen": branchlen,
+                "status": status,
+            }));
+        }
 
         Ok(serde_json::json!(tips))
     }
@@ -14159,17 +14771,23 @@ impl RustoshiRpcServer for RpcServerImpl {
                 )
             };
 
-        // verificationprogress: progress towards the network (header) tip,
-        // clamped to [0, 1]. Same derivation `getblockchaininfo` uses
-        // (`best_height / header_height`), so the two RPCs agree. Core computes
-        // `GuessVerificationProgress(tip)`; rustoshi has no tx-count estimator,
-        // so it uses the block/header-height ratio fleet-wide.
+        // Same GuessVerificationProgress as getblockchaininfo.
         let header_height = state.header_height.max(state.best_height);
-        let verificationprogress = if header_height > 0 {
-            (state.best_height as f64 / header_height as f64).clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
+        let chain_tx = active_chain_tx_count(&store, &state.best_hash);
+        let tip_time = store
+            .get_header(&state.best_hash)
+            .ok()
+            .flatten()
+            .map(|h| h.timestamp)
+            .unwrap_or(0);
+        let verificationprogress = guess_verification_progress(
+            state.params.network_id,
+            chain_tx,
+            tip_time,
+            state.best_height,
+            header_height,
+            rustoshi_consensus::mempool::current_unix_seconds(),
+        );
 
         // Coins-cache sizes: derive Core's coinsdb/coinstip split from the
         // genuine configured total dbcache budget (rustoshi has no separate
@@ -14346,39 +14964,10 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         match state.mempool.get(&txid_hash) {
             Some(entry) => {
-                let replaceable = state.mempool.is_bip125_replaceable(&txid_hash);
-                // FIX-72 (W120 BUG-9): expose Core-shaped modified fee
-                // (base + prioritise delta) — previously hard-coded to
-                // entry.fee so prioritisetransaction was invisible to clients.
-                let modified_fee_sats = rustoshi_consensus::mempool::Mempool::get_modified_fee(entry);
                 // Serialize via MempoolEntry + to_string so that BtcAmount's
                 // 8-decimal format is preserved.  serde_json::json! with f64 would
                 // emit "fee":1e-05 for small values instead of "fee":0.00001000.
-                let mem_entry = MempoolEntry {
-                    vsize: entry.vsize as u32,
-                    weight: entry.weight as u32,
-                    // Core: count_seconds(e.GetTime()) — the absolute Unix epoch
-                    // second the tx entered the pool, not its dwell time/age.
-                    time: entry.time_seconds as u64,
-                    height: state.best_height,
-                    descendantcount: entry.descendant_count as u32,
-                    descendantsize: entry.descendant_size as u32,
-                    ancestorcount: entry.ancestor_count as u32,
-                    ancestorsize: entry.ancestor_size as u32,
-                    wtxid: entry.tx.wtxid().to_hex(),
-                    // Nested fees object matching Bitcoin Core's entryToJSON shape
-                    // (rpc/mempool.cpp:527-532): base, modified, ancestor, descendant.
-                    fees: MempoolFees {
-                        base: BtcAmount::from_sats(entry.fee),
-                        modified: BtcAmount::from_sats(modified_fee_sats),
-                        ancestor: BtcAmount::from_sats(entry.ancestor_fees),
-                        descendant: BtcAmount::from_sats(entry.descendant_fees),
-                    },
-                    depends: vec![],
-                    spentby: vec![],
-                    bip125_replaceable: replaceable,
-                    unbroadcast: false,
-                };
+                let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
                 let json_str = serde_json::to_string(&mem_entry).unwrap();
                 Ok(serde_json::value::RawValue::from_string(json_str).unwrap())
             }
@@ -14598,28 +15187,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 if let Some(entry) = state.mempool.get(ancestor_txid) {
                     if !first { json.push(','); }
                     first = false;
-                    let modified_fee_sats = rustoshi_consensus::mempool::Mempool::get_modified_fee(entry);
-                    let mem_entry = MempoolEntry {
-                        vsize: entry.vsize as u32,
-                        weight: entry.weight as u32,
-                        time: entry.time_seconds as u64,
-                        height: state.best_height,
-                        descendantcount: entry.descendant_count as u32,
-                        descendantsize: entry.descendant_size as u32,
-                        ancestorcount: entry.ancestor_count as u32,
-                        ancestorsize: entry.ancestor_size as u32,
-                        wtxid: entry.tx.wtxid().to_hex(),
-                        fees: MempoolFees {
-                            base: BtcAmount::from_sats(entry.fee),
-                            modified: BtcAmount::from_sats(modified_fee_sats),
-                            ancestor: BtcAmount::from_sats(entry.ancestor_fees),
-                            descendant: BtcAmount::from_sats(entry.descendant_fees),
-                        },
-                        depends: vec![],
-                        spentby: vec![],
-                        bip125_replaceable: false,
-                        unbroadcast: false,
-                    };
+                    let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
                     json.push('"');
                     json.push_str(&ancestor_txid.to_hex());
                     json.push_str("\":");
@@ -14665,28 +15233,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                 if let Some(entry) = state.mempool.get(d) {
                     if !first { json.push(','); }
                     first = false;
-                    let modified_fee_sats = rustoshi_consensus::mempool::Mempool::get_modified_fee(entry);
-                    let mem_entry = MempoolEntry {
-                        vsize: entry.vsize as u32,
-                        weight: entry.weight as u32,
-                        time: entry.time_seconds as u64,
-                        height: state.best_height,
-                        descendantcount: entry.descendant_count as u32,
-                        descendantsize: entry.descendant_size as u32,
-                        ancestorcount: entry.ancestor_count as u32,
-                        ancestorsize: entry.ancestor_size as u32,
-                        wtxid: entry.tx.wtxid().to_hex(),
-                        fees: MempoolFees {
-                            base: BtcAmount::from_sats(entry.fee),
-                            modified: BtcAmount::from_sats(modified_fee_sats),
-                            ancestor: BtcAmount::from_sats(entry.ancestor_fees),
-                            descendant: BtcAmount::from_sats(entry.descendant_fees),
-                        },
-                        depends: vec![],
-                        spentby: vec![],
-                        bip125_replaceable: false,
-                        unbroadcast: false,
-                    };
+                    let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
                     json.push('"');
                     json.push_str(&d.to_hex());
                     json.push_str("\":");
@@ -26887,14 +27434,17 @@ mod tests {
             .parse()
             .expect("difficulty is a JSON number");
         assert!(diff.is_finite() && diff > 0.0, "difficulty positive finite");
-        // verificationprogress in [0,1]; at the tip it is 1.0.
+        // Core GuessVerificationProgress. This fixture's tip is genesis
+        // (ancient, and this setup writes no block-index nChainTx), so the
+        // count is unset and Core returns 0 — not 1.0. A recent tip with
+        // headers == blocks is the case that returns 1.
         assert!(
             (0.0..=1.0).contains(&cs.verificationprogress),
             "verificationprogress in [0,1]"
         );
         assert_eq!(
-            cs.verificationprogress, 1.0,
-            "fully synced -> progress 1.0"
+            cs.verificationprogress, 0.0,
+            "unset chain-tx count -> progress 0 (Core GuessVerificationProgress)"
         );
         // Coins-cache sizes derived from the configured total via Core's split.
         let (exp_db, exp_tip) =

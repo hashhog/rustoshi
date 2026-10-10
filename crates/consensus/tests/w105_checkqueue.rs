@@ -1151,10 +1151,18 @@ impl rustoshi_consensus::SequenceLockContext for NullSeq {
 #[test]
 fn script_verification_counter_recorded_in_parallel_helper() {
     let src = include_str!("../src/validation.rs");
-    let body = function_src(src, "pub fn validate_scripts_parallel_with_cache");
+    // The public wrapper delegates to `validate_scripts_on_pool`, which is
+    // where the checks are materialized and counted. Scanning only the
+    // wrapper misses a call that does run.
+    let wrapper = function_src(src, "pub fn validate_scripts_parallel_with_cache");
+    assert!(
+        wrapper.contains("validate_scripts_on_pool"),
+        "validate_scripts_parallel_with_cache must dispatch through validate_scripts_on_pool"
+    );
+    let body = function_src(src, "fn validate_scripts_on_pool");
     assert!(
         body.contains("record_script_checks"),
-        "validate_scripts_parallel_with_cache must record the checks it actually \
+        "validate_scripts_on_pool must record the checks it actually \
          dispatches so a range can prove scripts ran without grepping a log banner"
     );
 }
