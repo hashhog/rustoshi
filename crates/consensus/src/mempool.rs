@@ -1582,6 +1582,107 @@ pub struct Mempool {
     /// Core `CTxMemPool::m_unbroadcast_txids`. With no peers the set stays
     /// populated, so `getrawmempool` reports `unbroadcast: true`.
     unbroadcast: HashSet<Hash256>,
+    /// Length and capacity of Core's `txns_randomized`
+    /// (`vector<pair<Wtxid, txiter>>`, 40 bytes per element on x86_64).
+    ///
+    /// libstdc++ grows with `size + max(size, 1)` and the last-entry removal
+    /// calls `clear()`, which keeps capacity. `DynamicMemoryUsage` charges
+    /// `MallocUsage(capacity * 40)`, so the live transaction count is not
+    /// enough to recover the number.
+    txns_randomized_len: usize,
+    txns_randomized_cap: usize,
+}
+
+/// `memusage::MallocUsage` for glibc ≥ 2.19 on x86_64: round the request
+/// up to a multiple of 16, then add 16. An exact multiple of 16 is not a
+/// fixed point (`MallocUsage(64) == 80`). A zero-sized request allocates
+/// nothing.
+fn malloc_usage(alloc: usize) -> usize {
+    if alloc == 0 {
+        0
+    } else {
+        ((alloc + 31) >> 4) << 4
+    }
+}
+
+// x86_64 `sizeof` of the Core v31.1 objects that `DynamicMemoryUsage` charges.
+// CTxIn 112, CTxOut 48, CScript is prevector<36, uint8_t> (inline up to 36),
+// CTransaction 128, stl_shared_counter 24, CTxMemPoolEntry 136.
+const CTX_IN: usize = 112;
+const CTX_OUT: usize = 48;
+const CSCRIPT_DIRECT: usize = 36;
+const CTX: usize = 128;
+const SHARED_COUNTER: usize = 24;
+/// `sizeof(CTxMemPoolEntry) + 9 * sizeof(void*)` — the mapTx node Core multiplies by `mapTx.size()`.
+const MAPTX_ELEM: usize = 136 + 9 * 8;
+/// `stl_tree_node<pair<const COutPoint*, txiter>>`. txiter is one pointer
+/// (Boost.MultiIndex hashed-index iterator, safe mode off).
+const MAP_NEXT_NODE: usize = 48;
+/// `stl_tree_node<pair<const Txid, int64_t>>`.
+const MAP_DELTA_NODE: usize = 72;
+/// `sizeof(pair<Wtxid, txiter>)`.
+const RAND_PAIR: usize = 40;
+/// `sizeof(TxGraphImpl::Entry)`.
+const GRAPH_ENTRY: usize = 80;
+/// `stl_tree_node<ChunkData>`.
+const CHUNK_NODE: usize = 40;
+const SINGLETON_CLUSTER: usize = 48;
+const GENERIC_CLUSTER: usize = 104;
+const UNIQUE_PTR: usize = 8;
+/// `sizeof(DepGraph::Entry)` for `BitSet<64>`: FeeFrac 16 + two 8-byte sets.
+const DEP_ENTRY: usize = 32;
+/// `GraphIndex` / `DepGraphIndex` (`uint32_t`).
+const INDEX: usize = 4;
+
+/// Heap bytes of one `CScript` (`prevector<36>`). Unserialize from empty sets
+/// capacity equal to the length, so a spill is `MallocUsage(len)`.
+fn script_heap(len: usize) -> usize {
+    if len <= CSCRIPT_DIRECT {
+        0
+    } else {
+        malloc_usage(len)
+    }
+}
+
+/// `RecursiveDynamicUsage(CTransactionRef)`: the shared_ptr control block,
+/// the `CTransaction` object, and vin / vout / witness allocations.
+/// `CTxMemPoolEntry::DynamicMemoryUsage` returns this and nothing else;
+/// `cachedInnerUsage` is the sum over entries.
+fn tx_cached_inner_usage(tx: &Transaction) -> usize {
+    let mut mem = malloc_usage(tx.inputs.len() * CTX_IN) + malloc_usage(tx.outputs.len() * CTX_OUT);
+    for inp in &tx.inputs {
+        mem += script_heap(inp.script_sig.len());
+        // Witness stack vector capacity equals the item count (unserialize reserve).
+        mem += malloc_usage(inp.witness.len() * 24);
+        for item in &inp.witness {
+            // Each item is `vector<unsigned char>` resized to its length.
+            mem += malloc_usage(item.len());
+        }
+    }
+    for out in &tx.outputs {
+        mem += script_heap(out.script_pubkey.len());
+    }
+    // shared_ptr: MallocUsage(sizeof(CTransaction)) + MallocUsage(sizeof(stl_shared_counter)).
+    mem + malloc_usage(CTX) + malloc_usage(SHARED_COUNTER)
+}
+
+/// `Cluster::TotalMemoryUsage` after `Compact` (capacities equal the tx
+/// count). A singleton is constant-size. Two or more transactions live in a
+/// `GenericClusterImpl`; `GetMainMemoryUsage` keeps the post-compact cached
+/// value, so a later relinearize does not change it.
+fn txgraph_cluster_usage(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else if n == 1 {
+        malloc_usage(SINGLETON_CLUSTER) + UNIQUE_PTR
+    } else {
+        // mapping, linearization, depgraph entries, the cluster object, the unique_ptr slot.
+        malloc_usage(n * INDEX)
+            + malloc_usage(n * INDEX)
+            + malloc_usage(n * DEP_ENTRY)
+            + malloc_usage(GENERIC_CLUSTER)
+            + UNIQUE_PTR
+    }
 }
 
 impl Mempool {
@@ -1663,6 +1764,35 @@ impl Mempool {
             map_deltas: HashMap::new(),
             coin_mtp_provider: None,
             unbroadcast: HashSet::new(),
+            txns_randomized_len: 0,
+            txns_randomized_cap: 0,
+        }
+    }
+
+    /// Core `txns_randomized.emplace_back` (txmempool.cpp addNewTransaction).
+    fn note_randomized_added(&mut self) {
+        let old = self.txns_randomized_len;
+        if old + 1 > self.txns_randomized_cap {
+            // libstdc++ `_M_check_len`: `size + max(size, n)` with n = 1.
+            self.txns_randomized_cap = old + old.max(1);
+        }
+        self.txns_randomized_len += 1;
+    }
+
+    /// Core `removeUnchecked` update of `txns_randomized`.
+    ///
+    /// While more than one entry remains, Core swaps with the back and
+    /// `pop_back`, then `shrink_to_fit` when `size * 2 < capacity`. The final
+    /// entry takes the `clear()` branch, which drops the size and keeps the
+    /// capacity.
+    fn note_randomized_removed(&mut self) {
+        if self.txns_randomized_len > 1 {
+            self.txns_randomized_len -= 1;
+            if self.txns_randomized_len * 2 < self.txns_randomized_cap {
+                self.txns_randomized_cap = self.txns_randomized_len;
+            }
+        } else {
+            self.txns_randomized_len = 0;
         }
     }
 
@@ -2489,7 +2619,9 @@ impl Mempool {
             txid,
         };
         self.fee_rate_index.insert(fee_key, txid);
-        self.transactions.insert(txid, entry);
+        let replaced = self.transactions.insert(txid, entry);
+        debug_assert!(replaced.is_none(), "mapTx insert replaced an existing entry");
+        self.note_randomized_added();
         // W96 (gates 6 + 7): keep wtxid → txid index in lockstep with
         // `transactions`.  Required for the txn-already-in-mempool /
         // txn-same-nonwitness-data-in-mempool error-class distinction.
@@ -2676,6 +2808,7 @@ impl Mempool {
             };
             self.fee_rate_index.remove(&fee_key);
             self.total_size = self.total_size.saturating_sub(entry.vsize);
+            self.note_randomized_removed();
         }
     }
 
@@ -3858,6 +3991,58 @@ impl Mempool {
         self.total_size
     }
 
+    /// Mempool `usage` reported by `getmempoolinfo` / REST info.
+    ///
+    /// Bitcoin Core v31.1 `CTxMemPool::DynamicMemoryUsage` (txmempool.cpp)
+    /// on x86_64 / libstdc++ / glibc, evaluated from this pool's own
+    /// transactions, clusters, and `map_deltas`. The sizes below are the
+    /// `sizeof` values of Core's types (probed against the v31.1 headers);
+    /// `malloc_usage` is `memusage::MallocUsage`.
+    pub fn dynamic_memory_usage(&self) -> usize {
+        debug_assert_eq!(self.txns_randomized_len, self.transactions.len());
+        let n = self.transactions.len();
+        let mut inner = 0usize;
+        let mut inputs = 0usize;
+        for entry in self.transactions.values() {
+            inner += tx_cached_inner_usage(&entry.tx);
+            inputs += entry.tx.inputs.len();
+        }
+
+        let mut clusters_mem = 0usize;
+        let mut chunks = 0usize;
+        let mut clustered = 0usize;
+        for cluster in self.clusters.values() {
+            let k = cluster.txids.len();
+            if k == 0 {
+                continue;
+            }
+            clusters_mem += txgraph_cluster_usage(k);
+            chunks += cluster.linearization.len();
+            clustered += k;
+        }
+        // A transaction that has not been attached to a cluster yet is a
+        // Core singleton (one chunk). Admission always clusters first.
+        debug_assert_eq!(clustered, n);
+        let orphans = n.saturating_sub(clustered);
+        if orphans > 0 {
+            clusters_mem += txgraph_cluster_usage(1) * orphans;
+            chunks += orphans;
+        }
+        // GetMainMemoryUsage: cached cluster usage + sizeof(Entry) * txcount
+        // + one std::set node per chunk. Discarded chunk nodes are not counted.
+        let graph = clusters_mem + GRAPH_ENTRY * n + malloc_usage(CHUNK_NODE) * chunks;
+
+        // mapTx multi_index node, per entry: MallocUsage(sizeof(CTxMemPoolEntry) + 9 pointers).
+        // mapNextTx: one indirectmap node per input. mapDeltas: one std::map node per delta.
+        // txns_randomized: one vector allocation, MallocUsage(capacity * sizeof(pair)).
+        malloc_usage(MAPTX_ELEM) * n
+            + malloc_usage(MAP_NEXT_NODE) * inputs
+            + malloc_usage(MAP_DELTA_NODE) * self.map_deltas.len()
+            + malloc_usage(self.txns_randomized_cap * RAND_PAIR)
+            + graph
+            + inner
+    }
+
     /// Get a transaction by its txid.
     pub fn get(&self, txid: &Hash256) -> Option<&MempoolEntry> {
         self.transactions.get(txid)
@@ -4057,6 +4242,9 @@ impl Mempool {
         self.tx_to_cluster.clear();
         self.mining_score_index.clear();
         self.total_size = 0;
+        // `std::vector::clear` keeps capacity. One-by-one removal would
+        // shrink; this helper wipes the map in one shot.
+        self.txns_randomized_len = 0;
     }
 
     /// Get the total fees of all transactions in the mempool (in satoshis).
@@ -5235,7 +5423,9 @@ impl Mempool {
             txid,
         };
         self.fee_rate_index.insert(fee_key, txid);
-        self.transactions.insert(txid, entry);
+        let replaced = self.transactions.insert(txid, entry);
+        debug_assert!(replaced.is_none(), "mapTx insert replaced an existing entry");
+        self.note_randomized_added();
         // W96: maintain wtxid index in the package-admission path too.
         self.wtxid_index.insert(entry_wtxid, txid);
 

@@ -19,6 +19,8 @@ fresh Core node and a fresh rustoshi. Compared, field by field:
   * coinbase maturity at tip 99 (reject) and tip 100 (accept), via
     testmempoolaccept, sendrawtransaction, and a mined block
   * REST /rest/mempool/contents.json and /rest/mempool/info.json
+  * getmempoolinfo and REST info `usage` for an empty pool, the matured
+    spend, a 2-in/2-out, a parent+child chain, and a witness-heavy tx
   * a heavier side branch whose tip fails ConnectBlock (bad-cb-amount),
     then the same getchaintips / getbestblockhash after a restart
 
@@ -410,16 +412,153 @@ def build_chain(bitcoind: str, bitcoin_cli: str, work: str) -> dict:
         conf = json.loads(cli(bitcoin_cli, datadir, 18601, "generatetoaddress", "1", addr))
         hashes.append(conf[0])
         blocks = [cli(bitcoin_cli, datadir, 18601, "getblock", h, "0") for h in hashes]
+
+        def coinbase_txid(index: int) -> str:
+            blk = json.loads(cli(bitcoin_cli, datadir, 18601, "getblock", hashes[index]))
+            return blk["tx"][0]
+
+        def sign(raw: str) -> str:
+            signed = json.loads(
+                cli(bitcoin_cli, datadir, 18601, "signrawtransactionwithwallet", raw)
+            )
+            if not signed.get("complete"):
+                raise RuntimeError(f"sign failed: {signed}")
+            return signed["hex"]
+
+        addr2 = cli(bitcoin_cli, datadir, 18601, "getnewaddress")
+        # Two mature coinbases (heights 2 and 3). Distinct outputs so
+        # createrawtransaction accepts the pair. Fee 0.001 BTC.
+        two_raw = cli(
+            bitcoin_cli,
+            datadir,
+            18601,
+            "createrawtransaction",
+            json.dumps(
+                [
+                    {"txid": coinbase_txid(1), "vout": 0},
+                    {"txid": coinbase_txid(2), "vout": 0},
+                ]
+            ),
+            json.dumps([{addr: "49.99950000"}, {addr2: "49.99950000"}]),
+        )
+        two_hex = sign(two_raw)
+        two_dec = json.loads(cli(bitcoin_cli, datadir, 18601, "decoderawtransaction", two_hex))
+
+        # Parent fee 0.002 BTC, child fee 0.001 BTC, both P2WPKH. Parent
+        # feerate stays above the child's, so Core keeps two chunks.
+        parent_raw = cli(
+            bitcoin_cli,
+            datadir,
+            18601,
+            "createrawtransaction",
+            json.dumps([{"txid": coinbase_txid(4), "vout": 0}]),
+            json.dumps([{addr: "49.99800000"}]),
+        )
+        parent_hex = sign(parent_raw)
+        parent_dec = json.loads(
+            cli(bitcoin_cli, datadir, 18601, "decoderawtransaction", parent_hex)
+        )
+        parent_txid = parent_dec["txid"]
+        # The builder's tip is only 102, so this coinbase is still immature
+        # there and cannot be broadcast. Hand the parent output to the
+        # signer instead; the replay nodes mine far enough first.
+        parent_out = parent_dec["vout"][0]
+        child_raw = cli(
+            bitcoin_cli,
+            datadir,
+            18601,
+            "createrawtransaction",
+            json.dumps([{"txid": parent_txid, "vout": 0}]),
+            json.dumps([{addr2: "49.99700000"}]),
+        )
+        child_signed = json.loads(
+            cli(
+                bitcoin_cli,
+                datadir,
+                18601,
+                "signrawtransactionwithwallet",
+                child_raw,
+                json.dumps(
+                    [
+                        {
+                            "txid": parent_txid,
+                            "vout": 0,
+                            "scriptPubKey": parent_out["scriptPubKey"]["hex"],
+                            "amount": "49.99800000",
+                        }
+                    ]
+                ),
+            )
+        )
+        if not child_signed.get("complete"):
+            raise RuntimeError(f"child sign failed: {child_signed}")
+        child_hex = child_signed["hex"]
+
+        # Funding pays a P2WSH of OP_DROP OP_DROP OP_TRUE. The spend's
+        # witness is [80, 80, 3], which is standard (stack items ≤ 80).
+        decoded_script = json.loads(cli(bitcoin_cli, datadir, 18601, "decodescript", "755175"))
+        p2wsh_addr = decoded_script["segwit"]["address"]
+        fund_raw = cli(
+            bitcoin_cli,
+            datadir,
+            18601,
+            "createrawtransaction",
+            json.dumps([{"txid": coinbase_txid(3), "vout": 0}]),
+            json.dumps([{p2wsh_addr: "49.99900000"}]),
+        )
+        fund_hex = sign(fund_raw)
+        fund_dec = json.loads(cli(bitcoin_cli, datadir, 18601, "decoderawtransaction", fund_hex))
+        heavy_hex = witness_heavy_spend(fund_dec["txid"], 4_999_900_000 - 100_000)
+        heavy_dec = json.loads(cli(bitcoin_cli, datadir, 18601, "decoderawtransaction", heavy_hex))
+
         return {
             "blocks": blocks,
             "hashes": hashes,
             "tx_hex": tx_hex,
             "txid": txid,
             "wtxid": wtxid,
+            "two_hex": two_hex,
+            "two_txid": two_dec["txid"],
+            "two_wtxid": two_dec["hash"],
+            "parent_hex": parent_hex,
+            "child_hex": child_hex,
+            "fund_hex": fund_hex,
+            "fund_txid": fund_dec["txid"],
+            "fund_wtxid": fund_dec["hash"],
+            "heavy_hex": heavy_hex,
+            "heavy_txid": heavy_dec["txid"],
+            "heavy_wtxid": heavy_dec["hash"],
         }
     finally:
         node.stop()
         shutil.rmtree(datadir, ignore_errors=True)
+
+
+def witness_heavy_spend(funding_txid: str, value_out: int) -> str:
+    """P2WSH spend of script `OP_DROP OP_DROP OP_TRUE` with two 80-byte items.
+
+    The funding output must pay `SHA256(755175)`. No signature: the script
+    pushes true after dropping both items.
+    """
+    txid_le = bytes.fromhex(funding_txid)[::-1]
+    vin = txid_le + struct.pack("<I", 0) + compact_size(0) + struct.pack("<I", 0xFFFFFFFD)
+    spk = b"\x00\x14" + (b"\x11" * 20)
+    vout = struct.pack("<q", value_out) + compact_size(len(spk)) + spk
+    items = [b"\x11" * 80, b"\x22" * 80, bytes.fromhex("755175")]
+    witness = compact_size(len(items))
+    for item in items:
+        witness += compact_size(len(item)) + item
+    raw = (
+        struct.pack("<i", 2)
+        + b"\x00\x01"
+        + compact_size(1)
+        + vin
+        + compact_size(1)
+        + vout
+        + witness
+        + struct.pack("<I", 0)
+    )
+    return raw.hex()
 
 
 def header_hash(header_hex: str) -> str:
@@ -454,8 +593,15 @@ def snapshot(rpc: Rpc, blocks: list[str], mock_time: int, rest_base: str, spend:
         rec(f"{tag}:getchaintips", rpc.call("getchaintips"))
         rec(f"{tag}:getrawmempool", rpc.call("getrawmempool", [True]))
 
+    def rec_usage(tag: str) -> None:
+        rec(f"{tag}:getmempoolinfo", rpc.call("getmempoolinfo"))
+        rec(f"{tag}:rest-info", rest_get(rest_base, "/rest/mempool/info.json"))
+
     if len(blocks) != 102:
         raise RuntimeError(f"expected 102 blocks (heights 1..102), got {len(blocks)}")
+
+    # Fresh pool: Core reports usage 0 (no txns_randomized allocation yet).
+    rec_usage("usage-empty")
 
     # Heights 1..99. A height-1 coinbase is still immature here: Core's
     # mempool nSpendHeight is tip+1 (age 99) and ConnectBlock's spend height
@@ -482,6 +628,7 @@ def snapshot(rpc: Rpc, blocks: list[str], mock_time: int, rest_base: str, spend:
     submit("valid:100", blocks[99])
     rec("tip100:testmempoolaccept", rpc.call("testmempoolaccept", [[spend["hex"]]]))
     rec("tip100:sendrawtransaction", rpc.call("sendrawtransaction", [spend["hex"]]))
+    rec("tip100:getmempoolinfo", rpc.call("getmempoolinfo"))
     rec("tip100:rest-contents", rest_get(rest_base, "/rest/mempool/contents.json"))
     rec("tip100:rest-info", rest_get(rest_base, "/rest/mempool/info.json"))
     tip100 = rpc.call("getbestblockhash")
@@ -588,6 +735,70 @@ def snapshot(rpc: Rpc, blocks: list[str], mock_time: int, rest_base: str, spend:
     )
     submit("failed-connect:bad-cb-amount", bad)
     chain_view("after-failed-connect")
+
+    # The matured spend was admitted and removed (only ever one tx at a
+    # time), so the pool is empty but txns_randomized still holds its
+    # capacity. Then one shape at a time: confirm the single-tx shapes so
+    # the parent+child measurement is not mixed with them. Confirming
+    # blocks are deterministic and identical on both nodes; restart only
+    # compares tips.
+    rec_usage("usage-drained")
+
+    def mine_one(name: str, tx_hex: str, txid: str, wtxid: str, height: int, extra: bytes) -> None:
+        tip = rpc.call("getbestblockhash")
+        if not isinstance(tip, str):
+            raise RuntimeError(f"{name}: no tip before mining: {tip}")
+        blk = block_spending(
+            tip,
+            height,
+            block_time(rpc, tip) + 1,
+            tx_hex,
+            txid,
+            wtxid,
+            extra,
+        )
+        submit(name, blk)
+
+    def must_send(name: str, tx_hex: str) -> None:
+        result = rpc.call("sendrawtransaction", [tx_hex])
+        rec(name, result)
+        if not isinstance(result, str):
+            raise RuntimeError(f"{name} rejected: {result}")
+
+    must_send("usage-2in2out:send", spend["two_hex"])
+    rec_usage("usage-2in2out")
+    mine_one(
+        "usage-2in2out:mine",
+        spend["two_hex"],
+        spend["two_txid"],
+        spend["two_wtxid"],
+        104,
+        b"\x71\xc5",
+    )
+
+    must_send("usage-fund:send", spend["fund_hex"])
+    mine_one(
+        "usage-fund:mine",
+        spend["fund_hex"],
+        spend["fund_txid"],
+        spend["fund_wtxid"],
+        105,
+        b"\x72\xc5",
+    )
+    must_send("usage-heavy:send", spend["heavy_hex"])
+    rec_usage("usage-heavy")
+    mine_one(
+        "usage-heavy:mine",
+        spend["heavy_hex"],
+        spend["heavy_txid"],
+        spend["heavy_wtxid"],
+        106,
+        b"\x73\xc5",
+    )
+
+    must_send("usage-chain:parent", spend["parent_hex"])
+    must_send("usage-chain:child", spend["child_hex"])
+    rec_usage("usage-chain")
     return out
 
 
@@ -651,7 +862,7 @@ def values_equal(name: str, a, b) -> bool:
         return canonical_mempool(a) == canonical_mempool(b)
     if name.endswith(":getblockchaininfo"):
         return dicts_equal(a, b, INFO_FLOATS)
-    if name.endswith("rest-info"):
+    if name.endswith("rest-info") or name.endswith(":getmempoolinfo"):
         return dicts_equal(a, b, INFO_FEE_FIELDS)
     return a == b
 
@@ -735,7 +946,22 @@ def main() -> int:
         nodes.append(rust)
         print("replaying on core...")
         mock_time = int(time.time())
-        spend = {"hex": built["tx_hex"], "txid": built["txid"], "wtxid": built["wtxid"]}
+        spend = {
+            "hex": built["tx_hex"],
+            "txid": built["txid"],
+            "wtxid": built["wtxid"],
+            "two_hex": built["two_hex"],
+            "two_txid": built["two_txid"],
+            "two_wtxid": built["two_wtxid"],
+            "parent_hex": built["parent_hex"],
+            "child_hex": built["child_hex"],
+            "fund_hex": built["fund_hex"],
+            "fund_txid": built["fund_txid"],
+            "fund_wtxid": built["fund_wtxid"],
+            "heavy_hex": built["heavy_hex"],
+            "heavy_txid": built["heavy_txid"],
+            "heavy_wtxid": built["heavy_wtxid"],
+        }
         core_obs = snapshot(core.rpc, built["blocks"], mock_time, core.rest_base, spend)
         print("replaying on rustoshi...")
         rust_obs = snapshot(rust.rpc, built["blocks"], mock_time, rust.rest_base, spend)

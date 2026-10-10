@@ -250,11 +250,8 @@ pub(crate) fn mempool_info(state: &RpcState) -> MempoolInfo {
         loaded: true,
         size: state.mempool.size(),
         bytes: state.mempool.total_bytes(),
-        // Core's `usage` is CTxMemPool::DynamicMemoryUsage (map nodes, the
-        // txgraph, and each tx's recursive allocation). An empty pool is 0
-        // on both sides. A single 110-vbyte spend is 1176 there and
-        // `total_bytes * 2` here; that allocator estimate is not reproduced.
-        usage: state.mempool.total_bytes() * 2,
+        // Core `CTxMemPool::DynamicMemoryUsage` (map nodes, txgraph, cachedInnerUsage).
+        usage: state.mempool.dynamic_memory_usage(),
         total_fee: BtcAmount::from_sats(total_fee_sats),
         maxmempool: 300 * 1_000_000,
         mempoolminfee: BtcAmount::from_sats(mempool_min_kvb),
