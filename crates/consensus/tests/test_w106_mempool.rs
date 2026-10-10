@@ -1440,22 +1440,103 @@ fn test_extra_descendant_tx_size_limit_constant() {
 // Additional BUG: package path ancestor-fee tracking (P2)
 // ============================================================
 
-/// G_PKG_ANCESTOR_FEE — Package path missing ancestor_fees for correct
-/// CPFP-boost calculation.
-/// BUG (P2): add_transaction_for_package calculates ancestor_fees but uses
-/// the raw fee of each ancestor entry (entry.fee), not GetModifiedFee()
-/// (fee + fee_delta). While this mirrors the bug in the normal path (G28),
-/// it also means the package fee-rate check at line ~4103 uses the raw
-/// package_fee not the modified-fee package fee, which is the correct
-/// quantity for Core's MemPoolAccept::ConsiderPackage feerate check.
-/// In practice the difference only matters when prioritisetransaction
-/// is used in a package context; negligible without that RPC.
-/// Status: BUG (P3)
+/// Package CheckFeeRate uses the sum of modified fees (base + prioritisetransaction
+/// delta), matching Core `m_total_modified_fees` (validation.cpp:1503-1512).
+/// A 1-sat delta on a parent whose package is one sat under `GetFee` must admit
+/// the package. A -1 delta on a package that otherwise meets the floor must
+/// reject with `min relay fee not met, {modified} < {required}`.
 #[test]
-#[ignore = "BUG G_PKG_ANCESTOR_FEE P3: package acceptance uses raw fee not GetModifiedFee \
-            for package feerate check (no practical impact without prioritisetransaction RPC)"]
 fn test_package_fee_uses_modified_fee() {
-    assert!(false, "not implemented");
+    fn relay_required(vsize: usize) -> u64 {
+        (100u64 * vsize as u64 + 999) / 1000
+    }
+
+    let prev = hash_from_u8(0x71);
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: prev, vout: 0 }, coin(1_000_000))]
+            .into_iter()
+            .collect();
+    let lookup = |op: &OutPoint| utxos.get(op).cloned();
+    let parent = simple_tx(prev, 1_000_000, 1, 0xffff_ffff);
+    let parent_value = parent.outputs[0].value;
+    let parent_req = relay_required(parent.vsize());
+    let child_vsize = simple_tx(parent.txid(), parent_value, 1, 0xffff_ffff).vsize();
+    let pkg_vsize = parent.vsize() + child_vsize;
+    let pkg_req = relay_required(pkg_vsize);
+    // Parent fee 1 plus a 1-sat delta stays under the parent's own floor, so
+    // the parent is not individually valid. The child pays the rest.
+    assert!(
+        2 < parent_req,
+        "parent modified fee 2 must stay under {parent_req}"
+    );
+    let opts = AtmpOptions {
+        require_standard: false,
+        skip_script_checks: true,
+        ..AtmpOptions::default()
+    };
+
+    let child_fee = pkg_req - 2;
+    assert!(child_fee > 0 && child_fee < parent_value);
+    let child = simple_tx(parent.txid(), parent_value, child_fee, 0xffff_ffff);
+    assert_eq!(child.vsize(), child_vsize);
+    let mut mp = test_mempool();
+    mp.prioritise_transaction(&parent.txid(), 1);
+    let accepted =
+        mp.accept_package_with_options(vec![parent.clone(), child.clone()], &lookup, opts.clone());
+    assert!(
+        accepted.package_error.is_none(),
+        "positive delta must admit a package one sat under the base-fee floor: {accepted:?}"
+    );
+    assert!(
+        accepted.tx_results.iter().all(|r| r.error.is_none()),
+        "{:?}",
+        accepted.tx_results
+    );
+    assert!(mp.contains(&parent.txid()));
+    assert!(mp.contains(&child.txid()));
+    // A delta recorded before admission is part of nModFeesWithAncestors /
+    // nModFeesWithDescendants (txmempool.cpp ApplyDelta inside addUnchecked).
+    let parent_entry = mp.get(&parent.txid()).unwrap();
+    let child_entry = mp.get(&child.txid()).unwrap();
+    let parent_modified = parent_entry.fee + 1;
+    assert_eq!(parent_entry.fee_delta, 1);
+    assert_eq!(
+        parent_entry.ancestor_fees, parent_modified,
+        "parent ancestor fees must include the pre-admission delta"
+    );
+    assert_eq!(
+        parent_entry.descendant_fees,
+        parent_modified + child_fee,
+        "parent descendant fees are the parent's modified fee plus the child"
+    );
+    assert_eq!(
+        child_entry.ancestor_fees,
+        parent_modified + child_fee,
+        "child ancestor fees must include the parent's modified fee"
+    );
+    assert_eq!(child_entry.descendant_fees, child_fee);
+
+    let child_ok_fee = pkg_req - 1;
+    let child_ok = simple_tx(parent.txid(), parent_value, child_ok_fee, 0xffff_ffff);
+    let mut mp = test_mempool();
+    mp.prioritise_transaction(&parent.txid(), -1);
+    let rejected = mp.accept_package_with_options(
+        vec![parent.clone(), child_ok.clone()],
+        &lookup,
+        opts,
+    );
+    assert!(
+        rejected.package_error.is_some(),
+        "negative delta must reject a package whose base fee meets the floor: {rejected:?}"
+    );
+    assert!(!mp.contains(&parent.txid()) && !mp.contains(&child_ok.txid()));
+    let shown = 1i64 + child_ok_fee as i64 - 1;
+    let expect = format!("min relay fee not met, {shown} < {pkg_req}");
+    assert_eq!(
+        rejected.tx_results.last().and_then(|r| r.error.as_deref()),
+        Some(expect.as_str()),
+        "{rejected:?}"
+    );
 }
 
 // ============================================================

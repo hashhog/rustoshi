@@ -1601,6 +1601,50 @@ async fn testmempoolaccept_unspent_dust_parent_is_min_relay() {
     assert_keys(&rows[1], &["txid", "wtxid"], "unfinished child");
 }
 
+/// testmempoolaccept CheckFeeRate compares the modified fee (base + a
+/// prioritisetransaction delta), so reject-details shows that sum. Package
+/// feerates stay off: the parent still fails alone.
+#[tokio::test]
+async fn testmempoolaccept_package_reject_details_use_modified_fee() {
+    async fn details(delta: i64) -> (serde_json::Value, u64) {
+        let f = funded(1, 1).await;
+        let parent_req = relay_fee(f.parent.vsize());
+        assert!(2 < parent_req, "parent must fail even with a +1 delta");
+        result(
+            call(
+                &f.state,
+                "prioritisetransaction",
+                serde_json::json!([f.parent.txid().to_hex(), 0, delta]),
+            )
+            .await,
+        );
+        let res = result(
+            call(
+                &f.state,
+                "testmempoolaccept",
+                serde_json::json!([[hex_tx(&f.parent), hex_tx(&f.child)]]),
+            )
+            .await,
+        );
+        let rows = res.as_array().unwrap();
+        assert_eq!(rows[0]["reject-reason"], "min relay fee not met", "{rows:?}");
+        (rows[0]["reject-details"].clone(), parent_req)
+    }
+
+    let (positive, parent_req) = details(1).await;
+    assert_eq!(
+        positive,
+        format!("min relay fee not met, 2 < {parent_req}"),
+        "positive delta"
+    );
+    let (negative, parent_req) = details(-1).await;
+    assert_eq!(
+        negative,
+        format!("min relay fee not met, 0 < {parent_req}"),
+        "negative delta"
+    );
+}
+
 /// Fill a 63-tx cluster, then a 2-tx child-with-parent that would make it 65.
 async fn cluster_of_63() -> (Arc<RwLock<RpcState>>, Transaction, Transaction) {
     let (state, _) = server();
@@ -1825,9 +1869,10 @@ async fn sendrawtransaction_dust_returns_tostring_and_code() {
     assert_eq!(message, DUST_FEE_MSG, "{resp}");
 }
 
-/// `sendtoaddress` broadcasts through `broadcast_signed_tx`. A 1-sat output
-/// is dust with a nonzero wallet fee, so the RPC must return the same -26
-/// and PreCheckEphemeralTx string as `sendrawtransaction`.
+/// Core CreateTransaction rejects a dust recipient before broadcast.
+/// `sendtoaddress` maps that to -6; `send` maps it to -4. Both use the
+/// original string. Amount 0 is dust for a P2WPKH destination. An amount
+/// the wallet cannot cover is "Insufficient funds" at the same code.
 #[tokio::test]
 async fn sendtoaddress_dust_matches_sendraw_reject() {
     use crate::wallet::{WalletRpcImpl, WalletRpcServer, WalletRpcState};
@@ -1883,19 +1928,153 @@ async fn sendtoaddress_dust_matches_sendraw_reject() {
     let mut wallet_state = WalletRpcState::new(manager, dir.keep());
     wallet_state.node = Some(state);
     let rpc = WalletRpcImpl::new(Arc::new(RwLock::new(wallet_state)));
+    let addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string();
     let err = rpc
-        .send_to_address(
-            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
-            0.00000001,
+        .send_to_address(addr.clone(), serde_json::json!("0.00000001"), None, None, None, None, None, None)
+        .await
+        .expect_err("dust sendtoaddress must be rejected");
+    assert_eq!(err.code(), -6, "{err:?}");
+    assert_eq!(err.message(), "Transaction amount too small", "{err:?}");
+
+    let zero = rpc
+        .send_to_address(addr.clone(), serde_json::json!("0"), None, None, None, None, None, None)
+        .await
+        .expect_err("zero sendtoaddress must be rejected");
+    assert_eq!(zero.code(), -6, "{zero:?}");
+    assert_eq!(zero.message(), "Transaction amount too small", "{zero:?}");
+
+    let negative = rpc
+        .send_to_address(addr.clone(), serde_json::json!("-0.00000001"), None, None, None, None, None, None)
+        .await
+        .expect_err("negative sendtoaddress must be rejected");
+    assert_eq!(negative.code(), -3, "{negative:?}");
+    assert_eq!(negative.message(), "Amount out of range", "{negative:?}");
+
+    // 293 sat is still under the P2WPKH dust threshold (294). 294 is not dust.
+    let below = rpc
+        .send_to_address(addr.clone(), serde_json::json!(0.00000293), None, None, None, None, None, None)
+        .await
+        .expect_err("293 sat is dust");
+    assert_eq!(below.code(), -6, "{below:?}");
+    assert_eq!(below.message(), "Transaction amount too small", "{below:?}");
+
+    // The only coin is 100_000 sats. Spending all of it cannot also pay the
+    // no-input fee (42 vB at the wallet feerate). Do this before the 294-sat
+    // send, which spends the coin.
+    let exact = rpc
+        .send_to_address(addr.clone(), serde_json::json!(0.001), None, None, None, None, None, None)
+        .await
+        .expect_err("exact balance sendtoaddress");
+    assert_eq!(exact.code(), -6, "{exact:?}");
+    assert_eq!(
+        exact.message(),
+        "The total exceeds your balance when the 0.0000021 transaction fee is included.",
+        "{exact:?}"
+    );
+    let output = |amount: serde_json::Value| {
+        vec![serde_json::json!({ &addr: amount })]
+    };
+    let exact_send = rpc
+        .wallet_send(
+            output(serde_json::json!(0.001)),
             None,
             None,
-            None,
-            None,
-            None,
+            Some(serde_json::json!(1)),
             None,
         )
         .await
-        .expect_err("dust sendtoaddress must be rejected");
-    assert_eq!(err.code(), -26, "{err:?}");
-    assert_eq!(err.message(), DUST_FEE_MSG, "{err:?}");
+        .expect_err("exact balance send");
+    assert_eq!(exact_send.code(), -4, "{exact_send:?}");
+    assert_eq!(
+        exact_send.message(),
+        "The total exceeds your balance when the 0.00000042 transaction fee is included.",
+        "{exact_send:?}"
+    );
+
+    rpc.send_to_address(addr.clone(), serde_json::json!(0.00000294), None, None, None, None, None, None)
+        .await
+        .expect("294 sat is the P2WPKH dust threshold and must be created");
+
+    let dust_send = rpc
+        .wallet_send(
+            output(serde_json::json!(0.00000001)),
+            None,
+            None,
+            Some(serde_json::json!(1)),
+            None,
+        )
+        .await
+        .expect_err("dust send must be rejected");
+    assert_eq!(dust_send.code(), -4, "{dust_send:?}");
+    assert_eq!(dust_send.message(), "Transaction amount too small", "{dust_send:?}");
+
+    let zero_send = rpc
+        .wallet_send(
+            output(serde_json::json!(0)),
+            None,
+            None,
+            Some(serde_json::json!(1)),
+            None,
+        )
+        .await
+        .expect_err("zero send must be rejected");
+    assert_eq!(zero_send.code(), -4, "{zero_send:?}");
+    assert_eq!(zero_send.message(), "Transaction amount too small", "{zero_send:?}");
+
+    let neg_send = rpc
+        .wallet_send(
+            output(serde_json::json!(-0.00000001)),
+            None,
+            None,
+            Some(serde_json::json!(1)),
+            None,
+        )
+        .await
+        .expect_err("negative send must be rejected");
+    assert_eq!(neg_send.code(), -3, "{neg_send:?}");
+    assert_eq!(neg_send.message(), "Amount out of range", "{neg_send:?}");
+}
+
+/// An empty wallet cannot pay a non-dust amount. sendtoaddress is -6 and
+/// send is -4, both with Core's "Insufficient funds" and no have/need suffix.
+#[tokio::test]
+async fn wallet_insufficient_funds_matches_core_message() {
+    use crate::wallet::{WalletRpcImpl, WalletRpcServer, WalletRpcState};
+    use rustoshi_crypto::address::Network;
+    use rustoshi_wallet::{CreateWalletOptions, WalletManager};
+
+    let (state, _server) = server();
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = WalletManager::new(dir.path(), Network::Regtest).unwrap();
+    manager
+        .create_wallet("empty", CreateWalletOptions::default())
+        .unwrap();
+    {
+        let mut st = state.write().await;
+        st.mempool.notify_new_tip(200, 1_700_000_000);
+    }
+    let mut wallet_state = WalletRpcState::new(manager, dir.keep());
+    wallet_state.node = Some(state);
+    let rpc = WalletRpcImpl::new(Arc::new(RwLock::new(wallet_state)));
+    let addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string();
+
+    let sendto = rpc
+        .send_to_address(addr.clone(), serde_json::json!(1.0), None, None, None, None, None, None)
+        .await
+        .expect_err("empty wallet sendtoaddress");
+    assert_eq!(sendto.code(), -6, "{sendto:?}");
+    assert_eq!(sendto.message(), "Insufficient funds", "{sendto:?}");
+
+    let send = rpc
+        .wallet_send(
+            vec![serde_json::json!({ &addr: 1.0 })],
+            None,
+            None,
+            Some(serde_json::json!(1)),
+            None,
+        )
+        .await
+        .expect_err("empty wallet send");
+    assert_eq!(send.code(), -4, "{send:?}");
+    assert_eq!(send.message(), "Insufficient funds", "{send:?}");
 }
