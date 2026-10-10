@@ -12862,7 +12862,11 @@ impl RustoshiRpcServer for RpcServerImpl {
         } else if result.all_accepted() {
             "success".to_string()
         } else {
-            "partial failure".to_string()
+            // Core PCKG_TX with an empty debug string is "transaction failed".
+            // accept_package sets package_error on every failed package, so
+            // this arm is only a fallback if a result has a tx error and no
+            // package_error.
+            "transaction failed".to_string()
         };
 
         // Broadcast every package tx that is actually in the mempool. Core
@@ -14513,6 +14517,19 @@ impl RustoshiRpcServer for RpcServerImpl {
                         Some(format!("mempool min fee not met, {fee} < {required}")),
                     )
                 }
+                MempoolError::EphemeralDustNonZeroFee => (
+                    "dust".to_string(),
+                    Some("dust, tx with dust output must be 0-fee".to_string()),
+                ),
+                MempoolError::EphemeralDustNotFullySpent(_, _)
+                | MempoolError::EphemeralDustUnspent(_) => {
+                    let detail = format!(
+                        "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                        tx.txid(),
+                        tx.wtxid()
+                    );
+                    ("missing-ephemeral-spends".to_string(), Some(detail))
+                }
                 other => (other.reject_token(), Some(other.reject_debug())),
             };
             let mut obj = serde_json::json!({
@@ -14571,17 +14588,44 @@ impl RustoshiRpcServer for RpcServerImpl {
                     .err()
             };
             if let Some(err) = err {
-                let mut results = Vec::with_capacity(txs.len());
-                for prior in txs.iter().take(i) {
-                    results.push(blank(prior));
+                // AcceptMultipleTransactions runs every PreChecks before
+                // CheckMemPoolPolicyLimits. A per-tx cluster error is not the
+                // multi-tx result: that result is package-error with no
+                // `allowed`. A later non-cluster PreChecks failure still
+                // returns early, the way Core does before the cluster gate.
+                let cluster_limit = txs.len() > 1
+                    && matches!(
+                        err,
+                        MempoolError::ClusterSizeLimitExceeded(_, _)
+                            | MempoolError::ClusterWeightLimitExceeded(_, _)
+                    );
+                if !cluster_limit {
+                    let mut results = Vec::with_capacity(txs.len());
+                    for prior in txs.iter().take(i) {
+                        results.push(blank(prior));
+                    }
+                    results.push(rejection(tx, &err, fee, vsize));
+                    for later in txs.iter().skip(i + 1) {
+                        results.push(blank(later));
+                    }
+                    return Ok(serde_json::json!(results));
                 }
-                results.push(rejection(tx, &err, fee, vsize));
-                for later in txs.iter().skip(i + 1) {
-                    results.push(blank(later));
-                }
-                return Ok(serde_json::json!(results));
             }
             remember(&mut temp, tx);
+        }
+
+        if txs.len() > 1 && state.mempool.package_exceeds_cluster_limits(&txs) {
+            let results: Vec<serde_json::Value> = txs
+                .iter()
+                .map(|tx| {
+                    serde_json::json!({
+                        "txid": tx.txid().to_hex(),
+                        "wtxid": tx.wtxid().to_hex(),
+                        "package-error": "too-large-cluster",
+                    })
+                })
+                .collect();
+            return Ok(serde_json::json!(results));
         }
 
         temp.clear();
