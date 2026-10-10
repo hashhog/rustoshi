@@ -1371,6 +1371,19 @@ impl MempoolError {
             .unwrap_or(reason)
             .to_string()
     }
+
+    /// Core `TxValidationState::ToString`. `testmempoolaccept` stores this in
+    /// `reject-details`, and `sendrawtransaction` uses it as the RPC message.
+    /// A debug string is appended only when Core's check site sets one.
+    pub fn reject_debug(&self) -> String {
+        match self {
+            // tx_verify.cpp CheckTxInputs: "tried to spend coinbase at depth %d"
+            MempoolError::CoinbaseNotMature { age, .. } => format!(
+                "bad-txns-premature-spend-of-coinbase, tried to spend coinbase at depth {age}"
+            ),
+            other => other.reject_token(),
+        }
+    }
 }
 
 // ============================================================
@@ -1565,6 +1578,10 @@ pub struct Mempool {
     /// BIP68 coin-time lookup (see [`MempoolSeqLockCtx`]); set by the node
     /// from its header store.
     coin_mtp_provider: Option<CoinMtpProvider>,
+    /// Txids accepted by `sendrawtransaction` that have not been announced.
+    /// Core `CTxMemPool::m_unbroadcast_txids`. With no peers the set stays
+    /// populated, so `getrawmempool` reports `unbroadcast: true`.
+    unbroadcast: HashSet<Hash256>,
 }
 
 impl Mempool {
@@ -1645,7 +1662,21 @@ impl Mempool {
             next_sequence: 1,
             map_deltas: HashMap::new(),
             coin_mtp_provider: None,
+            unbroadcast: HashSet::new(),
         }
+    }
+
+    /// Record a tx accepted via `sendrawtransaction` as not yet announced.
+    pub fn add_unbroadcast(&mut self, txid: Hash256) {
+        self.unbroadcast.insert(txid);
+    }
+
+    pub fn is_unbroadcast(&self, txid: &Hash256) -> bool {
+        self.unbroadcast.contains(txid)
+    }
+
+    pub fn unbroadcast_count(&self) -> usize {
+        self.unbroadcast.len()
     }
 
     /// Allocate the next admission sequence number and advance the counter.
@@ -2607,6 +2638,7 @@ impl Mempool {
         // Remove from cluster structure first (before removing from transactions)
         self.remove_from_clusters(txid);
 
+        self.unbroadcast.remove(txid);
         if let Some(entry) = self.transactions.remove(txid) {
             // W96: keep the wtxid → txid index in sync with `transactions`.
             self.wtxid_index.remove(&entry.tx.wtxid());

@@ -227,7 +227,7 @@ pub(crate) fn rpc_mempool_entry(
         spentby: mempool.mempool_spent_by(&entry.txid),
         // BIP125 opt-in (self or unconfirmed ancestor). Not full-RBF.
         bip125_replaceable: mempool.is_bip125_replaceable(&entry.txid),
-        unbroadcast: false,
+        unbroadcast: mempool.is_unbroadcast(&entry.txid),
     }
 }
 
@@ -250,13 +250,17 @@ pub(crate) fn mempool_info(state: &RpcState) -> MempoolInfo {
         loaded: true,
         size: state.mempool.size(),
         bytes: state.mempool.total_bytes(),
+        // Core's `usage` is CTxMemPool::DynamicMemoryUsage (map nodes, the
+        // txgraph, and each tx's recursive allocation). An empty pool is 0
+        // on both sides. A single 110-vbyte spend is 1176 there and
+        // `total_bytes * 2` here; that allocator estimate is not reproduced.
         usage: state.mempool.total_bytes() * 2,
         total_fee: BtcAmount::from_sats(total_fee_sats),
         maxmempool: 300 * 1_000_000,
         mempoolminfee: BtcAmount::from_sats(mempool_min_kvb),
         minrelaytxfee: BtcAmount::from_sats(min_relay_kvb),
         incrementalrelayfee: BtcAmount::from_sats(incremental_kvb),
-        unbroadcastcount: 0,
+        unbroadcastcount: state.mempool.unbroadcast_count(),
         fullrbf: true,
         permitbaremultisig: true,
         maxdatacarriersize: 100_000,
@@ -5937,6 +5941,25 @@ pub fn try_attach_and_reorg_detailed(
                         failure.error
                     )));
                 }
+                // ConnectTip writes undo before a later block in the same step
+                // fails. Core's rev*.dat high-water mark keeps those bytes, so
+                // size_on_disk still counts them after the tip rolls back.
+                for (hash, _height, undo) in &failure.connected {
+                    let storage_undo = validation_undo_to_storage(undo);
+                    if let Err(err) = store.put_undo(hash, &storage_undo) {
+                        tracing::error!("failed reorg: undo for {} not stored: {}", hash, err);
+                        continue;
+                    }
+                    if let Ok(Some(mut entry)) = store.get_block_index(hash) {
+                        entry.status.set(BlockStatus::HAVE_UNDO);
+                        if let Err(err) = store.put_block_index(hash, &entry) {
+                            tracing::error!(
+                                "failed reorg: HAVE_UNDO on {} not stored: {}",
+                                hash, err
+                            );
+                        }
+                    }
+                }
                 let reason = format!(
                     "{}{}",
                     REORG_CONSENSUS_REJECT_SENTINEL,
@@ -9209,6 +9232,8 @@ impl RustoshiRpcServer for RpcServerImpl {
 
                 // Track for fee estimation
                 state.fee_estimator.track_transaction(txid, fee_rate);
+                // Core AddUnbroadcastTx: no peers, so the tx stays unbroadcast.
+                state.mempool.add_unbroadcast(txid);
 
                 // Drop the state lock before broadcasting
                 drop(state);
@@ -9256,7 +9281,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     // accept/reject decision is unchanged — only the string.
                     other => Err(Self::rpc_error(
                         rpc_error::RPC_TRANSACTION_REJECTED,
-                        other.reject_token(),
+                        other.reject_debug(),
                     )),
                 }
             }
@@ -14403,34 +14428,43 @@ impl RustoshiRpcServer for RpcServerImpl {
                     } else {
                         // Serialize fee as BTC with 8 decimal places, matching
                         // Core's ValueFromAmount format ("0.00001000" etc.).
-                        let base_fee_str = {
-                            let whole = fee_sats / 100_000_000;
-                            let frac  = fee_sats % 100_000_000;
-                            format!("{}.{:08}", whole, frac)
+                        let fee_num = |sats: u64| -> serde_json::Value {
+                            let text = format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000);
+                            serde_json::from_str(&text).unwrap_or(serde_json::json!(0))
                         };
-                        let base_fee_num: serde_json::Value =
-                            serde_json::from_str(&base_fee_str).unwrap_or(serde_json::json!(0));
+                        // Core CFeeRate(fee, vsize).GetFeePerK(): integer sat/kvB.
+                        let effective = if vsize > 0 {
+                            fee_sats.saturating_mul(1000) / vsize as u64
+                        } else {
+                            0
+                        };
                         results.push(serde_json::json!({
                             "txid": txid.to_hex(),
                             "wtxid": wtxid.to_hex(),
                             "allowed": true,
                             "vsize": vsize,
                             "fees": {
-                                "base": base_fee_num
+                                "base": fee_num(fee_sats),
+                                "effective-feerate": fee_num(effective),
+                                "effective-includes": [wtxid.to_hex()]
                             }
                         }));
                     }
                 }
                 Err(e) => {
-                    results.push(serde_json::json!({
+                    let mut result = serde_json::json!({
                         "txid": txid.to_hex(),
                         "wtxid": wtxid.to_hex(),
                         "allowed": false,
-                        // Emit Bitcoin Core's bare canonical reject token
-                        // (rpc/mempool.cpp surfaces state.GetRejectReason()),
-                        // not the Rust Display string.
+                        // Bare token. TX_MISSING_INPUTS is remapped and has no
+                        // reject-details; every other rejection also carries
+                        // state.ToString() (reason, plus the debug message).
                         "reject-reason": e.reject_token()
-                    }));
+                    });
+                    if e.reject_token() != "missing-inputs" {
+                        result["reject-details"] = serde_json::Value::String(e.reject_debug());
+                    }
+                    results.push(result);
                 }
             }
         }

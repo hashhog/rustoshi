@@ -308,11 +308,20 @@ where
 pub struct ReorgFailure {
     pub error: ValidationError,
     pub failed_block: Option<Hash256>,
+    /// Blocks this attempt connected before `failed_block` rejected.
+    /// Core's `ConnectTip` writes their undo before a later block in the
+    /// same `ActivateBestChainStep` fails; the rev file keeps those bytes
+    /// even though the tip is rolled back.
+    pub connected: Vec<(Hash256, u32, UndoData)>,
 }
 
 impl From<ValidationError> for ReorgFailure {
     fn from(error: ValidationError) -> Self {
-        ReorgFailure { error, failed_block: None }
+        ReorgFailure {
+            error,
+            failed_block: None,
+            connected: Vec::new(),
+        }
     }
 }
 
@@ -936,10 +945,16 @@ impl ChainState {
                 )?;
                 Ok(undo)
             })();
-            let undo = step.map_err(|error| ReorgFailure {
-                failed_block: error.is_invalid_block_verdict().then_some(*hash),
-                error,
-            })?;
+            let undo = match step {
+                Ok(undo) => undo,
+                Err(error) => {
+                    return Err(ReorgFailure {
+                        failed_block: error.is_invalid_block_verdict().then_some(*hash),
+                        error,
+                        connected,
+                    });
+                }
+            };
             self.tip_hash = *hash;
             self.tip_height = new_height;
             connected.push((*hash, new_height, undo));
