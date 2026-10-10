@@ -176,6 +176,11 @@ struct Cli {
     #[arg(long = "nofixedseeds", default_value = "false")]
     nofixedseeds: bool,
 
+    /// Relay and mine non-standard transactions (Bitcoin Core `-acceptnonstdtxn`).
+    /// Rejected on mainnet. Default off, so standardness stays required.
+    #[arg(long = "acceptnonstdtxn", default_value = "false")]
+    acceptnonstdtxn: bool,
+
     /// Specify your own public address `<ip>[:port]` to advertise to peers
     /// (Bitcoin Core `-externalip`; repeatable and/or comma-separated). A
     /// bare IP uses the P2P listen port. Implies `--discover=false` unless
@@ -3983,6 +3988,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // reads these startup flags instead. `--blockfilterindex` accepts
     // 0/false/off/no/"" => off, anything else (1/true/basic) => on, matching the
     // canonical parse below (`blockfilterindex_enabled`).
+    if cli.acceptnonstdtxn {
+        if params.network_id == NetworkId::Mainnet {
+            anyhow::bail!("acceptnonstdtxn is not currently supported for main chain");
+        }
+        rpc_state_inner.mempool.set_require_standard(false);
+    }
     rpc_state_inner.txindex_enabled = cli.txindex;
     rpc_state_inner.blockfilterindex_enabled =
         !matches!(cli.blockfilterindex.to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no");

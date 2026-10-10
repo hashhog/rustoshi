@@ -180,12 +180,9 @@ fn make_op_return_spk(n: usize) -> Vec<u8> {
 /// `GetSerializeSize(txout)` for our test outputs:
 ///   `8 (value) + 1 (script_len varint, since all our scripts ≤ 252 bytes) + script_len`
 fn core_dust_threshold(value_sat: u64, spk: &[u8], dust_relay_fee: u64) -> u64 {
-    // P2A and OP_RETURN are unspendable / anchor — Core returns 0.
+    // OP_RETURN is unspendable — Core `IsUnspendable()` returns 0.
+    // P2A is spendable; it uses the witness-program spending cost.
     if !spk.is_empty() && spk[0] == 0x6a {
-        return 0;
-    }
-    // P2A: `OP_1 0x02 0x4e 0x73`
-    if spk == [0x51u8, 0x02, 0x4e, 0x73] {
         return 0;
     }
     let _ = value_sat;
@@ -330,6 +327,7 @@ fn w135_g8_bug1_dust_threshold_formula() {
         ("p2wpkh", make_p2wpkh_spk(), 294),  // (8+1+22=31) +  67 =  98 → 294
         ("p2wsh", make_p2wsh_spk(), 330),    // (8+1+34=43) +  67 = 110 → 330
         ("p2tr", make_p2tr_spk(), 330),      // (8+1+34=43) +  67 = 110 → 330
+        ("p2a", make_p2a_spk(), 240),        // (8+1+4=13) +   67 =  80 → 240
     ] {
         let core = core_dust_threshold(1, &spk, dust_fee);
         assert_eq!(core, expected, "{name}: reference helper");
