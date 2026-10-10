@@ -1044,11 +1044,13 @@ def main() -> int:
     )
     run_solo("maxfeerate", hot["hex"], hot["txid"], "0.00001000")
 
-    def run_policy(name: str, hexes: list[str]):
+    def run_policy(name: str, hexes: list[str], allow_admit: bool = False):
         """submitpackage and testmempoolaccept, including JSON-RPC errors.
 
         Topology and the 1..=25 size gate are RPC errors (code + message).
-        IsWellFormedPackage failures are results. Neither path should admit a tx.
+        IsWellFormedPackage failures are results. `allow_admit` is for a
+        package whose individually valid parents stay in the mempool on both
+        nodes (too-large-cluster: the parent fits, the child does not).
         """
         log(f"=== {name} ===")
         before_c = mempool_txids(core)
@@ -1065,7 +1067,17 @@ def main() -> int:
         mismatches.extend(compare_outcome(c_res, r_res, "submitpackage"))
         after_c = mempool_txids(core)
         after_r = mempool_txids(rust)
-        if after_c != before_c or after_r != before_r or after_c != after_r:
+        if allow_admit:
+            if after_c != after_r:
+                mismatches.append(
+                    {
+                        "field": "getrawmempool",
+                        "core": after_c,
+                        "rustoshi": after_r,
+                        "justified": None,
+                    }
+                )
+        elif after_c != before_c or after_r != before_r or after_c != after_r:
             mismatches.append(
                 {
                     "field": "mempool_changed",
@@ -1156,6 +1168,187 @@ def main() -> int:
     run_policy(
         "duplicate-parents",
         [tree_parent.hex(), tree_parent.hex(), tree_child.hex()],
+    )
+
+    # KB-104: 60-byte empty scriptPubKey. IsStandardTx returns scriptpubkey
+    # before the 65-byte floor. A 61-byte OP_RETURN is standard and hits
+    # tx-size-small.
+    empty_spk = (1).to_bytes(4, "little")
+    empty_spk += bytes([1]) + bytes(32) + (0).to_bytes(4, "little")
+    empty_spk += bytes([0]) + (0xFFFFFFFF).to_bytes(4, "little")
+    empty_spk += bytes([1]) + (1).to_bytes(8, "little") + bytes([0])
+    empty_spk += (0).to_bytes(4, "little")
+    if len(empty_spk) != 60:
+        die(f"60-byte fixture is {len(empty_spk)} bytes")
+    core.rpc("decoderawtransaction", [empty_spk.hex()])
+    run_policy("empty-scriptpubkey-60", [empty_spk.hex()])
+
+    op_ret = (1).to_bytes(4, "little")
+    op_ret += bytes([1]) + bytes(32) + (0).to_bytes(4, "little")
+    op_ret += bytes([0]) + (0xFFFFFFFF).to_bytes(4, "little")
+    op_ret += bytes([1]) + (0).to_bytes(8, "little") + bytes([1, 0x6A])
+    op_ret += (0).to_bytes(4, "little")
+    if len(op_ret) >= 65:
+        die(f"OP_RETURN fixture is {len(op_ret)} bytes")
+    run_policy("op-return-tx-size-small", [op_ret.hex()])
+
+    def spendable_coin():
+        coins = core.cli_json("-rpcwallet=sweep", "listunspent", "100", "9999999")
+        for coin in coins:
+            if core.rpc("gettxout", [coin["txid"], int(coin["vout"])]) is not None:
+                return coin
+        die("no confirmed spendable coin left for dust/cluster cases")
+
+    def sign_raw(raw: str, prevs: list[dict]) -> dict:
+        encoded_prevs = []
+        for prev in prevs:
+            item = dict(prev)
+            amount = item.get("amount")
+            if isinstance(amount, Decimal):
+                item["amount"] = f"{amount:.8f}"
+            encoded_prevs.append(item)
+        signed = core.cli_json(
+            "-rpcwallet=sweep",
+            "signrawtransactionwithwallet",
+            raw,
+            json.dumps(encoded_prevs),
+        )
+        if not signed.get("complete"):
+            die(f"signrawtransactionwithwallet incomplete: {signed}")
+        decoded = core.cli_json("decoderawtransaction", signed["hex"])
+        return {"hex": signed["hex"], "decoded": decoded}
+
+    dust_addr = core.cli_json("-rpcwallet=sweep", "getnewaddress", "", "bech32")
+    coin = spendable_coin()
+    coin_sats = sats_of(coin["amount"])
+    coin_spk = core.cli_json(
+        "-rpcwallet=sweep", "getaddressinfo", coin["address"]
+    )["scriptPubKey"]
+    # One 1-sat output (dust) and a change output. Fee is nonzero, so Core
+    # PreCheckEphemeralTx rejects the parent before the child is finished.
+    change = coin_sats - 1 - 5_000
+    parent_raw = core.cli(
+        "createrawtransaction",
+        json.dumps([{"txid": coin["txid"], "vout": int(coin["vout"])}]),
+        json.dumps({dest: btc(change), dust_addr: btc(1)}),
+    )
+    dust_parent = sign_raw(
+        parent_raw,
+        [
+            {
+                "txid": coin["txid"],
+                "vout": int(coin["vout"]),
+                "scriptPubKey": coin_spk,
+                "amount": btc(coin_sats),
+            }
+        ],
+    )
+    parent_dec = dust_parent["decoded"]
+    prevs = []
+    for vout in parent_dec["vout"]:
+        prevs.append(
+            {
+                "txid": parent_dec["txid"],
+                "vout": vout["n"],
+                "scriptPubKey": vout["scriptPubKey"]["hex"],
+                "amount": vout["value"],
+            }
+        )
+    child_out = change + 1 - 5_000
+    child_raw = core.cli(
+        "createrawtransaction",
+        json.dumps(
+            [
+                {"txid": parent_dec["txid"], "vout": v["n"]}
+                for v in parent_dec["vout"]
+            ]
+        ),
+        json.dumps({dest: btc(child_out)}),
+    )
+    dust_child = sign_raw(child_raw, prevs)
+    run_policy(
+        "ephemeral-dust-nonzero-fee",
+        [dust_parent["hex"], dust_child["hex"]],
+    )
+
+    # 0-fee dust parent; child spends only the non-dust output.
+    # submitpackage package_msg is unspent-dust. testmempoolaccept stops at
+    # the parent's min-relay failure and leaves the child unfinished.
+    zero_change = coin_sats - 1
+    zero_raw = core.cli(
+        "createrawtransaction",
+        json.dumps([{"txid": coin["txid"], "vout": int(coin["vout"])}]),
+        json.dumps({dest: btc(zero_change), dust_addr: btc(1)}),
+    )
+    zero_parent = sign_raw(
+        zero_raw,
+        [
+            {
+                "txid": coin["txid"],
+                "vout": int(coin["vout"]),
+                "scriptPubKey": coin_spk,
+                "amount": btc(coin_sats),
+            }
+        ],
+    )
+    zero_dec = zero_parent["decoded"]
+    change_vout = next(v for v in zero_dec["vout"] if sats_of(v["value"]) != 1)
+    sweep_raw = core.cli(
+        "createrawtransaction",
+        json.dumps([{"txid": zero_dec["txid"], "vout": change_vout["n"]}]),
+        json.dumps({dest: btc(sats_of(change_vout["value"]) - 5_000)}),
+    )
+    sweep_child = sign_raw(
+        sweep_raw,
+        [
+            {
+                "txid": zero_dec["txid"],
+                "vout": change_vout["n"],
+                "scriptPubKey": change_vout["scriptPubKey"]["hex"],
+                "amount": change_vout["value"],
+            }
+        ],
+    )
+    run_policy(
+        "ephemeral-unspent-dust",
+        [zero_parent["hex"], sweep_child["hex"]],
+    )
+
+    # KB-107: 63-tx cluster, then a 2-tx package. testmempoolaccept is
+    # package-error too-large-cluster with no allowed. submitpackage admits
+    # the parent (cluster 64) and rejects the child.
+    cluster_coin = spendable_coin()
+    prev_txid = cluster_coin["txid"]
+    prev_vout = int(cluster_coin["vout"])
+    prev_sats = sats_of(cluster_coin["amount"])
+    prev_spk = core.cli_json(
+        "-rpcwallet=sweep", "getaddressinfo", cluster_coin["address"]
+    )["scriptPubKey"]
+    for i in range(63):
+        step = make_signed(
+            core, prev_txid, prev_vout, prev_sats, prev_spk, 10_000, dest
+        )
+        admit_both(f"cluster-fill-{i}", step["hex"])
+        prev_txid = step["txid"]
+        prev_vout = 0
+        prev_sats = step["out_sats"]
+        prev_spk = step["spk"]
+    cluster_parent = make_signed(
+        core, prev_txid, prev_vout, prev_sats, prev_spk, 10_000, dest
+    )
+    cluster_child = make_signed(
+        core,
+        cluster_parent["txid"],
+        0,
+        cluster_parent["out_sats"],
+        cluster_parent["spk"],
+        10_000,
+        dest,
+    )
+    run_policy(
+        "too-large-cluster",
+        [cluster_parent["hex"], cluster_child["hex"]],
+        allow_admit=True,
     )
 
     # invalidateblock / reconsiderblock of the current tip.
