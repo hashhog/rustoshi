@@ -227,7 +227,7 @@ def wait_rpc(node: Node, seconds: int = 60) -> None:
     die(f"{node.name} RPC did not come up: {last}")
 
 
-def start_core(datadir: Path) -> None:
+def start_core(datadir: Path, *extra: str) -> None:
     datadir.mkdir(parents=True, exist_ok=True)
     cmd = [
         BITCOIND,
@@ -240,6 +240,10 @@ def start_core(datadir: Path) -> None:
         f"-rpcport={CORE_RPC_PORT}",
         "-rpcbind=127.0.0.1",
         "-rpcallowip=127.0.0.1",
+        # A later restart (acceptnonstdtxn) must not reload the mempool this
+        # process saves on shutdown.
+        "-persistmempool=0",
+        *extra,
         "-daemon",
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -266,7 +270,7 @@ def stop_core(datadir: Path) -> None:
         time.sleep(0.25)
 
 
-def start_rustoshi(datadir: Path, log_path: Path) -> subprocess.Popen:
+def start_rustoshi(datadir: Path, log_path: Path, *extra: str) -> subprocess.Popen:
     datadir.mkdir(parents=True, exist_ok=True)
     log_f = open(log_path, "w")
     cmd = [
@@ -283,6 +287,7 @@ def start_rustoshi(datadir: Path, log_path: Path) -> subprocess.Popen:
         "--nofixedseeds",
         "--port",
         "18447",
+        *extra,
     ]
     proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
     return proc
@@ -473,9 +478,13 @@ def _compact_size(n: int) -> bytes:
     return b"\xff" + n.to_bytes(8, "little")
 
 
-def raw_tx(inputs: list[tuple[bytes, int, bytes]], outputs: list[tuple[int, bytes]]) -> bytes:
+def raw_tx(
+    inputs: list[tuple[bytes, int, bytes]],
+    outputs: list[tuple[int, bytes]],
+    version: int = 2,
+) -> bytes:
     """Non-witness tx. `inputs` are (prevout txid in internal order, vout, scriptSig)."""
-    raw = (2).to_bytes(4, "little")
+    raw = (version & 0xFFFFFFFF).to_bytes(4, "little")
     raw += _compact_size(len(inputs))
     for txid_le, vout, script in inputs:
         raw += txid_le
@@ -1350,6 +1359,502 @@ def main() -> int:
         [cluster_parent["hex"], cluster_child["hex"]],
         allow_admit=True,
     )
+
+    # Seven Core v31.1 paths. testmempoolaccept, sendrawtransaction, and
+    # submitpackage are compared whole. getrawmempool verbose is compared for
+    # the package txids that landed; time / chunkweight / fees.chunk / depends
+    # / spentby / bip125-replaceable are recorded as justified display gaps.
+    spk_bytes = bytes.fromhex(spk)
+    # OP_1 PUSH2 4e73. 0x02 is the push length; 0x20 would be a 32-byte push.
+    p2a_script = bytes.fromhex("51024e73")
+
+    def spendable_coins() -> list[dict]:
+        # minconf 1: outputs of txs just mined out of the mempool are spendable.
+        # Immature coinbases stay hidden. gettxout drops anything still in the mempool.
+        coins = core.cli_json("-rpcwallet=sweep", "listunspent", "1", "9999999")
+        live = []
+        for coin in coins:
+            if core.rpc("gettxout", [coin["txid"], int(coin["vout"])]) is not None:
+                live.append(coin)
+        return live
+
+    def sync_generated(n: int) -> None:
+        """Mine on Core and submit the same blocks to rustoshi so tips stay equal."""
+        hashes = core.cli_json("-rpcwallet=sweep", "generatetoaddress", str(n), dest)
+        if isinstance(hashes, str):
+            hashes = [hashes]
+        for bh in hashes:
+            raw = core.cli_json("getblock", bh, "0")
+            result = rust.rpc("submitblock", [raw])
+            if result not in (None, ""):
+                die(f"submitblock {bh}: {result}")
+        c_hash = core.rpc("getbestblockhash")
+        r_hash = rust.rpc("getbestblockhash")
+        if c_hash != r_hash or core.rpc("getblockcount") != rust.rpc("getblockcount"):
+            die(f"tip diverged after generate: core={c_hash} rustoshi={r_hash}")
+        log(
+            f"advanced to height {core.rpc('getblockcount')} "
+            f"mempool core={len(mempool_txids(core))} rustoshi={len(mempool_txids(rust))}"
+        )
+
+    def coin_prev(coin: dict) -> dict:
+        return {
+            "txid": coin["txid"],
+            "vout": int(coin["vout"]),
+            "scriptPubKey": coin["scriptPubKey"],
+            "amount": btc(sats_of(coin["amount"])),
+        }
+
+    def signed_outputs(coin: dict, outputs: list[tuple[int, bytes]], version: int = 2) -> dict:
+        txid_le = bytes.fromhex(coin["txid"])[::-1]
+        raw = raw_tx(
+            [(txid_le, int(coin["vout"]), b"")],
+            outputs,
+            version=version,
+        ).hex()
+        return sign_raw(raw, [coin_prev(coin)])
+
+    def signed_child(parent: dict, fee_sats: int, version: int = 2, extra_inputs: list[dict] | None = None) -> dict:
+        """Spend every parent output, plus any extra prevouts, paying `dest`."""
+        dec = parent["decoded"]
+        inputs = []
+        prevs = []
+        total = 0
+        for vout in dec["vout"]:
+            inputs.append((bytes.fromhex(dec["txid"])[::-1], vout["n"], b""))
+            prevs.append(
+                {
+                    "txid": dec["txid"],
+                    "vout": vout["n"],
+                    "scriptPubKey": vout["scriptPubKey"]["hex"],
+                    "amount": btc(sats_of(vout["value"])),
+                }
+            )
+            total += sats_of(vout["value"])
+        for extra in extra_inputs or []:
+            inputs.append(
+                (bytes.fromhex(extra["txid"])[::-1], int(extra["vout"]), b"")
+            )
+            prevs.append(
+                {
+                    "txid": extra["txid"],
+                    "vout": int(extra["vout"]),
+                    "scriptPubKey": extra["scriptPubKey"],
+                    "amount": btc(sats_of(extra["amount"])),
+                }
+            )
+            total += sats_of(extra["amount"])
+        out_sats = total - fee_sats
+        if out_sats <= 0:
+            die(f"child fee {fee_sats} exceeds inputs {total}")
+        raw = raw_tx(inputs, [(out_sats, spk_bytes)], version=version).hex()
+        return sign_raw(raw, prevs)
+
+    def strip_verbose_entry(entry: dict) -> dict:
+        kept = {
+            key: entry[key]
+            for key in entry
+            if key
+            not in (
+                "time",
+                "chunkweight",
+                "depends",
+                "spentby",
+                "bip125-replaceable",
+            )
+        }
+        fees = dict(kept.get("fees") or {})
+        fees.pop("chunk", None)
+        kept["fees"] = fees
+        return kept
+
+    def compare_verbose(core_map, rust_map, focus: list[str]) -> list[dict]:
+        mismatches = []
+        if not isinstance(core_map, dict) or not isinstance(rust_map, dict):
+            return [
+                {
+                    "field": "getrawmempool type",
+                    "core": core_map,
+                    "rustoshi": rust_map,
+                    "justified": None,
+                }
+            ]
+        c_ids, r_ids = list(core_map), list(rust_map)
+        if set(c_ids) != set(r_ids):
+            mismatches.append(
+                {
+                    "field": "getrawmempool txids",
+                    "core": sorted(set(c_ids) - set(r_ids)),
+                    "rustoshi": sorted(set(r_ids) - set(c_ids)),
+                    "justified": None,
+                }
+            )
+        if c_ids != r_ids and set(c_ids) == set(r_ids):
+            mismatches.append(
+                {
+                    "field": "getrawmempool key order",
+                    "core": len(c_ids),
+                    "rustoshi": len(r_ids),
+                    "justified": (
+                        "Core MempoolToJSON walks entryAll (rpc/mempool.cpp:579); "
+                        "rustoshi walks get_sorted_for_mining (crates/rpc/src/server.rs:9091)"
+                    ),
+                }
+            )
+        residual = {
+            "time": 0,
+            "chunkweight": 0,
+            "fees.chunk": 0,
+            "depends": 0,
+            "spentby": 0,
+            "bip125-replaceable": 0,
+        }
+        present = [txid for txid in focus if txid in core_map or txid in rust_map]
+        for txid in present:
+            if txid not in core_map or txid not in rust_map:
+                mismatches.append(
+                    {
+                        "field": f"getrawmempool.{txid}",
+                        "core": txid in core_map,
+                        "rustoshi": txid in rust_map,
+                        "justified": None,
+                    }
+                )
+                continue
+            c_ent, r_ent = core_map[txid], rust_map[txid]
+            if c_ent.get("time") != r_ent.get("time"):
+                residual["time"] += 1
+            if "chunkweight" in c_ent and "chunkweight" not in r_ent:
+                residual["chunkweight"] += 1
+            elif c_ent.get("chunkweight") != r_ent.get("chunkweight"):
+                mismatches.append(
+                    {
+                        "field": f"getrawmempool.{txid}.chunkweight",
+                        "core": c_ent.get("chunkweight"),
+                        "rustoshi": r_ent.get("chunkweight"),
+                        "justified": None,
+                    }
+                )
+            c_fees = c_ent.get("fees") if isinstance(c_ent.get("fees"), dict) else {}
+            r_fees = r_ent.get("fees") if isinstance(r_ent.get("fees"), dict) else {}
+            if "chunk" in c_fees and "chunk" not in r_fees:
+                residual["fees.chunk"] += 1
+            elif c_fees.get("chunk") != r_fees.get("chunk"):
+                mismatches.append(
+                    {
+                        "field": f"getrawmempool.{txid}.fees.chunk",
+                        "core": c_fees.get("chunk"),
+                        "rustoshi": r_fees.get("chunk"),
+                        "justified": None,
+                    }
+                )
+            for key in ("depends", "spentby", "bip125-replaceable"):
+                if c_ent.get(key) != r_ent.get(key):
+                    residual[key] += 1
+            mismatches.extend(
+                compare_json(
+                    strip_verbose_entry(c_ent),
+                    strip_verbose_entry(r_ent),
+                    f"getrawmempool.{txid}",
+                )
+            )
+        hit = {key: count for key, count in residual.items() if count}
+        if hit:
+            mismatches.append(
+                {
+                    "field": "getrawmempool verbose residuals",
+                    "core": hit,
+                    "rustoshi": "differs on the focused entries",
+                    "justified": (
+                        "time is the local Unix second the tx entered; "
+                        "chunkweight is Core entryToJSON (rpc/mempool.cpp:525), "
+                        "omitted by rustoshi MempoolEntry (crates/rpc/src/types.rs:723); "
+                        "fees.chunk is Core rpc/mempool.cpp:532, omitted by MempoolFees "
+                        "(crates/rpc/src/types.rs:696); depends, spentby, and "
+                        "bip125-replaceable are empty/false in get_raw_mempool "
+                        "(crates/rpc/src/server.rs:9130-9132)"
+                    ),
+                }
+            )
+        return mismatches
+
+    def package_txids(hexes: list[str]) -> list[str]:
+        return [core.rpc("decoderawtransaction", [hx])["txid"] for hx in hexes]
+
+    def run_reached(name: str, hexes: list[str], sendraw: list[str] | None = None) -> None:
+        log(f"=== {name} ===")
+        mismatches: list[dict] = []
+        before = set(mempool_txids(core))
+        c_tma = core.rpc_outcome("testmempoolaccept", [hexes])
+        r_tma = rust.rpc_outcome("testmempoolaccept", [hexes])
+        log("core testmempoolaccept: " + json.dumps(c_tma, default=str)[:2500])
+        log("rustoshi testmempoolaccept: " + json.dumps(r_tma, default=str)[:2500])
+        mismatches.extend(compare_outcome(c_tma, r_tma, "testmempoolaccept"))
+        for i, hx in enumerate(sendraw or []):
+            c_sr = core.rpc_outcome("sendrawtransaction", [hx])
+            r_sr = rust.rpc_outcome("sendrawtransaction", [hx])
+            log(f"core sendrawtransaction[{i}]: " + json.dumps(c_sr, default=str)[:1500])
+            log(f"rustoshi sendrawtransaction[{i}]: " + json.dumps(r_sr, default=str)[:1500])
+            mismatches.extend(compare_outcome(c_sr, r_sr, f"sendrawtransaction[{i}]"))
+        c_res = core.rpc_outcome("submitpackage", [hexes])
+        r_res = rust.rpc_outcome("submitpackage", [hexes])
+        log("core submitpackage: " + json.dumps(c_res, default=str)[:2500])
+        log("rustoshi submitpackage: " + json.dumps(r_res, default=str)[:2500])
+        mismatches.extend(compare_outcome(c_res, r_res, "submitpackage"))
+        c_tip = {
+            "height": core.rpc("getblockcount"),
+            "hash": core.rpc("getbestblockhash"),
+        }
+        r_tip = {
+            "height": rust.rpc("getblockcount"),
+            "hash": rust.rpc("getbestblockhash"),
+        }
+        log(f"  tip core={c_tip} rustoshi={r_tip}")
+        if c_tip != r_tip:
+            mismatches.append(
+                {
+                    "field": "tip",
+                    "core": c_tip,
+                    "rustoshi": r_tip,
+                    "justified": None,
+                }
+            )
+        focus = package_txids(hexes)
+        added = sorted(set(mempool_txids(core)) - before)
+        c_mem = core.rpc("getrawmempool", [True])
+        r_mem = rust.rpc("getrawmempool", [True])
+        mismatches.extend(compare_verbose(c_mem, r_mem, focus + added))
+        for m in mismatches:
+            shown = m["core"]
+            if isinstance(shown, (dict, list)) and len(json.dumps(shown, default=str)) > 400:
+                shown = json.dumps(shown, default=str)[:400] + "…"
+            tag = "JUSTIFIED" if m["justified"] else "MISMATCH"
+            log(f"  {tag} {m['field']}: core={shown!r} rustoshi={m['rustoshi']!r}")
+            if m["justified"]:
+                log(f"    why: {m['justified']}")
+        cases.append(
+            {
+                "name": name,
+                "core": c_res,
+                "rustoshi": r_res,
+                "mismatches": mismatches,
+            }
+        )
+
+    # The first 110 blocks only mature ~11 coinbases, and the cases above
+    # spend those in the mempool. One block confirms them into ordinary outputs.
+    sync_generated(1)
+    if mempool_txids(core) != mempool_txids(rust):
+        die(
+            "mempools diverged after the confirming block: "
+            f"core={mempool_txids(core)} rustoshi={mempool_txids(rust)}"
+        )
+    live = spendable_coins()
+    if len(live) < 4:
+        die(f"need 4 spendable coins for the seven Core paths, have {len(live)}")
+    reject_coin, rbf_parent_coin, rbf_low_coin, truc_coin = live[:4]
+    for label, coin in (
+        ("reject", reject_coin),
+        ("rbf-parent", rbf_parent_coin),
+        ("rbf-low", rbf_low_coin),
+        ("truc", truc_coin),
+    ):
+        log(
+            f"path coin {label} {coin['txid']}:{coin['vout']} {coin['amount']}"
+        )
+
+    # 1. Positive sub-threshold P2A is dust. 0-value P2A with a 0 fee stays
+    # ephemeral and fails the relay floor instead of the dust rule.
+    reject_sats = sats_of(reject_coin["amount"])
+    p2a_pos = signed_outputs(
+        reject_coin,
+        [(reject_sats - 10_000 - 1, spk_bytes), (1, p2a_script)],
+    )
+    run_reached("p2a-positive-dust", [p2a_pos["hex"]], sendraw=[p2a_pos["hex"]])
+    p2a_zero = signed_outputs(
+        reject_coin,
+        [(reject_sats, spk_bytes), (0, p2a_script)],
+    )
+    run_reached("p2a-zero-ephemeral", [p2a_zero["hex"]], sendraw=[p2a_zero["hex"]])
+
+    # 2. Both package members are below min relay. package_msg is
+    # `transaction failed`; only the child carries the package CheckFeeRate string.
+    low_parent = signed_outputs(reject_coin, [(reject_sats - 1, spk_bytes)])
+    low_child = signed_child(low_parent, 1)
+    run_reached(
+        "package-fee-checkfeerate",
+        [low_parent["hex"], low_child["hex"]],
+        sendraw=[low_parent["hex"], low_child["hex"]],
+    )
+
+    # 6. sendrawtransaction of a nonzero-fee dust parent: code -26 and the
+    # full PreCheckEphemeralTx string, not the bare `dust` token.
+    dust_pos = signed_outputs(
+        reject_coin,
+        [(reject_sats - 5_000 - 1, spk_bytes), (1, spk_bytes)],
+    )
+    run_reached("sendraw-dust-tostring", [dust_pos["hex"]], sendraw=[dust_pos["hex"]])
+
+    # 7. 0-base-fee dust plus a prioritisetransaction delta is still dust.
+    dust_zero = signed_outputs(
+        reject_coin,
+        [(reject_sats - 1, spk_bytes), (1, spk_bytes)],
+    )
+    dust_txid = dust_zero["decoded"]["txid"]
+    c_pri = core.rpc_outcome("prioritisetransaction", [dust_txid, 0, 1000])
+    r_pri = rust.rpc_outcome("prioritisetransaction", [dust_txid, 0, 1000])
+    log("core prioritisetransaction: " + json.dumps(c_pri, default=str))
+    log("rustoshi prioritisetransaction: " + json.dumps(r_pri, default=str))
+    pri_mismatch = compare_outcome(c_pri, r_pri, "prioritisetransaction")
+    if pri_mismatch:
+        cases.append(
+            {
+                "name": "prioritisetransaction-dust-delta",
+                "core": c_pri,
+                "rustoshi": r_pri,
+                "mismatches": pri_mismatch,
+            }
+        )
+        for m in pri_mismatch:
+            log(f"  MISMATCH {m['field']}: core={m['core']!r} rustoshi={m['rustoshi']!r}")
+    run_reached(
+        "ephemeral-dust-priority-delta",
+        [dust_zero["hex"]],
+        sendraw=[dust_zero["hex"]],
+    )
+
+    # 5. Replacement spends a mempool parent that already has a spender.
+    # Package fee clears the relay floor so Core reaches PackageRBFChecks.
+    rbf_p = signed_outputs(
+        rbf_parent_coin,
+        [(sats_of(rbf_parent_coin["amount"]) - 10_000, spk_bytes)],
+    )
+    admit_both("package-rbf-ancestor-parent", rbf_p["hex"])
+    rbf_m = signed_child(rbf_p, 10_000)
+    admit_both("package-rbf-ancestor-spender", rbf_m["hex"])
+    rbf_a = signed_outputs(
+        rbf_low_coin,
+        [(sats_of(rbf_low_coin["amount"]) - 1, spk_bytes)],
+    )
+    a_out = sats_of(rbf_a["decoded"]["vout"][0]["value"])
+    p_out = sats_of(rbf_p["decoded"]["vout"][0]["value"])
+    rbf_fee = 50_000
+    rbf_r_raw = raw_tx(
+        [
+            (bytes.fromhex(rbf_a["decoded"]["txid"])[::-1], 0, b""),
+            (bytes.fromhex(rbf_p["decoded"]["txid"])[::-1], 0, b""),
+        ],
+        [(a_out + p_out - rbf_fee, spk_bytes)],
+    ).hex()
+    rbf_r = sign_raw(
+        rbf_r_raw,
+        [
+            {
+                "txid": rbf_a["decoded"]["txid"],
+                "vout": 0,
+                "scriptPubKey": rbf_a["decoded"]["vout"][0]["scriptPubKey"]["hex"],
+                "amount": btc(a_out),
+            },
+            {
+                "txid": rbf_p["decoded"]["txid"],
+                "vout": 0,
+                "scriptPubKey": rbf_p["decoded"]["vout"][0]["scriptPubKey"]["hex"],
+                "amount": btc(p_out),
+            },
+        ],
+    )
+    run_reached(
+        "package-rbf-mempool-ancestor",
+        [rbf_a["hex"], rbf_r["hex"]],
+        sendraw=[rbf_a["hex"], rbf_r["hex"]],
+    )
+
+    # 3. Fee-sufficient v3 parent + non-v3 child. testmempoolaccept is
+    # package-error with the debug suffix; submitpackage admits the parent.
+    truc_parent = signed_outputs(
+        truc_coin,
+        [(sats_of(truc_coin["amount"]) - 10_000, spk_bytes)],
+        version=3,
+    )
+    if truc_parent["decoded"]["version"] != 3:
+        die(f"TRUC parent version is {truc_parent['decoded']['version']}")
+    truc_child = signed_child(truc_parent, 10_000)
+    run_reached(
+        "truc-package-error",
+        [truc_parent["hex"], truc_child["hex"]],
+        sendraw=[truc_child["hex"]],
+    )
+
+    # 4. require_standard off. A >=65-byte nonstandard output is accepted;
+    # the 65-byte floor still rejects the undersized OP_RETURN.
+    log("=== restart with acceptnonstdtxn ===")
+    stop_rustoshi(rust_proc)
+    rust_proc = None
+    stop_core(core_dir)
+    for stale in (
+        core_dir / "regtest" / "mempool.dat",
+        rust_dir / "mempool.dat",
+        rust_dir / "regtest" / "mempool.dat",
+        rust_dir / ".cookie",
+        rust_dir / "regtest" / ".cookie",
+    ):
+        stale.unlink(missing_ok=True)
+    # -walletbroadcast=0: otherwise the wallet resubmits the pre-restart
+    # mempool txs and Core's pool is not empty.
+    start_core(core_dir, "-acceptnonstdtxn=1", "-walletbroadcast=0")
+    wait_rpc(core)
+    wallets = core.rpc("listwallets")
+    if "sweep" not in wallets:
+        core.rpc("loadwallet", ["sweep"])
+    rust_proc = start_rustoshi(
+        rust_dir, WORKDIR / "rustoshi-nonstd.log", "--acceptnonstdtxn"
+    )
+    cookie_path = rust_dir / ".cookie"
+    deadline = time.time() + 90
+    while time.time() < deadline and not cookie_path.exists():
+        if rust_proc.poll() is not None:
+            die(
+                "rustoshi exited "
+                f"{rust_proc.returncode}: "
+                f"{(WORKDIR / 'rustoshi-nonstd.log').read_text()[-2000:]}"
+            )
+        time.sleep(0.25)
+    if not cookie_path.exists():
+        die(f"no cookie after acceptnonstdtxn restart: {(WORKDIR / 'rustoshi-nonstd.log').read_text()[-2000:]}")
+    rust = RustNode(
+        f"http://127.0.0.1:{RUST_RPC_PORT}",
+        cookie_path.read_text().strip(),
+    )
+    wait_rpc(rust, 90)
+    c_tip = {"height": core.rpc("getblockcount"), "hash": core.rpc("getbestblockhash")}
+    r_tip = {"height": rust.rpc("getblockcount"), "hash": rust.rpc("getbestblockhash")}
+    log(f"after restart tip core={c_tip} rustoshi={r_tip}")
+    if c_tip != r_tip:
+        die(f"tips diverged after acceptnonstdtxn restart: core={c_tip} rustoshi={r_tip}")
+    if mempool_txids(core) or mempool_txids(rust):
+        die(
+            "mempools not empty after acceptnonstdtxn restart: "
+            f"core={mempool_txids(core)} rustoshi={mempool_txids(rust)}"
+        )
+
+    nonstd_script = bytes([0x51]) + bytes([0x61]) * 20
+    nonstd_coin = spendable_coins()[0]
+    nonstd_parent = signed_outputs(
+        nonstd_coin,
+        [(sats_of(nonstd_coin["amount"]) - 10_000, nonstd_script)],
+    )
+    nonstd_value = sats_of(nonstd_parent["decoded"]["vout"][0]["value"])
+    # Empty scriptSig. OP_TRUE then OP_NOPs leaves a single true stack item.
+    nonstd_child_raw = raw_tx(
+        [(bytes.fromhex(nonstd_parent["decoded"]["txid"])[::-1], 0, b"")],
+        [(nonstd_value - 1_000, spk_bytes)],
+    ).hex()
+    nonstd_child = {"hex": nonstd_child_raw, "decoded": core.rpc("decoderawtransaction", [nonstd_child_raw])}
+    run_reached(
+        "acceptnonstdtxn-package",
+        [nonstd_parent["hex"], nonstd_child["hex"]],
+    )
+    run_reached("tx-size-small-still", [op_ret.hex()], sendraw=[op_ret.hex()])
 
     # invalidateblock / reconsiderblock of the current tip.
     log("=== invalidateblock / reconsiderblock ===")
