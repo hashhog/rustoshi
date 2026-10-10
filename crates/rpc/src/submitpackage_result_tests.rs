@@ -1824,3 +1824,78 @@ async fn sendrawtransaction_dust_returns_tostring_and_code() {
     assert_eq!(code, -26, "{resp}");
     assert_eq!(message, DUST_FEE_MSG, "{resp}");
 }
+
+/// `sendtoaddress` broadcasts through `broadcast_signed_tx`. A 1-sat output
+/// is dust with a nonzero wallet fee, so the RPC must return the same -26
+/// and PreCheckEphemeralTx string as `sendrawtransaction`.
+#[tokio::test]
+async fn sendtoaddress_dust_matches_sendraw_reject() {
+    use crate::wallet::{WalletRpcImpl, WalletRpcServer, WalletRpcState};
+    use rustoshi_crypto::address::{Address, Network};
+    use rustoshi_wallet::{CreateWalletOptions, WalletManager, WalletUtxo};
+
+    let (state, _server) = server();
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = WalletManager::new(dir.path(), Network::Regtest).unwrap();
+    manager
+        .create_wallet("dust", CreateWalletOptions::default())
+        .unwrap();
+    let utxo = {
+        let arc = manager.get_wallet("dust").unwrap();
+        let mut wallet = arc.lock().unwrap();
+        wallet.set_chain_height(200);
+        let addr = wallet.get_new_address().unwrap();
+        let path = wallet.get_derivation_path(&addr).unwrap().clone();
+        let spk = Address::from_string(&addr, Some(Network::Regtest))
+            .unwrap()
+            .to_script_pubkey();
+        let utxo = WalletUtxo {
+            outpoint: OutPoint {
+                txid: Hash256::from([0xb2; 32]),
+                vout: 0,
+            },
+            value: 100_000,
+            script_pubkey: spk,
+            derivation_path: path,
+            confirmations: 10,
+            is_change: false,
+            is_coinbase: false,
+            height: Some(100),
+        };
+        wallet.add_utxo(utxo.clone());
+        utxo
+    };
+    {
+        let mut st = state.write().await;
+        BlockStore::new(&st.db)
+            .put_utxo(
+                &utxo.outpoint,
+                &rustoshi_storage::CoinEntry {
+                    height: 1,
+                    is_coinbase: false,
+                    value: utxo.value,
+                    script_pubkey: utxo.script_pubkey.clone(),
+                },
+            )
+            .unwrap();
+        st.mempool.notify_new_tip(200, 1_700_000_000);
+    }
+    let mut wallet_state = WalletRpcState::new(manager, dir.keep());
+    wallet_state.node = Some(state);
+    let rpc = WalletRpcImpl::new(Arc::new(RwLock::new(wallet_state)));
+    let err = rpc
+        .send_to_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            0.00000001,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("dust sendtoaddress must be rejected");
+    assert_eq!(err.code(), -26, "{err:?}");
+    assert_eq!(err.message(), DUST_FEE_MSG, "{err:?}");
+}

@@ -181,6 +181,11 @@ struct Cli {
     #[arg(long = "acceptnonstdtxn", default_value = "false")]
     acceptnonstdtxn: bool,
 
+    /// Fees smaller than this (BTC/kvB) are rejected from the mempool
+    /// (Bitcoin Core `-minrelaytxfee`). Default is 0.00000100 (100 sat/kvB).
+    #[arg(long = "minrelaytxfee")]
+    minrelaytxfee: Option<String>,
+
     /// Specify your own public address `<ip>[:port]` to advertise to peers
     /// (Bitcoin Core `-externalip`; repeatable and/or comma-separated). A
     /// bare IP uses the P2P listen port. Implies `--discover=false` unless
@@ -445,6 +450,47 @@ enum Commands {
 /// Expand `~` in a datadir string and return the base path (no network
 /// subdirectory).  The cookie file is written here so that all
 /// implementations share the same `<datadir>/.cookie` convention.
+/// Core `ParseMoney` for a BTC/kvB `-minrelaytxfee` value: at most 8 decimal
+/// places, no floats. 0.00001005 BTC/kvB is 1005 sat/kvB.
+fn parse_btc_kvb_to_sats(amount: &str) -> anyhow::Result<u64> {
+    let amount = amount.trim();
+    if amount.is_empty() || amount.starts_with('-') || amount.starts_with('+') {
+        anyhow::bail!("minrelaytxfee amount out of range");
+    }
+    let (whole, frac) = match amount.split_once('.') {
+        Some((whole, frac)) => (whole, frac),
+        None => (amount, ""),
+    };
+    if frac.len() > 8
+        || whole.chars().any(|c| !c.is_ascii_digit())
+        || frac.chars().any(|c| !c.is_ascii_digit())
+    {
+        anyhow::bail!("minrelaytxfee amount out of range");
+    }
+    let whole_sats: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("minrelaytxfee amount out of range"))?
+    };
+    let mut frac_digits = frac.to_string();
+    while frac_digits.len() < 8 {
+        frac_digits.push('0');
+    }
+    let frac_sats: u64 = if frac_digits.is_empty() {
+        0
+    } else {
+        frac_digits
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("minrelaytxfee amount out of range"))?
+    };
+    whole_sats
+        .checked_mul(100_000_000)
+        .and_then(|whole| whole.checked_add(frac_sats))
+        .ok_or_else(|| anyhow::anyhow!("minrelaytxfee amount out of range"))
+}
+
 fn resolve_base_datadir(datadir: &str) -> PathBuf {
     let expanded = if datadir.starts_with('~') {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -3993,6 +4039,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             anyhow::bail!("acceptnonstdtxn is not currently supported for main chain");
         }
         rpc_state_inner.mempool.set_require_standard(false);
+    }
+    if let Some(ref amount) = cli.minrelaytxfee {
+        let mut sat_kvb = parse_btc_kvb_to_sats(amount)?;
+        // Core raises minrelaytxfee up to incrementalrelayfee when the
+        // operator sets it lower (mempool_args.cpp).
+        let incremental = rpc_state_inner.mempool.incremental_relay_feerate_kvb();
+        if sat_kvb < incremental {
+            sat_kvb = incremental;
+        }
+        rpc_state_inner.mempool.set_min_relay_feerate_kvb(sat_kvb);
     }
     rpc_state_inner.txindex_enabled = cli.txindex;
     rpc_state_inner.blockfilterindex_enabled =

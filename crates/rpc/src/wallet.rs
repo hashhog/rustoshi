@@ -2529,8 +2529,9 @@ impl WalletRpcServer for WalletRpcImpl {
             let mut node_state = crate::coins_coherence::write_coherent(&node)
                 .await
                 .map_err(|m| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, m))?;
-            crate::server::broadcast_signed_tx(&mut node_state, tx)
-                .map_err(|msg| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg))?;
+            crate::server::broadcast_signed_tx(&mut node_state, tx).map_err(|err| {
+                Self::rpc_error(err.code, err.message)
+            })?;
         }
 
         // Return the Core-style display txid (reversed).
@@ -2657,8 +2658,9 @@ impl WalletRpcServer for WalletRpcImpl {
             let mut node_state = crate::coins_coherence::write_coherent(&node)
                 .await
                 .map_err(|m| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, m))?;
-            crate::server::broadcast_signed_tx(&mut node_state, tx)
-                .map_err(|msg| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg))?;
+            crate::server::broadcast_signed_tx(&mut node_state, tx).map_err(|err| {
+                Self::rpc_error(err.code, err.message)
+            })?;
         }
         let txid_hex = hex::encode(txid.0.iter().rev().copied().collect::<Vec<_>>());
         Ok(SendResult {
