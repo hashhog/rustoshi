@@ -650,15 +650,25 @@ def big_p2wsh_spend(outpoints: list[tuple[str, int]], fee: int, value_each: int)
     return raw.hex()
 
 
+def block_subsidy(height: int) -> int:
+    """Regtest subsidy: 50 BTC, halved every 150 blocks."""
+    halvings = height // 150
+    if halvings >= 64:
+        return 0
+    return (50 * 100_000_000) >> halvings
+
+
 def mine_empty(rpc: Rpc, n: int, extra: bytes) -> None:
     for i in range(n):
         tip = rpc.call("getbestblockhash")
         info = rpc.call("getblock", [tip])
+        height = int(info["height"]) + 1
         blk = make_block(
             tip,
-            int(info["height"]) + 1,
+            height,
             int(info["time"]) + 1,
             extra=extra + bytes([i & 0xFF]),
+            value=block_subsidy(height),
         )
         result = rpc.call("submitblock", [blk])
         if result not in (None,):
@@ -714,7 +724,14 @@ def mempool_pressure(rpc: Rpc, rec, mock_time: int, rest_base: str) -> None:
     # Arm rolling-fee decay (Core removeForBlock stamps lastRollingFeeUpdate).
     tip = rpc.call("getbestblockhash")
     info = rpc.call("getblock", [tip])
-    blk = make_block(tip, int(info["height"]) + 1, int(info["time"]) + 1, extra=b"\x83\xc5")
+    height = int(info["height"]) + 1
+    blk = make_block(
+        tip,
+        height,
+        int(info["time"]) + 1,
+        extra=b"\x83\xc5",
+        value=block_subsidy(height),
+    )
     result = rpc.call("submitblock", [blk])
     if result is not None:
         raise RuntimeError(f"decay block rejected: {result}")
