@@ -1797,6 +1797,141 @@ fn rejected_package_tx(tx: &Transaction, fee: u64, vsize: usize, error: String) 
     }
 }
 
+/// Core `FormatMoney` (`util/moneystr.cpp`). Eight fractional digits, then
+/// trailing zeros are dropped while the character two places back is a digit,
+/// so at least two fractional digits remain (`1.00`, `0.0001`).
+fn format_money(n: i64) -> String {
+    const COIN: i64 = 100_000_000;
+    let neg = n < 0;
+    let mut quotient = n / COIN;
+    let mut remainder = n % COIN;
+    if neg {
+        quotient = -quotient;
+        remainder = -remainder;
+    }
+    let mut s = format!("{quotient}.{remainder:08}");
+    let bytes = s.as_bytes();
+    let mut n_trim = 0usize;
+    let mut i = bytes.len() - 1;
+    while bytes[i] == b'0' && bytes[i - 2].is_ascii_digit() {
+        n_trim += 1;
+        i -= 1;
+    }
+    if n_trim > 0 {
+        s.truncate(s.len() - n_trim);
+    }
+    if neg {
+        s.insert(0, '-');
+    }
+    s
+}
+
+/// Core `CFeeRate::ToString` (`policy/feerate.cpp`): `GetFeePerK` is
+/// `EvaluateFeeDown(1000)` (toward -inf), printed as eight decimals with no trim.
+fn cfeerate_tostring(fee: i64, vsize: usize) -> String {
+    if vsize == 0 {
+        return "0.00000000 BTC/kvB".to_string();
+    }
+    let num = (fee as i128).saturating_mul(1000);
+    let den = vsize as i128;
+    let mut per_kvb = num / den;
+    // Rust `/` truncates toward 0; Core rounds this quotient toward -inf.
+    if num < 0 && num % den != 0 {
+        per_kvb -= 1;
+    }
+    let neg = per_kvb < 0;
+    let abs = per_kvb.unsigned_abs();
+    let whole = abs / 100_000_000;
+    let frac = abs % 100_000_000;
+    let s = format!("{whole}.{frac:08} BTC/kvB");
+    if neg {
+        format!("-{s}")
+    } else {
+        s
+    }
+}
+
+/// Core `FeeFrac::operator>` (`util/feefrac.h`): higher feerate first; equal
+/// feerate, smaller size first. Diagrams are sorted this way before
+/// `CompareChunks` (`txgraph.cpp` `GetMainStagingDiagrams`).
+fn sort_diagram(chunks: &mut [FeeFrac]) {
+    chunks.sort_by(|a, b| {
+        let cross_a = (a.fee as i128) * (b.size as i128);
+        let cross_b = (b.fee as i128) * (a.size as i128);
+        if cross_a == cross_b {
+            a.size.cmp(&b.size)
+        } else {
+            cross_b.cmp(&cross_a)
+        }
+    });
+}
+
+/// `true` iff `CompareChunks(chunks0, chunks1)` is `std::partial_ordering::greater`
+/// (`util/feefrac.cpp`). `chunks0` is the proposed diagram.
+fn diagram_strictly_better(chunks0: &[FeeFrac], chunks1: &[FeeFrac]) -> bool {
+    let chunk = [chunks0, chunks1];
+    let mut next_index = [0usize, 0usize];
+    let mut accum = [FeeFrac::default(), FeeFrac::default()];
+    let mut better_somewhere = [false, false];
+
+    loop {
+        let done_0 = next_index[0] == chunk[0].len();
+        let done_1 = next_index[1] == chunk[1].len();
+        if done_0 && done_1 {
+            break;
+        }
+        // Side with the smaller unprocessed size; a finished side yields to the
+        // other. Equal sizes select side 0 (`next_point(0).size > next_point(1).size`
+        // is false, so the bool converts to 0).
+        let unproc_side: usize = if done_0 || done_1 {
+            if done_0 { 1 } else { 0 }
+        } else {
+            let size0 = chunk[0][next_index[0]].size + accum[0].size;
+            let size1 = chunk[1][next_index[1]].size + accum[1].size;
+            if size0 > size1 { 1 } else { 0 }
+        };
+        let other = 1 - unproc_side;
+        let point_p = chunk[unproc_side][next_index[unproc_side]] + accum[unproc_side];
+        let point_a = accum[other];
+        let slope_ap = point_p - point_a;
+        let cmp = if done_0 || done_1 {
+            // Exhausted side is a tail of feerate 0 (`FeeFrac(0, 1)`).
+            fee_rate_cmp(slope_ap, FeeFrac::new(0, 1))
+        } else {
+            let point_b = chunk[other][next_index[other]] + accum[other];
+            let slope_ab = point_b - point_a;
+            let cmp = fee_rate_cmp(slope_ap, slope_ab);
+            // Same size: the other point is already compared, so mark it done.
+            if point_b.size == point_p.size {
+                accum[other] += chunk[other][next_index[other]];
+                next_index[other] += 1;
+            }
+            cmp
+        };
+        if cmp == std::cmp::Ordering::Greater {
+            better_somewhere[unproc_side] = true;
+        }
+        if cmp == std::cmp::Ordering::Less {
+            better_somewhere[other] = true;
+        }
+        accum[unproc_side] += chunk[unproc_side][next_index[unproc_side]];
+        next_index[unproc_side] += 1;
+        // Both better somewhere: incomparable, not a strict improvement.
+        if better_somewhere[0] && better_somewhere[1] {
+            return false;
+        }
+    }
+    better_somewhere[0] && !better_somewhere[1]
+}
+
+/// Core `FeeRateCompare`: feerate only. Equal feerate is equivalent even when
+/// the sizes differ.
+fn fee_rate_cmp(a: FeeFrac, b: FeeFrac) -> std::cmp::Ordering {
+    let cross_a = (a.fee as i128) * (b.size as i128);
+    let cross_b = (b.fee as i128) * (a.size as i128);
+    cross_a.cmp(&cross_b)
+}
+
 impl Mempool {
     /// Install the per-height MTP lookup used for BIP68 time-based relative
     /// locks (Core CalculateLockPointsAtTip: coin time = MTP of the coin's
@@ -5194,11 +5329,6 @@ impl Mempool {
             );
         }
 
-        // Build map of txid to transaction for easy lookup
-        // tx_map is available for future use (e.g., package RBF)
-        let _tx_map: HashMap<Hash256, &Transaction> =
-            txs.iter().map(|tx| (tx.txid(), tx)).collect();
-
         // Exact wtxid already in the mempool vs same txid with a different
         // witness. Core AcceptPackage: exists(wtxid) is MEMPOOL_ENTRY;
         // exists(txid) is DIFFERENT_WITNESS and the submission is ignored.
@@ -5833,24 +5963,605 @@ impl Mempool {
         self.spent_outpoints.contains_key(op) && self.transactions.contains_key(&op.txid)
     }
 
-    fn package_rbf_blocked(&self, eval: &[&Transaction]) -> bool {
-        let mut conflict = false;
-        let mut mem_parent = false;
-        for tx in eval {
-            for input in &tx.inputs {
-                let op = &input.previous_output;
-                if self.spent_outpoints.contains_key(op) {
-                    conflict = true;
+    fn direct_conflict_ids(&self, tx: &Transaction) -> HashSet<Hash256> {
+        let mut ids = HashSet::new();
+        for input in &tx.inputs {
+            if let Some(&id) = self.spent_outpoints.get(&input.previous_output) {
+                ids.insert(id);
+            }
+        }
+        ids
+    }
+
+    fn eval_has_direct_conflict(&self, eval: &[&Transaction]) -> bool {
+        eval.iter().any(|tx| {
+            tx.inputs
+                .iter()
+                .any(|input| self.spent_outpoints.contains_key(&input.previous_output))
+        })
+    }
+
+    /// In-mempool creators of inputs. An in-package parent is not in
+    /// `transactions` yet, so it is not an ancestor here. Matches
+    /// `CCoinsViewMemPool::GetCoin`, which returns a mempool output even
+    /// when another mempool tx already spends it.
+    fn mempool_ancestor_ids(&self, tx: &Transaction) -> HashSet<Hash256> {
+        let mut ids = HashSet::new();
+        for input in &tx.inputs {
+            let prev = input.previous_output.txid;
+            if self.transactions.contains_key(&prev) {
+                ids.insert(prev);
+            }
+        }
+        ids
+    }
+
+    fn signed_modified_fee(entry: &MempoolEntry) -> i64 {
+        (entry.fee as i64).saturating_add(entry.fee_delta)
+    }
+
+    /// Direct conflicts plus descendants, and the sum of their modified fees
+    /// (Core `GetModifiedFee`, signed).
+    fn conflict_closure(&self, direct: &HashSet<Hash256>) -> (HashSet<Hash256>, i64) {
+        let mut all = HashSet::new();
+        let mut fees = 0i64;
+        for txid in direct {
+            if all.insert(*txid) {
+                if let Some(entry) = self.transactions.get(txid) {
+                    fees = fees.saturating_add(Self::signed_modified_fee(entry));
                 }
-                if self.created_utxos.contains_key(op)
-                    || (self.spent_outpoints.contains_key(op)
-                        && self.transactions.contains_key(&op.txid))
-                {
-                    mem_parent = true;
+            }
+            for desc in self.get_all_descendants(txid) {
+                if all.insert(desc) {
+                    if let Some(entry) = self.transactions.get(&desc) {
+                        fees = fees.saturating_add(Self::signed_modified_fee(entry));
+                    }
                 }
             }
         }
-        conflict && mem_parent
+        (all, fees)
+    }
+
+    /// Individual `ReplacementChecks` fee failure. `Some` is
+    /// `TxValidationState::ToString` (`insufficient fee` plus the PaysForRBF
+    /// debug). Other RBF results are not reconsiderable.
+    fn reconsiderable_rbf_tostring(&self, tx: &Transaction, mod_fee: i64) -> Option<String> {
+        let direct = self.direct_conflict_ids(tx);
+        if direct.is_empty() {
+            return None;
+        }
+        let parents = self.mempool_ancestor_ids(tx);
+        let probe = if mod_fee > 0 { mod_fee as u64 } else { 0 };
+        match self.check_rbf_rules(tx, probe, 0.0, tx.vsize(), &direct, &parents) {
+            Err(
+                MempoolError::RbfInsufficientAbsoluteFee(_, _)
+                | MempoolError::RbfInsufficientBandwidthFee(_, _)
+                | MempoolError::RbfInsufficientFeeRate(_, _),
+            ) => {
+                let (_, original) = self.conflict_closure(&direct);
+                // check_rbf_rules sums `get_modified_fee` (clamped at 0). The
+                // displayed original fee uses that same total when the signed
+                // sum would not reproduce the failure it just reported.
+                let original = if Self::pays_would_fail(original, mod_fee, tx.vsize(), self.config.incremental_relay_fee)
+                {
+                    original
+                } else {
+                    self.clamped_conflict_fees(&direct)
+                };
+                self.pays_for_rbf_debug(original, mod_fee, tx.vsize(), tx.txid())
+                    .map(|debug| format!("insufficient fee, {debug}"))
+            }
+            _ => None,
+        }
+    }
+
+    fn clamped_conflict_fees(&self, direct: &HashSet<Hash256>) -> i64 {
+        let mut seen = HashSet::new();
+        let mut total = 0i64;
+        for txid in direct {
+            if seen.insert(*txid) {
+                if let Some(entry) = self.transactions.get(txid) {
+                    total = total.saturating_add(Self::get_modified_fee(entry) as i64);
+                }
+            }
+            for desc in self.get_all_descendants(txid) {
+                if seen.insert(desc) {
+                    if let Some(entry) = self.transactions.get(&desc) {
+                        total = total.saturating_add(Self::get_modified_fee(entry) as i64);
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    fn pays_would_fail(original: i64, replacement: i64, vsize: usize, relay_kvb: u64) -> bool {
+        if replacement < original {
+            return true;
+        }
+        let additional = replacement - original;
+        let relay = Self::fee_for_kvb_rate(relay_kvb, vsize) as i64;
+        additional < relay
+    }
+
+    /// Core `PaysForRBF` debug string (policy/rbf.cpp). `None` when it passes.
+    fn pays_for_rbf_debug(
+        &self,
+        original_fees: i64,
+        replacement_fees: i64,
+        vsize: usize,
+        txid: Hash256,
+    ) -> Option<String> {
+        if replacement_fees < original_fees {
+            return Some(format!(
+                "rejecting replacement {txid}, less fees than conflicting txs; {} < {}",
+                format_money(replacement_fees),
+                format_money(original_fees)
+            ));
+        }
+        let additional = replacement_fees - original_fees;
+        let relay = Self::fee_for_kvb_rate(self.config.incremental_relay_fee, vsize) as i64;
+        if additional < relay {
+            return Some(format!(
+                "rejecting replacement {txid}, not enough additional fees to relay; {} < {}",
+                format_money(additional),
+                format_money(relay)
+            ));
+        }
+        None
+    }
+
+    fn eval_totals(&self, eval: &[&Transaction], tx_fees: &HashMap<Hash256, u64>) -> (i64, usize) {
+        let mut fee = 0i64;
+        let mut vsize = 0usize;
+        for tx in eval {
+            let base = tx_fees.get(&tx.txid()).copied().unwrap_or(0);
+            fee = fee.saturating_add(self.modified_fee_of(&tx.txid(), base));
+            vsize += tx.vsize();
+        }
+        (fee, vsize)
+    }
+
+    /// Core `IsChildWithParents`: the last tx spends every earlier tx.
+    fn refs_child_with_parents(txs: &[&Transaction]) -> bool {
+        if txs.len() < 2 {
+            return false;
+        }
+        let child = txs[txs.len() - 1];
+        txs[..txs.len() - 1].iter().all(|parent| {
+            let id = parent.txid();
+            child
+                .inputs
+                .iter()
+                .any(|input| input.previous_output.txid == id)
+        })
+    }
+
+    /// `PackageRBFChecks` failure ToString, or `None` when the package may be
+    /// submitted. Order matches validation.cpp: topology, mempool ancestors,
+    /// `GetEntriesForConflicts`, `PaysForRBF`, parent feerate, cluster limits,
+    /// `ImprovesFeerateDiagram`.
+    fn package_rbf_reject_reason(
+        &self,
+        eval: &[&Transaction],
+        tx_fees: &HashMap<Hash256, u64>,
+    ) -> Option<String> {
+        if eval.len() != 2 || !Self::refs_child_with_parents(eval) {
+            return Some("package RBF failed: package must be 1-parent-1-child".to_string());
+        }
+        if eval.iter().any(|tx| !self.mempool_ancestor_ids(tx).is_empty()) {
+            return Some(
+                "package RBF failed: new transaction cannot have mempool ancestors".to_string(),
+            );
+        }
+        let mut direct = HashSet::new();
+        for tx in eval {
+            direct.extend(self.direct_conflict_ids(tx));
+        }
+        let mut clusters = HashSet::new();
+        for txid in &direct {
+            if let Some(cid) = self.tx_to_cluster.get(txid) {
+                clusters.insert(*cid);
+            }
+        }
+        let child = eval[1];
+        if clusters.len() > MAX_REPLACEMENT_CANDIDATES {
+            let n = clusters.len();
+            return Some(format!(
+                "package RBF failed: too many potential replacements, rejecting replacement {}; too many conflicting clusters ({n} > {MAX_REPLACEMENT_CANDIDATES})",
+                child.txid()
+            ));
+        }
+        let (_, original_fees) = self.conflict_closure(&direct);
+        let (total_fee, total_vsize) = self.eval_totals(eval, tx_fees);
+        if let Some(debug) =
+            self.pays_for_rbf_debug(original_fees, total_fee, total_vsize, child.txid())
+        {
+            return Some(format!(
+                "package RBF failed: insufficient anti-DoS fees, {debug}"
+            ));
+        }
+        let parent = eval[0];
+        let parent_fee = self.modified_fee_of(&parent.txid(), tx_fees.get(&parent.txid()).copied().unwrap_or(0));
+        let parent_vsize = parent.vsize();
+        let child_fee = self.modified_fee_of(&child.txid(), tx_fees.get(&child.txid()).copied().unwrap_or(0));
+        // CFeeRate <= is cross-multiply, not the truncated GetFeePerK.
+        if parent_vsize > 0
+            && total_vsize > 0
+            && (total_fee as i128) * (parent_vsize as i128)
+                <= (parent_fee as i128) * (total_vsize as i128)
+        {
+            return Some(format!(
+                "package RBF failed: package feerate is less than or equal to parent feerate, package feerate {} <= parent feerate is {}",
+                cfeerate_tostring(total_fee, total_vsize),
+                cfeerate_tostring(parent_fee, parent_vsize)
+            ));
+        }
+        let weight: u64 = eval.iter().map(|tx| tx.weight() as u64).sum();
+        if eval.len() > MAX_CLUSTER_SIZE || weight > MAX_CLUSTER_SIZE_WEIGHT {
+            return Some("too-large-cluster".to_string());
+        }
+        if !self.improves_feerate_diagram(eval, &direct, parent_fee, child_fee) {
+            return Some(
+                "package RBF failed: insufficient feerate: does not improve feerate diagram"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    fn diagram_chunks(&self, txids: &HashSet<Hash256>) -> Vec<FeeFrac> {
+        if txids.is_empty() {
+            return Vec::new();
+        }
+        if txids.len() == 1 {
+            let txid = *txids.iter().next().unwrap();
+            return self
+                .transactions
+                .get(&txid)
+                .map(|entry| {
+                    vec![FeeFrac::new(
+                        Self::signed_modified_fee(entry),
+                        entry.vsize as i64,
+                    )]
+                })
+                .unwrap_or_default();
+        }
+        let mut graph = DepGraph::from_cluster(txids, &self.transactions, &self.parents);
+        for (i, txid) in graph.idx_to_txid.iter().enumerate() {
+            if let Some(entry) = self.transactions.get(txid) {
+                graph.feerates[i] =
+                    FeeFrac::new(Self::signed_modified_fee(entry), entry.vsize as i64);
+            }
+        }
+        graph.linearize().into_iter().map(|chunk| chunk.feefrac).collect()
+    }
+
+    /// Core `ImprovesFeerateDiagram`: staging diagram strictly greater than
+    /// the diagram of every main cluster touched by the replacement.
+    fn improves_feerate_diagram(
+        &self,
+        eval: &[&Transaction],
+        direct: &HashSet<Hash256>,
+        parent_fee: i64,
+        child_fee: i64,
+    ) -> bool {
+        let (all, _) = self.conflict_closure(direct);
+        let mut affected = HashSet::new();
+        for txid in direct.iter().chain(all.iter()) {
+            if let Some(cid) = self.tx_to_cluster.get(txid) {
+                affected.insert(*cid);
+            }
+        }
+        let mut old_chunks = Vec::new();
+        let mut new_chunks = Vec::new();
+        for cid in &affected {
+            let Some(cluster) = self.clusters.get(cid) else {
+                continue;
+            };
+            old_chunks.extend(self.diagram_chunks(&cluster.txids));
+            let remaining: HashSet<Hash256> = cluster
+                .txids
+                .iter()
+                .copied()
+                .filter(|txid| !all.contains(txid))
+                .collect();
+            new_chunks.extend(self.diagram_chunks(&remaining));
+        }
+        let parent_size = eval[0].vsize() as i64;
+        let child_size = eval[1].vsize() as i64;
+        let parent_ff = FeeFrac::new(parent_fee, parent_size);
+        let child_ff = FeeFrac::new(child_fee, child_size);
+        let combined = FeeFrac {
+            fee: parent_fee.saturating_add(child_fee),
+            size: parent_size.saturating_add(child_size),
+        };
+        // Package feerate above the parent feerate makes the 1p1c one chunk.
+        if combined.is_better_than(&parent_ff) {
+            new_chunks.push(combined);
+        } else {
+            new_chunks.push(parent_ff);
+            new_chunks.push(child_ff);
+        }
+        sort_diagram(&mut old_chunks);
+        sort_diagram(&mut new_chunks);
+        diagram_strictly_better(&new_chunks, &old_chunks)
+    }
+
+    /// Ancestors before descendants, so `restore_entry` relinks children.
+    fn ancestors_first(&self, ids: &HashSet<Hash256>) -> Vec<Hash256> {
+        let mut remaining = ids.clone();
+        let mut out = Vec::with_capacity(ids.len());
+        while !remaining.is_empty() {
+            let mut ready: Vec<Hash256> = remaining
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.parents
+                        .get(id)
+                        .map(|ps| ps.iter().all(|p| !remaining.contains(p)))
+                        .unwrap_or(true)
+                })
+                .collect();
+            if ready.is_empty() {
+                let mut rest: Vec<Hash256> = remaining.drain().collect();
+                rest.sort();
+                out.extend(rest);
+                break;
+            }
+            ready.sort();
+            for id in ready {
+                remaining.remove(&id);
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    fn package_failure_result(
+        &self,
+        txs: &[Transaction],
+        tx_fees: &HashMap<Hash256, u64>,
+        individual: &HashMap<Hash256, String>,
+        already_in_mempool: &HashSet<Hash256>,
+        different_witness: &HashMap<Hash256, Hash256>,
+        package_fee: u64,
+        package_vsize: usize,
+        package_fee_rate: f64,
+        package_msg: String,
+    ) -> PackageAcceptResult {
+        let mut tx_results = Vec::with_capacity(txs.len());
+        for tx in txs {
+            let txid = tx.txid();
+            let wtxid = tx.wtxid();
+            if let Some(other) = different_witness.get(&txid).copied() {
+                tx_results.push(PackageTxResult {
+                    txid,
+                    wtxid,
+                    vsize: 0,
+                    fee: 0,
+                    already_in_mempool: false,
+                    error: None,
+                    replaced_txids: Vec::new(),
+                    effective_fee_sat_per_kvb: None,
+                    effective_includes: None,
+                    other_wtxid: Some(other),
+                });
+                continue;
+            }
+            if already_in_mempool.contains(&txid) {
+                let fee = tx_fees.get(&txid).copied().unwrap_or(0);
+                tx_results.push(PackageTxResult {
+                    txid,
+                    wtxid,
+                    vsize: tx.vsize(),
+                    fee,
+                    already_in_mempool: true,
+                    error: None,
+                    replaced_txids: Vec::new(),
+                    effective_fee_sat_per_kvb: None,
+                    effective_includes: None,
+                    other_wtxid: None,
+                });
+                continue;
+            }
+            let fee = tx_fees.get(&txid).copied().unwrap_or(0);
+            tx_results.push(rejected_package_tx(
+                tx,
+                fee,
+                tx.vsize(),
+                individual
+                    .get(&txid)
+                    .cloned()
+                    .unwrap_or_else(|| "bad-txns-inputs-missingorspent".to_string()),
+            ));
+        }
+        PackageAcceptResult {
+            tx_results,
+            package_fee,
+            package_vsize,
+            package_fee_rate,
+            accepted_count: 0,
+            package_error: Some(package_msg),
+        }
+    }
+
+    /// Apply a package RBF that already passed `PackageRBFChecks`. Conflicts
+    /// are removed only after the checks; any later failure puts them back.
+    fn commit_package_rbf<F>(
+        &mut self,
+        txs: &[Transaction],
+        tx_fees: &HashMap<Hash256, u64>,
+        eval: &[&Transaction],
+        individual: &HashMap<Hash256, String>,
+        already_in_mempool: &HashSet<Hash256>,
+        different_witness: &HashMap<Hash256, Hash256>,
+        utxo_lookup: &F,
+        opts: &AtmpOptions,
+        package_fee: u64,
+        package_vsize: usize,
+        package_fee_rate: f64,
+    ) -> PackageAcceptResult
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
+        if opts.require_standard {
+            if let Err(MempoolError::EphemeralDustNotFullySpent(child_txid, _)) =
+                check_ephemeral_spends(txs, &self.transactions, self.config.dust_relay_fee)
+            {
+                let mut individual = individual.clone();
+                if let Some(child) = txs.iter().find(|tx| tx.txid() == child_txid) {
+                    individual.insert(child_txid, missing_ephemeral_spends_tostring(child));
+                }
+                return self.package_failure_result(
+                    txs,
+                    tx_fees,
+                    &individual,
+                    already_in_mempool,
+                    different_witness,
+                    package_fee,
+                    package_vsize,
+                    package_fee_rate,
+                    "unspent-dust".to_string(),
+                );
+            }
+        }
+
+        let mut direct = HashSet::new();
+        for tx in eval {
+            direct.extend(self.direct_conflict_ids(tx));
+        }
+        let (all, _) = self.conflict_closure(&direct);
+        let order = self.ancestors_first(&all);
+        let saved: HashMap<Hash256, MempoolEntry> = order
+            .iter()
+            .filter_map(|txid| self.transactions.get(txid).map(|entry| (*txid, entry.clone())))
+            .collect();
+        for txid in order.iter().rev() {
+            self.remove_single(txid);
+        }
+
+        let (eval_fee, eval_vsize) = self.eval_totals(eval, tx_fees);
+        let eval_fee_u = if eval_fee > 0 { eval_fee as u64 } else { 0 };
+        let mut added: Vec<Hash256> = Vec::new();
+        for tx in eval {
+            match self.add_transaction_for_package(
+                (*tx).clone(),
+                utxo_lookup,
+                eval_fee_u,
+                eval_vsize,
+                eval_fee,
+                opts,
+            ) {
+                Ok(_) => added.push(tx.txid()),
+                Err(e) => {
+                    for txid in added.iter().rev() {
+                        self.remove_transaction(txid, false);
+                    }
+                    for txid in &order {
+                        if let Some(entry) = saved.get(txid) {
+                            self.restore_entry(entry.clone());
+                        }
+                    }
+                    let mut individual = individual.clone();
+                    individual.insert(tx.txid(), submitpackage_member_error(self, tx, &e));
+                    return self.package_failure_result(
+                        txs,
+                        tx_fees,
+                        &individual,
+                        already_in_mempool,
+                        different_witness,
+                        package_fee,
+                        package_vsize,
+                        package_fee_rate,
+                        "transaction failed".to_string(),
+                    );
+                }
+            }
+        }
+
+        let includes: Vec<Hash256> = eval.iter().map(|tx| tx.wtxid()).collect();
+        let sat_kvb = if eval_vsize > 0 && eval_fee > 0 {
+            (eval_fee as u64).saturating_mul(1000) / eval_vsize as u64
+        } else {
+            0
+        };
+        let first = eval[0].txid();
+        let mut replaced: Vec<Hash256> = all.into_iter().collect();
+        replaced.sort();
+        let eval_ids: HashSet<Hash256> = eval.iter().map(|tx| tx.txid()).collect();
+
+        let mut tx_results = Vec::with_capacity(txs.len());
+        for tx in txs {
+            let txid = tx.txid();
+            let wtxid = tx.wtxid();
+            if let Some(other) = different_witness.get(&txid).copied() {
+                tx_results.push(PackageTxResult {
+                    txid,
+                    wtxid,
+                    vsize: 0,
+                    fee: 0,
+                    already_in_mempool: false,
+                    error: None,
+                    replaced_txids: Vec::new(),
+                    effective_fee_sat_per_kvb: None,
+                    effective_includes: None,
+                    other_wtxid: Some(other),
+                });
+                continue;
+            }
+            if already_in_mempool.contains(&txid) {
+                let fee = tx_fees.get(&txid).copied().unwrap_or(0);
+                let vsize = self
+                    .transactions
+                    .get(&txid)
+                    .map(|entry| entry.vsize)
+                    .unwrap_or_else(|| tx.vsize());
+                tx_results.push(PackageTxResult {
+                    txid,
+                    wtxid,
+                    vsize,
+                    fee,
+                    already_in_mempool: true,
+                    error: None,
+                    replaced_txids: Vec::new(),
+                    effective_fee_sat_per_kvb: None,
+                    effective_includes: None,
+                    other_wtxid: None,
+                });
+                continue;
+            }
+            let fee = tx_fees.get(&txid).copied().unwrap_or(0);
+            if eval_ids.contains(&txid) && self.transactions.contains_key(&txid) {
+                tx_results.push(PackageTxResult {
+                    txid,
+                    wtxid,
+                    vsize: tx.vsize(),
+                    fee,
+                    already_in_mempool: false,
+                    error: None,
+                    replaced_txids: if txid == first {
+                        replaced.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    effective_fee_sat_per_kvb: Some(sat_kvb),
+                    effective_includes: Some(includes.clone()),
+                    other_wtxid: None,
+                });
+            } else {
+                tx_results.push(rejected_package_tx(
+                    tx,
+                    fee,
+                    tx.vsize(),
+                    individual
+                        .get(&txid)
+                        .cloned()
+                        .unwrap_or_else(|| "bad-txns-inputs-missingorspent".to_string()),
+                ));
+            }
+        }
+        PackageAcceptResult::success(tx_results, package_fee, package_vsize)
     }
 
     /// Multi-tx package eval for reconsiderable txs only.
@@ -5905,8 +6616,17 @@ impl Mempool {
                 individual.insert(txid, msg);
                 continue;
             }
-            // Individually valid (including a single-tx RBF). Leave it to the
-            // add loop so a high-fee replacement is not package-rejected.
+            // PaysForRBF / fee-diagram failures are TX_RECONSIDERABLE: the
+            // package may still fund the replacement. A replacement that
+            // already clears single-tx RBF, or that fails a non-reconsiderable
+            // rule (too many conflicts, spends a conflict, not signaling),
+            // stops this pre-pass. Core submits the former alone and sets
+            // quit_early for the latter (validation.cpp AcceptPackage).
+            if let Some(msg) = self.reconsiderable_rbf_tostring(tx, mod_fee) {
+                eval.push(tx);
+                individual.insert(txid, msg);
+                continue;
+            }
             return None;
         }
         if eval.len() < 2 {
@@ -5928,8 +6648,24 @@ impl Mempool {
                     individual.insert(last, msg);
                 }
                 "transaction failed".to_string()
-            } else if self.package_rbf_blocked(&eval) {
-                "package RBF failed: new transaction cannot have mempool ancestors".to_string()
+            } else if self.eval_has_direct_conflict(&eval) {
+                if let Some(msg) = self.package_rbf_reject_reason(&eval, tx_fees) {
+                    msg
+                } else {
+                    return Some(self.commit_package_rbf(
+                        txs,
+                        tx_fees,
+                        &eval,
+                        &individual,
+                        already_in_mempool,
+                        different_witness,
+                        utxo_lookup,
+                        opts,
+                        package_fee,
+                        package_vsize,
+                        package_fee_rate,
+                    ));
+                }
             } else {
                 return None;
             }
@@ -6457,14 +7193,11 @@ impl Mempool {
             // Check for conflicts (double-spends)
             if let Some(&conflicting) = self.spent_outpoints.get(&input.previous_output) {
                 direct_conflicts.insert(conflicting);
-                // Deliberately chain-UTXO only (unlike add_transaction): a
-                // package member that replaces a mempool tx while spending a
-                // mempool parent's output is refused by Core too — package
-                // RBF requires no in-mempool ancestors (validation.cpp:1065,
-                // "package RBF failed: new transaction cannot have mempool
-                // ancestors"). rustoshi has no package-RBF rules yet, so this
-                // lookup is what keeps that case rejected (with the
-                // missing-inputs token rather than Core's package one).
+                // Chain UTXO only. Package RBF has already removed its
+                // conflicts; a conflict still present is single-tx RBF.
+                // Spending a mempool parent's output has no chain coin, so
+                // this stays missing-inputs (Core refuses that shape in
+                // PackageRBFChecks before it would be mined).
                 if let Some(coin) = utxo_lookup(&input.previous_output) {
                     if coin.is_coinbase {
                         spends_coinbase = true;
