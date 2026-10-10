@@ -1872,7 +1872,9 @@ impl Mempool {
                 // Coinbase maturity check.
                 if coin.is_coinbase {
                     spends_coinbase = true;
-                    let age = self.tip_height.saturating_sub(coin.height);
+                    // Core CheckTxInputs: nSpendHeight = tip + 1 (the next
+                    // block). A height-1 coinbase is mature at tip 100.
+                    let age = self.tip_height.saturating_add(1).saturating_sub(coin.height);
                     if age < COINBASE_MATURITY {
                         return Err(MempoolError::CoinbaseNotMature {
                             age,
@@ -4912,6 +4914,7 @@ impl Mempool {
         let mut mempool_parents = HashSet::new();
         let mut direct_conflicts = HashSet::new();
         let mut prevout_scripts: Vec<Vec<u8>> = Vec::with_capacity(tx.inputs.len());
+        let mut spends_coinbase = false;
 
         for input in &tx.inputs {
             // Check for conflicts (double-spends)
@@ -4926,6 +4929,16 @@ impl Mempool {
                 // lookup is what keeps that case rejected (with the
                 // missing-inputs token rather than Core's package one).
                 if let Some(coin) = utxo_lookup(&input.previous_output) {
+                    if coin.is_coinbase {
+                        spends_coinbase = true;
+                        let age = self.tip_height.saturating_add(1).saturating_sub(coin.height);
+                        if age < COINBASE_MATURITY {
+                            return Err(MempoolError::CoinbaseNotMature {
+                                age,
+                                required: COINBASE_MATURITY,
+                            });
+                        }
+                    }
                     prevout_scripts.push(coin.script_pubkey.clone());
                     input_sum += coin.value;
                 } else {
@@ -4954,6 +4967,16 @@ impl Mempool {
                 input_sum += parent.tx.outputs[vout].value;
                 mempool_parents.insert(*parent_txid);
             } else if let Some(coin) = utxo_lookup(&input.previous_output) {
+                if coin.is_coinbase {
+                    spends_coinbase = true;
+                    let age = self.tip_height.saturating_add(1).saturating_sub(coin.height);
+                    if age < COINBASE_MATURITY {
+                        return Err(MempoolError::CoinbaseNotMature {
+                            age,
+                            required: COINBASE_MATURITY,
+                        });
+                    }
+                }
                 prevout_scripts.push(coin.script_pubkey.clone());
                 input_sum += coin.value;
             } else {
@@ -5113,12 +5136,9 @@ impl Mempool {
         // Build the entry (cluster_id and mining_score will be updated by add_to_clusters)
         let weight = tx.weight();
         let has_ephemeral_dust = !get_ephemeral_dust_outputs(&tx).is_empty();
-        // W96: package-path entry_sequence + spends_coinbase.
         // Package admissions get a fresh sequence number (no bypass_limits).
-        // spends_coinbase here is approximated as false because the
-        // package path does not yet track per-input coinbase status; this
-        // is safe because non-coinbase-spending entries are simply
-        // excluded from the reorg re-scan set.
+        // spends_coinbase is the same per-input flag add_transaction records,
+        // so remove_for_reorg can re-check maturity after a reorg.
         let entry_sequence_pkg = self.get_and_increment_sequence();
         let entry = MempoolEntry {
             tx: tx.clone(),
@@ -5147,7 +5167,7 @@ impl Mempool {
             descendant_size: vsize,
             descendant_fees: fee,
             has_ephemeral_dust,
-            spends_coinbase: false,
+            spends_coinbase,
             entry_sequence: entry_sequence_pkg,
         };
         let entry_wtxid = entry.tx.wtxid();
@@ -12162,6 +12182,52 @@ mod tests {
         let entry = mempool.get(&txid).expect("entry must be in mempool");
         assert!(entry.spends_coinbase,
             "entry must mark spends_coinbase=true when any input prevout is_coinbase");
+    }
+
+    /// Core `CheckTxInputs` spends at `nSpendHeight = tip + 1`.
+    /// A height-1 coinbase is mature in the mempool at tip 100
+    /// (`101 - 1 = 100`) and immature at tip 99 (`100 - 1 = 99`).
+    #[test]
+    fn coinbase_maturity_spend_height_is_tip_plus_one() {
+        let prev = Hash256::from_bytes([0x61; 32]);
+        let p2pkh: Vec<u8> = {
+            let mut v = vec![0x76, 0xa9, 0x14];
+            v.extend_from_slice(&[0x42u8; 20]);
+            v.push(0x88);
+            v.push(0xac);
+            v
+        };
+        let utxos: HashMap<OutPoint, CoinEntry> = [(
+            OutPoint { txid: prev, vout: 0 },
+            CoinEntry {
+                height: 1,
+                is_coinbase: true,
+                value: 100_000,
+                script_pubkey: p2pkh,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let lookup = |op: &OutPoint| utxos.get(op).cloned();
+
+        let mut early = Mempool::new(MempoolConfig::default());
+        early.notify_new_tip(99, 0);
+        let rejected = early
+            .add_transaction(make_tx(vec![(prev, 0)], vec![90_000], 1), &lookup)
+            .unwrap_err();
+        assert!(
+            matches!(
+                rejected,
+                MempoolError::CoinbaseNotMature { age: 99, required: 100 }
+            ),
+            "tip 99 must reject with depth 99, got {rejected:?}"
+        );
+
+        let mut mature = Mempool::new(MempoolConfig::default());
+        mature.notify_new_tip(100, 0);
+        mature
+            .add_transaction(make_tx(vec![(prev, 0)], vec![90_000], 1), &lookup)
+            .expect("tip 100 must accept a height-1 coinbase (depth 100)");
     }
 
     /// W96 gate 16: entry_sequence advances per admission, and bypass_limits

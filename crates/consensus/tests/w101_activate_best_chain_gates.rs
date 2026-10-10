@@ -492,28 +492,37 @@ fn g22_precious_block_does_not_trigger_activate_best_chain() {
 
 /// G23/G25 — CORRECTNESS
 ///
-/// Core's `InvalidBlockFound` (validation.cpp:1991-1993) only sets
-/// `BLOCK_FAILED_VALID` and erases from `setBlockIndexCandidates` when
-/// the result is NOT `BLOCK_MUTATED`. A mutated block (malleable witness
-/// data) should NOT be permanently marked invalid — the same block with
-/// clean data could be valid.
-///
-/// Rustoshi has no `BLOCK_MUTATED` concept. Any block that fails
-/// `reorganize` is left without any invalid marker on disk (the reorg
-/// just returns `Err`). Ironically this means rustoshi is not wrong in
-/// the mutated-block case (it doesn't incorrectly mark the block), but
-/// it also means it never marks genuinely-invalid blocks either —
-/// the block stays in the index as HAVE_DATA and the side-branch could
-/// be re-attempted on every new peer connection.
+/// Core's `InvalidBlockFound` sets `BLOCK_FAILED_VALID` unless the result
+/// is `BLOCK_MUTATED`. A ConnectBlock failure is stored that way and is
+/// not retried; a mutated block is not. The disk mark is covered by
+/// `connect_failure_is_failed_valid_and_survives_restart`.
 #[test]
-#[ignore = "BUG G23/G25: BLOCK_MUTATED exception missing; more importantly, \
-            rustoshi never marks failed-connect blocks as FAILED_VALID on disk \
-            — failed side-branches can be retried indefinitely (CORRECTNESS)"]
 fn g23_g25_invalid_block_found_no_failed_valid_flag_on_failed_connect() {
+    use rustoshi_consensus::validation::ValidationError;
+    // Core InvalidBlockFound skips BLOCK_MUTATED. A merkle-root mismatch is
+    // not a verdict, so it must not be stored as BLOCK_FAILED_VALID.
     assert!(
-        false,
-        "G23/G25 BUG: blocks that fail ConnectTip are not marked FAILED_VALID \
-         on disk; the side-branch persists and will be retried by any reorg"
+        !ValidationError::BadMerkleRoot.is_invalid_block_verdict(),
+        "BLOCK_MUTATED must not be recorded as a failed block"
+    );
+    assert!(
+        !ValidationError::BadMerkleRoot.is_connect_block_failure(),
+        "a mutated block fails CheckBlock, before ConnectBlock"
+    );
+    // A coinbase that overpays fails inside ConnectBlock. That verdict is
+    // what InvalidBlockFound records. The durable mark (survives restart,
+    // resubmit is duplicate-invalid, heavier side tip included) is
+    // `invalidated_submit_tests::connect_failure_is_failed_valid_and_survives_restart`.
+    assert!(ValidationError::BadSubsidy(51, 50).is_invalid_block_verdict());
+    assert!(ValidationError::BadSubsidy(51, 50).is_connect_block_failure());
+    let src = include_str!("../../rpc/src/server.rs");
+    assert!(
+        src.contains("fn persist_failed_connect"),
+        "tip-extending ConnectBlock failure must persist BLOCK_FAILED_VALID"
+    );
+    assert!(
+        src.contains("BlockStatus::FAILED_VALIDITY"),
+        "failed connect must set BLOCK_FAILED_VALID"
     );
 }
 

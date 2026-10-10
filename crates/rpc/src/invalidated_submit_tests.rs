@@ -738,3 +738,113 @@ async fn submitheader_of_failed_parent_is_bad_prevblk_and_not_stored() {
         .any(|t| t["hash"].as_str() == Some(&child.block_hash().to_hex()));
     assert!(!listed, "unstored header must not be a chain tip");
 }
+
+fn mine_valued(h: u32, prev: Hash256, step: u32, value: u64, extra: u8) -> Block {
+    let mut script_sig = bip34_push(h);
+    script_sig.extend_from_slice(&[extra, 0xC5]);
+    let mut block = Block {
+        header: BlockHeader {
+            version: 0x2000_0000,
+            prev_block_hash: prev,
+            merkle_root: Hash256::ZERO,
+            timestamp: BASE_TIME + step * 600,
+            bits: 0x207f_ffff,
+            nonce: 0,
+        },
+        transactions: vec![Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256::ZERO, vout: u32::MAX },
+                script_sig,
+                sequence: 0xFFFF_FFFF,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value, script_pubkey: vec![0x51] }],
+            lock_time: 0,
+        }],
+    };
+    block.header.merkle_root = block.compute_merkle_root();
+    while !block.header.validate_pow_against_declared_target() {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+    block
+}
+
+fn index_failed_valid(db: &ChainDb, hash: &Hash256) -> bool {
+    BlockStore::new(db)
+        .get_block_index(hash)
+        .ok()
+        .flatten()
+        .is_some_and(|e| e.status.has(BlockStatus::FAILED_VALIDITY))
+}
+
+/// A block that passes header and context-free checks but fails ConnectBlock
+/// (coinbase value above the subsidy) is stored as BLOCK_FAILED_VALID. The
+/// active tip does not move. The mark is still there after the chain state
+/// is reloaded, and a resubmit is duplicate-invalid rather than another
+/// connect attempt.
+#[tokio::test]
+async fn connect_failure_is_failed_valid_and_survives_restart() {
+    let (server, blocks, db) = chain_db(2).await;
+    let tip = blocks[2].block_hash();
+    assert_eq!(server.get_block_count().await.unwrap(), 2);
+
+    // Tip-extending connect failure.
+    let bad = mine_valued(3, tip, 3, 51 * 100_000_000, 0x01);
+    let r = server.submit_block(hex_of(&bad)).await.unwrap();
+    assert_eq!(r.as_deref(), Some("bad-cb-amount"), "{r:?}");
+    assert_eq!(server.get_block_count().await.unwrap(), 2);
+    assert_eq!(server.get_best_block_hash().await.unwrap(), tip.to_hex());
+    assert!(
+        index_failed_valid(&db, &bad.block_hash()),
+        "tip-extending ConnectBlock failure must be BLOCK_FAILED_VALID"
+    );
+    let r = server.submit_block(hex_of(&bad)).await.unwrap();
+    assert_eq!(r.as_deref(), Some("duplicate-invalid"), "resubmit retried the connect: {r:?}");
+
+    // Heavier side branch whose tip fails ConnectBlock.
+    let params = ChainParams::regtest();
+    let s1 = mine_valued(1, params.genesis_hash, 11, 50 * 100_000_000, 0x99);
+    let s2 = mine_valued(2, s1.block_hash(), 12, 50 * 100_000_000, 0x99);
+    let s3 = mine_valued(3, s2.block_hash(), 13, 51 * 100_000_000, 0x99);
+    assert_eq!(
+        server.submit_block(hex_of(&s1)).await.unwrap().as_deref(),
+        Some("inconclusive")
+    );
+    assert_eq!(
+        server.submit_block(hex_of(&s2)).await.unwrap().as_deref(),
+        Some("inconclusive")
+    );
+    let r = server.submit_block(hex_of(&s3)).await.unwrap();
+    assert_eq!(r.as_deref(), Some("bad-cb-amount"), "heavier side tip: {r:?}");
+    assert_eq!(server.get_best_block_hash().await.unwrap(), tip.to_hex());
+    assert!(
+        index_failed_valid(&db, &s3.block_hash()),
+        "heavier side branch ConnectBlock failure must be BLOCK_FAILED_VALID"
+    );
+    let tips = server.get_chain_tips().await.unwrap();
+    let invalid = tips.as_array().unwrap().iter().find(|t| {
+        t["hash"].as_str() == Some(&s3.block_hash().to_hex())
+    });
+    let invalid = invalid.expect("invalid side tip must be listed");
+    assert_eq!(invalid["status"], "invalid");
+    assert_eq!(invalid["height"], 3);
+    assert_eq!(invalid["branchlen"], 3);
+
+    // Reload chain state from the same database (restart).
+    let mut reloaded = RpcState::new(db.clone(), params);
+    reloaded.init_from_db().unwrap();
+    assert_eq!(reloaded.best_hash, tip);
+    assert_eq!(reloaded.best_height, 2);
+    assert!(index_failed_valid(&db, &bad.block_hash()));
+    assert!(index_failed_valid(&db, &s3.block_hash()));
+    let again = RpcServerImpl::new(
+        Arc::new(RwLock::new(reloaded)),
+        Arc::new(RwLock::new(PeerState::default())),
+    );
+    assert_eq!(
+        again.submit_block(hex_of(&s3)).await.unwrap().as_deref(),
+        Some("duplicate-invalid")
+    );
+    assert_eq!(again.get_best_block_hash().await.unwrap(), tip.to_hex());
+}

@@ -16,6 +16,11 @@ fresh Core node and a fresh rustoshi. Compared, field by field:
     bip125-replaceable, fees.chunk, and chunkweight
   * submitheader of a header whose parent was invalidated (bad-prevblk,
     header not stored)
+  * coinbase maturity at tip 99 (reject) and tip 100 (accept), via
+    testmempoolaccept, sendrawtransaction, and a mined block
+  * REST /rest/mempool/contents.json and /rest/mempool/info.json
+  * a heavier side branch whose tip fails ConnectBlock (bad-cb-amount),
+    then the same getchaintips / getbestblockhash after a restart
 
 Usage:
   invalidated_submit_sweep.py --bitcoind PATH --bitcoin-cli PATH --rustoshi PATH
@@ -69,14 +74,14 @@ def script_num(height: int) -> bytes:
     return bytes([len(le)]) + bytes(le)
 
 
-def coinbase(height: int, extra: bytes = b"\x01\xc5") -> bytes:
+def coinbase(height: int, extra: bytes = b"\x01\xc5", value: int = 50 * 100_000_000) -> bytes:
     script = script_num(height) + extra
     tx = struct.pack("<i", 2)
     tx += compact_size(1)
     tx += b"\x00" * 32 + struct.pack("<I", 0xFFFFFFFF)
     tx += compact_size(len(script)) + script + struct.pack("<I", 0xFFFFFFFF)
     tx += compact_size(1)
-    tx += struct.pack("<q", 50 * 100_000_000) + compact_size(1) + b"\x51"
+    tx += struct.pack("<q", value) + compact_size(1) + b"\x51"
     tx += struct.pack("<I", 0)
     return tx
 
@@ -91,8 +96,14 @@ def solve(prefix76: bytes) -> bytes:
     raise RuntimeError("regtest PoW search failed")
 
 
-def make_block(prev_hex: str, cb_height: int, timestamp: int, extra: bytes = b"\x01\xc5") -> str:
-    tx = coinbase(cb_height, extra)
+def make_block(
+    prev_hex: str,
+    cb_height: int,
+    timestamp: int,
+    extra: bytes = b"\x01\xc5",
+    value: int = 50 * 100_000_000,
+) -> str:
+    tx = coinbase(cb_height, extra, value)
     merkle = sha256d(tx)
     prev = bytes.fromhex(prev_hex)[::-1]
     prefix = struct.pack("<i", 0x20000000) + prev + merkle + struct.pack("<II", timestamp, 0x207FFFFF)
@@ -108,6 +119,100 @@ def mutated_block(prev_hex: str, timestamp: int) -> str:
     prefix = struct.pack("<i", 0x20000000) + prev + merkle + struct.pack("<II", timestamp, 0x207FFFFF)
     hdr = solve(prefix)
     return (hdr + compact_size(1) + tx).hex()
+
+
+def merkle_root(leaves: list[bytes]) -> bytes:
+    level = list(leaves)
+    if not level:
+        return b"\x00" * 32
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])
+        level = [sha256d(level[i] + level[i + 1]) for i in range(0, len(level), 2)]
+    return level[0]
+
+
+def coinbase_with_commitment(height: int, value: int, extra: bytes, commitment: bytes) -> tuple[bytes, bytes]:
+    """Coinbase that commits to a witness merkle root.
+
+    Returns (non-witness serialization for the txid, full serialization
+    including the 32-byte witness nonce). The commitment output is
+    OP_RETURN 0x24 aa21a9ed || SHA256d(witness_root || nonce).
+    """
+    script = script_num(height) + extra
+    pay = b"\x51"
+    commit = bytes([0x6A, 0x24, 0xAA, 0x21, 0xA9, 0xED]) + commitment
+    vin = b"\x00" * 32 + struct.pack("<I", 0xFFFFFFFF)
+    vin += compact_size(len(script)) + script + struct.pack("<I", 0xFFFFFFFF)
+    vout = struct.pack("<q", value) + compact_size(len(pay)) + pay
+    vout += struct.pack("<q", 0) + compact_size(len(commit)) + commit
+    base = struct.pack("<i", 2) + compact_size(1) + vin + compact_size(2) + vout + struct.pack("<I", 0)
+    witness = b"\x01\x20" + (b"\x00" * 32)
+    full = (
+        struct.pack("<i", 2)
+        + b"\x00\x01"
+        + compact_size(1)
+        + vin
+        + compact_size(2)
+        + vout
+        + witness
+        + struct.pack("<I", 0)
+    )
+    return base, full
+
+
+def block_spending(
+    prev_hex: str,
+    height: int,
+    timestamp: int,
+    spend_hex: str,
+    txid_hex: str,
+    wtxid_hex: str,
+    extra: bytes,
+) -> str:
+    """Tip-extending block that pays a 50 BTC coinbase and includes `spend_hex`.
+
+    The coinbase claims the subsidy only (fees may go unclaimed). The
+    witness commitment uses a 32-zero nonce, matching BIP141.
+    """
+    txid = bytes.fromhex(txid_hex)[::-1]
+    wtxid = bytes.fromhex(wtxid_hex)[::-1]
+    witness_root = merkle_root([b"\x00" * 32, wtxid])
+    commitment = sha256d(witness_root + (b"\x00" * 32))
+    cb_base, cb_full = coinbase_with_commitment(height, 50 * 100_000_000, extra, commitment)
+    root = merkle_root([sha256d(cb_base), txid])
+    prev = bytes.fromhex(prev_hex)[::-1]
+    prefix = struct.pack("<i", 0x20000000) + prev + root + struct.pack("<II", timestamp, 0x207FFFFF)
+    hdr = solve(prefix)
+    return (hdr + compact_size(2) + cb_full + bytes.fromhex(spend_hex)).hex()
+
+
+def rest_get(base: str, path: str):
+    req = urllib.request.Request(base + path)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        return {"_http_error": e.code, "body": body[:500]}
+
+
+def wait_rest(base: str, proc: subprocess.Popen, log_path: str, timeout: int = 30) -> None:
+    deadline = time.time() + timeout
+    last = ""
+    url = base + "/rest/mempool/info.json"
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            tail = open(log_path).read()[-2000:]
+            raise RuntimeError(f"node exited {proc.returncode} before REST came up\n{tail}")
+        try:
+            rest_get(base, "/rest/mempool/info.json")
+            return
+        except Exception as e:  # noqa: BLE001 — startup race
+            last = str(e)
+            time.sleep(0.25)
+    tail = open(log_path).read()[-2000:] if os.path.exists(log_path) else ""
+    raise RuntimeError(f"REST never came up at {url} ({last})\n{tail}")
 
 
 class Rpc:
@@ -174,12 +279,21 @@ def stop_proc(proc: subprocess.Popen | None) -> None:
 
 
 class Node:
-    def __init__(self, name: str, proc: subprocess.Popen | None, rpc: Rpc, datadir: str, log_path: str):
+    def __init__(
+        self,
+        name: str,
+        proc: subprocess.Popen | None,
+        rpc: Rpc,
+        datadir: str,
+        log_path: str,
+        rest_base: str,
+    ):
         self.name = name
         self.proc = proc
         self.rpc = rpc
         self.datadir = datadir
         self.log_path = log_path
+        self.rest_base = rest_base
 
     def stop(self) -> None:
         if self.name == "core":
@@ -210,7 +324,9 @@ def start_core(bitcoind: str, datadir: str, rpc_port: int, p2p_port: int) -> Nod
             f"-port={p2p_port}",
             f"-rpcport={rpc_port}",
             "-rpcbind=127.0.0.1",
+            "-rpcallowip=127.0.0.1",
             "-fallbackfee=0.0002",
+            "-rest",
         ],
         stdout=open(log_path, "ab"),
         stderr=subprocess.STDOUT,
@@ -219,8 +335,11 @@ def start_core(bitcoind: str, datadir: str, rpc_port: int, p2p_port: int) -> Nod
         f"http://127.0.0.1:{rpc_port}/",
         [os.path.join(datadir, "regtest", ".cookie")],
     )
-    wait_rpc(rpc, proc, os.path.join(datadir, "regtest", "debug.log"))
-    return Node("core", proc, rpc, datadir, log_path)
+    rest_base = f"http://127.0.0.1:{rpc_port}"
+    core_log = os.path.join(datadir, "regtest", "debug.log")
+    wait_rpc(rpc, proc, core_log)
+    wait_rest(rest_base, proc, core_log)
+    return Node("core", proc, rpc, datadir, log_path, rest_base)
 
 
 def start_rustoshi(binary: str, datadir: str, rpc_port: int, p2p_port: int) -> Node:
@@ -235,6 +354,8 @@ def start_rustoshi(binary: str, datadir: str, rpc_port: int, p2p_port: int) -> N
             "--nofixedseeds",
             f"--port={p2p_port}",
             f"--rpcbind=127.0.0.1:{rpc_port}",
+            "--rest",
+            f"--restbind=127.0.0.1:{rpc_port + 100}",
         ],
         stdout=open(log_path, "w"),
         stderr=subprocess.STDOUT,
@@ -243,8 +364,10 @@ def start_rustoshi(binary: str, datadir: str, rpc_port: int, p2p_port: int) -> N
         f"http://127.0.0.1:{rpc_port}/",
         [os.path.join(datadir, ".cookie"), os.path.join(datadir, "regtest", ".cookie")],
     )
+    rest_base = f"http://127.0.0.1:{rpc_port + 100}"
     wait_rpc(rpc, proc, log_path)
-    return Node("rustoshi", proc, rpc, datadir, log_path)
+    wait_rest(rest_base, proc, log_path)
+    return Node("rustoshi", proc, rpc, datadir, log_path, rest_base)
 
 
 def cli(bitcoin_cli: str, datadir: str, rpc_port: int, *args: str) -> str:
@@ -275,11 +398,25 @@ def build_chain(bitcoind: str, bitcoin_cli: str, work: str) -> dict:
         if not signed.get("complete"):
             raise RuntimeError(f"sign failed: {signed}")
         tx_hex = signed["hex"]
-        txid = cli(bitcoin_cli, datadir, 18601, "sendrawtransaction", tx_hex)
+        decoded = json.loads(cli(bitcoin_cli, datadir, 18601, "decoderawtransaction", tx_hex))
+        txid = decoded["txid"]
+        wtxid = decoded["hash"]
+        if txid == wtxid:
+            raise RuntimeError("spend has no witness; the mined-block path needs a segwit commitment")
+        # Broadcast so the confirming block actually includes the spend.
+        sent = cli(bitcoin_cli, datadir, 18601, "sendrawtransaction", tx_hex)
+        if sent != txid:
+            raise RuntimeError(f"sendrawtransaction returned {sent}, want {txid}")
         conf = json.loads(cli(bitcoin_cli, datadir, 18601, "generatetoaddress", "1", addr))
         hashes.append(conf[0])
         blocks = [cli(bitcoin_cli, datadir, 18601, "getblock", h, "0") for h in hashes]
-        return {"blocks": blocks, "hashes": hashes, "tx_hex": tx_hex, "txid": txid}
+        return {
+            "blocks": blocks,
+            "hashes": hashes,
+            "tx_hex": tx_hex,
+            "txid": txid,
+            "wtxid": wtxid,
+        }
     finally:
         node.stop()
         shutil.rmtree(datadir, ignore_errors=True)
@@ -289,7 +426,14 @@ def header_hash(header_hex: str) -> str:
     return sha256d(bytes.fromhex(header_hex))[::-1].hex()
 
 
-def snapshot(rpc: Rpc, blocks: list[str], mock_time: int) -> dict:
+def block_time(rpc: Rpc, blockhash: str) -> int:
+    hdr = rpc.call("getblock", [blockhash])
+    if not isinstance(hdr, dict) or "time" not in hdr:
+        raise RuntimeError(f"getblock {blockhash} missing time: {hdr}")
+    return int(hdr["time"])
+
+
+def snapshot(rpc: Rpc, blocks: list[str], mock_time: int, rest_base: str, spend: dict) -> dict:
     """One full pass. `blocks` is height 1..102; the last confirms a non-coinbase spend."""
     out: dict = {"steps": []}
     # Same mock clock on both nodes so mempool `time` is not a race.
@@ -310,7 +454,54 @@ def snapshot(rpc: Rpc, blocks: list[str], mock_time: int) -> dict:
         rec(f"{tag}:getchaintips", rpc.call("getchaintips"))
         rec(f"{tag}:getrawmempool", rpc.call("getrawmempool", [True]))
 
-    for i, hx in enumerate(blocks, start=1):
+    if len(blocks) != 102:
+        raise RuntimeError(f"expected 102 blocks (heights 1..102), got {len(blocks)}")
+
+    # Heights 1..99. A height-1 coinbase is still immature here: Core's
+    # mempool nSpendHeight is tip+1 (age 99) and ConnectBlock's spend height
+    # is the block height (100 - 1 = 99). Both must reject.
+    for i, hx in enumerate(blocks[:99], start=1):
+        submit(f"valid:{i}", hx)
+    tip99 = rpc.call("getbestblockhash")
+    rec("tip99:testmempoolaccept", rpc.call("testmempoolaccept", [[spend["hex"]]]))
+    rec("tip99:sendrawtransaction", rpc.call("sendrawtransaction", [spend["hex"]]))
+    premature = block_spending(
+        tip99,
+        100,
+        block_time(rpc, tip99) + 1,
+        spend["hex"],
+        spend["txid"],
+        spend["wtxid"],
+        extra=b"\x51\xc5",
+    )
+    submit("tip99:premature-block", premature)
+
+    # Height 100. Age is now 100 on both the mempool (tip+1) and a block
+    # mined at height 101. Accept the spend, then diff REST while it sits
+    # in the mempool.
+    submit("valid:100", blocks[99])
+    rec("tip100:testmempoolaccept", rpc.call("testmempoolaccept", [[spend["hex"]]]))
+    rec("tip100:sendrawtransaction", rpc.call("sendrawtransaction", [spend["hex"]]))
+    rec("tip100:rest-contents", rest_get(rest_base, "/rest/mempool/contents.json"))
+    rec("tip100:rest-info", rest_get(rest_base, "/rest/mempool/info.json"))
+    tip100 = rpc.call("getbestblockhash")
+    mature = block_spending(
+        tip100,
+        101,
+        block_time(rpc, tip100) + 1,
+        spend["hex"],
+        spend["txid"],
+        spend["wtxid"],
+        extra=b"\x52\xc5",
+    )
+    submit("tip100:mature-block", mature)
+    mature_hash = header_hash(mature[:160])
+    rec("tip100:mature-block:getbestblockhash", rpc.call("getbestblockhash"))
+    # Drop the mature block so the shared canonical chain can continue.
+    # The spend re-enters the mempool and block 102 confirms it again.
+    rec("invalidate-mature-block", rpc.call("invalidateblock", [mature_hash]))
+
+    for i, hx in enumerate(blocks[100:], start=101):
         submit(f"valid:{i}", hx)
     chain_view("after-valid")
     submit("duplicate", blocks[0])
@@ -371,6 +562,32 @@ def snapshot(rpc: Rpc, blocks: list[str], mock_time: int) -> dict:
     chain_view("after-reconsider-100")
     submit("accept-child", valid_child)
     chain_view("after-accept-child")
+
+    # Heavier side branch whose tip fails ConnectBlock (coinbase pays 51 BTC).
+    # The sibling has equal work, so it stays off the active chain; the child
+    # has more work and is attempted. Core marks that child BLOCK_FAILED_VALID
+    # and does not move the tip. A restart must still report the same tip.
+    tip = rpc.call("getbestblockhash")
+    tip_info = rpc.call("getblock", [tip])
+    if not isinstance(tip_info, dict) or "previousblockhash" not in tip_info:
+        raise RuntimeError(f"getblock {tip} missing previousblockhash: {tip_info}")
+    sibling = make_block(
+        tip_info["previousblockhash"],
+        int(tip_info["height"]),
+        int(tip_info["time"]) + 1,
+        extra=b"\x61\xc5",
+    )
+    submit("failed-connect:sibling", sibling)
+    sibling_hash = header_hash(sibling[:160])
+    bad = make_block(
+        sibling_hash,
+        int(tip_info["height"]) + 1,
+        int(tip_info["time"]) + 2,
+        extra=b"\x62\xc5",
+        value=51 * 100_000_000,
+    )
+    submit("failed-connect:bad-cb-amount", bad)
+    chain_view("after-failed-connect")
     return out
 
 
@@ -407,24 +624,35 @@ def floats_close(a, b) -> bool:
     return a == b
 
 
+# Fee rates and totals. Same 8-decimal JSON numbers on both sides, compared
+# with a tolerance so a trailing-zero spelling cannot fail the diff.
+INFO_FEE_FIELDS = {"total_fee", "mempoolminfee", "minrelaytxfee", "incrementalrelayfee"}
+
+
+def dicts_equal(a, b, float_keys: set[str]) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return a == b
+    if set(a) != set(b):
+        return False
+    for k, av in a.items():
+        bv = b[k]
+        if k in float_keys:
+            if not floats_close(av, bv):
+                return False
+        elif av != bv:
+            return False
+    return True
+
+
 def values_equal(name: str, a, b) -> bool:
     if name.endswith(":getchaintips"):
         return canonical_tips(a) == canonical_tips(b)
-    if name.endswith(":getrawmempool"):
+    if name.endswith(":getrawmempool") or name.endswith("rest-contents"):
         return canonical_mempool(a) == canonical_mempool(b)
     if name.endswith(":getblockchaininfo"):
-        if not isinstance(a, dict) or not isinstance(b, dict):
-            return a == b
-        if set(a) != set(b):
-            return False
-        for k, av in a.items():
-            bv = b[k]
-            if k in INFO_FLOATS:
-                if not floats_close(av, bv):
-                    return False
-            elif av != bv:
-                return False
-        return True
+        return dicts_equal(a, b, INFO_FLOATS)
+    if name.endswith("rest-info"):
+        return dicts_equal(a, b, INFO_FEE_FIELDS)
     return a == b
 
 
@@ -507,9 +735,20 @@ def main() -> int:
         nodes.append(rust)
         print("replaying on core...")
         mock_time = int(time.time())
-        core_obs = snapshot(core.rpc, built["blocks"], mock_time)
+        spend = {"hex": built["tx_hex"], "txid": built["txid"], "wtxid": built["wtxid"]}
+        core_obs = snapshot(core.rpc, built["blocks"], mock_time, core.rest_base, spend)
         print("replaying on rustoshi...")
-        rust_obs = snapshot(rust.rpc, built["blocks"], mock_time)
+        rust_obs = snapshot(rust.rpc, built["blocks"], mock_time, rust.rest_base, spend)
+        print("restarting both nodes on the same datadirs...")
+        core.stop()
+        core = start_core(args.bitcoind, core.datadir, 18611, 18612)
+        nodes[0] = core
+        rust.stop()
+        rust = start_rustoshi(args.rustoshi, rust.datadir, 18621, 18622)
+        nodes[1] = rust
+        for obs, node in ((core_obs, core), (rust_obs, rust)):
+            for method in ("getbestblockhash", "getblockcount", "getchaintips"):
+                obs["steps"].append({"name": f"restart:{method}", "value": node.rpc.call(method)})
     finally:
         for n in nodes:
             n.stop()

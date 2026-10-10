@@ -786,18 +786,8 @@ async fn rest_mempool_info(
 ) -> Result<Response, RestError> {
     let rpc_state = state.rpc_state.read().await;
 
-    let info = RestMempoolInfo {
-        loaded: true,
-        size: rpc_state.mempool.size(),
-        bytes: rpc_state.mempool.total_bytes(),
-        usage: rpc_state.mempool.total_bytes(), // Simplified
-        total_fee: rpc_state.mempool.total_fees() as f64 / COIN as f64,
-        maxmempool: 300_000_000, // 300 MB default
-        mempoolminfee: 0.00001,
-        minrelaytxfee: 0.00001,
-        unbroadcastcount: 0,
-    };
-
+    // Same object as getmempoolinfo (Core MempoolInfoToJSON).
+    let info = crate::server::mempool_info(&rpc_state);
     Ok(json_response(&info))
 }
 
@@ -809,35 +799,13 @@ async fn rest_mempool_contents(
 ) -> Result<Response, RestError> {
     let rpc_state = state.rpc_state.read().await;
 
-    let sorted = rpc_state.mempool.get_sorted_for_mining();
-    let mut result: HashMap<String, RestMempoolEntry> = HashMap::new();
-
-    for txid in sorted {
-        if let Some(entry) = rpc_state.mempool.get(&txid) {
-            result.insert(
-                txid.to_hex(),
-                RestMempoolEntry {
-                    vsize: entry.vsize as u32,
-                    weight: entry.weight as u32,
-                    fee: entry.fee as f64 / COIN as f64,
-                    modifiedfee: entry.fee as f64 / COIN as f64,
-                    time: entry.time_added.elapsed().as_secs(),
-                    height: rpc_state.best_height,
-                    descendantcount: entry.descendant_count as u32,
-                    descendantsize: entry.descendant_size as u32,
-                    descendantfees: entry.descendant_fees,
-                    ancestorcount: entry.ancestor_count as u32,
-                    ancestorsize: entry.ancestor_size as u32,
-                    ancestorfees: entry.ancestor_fees,
-                    wtxid: entry.tx.wtxid().to_hex(),
-                    depends: vec![],
-                    spentby: vec![],
-                },
-            );
-        }
-    }
-
-    Ok(json_response(&result))
+    // Same object as getrawmempool true (Core MempoolToJSON / entryToJSON).
+    let json = crate::server::mempool_contents_json(&rpc_state);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json + "\n"))
+        .unwrap())
 }
 
 // ============================================================
@@ -869,40 +837,6 @@ struct RestHeaderInfo {
     difficulty: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     previousblockhash: Option<String>,
-}
-
-/// Mempool info for REST response.
-#[derive(Debug, Serialize)]
-struct RestMempoolInfo {
-    loaded: bool,
-    size: usize,
-    bytes: usize,
-    usage: usize,
-    total_fee: f64,
-    maxmempool: usize,
-    mempoolminfee: f64,
-    minrelaytxfee: f64,
-    unbroadcastcount: usize,
-}
-
-/// Mempool entry for REST response.
-#[derive(Debug, Serialize)]
-struct RestMempoolEntry {
-    vsize: u32,
-    weight: u32,
-    fee: f64,
-    modifiedfee: f64,
-    time: u64,
-    height: u32,
-    descendantcount: u32,
-    descendantsize: u32,
-    descendantfees: u64,
-    ancestorcount: u32,
-    ancestorsize: u32,
-    ancestorfees: u64,
-    wtxid: String,
-    depends: Vec<String>,
-    spentby: Vec<String>,
 }
 
 // ============================================================
@@ -2127,6 +2061,136 @@ pub fn rest_router_with_wallet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Core REST `/rest/mempool/contents.json` is `MempoolToJSON` (the same
+    /// object as `getrawmempool true`). `/rest/mempool/info.json` is
+    /// `MempoolInfoToJSON` (the same object as `getmempoolinfo`).
+    #[tokio::test]
+    async fn rest_mempool_contents_and_info_match_core_shape() {
+        use rustoshi_consensus::validation::CoinEntry;
+        use rustoshi_consensus::{ChainParams, MempoolConfig};
+        use rustoshi_primitives::{Transaction, TxIn, TxOut};
+        use rustoshi_storage::ChainDb;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let mut rpc_state = RpcState::new(db, ChainParams::regtest());
+        rpc_state.mempool = rustoshi_consensus::Mempool::new(MempoolConfig::default());
+        rpc_state.mempool.notify_new_tip(200, 0);
+        rpc_state.best_height = 200;
+
+        let prev = Hash256::from_bytes([0x44; 32]);
+        let spk = {
+            let mut v = vec![0x76, 0xa9, 0x14];
+            v.extend_from_slice(&[0x11u8; 20]);
+            v.extend_from_slice(&[0x88, 0xac]);
+            v
+        };
+        let utxos = [(
+            OutPoint { txid: prev, vout: 0 },
+            CoinEntry {
+                height: 1,
+                is_coinbase: false,
+                value: 100_000,
+                script_pubkey: spk.clone(),
+            },
+        )];
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev, vout: 0 },
+                script_sig: vec![0x51],
+                sequence: 0xFFFF_FFFD,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 90_000, script_pubkey: spk }],
+            lock_time: 0,
+        };
+        let txid = tx.txid().to_hex();
+        let coins: Vec<_> = utxos.into_iter().collect();
+        rpc_state
+            .mempool
+            .add_transaction(tx, &|op| {
+                coins.iter().find(|(o, _)| o == op).map(|(_, c)| c.clone())
+            })
+            .expect("admit");
+
+        let state = Arc::new(RwLock::new(rpc_state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let bound = listener.local_addr().expect("local_addr");
+        let router = rest_router(state);
+        let _server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        async fn get(addr: std::net::SocketAddr, path: &str) -> String {
+            let mut sock = TcpStream::connect(addr).await.expect("connect");
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            sock.write_all(req.as_bytes()).await.expect("write");
+            let mut buf = Vec::new();
+            sock.read_to_end(&mut buf).await.expect("read");
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            body
+        }
+
+        let info: serde_json::Value = serde_json::from_str(&get(bound, "/rest/mempool/info.json").await).unwrap();
+        for key in [
+            "loaded",
+            "size",
+            "bytes",
+            "usage",
+            "total_fee",
+            "maxmempool",
+            "mempoolminfee",
+            "minrelaytxfee",
+            "incrementalrelayfee",
+            "unbroadcastcount",
+            "fullrbf",
+            "permitbaremultisig",
+            "maxdatacarriersize",
+            "limitclustercount",
+            "limitclustersize",
+            "optimal",
+        ] {
+            assert!(info.get(key).is_some(), "info.json missing {key}: {info}");
+        }
+        assert_eq!(info["size"], 1);
+
+        let contents: serde_json::Value =
+            serde_json::from_str(&get(bound, "/rest/mempool/contents.json").await).unwrap();
+        let entry = contents.get(&txid).unwrap_or_else(|| panic!("missing {txid} in {contents}"));
+        for key in [
+            "vsize",
+            "weight",
+            "time",
+            "height",
+            "descendantcount",
+            "descendantsize",
+            "ancestorcount",
+            "ancestorsize",
+            "wtxid",
+            "chunkweight",
+            "fees",
+            "depends",
+            "spentby",
+            "bip125-replaceable",
+            "unbroadcast",
+        ] {
+            assert!(entry.get(key).is_some(), "contents entry missing {key}: {entry}");
+        }
+        assert!(entry.get("fee").is_none(), "flat fee is not a Core field: {entry}");
+        assert!(entry.get("modifiedfee").is_none(), "flat modifiedfee is not a Core field: {entry}");
+        let time = entry["time"].as_u64().unwrap();
+        assert!(time > 1_000_000_000, "time must be the entry's unix time, got {time}");
+        assert_eq!(entry["bip125-replaceable"], true);
+        assert!(entry["fees"].get("chunk").is_some(), "fees.chunk missing: {entry}");
+        assert_eq!(entry["chunkweight"], entry["weight"]);
+        assert_eq!(entry["height"], 200);
+    }
 
     #[test]
     fn test_parse_hash_and_format() {

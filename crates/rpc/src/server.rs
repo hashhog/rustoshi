@@ -195,7 +195,7 @@ pub(crate) fn guess_verification_progress(
     (chain_tx as f64 / f_tx_total).min(1.0)
 }
 
-fn rpc_mempool_entry(
+pub(crate) fn rpc_mempool_entry(
     mempool: &Mempool,
     entry: &rustoshi_consensus::mempool::MempoolEntry,
     height: u32,
@@ -229,6 +229,63 @@ fn rpc_mempool_entry(
         bip125_replaceable: mempool.is_bip125_replaceable(&entry.txid),
         unbroadcast: false,
     }
+}
+
+/// Core `MempoolInfoToJSON` — shared by `getmempoolinfo` and REST
+/// `/rest/mempool/info.json`.
+pub(crate) fn mempool_info(state: &RpcState) -> MempoolInfo {
+    let total_fee_sats: u64 = state
+        .mempool
+        .get_sorted_for_mining()
+        .iter()
+        .filter_map(|h| state.mempool.get(h))
+        .map(|e| e.fee)
+        .sum();
+    // Fee fields are the live admission floor, sat/kvB. BtcAmount serializes
+    // 100 sat/kvB as 0.00000100 BTC (Core ValueFromAmount).
+    let min_relay_kvb = state.mempool.min_relay_feerate_kvb();
+    let incremental_kvb = state.mempool.incremental_relay_feerate_kvb();
+    let mempool_min_kvb = std::cmp::max(state.mempool.mempool_min_feerate_kvb(), min_relay_kvb);
+    MempoolInfo {
+        loaded: true,
+        size: state.mempool.size(),
+        bytes: state.mempool.total_bytes(),
+        usage: state.mempool.total_bytes() * 2,
+        total_fee: BtcAmount::from_sats(total_fee_sats),
+        maxmempool: 300 * 1_000_000,
+        mempoolminfee: BtcAmount::from_sats(mempool_min_kvb),
+        minrelaytxfee: BtcAmount::from_sats(min_relay_kvb),
+        incrementalrelayfee: BtcAmount::from_sats(incremental_kvb),
+        unbroadcastcount: 0,
+        fullrbf: true,
+        permitbaremultisig: true,
+        maxdatacarriersize: 100_000,
+        limitclustercount: 64,
+        limitclustersize: 101_000,
+        optimal: true,
+    }
+}
+
+/// Core `MempoolToJSON(..., verbose=true)` — shared by `getrawmempool` and
+/// REST `/rest/mempool/contents.json`.
+pub(crate) fn mempool_contents_json(state: &RpcState) -> String {
+    let mut json = String::from("{");
+    let mut first = true;
+    for txid in state.mempool.get_sorted_for_mining() {
+        if let Some(entry) = state.mempool.get(&txid) {
+            let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            json.push('"');
+            json.push_str(&txid.to_hex());
+            json.push_str("\":");
+            json.push_str(&serde_json::to_string(&mem_entry).unwrap());
+        }
+    }
+    json.push('}');
+    json
 }
 
 pub(crate) fn unix_now_secs() -> i64 {
@@ -5324,6 +5381,61 @@ fn refresh_best_header_height(state: &mut RpcState) {
     state.header_height = best_height;
 }
 
+/// Core `AcceptBlock` writes the block, then `ConnectTip` fails and
+/// `InvalidBlockFound` sets `BLOCK_FAILED_VALID`. The active tip, height
+/// index, and UTXO set stay where they were. A later submit of the same
+/// block is `duplicate-invalid`.
+fn persist_failed_connect(
+    store: &BlockStore,
+    state: &RpcState,
+    block: &Block,
+    block_hash: &Hash256,
+) -> Result<(), String> {
+    use rustoshi_consensus::pow::{get_block_proof, ChainWork};
+    use rustoshi_storage::block_store::{BlockIndexEntry as StorageBlockIndexEntry, BlockStatus};
+
+    store
+        .put_header(block_hash, &block.header)
+        .map_err(|e| format!("put_header: {e}"))?;
+    store
+        .put_block(block_hash, block)
+        .map_err(|e| format!("put_block: {e}"))?;
+    let parent_work = if block.header.prev_block_hash != Hash256::ZERO {
+        store
+            .get_block_index(&block.header.prev_block_hash)
+            .ok()
+            .flatten()
+            .map(|e| ChainWork::from_be_bytes(e.chain_work))
+            .unwrap_or(ChainWork::ZERO)
+    } else {
+        ChainWork::ZERO
+    };
+    let this_work = parent_work.saturating_add(&get_block_proof(block.header.bits));
+    let mut status = store
+        .get_block_index(block_hash)
+        .ok()
+        .flatten()
+        .map(|e| e.status)
+        .unwrap_or_else(BlockStatus::new);
+    status.set(BlockStatus::HAVE_DATA);
+    status.set(BlockStatus::FAILED_VALIDITY);
+    let entry = StorageBlockIndexEntry {
+        height: state.best_height + 1,
+        status,
+        n_tx: block.transactions.len() as u32,
+        timestamp: block.header.timestamp,
+        bits: block.header.bits,
+        nonce: block.header.nonce,
+        version: block.header.version,
+        prev_hash: block.header.prev_block_hash,
+        chain_work: this_work.0,
+    };
+    store
+        .put_block_index(block_hash, &entry)
+        .map_err(|e| format!("put_block_index: {e}"))?;
+    Ok(())
+}
+
 /// Set `flag` on an existing block-index entry (no-op when absent).
 fn set_block_index_flag(store: &BlockStore, hash: &Hash256, flag: u32) {
     match store.get_block_index(hash) {
@@ -9352,44 +9464,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
         let state = self.state.read().await;
-
-        // Total fees: iterate mempool for sum of all entry fees.
-        let total_fee_sats: u64 = state.mempool.get_sorted_for_mining()
-            .iter()
-            .filter_map(|h| state.mempool.get(h))
-            .map(|e| e.fee)
-            .sum();
-        // Couple the displayed fee fields to the REAL admission floor instead
-        // of a hardcoded literal (audit wx12re33x: the prior `let _ = 100;`
-        // understated the policy by 10x). All three are sat/kvB integers read
-        // from the live mempool config; BtcAmount serializes 100 sat/kvB to
-        // 0.00000100 BTC (Core ValueFromAmount(CFeeRate(100).GetFeePerK())).
-        //   minrelaytxfee      = static min-relay floor (config.min_fee_rate)
-        //   incrementalrelayfee = config.incremental_relay_fee
-        //   mempoolminfee      = max(rolling, floor) per Core CTxMemPool::GetMinFee
-        let min_relay_kvb = state.mempool.min_relay_feerate_kvb();
-        let incremental_kvb = state.mempool.incremental_relay_feerate_kvb();
-        let mempool_min_kvb =
-            std::cmp::max(state.mempool.mempool_min_feerate_kvb(), min_relay_kvb);
-
-        Ok(MempoolInfo {
-            loaded: true,
-            size: state.mempool.size(),
-            bytes: state.mempool.total_bytes(),
-            usage: state.mempool.total_bytes() * 2, // approximate memory usage
-            total_fee: BtcAmount::from_sats(total_fee_sats),
-            maxmempool: 300 * 1_000_000, // DEFAULT_MAX_MEMPOOL_SIZE_MB(300) * 1'000'000 = 300000000
-            mempoolminfee: BtcAmount::from_sats(mempool_min_kvb),
-            minrelaytxfee: BtcAmount::from_sats(min_relay_kvb),
-            incrementalrelayfee: BtcAmount::from_sats(incremental_kvb),
-            unbroadcastcount: 0,
-            fullrbf: true,
-            permitbaremultisig: true, // DEFAULT_PERMIT_BAREMULTISIG
-            maxdatacarriersize: 100_000, // MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT(400000)/WITNESS_SCALE_FACTOR(4)
-            limitclustercount: 64, // DEFAULT_CLUSTER_LIMIT
-            limitclustersize: 101_000, // DEFAULT_CLUSTER_SIZE_LIMIT_KVB(101) * 1000
-            optimal: true, // DoWork(0) on default/empty mempool reports known-optimal
-        })
+        Ok(mempool_info(&state))
     }
 
     async fn get_raw_mempool(&self, verbose: Option<bool>) -> RpcResult<Box<serde_json::value::RawValue>> {
@@ -9405,28 +9480,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             return Ok(serde_json::value::RawValue::from_string(json_str).unwrap());
         }
 
-        // Verbose mode: map of txid -> entry details.
-        // Build JSON manually via to_string so that BtcAmount's 8-decimal
-        // serialiser is used and serde_json::to_value cannot collapse
-        // "0.00001000" to 1e-05 by routing through Value::Number (f64).
-        let mut json = String::from("{");
-        let mut first = true;
-        for txid in sorted {
-            if let Some(entry) = state.mempool.get(&txid) {
-                let mem_entry = rpc_mempool_entry(&state.mempool, entry, state.best_height);
-                if !first {
-                    json.push(',');
-                }
-                first = false;
-                // Key
-                json.push('"');
-                json.push_str(&txid.to_hex());
-                json.push_str("\":");
-                // Value: serialize via to_string to preserve BtcAmount precision.
-                json.push_str(&serde_json::to_string(&mem_entry).unwrap());
-            }
-        }
-        json.push('}');
+        // Verbose mode: same object REST `/rest/mempool/contents.json` serves.
+        // Built via to_string so BtcAmount keeps 8 decimal places.
+        let json = mempool_contents_json(&state);
         Ok(serde_json::value::RawValue::from_string(json).unwrap())
     }
 
@@ -10752,6 +10808,18 @@ impl RustoshiRpcServer for RpcServerImpl {
                 Err(submit_system_fault_error(&e.to_string()))
             }
             Err(e) => {
+                // ConnectBlock failed after the header and context-free checks
+                // passed. Core has already written the block; InvalidBlockFound
+                // marks BLOCK_FAILED_VALID and leaves the tip alone.
+                if e.is_connect_block_failure() {
+                    if let Err(err) = persist_failed_connect(&store, &state, &block, &block_hash) {
+                        tracing::error!(
+                            "submitblock: failed to persist invalid block {}: {}",
+                            block_hash, err
+                        );
+                        return Err(submit_system_fault_error(&err));
+                    }
+                }
                 tracing::warn!("submitblock: block {} rejected: {}", block_hash, e);
                 // Return canonical BIP-22 result string per BIP-22 and Bitcoin Core
                 // BIP22ValidationResult() in src/rpc/mining.cpp.
