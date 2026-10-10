@@ -800,11 +800,15 @@ def push_headers(host: str, port: int, headers: list[bytes], height: int) -> Non
         + struct.pack("<i", height)
         + b"\x01"
     )
-    payload = compact_size(len(headers))
+    # One header per `headers` message. Core rejects a batch whose headers
+    # do not form a single chain ("non-continuous headers sequence") before
+    # it looks at proof-of-work or the failed-parent filter, so the valid
+    # tip extension and the BLOCK_FAILED_VALID child cannot share a message.
+    payloads = []
     for header in headers:
         if len(header) != 80:
             raise RuntimeError(f"header is {len(header)} bytes")
-        payload += header + compact_size(0)
+        payloads.append(compact_size(1) + header + compact_size(0))
     sock = socket.create_connection((host, port), timeout=5)
     try:
         sock.sendall(_p2p_msg("version", version))
@@ -822,14 +826,17 @@ def push_headers(host: str, port: int, headers: list[bytes], height: int) -> Non
                 sock.sendall(_p2p_msg("pong", body))
         else:
             raise RuntimeError(f"no verack from {host}:{port}")
-        sock.sendall(_p2p_msg("headers", payload))
+        for payload in payloads:
+            sock.sendall(_p2p_msg("headers", payload))
+        # Core disconnects the peer after the invalid header. That close is
+        # the rejection, not a failed send.
         sock.settimeout(0.5)
         try:
             while True:
                 command, body = _read_p2p(sock)
                 if command == "ping":
                     sock.sendall(_p2p_msg("pong", body))
-        except socket.timeout:
+        except (socket.timeout, RuntimeError):
             pass
     finally:
         sock.close()
