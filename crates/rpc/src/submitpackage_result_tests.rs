@@ -1219,3 +1219,474 @@ async fn testmempoolaccept_overweight_duplicate_is_package_too_large() {
         &[&parent, &parent, &child],
     );
 }
+
+/// 60-byte tx: version 1, one zero prevout, empty scriptSig, one 1-sat
+/// empty scriptPubKey. Base size is 60, under Core's 65-byte floor, but
+/// `IsStandardTx` reports `scriptpubkey` before that floor (validation.cpp
+/// PreChecks: IsStandardTx, then MIN_STANDARD_TX_NONWITNESS_SIZE).
+fn tiny_empty_scriptpubkey() -> Transaction {
+    Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Hash256::ZERO,
+                vout: 0,
+            },
+            script_sig: vec![],
+            sequence: 0xffff_ffff,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: 1,
+            script_pubkey: vec![],
+        }],
+        lock_time: 0,
+    }
+}
+
+/// Standard NULL_DATA under 65 bytes. IsStandardTx accepts it, so the size
+/// floor that follows is `tx-size-small`.
+fn tiny_op_return() -> Transaction {
+    Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Hash256::ZERO,
+                vout: 0,
+            },
+            script_sig: vec![],
+            sequence: 0xffff_ffff,
+            witness: vec![],
+        }],
+        outputs: vec![TxOut {
+            value: 0,
+            script_pubkey: vec![0x6a],
+        }],
+        lock_time: 0,
+    }
+}
+
+fn dust_parent(prev: OutPoint, value: u64, fee: u64) -> Transaction {
+    let dust = 1u64;
+    Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: prev,
+            script_sig: vec![0x01, 0x51],
+            sequence: 0xffff_ffff,
+            witness: vec![],
+        }],
+        outputs: vec![
+            TxOut {
+                value: value - dust - fee,
+                script_pubkey: p2sh_true(),
+            },
+            TxOut {
+                value: dust,
+                script_pubkey: p2sh_true(),
+            },
+        ],
+        lock_time: 0,
+    }
+}
+
+fn spend_outputs(inputs: Vec<(OutPoint, u64)>, fee: u64) -> Transaction {
+    let sum: u64 = inputs.iter().map(|(_, v)| *v).sum();
+    Transaction {
+        version: 2,
+        inputs: inputs
+            .into_iter()
+            .map(|(prev, _)| TxIn {
+                previous_output: prev,
+                script_sig: vec![0x01, 0x51],
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            })
+            .collect(),
+        outputs: vec![TxOut {
+            value: sum - fee,
+            script_pubkey: p2sh_true(),
+        }],
+        lock_time: 0,
+    }
+}
+
+/// `CFeeRate::GetFee` for a sat/kvB rate.
+fn required_relay_fee(vsize: usize) -> u64 {
+    (100u64 * vsize as u64 + 999) / 1000
+}
+
+fn missing_ephemeral_spends(tx: &Transaction) -> String {
+    format!(
+        "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+        tx.txid(),
+        tx.wtxid()
+    )
+}
+
+const DUST_FEE_MSG: &str = "dust, tx with dust output must be 0-fee";
+
+/// KB-104: empty scriptPubKey is `scriptpubkey`, not `tx-size-small`.
+#[tokio::test]
+async fn submitpackage_60byte_empty_scriptpubkey_is_scriptpubkey() {
+    let tx = tiny_empty_scriptpubkey();
+    assert_eq!(tx.base_size(), 60, "fixture must be the 60-byte Core case");
+    let (state, _) = server();
+    let res = result(
+        call(&state, "submitpackage", serde_json::json!([[hex_tx(&tx)]])).await,
+    );
+    assert_top(&res);
+    assert_eq!(res["package_msg"], "transaction failed", "{res}");
+    assert_eq!(res["replaced-transactions"].as_array().unwrap().len(), 0);
+    let row = entry(&res, &tx.wtxid().to_hex());
+    assert_keys(row, TX_REJECTED, "60-byte submitpackage");
+    assert_eq!(row["txid"], tx.txid().to_hex());
+    assert_eq!(row["error"], "scriptpubkey", "{row}");
+    assert_ne!(res["package_msg"], "partial failure");
+}
+
+#[tokio::test]
+async fn testmempoolaccept_60byte_empty_scriptpubkey_is_scriptpubkey() {
+    let tx = tiny_empty_scriptpubkey();
+    assert_eq!(tx.base_size(), 60);
+    let (state, _) = server();
+    let res = result(
+        call(
+            &state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&tx)]]),
+        )
+        .await,
+    );
+    let row = &res.as_array().unwrap()[0];
+    assert_keys(
+        row,
+        &["txid", "wtxid", "allowed", "reject-reason", "reject-details"],
+        "60-byte testmempoolaccept",
+    );
+    assert_eq!(row["allowed"], false);
+    assert_eq!(row["reject-reason"], "scriptpubkey", "{row}");
+    assert_eq!(row["reject-details"], "scriptpubkey", "{row}");
+}
+
+/// A standard tiny OP_RETURN still hits the size floor after IsStandardTx.
+#[tokio::test]
+async fn testmempoolaccept_tiny_op_return_is_tx_size_small() {
+    let tx = tiny_op_return();
+    assert!(tx.base_size() < 65, "got {}", tx.base_size());
+    let (state, _) = server();
+    let res = result(
+        call(
+            &state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&tx)]]),
+        )
+        .await,
+    );
+    let row = &res.as_array().unwrap()[0];
+    assert_eq!(row["reject-reason"], "tx-size-small", "{row}");
+    assert_eq!(row["reject-details"], "tx-size-small", "{row}");
+    assert_eq!(row["allowed"], false);
+}
+
+/// KB-105: one dust output and a nonzero fee is PreCheckEphemeralTx.
+/// submitpackage records the individual results: parent ToString `dust`,
+/// child `bad-txns-inputs-missingorspent`, package_msg `transaction failed`.
+#[tokio::test]
+async fn submitpackage_ephemeral_nonzero_fee_is_dust_tostring() {
+    let f = funded(10_000, 10_000).await;
+    let parent = dust_parent(
+        OutPoint {
+            txid: Hash256::from([0x11u8; 32]),
+            vout: 0,
+        },
+        1_000_000,
+        5_000,
+    );
+    let change = 1_000_000 - 1 - 5_000;
+    let child = spend_outputs(
+        vec![
+            (
+                OutPoint {
+                    txid: parent.txid(),
+                    vout: 0,
+                },
+                change,
+            ),
+            (
+                OutPoint {
+                    txid: parent.txid(),
+                    vout: 1,
+                },
+                1,
+            ),
+        ],
+        5_000,
+    );
+    let res = result(
+        call(
+            &f.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_top(&res);
+    assert_eq!(res["package_msg"], "transaction failed", "{res}");
+    assert_ne!(res["package_msg"], "partial failure");
+    assert_eq!(res["replaced-transactions"].as_array().unwrap().len(), 0);
+    let parent_row = entry(&res, &parent.wtxid().to_hex());
+    assert_keys(parent_row, TX_REJECTED, "dust parent");
+    assert_eq!(parent_row["error"], DUST_FEE_MSG, "{parent_row}");
+    let child_row = entry(&res, &child.wtxid().to_hex());
+    assert_keys(child_row, TX_REJECTED, "dust child");
+    assert_eq!(child_row["error"], "bad-txns-inputs-missingorspent", "{child_row}");
+    let st = f.state.read().await;
+    assert!(!st.mempool.contains(&parent.txid()));
+    assert!(!st.mempool.contains(&child.txid()));
+}
+
+#[tokio::test]
+async fn testmempoolaccept_ephemeral_nonzero_fee_dust_details() {
+    let f = funded(10_000, 10_000).await;
+    let parent = dust_parent(
+        OutPoint {
+            txid: Hash256::from([0x11u8; 32]),
+            vout: 0,
+        },
+        1_000_000,
+        5_000,
+    );
+    let change = 1_000_000 - 1 - 5_000;
+    let child = spend_outputs(
+        vec![
+            (
+                OutPoint {
+                    txid: parent.txid(),
+                    vout: 0,
+                },
+                change,
+            ),
+            (
+                OutPoint {
+                    txid: parent.txid(),
+                    vout: 1,
+                },
+                1,
+            ),
+        ],
+        5_000,
+    );
+    let res = result(
+        call(
+            &f.state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    let rows = res.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_keys(
+        &rows[0],
+        &["txid", "wtxid", "allowed", "reject-reason", "reject-details"],
+        "nonzero-fee dust parent",
+    );
+    assert_eq!(rows[0]["allowed"], false);
+    assert_eq!(rows[0]["reject-reason"], "dust", "{rows:?}");
+    assert_eq!(rows[0]["reject-details"], DUST_FEE_MSG, "{rows:?}");
+    assert!(rows[0].get("package-error").is_none(), "{rows:?}");
+    assert_keys(&rows[1], &["txid", "wtxid"], "unfinished child");
+    assert_eq!(rows[1]["txid"], child.txid().to_hex());
+    assert_eq!(rows[1]["wtxid"], child.wtxid().to_hex());
+}
+
+/// KB-105: 0-fee dust parent whose child spends only the non-dust output.
+/// submitpackage package_msg is `unspent-dust`. The parent keeps its
+/// individual min-relay ToString. The child is `missing-ephemeral-spends`.
+#[tokio::test]
+async fn submitpackage_unspent_dust_package_msg_is_unspent_dust() {
+    let f = funded(10_000, 10_000).await;
+    let parent = dust_parent(
+        OutPoint {
+            txid: Hash256::from([0x11u8; 32]),
+            vout: 0,
+        },
+        1_000_000,
+        0,
+    );
+    let change = 1_000_000 - 1;
+    let child = spend(
+        OutPoint {
+            txid: parent.txid(),
+            vout: 0,
+        },
+        change,
+        5_000,
+    );
+    let res = result(
+        call(
+            &f.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_top(&res);
+    assert_eq!(res["package_msg"], "unspent-dust", "{res}");
+    assert_ne!(res["package_msg"], "partial failure");
+    assert_eq!(res["replaced-transactions"].as_array().unwrap().len(), 0);
+    let required = required_relay_fee(parent.vsize());
+    let parent_row = entry(&res, &parent.wtxid().to_hex());
+    assert_keys(parent_row, TX_REJECTED, "0-fee dust parent");
+    assert_eq!(
+        parent_row["error"],
+        format!("min relay fee not met, 0 < {required}"),
+        "{parent_row}"
+    );
+    let child_row = entry(&res, &child.wtxid().to_hex());
+    assert_keys(child_row, TX_REJECTED, "unspent child");
+    assert_eq!(child_row["error"], missing_ephemeral_spends(&child), "{child_row}");
+    let st = f.state.read().await;
+    assert!(!st.mempool.contains(&parent.txid()));
+    assert!(!st.mempool.contains(&child.txid()));
+}
+
+/// testmempoolaccept uses AcceptMultipleTransactions (package_feerates off),
+/// so the 0-fee parent fails CheckFeeRate and the child stays unfinished.
+/// `unspent-dust` is submitpackage only.
+#[tokio::test]
+async fn testmempoolaccept_unspent_dust_parent_is_min_relay() {
+    let f = funded(10_000, 10_000).await;
+    let parent = dust_parent(
+        OutPoint {
+            txid: Hash256::from([0x11u8; 32]),
+            vout: 0,
+        },
+        1_000_000,
+        0,
+    );
+    let change = 1_000_000 - 1;
+    let child = spend(
+        OutPoint {
+            txid: parent.txid(),
+            vout: 0,
+        },
+        change,
+        5_000,
+    );
+    let res = result(
+        call(
+            &f.state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    let rows = res.as_array().unwrap();
+    let required = required_relay_fee(parent.vsize());
+    assert_keys(
+        &rows[0],
+        &["txid", "wtxid", "allowed", "reject-reason", "reject-details"],
+        "0-fee dust parent",
+    );
+    assert_eq!(rows[0]["allowed"], false);
+    assert_eq!(rows[0]["reject-reason"], "min relay fee not met", "{rows:?}");
+    assert_eq!(
+        rows[0]["reject-details"],
+        format!("min relay fee not met, 0 < {required}"),
+        "{rows:?}"
+    );
+    assert!(rows[0].get("package-error").is_none(), "{rows:?}");
+    assert_keys(&rows[1], &["txid", "wtxid"], "unfinished child");
+}
+
+/// Fill a 63-tx cluster, then a 2-tx child-with-parent that would make it 65.
+async fn cluster_of_63() -> (Arc<RwLock<RpcState>>, Transaction, Transaction) {
+    let (state, _) = server();
+    let prev0 = OutPoint {
+        txid: Hash256::from([0x5cu8; 32]),
+        vout: 0,
+    };
+    let mut value = 100_000_000u64;
+    {
+        let mut st = state.write().await;
+        BlockStore::new(&st.db)
+            .put_utxo(
+                &prev0,
+                &rustoshi_storage::CoinEntry {
+                    height: 1,
+                    is_coinbase: false,
+                    value,
+                    script_pubkey: p2sh_true(),
+                },
+            )
+            .unwrap();
+        st.mempool.notify_new_tip(200, 1_700_000_000);
+    }
+    let mut prev = prev0;
+    for _ in 0..63 {
+        let tx = spend(prev, value, 1_000);
+        let res = result(
+            call(&state, "submitpackage", serde_json::json!([[hex_tx(&tx)]])).await,
+        );
+        assert_eq!(res["package_msg"], "success", "{res}");
+        prev = OutPoint {
+            txid: tx.txid(),
+            vout: 0,
+        };
+        value -= 1_000;
+    }
+    let parent = spend(prev, value, 1_000);
+    let child = spend(
+        OutPoint {
+            txid: parent.txid(),
+            vout: 0,
+        },
+        value - 1_000,
+        1_000,
+    );
+    (state, parent, child)
+}
+
+/// KB-107: multi-tx testmempoolaccept cluster failure is PCKG_POLICY with an
+/// empty tx-result map. Every row is package-error and has no `allowed`.
+#[tokio::test]
+async fn testmempoolaccept_too_large_cluster_has_package_error_and_no_allowed() {
+    let (state, parent, child) = cluster_of_63().await;
+    let res = result(
+        call(
+            &state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_tma_package_error(&res, "too-large-cluster", &[&parent, &child]);
+}
+
+/// submitpackage tries the parent alone (it fits at 64) and rejects the child.
+#[tokio::test]
+async fn submitpackage_too_large_cluster_child_is_transaction_failed() {
+    let (state, parent, child) = cluster_of_63().await;
+    let res = result(
+        call(
+            &state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_top(&res);
+    assert_eq!(res["package_msg"], "transaction failed", "{res}");
+    assert_ne!(res["package_msg"], "partial failure");
+    let parent_row = entry(&res, &parent.wtxid().to_hex());
+    assert!(parent_row.get("error").is_none(), "{parent_row}");
+    assert!(parent_row.get("vsize").is_some(), "{parent_row}");
+    let child_row = entry(&res, &child.wtxid().to_hex());
+    assert_keys(child_row, TX_REJECTED, "cluster child");
+    assert_eq!(child_row["error"], "too-large-cluster", "{child_row}");
+    let st = state.read().await;
+    assert!(st.mempool.contains(&parent.txid()));
+    assert!(!st.mempool.contains(&child.txid()));
+}
