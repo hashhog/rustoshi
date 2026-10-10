@@ -253,7 +253,7 @@ pub(crate) fn mempool_info(state: &RpcState) -> MempoolInfo {
         // Core `CTxMemPool::DynamicMemoryUsage` (map nodes, txgraph, cachedInnerUsage).
         usage: state.mempool.dynamic_memory_usage(),
         total_fee: BtcAmount::from_sats(total_fee_sats),
-        maxmempool: 300 * 1_000_000,
+        maxmempool: state.mempool.max_size_bytes(),
         mempoolminfee: BtcAmount::from_sats(mempool_min_kvb),
         minrelaytxfee: BtcAmount::from_sats(min_relay_kvb),
         incrementalrelayfee: BtcAmount::from_sats(incremental_kvb),
@@ -263,7 +263,9 @@ pub(crate) fn mempool_info(state: &RpcState) -> MempoolInfo {
         maxdatacarriersize: 100_000,
         limitclustercount: 64,
         limitclustersize: 101_000,
-        optimal: true,
+        // Core `pool.m_txgraph->DoWork(0)`: false while any cluster is not
+        // known to be optimally linearized.
+        optimal: state.mempool.txgraph_is_optimal(),
     }
 }
 
@@ -863,46 +865,53 @@ impl RpcState {
 
     /// Initialize from database state.
     pub fn init_from_db(&mut self) -> Result<(), String> {
-        let store = BlockStore::new(&self.db);
-
-        if let Some(hash) = store
-            .get_best_block_hash()
-            .map_err(|e| format!("db error: {}", e))?
         {
-            self.best_hash = hash;
-        } else {
-            self.best_hash = self.params.genesis_hash;
-        }
+            let store = BlockStore::new(&self.db);
 
-        if let Some(height) = store
-            .get_best_height()
-            .map_err(|e| format!("db error: {}", e))?
-        {
-            self.best_height = height;
-            self.header_height = height;
-        }
+            if let Some(hash) = store
+                .get_best_block_hash()
+                .map_err(|e| format!("db error: {}", e))?
+            {
+                self.best_hash = hash;
+            } else {
+                self.best_hash = self.params.genesis_hash;
+            }
 
-        // Check if we should exit initial block download based on stored state
-        if self.best_height > 0 {
-            if let Ok(Some(entry)) = store.get_block_index(&self.best_hash) {
-                // Check if chain work >= minimum chain work
-                if compare_chain_work(&entry.chain_work, &self.params.minimum_chain_work)
-                    != std::cmp::Ordering::Less
-                {
-                    // Check if tip is recent (within 24h)
-                    let max_tip_age_secs = 24 * 60 * 60; // 24 hours in seconds
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let tip_age = now.saturating_sub(entry.timestamp as u64);
+            if let Some(height) = store
+                .get_best_height()
+                .map_err(|e| format!("db error: {}", e))?
+            {
+                self.best_height = height;
+                self.header_height = height;
+            }
 
-                    if tip_age < max_tip_age_secs {
-                        self.is_ibd = false;
+            // Check if we should exit initial block download based on stored state
+            if self.best_height > 0 {
+                if let Ok(Some(entry)) = store.get_block_index(&self.best_hash) {
+                    // Check if chain work >= minimum chain work
+                    if compare_chain_work(&entry.chain_work, &self.params.minimum_chain_work)
+                        != std::cmp::Ordering::Less
+                    {
+                        // Check if tip is recent (within 24h)
+                        let max_tip_age_secs = 24 * 60 * 60; // 24 hours in seconds
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let tip_age = now.saturating_sub(entry.timestamp as u64);
+
+                        if tip_age < max_tip_age_secs {
+                            self.is_ibd = false;
+                        }
                     }
                 }
             }
         }
+
+        // Core loads `m_best_header` from the index: the most-work header that
+        // is not BLOCK_FAILED_*. A headers-only chain heavier than the active
+        // tip must survive restart. Equal work does not replace the tip.
+        refresh_best_header_height(self);
 
         Ok(())
     }
@@ -5362,7 +5371,13 @@ fn refresh_best_header_height(state: &mut RpcState) {
     let Ok(iter) = store.iter_block_index() else {
         return;
     };
-    let mut best_work: Option<[u8; 32]> = None;
+    // Start from the active tip so an equal-work header does not replace it.
+    // A missing tip entry leaves the scan to take the first non-failed header.
+    let mut best_work: Option<[u8; 32]> = store
+        .get_block_index(&state.best_hash)
+        .ok()
+        .flatten()
+        .map(|entry| entry.chain_work);
     let mut best_height = state.best_height;
     for (_hash, entry) in iter {
         if entry.status.has(BlockStatus::FAILED_VALIDITY)
@@ -9485,7 +9500,10 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        // Core MempoolInfoToJSON calls GetMinFee, which decays the rolling
+        // minimum before the value is reported.
+        state.mempool.get_min_fee();
         Ok(mempool_info(&state))
     }
 
@@ -10660,7 +10678,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     // same as the P2P / IBD block-connect paths in main.rs.
                     state
                         .mempool
-                        .on_block_connected(rustoshi_consensus::current_time_secs() as i64);
+                        .on_block_connected(rustoshi_consensus::mempool::current_unix_seconds());
                 }
 
                 // Wire fee estimator: notify it of the confirmed block.

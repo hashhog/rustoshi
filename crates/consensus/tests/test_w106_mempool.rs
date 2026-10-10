@@ -1308,8 +1308,9 @@ fn test_g28_fee_delta_used_in_mining_sort() {
 fn test_g29_trim_to_size_evicts_lowest_mining_score() {
     let mut mp = Mempool::new(MempoolConfig {
         verify_scripts: false,
-
-        max_size_bytes: 10_000, // very small limit
+        // Large enough that both txs are admitted. The trim limit below is
+        // one byte under DynamicMemoryUsage, not the old vsize cutoff.
+        max_size_bytes: 10_000_000,
         ..Default::default()
     });
 
@@ -1323,8 +1324,8 @@ fn test_g29_trim_to_size_evicts_lowest_mining_score() {
     let lo_tx = simple_tx(hash_from_u8(2), 200_000, 100, 0xffffffff); // 100 sat fee
     mp.add_transaction(lo_tx, &|op| utxos_lo.get(op).cloned()).ok();
 
-    // TrimToSize to fit only 1 tx
-    mp.trim_to_size(mp.get(&hi_id).map(|e| e.vsize).unwrap_or(1000));
+    // TrimToSize to fit only 1 tx (DynamicMemoryUsage, not vsize).
+    mp.trim_to_size(mp.dynamic_memory_usage().saturating_sub(1));
 
     // High-fee tx should survive
     assert!(mp.contains(&hi_id), "TrimToSize must retain high-fee tx");
@@ -1500,8 +1501,10 @@ fn test_dos_w14z8m3zc_dynamic_min_fee_enforced_on_admission() {
         verify_scripts: false,
         min_fee_rate: 1,
         incremental_relay_fee: 1_000,
-        // Tiny size limit so trim_to_size actually evicts and bumps the floor.
-        max_size_bytes: 250,
+        // trim_to_size(0) is what evicts. The byte limit must still be large
+        // enough to admit the prime tx: one tx's DynamicMemoryUsage is well
+        // above a few hundred bytes, and LimitMempoolSize runs after insert.
+        max_size_bytes: 10_000_000,
         ..Default::default()
     };
     let mut mp = Mempool::new(cfg);
@@ -1590,7 +1593,7 @@ fn test_dos_w14z8m3zc_on_block_connected_arms_rolling_fee_decay() {
         verify_scripts: false,
         min_fee_rate: 1,
         incremental_relay_fee: 1_000,
-        max_size_bytes: 250,
+        max_size_bytes: 10_000_000,
         ..Default::default()
     };
     let mut mp = Mempool::new(cfg);
@@ -1615,17 +1618,23 @@ fn test_dos_w14z8m3zc_on_block_connected_arms_rolling_fee_decay() {
         "with the bump flag unset the floor must stay pinned (no decay)"
     );
 
-    // on_block_connected arms the decay flag (and runs the 2-week expiry sweep,
-    // here a no-op on the now-empty pool).
-    let expired = mp.on_block_connected(now_secs());
+    // on_block_connected arms the decay flag and stamps lastRollingFeeUpdate
+    // (Core removeForBlock). Within 10 seconds the floor stays pinned.
+    let now = 1_700_000_000;
+    rustoshi_consensus::mempool::set_mock_time(now);
+    let expired = mp.on_block_connected(now);
     assert_eq!(expired, 0, "no stale entries to expire on an empty pool");
+    assert_eq!(
+        mp.get_min_fee(),
+        pinned1,
+        "a block connection does not decay the floor until 10 seconds have passed"
+    );
 
-    // With the flag armed, get_min_fee now enters the decay branch. Because
-    // last_rolling_fee_update is stale, the elapsed time is large and the floor
-    // decays below the previously-pinned value. The exact landing value is
-    // time-dependent; the teeth assertion is that it is STRICTLY LESS than the
-    // pinned value — i.e. decay is now reachable, which it never was pre-fix.
+    // One halflife later the floor drops. The pool is empty, so usage is the
+    // retained randomized-vector capacity, well under limit/4.
+    rustoshi_consensus::mempool::set_mock_time(now + 43_200 + 11);
     let after = mp.get_min_fee();
+    rustoshi_consensus::mempool::set_mock_time(0);
     assert!(
         after < pinned1,
         "after on_block_connected arms the flag, the floor must be able to decay \

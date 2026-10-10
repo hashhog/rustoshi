@@ -848,3 +848,36 @@ async fn connect_failure_is_failed_valid_and_survives_restart() {
     );
     assert_eq!(again.get_best_block_hash().await.unwrap(), tip.to_hex());
 }
+
+/// `init_from_db` must restore Core's `m_best_header`: the most-work header
+/// that is not failed, including a headers-only extension of the active tip.
+/// Reloading from the active-block height drops `headers` back to `blocks`.
+#[tokio::test]
+async fn init_from_db_header_height_is_best_valid_header() {
+    let (server, blocks, db) = chain_db(2).await;
+    let tip = blocks[2].block_hash();
+    let h1 = mine_at(3, tip, blocks[2].header.timestamp + 1);
+    server
+        .submit_header(header_hex(&h1))
+        .await
+        .expect("headers-only child of the tip");
+    let h2 = mine_at(4, h1.block_hash(), blocks[2].header.timestamp + 2);
+    server
+        .submit_header(header_hex(&h2))
+        .await
+        .expect("second headers-only block");
+
+    let live = server.get_blockchain_info().await.unwrap();
+    assert_eq!(live.blocks, 2);
+    assert_eq!(live.headers, 4, "live header tip follows the heavier chain");
+
+    let params = ChainParams::regtest();
+    let mut reloaded = RpcState::new(db, params);
+    reloaded.init_from_db().unwrap();
+    assert_eq!(reloaded.best_height, 2);
+    assert_eq!(reloaded.best_hash, tip);
+    assert_eq!(
+        reloaded.header_height, 4,
+        "after restart header_height must be the best valid header, not the active tip"
+    );
+}

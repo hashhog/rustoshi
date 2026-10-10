@@ -32,6 +32,7 @@
 //! ```
 
 pub mod auth;
+pub mod header_filter;
 pub mod chain_lock;
 pub mod coins_coherence;
 pub mod logging;
@@ -60,6 +61,7 @@ pub use rest::{
     rest_router, rest_router_with_wallet, start_rest_server, start_rest_server_with_wallet,
     RestConfig, RestServerHandle, RestState,
 };
+pub use header_filter::filter_incoming_headers;
 pub use server::{start_rpc_server, PeerState, RpcServerImpl, RpcState, RustoshiRpcServer};
 pub use tip_notifier::TipNotifier;
 pub use types::*;

@@ -784,7 +784,9 @@ fn parse_outpoint(s: &str) -> Result<OutPoint, RestError> {
 async fn rest_mempool_info(
     State(state): State<Arc<RestState>>,
 ) -> Result<Response, RestError> {
-    let rpc_state = state.rpc_state.read().await;
+    let mut rpc_state = state.rpc_state.write().await;
+    // Same decay as getmempoolinfo: Core's GetMinFee runs inside MempoolInfoToJSON.
+    rpc_state.mempool.get_min_fee();
 
     // Same object as getmempoolinfo (Core MempoolInfoToJSON).
     let info = crate::server::mempool_info(&rpc_state);

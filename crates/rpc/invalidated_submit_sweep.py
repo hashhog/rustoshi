@@ -38,6 +38,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -312,7 +313,14 @@ class Node:
             stop_proc(self.proc)
 
 
-def start_core(bitcoind: str, datadir: str, rpc_port: int, p2p_port: int) -> Node:
+def start_core(
+    bitcoind: str,
+    datadir: str,
+    rpc_port: int,
+    p2p_port: int,
+    listen: bool = False,
+    maxmempool_mb: int | None = None,
+) -> Node:
     os.makedirs(datadir, exist_ok=True)
     log_path = os.path.join(datadir, "debug.log")
     proc = subprocess.Popen(
@@ -320,7 +328,7 @@ def start_core(bitcoind: str, datadir: str, rpc_port: int, p2p_port: int) -> Nod
             bitcoind,
             "-regtest",
             f"-datadir={datadir}",
-            "-listen=0",
+            "-listen=1" if listen else "-listen=0",
             "-dnsseed=0",
             "-fixedseeds=0",
             f"-port={p2p_port}",
@@ -329,7 +337,8 @@ def start_core(bitcoind: str, datadir: str, rpc_port: int, p2p_port: int) -> Nod
             "-rpcallowip=127.0.0.1",
             "-fallbackfee=0.0002",
             "-rest",
-        ],
+        ]
+        + ([f"-maxmempool={maxmempool_mb}"] if maxmempool_mb is not None else []),
         stdout=open(log_path, "ab"),
         stderr=subprocess.STDOUT,
     )
@@ -344,7 +353,13 @@ def start_core(bitcoind: str, datadir: str, rpc_port: int, p2p_port: int) -> Nod
     return Node("core", proc, rpc, datadir, log_path, rest_base)
 
 
-def start_rustoshi(binary: str, datadir: str, rpc_port: int, p2p_port: int) -> Node:
+def start_rustoshi(
+    binary: str,
+    datadir: str,
+    rpc_port: int,
+    p2p_port: int,
+    maxmempool_mb: int | None = None,
+) -> Node:
     os.makedirs(datadir, exist_ok=True)
     log_path = os.path.join(datadir, "node.log")
     proc = subprocess.Popen(
@@ -358,7 +373,8 @@ def start_rustoshi(binary: str, datadir: str, rpc_port: int, p2p_port: int) -> N
             f"--rpcbind=127.0.0.1:{rpc_port}",
             "--rest",
             f"--restbind=127.0.0.1:{rpc_port + 100}",
-        ],
+        ]
+        + ([f"--maxmempool={maxmempool_mb}"] if maxmempool_mb is not None else []),
         stdout=open(log_path, "w"),
         stderr=subprocess.STDOUT,
     )
@@ -570,6 +586,236 @@ def block_time(rpc: Rpc, blockhash: str) -> int:
     if not isinstance(hdr, dict) or "time" not in hdr:
         raise RuntimeError(f"getblock {blockhash} missing time: {hdr}")
     return int(hdr["time"])
+
+
+P2WSH_SCRIPT = bytes.fromhex("755175")
+P2WSH_SPK = b"\x00\x20" + hashlib.sha256(P2WSH_SCRIPT).digest()
+REGTEST_MAGIC = bytes.fromhex("fabfb5da")
+# Inputs per spend, and how many such spends to push past -maxmempool=5.
+PRESSURE_INPUTS = 800
+PRESSURE_TXS = 14
+PRESSURE_VALUE = 20_000
+
+
+def fanout_block(prev_hex: str, height: int, timestamp: int, n_out: int, value_each: int, extra: bytes) -> tuple[str, str]:
+    """Coinbase block whose outputs are P2WSH(OP_DROP OP_DROP OP_TRUE)."""
+    script = script_num(height) + extra
+    vin = b"\x00" * 32 + struct.pack("<I", 0xFFFFFFFF)
+    vin += compact_size(len(script)) + script + struct.pack("<I", 0xFFFFFFFF)
+    spk = P2WSH_SPK
+    vout = b"".join(
+        struct.pack("<q", value_each) + compact_size(len(spk)) + spk for _ in range(n_out)
+    )
+    tx = (
+        struct.pack("<i", 2)
+        + compact_size(1)
+        + vin
+        + compact_size(n_out)
+        + vout
+        + struct.pack("<I", 0)
+    )
+    merkle = sha256d(tx)
+    prev = bytes.fromhex(prev_hex)[::-1]
+    prefix = struct.pack("<i", 0x20000000) + prev + merkle + struct.pack("<II", timestamp, 0x207FFFFF)
+    hdr = solve(prefix)
+    return (hdr + compact_size(1) + tx).hex(), sha256d(tx)[::-1].hex()
+
+
+def big_p2wsh_spend(outpoints: list[tuple[str, int]], fee: int, value_each: int) -> str:
+    """Standard P2WSH spend: witness [80, 80, OP_DROP OP_DROP OP_TRUE]."""
+    n = len(outpoints)
+    pay = n * value_each - fee
+    spk = b"\x00\x14" + (b"\x11" * 20)
+    vin = b""
+    for txid, vout in outpoints:
+        vin += bytes.fromhex(txid)[::-1]
+        vin += struct.pack("<I", vout) + compact_size(0) + struct.pack("<I", 0xFFFFFFFD)
+    vout_bytes = struct.pack("<q", pay) + compact_size(len(spk)) + spk
+    items = [b"\x11" * 80, b"\x22" * 80, P2WSH_SCRIPT]
+    witness = b""
+    for _ in range(n):
+        witness += compact_size(len(items))
+        for item in items:
+            witness += compact_size(len(item)) + item
+    raw = (
+        struct.pack("<i", 2)
+        + b"\x00\x01"
+        + compact_size(n)
+        + vin
+        + compact_size(1)
+        + vout_bytes
+        + witness
+        + struct.pack("<I", 0)
+    )
+    return raw.hex()
+
+
+def mine_empty(rpc: Rpc, n: int, extra: bytes) -> None:
+    for i in range(n):
+        tip = rpc.call("getbestblockhash")
+        info = rpc.call("getblock", [tip])
+        blk = make_block(
+            tip,
+            int(info["height"]) + 1,
+            int(info["time"]) + 1,
+            extra=extra + bytes([i & 0xFF]),
+        )
+        result = rpc.call("submitblock", [blk])
+        if result not in (None,):
+            raise RuntimeError(f"empty block {i} rejected: {result}")
+
+
+def mempool_pressure(rpc: Rpc, rec, mock_time: int, rest_base: str) -> None:
+    """Fill past -maxmempool, then decay the rolling fee across one block.
+
+    Both nodes are started with -maxmempool=5 (5_000_000 bytes). The spends
+    are independent, so each is its own chunk: TrimToSize drops the cheapest
+    ones. After a connected block, 12h+11s of mock time halves the bumped
+    feerate when dynamic usage stays at or above half the limit.
+    """
+    tip = rpc.call("getbestblockhash")
+    info = rpc.call("getblock", [tip])
+    n_out = PRESSURE_INPUTS * PRESSURE_TXS
+    blk, txid = fanout_block(
+        tip,
+        int(info["height"]) + 1,
+        int(info["time"]) + 1,
+        n_out,
+        PRESSURE_VALUE,
+        b"\x81\xc5",
+    )
+    result = rpc.call("submitblock", [blk])
+    if result is not None:
+        raise RuntimeError(f"fanout block rejected: {result}")
+    # Coinbase maturity is 100. Mempool spend height is tip+1, so 99
+    # descendants make the outputs spendable. Mine 100.
+    mine_empty(rpc, 100, b"\x82")
+
+    sent: list[str] = []
+    for i in range(PRESSURE_TXS):
+        outpoints = [(txid, v) for v in range(i * PRESSURE_INPUTS, (i + 1) * PRESSURE_INPUTS)]
+        fee = 20_000 + i * 5_000
+        raw = big_p2wsh_spend(outpoints, fee, PRESSURE_VALUE)
+        accepted = rpc.call("sendrawtransaction", [raw])
+        rec(f"pressure:send:{i}", accepted)
+        if isinstance(accepted, str):
+            sent.append(accepted)
+    pool = rpc.call("getrawmempool", [False])
+    if not isinstance(pool, list):
+        raise RuntimeError(f"getrawmempool after pressure: {pool}")
+    evicted = [txid for txid in sent if txid not in pool]
+    if not evicted:
+        info = rpc.call("getmempoolinfo")
+        raise RuntimeError(f"pressure phase evicted nothing; mempoolinfo={info} sent={len(sent)}")
+    rec("pressure:getrawmempool", pool)
+    rec("pressure:getmempoolinfo", rpc.call("getmempoolinfo"))
+    rec("pressure:rest-info", rest_get(rest_base, "/rest/mempool/info.json"))
+
+    # Arm rolling-fee decay (Core removeForBlock stamps lastRollingFeeUpdate).
+    tip = rpc.call("getbestblockhash")
+    info = rpc.call("getblock", [tip])
+    blk = make_block(tip, int(info["height"]) + 1, int(info["time"]) + 1, extra=b"\x83\xc5")
+    result = rpc.call("submitblock", [blk])
+    if result is not None:
+        raise RuntimeError(f"decay block rejected: {result}")
+    later = mock_time + 43_200 + 11
+    rec_clock = rpc.call("setmocktime", [later])
+    if isinstance(rec_clock, dict) and "_rpc_error" in rec_clock:
+        raise RuntimeError(f"setmocktime decay failed: {rec_clock}")
+    rec("pressure-decay:getmempoolinfo", rpc.call("getmempoolinfo"))
+    rec("pressure-decay:getrawmempool", rpc.call("getrawmempool", [False]))
+
+
+def submit_heavier_headers(rpc: Rpc, rec) -> None:
+    """Headers-only chain with more work than the active tip."""
+    tip = rpc.call("getbestblockhash")
+    info = rpc.call("getblock", [tip])
+    h1 = make_block(tip, int(info["height"]) + 1, int(info["time"]) + 1, extra=b"\x91\xc5")
+    rec("headers-only:submit:1", rpc.call("submitheader", [h1[:160]]))
+    h1_hash = header_hash(h1[:160])
+    h2 = make_block(h1_hash, int(info["height"]) + 2, int(info["time"]) + 2, extra=b"\x92\xc5")
+    rec("headers-only:submit:2", rpc.call("submitheader", [h2[:160]]))
+    rec("headers-only:getblockchaininfo", rpc.call("getblockchaininfo"))
+    rec("headers-only:getchaintips", rpc.call("getchaintips"))
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise RuntimeError("peer closed the connection")
+        buf += chunk
+    return buf
+
+
+def _p2p_msg(command: str, payload: bytes = b"") -> bytes:
+    cmd = command.encode().ljust(12, b"\x00")
+    return REGTEST_MAGIC + cmd + struct.pack("<I", len(payload)) + sha256d(payload)[:4] + payload
+
+
+def _read_p2p(sock: socket.socket) -> tuple[str, bytes]:
+    hdr = _recv_exact(sock, 24)
+    if hdr[:4] != REGTEST_MAGIC:
+        raise RuntimeError(f"bad magic {hdr[:4].hex()}")
+    command = hdr[4:16].split(b"\x00", 1)[0].decode()
+    length = struct.unpack("<I", hdr[16:20])[0]
+    checksum = hdr[20:24]
+    payload = _recv_exact(sock, length) if length else b""
+    if sha256d(payload)[:4] != checksum:
+        raise RuntimeError(f"bad checksum on {command}")
+    return command, payload
+
+
+def push_headers(host: str, port: int, headers: list[bytes], height: int) -> None:
+    """Inbound-style handshake, then one `headers` message. Regtest only."""
+    addr = struct.pack("<Q", 1) + b"\x00" * 10 + b"\xff\xff" + bytes([127, 0, 0, 1]) + struct.pack(">H", port)
+    ua = b"/sweep:0.0.1/"
+    version = (
+        struct.pack("<i", 70016)
+        + struct.pack("<Q", 1)
+        + struct.pack("<q", int(time.time()))
+        + addr
+        + addr
+        + struct.pack("<Q", 0x1234_5678_90AB_CDEF)
+        + compact_size(len(ua))
+        + ua
+        + struct.pack("<i", height)
+        + b"\x01"
+    )
+    payload = compact_size(len(headers))
+    for header in headers:
+        if len(header) != 80:
+            raise RuntimeError(f"header is {len(header)} bytes")
+        payload += header + compact_size(0)
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        sock.sendall(_p2p_msg("version", version))
+        verack_sent = False
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            sock.settimeout(max(0.2, deadline - time.time()))
+            command, body = _read_p2p(sock)
+            if command == "version" and not verack_sent:
+                sock.sendall(_p2p_msg("verack"))
+                verack_sent = True
+            elif command == "verack":
+                break
+            elif command == "ping":
+                sock.sendall(_p2p_msg("pong", body))
+        else:
+            raise RuntimeError(f"no verack from {host}:{port}")
+        sock.sendall(_p2p_msg("headers", payload))
+        sock.settimeout(0.5)
+        try:
+            while True:
+                command, body = _read_p2p(sock)
+                if command == "ping":
+                    sock.sendall(_p2p_msg("pong", body))
+        except socket.timeout:
+            pass
+    finally:
+        sock.close()
 
 
 def snapshot(rpc: Rpc, blocks: list[str], mock_time: int, rest_base: str, spend: dict) -> dict:
@@ -799,6 +1045,14 @@ def snapshot(rpc: Rpc, blocks: list[str], mock_time: int, rest_base: str, spend:
     must_send("usage-chain:parent", spend["parent_hex"])
     must_send("usage-chain:child", spend["child_hex"])
     rec_usage("usage-chain")
+
+    # -maxmempool=5 on both nodes. Independent max-standard spends fill past
+    # the dynamic-usage limit; the cheapest chunks are evicted. A following
+    # block plus 12h of mock time decays mempoolminfee. `optimal` is part of
+    # the getmempoolinfo object (Core DoWork(0)).
+    mempool_pressure(rpc, rec, mock_time, rest_base)
+    # Heavier headers-only chain, persisted so a restart still reports it.
+    submit_heavier_headers(rpc, rec)
     return out
 
 
@@ -940,9 +1194,24 @@ def main() -> int:
 
     nodes = []
     try:
-        core = start_core(args.bitcoind, os.path.join(args.work, "core"), 18611, 18612)
+        # -maxmempool=5 so TrimToSize / GetMinFee run on DynamicMemoryUsage.
+        # Core listens so the post-restart header is delivered over P2P.
+        core = start_core(
+            args.bitcoind,
+            os.path.join(args.work, "core"),
+            18611,
+            18612,
+            listen=True,
+            maxmempool_mb=5,
+        )
         nodes.append(core)
-        rust = start_rustoshi(args.rustoshi, os.path.join(args.work, "rustoshi"), 18621, 18622)
+        rust = start_rustoshi(
+            args.rustoshi,
+            os.path.join(args.work, "rustoshi"),
+            18621,
+            18622,
+            maxmempool_mb=5,
+        )
         nodes.append(rust)
         print("replaying on core...")
         mock_time = int(time.time())
@@ -967,14 +1236,88 @@ def main() -> int:
         rust_obs = snapshot(rust.rpc, built["blocks"], mock_time, rust.rest_base, spend)
         print("restarting both nodes on the same datadirs...")
         core.stop()
-        core = start_core(args.bitcoind, core.datadir, 18611, 18612)
+        core = start_core(
+            args.bitcoind, core.datadir, 18611, 18612, listen=True, maxmempool_mb=5
+        )
         nodes[0] = core
         rust.stop()
-        rust = start_rustoshi(args.rustoshi, rust.datadir, 18621, 18622)
+        rust = start_rustoshi(
+            args.rustoshi, rust.datadir, 18621, 18622, maxmempool_mb=5
+        )
         nodes[1] = rust
         for obs, node in ((core_obs, core), (rust_obs, rust)):
-            for method in ("getbestblockhash", "getblockcount", "getchaintips"):
+            for method in (
+                "getbestblockhash",
+                "getblockcount",
+                "getchaintips",
+                "getblockchaininfo",
+            ):
                 obs["steps"].append({"name": f"restart:{method}", "value": node.rpc.call(method)})
+
+        # Header descending from the BLOCK_FAILED_VALID side tip, plus one
+        # valid header on the active tip, both over P2P. Core rejects the
+        # descendant (it is not stored). The valid header shows the message
+        # was processed.
+        tips = core.rpc.call("getchaintips")
+        invalid = [t for t in tips if isinstance(t, dict) and t.get("status") == "invalid"]
+        if not invalid:
+            raise RuntimeError(f"no invalid chain tip to extend: {tips}")
+        failed = max(invalid, key=lambda t: int(t["height"]))
+        failed_info = core.rpc.call("getblockheader", [failed["hash"]])
+        active = core.rpc.call("getbestblockhash")
+        active_info = core.rpc.call("getblock", [active])
+        bad_child = make_block(
+            failed["hash"],
+            int(failed["height"]) + 1,
+            int(failed_info["time"]) + 1,
+            extra=b"\xa1\xc5",
+        )
+        good = make_block(
+            active,
+            int(active_info["height"]) + 1,
+            int(active_info["time"]) + 1,
+            extra=b"\xa2\xc5",
+        )
+        bad_hash = header_hash(bad_child[:160])
+        good_hash = header_hash(good[:160])
+        headers = [bytes.fromhex(good[:160]), bytes.fromhex(bad_child[:160])]
+        print("feeding headers over P2P...")
+        push_headers("127.0.0.1", 18612, headers, int(active_info["height"]))
+        push_headers("127.0.0.1", 18622, headers, int(active_info["height"]))
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            core_hdr = core.rpc.call("getblockheader", [good_hash])
+            rust_hdr = rust.rpc.call("getblockheader", [good_hash])
+            if isinstance(core_hdr, dict) and "hash" in core_hdr and isinstance(rust_hdr, dict) and "hash" in rust_hdr:
+                break
+            time.sleep(0.25)
+        else:
+            raise RuntimeError(
+                f"valid P2P header was not stored; core={core.rpc.call('getblockheader', [good_hash])} "
+                f"rust={rust.rpc.call('getblockheader', [good_hash])}"
+            )
+        for obs, node in ((core_obs, core), (rust_obs, rust)):
+            obs["steps"].append(
+                {"name": "p2p-header:getchaintips", "value": node.rpc.call("getchaintips")}
+            )
+            obs["steps"].append(
+                {
+                    "name": "p2p-header:getblockheader-valid",
+                    "value": node.rpc.call("getblockheader", [good_hash]),
+                }
+            )
+            obs["steps"].append(
+                {
+                    "name": "p2p-header:getblockheader-failed-child",
+                    "value": node.rpc.call("getblockheader", [bad_hash]),
+                }
+            )
+            obs["steps"].append(
+                {
+                    "name": "p2p-header:getblockchaininfo",
+                    "value": node.rpc.call("getblockchaininfo"),
+                }
+            )
     finally:
         for n in nodes:
             n.stop()

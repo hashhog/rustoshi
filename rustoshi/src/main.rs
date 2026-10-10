@@ -39,7 +39,10 @@ use rustoshi_network::{
     PROTOCOL_VERSION,
 };
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
-use rustoshi_rpc::{start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig, RpcState};
+use rustoshi_rpc::{
+    filter_incoming_headers, start_rest_server, start_rpc_server, PeerState, RestConfig, RpcConfig,
+    RpcState,
+};
 use rustoshi_storage::{
     block_store::{BlockIndexEntry, BlockStatus},
     coinstats_compute_next_entry, coinstats_genesis_entry,
@@ -140,6 +143,11 @@ struct Cli {
     /// P2P listen port (overrides network default)
     #[arg(long)]
     port: Option<u16>,
+
+    /// Maximum mempool size in megabytes (Bitcoin Core `-maxmempool`).
+    /// The byte limit is `megabytes * 1_000_000`. Core rejects values below 5.
+    #[arg(long, default_value_t = 300)]
+    maxmempool: u64,
 
     /// Maximum number of outbound connections
     #[arg(long, default_value = "8")]
@@ -3934,6 +3942,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     rpc_state_inner.txindex_enabled = cli.txindex;
     rpc_state_inner.blockfilterindex_enabled =
         !matches!(cli.blockfilterindex.to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no");
+    // Core init.cpp: `-maxmempool` is megabytes, minimum 5, stored as
+    // `max_size_bytes = megabytes * 1_000_000` and reported by getmempoolinfo.
+    if cli.maxmempool < 5 {
+        anyhow::bail!("Error: -maxmempool must be at least 5 MB");
+    }
+    rpc_state_inner
+        .mempool
+        .set_max_size_bytes((cli.maxmempool as usize).saturating_mul(1_000_000));
     rpc_state_inner.init_from_db().map_err(|e| anyhow::anyhow!(e))?;
 
     // If `--load-snapshot=<path>` was provided, ingest the Core-format UTXO
@@ -4671,8 +4687,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // header (Core drops BLOCK_FAILED_VALID blocks from the candidate set;
     // rustoshi's linear header index would otherwise re-pin it). The durable
     // source of truth is the FAILED_VALIDITY flag; this is an O(1) fast-path.
+    // Seed from the block index so a restart still rejects headers that
+    // descend from a BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD block. The
+    // session set alone is empty after process start.
     let mut invalid_block_hashes: std::collections::HashSet<Hash256> =
         std::collections::HashSet::new();
+    if let Ok(iter) = block_store.iter_block_index() {
+        for (hash, entry) in iter {
+            if entry.status.has(BlockStatus::FAILED_VALIDITY)
+                || entry.status.has(BlockStatus::FAILED_CHILD)
+            {
+                invalid_block_hashes.insert(hash);
+            }
+        }
+    }
     // child -> parent for every header dropped because its parent was failed
     // (Core keeps those in the block index as BLOCK_FAILED_CHILD), so
     // reconsiderblock can clear the descendants it never stored.
@@ -5752,7 +5780,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             // DoS-vector parity (audit w14z8m3zc, findings 2 + 3):
                             // arm the rolling-min-fee decay + expire stale txs.
                             rpc.mempool.on_block_connected(
-                                rustoshi_consensus::current_time_secs() as i64,
+                                rustoshi_consensus::mempool::current_unix_seconds(),
                             );
 
                             // Wire fee estimator: notify it of the newly connected
@@ -5965,26 +5993,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 // BLOCK_FAILED_CHILD). Without it, after an
                                 // `invalidateblock N` the peers' N+1, N+2 headers
                                 // were taken on as the header chain again.
-                                let headers: Vec<_> = if invalid_block_hashes.is_empty() {
-                                    headers
-                                } else {
-                                    let mut kept = Vec::with_capacity(headers.len());
-                                    for h in headers {
-                                        let hh = h.block_hash();
-                                        if invalid_block_hashes.contains(&hh) {
-                                            continue;
-                                        }
-                                        if invalid_block_hashes.contains(&h.prev_block_hash) {
-                                            invalid_block_hashes.insert(hh);
-                                            if failed_child_parent.len() < 100_000 {
-                                                failed_child_parent.insert(hh, h.prev_block_hash);
-                                            }
-                                            continue;
-                                        }
-                                        kept.push(h);
-                                    }
-                                    kept
-                                };
+                                let headers = filter_incoming_headers(
+                                    headers,
+                                    &mut invalid_block_hashes,
+                                    &mut failed_child_parent,
+                                    |hash| block_store.is_block_invalid(hash).unwrap_or(false),
+                                );
                                 let is_historical = historical_backfill
                                     .as_ref()
                                     .map(|bf| bf.is_backfill_batch(&block_store, &headers))
@@ -7348,7 +7362,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             let expired = rpc
                                                 .mempool
                                                 .on_block_connected(
-                                                    rustoshi_consensus::current_time_secs() as i64,
+                                                    rustoshi_consensus::mempool::current_unix_seconds(),
                                                 );
                                             if expired > 0 {
                                                 tracing::debug!(
