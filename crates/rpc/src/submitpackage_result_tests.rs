@@ -783,6 +783,122 @@ async fn submitpackage_rbf_success_lists_replaced_txids() {
     assert!(ids.contains(&r.child.txid().to_hex()), "{ids:?}");
 }
 
+/// Pad with a 0-value OP_RETURN so the non-witness vsize is exactly `target`.
+/// The spendable output stays vout 0, and the fee is unchanged.
+fn pad_to_vsize(tx: &Transaction, target: usize) -> Transaction {
+    let mut tx = tx.clone();
+    let base = tx.vsize();
+    assert!(target >= base, "vsize {base} already above {target}");
+    let extra = target - base;
+    assert!(extra >= 11, "cannot pad {extra} bytes");
+    let data_len = extra - 11;
+    assert!(data_len <= 75);
+    let mut script = vec![0x6a, data_len as u8];
+    script.extend(std::iter::repeat(0u8).take(data_len));
+    tx.outputs.push(TxOut {
+        value: 0,
+        script_pubkey: script,
+    });
+    assert_eq!(tx.vsize(), target);
+    tx
+}
+
+/// Core package RBF: parent fee 10001 / vsize 110 does not clear individual
+/// incremental relay against a 10000-sat conflict, but parent+child
+/// (50000 sat, vsize 110) does. Both results report the truncated package
+/// feerate 272731 sat/kvB = 0.00272731 BTC/kvB and the replaced txid.
+#[tokio::test]
+async fn submitpackage_package_rbf_1p1c_effective_feerate() {
+    let (state, _server) = server();
+    let prev = OutPoint {
+        txid: Hash256::from([0x91u8; 32]),
+        vout: 0,
+    };
+    let value = 1_000_000u64;
+    {
+        let mut st = state.write().await;
+        BlockStore::new(&st.db)
+            .put_utxo(
+                &prev,
+                &rustoshi_storage::CoinEntry {
+                    height: 1,
+                    is_coinbase: false,
+                    value,
+                    script_pubkey: p2sh_true(),
+                },
+            )
+            .unwrap();
+        st.mempool.notify_new_tip(200, 1_700_000_000);
+    }
+    let original = pad_to_vsize(&spend(prev.clone(), value, 10_000), 110);
+    let parent = pad_to_vsize(&spend(prev, value, 10_001), 110);
+    let child = pad_to_vsize(
+        &spend(
+            OutPoint {
+                txid: parent.txid(),
+                vout: 0,
+            },
+            value - 10_001,
+            50_000,
+        ),
+        110,
+    );
+    assert_eq!(original.vsize(), 110);
+    assert_eq!(parent.vsize(), 110);
+    assert_eq!(child.vsize(), 110);
+
+    let first = result(
+        call(
+            &state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&original)]]),
+        )
+        .await,
+    );
+    assert_eq!(first["package_msg"], "success", "{first}");
+
+    let res = result(
+        call(
+            &state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&parent), hex_tx(&child)]]),
+        )
+        .await,
+    );
+    assert_eq!(res["package_msg"], "success", "{res}");
+    assert_top(&res);
+    assert_tx_order(
+        &res,
+        &[&parent.wtxid().to_hex(), &child.wtxid().to_hex()],
+    );
+    let replaced = res["replaced-transactions"].as_array().unwrap();
+    assert_eq!(
+        replaced,
+        &vec![serde_json::Value::String(original.txid().to_hex())],
+        "{res}"
+    );
+    let expect_rate = trunc_sat_per_kvb(60_001, 220) as f64 / 100_000_000.0;
+    assert_eq!(trunc_sat_per_kvb(60_001, 220), 272_731);
+    let includes = vec![parent.wtxid().to_hex(), child.wtxid().to_hex()];
+    for tx in [&parent, &child] {
+        let e = entry(&res, &tx.wtxid().to_hex());
+        assert_keys(e, TX_ACCEPTED, "package rbf");
+        assert_eq!(e["vsize"], 110);
+        assert!(e.get("error").is_none(), "{e}");
+        let got = e["fees"]["effective-feerate"].as_f64().unwrap();
+        assert!(
+            (got - expect_rate).abs() < 1e-12,
+            "effective-feerate {got} != 0.00272731 ({expect_rate}) entry={e}"
+        );
+        let got_includes: Vec<String> = serde_json::from_value(e["fees"]["effective-includes"].clone()).unwrap();
+        assert_eq!(got_includes, includes, "{e}");
+    }
+    let ids = mempool(&state).await;
+    assert!(!ids.contains(&original.txid().to_hex()), "{ids:?}");
+    assert!(ids.contains(&parent.txid().to_hex()), "{ids:?}");
+    assert!(ids.contains(&child.txid().to_hex()), "{ids:?}");
+}
+
 /// A package that would evict and then fails must leave the original in
 /// place, with `replaced-transactions` empty. The parent clears RBF on its
 /// own fee but not the rolling mempool floor, so it is package-only; the
