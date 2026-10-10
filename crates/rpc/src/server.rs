@@ -10062,11 +10062,44 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // The parent height comes from CF_BLOCK_INDEX — authoritative, and NOT
         // the attacker-poisonable height→hash index.
-        let submit_parent_height = store
+        let submit_parent = store
             .get_block_index(&block.header.prev_block_hash)
             .ok()
-            .flatten()
-            .map(|e| e.height);
+            .flatten();
+
+        // Core ProcessNewBlock: CheckBlock, then AcceptBlockHeader. A parent
+        // with BLOCK_FAILED_MASK is BLOCK_INVALID_PREV "bad-prevblk" before
+        // ContextualCheckBlockHeader and ContextualCheckBlock (validation.cpp
+        // AcceptBlockHeader; rpc/mining.cpp submitblock → BIP22ValidationResult).
+        // A coinbase-height mismatch on a child of an invalidated block must
+        // not surface as bad-cb-height. The block is not added to the index.
+        if let Some(ref parent_idx) = submit_parent {
+            if parent_idx
+                .status
+                .has(rustoshi_storage::block_store::BlockStatus::FAILED_VALIDITY)
+                || parent_idx
+                    .status
+                    .has(rustoshi_storage::block_store::BlockStatus::FAILED_CHILD)
+            {
+                if let Err(e) =
+                    rustoshi_consensus::validation::check_block(&block, &state.params)
+                {
+                    tracing::warn!(
+                        "submitblock: block {} rejected (context-free CheckBlock, failed parent): {}",
+                        block_hash,
+                        e.bip22_string()
+                    );
+                    return Ok(Some(e.bip22_string()));
+                }
+                tracing::warn!(
+                    "submitblock: block {} rejected: bad-prevblk (parent {} is failed)",
+                    block_hash,
+                    block.header.prev_block_hash
+                );
+                return Ok(Some("bad-prevblk".to_string()));
+            }
+        }
+        let submit_parent_height = submit_parent.as_ref().map(|e| e.height);
         let submit_height = submit_parent_height
             .map(|h| h.saturating_add(1))
             .unwrap_or_else(|| state.best_height.saturating_add(1));
