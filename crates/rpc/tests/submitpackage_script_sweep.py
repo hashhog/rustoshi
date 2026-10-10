@@ -32,6 +32,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -142,6 +143,40 @@ class CoreNode(Node):
     def rpc_outcome(self, method: str, params: list | None = None):
         """Result JSON, or Core's JSONRPCError code and message."""
         payload = self._post(method, params)
+        if payload.get("error"):
+            err = payload["error"]
+            return {
+                "ok": False,
+                "code": err.get("code"),
+                "message": err.get("message"),
+            }
+        return {"ok": True, "result": payload.get("result")}
+
+    def wallet_outcome(self, method: str, params: list | None = None):
+        """Wallet RPC on /wallet/sweep. Root `/` has no wallet selected."""
+        cookie_path = self.datadir / "regtest" / ".cookie"
+        user, _, secret = cookie_path.read_text().strip().partition(":")
+        token = base64.b64encode(f"{user}:{secret}".encode()).decode()
+        body = json.dumps(
+            {"jsonrpc": "1.0", "id": "sweep", "method": method, "params": params or []}
+        ).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{CORE_RPC_PORT}/wallet/sweep",
+            data=body,
+            headers={
+                "Authorization": f"Basic {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                payload = json.loads(resp.read().decode(), parse_float=Decimal)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            try:
+                payload = json.loads(detail, parse_float=Decimal)
+            except json.JSONDecodeError:
+                return {"ok": False, "code": None, "message": detail}
         if payload.get("error"):
             err = payload["error"]
             return {
@@ -1461,6 +1496,7 @@ def main() -> int:
                 "depends",
                 "spentby",
                 "bip125-replaceable",
+                "unbroadcast",
             )
         }
         fees = dict(kept.get("fees") or {})
@@ -1508,6 +1544,7 @@ def main() -> int:
             "depends": 0,
             "spentby": 0,
             "bip125-replaceable": 0,
+            "unbroadcast": 0,
         }
         present = [txid for txid in focus if txid in core_map or txid in rust_map]
         for txid in present:
@@ -1548,7 +1585,7 @@ def main() -> int:
                         "justified": None,
                     }
                 )
-            for key in ("depends", "spentby", "bip125-replaceable"):
+            for key in ("depends", "spentby", "bip125-replaceable", "unbroadcast"):
                 if c_ent.get(key) != r_ent.get(key):
                     residual[key] += 1
             mismatches.extend(
@@ -1572,7 +1609,10 @@ def main() -> int:
                         "fees.chunk is Core rpc/mempool.cpp:532, omitted by MempoolFees "
                         "(crates/rpc/src/types.rs:696); depends, spentby, and "
                         "bip125-replaceable are empty/false in get_raw_mempool "
-                        "(crates/rpc/src/server.rs:9130-9132)"
+                        "(crates/rpc/src/server.rs:9130-9132); unbroadcast is "
+                        "hardcoded false (server.rs:9197) because rustoshi keeps "
+                        "no unbroadcast set, while Core's sendrawtransaction marks "
+                        "the tx via AddUnbroadcastTx"
                     ),
                 }
             )
@@ -1785,57 +1825,347 @@ def main() -> int:
         sendraw=[truc_child["hex"]],
     )
 
-    # 4. require_standard off. A >=65-byte nonstandard output is accepted;
-    # the 65-byte floor still rejects the undersized OP_RETURN.
-    log("=== restart with acceptnonstdtxn ===")
-    stop_rustoshi(rust_proc)
-    rust_proc = None
-    stop_core(core_dir)
-    for stale in (
-        core_dir / "regtest" / "mempool.dat",
-        rust_dir / "mempool.dat",
-        rust_dir / "regtest" / "mempool.dat",
-        rust_dir / ".cookie",
-        rust_dir / "regtest" / ".cookie",
-    ):
-        stale.unlink(missing_ok=True)
-    # -walletbroadcast=0: otherwise the wallet resubmits the pre-restart
-    # mempool txs and Core's pool is not empty.
-    start_core(core_dir, "-acceptnonstdtxn=1", "-walletbroadcast=0")
-    wait_rpc(core)
-    wallets = core.rpc("listwallets")
-    if "sweep" not in wallets:
-        core.rpc("loadwallet", ["sweep"])
-    rust_proc = start_rustoshi(
-        rust_dir, WORKDIR / "rustoshi-nonstd.log", "--acceptnonstdtxn"
-    )
-    cookie_path = rust_dir / ".cookie"
-    deadline = time.time() + 90
-    while time.time() < deadline and not cookie_path.exists():
-        if rust_proc.poll() is not None:
-            die(
-                "rustoshi exited "
-                f"{rust_proc.returncode}: "
-                f"{(WORKDIR / 'rustoshi-nonstd.log').read_text()[-2000:]}"
-            )
-        time.sleep(0.25)
-    if not cookie_path.exists():
-        die(f"no cookie after acceptnonstdtxn restart: {(WORKDIR / 'rustoshi-nonstd.log').read_text()[-2000:]}")
-    rust = RustNode(
-        f"http://127.0.0.1:{RUST_RPC_PORT}",
-        cookie_path.read_text().strip(),
-    )
-    wait_rpc(rust, 90)
-    c_tip = {"height": core.rpc("getblockcount"), "hash": core.rpc("getbestblockhash")}
-    r_tip = {"height": rust.rpc("getblockcount"), "hash": rust.rpc("getbestblockhash")}
-    log(f"after restart tip core={c_tip} rustoshi={r_tip}")
-    if c_tip != r_tip:
-        die(f"tips diverged after acceptnonstdtxn restart: core={c_tip} rustoshi={r_tip}")
-    if mempool_txids(core) or mempool_txids(rust):
-        die(
-            "mempools not empty after acceptnonstdtxn restart: "
-            f"core={mempool_txids(core)} rustoshi={mempool_txids(rust)}"
+    def fresh_coin() -> dict:
+        coins = spendable_coins()
+        if not coins:
+            sync_generated(1)
+            coins = spendable_coins()
+        if not coins:
+            die("no confirmed spendable coin")
+        return coins[0]
+
+    def sign_partial(raw: str, prevs: list[dict]) -> dict:
+        """Sign what the wallet can. A P2A input stays unsigned."""
+        encoded_prevs = []
+        for prev in prevs:
+            item = dict(prev)
+            amount = item.get("amount")
+            if isinstance(amount, Decimal):
+                item["amount"] = f"{amount:.8f}"
+            encoded_prevs.append(item)
+        signed = core.cli_json(
+            "-rpcwallet=sweep",
+            "signrawtransactionwithwallet",
+            raw,
+            json.dumps(encoded_prevs),
         )
+        decoded = core.cli_json("decoderawtransaction", signed["hex"])
+        by_vout = {int(prev["vout"]): prev for prev in encoded_prevs}
+        for vin in decoded["vin"]:
+            prev = by_vout[int(vin["vout"])]
+            witness = vin.get("txinwitness") or []
+            script_sig = (vin.get("scriptSig") or {}).get("hex") or ""
+            if prev["scriptPubKey"] == p2a_script.hex():
+                if witness or script_sig:
+                    die(f"P2A input must have a null witness and empty scriptSig: {vin}")
+            elif not witness:
+                die(f"signrawtransactionwithwallet left a non-anchor input unsigned: {signed}")
+        return {"hex": signed["hex"], "decoded": decoded}
+
+    # 0-fee 0-value P2A, spent by the child. Ephemeral dust: the package is
+    # accepted and the anchor is not left unspent. Solo sendraw of the parent
+    # fails the relay floor (PreCheckEphemeralTx allows the 0 fee).
+    anchor_coin = fresh_coin()
+    anchor_parent = signed_outputs(
+        anchor_coin,
+        [(sats_of(anchor_coin["amount"]), spk_bytes), (0, p2a_script)],
+    )
+    anchor_dec = anchor_parent["decoded"]
+    change_vout = next(v for v in anchor_dec["vout"] if sats_of(v["value"]) > 0)
+    anchor_vout = next(
+        v for v in anchor_dec["vout"] if v["scriptPubKey"]["hex"] == p2a_script.hex()
+    )
+    anchor_child_value = sats_of(change_vout["value"]) - 10_000
+    anchor_child_raw = raw_tx(
+        [
+            (bytes.fromhex(anchor_dec["txid"])[::-1], change_vout["n"], b""),
+            (bytes.fromhex(anchor_dec["txid"])[::-1], anchor_vout["n"], b""),
+        ],
+        [(anchor_child_value, spk_bytes)],
+    ).hex()
+    anchor_child = sign_partial(
+        anchor_child_raw,
+        [
+            {
+                "txid": anchor_dec["txid"],
+                "vout": change_vout["n"],
+                "scriptPubKey": change_vout["scriptPubKey"]["hex"],
+                "amount": btc(sats_of(change_vout["value"])),
+            },
+            {
+                "txid": anchor_dec["txid"],
+                "vout": anchor_vout["n"],
+                "scriptPubKey": anchor_vout["scriptPubKey"]["hex"],
+                "amount": btc(0),
+            },
+        ],
+    )
+    run_reached(
+        "p2a-zero-spent-by-child",
+        [anchor_parent["hex"], anchor_child["hex"]],
+        sendraw=[anchor_parent["hex"]],
+    )
+
+    # broadcast_signed_tx is sendtoaddress and send. No REST handler calls it.
+    # Core's wallet rejects 1 sat before BroadcastTransaction. rustoshi builds
+    # the tx and broadcast_signed_tx returns sendrawtransaction's -26 string.
+    log("=== sendtoaddress dust via broadcast_signed_tx ===")
+    rust.rpc("createwallet", ["sweep"])
+    rust_addr = rust.rpc("getnewaddress", ["", "bech32"])
+    rust_info = rust.rpc("getaddressinfo", [rust_addr])
+    rust_spk = bytes.fromhex(rust_info["scriptPubKey"])
+    fund_coin = fresh_coin()
+    fund_sats = sats_of(fund_coin["amount"])
+    fund_pay = min(100_000_000, fund_sats // 2)
+    fund_tx = signed_outputs(
+        fund_coin,
+        [(fund_pay, rust_spk), (fund_sats - fund_pay - 10_000, spk_bytes)],
+    )
+    admit_both("fund-rustoshi-wallet", fund_tx["hex"])
+    sync_generated(1)
+    log("rustoshi rescan: " + json.dumps(rust.rpc("rescanblockchain", []), default=str))
+    rust_unspent = rust.rpc("listunspent", [1, 9999999])
+    log("rustoshi listunspent: " + json.dumps(rust_unspent, default=str)[:1500])
+    if not rust_unspent:
+        die("rustoshi wallet saw no coins after rescanblockchain")
+    core_dust_addr = core.cli_json("-rpcwallet=sweep", "getnewaddress", "", "bech32")
+    rust_dust_addr = rust.rpc("getnewaddress", ["", "bech32"])
+    c_send = core.wallet_outcome("sendtoaddress", [core_dust_addr, 0.00000001])
+    r_send = rust.rpc_outcome("sendtoaddress", [rust_dust_addr, 0.00000001])
+    log("core sendtoaddress: " + json.dumps(c_send, default=str))
+    log("rustoshi sendtoaddress: " + json.dumps(r_send, default=str))
+    send_mismatches = compare_outcome(c_send, r_send, "sendtoaddress")
+    dust_broadcast = (
+        c_send.get("code") == -6
+        and c_send.get("message") == "Transaction amount too small"
+        and r_send.get("code") == -26
+        and r_send.get("message") == "dust, tx with dust output must be 0-fee"
+    )
+    if send_mismatches and dust_broadcast:
+        for item in send_mismatches:
+            item["justified"] = (
+                "Core wallet CreateTransaction rejects a 1-sat output with "
+                "RPC_WALLET_INSUFFICIENT_FUNDS (-6) 'Transaction amount too small' "
+                "before BroadcastTransaction (spend.cpp). sendtoaddress and send "
+                "are the only callers of broadcast_signed_tx; no REST path uses it. "
+                "rustoshi sendtoaddress reaches broadcast_signed_tx and returns "
+                "sendrawtransaction's -26 ToString. Matching the wallet pre-check "
+                "would skip that path."
+            )
+    for item in send_mismatches:
+        tag = "JUSTIFIED" if item["justified"] else "MISMATCH"
+        log(f"  {tag} {item['field']}: core={item['core']!r} rustoshi={item['rustoshi']!r}")
+        if item["justified"]:
+            log(f"    why: {item['justified']}")
+    cases.append(
+        {
+            "name": "sendtoaddress-broadcast-dust",
+            "core": c_send,
+            "rustoshi": r_send,
+            "mismatches": send_mismatches,
+        }
+    )
+
+    def restart_nodes(log_name: str, core_extra: list[str], rust_extra: list[str]) -> None:
+        nonlocal rust_proc, rust
+        log(f"=== restart {log_name} core={core_extra} rustoshi={rust_extra} ===")
+        stop_rustoshi(rust_proc)
+        rust_proc = None
+        stop_core(core_dir)
+        for stale in (
+            core_dir / "regtest" / "mempool.dat",
+            rust_dir / "mempool.dat",
+            rust_dir / "regtest" / "mempool.dat",
+            rust_dir / ".cookie",
+            rust_dir / "regtest" / ".cookie",
+        ):
+            stale.unlink(missing_ok=True)
+        # -walletbroadcast=0: otherwise the wallet resubmits the pre-restart
+        # mempool txs and Core's pool is not empty.
+        start_core(core_dir, *core_extra)
+        wait_rpc(core)
+        wallets = core.rpc("listwallets")
+        if "sweep" not in wallets:
+            core.rpc("loadwallet", ["sweep"])
+        log_path = WORKDIR / log_name
+        rust_proc = start_rustoshi(rust_dir, log_path, *rust_extra)
+        cookie_path = rust_dir / ".cookie"
+        deadline = time.time() + 90
+        while time.time() < deadline and not cookie_path.exists():
+            if rust_proc.poll() is not None:
+                die(
+                    "rustoshi exited "
+                    f"{rust_proc.returncode}: "
+                    f"{log_path.read_text()[-2000:]}"
+                )
+            time.sleep(0.25)
+        if not cookie_path.exists():
+            die(f"no cookie after restart: {log_path.read_text()[-2000:]}")
+        rust = RustNode(
+            f"http://127.0.0.1:{RUST_RPC_PORT}",
+            cookie_path.read_text().strip(),
+        )
+        wait_rpc(rust, 90)
+        c_tip = {"height": core.rpc("getblockcount"), "hash": core.rpc("getbestblockhash")}
+        r_tip = {"height": rust.rpc("getblockcount"), "hash": rust.rpc("getbestblockhash")}
+        log(f"after restart tip core={c_tip} rustoshi={r_tip}")
+        if c_tip != r_tip:
+            die(f"tips diverged after restart: core={c_tip} rustoshi={r_tip}")
+        if mempool_txids(core) or mempool_txids(rust):
+            die(
+                "mempools not empty after restart: "
+                f"core={mempool_txids(core)} rustoshi={mempool_txids(rust)}"
+            )
+
+    def null_data(payload: int) -> bytes:
+        if payload <= 75:
+            body = bytes([payload]) + bytes(payload)
+        elif payload <= 255:
+            body = bytes([0x4C, payload]) + bytes(payload)
+        else:
+            body = b"\x4d" + payload.to_bytes(2, "little") + bytes(payload)
+        return bytes([0x6A]) + body
+
+    def get_fee(rate: int, vsize: int) -> int:
+        return (rate * vsize + 999) // 1000
+
+    def floor_sat_kvb(fee: int, vsize: int) -> int:
+        return math.floor(fee / vsize * 1000)
+
+    def signed_padded(coin: dict, fee: int, pad: int) -> dict:
+        sats = sats_of(coin["amount"])
+        if fee <= 0 or fee >= sats:
+            die(f"pad fee {fee} does not fit coin {sats}")
+        return signed_outputs(
+            coin,
+            [(sats - fee, spk_bytes), (0, null_data(pad))],
+        )
+
+    # Rate 1005 sat/kvB is the smallest rate whose CFeeRate::GetFee(vsize)
+    # disagrees with floor(fee/vsize*1000). vsize 200, fee 201 floors to 1004.
+    # The rolling floor has no RPC on either node; the unit test covers it.
+    restart_nodes(
+        "rustoshi-feerate.log",
+        ["-minrelaytxfee=0.00001005", "-walletbroadcast=0"],
+        ["--minrelaytxfee=0.00001005"],
+    )
+    boundary_coin = fresh_coin()
+    boundary = None
+    base_v = int(signed_padded(boundary_coin, 201, 0)["decoded"]["vsize"])
+    for target in (200, 400, 600):
+        guess = max(0, target - base_v)
+        for pad in range(max(0, guess - 8), guess + 48):
+            probe_v = int(signed_padded(boundary_coin, 201, pad)["decoded"]["vsize"])
+            if probe_v not in (200, 400, 600):
+                continue
+            fee = get_fee(1005, probe_v)
+            exact = signed_padded(boundary_coin, fee, pad)
+            low = signed_padded(boundary_coin, fee - 1, pad)
+            exact_v = int(exact["decoded"]["vsize"])
+            low_v = int(low["decoded"]["vsize"])
+            if exact_v != probe_v or low_v != probe_v:
+                continue
+            if floor_sat_kvb(fee, exact_v) >= 1005:
+                continue
+            boundary = (exact, low, exact_v, fee, pad)
+            break
+        if boundary:
+            break
+    if boundary is None:
+        die("no vsize where floor(fee*1000/vsize) disagrees with GetFee")
+    exact_tx, low_tx, exact_v, exact_fee, exact_pad = boundary
+    log(
+        f"fee boundary vsize={exact_v} fee={exact_fee} "
+        f"floor={floor_sat_kvb(exact_fee, exact_v)} pad={exact_pad} "
+        f"getfee={get_fee(1005, exact_v)}"
+    )
+    # One sat under first: it must be rejected, so the coin is still free
+    # for the GetFee-sized tx that both nodes accept.
+    run_reached(
+        "fee-one-sat-under-getfee",
+        [low_tx["hex"]],
+        sendraw=[low_tx["hex"]],
+    )
+    run_reached(
+        "fee-getfee-boundary",
+        [exact_tx["hex"]],
+        sendraw=[exact_tx["hex"]],
+    )
+
+    package_coin = fresh_coin()
+    package_hit = None
+    parent_base = int(signed_padded(package_coin, 1, 0)["decoded"]["vsize"])
+    for target in (400, 600, 200):
+        guess = max(0, target - parent_base - 140)
+        for pad in range(guess, guess + 80):
+            parent = signed_padded(package_coin, 1, pad)
+            change = next(
+                v for v in parent["decoded"]["vout"] if sats_of(v["value"]) > 0
+            )
+            change_value = sats_of(change["value"])
+            child_probe = sign_raw(
+                raw_tx(
+                    [(bytes.fromhex(parent["decoded"]["txid"])[::-1], change["n"], b"")],
+                    [(change_value - 1, spk_bytes)],
+                ).hex(),
+                [
+                    {
+                        "txid": parent["decoded"]["txid"],
+                        "vout": change["n"],
+                        "scriptPubKey": change["scriptPubKey"]["hex"],
+                        "amount": btc(change_value),
+                    }
+                ],
+            )
+            combined = int(parent["decoded"]["vsize"]) + int(child_probe["decoded"]["vsize"])
+            if combined not in (200, 400, 600):
+                continue
+            fee = get_fee(1005, combined)
+            if fee <= 2 or change_value <= fee:
+                continue
+            child = sign_raw(
+                raw_tx(
+                    [(bytes.fromhex(parent["decoded"]["txid"])[::-1], change["n"], b"")],
+                    [(change_value - (fee - 1), spk_bytes)],
+                ).hex(),
+                [
+                    {
+                        "txid": parent["decoded"]["txid"],
+                        "vout": change["n"],
+                        "scriptPubKey": change["scriptPubKey"]["hex"],
+                        "amount": btc(change_value),
+                    }
+                ],
+            )
+            combined2 = int(parent["decoded"]["vsize"]) + int(child["decoded"]["vsize"])
+            if combined2 != combined or floor_sat_kvb(fee, combined2) >= 1005:
+                continue
+            package_hit = (parent, child, combined2, fee, pad)
+            break
+        if package_hit:
+            break
+    if package_hit is None:
+        die("no package vsize where floor(fee*1000/vsize) disagrees with GetFee")
+    pkg_parent, pkg_child, pkg_v, pkg_fee, pkg_pad = package_hit
+    log(
+        f"package fee boundary vsize={pkg_v} fee={pkg_fee} "
+        f"floor={floor_sat_kvb(pkg_fee, pkg_v)} pad={pkg_pad}"
+    )
+    run_reached(
+        "package-fee-getfee-boundary",
+        [pkg_parent["hex"], pkg_child["hex"]],
+        sendraw=[pkg_parent["hex"]],
+    )
+
+    # 4. require_standard off. A >=65-byte nonstandard output is accepted;
+    # the 65-byte floor still rejects the undersized OP_RETURN. Empty
+    # scriptPubKeys are nonstandard, so IsDust is not reached while
+    # standardness is on (IsStandardTx returns scriptpubkey first).
+    restart_nodes(
+        "rustoshi-nonstd.log",
+        ["-acceptnonstdtxn=1", "-walletbroadcast=0"],
+        ["--acceptnonstdtxn"],
+    )
 
     nonstd_script = bytes([0x51]) + bytes([0x61]) * 20
     nonstd_coin = spendable_coins()[0]
@@ -1855,6 +2185,49 @@ def main() -> int:
         [nonstd_parent["hex"], nonstd_child["hex"]],
     )
     run_reached("tx-size-small-still", [op_ret.hex()], sendraw=[op_ret.hex()])
+
+    def nonwitness_size(tx_hex: str, decoded: dict) -> int:
+        raw = bytes.fromhex(tx_hex)
+        if len(raw) >= 6 and raw[4] == 0x00:
+            size = int(decoded["size"])
+            weight = int(decoded["weight"])
+            return (weight - size + 2) // 3
+        return len(raw)
+
+    def empty_spk_tx(coin: dict, empty_value: int, fee: int) -> dict:
+        sats = sats_of(coin["amount"])
+        change = sats - empty_value - fee
+        if change <= 0:
+            die(f"empty-spk change {change} for value {empty_value} fee {fee}")
+        signed = signed_outputs(coin, [(change, spk_bytes), (empty_value, b"")])
+        base = nonwitness_size(signed["hex"], signed["decoded"])
+        if base < 65:
+            die(f"empty-spk tx base size {base} is below the 65-byte floor")
+        return signed
+
+    # Empty script is spendable. GetDustThreshold sizes it as 9 + 148 = 157,
+    # and CFeeRate(3000).GetFee(157) is 471, so 0 and 1 are both dust. With
+    # acceptnonstdtxn, IsStandard and PreCheckEphemeralTx are skipped, so a
+    # fee that clears min relay is accepted and a 0 fee is min-relay.
+    zero_fee_coin = fresh_coin()
+    empty_zero_fee = empty_spk_tx(zero_fee_coin, 0, 0)
+    run_reached(
+        "empty-spk-zero-value-zero-fee",
+        [empty_zero_fee["hex"]],
+        sendraw=[empty_zero_fee["hex"]],
+    )
+    paid_zero = empty_spk_tx(fresh_coin(), 0, 10_000)
+    run_reached(
+        "empty-spk-zero-value-with-fee",
+        [paid_zero["hex"]],
+        sendraw=[paid_zero["hex"]],
+    )
+    paid_one = empty_spk_tx(fresh_coin(), 1, 10_000)
+    run_reached(
+        "empty-spk-positive-value",
+        [paid_one["hex"]],
+        sendraw=[paid_one["hex"]],
+    )
 
     # invalidateblock / reconsiderblock of the current tip.
     log("=== invalidateblock / reconsiderblock ===")
