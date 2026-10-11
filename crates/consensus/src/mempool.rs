@@ -10197,6 +10197,88 @@ mod tests {
         );
     }
 
+    /// Low-fee parent and two children at different feerates, one chunk, plus
+    /// an independent tx below that chunk's feerate.
+    ///
+    /// Inside the chunk Core's linearization repeatedly takes the ready tx
+    /// with the highest tx feerate (cluster_linearize.h:1457-1462,
+    /// 1505-1524 `tx_cmp_fn`): parent (the only ready tx), then the
+    /// higher-feerate child, then the lower one. `DepGraph::topological_sort`
+    /// only counts in-chunk ancestors, so the two siblings follow `HashSet`
+    /// order.
+    #[test]
+    fn test_get_sorted_for_mining_in_chunk_higher_feerate_child_first() {
+        const RUNS: usize = 64;
+        let utxo_p = Hash256::from_hex(
+            "e500000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxo_i = Hash256::from_hex(
+            "e600000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo_p, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo_i, vout: 0 }, 1_000_000),
+        ]);
+        let mut wrong = Vec::new();
+        for run in 0..RUNS {
+            let mut mempool = Mempool::new(MempoolConfig::default());
+            let (parent, _) = make_feerate_tx((utxo_p, 0), 1_000_000, 2, 400_000, 1);
+            let parent_values = [parent.outputs[0].value, parent.outputs[1].value];
+            let parent_txid = parent.txid();
+            let (child_high, _) =
+                make_feerate_tx((parent_txid, 0), parent_values[0], 1, 0, 200);
+            let (child_low, _) =
+                make_feerate_tx((parent_txid, 1), parent_values[1], 1, 0, 150);
+            let (indep, _) = make_feerate_tx((utxo_i, 0), 1_000_000, 1, 0, 40);
+            let high_txid = child_high.txid();
+            let low_txid = child_low.txid();
+            let indep_txid = indep.txid();
+            let mut steps = vec![parent];
+            if run % 2 == 0 {
+                steps.push(child_high);
+                steps.push(child_low);
+            } else {
+                steps.push(child_low);
+                steps.push(child_high);
+            }
+            steps.insert(run % 4, indep);
+            for tx in steps {
+                mempool
+                    .add_transaction(tx, &|op| utxos.get(op).cloned())
+                    .unwrap();
+            }
+            let high = mempool.get(&high_txid).unwrap();
+            let low = mempool.get(&low_txid).unwrap();
+            assert_eq!(
+                high.sigop_adjusted_weight, low.sigop_adjusted_weight,
+                "round {run}: children share a size so feerate is the fee"
+            );
+            assert!(
+                Mempool::get_modified_fee(high) > Mempool::get_modified_fee(low),
+                "round {run}: high child pays more"
+            );
+            assert_chunk_members(
+                &mempool,
+                &parent_txid,
+                &[parent_txid, high_txid, low_txid],
+                run,
+            );
+            let sorted = mempool.get_sorted_for_mining();
+            let want = vec![parent_txid, high_txid, low_txid, indep_txid];
+            if sorted != want {
+                wrong.push((run, sorted, want));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {RUNS} mempools listed in-chunk siblings out of feerate order, first {:?}",
+            wrong.len(),
+            wrong[0]
+        );
+    }
+
     #[test]
     fn test_mining_score_orders_like_core_compare_main_transactions() {
         let score = |fee: i64, size: i64, max: u8| MiningScore {
@@ -15947,6 +16029,19 @@ mod tests {
             .iter()
             .map(|chunk| chunk.txids.clone())
             .collect()
+    }
+
+    /// The cluster's chunks contain exactly `members` as one chunk. Order
+    /// inside the chunk is not part of the check: `topological_sort` emits
+    /// siblings in `HashSet` order.
+    fn assert_chunk_members(mempool: &Mempool, txid: &Hash256, members: &[Hash256], run: usize) {
+        let chunks = chunk_txids(mempool, txid);
+        assert_eq!(chunks.len(), 1, "round {run}: expected one chunk, got {chunks:?}");
+        let mut got = chunks[0].clone();
+        got.sort();
+        let mut want = members.to_vec();
+        want.sort();
+        assert_eq!(got, want, "round {run}: chunk membership");
     }
 
     /// Warden (d): three chained spends with the same fee and size. Core
