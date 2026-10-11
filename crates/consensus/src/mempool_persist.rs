@@ -248,9 +248,11 @@ pub fn dump_mempool_with_key(
             xor.write_all(&delta.to_le_bytes())?;
         }
 
-        // Unbroadcast set: rustoshi does not track an explicit
-        // unbroadcast set yet, so this is always empty too.
-        write_compact_size(&mut xor, 0)?;
+        let unbroadcast = mempool.unbroadcast_txids();
+        write_compact_size(&mut xor, unbroadcast.len() as u64)?;
+        for txid in &unbroadcast {
+            xor.write_all(txid.as_ref())?;
+        }
 
         xor.flush()?;
         stats
@@ -305,6 +307,9 @@ pub struct ImportMempoolOptions {
     pub use_current_time: bool,
     /// Apply the per-entry fee deltas and the standalone `mapDeltas` block.
     pub apply_fee_delta_priority: bool,
+    /// Restore the unbroadcast set. Core's startup `LoadMempool` defaults
+    /// this to true; the `importmempool` RPC defaults it to false.
+    pub apply_unbroadcast_set: bool,
 }
 
 impl Default for ImportMempoolOptions {
@@ -312,6 +317,7 @@ impl Default for ImportMempoolOptions {
         Self {
             use_current_time: false,
             apply_fee_delta_priority: true,
+            apply_unbroadcast_set: true,
         }
     }
 }
@@ -471,11 +477,10 @@ where
     for _ in 0..n_unbroadcast {
         let mut txid_bytes = [0u8; 32];
         xor.read_exact(&mut txid_bytes)?;
-        // We do not yet maintain an explicit unbroadcast set; the
-        // txid is read so the file pointer advances correctly. A
-        // future implementation can call `mempool.add_unbroadcast(...)`
-        // here.
-        let _ = txid_bytes;
+        if opts.apply_unbroadcast_set {
+            let txid = Hash256::from_bytes(txid_bytes);
+            mempool.add_unbroadcast(txid);
+        }
     }
 
     Ok(stats)
