@@ -12879,6 +12879,20 @@ impl RustoshiRpcServer for RpcServerImpl {
                 })
         };
 
+        // Refresh the mempool's tip snapshot (height + MTP) before admission,
+        // as sendrawtransaction does. Core reads the active chain tip in
+        // MemPoolAccept, and getrawmempool `height` is that tip at entry.
+        {
+            let tip_height = state.best_height;
+            let store = BlockStore::new(&db);
+            let mtp = compute_prev_block_mtp(&store, &state.best_hash)
+                .map_err(|e| submit_system_fault_error(&e))? as i64;
+            if rustoshi_consensus::fatal::is_aborted() {
+                return Err(submit_system_fault_error("node is shutting down after a fatal error"));
+            }
+            state.mempool.notify_new_tip(tip_height, mtp);
+        }
+
         // Accept the package. Core ProcessNewPackage always runs
         // PolicyScriptChecks + ConsensusScriptChecks, including on regtest
         // where this node's mempool is built with verify_scripts = false.
