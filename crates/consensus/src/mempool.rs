@@ -10417,6 +10417,152 @@ mod tests {
         );
     }
 
+    /// Parent, child and independent tx, each one P2PKH spend of the same
+    /// vsize, with `delta_rate` sat/vB prioritised onto the child either
+    /// before admission (`ApplyDelta`, txmempool.cpp:1015-1023) or after it
+    /// (`PrioritiseTransaction` → `SetTransactionFee`, txmempool.cpp:641).
+    /// Returns the chunks of the parent's cluster and the listing, per run.
+    fn delta_cpfp_listing(
+        utxo_byte: u8,
+        rates: (u64, u64, u64),
+        delta_rate: i64,
+        before_admission: bool,
+        run: usize,
+    ) -> (Hash256, Hash256, Hash256, Vec<Vec<Hash256>>, Vec<Hash256>) {
+        let utxo_p = Hash256::from_bytes([utxo_byte; 32]);
+        let utxo_i = Hash256::from_bytes([utxo_byte.wrapping_add(1); 32]);
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo_p, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo_i, vout: 0 }, 1_000_000),
+        ]);
+        let mut mempool = chunk_tie_mempool();
+        let (parent, parent_fee) = make_feerate_tx((utxo_p, 0), 1_000_000, 1, 0, rates.0);
+        let (child, _) =
+            make_feerate_tx((parent.txid(), 0), 1_000_000 - parent_fee, 1, 0, rates.1);
+        let (indep, _) = make_feerate_tx((utxo_i, 0), 1_000_000, 1, 0, rates.2);
+        assert_eq!(parent.vsize(), child.vsize(), "P and C same vsize");
+        assert_eq!(parent.vsize(), indep.vsize(), "P and I same vsize");
+        let delta = delta_rate * child.vsize() as i64;
+        let (parent_txid, child_txid, indep_txid) = (parent.txid(), child.txid(), indep.txid());
+        if before_admission {
+            mempool.prioritise_transaction(&child_txid, delta);
+        }
+        let mut steps = vec![parent, child];
+        steps.insert(run % 3, indep);
+        for tx in steps {
+            mempool
+                .add_transaction(tx, &|op| utxos.get(op).cloned())
+                .unwrap();
+        }
+        if !before_admission {
+            mempool.prioritise_transaction(&child_txid, delta);
+        }
+        let chunks = chunk_txids(&mempool, &parent_txid);
+        let sorted = mempool.get_sorted_for_mining();
+        (parent_txid, child_txid, indep_txid, chunks, sorted)
+    }
+
+    /// Warden's block on #16: parent at 10 sat/vB, child at 50 sat/vB raw
+    /// prioritised by -49 sat/vB (modified 1 sat/vB), independent at
+    /// 8 sat/vB. TxGraph only sees the modified fee (txmempool.cpp:641 and
+    /// 1017-1023), so the parent is a chunk on its own at 10, above the
+    /// independent tx, and the child is a lone chunk at 1. Core lists
+    /// `[parent, indep, child]`. Linearizing on the raw fee merges parent and
+    /// child and drops the parent below the independent tx.
+    #[test]
+    fn test_get_sorted_for_mining_negative_delta_child_splits_chunk() {
+        for before_admission in [false, true] {
+            for run in 0..6 {
+                let (parent, child, indep, chunks, sorted) =
+                    delta_cpfp_listing(0xd1, (10, 50, 8), -49, before_admission, run);
+                assert_eq!(
+                    sorted,
+                    vec![parent, indep, child],
+                    "before_admission={before_admission} round {run}: Core listing order"
+                );
+                assert_eq!(
+                    chunks,
+                    vec![vec![parent], vec![child]],
+                    "before_admission={before_admission} round {run}: chunks on modified fee"
+                );
+            }
+        }
+    }
+
+    /// Parent at 10 sat/vB, child at 1 sat/vB raw prioritised by +49 sat/vB
+    /// (modified 50), independent at 20. On modified fees the child pays for
+    /// the parent: one chunk at 30, ahead of the independent tx. Core lists
+    /// `[parent, child, indep]`.
+    #[test]
+    fn test_get_sorted_for_mining_positive_delta_child_merges_chunk() {
+        for before_admission in [false, true] {
+            for run in 0..6 {
+                let (parent, child, indep, chunks, sorted) =
+                    delta_cpfp_listing(0xd3, (10, 1, 20), 49, before_admission, run);
+                assert_eq!(
+                    sorted,
+                    vec![parent, child, indep],
+                    "before_admission={before_admission} round {run}: Core listing order"
+                );
+                assert_eq!(
+                    chunks,
+                    vec![vec![parent, child]],
+                    "before_admission={before_admission} round {run}: chunks on modified fee"
+                );
+            }
+        }
+    }
+
+    /// Sigop-heavy parent: 100 OP_CHECKSIG outputs give sigop cost 400 and a
+    /// sigops-adjusted weight of 8_000 (policy.cpp:376-379
+    /// `GetSigOpsAdjustedWeight`), against a raw weight of about 4_440. TxGraph
+    /// takes the adjusted weight as the size (txmempool.cpp:1017). The parent
+    /// pays 2 sat/vB on that size, its child 20 sat/vB, the independent tx
+    /// 4 sat/vB. On adjusted size the parent+child chunk (about 2.7 sat/vB)
+    /// sorts after the independent tx: Core lists `[indep, parent, child]`.
+    /// On raw size the chunk would be about 4.8 sat/vB and lead.
+    #[test]
+    fn test_get_sorted_for_mining_sigop_adjusted_size_orders_chunks() {
+        let utxo_p = Hash256::from_bytes([0xd5; 32]);
+        let utxo_i = Hash256::from_bytes([0xd6; 32]);
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo_p, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo_i, vout: 0 }, 1_000_000),
+        ]);
+        let opts = AtmpOptions { require_standard: false, ..Default::default() };
+        for run in 0..6 {
+            let mut mempool = chunk_tie_mempool();
+            let mut parent = make_sigop_heavy_tx((utxo_p, 0), 0, 100, 1_000);
+            let parent_fee = 2 * 2_000;
+            parent.outputs[0].value = 1_000_000 - parent_fee - 1_000 * 99;
+            let parent_txid = parent.txid();
+            let (child, _) =
+                make_feerate_tx((parent_txid, 0), parent.outputs[0].value, 1, 0, 20);
+            let (indep, _) = make_feerate_tx((utxo_i, 0), 1_000_000, 1, 0, 4);
+            let (child_txid, indep_txid) = (child.txid(), indep.txid());
+            let mut steps = vec![parent, child];
+            steps.insert(run % 3, indep);
+            for tx in steps {
+                mempool
+                    .add_transaction_with_options(tx, &|op| utxos.get(op).cloned(), opts.clone())
+                    .unwrap();
+            }
+            let entry = mempool.get(&parent_txid).unwrap();
+            assert_eq!(entry.sigop_adjusted_weight, 8_000, "round {run}: sigop term");
+            assert!(entry.weight < 8_000, "round {run}: raw weight {}", entry.weight);
+            assert_eq!(
+                chunk_txids(&mempool, &parent_txid),
+                vec![vec![parent_txid, child_txid]],
+                "round {run}: parent+child chunk"
+            );
+            assert_eq!(
+                mempool.get_sorted_for_mining(),
+                vec![indep_txid, parent_txid, child_txid],
+                "round {run}: Core listing order on adjusted size"
+            );
+        }
+    }
+
     #[test]
     fn test_mining_score_orders_like_core_compare_main_transactions() {
         let score = |fee: i64, size: i64, max: u8| MiningScore {
