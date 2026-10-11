@@ -40,7 +40,7 @@
 //! - `nLockTime = height - 1` to prevent miners from re-mining old blocks
 //! - `nSequence = 0xFFFFFFFE` (MAX_SEQUENCE_NONFINAL) to ensure locktime is enforced
 
-use crate::mempool::Mempool;
+use crate::mempool::{Mempool, MiningScore};
 use crate::params::{
     block_subsidy, ChainParams, LOCKTIME_THRESHOLD, MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT,
     WITNESS_SCALE_FACTOR,
@@ -245,17 +245,15 @@ pub fn is_final_tx(tx: &Transaction, block_height: u32, median_time_past: i64) -
 // TRANSACTION PRIORITY
 // ============================================================
 
-/// Entry used in the transaction selection priority queue.
-/// Sorted by ancestor fee rate (highest first).
+/// Entry used in the transaction selection priority queue, ordered by
+/// Core's chunk mining order ([`MiningScore`]); the max-heap pops the chunk
+/// Core would mine first.
 #[derive(Clone, Debug)]
 struct TxPriority {
     txid: Hash256,
-    /// ancestor_fees / ancestor_vsize (satoshis per virtual byte)
+    score: MiningScore,
+    /// Package feerate in sat/vB, only for the blockMinFeeRate stop.
     ancestor_fee_rate: f64,
-    #[allow(dead_code)]
-    fee: u64,
-    #[allow(dead_code)]
-    weight: u64,
 }
 
 impl PartialEq for TxPriority {
@@ -268,10 +266,9 @@ impl Eq for TxPriority {}
 
 impl Ord for TxPriority {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Higher fee rate comes first (reverse ordering for max-heap)
-        self.ancestor_fee_rate
-            .partial_cmp(&other.ancestor_fee_rate)
-            .unwrap_or(Ordering::Equal)
+        self.score
+            .cmp(&other.score)
+            .then_with(|| other.txid.cmp(&self.txid))
     }
 }
 
@@ -368,9 +365,8 @@ pub fn build_block_template(
             };
             heap.push(TxPriority {
                 txid: *txid,
+                score: mempool.mining_score(entry),
                 ancestor_fee_rate,
-                fee: modified_fee,
-                weight: entry.weight as u64,
             });
         }
     }
