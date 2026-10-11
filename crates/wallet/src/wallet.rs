@@ -45,6 +45,51 @@ const COIN_TESTNET: u32 = 1 | HARDENED_FLAG;
 /// Minimum output value to avoid dust (546 satoshis for P2WPKH).
 const DUST_LIMIT: u64 = 546;
 
+/// CompactSize length of `n`, matching Core `GetSizeOfCompactSize`.
+fn compact_size_len(n: u64) -> u64 {
+    if n < 0xfd {
+        1
+    } else if n <= 0xffff {
+        3
+    } else if n <= 0xffff_ffff {
+        5
+    } else {
+        9
+    }
+}
+
+/// `GetSerializeSize(CTxOut)`: 8-byte value plus the script.
+fn txout_ser_size(script: &[u8]) -> u64 {
+    let script_len = script.len() as u64;
+    8 + compact_size_len(script_len) + script_len
+}
+
+/// `CFeeRate::GetFee` for a sat/vB rate. Core stores the rate as sat/kvB.
+fn fee_for_sat_vb(fee_rate_sat_vb: f64, vsize: u64) -> u64 {
+    if fee_rate_sat_vb <= 0.0 || vsize == 0 {
+        return 0;
+    }
+    let rate_sat_kvb = (fee_rate_sat_vb * 1000.0).round() as u64;
+    if rate_sat_kvb == 0 {
+        return 0;
+    }
+    rate_sat_kvb.saturating_mul(vsize).saturating_add(999) / 1000
+}
+
+/// Core `FormatMoney`: BTC with up to 8 decimals, trailing zeros stripped.
+fn format_money(sats: u64) -> String {
+    let whole = sats / 100_000_000;
+    let frac = sats % 100_000_000;
+    let mut s = format!("{whole}.{frac:08}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.push('0');
+    }
+    s
+}
+
 /// Default RBF sequence number (enables Replace-By-Fee, BIP-125).
 const RBF_SEQUENCE: u32 = 0xFFFFFFFD;
 
@@ -839,6 +884,32 @@ impl Wallet {
     ) -> Result<Transaction, WalletError> {
         let total_output: u64 = recipients.iter().map(|(_, v)| *v).sum();
 
+        // Core CreateTransactionInternal checks IsDust on each recipient
+        // before coin selection (spend.cpp). Amount 0 is dust for every
+        // spendable script. The threshold is per script at the dust relay
+        // feerate, not the change floor.
+        let mut noinput_vsize: u64 = 10 + compact_size_len(recipients.len() as u64);
+        for (addr_str, value) in &recipients {
+            let addr = Address::from_string(addr_str, Some(self.network))
+                .map_err(|_| WalletError::InvalidAddress(addr_str.clone()))?;
+            let txout = TxOut {
+                value: *value,
+                script_pubkey: addr.to_script_pubkey(),
+            };
+            noinput_vsize += txout_ser_size(&txout.script_pubkey);
+            if txout.value
+                < rustoshi_consensus::mempool::dust_threshold(
+                    &txout,
+                    rustoshi_consensus::params::DUST_RELAY_TX_FEE,
+                )
+            {
+                return Err(WalletError::AmountTooSmall);
+            }
+        }
+        // selection_target - recipients_sum in Core is the fee for the
+        // version/locktime/counts plus the recipient outputs, not the inputs.
+        let noinput_fee = fee_for_sat_vb(fee_rate, noinput_vsize);
+
         // Collect spendable UTXOs (confirmed, mature, unlocked). Mirror
         // Core's AvailableCoins which excludes setLockedCoins from automatic
         // coin selection (bitcoin-core/src/wallet/spend.cpp).
@@ -877,11 +948,22 @@ impl Wallet {
         };
 
         let mut rng = thread_rng();
-        let selection = select_coins(&available_utxos, &params, &mut rng)
-            .ok_or(WalletError::InsufficientFunds {
-                have: available_utxos.iter().map(|u| u.value).sum(),
-                need: total_output + bootstrap_fee,
-            })?;
+        let have: u64 = available_utxos.iter().map(|u| u.value).sum();
+        let selection = select_coins(&available_utxos, &params, &mut rng).ok_or_else(|| {
+            // Core: balance covers the recipients but not the fee → the
+            // no-input fee sentence. A balance below the recipient sum is
+            // the general "Insufficient funds".
+            if have >= total_output && total_output > 0 && noinput_fee > 0 {
+                WalletError::FeeExceedsBalance {
+                    fee: format_money(noinput_fee),
+                }
+            } else {
+                WalletError::InsufficientFunds {
+                    have,
+                    need: total_output + bootstrap_fee,
+                }
+            }
+        })?;
 
         let selected_utxos = selection.selected;
         let selected_value: u64 = selected_utxos.iter().map(|u| u.value).sum();
@@ -919,6 +1001,11 @@ impl Wallet {
 
         // Sanity check: we actually have enough funds after refining the fee.
         if selected_value < total_output + fee {
+            if selected_value >= total_output && total_output > 0 && noinput_fee > 0 {
+                return Err(WalletError::FeeExceedsBalance {
+                    fee: format_money(noinput_fee),
+                });
+            }
             return Err(WalletError::InsufficientFunds {
                 have: selected_value,
                 need: total_output + fee,

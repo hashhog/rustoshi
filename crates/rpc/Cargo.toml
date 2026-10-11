@@ -28,6 +28,8 @@ axum.workspace = true
 jsonrpsee.workspace = true
 tracing.workspace = true
 hex.workspace = true
+# Insertion-ordered map so `tx-results` follows package order (Core pushKV).
+indexmap = { version = "2.14", features = ["serde"] }
 sha2.workspace = true
 zmq.workspace = true
 rand.workspace = true

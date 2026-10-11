@@ -371,6 +371,83 @@ pub enum ScriptError {
     SigFindAndDelete,
 }
 
+impl ScriptError {
+    /// Bitcoin Core `ScriptErrorString` (`script/script_error.cpp`, v31.1).
+    pub fn core_message(&self) -> &'static str {
+        match self {
+            ScriptError::ScriptSize => "Script is too big",
+            ScriptError::StackOverflow => "Stack size limit exceeded",
+            ScriptError::StackUnderflow | ScriptError::InvalidStackOperation => {
+                "Operation not valid with the current stack size"
+            }
+            ScriptError::AltStackUnderflow => "Operation not valid with the current altstack size",
+            ScriptError::OpCount => "Operation limit exceeded",
+            ScriptError::DisabledOpcode => "Attempted to use a disabled opcode",
+            ScriptError::OpReturn => "OP_RETURN was encountered",
+            ScriptError::UnbalancedConditional => "Invalid OP_IF construction",
+            ScriptError::InvalidOpcode | ScriptError::BadOpcode => "Opcode missing or not understood",
+            ScriptError::PushSize => "Push value size limit exceeded",
+            ScriptError::NumberError(_) => "Script number overflowed or is non-minimally encoded",
+            ScriptError::VerifyFailed => "Script failed an OP_VERIFY operation",
+            ScriptError::EqualVerifyFailed => "Script failed an OP_EQUALVERIFY operation",
+            ScriptError::CheckSigVerifyFailed => "Script failed an OP_CHECKSIGVERIFY operation",
+            ScriptError::CheckMultiSigVerifyFailed => {
+                "Script failed an OP_CHECKMULTISIGVERIFY operation"
+            }
+            ScriptError::NumEqualVerifyFailed => "Script failed an OP_NUMEQUALVERIFY operation",
+            ScriptError::PubkeyCount => "Pubkey count negative or limit exceeded",
+            ScriptError::SigCount => "Signature count negative or greater than pubkey count",
+            ScriptError::NullDummy => "Dummy CHECKMULTISIG argument must be zero",
+            ScriptError::CleanStack => "Stack size must be exactly one after execution",
+            ScriptError::WitnessProgramMismatch | ScriptError::WitnessProgramMismatch2 => {
+                "Witness program hash mismatch"
+            }
+            ScriptError::WitnessProgramLength | ScriptError::WitnessProgramWrongLength => {
+                "Witness program has incorrect length"
+            }
+            ScriptError::NegativeLocktime => "Negative locktime",
+            ScriptError::UnsatisfiedLocktime => "Locktime requirement not satisfied",
+            ScriptError::MinimalIf => "OP_IF/NOTIF argument must be minimal",
+            ScriptError::NullFail => "Signature must be zero for failed CHECK(MULTI)SIG operation",
+            ScriptError::WitnessUnexpected => "Witness provided for non-witness script",
+            ScriptError::WitnessMalleated => "Witness requires empty scriptSig",
+            ScriptError::WitnessMalleatedP2SH => "Witness requires only-redeemscript scriptSig",
+            ScriptError::SigPushOnly => "Only push operators allowed in signatures",
+            ScriptError::NegativePickRoll | ScriptError::PickRollOutOfBounds => {
+                "Operation not valid with the current stack size"
+            }
+            ScriptError::WitnessPubkeyType => "Using non-compressed keys in segwit",
+            ScriptError::EvalFalse => {
+                "Script evaluated without error but finished with a false/empty top stack element"
+            }
+            ScriptError::MinimalPush => "Data push larger than necessary",
+            ScriptError::SigDer => "Non-canonical DER signature",
+            ScriptError::PubKeyType => "Public key is neither compressed or uncompressed",
+            ScriptError::SigHashType => "Signature hash type missing or not understood",
+            ScriptError::DiscourageUpgradableNops => "NOPx reserved for soft-fork upgrades",
+            ScriptError::SigHighS => "Non-canonical signature: S value is unnecessarily high",
+            ScriptError::TapscriptEmptyPubkey => "Empty public key in tapscript",
+            ScriptError::TapscriptCheckmultisig => {
+                "OP_CHECKMULTISIG(VERIFY) is not available in tapscript"
+            }
+            ScriptError::TapscriptValidationWeight => {
+                "Too much signature validation relative to witness weight"
+            }
+            ScriptError::DiscourageOpSuccess => "OP_SUCCESSx reserved for soft-fork upgrades",
+            ScriptError::WitnessProgramWitnessEmpty => "Witness program was passed an empty witness",
+            ScriptError::TaprootWrongControlSize => "Invalid Taproot control block size",
+            ScriptError::DiscourageUpgradableTaprootVersion => {
+                "Taproot version reserved for soft-fork upgrades"
+            }
+            ScriptError::DiscourageUpgradablePubkeyType => {
+                "Public key version reserved for soft-fork upgrades"
+            }
+            ScriptError::SigFindAndDelete => "Signature is found in scriptCode",
+            ScriptError::InvalidSignature => "unknown error",
+        }
+    }
+}
+
 /// Signature version for sighash computation.
 ///
 /// Different script types use different signature hash algorithms.
