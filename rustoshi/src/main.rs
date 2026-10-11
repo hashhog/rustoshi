@@ -7989,13 +7989,27 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             let rpc = rpc_state.read().await;
                                             if let Some(entry) = rpc.mempool.get(&item.hash) {
                                                 let tx = entry.tx.clone();
+                                                let txid = entry.txid;
                                                 drop(rpc);
-                                                let ps = peer_state.read().await;
-                                                if let Some(ref pm) = ps.peer_manager {
-                                                    pm.try_send_to_peer(
-                                                        peer_id,
-                                                        NetworkMessage::Tx(tx),
-                                                    );
+                                                let sent = {
+                                                    let ps = peer_state.read().await;
+                                                    if let Some(ref pm) = ps.peer_manager {
+                                                        pm.try_send_to_peer(
+                                                            peer_id,
+                                                            NetworkMessage::Tx(tx),
+                                                        )
+                                                    } else {
+                                                        false
+                                                    }
+                                                };
+                                                // Core ProcessGetData drops the tx from the
+                                                // unbroadcast set once the reply is queued.
+                                                if sent {
+                                                    rpc_state
+                                                        .write()
+                                                        .await
+                                                        .mempool
+                                                        .remove_unbroadcast(&txid);
                                                 }
                                             }
                                         }
@@ -8009,26 +8023,39 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             let served = rpc
                                                 .mempool
                                                 .get_by_wtxid(&item.hash)
-                                                .map(|entry| entry.tx.clone());
+                                                .map(|entry| (entry.txid, entry.tx.clone()));
                                             drop(rpc);
-                                            let ps = peer_state.read().await;
-                                            if let Some(ref pm) = ps.peer_manager {
-                                                match served {
-                                                    Some(tx) => {
-                                                        pm.try_send_to_peer(
-                                                            peer_id,
-                                                            NetworkMessage::Tx(tx),
-                                                        );
+                                            let sent_txid = {
+                                                let ps = peer_state.read().await;
+                                                if let Some(ref pm) = ps.peer_manager {
+                                                    match served {
+                                                        Some((txid, tx)) => {
+                                                            let sent = pm.try_send_to_peer(
+                                                                peer_id,
+                                                                NetworkMessage::Tx(tx),
+                                                            );
+                                                            if sent { Some(txid) } else { None }
+                                                        }
+                                                        None => {
+                                                            pm.try_send_to_peer(
+                                                                peer_id,
+                                                                NetworkMessage::NotFound(vec![
+                                                                    item.clone(),
+                                                                ]),
+                                                            );
+                                                            None
+                                                        }
                                                     }
-                                                    None => {
-                                                        pm.try_send_to_peer(
-                                                            peer_id,
-                                                            NetworkMessage::NotFound(vec![
-                                                                item.clone(),
-                                                            ]),
-                                                        );
-                                                    }
+                                                } else {
+                                                    None
                                                 }
+                                            };
+                                            if let Some(txid) = sent_txid {
+                                                rpc_state
+                                                    .write()
+                                                    .await
+                                                    .mempool
+                                                    .remove_unbroadcast(&txid);
                                             }
                                         }
                                         _ => {}

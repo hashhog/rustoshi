@@ -624,17 +624,47 @@ impl DepGraph {
         chunks
     }
 
-    /// Find the highest feerate topological subset of remaining transactions.
+    /// Highest-feerate ancestor-closed subset of `remaining`.
+    ///
+    /// Core's chunk is that subset (txgraph `FindBestChunk`), not only the
+    /// ancestor set of one transaction. Clusters of at most 16 transactions
+    /// are searched exactly. Larger clusters keep the ancestor-set heuristic.
+    /// A subset replaces the ancestor-set result only when its feerate is
+    /// strictly better, so equal-feerate ties stay where they were.
     fn find_best_chunk(&self, remaining: &HashSet<usize>) -> HashSet<usize> {
-        // For each transaction, consider it as the "last" transaction in a chunk.
-        // The chunk must include all its ancestors that are still remaining.
-        // Pick the chunk with the highest fee rate.
+        let mut best_chunk = self.find_best_ancestor_chunk(remaining);
+        if remaining.len() > 16 || best_chunk.is_empty() {
+            return best_chunk;
+        }
+        let mut best_feefrac = self.set_feefrac(&best_chunk);
+        let mut idxs: Vec<usize> = remaining.iter().copied().collect();
+        idxs.sort_unstable();
+        let n = idxs.len();
+        for mask in 1u32..(1u32 << n) {
+            let mut chunk = HashSet::with_capacity(n);
+            for bit in 0..n {
+                if mask & (1u32 << bit) != 0 {
+                    chunk.insert(idxs[bit]);
+                }
+            }
+            if !self.is_ancestor_closed(&chunk, remaining) {
+                continue;
+            }
+            let feefrac = self.set_feefrac(&chunk);
+            if feefrac.is_better_than(&best_feefrac) {
+                best_feefrac = feefrac;
+                best_chunk = chunk;
+            }
+        }
+        best_chunk
+    }
 
+    /// Ancestor set of each remaining transaction; the previous chunk picker.
+    fn find_best_ancestor_chunk(&self, remaining: &HashSet<usize>) -> HashSet<usize> {
         let mut best_chunk = HashSet::new();
         let mut best_feefrac = FeeFrac::default();
 
         for &idx in remaining {
-            // Build the minimal chunk containing this transaction
             let mut chunk: HashSet<usize> = HashSet::new();
             for &anc in &self.ancestors[idx] {
                 if remaining.contains(&anc) {
@@ -651,6 +681,18 @@ impl DepGraph {
         }
 
         best_chunk
+    }
+
+    /// Every in-`remaining` ancestor of every member is itself a member.
+    fn is_ancestor_closed(&self, chunk: &HashSet<usize>, remaining: &HashSet<usize>) -> bool {
+        for &idx in chunk {
+            for &anc in &self.ancestors[idx] {
+                if remaining.contains(&anc) && !chunk.contains(&anc) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Topologically sort a set of transaction indices.
@@ -960,6 +1002,14 @@ pub struct MempoolEntry {
     /// by a child transaction. If true and the child is evicted, this tx must
     /// also be evicted (ephemeral anchor policy).
     pub has_ephemeral_dust: bool,
+    /// Sigop cost at admission. Mirrors `CTxMemPoolEntry::sigOpCost`, set from
+    /// `GetTransactionSigOpCost` (legacy×4 + P2SH×4 + witness sigops).
+    /// `getblocktemplate` reports this value; the template budget charges it.
+    pub sigop_cost: u64,
+    /// Chain tip height when this transaction was admitted.
+    /// Mirrors `CTxMemPoolEntry::entryHeight` (`m_active_chainstate.m_chain.Height()`
+    /// at `addUnchecked`), not the live tip and not the next-block height.
+    pub entry_height: u32,
     /// Whether any input of this transaction spends a confirmed coinbase output.
     /// Mirrors Bitcoin Core `CTxMemPoolEntry::spendsCoinbase` (kernel/mempool_entry.h).
     /// Used by `remove_for_reorg` to re-check coinbase maturity on reorg
@@ -2599,6 +2649,8 @@ impl Mempool {
             descendant_fees: fee,
             has_ephemeral_dust,
             spends_coinbase,
+            sigop_cost: tx_sigop_cost,
+            entry_height: self.tip_height,
             entry_sequence,
         };
 
@@ -3657,15 +3709,18 @@ impl Mempool {
         ids
     }
 
-    /// In-mempool children, as display hex, in Core's `std::set` order.
+    /// Direct in-mempool children, as display hex, in Core's `uint256` order.
+    ///
+    /// `entryToJSON` sorts `spentby` with `CompareIteratorByHash` (memcmp of
+    /// the internal little-endian hash), not display-hex lexicographic order.
     pub fn mempool_spent_by(&self, txid: &Hash256) -> Vec<String> {
-        let mut ids: Vec<String> = self
+        let mut ids: Vec<Hash256> = self
             .children
             .get(txid)
-            .map(|set| set.iter().map(|h| h.to_hex()).collect())
+            .map(|set| set.iter().copied().collect())
             .unwrap_or_default();
         ids.sort();
-        ids
+        ids.into_iter().map(|id| id.to_hex()).collect()
     }
 
     /// Check if a mempool transaction is BIP-125 replaceable.
@@ -4501,6 +4556,26 @@ impl Mempool {
             .values()
             .map(|entry| (entry.txid, entry.tx.wtxid()))
             .collect()
+    }
+
+    /// Drop `txid` from the unbroadcast set. Mirrors `RemoveUnbroadcastTx`.
+    pub fn remove_unbroadcast(&mut self, txid: &Hash256) {
+        self.unbroadcast.remove(txid);
+    }
+
+    /// Unbroadcast txids in internal `uint256` order (stable `mempool.dat`).
+    pub fn unbroadcast_txids(&self) -> Vec<Hash256> {
+        let mut v: Vec<Hash256> = self.unbroadcast.iter().copied().collect();
+        v.sort();
+        v
+    }
+
+    /// Direct in-mempool children of `txid` (not sorted).
+    pub fn child_txids(&self, txid: &Hash256) -> Vec<Hash256> {
+        self.children
+            .get(txid)
+            .map(|c| c.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Check if a transaction is in the mempool.
@@ -5699,6 +5774,8 @@ impl Mempool {
             descendant_fees: fee,
             has_ephemeral_dust,
             spends_coinbase,
+            sigop_cost: tx_sigop_cost,
+            entry_height: self.tip_height,
             entry_sequence: entry_sequence_pkg,
         };
         let entry_wtxid = entry.tx.wtxid();
