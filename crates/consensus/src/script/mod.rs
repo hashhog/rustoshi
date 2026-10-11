@@ -29,7 +29,8 @@
 //!
 //! - **P2A** (Pay-to-Anchor): A special anyone-can-spend output type used for
 //!   CPFP fee bumping in Lightning and similar protocols. The script is
-//!   `OP_1 <0x4e73>` (4 bytes total). P2A outputs are exempt from dust thresholds.
+//!   `OP_1 <0x4e73>` (4 bytes total). A positive P2A output below the dust
+//!   threshold is policy dust; a 0-value P2A is ephemeral dust.
 //!
 //! # Consensus vs Policy
 //!

@@ -53,6 +53,8 @@ mod r5_errcode_tests;
 mod f0_coin_view_tests;
 #[cfg(test)]
 mod invalidated_submit_tests;
+#[cfg(test)]
+mod submitpackage_result_tests;
 
 pub use payjoin_sender::{
     post_original_psbt, trim_to_base64 as payjoin_trim_to_base64, SenderHttpError, SenderRequest,

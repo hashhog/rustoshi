@@ -955,7 +955,7 @@ pub trait WalletRpc {
     async fn send_to_address(
         &self,
         address: String,
-        amount: f64,
+        amount: serde_json::Value,
         comment: Option<String>,
         comment_to: Option<String>,
         subtractfeefromamount: Option<bool>,
@@ -1533,6 +1533,37 @@ impl WalletRpcImpl {
 
     /// Core `AmountFromValue` (`rpc/util.cpp:98-108`): number in MoneyRange,
     /// else RPC_TYPE_ERROR (-3).
+    /// CreateTransaction errors keep Core's original string. `sendtoaddress`
+    /// (`SendMoney`) uses -6; `send` (`FundTransaction`) uses -4. Anything
+    /// else stays a wallet error, with a bad address still -5.
+    fn map_create_transaction_error(
+        e: rustoshi_wallet::WalletError,
+        create_code: i32,
+    ) -> ErrorObjectOwned {
+        match e {
+            rustoshi_wallet::WalletError::AmountTooSmall => {
+                Self::rpc_error(create_code, "Transaction amount too small")
+            }
+            rustoshi_wallet::WalletError::InsufficientFunds { .. } => {
+                Self::rpc_error(create_code, "Insufficient funds")
+            }
+            rustoshi_wallet::WalletError::FeeExceedsBalance { fee } => Self::rpc_error(
+                create_code,
+                format!(
+                    "The total exceeds your balance when the {fee} transaction fee is included."
+                ),
+            ),
+            other => {
+                let msg = other.to_string();
+                if msg.contains("address") {
+                    Self::rpc_error(wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY, msg)
+                } else {
+                    Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
+                }
+            }
+        }
+    }
+
     fn amount_from_value(v: &serde_json::Value) -> Result<u64, ErrorObjectOwned> {
         let n = match v {
             serde_json::Value::Number(num) => num
@@ -2441,7 +2472,7 @@ impl WalletRpcServer for WalletRpcImpl {
     async fn send_to_address(
         &self,
         address: String,
-        amount: f64,
+        amount: serde_json::Value,
         _comment: Option<String>,
         _comment_to: Option<String>,
         _subtractfeefromamount: Option<bool>,
@@ -2470,16 +2501,10 @@ impl WalletRpcServer for WalletRpcImpl {
         // P0-SECURITY gate (W118 BUG-1): signing requires an unlocked wallet.
         Self::require_unlocked(&state, &name)?;
 
-        // Core AmountFromValue: negative / out of MoneyRange is RPC_TYPE_ERROR
-        // (-3) "Amount out of range" (`rpc/util.cpp:105-106`), not a wallet
-        // error. Check BEFORE converting to sats (a negative f64 would wrap).
-        if amount < 0.0 || amount > 21_000_000.0 {
-            return Err(Self::rpc_error(
-                wallet_error::RPC_TYPE_ERROR,
-                "Amount out of range",
-            ));
-        }
-        let amount_sats = Self::btc_to_sats(amount);
+        // Core AmountFromValue (`rpc/util.cpp:98-108`): a JSON number or
+        // string. Negative / out of MoneyRange is RPC_TYPE_ERROR (-3)
+        // "Amount out of range", before CreateTransaction.
+        let amount_sats = Self::amount_from_value(&amount)?;
         // Default fee rate in sat/vByte. Padded above the 1 sat/vB relay floor
         // so the wallet's vsize estimate (which can undershoot the final
         // witness-stack size by a byte or two) never lands the tx below the
@@ -2498,14 +2523,12 @@ impl WalletRpcServer for WalletRpcImpl {
             wallet_guard
                 .create_transaction(vec![(address, amount_sats)], fee_rate)
                 .map_err(|e| {
-                    let msg = e.to_string();
-                    if msg.contains("nsufficient") {
-                        Self::rpc_error(wallet_error::RPC_WALLET_INSUFFICIENT_FUNDS, msg)
-                    } else if msg.contains("address") {
-                        Self::rpc_error(wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY, msg)
-                    } else {
-                        Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
-                    }
+                    // SendMoney maps every CreateTransaction error to -6
+                    // (spend.cpp) and keeps the original string.
+                    Self::map_create_transaction_error(
+                        e,
+                        wallet_error::RPC_WALLET_INSUFFICIENT_FUNDS,
+                    )
                 })?
         };
 
@@ -2529,8 +2552,9 @@ impl WalletRpcServer for WalletRpcImpl {
             let mut node_state = crate::coins_coherence::write_coherent(&node)
                 .await
                 .map_err(|m| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, m))?;
-            crate::server::broadcast_signed_tx(&mut node_state, tx)
-                .map_err(|msg| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg))?;
+            crate::server::broadcast_signed_tx(&mut node_state, tx).map_err(|err| {
+                Self::rpc_error(err.code, err.message)
+            })?;
         }
 
         // Return the Core-style display txid (reversed).
@@ -2630,17 +2654,9 @@ impl WalletRpcServer for WalletRpcImpl {
             wallet_guard
                 .create_transaction(parsed, fee_rate_sat_vb)
                 .map_err(|e| {
-                    let msg = e.to_string();
-                    if msg.contains("nsufficient") {
-                        Self::rpc_error(wallet_error::RPC_WALLET_INSUFFICIENT_FUNDS, msg)
-                    } else if msg.contains("address") {
-                        Self::rpc_error(
-                            wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
-                            format!("Invalid Bitcoin address: {msg}"),
-                        )
-                    } else {
-                        Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg)
-                    }
+                    // FundTransaction (the `send` RPC) maps every
+                    // CreateTransaction error to RPC_WALLET_ERROR (-4).
+                    Self::map_create_transaction_error(e, wallet_error::RPC_WALLET_ERROR)
                 })?
         };
         let txid = tx.txid();
@@ -2657,8 +2673,9 @@ impl WalletRpcServer for WalletRpcImpl {
             let mut node_state = crate::coins_coherence::write_coherent(&node)
                 .await
                 .map_err(|m| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, m))?;
-            crate::server::broadcast_signed_tx(&mut node_state, tx)
-                .map_err(|msg| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, msg))?;
+            crate::server::broadcast_signed_tx(&mut node_state, tx).map_err(|err| {
+                Self::rpc_error(err.code, err.message)
+            })?;
         }
         let txid_hex = hex::encode(txid.0.iter().rev().copied().collect::<Vec<_>>());
         Ok(SendResult {
@@ -6361,7 +6378,7 @@ mod tests {
         let err = rpc
             .send_to_address(
                 "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".into(),
-                -1.0,
+                serde_json::json!(-1.0),
                 None,
                 None,
                 None,
