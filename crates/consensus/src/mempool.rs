@@ -624,13 +624,11 @@ impl DepGraph {
         chunks
     }
 
-    /// Highest-feerate ancestor-closed subset of `remaining`.
+    /// Best ancestor-closed subset of `remaining`, by `is_better_chunk`.
     ///
     /// Core's chunk is that subset (txgraph `FindBestChunk`), not only the
     /// ancestor set of one transaction. Clusters of at most 16 transactions
     /// are searched exactly. Larger clusters keep the ancestor-set heuristic.
-    /// A subset replaces the ancestor-set result only when its feerate is
-    /// strictly better, so equal-feerate ties stay where they were.
     fn find_best_chunk(&self, remaining: &HashSet<usize>) -> HashSet<usize> {
         let mut best_chunk = self.find_best_ancestor_chunk(remaining);
         if remaining.len() > 16 || best_chunk.is_empty() {
@@ -651,7 +649,7 @@ impl DepGraph {
                 continue;
             }
             let feefrac = self.set_feefrac(&chunk);
-            if feefrac.is_better_than(&best_feefrac) {
+            if self.is_better_chunk(&chunk, &feefrac, &best_chunk, &best_feefrac) {
                 best_feefrac = feefrac;
                 best_chunk = chunk;
             }
@@ -674,13 +672,45 @@ impl DepGraph {
 
             let feefrac = self.set_feefrac(&chunk);
 
-            if best_chunk.is_empty() || feefrac.is_better_than(&best_feefrac) {
+            if best_chunk.is_empty()
+                || self.is_better_chunk(&chunk, &feefrac, &best_chunk, &best_feefrac)
+            {
                 best_chunk = chunk;
                 best_feefrac = feefrac;
             }
         }
 
         best_chunk
+    }
+
+    /// Core's order for picking the next chunk among candidates.
+    ///
+    /// Higher feerate first; on equal feerate the smaller set (`FeeFrac`
+    /// `operator<=>`, util/feefrac.h:178-183), so equal-feerate parts are
+    /// never pulled into one chunk, matching SFL's minimal chunks
+    /// (cluster_linearize.h:614-626). Remaining ties go to the set whose
+    /// largest txid is lowest (`GetLinearization` `chunk_cmp_fn`,
+    /// cluster_linearize.h:1529-1547, with the txid fallback order of
+    /// txmempool.cpp:183-187), so the result does not depend on
+    /// `HashSet` iteration order.
+    fn is_better_chunk(
+        &self,
+        candidate: &HashSet<usize>,
+        candidate_feefrac: &FeeFrac,
+        best: &HashSet<usize>,
+        best_feefrac: &FeeFrac,
+    ) -> bool {
+        let lhs = (candidate_feefrac.fee as i128) * (best_feefrac.size as i128);
+        let rhs = (best_feefrac.fee as i128) * (candidate_feefrac.size as i128);
+        lhs.cmp(&rhs)
+            .then_with(|| best_feefrac.size.cmp(&candidate_feefrac.size))
+            .then_with(|| self.max_txid(best).cmp(&self.max_txid(candidate)))
+            .is_gt()
+    }
+
+    /// Largest txid in `set`, in Core's `uint256` (memcmp) order.
+    fn max_txid(&self, set: &HashSet<usize>) -> Option<Hash256> {
+        set.iter().map(|&idx| self.idx_to_txid[idx]).max()
     }
 
     /// Every in-`remaining` ancestor of every member is itself a member.
@@ -13265,6 +13295,175 @@ mod tests {
         ] {
             assert!(!tok.contains("transaction"), "token leaked Display prose: {tok}");
             assert!(!tok.contains(" at index "), "token leaked prose detail: {tok}");
+        }
+    }
+
+    /// Fresh mempools per round, so each round draws new `HashSet` seeds
+    /// and a new index assignment in `DepGraph::from_cluster`.
+    const CHUNK_TIE_ROUNDS: usize = 32;
+
+    /// Fund `outputs` from `prev` so the tx pays exactly `sat_per_vb` × vsize.
+    /// Every output but the first gets `value_each`; the first takes the change.
+    fn make_feerate_tx(
+        prev: (Hash256, u32),
+        prev_value: u64,
+        n_outputs: usize,
+        value_each: u64,
+        sat_per_vb: u64,
+    ) -> (Transaction, u64) {
+        let mut tx = make_tx(vec![prev], vec![value_each; n_outputs], 1);
+        let fee = sat_per_vb * tx.vsize() as u64;
+        tx.outputs[0].value = prev_value - fee - value_each * (n_outputs as u64 - 1);
+        (tx, fee)
+    }
+
+    fn chunk_tie_mempool() -> Mempool {
+        Mempool::new(MempoolConfig {
+            min_fee_rate: 0,
+            ..Default::default()
+        })
+    }
+
+    fn chunk_txids(mempool: &Mempool, txid: &Hash256) -> Vec<Vec<Hash256>> {
+        let cluster_id = mempool.get(txid).unwrap().cluster_id;
+        mempool.clusters[&cluster_id]
+            .linearization
+            .iter()
+            .map(|chunk| chunk.txids.clone())
+            .collect()
+    }
+
+    /// Warden (d): three chained spends with the same fee and size. Core
+    /// v31.1 keeps equal-feerate chunks apart (`ChunkLinearizationInfo`
+    /// merges only on `>>`, and SFL minimizes chunks), so every entry's
+    /// `chunkweight` / `fees.chunk` is its own weight and fee.
+    #[test]
+    fn test_equal_fee_chain_chunks_match_core() {
+        let utxo = Hash256::from_hex(
+            "d100000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 1_000_000)]);
+        for round in 0..CHUNK_TIE_ROUNDS {
+            let mut mempool = chunk_tie_mempool();
+            let mut prev = (utxo, 0u32);
+            let mut value = 1_000_000u64;
+            let mut txids = Vec::new();
+            for _ in 0..3 {
+                value -= 10_000;
+                let tx = make_tx(vec![prev], vec![value], 1);
+                let txid = mempool
+                    .add_transaction(tx, &|op| utxos.get(op).cloned())
+                    .unwrap();
+                txids.push(txid);
+                prev = (txid, 0);
+            }
+            for (i, txid) in txids.iter().enumerate() {
+                let weight = mempool.get(txid).unwrap().sigop_adjusted_weight;
+                assert_eq!(
+                    mempool.main_chunk_fee_and_weight(txid),
+                    Some((10_000, weight)),
+                    "round {round}: entry-tx{i} chunk"
+                );
+            }
+            assert_eq!(
+                chunk_txids(&mempool, &txids[0]),
+                vec![vec![txids[0]], vec![txids[1]], vec![txids[2]]],
+                "round {round}: chunk order"
+            );
+        }
+    }
+
+    /// Equal feerate, different sizes: each chained tx pays 10 sat/vB but
+    /// carries 2, 1 and 3 outputs. The smallest equal-feerate set wins
+    /// (Core `FeeFrac` orders equal feerate by smaller size), so no merge.
+    #[test]
+    fn test_equal_feerate_different_sizes_chunks_match_core() {
+        let utxo = Hash256::from_hex(
+            "d200000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 1_000_000)]);
+        for round in 0..CHUNK_TIE_ROUNDS {
+            let mut mempool = chunk_tie_mempool();
+            let mut prev = (utxo, 0u32);
+            let mut value = 1_000_000u64;
+            let mut expected = Vec::new();
+            for n_outputs in [2usize, 1, 3] {
+                let (tx, fee) = make_feerate_tx(prev, value, n_outputs, 1_000, 10);
+                value = tx.outputs[0].value;
+                let txid = mempool
+                    .add_transaction(tx, &|op| utxos.get(op).cloned())
+                    .unwrap();
+                expected.push((txid, fee));
+                prev = (txid, 0);
+            }
+            let sizes: Vec<usize> = expected
+                .iter()
+                .map(|(txid, _)| mempool.get(txid).unwrap().vsize)
+                .collect();
+            assert!(sizes[0] != sizes[1] && sizes[1] != sizes[2], "sizes {sizes:?}");
+            for (i, (txid, fee)) in expected.iter().enumerate() {
+                let weight = mempool.get(txid).unwrap().sigop_adjusted_weight;
+                assert_eq!(
+                    mempool.main_chunk_fee_and_weight(txid),
+                    Some((*fee, weight)),
+                    "round {round}: tx{i} chunk"
+                );
+            }
+        }
+    }
+
+    /// A parent and two same-size children, all at one feerate: three
+    /// chunks. The two child chunks tie on feerate and size, so Core puts
+    /// the one with the lower txid (memcmp `uint256` order) first.
+    #[test]
+    fn test_parent_with_two_equal_children_chunks_match_core() {
+        let utxo = Hash256::from_hex(
+            "d300000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo, vout: 0 }, 1_000_000)]);
+        for round in 0..CHUNK_TIE_ROUNDS {
+            let mut mempool = chunk_tie_mempool();
+            let (parent, parent_fee) = make_feerate_tx((utxo, 0), 1_000_000, 2, 400_000, 10);
+            let parent_values = [parent.outputs[0].value, parent.outputs[1].value];
+            let parent_txid = mempool
+                .add_transaction(parent, &|op| utxos.get(op).cloned())
+                .unwrap();
+            let mut children = Vec::new();
+            for vout in 0..2u32 {
+                let (child, fee) =
+                    make_feerate_tx((parent_txid, vout), parent_values[vout as usize], 1, 0, 10);
+                let txid = mempool
+                    .add_transaction(child, &|op| utxos.get(op).cloned())
+                    .unwrap();
+                children.push((txid, fee));
+            }
+            let parent_weight = mempool.get(&parent_txid).unwrap().sigop_adjusted_weight;
+            assert_eq!(
+                mempool.main_chunk_fee_and_weight(&parent_txid),
+                Some((parent_fee, parent_weight)),
+                "round {round}: parent chunk"
+            );
+            for (txid, fee) in &children {
+                let weight = mempool.get(txid).unwrap().sigop_adjusted_weight;
+                assert_eq!(
+                    mempool.main_chunk_fee_and_weight(txid),
+                    Some((*fee, weight)),
+                    "round {round}: child chunk"
+                );
+            }
+            let (low, high) = if children[0].0 < children[1].0 {
+                (children[0].0, children[1].0)
+            } else {
+                (children[1].0, children[0].0)
+            };
+            assert_eq!(
+                chunk_txids(&mempool, &parent_txid),
+                vec![vec![parent_txid], vec![low], vec![high]],
+                "round {round}: chunk order"
+            );
         }
     }
 }
