@@ -1123,6 +1123,120 @@ mod tests {
         assert_eq!(template.total_fees, 21_000);
     }
 
+    /// Warden's KB-160 repro: four independent spends paying exactly
+    /// 10 sat/vB with 1, 2, 4 and 6 outputs. `rotation` changes the order
+    /// they enter the mempool.
+    fn equal_feerate_mempool(rotation: usize) -> Mempool {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let shapes = [1usize, 2, 4, 6];
+        let prevouts: Vec<Hash256> = (0..shapes.len())
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 0xa0 + i as u8;
+                Hash256(bytes)
+            })
+            .collect();
+        let utxos = mock_utxo_set(
+            prevouts
+                .iter()
+                .map(|txid| (OutPoint { txid: *txid, vout: 0 }, 100_000))
+                .collect(),
+        );
+        for k in 0..shapes.len() {
+            let i = (k + rotation) % shapes.len();
+            let mut tx = make_tx(vec![(prevouts[i], 0)], vec![0; shapes[i]], 2);
+            let fee = 10 * tx.vsize() as u64;
+            let each = (100_000 - fee) / shapes[i] as u64;
+            for out in tx.outputs.iter_mut() {
+                out.value = each;
+            }
+            tx.outputs[0].value += (100_000 - fee) - each * shapes[i] as u64;
+            mempool
+                .add_transaction(tx, &|op| utxos.get(op).cloned())
+                .unwrap();
+        }
+        mempool
+    }
+
+    fn template_for(mempool: &Mempool) -> BlockTemplate {
+        let config = BlockTemplateConfig {
+            coinbase_script_pubkey: vec![0x51],
+            ..Default::default()
+        };
+        build_block_template(
+            mempool,
+            Hash256::ZERO,
+            100,
+            1714777860,
+            0x1d00ffff,
+            1714777800,
+            &ChainParams::testnet4(),
+            &config,
+        )
+    }
+
+    /// Core v31.1 mines equal-feerate chunks from distinct clusters smallest
+    /// first (txgraph.cpp CompareMainTransactions), so the 1/2/4/6-output
+    /// spends come out 1, 2, 4, 6 whatever order the mempool hashes them in.
+    #[test]
+    fn test_equal_feerate_chunks_smaller_first_every_template() {
+        const RUNS: usize = 64;
+        let mut wrong = Vec::new();
+        for run in 0..RUNS {
+            let template = template_for(&equal_feerate_mempool(run % 4));
+            let order: Vec<usize> = template.transactions[1..]
+                .iter()
+                .map(|tx| tx.outputs.len())
+                .collect();
+            if order != [1, 2, 4, 6] {
+                wrong.push((run, order));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {RUNS} templates left Core's 1,2,4,6 order, first {:?}",
+            wrong.len(),
+            wrong[0]
+        );
+    }
+
+    /// Equal feerate and equal size: Core falls back to the lower maximum
+    /// txid of the chunk (txgraph.cpp CompareMainTransactions, fallback
+    /// order `txid_a <=> txid_b` from txmempool.cpp), compared as raw bytes.
+    #[test]
+    fn test_equal_feerate_equal_size_chunks_lower_txid_first() {
+        const RUNS: usize = 64;
+        let a = Hash256([0xb1; 32]);
+        let b = Hash256([0xb2; 32]);
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: a, vout: 0 }, 100_000),
+            (OutPoint { txid: b, vout: 0 }, 100_000),
+        ]);
+        let tx_a = make_tx(vec![(a, 0)], vec![99_000], 2);
+        let tx_b = make_tx(vec![(b, 0)], vec![99_000], 2);
+        let expected = if tx_a.txid() < tx_b.txid() {
+            vec![tx_a.txid(), tx_b.txid()]
+        } else {
+            vec![tx_b.txid(), tx_a.txid()]
+        };
+        let mut wrong = 0;
+        for run in 0..RUNS {
+            let mut mempool = Mempool::new(MempoolConfig::default());
+            let (first, second) = if run % 2 == 0 { (&tx_a, &tx_b) } else { (&tx_b, &tx_a) };
+            for tx in [first, second] {
+                mempool
+                    .add_transaction(tx.clone(), &|op| utxos.get(op).cloned())
+                    .unwrap();
+            }
+            let order: Vec<Hash256> =
+                template_for(&mempool).transactions[1..].iter().map(|tx| tx.txid()).collect();
+            if order != expected {
+                wrong += 1;
+            }
+        }
+        assert_eq!(wrong, 0, "{wrong} of {RUNS} templates put the higher txid first");
+    }
+
     #[test]
     fn test_block_template_weight_limit() {
         let config = MempoolConfig::default();

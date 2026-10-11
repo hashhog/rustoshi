@@ -9916,6 +9916,63 @@ mod tests {
         assert_eq!(sorted[1], txid_low);
     }
 
+    /// getrawmempool, its verbose form, and REST mempool contents list
+    /// `get_sorted_for_mining`; Core lists `entryAll()`, which sorts with the
+    /// same CompareMainOrder it mines with (txmempool.cpp
+    /// GetSortedScoreWithTopology). Four independent 10 sat/vB spends with
+    /// 1, 2, 4 and 6 outputs must come out smallest first on every mempool.
+    #[test]
+    fn test_get_sorted_for_mining_equal_feerate_smaller_first() {
+        const RUNS: usize = 64;
+        let shapes = [1usize, 2, 4, 6];
+        let prevouts: Vec<Hash256> = (0..shapes.len())
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 0xc0 + i as u8;
+                Hash256(bytes)
+            })
+            .collect();
+        let utxos = mock_utxo_set(
+            prevouts
+                .iter()
+                .map(|txid| (OutPoint { txid: *txid, vout: 0 }, 100_000))
+                .collect(),
+        );
+        let mut wrong = Vec::new();
+        for run in 0..RUNS {
+            let mut mempool = Mempool::new(MempoolConfig::default());
+            let mut outputs_of = HashMap::new();
+            for k in 0..shapes.len() {
+                let i = (k + run) % shapes.len();
+                let mut tx = make_tx(vec![(prevouts[i], 0)], vec![0; shapes[i]], 2);
+                let fee = 10 * tx.vsize() as u64;
+                let each = (100_000 - fee) / shapes[i] as u64;
+                for out in tx.outputs.iter_mut() {
+                    out.value = each;
+                }
+                tx.outputs[0].value += (100_000 - fee) - each * shapes[i] as u64;
+                outputs_of.insert(tx.txid(), shapes[i]);
+                mempool
+                    .add_transaction(tx, &|op| utxos.get(op).cloned())
+                    .unwrap();
+            }
+            let order: Vec<usize> = mempool
+                .get_sorted_for_mining()
+                .iter()
+                .map(|txid| outputs_of[txid])
+                .collect();
+            if order != shapes {
+                wrong.push((run, order));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {RUNS} mempools listed equal-feerate txs out of Core order, first {:?}",
+            wrong.len(),
+            wrong[0]
+        );
+    }
+
     #[test]
     fn test_missing_input() {
         let config = MempoolConfig::default();
