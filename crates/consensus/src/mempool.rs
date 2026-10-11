@@ -335,14 +335,15 @@ impl std::ops::SubAssign for FeeFrac {
 pub struct Chunk {
     /// Transaction IDs in this chunk (topologically sorted).
     pub txids: Vec<Hash256>,
-    /// Combined fee and size of all transactions in the chunk.
+    /// Combined modified fee and sigops-adjusted weight of the chunk, the
+    /// TxGraph feerate inputs (see [`Mempool::linearization_feefrac`]).
     pub feefrac: FeeFrac,
 }
 
 impl Chunk {
-    /// Get the effective fee rate of this chunk.
+    /// Effective fee rate of this chunk in sat per sigops-adjusted vbyte.
     pub fn fee_rate(&self) -> f64 {
-        self.feefrac.fee_rate()
+        self.feefrac.fee_rate() * crate::params::WITNESS_SCALE_FACTOR as f64
     }
 }
 
@@ -383,10 +384,16 @@ pub struct Cluster {
 
 impl Cluster {
     /// Create a new cluster with a single transaction.
-    pub fn new_singleton(id: ClusterId, txid: Hash256, fee: u64, vsize: usize) -> Self {
+    pub fn new_singleton(
+        id: ClusterId,
+        txid: Hash256,
+        fee: u64,
+        vsize: usize,
+        feefrac: FeeFrac,
+    ) -> Self {
         let chunk = Chunk {
             txids: vec![txid],
-            feefrac: FeeFrac::from_tx(fee, vsize),
+            feefrac,
         };
         let mut tx_to_chunk = HashMap::new();
         tx_to_chunk.insert(txid, 0);
@@ -466,7 +473,7 @@ impl DepGraph {
             txid_to_idx.insert(*txid, i);
             idx_to_txid.push(*txid);
             if let Some(entry) = entries.get(txid) {
-                feerates.push(FeeFrac::from_tx(entry.fee, entry.vsize));
+                feerates.push(Mempool::linearization_feefrac(entry));
             } else {
                 feerates.push(FeeFrac::default());
             }
@@ -1720,12 +1727,16 @@ pub struct Mempool {
     require_standard: bool,
 }
 
-/// `CFeeRate(fee, size).GetFeePerK()`: integer satoshis per 1000 vbytes.
+/// `CFeeRate(fee, size).GetFeePerK()` of a chunk's weight-based feerate
+/// after `ToFeePerVSize` (policy.h:196, txmempool.cpp:869-871): the size is
+/// rounded up to vbytes, then integer satoshis per 1000 vbytes.
 fn chunk_sat_per_kvb(feefrac: &FeeFrac) -> i64 {
-    if feefrac.size <= 0 {
+    let scale = crate::params::WITNESS_SCALE_FACTOR as i64;
+    let vsize = (feefrac.size + scale - 1) / scale;
+    if vsize <= 0 {
         0
     } else {
-        feefrac.fee.saturating_mul(1000) / feefrac.size
+        feefrac.fee.saturating_mul(1000) / vsize
     }
 }
 
@@ -3654,7 +3665,7 @@ impl Mempool {
         let mut size = 0i64;
         for txid in &chunk.txids {
             if let Some(entry) = self.transactions.get(txid) {
-                fee = fee.saturating_add(Self::get_modified_fee(entry) as i64);
+                fee = fee.saturating_add(Self::signed_modified_fee(entry));
                 size = size.saturating_add(entry.sigop_adjusted_weight as i64);
             }
         }
@@ -3710,10 +3721,7 @@ impl Mempool {
     /// Modified fee over sigops-adjusted weight (txmempool.cpp:1017).
     fn tx_mining_feefrac(&self, txid: &Hash256) -> FeeFrac {
         match self.transactions.get(txid) {
-            Some(entry) => FeeFrac::new(
-                Self::get_modified_fee(entry) as i64,
-                entry.sigop_adjusted_weight as i64,
-            ),
+            Some(entry) => Self::linearization_feefrac(entry),
             None => FeeFrac::default(),
         }
     }
@@ -4888,6 +4896,7 @@ impl Mempool {
         // W106 G8 closure.
         if entry_delta_change != 0 {
             self.propagate_fee_delta(txid, entry_delta_change);
+            self.relinearize_after_fee_change(txid);
         }
 
         if new_delta == 0 {
@@ -5105,7 +5114,12 @@ impl Mempool {
             let cluster_id = self.next_cluster_id;
             self.next_cluster_id += 1;
 
-            let cluster = Cluster::new_singleton(cluster_id, txid, fee, vsize);
+            let feefrac = self
+                .transactions
+                .get(&txid)
+                .map(Self::linearization_feefrac)
+                .unwrap_or_else(|| FeeFrac::from_tx(fee, vsize));
+            let cluster = Cluster::new_singleton(cluster_id, txid, fee, vsize, feefrac);
             let mining_score = cluster.mining_score(&txid).unwrap_or(0.0);
 
             self.clusters.insert(cluster_id, cluster);
@@ -5230,6 +5244,35 @@ impl Mempool {
         self.relinearize_cluster(merged_id);
 
         merged_id
+    }
+
+    /// The feerate TxGraph linearizes a transaction on: its modified fee
+    /// (`GetModifiedFee`, signed, set by `SetTransactionFee` at
+    /// txmempool.cpp:641 and 1020-1023) over its sigops-adjusted weight
+    /// (txmempool.cpp:1017 `GetSigOpsAdjustedWeight(GetTransactionWeight(*tx),
+    /// sigops_cost, ::nBytesPerSigOp)`, policy.cpp:376-379).
+    fn linearization_feefrac(entry: &MempoolEntry) -> FeeFrac {
+        FeeFrac::new(
+            Self::signed_modified_fee(entry),
+            entry.sigop_adjusted_weight as i64,
+        )
+    }
+
+    /// Relinearize the cluster of `txid` after its modified fee changed
+    /// (`PrioritiseTransaction` → `SetTransactionFee`, txmempool.cpp:641).
+    fn relinearize_after_fee_change(&mut self, txid: &Hash256) {
+        let Some(&cluster_id) = self.tx_to_cluster.get(txid) else {
+            return;
+        };
+        if let Some(cluster) = self.clusters.get(&cluster_id) {
+            for member in &cluster.txids {
+                if let Some(entry) = self.transactions.get(member) {
+                    self.mining_score_index
+                        .remove(&((entry.mining_score * 1_000_000.0) as u64, *member));
+                }
+            }
+        }
+        self.relinearize_cluster(cluster_id);
     }
 
     /// Relinearize a cluster and update mining scores.
