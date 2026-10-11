@@ -24,7 +24,12 @@ rustoshi regtest builds the mempool with `verify_scripts = false`
 
 Usage:
   BITCOIND=... BITCOIN_CLI=... RUSTOSHI=target/debug/rustoshi \\
+    CORE_RPC_PORT=18445 RUST_RPC_PORT=18443 \\
+    CORE_P2P_PORT=18446 RUST_P2P_PORT=18447 \\
     python3 crates/rpc/tests/submitpackage_script_sweep.py
+
+Port defaults match a single local regtest pair. Set the four variables
+when another job already holds those ports.
 """
 
 from __future__ import annotations
@@ -51,8 +56,25 @@ BITCOIN_CLI = os.environ.get(
 )
 RUSTOSHI = os.environ.get("RUSTOSHI", "target/debug/rustoshi")
 WORKDIR = Path(os.environ.get("SWEEP_WORKDIR", "/tmp/submitpackage-sweep"))
-CORE_RPC_PORT = 18445
-RUST_RPC_PORT = 18443
+
+
+def _env_port(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"FATAL: {name}={raw} is not an integer") from exc
+    if not 1 <= port <= 65535:
+        raise SystemExit(f"FATAL: {name}={port} is out of range")
+    return port
+
+
+CORE_RPC_PORT = _env_port("CORE_RPC_PORT", 18445)
+RUST_RPC_PORT = _env_port("RUST_RPC_PORT", 18443)
+CORE_P2P_PORT = _env_port("CORE_P2P_PORT", 18446)
+RUST_P2P_PORT = _env_port("RUST_P2P_PORT", 18447)
 CHAIN_BLOCKS = 110
 
 
@@ -271,7 +293,7 @@ def start_core(datadir: Path, *extra: str) -> None:
         "-listen=0",
         "-dnsseed=0",
         "-fixedseeds=0",
-        "-port=18446",
+        f"-port={CORE_P2P_PORT}",
         f"-rpcport={CORE_RPC_PORT}",
         "-rpcbind=127.0.0.1",
         "-rpcallowip=127.0.0.1",
@@ -321,7 +343,7 @@ def start_rustoshi(datadir: Path, log_path: Path, *extra: str) -> subprocess.Pop
         "--nodnsseed",
         "--nofixedseeds",
         "--port",
-        "18447",
+        str(RUST_P2P_PORT),
         *extra,
     ]
     proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
@@ -517,6 +539,7 @@ def raw_tx(
     inputs: list[tuple[bytes, int, bytes]],
     outputs: list[tuple[int, bytes]],
     version: int = 2,
+    locktime: int = 0,
 ) -> bytes:
     """Non-witness tx. `inputs` are (prevout txid in internal order, vout, scriptSig)."""
     raw = (version & 0xFFFFFFFF).to_bytes(4, "little")
@@ -530,7 +553,7 @@ def raw_tx(
     for value, spk in outputs:
         raw += int(value).to_bytes(8, "little")
         raw += _compact_size(len(spk)) + spk
-    raw += (0).to_bytes(4, "little")
+    raw += (locktime & 0xFFFFFFFF).to_bytes(4, "little")
     return raw
 
 
@@ -589,7 +612,7 @@ def main() -> int:
 
     log(
         "starting rustoshi (--maxconnections 0 --nodnsseed --nofixedseeds, "
-        "--port 18447). --listen is a switch that cannot be set false "
+        f"--port {RUST_P2P_PORT}). --listen is a switch that cannot be set false "
         "(default true); maxconnections 0 is the offline gate"
     )
     rust_log = WORKDIR / "rustoshi.log"
@@ -632,10 +655,6 @@ def main() -> int:
     )
 
     cases = []
-    # Full package RBF is not implemented in this run. This list records the
-    # one submitpackage the sweep sends specifically to measure it. It is not
-    # part of the exit code.
-    package_rbf_observed = []
 
     def run_case(name: str, parent_hex: str, child_hex: str, parent_txid: str, child_txid: str):
         log(f"=== {name} ===")
@@ -1445,12 +1464,18 @@ def main() -> int:
             "amount": btc(sats_of(coin["amount"])),
         }
 
-    def signed_outputs(coin: dict, outputs: list[tuple[int, bytes]], version: int = 2) -> dict:
+    def signed_outputs(
+        coin: dict,
+        outputs: list[tuple[int, bytes]],
+        version: int = 2,
+        locktime: int = 0,
+    ) -> dict:
         txid_le = bytes.fromhex(coin["txid"])[::-1]
         raw = raw_tx(
             [(txid_le, int(coin["vout"]), b"")],
             outputs,
             version=version,
+            locktime=locktime,
         ).hex()
         return sign_raw(raw, [coin_prev(coin)])
 
@@ -2163,37 +2188,512 @@ def main() -> int:
     modified_fee_package(2, 1, "package-modified-fee-positive")
     modified_fee_package(1, -1, "package-modified-fee-negative")
 
-    # Package RBF where the parent alone does not pay the incremental relay
-    # fee and the child does. Not scored: this run does not implement it.
-    rbf_coin = fresh_coin()
-    rbf_sats = sats_of(rbf_coin["amount"])
-    rbf_original = signed_outputs(rbf_coin, [(rbf_sats - 10_000, spk_bytes)])
-    admit_both("package-rbf-child-pays-original", rbf_original["hex"])
-    rbf_parent = signed_outputs(rbf_coin, [(rbf_sats - 10_001, spk_bytes)])
-    rbf_child = signed_child(rbf_parent, 50_000)
-    log("=== package-rbf-child-pays (not scored) ===")
-    rbf_hexes = [rbf_parent["hex"], rbf_child["hex"]]
-    rbf_core = core.rpc_outcome("submitpackage", [rbf_hexes])
-    rbf_rust = rust.rpc_outcome("submitpackage", [rbf_hexes])
-    log("core submitpackage: " + json.dumps(rbf_core, default=str)[:2500])
-    log("rustoshi submitpackage: " + json.dumps(rbf_rust, default=str)[:2500])
-    package_rbf_observed.append(
-        {
-            "name": "package-rbf-child-pays",
-            "inputs": {
-                "original_fee_sat": 10_000,
-                "parent_fee_sat": 10_001,
-                "child_fee_sat": 50_000,
-                "original_txid": rbf_original["decoded"]["txid"],
-                "parent_txid": rbf_parent["decoded"]["txid"],
-                "child_txid": rbf_child["decoded"]["txid"],
-                "parent_hex": rbf_parent["hex"],
-                "child_hex": rbf_child["hex"],
-            },
-            "core": rbf_core,
-            "rustoshi": rbf_rust,
-            "mismatches": compare_outcome(rbf_core, rbf_rust, "submitpackage"),
+    # Package RBF. Expectations come from the Core node this sweep is
+    # talking to. A construction that does not reach the path it names
+    # is a sweep bug and stops the run.
+    def relay_sats(vsize: int) -> int:
+        return (100 * vsize + 999) // 1000
+
+    def tx_vsize(tx: dict) -> int:
+        return int(tx["decoded"]["vsize"])
+
+    def package_msg_of(obj) -> str:
+        if not isinstance(obj, dict):
+            return "n/a"
+        if "package_msg" in obj:
+            return str(obj["package_msg"])
+        inner = obj.get("result")
+        if isinstance(inner, dict) and "package_msg" in inner:
+            return str(inner["package_msg"])
+        if obj.get("ok") is False:
+            return f"error {obj.get('code')}: {obj.get('message')}"
+        return "n/a"
+
+    def outcome_result(obj) -> dict | None:
+        if not isinstance(obj, dict) or not obj.get("ok"):
+            return None
+        inner = obj.get("result")
+        return inner if isinstance(inner, dict) else None
+
+    def require_core_path(name: str, outcome: dict, needle: str) -> None:
+        msg = package_msg_of(outcome)
+        if needle not in msg:
+            die(f"{name}: Core package_msg {msg!r} does not contain {needle!r}")
+
+    def fit_vsize(build, target: int) -> dict:
+        """`build(payload, locktime)` signs one tx.
+
+        payload None is the unpadded tx. The smallest OP_RETURN output is 11
+        vbytes, so a 1-vbyte gap (a 70-byte DER sig) cannot be closed that way.
+        Locktime is ignored when every sequence is 0xffffffff, but it changes
+        the sighash and therefore the signature length.
+        """
+        bare = build(None, 0)
+        if tx_vsize(bare) == target:
+            return bare
+        gap = target - tx_vsize(bare)
+        if gap >= 11:
+            for payload in range(0, 80):
+                trial = build(payload, 0)
+                if tx_vsize(trial) == target:
+                    return trial
+        for locktime in range(0, 400):
+            trial = build(None, locktime)
+            if tx_vsize(trial) == target:
+                return trial
+        die(
+            f"vsize {tx_vsize(bare)} cannot be brought to {target} "
+            f"(last tried {tx_vsize(trial)})"
+        )
+
+    def spend_exact(coin: dict, fee: int, target: int, version: int = 2) -> dict:
+        sats = sats_of(coin["amount"])
+
+        def build(payload, locktime):
+            outputs = [(sats - fee, spk_bytes)]
+            if payload is not None:
+                outputs.append((0, null_data(payload)))
+            return signed_outputs(coin, outputs, version=version, locktime=locktime)
+
+        return fit_vsize(build, target)
+
+    def child_exact(parent: dict, fee: int, target: int, version: int = 2) -> dict:
+        change = next(v for v in parent["decoded"]["vout"] if sats_of(v["value"]) > 0)
+        change_value = sats_of(change["value"])
+        prev = {
+            "txid": parent["decoded"]["txid"],
+            "vout": change["n"],
+            "scriptPubKey": change["scriptPubKey"]["hex"],
+            "amount": btc(change_value),
         }
+
+        def build(payload, locktime):
+            outputs = [(change_value - fee, spk_bytes)]
+            if payload is not None:
+                outputs.append((0, null_data(payload)))
+            raw = raw_tx(
+                [(bytes.fromhex(parent["decoded"]["txid"])[::-1], change["n"], b"")],
+                outputs,
+                version=version,
+                locktime=locktime,
+            ).hex()
+            return sign_raw(raw, [prev])
+
+        return fit_vsize(build, target)
+
+    def make_child(
+        parent: dict,
+        fee: int,
+        version: int = 2,
+        extra_coins: list[dict] | None = None,
+        extra_outputs: list[tuple[int, bytes]] | None = None,
+    ) -> dict:
+        dec = parent["decoded"]
+        inputs = []
+        prevs = []
+        total = 0
+        for vout in dec["vout"]:
+            spk_hex = vout["scriptPubKey"]["hex"]
+            if spk_hex.startswith("6a"):
+                continue
+            inputs.append((bytes.fromhex(dec["txid"])[::-1], vout["n"], b""))
+            amount = sats_of(vout["value"])
+            prevs.append(
+                {
+                    "txid": dec["txid"],
+                    "vout": vout["n"],
+                    "scriptPubKey": spk_hex,
+                    "amount": btc(amount),
+                }
+            )
+            total += amount
+        for extra in extra_coins or []:
+            amount = sats_of(extra["amount"])
+            inputs.append(
+                (bytes.fromhex(extra["txid"])[::-1], int(extra["vout"]), b"")
+            )
+            prevs.append(
+                {
+                    "txid": extra["txid"],
+                    "vout": int(extra["vout"]),
+                    "scriptPubKey": extra["scriptPubKey"],
+                    "amount": btc(amount),
+                }
+            )
+            total += amount
+        if fee <= 0 or fee >= total:
+            die(f"child fee {fee} does not fit inputs {total}")
+        outputs = [(total - fee, spk_bytes)]
+        outputs.extend(extra_outputs or [])
+        raw = raw_tx(inputs, outputs, version=version).hex()
+        return sign_raw(raw, prevs)
+
+    def spend_coins(coins: list[dict], fee: int, version: int = 2) -> dict:
+        inputs = []
+        prevs = []
+        total = 0
+        for coin in coins:
+            amount = sats_of(coin["amount"])
+            inputs.append(
+                (bytes.fromhex(coin["txid"])[::-1], int(coin["vout"]), b"")
+            )
+            prevs.append(
+                {
+                    "txid": coin["txid"],
+                    "vout": int(coin["vout"]),
+                    "scriptPubKey": coin["scriptPubKey"],
+                    "amount": btc(amount),
+                }
+            )
+            total += amount
+        if fee <= 0 or fee >= total:
+            die(f"multi fee {fee} does not fit inputs {total}")
+        raw = raw_tx(inputs, [(total - fee, spk_bytes)], version=version).hex()
+        return sign_raw(raw, prevs)
+
+    def must_match_submit(name: str, hex_tx: str) -> None:
+        c_res = core.rpc_outcome("submitpackage", [[hex_tx]])
+        r_res = rust.rpc_outcome("submitpackage", [[hex_tx]])
+        mismatches = compare_outcome(c_res, r_res, "submitpackage")
+        if mempool_txids(core) != mempool_txids(rust):
+            mismatches.append(
+                {
+                    "field": "getrawmempool",
+                    "core": mempool_txids(core),
+                    "rustoshi": mempool_txids(rust),
+                    "out_of_scope": None,
+                }
+            )
+        if not c_res.get("ok") or package_msg_of(c_res) != "success":
+            die(f"{name}: Core rejected setup tx: {package_msg_of(c_res)}")
+        if mismatches:
+            cases.append(
+                {
+                    "name": name,
+                    "core": c_res,
+                    "rustoshi": r_res,
+                    "mismatches": mismatches,
+                }
+            )
+            die(f"{name}: rustoshi diverged while admitting a package RBF input")
+
+    def run_package_rbf(name: str, hexes: list[str], focus_extra: list[str] | None = None) -> dict:
+        log(f"=== {name} ===")
+        mismatches: list[dict] = []
+        c_res = core.rpc_outcome("submitpackage", [hexes])
+        r_res = rust.rpc_outcome("submitpackage", [hexes])
+        log("core submitpackage: " + json.dumps(c_res, default=str)[:4000])
+        log("rustoshi submitpackage: " + json.dumps(r_res, default=str)[:4000])
+        mismatches.extend(compare_outcome(c_res, r_res, "submitpackage"))
+        focus = package_txids(hexes) + (focus_extra or [])
+        c_mem = core.rpc("getrawmempool", [True])
+        r_mem = rust.rpc("getrawmempool", [True])
+        log(
+            f"  mempool size core={len(c_mem) if isinstance(c_mem, dict) else c_mem} "
+            f"rustoshi={len(r_mem) if isinstance(r_mem, dict) else r_mem}"
+        )
+        mismatches.extend(compare_verbose(c_mem, r_mem, focus))
+        for m in mismatches:
+            shown = m["core"]
+            if isinstance(shown, (dict, list)) and len(json.dumps(shown, default=str)) > 400:
+                shown = json.dumps(shown, default=str)[:400] + "…"
+            tag = "OUT_OF_SCOPE" if m["out_of_scope"] else "MISMATCH"
+            log(f"  {tag} {m['field']}: core={shown!r} rustoshi={m['rustoshi']!r}")
+            if m["out_of_scope"]:
+                log(f"    why: {m['out_of_scope']}")
+        cases.append(
+            {
+                "name": name,
+                "core": c_res,
+                "rustoshi": r_res,
+                "mismatches": mismatches,
+            }
+        )
+        return c_res
+
+    def coin_at_least(min_sats: int) -> dict:
+        coins = [c for c in spendable_coins() if sats_of(c["amount"]) > min_sats]
+        if not coins:
+            sync_generated(1)
+            coins = [c for c in spendable_coins() if sats_of(c["amount"]) > min_sats]
+        if not coins:
+            die(f"no confirmed coin above {min_sats} sats")
+        return max(coins, key=lambda c: sats_of(c["amount"]))
+
+    def one_conflict_package(original_fee: int, parent_fee: int, child_fee: int, version: int = 2):
+        coin = coin_at_least(parent_fee + child_fee + 1000)
+        original = spend_exact(coin, original_fee, 110, version=version)
+        must_match_submit(f"package-rbf-setup-{original['decoded']['txid'][:8]}", original["hex"])
+        parent = spend_exact(coin, parent_fee, 110, version=version)
+        child = child_exact(parent, child_fee, 110, version=version)
+        assert tx_vsize(parent) == 110 and tx_vsize(child) == 110
+        return original, parent, child
+
+    # (a) Parent alone is one sat short of the conflict plus incremental
+    # relay. The child funds the replacement. vsize 110+110, fees
+    # 10001+50000 → effective feerate 272731 sat/kvB.
+    original, parent, child = one_conflict_package(10_000, 10_001, 50_000)
+    log(
+        f"package-rbf-child-pays vsizes parent={tx_vsize(parent)} "
+        f"child={tx_vsize(child)} original={tx_vsize(original)}"
+    )
+    child_pays = run_package_rbf(
+        "package-rbf-child-pays",
+        [parent["hex"], child["hex"]],
+        [original["decoded"]["txid"]],
+    )
+    require_core_path("package-rbf-child-pays", child_pays, "success")
+    child_pays_body = outcome_result(child_pays)
+    if child_pays_body is None:
+        die("package-rbf-child-pays: Core submitpackage was not ok")
+    if child_pays_body.get("replaced-transactions") != [original["decoded"]["txid"]]:
+        die(
+            "package-rbf-child-pays: Core replaced-transactions "
+            f"{child_pays_body.get('replaced-transactions')!r}"
+        )
+    for entry in (child_pays_body.get("tx-results") or {}).values():
+        rate = (entry.get("fees") or {}).get("effective-feerate")
+        if rate != Decimal("0.00272731"):
+            die(f"package-rbf-child-pays: Core effective-feerate {rate!r}")
+
+    # (b) Child fee does not cover incremental relay against the conflict.
+    original, parent, _child = one_conflict_package(10_000, 10_001, 10)
+    # one_conflict_package already built a 10-sat child at vsize 110.
+    # Rebuild is unnecessary: that child is the anti-DoS shape.
+    anti = run_package_rbf(
+        "package-rbf-anti-dos",
+        [parent["hex"], _child["hex"]],
+        [original["decoded"]["txid"]],
+    )
+    require_core_path("package-rbf-anti-dos", anti, "insufficient anti-DoS fees")
+
+    # (c) Anti-DoS passes and the package feerate is still <= the parent.
+    # Search the child fee against the signed vsizes. Core's CFeeRate <=
+    # is a cross-multiply, and PaysForRBF uses ceiling GetFee.
+    feerate_coin_original, feerate_parent, _ignored = one_conflict_package(10_000, 10_001, 21)
+    # The pinned 21-sat child may or may not land on the right side of
+    # GetFee once the signature length is known. Search below.
+    del _ignored
+
+    def parent_feerate_ok(parent_tx, child_tx, fee):
+        pv = tx_vsize(parent_tx)
+        cv = tx_vsize(child_tx)
+        total_fee = 10_001 + fee
+        total_v = pv + cv
+        additional = total_fee - 10_000
+        if additional < relay_sats(total_v):
+            return False
+        return total_fee * pv <= 10_001 * total_v
+
+    # one_conflict_package already admitted an original. Find the child
+    # on that same parent instead of spending another coin.
+    feerate_child = None
+    change_room = sats_of(
+        next(v["value"] for v in feerate_parent["decoded"]["vout"] if sats_of(v["value"]) > 0)
+    )
+    for fee in range(1, min(change_room, 20_000)):
+        trial = make_child(feerate_parent, fee)
+        if parent_feerate_ok(feerate_parent, trial, fee):
+            feerate_child = trial
+            log(
+                f"package-rbf-feerate-le-parent child_fee={fee} "
+                f"vsize={tx_vsize(feerate_parent)}+{tx_vsize(trial)}"
+            )
+            break
+    if feerate_child is None:
+        die("no child fee with package feerate <= parent and anti-DoS paid")
+    feerate_res = run_package_rbf(
+        "package-rbf-feerate-le-parent",
+        [feerate_parent["hex"], feerate_child["hex"]],
+        [feerate_coin_original["decoded"]["txid"]],
+    )
+    require_core_path(
+        "package-rbf-feerate-le-parent",
+        feerate_res,
+        "package feerate is less than or equal to parent feerate",
+    )
+
+    # (f) Absolute package fee beats the conflict, package feerate beats
+    # the parent, and the chunk diagram does not.
+    diagram_original, diagram_parent, _ignored = one_conflict_package(50_000, 10_001, 45_000)
+    del _ignored
+    diagram_child = None
+    for fee in (45_000, 40_000, 30_000, 20_000, 60_000):
+        trial = make_child(diagram_parent, fee)
+        pv = tx_vsize(diagram_parent)
+        cv = tx_vsize(trial)
+        ov = tx_vsize(diagram_original)
+        total_fee = 10_001 + fee
+        total_v = pv + cv
+        additional = total_fee - 50_000
+        if additional < relay_sats(total_v):
+            continue
+        if total_fee * pv <= 10_001 * total_v:
+            continue
+        # Higher total fee, lower feerate than the conflict: CompareChunks
+        # is unordered, which PackageRBFChecks rejects.
+        if total_fee > 50_000 and total_fee * ov < 50_000 * total_v:
+            diagram_child = trial
+            log(
+                f"package-rbf-feerate-diagram child_fee={fee} "
+                f"vsize original={ov} package={total_v}"
+            )
+            break
+    if diagram_child is None:
+        die("no child fee that fails only the feerate diagram")
+    diagram_res = run_package_rbf(
+        "package-rbf-feerate-diagram",
+        [diagram_parent["hex"], diagram_child["hex"]],
+        [diagram_original["decoded"]["txid"]],
+    )
+    require_core_path(
+        "package-rbf-feerate-diagram",
+        diagram_res,
+        "insufficient feerate: does not improve feerate diagram",
+    )
+
+    # (g) 1p1c package RBF whose child is over TRUC_CHILD_MAX_VSIZE.
+    # The non-TRUC package clears parent feerate, anti-DoS, and the
+    # diagram, so Core accepts it. The v3 package dies in
+    # PackageTRUCChecks before those checks. Same fee shape, two coins.
+    def oversized_child(parent: dict, version: int) -> tuple[dict, int]:
+        payload_hit = None
+        for payload in range(900, 1600, 20):
+            probe = make_child(
+                parent,
+                50_000,
+                version=version,
+                extra_outputs=[(0, null_data(payload))],
+            )
+            size = tx_vsize(probe)
+            if 1000 < size <= 10_000:
+                payload_hit = payload
+                break
+        if payload_hit is None:
+            die(f"version {version} child never landed in (1000, 10000] vbytes")
+        # Second pass uses the signed size. fee * parent_vsize must beat
+        # parent_fee * package_vsize, with margin for a 1-byte signature.
+        pv = tx_vsize(parent)
+        cv = tx_vsize(probe)
+        fee = (10_001 * cv) // pv + 20_000
+        child = make_child(
+            parent,
+            fee,
+            version=version,
+            extra_outputs=[(0, null_data(payload_hit))],
+        )
+        cv = tx_vsize(child)
+        total_fee = 10_001 + fee
+        total_v = pv + cv
+        if not (1000 < cv <= 10_000):
+            die(f"version {version} child vsize {cv} left the TRUC child window")
+        if total_fee * pv <= 10_001 * total_v:
+            die(
+                f"version {version} package feerate does not beat the parent "
+                f"({total_fee}/{total_v} vs 10001/{pv})"
+            )
+        if total_fee * 110 <= 10_000 * total_v:
+            die(
+                f"version {version} package feerate does not beat the conflict "
+                f"({total_fee}/{total_v})"
+            )
+        log(f"version {version} oversized child fee={fee} vsize={cv} payload={payload_hit}")
+        return child, fee
+
+    def conflict_110(version: int):
+        # The oversized child fee is about parent_fee * child_vsize / parent_vsize.
+        coin = coin_at_least(2_000_000)
+        original = spend_exact(coin, 10_000, 110, version=version)
+        must_match_submit(
+            f"package-rbf-v{version}-original-{original['decoded']['txid'][:8]}",
+            original["hex"],
+        )
+        parent = spend_exact(coin, 10_001, 110, version=version)
+        return original, parent
+
+    plain_original, plain_parent = conflict_110(2)
+    plain_child, _plain_fee = oversized_child(plain_parent, 2)
+    plain_res = run_package_rbf(
+        "package-rbf-large-child",
+        [plain_parent["hex"], plain_child["hex"]],
+        [plain_original["decoded"]["txid"]],
+    )
+    require_core_path("package-rbf-large-child", plain_res, "success")
+    truc_original, truc_parent = conflict_110(3)
+    truc_child, _truc_fee = oversized_child(truc_parent, 3)
+    truc_res = run_package_rbf(
+        "package-rbf-truc",
+        [truc_parent["hex"], truc_child["hex"]],
+        [truc_original["decoded"]["txid"]],
+    )
+    if package_msg_of(truc_res) == package_msg_of(plain_res):
+        die(
+            "TRUC package RBF package_msg matches the non-TRUC control "
+            f"({package_msg_of(truc_res)!r}); Core did not treat v3 differently"
+        )
+    require_core_path("package-rbf-truc", truc_res, "TRUC-violation")
+
+    # (d) 60 clusters on the parent and 41 on the child. Each side is
+    # under GetEntriesForConflicts' limit of 100; the union is not.
+    # One confirmed fan-out creates the coins. Independent mempool
+    # spends are the clusters the package conflicts with.
+    if mempool_txids(core) != mempool_txids(rust):
+        die(
+            "mempools diverged before the cluster fan-out: "
+            f"core={len(mempool_txids(core))} rustoshi={len(mempool_txids(rust))}"
+        )
+    sync_generated(1)
+    fan_coin = max(spendable_coins(), key=lambda c: sats_of(c["amount"]))
+    fan_sats = sats_of(fan_coin["amount"])
+    cluster_n = 101
+    each = 100_000
+    fan_fee = 10_000
+    if fan_sats <= each * cluster_n + fan_fee:
+        die(f"fan-out coin {fan_sats} cannot fund {cluster_n} outputs")
+    fan_outputs = [(each, spk_bytes)] * cluster_n
+    fan_outputs.append((fan_sats - each * cluster_n - fan_fee, spk_bytes))
+    fan_tx = signed_outputs(fan_coin, fan_outputs)
+    must_match_submit("package-rbf-cluster-fanout", fan_tx["hex"])
+    sync_generated(1)
+    fan_coins = []
+    for vout in fan_tx["decoded"]["vout"]:
+        if sats_of(vout["value"]) != each:
+            continue
+        fan_coins.append(
+            {
+                "txid": fan_tx["decoded"]["txid"],
+                "vout": vout["n"],
+                "scriptPubKey": vout["scriptPubKey"]["hex"],
+                "amount": vout["value"],
+            }
+        )
+    if len(fan_coins) != cluster_n:
+        die(f"fan-out produced {len(fan_coins)} coins, want {cluster_n}")
+    conflict_ids = []
+    for i, coin in enumerate(fan_coins):
+        conflict = signed_outputs(coin, [(each - 1_000, spk_bytes)])
+        must_match_submit(f"package-rbf-cluster-conflict-{i}", conflict["hex"])
+        conflict_ids.append(conflict["decoded"]["txid"])
+        if i % 25 == 24:
+            log(f"  admitted {i + 1} conflicting clusters")
+    parent_coins = fan_coins[:60]
+    child_coins = fan_coins[60:]
+    cluster_parent = spend_coins(parent_coins, 10_001)
+    cluster_child = make_child(cluster_parent, 50_000, extra_coins=child_coins)
+    log(
+        f"package-rbf-too-many-clusters parent_inputs={len(parent_coins)} "
+        f"child_extra={len(child_coins)} "
+        f"parent_vsize={tx_vsize(cluster_parent)} child_vsize={tx_vsize(cluster_child)}"
+    )
+    cluster_res = run_package_rbf(
+        "package-rbf-too-many-clusters",
+        [cluster_parent["hex"], cluster_child["hex"]],
+        conflict_ids,
+    )
+    require_core_path(
+        "package-rbf-too-many-clusters",
+        cluster_res,
+        "too many conflicting clusters",
     )
 
     # Rate 1005 sat/kvB is the smallest rate whose CFeeRate::GetFee(vsize)
@@ -2487,7 +2987,6 @@ def main() -> int:
     report = {
         "cases": cases,
         "reconsider": reconsider,
-        "package_rbf_not_implemented": package_rbf_observed,
     }
     out = WORKDIR / "report.json"
     out.write_text(json.dumps(report, indent=2, sort_keys=True, default=str))
@@ -2531,12 +3030,31 @@ def main() -> int:
     for name, m in out_of_scope:
         why = m.get("out_of_scope")
         log(f"  {name} {m.get('field')}: {why}")
-    for note in package_rbf_observed:
-        n = len(note["mismatches"])
-        log(f"package RBF not implemented this run: {note['name']} differences={n}")
-        if n:
-            log("  core: " + json.dumps(note["core"], default=str)[:2000])
-            log("  rustoshi: " + json.dumps(note["rustoshi"], default=str)[:2000])
+
+    in_scope_names = {name for name, _m in in_scope}
+    log("=== summary ===")
+    log(f"{'case':<44} {'status':<9} core package_msg")
+    log(f"{'':<44} {'':<9} rustoshi package_msg")
+    n_mismatch = 0
+    for case in cases:
+        c_msg = package_msg_of(case["core"]).replace("\n", " ")
+        r_msg = package_msg_of(case["rustoshi"]).replace("\n", " ")
+        status = "mismatch" if case["name"] in in_scope_names else "match"
+        if status == "mismatch":
+            n_mismatch += 1
+        log(f"{case['name']:<44} {status:<9} {c_msg}")
+        log(f"{'':<44} {'':<9} {r_msg}")
+    if c_after_inv != r_after_inv or c_after_re != r_after_re:
+        inv_status = "mismatch" if c_after_inv != r_after_inv else "match"
+        re_status = "mismatch" if "reconsiderblock" in in_scope_names else "match"
+        log(f"{'invalidateblock':<44} {inv_status:<9} n/a")
+        log(f"{'':<44} {'':<9} n/a")
+        log(f"{'reconsiderblock':<44} {re_status:<9} n/a")
+        log(f"{'':<44} {'':<9} n/a")
+    log(
+        f"summary: {len(cases)} cases, {n_mismatch} mismatch, "
+        f"{len(cases) - n_mismatch} match, in-scope={len(in_scope)}"
+    )
 
     stop_rustoshi(rust_proc)
     stop_core(core_dir)
