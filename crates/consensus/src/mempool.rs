@@ -3595,17 +3595,68 @@ impl Mempool {
     /// Txids in Core's mining order: what `entryAll()` lists for
     /// getrawmempool (txmempool.cpp:572-597, `GetSortedScoreWithTopology`
     /// sorting by `CompareMainOrder`) and what the block builder walks.
-    /// Each entry is ranked by [`Mempool::mining_score`] of its ancestor
-    /// package; exact ties fall to the lower txid so the order never depends
-    /// on HashMap iteration.
+    ///
+    /// Each entry is ranked by [`MiningScore`] of its cluster chunk
+    /// (txgraph.cpp:492-526 `CompareMainTransactions`): chunk feerate,
+    /// then the equal-feerate chunk prefix size (txgraph.cpp:502-508,
+    /// 1093-1128: within a cluster, the cumulative sigops-adjusted weight
+    /// of the run of consecutive equal-feerate chunks up to and including
+    /// this chunk; for a lone chunk, its size), then the lower maximum
+    /// txid in the chunk. Within one chunk, the cluster linearization
+    /// index (`m_main_lin_index`, txgraph.cpp:522-523).
     pub fn get_sorted_for_mining(&self) -> Vec<Hash256> {
-        let mut entries: Vec<(MiningScore, Hash256)> = self
+        let mut keys: HashMap<Hash256, (MiningScore, usize)> =
+            HashMap::with_capacity(self.transactions.len());
+        for cluster in self.clusters.values() {
+            let mut prefix = FeeFrac::default();
+            let mut lin_index = 0usize;
+            for chunk in &cluster.linearization {
+                let chunk_ff = self.chunk_mining_feefrac(chunk);
+                if fee_rate_cmp(chunk_ff, prefix) == std::cmp::Ordering::Less {
+                    prefix = chunk_ff;
+                } else {
+                    prefix += chunk_ff;
+                }
+                let Some(max_txid) = chunk.txids.iter().copied().max() else {
+                    continue;
+                };
+                let score = MiningScore {
+                    feerate: prefix,
+                    max_txid,
+                };
+                for txid in &chunk.txids {
+                    keys.insert(*txid, (score, lin_index));
+                    lin_index += 1;
+                }
+            }
+        }
+        let mut entries: Vec<(MiningScore, usize, Hash256)> = self
             .transactions
             .values()
-            .map(|e| (self.mining_score(e), e.txid))
+            .map(|e| {
+                keys.get(&e.txid)
+                    .copied()
+                    .map(|(score, lin)| (score, lin, e.txid))
+                    .unwrap_or_else(|| (self.mining_score(e), 0, e.txid))
+            })
             .collect();
         entries.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        entries.into_iter().map(|(_, txid)| txid).collect()
+        entries.into_iter().map(|(_, _, txid)| txid).collect()
+    }
+
+    /// Modified fee and sigops-adjusted weight of `chunk` as a [`FeeFrac`].
+    /// Core feeds TxGraph `GetModifiedFee` / `GetSigOpsAdjustedWeight`
+    /// (txmempool.cpp:1017).
+    fn chunk_mining_feefrac(&self, chunk: &Chunk) -> FeeFrac {
+        let mut fee = 0i64;
+        let mut size = 0i64;
+        for txid in &chunk.txids {
+            if let Some(entry) = self.transactions.get(txid) {
+                fee = fee.saturating_add(Self::get_modified_fee(entry) as i64);
+                size = size.saturating_add(entry.sigop_adjusted_weight as i64);
+            }
+        }
+        FeeFrac::new(fee, size)
     }
 
     /// Mining score of `entry`'s ancestor package (the entry plus every
