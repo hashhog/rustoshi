@@ -2617,12 +2617,27 @@ impl Mempool {
             self.created_utxos.insert(outpoint, txid);
         }
 
+        // Core UpdateTransactionsFromBlock (txmempool.cpp): a tx re-added
+        // from a disconnected block can already have in-mempool children --
+        // txs that spent its outputs while it was confirmed. They must become
+        // its descendants (ancestor/descendant state, clusters, recursive
+        // removal, template order). Outside a reorg refill this set is always
+        // empty: a tx spending a not-yet-known output is an orphan, never a
+        // mempool entry.
+        let existing_children: HashSet<Hash256> = (0..tx.outputs.len() as u32)
+            .filter_map(|vout| self.spent_outpoints.get(&OutPoint { txid, vout }).copied())
+            .collect();
+
         // Track parent/child relationships
         self.parents.insert(txid, mempool_parents.clone());
         for parent in &mempool_parents {
             self.children.entry(*parent).or_default().insert(txid);
         }
         self.children.entry(txid).or_default();
+        for child in &existing_children {
+            self.parents.entry(*child).or_default().insert(txid);
+            self.children.entry(txid).or_default().insert(*child);
+        }
 
         // Update all ancestors' descendant stats (once per ancestor, not per parent)
         self.update_all_ancestors_for_add(&mempool_parents, vsize, fee);
@@ -2646,8 +2661,17 @@ impl Mempool {
         // → ApplyDelta sequence (txmempool.cpp:1015).
         self.apply_pending_delta(&txid);
 
-        // Add to cluster structure and compute mining score
-        self.add_to_clusters(txid, fee, vsize, &mempool_parents);
+        if !existing_children.is_empty() {
+            // The new entry joins its pre-existing children's packages:
+            // recompute the cached aggregates of everything now related to it.
+            self.recompute_relative_stats(&txid);
+        }
+
+        // Add to cluster structure and compute mining score. Pre-existing
+        // children's clusters merge with the parents' (one connected component).
+        let mut cluster_neighbours = mempool_parents.clone();
+        cluster_neighbours.extend(existing_children.iter().copied());
+        self.add_to_clusters(txid, fee, vsize, &cluster_neighbours);
 
         // Core LimitMempoolSize runs AFTER addUnchecked. TrimToSize evicts the
         // worst chunk, which may be this transaction. W96: skipped on
@@ -2661,6 +2685,51 @@ impl Mempool {
         }
 
         Ok(txid)
+    }
+
+    /// Recompute the cached ancestor/descendant aggregates (count, vsize,
+    /// modified fees) of `txid`, every ancestor and every descendant of it,
+    /// from the parent/child graph. Used after a re-added tx is linked to
+    /// children that were already in the mempool (Core
+    /// `UpdateTransactionsFromBlock` -> `UpdateForDescendants`), where the
+    /// incremental add/remove bookkeeping cannot express the new edges.
+    fn recompute_relative_stats(&mut self, txid: &Hash256) {
+        let mut affected: Vec<Hash256> = vec![*txid];
+        affected.extend(self.get_ancestors_of(txid));
+        affected.extend(self.get_descendants_of(txid));
+        let mut seen = HashSet::new();
+        affected.retain(|t| seen.insert(*t));
+        let mut updates = Vec::with_capacity(affected.len());
+        for t in &affected {
+            let Some(me) = self.transactions.get(t) else { continue };
+            let (mut ac, mut asz, mut af) = (1usize, me.vsize, Self::get_modified_fee(me));
+            for a in self.get_ancestors_of(t) {
+                if let Some(e) = self.transactions.get(&a) {
+                    ac += 1;
+                    asz += e.vsize;
+                    af = af.saturating_add(Self::get_modified_fee(e));
+                }
+            }
+            let (mut dc, mut dsz, mut df) = (1usize, me.vsize, Self::get_modified_fee(me));
+            for d in self.get_descendants_of(t) {
+                if let Some(e) = self.transactions.get(&d) {
+                    dc += 1;
+                    dsz += e.vsize;
+                    df = df.saturating_add(Self::get_modified_fee(e));
+                }
+            }
+            updates.push((*t, ac, asz, af, dc, dsz, df));
+        }
+        for (t, ac, asz, af, dc, dsz, df) in updates {
+            if let Some(e) = self.transactions.get_mut(&t) {
+                e.ancestor_count = ac;
+                e.ancestor_size = asz;
+                e.ancestor_fees = af;
+                e.descendant_count = dc;
+                e.descendant_size = dsz;
+                e.descendant_fees = df;
+            }
+        }
     }
 
     /// Update all ancestors' descendant stats when adding a new transaction.
@@ -2796,6 +2865,22 @@ impl Mempool {
         self.remove_from_clusters(txid);
 
         self.unbroadcast.remove(txid);
+
+        // Drop this tx from each in-pool child's parent set before the entry
+        // itself goes away. remove_for_block confirms a parent while leaving
+        // its spenders; without this unlink their cached ancestor totals still
+        // include the confirmed tx (Core removeUnchecked updates the graph).
+        let child_ids: Vec<Hash256> = self
+            .children
+            .get(txid)
+            .map(|c| c.iter().copied().collect())
+            .unwrap_or_default();
+        for child in &child_ids {
+            if let Some(parents) = self.parents.get_mut(child) {
+                parents.remove(txid);
+            }
+        }
+
         if let Some(entry) = self.transactions.remove(txid) {
             // W96: keep the wtxid → txid index in sync with `transactions`.
             self.wtxid_index.remove(&entry.tx.wtxid());
@@ -2834,6 +2919,12 @@ impl Mempool {
             self.fee_rate_index.remove(&fee_key);
             self.total_size = self.total_size.saturating_sub(entry.vsize);
             self.note_randomized_removed();
+        }
+
+        for child in &child_ids {
+            if self.transactions.contains_key(child) {
+                self.recompute_relative_stats(child);
+            }
         }
     }
 
@@ -2991,32 +3082,186 @@ impl Mempool {
     where
         F: Fn(&OutPoint) -> Option<CoinEntry>,
     {
+        self.readd_disconnected_blocks(std::iter::once(block_transactions), utxo_lookup)
+    }
+
+    /// Core `MaybeUpdateMempoolForReorg`, re-add half (validation.cpp): put
+    /// the non-coinbase txs of the disconnected blocks back, EARLIEST
+    /// CONFIRMED FIRST. `blocks_earliest_first` must yield the blocks in
+    /// ascending height (Core iterates `DisconnectedBlockTransactions` in
+    /// reverse: the pool's front is the most recently confirmed tx).
+    ///
+    /// Order matters: a tx in block N+1 spending a tx in block N can only be
+    /// accepted once its parent is back in the pool; re-adding tip-first
+    /// rejected it as an orphan (mempool-reorg-sweep scenario a/d: C <- P:0).
+    ///
+    /// A re-added tx with children already in the mempool is linked to them
+    /// in `add_transaction_with_options` (Core `UpdateTransactionsFromBlock`).
+    /// Linking merges those clusters after the per-tx cluster gate, which only
+    /// sees mempool parents, so the merged cluster can exceed 64 txs or
+    /// 404_000 WU. `trim_cluster_limits` is Core `TxGraphImpl::Trim`, called
+    /// at the end of `UpdateTransactionsFromBlock`.
+    /// A tx that fails re-admission is removed recursively: any in-mempool
+    /// spender of its outputs goes too (Core `removeRecursive`).
+    ///
+    /// The caller runs `remove_for_reorg` (finality / BIP68 / coinbase
+    /// maturity at the new tip) afterwards, then `limit_mempool_size`.
+    pub fn readd_disconnected_blocks<'a, I, F>(
+        &mut self,
+        blocks_earliest_first: I,
+        utxo_lookup: &F,
+    ) -> usize
+    where
+        I: IntoIterator<Item = &'a [Transaction]>,
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
         let mut readded = 0;
-        for tx in block_transactions {
-            if tx.is_coinbase() {
-                continue;
-            }
-            // Best-effort: a tx may legitimately fail re-admit (no longer
-            // final under new MTP, double-spent by a tx already in mempool,
-            // inputs no longer in the UTXO set, etc.). Drop quietly.
-            //
-            // W96: use `AtmpOptions::reorg_refill()` to (a) skip the fee
-            // gate (so low-fee txs that were already mined get a chance
-            // to re-enter), (b) skip mempool-full eviction during the
-            // re-admit burst, (c) skip script verification (already
-            // verified at original ConnectBlock time), and (d) tag the
-            // entry_sequence as 0 so reorged children sort before any
-            // existing children.  Mirrors Core's `MaybeUpdateMempoolForReorg`.
-            match self.add_transaction_with_options(
-                tx.clone(),
-                utxo_lookup,
-                AtmpOptions::reorg_refill(),
-            ) {
-                Ok(_) => readded += 1,
-                Err(_) => {}
+        for block_transactions in blocks_earliest_first {
+            for tx in block_transactions {
+                if tx.is_coinbase() {
+                    continue;
+                }
+                // `reorg_refill`: bypass_limits (no fee floor, no mempool-full
+                // eviction during the burst), entry_sequence 0. Every other
+                // admission check runs against the post-disconnect view.
+                match self.add_transaction_with_options(
+                    tx.clone(),
+                    utxo_lookup,
+                    AtmpOptions::reorg_refill(),
+                ) {
+                    Ok(_) => readded += 1,
+                    // Same txid already in the pool: it stays, with its children.
+                    Err(MempoolError::AlreadyExists)
+                    | Err(MempoolError::WtxidAlreadyInMempool)
+                    | Err(MempoolError::TxidSameNonwitnessData) => {}
+                    Err(_) => {
+                        // Core: `if (!accepted) removeRecursive(tx)`.
+                        let txid = tx.txid();
+                        for vout in 0..tx.outputs.len() as u32 {
+                            if let Some(spender) =
+                                self.spent_outpoints.get(&OutPoint { txid, vout }).copied()
+                            {
+                                self.remove_transaction(&spender, true);
+                            }
+                        }
+                    }
+                }
             }
         }
+        // Core CTxMemPool::UpdateTransactionsFromBlock ends with TxGraph::Trim
+        // once every re-added tx has been linked to in-pool children.
+        self.trim_cluster_limits();
         readded
+    }
+
+    /// Drop transactions from clusters that exceed [`MAX_CLUSTER_SIZE`] or
+    /// [`MAX_CLUSTER_SIZE_WEIGHT`] after a reorg linked in-pool children.
+    ///
+    /// Core `TxGraphImpl::Trim` (txgraph.cpp): walk the merged cluster in
+    /// decreasing chunk-feerate order (the linearization). A transaction whose
+    /// addition would exceed either limit is not included, and neither are its
+    /// descendants — their dependency stays unmet, so they are removed too.
+    /// 64 txs and 404_000 WU are within the limit (`>` comparison).
+    fn trim_cluster_limits(&mut self) -> usize {
+        let cluster_ids: Vec<ClusterId> = self.clusters.keys().copied().collect();
+        let mut removed = 0;
+        for id in cluster_ids {
+            let Some(drop_ids) = self.plan_cluster_trim(id) else {
+                continue;
+            };
+            for txid in drop_ids {
+                if self.transactions.contains_key(&txid) {
+                    self.remove_transaction(&txid, true);
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
+    /// Txids to remove so `id` satisfies the cluster limits, in an order where
+    /// each dropped tx is removed with its descendants. `None` when the
+    /// cluster already fits.
+    fn plan_cluster_trim(&self, id: ClusterId) -> Option<Vec<Hash256>> {
+        let cluster = self.clusters.get(&id)?;
+        let total_weight: u64 = cluster
+            .txids
+            .iter()
+            .map(|t| {
+                self.transactions
+                    .get(t)
+                    .map(|e| e.sigop_adjusted_weight)
+                    .unwrap_or(0)
+            })
+            .sum();
+        if cluster.txids.len() <= MAX_CLUSTER_SIZE && total_weight <= MAX_CLUSTER_SIZE_WEIGHT {
+            return None;
+        }
+        let members = cluster.txids.clone();
+        let mut order: Vec<Hash256> = cluster
+            .linearization
+            .iter()
+            .flat_map(|chunk| chunk.txids.iter().copied())
+            .collect();
+        let mut in_order: HashSet<Hash256> = order.iter().copied().collect();
+        for txid in &members {
+            if in_order.insert(*txid) {
+                order.push(*txid);
+            }
+        }
+        let mut dropped: HashSet<Hash256> = HashSet::new();
+        let mut roots: Vec<Hash256> = Vec::new();
+        let mut kept_count = 0usize;
+        let mut kept_weight = 0u64;
+        for txid in order {
+            let blocked = self.ancestor_was_dropped(&txid, &dropped);
+            let weight = self
+                .transactions
+                .get(&txid)
+                .map(|e| e.sigop_adjusted_weight)
+                .unwrap_or(0);
+            let fits = !blocked
+                && kept_count + 1 <= MAX_CLUSTER_SIZE
+                && kept_weight.saturating_add(weight) <= MAX_CLUSTER_SIZE_WEIGHT;
+            if fits {
+                kept_count += 1;
+                kept_weight += weight;
+            } else if dropped.insert(txid) {
+                roots.push(txid);
+            }
+        }
+        Some(roots)
+    }
+
+    fn ancestor_was_dropped(&self, txid: &Hash256, dropped: &HashSet<Hash256>) -> bool {
+        let mut stack: Vec<Hash256> = self
+            .parents
+            .get(txid)
+            .map(|ps| ps.iter().copied().collect())
+            .unwrap_or_default();
+        let mut seen: HashSet<Hash256> = HashSet::new();
+        while let Some(parent) = stack.pop() {
+            if !seen.insert(parent) {
+                continue;
+            }
+            if dropped.contains(&parent) {
+                return true;
+            }
+            if let Some(grandparents) = self.parents.get(&parent) {
+                stack.extend(grandparents.iter().copied());
+            }
+        }
+        false
+    }
+
+    /// Core `LimitMempoolSize` after a reorg refill (which bypassed the size
+    /// limit): trim back to the configured maximum. Returns entries evicted.
+    pub fn limit_mempool_size(&mut self) -> usize {
+        if self.total_size > self.config.max_size_bytes {
+            self.trim_to_size(self.config.max_size_bytes)
+        } else {
+            0
+        }
     }
 
     /// Get transactions sorted by descendant fee rate for block building.
@@ -6775,6 +7020,43 @@ mod tests {
         // Verify ancestor stats
         let entry = mempool.get(&txid2).unwrap();
         assert_eq!(entry.ancestor_count, 2); // self + parent
+    }
+
+    /// Confirming a parent must drop it from in-pool children's ancestor totals.
+    /// `remove_for_block` removes the parent only (`remove_descendants` false);
+    /// the child stays, and its cached ancestor count/fees must not still
+    /// include the parent.
+    #[test]
+    fn remove_for_block_unlinks_parent_from_child_ancestors() {
+        let mut mempool = Mempool::new(MempoolConfig::default());
+        let utxo_txid =
+            Hash256::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let utxos = mock_utxo_set(vec![(OutPoint { txid: utxo_txid, vout: 0 }, 100_000)]);
+
+        let parent = make_tx(vec![(utxo_txid, 0)], vec![90_000], 1);
+        let parent_id = parent.txid();
+        mempool
+            .add_transaction(parent, &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        let child = make_tx(vec![(parent_id, 0)], vec![80_000], 1);
+        let child_id = child.txid();
+        mempool
+            .add_transaction(child.clone(), &|op| utxos.get(op).cloned())
+            .unwrap();
+
+        mempool.remove_for_block(&[parent_id], &[]);
+
+        assert!(mempool.get(&parent_id).is_none(), "confirmed parent leaves the pool");
+        let entry = mempool.get(&child_id).expect("child stays");
+        assert!(
+            mempool.parents.get(&child_id).map(|p| p.is_empty()).unwrap_or(true),
+            "child must not keep the confirmed parent as a mempool parent"
+        );
+        assert_eq!(entry.ancestor_count, 1);
+        assert_eq!(entry.ancestor_fees, entry.fee);
+        assert_eq!(entry.ancestor_size, entry.vsize);
     }
 
     /// `max_ancestor_count` is NO LONGER A GATE (Core v31 cluster mempool).
