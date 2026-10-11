@@ -1670,6 +1670,8 @@ fn test_dos_w14z8m3zc_dynamic_min_fee_enforced_on_admission() {
 /// ever set the flag.
 #[test]
 fn test_dos_w14z8m3zc_on_block_connected_arms_rolling_fee_decay() {
+    let _clock = mock_clock_lock();
+    let _reset = ResetMockTime;
     let cfg = MempoolConfig {
         verify_scripts: false,
         min_fee_rate: 1,
@@ -1734,6 +1736,7 @@ fn test_dos_w14z8m3zc_on_block_connected_arms_rolling_fee_decay() {
 /// (the new live block-connect hook) sweeps it.
 #[test]
 fn test_dos_w14z8m3zc_on_block_connected_expires_stale_txs() {
+    let _clock = mock_clock_lock();
     let mut mp = test_mempool();
     let prev = hash_from_u8(9);
     let utxos: HashMap<OutPoint, CoinEntry> =
@@ -2037,6 +2040,21 @@ fn test_finding1_testmempoolaccept_forces_script_verification() {
          invalid-sig tx; got {:?}",
         forced
     );
+}
+
+/// Serialises the tests that set or depend on the process-wide mock clock
+/// (`set_mock_time`), as `invalidated_submit_tests.rs` does in rustoshi-rpc.
+fn mock_clock_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Puts the wall clock back even when a mock-time test panics.
+struct ResetMockTime;
+impl Drop for ResetMockTime {
+    fn drop(&mut self) {
+        rustoshi_consensus::mempool::set_mock_time(0);
+    }
 }
 
 /// Helper: current wall-clock time in seconds (i64).
