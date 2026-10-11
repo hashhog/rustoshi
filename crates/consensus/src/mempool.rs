@@ -10017,6 +10017,135 @@ mod tests {
         );
     }
 
+    /// Parent at 1 sat/vB, child at 200 sat/vB, independent at 50 sat/vB.
+    /// Core lists `[parent, child, independent]`: the parent+child chunk's
+    /// feerate beats the independent tx (txgraph.cpp:492-500), and inside
+    /// the chunk the parent comes first by `m_main_lin_index`
+    /// (txgraph.cpp:522-523).
+    #[test]
+    fn test_get_sorted_for_mining_cpfp_chunk_parent_before_child() {
+        const RUNS: usize = 64;
+        let utxo_p = Hash256::from_hex(
+            "e100000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxo_i = Hash256::from_hex(
+            "e200000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo_p, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo_i, vout: 0 }, 1_000_000),
+        ]);
+        let mut wrong = Vec::new();
+        for run in 0..RUNS {
+            let mut mempool = Mempool::new(MempoolConfig::default());
+            let (parent, _) = make_feerate_tx((utxo_p, 0), 1_000_000, 1, 0, 1);
+            let parent_value = parent.outputs[0].value;
+            let (child, _) =
+                make_feerate_tx((parent.txid(), 0), parent_value, 1, 0, 200);
+            let (indep, _) = make_feerate_tx((utxo_i, 0), 1_000_000, 1, 0, 50);
+            let parent_txid = parent.txid();
+            let child_txid = child.txid();
+            let indep_txid = indep.txid();
+            let mut steps = vec![parent, child];
+            steps.insert(run % 3, indep);
+            for tx in steps {
+                mempool
+                    .add_transaction(tx, &|op| utxos.get(op).cloned())
+                    .unwrap();
+            }
+            assert_eq!(
+                chunk_txids(&mempool, &parent_txid),
+                vec![vec![parent_txid, child_txid]],
+                "round {run}: parent+child must be one chunk"
+            );
+            let sorted = mempool.get_sorted_for_mining();
+            let want = vec![parent_txid, child_txid, indep_txid];
+            if sorted != want {
+                wrong.push((run, sorted));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {RUNS} mempools listed CPFP txs out of Core chunk order, first {:?}",
+            wrong.len(),
+            wrong[0]
+        );
+    }
+
+    /// Consecutive equal-feerate chunks in one cluster, plus a multi-tx
+    /// chunk, next to another cluster's chunk of the same feerate.
+    ///
+    /// Parent 1 sat/vB + child 19 sat/vB (same vsize) linearize as one
+    /// chunk at 10 sat/vB; a grandchild at 10 sat/vB is the next
+    /// equal-feerate chunk in that cluster; an independent 10 sat/vB tx
+    /// is its own cluster. `CompareMainTransactions` then orders by
+    /// equal-feerate prefix size (txgraph.cpp:502-508, 1093-1128): the
+    /// independent chunk's prefix is its size, the parent+child chunk's
+    /// prefix is that chunk's size (larger), the grandchild's prefix is
+    /// the sum of both cluster chunks (larger still). Within the
+    /// parent+child chunk, `m_main_lin_index` puts the parent first
+    /// (txgraph.cpp:522-523). Expected: `[indep, parent, child, grandchild]`.
+    #[test]
+    fn test_get_sorted_for_mining_equal_feerate_chunk_prefix_size() {
+        const RUNS: usize = 64;
+        let utxo_p = Hash256::from_hex(
+            "e300000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxo_i = Hash256::from_hex(
+            "e400000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo_p, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo_i, vout: 0 }, 1_000_000),
+        ]);
+        let mut wrong = Vec::new();
+        for run in 0..RUNS {
+            let mut mempool = Mempool::new(MempoolConfig::default());
+            let (parent, _) = make_feerate_tx((utxo_p, 0), 1_000_000, 1, 0, 1);
+            let parent_value = parent.outputs[0].value;
+            let (child, _) =
+                make_feerate_tx((parent.txid(), 0), parent_value, 1, 0, 19);
+            let child_value = child.outputs[0].value;
+            let (grandchild, _) =
+                make_feerate_tx((child.txid(), 0), child_value, 1, 0, 10);
+            let (indep, _) = make_feerate_tx((utxo_i, 0), 1_000_000, 1, 0, 10);
+            assert_eq!(parent.vsize(), child.vsize(), "P and C same vsize");
+            assert_eq!(parent.vsize(), grandchild.vsize(), "P and G same vsize");
+            assert_eq!(parent.vsize(), indep.vsize(), "P and I same vsize");
+            let parent_txid = parent.txid();
+            let child_txid = child.txid();
+            let grandchild_txid = grandchild.txid();
+            let indep_txid = indep.txid();
+            let mut steps = vec![parent, child, grandchild];
+            steps.insert(run % 4, indep);
+            for tx in steps {
+                mempool
+                    .add_transaction(tx, &|op| utxos.get(op).cloned())
+                    .unwrap();
+            }
+            assert_eq!(
+                chunk_txids(&mempool, &parent_txid),
+                vec![vec![parent_txid, child_txid], vec![grandchild_txid]],
+                "round {run}: equal-feerate [P,C] then G"
+            );
+            let sorted = mempool.get_sorted_for_mining();
+            let want = vec![indep_txid, parent_txid, child_txid, grandchild_txid];
+            if sorted != want {
+                wrong.push((run, sorted));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {RUNS} mempools listed equal-feerate chunks out of Core prefix-size order, first {:?}",
+            wrong.len(),
+            wrong[0]
+        );
+    }
+
     #[test]
     fn test_mining_score_orders_like_core_compare_main_transactions() {
         let score = |fee: i64, size: i64, max: u8| MiningScore {
