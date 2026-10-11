@@ -10279,6 +10279,85 @@ mod tests {
         );
     }
 
+    /// Same shape as the unequal-sibling chunk, but the children pay the
+    /// same feerate and have the same size. Core then takes the lower txid
+    /// (`fallback_order`, txmempool.cpp:183-187). The lower txid is measured
+    /// here; it is not a fixed child.
+    #[test]
+    fn test_get_sorted_for_mining_in_chunk_equal_feerate_lower_txid_first() {
+        const RUNS: usize = 64;
+        let utxo_p = Hash256::from_hex(
+            "e700000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxo_i = Hash256::from_hex(
+            "e800000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let utxos = mock_utxo_set(vec![
+            (OutPoint { txid: utxo_p, vout: 0 }, 1_000_000),
+            (OutPoint { txid: utxo_i, vout: 0 }, 1_000_000),
+        ]);
+        let mut wrong = Vec::new();
+        for run in 0..RUNS {
+            let mut mempool = Mempool::new(MempoolConfig::default());
+            let (parent, _) = make_feerate_tx((utxo_p, 0), 1_000_000, 2, 400_000, 1);
+            let parent_values = [parent.outputs[0].value, parent.outputs[1].value];
+            let parent_txid = parent.txid();
+            let (child_a, _) =
+                make_feerate_tx((parent_txid, 0), parent_values[0], 1, 0, 180);
+            let (child_b, _) =
+                make_feerate_tx((parent_txid, 1), parent_values[1], 1, 0, 180);
+            let (indep, _) = make_feerate_tx((utxo_i, 0), 1_000_000, 1, 0, 40);
+            let a_txid = child_a.txid();
+            let b_txid = child_b.txid();
+            let indep_txid = indep.txid();
+            assert_ne!(a_txid, b_txid, "the two children must be distinct txs");
+            let (low_txid, high_txid) = if a_txid < b_txid {
+                (a_txid, b_txid)
+            } else {
+                (b_txid, a_txid)
+            };
+            let mut steps = vec![parent];
+            if run % 2 == 0 {
+                steps.push(child_a);
+                steps.push(child_b);
+            } else {
+                steps.push(child_b);
+                steps.push(child_a);
+            }
+            steps.insert(run % 4, indep);
+            for tx in steps {
+                mempool
+                    .add_transaction(tx, &|op| utxos.get(op).cloned())
+                    .unwrap();
+            }
+            let a = mempool.get(&a_txid).unwrap();
+            let b = mempool.get(&b_txid).unwrap();
+            assert_eq!(
+                a.sigop_adjusted_weight, b.sigop_adjusted_weight,
+                "round {run}: equal size"
+            );
+            assert_eq!(
+                Mempool::get_modified_fee(a),
+                Mempool::get_modified_fee(b),
+                "round {run}: equal modified fee"
+            );
+            assert_chunk_members(&mempool, &parent_txid, &[parent_txid, a_txid, b_txid], run);
+            let sorted = mempool.get_sorted_for_mining();
+            let want = vec![parent_txid, low_txid, high_txid, indep_txid];
+            if sorted != want {
+                wrong.push((run, sorted, want));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {RUNS} mempools listed equal-feerate siblings out of txid order, first {:?}",
+            wrong.len(),
+            wrong[0]
+        );
+    }
+
     #[test]
     fn test_mining_score_orders_like_core_compare_main_transactions() {
         let score = |fee: i64, size: i64, max: u8| MiningScore {
