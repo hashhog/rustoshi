@@ -3602,8 +3602,10 @@ impl Mempool {
     /// 1093-1128: within a cluster, the cumulative sigops-adjusted weight
     /// of the run of consecutive equal-feerate chunks up to and including
     /// this chunk; for a lone chunk, its size), then the lower maximum
-    /// txid in the chunk. Within one chunk, the cluster linearization
-    /// index (`m_main_lin_index`, txgraph.cpp:522-523).
+    /// txid in the chunk. Within one chunk, position is Core's cluster
+    /// linearization index (`m_main_lin_index`, txgraph.cpp:522-523): the
+    /// ready tx with the highest tx feerate, then the smaller size, then
+    /// the lower txid (cluster_linearize.h:1457-1462, 1505-1524).
     pub fn get_sorted_for_mining(&self) -> Vec<Hash256> {
         let mut keys: HashMap<Hash256, (MiningScore, usize)> =
             HashMap::with_capacity(self.transactions.len());
@@ -3624,8 +3626,8 @@ impl Mempool {
                     feerate: prefix,
                     max_txid,
                 };
-                for txid in &chunk.txids {
-                    keys.insert(*txid, (score, lin_index));
+                for txid in self.chunk_lin_order(chunk) {
+                    keys.insert(txid, (score, lin_index));
                     lin_index += 1;
                 }
             }
@@ -3657,6 +3659,63 @@ impl Mempool {
             }
         }
         FeeFrac::new(fee, size)
+    }
+
+    /// In-chunk listing order. Core `GetLinearization` (cluster_linearize.h:1457-1462,
+    /// 1562-1599) repeatedly appends the ready tx — every in-chunk parent already
+    /// placed — with the highest tx feerate (`FeeRateCompare` of modified fee over
+    /// sigops-adjusted weight, txmempool.cpp:1017), then the smaller size, then the
+    /// lower txid (`fallback_order`, txmempool.cpp:183-187).
+    ///
+    /// Stored chunk txids come from `DepGraph::topological_sort`, which orders
+    /// siblings by `HashSet` iteration. This reorders only the listing; chunk
+    /// membership is left as `linearize` computed it.
+    fn chunk_lin_order(&self, chunk: &Chunk) -> Vec<Hash256> {
+        let mut remaining: HashSet<Hash256> = chunk.txids.iter().copied().collect();
+        let mut out = Vec::with_capacity(chunk.txids.len());
+        while !remaining.is_empty() {
+            let mut ready: Vec<Hash256> = remaining
+                .iter()
+                .copied()
+                .filter(|txid| {
+                    self.parents
+                        .get(txid)
+                        .map(|ps| ps.iter().all(|parent| !remaining.contains(parent)))
+                        .unwrap_or(true)
+                })
+                .collect();
+            // A chunk that is not ancestor-closed has no ready tx. Still pick one
+            // so the listing terminates.
+            if ready.is_empty() {
+                ready.extend(remaining.iter().copied());
+            }
+            ready.sort_by(|a, b| self.cmp_in_chunk_tx(a, b));
+            let pick = ready[0];
+            remaining.remove(&pick);
+            out.push(pick);
+        }
+        out
+    }
+
+    /// Earlier tx compares `Less`. Core's `tx_cmp_fn` (cluster_linearize.h:1505-1524)
+    /// is the heap form of this order: true when the first argument appears later.
+    fn cmp_in_chunk_tx(&self, a: &Hash256, b: &Hash256) -> std::cmp::Ordering {
+        let left = self.tx_mining_feefrac(a);
+        let right = self.tx_mining_feefrac(b);
+        fee_rate_cmp(right, left)
+            .then_with(|| left.size.cmp(&right.size))
+            .then_with(|| a.cmp(b))
+    }
+
+    /// Modified fee over sigops-adjusted weight (txmempool.cpp:1017).
+    fn tx_mining_feefrac(&self, txid: &Hash256) -> FeeFrac {
+        match self.transactions.get(txid) {
+            Some(entry) => FeeFrac::new(
+                Self::get_modified_fee(entry) as i64,
+                entry.sigop_adjusted_weight as i64,
+            ),
+            None => FeeFrac::default(),
+        }
     }
 
     /// Mining score of `entry`'s ancestor package (the entry plus every
