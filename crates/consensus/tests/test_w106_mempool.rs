@@ -1770,6 +1770,44 @@ fn test_dos_w14z8m3zc_on_block_connected_expires_stale_txs() {
     assert!(mp.contains(&fresh_id));
 }
 
+/// KB-162: the two w14z8m3zc tests share the process-wide mock clock
+/// (`set_mock_time`). While the decay test holds it at 1_700_000_000, a tx
+/// the TTL test admits is stamped with that 2023 time and the TTL sweep,
+/// which measures from the wall clock, expires it ("a fresh tx must survive
+/// the TTL sweep", left 1, right 0). Starting both side by side many times
+/// makes that overlap happen on most runs instead of about one in forty.
+#[test]
+fn test_w14z8m3zc_mock_time_tests_do_not_race() {
+    const ROUNDS: usize = 2_000;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let decay_barrier = barrier.clone();
+    let decay = std::thread::spawn(move || {
+        let mut failures = 0;
+        for _ in 0..ROUNDS {
+            decay_barrier.wait();
+            if std::panic::catch_unwind(test_dos_w14z8m3zc_on_block_connected_arms_rolling_fee_decay)
+                .is_err()
+            {
+                failures += 1;
+            }
+        }
+        failures
+    });
+    let mut ttl_failures = 0;
+    for _ in 0..ROUNDS {
+        barrier.wait();
+        if std::panic::catch_unwind(test_dos_w14z8m3zc_on_block_connected_expires_stale_txs).is_err() {
+            ttl_failures += 1;
+        }
+    }
+    let decay_failures = decay.join().expect("decay thread");
+    assert_eq!(
+        (ttl_failures, decay_failures),
+        (0, 0),
+        "TTL / decay failures out of {ROUNDS} side-by-side rounds"
+    );
+}
+
 /// Finding 4 (remove_for_reorg evicts now-non-final entries).
 ///
 /// Pre-fix: `remove_for_reorg` had no live caller, so after a reorg an entry
