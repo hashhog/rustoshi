@@ -2004,6 +2004,44 @@ fn diagram_strictly_better(chunks0: &[FeeFrac], chunks1: &[FeeFrac]) -> bool {
     better_somewhere[0] && !better_somewhere[1]
 }
 
+/// Mining order of a package, as Core v31.1 orders chunks of distinct
+/// clusters for the block builder and `entryAll()` (txgraph.cpp:492-526
+/// `CompareMainTransactions`, behind the `ChunkOrder` index at
+/// txgraph.cpp:529-541 that miner.cpp:279-333 `addChunks` drains through
+/// `GetBlockBuilderChunk`). Within one cluster cluster_linearize.h:1448-1463
+/// and 1529-1547 (`chunk_cmp_fn`) apply the same rule.
+///
+/// `Greater` means mined earlier:
+/// 1. higher feerate, compared exactly by cross multiplication
+///    (util/feefrac.h:157-161 `FeeRateCompare`), not as an f64;
+/// 2. then the smaller size (txgraph.cpp:502-508, the equal-feerate chunk
+///    prefix size, which for a lone chunk is its size);
+/// 3. then the lower maximum txid in the package (txgraph.cpp:509-520 with
+///    the fallback order `txid_a <=> txid_b` from txmempool.cpp:183-187,
+///    a raw-byte `memcmp`, uint256.h:64; the maximum per chunk is picked at
+///    txgraph.cpp:1110-1119).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MiningScore {
+    /// Package fee over package sigops-adjusted weight.
+    pub feerate: FeeFrac,
+    /// Highest txid (internal byte order) in the package.
+    pub max_txid: Hash256,
+}
+
+impl Ord for MiningScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fee_rate_cmp(self.feerate, other.feerate)
+            .then_with(|| other.feerate.size.cmp(&self.feerate.size))
+            .then_with(|| other.max_txid.cmp(&self.max_txid))
+    }
+}
+
+impl PartialOrd for MiningScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Core `FeeRateCompare`: feerate only. Equal feerate is equivalent even when
 /// the sizes differ.
 fn fee_rate_cmp(a: FeeFrac, b: FeeFrac) -> std::cmp::Ordering {
@@ -3554,43 +3592,49 @@ impl Mempool {
         }
     }
 
-    /// Get transactions sorted by descendant fee rate for block building.
-    ///
-    /// Returns txids in priority order (highest fee rate first).
-    /// FIX-72 (W120 BUG-9 + BUG-10): single-entry ranks now use modified fee
-    /// (base + prioritisetransaction delta) so an operator-prioritised tx
-    /// surfaces ahead of equally-feed peers.  Mining selection
-    /// (block_template.rs:330+) does the same on its own heap, so this is
-    /// the upstream sort that feeds it.  Note: ancestor_fees aggregation
-    /// still uses raw fees (W106 G8 is a separate follow-up); the modified
-    /// fee is used as a tiebreaker / lone-entry rank.
+    /// Txids in Core's mining order: what `entryAll()` lists for
+    /// getrawmempool (txmempool.cpp:572-597, `GetSortedScoreWithTopology`
+    /// sorting by `CompareMainOrder`) and what the block builder walks.
+    /// Each entry is ranked by [`Mempool::mining_score`] of its ancestor
+    /// package; exact ties fall to the lower txid so the order never depends
+    /// on HashMap iteration.
     pub fn get_sorted_for_mining(&self) -> Vec<Hash256> {
-        // Use ancestor fee rate for CPFP (child-pays-for-parent), folding in
-        // the prioritise delta for entries with no further ancestors.
-        let mut entries: Vec<_> = self
+        let mut entries: Vec<(MiningScore, Hash256)> = self
             .transactions
             .values()
-            .map(|e| {
-                let modified_fee = Self::get_modified_fee(e);
-                let ancestor_fee_rate = if e.ancestor_count > 1 {
-                    // Multi-ancestor: aggregate ancestor_fees, which now folds
-                    // in prioritisetransaction deltas (W106 G8 closed —
-                    // propagate_fee_delta keeps ancestor_fees/descendant_fees
-                    // in sync with each entry's fee_delta).
-                    e.ancestor_fees as f64 / e.ancestor_size as f64
-                } else if e.vsize > 0 {
-                    modified_fee as f64 / e.vsize as f64
-                } else {
-                    e.fee_rate
-                };
-                (ancestor_fee_rate, e.txid)
-            })
+            .map(|e| (self.mining_score(e), e.txid))
             .collect();
-
-        // Sort by ancestor fee rate (highest first)
-        entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
+        entries.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         entries.into_iter().map(|(_, txid)| txid).collect()
+    }
+
+    /// Mining score of `entry`'s ancestor package (the entry plus every
+    /// in-mempool ancestor). Fee is the modified fee for a lone entry and
+    /// `ancestor_fees` (which carries prioritise deltas) otherwise; size is
+    /// the summed sigops-adjusted weight Core gives TxGraph
+    /// (txmempool.cpp:1017).
+    pub fn mining_score(&self, entry: &MempoolEntry) -> MiningScore {
+        if entry.ancestor_count <= 1 {
+            return MiningScore {
+                feerate: FeeFrac::new(
+                    Self::get_modified_fee(entry) as i64,
+                    entry.sigop_adjusted_weight as i64,
+                ),
+                max_txid: entry.txid,
+            };
+        }
+        let mut size = entry.sigop_adjusted_weight;
+        let mut max_txid = entry.txid;
+        for id in self.get_ancestors_of(&entry.txid) {
+            if let Some(ancestor) = self.transactions.get(&id) {
+                size = size.saturating_add(ancestor.sigop_adjusted_weight);
+                max_txid = max_txid.max(id);
+            }
+        }
+        MiningScore {
+            feerate: FeeFrac::new(entry.ancestor_fees as i64, size as i64),
+            max_txid,
+        }
     }
 
     /// Check transaction standardness rules.
@@ -9914,6 +9958,85 @@ mod tests {
         assert_eq!(sorted.len(), 2);
         assert_eq!(sorted[0], txid_high); // Higher fee rate first
         assert_eq!(sorted[1], txid_low);
+    }
+
+    /// getrawmempool, its verbose form, and REST mempool contents list
+    /// `get_sorted_for_mining`; Core lists `entryAll()`, which sorts with the
+    /// same CompareMainOrder it mines with (txmempool.cpp
+    /// GetSortedScoreWithTopology). Four independent 10 sat/vB spends with
+    /// 1, 2, 4 and 6 outputs must come out smallest first on every mempool.
+    #[test]
+    fn test_get_sorted_for_mining_equal_feerate_smaller_first() {
+        const RUNS: usize = 64;
+        let shapes = [1usize, 2, 4, 6];
+        let prevouts: Vec<Hash256> = (0..shapes.len())
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 0xc0 + i as u8;
+                Hash256(bytes)
+            })
+            .collect();
+        let utxos = mock_utxo_set(
+            prevouts
+                .iter()
+                .map(|txid| (OutPoint { txid: *txid, vout: 0 }, 100_000))
+                .collect(),
+        );
+        let mut wrong = Vec::new();
+        for run in 0..RUNS {
+            let mut mempool = Mempool::new(MempoolConfig::default());
+            let mut outputs_of = HashMap::new();
+            for k in 0..shapes.len() {
+                let i = (k + run) % shapes.len();
+                let mut tx = make_tx(vec![(prevouts[i], 0)], vec![0; shapes[i]], 2);
+                let fee = 10 * tx.vsize() as u64;
+                let each = (100_000 - fee) / shapes[i] as u64;
+                for out in tx.outputs.iter_mut() {
+                    out.value = each;
+                }
+                tx.outputs[0].value += (100_000 - fee) - each * shapes[i] as u64;
+                outputs_of.insert(tx.txid(), shapes[i]);
+                mempool
+                    .add_transaction(tx, &|op| utxos.get(op).cloned())
+                    .unwrap();
+            }
+            let order: Vec<usize> = mempool
+                .get_sorted_for_mining()
+                .iter()
+                .map(|txid| outputs_of[txid])
+                .collect();
+            if order != shapes {
+                wrong.push((run, order));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {RUNS} mempools listed equal-feerate txs out of Core order, first {:?}",
+            wrong.len(),
+            wrong[0]
+        );
+    }
+
+    #[test]
+    fn test_mining_score_orders_like_core_compare_main_transactions() {
+        let score = |fee: i64, size: i64, max: u8| MiningScore {
+            feerate: FeeFrac::new(fee, size),
+            max_txid: Hash256([max; 32]),
+        };
+        assert!(score(2_000, 400, 9) > score(1_000, 400, 1), "higher feerate first");
+        assert!(score(1_000, 400, 9) > score(2_000, 800, 1), "equal feerate: smaller first");
+        assert!(score(1_000, 400, 1) > score(1_000, 400, 2), "then lower max txid first");
+        assert_eq!(score(1_000, 400, 1).cmp(&score(1_000, 400, 1)), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_mining_score_compares_feerates_exactly() {
+        let (a, b) = (2_008_252_119_357_514_i64, 563_664_i64);
+        let (c, d) = (2_008_255_682_210_773_i64, 563_665_i64);
+        assert_eq!(a as f64 / b as f64, c as f64 / d as f64);
+        let lower = MiningScore { feerate: FeeFrac::new(a, b), max_txid: Hash256([1; 32]) };
+        let higher = MiningScore { feerate: FeeFrac::new(c, d), max_txid: Hash256([2; 32]) };
+        assert!(higher > lower, "c/d is the higher feerate though both round to one f64");
     }
 
     #[test]
