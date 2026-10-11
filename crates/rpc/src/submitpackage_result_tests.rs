@@ -2078,3 +2078,26 @@ async fn wallet_insufficient_funds_matches_core_message() {
     assert_eq!(send.code(), -4, "{send:?}");
     assert_eq!(send.message(), "Insufficient funds", "{send:?}");
 }
+
+/// Core `entryToJSON` `height` is the chain tip when the tx entered the
+/// mempool. `submitpackage` must use the current tip, not the mempool's last
+/// tip snapshot (`sendrawtransaction` and `testmempoolaccept` refresh it).
+#[tokio::test]
+async fn submitpackage_entry_height_is_current_tip() {
+    let f = funded(1, 20_000).await;
+    // `funded` leaves the mempool tip snapshot at 200; the chain is at 205.
+    f.state.write().await.best_height = 205;
+    let res = result(
+        call(
+            &f.state,
+            "submitpackage",
+            serde_json::json!([[hex_tx(&f.parent), hex_tx(&f.child)]]),
+        )
+        .await,
+    );
+    assert_eq!(res["package_msg"], "success", "{res}");
+    let pool = result(call(&f.state, "getrawmempool", serde_json::json!([true])).await);
+    for tx in [&f.parent, &f.child] {
+        assert_eq!(pool[tx.txid().to_hex()]["height"], 205, "{pool}");
+    }
+}
