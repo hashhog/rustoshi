@@ -15217,6 +15217,8 @@ mod tests {
     /// zero it.
     #[test]
     fn test_get_min_fee_halflife_follows_dynamic_usage_and_mock_time() {
+        let _clock = mock_clock_lock();
+        let _reset = ResetMockTime;
         let config = MempoolConfig {
             max_size_bytes: 10_000_000,
             min_fee_rate: 0,
@@ -15271,6 +15273,90 @@ mod tests {
             "one full halflife must halve 160000 sat/kvB, got {decayed}"
         );
         super::set_mock_time(0);
+    }
+
+    /// One poison-tolerant mutex for every lib test that sets or reads the
+    /// process-wide mock clock. Same pattern as `mock_clock_lock` in
+    /// `test_w106_mempool.rs` (KB-162) and `invalidated_submit_tests.rs`.
+    fn mock_clock_mutex() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        &LOCK
+    }
+
+    /// Serialises the tests that set or depend on the process-wide mock clock
+    /// (`set_mock_time`), as `test_w106_mempool.rs` does for KB-162.
+    fn mock_clock_lock() -> std::sync::MutexGuard<'static, ()> {
+        mock_clock_mutex().lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `try_lock` of [`mock_clock_lock`]. Poison counts as acquired so a
+    /// panicked holder cannot hide the clock from the next reader.
+    fn try_mock_clock_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+        match mock_clock_mutex().try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Puts the wall clock back even when a mock-time test panics.
+    struct ResetMockTime;
+    impl Drop for ResetMockTime {
+        fn drop(&mut self) {
+            super::set_mock_time(0);
+        }
+    }
+
+    /// KB-164: lib tests share the process-wide mock clock (`set_mock_time`).
+    /// The holder keeps `1_700_000_000` set for the whole window between the
+    /// two barriers. A reader that is not excluded observes that mock and the
+    /// assertion fails. A reader the lock refuses records "excluded" and
+    /// passes. No sleeps: the barriers are the only sync.
+    #[test]
+    fn test_kb164_lib_mock_clock_race() {
+        const MOCK_2023: i64 = 1_700_000_000;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let holder_barrier = std::sync::Arc::clone(&barrier);
+        let holder = std::thread::spawn(move || {
+            // Guard first, reset second: Drop clears the mock, then releases.
+            let _guard = mock_clock_lock();
+            let _reset = ResetMockTime;
+            super::set_mock_time(MOCK_2023);
+            holder_barrier.wait();
+            holder_barrier.wait();
+        });
+
+        barrier.wait();
+        let observed = match try_mock_clock_lock() {
+            Some(_reader_guard) => {
+                let now = super::current_unix_seconds();
+                let wall = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock before unix epoch")
+                    .as_secs() as i64;
+                Some((now, wall))
+            }
+            None => None,
+        };
+        barrier.wait();
+        holder.join().expect("holder thread");
+
+        let recorded = match observed {
+            None => "excluded",
+            Some((now, wall)) => {
+                assert!(
+                    (now - wall).abs() <= 60,
+                    "assertion failed: KB-164 mock clock leaked into a lib reader that was not excluded; \
+                     current_unix_seconds()={now} wall={wall} while the holder kept \
+                     {MOCK_2023} set between the two barriers"
+                );
+                "acquired-wall"
+            }
+        };
+        assert_eq!(
+            recorded, "excluded",
+            "reader acquired the clock lock while the holder kept the mock set"
+        );
     }
 
     /// `optimal` is false while any cluster is not known to be optimally
@@ -15390,6 +15476,8 @@ mod tests {
     /// At t=0 it equals the bumped rate; after 12h it halves; after 24h it quarters.
     #[test]
     fn test_w86_get_min_fee_decays_after_block() {
+        let _clock = mock_clock_lock();
+        let _reset = ResetMockTime;
         let config = MempoolConfig::default();
         let mut mempool = Mempool::new(config);
 
@@ -15418,6 +15506,8 @@ mod tests {
     /// Mirrors txmempool.cpp:845-848.
     #[test]
     fn test_w86_get_min_fee_zeros_below_half_incremental() {
+        let _clock = mock_clock_lock();
+        let _reset = ResetMockTime;
         let config = MempoolConfig {
             incremental_relay_fee: 100, // default
             ..Default::default()
@@ -15449,6 +15539,8 @@ mod tests {
     /// The max(rolling, incremental) is only applied on the decay path (after a block).
     #[test]
     fn test_w86_get_min_fee_short_circuit_returns_raw_rolling() {
+        let _clock = mock_clock_lock();
+        let _reset = ResetMockTime;
         let config = MempoolConfig {
             incremental_relay_fee: 100,
             ..Default::default()
