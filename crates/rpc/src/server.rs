@@ -899,6 +899,21 @@ impl RpcState {
                     }
                 }
             }
+
+            // Core LoadChainTip: nSequenceId is not on disk. Active-chain
+            // blocks get SEQ_ID_BEST_CHAIN_FROM_DISK (0); every other index
+            // entry stays SEQ_ID_INIT_FROM_DISK (1). Equal-work ties after
+            // restart therefore keep the loaded tip.
+            let mut hash = self.best_hash;
+            let mut guard = self.best_height.saturating_add(2);
+            while hash != Hash256::ZERO && guard > 0 {
+                self.chain_manager_state.mark_best_chain_from_disk(hash);
+                guard -= 1;
+                match store.get_block_index(&hash) {
+                    Ok(Some(entry)) => hash = entry.prev_hash,
+                    _ => break,
+                }
+            }
         }
 
         // Core loads `m_best_header` from the index: the most-work header that
@@ -5543,6 +5558,23 @@ enum BestChainCandidateSet<'a> {
     BlockIndex,
 }
 
+/// Core `CBlockIndexWorkComparator()(tip, cand)`: true if `tip` is worse.
+/// Higher chain work wins; equal work prefers the earlier `nSequenceId`
+/// (first seen). Equal work and equal sequence keeps the current tip
+/// (Core's pointer-address fallback is only for disk-loaded ties).
+fn tip_worse_than_candidate(
+    tip_work: &[u8; 32],
+    tip_seq: i32,
+    cand_work: &[u8; 32],
+    cand_seq: i32,
+) -> bool {
+    match compare_chain_work(tip_work, cand_work) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => tip_seq > cand_seq,
+    }
+}
+
 /// Core `ActivateBestChain` (validation.cpp `FindMostWorkChain` +
 /// `ActivateBestChainStep`). The most-work candidate whose whole branch down
 /// to the active chain has its body and no failure flag becomes the tip
@@ -5585,23 +5617,43 @@ fn activate_best_chain(
             .get_block_index(&state.best_hash)
             .map_err(|e| format!("get_block_index(tip): {}", e))?
             .ok_or_else(|| format!("tip {} missing from block index", state.best_hash))?;
-        // Most-work block with data that beats the tip. Equal work does not
-        // replace the active chain (Core's sequence-id tie-break is not used).
+        let tip_hash = state.best_hash;
+        let tip_seq = state
+            .chain_manager_state
+            .sequence_id_or_disk_default(&tip_hash);
+        let seq_of = |h: &Hash256| state.chain_manager_state.sequence_id_or_disk_default(h);
+        // Most-work block with data that beats the tip. Equal work replaces
+        // the active chain only when the candidate has a lower nSequenceId
+        // (Core CBlockIndexWorkComparator: first seen wins).
         let mut cands: Vec<(Hash256, rustoshi_storage::block_store::BlockIndexEntry)> = match &set
         {
             BestChainCandidateSet::Cleared(cleared) => cleared
                 .iter()
-                .filter(|h| !tried.contains(*h))
+                .filter(|h| !tried.contains(*h) && **h != tip_hash)
                 .filter_map(|h| store.get_block_index(h).ok().flatten().map(|e| (*h, e)))
-                .filter(|(_, e)| e.status.has(BlockStatus::HAVE_DATA) && !failed(e.status))
-                .filter(|(_, e)| compare_chain_work(&e.chain_work, &tip_entry.chain_work).is_gt())
+                .filter(|(h, e)| {
+                    e.status.has(BlockStatus::HAVE_DATA)
+                        && !failed(e.status)
+                        && tip_worse_than_candidate(
+                            &tip_entry.chain_work,
+                            tip_seq,
+                            &e.chain_work,
+                            seq_of(h),
+                        )
+                })
                 .collect(),
             BestChainCandidateSet::BlockIndex => {
                 let indexed = store
                     .iter_block_index()
                     .map_err(|e| format!("iter_block_index: {e}"))?;
+                // InvalidateBlock's InvalidChainFound re-adds >=-work
+                // headers, but this path only *connects* strictly more
+                // work (the original KB-180 ActivateBestChain). Equal-work
+                // first-seen is applied on reconsider, where Core's
+                // ResetBlockFailureFlags re-inserts the cleared blocks
+                // and ActivateBestChain may displace the current tip.
                 indexed
-                    .filter(|(h, _)| !tried.contains(h))
+                    .filter(|(h, _)| !tried.contains(h) && *h != tip_hash)
                     .filter(|(_, e)| e.status.has(BlockStatus::HAVE_DATA) && !failed(e.status))
                     .filter(|(_, e)| {
                         compare_chain_work(&e.chain_work, &tip_entry.chain_work).is_gt()
@@ -5609,7 +5661,12 @@ fn activate_best_chain(
                     .collect()
             }
         };
-        cands.sort_by(|a, b| compare_chain_work(&b.1.chain_work, &a.1.chain_work));
+        cands.sort_by(|a, b| {
+            match compare_chain_work(&b.1.chain_work, &a.1.chain_work) {
+                std::cmp::Ordering::Equal => seq_of(&a.0).cmp(&seq_of(&b.0)),
+                other => other,
+            }
+        });
         let mut chosen: Option<(Hash256, Block)> = None;
         for (h, e) in cands {
             tried.insert(h);
@@ -5911,13 +5968,22 @@ pub fn try_attach_and_reorg_detailed(
         if let Err(e) = store.put_block_index(block_hash, &entry) {
             return Err(AttachReorgError::from(format!("put_block_index: {}", e)));
         }
+        state
+            .chain_manager_state
+            .assign_received_sequence(*block_hash);
     }
 
-    // If the active tip still has at least as much work, do nothing more -
-    // the block is kept on disk in case the side-branch later overtakes us.
-    if !rustoshi_consensus::chain_manager::compare_chain_work(&this_work.0, &tip_work_bytes)
-        .is_gt()
-    {
+    // Reorg onto this branch only when it beats the tip the way Core's
+    // CBlockIndexWorkComparator does: more work, or equal work with an
+    // earlier nSequenceId (first seen). A newly received equal-work sibling
+    // has a later sequence id and stays stored, inactive.
+    let cand_seq = state
+        .chain_manager_state
+        .sequence_id_or_disk_default(block_hash);
+    let tip_seq = state
+        .chain_manager_state
+        .sequence_id_or_disk_default(&state.best_hash);
+    if !tip_worse_than_candidate(&tip_work_bytes, tip_seq, &this_work.0, cand_seq) {
         return Ok(false);
     }
 
@@ -10832,6 +10898,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // Update RPC state
                 state.best_height = new_height;
                 state.best_hash = block_hash;
+                // Core ReceivedBlockTransactions: nSequenceId = nBlockSequenceId++
+                // once the body is on disk. First-seen order is the equal-work
+                // tie-break in ActivateBestChain.
+                state
+                    .chain_manager_state
+                    .assign_received_sequence(block_hash);
                 // Advance the most-work header tip alongside the block tip so
                 // getblockchaininfo.headers / verificationprogress / getsyncstate
                 // (all read state.header_height) stay correct over the process
@@ -13517,9 +13589,10 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Core InvalidateBlock -> InvalidChainFound re-adds every non-failed
         // block with data and at least as much work as the new tip, then the
-        // RPC calls ActivateBestChain. Candidates with strictly more work are
-        // connected through the same attach-and-reorg path submitblock, P2P,
-        // and reconsiderblock use. A candidate that fails ConnectTip is marked
+        // RPC calls ActivateBestChain. Candidates that beat the tip (more
+        // work, or equal work with an earlier nSequenceId) are connected
+        // through the same attach-and-reorg path submitblock, P2P, and
+        // reconsiderblock use. A candidate that fails ConnectTip is marked
         // invalid and skipped; that is not an RPC error.
         let newly_invalid = activate_best_chain(
             &mut state,
@@ -22776,6 +22849,7 @@ mod tests {
         let state = ChainManagerState::new();
         assert_eq!(state.last_precious_chainwork, [0u8; 32]);
         assert_eq!(state.block_reverse_sequence_id, -1);
+        assert_eq!(state.block_sequence_id, 2);
         assert!(state.sequence_ids.is_empty());
     }
 
