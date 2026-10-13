@@ -10281,6 +10281,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         };
 
         let result = BlockTemplateResult {
+            // Core mining.cpp template mode, before `version`. Shape only:
+            // this does not implement proposal mode.
+            capabilities: vec!["proposal".to_string()],
             version: template.header.version,
             rules: gbt_rules,
             vbavailable: gbt_vbavailable,
