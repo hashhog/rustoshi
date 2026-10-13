@@ -31,7 +31,7 @@ const SUBSIDY: u64 = 50 * 100_000_000;
 struct LiveChain {
     server: RpcServerImpl,
     db: Arc<ChainDb>,
-    /// Active chain, index 0 = genesis, index h = height h. Built as G-1-2-3a-4a-5a.
+    /// Active chain, index 0 = genesis, index h = height h.
     blocks: Vec<Block>,
     path: std::path::PathBuf,
     dir: tempfile::TempDir,
@@ -125,8 +125,8 @@ fn is_failed(status: BlockStatus) -> bool {
     status.has(BlockStatus::FAILED_VALIDITY) || status.has(BlockStatus::FAILED_CHILD)
 }
 
-/// Regtest chain G-1-2-3a-4a-5a accepted through `submitblock`.
-async fn active_chain() -> LiveChain {
+/// Regtest chain G-1-…-Na accepted through `submitblock`.
+async fn active_chain_to(height: u32) -> LiveChain {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
     let db = Arc::new(ChainDb::open(&path).expect("open ChainDb"));
@@ -142,7 +142,7 @@ async fn active_chain() -> LiveChain {
     );
     let mut blocks = vec![params.genesis_block.clone()];
     let mut prev = params.genesis_hash;
-    for h in 1..=5 {
+    for h in 1..=height {
         // Marker 0x01 matches the chain helper the other submit tests use.
         let block = mine_marked(h, prev, h, SUBSIDY, 0x01);
         let result = server
@@ -153,7 +153,7 @@ async fn active_chain() -> LiveChain {
         prev = block.block_hash();
         blocks.push(block);
     }
-    assert_eq!(server.get_block_count().await.unwrap(), 5);
+    assert_eq!(server.get_block_count().await.unwrap(), height);
     LiveChain {
         server,
         db,
@@ -163,31 +163,49 @@ async fn active_chain() -> LiveChain {
     }
 }
 
-/// Submit 3'-4'-tip on top of block 2. Equal height to 5a, so the branch stays
-/// inactive. `tip_value` is the subsidy for a valid 5', or above it for 5''.
-async fn submit_side(chain: &LiveChain, tip_value: u64) -> Vec<Block> {
+/// Regtest chain G-1-2-3a-4a-5a accepted through `submitblock`.
+async fn active_chain() -> LiveChain {
+    active_chain_to(5).await
+}
+
+/// Submit `count` side blocks 3'… on top of block 2. Equal height to the
+/// active tip, so the branch stays inactive. The last block uses `tip_value`
+/// (subsidy, or above it for a bad coinbase).
+async fn submit_side_n(chain: &LiveChain, count: u32, tip_value: u64) -> Vec<Block> {
+    assert!(count >= 1);
+    let tip_height = chain.blocks.len() as u32 - 1;
     let parent = chain.blocks[2].block_hash();
-    let b3 = mine_marked(3, parent, 30, SUBSIDY, 0x99);
-    let b4 = mine_marked(4, b3.block_hash(), 31, SUBSIDY, 0x99);
-    let b5 = mine_marked(5, b4.block_hash(), 32, tip_value, 0x99);
-    for (block, name) in [(&b3, "3'"), (&b4, "4'"), (&b5, "5'")] {
+    let mut out = Vec::new();
+    let mut prev = parent;
+    for i in 0..count {
+        let height = 3 + i;
+        let value = if i + 1 == count { tip_value } else { SUBSIDY };
+        let block = mine_marked(height, prev, 30 + i, value, 0x99);
         let result = chain
             .server
-            .submit_block(hex_of(block))
+            .submit_block(hex_of(&block))
             .await
             .expect("submitblock rpc");
         assert_eq!(
             result.as_deref(),
             Some("inconclusive"),
-            "equal-work side block {name} must be stored and not connected, got {result:?}"
+            "equal-work side block at height {height} must be stored and not connected, got {result:?}"
         );
+        prev = block.block_hash();
+        out.push(block);
     }
     assert_eq!(
         chain.server.get_best_block_hash().await.unwrap(),
-        chain.blocks[5].block_hash().to_hex(),
+        chain.blocks[tip_height as usize].block_hash().to_hex(),
         "side branch must stay inactive before invalidateblock"
     );
-    vec![b3, b4, b5]
+    out
+}
+
+/// Submit 3'-4'-tip on top of block 2. Equal height to 5a, so the branch stays
+/// inactive. `tip_value` is the subsidy for a valid 5', or above it for 5''.
+async fn submit_side(chain: &LiveChain, tip_value: u64) -> Vec<Block> {
+    submit_side_n(chain, 3, tip_value).await
 }
 
 /// Same open the node uses at startup: `ChainDb::open` then `RpcState::init_from_db`.
@@ -204,14 +222,28 @@ fn reopen_like_node(path: &Path) -> (RpcServerImpl, Arc<ChainDb>) {
     (server, db)
 }
 
-async fn assert_tip(server: &RpcServerImpl, expected: &Block, what: &str) {
+async fn assert_tip_at(server: &RpcServerImpl, expected: &Block, height: u32, what: &str) {
     let tip = server.get_best_block_hash().await.expect("getbestblockhash");
     assert_eq!(tip, expected.block_hash().to_hex(), "{what}");
     assert_eq!(
         server.get_block_count().await.expect("getblockcount"),
-        5,
+        height,
         "{what}: height"
     );
+}
+
+async fn assert_tip(server: &RpcServerImpl, expected: &Block, what: &str) {
+    assert_tip_at(server, expected, 5, what).await;
+}
+
+fn tip_status(tips: &serde_json::Value, hash: &Hash256) -> String {
+    let hex = hash.to_hex();
+    tips.as_array()
+        .expect("getchaintips array")
+        .iter()
+        .find(|t| t["hash"].as_str() == Some(hex.as_str()))
+        .and_then(|t| t["status"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("getchaintips missing {hex}: {tips}"))
 }
 
 async fn assert_height_index(server: &RpcServerImpl, heights: &[(u32, &Block)]) {
@@ -418,5 +450,77 @@ async fn test_kb180_invalidate_switch_survives_restart() {
     assert!(
         coin.is_some(),
         "3' coinbase must still be in the UTXO set after restart"
+    );
+}
+
+/// Scenario C: active G-1-2-3a-4a, valid equal-work side 3'-4' on 2.
+/// `invalidateblock 4a` activates 4' (more work than 3a). `reconsiderblock 4a`
+/// must return the tip to 4a: equal work, 4a was received first (Core
+/// `nSequenceId`). 4' becomes `valid-fork`. Pre-fix the tip stays on 4'.
+#[tokio::test]
+async fn test_kb180_reconsiderblock_equal_work_first_seen_wins() {
+    let chain = active_chain_to(4).await;
+    let side = submit_side_n(&chain, 2, SUBSIDY).await;
+    let block_4a = &chain.blocks[4];
+    let block_4s = &side[1];
+
+    chain
+        .server
+        .invalidate_block(block_4a.block_hash().to_hex())
+        .await
+        .expect("invalidateblock");
+    assert_tip_at(
+        &chain.server,
+        block_4s,
+        4,
+        "invalidateblock 4a must activate equal-height side tip 4'",
+    )
+    .await;
+
+    chain
+        .server
+        .reconsider_block(block_4a.block_hash().to_hex())
+        .await
+        .expect("reconsiderblock");
+
+    assert_tip_at(
+        &chain.server,
+        block_4a,
+        4,
+        "reconsiderblock 4a must return the tip to 4a (first seen wins); the pre-fix tip is 4'",
+    )
+    .await;
+    assert_height_index(
+        &chain.server,
+        &[
+            (2, &chain.blocks[2]),
+            (3, &chain.blocks[3]),
+            (4, block_4a),
+        ],
+    )
+    .await;
+    assert_coin(&chain.server, &chain.blocks[3], true, block_4a).await;
+    assert_coin(&chain.server, block_4a, true, block_4a).await;
+    assert_coin(&chain.server, &side[0], false, block_4a).await;
+    assert_coin(&chain.server, block_4s, false, block_4a).await;
+
+    let tips = chain
+        .server
+        .get_chain_tips()
+        .await
+        .expect("getchaintips");
+    assert_eq!(
+        tip_status(&tips, &block_4a.block_hash()),
+        "active",
+        "4a must be the active tip after reconsiderblock"
+    );
+    assert_eq!(
+        tip_status(&tips, &block_4s.block_hash()),
+        "valid-fork",
+        "4' must become valid-fork after reconsiderblock returns to 4a"
+    );
+    assert!(
+        !is_failed(index_status(&chain.db, &block_4a.block_hash())),
+        "4a must not be failed after reconsiderblock"
     );
 }
