@@ -819,6 +819,10 @@ pub struct MiningInfoNext {
 /// Response for `getblocktemplate` RPC.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BlockTemplateResult {
+    /// BIP-22 capabilities. Core template mode always emits `["proposal"]`
+    /// before `version` (`src/rpc/mining.cpp`). Not `skip_serializing_if`:
+    /// the key is unconditional. Proposal-mode dispatch is separate.
+    pub capabilities: Vec<String>,
     /// Block version.
     pub version: i32,
     /// Supported version bits rules.
@@ -1999,6 +2003,7 @@ mod tests {
     #[test]
     fn test_getblocktemplate_response_bip22() {
         let template = BlockTemplateResult {
+            capabilities: vec!["proposal".to_string()],
             version: 0x20000000,
             rules: vec!["csv".to_string(), "segwit".to_string()],
             vbavailable: serde_json::json!({}),
@@ -2027,7 +2032,9 @@ mod tests {
 
         let json = serde_json::to_string(&template).unwrap();
 
-        // BIP22/23 required fields
+        // BIP22/23 required fields. `capabilities` is first (Core pushKV order).
+        assert!(json.contains("\"capabilities\":[\"proposal\"]"));
+        assert!(json.starts_with("{\"capabilities\":"));
         assert!(json.contains("\"version\":"));
         assert!(json.contains("\"rules\":"));
         assert!(json.contains("\"previousblockhash\":"));
