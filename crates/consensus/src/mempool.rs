@@ -15273,6 +15273,77 @@ mod tests {
         super::set_mock_time(0);
     }
 
+    /// Master does not serialize `set_mock_time`. Each caller receives a guard
+    /// from its own mutex, so one holder excludes nobody.
+    fn mock_clock_lock() -> std::sync::MutexGuard<'static, ()> {
+        Box::leak(Box::new(std::sync::Mutex::new(())))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Same unlocked model as [`mock_clock_lock`]: a guard is always handed out.
+    fn try_mock_clock_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+        Some(mock_clock_lock())
+    }
+
+    /// KB-164: lib tests share the process-wide mock clock (`set_mock_time`)
+    /// with no lock. The holder keeps `1_700_000_000` set for the whole window
+    /// between the two barriers. A reader that is not excluded observes that
+    /// mock and the assertion fails. A reader the lock refuses records
+    /// "excluded" and passes. No sleeps: the barriers are the only sync.
+    #[test]
+    fn test_kb164_lib_mock_clock_race() {
+        const MOCK_2023: i64 = 1_700_000_000;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let holder_barrier = std::sync::Arc::clone(&barrier);
+        let holder = std::thread::spawn(move || {
+            struct ResetOnDrop;
+            impl Drop for ResetOnDrop {
+                fn drop(&mut self) {
+                    super::set_mock_time(0);
+                }
+            }
+            // Guard first, reset second: Drop runs the reset, then releases.
+            let _guard = mock_clock_lock();
+            let _reset = ResetOnDrop;
+            super::set_mock_time(MOCK_2023);
+            holder_barrier.wait();
+            holder_barrier.wait();
+        });
+
+        barrier.wait();
+        let observed = match try_mock_clock_lock() {
+            Some(_reader_guard) => {
+                let now = super::current_unix_seconds();
+                let wall = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock before unix epoch")
+                    .as_secs() as i64;
+                Some((now, wall))
+            }
+            None => None,
+        };
+        barrier.wait();
+        holder.join().expect("holder thread");
+
+        let recorded = match observed {
+            None => "excluded",
+            Some((now, wall)) => {
+                assert!(
+                    (now - wall).abs() <= 60,
+                    "assertion failed: KB-164 mock clock leaked into a lib reader that was not excluded; \
+                     current_unix_seconds()={now} wall={wall} while the holder kept \
+                     {MOCK_2023} set between the two barriers"
+                );
+                "acquired-wall"
+            }
+        };
+        assert_eq!(
+            recorded, "excluded",
+            "reader acquired the clock lock while the holder kept the mock set"
+        );
+    }
+
     /// `optimal` is false while any cluster is not known to be optimally
     /// linearized, and true for an empty pool and after an ordinary admit
     /// (singletons are inserted optimal, matching Core).
