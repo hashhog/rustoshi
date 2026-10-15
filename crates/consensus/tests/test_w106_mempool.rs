@@ -695,17 +695,10 @@ fn test_g15_pays_for_bandwidth() {
 // ============================================================
 
 /// G16 — MAX_REPLACEMENT_CANDIDATES constant = 100.
-/// BUG (P2): Core 27+ changed the semantics of Rule #5 from
-/// "total eviction count <= 100" to "unique cluster count <= 100"
-/// (rbf.h:24: "GetEntriesForConflicts"). Rustoshi implements the
-/// OLD count-based semantics (eviction count, pre-cluster-mempool).
-/// For small replacements this produces the same result, but for
-/// adversarial clusters it can accept replacements that Core would
-/// reject (cluster count < eviction count) or vice versa.
-/// In practice since rustoshi's cluster size is capped at 64, the
-/// divergence window is theoretical but the semantics differ.
-/// Severity: P2
-/// Status: BUG (P2) — documented, constant correct
+/// Core 27+ applies it to the number of distinct clusters the replacement
+/// conflicts with (`GetEntriesForConflicts`). rustoshi counted evictions
+/// until KB-137; G16b and G16c pin the cluster count.
+/// Status: OK
 #[test]
 fn test_g16_max_replacement_candidates_constant() {
     assert_eq!(MAX_REPLACEMENT_CANDIDATES, 100,
