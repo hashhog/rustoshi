@@ -712,36 +712,110 @@ fn test_g16_max_replacement_candidates_constant() {
         "MAX_REPLACEMENT_CANDIDATES must be 100 (Core policy/rbf.h:26)");
 }
 
-/// G16b — Reject replacement when eviction set > 100.
-/// (Tests the count-based path that IS implemented.)
-/// Status: OK for count-based enforcement
+/// G16b — Rule 5 rejects a replacement that conflicts directly with more
+/// than MAX_REPLACEMENT_CANDIDATES distinct clusters (Core
+/// `GetEntriesForConflicts`, policy/rbf.cpp). 101 independent mempool txs are
+/// 101 singleton clusters; one replacement spending all 101 coins conflicts
+/// with all of them.
+/// Status: OK (regression guard)
 #[test]
 fn test_g16b_too_many_replacements_rejected() {
-    let mut mp = Mempool::new(MempoolConfig {
-        verify_scripts: false,
-
-        full_rbf: true,
-        max_ancestor_count: usize::MAX,
-        max_descendant_count: usize::MAX,
-        max_ancestor_size: usize::MAX,
-        max_descendant_size: usize::MAX,
-        ..Default::default()
-    });
-
-    // Create 101 transactions all spending the same confirmed output (via different vouts)
-    // We use a multi-output parent for this
-    let parent_txid = hash_from_u8(99);
+    let mut mp = Mempool::new(rbf_test_config());
+    let funding = hash_from_u8(99);
     let mut utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
-    for i in 0..=100u32 {
-        utxos.insert(OutPoint { txid: parent_txid, vout: i }, coin(100_000));
+    for vout in 0..=100u32 {
+        utxos.insert(OutPoint { txid: funding, vout }, coin(100_000));
+        let tx = spend_outpoints(&[(funding, vout)], 1_000, 1, 100_000);
+        mp.add_transaction(tx, &|op| utxos.get(op).cloned()).unwrap();
     }
+    assert_eq!(mp.size(), 101);
 
-    // Add 101 mempool txs each spending a different vout but all spending the same
-    // "replacement" vout 200 — actually we'll create 101 independent txs
-    // then a replacement that double-spends all of them is not straightforward.
-    // Use the simpler approach: add 101 independent transactions, then check
-    // that the replacement candidate counting works. This is a structural test.
-    assert_eq!(MAX_REPLACEMENT_CANDIDATES, 100);
+    let all: Vec<(Hash256, u32)> = (0..=100u32).map(|vout| (funding, vout)).collect();
+    let replacement = spend_outpoints(&all, 1_000_000, 1, 101 * 100_000);
+    let result = mp.add_transaction(replacement, &|op| utxos.get(op).cloned());
+    assert!(
+        matches!(result, Err(MempoolError::RbfTooManyReplacements(101, 100))),
+        "101 conflicting clusters must exceed Rule 5: {:?}",
+        result
+    );
+    assert_eq!(mp.size(), 101);
+}
+
+/// G16c — Rule 5 counts conflicting CLUSTERS, not evicted transactions
+/// (KB-137). Five roots, each with 20 children, are five clusters of 21
+/// transactions. A replacement that spends the five roots' coins evicts 105
+/// transactions from 5 clusters. Core v31.1 accepts it (5 <= 100); counting
+/// evictions rejects it (105 > 100). Core regtest row:
+/// `rbf/clusters/submit:$` in tools/core-regtest.
+/// Status: was BUG (P2), fixed
+#[test]
+fn test_g16c_rule5_counts_conflicting_clusters_not_evictions() {
+    let mut mp = Mempool::new(rbf_test_config());
+    let mut utxos: HashMap<OutPoint, CoinEntry> = HashMap::new();
+    let mut coins = Vec::new();
+    for cluster in 0..5u8 {
+        let funding = hash_from_u8(200 + cluster);
+        utxos.insert(OutPoint { txid: funding, vout: 0 }, coin(10_000_000));
+        coins.push((funding, 0u32));
+        let root = spend_outpoints(&[(funding, 0)], 1_000, 20, 10_000_000);
+        let root_id = root.txid();
+        let each = root.outputs[0].value;
+        mp.add_transaction(root, &|op| utxos.get(op).cloned()).unwrap();
+        for vout in 0..20u32 {
+            let child = spend_outpoints(&[(root_id, vout)], 1_000, 1, each);
+            mp.add_transaction(child, &|op| utxos.get(op).cloned()).unwrap();
+        }
+    }
+    assert_eq!(mp.size(), 105);
+
+    let replacement = spend_outpoints(&coins, 200_000, 1, 5 * 10_000_000);
+    let replacement_id = replacement.txid();
+    let result = mp.add_transaction(replacement, &|op| utxos.get(op).cloned());
+    assert!(
+        result.is_ok(),
+        "5 conflicting clusters (105 evictions) is within Rule 5: {:?}",
+        result
+    );
+    assert_eq!(mp.size(), 1);
+    assert!(mp.contains(&replacement_id));
+}
+
+/// MempoolConfig for the RBF gates: full RBF, Core's default 100 sat/kvB
+/// incremental relay feerate, scripts not run (the inputs are fake coins).
+fn rbf_test_config() -> MempoolConfig {
+    MempoolConfig {
+        verify_scripts: false,
+        full_rbf: true,
+        incremental_relay_fee: 100,
+        ..Default::default()
+    }
+}
+
+/// Spend `inputs` (worth `value_in` in total) into `outputs` equal P2PKH
+/// outputs, paying `fee`. Output 0 takes the remainder.
+fn spend_outpoints(inputs: &[(Hash256, u32)], fee: u64, outputs: u32, value_in: u64) -> Transaction {
+    let spendable = value_in - fee;
+    let each = spendable / outputs as u64;
+    let remainder = spendable - each * outputs as u64;
+    Transaction {
+        version: 2,
+        inputs: inputs
+            .iter()
+            .map(|(txid, vout)| TxIn {
+                previous_output: OutPoint { txid: *txid, vout: *vout },
+                script_sig: vec![],
+                sequence: 0xFFFFFFFD,
+                witness: vec![],
+            })
+            .collect(),
+        outputs: (0..outputs)
+            .map(|i| TxOut {
+                value: each + if i == 0 { remainder } else { 0 },
+                script_pubkey: p2pkh_spk(),
+            })
+            .collect(),
+        lock_time: 0,
+    }
 }
 
 // ============================================================
@@ -912,25 +986,111 @@ fn test_g19_descendants_collected_for_conflict_eviction() {
 // G20: Cluster-mempool replacement (ImprovesFeerateDiagram)
 // ============================================================
 
-/// G20 — ImprovesFeerateDiagram check (cluster-mempool RBF, Core 27+).
-/// BUG: rustoshi does not implement ImprovesFeerateDiagram / CalculateChunksForRBF.
-/// Instead it uses the old fee-based Rules #3/#4. This means:
-/// 1. A replacement that improves feerate diagram is incorrectly *rejected* if
-///    it doesn't also meet the absolute-fee threshold.
-/// 2. A replacement that meets absolute-fee threshold but *worsens* feerate
-///    diagram (degrading CPFP chains) is incorrectly *accepted*.
-/// Severity: P2 — diverges from Core 27+ replacement logic; can accept txs that
-/// Core would reject (case 2), breaking relay consistency.
-/// Status: BUG (P2)
-/// Note: The comment at mempool.rs:2718 acknowledges this with "Deferred".
+/// G20 — ImprovesFeerateDiagram (Core policy/rbf.cpp, called from
+/// MemPoolAccept::ReplacementChecks). A 1-in-1-out tx paying 5_000 sats is
+/// replaced by a 1-in-40-out spend of the same coin paying 5_200: PaysForRBF
+/// passes (Rules 3 and 4), but the replacement's feerate is far lower, so the
+/// new feerate diagram is below the old one at the original's size. Core
+/// rejects `replacement-failed`, `insufficient feerate: does not improve
+/// feerate diagram`. Core regtest row: `rbf/diagram/submit:$`.
+/// Status: was BUG (P2), fixed (KB-137)
 #[test]
-#[ignore = "BUG G20 P2: ImprovesFeerateDiagram not implemented (Core 27+ cluster-mempool RBF) \
-            — rustoshi uses old fee-sum rules only; feerate diagram check deferred \
-            (mempool.rs:2718 comment acknowledges this)"]
 fn test_g20_improves_feerate_diagram() {
-    // Placeholder: would construct a scenario where replacement meets old fee rules
-    // but worsens the feerate diagram; rustoshi would accept it; Core would reject.
-    assert!(false, "not implemented: feerate diagram check required");
+    let mut mp = Mempool::new(rbf_test_config());
+    let funding = hash_from_u8(150);
+    let utxos: HashMap<OutPoint, CoinEntry> =
+        [(OutPoint { txid: funding, vout: 0 }, coin(10_000_000))].into_iter().collect();
+    let original = spend_outpoints(&[(funding, 0)], 5_000, 1, 10_000_000);
+    let original_id = original.txid();
+    let original_vsize = original.vsize() as u64;
+    mp.add_transaction(original, &|op| utxos.get(op).cloned()).unwrap();
+
+    let wide = spend_outpoints(&[(funding, 0)], 5_200, 40, 10_000_000);
+    let wide_vsize = wide.vsize() as u64;
+    // Rules 3 and 4 pass; only the diagram can refuse it.
+    assert!(5_200 - 5_000 >= (100 * wide_vsize + 999) / 1000);
+    assert!(5_200 * original_vsize < 5_000 * wide_vsize);
+
+    let result = mp.add_transaction(wide, &|op| utxos.get(op).cloned());
+    let err = result.expect_err("a replacement that lowers the feerate diagram must be rejected");
+    assert_eq!(err.reject_token(), "replacement-failed", "{err:?}");
+    assert_eq!(
+        err.reject_debug(),
+        "replacement-failed, insufficient feerate: does not improve feerate diagram"
+    );
+    assert!(mp.contains(&original_id));
+    assert_eq!(mp.size(), 1);
+}
+
+/// G20b — the replacement joins its in-mempool parent's cluster, so the new
+/// diagram is that of parent + replacement, not of the replacement alone.
+/// Conflict C pays 1_000 at ~2.5 sat/vB. The replacement R spends C's coin and
+/// an output of a large low-feerate parent P, paying ~8 sat/vB alone, but
+/// P + R is one chunk at ~1.5 sat/vB, below C's chunk at C's size. Core
+/// rejects. Treating R as a singleton would accept it.
+#[test]
+fn test_g20b_diagram_includes_replacement_parent_cluster() {
+    let mut mp = Mempool::new(rbf_test_config());
+    let c_coin = hash_from_u8(151);
+    let p_coin = hash_from_u8(152);
+    let utxos: HashMap<OutPoint, CoinEntry> = [
+        (OutPoint { txid: c_coin, vout: 0 }, coin(10_000_000)),
+        (OutPoint { txid: p_coin, vout: 0 }, coin(10_000_000)),
+    ]
+    .into_iter()
+    .collect();
+    // C: about 400 vB (11 outputs), 1_000 sats.
+    let c = spend_outpoints(&[(c_coin, 0)], 1_000, 11, 10_000_000);
+    let c_id = c.txid();
+    let c_vsize = c.vsize() as u64;
+    mp.add_transaction(c, &|op| utxos.get(op).cloned()).unwrap();
+    // P: about 800 vB (23 outputs), 200 sats.
+    let p = spend_outpoints(&[(p_coin, 0)], 200, 23, 10_000_000);
+    let p_id = p.txid();
+    let p_vsize = p.vsize() as u64;
+    let p_out = p.outputs[0].value;
+    mp.add_transaction(p, &|op| utxos.get(op).cloned()).unwrap();
+
+    let r = spend_outpoints(&[(c_coin, 0), (p_id, 0)], 1_100, 1, 10_000_000 + p_out);
+    let r_vsize = r.vsize() as u64;
+    // R alone beats C's feerate; P + R does not.
+    assert!(1_100 * c_vsize > 1_000 * r_vsize);
+    assert!(1_300 * c_vsize < 1_000 * (p_vsize + r_vsize));
+
+    let result = mp.add_transaction(r, &|op| utxos.get(op).cloned());
+    let err = result.expect_err("parent + replacement chunk is below the evicted chunk");
+    assert_eq!(err.reject_token(), "replacement-failed", "{err:?}");
+    assert!(mp.contains(&c_id));
+    assert!(mp.contains(&p_id));
+}
+
+/// G20c — same shape as G20b with a small parent: P + R is one chunk above
+/// C's feerate, the diagram improves, and Core accepts.
+#[test]
+fn test_g20c_diagram_accepts_cpfp_of_parent() {
+    let mut mp = Mempool::new(rbf_test_config());
+    let c_coin = hash_from_u8(153);
+    let p_coin = hash_from_u8(154);
+    let utxos: HashMap<OutPoint, CoinEntry> = [
+        (OutPoint { txid: c_coin, vout: 0 }, coin(10_000_000)),
+        (OutPoint { txid: p_coin, vout: 0 }, coin(10_000_000)),
+    ]
+    .into_iter()
+    .collect();
+    let c = spend_outpoints(&[(c_coin, 0)], 1_000, 11, 10_000_000);
+    mp.add_transaction(c, &|op| utxos.get(op).cloned()).unwrap();
+    let p = spend_outpoints(&[(p_coin, 0)], 100, 1, 10_000_000);
+    let p_id = p.txid();
+    let p_out = p.outputs[0].value;
+    mp.add_transaction(p, &|op| utxos.get(op).cloned()).unwrap();
+
+    let r = spend_outpoints(&[(c_coin, 0), (p_id, 0)], 1_100, 1, 10_000_000 + p_out);
+    let r_id = r.txid();
+    let result = mp.add_transaction(r, &|op| utxos.get(op).cloned());
+    assert!(result.is_ok(), "parent + replacement improves the diagram: {:?}", result);
+    assert!(mp.contains(&r_id));
+    assert!(mp.contains(&p_id));
+    assert_eq!(mp.size(), 2);
 }
 
 // ============================================================
