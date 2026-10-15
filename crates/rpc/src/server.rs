@@ -1815,7 +1815,7 @@ pub trait RustoshiRpc {
         &self,
         rawtxs: Vec<String>,
         maxfeerate: Option<f64>,
-    ) -> RpcResult<serde_json::Value>;
+    ) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Create a raw transaction from inputs and outputs.
     #[method(name = "createrawtransaction")]
@@ -14514,7 +14514,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         &self,
         rawtxs: Vec<String>,
         maxfeerate: Option<f64>,
-    ) -> RpcResult<serde_json::Value> {
+    ) -> RpcResult<Box<serde_json::value::RawValue>> {
         use rustoshi_consensus::mempool::{AtmpOptions, MAX_PACKAGE_COUNT};
 
         // Default maxfeerate: 0.10 BTC/kvB. 0 disables the post-ATMP cap.
@@ -14562,7 +14562,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                         })
                     })
                     .collect();
-                return Ok(serde_json::json!(results));
+                return Ok(raw_json(serde_json::json!(results)));
             }
         }
 
@@ -14615,10 +14615,6 @@ impl RustoshiRpcServer for RpcServerImpl {
         use rustoshi_consensus::validation::CoinEntry;
         use std::collections::HashMap;
 
-        let amount = |sats: u64| -> serde_json::Value {
-            let text = format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000);
-            serde_json::from_str(&text).unwrap_or(serde_json::json!(0))
-        };
         let blank = |tx: &Transaction| {
             serde_json::json!({
                 "txid": tx.txid().to_hex(),
@@ -14778,7 +14774,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     for later in txs.iter().skip(i + 1) {
                         results.push(blank(later));
                     }
-                    return Ok(serde_json::json!(results));
+                    return Ok(raw_json(serde_json::json!(results)));
                 }
             }
             remember(&mut temp, tx);
@@ -14796,7 +14792,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                         })
                     })
                     .collect();
-                return Ok(serde_json::json!(results));
+                return Ok(raw_json(serde_json::json!(results)));
             }
         }
 
@@ -14811,7 +14807,7 @@ impl RustoshiRpcServer for RpcServerImpl {
                     })
                 })
                 .collect();
-            return Ok(serde_json::json!(results));
+            return Ok(raw_json(serde_json::json!(results)));
         }
 
         temp.clear();
@@ -14823,11 +14819,11 @@ impl RustoshiRpcServer for RpcServerImpl {
             require_standard: state.mempool.require_standard(),
             ..AtmpOptions::test_accept()
         };
-        let mut results = Vec::with_capacity(txs.len());
+        let mut results: Vec<String> = Vec::with_capacity(txs.len());
         let mut exit_early = false;
         for tx in &txs {
             if exit_early {
-                results.push(blank(tx));
+                results.push(blank(tx).to_string());
                 continue;
             }
             let fee = fee_of(tx, &temp, &state.mempool);
@@ -14841,18 +14837,21 @@ impl RustoshiRpcServer for RpcServerImpl {
                     .err()
             };
             if let Some(err) = err {
-                results.push(rejection(tx, &err, shown_fee, vsize));
+                results.push(rejection(tx, &err, shown_fee, vsize).to_string());
                 exit_early = true;
                 continue;
             }
             let cap = required_fee(max_sat_kvb, vsize);
             if cap > 0 && fee > cap {
-                results.push(serde_json::json!({
-                    "txid": tx.txid().to_hex(),
-                    "wtxid": tx.wtxid().to_hex(),
-                    "allowed": false,
-                    "reject-reason": "max-fee-exceeded",
-                }));
+                results.push(
+                    serde_json::json!({
+                        "txid": tx.txid().to_hex(),
+                        "wtxid": tx.wtxid().to_hex(),
+                        "allowed": false,
+                        "reject-reason": "max-fee-exceeded",
+                    })
+                    .to_string(),
+                );
                 exit_early = true;
                 continue;
             }
@@ -14861,21 +14860,28 @@ impl RustoshiRpcServer for RpcServerImpl {
             } else {
                 0
             };
-            results.push(serde_json::json!({
-                "txid": tx.txid().to_hex(),
-                "wtxid": tx.wtxid().to_hex(),
-                "allowed": true,
-                "vsize": vsize,
-                "fees": {
-                    "base": amount(fee),
-                    "effective-feerate": amount(sat_kvb),
-                    "effective-includes": [tx.wtxid().to_hex()],
-                },
-            }));
+            // Core's ValueFromAmount: always eight fractional digits. A
+            // serde_json::Value would collapse them (0.0001), so the accepted
+            // entry is serialized from a typed struct (BtcAmount -> RawValue).
+            results.push(
+                serde_json::to_string(&AcceptedEntry {
+                    txid: tx.txid().to_hex(),
+                    wtxid: tx.wtxid().to_hex(),
+                    allowed: true,
+                    vsize,
+                    fees: AcceptedFees {
+                        base: BtcAmount::from_sats(fee),
+                        effective_feerate: BtcAmount::from_sats(sat_kvb),
+                        effective_includes: vec![tx.wtxid().to_hex()],
+                    },
+                })
+                .unwrap_or_default(),
+            );
             remember(&mut temp, tx);
         }
 
-        Ok(serde_json::json!(results))
+        serde_json::value::RawValue::from_string(format!("[{}]", results.join(",")))
+            .map_err(|e| Self::rpc_error(rpc_error::RPC_MISC_ERROR, &e.to_string()))
     }
 
     async fn create_raw_transaction(
@@ -31253,4 +31259,28 @@ mod tests {
         );
         assert_eq!(r["error_locations"], serde_json::json!([]), "got {resp}");
     }
+}
+
+/// Wrap a built `Value` as an RPC `RawValue` response.
+fn raw_json(v: serde_json::Value) -> Box<serde_json::value::RawValue> {
+    serde_json::value::RawValue::from_string(v.to_string())
+        .unwrap_or_else(|_| serde_json::value::RawValue::from_string("null".into()).unwrap())
+}
+
+#[derive(serde::Serialize)]
+struct AcceptedFees {
+    base: BtcAmount,
+    #[serde(rename = "effective-feerate")]
+    effective_feerate: BtcAmount,
+    #[serde(rename = "effective-includes")]
+    effective_includes: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct AcceptedEntry {
+    txid: String,
+    wtxid: String,
+    allowed: bool,
+    vsize: usize,
+    fees: AcceptedFees,
 }

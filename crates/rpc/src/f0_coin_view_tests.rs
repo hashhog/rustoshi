@@ -295,7 +295,7 @@ async fn f0_testmempoolaccept_rejects_tx_spending_unflushed_spend() {
     let (d, _x) = double_spend(&c, h102);
     let r = c.server.test_mempool_accept(vec![hex_of(&d)], None).await;
     finish(stop, handle);
-    let r = r.expect("testmempoolaccept answered");
+    let r: serde_json::Value = serde_json::from_str(r.expect("testmempoolaccept answered").get()).unwrap();
     assert_eq!(
         r[0]["allowed"].as_bool(),
         Some(false),
@@ -339,7 +339,8 @@ async fn f0_control_flushed_window_answers_like_core() {
     let s = c.server.submit_block(hex_of(&x103)).await;
     finish(stop, handle);
     assert!(g.expect("gettxout").is_none());
-    assert_eq!(t.expect("tma")[0]["allowed"].as_bool(), Some(false));
+    let t: serde_json::Value = serde_json::from_str(t.expect("tma").get()).unwrap();
+    assert_eq!(t[0]["allowed"].as_bool(), Some(false));
     assert_eq!(s.expect("submitblock").as_deref(), Some("bad-txns-inputs-missingorspent"));
 }
 
