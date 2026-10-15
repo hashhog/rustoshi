@@ -1164,6 +1164,10 @@ pub enum MempoolError {
     #[error("rbf: replacement spends conflicting transaction")]
     RbfSpendsConflicting,
 
+    /// Core `ImprovesFeerateDiagram` failure (policy/rbf.cpp).
+    #[error("rbf: replacement does not improve the feerate diagram")]
+    RbfDiagramNotImproved,
+
     // TRUC/v3 errors
     #[error("truc: v3 tx {0} is too large ({1} vB > {2} vB)")]
     TrucTxTooLarge(Hash256, usize, usize),
@@ -1398,6 +1402,8 @@ impl MempoolError {
             | MempoolError::RbfInsufficientFeeRate(_, _)
             | MempoolError::RbfInsufficientBandwidthFee(_, _) => "insufficient fee".to_string(),
             MempoolError::RbfSpendsConflicting => "bad-txns-spends-conflicting-tx".to_string(),
+            // validation.cpp ReplacementChecks: TX_RECONSIDERABLE "replacement-failed".
+            MempoolError::RbfDiagramNotImproved => "replacement-failed".to_string(),
             MempoolError::ReplacementDisallowed => "bip125-replacement-disallowed".to_string(),
 
             // ---- TRUC / v3 topology (validation.cpp:974 "TRUC-violation") ----
@@ -1500,6 +1506,11 @@ impl MempoolError {
             MempoolError::CoinbaseNotMature { age, .. } => format!(
                 "bad-txns-premature-spend-of-coinbase, tried to spend coinbase at depth {age}"
             ),
+            // policy/rbf.cpp ImprovesFeerateDiagram DiagramCheckError::FAILURE.
+            MempoolError::RbfDiagramNotImproved => {
+                "replacement-failed, insufficient feerate: does not improve feerate diagram"
+                    .to_string()
+            }
             other => other.reject_token(),
         }
     }
@@ -2802,6 +2813,12 @@ impl Mempool {
                 new_cluster_weight,
                 MAX_CLUSTER_SIZE_WEIGHT,
             ));
+        }
+
+        // ImprovesFeerateDiagram (validation.cpp ReplacementChecks), after
+        // the cluster limits like Core.
+        if !direct_conflicts.is_empty() {
+            self.check_rbf_diagram(txid, modified_fee, vsize, &direct_conflicts, &mempool_parents)?;
         }
 
         // CheckEphemeralSpends for a single tx (validation.cpp:1377), after
@@ -4191,11 +4208,13 @@ impl Mempool {
     ///          edge case where additional_fee == 0).
     /// Rule #4 (Core policy/rbf.cpp:114-123, PaysForRBF): additional_fees must cover the
     ///          replacement's own relay bandwidth: additional_fee >= relay_fee * replacement_vsize.
-    /// Rule #5 (Core policy/rbf.cpp:64-75, GetEntriesForConflicts): total evictions
-    ///          (direct conflicts + all descendants) <= MAX_REPLACEMENT_CANDIDATES.
+    /// Rule #5 (Core policy/rbf.cpp:64-75, GetEntriesForConflicts): the replacement
+    ///          conflicts directly with at most MAX_REPLACEMENT_CANDIDATES distinct
+    ///          clusters. Evicted descendants are not counted.
     ///
-    /// Note: Core's ImprovesFeerateDiagram (cluster-mempool, Core 27+) is not implemented
-    /// because rustoshi does not yet have a cluster mempool. Deferred.
+    /// Core's ImprovesFeerateDiagram runs after the cluster limits, so it is
+    /// [`Self::check_rbf_diagram`], called by the admission paths after their
+    /// cluster gates.
     fn check_rbf_rules(
         &self,
         _new_tx: &Transaction,
@@ -4253,13 +4272,14 @@ impl Mempool {
             }
         }
 
-        // Rule #5: Limit total evictions to MAX_REPLACEMENT_CANDIDATES.
-        // Core policy/rbf.cpp:69-75 (GetEntriesForConflicts).
-        // NOTE: Core 27+ uses unique cluster count; pre-cluster-mempool Core used eviction count.
-        // Rustoshi uses the eviction-count approach (pre-cluster-mempool compatible).
-        if all_to_evict.len() > MAX_REPLACEMENT_CANDIDATES {
+        // Rule #5: at most MAX_REPLACEMENT_CANDIDATES distinct clusters among the
+        // direct conflicts. Core policy/rbf.cpp:69-75 (GetEntriesForConflicts,
+        // `pool.GetUniqueClusterCount(iters_conflicting)`). Descendants share
+        // their conflict's cluster, so they never add to the count.
+        let conflict_clusters = self.unique_cluster_count(direct_conflicts);
+        if conflict_clusters > MAX_REPLACEMENT_CANDIDATES {
             return Err(MempoolError::RbfTooManyReplacements(
-                all_to_evict.len(),
+                conflict_clusters,
                 MAX_REPLACEMENT_CANDIDATES,
             ));
         }
@@ -4308,6 +4328,118 @@ impl Mempool {
         }
 
         Ok(())
+    }
+
+    /// Core `CTxMemPool::GetUniqueClusterCount`. A txid with no cluster
+    /// record counts as its own cluster.
+    fn unique_cluster_count(&self, txids: &HashSet<Hash256>) -> usize {
+        let mut clusters = HashSet::new();
+        let mut unclustered = 0usize;
+        for txid in txids {
+            match self.tx_to_cluster.get(txid) {
+                Some(cid) => {
+                    clusters.insert(*cid);
+                }
+                None => unclustered += 1,
+            }
+        }
+        clusters.len() + unclustered
+    }
+
+    /// Core `ImprovesFeerateDiagram` for a single-transaction replacement
+    /// (validation.cpp ReplacementChecks, after `CheckMemPoolPolicyLimits`).
+    ///
+    /// Old diagram: every cluster holding an evicted transaction or an
+    /// in-mempool parent of the replacement. New diagram: the same clusters
+    /// with the evictions removed, and the replacement joined to its parents'
+    /// clusters (Core stages it into the parents' cluster, `GetMainStagingDiagrams`).
+    /// The new diagram must be strictly better. Fees are modified fees.
+    fn check_rbf_diagram(
+        &self,
+        new_txid: Hash256,
+        new_modified_fee: i64,
+        new_vsize: usize,
+        direct_conflicts: &HashSet<Hash256>,
+        mempool_parents: &HashSet<Hash256>,
+    ) -> Result<(), MempoolError> {
+        let (evicted, _) = self.conflict_closure(direct_conflicts);
+        let parent_clusters: HashSet<ClusterId> = mempool_parents
+            .iter()
+            .filter_map(|txid| self.tx_to_cluster.get(txid).copied())
+            .collect();
+        let mut affected: HashSet<ClusterId> = evicted
+            .iter()
+            .filter_map(|txid| self.tx_to_cluster.get(txid).copied())
+            .collect();
+        affected.extend(parent_clusters.iter().copied());
+
+        let mut old_chunks = Vec::new();
+        let mut new_chunks = Vec::new();
+        let mut joined: HashSet<Hash256> = HashSet::new();
+        for cid in &affected {
+            let Some(cluster) = self.clusters.get(cid) else {
+                continue;
+            };
+            old_chunks.extend(self.diagram_chunks(&cluster.txids));
+            let remaining = cluster
+                .txids
+                .iter()
+                .copied()
+                .filter(|txid| !evicted.contains(txid));
+            if parent_clusters.contains(cid) {
+                joined.extend(remaining);
+            } else {
+                new_chunks.extend(self.diagram_chunks(&remaining.collect()));
+            }
+        }
+        let new_ff = FeeFrac::new(new_modified_fee, new_vsize as i64);
+        new_chunks.extend(self.diagram_chunks_with_child(&joined, new_txid, new_ff, mempool_parents));
+        sort_diagram(&mut old_chunks);
+        sort_diagram(&mut new_chunks);
+        if diagram_strictly_better(&new_chunks, &old_chunks) {
+            Ok(())
+        } else {
+            Err(MempoolError::RbfDiagramNotImproved)
+        }
+    }
+
+    /// Chunks of `txids` (mempool transactions) plus one new transaction
+    /// `child` that spends `parents` (a subset of `txids`).
+    fn diagram_chunks_with_child(
+        &self,
+        txids: &HashSet<Hash256>,
+        child: Hash256,
+        child_ff: FeeFrac,
+        parents: &HashSet<Hash256>,
+    ) -> Vec<FeeFrac> {
+        if txids.is_empty() {
+            return vec![child_ff];
+        }
+        let mut graph = DepGraph::from_cluster(txids, &self.transactions, &self.parents);
+        for (i, txid) in graph.idx_to_txid.iter().enumerate() {
+            if let Some(entry) = self.transactions.get(txid) {
+                graph.feerates[i] =
+                    FeeFrac::new(Self::signed_modified_fee(entry), entry.vsize as i64);
+            }
+        }
+        let idx = graph.idx_to_txid.len();
+        let mut ancestors: HashSet<usize> = std::iter::once(idx).collect();
+        for parent in parents {
+            if let Some(&p) = graph.txid_to_idx.get(parent) {
+                ancestors.extend(graph.ancestors[p].iter().copied());
+            }
+        }
+        for &a in &ancestors {
+            if a != idx {
+                graph.descendants[a].insert(idx);
+            }
+        }
+        graph.txid_to_idx.insert(child, idx);
+        graph.idx_to_txid.push(child);
+        graph.feerates.push(child_ff);
+        graph.ancestors.push(ancestors);
+        graph.descendants.push(std::iter::once(idx).collect());
+        graph.linearize().into_iter().map(|chunk| chunk.feefrac).collect()
     }
 
     // ====================================================================
@@ -11647,17 +11779,22 @@ mod tests {
         let tx1 = make_tx(vec![(prev_txid, 0)], vec![90_000], 1);
         mempool.add_transaction(tx1, &|op| utxos.get(op).cloned()).unwrap();
 
-        // Replacement with SAME absolute fee (10k). Rule #3 must NOT reject this.
-        // (Rule #4 with relay_fee=0 also passes → replacement accepted.)
+        // Replacement with SAME absolute fee (10k) and the same size. Rule #3
+        // must NOT reject this (Rule #4 with relay_fee=0 also passes). It then
+        // reaches ImprovesFeerateDiagram, and an equal diagram is not a strict
+        // improvement (policy/rbf.cpp `!std::is_gt(CompareChunks(...))`), so
+        // Core v31.1 rejects it there: replacement-failed, not Rule #3.
+        let tx1_id = make_tx(vec![(prev_txid, 0)], vec![90_000], 1).txid();
         let tx2 = make_tx(vec![(prev_txid, 0)], vec![90_000], 2);
         let txid2 = tx2.txid();
         let result = mempool.add_transaction(tx2, &|op| utxos.get(op).cloned());
         assert!(
-            result.is_ok(),
-            "Replacement with equal fee must pass Rule #3 (< not <=). Got: {:?}",
+            matches!(result, Err(MempoolError::RbfDiagramNotImproved)),
+            "Replacement with equal fee must pass Rule #3 (< not <=) and stop at the diagram. Got: {:?}",
             result
         );
-        assert!(mempool.contains(&txid2));
+        assert!(!mempool.contains(&txid2));
+        assert!(mempool.contains(&tx1_id));
 
         // Replacement with LOWER fee must be rejected.
         let tx3 = make_tx(vec![(prev_txid, 0)], vec![95_000], 3); // 5k fee < 10k

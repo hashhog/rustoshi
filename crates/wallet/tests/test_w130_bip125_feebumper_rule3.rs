@@ -251,7 +251,9 @@ fn g6_truc_v3_implicit_replaceability_honored() {
 }
 
 /// G7: Rule 5 cap = `MAX_REPLACEMENT_CANDIDATES = 100`, matching Core
-/// `policy/rbf.h:26`.
+/// `policy/rbf.h:26`, applied to the number of distinct clusters the
+/// replacement conflicts with (Core v31.1 `GetEntriesForConflicts`,
+/// `GetUniqueClusterCount`), not to the eviction count (KB-137).
 #[test]
 fn g7_rule5_max_replacement_candidates_constant() {
     assert!(
@@ -261,8 +263,13 @@ fn g7_rule5_max_replacement_candidates_constant() {
     let runtime_val: usize = 100;
     assert_eq!(runtime_val, CORE_MAX_REPLACEMENT_CANDIDATES);
     assert!(
-        MEMPOOL_SRC.contains("if all_to_evict.len() > MAX_REPLACEMENT_CANDIDATES"),
-        "Rule 5 must check eviction count vs constant"
+        MEMPOOL_SRC.contains("let conflict_clusters = self.unique_cluster_count(direct_conflicts);")
+            && MEMPOOL_SRC.contains("if conflict_clusters > MAX_REPLACEMENT_CANDIDATES"),
+        "Rule 5 must check the conflicting cluster count vs constant"
+    );
+    assert!(
+        !MEMPOOL_SRC.contains("all_to_evict.len() > MAX_REPLACEMENT_CANDIDATES"),
+        "Rule 5 must not count evicted transactions (Core v31.1 counts clusters)"
     );
 }
 
