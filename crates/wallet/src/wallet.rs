@@ -882,6 +882,19 @@ impl Wallet {
         recipients: Vec<(String, u64)>,
         fee_rate: f64,
     ) -> Result<Transaction, WalletError> {
+        self.create_transaction_at(recipients, Some(fee_rate))
+    }
+
+    /// [`Self::create_transaction`] for a caller whose fee rate may be
+    /// unresolved. `None` is Core's FeeReason::FALLBACK with `-fallbackfee`
+    /// disabled: the recipient dust check still runs first, then this fails
+    /// with [`WalletError::FallbackFeeDisabled`] before any coin is selected
+    /// (CreateTransactionInternal, spend.cpp).
+    pub fn create_transaction_at(
+        &mut self,
+        recipients: Vec<(String, u64)>,
+        fee_rate: Option<f64>,
+    ) -> Result<Transaction, WalletError> {
         let total_output: u64 = recipients.iter().map(|(_, v)| *v).sum();
 
         // Core CreateTransactionInternal checks IsDust on each recipient
@@ -906,6 +919,7 @@ impl Wallet {
                 return Err(WalletError::AmountTooSmall);
             }
         }
+        let fee_rate = fee_rate.ok_or(WalletError::FallbackFeeDisabled)?;
         // selection_target - recipients_sum in Core is the fee for the
         // version/locktime/counts plus the recipient outputs, not the inputs.
         let noinput_fee = fee_for_sat_vb(fee_rate, noinput_vsize);

@@ -186,6 +186,12 @@ struct Cli {
     #[arg(long = "minrelaytxfee")]
     minrelaytxfee: Option<String>,
 
+    /// Fee rate (BTC/kvB) the wallet uses when fee estimation has
+    /// insufficient data (Bitcoin Core `-fallbackfee`). 0 disables the
+    /// fallback, and then a send with no estimate fails. Default: 0.
+    #[arg(long = "fallbackfee")]
+    fallbackfee: Option<String>,
+
     /// Specify your own public address `<ip>[:port]` to advertise to peers
     /// (Bitcoin Core `-externalip`; repeatable and/or comma-separated). A
     /// bare IP uses the P2P listen port. Implies `--discover=false` unless
@@ -489,6 +495,23 @@ fn parse_btc_kvb_to_sats(amount: &str) -> anyhow::Result<u64> {
         .checked_mul(100_000_000)
         .and_then(|whole| whole.checked_add(frac_sats))
         .ok_or_else(|| anyhow::anyhow!("minrelaytxfee amount out of range"))
+}
+
+/// Core wallet.cpp `-fallbackfee`: ParseMoney in BTC/kvB, refuse to start on
+/// a bad amount, warn above HIGH_TX_FEE_PER_KB (0.01 BTC/kvB). Unset is
+/// Core's DEFAULT_FALLBACK_FEE, 0, which disables the fallback.
+fn fallback_fee_sat_kvb(amount: Option<&str>) -> anyhow::Result<u64> {
+    let Some(amount) = amount else {
+        return Ok(0);
+    };
+    let sat_kvb = parse_btc_kvb_to_sats(amount)
+        .map_err(|_| anyhow::anyhow!("Invalid amount for -fallbackfee=<amount>: '{amount}'"))?;
+    if sat_kvb > 1_000_000 {
+        tracing::warn!(
+            "-fallbackfee is set very high! This is the transaction fee you may pay when fee estimates are not available."
+        );
+    }
+    Ok(sat_kvb)
 }
 
 fn resolve_base_datadir(datadir: &str) -> PathBuf {
@@ -4050,6 +4073,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
         rpc_state_inner.mempool.set_min_relay_feerate_kvb(sat_kvb);
     }
+    rpc_state_inner.wallet_fallback_fee_sat_kvb = fallback_fee_sat_kvb(cli.fallbackfee.as_deref())?;
     rpc_state_inner.txindex_enabled = cli.txindex;
     rpc_state_inner.blockfilterindex_enabled =
         !matches!(cli.blockfilterindex.to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no");
@@ -10178,6 +10202,26 @@ mod tests {
         // Core also accepts `basic`.
         let cli = Cli::try_parse_from(["rustoshi", "--blockfilterindex", "basic"]).unwrap();
         assert_eq!(cli.blockfilterindex, "basic");
+    }
+
+    /// KB-135: `--fallbackfee` is Core's `-fallbackfee` in BTC/kvB. Unset is
+    /// 0 (fallback disabled), a bad amount refuses to start with Core's text.
+    #[test]
+    fn test_cli_fallbackfee_kb135() {
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert_eq!(fallback_fee_sat_kvb(cli.fallbackfee.as_deref()).unwrap(), 0);
+        let cli = Cli::try_parse_from(["rustoshi", "--fallbackfee=0.0002"]).unwrap();
+        assert_eq!(
+            fallback_fee_sat_kvb(cli.fallbackfee.as_deref()).unwrap(),
+            20_000
+        );
+        assert_eq!(fallback_fee_sat_kvb(Some("0")).unwrap(), 0);
+        let err = fallback_fee_sat_kvb(Some("abc")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid amount for -fallbackfee=<amount>: 'abc'"
+        );
+        assert!(fallback_fee_sat_kvb(Some("-0.0001")).is_err());
     }
 
     /// FIX-88 W121 G30: `--peerblockfilters` parses + defaults off.

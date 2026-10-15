@@ -127,3 +127,65 @@ async fn sendtoaddress_without_fallbackfee_fails_like_core() {
         "nothing was broadcast"
     );
 }
+
+/// `-fallbackfee=0.0002` (20 sat/vB, what Core's regtest functional tests
+/// pass): with no estimate the spend goes through at that rate.
+#[tokio::test]
+async fn sendtoaddress_pays_fallbackfee_when_set() {
+    let (state, mut wallet_state) = funded_wallet().await;
+    wallet_state.fallback_fee_sat_kvb = 20_000;
+    let rpc = WalletRpcImpl::new(Arc::new(RwLock::new(wallet_state)));
+
+    // The no-input fee is 42 vB at the fallback rate: 840 sat.
+    let exact = send(&rpc, serde_json::json!(0.001))
+        .await
+        .expect_err("the whole coin cannot also pay the fee");
+    assert_eq!(exact.code(), -6, "{exact:?}");
+    assert_eq!(
+        exact.message(),
+        "The total exceeds your balance when the 0.0000084 transaction fee is included.",
+        "{exact:?}"
+    );
+
+    let txid_hex = send(&rpc, serde_json::json!(0.0005))
+        .await
+        .expect("fallback fee set: the spend goes through");
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&hex::decode(&txid_hex).unwrap());
+    txid.reverse();
+    let st = state.read().await;
+    let entry = st
+        .mempool
+        .get(&Hash256::from(txid))
+        .expect("broadcast into the mempool");
+    let rate = entry.fee as f64 / entry.vsize as f64;
+    assert!(
+        (20.0..21.0).contains(&rate),
+        "fee {} over {} vB",
+        entry.fee,
+        entry.vsize
+    );
+}
+
+/// `GetMinimumFeeRate` precedence: an estimate wins over the fallback (and is
+/// used even with the fallback disabled), only a missing estimate consults
+/// the fallback, and the result is floored at the mempool minimum and at
+/// `max(-mintxfee, -minrelaytxfee)`.
+#[test]
+fn wallet_fee_rate_follows_core_precedence() {
+    let rate = WalletRpcImpl::wallet_fee_rate_sat_vb;
+    // No estimate: fallback disabled refuses, fallback set is used.
+    assert_eq!(rate(None, 0, 100, 100), None);
+    assert_eq!(rate(None, 20_000, 100, 100), Some(20.0));
+    // An estimate is used whatever the fallback says.
+    assert_eq!(rate(Some(12.0), 0, 100, 100), Some(12.0));
+    assert_eq!(rate(Some(12.0), 20_000, 100, 100), Some(12.0));
+    // Mempool minimum floors the estimate and the fallback.
+    assert_eq!(rate(Some(2.0), 0, 3_000, 100), Some(3.0));
+    assert_eq!(rate(None, 2_000, 3_000, 100), Some(3.0));
+    // -mintxfee (1000 sat/kvB) floors a low estimate or fallback; a higher
+    // -minrelaytxfee raises that floor.
+    assert_eq!(rate(Some(0.5), 0, 100, 100), Some(1.0));
+    assert_eq!(rate(None, 500, 100, 100), Some(1.0));
+    assert_eq!(rate(None, 500, 100, 2_000), Some(2.0));
+}
