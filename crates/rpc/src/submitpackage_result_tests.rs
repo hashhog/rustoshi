@@ -2217,3 +2217,28 @@ async fn submitpackage_entry_height_is_current_tip() {
         assert_eq!(pool[tx.txid().to_hex()]["height"], 205, "{pool}");
     }
 }
+
+/// Raw JSON-RPC response text (the bytes a client sees), not a re-parsed Value.
+async fn call_raw(state: &Arc<RwLock<RpcState>>, method: &str, params: serde_json::Value) -> String {
+    let server = RpcServerImpl::new(state.clone(), Arc::new(RwLock::new(PeerState::default())));
+    let module = server.into_rpc();
+    let req = serde_json::json!({"jsonrpc": "2.0", "id": "raw", "method": method, "params": params})
+        .to_string();
+    module.raw_json_request(&req, 1).await.expect("dispatch").0
+}
+
+/// Core emits `fees.base` / `fees.effective-feerate` via `ValueFromAmount`:
+/// always eight fractional digits (`0.00010000`), never `0.0001` or `1e-5`.
+#[tokio::test]
+async fn testmempoolaccept_fees_use_eight_decimal_amount_format() {
+    let f = funded(10_000, 10_000).await;
+    let raw = call_raw(&f.state, "testmempoolaccept", serde_json::json!([[hex_tx(&f.parent)]])).await;
+    assert!(raw.contains("\"allowed\":true"), "not accepted: {raw}");
+    assert!(
+        raw.contains("\"base\":0.00010000"),
+        "fees.base not ValueFromAmount-formatted: {raw}"
+    );
+    let rate = trunc_sat_per_kvb(10_000, f.parent.vsize());
+    let want = format!("\"effective-feerate\":{}.{:08}", rate / 100_000_000, rate % 100_000_000);
+    assert!(raw.contains(&want), "effective-feerate: want {want} in {raw}");
+}
