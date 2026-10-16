@@ -11362,6 +11362,58 @@ mod tests {
         assert!(V::BadDifficulty.is_invalid_block_verdict());
     }
 
+    /// Run `e` through the connect path's marking decision (the
+    /// `connect_error_is_verdict` -> `mark_connect_failed_block_invalid` pair
+    /// at both P2P connect sites) and report whether the block's index entry
+    /// ended up FAILED_VALIDITY.
+    fn connect_failure_marks_index(e: &ValidationError) -> bool {
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::mainnet();
+        let parent = hdr(params.genesis_hash, 1_775_651_930);
+        let block = rustoshi_primitives::Block {
+            header: hdr(parent.block_hash(), 1_775_653_126),
+            transactions: params.genesis_block.transactions.clone(),
+        };
+        let hash = block.header.block_hash();
+        index_entry(&store, &parent, 1);
+        index_entry(&store, &block.header, 2);
+        let mut hs = HeaderSync::new(params.genesis_hash);
+        hs.set_best_header(2, hash);
+        let mut dl = BlockDownloader::new(1, 2);
+        if connect_error_is_verdict(e) {
+            mark_connect_failed_block_invalid(&store, &mut hs, &mut dl, &block, hash, 2);
+        }
+        store
+            .get_block_index(&hash)
+            .unwrap()
+            .expect("index entry")
+            .status
+            .has(BlockStatus::FAILED_VALIDITY)
+    }
+
+    /// A low-work block is refused (`too-little-chainwork`) but its index
+    /// entry is NOT flagged failed. Core's AcceptBlockHeader returns
+    /// BLOCK_HEADER_LOW_WORK before AddToBlockIndex, so InvalidBlockFound never
+    /// runs: low work says the chain is not yet worth storing, not that the
+    /// block is invalid. Marking it would make the same block, once its chain
+    /// has the work, permanently rejected as cached-invalid.
+    #[test]
+    fn low_work_block_rejected_but_not_marked_failed() {
+        use rustoshi_consensus::validation::accept_block_header_chain_work;
+        let params = ChainParams::mainnet();
+        let e = accept_block_header_chain_work(&[0u8; 32], false, &params)
+            .expect_err("work below nMinimumChainWork must be refused");
+        assert_eq!(e, ValidationError::TooLittleChainwork);
+        assert!(!e.is_invalid_block_verdict(), "{e:?}");
+        assert!(!connect_failure_marks_index(&e), "low-work block was flagged FAILED_VALIDITY");
+        // Control: the harness does see a mark for a content verdict.
+        assert!(connect_failure_marks_index(&ValidationError::BadProofOfWork));
+        // Control: work at the minimum is accepted, so the gate is not
+        // refusing everything.
+        assert!(accept_block_header_chain_work(&params.minimum_chain_work, false, &params).is_ok());
+    }
+
     /// R-b: a block parked on a missing pre-snapshot header stays parked
     /// until that header's whole MTP window is stored (a short window fails
     /// closed), and is released exactly then.
