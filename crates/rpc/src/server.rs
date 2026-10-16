@@ -563,6 +563,9 @@ pub struct RpcState {
     /// subsystem failed to initialise (`-disablewallet`-equivalent), in which
     /// case block-connect simply skips the wallet scan.
     pub wallet_state: Option<Arc<RwLock<crate::wallet::WalletRpcState>>>,
+    /// `-fallbackfee` in sat/kvB, handed to the wallet RPC state when
+    /// `start_rpc_server` builds it. 0 (Core's default) disables the fallback.
+    pub wallet_fallback_fee_sat_kvb: u64,
     /// Whether the per-height coinstatsindex is enabled (`-coinstatsindex=1`).
     /// When set, every block-connect/disconnect maintains a per-height running
     /// `MuHash3072` + UTXO-set counts (`CF_COINSTATS`), so `gettxoutsetinfo`
@@ -791,6 +794,7 @@ impl RpcState {
             block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orphanage: TxOrphanage::new(),
             wallet_state: None,
+            wallet_fallback_fee_sat_kvb: 0,
             coinstatsindex_enabled: false,
             txospenderindex_enabled: false,
             txindex_enabled: false,
@@ -828,6 +832,7 @@ impl RpcState {
             block_submission_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orphanage: TxOrphanage::new(),
             wallet_state: None,
+            wallet_fallback_fee_sat_kvb: 0,
             coinstatsindex_enabled: false,
             txospenderindex_enabled: false,
             txindex_enabled: false,
@@ -20977,7 +20982,7 @@ pub async fn start_rpc_server(
     // node's network-resolved datadir (Core lays wallets out under
     // `<datadir>/wallets`, which `WalletManager::new` creates), then merge its
     // `into_rpc()` module into the core methods on BOTH transports below.
-    let (wallet_data_dir, wallet_network) = {
+    let (wallet_data_dir, wallet_network, wallet_fallback_fee) = {
         let st = state.read().await;
         let net = match st.params.network_id {
             NetworkId::Mainnet => rustoshi_crypto::address::Network::Mainnet,
@@ -20992,7 +20997,7 @@ pub async fn start_rpc_server(
             .data_dir
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        (dir, net)
+        (dir, net, st.wallet_fallback_fee_sat_kvb)
     };
 
     // Handle to the shared wallet RPC state, captured so the startup history
@@ -21057,6 +21062,7 @@ pub async fn start_rpc_server(
             {
                 let mut ws = wallet_state.write().await;
                 ws.node = Some(state.clone());
+                ws.fallback_fee_sat_kvb = wallet_fallback_fee;
             }
             // Capture the shared wallet state for the deferred background
             // reconcile (fired once the RPC server is up, below).

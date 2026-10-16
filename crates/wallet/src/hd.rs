@@ -87,6 +87,15 @@ pub enum WalletError {
     #[error("Transaction amount too small")]
     AmountTooSmall,
 
+    /// CreateTransactionInternal (spend.cpp): fee estimation had no data and
+    /// `-fallbackfee` is 0 (Core's default), so no fee rate was chosen.
+    /// Checked after the recipient dust check and before coin selection.
+    /// sendtoaddress maps this to RPC -6 with Core's original string.
+    #[error(
+        "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee."
+    )]
+    FallbackFeeDisabled,
+
     /// SelectCoins failed because the balance covers the recipients but not
     /// the fee. `{fee}` is Core `FormatMoney` of the no-input fee
     /// (`selection_target - recipients_sum`).

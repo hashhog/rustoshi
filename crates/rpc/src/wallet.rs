@@ -767,6 +767,10 @@ pub struct WalletRpcState {
     /// the wallet RPC is constructed standalone (unit tests): `sendtoaddress`
     /// then builds + signs but cannot broadcast.
     pub node: Option<Arc<RwLock<crate::server::RpcState>>>,
+    /// `-fallbackfee` in sat/kvB: the fee rate sendtoaddress uses when fee
+    /// estimation has no data. 0 (Core's DEFAULT_FALLBACK_FEE) disables the
+    /// fallback, and such a spend fails like Core's instead of guessing.
+    pub fallback_fee_sat_kvb: u64,
 }
 
 impl WalletRpcState {
@@ -777,6 +781,7 @@ impl WalletRpcState {
             data_dir,
             payjoin_endpoint: None,
             node: None,
+            fallback_fee_sat_kvb: 0,
         }
     }
 
@@ -787,6 +792,14 @@ impl WalletRpcState {
         self
     }
 }
+
+/// Core `DEFAULT_TRANSACTION_MINFEE` (`wallet/wallet.h`), the `-mintxfee`
+/// default, in sat/kvB.
+const DEFAULT_TRANSACTION_MINFEE_SAT_KVB: u64 = 1000;
+
+/// Core `DEFAULT_TX_CONFIRM_TARGET` (`wallet/wallet.h`), the
+/// `-txconfirmtarget` default.
+const DEFAULT_TX_CONFIRM_TARGET: u32 = 6;
 
 /// Help dump thrown as RPC_MISC_ERROR (-1) when `createwallet` is called
 /// with no name. Core `RPCHelpMan::HandleRequest` (`rpc/util.cpp:644-646`).
@@ -1531,6 +1544,51 @@ impl WalletRpcImpl {
         (btc * 100_000_000.0).round() as u64
     }
 
+    /// Core `GetMinimumFeeRate` (`wallet/fees.cpp`) without an explicit fee
+    /// rate, in sat/vB. `estimate` is the smart-fee estimate (`None` when it
+    /// has no data). `None` result is FeeReason::FALLBACK with the fallback
+    /// disabled, returned before any floor is applied. Otherwise the rate is
+    /// raised to the mempool minimum, then to the required rate
+    /// `max(-mintxfee, -minrelaytxfee)`.
+    pub(crate) fn wallet_fee_rate_sat_vb(
+        estimate: Option<f64>,
+        fallback_fee_sat_kvb: u64,
+        mempool_min_sat_kvb: u64,
+        min_relay_sat_kvb: u64,
+    ) -> Option<f64> {
+        let mut rate = match estimate {
+            Some(rate) if rate > 0.0 => rate,
+            _ if fallback_fee_sat_kvb == 0 => return None,
+            _ => fallback_fee_sat_kvb as f64 / 1000.0,
+        };
+        rate = rate.max(mempool_min_sat_kvb as f64 / 1000.0);
+        let required = DEFAULT_TRANSACTION_MINFEE_SAT_KVB.max(min_relay_sat_kvb);
+        Some(rate.max(required as f64 / 1000.0))
+    }
+
+    /// The fee rate sendtoaddress pays: the node's estimate for `conf_target`
+    /// (Core's wallet default `-txconfirmtarget` is 6), else `-fallbackfee`.
+    async fn sendtoaddress_fee_rate(&self, conf_target: Option<u32>) -> Option<f64> {
+        let (node, fallback) = {
+            let state = self.state.read().await;
+            (state.node.clone(), state.fallback_fee_sat_kvb)
+        };
+        let (estimate, mempool_min, min_relay) = match node {
+            Some(node) => {
+                let node = node.read().await;
+                let min_relay = node.mempool.min_relay_feerate_kvb();
+                (
+                    node.fee_estimator
+                        .estimate_fee(conf_target.unwrap_or(DEFAULT_TX_CONFIRM_TARGET) as usize),
+                    node.mempool.mempool_min_feerate_kvb().max(min_relay),
+                    min_relay,
+                )
+            }
+            None => (None, 0, 0),
+        };
+        Self::wallet_fee_rate_sat_vb(estimate, fallback, mempool_min, min_relay)
+    }
+
     /// Core `AmountFromValue` (`rpc/util.cpp:98-108`): number in MoneyRange,
     /// else RPC_TYPE_ERROR (-3).
     /// CreateTransaction errors keep Core's original string. `sendtoaddress`
@@ -1547,6 +1605,10 @@ impl WalletRpcImpl {
             rustoshi_wallet::WalletError::InsufficientFunds { .. } => {
                 Self::rpc_error(create_code, "Insufficient funds")
             }
+            rustoshi_wallet::WalletError::FallbackFeeDisabled => Self::rpc_error(
+                create_code,
+                rustoshi_wallet::WalletError::FallbackFeeDisabled.to_string(),
+            ),
             rustoshi_wallet::WalletError::FeeExceedsBalance { fee } => Self::rpc_error(
                 create_code,
                 format!(
@@ -2477,9 +2539,13 @@ impl WalletRpcServer for WalletRpcImpl {
         _comment_to: Option<String>,
         _subtractfeefromamount: Option<bool>,
         _replaceable: Option<bool>,
-        _conf_target: Option<u32>,
+        conf_target: Option<u32>,
         _estimate_mode: Option<String>,
     ) -> RpcResult<String> {
+        // Choose the fee rate before taking the wallet-state guard: it reads
+        // the node, and the block-connect path takes node then wallet.
+        let fee_rate = self.sendtoaddress_fee_rate(conf_target).await;
+
         let state = self.state.read().await;
 
         let (name, wallet) = self.resolve_wallet(&state)?;
@@ -2505,12 +2571,6 @@ impl WalletRpcServer for WalletRpcImpl {
         // string. Negative / out of MoneyRange is RPC_TYPE_ERROR (-3)
         // "Amount out of range", before CreateTransaction.
         let amount_sats = Self::amount_from_value(&amount)?;
-        // Default fee rate in sat/vByte. Padded above the 1 sat/vB relay floor
-        // so the wallet's vsize estimate (which can undershoot the final
-        // witness-stack size by a byte or two) never lands the tx below the
-        // mempool's minimum-relay-fee and gets rejected — the same fee-floor
-        // fix the beamchain reference cell needed.
-        let fee_rate = 5.0;
 
         // Build + sign the transaction under the wallet lock, then DROP the
         // wallet guard before touching the node mempool. The mining /
@@ -2521,7 +2581,7 @@ impl WalletRpcServer for WalletRpcImpl {
                 Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
             })?;
             wallet_guard
-                .create_transaction(vec![(address, amount_sats)], fee_rate)
+                .create_transaction_at(vec![(address, amount_sats)], fee_rate)
                 .map_err(|e| {
                     // SendMoney maps every CreateTransaction error to -6
                     // (spend.cpp) and keeps the original string.
