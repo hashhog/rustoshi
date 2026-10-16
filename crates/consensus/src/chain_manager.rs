@@ -79,8 +79,13 @@ impl BlockMeta {
     }
 }
 
-/// Chain management state for tracking precious blocks.
-#[derive(Debug, Default)]
+/// Core `SEQ_ID_BEST_CHAIN_FROM_DISK`: active-chain blocks after `LoadChainTip`.
+pub const SEQ_ID_BEST_CHAIN_FROM_DISK: i32 = 0;
+/// Core `SEQ_ID_INIT_FROM_DISK`: every other block loaded from disk.
+pub const SEQ_ID_INIT_FROM_DISK: i32 = 1;
+
+/// Chain management state for tracking precious blocks and receive order.
+#[derive(Debug)]
 pub struct ChainManagerState {
     /// Last chain work when precious block was called.
     /// Used to detect if the chain has grown since the last call.
@@ -90,8 +95,19 @@ pub struct ChainManagerState {
     /// Lower sequence IDs are preferred in tie-breaking.
     pub block_reverse_sequence_id: i32,
 
-    /// Sequence ID assignments for blocks.
+    /// Next nSequenceId for a newly received block body (Core `nBlockSequenceId`).
+    /// Starts at `SEQ_ID_INIT_FROM_DISK + 1` so disk-loaded ids stay 0/1.
+    pub block_sequence_id: i32,
+
+    /// Sequence ID assignments for blocks (Core `CBlockIndex::nSequenceId`).
+    /// In-memory only: lost on restart, matching Core (not persisted to disk).
     pub sequence_ids: HashMap<Hash256, i32>,
+}
+
+impl Default for ChainManagerState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChainManagerState {
@@ -100,6 +116,7 @@ impl ChainManagerState {
         Self {
             last_precious_chainwork: [0u8; 32],
             block_reverse_sequence_id: -1,
+            block_sequence_id: SEQ_ID_INIT_FROM_DISK + 1,
             sequence_ids: HashMap::new(),
         }
     }
@@ -107,6 +124,38 @@ impl ChainManagerState {
     /// Get the sequence ID for a block, if any.
     pub fn get_sequence_id(&self, hash: &Hash256) -> Option<i32> {
         self.sequence_ids.get(hash).copied()
+    }
+
+    /// nSequenceId used by `CBlockIndexWorkComparator`. Missing means this
+    /// process loaded the block from disk and never received the body again
+    /// (`SEQ_ID_INIT_FROM_DISK`); the active chain is marked 0 at load.
+    pub fn sequence_id_or_disk_default(&self, hash: &Hash256) -> i32 {
+        self.sequence_ids
+            .get(hash)
+            .copied()
+            .unwrap_or(SEQ_ID_INIT_FROM_DISK)
+    }
+
+    /// Core `ReceivedBlockTransactions`: `pindex->nSequenceId = nBlockSequenceId++`.
+    /// Assigned once when the body first arrives this process.
+    pub fn assign_received_sequence(&mut self, hash: Hash256) -> i32 {
+        if let Some(&existing) = self.sequence_ids.get(&hash) {
+            return existing;
+        }
+        let seq_id = self.block_sequence_id;
+        self.sequence_ids.insert(hash, seq_id);
+        if self.block_sequence_id < i32::MAX {
+            self.block_sequence_id += 1;
+        }
+        seq_id
+    }
+
+    /// Core `LoadChainTip`: walk the active chain and set
+    /// `SEQ_ID_BEST_CHAIN_FROM_DISK` so an equal-work fork loaded from disk
+    /// does not displace the tip (first-seen is lost across restart).
+    pub fn mark_best_chain_from_disk(&mut self, hash: Hash256) {
+        self.sequence_ids
+            .insert(hash, SEQ_ID_BEST_CHAIN_FROM_DISK);
     }
 
     /// Assign a precious sequence ID to a block.
@@ -515,6 +564,7 @@ mod tests {
     #[test]
     fn test_chain_manager_state_precious() {
         let mut state = ChainManagerState::new();
+        assert_eq!(state.block_sequence_id, SEQ_ID_INIT_FROM_DISK + 1);
         let hash_a = make_hash(1);
         let hash_b = make_hash(2);
 
