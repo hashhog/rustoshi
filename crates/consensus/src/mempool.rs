@@ -6820,11 +6820,15 @@ impl Mempool {
     /// submitted. Order matches validation.cpp: topology, mempool ancestors,
     /// `GetEntriesForConflicts`, `PaysForRBF`, parent feerate, cluster limits,
     /// `ImprovesFeerateDiagram`.
-    fn package_rbf_reject_reason(
+    fn package_rbf_reject_reason<F>(
         &self,
         eval: &[&Transaction],
         tx_fees: &HashMap<Hash256, u64>,
-    ) -> Option<String> {
+        utxo_lookup: &F,
+    ) -> Option<String>
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
         if eval.len() != 2 || !Self::refs_child_with_parents(eval) {
             return Some("package RBF failed: package must be 1-parent-1-child".to_string());
         }
@@ -6876,7 +6880,14 @@ impl Mempool {
                 cfeerate_tostring(parent_fee, parent_vsize)
             ));
         }
-        let weight: u64 = eval.iter().map(|tx| tx.weight() as u64).sum();
+        // The package has no mempool ancestors and the conflicts (with their
+        // descendants) are staged for removal, so the post-replacement cluster
+        // is the package alone. TxGraph sizes each entry by its sigop-adjusted
+        // weight (txmempool.cpp `GetSigOpsAdjustedWeight`), not raw weight.
+        let weight: u64 = eval
+            .iter()
+            .map(|tx| self.package_tx_adjusted_weight(tx, eval, utxo_lookup))
+            .sum();
         if eval.len() > MAX_CLUSTER_SIZE || weight > MAX_CLUSTER_SIZE_WEIGHT {
             return Some("too-large-cluster".to_string());
         }
@@ -6887,6 +6898,67 @@ impl Mempool {
             );
         }
         None
+    }
+
+    /// Core `GetSigOpsAdjustedWeight` for a not-yet-admitted package tx.
+    /// Prevouts resolve from an earlier package tx, the mempool, then the
+    /// UTXO set; with any prevout unknown the sigop cost is 0, as in the
+    /// single-tx admission path.
+    fn package_tx_adjusted_weight<F>(
+        &self,
+        tx: &Transaction,
+        eval: &[&Transaction],
+        utxo_lookup: &F,
+    ) -> u64
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
+        let prevout_script = |op: &OutPoint| -> Option<Vec<u8>> {
+            let from_package = eval
+                .iter()
+                .find(|ptx| ptx.txid() == op.txid)
+                .and_then(|ptx| ptx.outputs.get(op.vout as usize));
+            let from_mempool = || {
+                self.transactions
+                    .get(&op.txid)
+                    .and_then(|entry| entry.tx.outputs.get(op.vout as usize))
+            };
+            match from_package.or_else(from_mempool) {
+                Some(out) => Some(out.script_pubkey.clone()),
+                None => utxo_lookup(op).map(|coin| coin.script_pubkey),
+            }
+        };
+        let scripts: Vec<Option<Vec<u8>>> = tx
+            .inputs
+            .iter()
+            .map(|input| prevout_script(&input.previous_output))
+            .collect();
+        let sigop_cost = if !tx.is_coinbase() && scripts.iter().all(Option::is_some) {
+            let std_flags = ScriptFlags::standard_flags();
+            get_transaction_sigop_cost(
+                tx,
+                |outpoint| {
+                    tx.inputs
+                        .iter()
+                        .position(|input| input.previous_output == *outpoint)
+                        .and_then(|idx| scripts[idx].clone())
+                        .map(|script_pubkey| CoinEntry {
+                            height: 0,
+                            is_coinbase: false,
+                            value: 0,
+                            script_pubkey,
+                        })
+                },
+                &std_flags,
+            )
+        } else {
+            0
+        };
+        crate::params::get_sigops_adjusted_weight(
+            tx.weight() as u64,
+            sigop_cost,
+            crate::params::DEFAULT_BYTES_PER_SIGOP,
+        )
     }
 
     fn diagram_chunks(&self, txids: &HashSet<Hash256>) -> Vec<FeeFrac> {
@@ -7328,7 +7400,7 @@ impl Mempool {
                 }
                 "transaction failed".to_string()
             } else if self.eval_has_direct_conflict(&eval) {
-                if let Some(msg) = self.package_rbf_reject_reason(&eval, tx_fees) {
+                if let Some(msg) = self.package_rbf_reject_reason(&eval, tx_fees, utxo_lookup) {
                     msg
                 } else {
                     return Some(self.commit_package_rbf(
