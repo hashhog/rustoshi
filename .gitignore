@@ -9,9 +9,18 @@ Cargo.lock
 
 .claude/skills/
 
-# Project-meta audit artifacts live in the meta-repo (audit-archive/).
+# Maintainer audit notes are kept outside this repository.
 audit/
 CORE-PARITY-AUDIT/
 
-# runtime setban list (written on setban; must not dirty the tree / block the bot)
+# runtime setban list (written by setban)
 crates/rpc/banlist.json
+
+# Local run output: logs, crash dumps, node state, fuzz findings
+*.log
+*.crashdump
+peers.json
+peers.dat
+anchors.dat
+fuzz/artifacts/
+fuzz/target/
