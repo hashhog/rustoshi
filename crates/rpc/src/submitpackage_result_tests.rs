@@ -2043,6 +2043,9 @@ async fn sendtoaddress_dust_matches_sendraw_reject() {
     }
     let mut wallet_state = WalletRpcState::new(manager, dir.keep());
     wallet_state.node = Some(state);
+    // No fee estimate on a fresh regtest node, so the fee comes from
+    // -fallbackfee. 5 sat/vB is the rate the fee strings below are pinned to.
+    wallet_state.fallback_fee_sat_kvb = 5_000;
     let rpc = WalletRpcImpl::new(Arc::new(RwLock::new(wallet_state)));
     let addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string();
     let err = rpc
@@ -2171,6 +2174,10 @@ async fn wallet_insufficient_funds_matches_core_message() {
     }
     let mut wallet_state = WalletRpcState::new(manager, dir.keep());
     wallet_state.node = Some(state);
+    // Without a fallback fee Core fails on fee estimation before it gets to
+    // coin selection. This test is about coin selection, so set one, as
+    // Core's regtest functional tests do (-fallbackfee=0.0002).
+    wallet_state.fallback_fee_sat_kvb = 20_000;
     let rpc = WalletRpcImpl::new(Arc::new(RwLock::new(wallet_state)));
     let addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string();
 

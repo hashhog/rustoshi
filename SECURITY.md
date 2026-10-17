@@ -1,74 +1,40 @@
-# Security Policy — rustoshi
+# Security policy
 
-rustoshi is a from-scratch Bitcoin full-node implementation in Rust, part of the
-[hashhog](https://github.com/hashhog) fleet of ten independent nodes that
-cross-validate each other and Bitcoin Core. It is the lead flagship — the node with
-the strongest correctness evidence in the fleet. Security is the entire purpose.
-
-## Project maturity — read this first
-
-rustoshi is released on the **tagged-validator** bar: a node you can build, run
-*beside* Bitcoin Core in watchtower mode, and trust to track consensus. Its
-correctness is unusually well-evidenced: an **`--assumevalid=0` genesis→tip
-validation reaches the exact Core tip byte-for-byte**, trusting no checkpoint — the
-strongest such proof in the fleet. P0 is proven: crash-recovery 3/3, deep-reorg 6/6
-(incl. a 110-block reorg), clean differential guard, byte-exact with Core live, and
-P2P DoS-hardened (getblocktxn-depth + accept-time inbound caps) with a signature cache.
-
-**It is NOT yet fund-capable for general custody.** rustoshi is the fleet's *funding
-target* and is closest to that bar, but it is not there. Do not custody funds on it
-yet beyond an eyes-open canary. The intended trust model for this release is: run it
-alongside Core with `consensus-diff` as a live divergence alarm.
-
-There are no fund-grade guarantees. Run from a pinned commit.
+rustoshi is an experimental, independent implementation of a Bitcoin full node. It is meant for research and testing. Do not use it to hold or move real funds.
 
 ## Supported versions
 
-| Version | Supported |
-|---------|-----------|
-| `v0.1.0-rc1` (pinned `e735ef1`) | Validator RC — best-effort; no security SLA until the final `v0.1.0` |
-| pre-release (`master`) | Best-effort |
+Only the latest `master` receives fixes. There are no long-term support releases and no response-time guarantee.
 
 ## Reporting a vulnerability
 
-**Please do NOT open a public GitHub issue** for anything in the consensus, P2P, or
-wallet paths — a public report could put real Bitcoin nodes or funds at risk.
+Please do not open a public GitHub issue for a problem in consensus, P2P or wallet code. A public report can put other nodes at risk before a fix exists.
 
-Report privately to the maintainer:
+Email the maintainer at `max@dockyard.navy` with:
 
-- **Email:** `max@dockyard.navy`  <!-- TODO(max): confirm or replace with a dedicated security alias -->
+- the affected component and commit,
+- a reproduction: a regtest script, a block or transaction in hex, or a malformed P2P message,
+- what happens and what you expected (ideally what Bitcoin Core does with the same input),
+- a suggested fix, if you have one.
 
-Include the affected path, a deterministic reproduction (a diff-test corpus entry,
-regtest script, or malformed message), impact, and any suggested fix. We coordinate
-a fix + disclosure timeline and credit you if you wish.
+You will get an acknowledgement, a fix and disclosure timeline agreed with you, and credit if you want it.
 
-## In scope (highest priority)
+## In scope
 
-- **Consensus divergence** — rustoshi accepting a block/tx Core rejects, or vice-versa.
-  This is the core concern; rustoshi carries 33+ receipted-and-fixed divergences with
-  Core `file:line` citations (see `../CORE-PARITY-AUDIT/`).
-- **Remotely-triggerable crashes / OOM / resource exhaustion** in the P2P or block/tx
-  decode paths (past examples: P2P-decoder OOM, BIP-157 overflow — both fixed).
-- **Wallet funds-safety** — silent wrong-key signing, a spend the node reports valid
-  that the network rejects, un-recoverable backups, fee miscalculation stranding funds.
-- **Chainstate corruption on crash** (crash-recovery is 3/3; regressions are in scope).
-
-## Custody caveats (not consensus, but real — for the fund track, not this validator tag)
-
-- The **default `createwallet` is not exportable/backup-able** (`listdescriptors`/
-  `dumpwallet` fail on it) — a funds trap. Use the seed (`sethdseed`) path for any
-  canary funding; the seed you generate offline IS the backup. See the funding runbook.
-- `signrawtransactionwithwallet` ignores `prevtxs` (no offline/hardware-wallet signing yet).
-
-These gate fund-capability (P2), not the watchtower-validator tag.
+- Consensus divergence: rustoshi accepting a block or transaction that Bitcoin Core rejects, or rejecting one Core accepts.
+- Remotely triggerable crashes, hangs, memory exhaustion or disk exhaustion through P2P messages, or through RPC on a port bound beyond localhost.
+- Chainstate corruption after a crash or power loss.
+- Wallet bugs that sign with the wrong key, produce a transaction the network rejects, compute a wrong fee, or lose keys.
 
 ## Out of scope
 
-- IBD/sync performance characteristics.
-- Issues requiring an already-compromised host.
+- Sync speed and resource use that is merely high.
+- Attacks that need an already compromised host or access to the datadir.
+- Exposing the RPC, REST or metrics port to an untrusted network. RPC is protected by the cookie or password, but REST and metrics have no authentication; bind them to localhost or firewall them.
 
-## Disclosure
+## Wallet caveats
 
-Coordinated disclosure. Consensus fixes are verified with `../tools/verify-fix.sh` and
-gated through the differential corpus before they are considered landed; a live
-watchtower (`../tools/watchtower.sh`) alarms on any rustoshi-vs-Core divergence.
+The wallet has not been reviewed for custody.
+
+- Wallet files live under `<datadir>/<net>/wallets/<name>/`, including the HD seed. They are not encrypted unless you call `encryptwallet`. Protect the datadir accordingly.
+- A wallet created with plain `createwallet` reports no descriptors from `listdescriptors`, so that call cannot be used to back it up. Use `backupwallet`, or create the wallet from a seed you generated and stored yourself (`sethdseed`).

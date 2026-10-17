@@ -407,3 +407,108 @@ fn test_package_rbf_diagram_and_modified_conflict_fee() {
     assert!(!mp.contains(&parent2.txid()));
     assert!(!mp.contains(&child2.txid()));
 }
+
+/// Bare 1-of-1 multisig. `GetLegacySigOpCount` charges an output
+/// OP_CHECKMULTISIG 20 sigops (cost 80), so each output adds
+/// 80 * DEFAULT_BYTES_PER_SIGOP = 1600 sigop-adjusted weight against 184 raw.
+fn bare_multisig_spk() -> Vec<u8> {
+    let mut s = vec![0x51, 0x21, 0x02];
+    s.extend_from_slice(&[0x11u8; 32]);
+    s.push(0x51);
+    s.push(0xae);
+    s
+}
+
+/// Original `O` (fee 20000) and its child `D` (fee 1000) in the mempool.
+/// The package parent conflicts with `O`, pays less than `O` + `D` so it is
+/// reconsidered with its child, and carries `parent_sigop_outs` bare-multisig
+/// outputs; the child carries `child_sigop_outs`.
+fn sigop_heavy_package_rbf(
+    seed: u16,
+    parent_sigop_outs: usize,
+    child_sigop_outs: usize,
+) -> (Mempool, PackageAcceptResult, [Transaction; 4]) {
+    let mut mp = pool();
+    let prev = hash_n(seed);
+    let value = 10_000_000u64;
+    let utxos: HashMap<_, _> = [(OutPoint { txid: prev, vout: 0 }, coin(value))]
+        .into_iter()
+        .collect();
+    // ~13.7k vB at fee 20000: a feerate the package's chunk beats, so the
+    // feerate diagram improves and the cluster limit is what decides.
+    let mut original_outs = vec![(value - 20_000 - 400 * 1_000, p2pkh_spk())];
+    original_outs.extend(std::iter::repeat((1_000u64, p2pkh_spk())).take(400));
+    let original = tx_with_outputs(&[(prev, 0)], &original_outs);
+    assert!(accept(&mut mp, vec![original.clone()], &utxos).all_accepted());
+    let descendant = tx_with_outputs(
+        &[(original.txid(), 0)],
+        &[(value - 21_000 - 400 * 1_000, p2pkh_spk())],
+    );
+    assert!(accept(&mut mp, vec![descendant.clone()], &utxos).all_accepted());
+    assert_eq!(mp.size(), 2);
+
+    let multisig = (1_000u64, bare_multisig_spk());
+    let parent_fee = 6_000u64;
+    let parent_change = value - parent_fee - 1_000 * parent_sigop_outs as u64;
+    let mut parent_outs = vec![(parent_change, p2pkh_spk())];
+    parent_outs.extend(std::iter::repeat(multisig.clone()).take(parent_sigop_outs));
+    let parent = tx_with_outputs(&[(prev, 0)], &parent_outs);
+    let child_fee = 200_000u64;
+    let child_change = parent_change - child_fee - 1_000 * child_sigop_outs as u64;
+    let mut child_outs = vec![(child_change, p2pkh_spk())];
+    child_outs.extend(std::iter::repeat(multisig).take(child_sigop_outs));
+    let child = tx_with_outputs(&[(parent.txid(), 0)], &child_outs);
+    // Raw weight is far under MAX_CLUSTER_SIZE_WEIGHT (404_000); only the
+    // sigop-adjusted weight can reach it.
+    assert!(parent.weight() + child.weight() < 60_000);
+
+    let res = accept(&mut mp, vec![parent.clone(), child.clone()], &utxos);
+    (mp, res, [original, descendant, parent, child])
+}
+
+/// Core sizes TxGraph entries by `GetSigOpsAdjustedWeight` (txmempool.cpp),
+/// so `CheckMemPoolPolicyLimits` in `PackageRBFChecks` sees
+/// 253 * 1600 = 404_800 > 404_000 and fails the package `too-large-cluster`,
+/// even though the raw weight is ~47k. The conflict's descendant is evicted
+/// with it and does not join the package's cluster.
+#[test]
+fn test_package_rbf_cluster_weight_is_sigop_adjusted() {
+    let (mp, res, [original, descendant, parent, child]) = sigop_heavy_package_rbf(40, 127, 126);
+    assert_eq!(res.package_error.as_deref(), Some("too-large-cluster"), "{res:?}");
+    assert_eq!(
+        res.tx_results[0].error.as_deref(),
+        Some(
+            format!(
+                "insufficient fee, rejecting replacement {}, less fees than conflicting txs; 0.00006 < 0.00021",
+                parent.txid()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        res.tx_results[1].error.as_deref(),
+        Some("bad-txns-inputs-missingorspent")
+    );
+    assert!(replaced_union(&res).is_empty(), "{:?}", replaced_union(&res));
+    assert!(mp.contains(&original.txid()));
+    assert!(mp.contains(&descendant.txid()));
+    assert!(!mp.contains(&parent.txid()));
+    assert!(!mp.contains(&child.txid()));
+    assert_eq!(mp.size(), 2);
+}
+
+/// One output fewer: 252 * 1600 = 403_200 <= 404_000. Core accepts and
+/// evicts the conflict and its descendant. Guards against over-counting.
+#[test]
+fn test_package_rbf_cluster_weight_at_limit_accepts() {
+    let (mp, res, [original, descendant, parent, child]) = sigop_heavy_package_rbf(41, 126, 126);
+    assert_eq!(res.package_error, None, "{res:?}");
+    assert!(res.tx_results.iter().all(|r| r.error.is_none()), "{:?}", res.tx_results);
+    let mut expect = vec![original.txid(), descendant.txid()];
+    expect.sort();
+    assert_eq!(replaced_union(&res), expect);
+    assert!(!mp.contains(&original.txid()));
+    assert!(!mp.contains(&descendant.txid()));
+    assert!(mp.contains(&parent.txid()));
+    assert!(mp.contains(&child.txid()));
+}

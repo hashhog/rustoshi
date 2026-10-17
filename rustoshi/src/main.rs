@@ -186,6 +186,12 @@ struct Cli {
     #[arg(long = "minrelaytxfee")]
     minrelaytxfee: Option<String>,
 
+    /// Fee rate (BTC/kvB) the wallet uses when fee estimation has
+    /// insufficient data (Bitcoin Core `-fallbackfee`). 0 disables the
+    /// fallback, and then a send with no estimate fails. Default: 0.
+    #[arg(long = "fallbackfee")]
+    fallbackfee: Option<String>,
+
     /// Specify your own public address `<ip>[:port]` to advertise to peers
     /// (Bitcoin Core `-externalip`; repeatable and/or comma-separated). A
     /// bare IP uses the P2P listen port. Implies `--discover=false` unless
@@ -489,6 +495,23 @@ fn parse_btc_kvb_to_sats(amount: &str) -> anyhow::Result<u64> {
         .checked_mul(100_000_000)
         .and_then(|whole| whole.checked_add(frac_sats))
         .ok_or_else(|| anyhow::anyhow!("minrelaytxfee amount out of range"))
+}
+
+/// Core wallet.cpp `-fallbackfee`: ParseMoney in BTC/kvB, refuse to start on
+/// a bad amount, warn above HIGH_TX_FEE_PER_KB (0.01 BTC/kvB). Unset is
+/// Core's DEFAULT_FALLBACK_FEE, 0, which disables the fallback.
+fn fallback_fee_sat_kvb(amount: Option<&str>) -> anyhow::Result<u64> {
+    let Some(amount) = amount else {
+        return Ok(0);
+    };
+    let sat_kvb = parse_btc_kvb_to_sats(amount)
+        .map_err(|_| anyhow::anyhow!("Invalid amount for -fallbackfee=<amount>: '{amount}'"))?;
+    if sat_kvb > 1_000_000 {
+        tracing::warn!(
+            "-fallbackfee is set very high! This is the transaction fee you may pay when fee estimates are not available."
+        );
+    }
+    Ok(sat_kvb)
 }
 
 fn resolve_base_datadir(datadir: &str) -> PathBuf {
@@ -4050,6 +4073,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
         rpc_state_inner.mempool.set_min_relay_feerate_kvb(sat_kvb);
     }
+    rpc_state_inner.wallet_fallback_fee_sat_kvb = fallback_fee_sat_kvb(cli.fallbackfee.as_deref())?;
     rpc_state_inner.txindex_enabled = cli.txindex;
     rpc_state_inner.blockfilterindex_enabled =
         !matches!(cli.blockfilterindex.to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no");
@@ -10180,6 +10204,26 @@ mod tests {
         assert_eq!(cli.blockfilterindex, "basic");
     }
 
+    /// KB-135: `--fallbackfee` is Core's `-fallbackfee` in BTC/kvB. Unset is
+    /// 0 (fallback disabled), a bad amount refuses to start with Core's text.
+    #[test]
+    fn test_cli_fallbackfee_kb135() {
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert_eq!(fallback_fee_sat_kvb(cli.fallbackfee.as_deref()).unwrap(), 0);
+        let cli = Cli::try_parse_from(["rustoshi", "--fallbackfee=0.0002"]).unwrap();
+        assert_eq!(
+            fallback_fee_sat_kvb(cli.fallbackfee.as_deref()).unwrap(),
+            20_000
+        );
+        assert_eq!(fallback_fee_sat_kvb(Some("0")).unwrap(), 0);
+        let err = fallback_fee_sat_kvb(Some("abc")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid amount for -fallbackfee=<amount>: 'abc'"
+        );
+        assert!(fallback_fee_sat_kvb(Some("-0.0001")).is_err());
+    }
+
     /// FIX-88 W121 G30: `--peerblockfilters` parses + defaults off.
     /// Mirrors Bitcoin Core `init.cpp:993 DEFAULT_PEERBLOCKFILTERS=false`.
     #[test]
@@ -11316,6 +11360,58 @@ mod tests {
         assert!(V::BadSubsidy(1, 0).is_invalid_block_verdict());
         assert!(V::NonFinalTx.is_invalid_block_verdict());
         assert!(V::BadDifficulty.is_invalid_block_verdict());
+    }
+
+    /// Run `e` through the connect path's marking decision (the
+    /// `connect_error_is_verdict` -> `mark_connect_failed_block_invalid` pair
+    /// at both P2P connect sites) and report whether the block's index entry
+    /// ended up FAILED_VALIDITY.
+    fn connect_failure_marks_index(e: &ValidationError) -> bool {
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let params = ChainParams::mainnet();
+        let parent = hdr(params.genesis_hash, 1_775_651_930);
+        let block = rustoshi_primitives::Block {
+            header: hdr(parent.block_hash(), 1_775_653_126),
+            transactions: params.genesis_block.transactions.clone(),
+        };
+        let hash = block.header.block_hash();
+        index_entry(&store, &parent, 1);
+        index_entry(&store, &block.header, 2);
+        let mut hs = HeaderSync::new(params.genesis_hash);
+        hs.set_best_header(2, hash);
+        let mut dl = BlockDownloader::new(1, 2);
+        if connect_error_is_verdict(e) {
+            mark_connect_failed_block_invalid(&store, &mut hs, &mut dl, &block, hash, 2);
+        }
+        store
+            .get_block_index(&hash)
+            .unwrap()
+            .expect("index entry")
+            .status
+            .has(BlockStatus::FAILED_VALIDITY)
+    }
+
+    /// A low-work block is refused (`too-little-chainwork`) but its index
+    /// entry is NOT flagged failed. Core's AcceptBlockHeader returns
+    /// BLOCK_HEADER_LOW_WORK before AddToBlockIndex, so InvalidBlockFound never
+    /// runs: low work says the chain is not yet worth storing, not that the
+    /// block is invalid. Marking it would make the same block, once its chain
+    /// has the work, permanently rejected as cached-invalid.
+    #[test]
+    fn low_work_block_rejected_but_not_marked_failed() {
+        use rustoshi_consensus::validation::accept_block_header_chain_work;
+        let params = ChainParams::mainnet();
+        let e = accept_block_header_chain_work(&[0u8; 32], false, &params)
+            .expect_err("work below nMinimumChainWork must be refused");
+        assert_eq!(e, ValidationError::TooLittleChainwork);
+        assert!(!e.is_invalid_block_verdict(), "{e:?}");
+        assert!(!connect_failure_marks_index(&e), "low-work block was flagged FAILED_VALIDITY");
+        // Control: the harness does see a mark for a content verdict.
+        assert!(connect_failure_marks_index(&ValidationError::BadProofOfWork));
+        // Control: work at the minimum is accepted, so the gate is not
+        // refusing everything.
+        assert!(accept_block_header_chain_work(&params.minimum_chain_work, false, &params).is_ok());
     }
 
     /// R-b: a block parked on a missing pre-snapshot header stays parked

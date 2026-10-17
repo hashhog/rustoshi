@@ -14,13 +14,22 @@ hangs.
 | `fuzz_eval_script`   | Script interpreter | `eval_script` / `verify_script` (consensus, `DummyChecker`) |
 | `fuzz_netmsg_decode` | P2P message  | `NetworkMessage::deserialize(command, payload)` (network) |
 
-`fuzz/` is a **standalone workspace** (its own `[workspace]` table) nested in the
-rustoshi repo, so the libfuzzer/sanitizer deps stay out of the parent
-`Cargo.lock` and the fleet's stable `cargo build --release` is unaffected.
+`fuzz/` is a standalone workspace (its own `[workspace]` table) nested in the
+repository, so the libFuzzer and sanitizer dependencies stay out of the main
+workspace and a stable `cargo build --release` is unaffected.
 
 ## Requirements
 
-nightly toolchain + `cargo-fuzz` (both present on maxbox):
+A nightly toolchain and `cargo-fuzz`:
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+```
+
+Run the commands below from the repository root.
+
+## Build all targets
 
 ```bash
 cargo +nightly fuzz build
@@ -29,28 +38,20 @@ cargo +nightly fuzz build
 ## Run one target
 
 ```bash
-cargo +nightly fuzz run fuzz_block_decode
+cargo +nightly fuzz run fuzz_block_decode -- -max_total_time=60
 ```
 
-## Background accumulation (all four, 8 workers each)
+Drop `-max_total_time` to run until stopped. Useful libFuzzer options are
+`-jobs=N -workers=N` for parallel runs and `-rss_limit_mb=4096`, which reports
+any input that makes a decoder allocate more than about 4 GB as an
+out-of-memory finding.
+
+The corpus grows under `fuzz/corpus/<target>/`. Crashing, out-of-memory and
+timeout inputs are saved under `fuzz/artifacts/<target>/` with a `crash-`,
+`oom-` or `timeout-` prefix. Run a single saved input with:
 
 ```bash
-cd rustoshi        # the rustoshi submodule root (fuzz/ lives here)
-for t in fuzz_block_decode fuzz_tx_decode fuzz_eval_script fuzz_netmsg_decode; do
-  nohup cargo +nightly fuzz run "$t" -- \
-    -jobs=8 -workers=8 -rss_limit_mb=4096 \
-    > "fuzz/${t}.log" 2>&1 &
-done
+cargo +nightly fuzz run fuzz_block_decode fuzz/corpus/fuzz_block_decode/00939fdc1a1c47dbc3e994e1cc275153409e3524
 ```
 
-Corpus accumulates under `fuzz/corpus/<target>/`; crashing/OOM inputs are saved
-under `fuzz/artifacts/<target>/` (prefixed `crash-`, `oom-`, `timeout-`).
-Reproduce any finding with:
-
-```bash
-cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>
-```
-
-`-rss_limit_mb=4096` makes libFuzzer flag any single allocation above ~4 GB as
-an out-of-memory finding — the mechanism that surfaced the `reject`-message DoS
-(see project report).
+Pass a file from `fuzz/artifacts/<target>/` the same way to reproduce a finding.
