@@ -404,6 +404,9 @@ impl ValidationError {
     /// - `InvalidChain` (only produced by disconnect / chain-walk failures,
     ///   i.e. local state, never by a block's own content).
     /// - `SystemFault` (gate 6: a local I/O / disk / DB failure).
+    /// - `TooLittleChainwork` (BLOCK_HEADER_LOW_WORK: AcceptBlockHeader
+    ///   returns it before AddToBlockIndex, so InvalidBlockFound never runs;
+    ///   the same block is valid once its chain has the work).
     ///
     /// EXHAUSTIVE (no wildcard): a new variant does not compile until someone
     /// decides whether it is a verdict. The old `!matches!(..)` deny-list made
@@ -420,7 +423,8 @@ impl ValidationError {
             | ValidationError::MissingAncestorHeader(_)
             | ValidationError::BlockTooFarAhead(_, _)
             | ValidationError::InvalidChain
-            | ValidationError::SystemFault(_) => false,
+            | ValidationError::SystemFault(_)
+            | ValidationError::TooLittleChainwork => false,
             // Verdicts: properties of the block's own content.
             ValidationError::BlockTooLarge(_)
             | ValidationError::BlockLengthTooLarge(_)
@@ -441,8 +445,7 @@ impl ValidationError {
             | ValidationError::FeesOutOfRange(_)
             | ValidationError::WeightExceeded(_)
             | ValidationError::NonFinalTx
-            | ValidationError::Bip30DuplicateOutput
-            | ValidationError::TooLittleChainwork => true,
+            | ValidationError::Bip30DuplicateOutput => true,
         }
     }
 
