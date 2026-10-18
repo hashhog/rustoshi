@@ -678,19 +678,61 @@ mod tests {
     // G4 — Base block header must be in chain (MISSING)
     // ================================================================
 
-    /// G4 BUG: the CLI --load-snapshot path does NOT check that the snapshot's
-    /// base_blockhash is present in the headers chain before ingesting coins.
-    /// Bitcoin Core's ActivateSnapshot returns an error:
-    ///   "The base block header (...) must appear in the headers chain."
-    /// Rustoshi creates a synthetic BlockIndexEntry with prev_hash=ZERO and
-    /// proceeds unconditionally.
+    /// G4: both load paths (CLI `--load-snapshot` and RPC `loadtxoutset`)
+    /// refuse a base header they do not know, as Core's ActivateSnapshot
+    /// does: "The base block header (...) must appear in the headers chain."
+    /// This pins the lookup they share. End-to-end refusals:
+    /// `rustoshi/tests/test_load_snapshot_base_header.rs` (CLI) and
+    /// `test_loadtxoutset_refuses_unknown_base_header_and_writes_nothing` (RPC).
     #[test]
-    #[ignore = "G4 BUG: no headers-chain presence check before snapshot activation — main.rs:1501 proceeds regardless of whether base_blockhash has been synced"]
     fn g4_snapshot_rejected_if_base_header_not_in_chain() {
-        // This test would verify that --load-snapshot with a snapshot whose
-        // base_blockhash is not yet known to the headers database returns an
-        // appropriate error rather than activating a phantom chain tip.
-        let _ = "not yet implemented";
+        use crate::block_store::BlockStore;
+        use crate::db::ChainDb;
+        use crate::snapshot::{known_snapshot_base_header, snapshot_base_header_unknown_message};
+        use rustoshi_primitives::BlockHeader;
+
+        let hdr = |prev: Hash256, nonce: u32| BlockHeader {
+            version: 4,
+            prev_block_hash: prev,
+            merkle_root: Hash256([0x33; 32]),
+            timestamp: 1_700_000_000,
+            bits: 0x207fffff,
+            nonce,
+        };
+        let parent = hdr(Hash256([0x11; 32]), 1);
+        let base = hdr(parent.block_hash(), 2);
+        let base_hash = base.block_hash();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = ChainDb::open(tmp.path()).unwrap();
+        let store = BlockStore::new(&db);
+
+        // Unknown: nothing stored, no band.
+        assert_eq!(known_snapshot_base_header(&store, &base_hash, &[]).unwrap(), None);
+        // A band whose last header is not the base does not count.
+        assert_eq!(
+            known_snapshot_base_header(&store, &base_hash, &[base.clone(), parent.clone()])
+                .unwrap(),
+            None
+        );
+        // A band ending at the base supplies it.
+        assert_eq!(
+            known_snapshot_base_header(&store, &base_hash, &[parent.clone(), base.clone()])
+                .unwrap(),
+            Some(base.clone())
+        );
+        // A stored header (header sync / submitheader) supplies it.
+        store.put_header(&base_hash, &base).unwrap();
+        assert_eq!(known_snapshot_base_header(&store, &base_hash, &[]).unwrap(), Some(base));
+
+        assert_eq!(
+            snapshot_base_header_unknown_message(&base_hash),
+            format!(
+                "The base block header ({}) must appear in the headers chain. Make sure all \
+                 headers are syncing, and call loadtxoutset again",
+                base_hash.to_hex()
+            )
+        );
     }
 
     // ================================================================

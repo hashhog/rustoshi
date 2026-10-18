@@ -2368,6 +2368,17 @@ impl RpcServerImpl {
         };
 
         let store = BlockStore::new(&state.db);
+        // `load_tx_outset` already refused an unknown base header; look it up
+        // before the first write so the index entry never gets zero defaults.
+        let base_header = store.get_header(&base_blockhash).ok().flatten().ok_or_else(|| {
+            Self::rpc_error(
+                rpc_error::RPC_INTERNAL_ERROR,
+                format!(
+                    "Unable to load UTXO snapshot: {}",
+                    rustoshi_storage::snapshot_base_header_unknown_message(&base_blockhash)
+                ),
+            )
+        })?;
         for (outpoint, coin) in coins {
             store.put_utxo(outpoint, &coin.to_entry()).map_err(|e| {
                 Self::rpc_error(
@@ -2377,7 +2388,6 @@ impl RpcServerImpl {
             })?;
         }
 
-        let base_header = store.get_header(&base_blockhash).ok().flatten();
         let mut snap_status = BlockStatus::new();
         snap_status.set(BlockStatus::VALID_HEADER);
         snap_status.set(BlockStatus::VALID_TREE);
@@ -2389,14 +2399,11 @@ impl RpcServerImpl {
             height: base_height,
             status: snap_status,
             n_tx: 0,
-            timestamp: base_header.as_ref().map(|h| h.timestamp).unwrap_or(0),
-            bits: base_header.as_ref().map(|h| h.bits).unwrap_or(0),
-            nonce: base_header.as_ref().map(|h| h.nonce).unwrap_or(0),
-            version: base_header.as_ref().map(|h| h.version).unwrap_or(0),
-            prev_hash: base_header
-                .as_ref()
-                .map(|h| h.prev_block_hash)
-                .unwrap_or(Hash256::ZERO),
+            timestamp: base_header.timestamp,
+            bits: base_header.bits,
+            nonce: base_header.nonce,
+            version: base_header.version,
+            prev_hash: base_header.prev_block_hash,
             chain_work: state.params.minimum_chain_work,
         };
         store
@@ -16817,6 +16824,36 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         };
 
+        // Core `ActivateSnapshot` (validation.cpp:5611-5615): the base header
+        // must already be known, checked before any coin is read or written.
+        // Without it the base index entry would get `prev_hash = ZERO` and
+        // `bits = 0`, which breaks ancestor walks and leaves the base's own
+        // proof out of chain work (mainnet 2026-09-28).
+        {
+            let db = self.state.read().await.db.clone();
+            let known = rustoshi_storage::known_snapshot_base_header(
+                &BlockStore::new(&db),
+                &base_blockhash,
+                &au.base_tail_headers,
+            )
+            .map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_INTERNAL_ERROR,
+                    format!("Failed to look up the snapshot base header: {e}"),
+                )
+            })?;
+            if known.is_none() {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INTERNAL_ERROR,
+                    format!(
+                        "Unable to load UTXO snapshot: {}. ({})",
+                        rustoshi_storage::snapshot_base_header_unknown_message(&base_blockhash),
+                        resolved.display()
+                    ),
+                ));
+            }
+        }
+
         // Read every coin and compute the file's HASH_SERIALIZED.
         let mut file_coins: Vec<(rustoshi_primitives::OutPoint, Coin)> = Vec::new();
         loop {
@@ -24892,10 +24929,12 @@ mod tests {
         let b3_hash = b3.header.block_hash();
         blocks.push(b3);
 
-        // Store blocks + the active height index so loadtxoutset's walk finds
-        // them by height.
+        // Store headers, blocks + the active height index so loadtxoutset's
+        // walk finds them by height. The headers matter too: like Core,
+        // loadtxoutset refuses a base whose header it does not know.
         for (h, blk) in blocks.iter().enumerate() {
             let hash = blk.header.block_hash();
+            store.put_header(&hash, &blk.header).expect("put_header");
             store.put_block(&hash, blk).expect("put_block");
             store.put_height_index(h as u32, &hash).expect("put_height_index");
         }
@@ -25056,6 +25095,95 @@ mod tests {
             active.snapshot_blockhash.as_deref(),
             Some(base_hash.to_hex().as_str()),
             "getchainstates must report the snapshot_blockhash"
+        );
+    }
+
+    /// Core `ActivateSnapshot` (validation.cpp:5611-5615): a whitelisted
+    /// snapshot whose base header is unknown is refused with Core's error and
+    /// nothing is written. Before the fix the RPC ingested the coins, moved
+    /// the tip, and wrote the base index entry with `prev_hash = ZERO` and
+    /// `bits = 0`, so the base's proof was missing from chain work and every
+    /// ancestor walk stopped at the base.
+    ///
+    /// Control: the same file, once the base header is stored, loads and the
+    /// base entry carries the header's real parent link and bits. That shows
+    /// the header is the only thing the first call lacked.
+    #[tokio::test]
+    async fn test_loadtxoutset_refuses_unknown_base_header_and_writes_nothing() {
+        use rustoshi_storage::{compute_hash_serialized, ChainDb, CF_UTXO};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let mut params = rustoshi_consensus::ChainParams::regtest();
+        let magic = params.network_magic;
+
+        let parent = Hash256([0x5a; 32]);
+        let base_header = au_header(parent, 3);
+        let base_hash = base_header.block_hash();
+        let coins = vec![(
+            OutPoint { txid: Hash256([0x42; 32]), vout: 0 },
+            Coin {
+                tx_out: TxOut { value: 50_0000_0000, script_pubkey: au_p2pkh(0x11) },
+                height: 1,
+                is_coinbase: true,
+            },
+        )];
+        let commitment = compute_hash_serialized(coins.iter().cloned());
+        assert!(params.register_regtest_assumeutxo(3, base_hash, commitment, 2, None));
+        let snap = au_write_snapshot(tmp.path(), base_hash, &coins, magic);
+
+        let db_for_check = db.clone();
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.data_dir = Some(tmp.path().to_path_buf());
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        let err = rpc
+            .load_tx_outset(snap.to_string_lossy().to_string())
+            .await
+            .expect_err("loadtxoutset must refuse a base header it does not know");
+        assert_eq!(err.code(), rpc_error::RPC_INTERNAL_ERROR);
+        let want = format!(
+            "Unable to load UTXO snapshot: The base block header ({}) must appear in the \
+             headers chain. Make sure all headers are syncing, and call loadtxoutset again. ({})",
+            base_hash.to_hex(),
+            snap.display()
+        );
+        assert_eq!(err.message(), want);
+
+        let store = BlockStore::new(&db_for_check);
+        let coin_rows = db_for_check.iter_cf(CF_UTXO).map(|it| it.count()).unwrap_or(0);
+        assert_eq!(coin_rows, 0, "refused load must not write coins");
+        assert!(store.get_block_index(&base_hash).unwrap().is_none(), "no base index entry");
+        assert!(store.get_hash_by_height(3).unwrap().is_none(), "no base height entry");
+        assert_eq!(rpc.get_block_count().await.unwrap(), 0, "tip must not move");
+        assert!(
+            rustoshi_storage::read_snapshot_blockhash(tmp.path()).unwrap().is_none(),
+            "no snapshot base marker"
+        );
+        let gcs = rpc.get_chain_states().await.expect("getchainstates");
+        assert!(
+            gcs.chainstates.iter().all(|c| c.snapshot_blockhash.is_none()),
+            "refused load must not activate a snapshot chainstate"
+        );
+
+        // Control: with the header known, the same file loads.
+        store.put_header(&base_hash, &base_header).unwrap();
+        rpc.load_tx_outset(snap.to_string_lossy().to_string())
+            .await
+            .expect("loadtxoutset must accept once the base header is known");
+        assert_eq!(rpc.get_block_count().await.unwrap(), 3);
+        let entry = store.get_block_index(&base_hash).unwrap().expect("base index entry");
+        assert_eq!(entry.prev_hash, parent, "base parent link comes from its header");
+        assert_eq!(entry.bits, base_header.bits, "base bits come from its header");
+        assert_eq!(entry.timestamp, base_header.timestamp);
+        assert_eq!(entry.nonce, base_header.nonce);
+        assert_eq!(entry.version, base_header.version);
+        assert_ne!(
+            rustoshi_consensus::get_block_proof(entry.bits),
+            rustoshi_consensus::get_block_proof(0),
+            "the base's own proof must count toward chain work"
         );
     }
 

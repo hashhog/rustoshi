@@ -92,7 +92,8 @@ pub use utxo_cache::{
 };
 pub use snapshot::{
     compute_hash_serialized, compute_utxo_hash, compute_utxo_muhash, find_snapshot_chainstate_dir,
-    read_snapshot_blockhash, write_snapshot_blockhash, BackgroundChainstate,
+    known_snapshot_base_header, read_snapshot_blockhash, snapshot_base_header_unknown_message,
+    write_snapshot_blockhash, BackgroundChainstate,
     BackgroundValidationError, ChainstateManager, SnapshotActivation, SnapshotError,
     SnapshotMetadata, SnapshotReader, SnapshotState, SnapshotVerdict, SnapshotWriter,
     core_block_undo_payload, read_core_txin_undo,

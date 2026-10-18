@@ -1314,6 +1314,39 @@ pub fn write_snapshot_blockhash(
     Ok(())
 }
 
+/// The snapshot base block's header, if this node knows it.
+///
+/// Core's `ActivateSnapshot` refuses to load a snapshot until the base header
+/// is in the block index (`validation.cpp:5611-5615`), so the base's
+/// `CBlockIndex` always has a real `pprev` and `nBits`. rustoshi knows the
+/// header when it is stored in `CF_HEADERS` (header sync or `submitheader`),
+/// or when the matched assumeutxo entry carries a base-tail header band whose
+/// last header hashes to the base. Anything else is unknown: activating would
+/// write a base index entry with `prev_hash = ZERO` and `bits = 0`.
+pub fn known_snapshot_base_header(
+    store: &crate::block_store::BlockStore<'_>,
+    base_blockhash: &Hash256,
+    base_tail_headers: &[rustoshi_primitives::BlockHeader],
+) -> Result<Option<rustoshi_primitives::BlockHeader>, StorageError> {
+    if let Some(h) = store.get_header(base_blockhash)? {
+        return Ok(Some(h));
+    }
+    Ok(base_tail_headers
+        .last()
+        .filter(|h| h.block_hash() == *base_blockhash)
+        .cloned())
+}
+
+/// Core's refusal when the snapshot base header is unknown
+/// (`validation.cpp:5613`).
+pub fn snapshot_base_header_unknown_message(base_blockhash: &Hash256) -> String {
+    format!(
+        "The base block header ({}) must appear in the headers chain. Make sure all \
+         headers are syncing, and call loadtxoutset again",
+        base_blockhash.to_hex()
+    )
+}
+
 /// Read the base blockhash from a file in the chainstate directory.
 pub fn read_snapshot_blockhash(
     chainstate_dir: &std::path::Path,
