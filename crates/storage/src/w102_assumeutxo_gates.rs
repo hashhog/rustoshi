@@ -725,6 +725,21 @@ mod tests {
         store.put_header(&base_hash, &base).unwrap();
         assert_eq!(known_snapshot_base_header(&store, &base_hash, &[]).unwrap(), Some(base));
 
+        // Production boots `--load-snapshot` on a fresh mainnet datadir with
+        // no headers: every built-in mainnet entry must supply its base header
+        // through its band, or the gate would refuse the normal load.
+        let empty = ChainDb::open(&tmp.path().join("empty")).unwrap();
+        let empty_store = BlockStore::new(&empty);
+        let mainnet = rustoshi_consensus::ChainParams::mainnet();
+        assert!(!mainnet.assumeutxo_data.is_empty());
+        for e in &mainnet.assumeutxo_data {
+            let h = known_snapshot_base_header(&empty_store, &e.blockhash, &e.base_tail_headers)
+                .unwrap()
+                .unwrap_or_else(|| panic!("mainnet entry {} has no base header", e.height));
+            assert_eq!(h.block_hash(), e.blockhash);
+            assert_ne!(h.bits, 0);
+        }
+
         assert_eq!(
             snapshot_base_header_unknown_message(&base_hash),
             format!(
