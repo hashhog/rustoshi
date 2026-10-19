@@ -566,6 +566,81 @@ async fn size_on_disk_counts_block_and_undo_bytes() {
     assert_eq!(info.size_on_disk, expected, "invalidateblock does not shrink the files");
 }
 
+/// The memoized `size_on_disk` and chain-tx count (`crate::chain_stats`) give
+/// the same answers as the full walks they replaced, after each kind of change
+/// that moves them: a new block, a block losing its data (pruned), and an
+/// ancestor whose body arrives after its descendants were counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_stats_cache_matches_the_full_walks() {
+    use crate::server::{active_chain_tx_count, core_size_on_disk};
+    let (server, blocks, db) = chain_db(3).await;
+    let store = BlockStore::new(&db);
+    let tip = || blocks[3].block_hash();
+
+    let info = server.get_blockchain_info().await.unwrap();
+    assert_eq!(info.size_on_disk, core_size_on_disk(&store), "first pass");
+
+    // New block: counted on the next call.
+    let r = server.submit_block(hex_of(&blocks[4])).await.unwrap();
+    assert!(r.is_none(), "block 4 rejected: {r:?}");
+    let info = server.get_blockchain_info().await.unwrap();
+    assert_eq!(info.blocks, 4);
+    assert_eq!(
+        info.size_on_disk,
+        core_size_on_disk(&store),
+        "after a new block"
+    );
+
+    // Pruned: block 1 loses its data and undo, and the cached figure for it
+    // must not be reused.
+    let before = info.size_on_disk;
+    let h1 = blocks[1].block_hash();
+    let mut e1 = store.get_block_index(&h1).unwrap().unwrap();
+    e1.status.clear(BlockStatus::HAVE_DATA);
+    e1.status.clear(BlockStatus::HAVE_UNDO);
+    store.put_block_index(&h1, &e1).unwrap();
+    let info = server.get_blockchain_info().await.unwrap();
+    assert_eq!(
+        info.size_on_disk,
+        core_size_on_disk(&store),
+        "after pruning block 1"
+    );
+    assert!(
+        info.size_on_disk < before,
+        "pruning must shrink size_on_disk"
+    );
+
+    // Chain tx: block 2's body "has not arrived" (n_tx 0) when the tip is
+    // first counted; once it arrives the count must include it. (A fresh
+    // cache: the node's own already holds these tips, counted with data.)
+    let stats = crate::chain_stats::ChainStatsCache::shared();
+    let h2 = blocks[2].block_hash();
+    let mut e2 = store.get_block_index(&h2).unwrap().unwrap();
+    let real_ntx = e2.n_tx;
+    e2.n_tx = 0;
+    store.put_block_index(&h2, &e2).unwrap();
+    assert_eq!(
+        stats.active_chain_tx(&store, &tip()),
+        active_chain_tx_count(&store, &tip())
+    );
+    e2.n_tx = real_ntx;
+    store.put_block_index(&h2, &e2).unwrap();
+    let full = active_chain_tx_count(&store, &tip());
+    assert_eq!(
+        stats.active_chain_tx(&store, &tip()),
+        full,
+        "stale after the body arrived"
+    );
+    // Cached now: a repeat and a child of the tip both agree with the walk.
+    assert_eq!(stats.active_chain_tx(&store, &tip()), full);
+    let tip4 = blocks[4].block_hash();
+    assert_eq!(
+        stats.active_chain_tx(&store, &tip4),
+        active_chain_tx_count(&store, &tip4)
+    );
+    assert_eq!(stats.active_chain_tx(&store, &tip4), full + 1);
+}
+
 /// P2SH wrapping `OP_TRUE`: standard prevout, consensus-valid without a
 /// signature, no witness (so the confirming block needs no witness commitment).
 fn p2sh_op_true() -> (Vec<u8>, Vec<u8>) {

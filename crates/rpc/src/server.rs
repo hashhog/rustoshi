@@ -85,7 +85,7 @@ pub(crate) static DISK_USAGE_WALK_HOOK: std::sync::Mutex<Option<(usize, Box<dyn 
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-fn disk_usage_walk_test_hook(db: &ChainDb) {
+pub(crate) fn disk_usage_walk_test_hook(db: &ChainDb) {
     let key = db as *const ChainDb as usize;
     if let Some((k, f)) = DISK_USAGE_WALK_HOOK.lock().unwrap().as_ref() {
         if *k == key {
@@ -94,27 +94,11 @@ fn disk_usage_walk_test_hook(db: &ChainDb) {
     }
 }
 
-/// Total on-disk byte usage of the block/chain storage under `data_dir`.
-///
-/// Mirrors Bitcoin Core's `getblockchaininfo` `size_on_disk`
-/// (`rpc/blockchain.cpp` → `BlockManager::CalculateCurrentUsage()`), which sums
-/// the bytes of the block+undo storage. rustoshi keeps full block bodies and the
-/// chainstate together in a single RocksDB rooted at `<data_dir>/chainstate`
-/// (see `rustoshi/src/main.rs`: `datadir.join("chainstate")`), so the analogous
-/// figure is the recursive size of that directory. Cosmetic/reporting only — the
-/// value is never consulted by any validation or fork-choice path.
-///
-/// Best-effort: file/dir stat errors are skipped (a transient RocksDB compaction
-/// Core `BlockManager::CalculateCurrentUsage`: logical bytes of every
-/// `blk*.dat` record (magic + size + block) plus every `rev*.dat` record
-/// (magic + size + undo payload + 32-byte checksum). Genesis has no undo.
-/// Headers-only blocks are not in the block files. Invalidate does not
-/// delete the records, so a failed block still counts.
-fn core_size_on_disk(store: &BlockStore) -> u64 {
+/// The uncached `size_on_disk` walk that [`crate::chain_stats`] replaced,
+/// kept as the reference the cache is tested against.
+#[cfg(test)]
+pub(crate) fn core_size_on_disk(store: &BlockStore) -> u64 {
     use rustoshi_storage::block_store::BlockStatus;
-    crate::test_hooks::disk_usage_walk_sleep();
-    #[cfg(test)]
-    disk_usage_walk_test_hook(store.db());
     let Ok(iter) = store.iter_block_index() else {
         return 0;
     };
@@ -155,7 +139,9 @@ fn core_size_on_disk(store: &BlockStore) -> u64 {
     total
 }
 
-/// Chain-tx total of the active chain (Core `nChainTx` at the tip).
+/// The uncached chain-tx walk, kept as the reference the cache is tested
+/// against.
+#[cfg(test)]
 pub(crate) fn active_chain_tx_count(store: &BlockStore, tip: &Hash256) -> u64 {
     let mut total = 0u64;
     let mut walk = *tip;
@@ -653,6 +639,10 @@ pub struct RpcState {
     /// connect/flush/publish and by every RPC chainstate writer (see
     /// [`crate::chain_lock`]). Lock order: chain lock BEFORE this `RpcState`.
     pub chain_lock: Arc<crate::chain_lock::ChainLock>,
+    /// Memoized `size_on_disk` and chain-tx count (see [`crate::chain_stats`]):
+    /// walked off the state lock, so `getblockchaininfo` never holds it across
+    /// a read of every block.
+    pub chain_stats: Arc<crate::chain_stats::ChainStatsCache>,
 }
 
 /// Select the mempool configuration appropriate for `network`.
@@ -824,6 +814,7 @@ impl RpcState {
             tip_notifier: crate::tip_notifier::TipNotifier::shared(),
             chainstate_flush: Arc::new(rustoshi_storage::ChainstateFlushSignal::new()),
             chain_lock: crate::chain_lock::ChainLock::new(),
+            chain_stats: crate::chain_stats::ChainStatsCache::shared(),
         }
     }
 
@@ -862,6 +853,7 @@ impl RpcState {
             tip_notifier: crate::tip_notifier::TipNotifier::shared(),
             chainstate_flush: Arc::new(rustoshi_storage::ChainstateFlushSignal::new()),
             chain_lock: crate::chain_lock::ChainLock::new(),
+            chain_stats: crate::chain_stats::ChainStatsCache::shared(),
         }
     }
 
@@ -7151,11 +7143,14 @@ pub fn build_softforks_map(
 #[async_trait]
 impl RustoshiRpcServer for RpcServerImpl {
     async fn get_blockchain_info(&self) -> RpcResult<BlockchainInfo> {
-        // Take a write lock so we can flip the IBD latch if the tip is now
-        // caught up. Without this, a node that finishes IBD before any
-        // submitblock/generate_block call would report initialblockdownload=true
-        // forever.
-        let mut state = self.state.write().await;
+        // READ lock only, and never across a chain-wide walk. This used to
+        // take the WRITE lock (for the IBD latch below) and then walk every
+        // block body for `size_on_disk` under it: on the 2026-10-19 mainnet
+        // restart that held the lock for the whole ~20-minute walk, and RPC,
+        // block connection and P2P all queued behind it. The chain-tx count
+        // and `size_on_disk` are now computed after the guard is dropped
+        // (`crate::chain_stats`), and the latch takes the write lock briefly.
+        let state = self.state.read().await;
 
         // Fetch everything we need from the store up front, then drop the store
         // so we can mutate `state.is_ibd` without a borrow-checker conflict.
@@ -7223,23 +7218,6 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         };
 
-        // Core GuessVerificationProgress. header_height is the most-work
-        // non-failed header, refreshed on invalidate / reconsider / submitheader.
-        let progress = {
-            let store = BlockStore::new(&state.db);
-            let chain_tx = active_chain_tx_count(&store, &state.best_hash);
-            let header_height = state.header_height.max(state.best_height);
-            guess_verification_progress(
-                state.params.network_id,
-                chain_tx,
-                tip_timestamp,
-                state.best_height,
-                header_height,
-                // Core NodeClock::now() honors setmocktime.
-                rustoshi_consensus::mempool::current_unix_seconds(),
-            )
-        };
-
         // Core GetChainTypeString (util/chaintype.cpp): testnet3 -> "test",
         // testnet4 -> "testnet4" (was "test3"/"test4", which broke clients
         // gating on chain=="testnet4").
@@ -7250,18 +7228,6 @@ impl RustoshiRpcServer for RpcServerImpl {
             NetworkId::Signet => "signet",
             NetworkId::Regtest => "regtest",
         };
-
-        // Evaluate the IBD latch on every getblockchaininfo call. This ensures
-        // a node that finished sync without receiving a submitblock/generate
-        // call still flips to initialblockdownload=false the first time a
-        // client asks.
-        if state.is_ibd && self.should_exit_ibd(&state, chainwork_opt.as_ref(), tip_timestamp) {
-            state.is_ibd = false;
-            tracing::info!(
-                "Exiting initial block download at height {} (evaluated on getblockchaininfo)",
-                state.best_height
-            );
-        }
 
         // NOTE: Core v31.99's `getblockchaininfo` does NOT emit a `softforks`
         // field — its body never calls `DeploymentInfo()` (that builder is now
@@ -7300,18 +7266,75 @@ impl RustoshiRpcServer for RpcServerImpl {
             pruned = true;
             pruneheight = Some(pruneheight.map(|p| p.max(floor)).unwrap_or(floor));
         }
+        drop(store);
+
+        // Everything below works from this copy of the tip; the guard is
+        // released before any walk.
+        let db = Arc::clone(&state.db);
+        let chain_stats = Arc::clone(&state.chain_stats);
+        let network = state.params.network_id;
+        let best_hash = state.best_hash;
+        let best_height = state.best_height;
+        let header_height = state.header_height.max(state.best_height);
+        let exit_ibd =
+            state.is_ibd && self.should_exit_ibd(&state, chainwork_opt.as_ref(), tip_timestamp);
+        let mut is_ibd = state.is_ibd;
+        drop(state);
+
+        // Evaluate the IBD latch on every getblockchaininfo call. This ensures
+        // a node that finished sync without receiving a submitblock/generate
+        // call still flips to initialblockdownload=false the first time a
+        // client asks. The write lock is taken only to flip it, and only if
+        // the tip it was evaluated on is still the tip.
+        if exit_ibd {
+            let mut st = self.state.write().await;
+            if st.is_ibd && st.best_hash == best_hash {
+                st.is_ibd = false;
+                tracing::info!(
+                    "Exiting initial block download at height {} (evaluated on getblockchaininfo)",
+                    best_height
+                );
+            }
+            is_ibd = st.is_ibd;
+        }
+
+        // Core GuessVerificationProgress. header_height is the most-work
+        // non-failed header, refreshed on invalidate / reconsider / submitheader.
+        let chain_tx = {
+            let db = Arc::clone(&db);
+            let stats = Arc::clone(&chain_stats);
+            tokio::task::spawn_blocking(move || {
+                stats.active_chain_tx(&BlockStore::new(&db), &best_hash)
+            })
+            .await
+            .unwrap_or(0)
+        };
+        let progress = guess_verification_progress(
+            network,
+            chain_tx,
+            tip_timestamp,
+            best_height,
+            header_height,
+            // Core NodeClock::now() honors setmocktime.
+            rustoshi_consensus::mempool::current_unix_seconds(),
+        );
+
+        // Core BlockManager::CalculateCurrentUsage: blk + rev logical bytes.
+        let size_on_disk = chain_stats
+            .size_on_disk(db, crate::chain_stats::SIZE_ON_DISK_WAIT)
+            .await;
 
         Ok(BlockchainInfo {
             chain: chain_name.to_string(),
-            blocks: state.best_height,
+            blocks: best_height,
             // Core (blockchain.cpp:1423) emits the most-work *header* tip
             // height (`m_best_header->nHeight`), which is always >= the
             // connected block tip. `state.header_height` is loaded once at
             // startup and advanced on connect, but a header tip can never be
             // behind the block tip — guard with `.max(best_height)` so a
             // synced node (no headers ahead) reports headers == blocks.
-            headers: state.header_height.max(state.best_height),
-            bestblockhash: state.best_hash.to_hex(),
+            headers: header_height,
+            bestblockhash: best_hash.to_hex(),
             bits: tip_bits,
             target: tip_target,
             // %.16g (Core setprecision(16)) as a raw JSON number — same value
@@ -7323,10 +7346,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             time: tip_time,
             mediantime,
             verificationprogress: progress,
-            initialblockdownload: state.is_ibd,
+            initialblockdownload: is_ibd,
             chainwork: chainwork_hex,
-            // Core BlockManager::CalculateCurrentUsage: blk + rev logical bytes.
-            size_on_disk: core_size_on_disk(&store),
+            size_on_disk,
             pruned,
             pruneheight,
             prune_target_size,
@@ -7416,7 +7438,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         let progress = {
             let store = BlockStore::new(&state.db);
-            let chain_tx = active_chain_tx_count(&store, &state.best_hash);
+            let chain_tx = state.chain_stats.active_chain_tx(&store, &state.best_hash);
             let tip_time = store
                 .get_header(&state.best_hash)
                 .ok()
@@ -15337,7 +15359,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Same GuessVerificationProgress as getblockchaininfo.
         let header_height = state.header_height.max(state.best_height);
-        let chain_tx = active_chain_tx_count(&store, &state.best_hash);
+        let chain_tx = state.chain_stats.active_chain_tx(&store, &state.best_hash);
         let tip_time = store
             .get_header(&state.best_hash)
             .ok()
