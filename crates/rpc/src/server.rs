@@ -76,6 +76,24 @@ fn txoutset_walk_test_hook(db: &ChainDb) {
     }
 }
 
+/// Test-only pause at the start of the `size_on_disk` walk, keyed like
+/// [`TXOUTSET_WALK_HOOK`]: lets a test hold the walk open and prove the rest
+/// of the node still answers while it runs.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static DISK_USAGE_WALK_HOOK: std::sync::Mutex<Option<(usize, Box<dyn Fn() + Send>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn disk_usage_walk_test_hook(db: &ChainDb) {
+    let key = db as *const ChainDb as usize;
+    if let Some((k, f)) = DISK_USAGE_WALK_HOOK.lock().unwrap().as_ref() {
+        if *k == key {
+            f();
+        }
+    }
+}
+
 /// Total on-disk byte usage of the block/chain storage under `data_dir`.
 ///
 /// Mirrors Bitcoin Core's `getblockchaininfo` `size_on_disk`
@@ -94,6 +112,9 @@ fn txoutset_walk_test_hook(db: &ChainDb) {
 /// delete the records, so a failed block still counts.
 fn core_size_on_disk(store: &BlockStore) -> u64 {
     use rustoshi_storage::block_store::BlockStatus;
+    crate::test_hooks::disk_usage_walk_sleep();
+    #[cfg(test)]
+    disk_usage_walk_test_hook(store.db());
     let Ok(iter) = store.iter_block_index() else {
         return 0;
     };
@@ -31229,6 +31250,83 @@ mod tests {
         assert_eq!(after["height"], 2);
         assert_eq!(after["txouts"], 3);
         assert_ne!(after["hash_serialized_3"], before["hash_serialized_3"]);
+    }
+
+    /// Mainnet restart of 9d231620, 2026-10-19: `getblockchaininfo` walked
+    /// every block body and undo record for `size_on_disk` (86 GB read in 13
+    /// minutes) while holding the `RpcState` WRITE lock on a tokio worker.
+    /// `getblockcount` and the connect loop queued behind it, P2P went quiet
+    /// and the 900 s watchdog exited; each monitor poll started the walk again.
+    ///
+    /// The walk is paused at its start. While it is paused:
+    ///   1. `getblockcount` answers,
+    ///   2. the `RpcState` WRITE lock (connect loop, P2P) is acquirable,
+    ///   3. a second `getblockchaininfo` answers.
+    /// Then the walk is released and the first call completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn getblockchaininfo_disk_walk_leaves_rpc_and_state_lock_free() {
+        use std::time::Duration;
+
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                *DISK_USAGE_WALK_HOOK.lock().unwrap() = None;
+            }
+        }
+
+        // Declared before `go_tx` so it drops after it: the hook runs under
+        // the hook mutex until `go_tx` is sent or dropped.
+        let _clear = ClearHook;
+        let server = setup_test_server();
+        let db_key = {
+            let st = server.state.read().await;
+            &*st.db as *const ChainDb as usize
+        };
+        let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+        // Dropping `go_tx` (also on a failed assert) releases the walk.
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let open_tx = std::sync::Mutex::new(open_tx);
+        let go_rx = std::sync::Mutex::new(go_rx);
+        *DISK_USAGE_WALK_HOOK.lock().unwrap() = Some((
+            db_key,
+            Box::new(move || {
+                let _ = open_tx.lock().unwrap().send(());
+                let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
+            }),
+        ));
+
+        let walker = RpcServerImpl::new(server.state.clone(), server.peer_state.clone());
+        let first = tokio::spawn(async move { walker.get_blockchain_info().await });
+        tokio::task::spawn_blocking(move || open_rx.recv_timeout(Duration::from_secs(60)))
+            .await
+            .unwrap()
+            .expect("size_on_disk walk never started");
+
+        // 1. getblockcount answers while the walk runs.
+        let count = tokio::time::timeout(Duration::from_secs(2), server.get_block_count()).await;
+        assert!(
+            matches!(count, Ok(Ok(0))),
+            "getblockcount blocked behind the size_on_disk walk"
+        );
+
+        // 2. The connect loop / P2P can take the state lock.
+        let w = tokio::time::timeout(Duration::from_secs(2), server.state.write()).await;
+        assert!(w.is_ok(), "size_on_disk walk holds the RpcState lock");
+        drop(w);
+
+        // 3. A second getblockchaininfo does not wait for the walk to finish.
+        let second =
+            tokio::time::timeout(Duration::from_secs(5), server.get_blockchain_info()).await;
+        let second = second.expect("second getblockchaininfo waited for the walk");
+        assert_eq!(second.unwrap().blocks, 0);
+
+        go_tx.send(()).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(30), first)
+            .await
+            .expect("first getblockchaininfo never finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.blocks, 0);
     }
 
     #[tokio::test]
