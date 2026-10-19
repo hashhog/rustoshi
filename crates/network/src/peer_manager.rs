@@ -4244,7 +4244,7 @@ impl PeerManager {
         }
     }
 
-    /// Ban a peer for misbehavior.
+    /// Discourage and disconnect a peer (no persisted ban; use `ban_ip` for setban).
     pub async fn ban_peer(&mut self, peer_id: PeerId) {
         self.ban_peer_with_reason(peer_id, "manual ban".to_string())
             .await;
@@ -4261,7 +4261,8 @@ impl PeerManager {
     ///   immediately for `IsManualConn()`.
     /// * **Local address** (loopback / link-local / site-local) → disconnect
     ///   only, no discourage: avoids polluting the ban-list with local addrs.
-    /// * **All other peers** → write to discourage/ban-list AND disconnect.
+    /// * **All other peers** → discourage (in memory, NOT the persisted
+    ///   banlist) AND disconnect.
     pub async fn ban_peer_with_reason(&mut self, peer_id: PeerId, reason: String) {
         let peer = match self.peers.get(&peer_id) {
             Some(p) => p,
@@ -4305,10 +4306,12 @@ impl PeerManager {
             );
             let _ = peer.command_tx.send(PeerCommand::Disconnect).await;
         } else {
-            // Regular inbound/outbound: discourage + disconnect.
+            // Regular inbound/outbound: discourage + disconnect. Core keeps
+            // discouragement in a rolling in-memory filter; it is never
+            // written to banlist.dat (only setban does that). The address
+            // manager's in-memory deny entry keeps us from redialling it.
+            tracing::debug!("Discouraging peer {} ({}): {}", peer_id.0, addr, reason);
             self.addr_manager.ban(&addr, self.config.ban_duration);
-            self.ban_manager
-                .ban_addr(addr, self.config.ban_duration, reason);
             let _ = self.peers[&peer_id]
                 .command_tx
                 .send(PeerCommand::Disconnect)
@@ -4361,6 +4364,12 @@ impl PeerManager {
     /// Check if an IP address is banned.
     pub fn is_banned(&self, ip: &IpAddr) -> bool {
         self.ban_manager.is_banned(ip)
+    }
+
+    /// Whether `addr` was discouraged for misbehaviour (in-memory only, not in
+    /// the persisted banlist).
+    pub fn is_discouraged(&self, addr: &SocketAddr) -> bool {
+        self.addr_manager.is_banned(addr)
     }
 
     /// Check if a socket address is banned.
