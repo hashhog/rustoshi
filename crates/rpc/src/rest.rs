@@ -1295,7 +1295,9 @@ async fn rest_chaininfo(
         (None, None) => (1.0, "0".repeat(64), 0),
     };
 
-    let chain_tx = crate::server::active_chain_tx_count(&store, &rpc_state.best_hash);
+    let chain_tx = rpc_state
+        .chain_stats
+        .active_chain_tx(&store, &rpc_state.best_hash);
     let tip_time = header_opt.as_ref().map(|h| h.timestamp).unwrap_or(0);
     let progress = crate::server::guess_verification_progress(
         rpc_state.params.network_id,

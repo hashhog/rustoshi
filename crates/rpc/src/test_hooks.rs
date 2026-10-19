@@ -17,6 +17,9 @@
 //! * `RUSTOSHI_TEST_COHERENT_READ_SLEEP_MS`: a coherent coin reader
 //!   (`read_coherent`: `gettxout`, REST `getutxos`) sleeps once, holding the
 //!   `RpcState` lock, after the coherence check passed and before it reads.
+//! * `RUSTOSHI_TEST_DISK_USAGE_WALK_SLEEP_MS`: the `getblockchaininfo`
+//!   `size_on_disk` walk (every blk/rev record) sleeps once at its start, the
+//!   way a mainnet-sized walk takes minutes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -47,6 +50,20 @@ pub fn txoutset_walk_sleep(which: &str) {
         std::thread::sleep(Duration::from_millis(ms));
         tracing::warn!("TEST HOOK: {} walk resuming", which);
     }
+}
+
+/// Sleep at the start of the `size_on_disk` walk (blocking, fires once).
+pub fn disk_usage_walk_sleep() {
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    let Some(ms) = env_u64("RUSTOSHI_TEST_DISK_USAGE_WALK_SLEEP_MS") else {
+        return;
+    };
+    if FIRED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tracing::warn!("TEST HOOK: size_on_disk walk sleeping {} ms", ms);
+    std::thread::sleep(Duration::from_millis(ms));
+    tracing::warn!("TEST HOOK: size_on_disk walk resuming");
 }
 
 /// Pause between the rollback rewind and the dump (fires once).
