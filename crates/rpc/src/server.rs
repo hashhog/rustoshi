@@ -76,23 +76,28 @@ fn txoutset_walk_test_hook(db: &ChainDb) {
     }
 }
 
-/// Total on-disk byte usage of the block/chain storage under `data_dir`.
-///
-/// Mirrors Bitcoin Core's `getblockchaininfo` `size_on_disk`
-/// (`rpc/blockchain.cpp` → `BlockManager::CalculateCurrentUsage()`), which sums
-/// the bytes of the block+undo storage. rustoshi keeps full block bodies and the
-/// chainstate together in a single RocksDB rooted at `<data_dir>/chainstate`
-/// (see `rustoshi/src/main.rs`: `datadir.join("chainstate")`), so the analogous
-/// figure is the recursive size of that directory. Cosmetic/reporting only — the
-/// value is never consulted by any validation or fork-choice path.
-///
-/// Best-effort: file/dir stat errors are skipped (a transient RocksDB compaction
-/// Core `BlockManager::CalculateCurrentUsage`: logical bytes of every
-/// `blk*.dat` record (magic + size + block) plus every `rev*.dat` record
-/// (magic + size + undo payload + 32-byte checksum). Genesis has no undo.
-/// Headers-only blocks are not in the block files. Invalidate does not
-/// delete the records, so a failed block still counts.
-fn core_size_on_disk(store: &BlockStore) -> u64 {
+/// Test-only pause at the start of the `size_on_disk` walk, keyed like
+/// [`TXOUTSET_WALK_HOOK`]: lets a test hold the walk open and prove the rest
+/// of the node still answers while it runs.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static DISK_USAGE_WALK_HOOK: std::sync::Mutex<Option<(usize, Box<dyn Fn() + Send>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn disk_usage_walk_test_hook(db: &ChainDb) {
+    let key = db as *const ChainDb as usize;
+    if let Some((k, f)) = DISK_USAGE_WALK_HOOK.lock().unwrap().as_ref() {
+        if *k == key {
+            f();
+        }
+    }
+}
+
+/// The uncached `size_on_disk` walk that [`crate::chain_stats`] replaced,
+/// kept as the reference the cache is tested against.
+#[cfg(test)]
+pub(crate) fn core_size_on_disk(store: &BlockStore) -> u64 {
     use rustoshi_storage::block_store::BlockStatus;
     let Ok(iter) = store.iter_block_index() else {
         return 0;
@@ -134,7 +139,9 @@ fn core_size_on_disk(store: &BlockStore) -> u64 {
     total
 }
 
-/// Chain-tx total of the active chain (Core `nChainTx` at the tip).
+/// The uncached chain-tx walk, kept as the reference the cache is tested
+/// against.
+#[cfg(test)]
 pub(crate) fn active_chain_tx_count(store: &BlockStore, tip: &Hash256) -> u64 {
     let mut total = 0u64;
     let mut walk = *tip;
@@ -632,6 +639,10 @@ pub struct RpcState {
     /// connect/flush/publish and by every RPC chainstate writer (see
     /// [`crate::chain_lock`]). Lock order: chain lock BEFORE this `RpcState`.
     pub chain_lock: Arc<crate::chain_lock::ChainLock>,
+    /// Memoized `size_on_disk` and chain-tx count (see [`crate::chain_stats`]):
+    /// walked off the state lock, so `getblockchaininfo` never holds it across
+    /// a read of every block.
+    pub chain_stats: Arc<crate::chain_stats::ChainStatsCache>,
 }
 
 /// Select the mempool configuration appropriate for `network`.
@@ -803,6 +814,7 @@ impl RpcState {
             tip_notifier: crate::tip_notifier::TipNotifier::shared(),
             chainstate_flush: Arc::new(rustoshi_storage::ChainstateFlushSignal::new()),
             chain_lock: crate::chain_lock::ChainLock::new(),
+            chain_stats: crate::chain_stats::ChainStatsCache::shared(),
         }
     }
 
@@ -841,6 +853,7 @@ impl RpcState {
             tip_notifier: crate::tip_notifier::TipNotifier::shared(),
             chainstate_flush: Arc::new(rustoshi_storage::ChainstateFlushSignal::new()),
             chain_lock: crate::chain_lock::ChainLock::new(),
+            chain_stats: crate::chain_stats::ChainStatsCache::shared(),
         }
     }
 
@@ -2368,6 +2381,17 @@ impl RpcServerImpl {
         };
 
         let store = BlockStore::new(&state.db);
+        // `load_tx_outset` already refused an unknown base header; look it up
+        // before the first write so the index entry never gets zero defaults.
+        let base_header = store.get_header(&base_blockhash).ok().flatten().ok_or_else(|| {
+            Self::rpc_error(
+                rpc_error::RPC_INTERNAL_ERROR,
+                format!(
+                    "Unable to load UTXO snapshot: {}",
+                    rustoshi_storage::snapshot_base_header_unknown_message(&base_blockhash)
+                ),
+            )
+        })?;
         for (outpoint, coin) in coins {
             store.put_utxo(outpoint, &coin.to_entry()).map_err(|e| {
                 Self::rpc_error(
@@ -2377,7 +2401,6 @@ impl RpcServerImpl {
             })?;
         }
 
-        let base_header = store.get_header(&base_blockhash).ok().flatten();
         let mut snap_status = BlockStatus::new();
         snap_status.set(BlockStatus::VALID_HEADER);
         snap_status.set(BlockStatus::VALID_TREE);
@@ -2389,14 +2412,11 @@ impl RpcServerImpl {
             height: base_height,
             status: snap_status,
             n_tx: 0,
-            timestamp: base_header.as_ref().map(|h| h.timestamp).unwrap_or(0),
-            bits: base_header.as_ref().map(|h| h.bits).unwrap_or(0),
-            nonce: base_header.as_ref().map(|h| h.nonce).unwrap_or(0),
-            version: base_header.as_ref().map(|h| h.version).unwrap_or(0),
-            prev_hash: base_header
-                .as_ref()
-                .map(|h| h.prev_block_hash)
-                .unwrap_or(Hash256::ZERO),
+            timestamp: base_header.timestamp,
+            bits: base_header.bits,
+            nonce: base_header.nonce,
+            version: base_header.version,
+            prev_hash: base_header.prev_block_hash,
             chain_work: state.params.minimum_chain_work,
         };
         store
@@ -7123,11 +7143,14 @@ pub fn build_softforks_map(
 #[async_trait]
 impl RustoshiRpcServer for RpcServerImpl {
     async fn get_blockchain_info(&self) -> RpcResult<BlockchainInfo> {
-        // Take a write lock so we can flip the IBD latch if the tip is now
-        // caught up. Without this, a node that finishes IBD before any
-        // submitblock/generate_block call would report initialblockdownload=true
-        // forever.
-        let mut state = self.state.write().await;
+        // READ lock only, and never across a chain-wide walk. This used to
+        // take the WRITE lock (for the IBD latch below) and then walk every
+        // block body for `size_on_disk` under it: on the 2026-10-19 mainnet
+        // restart that held the lock for the whole ~20-minute walk, and RPC,
+        // block connection and P2P all queued behind it. The chain-tx count
+        // and `size_on_disk` are now computed after the guard is dropped
+        // (`crate::chain_stats`), and the latch takes the write lock briefly.
+        let state = self.state.read().await;
 
         // Fetch everything we need from the store up front, then drop the store
         // so we can mutate `state.is_ibd` without a borrow-checker conflict.
@@ -7195,23 +7218,6 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         };
 
-        // Core GuessVerificationProgress. header_height is the most-work
-        // non-failed header, refreshed on invalidate / reconsider / submitheader.
-        let progress = {
-            let store = BlockStore::new(&state.db);
-            let chain_tx = active_chain_tx_count(&store, &state.best_hash);
-            let header_height = state.header_height.max(state.best_height);
-            guess_verification_progress(
-                state.params.network_id,
-                chain_tx,
-                tip_timestamp,
-                state.best_height,
-                header_height,
-                // Core NodeClock::now() honors setmocktime.
-                rustoshi_consensus::mempool::current_unix_seconds(),
-            )
-        };
-
         // Core GetChainTypeString (util/chaintype.cpp): testnet3 -> "test",
         // testnet4 -> "testnet4" (was "test3"/"test4", which broke clients
         // gating on chain=="testnet4").
@@ -7222,18 +7228,6 @@ impl RustoshiRpcServer for RpcServerImpl {
             NetworkId::Signet => "signet",
             NetworkId::Regtest => "regtest",
         };
-
-        // Evaluate the IBD latch on every getblockchaininfo call. This ensures
-        // a node that finished sync without receiving a submitblock/generate
-        // call still flips to initialblockdownload=false the first time a
-        // client asks.
-        if state.is_ibd && self.should_exit_ibd(&state, chainwork_opt.as_ref(), tip_timestamp) {
-            state.is_ibd = false;
-            tracing::info!(
-                "Exiting initial block download at height {} (evaluated on getblockchaininfo)",
-                state.best_height
-            );
-        }
 
         // NOTE: Core v31.99's `getblockchaininfo` does NOT emit a `softforks`
         // field — its body never calls `DeploymentInfo()` (that builder is now
@@ -7272,18 +7266,75 @@ impl RustoshiRpcServer for RpcServerImpl {
             pruned = true;
             pruneheight = Some(pruneheight.map(|p| p.max(floor)).unwrap_or(floor));
         }
+        drop(store);
+
+        // Everything below works from this copy of the tip; the guard is
+        // released before any walk.
+        let db = Arc::clone(&state.db);
+        let chain_stats = Arc::clone(&state.chain_stats);
+        let network = state.params.network_id;
+        let best_hash = state.best_hash;
+        let best_height = state.best_height;
+        let header_height = state.header_height.max(state.best_height);
+        let exit_ibd =
+            state.is_ibd && self.should_exit_ibd(&state, chainwork_opt.as_ref(), tip_timestamp);
+        let mut is_ibd = state.is_ibd;
+        drop(state);
+
+        // Evaluate the IBD latch on every getblockchaininfo call. This ensures
+        // a node that finished sync without receiving a submitblock/generate
+        // call still flips to initialblockdownload=false the first time a
+        // client asks. The write lock is taken only to flip it, and only if
+        // the tip it was evaluated on is still the tip.
+        if exit_ibd {
+            let mut st = self.state.write().await;
+            if st.is_ibd && st.best_hash == best_hash {
+                st.is_ibd = false;
+                tracing::info!(
+                    "Exiting initial block download at height {} (evaluated on getblockchaininfo)",
+                    best_height
+                );
+            }
+            is_ibd = st.is_ibd;
+        }
+
+        // Core GuessVerificationProgress. header_height is the most-work
+        // non-failed header, refreshed on invalidate / reconsider / submitheader.
+        let chain_tx = {
+            let db = Arc::clone(&db);
+            let stats = Arc::clone(&chain_stats);
+            tokio::task::spawn_blocking(move || {
+                stats.active_chain_tx(&BlockStore::new(&db), &best_hash)
+            })
+            .await
+            .unwrap_or(0)
+        };
+        let progress = guess_verification_progress(
+            network,
+            chain_tx,
+            tip_timestamp,
+            best_height,
+            header_height,
+            // Core NodeClock::now() honors setmocktime.
+            rustoshi_consensus::mempool::current_unix_seconds(),
+        );
+
+        // Core BlockManager::CalculateCurrentUsage: blk + rev logical bytes.
+        let size_on_disk = chain_stats
+            .size_on_disk(db, crate::chain_stats::SIZE_ON_DISK_WAIT)
+            .await;
 
         Ok(BlockchainInfo {
             chain: chain_name.to_string(),
-            blocks: state.best_height,
+            blocks: best_height,
             // Core (blockchain.cpp:1423) emits the most-work *header* tip
             // height (`m_best_header->nHeight`), which is always >= the
             // connected block tip. `state.header_height` is loaded once at
             // startup and advanced on connect, but a header tip can never be
             // behind the block tip — guard with `.max(best_height)` so a
             // synced node (no headers ahead) reports headers == blocks.
-            headers: state.header_height.max(state.best_height),
-            bestblockhash: state.best_hash.to_hex(),
+            headers: header_height,
+            bestblockhash: best_hash.to_hex(),
             bits: tip_bits,
             target: tip_target,
             // %.16g (Core setprecision(16)) as a raw JSON number — same value
@@ -7295,10 +7346,9 @@ impl RustoshiRpcServer for RpcServerImpl {
             time: tip_time,
             mediantime,
             verificationprogress: progress,
-            initialblockdownload: state.is_ibd,
+            initialblockdownload: is_ibd,
             chainwork: chainwork_hex,
-            // Core BlockManager::CalculateCurrentUsage: blk + rev logical bytes.
-            size_on_disk: core_size_on_disk(&store),
+            size_on_disk,
             pruned,
             pruneheight,
             prune_target_size,
@@ -7388,7 +7438,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         let progress = {
             let store = BlockStore::new(&state.db);
-            let chain_tx = active_chain_tx_count(&store, &state.best_hash);
+            let chain_tx = state.chain_stats.active_chain_tx(&store, &state.best_hash);
             let tip_time = store
                 .get_header(&state.best_hash)
                 .ok()
@@ -15309,7 +15359,7 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Same GuessVerificationProgress as getblockchaininfo.
         let header_height = state.header_height.max(state.best_height);
-        let chain_tx = active_chain_tx_count(&store, &state.best_hash);
+        let chain_tx = state.chain_stats.active_chain_tx(&store, &state.best_hash);
         let tip_time = store
             .get_header(&state.best_hash)
             .ok()
@@ -16816,6 +16866,36 @@ impl RustoshiRpcServer for RpcServerImpl {
                 ));
             }
         };
+
+        // Core `ActivateSnapshot` (validation.cpp:5611-5615): the base header
+        // must already be known, checked before any coin is read or written.
+        // Without it the base index entry would get `prev_hash = ZERO` and
+        // `bits = 0`, which breaks ancestor walks and leaves the base's own
+        // proof out of chain work (mainnet 2026-09-28).
+        {
+            let db = self.state.read().await.db.clone();
+            let known = rustoshi_storage::known_snapshot_base_header(
+                &BlockStore::new(&db),
+                &base_blockhash,
+                &au.base_tail_headers,
+            )
+            .map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_INTERNAL_ERROR,
+                    format!("Failed to look up the snapshot base header: {e}"),
+                )
+            })?;
+            if known.is_none() {
+                return Err(Self::rpc_error(
+                    rpc_error::RPC_INTERNAL_ERROR,
+                    format!(
+                        "Unable to load UTXO snapshot: {}. ({})",
+                        rustoshi_storage::snapshot_base_header_unknown_message(&base_blockhash),
+                        resolved.display()
+                    ),
+                ));
+            }
+        }
 
         // Read every coin and compute the file's HASH_SERIALIZED.
         let mut file_coins: Vec<(rustoshi_primitives::OutPoint, Coin)> = Vec::new();
@@ -24892,10 +24972,12 @@ mod tests {
         let b3_hash = b3.header.block_hash();
         blocks.push(b3);
 
-        // Store blocks + the active height index so loadtxoutset's walk finds
-        // them by height.
+        // Store headers, blocks + the active height index so loadtxoutset's
+        // walk finds them by height. The headers matter too: like Core,
+        // loadtxoutset refuses a base whose header it does not know.
         for (h, blk) in blocks.iter().enumerate() {
             let hash = blk.header.block_hash();
+            store.put_header(&hash, &blk.header).expect("put_header");
             store.put_block(&hash, blk).expect("put_block");
             store.put_height_index(h as u32, &hash).expect("put_height_index");
         }
@@ -25056,6 +25138,95 @@ mod tests {
             active.snapshot_blockhash.as_deref(),
             Some(base_hash.to_hex().as_str()),
             "getchainstates must report the snapshot_blockhash"
+        );
+    }
+
+    /// Core `ActivateSnapshot` (validation.cpp:5611-5615): a whitelisted
+    /// snapshot whose base header is unknown is refused with Core's error and
+    /// nothing is written. Before the fix the RPC ingested the coins, moved
+    /// the tip, and wrote the base index entry with `prev_hash = ZERO` and
+    /// `bits = 0`, so the base's proof was missing from chain work and every
+    /// ancestor walk stopped at the base.
+    ///
+    /// Control: the same file, once the base header is stored, loads and the
+    /// base entry carries the header's real parent link and bits. That shows
+    /// the header is the only thing the first call lacked.
+    #[tokio::test]
+    async fn test_loadtxoutset_refuses_unknown_base_header_and_writes_nothing() {
+        use rustoshi_storage::{compute_hash_serialized, ChainDb, CF_UTXO};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let mut params = rustoshi_consensus::ChainParams::regtest();
+        let magic = params.network_magic;
+
+        let parent = Hash256([0x5a; 32]);
+        let base_header = au_header(parent, 3);
+        let base_hash = base_header.block_hash();
+        let coins = vec![(
+            OutPoint { txid: Hash256([0x42; 32]), vout: 0 },
+            Coin {
+                tx_out: TxOut { value: 50_0000_0000, script_pubkey: au_p2pkh(0x11) },
+                height: 1,
+                is_coinbase: true,
+            },
+        )];
+        let commitment = compute_hash_serialized(coins.iter().cloned());
+        assert!(params.register_regtest_assumeutxo(3, base_hash, commitment, 2, None));
+        let snap = au_write_snapshot(tmp.path(), base_hash, &coins, magic);
+
+        let db_for_check = db.clone();
+        let mut rpc_state = RpcState::new(db, params);
+        rpc_state.data_dir = Some(tmp.path().to_path_buf());
+        let state = Arc::new(RwLock::new(rpc_state));
+        let peer_state = Arc::new(RwLock::new(PeerState::default()));
+        let rpc = RpcServerImpl::new(state, peer_state);
+
+        let err = rpc
+            .load_tx_outset(snap.to_string_lossy().to_string())
+            .await
+            .expect_err("loadtxoutset must refuse a base header it does not know");
+        assert_eq!(err.code(), rpc_error::RPC_INTERNAL_ERROR);
+        let want = format!(
+            "Unable to load UTXO snapshot: The base block header ({}) must appear in the \
+             headers chain. Make sure all headers are syncing, and call loadtxoutset again. ({})",
+            base_hash.to_hex(),
+            snap.display()
+        );
+        assert_eq!(err.message(), want);
+
+        let store = BlockStore::new(&db_for_check);
+        let coin_rows = db_for_check.iter_cf(CF_UTXO).map(|it| it.count()).unwrap_or(0);
+        assert_eq!(coin_rows, 0, "refused load must not write coins");
+        assert!(store.get_block_index(&base_hash).unwrap().is_none(), "no base index entry");
+        assert!(store.get_hash_by_height(3).unwrap().is_none(), "no base height entry");
+        assert_eq!(rpc.get_block_count().await.unwrap(), 0, "tip must not move");
+        assert!(
+            rustoshi_storage::read_snapshot_blockhash(tmp.path()).unwrap().is_none(),
+            "no snapshot base marker"
+        );
+        let gcs = rpc.get_chain_states().await.expect("getchainstates");
+        assert!(
+            gcs.chainstates.iter().all(|c| c.snapshot_blockhash.is_none()),
+            "refused load must not activate a snapshot chainstate"
+        );
+
+        // Control: with the header known, the same file loads.
+        store.put_header(&base_hash, &base_header).unwrap();
+        rpc.load_tx_outset(snap.to_string_lossy().to_string())
+            .await
+            .expect("loadtxoutset must accept once the base header is known");
+        assert_eq!(rpc.get_block_count().await.unwrap(), 3);
+        let entry = store.get_block_index(&base_hash).unwrap().expect("base index entry");
+        assert_eq!(entry.prev_hash, parent, "base parent link comes from its header");
+        assert_eq!(entry.bits, base_header.bits, "base bits come from its header");
+        assert_eq!(entry.timestamp, base_header.timestamp);
+        assert_eq!(entry.nonce, base_header.nonce);
+        assert_eq!(entry.version, base_header.version);
+        assert_ne!(
+            rustoshi_consensus::get_block_proof(entry.bits),
+            rustoshi_consensus::get_block_proof(0),
+            "the base's own proof must count toward chain work"
         );
     }
 
@@ -31101,6 +31272,83 @@ mod tests {
         assert_eq!(after["height"], 2);
         assert_eq!(after["txouts"], 3);
         assert_ne!(after["hash_serialized_3"], before["hash_serialized_3"]);
+    }
+
+    /// Mainnet restart of 9d231620, 2026-10-19: `getblockchaininfo` walked
+    /// every block body and undo record for `size_on_disk` (86 GB read in 13
+    /// minutes) while holding the `RpcState` WRITE lock on a tokio worker.
+    /// `getblockcount` and the connect loop queued behind it, P2P went quiet
+    /// and the 900 s watchdog exited; each monitor poll started the walk again.
+    ///
+    /// The walk is paused at its start. While it is paused:
+    ///   1. `getblockcount` answers,
+    ///   2. the `RpcState` WRITE lock (connect loop, P2P) is acquirable,
+    ///   3. a second `getblockchaininfo` answers.
+    /// Then the walk is released and the first call completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn getblockchaininfo_disk_walk_leaves_rpc_and_state_lock_free() {
+        use std::time::Duration;
+
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                *DISK_USAGE_WALK_HOOK.lock().unwrap() = None;
+            }
+        }
+
+        // Declared before `go_tx` so it drops after it: the hook runs under
+        // the hook mutex until `go_tx` is sent or dropped.
+        let _clear = ClearHook;
+        let server = setup_test_server();
+        let db_key = {
+            let st = server.state.read().await;
+            &*st.db as *const ChainDb as usize
+        };
+        let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+        // Dropping `go_tx` (also on a failed assert) releases the walk.
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let open_tx = std::sync::Mutex::new(open_tx);
+        let go_rx = std::sync::Mutex::new(go_rx);
+        *DISK_USAGE_WALK_HOOK.lock().unwrap() = Some((
+            db_key,
+            Box::new(move || {
+                let _ = open_tx.lock().unwrap().send(());
+                let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
+            }),
+        ));
+
+        let walker = RpcServerImpl::new(server.state.clone(), server.peer_state.clone());
+        let first = tokio::spawn(async move { walker.get_blockchain_info().await });
+        tokio::task::spawn_blocking(move || open_rx.recv_timeout(Duration::from_secs(60)))
+            .await
+            .unwrap()
+            .expect("size_on_disk walk never started");
+
+        // 1. getblockcount answers while the walk runs.
+        let count = tokio::time::timeout(Duration::from_secs(2), server.get_block_count()).await;
+        assert!(
+            matches!(count, Ok(Ok(0))),
+            "getblockcount blocked behind the size_on_disk walk"
+        );
+
+        // 2. The connect loop / P2P can take the state lock.
+        let w = tokio::time::timeout(Duration::from_secs(2), server.state.write()).await;
+        assert!(w.is_ok(), "size_on_disk walk holds the RpcState lock");
+        drop(w);
+
+        // 3. A second getblockchaininfo does not wait for the walk to finish.
+        let second =
+            tokio::time::timeout(Duration::from_secs(5), server.get_blockchain_info()).await;
+        let second = second.expect("second getblockchaininfo waited for the walk");
+        assert_eq!(second.unwrap().blocks, 0);
+
+        go_tx.send(()).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(30), first)
+            .await
+            .expect("first getblockchaininfo never finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.blocks, 0);
     }
 
     #[tokio::test]

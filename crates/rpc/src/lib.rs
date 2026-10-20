@@ -32,6 +32,7 @@
 //! ```
 
 pub mod auth;
+pub mod chain_stats;
 pub mod header_filter;
 pub mod chain_lock;
 pub mod coins_coherence;

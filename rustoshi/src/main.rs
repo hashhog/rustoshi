@@ -4175,6 +4175,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let mut reader = reader.with_base_height(assume.height);
 
         let store = BlockStore::new(&db);
+        // Core `ActivateSnapshot` (validation.cpp:5611-5615) refuses a
+        // snapshot whose base header is not known, before touching the coins
+        // DB. Known = stored in CF_HEADERS or supplied by the entry's verified
+        // base-tail band. Activating without it wrote a base index entry with
+        // `prev_hash = ZERO` and `bits = 0` (mainnet 2026-09-28: chain work one
+        // block short from the base up; a98809af/ee4e28f9 repair that later).
+        let base_header = rustoshi_storage::known_snapshot_base_header(
+            &store,
+            &blockhash,
+            &assume.base_tail_headers,
+        )
+        .map_err(|e| anyhow::anyhow!("snapshot base header lookup: {}", e))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unable to load UTXO snapshot: {}. ({})",
+                rustoshi_storage::snapshot_base_header_unknown_message(&blockhash),
+                path.display()
+            )
+        })?;
         use sha2::Digest as _;
         // Maintain TWO hash accumulators in parallel, mirroring the RPC
         // `loadtxoutset` path in `crates/rpc/src/server.rs::load_tx_outset`.
@@ -4330,15 +4349,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         // `minimum_chain_work + block_proof(snapshot+1)` and onward.
         let snapshot_chain_work = ChainWork::from_be_bytes(params.minimum_chain_work);
 
-        // The snapshot block's full BlockHeader is unknown at this point
-        // (the snapshot file carries the UTXO set, not the block itself).
-        // We populate the BlockIndexEntry with the fields we know and
-        // zero/placeholder values for the rest. The header sync that
-        // follows will fetch the actual headers — including the snapshot
-        // block's neighbours — so callers needing the real header can
-        // wait for that. RPCs that consult only height/chain_work/n_tx
-        // (e.g. `getblockchaininfo`'s difficulty/chainwork fields) work
-        // from this entry directly.
+        // The base header was required above, so every header-derived
+        // field of the BlockIndexEntry is real. Only n_tx (needs the block
+        // body) and chain_work (placeholder, see above) are not.
         let mut snap_status = BlockStatus::new();
         snap_status.set(BlockStatus::VALID_HEADER);
         snap_status.set(BlockStatus::VALID_TREE);
@@ -4346,23 +4359,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         snap_status.set(BlockStatus::VALID_CHAIN);
         snap_status.set(BlockStatus::VALID_SCRIPTS);
         snap_status.set(BlockStatus::HAVE_DATA);
-        // When the matched campaign entry carries a real base-tail-header
-        // band (`AssumeutxoData::base_tail_headers`), its LAST header is the
-        // base block's own genuine header -- use it to fill in the base's
-        // BlockIndexEntry fields instead of the zeroed placeholder. Legacy
-        // entries with no tail headers keep the placeholder unchanged.
-        let base_header = assume.base_tail_headers.last();
         let snap_index_entry = BlockIndexEntry {
             height: assume.height,
             status: snap_status,
             n_tx: 0, // unknown without the block body
-            timestamp: base_header.map(|h| h.timestamp).unwrap_or(0),
-            bits: base_header.map(|h| h.bits).unwrap_or(0),
-            nonce: base_header.map(|h| h.nonce).unwrap_or(0),
-            version: base_header.map(|h| h.version).unwrap_or(0),
-            prev_hash: base_header
-                .map(|h| h.prev_block_hash)
-                .unwrap_or(Hash256::ZERO),
+            timestamp: base_header.timestamp,
+            bits: base_header.bits,
+            nonce: base_header.nonce,
+            version: base_header.version,
+            prev_hash: base_header.prev_block_hash,
             chain_work: snapshot_chain_work.0,
         };
         if let Err(e) = block_store.put_block_index(&blockhash, &snap_index_entry) {

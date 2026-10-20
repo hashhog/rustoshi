@@ -437,16 +437,21 @@ fn g15_hash_check_must_not_accept_legacy_form() {
 // SECTION 4 — Headers-chain presence + chainwork (G16–G20)
 // =====================================================================
 
-/// BUG-5 (G16 P0-CONSENSUS): the CLI `--load-snapshot` path does NOT
-/// check that the snapshot's base_blockhash is present in the headers
-/// chain before ingesting coins. Core's `ActivateSnapshot` returns
-/// `"The base block header (X) must appear in the headers chain"`
-/// at validation.cpp:5611-5614. Rustoshi creates a synthetic
-/// `BlockIndexEntry` with `prev_hash = Hash256::ZERO`.
+/// BUG-5 (G16), fixed: both load paths now refuse an unknown base header
+/// with Core's `"The base block header (X) must appear in the headers
+/// chain"` (validation.cpp:5611-5614) before writing anything. Covered
+/// end-to-end by `rustoshi/tests/test_load_snapshot_base_header.rs` (CLI)
+/// and `test_loadtxoutset_refuses_unknown_base_header_and_writes_nothing`
+/// (RPC); the shared lookup is pinned by w102 `g4_...`.
 #[test]
-#[ignore = "BUG-5 (W138 G16 P0-CONSENSUS): main.rs:1659-1905 has NO headers-chain presence check; snapshot ingests even if base_blockhash is unknown; harness needed to drive end-to-end"]
 fn g16_snapshot_rejected_when_base_header_not_in_chain() {
-    let _ = "see audit/w138_assumeutxo.md BUG-5";
+    let tmp = tempfile::tempdir().unwrap();
+    let db = rustoshi_storage::ChainDb::open(tmp.path()).unwrap();
+    let store = rustoshi_storage::block_store::BlockStore::new(&db);
+    let unknown = rustoshi_primitives::Hash256([0xab; 32]);
+    assert!(rustoshi_storage::known_snapshot_base_header(&store, &unknown, &[])
+        .unwrap()
+        .is_none());
 }
 
 /// BUG-6 (G17 P0-CDIV): the snapshot tip's chain_work is hardcoded
