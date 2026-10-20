@@ -237,8 +237,10 @@ mod tests {
 
     /// G2 FIXED — Regular inbound peer: discouraged AND disconnected.
     ///
-    /// A standard inbound peer with no special flags must be written to the
-    /// ban-list AND have a Disconnect command sent.
+    /// A standard inbound peer with no special flags is added to the in-memory
+    /// discouragement set (not the persisted ban-list) AND has a Disconnect
+    /// command sent. Accept, eviction and automatic dials consult that set;
+    /// see the `discouraged_*` tests in peer_manager.rs.
     #[tokio::test]
     async fn g2_regular_inbound_peer_is_discouraged_not_banned() {
         let tmp = TempDir::new().unwrap();
