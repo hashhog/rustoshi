@@ -1216,7 +1216,16 @@ fn block_getdata_reply(
     tip_height: u32,
     nonce: u64,
 ) -> NetworkMessage {
-    let _ = (inv_type, block_height, tip_height, nonce);
+    if inv_type == InvType::MsgCmpctBlock {
+        // Core: pindex->nHeight >= ActiveChain().Height() - MAX_CMPCTBLOCK_DEPTH
+        // (signed arithmetic, hence saturating_sub).
+        if let Some(h) = block_height {
+            if h >= tip_height.saturating_sub(MAX_CMPCTBLOCK_DEPTH) {
+                let cb = rustoshi_network::CmpctBlock::from_block(&block, nonce);
+                return NetworkMessage::CmpctBlock(cb.serialize());
+            }
+        }
+    }
     NetworkMessage::Block(block)
 }
 
