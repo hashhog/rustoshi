@@ -1202,6 +1202,24 @@ fn blocktxn_within_depth(block_height: u32, tip_height: u32) -> bool {
     block_height >= tip_height.saturating_sub(MAX_BLOCKTXN_DEPTH)
 }
 
+/// Mirrors Bitcoin Core's `MAX_CMPCTBLOCK_DEPTH` (net_processing.cpp:138).
+const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
+
+/// Build the reply to a getdata block item. For `MSG_CMPCT_BLOCK` on a block
+/// within `MAX_CMPCTBLOCK_DEPTH` of the tip, Core (ProcessGetBlockData) sends a
+/// BIP-152 `cmpctblock` (coinbase prefilled, SipHash short wtxids keyed from
+/// header+nonce); otherwise (deeper, or any other inv type) the full block.
+fn block_getdata_reply(
+    inv_type: InvType,
+    block: rustoshi_primitives::Block,
+    block_height: Option<u32>,
+    tip_height: u32,
+    nonce: u64,
+) -> NetworkMessage {
+    let _ = (inv_type, block_height, tip_height, nonce);
+    NetworkMessage::Block(block)
+}
+
 /// Result of [`reorg_retention_prune_targets`]: the bodies/undo to drop
 /// this flush plus the watermark to persist atomically alongside them.
 struct ReorgPrunePlan {
@@ -8036,11 +8054,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     match item.inv_type {
                                         // MSG_CMPCT_BLOCK: a Core peer that chose us as a
                                         // BIP-152 high-bandwidth peer fetches an announced
-                                        // tip this way. Serve the full block — what Core
-                                        // itself sends for MSG_CMPCT_BLOCK outside
-                                        // MAX_CMPCTBLOCK_DEPTH (ProcessGetBlockData,
-                                        // IsMsgCmpctBlk arm); it satisfies the in-flight
-                                        // request. It used to be dropped silently.
+                                        // tip this way. Within MAX_CMPCTBLOCK_DEPTH of the
+                                        // tip answer with a cmpctblock, otherwise the full
+                                        // block (ProcessGetBlockData, IsMsgCmpctBlk arm).
                                         InvType::MsgBlock | InvType::MsgWitnessBlock | InvType::MsgCmpctBlock => {
                                             // Look up block from storage and send it. A block
                                             // connected since the last durable flush lives only
@@ -8064,12 +8080,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                         "Serving block {} to peer {}",
                                                         item.hash, peer_id.0
                                                     );
+                                                    let reply = if item.inv_type == InvType::MsgCmpctBlock {
+                                                        let tip_height = rpc_state.read().await.best_height;
+                                                        let block_height = block_store
+                                                            .get_height(&item.hash)
+                                                            .ok()
+                                                            .flatten();
+                                                        block_getdata_reply(
+                                                            item.inv_type,
+                                                            block,
+                                                            block_height,
+                                                            tip_height,
+                                                            rand::random::<u64>(),
+                                                        )
+                                                    } else {
+                                                        NetworkMessage::Block(block)
+                                                    };
                                                     let ps = peer_state.read().await;
                                                     if let Some(ref pm) = ps.peer_manager {
-                                                        pm.try_send_to_peer(
-                                                            peer_id,
-                                                            NetworkMessage::Block(block),
-                                                        );
+                                                        pm.try_send_to_peer(peer_id, reply);
                                                     }
                                                 }
                                                 _ => {
@@ -9908,6 +9937,66 @@ mod tests {
         // so any block height is within depth — matches Core's negative RHS.
         assert!(blocktxn_within_depth(0, 5));
         assert!(blocktxn_within_depth(5, 5));
+    }
+
+    /// Compact-block serving: getdata(MSG_CMPCT_BLOCK) within MAX_CMPCTBLOCK_DEPTH
+    /// is answered with a cmpctblock (Core ProcessGetBlockData); deeper, or for
+    /// MSG_BLOCK/MSG_WITNESS_BLOCK, with the full block.
+    #[test]
+    fn test_getdata_cmpctblock_serve() {
+        use rustoshi_network::CmpctBlock;
+        use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint, Transaction, TxIn, TxOut};
+        let mk = |n: u8| Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([n; 32]), vout: 0 },
+                script_sig: vec![n],
+                sequence: 0xffff_fffe,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1000, script_pubkey: vec![0x51] }],
+            lock_time: 0,
+        };
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block_hash: Hash256([0; 32]),
+                merkle_root: Hash256([7; 32]),
+                timestamp: 1,
+                bits: 0x207fffff,
+                nonce: 3,
+            },
+            transactions: vec![mk(1), mk(2), mk(3)],
+        };
+        let tip = 100u32;
+        // Within depth, MSG_CMPCT_BLOCK -> cmpctblock with coinbase prefilled.
+        for h in [tip, tip - MAX_CMPCTBLOCK_DEPTH] {
+            match block_getdata_reply(InvType::MsgCmpctBlock, block.clone(), Some(h), tip, 42) {
+                NetworkMessage::CmpctBlock(data) => {
+                    let cb = CmpctBlock::decode(&mut std::io::Cursor::new(&data)).unwrap();
+                    assert_eq!(cb.block_hash(), block.header.block_hash());
+                    assert_eq!(cb.nonce, 42);
+                    assert_eq!(cb.prefilled_txn.len(), 1);
+                    assert_eq!(cb.short_ids.len(), 2);
+                    assert_eq!(cb.short_ids[0], cb.get_short_id(&block.transactions[1].wtxid()));
+                }
+                _ => panic!("expected cmpctblock at height {h}"),
+            }
+        }
+        // One deeper than the window, or unknown height -> full block.
+        for h in [Some(tip - MAX_CMPCTBLOCK_DEPTH - 1), Some(0), None] {
+            assert!(matches!(
+                block_getdata_reply(InvType::MsgCmpctBlock, block.clone(), h, tip, 42),
+                NetworkMessage::Block(_)
+            ));
+        }
+        // Plain block requests are never compacted.
+        for t in [InvType::MsgBlock, InvType::MsgWitnessBlock] {
+            assert!(matches!(
+                block_getdata_reply(t, block.clone(), Some(tip), tip, 42),
+                NetworkMessage::Block(_)
+            ));
+        }
     }
 
     /// EFFECTIVE assumevalid-disable test: a block far below the built-in
