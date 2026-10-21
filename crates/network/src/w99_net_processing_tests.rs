@@ -237,16 +237,18 @@ mod tests {
 
     /// G2 FIXED — Regular inbound peer: discouraged AND disconnected.
     ///
-    /// A standard inbound peer with no special flags must be written to the
-    /// ban-list AND have a Disconnect command sent.
+    /// A standard inbound peer with no special flags is added to the in-memory
+    /// discouragement set (not the persisted ban-list) AND has a Disconnect
+    /// command sent. Accept, eviction and automatic dials consult that set;
+    /// see the `discouraged_*` tests in peer_manager.rs.
     #[tokio::test]
-    async fn g2_regular_inbound_peer_is_banned() {
+    async fn g2_regular_inbound_peer_is_discouraged_not_banned() {
         let tmp = TempDir::new().unwrap();
         let mut mgr = make_test_manager_in(&tmp);
         let peer_id = PeerId(4);
         let addr: SocketAddr = "203.0.113.7:8333".parse().unwrap();
 
-        let _cmd_rx = mgr.insert_test_peer_with_flags(
+        let mut cmd_rx = mgr.insert_test_peer_with_flags(
             peer_id,
             addr,
             ConnectionType::Inbound,
@@ -256,11 +258,31 @@ mod tests {
         mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string())
             .await;
 
-        // Ban-list MUST contain this address.
         assert!(
-            mgr.is_banned(&addr.ip()),
-            "Regular inbound peer must be written to the ban-list on misbehavior"
+            matches!(cmd_rx.try_recv(), Ok(crate::peer::PeerCommand::Disconnect)),
+            "misbehaving peer must still be disconnected"
         );
+        // Discouraged in memory, NOT written to the persisted ban-list.
+        assert!(mgr.is_discouraged(&addr), "peer must be discouraged");
+        assert!(
+            !mgr.is_banned(&addr.ip()),
+            "misbehavior must not write to the persisted ban-list"
+        );
+        assert!(
+            !tmp.path().join("banlist.json").exists(),
+            "misbehavior must not persist banlist.json"
+        );
+    }
+
+    /// Manual setban (ban_ip, as used by the setban RPC) still persists.
+    #[tokio::test]
+    async fn g2_manual_setban_still_persists() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = make_test_manager_in(&tmp);
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        mgr.ban_ip(ip, std::time::Duration::from_secs(3600), "manual".to_string());
+        assert!(mgr.is_banned(&ip));
+        assert!(tmp.path().join("banlist.json").exists());
     }
 
     // ─── G3: banlist persistence ──────────────────────────────────────────────

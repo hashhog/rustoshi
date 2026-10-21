@@ -291,6 +291,45 @@ fn reject_inbound_at_accept(pre_handshake_inbound: usize, max_inbound: usize) ->
     pre_handshake_inbound >= max_inbound
 }
 
+/// Discouraged-inbound admission gate (Core net.cpp:1813-1818
+/// `CreateNodeFromAcceptedSocket`): a discouraged address is still accepted
+/// while inbound slots remain, but is dropped once admitting it would bring the
+/// inbound count to the cap, unless it has NoBan permission.
+fn drop_discouraged_inbound(
+    inbound: usize,
+    max_inbound: usize,
+    discouraged: bool,
+    noban: bool,
+) -> bool {
+    !noban && discouraged && inbound + 1 >= max_inbound
+}
+
+/// In-memory discouragement filter, keyed by IP (Core `BanMan::Discourage`
+/// takes a `CNetAddr`, so a peer reconnecting from a new source port is still
+/// discouraged). Never persisted: only `setban` writes banlist.json. Cloned
+/// into the inbound accept task so misbehaviour takes effect there without a
+/// disk round-trip.
+#[derive(Clone, Default)]
+pub(crate) struct DiscouragedSet(Arc<std::sync::Mutex<HashMap<IpAddr, Instant>>>);
+
+impl DiscouragedSet {
+    fn discourage(&self, ip: IpAddr, duration: Duration) {
+        self.0.lock().unwrap().insert(ip, Instant::now() + duration);
+    }
+
+    fn contains(&self, ip: &IpAddr) -> bool {
+        let mut map = self.0.lock().unwrap();
+        match map.get(ip) {
+            Some(until) if Instant::now() < *until => true,
+            Some(_) => {
+                map.remove(ip);
+                false
+            }
+            None => false,
+        }
+    }
+}
+
 impl Default for PeerManagerConfig {
     fn default() -> Self {
         Self {
@@ -2499,6 +2538,9 @@ pub struct PeerManager {
     /// registered via Connected event in handle_event().
     #[allow(clippy::type_complexity)]
     inbound_cmd_txs: Option<Arc<std::sync::Mutex<HashMap<PeerId, mpsc::Sender<PeerCommand>>>>>,
+    /// Addresses discouraged for misbehaviour (in memory only), shared with
+    /// the inbound accept task.
+    discouraged: DiscouragedSet,
     /// Address manager for peer discovery.
     addr_manager: AddressManager,
     /// Misbehavior tracker for all peers.
@@ -2608,6 +2650,7 @@ impl PeerManager {
             params,
             peers: HashMap::new(),
             inbound_cmd_txs: None,
+            discouraged: DiscouragedSet::default(),
             addr_manager: AddressManager::new(),
             misbehavior_tracker: MisbehaviorTracker::new(),
             ban_manager,
@@ -2666,6 +2709,7 @@ impl PeerManager {
             params,
             peers: HashMap::new(),
             inbound_cmd_txs: None,
+            discouraged: DiscouragedSet::default(),
             addr_manager,
             misbehavior_tracker: MisbehaviorTracker::new(),
             ban_manager,
@@ -3003,10 +3047,12 @@ impl PeerManager {
                     // loop.  The listener task lives outside the manager's
                     // `&mut self`, so it cannot share the in-memory
                     // `BanManager`.  Re-reading the file on each accept()
-                    // is cheap (rare event) and lets RPC `setban` /
-                    // misbehavior-driven bans take effect on the next
-                    // connection without extra plumbing.
+                    // is cheap (rare event) and lets RPC `setban` take
+                    // effect on the next connection without extra plumbing.
+                    // Misbehaviour is never written to that file; it lands in
+                    // the shared in-memory `discouraged` set instead.
                     let ban_path = self.config.data_dir.clone();
+                    let discouraged = self.discouraged.clone();
                     // Clone the node-global network-active flag so the listener
                     // task (which lives outside the manager's `&mut self`) can
                     // consult it at accept time — the inbound-accept gate of
@@ -3020,9 +3066,9 @@ impl PeerManager {
                     let max_inbound = self.config.max_inbound;
                     tokio::spawn(async move {
                         // Cheap, per-accept ban check: re-read the persisted
-                        // banlist file on disk.  This means RPC `setban` /
-                        // misbehavior-driven bans take effect on the next
-                        // accept without needing extra plumbing.
+                        // banlist file on disk, so RPC `setban` takes effect on
+                        // the next accept; then consult the in-memory
+                        // discouragement set for misbehaving addresses.
                         loop {
                             match listener.accept().await {
                                 Ok((stream, addr)) => {
@@ -3122,6 +3168,26 @@ impl PeerManager {
                                     // half-open flood Core prevents at accept.
                                     let pre_handshake_inbound =
                                         inbound_senders.lock().unwrap().len();
+                                    // Discouraged addresses (Core net.cpp:1813):
+                                    // admitted while slots remain, dropped when
+                                    // this one would fill the last slot. Only the
+                                    // pre-handshake count is visible here; the
+                                    // established count is re-checked on
+                                    // registration in `handle_event`. rustoshi
+                                    // has no -whitelist, so no inbound has NoBan.
+                                    if drop_discouraged_inbound(
+                                        pre_handshake_inbound,
+                                        max_inbound,
+                                        discouraged.contains(&addr.ip()),
+                                        false,
+                                    ) {
+                                        tracing::debug!(
+                                            "Rejecting inbound connection from {}: discouraged",
+                                            addr
+                                        );
+                                        drop(stream);
+                                        continue;
+                                    }
                                     if reject_inbound_at_accept(pre_handshake_inbound, max_inbound)
                                     {
                                         tracing::debug!(
@@ -3314,8 +3380,7 @@ impl PeerManager {
 
     /// Immediately initiate an outbound connection to a peer (for addnode "onetry").
     pub async fn connect_to_peer(&mut self, addr: SocketAddr) {
-        self.connect_to_with_type(addr, ConnectionType::FullRelay)
-            .await;
+        self.dial(addr, ConnectionType::FullRelay, true).await;
     }
 
     /// Connect to anchor peers (block-relay-only connections from previous session).
@@ -3611,8 +3676,7 @@ impl PeerManager {
             }
             self.connect_attempt_at.insert(addr, now);
             tracing::info!("Connecting to pinned -connect peer {}", addr);
-            self.connect_to_with_type(addr, ConnectionType::FullRelay)
-                .await;
+            self.dial(addr, ConnectionType::FullRelay, true).await;
         }
     }
 
@@ -3735,11 +3799,24 @@ impl PeerManager {
             .await;
     }
 
-    /// Initiate an outbound connection to a peer with a specific connection type.
+    /// Initiate an automatic (addrman, anchor, feeler) outbound connection
+    /// to a peer with a specific connection type.
     async fn connect_to_with_type(&mut self, addr: SocketAddr, conn_type: ConnectionType) {
+        self.dial(addr, conn_type, false).await;
+    }
+
+    /// Open an outbound connection. `manual_dest` marks an operator-named
+    /// destination (addnode onetry, -connect): Core's `OpenNetworkConnection`
+    /// only refuses discouraged addresses when no `pszDest` was given
+    /// (net.cpp:3025-3029), so those dials skip the discouragement check.
+    async fn dial(&mut self, addr: SocketAddr, conn_type: ConnectionType, manual_dest: bool) {
         // Skip banned addresses
         if self.ban_manager.is_addr_banned(&addr) {
             tracing::debug!("Skipping banned address: {}", addr);
+            return;
+        }
+        if !manual_dest && self.is_discouraged(&addr) {
+            tracing::debug!("Skipping discouraged address: {}", addr);
             return;
         }
 
@@ -4244,7 +4321,7 @@ impl PeerManager {
         }
     }
 
-    /// Ban a peer for misbehavior.
+    /// Discourage and disconnect a peer (no persisted ban; use `ban_ip` for setban).
     pub async fn ban_peer(&mut self, peer_id: PeerId) {
         self.ban_peer_with_reason(peer_id, "manual ban".to_string())
             .await;
@@ -4261,7 +4338,8 @@ impl PeerManager {
     ///   immediately for `IsManualConn()`.
     /// * **Local address** (loopback / link-local / site-local) → disconnect
     ///   only, no discourage: avoids polluting the ban-list with local addrs.
-    /// * **All other peers** → write to discourage/ban-list AND disconnect.
+    /// * **All other peers** → discourage (in memory, NOT the persisted
+    ///   banlist) AND disconnect.
     pub async fn ban_peer_with_reason(&mut self, peer_id: PeerId, reason: String) {
         let peer = match self.peers.get(&peer_id) {
             Some(p) => p,
@@ -4305,10 +4383,15 @@ impl PeerManager {
             );
             let _ = peer.command_tx.send(PeerCommand::Disconnect).await;
         } else {
-            // Regular inbound/outbound: discourage + disconnect.
+            // Regular inbound/outbound: discourage + disconnect. Core keeps
+            // discouragement in a rolling in-memory filter; it is never
+            // written to banlist.dat (only setban does that). The shared
+            // `discouraged` set is what inbound accept, eviction and
+            // automatic dials consult.
+            tracing::debug!("Discouraging peer {} ({}): {}", peer_id.0, addr, reason);
             self.addr_manager.ban(&addr, self.config.ban_duration);
-            self.ban_manager
-                .ban_addr(addr, self.config.ban_duration, reason);
+            self.discouraged
+                .discourage(addr.ip(), self.config.ban_duration);
             let _ = self.peers[&peer_id]
                 .command_tx
                 .send(PeerCommand::Disconnect)
@@ -4361,6 +4444,13 @@ impl PeerManager {
     /// Check if an IP address is banned.
     pub fn is_banned(&self, ip: &IpAddr) -> bool {
         self.ban_manager.is_banned(ip)
+    }
+
+    /// Whether `addr` was discouraged for misbehaviour (in-memory only, not in
+    /// the persisted banlist).
+    /// Keyed by IP, like Core's `BanMan::IsDiscouraged(CNetAddr)`.
+    pub fn is_discouraged(&self, addr: &SocketAddr) -> bool {
+        self.discouraged.contains(&addr.ip())
     }
 
     /// Check if a socket address is banned.
@@ -4453,6 +4543,27 @@ impl PeerManager {
                         // -> unbounded inbound connections (a resource-exhaustion / DoS
                         // surface). The ban and network-active gates run earlier in the
                         // accept loop; this is purely the slot cap.
+                        //
+                        // Discouraged addresses first (Core net.cpp:1813-1818): with
+                        // the established count in hand, drop a discouraged peer that
+                        // would take the last inbound slot rather than evicting
+                        // someone for it. Inbound peers never carry NoBan here.
+                        if drop_discouraged_inbound(
+                            self.inbound_count(),
+                            self.config.max_inbound,
+                            self.is_discouraged(&info.addr),
+                            false,
+                        ) {
+                            tracing::debug!(
+                                "Inbound peer {} from {} dropped (discouraged, {}/{} inbound)",
+                                id.0,
+                                info.addr,
+                                self.inbound_count(),
+                                self.config.max_inbound
+                            );
+                            let _ = cmd_tx.send(PeerCommand::Disconnect).await;
+                            return Some(event);
+                        }
                         if self.inbound_count() >= self.config.max_inbound {
                             match self.select_inbound_to_evict() {
                                 Some(victim) => {
@@ -4839,9 +4950,9 @@ impl PeerManager {
                 }
             }
             PeerEvent::Misbehaving(id, reason) => {
-                // Forward to the misbehavior tracker + ban manager.  A peer
-                // hitting the 100-point threshold is added to the persistent
-                // banlist and will be refused on the next accept().
+                // Forward to the misbehavior tracker. A peer hitting the
+                // 100-point threshold is discouraged in memory (never the
+                // persisted banlist) and disconnected.
                 let reason = reason.clone();
                 self.misbehaving(*id, reason).await;
             }
@@ -5286,8 +5397,12 @@ impl PeerManager {
                     (p.info.services & NODE_NETWORK != 0) && (p.info.services & NODE_WITNESS != 0),
                     p.info.relay,
                     false, // bloom_filter - we don't track this currently
-                    false, // prefer_evict
-                    false, // noban
+                    // Core sets m_prefer_evict = IsDiscouraged at accept
+                    // (net.cpp:1854). Checked at eviction time instead, which
+                    // also covers a connection whose address was discouraged
+                    // after it was accepted.
+                    self.is_discouraged(&p.info.addr), // prefer_evict
+                    false,                             // noban
                 )
             })
             .collect();
@@ -8953,6 +9068,145 @@ mod tests {
                 "a protected existing peer must NOT be disconnected"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Discouragement reaches inbound accept, eviction and automatic dials
+    // (Core net.cpp:1813-1854 CreateNodeFromAcceptedSocket, :3025
+    // OpenNetworkConnection). Misbehaviour is in-memory only, so these are
+    // the only places it can take effect.
+    // ------------------------------------------------------------------
+
+    fn discourage_test_manager(tmp: &tempfile::TempDir, max_inbound: usize) -> PeerManager {
+        let mut config = PeerManagerConfig::testnet4().with_data_dir(tmp.path().to_path_buf());
+        config.max_inbound = max_inbound;
+        PeerManager::new(config, ChainParams::testnet4())
+    }
+
+    /// Insert an inbound peer at `addr` and misbehave it, leaving it in the
+    /// peer map (the Disconnected event has not been processed yet).
+    async fn discourage_via_peer(mgr: &mut PeerManager, peer_id: PeerId, addr: SocketAddr) {
+        let _rx = mgr.insert_test_peer(peer_id, addr, false, true);
+        mgr.ban_peer_with_reason(peer_id, "test-misbehavior".to_string())
+            .await;
+        assert!(mgr.is_discouraged(&addr));
+    }
+
+    /// A discouraged address reconnecting from a new source port is dropped
+    /// when admitting it would take the last inbound slot. Core:
+    /// `if (!NoBan && nInbound + 1 >= m_max_inbound && discouraged) return;`
+    #[tokio::test]
+    async fn discouraged_inbound_dropped_when_it_would_fill_last_slot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = discourage_test_manager(&tmp, 4);
+        let _a = mgr.insert_test_peer(PeerId(1), "8.1.0.1:8333".parse().unwrap(), false, true);
+        let _b = mgr.insert_test_peer(PeerId(2), "8.2.0.1:8333".parse().unwrap(), false, true);
+        discourage_via_peer(&mut mgr, PeerId(3), "203.0.113.7:50000".parse().unwrap()).await;
+        assert_eq!(mgr.inbound_count(), 3);
+        assert!(!tmp.path().join("banlist.json").exists());
+
+        let newcomer = PeerId(10);
+        let mut rx =
+            drive_inbound_registration(&mut mgr, newcomer, "203.0.113.7:50001".parse().unwrap())
+                .await;
+
+        assert!(
+            !mgr.peers.contains_key(&newcomer),
+            "discouraged inbound must be dropped when 3 + 1 >= max_inbound 4"
+        );
+        assert!(matches!(rx.try_recv(), Ok(PeerCommand::Disconnect)));
+        assert_eq!(mgr.inbound_count(), 3);
+    }
+
+    /// While slots remain, a discouraged inbound is still accepted (Core
+    /// keeps the slot usable; it only loses the last one).
+    #[tokio::test]
+    async fn discouraged_inbound_admitted_while_slots_remain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = discourage_test_manager(&tmp, 8);
+        discourage_via_peer(&mut mgr, PeerId(3), "203.0.113.7:50000".parse().unwrap()).await;
+
+        let newcomer = PeerId(10);
+        let _rx =
+            drive_inbound_registration(&mut mgr, newcomer, "203.0.113.7:50001".parse().unwrap())
+                .await;
+        assert!(mgr.peers.contains_key(&newcomer));
+    }
+
+    /// The accept-time predicate, including the NoBan exemption.
+    #[test]
+    fn drop_discouraged_inbound_predicate() {
+        assert!(!drop_discouraged_inbound(2, 4, true, false));
+        assert!(drop_discouraged_inbound(3, 4, true, false));
+        assert!(!drop_discouraged_inbound(3, 4, false, false));
+        assert!(!drop_discouraged_inbound(3, 4, true, true));
+    }
+
+    /// Discouraged inbound peers are preferred for eviction (Core sets
+    /// `prefer_evict = discouraged`). 50 older discouraged peers, then 60
+    /// younger clean ones, all in one /16. Whatever the protection ladder
+    /// shields (at most 28 by category, then half the rest by uptime), both
+    /// kinds survive it, and without prefer_evict the youngest survivor -- a
+    /// clean peer -- is the victim.
+    #[tokio::test]
+    async fn discouraged_inbound_preferred_for_eviction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = discourage_test_manager(&tmp, 8);
+        let mut discouraged_ids = Vec::new();
+        for i in 0..50u32 {
+            let addr: SocketAddr = format!("8.8.0.{}:8333", i).parse().unwrap();
+            let id = PeerId(1000 + i as u64);
+            discourage_via_peer(&mut mgr, id, addr).await;
+            discouraged_ids.push(id);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        for i in 0..60u32 {
+            let addr: SocketAddr = format!("8.8.200.{}:8333", i).parse().unwrap();
+            let _rx = mgr.insert_test_peer(PeerId(5000 + i as u64), addr, false, true);
+        }
+
+        let victim = mgr.select_inbound_to_evict().expect("a victim");
+        assert!(
+            discouraged_ids.contains(&victim),
+            "eviction must prefer a discouraged peer, picked {:?}",
+            victim
+        );
+    }
+
+    /// An anchor whose address was discouraged is not dialed; Core's
+    /// `OpenNetworkConnection` refuses discouraged non-manual destinations.
+    #[tokio::test]
+    async fn anchor_dial_skips_discouraged_address() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = discourage_test_manager(&tmp, 8);
+        discourage_via_peer(&mut mgr, PeerId(3), "203.0.113.7:50000".parse().unwrap()).await;
+        mgr.peers.remove(&PeerId(3));
+
+        let bad: SocketAddr = "203.0.113.7:8333".parse().unwrap();
+        let good: SocketAddr = "198.51.100.9:8333".parse().unwrap();
+        mgr.anchors = vec![bad, good];
+        mgr.connect_to_anchors().await;
+
+        let dialed: Vec<SocketAddr> = mgr.peers.values().map(|p| p.info.addr).collect();
+        assert!(
+            !dialed.contains(&bad),
+            "discouraged anchor must not be dialed"
+        );
+        assert!(dialed.contains(&good), "a clean anchor is still dialed");
+    }
+
+    /// An operator-named destination (addnode onetry) still dials a
+    /// discouraged address, as Core exempts `pszDest` connections.
+    #[tokio::test]
+    async fn manual_dial_ignores_discouragement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = discourage_test_manager(&tmp, 8);
+        discourage_via_peer(&mut mgr, PeerId(3), "203.0.113.7:50000".parse().unwrap()).await;
+        mgr.peers.remove(&PeerId(3));
+
+        let addr: SocketAddr = "203.0.113.7:8333".parse().unwrap();
+        mgr.connect_to_peer(addr).await;
+        assert!(mgr.peers.values().any(|p| p.info.addr == addr));
     }
 
     // ------------------------------------------------------------------
