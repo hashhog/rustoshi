@@ -19,7 +19,7 @@ use crate::eviction::{select_node_to_evict, EvictionCandidate, EvictionCandidate
 use crate::message::{
     parse_message_header, serialize_message, NetAddress, NetworkMessage, TimestampedNetAddress,
     VersionMessage, FEEFILTER_VERSION, MAX_ADDR, MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE,
-    MIN_PEER_PROTO_VERSION, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK,
+    MIN_PEER_PROTO_VERSION, SENDCMPCT_VERSION, SendCmpctMessage, NODE_BLOOM, NODE_COMPACT_FILTERS, NODE_NETWORK,
     NODE_NETWORK_LIMITED, NODE_P2P_V2, NODE_WITNESS, PROTOCOL_VERSION, SENDHEADERS_VERSION,
 };
 use crate::misbehavior::{BanEntry, BanManager, MisbehaviorReason, MisbehaviorTracker};
@@ -6318,6 +6318,18 @@ pub async fn run_inbound_peer(
             stats.record_send("sendheaders", msg.len() as u64);
         }
     }
+    // BIP 152: advertise compact-block support (version 2, low-bandwidth) so the
+    // peer may request our blocks as MSG_CMPCT_BLOCK. Core only does so after
+    // receiving sendcmpct from us; outbound flows already send it.
+    if their_version.version >= SENDCMPCT_VERSION {
+        let msg = serialize_message(
+            &magic,
+            &NetworkMessage::SendCmpct(SendCmpctMessage { announce: false, version: 2 }),
+        );
+        if writer.write_all(&msg).await.is_ok() {
+            stats.record_send("sendcmpct", msg.len() as u64);
+        }
+    }
     let _ = writer.flush().await;
 
     // Full message loop — same as outbound peers
@@ -6707,6 +6719,19 @@ async fn run_inbound_v2_peer(
         their_version.user_agent,
         their_version.version,
     );
+
+    // BIP 152: advertise compact-block support (see the v1 inbound flow).
+    let mut cipher = cipher;
+    let mut writer = writer;
+    if their_version.version >= SENDCMPCT_VERSION {
+        let _ = crate::peer::v2_send_message_tracked(
+            &mut cipher,
+            &mut writer,
+            &NetworkMessage::SendCmpct(SendCmpctMessage { announce: false, version: 2 }),
+            &stats,
+        )
+        .await;
+    }
 
     // ----- Main v2 message loop over the cipher. -----
     crate::peer::run_message_loop_v2_tracked(
