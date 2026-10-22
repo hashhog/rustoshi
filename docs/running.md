@@ -60,7 +60,7 @@ Flags use the `--name value` or `--name=value` form. Boolean flags are switched 
 |---|---|---|
 | `--listen` | on | Accept inbound connections on `0.0.0.0:<port>`. It cannot be switched off on the command line; use `listen=0` in the config file. |
 | `--port <port>` | per network | P2P listen port. |
-| `--maxconnections <n>` | 8 | Number of outbound connections. |
+| `--maxconnections <n>` | 125 | Maximum automatic connections (inbound + outbound + the one feeler), as in Core. Outbound targets are min(8, n) full-relay plus min(2, n − full-relay) block-relay-only; the inbound cap is n − full-relay − block-relay − 1 (0 when n ≤ 11, 114 at the default); a feeler only runs while the total is below n. `0` runs offline: no listener and no outbound connection of any kind. `--connect` and `addnode` peers are outside this budget. |
 | `--connect <ip:port>` | none | Connect only to these peers (repeatable). Disables DNS seeds and automatic outbound connections. |
 | `--nodnsseed` | off | Do not query DNS seeds. |
 | `--nofixedseeds` | off | Do not fall back to the built-in seed list. |
