@@ -2286,3 +2286,240 @@ async fn testmempoolaccept_single_tx_valid_replacement_is_allowed() {
     let ids = mempool(&r.state).await;
     assert!(ids.contains(&r.original.txid().to_hex()), "{ids:?}");
 }
+
+/// 1-in/1-out P2WPKH with an explicit nSequence. `0xffff_ffff` does not signal
+/// BIP-125.
+fn signed_spend_seq(
+    prev: OutPoint,
+    in_value: u64,
+    fee: u64,
+    who: &Signer,
+    dest: &Signer,
+    sequence: u32,
+) -> Transaction {
+    let mut tx = signed_spend(prev, in_value, fee, who, dest, false);
+    tx.inputs[0].sequence = sequence;
+    tx.inputs[0].witness = vec![];
+    let script_code = p2wpkh_script_code(&who.h160);
+    let sighash = segwit_v0_sighash(&tx, 0, &script_code, in_value, SIGHASH_ALL);
+    let mut der = serialize_der_signature(&ecdsa_sign(&who.sk, &sighash));
+    der.push(SIGHASH_ALL as u8);
+    tx.inputs[0].witness = vec![der, who.pk.to_vec()];
+    tx
+}
+
+/// Single-tx testmempoolaccept row for `tx`, with `original` already accepted.
+async fn single_tma(state: &Arc<RwLock<RpcState>>, original: &Transaction, tx: &Transaction) -> serde_json::Value {
+    let first = result(call(state, "submitpackage", serde_json::json!([[hex_tx(original)]])).await);
+    assert_eq!(first["package_msg"], "success", "{first}");
+    let rows = result(call(state, "testmempoolaccept", serde_json::json!([[hex_tx(tx)]])).await);
+    rows[0].clone()
+}
+
+/// Core v31.1 `ReplacementChecks` → `PaysForRBF` rule 3, and
+/// `TxValidationState::ToString` joins reason and debug with ", ".
+#[tokio::test]
+async fn testmempoolaccept_single_tx_rule3_reject_details_match_core() {
+    let r = replacement_pkg(20_000, 5_000, 5_000, false).await;
+    let row = single_tma(&r.state, &r.original, &r.parent).await;
+    assert_eq!(row["allowed"], false, "{row}");
+    assert_eq!(row["reject-reason"], "insufficient fee", "{row}");
+    assert_eq!(
+        row["reject-details"],
+        format!(
+            "insufficient fee, rejecting replacement {}, less fees than conflicting txs; 0.00005 < 0.0002",
+            r.parent.txid()
+        ),
+        "{row}"
+    );
+}
+
+/// `PaysForRBF` rule 4: the extra fee must cover the incremental relay fee
+/// (100 sat/kvB) on the replacement's own vsize.
+#[tokio::test]
+async fn testmempoolaccept_single_tx_rule4_reject_details_match_core() {
+    let r = replacement_pkg(10_000, 10_001, 5_000, false).await;
+    assert_eq!(r.parent.vsize(), 110);
+    let row = single_tma(&r.state, &r.original, &r.parent).await;
+    assert_eq!(row["allowed"], false, "{row}");
+    assert_eq!(row["reject-reason"], "insufficient fee", "{row}");
+    assert_eq!(
+        row["reject-details"],
+        format!(
+            "insufficient fee, rejecting replacement {}, not enough additional fees to relay; 0.00000001 < 0.00000011",
+            r.parent.txid()
+        ),
+        "{row}"
+    );
+}
+
+/// `GetEntriesForConflicts` rule 5: more than 100 distinct conflicting
+/// clusters. The debug is `rejecting replacement <txid>; too many conflicting
+/// clusters (N > 100)`.
+#[tokio::test]
+async fn testmempoolaccept_single_tx_rule5_reject_details_match_core() {
+    const N: usize = 101;
+    let alice = signer(0x11);
+    let bob = signer(0x22);
+    let carol = signer(0x33);
+    let (state, _server) = server();
+    let prevs: Vec<OutPoint> = (0..N)
+        .map(|i| {
+            let mut id = [0x55u8; 32];
+            id[0] = i as u8;
+            OutPoint {
+                txid: Hash256::from(id),
+                vout: 0,
+            }
+        })
+        .collect();
+    {
+        let mut st = state.write().await;
+        let store = BlockStore::new(&st.db);
+        for prev in &prevs {
+            store
+                .put_utxo(
+                    prev,
+                    &rustoshi_storage::CoinEntry {
+                        height: 1,
+                        is_coinbase: false,
+                        value: IN_VALUE,
+                        script_pubkey: p2wpkh_spk(&alice),
+                    },
+                )
+                .unwrap();
+        }
+        st.mempool.notify_new_tip(200, 1_700_000_000);
+    }
+    for prev in &prevs {
+        let orig = signed_spend(prev.clone(), IN_VALUE, 1_000, &alice, &bob, false);
+        let res = result(call(&state, "submitpackage", serde_json::json!([[hex_tx(&orig)]])).await);
+        assert_eq!(res["package_msg"], "success", "{res}");
+    }
+    assert_eq!(mempool(&state).await.len(), N);
+
+    // One tx spending every UTXO, so it conflicts with all N originals.
+    let fee = 1_000_000u64;
+    let mut tx = Transaction {
+        version: 2,
+        inputs: prevs
+            .iter()
+            .map(|p| TxIn {
+                previous_output: p.clone(),
+                script_sig: vec![],
+                sequence: 0xffff_fffd,
+                witness: vec![],
+            })
+            .collect(),
+        outputs: vec![TxOut {
+            value: IN_VALUE * N as u64 - fee,
+            script_pubkey: p2wpkh_spk(&carol),
+        }],
+        lock_time: 0,
+    };
+    let script_code = p2wpkh_script_code(&alice.h160);
+    let witnesses: Vec<Vec<Vec<u8>>> = (0..N)
+        .map(|i| {
+            let sighash = segwit_v0_sighash(&tx, i, &script_code, IN_VALUE, SIGHASH_ALL);
+            let mut der = serialize_der_signature(&ecdsa_sign(&alice.sk, &sighash));
+            der.push(SIGHASH_ALL as u8);
+            vec![der, alice.pk.to_vec()]
+        })
+        .collect();
+    for (input, w) in tx.inputs.iter_mut().zip(witnesses) {
+        input.witness = w;
+    }
+
+    let rows = result(call(&state, "testmempoolaccept", serde_json::json!([[hex_tx(&tx)]])).await);
+    let row = &rows[0];
+    assert_eq!(row["allowed"], false, "{row}");
+    assert_eq!(row["reject-reason"], "too many potential replacements", "{row}");
+    assert_eq!(
+        row["reject-details"],
+        format!(
+            "too many potential replacements, rejecting replacement {}; too many conflicting clusters (101 > 100)",
+            tx.txid()
+        ),
+        "{row}"
+    );
+}
+
+/// Core v31.1 has no BIP-125 signaling gate (full RBF): a replacement of a
+/// non-signaling original is allowed by a single-tx dry run, which leaves the
+/// original in the mempool.
+#[tokio::test]
+async fn testmempoolaccept_single_tx_replaces_non_signaling_original() {
+    let r = replacement_pkg(10_000, 50_000, 5_000, false).await;
+    let alice = signer(0x11);
+    let bob = signer(0x22);
+    let prev = r.original.inputs[0].previous_output.clone();
+    let original = signed_spend_seq(prev, IN_VALUE, 10_000, &alice, &bob, 0xffff_ffff);
+    let row = single_tma(&r.state, &original, &r.parent).await;
+    assert_eq!(row["allowed"], true, "{row}");
+    let ids = mempool(&r.state).await;
+    assert!(ids.contains(&original.txid().to_hex()), "{ids:?}");
+}
+
+/// A multi-tx testmempoolaccept keeps `m_allow_replacement=false`: the
+/// conflicting first tx is `bip125-replacement-disallowed` and the later tx is
+/// unfinished (`txid` and `wtxid` only).
+#[tokio::test]
+async fn testmempoolaccept_package_conflict_stays_replacement_disallowed() {
+    let r = replacement_pkg(10_000, 50_000, 5_000, false).await;
+    let first = result(
+        call(&r.state, "submitpackage", serde_json::json!([[hex_tx(&r.original)]])).await,
+    );
+    assert_eq!(first["package_msg"], "success", "{first}");
+    let rows = result(
+        call(
+            &r.state,
+            "testmempoolaccept",
+            serde_json::json!([[hex_tx(&r.parent), hex_tx(&r.child)]]),
+        )
+        .await,
+    );
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows[0]["allowed"], false, "{rows:?}");
+    assert_eq!(rows[0]["reject-reason"], "bip125-replacement-disallowed", "{rows:?}");
+    assert_keys(&rows[1], &["txid", "wtxid"], "unfinished child");
+}
+
+/// Rules 3 and 4 compare the replacement's MODIFIED fee (base plus a
+/// prioritisetransaction delta), as Core `PaysForRBF(..., ws.m_modified_fees, ...)`.
+#[tokio::test]
+async fn testmempoolaccept_single_tx_rbf_uses_modified_fee() {
+    // Base 5,000 < 20,000, but +20,000 makes the modified fee 25,000.
+    let r = replacement_pkg(20_000, 5_000, 5_000, false).await;
+    result(
+        call(
+            &r.state,
+            "prioritisetransaction",
+            serde_json::json!([r.parent.txid().to_hex(), 0, 20_000]),
+        )
+        .await,
+    );
+    let row = single_tma(&r.state, &r.original, &r.parent).await;
+    assert_eq!(row["allowed"], true, "positive delta: {row}");
+
+    // Base 30,000 > 20,000, but -15,000 makes the modified fee 15,000.
+    let r = replacement_pkg(20_000, 30_000, 5_000, false).await;
+    result(
+        call(
+            &r.state,
+            "prioritisetransaction",
+            serde_json::json!([r.parent.txid().to_hex(), 0, -15_000]),
+        )
+        .await,
+    );
+    let row = single_tma(&r.state, &r.original, &r.parent).await;
+    assert_eq!(row["allowed"], false, "negative delta: {row}");
+    assert_eq!(row["reject-reason"], "insufficient fee", "{row}");
+    assert_eq!(
+        row["reject-details"],
+        format!(
+            "insufficient fee, rejecting replacement {}, less fees than conflicting txs; 0.00015 < 0.0002",
+            r.parent.txid()
+        ),
+        "{row}"
+    );
+}

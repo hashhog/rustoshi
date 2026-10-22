@@ -1514,6 +1514,29 @@ impl MempoolError {
             other => other.reject_token(),
         }
     }
+
+    /// Core `TxValidationState::ToString` for the `ReplacementChecks`
+    /// failures of replacement `txid`, whose modified fee is `modified_fee`:
+    /// rule 5 (`GetEntriesForConflicts`) and rules 3/4 (`PaysForRBF`).
+    /// Other errors fall back to [`Self::reject_debug`].
+    pub fn replacement_reject_debug(&self, txid: &Hash256, modified_fee: i64) -> String {
+        match self {
+            MempoolError::RbfTooManyReplacements(clusters, max) => format!(
+                "too many potential replacements, rejecting replacement {txid}; too many conflicting clusters ({clusters} > {max})"
+            ),
+            MempoolError::RbfInsufficientAbsoluteFee(_, original) => format!(
+                "insufficient fee, rejecting replacement {txid}, less fees than conflicting txs; {} < {}",
+                format_money(modified_fee),
+                format_money(i64::try_from(*original).unwrap_or(i64::MAX))
+            ),
+            MempoolError::RbfInsufficientBandwidthFee(additional, relay) => format!(
+                "insufficient fee, rejecting replacement {txid}, not enough additional fees to relay; {} < {}",
+                format_money(i64::try_from(*additional).unwrap_or(i64::MAX)),
+                format_money(i64::try_from(*relay).unwrap_or(i64::MAX))
+            ),
+            other => other.reject_debug(),
+        }
+    }
 }
 
 // ============================================================
@@ -2710,8 +2733,9 @@ impl Mempool {
         // after every check passed and only when !test_accept.
         let mut staged_removals: Vec<Hash256> = Vec::new();
         if !direct_conflicts.is_empty() {
-            // Check RBF rules (read-only).
-            self.check_rbf_rules(&tx, fee, fee_rate, vsize, &direct_conflicts, &mempool_parents)?;
+            // Check RBF rules (read-only). Rules 3 and 4 compare the modified
+            // fee (Core PaysForRBF(..., ws.m_modified_fees, ...)).
+            self.check_rbf_rules(&tx, modified_fee, fee_rate, vsize, &direct_conflicts, &mempool_parents)?;
 
             // Collect all transactions to remove (direct conflicts + their descendants)
             let mut all_to_remove = HashSet::new();
@@ -4218,7 +4242,7 @@ impl Mempool {
     fn check_rbf_rules(
         &self,
         _new_tx: &Transaction,
-        new_fee: u64,
+        new_fee: i64,
         _new_fee_rate: f64,
         new_vsize: usize,
         direct_conflicts: &HashSet<Hash256>,
@@ -4303,8 +4327,14 @@ impl Mempool {
         // Rule #3: Replacement fees must be >= original fees.
         // Core policy/rbf.cpp:109-112 (PaysForRBF): `if (replacement_fees < original_fees)`.
         // Equal fees are allowed here; Rule #4 (bandwidth) then enforces the economic constraint.
-        if new_fee < conflicting_fees {
-            return Err(MempoolError::RbfInsufficientAbsoluteFee(new_fee, conflicting_fees));
+        // `new_fee` is the replacement's modified fee (base + any
+        // prioritisetransaction delta), so it can be negative.
+        let original_fees = i64::try_from(conflicting_fees).unwrap_or(i64::MAX);
+        if new_fee < original_fees {
+            return Err(MempoolError::RbfInsufficientAbsoluteFee(
+                new_fee.max(0) as u64,
+                conflicting_fees,
+            ));
         }
 
         // Rule #4: Replacement must pay for its own bandwidth.
@@ -4316,9 +4346,9 @@ impl Mempool {
         // replacement's fee rate to exceed the original's fee rate. That spurious check
         // has been removed.
         //
-        // Safety: new_fee >= conflicting_fees guaranteed by Rule #3 above, so no underflow.
+        // Safety: new_fee >= original_fees guaranteed by Rule #3 above, so no underflow.
         // incremental_relay_fee is in sat/kvB; mirrors Core CFeeRate::GetFee(vsize) (ceiling).
-        let additional_fee = new_fee - conflicting_fees;
+        let additional_fee = (new_fee - original_fees) as u64;
         let required_bandwidth_fee = (self.config.incremental_relay_fee * new_vsize as u64 + 999) / 1000;
         if additional_fee < required_bandwidth_fee {
             return Err(MempoolError::RbfInsufficientBandwidthFee(
@@ -6710,8 +6740,7 @@ impl Mempool {
             return None;
         }
         let parents = self.mempool_ancestor_ids(tx);
-        let probe = if mod_fee > 0 { mod_fee as u64 } else { 0 };
-        match self.check_rbf_rules(tx, probe, 0.0, tx.vsize(), &direct, &parents) {
+        match self.check_rbf_rules(tx, mod_fee, 0.0, tx.vsize(), &direct, &parents) {
             Err(
                 MempoolError::RbfInsufficientAbsoluteFee(_, _)
                 | MempoolError::RbfInsufficientBandwidthFee(_, _)
@@ -8089,7 +8118,14 @@ impl Mempool {
 
         // Handle conflicts via RBF (same as normal add_transaction)
         if !direct_conflicts.is_empty() {
-            self.check_rbf_rules(&tx, fee, fee_rate, vsize, &direct_conflicts, &mempool_parents)?;
+            self.check_rbf_rules(
+                &tx,
+                self.modified_fee_of(&txid, fee),
+                fee_rate,
+                vsize,
+                &direct_conflicts,
+                &mempool_parents,
+            )?;
 
             let mut all_to_remove = HashSet::new();
             for conflict_txid in &direct_conflicts {

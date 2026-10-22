@@ -14875,7 +14875,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                     );
                     ("missing-ephemeral-spends".to_string(), Some(detail))
                 }
-                other => (other.reject_token(), Some(other.reject_debug())),
+                // ReplacementChecks failures carry Core's debug message
+                // (rule 5 cluster count, PaysForRBF amounts on the modified fee).
+                other => (
+                    other.reject_token(),
+                    Some(other.replacement_reject_debug(&tx.txid(), shown_fee)),
+                ),
             };
             let mut obj = serde_json::json!({
                 "txid": tx.txid().to_hex(),
