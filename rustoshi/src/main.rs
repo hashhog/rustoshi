@@ -1205,10 +1205,36 @@ fn blocktxn_within_depth(block_height: u32, tip_height: u32) -> bool {
 /// Mirrors Bitcoin Core's `MAX_CMPCTBLOCK_DEPTH` (net_processing.cpp:138).
 const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 
-/// Build the reply to a getdata block item. For `MSG_CMPCT_BLOCK` on a block
-/// within `MAX_CMPCTBLOCK_DEPTH` of the tip, Core (ProcessGetBlockData) sends a
-/// BIP-152 `cmpctblock` (coinbase prefilled, SipHash short wtxids keyed from
-/// header+nonce); otherwise (deeper, or any other inv type) the full block.
+/// Core's `BLOCK_VALID_MASK`: the low three status bits hold the validity
+/// level (VALID_HEADER .. VALID_SCRIPTS), compared as a number, not as bits.
+const BLOCK_VALID_MASK: u32 = 7;
+
+/// Core `CBlockIndex::IsValid(BLOCK_VALID_SCRIPTS)` plus `BLOCK_HAVE_DATA`:
+/// the block's scripts were validated, nothing on it or below it failed, and
+/// its body is stored. `BlockStatus::has(VALID_SCRIPTS)` is a bitwise test of
+/// 0b101, which a VALID_HEADER or VALID_CHAIN entry would also pass.
+fn block_fully_validated(entry: &BlockIndexEntry) -> bool {
+    let raw = entry.status.raw();
+    raw & BLOCK_VALID_MASK >= BlockStatus::VALID_SCRIPTS
+        && raw & BlockStatus::HAVE_DATA != 0
+        && raw & (BlockStatus::FAILED_VALIDITY | BlockStatus::FAILED_CHILD) == 0
+}
+
+/// Core `CanDirectFetch()` (net_processing.cpp): the active tip's time is
+/// later than `now - 20 * nPowTargetSpacing`. An unknown tip time is stale.
+fn tip_allows_direct_fetch(tip_time: Option<u32>, now: u64) -> bool {
+    let window = 20 * rustoshi_consensus::params::TARGET_BLOCK_TIME as u64;
+    tip_time.is_some_and(|t| t as u64 > now.saturating_sub(window))
+}
+
+/// Build the reply to a getdata block item. For `MSG_CMPCT_BLOCK` Core
+/// (ProcessGetBlockData, IsMsgCmpctBlk arm) sends a BIP-152 `cmpctblock`
+/// (coinbase prefilled, SipHash short wtxids keyed from header+nonce) when
+/// the tip is fresh (`CanDirectFetch`) and the block is within
+/// `MAX_CMPCTBLOCK_DEPTH` of it; otherwise (deeper, stale tip, or any other
+/// inv type) the full block. Core only reaches that arm for a block that is
+/// fully validated with data (`BlockRequestAllowed` + `BLOCK_HAVE_DATA`), so a
+/// failed or not-yet-validated block is never compacted here.
 fn block_getdata_reply(
     inv_type: InvType,
     block: rustoshi_primitives::Block,
@@ -1218,12 +1244,11 @@ fn block_getdata_reply(
     now: u64,
     nonce: u64,
 ) -> NetworkMessage {
-    let _ = (tip_time, now);
-    if inv_type == InvType::MsgCmpctBlock {
-        // Core: pindex->nHeight >= ActiveChain().Height() - MAX_CMPCTBLOCK_DEPTH
-        // (signed arithmetic, hence saturating_sub).
-        if let Some(h) = block_index.map(|e| e.height) {
-            if h >= tip_height.saturating_sub(MAX_CMPCTBLOCK_DEPTH) {
+    if inv_type == InvType::MsgCmpctBlock && tip_allows_direct_fetch(tip_time, now) {
+        if let Some(entry) = block_index.filter(|e| block_fully_validated(e)) {
+            // Core: pindex->nHeight >= tip->nHeight - MAX_CMPCTBLOCK_DEPTH
+            // (signed arithmetic, hence saturating_sub).
+            if entry.height >= tip_height.saturating_sub(MAX_CMPCTBLOCK_DEPTH) {
                 let cb = rustoshi_network::CmpctBlock::from_block(&block, nonce);
                 return NetworkMessage::CmpctBlock(cb.serialize());
             }
@@ -8066,9 +8091,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     match item.inv_type {
                                         // MSG_CMPCT_BLOCK: a Core peer that chose us as a
                                         // BIP-152 high-bandwidth peer fetches an announced
-                                        // tip this way. Within MAX_CMPCTBLOCK_DEPTH of the
-                                        // tip answer with a cmpctblock, otherwise the full
-                                        // block (ProcessGetBlockData, IsMsgCmpctBlk arm).
+                                        // tip this way. A fully validated block within
+                                        // MAX_CMPCTBLOCK_DEPTH of a fresh tip is answered with
+                                        // a cmpctblock, anything else with the full block
+                                        // (ProcessGetBlockData, IsMsgCmpctBlk arm).
                                         InvType::MsgBlock | InvType::MsgWitnessBlock | InvType::MsgCmpctBlock => {
                                             // Look up block from storage and send it. A block
                                             // connected since the last durable flush lives only
