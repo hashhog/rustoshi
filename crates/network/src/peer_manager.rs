@@ -267,6 +267,41 @@ impl PeerManagerConfig {
         (full_relay, block_relay)
     }
 
+    /// The default config with every connection cap derived from a
+    /// `-maxconnections` budget `n`, as Core's `CConnman::Init` does
+    /// (net.h:1106-1110):
+    ///
+    /// ```text
+    /// full_relay, block_relay  = outbound_limits_for_max_connections(n)
+    /// m_max_automatic_outbound = full_relay + block_relay + m_max_feeler (1)
+    /// m_max_inbound            = max(0, n - m_max_automatic_outbound)
+    /// ```
+    ///
+    /// `max_total` records `n` itself; [`Self::max_automatic_outbound`] caps
+    /// automatic outbound (feelers included) at it like Core's `semOutbound`.
+    /// `n == 0` is the fully offline node: no listener, no dial of any kind.
+    pub fn with_max_connections(max_connections: usize) -> Self {
+        let (full_relay, block_relay) = Self::outbound_limits_for_max_connections(max_connections);
+        Self {
+            max_outbound_full_relay: full_relay,
+            max_outbound_block_relay: block_relay,
+            max_inbound: max_connections
+                .saturating_sub(full_relay + block_relay + MAX_FEELER_CONNECTIONS),
+            max_total: max_connections,
+            offline: max_connections == 0,
+            ..Default::default()
+        }
+    }
+
+    /// How many automatic outbound connections (full-relay, block-relay-only
+    /// and feeler, connecting or established) may be open at once. Core sizes
+    /// its outbound semaphore to `min(m_max_automatic_outbound,
+    /// m_max_automatic_connections)` (net.cpp:3510), so a feeler only runs
+    /// while the `-maxconnections` budget has room for it.
+    pub fn max_automatic_outbound(&self) -> usize {
+        (self.max_outbound() + MAX_FEELER_CONNECTIONS).min(self.max_total)
+    }
+
     /// Build a `ProxyConfig` from these fields, suitable for passing into
     /// `run_outbound_peer_with_proxy`.
     pub fn build_proxy_config(&self) -> ProxyConfig {
@@ -3524,11 +3559,21 @@ impl PeerManager {
             })
             .count();
 
+        // Core's outbound semaphore (net.cpp:3510) is shared with the feeler,
+        // so an in-flight feeler at a small `-maxconnections` holds a slot the
+        // refill must not take: the total never exceeds the budget.
+        let mut budget_left = self
+            .config
+            .max_automatic_outbound()
+            .saturating_sub(self.automatic_outbound_count());
+
         // Fill full-relay connections first
         let full_relay_needed = self
             .config
             .max_outbound_full_relay
-            .saturating_sub(full_relay_count + full_relay_connecting);
+            .saturating_sub(full_relay_count + full_relay_connecting)
+            .min(budget_left);
+        budget_left -= full_relay_needed;
 
         for _ in 0..full_relay_needed {
             if let Some(addr) = self.addr_manager.next_addr_to_try(&self.netgroup_manager) {
@@ -3543,7 +3588,8 @@ impl PeerManager {
         let block_relay_needed = self
             .config
             .max_outbound_block_relay
-            .saturating_sub(block_relay_count + block_relay_connecting);
+            .saturating_sub(block_relay_count + block_relay_connecting)
+            .min(budget_left);
 
         for _ in 0..block_relay_needed {
             if let Some(addr) = self.addr_manager.next_addr_to_try(&self.netgroup_manager) {
@@ -3732,6 +3778,23 @@ impl PeerManager {
             .count()
     }
 
+    /// Count automatic outbound connections (full-relay, block-relay-only and
+    /// feeler; connecting or established): the peers that hold a slot of
+    /// Core's `semOutbound`. Manual and inbound peers do not.
+    fn automatic_outbound_count(&self) -> usize {
+        self.peers
+            .values()
+            .filter(|p| {
+                matches!(
+                    p.conn_type,
+                    ConnectionType::FullRelay
+                        | ConnectionType::BlockRelayOnly
+                        | ConnectionType::Feeler
+                ) && matches!(p.info.state, PeerState::Established | PeerState::Connecting)
+            })
+            .count()
+    }
+
     /// Open at most one short-lived feeler connection (Core net.cpp
     /// ThreadOpenConnections FEELER branch). Selects a NEW-table address (the
     /// addresses a feeler exists to probe), dials it as a `Feeler` connection,
@@ -3758,7 +3821,18 @@ impl PeerManager {
         if !self.config.connect_peers.is_empty() {
             return;
         }
+        // `--maxconnections=0` makes no connection of any kind.
+        if self.config.offline {
+            return;
+        }
         if self.feeler_count() >= MAX_FEELER_CONNECTIONS {
+            return;
+        }
+        // Core's outbound semaphore (net.cpp:3510): the feeler takes a slot of
+        // the same min(full + block + feeler, maxconnections) budget as the
+        // other automatic outbound peers, so it never pushes the total over
+        // `-maxconnections`.
+        if self.automatic_outbound_count() >= self.config.max_automatic_outbound() {
             return;
         }
         // Record the attempt in addrman so a never-answering NEW entry ages out
@@ -8779,6 +8853,100 @@ mod tests {
             Ok(PeerCommand::Disconnect) => {}
             other => panic!("expected Disconnect on feeler channel, got {:?}", other),
         }
+    }
+
+    fn count_conn_type(mgr: &PeerManager, conn_type: ConnectionType) -> usize {
+        mgr.peers.values().filter(|p| p.conn_type == conn_type).count()
+    }
+
+    /// A manager whose caps are what Core derives from `-maxconnections=n`
+    /// (net.h:1106-1110), set field by field, with one NEW-table address a
+    /// feeler could probe.
+    fn budget_manager(n: usize, full: usize, block: usize) -> PeerManager {
+        let config = PeerManagerConfig {
+            max_outbound_full_relay: full,
+            max_outbound_block_relay: block,
+            max_inbound: n.saturating_sub(full + block + MAX_FEELER_CONNECTIONS),
+            max_total: n,
+            offline: n == 0,
+            ..PeerManagerConfig::testnet4()
+        };
+        let mut mgr = PeerManager::new(config, ChainParams::testnet4());
+        let ng = mgr.netgroup_manager.clone();
+        mgr.addr_manager
+            .test_seed_new("9.9.9.9:8333".parse().unwrap(), &ng);
+        mgr
+    }
+
+    fn insert_outbound(mgr: &mut PeerManager, count: usize, conn_type: ConnectionType) {
+        for i in 0..count {
+            let id = 1000 + mgr.peers.len() as u64;
+            let addr: SocketAddr = format!("11.{}.0.1:8333", i + 1).parse().unwrap();
+            mgr.insert_test_peer_with_flags(PeerId(id), addr, conn_type, false);
+        }
+    }
+
+    /// `--maxconnections=0` is fully offline: Core's outbound semaphore is 0,
+    /// so not even a feeler runs. Before this the maintenance tick still
+    /// opened feelers on an offline node.
+    #[tokio::test]
+    async fn feeler_not_opened_when_offline() {
+        let mut mgr = budget_manager(0, 0, 0);
+        mgr.maybe_open_feeler().await;
+        assert_eq!(count_conn_type(&mgr, ConnectionType::Feeler), 0);
+    }
+
+    /// With `-maxconnections=8` Core targets 8 full-relay and its semaphore
+    /// is min(8 + 0 + 1, 8) = 8, so a feeler waits while all 8 are held, and
+    /// runs once one frees up (positive control: the gate is the budget, not
+    /// an empty NEW table).
+    #[tokio::test]
+    async fn feeler_respects_maxconnections_budget() {
+        let mut mgr = budget_manager(8, 8, 0);
+        insert_outbound(&mut mgr, 8, ConnectionType::FullRelay);
+        mgr.maybe_open_feeler().await;
+        assert_eq!(
+            count_conn_type(&mgr, ConnectionType::Feeler),
+            0,
+            "a feeler must not push 8 automatic connections over -maxconnections=8"
+        );
+
+        let mut mgr = budget_manager(8, 8, 0);
+        insert_outbound(&mut mgr, 7, ConnectionType::FullRelay);
+        mgr.maybe_open_feeler().await;
+        assert_eq!(count_conn_type(&mgr, ConnectionType::Feeler), 1);
+
+        // -maxconnections=10: 8 + 2 fill the budget, no feeler.
+        let mut mgr = budget_manager(10, 8, 2);
+        insert_outbound(&mut mgr, 8, ConnectionType::FullRelay);
+        insert_outbound(&mut mgr, 2, ConnectionType::BlockRelayOnly);
+        mgr.maybe_open_feeler().await;
+        assert_eq!(count_conn_type(&mgr, ConnectionType::Feeler), 0);
+
+        // Default budget (125): 8 + 2 outbound leave the feeler its slot.
+        let mut mgr = budget_manager(125, 8, 2);
+        insert_outbound(&mut mgr, 8, ConnectionType::FullRelay);
+        insert_outbound(&mut mgr, 2, ConnectionType::BlockRelayOnly);
+        mgr.maybe_open_feeler().await;
+        assert_eq!(count_conn_type(&mgr, ConnectionType::Feeler), 1);
+    }
+
+    /// The refill shares the budget with an in-flight feeler (Core's single
+    /// `semOutbound`): at `-maxconnections=8` with 7 full-relay and a feeler
+    /// open, the eighth full-relay waits for the feeler to finish.
+    #[tokio::test]
+    async fn outbound_refill_shares_budget_with_feeler() {
+        let mut mgr = budget_manager(8, 8, 0);
+        insert_outbound(&mut mgr, 7, ConnectionType::FullRelay);
+        insert_outbound(&mut mgr, 1, ConnectionType::Feeler);
+        mgr.fill_outbound_connections().await;
+        assert_eq!(count_conn_type(&mgr, ConnectionType::FullRelay), 7);
+
+        // Control: without the feeler the same state does dial the eighth.
+        let mut mgr = budget_manager(8, 8, 0);
+        insert_outbound(&mut mgr, 7, ConnectionType::FullRelay);
+        mgr.fill_outbound_connections().await;
+        assert_eq!(count_conn_type(&mgr, ConnectionType::FullRelay), 8);
     }
 
     /// GETADDR-once: a 2nd getaddr from the same peer is ignored (no addr sent),

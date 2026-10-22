@@ -152,9 +152,11 @@ struct Cli {
     /// Maintain at most <n> automatic connections to peers (Bitcoin Core
     /// `-maxconnections`, default 125). This is the budget for ALL automatic
     /// connections, not an outbound count: the outbound targets are
-    /// min(8, n) full-relay plus min(2, n - full-relay) block-relay-only
-    /// (see `PeerManagerConfig::outbound_limits_for_max_connections`).
-    /// `0` runs the node fully offline.
+    /// min(8, n) full-relay plus min(2, n - full-relay) block-relay-only, the
+    /// inbound cap is n - full-relay - block-relay - 1 (the 1 is the feeler,
+    /// which only runs while the total is below n), see
+    /// `PeerManagerConfig::with_max_connections`. `0` runs the node fully
+    /// offline: no listener and no outbound connection of any kind.
     #[arg(long, default_value_t = DEFAULT_MAX_PEER_CONNECTIONS)]
     maxconnections: usize,
 
@@ -3482,6 +3484,17 @@ fn split_dbcache(dbcache_mib: usize) -> (usize, usize) {
     (block, coins)
 }
 
+/// The peer config's connection caps for `--maxconnections`: outbound
+/// targets, inbound cap, total budget and offline mode, all derived from the
+/// one budget as Core's `CConnman::Init` does (net.h:1106-1110). `async_main`
+/// builds its `PeerManagerConfig` on top of this. It used to set full-relay
+/// to `maxconnections - 2` with maxconnections defaulting to 8 (so mainnet
+/// held only 6 full-relay outbound) and left the inbound cap at 114 for
+/// every budget.
+fn connection_budget_config(cli: &Cli) -> PeerManagerConfig {
+    PeerManagerConfig::with_max_connections(cli.maxconnections)
+}
+
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // Resolve network early so we can place the debug log under the
     // network-specific data directory.
@@ -4760,17 +4773,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Configure peer manager
-    let (max_outbound_full_relay, max_outbound_block_relay) =
-        PeerManagerConfig::outbound_limits_for_max_connections(cli.maxconnections);
     let peer_config = PeerManagerConfig {
-        // Core net.h:1107-1108. This used to be `maxconnections - 2` full-relay
-        // with maxconnections defaulting to 8, so the block-relay-only pair ate
-        // two full-relay slots and mainnet held only 6 full-relay outbound.
-        max_outbound_full_relay,
-        max_outbound_block_relay,
-        // Phase B: maxconnections=0 is a fully offline node — no DNS seeds,
-        // no outbound peers — that advances only via submitblock.
-        offline: cli.maxconnections == 0,
         listen_port: cli.port.unwrap_or(params.default_port),
         listen: cli.listen,
         peer_bloom_filters: cli.peerbloomfilters,
@@ -4810,7 +4813,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         no_fixed_seeds: cli.nofixedseeds,
         // Core -discover: default on, soft-set off by -externalip (init.cpp:815).
         discover: cli.discover.unwrap_or(cli.externalip.is_empty()),
-        ..Default::default()
+        ..connection_budget_config(&cli)
     };
     let mut peer_manager = PeerManager::new_with_netgroup(peer_config, params.clone(), netgroup_manager);
     // Core -externalip: our own address(es) at LOCAL_MANUAL score.
@@ -10457,6 +10460,45 @@ mod tests {
         assert_eq!(f(10), (8, 2));
         assert_eq!(f(16), (8, 2));
         assert_eq!(f(DEFAULT_MAX_PEER_CONNECTIONS), (8, 2));
+    }
+
+    /// The config `async_main` builds for `--maxconnections=<n>` must carry
+    /// every cap Core's `CConnman::Init` derives from `n` (net.h:1106-1110,
+    /// semaphore net.cpp:3510): (full-relay, block-relay, inbound, total,
+    /// offline, automatic-outbound slots incl. the feeler). Before this the
+    /// inbound cap stayed 114 and the total 125 for every `n`.
+    #[test]
+    fn test_connection_budget_config_matches_core_for_maxconnections() {
+        let cases: [(usize, (usize, usize, usize, usize, bool, usize)); 8] = [
+            (0, (0, 0, 0, 0, true, 0)),
+            (1, (1, 0, 0, 1, false, 1)),
+            (8, (8, 0, 0, 8, false, 8)),
+            (10, (8, 2, 0, 10, false, 10)),
+            (11, (8, 2, 0, 11, false, 11)),
+            (12, (8, 2, 1, 12, false, 11)),
+            (125, (8, 2, 114, 125, false, 11)),
+            (200, (8, 2, 189, 200, false, 11)),
+        ];
+        for (n, want) in cases {
+            let arg = format!("--maxconnections={n}");
+            let cli = Cli::try_parse_from(["rustoshi", arg.as_str()]).unwrap();
+            let c = connection_budget_config(&cli);
+            assert_eq!(
+                (
+                    c.max_outbound_full_relay,
+                    c.max_outbound_block_relay,
+                    c.max_inbound,
+                    c.max_total,
+                    c.offline,
+                    c.max_automatic_outbound(),
+                ),
+                want,
+                "--maxconnections={n}"
+            );
+        }
+        // No flag: Core's default budget, 8 + 2 outbound and 114 inbound.
+        let c = connection_budget_config(&Cli::try_parse_from(["rustoshi"]).unwrap());
+        assert_eq!((c.max_outbound(), c.max_inbound, c.max_total), (10, 114, 125));
     }
 
     #[test]
